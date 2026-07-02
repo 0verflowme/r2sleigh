@@ -20239,6 +20239,85 @@ mod tests {
     }
 
     #[test]
+    fn certified_prepared_render_view_requires_renderable_exact_nonraw_call_arg() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0x10, 8),
+            src: Varnode::constant(7, 8),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(1, 8),
+            src: Varnode::constant(0x401050, 8),
+        });
+        entry.push(R2ILOp::Call {
+            target: Varnode::unique(1, 8),
+        });
+
+        let prepared =
+            prepared_from_r2il_blocks(&[entry], &arch).with_name("certified_prepared_view_arg");
+        let arg_value = prepared
+            .callsite_certificate_for_op(0x1000, 2)
+            .expect("prepared callsite certificate")
+            .argument_values[0];
+        let render_facts = |renderable| r2types::FunctionRenderFacts {
+            expressions: BTreeMap::from([(
+                arg_value,
+                r2types::ExpressionRenderFact {
+                    value: arg_value,
+                    defining_inst: None,
+                    width: 8,
+                    renderable,
+                },
+            )]),
+            ..r2types::FunctionRenderFacts::default()
+        };
+        let prepared_view = |value, expr| PreparedSemanticView {
+            call_view_by_site: BTreeMap::from([(
+                (0x1000, 2),
+                crate::analysis::PreparedCallView {
+                    authoritative_args: vec![expr],
+                    authoritative_arg_values: vec![value],
+                    ..crate::analysis::PreparedCallView::default()
+                },
+            )]),
+            ..PreparedSemanticView::default()
+        };
+
+        let render = render_facts(true);
+        let view = prepared_view(arg_value, CExpr::Var("n".to_string()));
+        let adapter = CertifiedPreparedRenderView::new(
+            &view,
+            CertifiedRenderContext::new(&prepared, &render),
+        );
+        assert_eq!(
+            adapter.call_arg_expr((0x1000, 2), arg_value, |_| false),
+            Some(CExpr::Var("n".to_string()))
+        );
+
+        let unrenderable = render_facts(false);
+        let adapter = CertifiedPreparedRenderView::new(
+            &view,
+            CertifiedRenderContext::new(&prepared, &unrenderable),
+        );
+        assert_eq!(adapter.call_arg_expr((0x1000, 2), arg_value, |_| false), None);
+
+        let wrong_value_view = prepared_view(r2ssa::ValueId(9999), CExpr::Var("n".to_string()));
+        let adapter = CertifiedPreparedRenderView::new(
+            &wrong_value_view,
+            CertifiedRenderContext::new(&prepared, &render),
+        );
+        assert_eq!(adapter.call_arg_expr((0x1000, 2), arg_value, |_| false), None);
+
+        let raw_storage_view = prepared_view(arg_value, CExpr::Var("tmp:raw_1".to_string()));
+        let adapter = CertifiedPreparedRenderView::new(
+            &raw_storage_view,
+            CertifiedRenderContext::new(&prepared, &render),
+        );
+        assert_eq!(adapter.call_arg_expr((0x1000, 2), arg_value, |_| true), None);
+    }
+
+    #[test]
     fn return_inline_ssa_storage_carriers_inline_raw_tmp_and_const() {
         let mut ctx = make_x86_64_ctx();
         ctx.state.analysis_ctx.use_info.definitions.insert(

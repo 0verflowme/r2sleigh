@@ -792,10 +792,17 @@ pub struct EnginePhaseTimingJson {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct EngineSemanticStatusJson {
+    pub available: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct EngineInferredTypeWritebackJson {
     #[serde(flatten)]
     pub core: EngineTypeWritebackJsonCore,
     pub interproc: EngineInterprocSummaryJson,
+    pub semantic_status: EngineSemanticStatusJson,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub semantics: Option<r2sym::SemanticArtifact>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1103,12 +1110,42 @@ pub fn type_writeback_report_json(
     semantics: Option<r2sym::SemanticArtifact>,
     compiled_semantics: Option<r2sym::CompiledSemanticInfo>,
 ) -> EngineInferredTypeWritebackJson {
+    let semantic_status = semantic_status_json(semantics.as_ref(), None);
     EngineInferredTypeWritebackJson {
         core: type_writeback_json_core(payload),
         interproc,
+        semantic_status,
         semantics,
         compiled_semantics,
         phase_timings: Vec::new(),
+    }
+}
+
+fn semantic_status_json(
+    semantics: Option<&r2sym::SemanticArtifact>,
+    fallback_reason: Option<String>,
+) -> EngineSemanticStatusJson {
+    match semantics {
+        Some(artifact) => EngineSemanticStatusJson {
+            available: true,
+            reason: format!(
+                "{} {}",
+                semantic_granularity_label(artifact.granularity),
+                semantic_mode_label(artifact)
+            ),
+        },
+        None => EngineSemanticStatusJson {
+            available: false,
+            reason: fallback_reason.unwrap_or_else(|| "semantic artifact unavailable".to_string()),
+        },
+    }
+}
+
+fn semantic_granularity_label(granularity: r2sym::ArtifactGranularity) -> &'static str {
+    match granularity {
+        r2sym::ArtifactGranularity::WholeFunction => "whole_function",
+        r2sym::ArtifactGranularity::Regioned => "regioned",
+        r2sym::ArtifactGranularity::SummaryOnly => "summary_only",
     }
 }
 
@@ -1117,7 +1154,7 @@ pub fn type_writeback_report_json_from_function_analysis(
 ) -> EngineInferredTypeWritebackJson {
     let semantics = request.report.semantic_artifact.clone();
     let compiled_semantics = semantics.as_ref().map(compiled_semantic_info);
-    type_writeback_report_json(
+    let mut report = type_writeback_report_json(
         request.report.type_writeback.clone(),
         interproc_summary_json(EngineInterprocSummaryJsonInput {
             callsite_count: request.report.callsite_count,
@@ -1130,7 +1167,23 @@ pub fn type_writeback_report_json_from_function_analysis(
         }),
         semantics,
         compiled_semantics,
-    )
+    );
+    report.semantic_status = semantic_status_json(
+        report.semantics.as_ref(),
+        request
+            .report
+            .semantic_route
+            .as_ref()
+            .and_then(|route| route.reason.clone())
+            .or_else(|| {
+                request
+                    .report
+                    .summary_diagnostics
+                    .as_ref()
+                    .map(|diagnostics| format!("summary diagnostics: {diagnostics:?}"))
+            }),
+    );
+    report
 }
 
 pub fn symbolic_scope_report_json(
@@ -3751,6 +3804,18 @@ impl EngineFunctionDecompileRequestInput {
         self.input_quality = input_quality;
         self
     }
+
+    pub fn with_interproc_scope(
+        mut self,
+        scope_facts: InterprocScopeFacts,
+        interproc_max_iterations: usize,
+        symbolic_scope: Option<r2sym::PreparedFunctionScope>,
+    ) -> Self {
+        self.scope_facts = scope_facts;
+        self.interproc_max_iterations = interproc_max_iterations.max(1);
+        self.symbolic_scope = symbolic_scope;
+        self
+    }
 }
 
 impl EngineFunctionDecompileRequest {
@@ -5511,18 +5576,55 @@ fn should_reuse_decompile_ssa_for_pattern_analysis(prepared: &r2ssa::SsaArtifact
         && summary.back_edge_count == 0
 }
 
+fn callee_linkage_to_summary_linkage(
+    linkage: r2types::CalleeLinkage,
+) -> r2ssa::FunctionSemanticLinkage {
+    match linkage {
+        r2types::CalleeLinkage::Unknown => r2ssa::FunctionSemanticLinkage::Unknown,
+        r2types::CalleeLinkage::Internal => r2ssa::FunctionSemanticLinkage::Internal,
+        r2types::CalleeLinkage::Imported => r2ssa::FunctionSemanticLinkage::Imported,
+    }
+}
+
+fn merge_typed_callee_summary_seeds(
+    seeds: &mut BTreeMap<r2ssa::InterprocFunctionId, r2ssa::FunctionSemanticSummary>,
+    callee_facts: &BTreeMap<u64, r2types::CalleeFact>,
+) {
+    for (addr, fact) in callee_facts {
+        let linkage = callee_linkage_to_summary_linkage(fact.linkage);
+        let Some(name) = fact.name.as_deref() else {
+            continue;
+        };
+        let id = r2ssa::InterprocFunctionId(*addr);
+        let Some(mut summary) =
+            r2sym::function_semantic_summary_seed_for_name_with_linkage(id, name, linkage)
+        else {
+            continue;
+        };
+        summary.linkage = linkage;
+        summary.callsite_count = summary.callsite_count.max(fact.callsite_count);
+        seeds.entry(id).or_insert(summary);
+    }
+}
+
+pub struct InterprocSummaryBuildInput<'a> {
+    pub function_name: &'a str,
+    pub function_addr: u64,
+    pub arch: Option<&'a r2il::ArchSpec>,
+    pub analysis: &'a EngineAnalysis,
+    pub parsed_context: &'a r2types::ParsedExternalContext,
+    pub scope_facts: &'a InterprocScopeFacts,
+    pub max_iterations: usize,
+    pub symbolic_scope: Option<&'a r2sym::PreparedFunctionScope>,
+}
+
 pub fn build_interproc_summary_set_with_scope_facts(
-    function_name: &str,
-    function_addr: u64,
-    arch: Option<&r2il::ArchSpec>,
-    analysis: &EngineAnalysis,
-    scope_facts: &InterprocScopeFacts,
-    max_iterations: usize,
-    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
+    input: InterprocSummaryBuildInput<'_>,
 ) -> r2ssa::InterprocSummarySet {
-    let root = r2ssa::InterprocFunctionId(function_addr);
-    let mut seeds = scope_facts.summaries.clone();
-    if let Some(scope) = symbolic_scope {
+    let root = r2ssa::InterprocFunctionId(input.function_addr);
+    let mut seeds = input.scope_facts.summaries.clone();
+    merge_typed_callee_summary_seeds(&mut seeds, &input.parsed_context.callee_facts);
+    if let Some(scope) = input.symbolic_scope {
         for function in scope.functions().values() {
             let Some(name) = function.name.as_deref() else {
                 continue;
@@ -5539,10 +5641,10 @@ pub fn build_interproc_summary_set_with_scope_facts(
         .collect::<std::collections::BTreeSet<_>>();
     let mut functions = vec![r2ssa::InterprocFunctionInput {
         id: root,
-        name: Some(function_name.to_string()),
-        prepared: &analysis.ssa_func,
+        name: Some(input.function_name.to_string()),
+        prepared: &input.analysis.ssa_func,
     }];
-    if let Some(scope) = symbolic_scope {
+    if let Some(scope) = input.symbolic_scope {
         for function in scope.functions().values() {
             if function.id == root || seeded_helpers.contains(&function.id) {
                 continue;
@@ -5556,11 +5658,11 @@ pub fn build_interproc_summary_set_with_scope_facts(
     }
     r2ssa::solve_interproc_summary_set(
         &functions,
-        arch,
+        input.arch,
         Some(root),
         &seeds,
         r2ssa::InterprocSolveConfig {
-            max_iterations: max_iterations.max(1),
+            max_iterations: input.max_iterations.max(1),
         },
     )
 }
@@ -5570,15 +5672,16 @@ fn build_engine_analysis_artifact(
     analysis: EngineAnalysis,
 ) -> Option<EngineAnalysisArtifact> {
     let interproc_summary_set = request.include_interproc_summary_set.then(|| {
-        build_interproc_summary_set_with_scope_facts(
-            &request.function_name,
-            request.function_addr,
-            request.arch.as_ref(),
-            &analysis,
-            &request.scope_facts,
-            request.interproc_max_iterations,
-            request.symbolic_scope.as_ref(),
-        )
+        build_interproc_summary_set_with_scope_facts(InterprocSummaryBuildInput {
+            function_name: &request.function_name,
+            function_addr: request.function_addr,
+            arch: request.arch.as_ref(),
+            analysis: &analysis,
+            parsed_context: &request.parsed_context,
+            scope_facts: &request.scope_facts,
+            max_iterations: request.interproc_max_iterations,
+            symbolic_scope: request.symbolic_scope.as_ref(),
+        })
     });
     let semantic_analysis = if request.parsed_context.assumptions.is_empty() {
         analysis.clone()
@@ -10866,6 +10969,42 @@ mod tests {
             typed.identity_hash(),
             "summary linkage must participate in cache identity"
         );
+    }
+
+    #[test]
+    fn typed_callee_facts_seed_imported_allocator_summaries() {
+        let parsed = r2types::parse_external_context_json(
+            r#"{
+                "callees": [
+                    {
+                        "call_addr": 4665,
+                        "addr": 4272,
+                        "name": "sym.imp.malloc",
+                        "linkage": "imported",
+                        "signature": {
+                            "name": "malloc",
+                            "ret_type": "void *",
+                            "params": [
+                                {"name": "size", "type": "size_t"}
+                            ]
+                        }
+                    }
+                ]
+            }"#,
+            64,
+        );
+        let mut seeds = BTreeMap::new();
+        merge_typed_callee_summary_seeds(&mut seeds, &parsed.callee_facts);
+
+        let summary = seeds
+            .get(&r2ssa::InterprocFunctionId(4272))
+            .expect("imported malloc seed");
+        assert_eq!(
+            summary.return_relation,
+            r2ssa::SummaryReturnRelation::HeapAlloc
+        );
+        assert_eq!(summary.linkage, r2ssa::FunctionSemanticLinkage::Imported);
+        assert_eq!(summary.callsite_count, 1);
     }
 
     #[test]

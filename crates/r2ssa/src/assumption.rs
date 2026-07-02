@@ -106,7 +106,9 @@ pub struct AssumptionSet {
 
 impl AssumptionSet {
     pub fn new(items: Vec<AnalysisAssumption>) -> Self {
-        Self { items }
+        let mut out = Self { items: Vec::new() };
+        out.extend(items);
+        out
     }
 
     pub fn is_empty(&self) -> bool {
@@ -118,6 +120,14 @@ impl AssumptionSet {
     }
 
     pub fn push(&mut self, assumption: AnalysisAssumption) {
+        if let Some(existing) = self
+            .items
+            .iter_mut()
+            .find(|item| assumption_binding_eq(item, &assumption))
+        {
+            merge_assumption_metadata(existing, assumption);
+            return;
+        }
         self.items.push(assumption);
     }
 
@@ -125,7 +135,9 @@ impl AssumptionSet {
     where
         I: IntoIterator<Item = AnalysisAssumption>,
     {
-        self.items.extend(iter);
+        for assumption in iter {
+            self.push(assumption);
+        }
     }
 
     pub fn type_hints_for_parameter(&self, index: usize) -> impl Iterator<Item = &str> {
@@ -165,6 +177,30 @@ impl AssumptionSet {
                 _ => None,
             },
         )
+    }
+}
+
+fn assumption_binding_eq(left: &AnalysisAssumption, right: &AnalysisAssumption) -> bool {
+    left.subject == right.subject && left.value == right.value && left.scope == right.scope
+}
+
+fn assumption_provenance_rank(provenance: &AssumptionProvenance) -> u8 {
+    match provenance {
+        AssumptionProvenance::ImportedContext => 0,
+        AssumptionProvenance::Derived => 1,
+        AssumptionProvenance::Replay => 2,
+        AssumptionProvenance::User => 3,
+    }
+}
+
+fn merge_assumption_metadata(existing: &mut AnalysisAssumption, incoming: AnalysisAssumption) {
+    if existing.id.is_none() {
+        existing.id = incoming.id;
+    }
+    if assumption_provenance_rank(&incoming.provenance)
+        > assumption_provenance_rank(&existing.provenance)
+    {
+        existing.provenance = incoming.provenance;
     }
 }
 
@@ -221,5 +257,51 @@ impl AssumptionUsageReport {
         for conflict in &other.conflicts {
             self.mark_conflict(&conflict.assumption, conflict.reason.clone());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reg_type_assumption(
+        reg: &str,
+        ty: &str,
+        provenance: AssumptionProvenance,
+    ) -> AnalysisAssumption {
+        AnalysisAssumption {
+            id: None,
+            subject: AssumptionSubject::Register {
+                name: reg.to_string(),
+            },
+            value: AssumptionValue::TypeHint { ty: ty.to_string() },
+            scope: AssumptionScope::Function,
+            provenance,
+        }
+    }
+
+    #[test]
+    fn assumption_set_deduplicates_same_binding_and_keeps_strongest_provenance() {
+        let mut assumptions = AssumptionSet::new(vec![reg_type_assumption(
+            "rdi",
+            "int32_t",
+            AssumptionProvenance::ImportedContext,
+        )]);
+        assumptions.push(reg_type_assumption(
+            "rdi",
+            "int32_t",
+            AssumptionProvenance::User,
+        ));
+        assumptions.extend([
+            reg_type_assumption("rsi", "size_t", AssumptionProvenance::ImportedContext),
+            reg_type_assumption("rsi", "size_t", AssumptionProvenance::Derived),
+        ]);
+
+        assert_eq!(assumptions.items.len(), 2);
+        assert_eq!(assumptions.items[0].provenance, AssumptionProvenance::User);
+        assert_eq!(
+            assumptions.items[1].provenance,
+            AssumptionProvenance::Derived
+        );
     }
 }

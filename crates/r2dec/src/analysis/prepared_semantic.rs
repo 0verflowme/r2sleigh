@@ -195,6 +195,19 @@ impl PreparedSemanticView {
         self.call_view_by_site.get(&site)
     }
 
+    pub(crate) fn authoritative_call_arg_expr_for_value(
+        &self,
+        site: (u64, usize),
+        value: ValueId,
+    ) -> Option<CExpr> {
+        let call_view = self.call_view_for_site(site)?;
+        call_view
+            .authoritative_arg_values
+            .iter()
+            .position(|candidate| *candidate == value)
+            .and_then(|index| call_view.authoritative_args.get(index).cloned())
+    }
+
     pub(crate) fn call_result_source_for_var(&self, var: &SSAVar) -> Option<(u64, usize)> {
         self.value_id_for_var(var)
             .and_then(|value_id| self.call_result_source_by_value.get(&value_id).copied())
@@ -4149,6 +4162,35 @@ mod tests {
                 func: Box::new(CExpr::Var("sym.helper".to_string())),
                 args: vec![CExpr::IntLit(7)],
             })
+        );
+    }
+
+    #[test]
+    fn prepared_view_resolves_authoritative_call_arg_by_value() {
+        let site = (0x1000, 2);
+        let view = PreparedSemanticView {
+            call_view_by_site: BTreeMap::from([(
+                site,
+                PreparedCallView {
+                    authoritative_args: vec![CExpr::Var("n".to_string()), CExpr::IntLit(7)],
+                    authoritative_arg_values: vec![ValueId(26), ValueId(27)],
+                    ..PreparedCallView::default()
+                },
+            )]),
+            ..PreparedSemanticView::default()
+        };
+
+        assert_eq!(
+            view.authoritative_call_arg_expr_for_value(site, ValueId(26)),
+            Some(CExpr::Var("n".to_string()))
+        );
+        assert_eq!(
+            view.authoritative_call_arg_expr_for_value(site, ValueId(99)),
+            None
+        );
+        assert_eq!(
+            view.authoritative_call_arg_expr_for_value((0x2000, 0), ValueId(26)),
+            None
         );
     }
 

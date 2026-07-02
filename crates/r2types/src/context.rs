@@ -535,8 +535,22 @@ pub fn parse_external_assumption_payload_json(
     }
 
     if trimmed.starts_with('[') {
-        let assumptions = serde_json::from_str::<Vec<r2ssa::AnalysisAssumption>>(trimmed)
+        let raw_items = serde_json::from_str::<Vec<serde_json::Value>>(trimmed)
             .map_err(|_| ExternalAssumptionPayloadParseError::InvalidAssumptionArray)?;
+        let assumptions = raw_items
+            .into_iter()
+            .map(|item| {
+                let has_provenance = item
+                    .as_object()
+                    .is_some_and(|object| object.contains_key("provenance"));
+                let mut assumption = serde_json::from_value::<r2ssa::AnalysisAssumption>(item)
+                    .map_err(|_| ExternalAssumptionPayloadParseError::InvalidAssumptionArray)?;
+                if !has_provenance {
+                    assumption.provenance = r2ssa::AssumptionProvenance::User;
+                }
+                Ok(assumption)
+            })
+            .collect::<Result<Vec<_>, ExternalAssumptionPayloadParseError>>()?;
         return Ok(r2ssa::AssumptionSet::new(assumptions));
     }
 
@@ -2057,6 +2071,25 @@ mod tests {
         assert_eq!(
             assumptions.items[0].value,
             r2ssa::AssumptionValue::Constant { value: 4660 }
+        );
+        assert_eq!(
+            assumptions.items[0].provenance,
+            r2ssa::AssumptionProvenance::User
+        );
+    }
+
+    #[test]
+    fn parse_external_assumption_payload_preserves_explicit_direct_provenance() {
+        let assumptions = parse_external_assumption_payload_json(
+            r#"[{"subject":{"register":{"name":"rdi"}},"value":{"constant":{"value":4660}},"provenance":"replay"}]"#,
+            64,
+        )
+        .expect("assumptions");
+
+        assert_eq!(assumptions.items.len(), 1);
+        assert_eq!(
+            assumptions.items[0].provenance,
+            r2ssa::AssumptionProvenance::Replay
         );
     }
 

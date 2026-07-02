@@ -588,6 +588,45 @@ struct RenderCandidate {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub(crate) struct CertifiedPreparedRenderView<'a> {
+    prepared_view: &'a analysis::PreparedSemanticView,
+    proof: CertifiedRenderContext<'a>,
+}
+
+impl<'a> CertifiedPreparedRenderView<'a> {
+    fn new(
+        prepared_view: &'a analysis::PreparedSemanticView,
+        proof: CertifiedRenderContext<'a>,
+    ) -> Self {
+        Self {
+            prepared_view,
+            proof,
+        }
+    }
+
+    fn call_arg_expr<F>(
+        &self,
+        site: (u64, usize),
+        value: r2ssa::ValueId,
+        contains_raw_storage_name: F,
+    ) -> Option<CExpr>
+    where
+        F: FnOnce(&CExpr) -> bool,
+    {
+        if !self.proof.expression_is_renderable(value) {
+            return None;
+        }
+        let expr = self
+            .prepared_view
+            .authoritative_call_arg_expr_for_value(site, value)?;
+        if contains_raw_storage_name(&expr) {
+            return None;
+        }
+        Some(expr)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct CertifiedRenderContext<'a> {
     prepared: &'a SsaArtifact,
     render_facts: &'a FunctionRenderFacts,
@@ -718,6 +757,16 @@ impl<'a> FoldingContext<'a> {
         Some(CertifiedRenderContext::new(
             self.prepared_ssa()?,
             self.inputs.render_facts()?,
+        ))
+    }
+
+    pub(crate) fn certified_prepared_render_view<'b>(
+        &'b self,
+        proof: CertifiedRenderContext<'b>,
+    ) -> Option<CertifiedPreparedRenderView<'b>> {
+        Some(CertifiedPreparedRenderView::new(
+            self.prepared_semantic_view()?,
+            proof,
         ))
     }
 
@@ -12944,6 +12993,11 @@ impl<'a> FoldingContext<'a> {
         if !matches!(op, SSAOp::Call { .. } | SSAOp::CallInd { .. }) {
             return false;
         }
+        if self.requires_certified_rendering()
+            && self.certified_call_result_flows_to_return((block.addr, op_idx))
+        {
+            return true;
+        }
 
         if self
             .inlined_call_result_set()
@@ -12977,6 +13031,24 @@ impl<'a> FoldingContext<'a> {
         }
 
         false
+    }
+
+    fn certified_call_result_flows_to_return(&self, source_call: (u64, usize)) -> bool {
+        let callsite = r2types::CallsiteKey {
+            block_addr: source_call.0,
+            op_index: source_call.1,
+        };
+        let Some(call_result_facts) = self.inputs.call_result_facts() else {
+            return false;
+        };
+        let Some(render_facts) = self.inputs.render_facts() else {
+            return false;
+        };
+        render_facts.returns_by_op.values().any(|return_fact| {
+            call_result_facts
+                .result_for_value(return_fact.value)
+                .is_some_and(|result| result.callsite == callsite)
+        })
     }
 
     fn is_consumed_immediate_call_home_store(

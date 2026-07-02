@@ -327,10 +327,18 @@ impl<'a> FoldingContext<'a> {
             expected_values.truncate(max_arity);
         }
 
+        let prepared_render = self.certified_prepared_render_view(proof);
         let args = expected_values
             .iter()
             .copied()
-            .map(|value| self.certified_call_arg_expr_for_value(value, &proof))
+            .map(|value| {
+                self.certified_call_arg_expr_for_value_at_site(
+                    (block_addr, op_idx),
+                    value,
+                    &proof,
+                    prepared_render.as_ref(),
+                )
+            })
             .collect::<Option<Vec<_>>>()?;
         if args.iter().any(Self::call_arg_expr_is_unresolved_fallback) {
             return None;
@@ -370,6 +378,21 @@ impl<'a> FoldingContext<'a> {
         let expr =
             self.certified_structural_return_expr_for_value(value, 0, &mut BTreeSet::new())?;
         Some(expr)
+    }
+
+    fn certified_call_arg_expr_for_value_at_site(
+        &self,
+        site: (u64, usize),
+        value: r2ssa::ValueId,
+        proof: &CertifiedRenderContext<'_>,
+        prepared_render: Option<&CertifiedPreparedRenderView<'_>>,
+    ) -> Option<CExpr> {
+        if let Some(expr) = self.certified_call_arg_expr_for_value(value, proof) {
+            return Some(expr);
+        }
+        prepared_render?.call_arg_expr(site, value, |expr| {
+            self.certified_return_expr_contains_raw_storage_name(expr)
+        })
     }
 
     #[cfg(test)]

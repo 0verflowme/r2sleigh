@@ -3256,11 +3256,25 @@ fn r2sleigh_engine_decompile_function_output(
         unsafe { typed_function_context_to_engine_input(&input.function_context) },
         ptr_bits,
     );
+    let scope_facts = unsafe { typed_interproc_scope_facts(&input.interproc_scope) };
+    let symbolic_scope = unsafe {
+        analysis::sym::build_symbolic_scope_from_ffi(
+            input.interproc_scope.functions,
+            input.interproc_scope.num_functions,
+            ctx_view.arch,
+            input.function_addr,
+        )
+    };
     let decompile_input =
         r2engine::EngineFunctionDecompileRequestInput::single_function_from_engine_context(
             function_input,
             None,
             parsed_context,
+        )
+        .with_interproc_scope(
+            scope_facts,
+            input.interproc_plan.interproc_max_iters.max(1),
+            symbolic_scope,
         )
         .with_input_quality(input_quality);
     decompiler::run_engine_decompile_on_large_stack(decompile_input)
@@ -3836,6 +3850,16 @@ pub extern "C" fn r2sleigh_ffi_alignof_function_context() -> usize {
     std::mem::align_of::<R2SleighFunctionContext>()
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_ffi_sizeof_engine_decompile_input() -> usize {
+    std::mem::size_of::<R2SleighEngineDecompileInput>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_ffi_alignof_engine_decompile_input() -> usize {
+    std::mem::align_of::<R2SleighEngineDecompileInput>()
+}
+
 #[repr(C)]
 pub struct R2SleighEngineDecompileInput {
     ctx: *const R2ILContext,
@@ -3845,6 +3869,8 @@ pub struct R2SleighEngineDecompileInput {
     function_name: *const c_char,
     function_context: R2SleighFunctionContext,
     lift_quality: R2SleighLiftQuality,
+    interproc_scope: R2SleighInterprocScope,
+    interproc_plan: R2SleighInterprocSessionPlan,
 }
 
 #[repr(C)]
@@ -6947,7 +6973,6 @@ mod tests {
         );
         for forbidden in [
             "EngineSessionBudget::from_input",
-            "input.interproc_scope",
             "input.apply_policy",
             "build_inference_symbolic_scope(",
             "interproc_max_iterations: budget.interproc_max_iters",
@@ -6960,6 +6985,10 @@ mod tests {
         assert!(
             engine_impl.contains("EngineFunctionDecompileRequestInput::single_function"),
             "engine decompile FFI wrapper must delegate one-function defaults to r2engine"
+        );
+        assert!(
+            engine_impl.contains(".with_interproc_scope("),
+            "engine decompile FFI wrapper must transport typed interproc scope into r2engine"
         );
     }
 
@@ -8955,6 +8984,38 @@ mod integration_tests {
         }
     }
 
+    fn empty_interproc_scope() -> R2SleighInterprocScope {
+        R2SleighInterprocScope {
+            schema_version: 1,
+            functions: ptr::null(),
+            num_functions: 0,
+            seeds: ptr::null(),
+            num_seeds: 0,
+        }
+    }
+
+    fn empty_interproc_plan() -> R2SleighInterprocSessionPlan {
+        R2SleighInterprocSessionPlan {
+            include_type_interproc_scope: 0,
+            include_root_symbolic_scope: 0,
+            interproc_iter: 0,
+            interproc_max_iters: 0,
+            interproc_converged: 0,
+        }
+    }
+
+    #[test]
+    fn engine_decompile_input_layout_exports_match_rust_layout() {
+        assert_eq!(
+            r2sleigh_ffi_sizeof_engine_decompile_input(),
+            std::mem::size_of::<R2SleighEngineDecompileInput>()
+        );
+        assert_eq!(
+            r2sleigh_ffi_alignof_engine_decompile_input(),
+            std::mem::align_of::<R2SleighEngineDecompileInput>()
+        );
+    }
+
     #[cfg(feature = "x86")]
     #[test]
     fn engine_decompile_ffi_refuses_incomplete_zero_block_lift() {
@@ -8979,12 +9040,107 @@ mod integration_tests {
                 null_lift_failures: 0,
                 truncated_blocks: 0,
             },
+            interproc_scope: empty_interproc_scope(),
+            interproc_plan: empty_interproc_plan(),
         };
 
         let output = r2sleigh_engine_decompile_function_output(&input)
             .expect("incomplete lift must still reach engine refusal");
         assert!(output.contains("empty lifted function input"), "{output}");
         assert!(output.contains("read_failures=1"), "{output}");
+
+        r2il_free(ctx);
+    }
+
+    #[cfg(feature = "x86")]
+    #[test]
+    fn engine_decompile_ffi_uses_imported_allocator_scope_for_signature() {
+        fn decode_hex(bytes: &str) -> Vec<u8> {
+            let bytes = bytes.as_bytes();
+            assert_eq!(bytes.len() % 2, 0, "hex input must have even length");
+            bytes
+                .chunks_exact(2)
+                .map(|pair| {
+                    let hi = (pair[0] as char).to_digit(16).expect("valid hex") as u8;
+                    let lo = (pair[1] as char).to_digit(16).expect("valid hex") as u8;
+                    (hi << 4) | lo
+                })
+                .collect()
+        }
+
+        let arch_name = CString::new("x86-64").expect("arch");
+        let ctx = r2il_arch_init(arch_name.as_ptr());
+        assert!(!ctx.is_null(), "x86 context must initialize");
+        let (_arch, disasm) = create_disassembler_for_arch("x86-64").expect("disassembler");
+        let bytes = decode_hex("f30f1efa554889e54883ec1048897df8488b45f84889c7e85bfeffffc9c3");
+        let block = disasm
+            .lift_block(&bytes, 0x1239, 30)
+            .expect("alloc_wrapper block");
+        let blocks = [&block as *const R2ILBlock];
+        let function_name = CString::new("dbg.alloc_wrapper").expect("function name");
+        let external_context = CString::new(
+            r#"{
+                "signature": {
+                    "name": "dbg.alloc_wrapper",
+                    "ret_type": "void *",
+                    "callconv": "amd64",
+                    "params": [
+                        {"name": "n", "type": "size_t"}
+                    ]
+                },
+                "vars": [
+                    {"kind":"register","name":"n","type":"size_t","reg":"rdi","param_index":0}
+                ]
+            }"#,
+        )
+        .expect("external context");
+        let seed_name = CString::new("sym.imp.malloc").expect("seed name");
+        let seeds = [R2SleighInterprocSeed {
+            id: 0x10b0,
+            name: seed_name.as_ptr(),
+            arg_count_hint: 0,
+            has_arg_count_hint: 0,
+            linkage: R2SLEIGH_INTERPROC_LINKAGE_IMPORTED,
+        }];
+        let interproc_scope = R2SleighInterprocScope {
+            schema_version: 1,
+            functions: ptr::null(),
+            num_functions: 0,
+            seeds: seeds.as_ptr(),
+            num_seeds: seeds.len(),
+        };
+        let interproc_plan = R2SleighInterprocSessionPlan {
+            include_type_interproc_scope: 1,
+            include_root_symbolic_scope: 0,
+            interproc_iter: 1,
+            interproc_max_iters: 4,
+            interproc_converged: 1,
+        };
+        let input = R2SleighEngineDecompileInput {
+            ctx,
+            blocks: blocks.as_ptr(),
+            num_blocks: blocks.len(),
+            function_addr: 0x1239,
+            function_name: function_name.as_ptr(),
+            function_context: test_function_context(&external_context),
+            lift_quality: R2SleighLiftQuality {
+                expected_blocks: 1,
+                lifted_blocks: 1,
+                read_failures: 0,
+                invalid_blocks: 0,
+                null_lift_failures: 0,
+                truncated_blocks: 0,
+            },
+            interproc_scope,
+            interproc_plan,
+        };
+
+        let output = r2sleigh_engine_decompile_function_output(&input)
+            .expect("decompile output should be produced");
+        assert!(
+            output.starts_with("allocation_ptr dbg.alloc_wrapper("),
+            "{output}"
+        );
 
         r2il_free(ctx);
     }
@@ -10982,7 +11138,7 @@ mod integration_tests {
         .to_string();
 
         let artifact = crate::types::build_detached_function_analysis_artifact(
-            &[block],
+            &[block.clone()],
             "dbg.alloc_wrapper2",
             Some(&arch),
             64,
@@ -11010,6 +11166,34 @@ mod integration_tests {
         assert!(
             resolved_targets.contains(&0x1239),
             "canonical SsaArtifact callsite resolver must keep the direct alloc_wrapper target, got {resolved_targets:?}"
+        );
+        let parsed_context =
+            r2engine::parse_external_context_json_for_engine(external_context.as_str(), 64);
+        let function_input = r2engine::EngineFunctionInput {
+            function_name: "dbg.alloc_wrapper2".to_string(),
+            function_addr: 0x1257,
+            blocks: vec![block],
+            arch: Some(arch),
+            semantic_metadata_enabled: true,
+        };
+        let response = r2engine::EngineSession::new(4).decompile_function_from_input(
+            r2engine::EngineFunctionDecompileRequestInput::single_function(
+                function_input,
+                Some(64),
+                parsed_context.parsed_context,
+                parsed_context.fallback_hash,
+            ),
+        );
+        assert!(
+            (response.output.contains("return dbg.alloc_wrapper(n);")
+                || response.output.contains("return sub_1239(n);")),
+            "certified decompile should render the wrapper call as an executable return, got:\n{}",
+            response.output
+        );
+        assert!(
+            !response.output.contains("rendered 0 executable call(s)"),
+            "certified decompile must not drop the source callsite effect, got:\n{}",
+            response.output
         );
     }
 

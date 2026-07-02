@@ -335,10 +335,12 @@ typedef struct {
 	const R2ILBlock **blocks;
 	size_t num_blocks;
 	unsigned long long function_addr;
-	const char *function_name;
-	R2SleighFunctionContext function_context;
-	R2SleighLiftQuality lift_quality;
-} R2SleighEngineDecompileInput;
+		const char *function_name;
+		R2SleighFunctionContext function_context;
+		R2SleighLiftQuality lift_quality;
+		R2SleighInterprocScope interproc_scope;
+		R2SleighInterprocSessionPlan interproc_plan;
+	} R2SleighEngineDecompileInput;
 typedef struct {
 	const R2ILContext *ctx;
 	const R2ILBlock **blocks;
@@ -701,6 +703,16 @@ typedef struct {
 	size_t count;
 	size_t capacity;
 } SymFunctionScope;
+
+typedef struct {
+	SymFunctionScope sym_scope;
+	R2SleighInterprocSeed *seeds;
+	size_t seed_count;
+	size_t seed_capacity;
+	size_t borrowed_seed_count;
+	R2SleighInterprocScope scope;
+	R2SleighInterprocSessionPlan plan;
+} SleighInterprocScope;
 
 static const char *function_context_stack_base_name(RAnalFcnSlotBase base, const char *base_name);
 static unsigned int function_context_stack_slot_role_id(RAnalFcnSlotRole role);
@@ -1136,7 +1148,17 @@ static bool build_symbolic_function_scope_with_target(
 	SymFunctionScope *scope,
 	ut64 target_hint
 );
+static bool sleigh_interproc_scope_build(
+	RCore *core,
+	RAnal *anal,
+	RAnalFunction *fcn,
+	R2ILContext *ctx,
+	unsigned int purpose,
+	SleighInterprocScope *out
+);
+static void sleigh_interproc_scope_clear(SleighInterprocScope *scope);
 static char *resolve_interproc_seed_name(RCore *core, RAnal *anal, ut64 addr);
+static unsigned int resolve_interproc_seed_linkage(RCore *core, RAnal *anal, ut64 addr);
 static ut64 *collect_type_interproc_direct_targets_from_blocks(
 	R2ILContext *ctx,
 	const BlockArray *blocks,
@@ -6342,67 +6364,54 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		}
 		sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_LIFT, r_time_now_mono () - profile_start_us);
 
-		SleighTypedFunctionContext typed_context = {0};
-		profile_start_us = r_time_now_mono ();
-		if (!sleigh_typed_function_context_build (anal, fcn, &typed_context, NULL)) {
-			R_LOG_ERROR ("r2sleigh: failed to collect typed function context");
-			block_array_free (&blocks);
-			return strdup("");
-		}
-		sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_TYPED_CONTEXT, r_time_now_mono () - profile_start_us);
-
-		R2SleighInterprocSessionPlan interproc_plan =
-			sleigh_interproc_session_plan_for_function (anal, fcn, R2SLEIGH_INTERPROC_SESSION_TYPE_ANALYSIS);
-		SymFunctionScope sym_scope;
-		R2SleighInterprocSeed *interproc_seeds = NULL;
-		R2SleighInterprocScope interproc_scope = {0};
-		bool have_sym_scope = false;
-		sym_function_scope_init (&sym_scope);
-		if (interproc_plan.include_type_interproc_scope || interproc_plan.include_root_symbolic_scope) {
-			have_sym_scope = build_symbolic_function_scope (anal, fcn, ctx, &sym_scope);
-			if (have_sym_scope && sym_scope.count) {
-				interproc_seeds = R_NEWS0 (R2SleighInterprocSeed, sym_scope.count);
-				if (interproc_seeds) {
-					size_t i;
-					for (i = 0; i < sym_scope.count; i++) {
-						interproc_seeds[i].id = sym_scope.functions[i].entry_addr;
-						interproc_seeds[i].name = sym_scope.functions[i].name;
-						interproc_seeds[i].linkage = R2SLEIGH_INTERPROC_LINKAGE_INTERNAL;
-					}
-				}
+			SleighTypedFunctionContext typed_context = {0};
+			profile_start_us = r_time_now_mono ();
+			if (!sleigh_typed_function_context_build (anal, fcn, &typed_context, NULL)) {
+				R_LOG_ERROR ("r2sleigh: failed to collect typed function context");
+				block_array_free (&blocks);
+				return strdup("");
 			}
-		}
-		interproc_scope.schema_version = 1;
-		interproc_scope.functions = have_sym_scope? sym_scope.functions: NULL;
-		interproc_scope.num_functions = have_sym_scope? sym_scope.count: 0;
-		interproc_scope.seeds = interproc_seeds;
-		interproc_scope.num_seeds = interproc_seeds? sym_scope.count: 0;
+			sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_TYPED_CONTEXT, r_time_now_mono () - profile_start_us);
 
-		R2SleighEngineTypeFunctionInput type_input = {
-			.ctx = ctx,
-			.blocks = lift_ok ? (const R2ILBlock **)blocks.blocks : NULL,
-			.num_blocks = lift_ok ? blocks.count : 0,
-			.function_addr = fcn->addr,
-			.function_name = fcn->name,
-			.function_context = typed_context.context,
-			.lift_quality = blocks.quality,
-			.interproc_scope = interproc_scope,
-			.interproc_plan = interproc_plan,
-			.analysis_depth = anal? (unsigned int)anal->plugin_analysis_depth: 0,
-		};
-		char *result = r2sleigh_engine_type_function_json (&type_input);
-		if (cons && result) {
-			r_cons_printf (cons, "%s\n", result);
+			SleighInterprocScope interproc_scope = {0};
+			if (!sleigh_interproc_scope_build (
+				core,
+				anal,
+				fcn,
+				ctx,
+				R2SLEIGH_INTERPROC_SESSION_TYPE_ANALYSIS,
+				&interproc_scope
+			)) {
+				R_LOG_ERROR ("r2sleigh: failed to build interprocedural scope");
+				sleigh_typed_function_context_clear (&typed_context);
+				block_array_free (&blocks);
+				return strdup ("");
+			}
+
+			R2SleighEngineTypeFunctionInput type_input = {
+				.ctx = ctx,
+				.blocks = lift_ok ? (const R2ILBlock **)blocks.blocks : NULL,
+				.num_blocks = lift_ok ? blocks.count : 0,
+				.function_addr = fcn->addr,
+				.function_name = fcn->name,
+				.function_context = typed_context.context,
+				.lift_quality = blocks.quality,
+				.interproc_scope = interproc_scope.scope,
+				.interproc_plan = interproc_scope.plan,
+				.analysis_depth = anal? (unsigned int)anal->plugin_analysis_depth: 0,
+			};
+			char *result = r2sleigh_engine_type_function_json (&type_input);
+			if (cons && result) {
+				r_cons_printf (cons, "%s\n", result);
+			}
+			if (result) {
+				r2il_string_free (result);
+			}
+			sleigh_interproc_scope_clear (&interproc_scope);
+			sleigh_typed_function_context_clear (&typed_context);
+			block_array_free (&blocks);
+			return strdup ("");
 		}
-		if (result) {
-			r2il_string_free (result);
-		}
-		free (interproc_seeds);
-		sym_function_scope_free (&sym_scope);
-		sleigh_typed_function_context_clear (&typed_context);
-		block_array_free (&blocks);
-		return strdup ("");
-	}
 
 	/* ========== Function-level SSA commands ========== */
 
@@ -6737,30 +6746,47 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		}
 		sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_LIFT, r_time_now_mono () - profile_start_us);
 
-		char *result = NULL;
+			char *result = NULL;
 
-		SleighTypedFunctionContext typed_context = {0};
+			SleighTypedFunctionContext typed_context = {0};
 
-		profile_start_us = r_time_now_mono ();
-		if (!sleigh_typed_function_context_build (anal, fcn, &typed_context, NULL)) {
-			R_LOG_ERROR ("r2sleigh: failed to collect typed function context");
-			block_array_free (&blocks);
-			return strdup("");
-		}
-		sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_TYPED_CONTEXT, r_time_now_mono () - profile_start_us);
+			profile_start_us = r_time_now_mono ();
+			if (!sleigh_typed_function_context_build (anal, fcn, &typed_context, NULL)) {
+				R_LOG_ERROR ("r2sleigh: failed to collect typed function context");
+				block_array_free (&blocks);
+				return strdup("");
+			}
+			sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_TYPED_CONTEXT, r_time_now_mono () - profile_start_us);
 
-		R2SleighEngineDecompileInput decompile_input = {
-			.ctx = ctx,
-			.blocks = lift_ok ? (const R2ILBlock **)blocks.blocks : NULL,
-			.num_blocks = lift_ok ? blocks.count : 0,
-			.function_addr = fcn->addr,
-			.function_name = fcn->name,
-			.function_context = typed_context.context,
-			.lift_quality = blocks.quality,
-		};
-		profile_start_us = r_time_now_mono ();
-		result = r2sleigh_engine_decompile_function (&decompile_input);
-		sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_DECOMPILE, r_time_now_mono () - profile_start_us);
+			SleighInterprocScope interproc_scope = {0};
+			if (!sleigh_interproc_scope_build (
+				core,
+				anal,
+				fcn,
+				ctx,
+				R2SLEIGH_INTERPROC_SESSION_DECOMPILE,
+				&interproc_scope
+			)) {
+				R_LOG_ERROR ("r2sleigh: failed to build interprocedural scope");
+				sleigh_typed_function_context_clear (&typed_context);
+				block_array_free (&blocks);
+				return strdup("");
+			}
+
+			R2SleighEngineDecompileInput decompile_input = {
+				.ctx = ctx,
+				.blocks = lift_ok ? (const R2ILBlock **)blocks.blocks : NULL,
+				.num_blocks = lift_ok ? blocks.count : 0,
+				.function_addr = fcn->addr,
+				.function_name = fcn->name,
+				.function_context = typed_context.context,
+				.lift_quality = blocks.quality,
+				.interproc_scope = interproc_scope.scope,
+				.interproc_plan = interproc_scope.plan,
+			};
+			profile_start_us = r_time_now_mono ();
+			result = r2sleigh_engine_decompile_function (&decompile_input);
+			sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_DECOMPILE, r_time_now_mono () - profile_start_us);
 
 		if (cons) {
 			if (result) {
@@ -6768,13 +6794,14 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			}
 		}
 
-		if (result) {
-			r2il_string_free (result);
+			if (result) {
+				r2il_string_free (result);
+			}
+			sleigh_interproc_scope_clear (&interproc_scope);
+			sleigh_typed_function_context_clear (&typed_context);
+			block_array_free (&blocks);
+			return strdup("");
 		}
-		sleigh_typed_function_context_clear (&typed_context);
-		block_array_free (&blocks);
-		return strdup("");
-	}
 
 	if (!strcmp (cmd, "sla.cfg") || !strcmp (cmd, "sla.cfg.json")) {
 		R2ILContext *ctx = get_context (anal);
@@ -7226,6 +7253,190 @@ static ut64 *collect_type_interproc_direct_targets_from_blocks(
 		*out_count = count;
 	}
 	return targets;
+}
+
+static bool sleigh_interproc_scope_ensure_seed_capacity(SleighInterprocScope *scope, size_t needed) {
+	R2SleighInterprocSeed *grown;
+	size_t new_capacity;
+
+	if (!scope) {
+		return false;
+	}
+	if (needed <= scope->seed_capacity) {
+		return true;
+	}
+	new_capacity = scope->seed_capacity? scope->seed_capacity * 2: 4;
+	while (new_capacity < needed) {
+		new_capacity *= 2;
+	}
+	grown = realloc (scope->seeds, new_capacity * sizeof (*scope->seeds));
+	if (!grown) {
+		return false;
+	}
+	memset (grown + scope->seed_capacity, 0,
+		(new_capacity - scope->seed_capacity) * sizeof (*grown));
+	scope->seeds = grown;
+	scope->seed_capacity = new_capacity;
+	return true;
+}
+
+static bool sleigh_interproc_scope_has_seed(const SleighInterprocScope *scope, ut64 id) {
+	size_t i;
+	if (!scope || !scope->seeds) {
+		return false;
+	}
+	for (i = 0; i < scope->seed_count; i++) {
+		if (scope->seeds[i].id == id) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool sleigh_interproc_scope_append_seed(
+	SleighInterprocScope *scope,
+	ut64 id,
+	const char *name,
+	unsigned int linkage
+) {
+	R2SleighInterprocSeed *seed;
+	if (!scope || !sleigh_interproc_scope_ensure_seed_capacity (scope, scope->seed_count + 1)) {
+		return false;
+	}
+	seed = &scope->seeds[scope->seed_count++];
+	seed->id = id;
+	seed->name = name;
+	seed->linkage = linkage;
+	return true;
+}
+
+static void sleigh_interproc_scope_clear(SleighInterprocScope *scope) {
+	size_t i;
+	if (!scope) {
+		return;
+	}
+	if (scope->seeds) {
+		for (i = scope->borrowed_seed_count; i < scope->seed_count; i++) {
+			free ((void *)scope->seeds[i].name);
+		}
+	}
+	free (scope->seeds);
+	sym_function_scope_free (&scope->sym_scope);
+	memset (scope, 0, sizeof (*scope));
+}
+
+static bool sleigh_interproc_scope_append_import_seed(
+	SleighInterprocScope *scope,
+	RCore *core,
+	RAnal *anal,
+	ut64 target
+) {
+	char *target_name;
+	unsigned int linkage;
+
+	if (!scope || sleigh_interproc_scope_has_seed (scope, target)) {
+		return true;
+	}
+	linkage = resolve_interproc_seed_linkage (core, anal, target);
+	if (linkage != R2SLEIGH_INTERPROC_LINKAGE_IMPORTED) {
+		return true;
+	}
+	target_name = resolve_interproc_seed_name (core, anal, target);
+	if (!target_name || !*target_name) {
+		free (target_name);
+		return true;
+	}
+	if (!sleigh_interproc_scope_append_seed (scope, target, target_name, linkage)) {
+		free (target_name);
+		return false;
+	}
+	return true;
+}
+
+static bool sleigh_interproc_scope_append_helper_imports(
+	SleighInterprocScope *scope,
+	RCore *core,
+	RAnal *anal,
+	R2ILContext *ctx
+) {
+	size_t i;
+	if (!scope) {
+		return false;
+	}
+	for (i = 0; i < scope->sym_scope.count; i++) {
+		const R2ILFunctionBlocks *function = &scope->sym_scope.functions[i];
+		const BlockArray *scope_blocks = &scope->sym_scope.owned_blocks[i];
+		size_t direct_target_count = 0;
+		ut64 *direct_targets = collect_type_interproc_direct_targets_from_blocks (
+			ctx,
+			scope_blocks,
+			function->entry_addr,
+			function->name,
+			&direct_target_count
+		);
+		size_t j;
+		for (j = 0; j < direct_target_count; j++) {
+			if (!sleigh_interproc_scope_append_import_seed (scope, core, anal, direct_targets[j])) {
+				free (direct_targets);
+				return false;
+			}
+		}
+		free (direct_targets);
+	}
+	return true;
+}
+
+static bool sleigh_interproc_scope_build(
+	RCore *core,
+	RAnal *anal,
+	RAnalFunction *fcn,
+	R2ILContext *ctx,
+	unsigned int purpose,
+	SleighInterprocScope *out
+) {
+	size_t i;
+
+	if (!out) {
+		return false;
+	}
+	memset (out, 0, sizeof (*out));
+	sym_function_scope_init (&out->sym_scope);
+	out->plan = sleigh_interproc_session_plan_for_function (anal, fcn, purpose);
+	out->scope.schema_version = 1;
+	if (!out->plan.include_type_interproc_scope && !out->plan.include_root_symbolic_scope) {
+		return true;
+	}
+	if (!build_symbolic_function_scope (anal, fcn, ctx, &out->sym_scope)) {
+		return true;
+	}
+	out->scope.functions = out->sym_scope.functions;
+	out->scope.num_functions = out->sym_scope.count;
+	if (!out->sym_scope.count) {
+		return true;
+	}
+	if (!sleigh_interproc_scope_ensure_seed_capacity (out, out->sym_scope.count)) {
+		sleigh_interproc_scope_clear (out);
+		return false;
+	}
+	for (i = 0; i < out->sym_scope.count; i++) {
+		if (!sleigh_interproc_scope_append_seed (
+			out,
+			out->sym_scope.functions[i].entry_addr,
+			out->sym_scope.functions[i].name,
+			R2SLEIGH_INTERPROC_LINKAGE_INTERNAL
+		)) {
+			sleigh_interproc_scope_clear (out);
+			return false;
+		}
+	}
+	out->borrowed_seed_count = out->seed_count;
+	if (!sleigh_interproc_scope_append_helper_imports (out, core, anal, ctx)) {
+		sleigh_interproc_scope_clear (out);
+		return false;
+	}
+	out->scope.seeds = out->seeds;
+	out->scope.num_seeds = out->seed_count;
+	return true;
 }
 
 static void free_interproc_target_names(char **target_names, size_t target_count) {
