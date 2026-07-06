@@ -20,6 +20,22 @@ is a gold-standard radare2 analysis engine where:
 The plugin should feel like radare2 itself got smarter, not like radare2 grew a
 second shell.
 
+## Default Decision Path
+
+When the right move is not obvious, use this short path before touching code:
+
+1. What user-visible behavior or invariant is broken?
+2. Which crate or `../radare2` owns the missing fact?
+3. Which canonical typed contract should carry it?
+4. What evidence proves the result, and when should the system refuse instead?
+5. What is the cheapest deterministic pipeline test that exercises the contract?
+6. What manual command/session confirms the real output is not fake semantics?
+7. Is this failure mode common enough to deserve a Dylint, proof, fuzz target,
+   mutation target, benchmark gate, or script?
+
+If a fix starts in `r2plugin` or `r2dec`, first prove the missing fact really
+belongs there. Most semantic/type/cache/route fixes should move upstream.
+
 ## Non-Negotiables
 
 1. One fact, one owner.
@@ -190,11 +206,16 @@ For any non-trivial change, follow this order:
 4. State the complexity target: lookup, traversal, search, cache, summary.
 5. Push facts upstream to the owner instead of reconstructing them downstream.
 6. Add the smallest deterministic test at the layer users actually exercise.
-7. If the change touches rendering, state why the rendered C is justified by
+7. Prefer one behavior-level test that exercises the whole relevant pipeline
+   over several helper tests that only lock the current implementation shape.
+8. If the change touches rendering, state why the rendered C is justified by
    canonical facts or mark it as residual/summary-driven.
-8. If the seam crosses into `../radare2`, validate both repos before claiming
+9. If the change affects semantic quality, decompilation, types, summaries, or
+   route policy, manually inspect at least one real command/session path instead
+   of trusting benchmark deltas alone.
+10. If the seam crosses into `../radare2`, validate both repos before claiming
    the work is complete.
-9. If the task reveals hacky behavior, remove or rewrite that behavior before
+11. If the task reveals hacky behavior, remove or rewrite that behavior before
    adding new feature work that depends on it.
 
 ## Ownership Boundaries
@@ -289,7 +310,11 @@ an internal data source.
 
 Rules:
 
-- use the typed function/base-type collector APIs in `../radare2`
+- use the typed function/base-type collector APIs in `../radare2`, especially
+  `r_anal_function_context_collect`, `r_anal_function_context_free`,
+  `r_anal_function_get_signature`, `r_anal_function_set_signature`,
+  `r_anal_function_list_assumptions`, `r_anal_types_snapshot`,
+  `r_anal_types_context_hash`, and `r_anal_get_base_type`
 - keep user-visible commands, but do not use them as plugin internals
 - if a typed field is missing, add it in `../radare2`
 - prefer one consolidated typed context payload over multiple overlapping JSON
@@ -373,8 +398,71 @@ Before landing any non-trivial change, check these explicitly:
    `r2types`, or `r2engine` should own?
 10. Did I render fake C/control/type information instead of an explicit
     residual or summary route?
+11. Did I leave a repeated bad pattern as a reminder instead of encoding it in
+    a lint, proof, regression, benchmark gate, or script?
+12. Did I remove, weaken, or ignore a quality gate because it made the current
+    patch harder?
+13. Did I add dependency or feature complexity without checking whether it
+    belongs in the subsystem spine?
+14. Did I claim semantic or decompiler quality from a benchmark score without
+    manually inspecting representative real output?
 
 If any answer is "yes", the design is probably wrong.
+
+## Quality Ratchet
+
+Quality tooling is part of the architecture. It is not cleanup after the real
+work. When a failure mode repeats, turn it into a mechanical guardrail at the
+right layer.
+
+Use the existing repo gate for rewrite and architecture-sensitive work:
+
+```bash
+# Show the commands without running expensive phases
+scripts/quality-gate.sh --dry-run
+
+# Run the local rewrite quality gate
+scripts/quality-gate.sh
+
+# Make existing local Dylint findings fatal for a cleaned slice
+scripts/quality-gate.sh --strict-dylint
+```
+
+`scripts/quality-gate.sh` is documented in `doc/rewrite_quality_gates.md`. It
+currently covers dependency hygiene, `cargo fmt`, workspace Clippy, local
+Dylint rules, focused Kani harnesses, and targeted mutation testing. It
+complements the required validation bar below; it does not replace subsystem
+tests, plugin install, r2r, or `../radare2` validation when those apply.
+
+Currently enforced guardrails:
+
+- use `tools/dylints/r2sleigh_lints` for forbidden ownership and flow patterns:
+  plugin-side route policy, decompiler-side fact repair, string-prefix
+  semantic classification, nondeterministic render maps, summary routes that
+  masquerade as native C, and other repo-specific architectural seams
+- use Kani for bounded algebraic and policy invariants: width/sign-extension
+  rules, address intervals, lattice laws, cache-key separation, refusal policy,
+  and authority matrices
+- use `cargo machete` and `cargo +nightly udeps` for dependency hygiene
+- use `cargo mutants` when tests need to prove behavior, not just execute code
+
+Candidate guardrails to add when a failure mode earns them:
+
+- use `cargo-fuzz` or another coverage-guided fuzzer for parsers, binary/JSON
+  payload normalization, IL/SSA serialization, FFI boundary decoding, and
+  address/type syntax
+- use Miri for focused unsafe, aliasing, and FFI-adjacent Rust tests where the
+  code can run under the interpreter
+- use `cargo deny` for duplicate-version pressure, advisories, and license policy
+- use `cargo llvm-cov` to find unexercised surfaces, then decide whether
+  behavior-level tests or mutation targets are the right ratchet
+- use broad maintainability scanners such as `rustqual` only as triage signals;
+  promote real findings into repo-owned tests, Dylints, scripts, or docs
+
+Never delete or weaken a proof, lint, fuzz target, mutation target, or benchmark
+gate just to make progress. If a guardrail is wrong, replace it with a stronger
+one and state the invariant, owner, evidence, and removal condition in the same
+change.
 
 ## Build And Run
 
@@ -402,6 +490,10 @@ make -C tests/r2r run
 
 # Run the Rust e2e suite when needed
 cargo e2e-test
+
+# Run rewrite/architecture quality gates when the change warrants it
+scripts/quality-gate.sh --dry-run
+scripts/quality-gate.sh
 ```
 
 Notes:
@@ -413,6 +505,64 @@ Notes:
 - if you touch the typed `../radare2` seam, build and test `../radare2` too
 
 ## Testing Policy
+
+### Behavior-First Tests
+
+One strong test that drives the real user-facing or contract-facing path is
+usually better than a chain of helper tests. Tests should prove that facts flow
+through the intended owner and typed contract, not that today's private helper
+calls happen in today's order.
+
+When adding or changing tests:
+
+- prefer a single deterministic `r2r`, e2e, or crate-level pipeline test that
+  exercises lift, SSA, semantic evidence, type facts, engine routing, and render
+  behavior as far as the change requires
+- assert the important contract facts, residuals, refusal reasons, ordering, and
+  output shape in one informative scenario instead of scattering weak asserts
+  across private helpers
+- delete or collapse helper-level tests when a higher-level test covers the same
+  invariant with better evidence
+- keep focused helper tests only for local algebra, parser edge cases, proof
+  harnesses, fuzz regressions, or failure localization that would be noisy or
+  impractical through the full pipeline
+- do not test private helper names, temporary locals, summary-shaped variables,
+  or incidental traversal order unless that detail is itself the canonical
+  contract
+- when replacing helper tests, preserve the invariant they were meant to protect
+  and make the new test fail for the old bug, not merely pass on the new code
+
+The target is not fewer tests for its own sake. The target is higher signal:
+tests that catch broken ownership, broken evidence flow, fake semantics,
+missing residuals, nondeterminism, and real user-visible regressions.
+
+### Manual Verification
+
+Manual testing is required for quality claims about semantics, types,
+decompilation, summaries, route selection, and radare2 integration. Benchmarks
+and scripts can find suspicious cases, but they do not prove the output is
+right. A higher score can still mean the engine learned to emit prettier fake C.
+
+Manual verification should inspect the real workflow a user or maintainer would
+see:
+
+- run the relevant radare2/plugin/CLI command on at least one representative
+  binary or fixture
+- compare the rendered output with CFG, SSA/dataflow, type facts, semantic
+  evidence, residuals, and refusal reasons
+- check that clean-looking C is backed by native facts, not summary templates,
+  source-shaped local names, or benchmark-friendly guesses
+- look for exposed issues that scripts miss: misleading confidence, missing
+  residuals, bad command UX, unstable ordering, awkward facts, and incorrect
+  fallback routes
+- record the exact command, fixture, and observed behavior when the manual check
+  justifies a quality claim or a benchmark interpretation; put it in the final
+  response, PR description, commit message, or benchmark report, whichever is
+  the durable artifact for the change
+
+Do not replace manual inspection with a new benchmark script. Write scripts to
+reproduce and track what manual testing found, then keep using manual checks to
+audit whether the metric is still measuring the right thing.
 
 ### Default: `tests/r2r`
 
@@ -445,6 +595,7 @@ If you touch `r2ssa`, `r2sym`, `r2types`, `r2engine`, `r2dec`, `r2plugin`, or
 the typed `../radare2` seam, the minimum validation bar is:
 
 ```bash
+cargo fmt --all -- --check
 cargo test -p r2ssa
 cargo test -p r2sym
 cargo test -p r2types
@@ -570,10 +721,16 @@ There are two different block types in `r2ssa`:
 ## Benchmark Triage
 
 Use `scripts/reversing_benchmark.py --closure-gate` when a corpus run is meant
-to prove closure rather than just gather signal. The report includes owner
-buckets for `../radare2`, `r2ssa`, `r2sym`, `r2types`, `r2engine`, `r2dec`, and
-plugin glue; treat those buckets as triage hints, then verify the canonical
-owner before editing.
+to check closure pressure rather than just gather signal. The report includes
+owner buckets for `../radare2`, `r2ssa`, `r2sym`, `r2types`, `r2engine`,
+`r2dec`, and plugin glue; treat those buckets as triage hints, then verify the
+canonical owner before editing.
+
+Benchmark scores are never semantic proof. Before claiming a benchmark
+improvement is a real quality improvement, manually inspect representative
+outputs from the improved and regressed buckets. If the score improves by hiding
+residuals, emitting source-shaped summaries, trusting names, or rewarding fake
+control flow, fix the benchmark gate before using it to guide more work.
 
 ## Gotchas
 
@@ -598,6 +755,7 @@ owner before editing.
 
 - `README.md` for current build and testing quick-start
 - `ROADMAP.md` for current system direction and priority order
+- `doc/rewrite_quality_gates.md` for the local rewrite quality gate and tooling
 - `tests/e2e/README.md` for the split between Rust E2E and `r2r`
 - `doc/` for IL, SSA, ESIL, decompiler, taint, symex, and type-system notes
 - radare2 ESIL docs: <https://book.rada.re/disassembling/esil.html>
