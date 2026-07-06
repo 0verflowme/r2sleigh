@@ -73,9 +73,10 @@ pub use function_facts::{
     ExpressionRenderFact, FunctionCallRenderFacts, FunctionCallResultFacts, FunctionCallsiteFacts,
     FunctionControlFacts, FunctionFacts, FunctionInputQualityFacts, FunctionRenderFacts,
     InterprocSummaryView, LoopStructureFact, MemberAccessRenderFact, MemoryAccessRenderFact,
-    MemoryOpSiteKey, OpSiteKey, PredicateComparisonFact, RegisterCallArgumentLocationFact,
-    ReturnValueRenderFact, StackCallArgumentLocationFact, StackSlotOwnerRenderAuthorization,
-    SummaryEffectRollup, SummaryHelperView, SummaryOutParamFact, SwitchSelectorFact,
+    MemoryOpSiteKey, OpSiteKey, ParamSlotResolver, PredicateComparisonFact,
+    RegisterCallArgumentLocationFact, ReturnValueRenderFact, StackCallArgumentLocationFact,
+    StackSlotOwnerRenderAuthorization, SummaryEffectRollup, SummaryHelperView, SummaryOutParamFact,
+    SwitchSelectorFact,
 };
 pub use inference::{CombinedTypeOracle, TypeInference};
 pub use model::{Signedness, StructField, StructShape, Type, TypeArena, TypeId};

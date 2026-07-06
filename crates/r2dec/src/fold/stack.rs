@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use r2ssa::{ObjectId, ObjectKind, SSAOp, SSAVar};
 use r2types::{
     ExternalStackBase, ExternalStackSlotRole, ExternalStackSlotSpec, StackSlotKey, VisibleBinding,
@@ -334,6 +336,15 @@ impl<'a> FoldingContext<'a> {
         .or_else(|| {
             self.lookup_definition_raw(&val.display_name())
                 .and_then(|expr| self.arg_alias_for_expr(&expr))
+        })
+        .or_else(|| {
+            if !self.requires_certified_rendering() {
+                return None;
+            }
+            let src = self.prepared_transparent_source_var(val)?;
+            (src.version == 0)
+                .then(|| self.arg_alias_for_register_name(&src.name))
+                .flatten()
         });
         if entry_arg_alias.is_none() {
             return false;
@@ -351,6 +362,49 @@ impl<'a> FoldingContext<'a> {
             CExpr::Cast { expr: inner, .. } => self.arg_alias_for_expr(inner),
             _ => None,
         }
+    }
+
+    fn prepared_transparent_source_var(&self, var: &SSAVar) -> Option<SSAVar> {
+        self.prepared_transparent_source_var_inner(var, 0, &mut HashSet::new())
+    }
+
+    fn prepared_transparent_source_var_inner(
+        &self,
+        var: &SSAVar,
+        depth: u32,
+        visited: &mut HashSet<r2ssa::ValueId>,
+    ) -> Option<SSAVar> {
+        if depth > MAX_STACK_ALIAS_DEPTH {
+            return None;
+        }
+        if var.version == 0 && var.is_register() {
+            return Some(var.clone());
+        }
+        let prepared = self.inputs.prepared_ssa?;
+        let value = self.prepared_value_id_for_var(var)?;
+        if !visited.insert(value) {
+            return None;
+        }
+        let result = (|| {
+            let inst_id = prepared.graph().def_inst(value)?;
+            let inst = prepared.graph().inst(inst_id)?;
+            let r2ssa::InstPayload::Op(op) = &inst.payload else {
+                return None;
+            };
+            let src = match op {
+                SSAOp::Copy { src, .. }
+                | SSAOp::New { src, .. }
+                | SSAOp::Cast { src, .. }
+                | SSAOp::Subpiece { src, .. }
+                | SSAOp::IntZExt { src, .. }
+                | SSAOp::IntSExt { src, .. }
+                | SSAOp::Trunc { src, .. } => src,
+                _ => return None,
+            };
+            self.prepared_transparent_source_var_inner(src, depth + 1, visited)
+        })();
+        visited.remove(&value);
+        result
     }
 
     /// Check if an address expression is a stack access and return the variable name.
@@ -764,7 +818,12 @@ impl<'a> FoldingContext<'a> {
                     // Indirect: val is a temp, trace it back via copy_sources
                     if utils::is_temporary_name(&val.name) {
                         let val_key = val.display_name();
-                        if let Some(src_key) = self.render_copy_source_for_name(&val_key) {
+                        if let Some(src_key) =
+                            self.render_copy_source_for_name(&val_key).or_else(|| {
+                                self.prepared_transparent_source_var(val)
+                                    .map(|src| src.display_name())
+                            })
+                        {
                             let src_lower = src_key.to_lowercase();
                             if self.inputs.arch.is_callee_saved_name(&src_lower)
                                 || self.inputs.arch.is_frame_pointer_name(&src_lower)

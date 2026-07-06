@@ -1246,6 +1246,55 @@ mod tests {
     }
 
     #[test]
+    fn certified_stack_param_name_does_not_reverse_resolve_to_register_arg() {
+        let mut ctx = make_x86_64_ctx();
+        let int64 = Some(r2types::CTypeLike::Int {
+            bits: 64,
+            signedness: Signedness::Signed,
+        });
+        let signature = r2types::FunctionSignatureSpec {
+            ret_type: int64.clone(),
+            params: (0..7)
+                .map(|idx| r2types::FunctionParamSpec {
+                    name: if idx == 6 {
+                        "arg6".to_string()
+                    } else {
+                        format!("param{idx}")
+                    },
+                    ty: int64.clone(),
+                })
+                .collect(),
+        };
+        let signature_certificate = r2types::SignatureCertificate::from_signature(
+            &signature,
+            [r2types::SignatureCertificateSource::ExternalContext],
+        )
+        .expect("typed seven-argument signature should be certifiable");
+        mutate_function_facts(&mut ctx, |function_facts| {
+            let mut type_facts = function_facts.type_facts().clone();
+            type_facts.merged_signature = Some(signature);
+            type_facts.signature_certificate = Some(signature_certificate);
+            function_facts.replace_type_facts(type_facts);
+        });
+        install_certified_function_facts(&mut ctx);
+
+        assert!(
+            ctx.requires_certified_rendering(),
+            "fixture should exercise certified reverse lookup"
+        );
+        assert_eq!(
+            ctx.debug_ssa_var_for_visible_name("arg5"),
+            Some(make_var("r8", 0, 8)),
+            "ordinary generic register arguments should keep their ABI reverse lookup"
+        );
+        assert_eq!(
+            ctx.debug_ssa_var_for_visible_name("arg6"),
+            None,
+            "certified stack-parameter name arg6 must not be rebound to the sixth register argument r9"
+        );
+    }
+
+    #[test]
     fn certified_visible_stack_storage_requires_typed_render_fact() {
         let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x1000, 4);
@@ -1492,6 +1541,19 @@ mod tests {
             | CExpr::CharLit(_)
             | CExpr::SizeofType(_) => false,
         }
+    }
+
+    fn expr_contains_member(expr: &CExpr, target: &str) -> bool {
+        let mut found = false;
+        expr.visit(&mut |node| {
+            if matches!(
+                node,
+                CExpr::Member { member, .. } | CExpr::PtrMember { member, .. } if member == target
+            ) {
+                found = true;
+            }
+        });
+        found
     }
 
     fn expr_contains_addr_of(expr: &CExpr) -> bool {
@@ -20239,7 +20301,7 @@ mod tests {
     }
 
     #[test]
-    fn certified_prepared_render_view_requires_renderable_exact_nonraw_call_arg() {
+    fn certified_render_plan_requires_renderable_exact_nonraw_call_arg() {
         let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x1000, 4);
         entry.push(R2ILOp::Copy {
@@ -20286,7 +20348,9 @@ mod tests {
 
         let render = render_facts(true);
         let view = prepared_view(arg_value, CExpr::Var("n".to_string()));
-        let adapter = CertifiedPreparedRenderView::new(
+        let function_facts = r2types::FunctionFacts::default();
+        let adapter = CertifiedRenderPlan::new(
+            &function_facts,
             &view,
             CertifiedRenderContext::new(&prepared, &render),
         );
@@ -20296,21 +20360,24 @@ mod tests {
         );
 
         let unrenderable = render_facts(false);
-        let adapter = CertifiedPreparedRenderView::new(
+        let adapter = CertifiedRenderPlan::new(
+            &function_facts,
             &view,
             CertifiedRenderContext::new(&prepared, &unrenderable),
         );
         assert_eq!(adapter.call_arg_expr((0x1000, 2), arg_value, |_| false), None);
 
         let wrong_value_view = prepared_view(r2ssa::ValueId(9999), CExpr::Var("n".to_string()));
-        let adapter = CertifiedPreparedRenderView::new(
+        let adapter = CertifiedRenderPlan::new(
+            &function_facts,
             &wrong_value_view,
             CertifiedRenderContext::new(&prepared, &render),
         );
         assert_eq!(adapter.call_arg_expr((0x1000, 2), arg_value, |_| false), None);
 
         let raw_storage_view = prepared_view(arg_value, CExpr::Var("tmp:raw_1".to_string()));
-        let adapter = CertifiedPreparedRenderView::new(
+        let adapter = CertifiedRenderPlan::new(
+            &function_facts,
             &raw_storage_view,
             CertifiedRenderContext::new(&prepared, &render),
         );
@@ -21071,6 +21138,333 @@ mod tests {
                     && proof.op_idx == 0
             }),
             "certified load return must record exact memory proof"
+        );
+    }
+
+    #[test]
+    fn certified_return_stack_arg_load_renders_authorized_param_name() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(1, 8),
+            a: Varnode::register(0x28, 8),
+            b: Varnode::constant(8, 8),
+        });
+        entry.push(R2ILOp::Load {
+            dst: Varnode::register(0x00, 8),
+            space: SpaceId::Ram,
+            addr: Varnode::unique(1, 8),
+        });
+        entry.push(R2ILOp::Return {
+            target: Varnode::register(0x00, 8),
+        });
+
+        let prepared =
+            prepared_from_r2il_blocks(&[entry], &arch).with_name("certified_return_stack_arg");
+        let load_cert = prepared
+            .memory_certificate_for_op_site(0x1000, 1, false)
+            .expect("stack argument load memory certificate");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        mutate_function_facts(&mut ctx, |function_facts| {
+            let mut type_facts = function_facts.type_facts().clone();
+            type_facts.visible_bindings.push(VisibleBinding {
+                name: "g".to_string(),
+                ty: Some(r2types::CTypeLike::Int {
+                    bits: 64,
+                    signedness: Signedness::Signed,
+                }),
+                kind: VisibleBindingKind::Param,
+                stack_slot: Some(StackSlotKey {
+                    base: ExternalStackBase::StackPointer,
+                    offset: 8,
+                }),
+                param_index: Some(6),
+                source_reg: None,
+            });
+            function_facts.replace_type_facts(type_facts);
+        });
+
+        let block = prepared.function().get_block(0x1000).expect("entry");
+        let stmts = ctx.fold_block(block, block.addr);
+
+        assert!(
+            stmts
+                .iter()
+                .any(|stmt| matches!(stmt, CStmt::Return(Some(CExpr::Var(name))) if name == "g")),
+            "certified incoming stack argument load should render as its typed parameter owner: {stmts:?}"
+        );
+        assert!(
+            !stmts
+                .iter()
+                .any(|stmt| matches!(stmt, CStmt::Return(Some(CExpr::Deref(_))))),
+            "stack argument loads should not be rendered as raw stack dereferences: {stmts:?}"
+        );
+        assert!(
+            ctx.inputs
+                .function_facts
+                .render_facts()
+                .stack_slot_offsets
+                .contains_key(&load_cert.object),
+            "the test must use the prepared stack-object proof for the loaded argument"
+        );
+    }
+
+    fn prepared_o0_stack_home_member_return() -> r2ssa::SsaArtifact {
+        let mut arch = make_test_arch_x86_64();
+        arch.add_register(RegisterDef::new("RIP", 0x30, 8));
+
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(0x2700, 8),
+            src: Varnode::register(0x20, 8),
+        });
+        entry.push(R2ILOp::IntSub {
+            dst: Varnode::register(0x28, 8),
+            a: Varnode::register(0x28, 8),
+            b: Varnode::constant(8, 8),
+        });
+        entry.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::register(0x28, 8),
+            val: Varnode::unique(0x2700, 8),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0x20, 8),
+            src: Varnode::register(0x28, 8),
+        });
+        entry.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(0x4700, 8),
+            a: Varnode::register(0x20, 8),
+            b: Varnode::constant(0xffff_ffff_ffff_fff8, 8),
+        });
+        entry.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x4700, 8),
+            val: Varnode::register(0x10, 8),
+        });
+        entry.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(0x4701, 8),
+            a: Varnode::register(0x20, 8),
+            b: Varnode::constant(0xffff_ffff_ffff_fff8, 8),
+        });
+        entry.push(R2ILOp::Load {
+            dst: Varnode::unique(0x11f80, 8),
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x4701, 8),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0x00, 8),
+            src: Varnode::unique(0x11f80, 8),
+        });
+        entry.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(0x4702, 8),
+            a: Varnode::register(0x00, 8),
+            b: Varnode::constant(4, 8),
+        });
+        entry.push(R2ILOp::Load {
+            dst: Varnode::unique(0x11f00, 4),
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x4702, 8),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0x00, 4),
+            src: Varnode::unique(0x11f00, 4),
+        });
+        entry.push(R2ILOp::IntZExt {
+            dst: Varnode::register(0x00, 8),
+            src: Varnode::register(0x00, 4),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(0x55400, 8),
+            src: Varnode::constant(0, 8),
+        });
+        entry.push(R2ILOp::Load {
+            dst: Varnode::unique(0x55400, 8),
+            space: SpaceId::Ram,
+            addr: Varnode::register(0x28, 8),
+        });
+        entry.push(R2ILOp::IntAdd {
+            dst: Varnode::register(0x28, 8),
+            a: Varnode::register(0x28, 8),
+            b: Varnode::constant(8, 8),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0x20, 8),
+            src: Varnode::unique(0x55400, 8),
+        });
+        entry.push(R2ILOp::Load {
+            dst: Varnode::register(0x30, 8),
+            space: SpaceId::Ram,
+            addr: Varnode::register(0x28, 8),
+        });
+        entry.push(R2ILOp::IntAdd {
+            dst: Varnode::register(0x28, 8),
+            a: Varnode::register(0x28, 8),
+            b: Varnode::constant(8, 8),
+        });
+        entry.push(R2ILOp::Return {
+            target: Varnode::register(0x30, 8),
+        });
+
+        prepared_from_r2il_blocks(&[entry], &arch).with_name("o0_stack_home_member_return")
+    }
+
+    fn install_o0_stack_home_member_facts(
+        ctx: &mut FoldingContext<'_>,
+        prepared: &r2ssa::SsaArtifact,
+        install_member_fact: bool,
+    ) -> r2types::MemoryAccessRenderFact {
+        ctx.inputs.param_register_aliases = Box::leak(Box::new(HashMap::from([
+            ("RDI".to_string(), "node".to_string()),
+            ("rdi".to_string(), "node".to_string()),
+        ])));
+        ctx.set_type_hints(HashMap::from([
+            ("node".to_string(), CType::ptr(CType::Struct("Node".to_string()))),
+            ("RDI".to_string(), CType::ptr(CType::Struct("Node".to_string()))),
+            ("rdi".to_string(), CType::ptr(CType::Struct("Node".to_string()))),
+        ]));
+        ctx.inputs.external_type_db = Box::leak(Box::new(ExternalTypeDb {
+            structs: [(
+                "node".to_string(),
+                ExternalStruct {
+                    name: "Node".to_string(),
+                    fields: [(
+                        4,
+                        ExternalField {
+                            name: "hash".to_string(),
+                            offset: 4,
+                            ty: Some("uint32_t".to_string()),
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        }));
+        ctx.inputs.field_access_certificates = Box::leak(Box::new(vec![FieldAccessCertificate {
+            slot: 0,
+            field_offset: 4,
+            field_name: "hash".to_string(),
+            field_type: Some("uint32_t".to_string()),
+        }]));
+        let field_load = prepared
+            .certificates()
+            .memory_accesses
+            .values()
+            .find(|cert| !cert.is_write && cert.width == 4)
+            .expect("field load memory certificate")
+            .clone();
+        let field_load_fact = ctx
+            .inputs
+            .function_facts
+            .render_facts()
+            .memory_accesses
+            .get(&field_load.access)
+            .expect("field load render fact")
+            .clone();
+
+        mutate_function_facts(ctx, |function_facts| {
+            let mut type_facts = function_facts.type_facts().clone();
+            type_facts.visible_bindings.push(VisibleBinding {
+                name: "node".to_string(),
+                ty: Some(r2types::CTypeLike::Pointer(Box::new(
+                    r2types::CTypeLike::Struct("Node".to_string()),
+                ))),
+                kind: VisibleBindingKind::Param,
+                stack_slot: Some(StackSlotKey {
+                    base: ExternalStackBase::FramePointer,
+                    offset: 8,
+                }),
+                param_index: Some(0),
+                source_reg: Some("rdi".to_string()),
+            });
+            function_facts.replace_type_facts(type_facts);
+
+            if install_member_fact {
+                let mut render_facts = function_facts.render_facts().clone();
+                render_facts
+                    .member_accesses_by_op
+                    .entry((field_load.block_addr, field_load.op_index, false))
+                    .or_default()
+                    .push(r2types::MemberAccessRenderFact {
+                        access: field_load.access,
+                        block_addr: field_load.block_addr,
+                        op_index: field_load.op_index,
+                        object: field_load.object,
+                        is_write: false,
+                        field_offset: 4,
+                        field_name: "hash".to_string(),
+                        access_width: field_load.width,
+                    });
+                function_facts.set_render(render_facts);
+            }
+        });
+
+        field_load_fact
+    }
+
+    #[test]
+    fn certified_o0_stack_home_member_return_follows_transparent_value_forwards() {
+        let prepared = prepared_o0_stack_home_member_return();
+        let _return_cert = prepared
+            .certificates()
+            .returns
+            .iter()
+            .find(|cert| cert.block_addr == 0x1000)
+            .expect("control return must certify the forwarded RAX value");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        let field_load =
+            install_o0_stack_home_member_facts(&mut ctx, &prepared, true);
+        let block = prepared.function().get_block(0x1000).expect("entry");
+
+        let stmts = ctx.fold_block(block, block.addr);
+
+        assert!(
+            stmts.iter().any(|stmt| {
+                matches!(stmt, CStmt::Return(Some(expr)) if expr_contains_member(expr, "hash"))
+            }),
+            "certified O0 stack-home member return should render node->hash: {stmts:?}"
+        );
+        assert!(
+            !format!("{stmts:?}").contains("r2sleigh residual"),
+            "fully certified O0 member return must not leave residual comments: {stmts:?}"
+        );
+        assert!(
+            ctx.effect_render_proofs().iter().any(|proof| {
+                proof.kind == EffectRenderProofKind::MemoryRead
+                    && proof.block_addr == field_load.block_addr
+                    && proof.op_idx == field_load.op_index
+            }),
+            "certified member return must record exact memory read proof"
+        );
+    }
+
+    #[test]
+    fn certified_o0_stack_home_member_return_requires_member_fact() {
+        let prepared = prepared_o0_stack_home_member_return();
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        install_o0_stack_home_member_facts(&mut ctx, &prepared, false);
+        let block = prepared.function().get_block(0x1000).expect("entry");
+
+        let stmts = ctx.fold_block(block, block.addr);
+
+        assert!(
+            stmts.iter().any(|stmt| {
+                matches!(stmt, CStmt::Comment(text) if text.contains("uncertified return expression"))
+            }),
+            "missing member FunctionRenderFacts proof must residualize: {stmts:?}"
+        );
+        assert!(
+            !stmts.iter().any(|stmt| {
+                matches!(stmt, CStmt::Return(Some(expr)) if expr_contains_member(expr, "hash"))
+            }),
+            "field certificate without exact member render proof must not emit node->hash: {stmts:?}"
         );
     }
 

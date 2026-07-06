@@ -1054,13 +1054,32 @@ fn parse_external_vars(
                         ExternalStackSlotRole::Unknown
                     }
                 });
+                let param_index = var.param_index.or_else(|| {
+                    matches!(role, ExternalStackSlotRole::StackArg)
+                        .then(|| sysv64_stack_arg_index(&base, offset, ptr_bits))
+                        .flatten()
+                });
+                let param_name = var.param_name.clone().or_else(|| {
+                    if !matches!(role, ExternalStackSlotRole::StackArg) {
+                        return None;
+                    }
+                    let param_index = param_index?;
+                    signature
+                        .and_then(|signature| signature.params.get(param_index))
+                        .filter(|param| !is_generic_arg_name(&param.name))
+                        .map(|param| param.name.clone())
+                        .or_else(|| {
+                            is_low_quality_stack_name(&name)
+                                .then(|| format!("arg{}", param_index + 1))
+                        })
+                });
                 let candidate = ExternalStackSlotSpec {
                     name,
                     ty,
                     base: base.clone(),
                     role,
-                    param_index: var.param_index,
-                    param_name: var.param_name.clone(),
+                    param_index,
+                    param_name,
                     source_reg: var.source_reg.clone(),
                 };
                 let key = StackSlotKey { base, offset };
@@ -1156,6 +1175,17 @@ fn register_name_matches(actual: &str, expected: &str) -> bool {
     )
 }
 
+fn sysv64_stack_arg_index(base: &ExternalStackBase, offset: i64, ptr_bits: u32) -> Option<usize> {
+    if !matches!(base, ExternalStackBase::StackPointer) || ptr_bits != 64 {
+        return None;
+    }
+    let ptr_bytes = i64::from(ptr_bits / 8);
+    if offset < ptr_bytes || (offset - ptr_bytes) % ptr_bytes != 0 {
+        return None;
+    }
+    Some(6 + ((offset - ptr_bytes) / ptr_bytes) as usize)
+}
+
 fn parse_external_stack_base(raw: Option<&str>) -> ExternalStackBase {
     let lower = raw.unwrap_or_default().trim().to_ascii_lowercase();
     match lower.as_str() {
@@ -1189,6 +1219,7 @@ fn is_low_quality_stack_name(name: &str) -> bool {
     lower.starts_with("var_")
         || lower.starts_with("local_")
         || lower.starts_with("stack_")
+        || lower.starts_with("arg_")
         || lower == "saved_fp"
         || is_generic_arg_name(&lower)
 }
@@ -2212,6 +2243,39 @@ mod tests {
         assert_eq!(sp_local.name, "sp_local");
 
         assert!(ctx.external_stack_vars.is_empty());
+    }
+
+    #[test]
+    fn parse_external_context_derives_sysv_stack_arg_index() {
+        let ctx = parse_external_context_json(
+            r#"{
+                "vars":[
+                    {
+                        "kind":"stack",
+                        "name":"arg_8h",
+                        "type":"int64_t",
+                        "base":"rsp",
+                        "offset":8,
+                        "role":"stack_arg",
+                        "is_arg":true
+                    }
+                ]
+            }"#,
+            64,
+        );
+
+        let stack_arg = ctx
+            .stack_slots
+            .get(&StackSlotKey {
+                base: ExternalStackBase::StackPointer,
+                offset: 8,
+            })
+            .expect("stack-pointer argument slot");
+
+        assert_eq!(stack_arg.role, ExternalStackSlotRole::StackArg);
+        assert_eq!(stack_arg.param_index, Some(6));
+        assert_eq!(stack_arg.param_name.as_deref(), Some("arg7"));
+        assert_eq!(stack_arg.name, "arg_8h");
     }
 
     #[test]

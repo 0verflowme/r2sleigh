@@ -327,7 +327,7 @@ impl<'a> FoldingContext<'a> {
             expected_values.truncate(max_arity);
         }
 
-        let prepared_render = self.certified_prepared_render_view(proof);
+        let render_plan = self.certified_render_plan(proof);
         let args = expected_values
             .iter()
             .copied()
@@ -336,7 +336,7 @@ impl<'a> FoldingContext<'a> {
                     (block_addr, op_idx),
                     value,
                     &proof,
-                    prepared_render.as_ref(),
+                    render_plan.as_ref(),
                 )
             })
             .collect::<Option<Vec<_>>>()?;
@@ -385,12 +385,12 @@ impl<'a> FoldingContext<'a> {
         site: (u64, usize),
         value: r2ssa::ValueId,
         proof: &CertifiedRenderContext<'_>,
-        prepared_render: Option<&CertifiedPreparedRenderView<'_>>,
+        render_plan: Option<&CertifiedRenderPlan<'_>>,
     ) -> Option<CExpr> {
         if let Some(expr) = self.certified_call_arg_expr_for_value(value, proof) {
             return Some(expr);
         }
-        prepared_render?.call_arg_expr(site, value, |expr| {
+        render_plan?.call_arg_expr(site, value, |expr| {
             self.certified_return_expr_contains_raw_storage_name(expr)
         })
     }

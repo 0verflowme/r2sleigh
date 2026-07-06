@@ -146,7 +146,9 @@ impl<'a> FoldingContext<'a> {
     ) -> Option<(SSAVar, CExpr)> {
         let prepared = self.prepared_ssa()?;
         let addr = prepared.value_var(fact.address)?.clone();
-        let expr = self.render_certified_value_expr_for_var(&addr)?;
+        let expr = self
+            .render_certified_address_expr_for_var(&addr, 0, &mut HashSet::new())
+            .or_else(|| self.render_certified_value_expr_for_var(&addr))?;
         if self.expr_contains_raw_stack_base_arithmetic(&expr)
             || self.certified_return_expr_contains_raw_storage_name(&expr)
         {
@@ -155,12 +157,173 @@ impl<'a> FoldingContext<'a> {
         Some((addr, expr))
     }
 
+    fn render_certified_address_expr_for_var(
+        &self,
+        var: &SSAVar,
+        depth: u32,
+        visited: &mut HashSet<r2ssa::ValueId>,
+    ) -> Option<CExpr> {
+        if depth > Self::MAX_SEMANTIC_RENDER_DEPTH {
+            return None;
+        }
+        if var.is_const() {
+            return self.render_certified_value_expr_for_var(var);
+        }
+        if var.version == 0 && var.is_register() {
+            let rendered = self.var_name(var);
+            return Some(
+                self.arg_alias_for_rendered_name(&rendered)
+                    .or_else(|| self.certified_signature_arg_alias_for_register(&rendered))
+                    .map(CExpr::Var)
+                    .unwrap_or_else(|| CExpr::Var(rendered)),
+            );
+        }
+
+        let prepared = self.prepared_ssa()?;
+        let value = self.prepared_value_id_for_var(var)?;
+        if !visited.insert(value) {
+            return None;
+        }
+
+        let result = (|| {
+            let inst_id = prepared.graph().def_inst(value)?;
+            let inst = prepared.graph().inst(inst_id)?;
+            let r2ssa::InstPayload::Op(op) = &inst.payload else {
+                return None;
+            };
+            match op {
+                SSAOp::Copy { src, .. }
+                | SSAOp::New { src, .. }
+                | SSAOp::Cast { src, .. }
+                | SSAOp::Subpiece { src, .. }
+                | SSAOp::IntZExt { src, .. }
+                | SSAOp::IntSExt { src, .. } => {
+                    self.render_certified_address_expr_for_var(src, depth + 1, visited)
+                }
+                SSAOp::Load { .. } => {
+                    let (block_addr, op_idx) = prepared.inst_op_site(inst_id)?;
+                    let proof = self.certified_render_context()?;
+                    let fact = proof.memory_access_for_op(block_addr, op_idx, false)?;
+                    if fact.value != Some(value) {
+                        return None;
+                    }
+                    self.certified_render_plan(proof)?
+                        .stack_param_expr_for_memory_fact(fact)
+                }
+                SSAOp::IntAdd { a, b, .. } => Some(CExpr::binary(
+                    BinaryOp::Add,
+                    self.render_certified_address_expr_for_var(a, depth + 1, visited)?,
+                    self.render_certified_address_expr_for_var(b, depth + 1, visited)?,
+                )),
+                SSAOp::IntSub { a, b, .. } => Some(CExpr::binary(
+                    BinaryOp::Sub,
+                    self.render_certified_address_expr_for_var(a, depth + 1, visited)?,
+                    self.render_certified_address_expr_for_var(b, depth + 1, visited)?,
+                )),
+                SSAOp::PtrAdd {
+                    base,
+                    index,
+                    element_size,
+                    ..
+                } => {
+                    let index =
+                        self.render_certified_address_expr_for_var(index, depth + 1, visited)?;
+                    let scaled = if *element_size == 1 {
+                        index
+                    } else {
+                        CExpr::binary(
+                            BinaryOp::Mul,
+                            index,
+                            CExpr::IntLit(i64::from(*element_size)),
+                        )
+                    };
+                    Some(CExpr::binary(
+                        BinaryOp::Add,
+                        self.render_certified_address_expr_for_var(base, depth + 1, visited)?,
+                        scaled,
+                    ))
+                }
+                SSAOp::PtrSub {
+                    base,
+                    index,
+                    element_size,
+                    ..
+                } => {
+                    let index =
+                        self.render_certified_address_expr_for_var(index, depth + 1, visited)?;
+                    let scaled = if *element_size == 1 {
+                        index
+                    } else {
+                        CExpr::binary(
+                            BinaryOp::Mul,
+                            index,
+                            CExpr::IntLit(i64::from(*element_size)),
+                        )
+                    };
+                    Some(CExpr::binary(
+                        BinaryOp::Sub,
+                        self.render_certified_address_expr_for_var(base, depth + 1, visited)?,
+                        scaled,
+                    ))
+                }
+                _ => None,
+            }
+        })();
+
+        visited.remove(&value);
+        result
+    }
+
+    pub(super) fn certified_signature_arg_alias_for_register(
+        &self,
+        reg_name: &str,
+    ) -> Option<String> {
+        if !self.requires_certified_rendering() {
+            return None;
+        }
+        let reg_name = reg_name.to_ascii_lowercase();
+        let index = self.inputs.arch.arg_regs.iter().position(|arg_reg| {
+            crate::register_alias_names(arg_reg)
+                .into_iter()
+                .any(|alias| alias.eq_ignore_ascii_case(&reg_name))
+        })?;
+        self.inputs
+            .function_facts
+            .type_facts()
+            .render_authorized_signature()
+            .and_then(|signature| signature.params.get(index))
+            .map(|param| param.name.clone())
+            .filter(|name| !name.trim().is_empty())
+    }
+
     pub(super) fn render_certified_memory_expr_for_fact(
         &self,
         fact: &r2types::MemoryAccessRenderFact,
         elem_ty: CType,
     ) -> Option<CExpr> {
+        if let Some(plan) = self
+            .certified_render_context()
+            .and_then(|proof| self.certified_render_plan(proof))
+            && let Some(expr) = plan.stack_param_expr_for_memory_fact(fact)
+        {
+            return Some(expr);
+        }
         let (addr, addr_expr) = self.certified_memory_address_expr(fact)?;
+        let previous_block = self.current_block_addr.get();
+        let previous_op = self.current_op_idx.get();
+        self.current_block_addr.set(Some(fact.block_addr));
+        self.current_op_idx.set(Some(fact.op_index));
+        let mut visited = HashSet::new();
+        let rendered =
+            self.render_memory_access_from_visible_expr(&addr_expr, fact.width, 0, &mut visited);
+        self.current_block_addr.set(previous_block);
+        self.current_op_idx.set(previous_op);
+        if let Some(rendered) = rendered {
+            return Some(rendered);
+        }
+        if matches!(addr_expr, CExpr::Binary { .. }) {
+            return None;
+        }
         let ptr_ty = CType::ptr(elem_ty);
         let casted = self.cast_addr_expr_to_ptr_if_needed(&addr, addr_expr, &ptr_ty);
         Some(CExpr::Deref(Box::new(casted)))

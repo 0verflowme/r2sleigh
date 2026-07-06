@@ -7258,12 +7258,23 @@ fn merge_recovered_arg_types_into_signature(
 
     let max_slot = local_arg_types.keys().copied().max()?;
     let sig = signature.get_or_insert_with(Default::default);
-    let allow_param_count_extension = !signature_param_count_is_authoritative(sig);
+    let has_recovered_stack_arg_beyond_signature = vars.iter().any(|var| {
+        var.isarg
+            && var.kind == "s"
+            && var
+                .name
+                .strip_prefix("arg")
+                .and_then(|idx| idx.parse::<usize>().ok())
+                .is_some_and(|slot| slot >= sig.params.len())
+    });
+    let allow_param_count_extension =
+        !signature_param_count_is_authoritative(sig) || has_recovered_stack_arg_beyond_signature;
     while allow_param_count_extension && sig.params.len() <= max_slot {
         let idx = sig.params.len();
         sig.params.push(FunctionParamSpec {
             name: format!("arg{}", idx + 1),
-            ty: None,
+            ty: has_recovered_stack_arg_beyond_signature
+                .then(|| abi_placeholder_param_type(ptr_bits)),
         });
     }
 
@@ -7283,6 +7294,13 @@ fn merge_recovered_arg_types_into_signature(
     }
 
     signature
+}
+
+fn abi_placeholder_param_type(ptr_bits: u32) -> CTypeLike {
+    CTypeLike::Int {
+        bits: ptr_bits.max(8),
+        signedness: Signedness::Signed,
+    }
 }
 
 fn collect_recovered_arg_types(
@@ -7558,10 +7576,21 @@ fn build_visible_bindings(
         let Some(key) = visible_binding_key_for_recovered_var(var) else {
             continue;
         };
+        let recovered_stack_arg_index = if var.isarg && matches!(key, VisibleBindingKey::Stack(_)) {
+            var.name
+                .strip_prefix("arg")
+                .and_then(|idx| idx.parse::<usize>().ok())
+        } else {
+            None
+        };
         let candidate_name = rename_map
             .get(var.name.as_str())
             .cloned()
-            .unwrap_or_else(|| var.name.clone());
+            .unwrap_or_else(|| {
+                recovered_stack_arg_index
+                    .map(|idx| format!("arg{}", idx + 1))
+                    .unwrap_or_else(|| var.name.clone())
+            });
         let candidate = VisibleBinding {
             name: sanitize_c_identifier(&candidate_name).unwrap_or(candidate_name),
             ty: type_map
@@ -7581,7 +7610,7 @@ fn build_visible_bindings(
             },
             param_index: match key {
                 VisibleBindingKey::Param(idx) => Some(idx),
-                VisibleBindingKey::Stack(_) => None,
+                VisibleBindingKey::Stack(_) => recovered_stack_arg_index,
             },
             source_reg: var.reg.clone(),
         };
@@ -12586,6 +12615,104 @@ mod tests {
                 bits: 32,
                 signedness: Signedness::Signed,
             })
+        );
+    }
+
+    #[test]
+    fn recovered_stack_arg_extends_external_register_only_signature() {
+        let mut parsed_context = ParsedExternalContext::default();
+        parsed_context.current_signature = Some(FunctionSignatureSpec {
+            ret_type: Some(CTypeLike::Int {
+                bits: 64,
+                signedness: Signedness::Signed,
+            }),
+            params: vec![FunctionParamSpec {
+                name: "arg1".to_string(),
+                ty: Some(CTypeLike::Int {
+                    bits: 64,
+                    signedness: Signedness::Signed,
+                }),
+            }],
+        });
+        parsed_context.merged_signature = parsed_context.current_signature.clone();
+
+        let vars = [
+            RecoveredVariable {
+                name: "arg0".to_string(),
+                kind: "r".to_string(),
+                delta: 0,
+                var_type: "int64_t".to_string(),
+                isarg: true,
+                reg: Some("rdi".to_string()),
+            },
+            RecoveredVariable {
+                name: "arg6".to_string(),
+                kind: "s".to_string(),
+                delta: 8,
+                var_type: "int64_t".to_string(),
+                isarg: true,
+                reg: None,
+            },
+        ];
+
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "sym.stack_arg",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "sym.stack_arg".to_string(),
+                signature: "int64_t sym.stack_arg (int64_t arg1)".to_string(),
+                ret_type: "int64_t".to_string(),
+                params: vec![InferredSignatureParam {
+                    name: "arg1".to_string(),
+                    param_type: "int64_t".to_string(),
+                }],
+                callconv: String::new(),
+                arch: "x86-64".to_string(),
+                confidence: 90,
+                callconv_confidence: 0,
+            },
+            recovered_vars: &vars,
+            ssa_blocks: &[],
+            parsed_context,
+            local_structs: LocalStructArtifacts::default(),
+            interproc_summary_set: None,
+            diagnostics: TypeWritebackDiagnostics::default(),
+        });
+
+        let merged = analysis
+            .type_facts
+            .merged_signature
+            .as_ref()
+            .expect("merged signature");
+        assert_eq!(merged.params.len(), 7);
+        for idx in 1..6 {
+            assert_eq!(
+                merged.params[idx].ty,
+                Some(CTypeLike::Int {
+                    bits: 64,
+                    signedness: Signedness::Signed,
+                })
+            );
+        }
+        assert_eq!(merged.params[6].name, "arg7");
+        assert_eq!(
+            merged.params[6].ty,
+            Some(CTypeLike::Int {
+                bits: 64,
+                signedness: Signedness::Signed,
+            })
+        );
+        assert!(
+            analysis.type_facts.visible_bindings.iter().any(|binding| {
+                binding.name == "arg7"
+                    && binding.param_index == Some(6)
+                    && binding.stack_slot
+                        == Some(StackSlotKey {
+                            base: ExternalStackBase::StackPointer,
+                            offset: 8,
+                        })
+            }),
+            "recovered stack-arg binding should use the canonical C parameter name"
         );
     }
 

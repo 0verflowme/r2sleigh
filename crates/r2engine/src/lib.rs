@@ -16,8 +16,8 @@ use r2il::R2ILBlock;
 use r2ssa::{CFGRiskSummary, SsaArtifact};
 use r2types::{
     CalleeResolutionFacts, FunctionFacts, FunctionSignatureProjection, FunctionTypeFacts,
-    MetadataScalarKind, SignatureCertificateSource, TypeHint, TypeWritebackPlan, merge_type_hint,
-    type_hint_from_value_metadata,
+    MetadataScalarKind, ParamSlotResolver, SignatureCertificateSource, TypeHint, TypeWritebackPlan,
+    merge_type_hint, type_hint_from_value_metadata,
 };
 use serde::{Deserialize, Serialize};
 
@@ -2259,8 +2259,12 @@ pub fn decompile_callee_resolution_facts(
 pub fn attach_prepared_decompile_evidence(
     prepared: &SsaArtifact,
     mut function_facts: FunctionFacts,
+    param_slots: &ParamSlotResolver,
 ) -> FunctionFacts {
     function_facts.attach_prepared_decompile_evidence(prepared);
+    function_facts.normalize_field_certificates_from_external_layout();
+    function_facts
+        .populate_member_access_render_facts_from_field_certificates(prepared, param_slots);
     function_facts.populate_array_access_render_facts_from_scalar_candidates();
     function_facts
 }
@@ -2269,9 +2273,10 @@ pub fn function_facts_for_decompile(
     func_name: &str,
     prepared: &SsaArtifact,
     function_facts: FunctionFacts,
+    param_slots: &ParamSlotResolver,
 ) -> FunctionFacts {
-    let mut function_facts = attach_prepared_decompile_evidence(prepared, function_facts);
-    function_facts.normalize_field_certificates_from_external_layout();
+    let mut function_facts =
+        attach_prepared_decompile_evidence(prepared, function_facts, param_slots);
     if function_facts.decompile_route().is_none() {
         let cfg_summary = prepared.function().cfg_risk_summary();
         let route_decision =
@@ -2285,6 +2290,7 @@ pub fn function_facts_for_decompile(
 pub fn decompiler_input_from_prepared_facts(
     ssa_func: SsaArtifact,
     function_facts: FunctionFacts,
+    param_slots: &ParamSlotResolver,
     _function_names: HashMap<u64, String>,
     _strings: HashMap<u64, String>,
     _symbols: HashMap<u64, String>,
@@ -2295,7 +2301,8 @@ pub fn decompiler_input_from_prepared_facts(
         .name
         .clone()
         .unwrap_or_else(|| format!("sub_{:x}", ssa_func.entry));
-    let function_facts = function_facts_for_decompile(&func_name, &ssa_func, function_facts);
+    let function_facts =
+        function_facts_for_decompile(&func_name, &ssa_func, function_facts, param_slots);
     let _ = ptr_bits;
     let context = r2dec::DecompilerContext::from_function_facts(function_facts);
     r2dec::DecompilerInput::new(ssa_func, context)
@@ -4719,10 +4726,11 @@ impl EngineSession {
         } else {
             None
         };
-        let (_, render_target) = EngineRenderTarget::for_arch_with_ptr_bits(
+        let (arch_name, render_target) = EngineRenderTarget::for_arch_with_ptr_bits(
             analysis_request.arch.as_ref(),
             analysis_request.ptr_bits,
         );
+        let param_slots = ParamSlotResolver::from_arch_name(Some(&arch_name));
         let identity = EngineFunctionIdentity::new(
             analysis_request.function_addr,
             &canonical_name,
@@ -4769,6 +4777,7 @@ impl EngineSession {
             &display_name,
             &artifact.ssa_func,
             artifact.function_facts,
+            &param_slots,
         );
         let render_cache_key = decompile_render_cache_key(DecompileRenderCacheKeyInput {
             blocks: &analysis_request.blocks,
@@ -5796,8 +5805,12 @@ fn build_engine_analysis_artifact(
     ));
     function_facts
         .merge_proof_coverage(proof_coverage_from_type_facts(function_facts.type_facts()));
-    function_facts =
-        attach_prepared_decompile_evidence(&semantic_analysis.ssa_func, function_facts);
+    let param_slots = ParamSlotResolver::from_arch_name(Some(&arch_name));
+    function_facts = attach_prepared_decompile_evidence(
+        &semantic_analysis.ssa_func,
+        function_facts,
+        &param_slots,
+    );
     Some(EngineAnalysisArtifact {
         ssa_func: semantic_analysis.ssa_func,
         pattern_ssa_func: semantic_analysis.pattern_ssa_func,
@@ -7385,6 +7398,10 @@ mod tests {
         arch.add_register(r2il::RegisterDef::new("RDI", 0x10, 8));
         arch.add_register(r2il::RegisterDef::new("RSI", 0x18, 8));
         arch
+    }
+
+    fn x86_64_param_slots() -> ParamSlotResolver {
+        ParamSlotResolver::from_arch_name(Some("x86-64"))
     }
 
     fn x86_64_result_arch() -> r2il::ArchSpec {
@@ -12989,8 +13006,13 @@ mod tests {
     fn function_facts_for_decompile_stamps_route_without_context_adapter() {
         let blocks = const_return_blocks(0x3000, 0);
         let prepared = r2ssa::SsaArtifact::for_decompile(&blocks, None).expect("prepared");
-        let function_facts =
-            function_facts_for_decompile("sym.simple", &prepared, FunctionFacts::default());
+        let param_slots = ParamSlotResolver::new();
+        let function_facts = function_facts_for_decompile(
+            "sym.simple",
+            &prepared,
+            FunctionFacts::default(),
+            &param_slots,
+        );
 
         let route_facts = function_facts
             .decompile_route()
@@ -13010,7 +13032,9 @@ mod tests {
         );
         let function_facts = FunctionFacts::default().with_decompile_route(existing_route.clone());
 
-        let function_facts = function_facts_for_decompile("sym.simple", &prepared, function_facts);
+        let param_slots = ParamSlotResolver::new();
+        let function_facts =
+            function_facts_for_decompile("sym.simple", &prepared, function_facts, &param_slots);
 
         assert_eq!(function_facts.decompile_route(), Some(&existing_route));
     }
@@ -13023,6 +13047,7 @@ mod tests {
         let input = decompiler_input_from_prepared_facts(
             prepared,
             FunctionFacts::default(),
+            &ParamSlotResolver::new(),
             HashMap::from([(0x402000, "sym.imp.printf".to_string())]),
             HashMap::new(),
             HashMap::new(),
@@ -13065,6 +13090,7 @@ mod tests {
         let input = decompiler_input_from_prepared_facts(
             prepared,
             FunctionFacts::default(),
+            &x86_64_param_slots(),
             HashMap::from([(0x402000, "sym.helper".to_string())]),
             HashMap::new(),
             HashMap::new(),
@@ -13099,6 +13125,7 @@ mod tests {
         let input = decompiler_input_from_prepared_facts(
             prepared,
             FunctionFacts::default(),
+            &x86_64_param_slots(),
             HashMap::from([(0x402000, "sym.helper".to_string())]),
             HashMap::new(),
             HashMap::new(),
@@ -13132,6 +13159,7 @@ mod tests {
         let input = decompiler_input_from_prepared_facts(
             prepared,
             FunctionFacts::default(),
+            &x86_64_param_slots(),
             HashMap::from([(0x402000, "sym.helper".to_string())]),
             HashMap::new(),
             HashMap::new(),
@@ -13187,6 +13215,7 @@ mod tests {
         let input = decompiler_input_from_prepared_facts(
             prepared,
             FunctionFacts::default(),
+            &x86_64_param_slots(),
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
@@ -13237,8 +13266,11 @@ mod tests {
             ..FunctionTypeFacts::default()
         };
 
-        let facts =
-            attach_prepared_decompile_evidence(&prepared, FunctionFacts::new(type_facts, None));
+        let facts = attach_prepared_decompile_evidence(
+            &prepared,
+            FunctionFacts::new(type_facts, None),
+            &x86_64_param_slots(),
+        );
 
         let array = facts
             .render()
@@ -13248,6 +13280,76 @@ mod tests {
         assert_eq!(array.block_addr, 0x401000);
         assert_eq!(array.op_index, 0);
         assert!(!array.is_write);
+    }
+
+    #[test]
+    fn prepared_facts_promote_layout_normalized_member_render_fact() {
+        let mut arch = r2il::ArchSpec::new("x86-64");
+        arch.addr_size = 8;
+        arch.add_register(r2il::RegisterDef::new("rax", 0, 8));
+        arch.add_register(r2il::RegisterDef::new("rdi", 0x10, 8));
+        let mut block = R2ILBlock::new(0x401000, 4);
+        block.push(r2il::R2ILOp::IntAdd {
+            dst: r2il::Varnode::unique(0x100, 8),
+            a: r2il::Varnode::register(0x10, 8),
+            b: r2il::Varnode::constant(8, 8),
+        });
+        block.push(r2il::R2ILOp::Load {
+            dst: r2il::Varnode::register(0, 8),
+            space: r2il::SpaceId::Ram,
+            addr: r2il::Varnode::unique(0x100, 8),
+        });
+        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&arch)).expect("prepared");
+        let signature = r2types::FunctionSignatureSpec {
+            ret_type: None,
+            params: vec![r2types::FunctionParamSpec {
+                name: "node".to_string(),
+                ty: Some(r2types::CTypeLike::Pointer(Box::new(
+                    r2types::CTypeLike::Struct("Node".to_string()),
+                ))),
+            }],
+        };
+        let type_facts = FunctionTypeFacts {
+            merged_signature: Some(signature),
+            external_type_db: r2types::ExternalTypeDb {
+                structs: HashMap::from([(
+                    "node".to_string(),
+                    r2types::ExternalStruct {
+                        name: "Node".to_string(),
+                        fields: BTreeMap::from([(
+                            8,
+                            r2types::ExternalField {
+                                name: "hash".to_string(),
+                                offset: 8,
+                                ty: Some("uint64_t".to_string()),
+                            },
+                        )]),
+                    },
+                )]),
+                ..r2types::ExternalTypeDb::default()
+            },
+            field_access_certificates: vec![r2types::FieldAccessCertificate {
+                slot: 0,
+                field_offset: 8,
+                field_name: "f_8".to_string(),
+                field_type: None,
+            }],
+            ..FunctionTypeFacts::default()
+        };
+
+        let facts = attach_prepared_decompile_evidence(
+            &prepared,
+            FunctionFacts::new(type_facts, None),
+            &x86_64_param_slots(),
+        );
+
+        let member = facts
+            .render()
+            .expect("render facts")
+            .member_access_for_op(0x401000, 1, false, "hash", 8, Some(8))
+            .expect("normalized field certificate must become a member render proof");
+        assert_eq!(member.field_name, "hash");
+        assert_eq!(member.field_offset, 8);
     }
 
     #[test]
@@ -13275,8 +13377,11 @@ mod tests {
             ..FunctionTypeFacts::default()
         };
 
-        let facts =
-            attach_prepared_decompile_evidence(&prepared, FunctionFacts::new(type_facts, None));
+        let facts = attach_prepared_decompile_evidence(
+            &prepared,
+            FunctionFacts::new(type_facts, None),
+            &x86_64_param_slots(),
+        );
 
         assert!(
             facts
@@ -13297,6 +13402,7 @@ mod tests {
         let input = decompiler_input_from_prepared_facts(
             prepared,
             FunctionFacts::default(),
+            &x86_64_param_slots(),
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),

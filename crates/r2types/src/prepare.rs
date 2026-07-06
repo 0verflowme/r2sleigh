@@ -28,6 +28,11 @@ pub struct TypeHint {
     pub ty: String,
 }
 
+struct StackVarRecoveryHint {
+    type_override: Option<String>,
+    stack_arg_index: Option<usize>,
+}
+
 impl TypeHint {
     pub fn pointer() -> Self {
         Self {
@@ -192,6 +197,75 @@ pub fn recover_vars_arch_profile(
     (&[], GENERIC_STACK_BASES, GENERIC_FRAME_BASES)
 }
 
+fn arch_is_x86_64_sysv_like(arch_name: Option<&str>) -> bool {
+    let Some(arch_name) = arch_name else {
+        return false;
+    };
+    let arch_name = arch_name.to_ascii_lowercase();
+    arch_name.contains("x86-64")
+        || arch_name.contains("x86_64")
+        || arch_name.contains("amd64")
+        || (arch_name.contains("x86") && arch_name.contains("64"))
+}
+
+fn incoming_stack_arg_index(
+    arch_name: Option<&str>,
+    base_reg: &str,
+    offset: i64,
+    ptr_bits: u32,
+    arg_reg_count: usize,
+) -> Option<usize> {
+    if !arch_is_x86_64_sysv_like(arch_name) || base_reg != "rsp" || ptr_bits != 64 {
+        return None;
+    }
+    let ptr_bytes = i64::from(ptr_bits / 8);
+    if offset < ptr_bytes || (offset - ptr_bytes) % ptr_bytes != 0 {
+        return None;
+    }
+    Some(arg_reg_count + ((offset - ptr_bytes) / ptr_bytes) as usize)
+}
+
+fn incoming_stack_arg_addr_temp<'a>(
+    op: &'a SSAOp,
+    arch_name: Option<&str>,
+    ptr_bits: u32,
+    arg_reg_count: usize,
+) -> Option<(&'a SSAVar, String, i64)> {
+    match op {
+        SSAOp::IntAdd { dst, a, b } | SSAOp::IntSub { dst, a, b } => {
+            let a_name = a.name.to_lowercase();
+            let b_name = b.name.to_lowercase();
+            if a.version == 0
+                && let Some(raw_offset) = parse_const_value(&b.name)
+            {
+                let offset = if matches!(op, SSAOp::IntSub { .. }) {
+                    -(raw_offset as i64)
+                } else {
+                    raw_offset as i64
+                };
+                if incoming_stack_arg_index(arch_name, &a_name, offset, ptr_bits, arg_reg_count)
+                    .is_some()
+                {
+                    return Some((dst, a_name, offset));
+                }
+            }
+            if b.version == 0
+                && matches!(op, SSAOp::IntAdd { .. })
+                && let Some(raw_offset) = parse_const_value(&a.name)
+            {
+                let offset = raw_offset as i64;
+                if incoming_stack_arg_index(arch_name, &b_name, offset, ptr_bits, arg_reg_count)
+                    .is_some()
+                {
+                    return Some((dst, b_name, offset));
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 pub fn size_to_type(size: u32) -> String {
     match size {
         1 => "int8_t".to_string(),
@@ -294,10 +368,54 @@ pub fn recover_signature_params_from_ssa(
     };
 
     let mut seen_arg_regs: HashSet<String> = HashSet::new();
+    let mut seen_stack_args: HashSet<usize> = HashSet::new();
     let mut params = Vec::new();
+    let mut stack_addr_temps: HashMap<String, (String, i64)> = HashMap::new();
 
     for block in ssa_blocks {
         for op in &block.ops {
+            match op {
+                SSAOp::IntAdd { .. } | SSAOp::IntSub { .. } => {
+                    if let Some((dst, base_reg, offset)) =
+                        incoming_stack_arg_addr_temp(op, arch_name, ptr_bits, arg_regs.len())
+                    {
+                        let dst_key = ssa_var_block_key(block.addr, dst);
+                        stack_addr_temps.insert(dst_key, (base_reg, offset));
+                    }
+                }
+                SSAOp::Load { dst, addr, .. } => {
+                    let addr_key = ssa_var_block_key(block.addr, addr);
+                    if let Some((base_reg, offset)) = stack_addr_temps.get(&addr_key)
+                        && let Some(index) = incoming_stack_arg_index(
+                            arch_name,
+                            base_reg,
+                            *offset,
+                            ptr_bits,
+                            arg_regs.len(),
+                        )
+                        && seen_stack_args.insert(index)
+                    {
+                        let hinted_type = if semantic_typing_enabled
+                            && signature_evidence.as_ref().is_some_and(|evidence| {
+                                evidence.pointer_vars.contains(&ssa_var_key(dst))
+                            }) {
+                            Some("void *")
+                        } else {
+                            None
+                        };
+                        let initial_ty = hinted_type
+                            .and_then(|ty| parse_type_like_spec(ty, ptr_bits))
+                            .unwrap_or_else(|| size_to_type_like(dst.size));
+                        params.push(RecoveredSignatureParam {
+                            name: format!("arg{index}"),
+                            ssa_var: dst.clone(),
+                            initial_ty,
+                        });
+                    }
+                }
+                _ => {}
+            }
+
             for src in op.sources() {
                 if src.version != 0 {
                     continue;
@@ -348,6 +466,11 @@ pub fn recover_vars_from_ssa(
     let mut seen_slots: HashMap<(bool, i64), usize> = HashMap::new();
     let mut seen_arg_regs: HashSet<String> = HashSet::new();
     let (arg_regs, stack_bases, frame_bases) = recover_vars_arch_profile(arch_name);
+    let ptr_bits = if arch_is_x86_64_sysv_like(arch_name) {
+        64
+    } else {
+        0
+    };
     let signature_evidence =
         semantic_typing_enabled.then(|| collect_signature_type_evidence_context(ssa_blocks));
     let (usage_reg_type_hints, pointer_var_keys) = if semantic_typing_enabled {
@@ -406,7 +529,16 @@ pub fn recover_vars_from_ssa(
                             frame_bases,
                             *offset,
                             val.size,
-                            type_override,
+                            StackVarRecoveryHint {
+                                type_override,
+                                stack_arg_index: incoming_stack_arg_index(
+                                    arch_name,
+                                    base_reg,
+                                    *offset,
+                                    ptr_bits,
+                                    arg_regs.len(),
+                                ),
+                            },
                         );
                     }
                 }
@@ -427,7 +559,16 @@ pub fn recover_vars_from_ssa(
                             frame_bases,
                             *offset,
                             dst.size,
-                            type_override,
+                            StackVarRecoveryHint {
+                                type_override,
+                                stack_arg_index: incoming_stack_arg_index(
+                                    arch_name,
+                                    base_reg,
+                                    *offset,
+                                    ptr_bits,
+                                    arg_regs.len(),
+                                ),
+                            },
                         );
                     }
                 }
@@ -634,8 +775,12 @@ fn add_stack_var(
     frame_bases: &[&str],
     offset: i64,
     size: u32,
-    type_override: Option<String>,
+    hint: StackVarRecoveryHint,
 ) {
+    let StackVarRecoveryHint {
+        type_override,
+        stack_arg_index,
+    } = hint;
     let is_frame_base = frame_bases.contains(&base_reg);
     let slot_key = (is_frame_base, offset);
     if let Some(existing_idx) = seen_slots.get(&slot_key).copied() {
@@ -649,8 +794,10 @@ fn add_stack_var(
         return;
     }
 
-    let is_arg = if is_frame_base { offset > 0 } else { false };
-    let var_name = if is_arg && offset > 8 {
+    let is_arg = stack_arg_index.is_some() || if is_frame_base { offset > 0 } else { false };
+    let var_name = if let Some(index) = stack_arg_index {
+        format!("arg{index}")
+    } else if is_arg && offset > 8 {
         format!("arg_{:x}h", offset.unsigned_abs())
     } else {
         format!("var_{:x}h", offset.unsigned_abs())
@@ -662,7 +809,7 @@ fn add_stack_var(
         kind: kind.to_string(),
         delta: offset,
         var_type: type_override.unwrap_or_else(|| size_to_type(size)),
-        isarg: is_arg && offset > 8,
+        isarg: stack_arg_index.is_some() || (is_arg && offset > 8),
         reg: None,
     });
     seen_slots.insert(slot_key, vars.len().saturating_sub(1));
@@ -1490,6 +1637,76 @@ mod tests {
                 signedness: crate::Signedness::Signed,
             }
         );
+    }
+
+    #[test]
+    fn recovered_signature_params_include_x86_64_stack_pointer_args() {
+        let block = SSABlock {
+            addr: 0x401000,
+            size: 12,
+            ops: vec![
+                SSAOp::Copy {
+                    dst: SSAVar::new("tmp:0", 1, 8),
+                    src: SSAVar::new("rdi", 0, 8),
+                },
+                SSAOp::IntAdd {
+                    dst: SSAVar::new("tmp:sp8", 1, 8),
+                    a: SSAVar::new("rsp", 0, 8),
+                    b: SSAVar::new("const:0x8", 0, 8),
+                },
+                SSAOp::Load {
+                    dst: SSAVar::new("tmp:stack_arg", 1, 8),
+                    addr: SSAVar::new("tmp:sp8", 1, 8),
+                    space: "ram".to_string(),
+                },
+            ],
+        };
+
+        let params =
+            recover_signature_params_from_ssa(&[block], Some("x86-64"), &HashMap::new(), true, 64);
+
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].name, "arg0");
+        assert_eq!(params[0].ssa_var, SSAVar::new("rdi", 0, 8));
+        assert_eq!(params[1].name, "arg6");
+        assert_eq!(params[1].ssa_var, SSAVar::new("tmp:stack_arg", 1, 8));
+        assert_eq!(
+            params[1].initial_ty,
+            crate::CTypeLike::Int {
+                bits: 64,
+                signedness: crate::Signedness::Signed,
+            }
+        );
+    }
+
+    #[test]
+    fn recover_vars_from_ssa_marks_x86_64_stack_pointer_arg_slot() {
+        let block = SSABlock {
+            addr: 0x401000,
+            size: 8,
+            ops: vec![
+                SSAOp::IntAdd {
+                    dst: SSAVar::new("tmp:sp8", 1, 8),
+                    a: SSAVar::new("rsp", 0, 8),
+                    b: SSAVar::new("const:0x8", 0, 8),
+                },
+                SSAOp::Load {
+                    dst: SSAVar::new("tmp:stack_arg", 1, 8),
+                    addr: SSAVar::new("tmp:sp8", 1, 8),
+                    space: "ram".to_string(),
+                },
+            ],
+        };
+
+        let vars = recover_vars_from_ssa(&[block], Some("x86-64"), &HashMap::new(), true);
+        let stack_arg = vars
+            .iter()
+            .find(|var| var.kind == "s" && var.delta == 8)
+            .expect("rsp+8 should be recovered as an incoming stack argument");
+
+        assert_eq!(stack_arg.name, "arg6");
+        assert!(stack_arg.isarg);
+        assert_eq!(stack_arg.var_type, "int64_t");
     }
 
     #[test]

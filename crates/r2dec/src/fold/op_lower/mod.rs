@@ -588,17 +588,20 @@ struct RenderCandidate {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct CertifiedPreparedRenderView<'a> {
+pub(crate) struct CertifiedRenderPlan<'a> {
+    function_facts: &'a r2types::FunctionFacts,
     prepared_view: &'a analysis::PreparedSemanticView,
     proof: CertifiedRenderContext<'a>,
 }
 
-impl<'a> CertifiedPreparedRenderView<'a> {
+impl<'a> CertifiedRenderPlan<'a> {
     fn new(
+        function_facts: &'a r2types::FunctionFacts,
         prepared_view: &'a analysis::PreparedSemanticView,
         proof: CertifiedRenderContext<'a>,
     ) -> Self {
         Self {
+            function_facts,
             prepared_view,
             proof,
         }
@@ -623,6 +626,25 @@ impl<'a> CertifiedPreparedRenderView<'a> {
             return None;
         }
         Some(expr)
+    }
+
+    fn stack_param_expr_for_memory_fact(
+        &self,
+        fact: &r2types::MemoryAccessRenderFact,
+    ) -> Option<CExpr> {
+        if fact.is_write || fact.width == 0 {
+            return None;
+        }
+        let offset = self
+            .proof
+            .render_facts
+            .stack_slot_offsets
+            .get(&fact.object)
+            .copied()?;
+        let authorization = self
+            .function_facts
+            .authorized_stack_param_owner_render(fact.object, offset)?;
+        Some(CExpr::Var(authorization.name))
     }
 }
 
@@ -760,11 +782,12 @@ impl<'a> FoldingContext<'a> {
         ))
     }
 
-    pub(crate) fn certified_prepared_render_view<'b>(
+    pub(crate) fn certified_render_plan<'b>(
         &'b self,
         proof: CertifiedRenderContext<'b>,
-    ) -> Option<CertifiedPreparedRenderView<'b>> {
-        Some(CertifiedPreparedRenderView::new(
+    ) -> Option<CertifiedRenderPlan<'b>> {
+        Some(CertifiedRenderPlan::new(
+            self.inputs.function_facts,
             self.prepared_semantic_view()?,
             proof,
         ))
@@ -978,13 +1001,13 @@ impl<'a> FoldingContext<'a> {
             if var.is_const() {
                 return self.certified_const_expr(var);
             }
-            if !self
+            let expression_renderable = self
                 .certified_render_context()
-                .is_some_and(|proof| proof.expression_is_renderable(value))
-            {
-                return None;
-            }
+                .is_some_and(|proof| proof.expression_is_renderable(value));
             if var.version == 0 && var.is_register() {
+                if !expression_renderable {
+                    return None;
+                }
                 let rendered = self.var_name(var);
                 return Some(
                     self.arg_alias_for_rendered_name(&rendered)
@@ -995,6 +1018,23 @@ impl<'a> FoldingContext<'a> {
 
             let inst_id = prepared.graph().def_inst(value)?;
             let inst = prepared.graph().inst(inst_id)?;
+            let transparent_value_forward = matches!(
+                &inst.payload,
+                r2ssa::InstPayload::Op(
+                    SSAOp::Copy { .. }
+                        | SSAOp::New { .. }
+                        | SSAOp::Cast { .. }
+                        | SSAOp::Subpiece { .. }
+                        | SSAOp::IntZExt { .. }
+                        | SSAOp::IntSExt { .. }
+                        | SSAOp::Trunc { .. }
+                )
+            );
+            let is_memory_load =
+                matches!(&inst.payload, r2ssa::InstPayload::Op(SSAOp::Load { .. }));
+            if !expression_renderable && !is_memory_load && !transparent_value_forward {
+                return None;
+            }
             match &inst.payload {
                 r2ssa::InstPayload::Phi { .. } => {
                     let mut rendered = None;
@@ -4088,6 +4128,7 @@ impl<'a> FoldingContext<'a> {
             let rendered = self.var_name(&value.var);
             Some(
                 self.arg_alias_for_rendered_name(&rendered)
+                    .or_else(|| self.certified_signature_arg_alias_for_register(&rendered))
                     .map(CExpr::Var)
                     .unwrap_or_else(|| CExpr::Var(rendered)),
             )
@@ -4831,6 +4872,48 @@ impl<'a> FoldingContext<'a> {
             .then_some(field_name)
     }
 
+    pub(super) fn certified_member_field_name_for_current_op_offset(
+        &self,
+        offset: i64,
+        access_size: Option<u32>,
+        is_write: bool,
+    ) -> Option<String> {
+        if !self.requires_certified_rendering() {
+            return None;
+        }
+        let offset = u64::try_from(offset).ok()?;
+        let render_facts = self.inputs.render_facts()?;
+        let block_addr = self.current_block_addr.get()?;
+        let op_idx = self.current_op_idx.get()?;
+        let mut names = render_facts
+            .member_accesses_by_op
+            .get(&(block_addr, op_idx, is_write))?
+            .iter()
+            .filter_map(|fact| {
+                let memory = render_facts.memory_accesses.get(&fact.access)?;
+                (memory.block_addr == block_addr
+                    && memory.op_index == op_idx
+                    && memory.is_write == is_write
+                    && memory.object == fact.object
+                    && memory.width == fact.access_width
+                    && fact.field_offset == offset
+                    && access_size.is_none_or(|width| fact.access_width == width))
+                .then(|| fact.field_name.clone())
+            })
+            .collect::<Vec<_>>();
+        names.sort_by_key(|name| name.to_ascii_lowercase());
+        names.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+        let [field_name] = names.as_slice() else {
+            return None;
+        };
+        self.certified_field_name_for_offset(
+            field_name.clone(),
+            offset as i64,
+            access_size,
+            is_write,
+        )
+    }
+
     fn certified_array_access_for_current_op(
         &self,
         field_offset: i64,
@@ -5281,6 +5364,13 @@ impl<'a> FoldingContext<'a> {
                             Some(elem_size),
                         )
                     })
+                })
+                .or_else(|| {
+                    self.certified_member_field_name_for_current_op_offset(
+                        effective_addr.offset_bytes,
+                        Some(elem_size),
+                        is_write,
+                    )
                 })
                 .or_else(|| self.oracle_member_name(None, &base_expr, effective_addr.offset_bytes))
                 .and_then(|field| {
@@ -6152,6 +6242,35 @@ impl<'a> FoldingContext<'a> {
             if alias.eq_ignore_ascii_case(name) {
                 return Some(SSAVar::new(reg_name, 0, infer_reg_size(reg_name)));
             }
+        }
+
+        if self.requires_certified_rendering()
+            && let Some(signature) = self
+                .inputs
+                .function_facts
+                .type_facts()
+                .render_authorized_signature()
+            && let Some((idx, _)) = signature
+                .params
+                .iter()
+                .enumerate()
+                .find(|(_, param)| param.name.eq_ignore_ascii_case(name))
+            && let Some(reg_name) = self.inputs.arch.arg_regs.get(idx)
+        {
+            return Some(SSAVar::new(reg_name, 0, infer_reg_size(reg_name)));
+        }
+
+        if self.requires_certified_rendering()
+            && let Some(signature) = self
+                .inputs
+                .function_facts
+                .type_facts()
+                .render_authorized_signature()
+            && signature.params.iter().enumerate().any(|(idx, param)| {
+                idx >= self.inputs.arch.arg_regs.len() && param.name.eq_ignore_ascii_case(name)
+            })
+        {
+            return None;
         }
 
         if let Some(rest) = name.strip_prefix("arg")

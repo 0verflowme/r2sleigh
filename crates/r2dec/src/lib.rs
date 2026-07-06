@@ -64,7 +64,8 @@ use r2ssa::cfg::BlockTerminator;
 use r2types::{
     CTypeLike, DecompileRouteFacts, DecompileRouteKind, ExternalRegisterParamSpec,
     ExternalStackBase, ExternalStackSlotRole, FunctionFacts, FunctionSignatureSpec,
-    FunctionTypeFacts, StackSlotKey, TypeInference, TypeOracle, VisibleBinding, VisibleBindingKind,
+    FunctionTypeFacts, ParamSlotResolver, StackSlotKey, TypeInference, TypeOracle, VisibleBinding,
+    VisibleBindingKind,
 };
 #[cfg(test)]
 use r2types::{ExternalTypeDb, FunctionType};
@@ -4337,7 +4338,23 @@ impl Decompiler {
 
     /// Build a C function from a prepared function + typed context payload.
     pub fn build_function_from_input(&self, input: &DecompilerInput) -> CFunction {
-        let decompiler = Self::new(self.config.clone()).with_context(input.context.clone());
+        let mut decompiler = Self::new(self.config.clone()).with_context(input.context.clone());
+        let param_slots = ParamSlotResolver::from_arg_regs(&decompiler.config.arg_regs);
+        decompiler
+            .context
+            .function_facts
+            .normalize_field_certificates_from_external_layout();
+        decompiler
+            .context
+            .function_facts
+            .populate_member_access_render_facts_from_field_certificates(
+                &input.prepared_ssa,
+                &param_slots,
+            );
+        decompiler
+            .context
+            .function_facts
+            .populate_array_access_render_facts_from_scalar_candidates();
         let func = input.prepared_ssa.function();
         let func_name = func
             .name
@@ -6211,10 +6228,15 @@ mod tests {
     use r2types::{
         ArrayIndexBase, ArrayIndexCertificate, ExternalField, ExternalRegisterParamSpec,
         ExternalStackBase, ExternalStackSlotRole, ExternalStackSlotSpec, ExternalStruct,
-        FieldAccessCertificate, FunctionFacts, FunctionParamSpec, FunctionRenderFacts,
-        FunctionSignatureSpec, FunctionTypeFacts, Signedness,
+        ExternalTypeDb, FieldAccessCertificate, FunctionFacts, FunctionParamSpec,
+        FunctionRenderFacts, FunctionSignatureSpec, FunctionTypeFacts, ParamSlotResolver,
+        Signedness,
     };
     use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+    fn x86_64_param_slot_resolver() -> ParamSlotResolver {
+        ParamSlotResolver::from_arg_regs(DecompilerConfig::x86_64().arg_regs)
+    }
 
     fn empty_fold_context_for_linearization<'a>() -> FoldingContext<'a> {
         let arch = Box::leak(Box::new(FoldArchConfig {
@@ -6442,7 +6464,7 @@ mod tests {
         type_facts: FunctionTypeFacts,
         reason: &str,
     ) -> DecompilerInput {
-        let function_facts = FunctionFacts::new(type_facts, None)
+        let mut function_facts = FunctionFacts::new(type_facts, None)
             .with_callsites(test_callsite_facts(&prepared))
             .with_call_results(test_call_result_facts(&prepared))
             .with_call_render(test_call_render_facts(&prepared))
@@ -6453,6 +6475,12 @@ mod tests {
                 None,
                 r2sym::RenderPermission::certified(r2sym::ProofOwner::R2engine, reason),
             ));
+        function_facts.normalize_field_certificates_from_external_layout();
+        function_facts.populate_member_access_render_facts_from_field_certificates(
+            &prepared,
+            &x86_64_param_slot_resolver(),
+        );
+        function_facts.populate_array_access_render_facts_from_scalar_candidates();
         DecompilerInput::new(
             prepared,
             DecompilerContext::default().with_function_facts(function_facts),
@@ -8418,6 +8446,215 @@ mod tests {
                 .map(|local| local.name.clone())
                 .collect::<Vec<_>>(),
             "local declaration order should be stable across builds"
+        );
+    }
+
+    #[test]
+    fn certified_standard_output_accepts_auto_populated_prepared_member_access() {
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_from_ops(
+            vec![
+                R2ILOp::IntAdd {
+                    dst: Varnode::unique(0x10, 8),
+                    a: Varnode::register(0x10, 8),
+                    b: Varnode::constant(8, 8),
+                },
+                R2ILOp::Load {
+                    dst: Varnode::register(0x00, 8),
+                    space: SpaceId::Ram,
+                    addr: Varnode::unique(0x10, 8),
+                },
+                R2ILOp::Return {
+                    target: Varnode::register(0x00, 8),
+                },
+            ],
+            &arch,
+        );
+        let mut function_facts = test_function_facts_with_prepared_render(&prepared);
+        function_facts.replace_type_facts(FunctionTypeFacts {
+            field_access_certificates: vec![FieldAccessCertificate {
+                slot: 0,
+                field_offset: 8,
+                field_name: "hash".to_string(),
+                field_type: Some("uint64_t".to_string()),
+            }],
+            ..FunctionTypeFacts::default()
+        });
+        function_facts.populate_member_access_render_facts_from_field_certificates(
+            &prepared,
+            &x86_64_param_slot_resolver(),
+        );
+        assert!(
+            function_facts.render().is_some_and(|render| render
+                .member_access_for_op(0x1000, 1, false, "hash", 8, Some(8))
+                .is_some()),
+            "prepared field certificate should populate member render fact"
+        );
+        let func = CFunction::new("field_auto_ok", CType::u64()).with_body(vec![CStmt::Return(
+            Some(CExpr::PtrMember {
+                base: Box::new(CExpr::var("arg0")),
+                member: "hash".to_string(),
+            }),
+        )]);
+        let memory_cert = prepared
+            .memory_certificate_for_op_site(0x1000, 1, false)
+            .expect("memory certificate");
+        let return_cert = prepared
+            .return_certificate_for_op(0x1000, 2)
+            .expect("return certificate");
+        let effect_proofs = [
+            EffectRenderProof {
+                kind: EffectRenderProofKind::MemoryRead,
+                block_addr: 0x1000,
+                op_idx: 1,
+                call_disposition: None,
+                target: None,
+                address: Some(memory_cert.address),
+                value: memory_cert.value,
+                values: Vec::new(),
+                materialized_phi_copy: false,
+            },
+            EffectRenderProof {
+                kind: EffectRenderProofKind::Return,
+                block_addr: 0x1000,
+                op_idx: 2,
+                call_disposition: None,
+                target: None,
+                address: None,
+                value: Some(return_cert.value),
+                values: Vec::new(),
+                materialized_phi_copy: false,
+            },
+        ];
+
+        let reason = certified_standard_output_residual_reason_with_effect_proofs(
+            &prepared,
+            &function_facts,
+            &func,
+            Some(&effect_proofs),
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    fn prepared_member_return_fixture(arch: &ArchSpec) -> r2ssa::SsaArtifact {
+        prepared_from_ops(
+            vec![
+                R2ILOp::IntAdd {
+                    dst: Varnode::unique(0x10, 8),
+                    a: Varnode::register(0x10, 8),
+                    b: Varnode::constant(8, 8),
+                },
+                R2ILOp::Load {
+                    dst: Varnode::register(0x00, 8),
+                    space: SpaceId::Ram,
+                    addr: Varnode::unique(0x10, 8),
+                },
+                R2ILOp::Return {
+                    target: Varnode::register(0x00, 8),
+                },
+            ],
+            arch,
+        )
+    }
+
+    fn node_hash_type_db() -> ExternalTypeDb {
+        ExternalTypeDb {
+            structs: [(
+                "node".to_string(),
+                ExternalStruct {
+                    name: "Node".to_string(),
+                    fields: [(
+                        8,
+                        ExternalField {
+                            name: "hash".to_string(),
+                            offset: 8,
+                            ty: Some("uint64_t".to_string()),
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..ExternalTypeDb::default()
+        }
+    }
+
+    fn node_hash_signature() -> FunctionSignatureSpec {
+        signature_spec(
+            Some(CType::UInt(64)),
+            vec![(
+                "node",
+                Some(CType::Pointer(Box::new(CType::Struct("Node".to_string())))),
+            )],
+        )
+    }
+
+    #[test]
+    fn decompile_renders_certified_member_return_load() {
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_member_return_fixture(&arch);
+        let signature = node_hash_signature();
+        let input = prepared_standard_input_with_type_facts(
+            prepared,
+            FunctionTypeFacts {
+                signature_certificate: external_signature_certificate(&signature),
+                merged_signature: Some(signature),
+                external_type_db: node_hash_type_db(),
+                field_access_certificates: vec![FieldAccessCertificate {
+                    slot: 0,
+                    field_offset: 8,
+                    field_name: "hash".to_string(),
+                    field_type: Some("uint64_t".to_string()),
+                }],
+                ..FunctionTypeFacts::default()
+            },
+            "prepared member return certificate route",
+        );
+        let output = Decompiler::new(DecompilerConfig::x86_64()).decompile_input(&input);
+
+        assert!(
+            output.contains("return node->hash;"),
+            "certified member load return should render executable C, got:\n{output}"
+        );
+        assert!(
+            !output.contains("summary return unresolved"),
+            "certified member load return must not residualize, got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn decompile_residualizes_member_return_load_without_matching_member_proof() {
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_member_return_fixture(&arch);
+        let signature = node_hash_signature();
+        let input = prepared_standard_input_with_type_facts(
+            prepared,
+            FunctionTypeFacts {
+                signature_certificate: external_signature_certificate(&signature),
+                merged_signature: Some(signature),
+                external_type_db: node_hash_type_db(),
+                field_access_certificates: vec![FieldAccessCertificate {
+                    slot: 0,
+                    field_offset: 8,
+                    field_name: "hash".to_string(),
+                    field_type: Some("uint32_t".to_string()),
+                }],
+                ..FunctionTypeFacts::default()
+            },
+            "prepared member return missing proof route",
+        );
+        let output = Decompiler::new(DecompilerConfig::x86_64()).decompile_input(&input);
+
+        assert!(
+            output.contains("r2dec residual"),
+            "wrong-width member proof must residualize, got:\n{output}"
+        );
+        assert!(
+            !output.contains("return node->hash;"),
+            "wrong-width member proof must not render member return, got:\n{output}"
         );
     }
 

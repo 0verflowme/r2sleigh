@@ -5,13 +5,194 @@ use serde::{Deserialize, Serialize};
 use crate::callee::{CalleeIdentityContext, CalleeResolutionFacts, CallsiteKey};
 use crate::context::{ExternalStackBase, ExternalStackSlotRole, StackSlotKey};
 use crate::facts::{
-    FunctionSignatureProjection, FunctionTypeFacts, OutParamCertificateEvidence,
-    OutParamCertificateSource, SignatureProjectionResult, VisibleBindingKind,
+    FunctionSignatureProjection, FunctionSignatureSpec, FunctionTypeFacts,
+    OutParamCertificateEvidence, OutParamCertificateSource, SignatureProjectionResult,
+    VisibleBindingKind,
 };
-use crate::{CTypeLike, normalize_external_type_name};
+use crate::{CTypeLike, normalize_external_type_name, parse_type_like_spec};
 
 pub type OpSiteKey = (u64, usize);
 pub type MemoryOpSiteKey = (u64, usize, bool);
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ParamSlotResolver {
+    slots_by_register: BTreeMap<String, usize>,
+}
+
+impl ParamSlotResolver {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn from_arch_name(arch_name: Option<&str>) -> Self {
+        let (arg_regs, _, _) = crate::prepare::recover_vars_arch_profile(arch_name);
+        Self::from_arg_alias_map(arg_regs)
+    }
+
+    pub fn from_arg_alias_map(arg_regs: crate::prepare::ArgAliasMap) -> Self {
+        let mut resolver = Self::new();
+        for (slot, (canonical, aliases)) in arg_regs.iter().enumerate() {
+            resolver.insert_alias(canonical, slot);
+            for alias in *aliases {
+                resolver.insert_alias(alias, slot);
+            }
+        }
+        resolver
+    }
+
+    pub fn from_arg_regs<I, S>(arg_regs: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut resolver = Self::new();
+        for (slot, reg) in arg_regs.into_iter().enumerate() {
+            resolver.insert_register_family_aliases(reg.as_ref(), slot);
+        }
+        resolver
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots_by_register.is_empty()
+    }
+
+    pub fn insert_alias(&mut self, register: &str, slot: usize) {
+        let normalized = normalize_param_slot_register_name(register);
+        if normalized.is_empty() {
+            return;
+        }
+        self.slots_by_register.entry(normalized).or_insert(slot);
+    }
+
+    pub fn slot_for_register_name(&self, register: &str) -> Option<usize> {
+        let normalized = normalize_param_slot_register_name(register);
+        self.slots_by_register.get(&normalized).copied()
+    }
+
+    pub fn slot_for_var(&self, var: &r2ssa::SSAVar) -> Option<usize> {
+        if var.version != 0 || !var.is_register() || var.is_memory() {
+            return None;
+        }
+        self.slot_for_register_name(&var.name)
+    }
+
+    fn insert_register_family_aliases(&mut self, register: &str, slot: usize) {
+        let normalized = normalize_param_slot_register_name(register);
+        if normalized.is_empty() {
+            return;
+        }
+        self.insert_alias(&normalized, slot);
+        for alias in inferred_param_slot_register_aliases(&normalized) {
+            self.insert_alias(&alias, slot);
+        }
+    }
+}
+
+fn normalize_param_slot_register_name(register: &str) -> String {
+    register.trim_start_matches('$').to_ascii_lowercase()
+}
+
+fn inferred_param_slot_register_aliases(register: &str) -> Vec<String> {
+    match register {
+        "rax" => {
+            return ["eax", "ax", "al", "ah"]
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+        }
+        "eax" | "ax" | "al" | "ah" => return vec!["rax".to_string()],
+        "rbx" => {
+            return ["ebx", "bx", "bl", "bh"]
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+        }
+        "ebx" | "bx" | "bl" | "bh" => return vec!["rbx".to_string()],
+        "rcx" => {
+            return ["ecx", "cx", "cl", "ch"]
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+        }
+        "ecx" | "cx" | "cl" | "ch" => return vec!["rcx".to_string()],
+        "rdx" => {
+            return ["edx", "dx", "dl", "dh"]
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+        }
+        "edx" | "dx" | "dl" | "dh" => return vec!["rdx".to_string()],
+        "rsi" => {
+            return ["esi", "si", "sil"]
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+        }
+        "esi" | "si" | "sil" => return vec!["rsi".to_string()],
+        "rdi" => {
+            return ["edi", "di", "dil"]
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+        }
+        "edi" | "di" | "dil" => return vec!["rdi".to_string()],
+        "rbp" => {
+            return ["ebp", "bp", "bpl"]
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+        }
+        "ebp" | "bp" | "bpl" => return vec!["rbp".to_string()],
+        "rsp" => {
+            return ["esp", "sp", "spl"]
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+        }
+        "esp" | "sp" | "spl" => return vec!["rsp".to_string()],
+        _ => {}
+    }
+
+    if let Some(rest) = register.strip_prefix('r')
+        && let Some(index) = rest.strip_suffix('d').or_else(|| rest.strip_suffix('w'))
+        && index.chars().all(|c| c.is_ascii_digit())
+    {
+        return vec![format!("r{index}")];
+    }
+    if let Some(index) = register.strip_prefix('r')
+        && index.chars().all(|c| c.is_ascii_digit())
+    {
+        return vec![
+            format!("r{index}d"),
+            format!("r{index}w"),
+            format!("r{index}b"),
+        ];
+    }
+    if let Some(index) = register.strip_prefix('x')
+        && index.chars().all(|c| c.is_ascii_digit())
+    {
+        return vec![format!("w{index}")];
+    }
+    if let Some(index) = register.strip_prefix('w')
+        && index.chars().all(|c| c.is_ascii_digit())
+    {
+        return vec![format!("x{index}")];
+    }
+    if let Some(index) = register.strip_prefix('a')
+        && let Ok(index) = index.parse::<u8>()
+        && index <= 7
+    {
+        return vec![format!("x{}", index + 10)];
+    }
+    if let Some(index) = register.strip_prefix('x')
+        && let Ok(index) = index.parse::<u8>()
+        && (10..=17).contains(&index)
+    {
+        return vec![format!("a{}", index - 10)];
+    }
+
+    Vec::new()
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnalysisPlans {
@@ -340,6 +521,10 @@ fn stack_slot_offset(slot: &StackSlotKey) -> i64 {
     }
 }
 
+fn stack_slot_matches_offset(slot: &StackSlotKey, offset: i64) -> bool {
+    stack_slot_offset(slot) == offset
+}
+
 fn visible_stack_binding_kind_is_renderable(kind: &VisibleBindingKind) -> bool {
     matches!(
         kind,
@@ -354,8 +539,66 @@ fn external_stack_slot_role_is_renderable(role: ExternalStackSlotRole) -> bool {
     )
 }
 
+fn remember_stack_param_owner_name(candidate: &mut Option<String>, name: &str) -> Option<()> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Some(());
+    }
+    if let Some(existing) = candidate.as_ref() {
+        return existing.eq_ignore_ascii_case(name).then_some(());
+    }
+    *candidate = Some(name.to_string());
+    Some(())
+}
+
 fn stack_owner_type_is_renderable(ty: &CTypeLike) -> bool {
     !matches!(ty, CTypeLike::Unknown | CTypeLike::Void)
+}
+
+fn signature_param_name_type_is_renderable(
+    signature: Option<&FunctionSignatureSpec>,
+    name: &str,
+) -> bool {
+    signature
+        .into_iter()
+        .flat_map(|signature| signature.params.iter())
+        .any(|param| {
+            param.name.eq_ignore_ascii_case(name)
+                && param
+                    .ty
+                    .as_ref()
+                    .is_some_and(stack_owner_type_is_renderable)
+        })
+}
+
+fn type_like_size_bytes(ty: &CTypeLike, ptr_bits: u32) -> Option<u64> {
+    match ty {
+        CTypeLike::Void | CTypeLike::Unknown | CTypeLike::Function => None,
+        CTypeLike::Bool => Some(1),
+        CTypeLike::Int { bits, .. } | CTypeLike::Float(bits) => {
+            Some((u64::from(*bits).saturating_add(7) / 8).max(1))
+        }
+        CTypeLike::Pointer(_) => Some((ptr_bits / 8).max(1) as u64),
+        CTypeLike::Array(inner, Some(count)) => {
+            type_like_size_bytes(inner, ptr_bits).map(|size| size.saturating_mul(*count as u64))
+        }
+        CTypeLike::Array(inner, None) => type_like_size_bytes(inner, ptr_bits),
+        CTypeLike::Struct(_) | CTypeLike::Union(_) | CTypeLike::Enum(_) | CTypeLike::Typedef(_) => {
+            None
+        }
+    }
+}
+
+fn field_certificate_width_matches(
+    cert: &crate::facts::FieldAccessCertificate,
+    access_width: u32,
+    ptr_bits: u32,
+) -> bool {
+    cert.field_type
+        .as_deref()
+        .and_then(|field_type| parse_type_like_spec(field_type, ptr_bits))
+        .and_then(|ty| type_like_size_bytes(&ty, ptr_bits))
+        .is_none_or(|width| width == u64::from(access_width))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -988,23 +1231,110 @@ impl FunctionFacts {
         self.authorized_stack_slot_owner_render(object, offset, name)
     }
 
+    pub fn authorized_stack_param_owner_render(
+        &self,
+        object: r2ssa::ObjectId,
+        offset: i64,
+    ) -> Option<StackSlotOwnerRenderAuthorization> {
+        let render_offset = self.render.stack_slot_offsets.get(&object).copied()?;
+        if render_offset != offset {
+            return None;
+        }
+        if let Some(name) = self.stack_param_owner_name_for_offset(offset) {
+            return self.authorized_stack_slot_owner_render(object, offset, &name);
+        }
+        None
+    }
+
+    fn stack_param_owner_name_for_offset(&self, offset: i64) -> Option<String> {
+        let mut candidate = None;
+        for (slot_key, slot) in &self.types.stack_slots {
+            if stack_slot_matches_offset(slot_key, offset)
+                && matches!(
+                    slot.role,
+                    ExternalStackSlotRole::StackArg | ExternalStackSlotRole::ParamHome
+                )
+            {
+                if let Some(name) = slot
+                    .param_name
+                    .as_ref()
+                    .filter(|name| !name.trim().is_empty())
+                    .filter(|name| {
+                        slot.ty.as_ref().is_some_and(stack_owner_type_is_renderable)
+                            || (matches!(slot.role, ExternalStackSlotRole::ParamHome)
+                                && signature_param_name_type_is_renderable(
+                                    self.types.merged_signature.as_ref(),
+                                    name,
+                                ))
+                    })
+                {
+                    remember_stack_param_owner_name(&mut candidate, name)?;
+                    continue;
+                }
+                if !slot.name.trim().is_empty() {
+                    remember_stack_param_owner_name(&mut candidate, &slot.name)?;
+                }
+            }
+        }
+        if candidate.is_some() {
+            return candidate;
+        }
+
+        for binding in &self.types.visible_bindings {
+            let Some(slot) = binding.stack_slot.as_ref() else {
+                continue;
+            };
+            if stack_slot_matches_offset(slot, offset)
+                && matches!(binding.kind, VisibleBindingKind::Param)
+                && binding
+                    .ty
+                    .as_ref()
+                    .is_some_and(stack_owner_type_is_renderable)
+                && !binding.name.trim().is_empty()
+            {
+                remember_stack_param_owner_name(&mut candidate, &binding.name)?;
+            }
+        }
+        candidate
+    }
+
     fn stack_owner_name_is_renderable(&self, offset: i64, name: &str) -> bool {
         self.types.visible_bindings.iter().any(|binding| {
             let Some(slot) = binding.stack_slot.as_ref() else {
                 return false;
             };
             binding.name.eq_ignore_ascii_case(name)
-                && stack_slot_offset(slot) == offset
+                && stack_slot_matches_offset(slot, offset)
                 && binding
                     .ty
                     .as_ref()
                     .is_some_and(stack_owner_type_is_renderable)
                 && visible_stack_binding_kind_is_renderable(&binding.kind)
         }) || self.types.stack_slots.iter().any(|(slot_key, slot)| {
-            slot.name.eq_ignore_ascii_case(name)
-                && stack_slot_offset(slot_key) == offset
-                && slot.ty.as_ref().is_some_and(stack_owner_type_is_renderable)
-                && external_stack_slot_role_is_renderable(slot.role)
+            (slot.name.eq_ignore_ascii_case(name)
+                || (matches!(
+                    slot.role,
+                    ExternalStackSlotRole::StackArg | ExternalStackSlotRole::ParamHome
+                ) && slot
+                    .param_name
+                    .as_ref()
+                    .is_some_and(|param_name| param_name.eq_ignore_ascii_case(name))))
+                && stack_slot_matches_offset(slot_key, offset)
+                && (slot.ty.as_ref().is_some_and(stack_owner_type_is_renderable)
+                    || (matches!(slot.role, ExternalStackSlotRole::ParamHome)
+                        && slot.param_name.as_ref().is_some_and(|param_name| {
+                            param_name.eq_ignore_ascii_case(name)
+                                && signature_param_name_type_is_renderable(
+                                    self.types.merged_signature.as_ref(),
+                                    param_name,
+                                )
+                        })))
+                && (external_stack_slot_role_is_renderable(slot.role)
+                    || (matches!(slot.role, ExternalStackSlotRole::ParamHome)
+                        && slot
+                            .param_name
+                            .as_ref()
+                            .is_some_and(|param_name| param_name.eq_ignore_ascii_case(name))))
         })
     }
 
@@ -1089,6 +1419,124 @@ impl FunctionFacts {
                 cert.field_type = field.ty.clone();
             }
         }
+    }
+
+    pub fn populate_member_access_render_facts_from_field_certificates(
+        &mut self,
+        prepared: &r2ssa::SsaArtifact,
+        param_slots: &ParamSlotResolver,
+    ) {
+        if self.types.field_access_certificates.is_empty() {
+            return;
+        }
+
+        let mut member_facts = Vec::new();
+        for memory in self.render.memory_accesses.values() {
+            if memory.width == 0 {
+                continue;
+            }
+            let Some(field_offset) = prepared_memory_access_field_offset(prepared, memory) else {
+                continue;
+            };
+            let param_slot = prepared_memory_access_param_slot(prepared, memory, param_slots);
+            let ptr_bits = prepared_memory_access_ptr_bits(prepared, memory);
+            member_facts.extend(self.member_render_facts_for_memory(
+                memory,
+                field_offset,
+                ptr_bits,
+                param_slot,
+            ));
+        }
+
+        for candidate in self.types.scalar_array_render_candidates.iter().copied() {
+            if candidate.access_width == 0 {
+                continue;
+            }
+            let key = (candidate.block_addr, candidate.op_index, candidate.is_write);
+            let Some(accesses) = self.render.memory_accesses_by_op.get(&key) else {
+                continue;
+            };
+            for access in accesses {
+                let Some(memory) = self.render.memory_accesses.get(access) else {
+                    continue;
+                };
+                if memory.block_addr != candidate.block_addr
+                    || memory.op_index != candidate.op_index
+                    || memory.is_write != candidate.is_write
+                    || memory.width == 0
+                    || memory.width != candidate.access_width
+                {
+                    continue;
+                }
+                let param_slot = prepared_memory_access_param_slot(prepared, memory, param_slots);
+                let ptr_bits = prepared_memory_access_ptr_bits(prepared, memory);
+                member_facts.extend(self.member_render_facts_for_memory(
+                    memory,
+                    candidate.field_offset,
+                    ptr_bits,
+                    param_slot,
+                ));
+            }
+        }
+
+        for fact in member_facts {
+            let key = (fact.block_addr, fact.op_index, fact.is_write);
+            let facts = self.render.member_accesses_by_op.entry(key).or_default();
+            if !facts.contains(&fact) {
+                facts.push(fact);
+            }
+        }
+
+        for facts in self.render.member_accesses_by_op.values_mut() {
+            facts.sort_by(|a, b| {
+                (
+                    a.block_addr,
+                    a.op_index,
+                    a.is_write,
+                    a.field_offset,
+                    a.access_width,
+                    a.field_name.as_str(),
+                    a.access,
+                )
+                    .cmp(&(
+                        b.block_addr,
+                        b.op_index,
+                        b.is_write,
+                        b.field_offset,
+                        b.access_width,
+                        b.field_name.as_str(),
+                        b.access,
+                    ))
+            });
+        }
+    }
+
+    fn member_render_facts_for_memory(
+        &self,
+        memory: &MemoryAccessRenderFact,
+        field_offset: u64,
+        ptr_bits: u32,
+        param_slot: Option<usize>,
+    ) -> Vec<MemberAccessRenderFact> {
+        self.types
+            .field_access_certificates
+            .iter()
+            .filter(|cert| {
+                param_slot == Some(cert.slot)
+                    && cert.field_offset == field_offset
+                    && field_certificate_width_matches(cert, memory.width, ptr_bits)
+            })
+            .map(|cert| MemberAccessRenderFact {
+                access: memory.access,
+                block_addr: memory.block_addr,
+                op_index: memory.op_index,
+                object: memory.object,
+                is_write: memory.is_write,
+                field_offset,
+                field_name: cert.field_name.clone(),
+                access_width: memory.width,
+            })
+            .collect()
     }
 
     pub fn populate_array_access_render_facts_from_scalar_candidates(&mut self) {
@@ -1613,6 +2061,227 @@ fn prepared_call_render_facts(
     FunctionCallRenderFacts { by_callsite }
 }
 
+fn prepared_memory_access_field_offset(
+    prepared: &r2ssa::SsaArtifact,
+    memory: &MemoryAccessRenderFact,
+) -> Option<u64> {
+    let offset = prepared_address_base_offset(prepared, memory.address, 0)?;
+    u64::try_from(offset).ok()
+}
+
+fn prepared_memory_access_param_slot(
+    prepared: &r2ssa::SsaArtifact,
+    memory: &MemoryAccessRenderFact,
+    param_slots: &ParamSlotResolver,
+) -> Option<usize> {
+    prepared_address_base_param_slot(prepared, memory.address, param_slots, 0)
+}
+
+fn prepared_memory_access_ptr_bits(
+    prepared: &r2ssa::SsaArtifact,
+    memory: &MemoryAccessRenderFact,
+) -> u32 {
+    prepared
+        .graph()
+        .value(memory.address)
+        .map(|value| value.var.size.saturating_mul(8))
+        .filter(|bits| *bits > 0)
+        .unwrap_or(64)
+}
+
+fn prepared_address_base_offset(
+    prepared: &r2ssa::SsaArtifact,
+    value: r2ssa::ValueId,
+    depth: usize,
+) -> Option<i64> {
+    if depth > 8 {
+        return None;
+    }
+    let graph = prepared.graph();
+    let var = &graph.value(value)?.var;
+    if const_var_i64(var).is_some() {
+        return None;
+    }
+    if prepared
+        .stack_reload_certificate_for_value(value)
+        .and_then(|reload| graph.value(reload.canonical_source))
+        .is_some_and(|source| source.var.version == 0 && source.var.is_register())
+    {
+        return Some(0);
+    }
+    let Some(def_inst) = graph.def_inst(value) else {
+        return Some(0);
+    };
+    let inst = graph.inst(def_inst)?;
+    let r2ssa::InstPayload::Op(op) = &inst.payload else {
+        return None;
+    };
+    match op {
+        r2ssa::SSAOp::Copy { src, .. }
+        | r2ssa::SSAOp::New { src, .. }
+        | r2ssa::SSAOp::Cast { src, .. }
+        | r2ssa::SSAOp::Subpiece { src, .. }
+        | r2ssa::SSAOp::IntZExt { src, .. }
+        | r2ssa::SSAOp::IntSExt { src, .. } => prepared_var_base_offset(prepared, src, depth + 1),
+        r2ssa::SSAOp::IntAdd { a, b, .. } => {
+            prepared_binary_const_offset(prepared, a, b, depth + 1, 1)
+        }
+        r2ssa::SSAOp::IntSub { a, b, .. } => {
+            prepared_binary_const_offset(prepared, a, b, depth + 1, -1)
+        }
+        r2ssa::SSAOp::PtrAdd {
+            base,
+            index,
+            element_size,
+            ..
+        } => {
+            let delta = const_var_i64(index)?.checked_mul(i64::from(*element_size))?;
+            prepared_var_base_offset(prepared, base, depth + 1)?.checked_add(delta)
+        }
+        r2ssa::SSAOp::PtrSub {
+            base,
+            index,
+            element_size,
+            ..
+        } => {
+            let delta = const_var_i64(index)?.checked_mul(i64::from(*element_size))?;
+            prepared_var_base_offset(prepared, base, depth + 1)?.checked_sub(delta)
+        }
+        _ => None,
+    }
+}
+
+fn prepared_var_base_offset(
+    prepared: &r2ssa::SsaArtifact,
+    var: &r2ssa::SSAVar,
+    depth: usize,
+) -> Option<i64> {
+    let value = prepared.graph().value_id_for_var(var)?;
+    prepared_address_base_offset(prepared, value, depth)
+}
+
+fn prepared_binary_const_offset(
+    prepared: &r2ssa::SsaArtifact,
+    a: &r2ssa::SSAVar,
+    b: &r2ssa::SSAVar,
+    depth: usize,
+    rhs_sign: i64,
+) -> Option<i64> {
+    match (const_var_i64(a), const_var_i64(b)) {
+        (None, Some(rhs)) => {
+            let delta = rhs.checked_mul(rhs_sign)?;
+            prepared_var_base_offset(prepared, a, depth)?.checked_add(delta)
+        }
+        (Some(lhs), None) if rhs_sign == 1 => {
+            prepared_var_base_offset(prepared, b, depth)?.checked_add(lhs)
+        }
+        _ => None,
+    }
+}
+
+fn prepared_address_base_param_slot(
+    prepared: &r2ssa::SsaArtifact,
+    value: r2ssa::ValueId,
+    param_slots: &ParamSlotResolver,
+    depth: usize,
+) -> Option<usize> {
+    if depth > 8 {
+        return None;
+    }
+    let graph = prepared.graph();
+    let var = &graph.value(value)?.var;
+    if const_var_i64(var).is_some() {
+        return None;
+    }
+    if let Some(source) = prepared
+        .stack_reload_certificate_for_value(value)
+        .and_then(|reload| graph.value(reload.canonical_source))
+        && source.var.version == 0
+    {
+        return param_slots.slot_for_var(&source.var);
+    }
+    let Some(def_inst) = graph.def_inst(value) else {
+        return param_slots.slot_for_var(var);
+    };
+    let inst = graph.inst(def_inst)?;
+    let r2ssa::InstPayload::Op(op) = &inst.payload else {
+        return None;
+    };
+    match op {
+        r2ssa::SSAOp::Copy { src, .. }
+        | r2ssa::SSAOp::New { src, .. }
+        | r2ssa::SSAOp::Cast { src, .. }
+        | r2ssa::SSAOp::Subpiece { src, .. }
+        | r2ssa::SSAOp::IntZExt { src, .. }
+        | r2ssa::SSAOp::IntSExt { src, .. } => {
+            prepared_var_base_param_slot(prepared, src, param_slots, depth + 1)
+        }
+        r2ssa::SSAOp::IntAdd { a, b, .. } => {
+            prepared_add_param_slot(prepared, a, b, param_slots, depth + 1)
+        }
+        r2ssa::SSAOp::IntSub { a, b, .. } => {
+            prepared_sub_param_slot(prepared, a, b, param_slots, depth + 1)
+        }
+        r2ssa::SSAOp::PtrAdd { base, .. } | r2ssa::SSAOp::PtrSub { base, .. } => {
+            prepared_var_base_param_slot(prepared, base, param_slots, depth + 1)
+        }
+        _ => None,
+    }
+}
+
+fn prepared_var_base_param_slot(
+    prepared: &r2ssa::SsaArtifact,
+    var: &r2ssa::SSAVar,
+    param_slots: &ParamSlotResolver,
+    depth: usize,
+) -> Option<usize> {
+    let value = prepared.graph().value_id_for_var(var)?;
+    prepared_address_base_param_slot(prepared, value, param_slots, depth)
+}
+
+fn prepared_add_param_slot(
+    prepared: &r2ssa::SsaArtifact,
+    a: &r2ssa::SSAVar,
+    b: &r2ssa::SSAVar,
+    param_slots: &ParamSlotResolver,
+    depth: usize,
+) -> Option<usize> {
+    match (const_var_i64(a), const_var_i64(b)) {
+        (None, Some(_)) => prepared_var_base_param_slot(prepared, a, param_slots, depth),
+        (Some(_), None) => prepared_var_base_param_slot(prepared, b, param_slots, depth),
+        _ => None,
+    }
+}
+
+fn prepared_sub_param_slot(
+    prepared: &r2ssa::SsaArtifact,
+    a: &r2ssa::SSAVar,
+    b: &r2ssa::SSAVar,
+    param_slots: &ParamSlotResolver,
+    depth: usize,
+) -> Option<usize> {
+    match (const_var_i64(a), const_var_i64(b)) {
+        (None, Some(_)) => prepared_var_base_param_slot(prepared, a, param_slots, depth),
+        _ => None,
+    }
+}
+
+fn const_var_i64(var: &r2ssa::SSAVar) -> Option<i64> {
+    let raw = r2ssa::parse_const_value(&var.name)?;
+    let bits = var.size.saturating_mul(8);
+    if bits == 0 || bits >= 64 {
+        return Some(raw as i64);
+    }
+    let sign_bit = 1u64.checked_shl(bits - 1)?;
+    let mask = 1u64.checked_shl(bits)?.wrapping_sub(1);
+    let truncated = raw & mask;
+    if truncated & sign_bit == 0 {
+        Some(truncated as i64)
+    } else {
+        Some((truncated | !mask) as i64)
+    }
+}
+
 fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
     let certificates = prepared.certificates();
     let expressions = certificates
@@ -1963,7 +2632,8 @@ fn push_structured_summary_pointer_indices(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use r2il::{R2ILBlock, R2ILOp, Varnode};
+    use crate::FunctionParamSpec;
+    use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
     use std::collections::{BTreeMap, HashMap};
 
     #[test]
@@ -2253,7 +2923,8 @@ mod tests {
         block.push(R2ILOp::Call {
             target: Varnode::constant(0x402000, 8),
         });
-        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], None).expect("prepared");
+        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
+            .expect("prepared");
         let callsite = CallsiteKey {
             block_addr: 0x401000,
             op_index: 0,
@@ -2354,6 +3025,487 @@ mod tests {
                 .and_then(|resolution| resolution.identity_for_callsite(callsite))
                 .is_some(),
             "prepared evidence should still fill missing FunctionFacts groups"
+        );
+    }
+
+    #[test]
+    fn field_certificates_populate_direct_member_render_facts() {
+        let mut block = R2ILBlock::new(0x401000, 4);
+        block.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(0x100, 8),
+            a: Varnode::register(0x10, 8),
+            b: Varnode::constant(8, 8),
+        });
+        block.push(R2ILOp::Load {
+            dst: Varnode::register(0x00, 8),
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x100, 8),
+        });
+        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
+            .expect("prepared");
+        let type_facts = FunctionTypeFacts {
+            field_access_certificates: vec![crate::facts::FieldAccessCertificate {
+                slot: 0,
+                field_offset: 8,
+                field_name: "hash".to_string(),
+                field_type: Some("uint64_t".to_string()),
+            }],
+            ..FunctionTypeFacts::default()
+        };
+        let mut facts = FunctionFacts::new(type_facts, None);
+
+        facts.attach_prepared_decompile_evidence(&prepared);
+        facts.populate_member_access_render_facts_from_field_certificates(
+            &prepared,
+            &x86_stack_home_param_slots(),
+        );
+
+        assert!(
+            facts.render().is_some_and(|render| render
+                .member_access_for_op(0x401000, 1, false, "hash", 8, Some(8))
+                .is_some()),
+            "field certificate plus prepared memory address proof must authorize direct member rendering"
+        );
+    }
+
+    #[test]
+    fn field_certificates_do_not_populate_member_render_facts_for_wrong_width() {
+        let mut block = R2ILBlock::new(0x401000, 4);
+        block.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(0x100, 8),
+            a: Varnode::register(0x10, 8),
+            b: Varnode::constant(8, 8),
+        });
+        block.push(R2ILOp::Load {
+            dst: Varnode::register(0x00, 8),
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x100, 8),
+        });
+        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
+            .expect("prepared");
+        let type_facts = FunctionTypeFacts {
+            field_access_certificates: vec![crate::facts::FieldAccessCertificate {
+                slot: 0,
+                field_offset: 8,
+                field_name: "small".to_string(),
+                field_type: Some("uint32_t".to_string()),
+            }],
+            ..FunctionTypeFacts::default()
+        };
+        let mut facts = FunctionFacts::new(type_facts, None);
+
+        facts.attach_prepared_decompile_evidence(&prepared);
+        facts.populate_member_access_render_facts_from_field_certificates(
+            &prepared,
+            &x86_stack_home_param_slots(),
+        );
+
+        assert!(
+            facts.render().is_none_or(|render| render
+                .member_access_for_op(0x401000, 1, false, "small", 8, Some(8))
+                .is_none()),
+            "wrong-width field certificate must not authorize member rendering"
+        );
+    }
+
+    #[test]
+    fn field_certificates_do_not_populate_member_render_facts_for_wrong_param_slot() {
+        let mut block = R2ILBlock::new(0x401000, 4);
+        block.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(0x100, 8),
+            a: Varnode::register(0x18, 8),
+            b: Varnode::constant(8, 8),
+        });
+        block.push(R2ILOp::Load {
+            dst: Varnode::register(0x00, 8),
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x100, 8),
+        });
+        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
+            .expect("prepared");
+        let type_facts = FunctionTypeFacts {
+            field_access_certificates: vec![crate::facts::FieldAccessCertificate {
+                slot: 0,
+                field_offset: 8,
+                field_name: "hash".to_string(),
+                field_type: Some("uint64_t".to_string()),
+            }],
+            ..FunctionTypeFacts::default()
+        };
+        let mut facts = FunctionFacts::new(type_facts, None);
+
+        facts.attach_prepared_decompile_evidence(&prepared);
+        facts.populate_member_access_render_facts_from_field_certificates(
+            &prepared,
+            &x86_stack_home_param_slots(),
+        );
+
+        assert!(
+            facts.render().is_none_or(|render| render
+                .member_access_for_op(0x401000, 1, false, "hash", 8, Some(8))
+                .is_none()),
+            "a field certificate for one parameter slot must not authorize the same offset on another parameter"
+        );
+
+        let matching_type_facts = FunctionTypeFacts {
+            field_access_certificates: vec![crate::facts::FieldAccessCertificate {
+                slot: 1,
+                field_offset: 8,
+                field_name: "hash".to_string(),
+                field_type: Some("uint64_t".to_string()),
+            }],
+            ..FunctionTypeFacts::default()
+        };
+        let mut matching_facts = FunctionFacts::new(matching_type_facts, None);
+
+        matching_facts.attach_prepared_decompile_evidence(&prepared);
+        matching_facts.populate_member_access_render_facts_from_field_certificates(
+            &prepared,
+            &x86_stack_home_param_slots(),
+        );
+
+        assert!(
+            matching_facts.render().is_some_and(|render| render
+                .member_access_for_op(0x401000, 1, false, "hash", 8, Some(8))
+                .is_some()),
+            "the same memory proof should authorize the certificate for the matching parameter slot"
+        );
+    }
+
+    fn x86_stack_home_arch() -> ArchSpec {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.add_register(RegisterDef::new("rax", 0x00, 8));
+        arch.add_register(RegisterDef::sub("eax", 0x00, 4, "rax"));
+        arch.add_register(RegisterDef::new("rdi", 0x10, 8));
+        arch.add_register(RegisterDef::new("rsi", 0x18, 8));
+        arch.add_register(RegisterDef::new("rbp", 0x20, 8));
+        arch
+    }
+
+    fn x86_stack_home_param_slots() -> ParamSlotResolver {
+        ParamSlotResolver::from_arch_name(Some("x86-64"))
+    }
+
+    fn member_load_prepared_for_register(
+        arch: &ArchSpec,
+        register_offset: u64,
+    ) -> r2ssa::SsaArtifact {
+        let mut block = R2ILBlock::new(0x401000, 4);
+        block.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(0x100, 8),
+            a: Varnode::register(register_offset, 8),
+            b: Varnode::constant(8, 8),
+        });
+        block.push(R2ILOp::Load {
+            dst: Varnode::register(0x00, 8),
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x100, 8),
+        });
+        r2ssa::SsaArtifact::for_decompile(&[block], Some(arch)).expect("prepared")
+    }
+
+    fn field_certificate_type_facts(slot: usize, offset: u64) -> FunctionTypeFacts {
+        FunctionTypeFacts {
+            field_access_certificates: vec![crate::facts::FieldAccessCertificate {
+                slot,
+                field_offset: offset,
+                field_name: "hash".to_string(),
+                field_type: Some("uint64_t".to_string()),
+            }],
+            ..FunctionTypeFacts::default()
+        }
+    }
+
+    #[test]
+    fn param_slot_resolver_maps_explicit_windows_x64_register_order() {
+        let resolver = ParamSlotResolver::from_arg_regs(["rcx", "rdx"]);
+
+        assert_eq!(resolver.slot_for_register_name("rcx"), Some(0));
+        assert_eq!(resolver.slot_for_register_name("ecx"), Some(0));
+        assert_eq!(resolver.slot_for_register_name("rdx"), Some(1));
+        assert_eq!(resolver.slot_for_register_name("edx"), Some(1));
+        assert_eq!(resolver.slot_for_register_name("rdi"), None);
+    }
+
+    #[test]
+    fn param_slot_resolver_maps_aarch64_aliases_from_abi_evidence() {
+        let resolver = ParamSlotResolver::from_arch_name(Some("aarch64"));
+
+        assert_eq!(resolver.slot_for_register_name("x0"), Some(0));
+        assert_eq!(resolver.slot_for_register_name("w0"), Some(0));
+        assert_eq!(resolver.slot_for_register_name("x1"), Some(1));
+        assert_eq!(resolver.slot_for_register_name("w1"), Some(1));
+    }
+
+    #[test]
+    fn field_certificates_fail_closed_without_param_slot_resolver() {
+        let prepared = member_load_prepared_for_register(&x86_stack_home_arch(), 0x10);
+        let mut facts = FunctionFacts::new(field_certificate_type_facts(0, 8), None);
+
+        facts.attach_prepared_decompile_evidence(&prepared);
+        facts.populate_member_access_render_facts_from_field_certificates(
+            &prepared,
+            &ParamSlotResolver::new(),
+        );
+
+        assert!(
+            facts.render().is_none_or(|render| render
+                .member_access_for_op(0x401000, 1, false, "hash", 8, Some(8))
+                .is_none()),
+            "missing ABI slot evidence must not guess rdi as parameter slot 0"
+        );
+    }
+
+    #[test]
+    fn field_certificates_use_explicit_windows_x64_param_slots() {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.add_register(RegisterDef::new("rax", 0x00, 8));
+        arch.add_register(RegisterDef::new("rcx", 0x10, 8));
+        arch.add_register(RegisterDef::new("rdx", 0x18, 8));
+        let param_slots = ParamSlotResolver::from_arg_regs(["rcx", "rdx"]);
+
+        let rcx_prepared = member_load_prepared_for_register(&arch, 0x10);
+        let mut rcx_facts = FunctionFacts::new(field_certificate_type_facts(0, 8), None);
+        rcx_facts.attach_prepared_decompile_evidence(&rcx_prepared);
+        rcx_facts.populate_member_access_render_facts_from_field_certificates(
+            &rcx_prepared,
+            &param_slots,
+        );
+        assert!(
+            rcx_facts.render().is_some_and(|render| render
+                .member_access_for_op(0x401000, 1, false, "hash", 8, Some(8))
+                .is_some()),
+            "explicit Windows x64 resolver must map rcx to slot 0"
+        );
+
+        let rdx_prepared = member_load_prepared_for_register(&arch, 0x18);
+        let mut wrong_slot_facts = FunctionFacts::new(field_certificate_type_facts(0, 8), None);
+        wrong_slot_facts.attach_prepared_decompile_evidence(&rdx_prepared);
+        wrong_slot_facts.populate_member_access_render_facts_from_field_certificates(
+            &rdx_prepared,
+            &param_slots,
+        );
+        assert!(
+            wrong_slot_facts.render().is_none_or(|render| render
+                .member_access_for_op(0x401000, 1, false, "hash", 8, Some(8))
+                .is_none()),
+            "slot 0 certificate must not authorize rdx when resolver maps rdx to slot 1"
+        );
+
+        let mut matching_slot_facts = FunctionFacts::new(field_certificate_type_facts(1, 8), None);
+        matching_slot_facts.attach_prepared_decompile_evidence(&rdx_prepared);
+        matching_slot_facts.populate_member_access_render_facts_from_field_certificates(
+            &rdx_prepared,
+            &param_slots,
+        );
+        assert!(
+            matching_slot_facts.render().is_some_and(|render| render
+                .member_access_for_op(0x401000, 1, false, "hash", 8, Some(8))
+                .is_some()),
+            "explicit Windows x64 resolver must map rdx to slot 1"
+        );
+    }
+
+    fn stack_home_field_load_prepared(with_store: bool) -> r2ssa::SsaArtifact {
+        let mut block = R2ILBlock::new(0x401000, 4);
+        block.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(0x100, 8),
+            a: Varnode::register(0x20, 8),
+            b: Varnode::constant(0xffff_ffff_ffff_fff8, 8),
+        });
+        if with_store {
+            block.push(R2ILOp::Copy {
+                dst: Varnode::unique(0x104, 8),
+                src: Varnode::register(0x10, 8),
+            });
+            block.push(R2ILOp::Store {
+                space: SpaceId::Ram,
+                addr: Varnode::unique(0x100, 8),
+                val: Varnode::unique(0x104, 8),
+            });
+        }
+        block.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(0x108, 8),
+            a: Varnode::register(0x20, 8),
+            b: Varnode::constant(0xffff_ffff_ffff_fff8, 8),
+        });
+        block.push(R2ILOp::Load {
+            dst: Varnode::unique(0x110, 8),
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x108, 8),
+        });
+        block.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(0x118, 8),
+            a: Varnode::unique(0x110, 8),
+            b: Varnode::constant(4, 8),
+        });
+        block.push(R2ILOp::Load {
+            dst: Varnode::register(0x00, 4),
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x118, 8),
+        });
+        r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch())).expect("prepared")
+    }
+
+    #[test]
+    fn field_certificates_populate_stack_home_member_render_facts() {
+        let prepared = stack_home_field_load_prepared(true);
+        let type_facts = FunctionTypeFacts {
+            field_access_certificates: vec![crate::facts::FieldAccessCertificate {
+                slot: 0,
+                field_offset: 4,
+                field_name: "hash".to_string(),
+                field_type: Some("uint32_t".to_string()),
+            }],
+            ..FunctionTypeFacts::default()
+        };
+        let mut facts = FunctionFacts::new(type_facts, None);
+
+        facts.attach_prepared_decompile_evidence(&prepared);
+        facts.populate_member_access_render_facts_from_field_certificates(
+            &prepared,
+            &x86_stack_home_param_slots(),
+        );
+
+        assert!(
+            facts.render().is_some_and(|render| render
+                .member_access_for_op(0x401000, 6, false, "hash", 4, Some(4))
+                .is_some()),
+            "field certificate plus prepared stack-reload proof must authorize O0 stack-home member rendering"
+        );
+    }
+
+    #[test]
+    fn field_certificates_do_not_populate_stack_home_member_without_reload_proof() {
+        let prepared = stack_home_field_load_prepared(false);
+        let type_facts = FunctionTypeFacts {
+            field_access_certificates: vec![crate::facts::FieldAccessCertificate {
+                slot: 0,
+                field_offset: 4,
+                field_name: "hash".to_string(),
+                field_type: Some("uint32_t".to_string()),
+            }],
+            ..FunctionTypeFacts::default()
+        };
+        let mut facts = FunctionFacts::new(type_facts, None);
+
+        facts.attach_prepared_decompile_evidence(&prepared);
+        facts.populate_member_access_render_facts_from_field_certificates(
+            &prepared,
+            &x86_stack_home_param_slots(),
+        );
+
+        assert!(
+            facts.render().is_none_or(|render| render
+                .member_access_for_op(0x401000, 4, false, "hash", 4, Some(4))
+                .is_none()),
+            "field certificate must not authorize a member render through an unproven stack load"
+        );
+    }
+
+    #[test]
+    fn scalar_array_candidates_populate_indexed_member_render_facts() {
+        let mut block = R2ILBlock::new(0x401000, 4);
+        block.push(R2ILOp::Load {
+            dst: Varnode::register(0x00, 4),
+            space: SpaceId::Ram,
+            addr: Varnode::register(0x10, 8),
+        });
+        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
+            .expect("prepared");
+        let type_facts = FunctionTypeFacts {
+            field_access_certificates: vec![crate::facts::FieldAccessCertificate {
+                slot: 0,
+                field_offset: 4,
+                field_name: "score".to_string(),
+                field_type: Some("int32_t".to_string()),
+            }],
+            scalar_array_render_candidates: vec![crate::facts::ScalarArrayRenderCandidate {
+                block_addr: 0x401000,
+                op_index: 0,
+                is_write: false,
+                field_offset: 4,
+                element_stride: 16,
+                access_width: 4,
+            }],
+            ..FunctionTypeFacts::default()
+        };
+        let mut facts = FunctionFacts::new(type_facts, None);
+
+        facts.attach_prepared_decompile_evidence(&prepared);
+        facts.populate_member_access_render_facts_from_field_certificates(
+            &prepared,
+            &x86_stack_home_param_slots(),
+        );
+        facts.populate_array_access_render_facts_from_scalar_candidates();
+
+        let render = facts.render().expect("render facts");
+        assert!(
+            render
+                .member_access_for_op(0x401000, 0, false, "score", 4, Some(4))
+                .is_some(),
+            "scalar array candidate plus field certificate must authorize indexed member rendering"
+        );
+        assert!(
+            render
+                .array_access_for_op(0x401000, 0, false, 4, 16, Some(4))
+                .is_some(),
+            "scalar array candidate must still authorize array rendering"
+        );
+    }
+
+    #[test]
+    fn scalar_array_member_candidate_requires_matching_second_param_slot() {
+        let mut block = R2ILBlock::new(0x401000, 4);
+        block.push(R2ILOp::Load {
+            dst: Varnode::register(0x00, 4),
+            space: SpaceId::Ram,
+            addr: Varnode::register(0x18, 8),
+        });
+        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
+            .expect("prepared");
+        let type_facts_for_slot = |slot| FunctionTypeFacts {
+            field_access_certificates: vec![crate::facts::FieldAccessCertificate {
+                slot,
+                field_offset: 4,
+                field_name: "score".to_string(),
+                field_type: Some("int32_t".to_string()),
+            }],
+            scalar_array_render_candidates: vec![crate::facts::ScalarArrayRenderCandidate {
+                block_addr: 0x401000,
+                op_index: 0,
+                is_write: false,
+                field_offset: 4,
+                element_stride: 16,
+                access_width: 4,
+            }],
+            ..FunctionTypeFacts::default()
+        };
+
+        let mut wrong_slot_facts = FunctionFacts::new(type_facts_for_slot(0), None);
+        wrong_slot_facts.attach_prepared_decompile_evidence(&prepared);
+        wrong_slot_facts.populate_member_access_render_facts_from_field_certificates(
+            &prepared,
+            &x86_stack_home_param_slots(),
+        );
+        assert!(
+            wrong_slot_facts.render().is_none_or(|render| render
+                .member_access_for_op(0x401000, 0, false, "score", 4, Some(4))
+                .is_none()),
+            "scalar-array member candidate from rsi must not render with a slot 0 certificate"
+        );
+
+        let mut matching_slot_facts = FunctionFacts::new(type_facts_for_slot(1), None);
+        matching_slot_facts.attach_prepared_decompile_evidence(&prepared);
+        matching_slot_facts.populate_member_access_render_facts_from_field_certificates(
+            &prepared,
+            &x86_stack_home_param_slots(),
+        );
+        assert!(
+            matching_slot_facts.render().is_some_and(|render| render
+                .member_access_for_op(0x401000, 0, false, "score", 4, Some(4))
+                .is_some()),
+            "scalar-array member candidate from rsi must render with a slot 1 certificate"
         );
     }
 
@@ -2605,6 +3757,222 @@ mod tests {
                 .authorized_stack_slot_owner_render(r2ssa::ObjectId(12), -8, "local_buf")
                 .is_none(),
             "a matching offset must not authorize the wrong SSA object"
+        );
+    }
+
+    #[test]
+    fn function_facts_authorizes_stack_param_owner_render_only_for_params() {
+        let object = r2ssa::ObjectId(13);
+        let facts = FunctionFacts::new(
+            FunctionTypeFacts {
+                visible_bindings: vec![
+                    crate::VisibleBinding {
+                        name: "stack_arg".to_string(),
+                        ty: Some(CTypeLike::Int {
+                            bits: 64,
+                            signedness: crate::Signedness::Signed,
+                        }),
+                        kind: VisibleBindingKind::Param,
+                        stack_slot: Some(StackSlotKey {
+                            base: ExternalStackBase::StackPointer,
+                            offset: 8,
+                        }),
+                        param_index: Some(6),
+                        source_reg: None,
+                    },
+                    crate::VisibleBinding {
+                        name: "local_alias".to_string(),
+                        ty: Some(CTypeLike::Int {
+                            bits: 64,
+                            signedness: crate::Signedness::Signed,
+                        }),
+                        kind: VisibleBindingKind::Local,
+                        stack_slot: Some(StackSlotKey {
+                            base: ExternalStackBase::StackPointer,
+                            offset: 8,
+                        }),
+                        param_index: None,
+                        source_reg: None,
+                    },
+                ],
+                ..FunctionTypeFacts::default()
+            },
+            None,
+        )
+        .with_render(FunctionRenderFacts {
+            stack_slot_offsets: BTreeMap::from([(object, 8)]),
+            ..FunctionRenderFacts::default()
+        });
+
+        let authorization = facts
+            .authorized_stack_param_owner_render(object, 8)
+            .expect("typed parameter binding plus exact render object should authorize owner");
+        assert_eq!(authorization.object, object);
+        assert_eq!(authorization.offset, 8);
+        assert_eq!(authorization.name, "stack_arg");
+        assert!(
+            facts
+                .authorized_stack_param_owner_render(r2ssa::ObjectId(14), 8)
+                .is_none(),
+            "the stack parameter path still requires the exact render object"
+        );
+        assert!(
+            facts
+                .authorized_stack_param_owner_render(object, -8)
+                .is_none(),
+            "the stack parameter path still requires the exact offset"
+        );
+
+        let ambiguous = FunctionFacts::new(
+            FunctionTypeFacts {
+                visible_bindings: vec![
+                    crate::VisibleBinding {
+                        name: "left".to_string(),
+                        ty: Some(CTypeLike::Int {
+                            bits: 64,
+                            signedness: crate::Signedness::Signed,
+                        }),
+                        kind: VisibleBindingKind::Param,
+                        stack_slot: Some(StackSlotKey {
+                            base: ExternalStackBase::StackPointer,
+                            offset: 8,
+                        }),
+                        param_index: Some(6),
+                        source_reg: None,
+                    },
+                    crate::VisibleBinding {
+                        name: "right".to_string(),
+                        ty: Some(CTypeLike::Int {
+                            bits: 64,
+                            signedness: crate::Signedness::Signed,
+                        }),
+                        kind: VisibleBindingKind::Param,
+                        stack_slot: Some(StackSlotKey {
+                            base: ExternalStackBase::StackPointer,
+                            offset: 8,
+                        }),
+                        param_index: Some(6),
+                        source_reg: None,
+                    },
+                ],
+                ..FunctionTypeFacts::default()
+            },
+            None,
+        )
+        .with_render(FunctionRenderFacts {
+            stack_slot_offsets: BTreeMap::from([(object, 8)]),
+            ..FunctionRenderFacts::default()
+        });
+        assert!(
+            ambiguous
+                .authorized_stack_param_owner_render(object, 8)
+                .is_none(),
+            "ambiguous typed parameter names at one stack offset must not be rendered"
+        );
+
+        let canonical_slot = FunctionFacts::new(
+            FunctionTypeFacts {
+                visible_bindings: vec![crate::VisibleBinding {
+                    name: "arg6".to_string(),
+                    ty: Some(CTypeLike::Int {
+                        bits: 64,
+                        signedness: crate::Signedness::Signed,
+                    }),
+                    kind: VisibleBindingKind::Param,
+                    stack_slot: Some(StackSlotKey {
+                        base: ExternalStackBase::StackPointer,
+                        offset: 8,
+                    }),
+                    param_index: Some(6),
+                    source_reg: None,
+                }],
+                stack_slots: BTreeMap::from([(
+                    StackSlotKey {
+                        base: ExternalStackBase::StackPointer,
+                        offset: 8,
+                    },
+                    crate::ExternalStackSlotSpec {
+                        name: "arg_8h".to_string(),
+                        ty: Some(CTypeLike::Int {
+                            bits: 64,
+                            signedness: crate::Signedness::Signed,
+                        }),
+                        base: ExternalStackBase::StackPointer,
+                        role: ExternalStackSlotRole::StackArg,
+                        param_index: Some(6),
+                        param_name: Some("arg7".to_string()),
+                        source_reg: None,
+                    },
+                )]),
+                ..FunctionTypeFacts::default()
+            },
+            None,
+        )
+        .with_render(FunctionRenderFacts {
+            stack_slot_offsets: BTreeMap::from([(object, 8)]),
+            ..FunctionRenderFacts::default()
+        });
+        let authorization = canonical_slot
+            .authorized_stack_param_owner_render(object, 8)
+            .expect("canonical stack slot name should authorize");
+        assert_eq!(authorization.name, "arg7");
+
+        let param_home = FunctionFacts::new(
+            FunctionTypeFacts {
+                merged_signature: Some(FunctionSignatureSpec {
+                    ret_type: Some(CTypeLike::Int {
+                        bits: 32,
+                        signedness: crate::Signedness::Signed,
+                    }),
+                    params: vec![FunctionParamSpec {
+                        name: "node".to_string(),
+                        ty: Some(CTypeLike::Pointer(Box::new(CTypeLike::Struct(
+                            "Node".to_string(),
+                        )))),
+                    }],
+                }),
+                stack_slots: BTreeMap::from([(
+                    StackSlotKey {
+                        base: ExternalStackBase::FramePointer,
+                        offset: 8,
+                    },
+                    crate::ExternalStackSlotSpec {
+                        name: "node_home".to_string(),
+                        ty: None,
+                        base: ExternalStackBase::FramePointer,
+                        role: ExternalStackSlotRole::ParamHome,
+                        param_index: Some(0),
+                        param_name: Some("node".to_string()),
+                        source_reg: Some("rdi".to_string()),
+                    },
+                )]),
+                ..FunctionTypeFacts::default()
+            },
+            None,
+        )
+        .with_render(FunctionRenderFacts {
+            stack_slot_offsets: BTreeMap::from([(object, -8)]),
+            ..FunctionRenderFacts::default()
+        });
+        let authorization = param_home
+            .authorized_stack_param_owner_render(object, -8)
+            .expect("typed parameter home should authorize original parameter owner");
+        assert_eq!(authorization.name, "node");
+        let raw_offset_param_home = param_home.clone().with_render(FunctionRenderFacts {
+            stack_slot_offsets: BTreeMap::from([(object, 8)]),
+            ..FunctionRenderFacts::default()
+        });
+        assert!(
+            raw_offset_param_home
+                .authorized_stack_param_owner_render(object, 8)
+                .is_none(),
+            "frame-pointer parameter homes must match the canonical rendered offset, not the raw slot sign"
+        );
+        assert!(
+            param_home
+                .authorized_stack_slot_owner_render(object, -8, "node_home")
+                .is_none(),
+            "hidden parameter-home storage name must not become a rendered owner"
         );
     }
 
