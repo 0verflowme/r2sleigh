@@ -1404,6 +1404,31 @@ fn collect_renderable_expression_values(
         if matches!(&inst.payload, InstPayload::Phi { .. }) {
             renderable.insert(output);
             ready.push_back(output);
+        } else if matches!(
+            &inst.payload,
+            InstPayload::Op(
+                SSAOp::Copy { .. }
+                    | SSAOp::New { .. }
+                    | SSAOp::Subpiece { .. }
+                    | SSAOp::Piece { .. }
+                    | SSAOp::IntZExt { .. }
+                    | SSAOp::IntSExt { .. }
+                    | SSAOp::Trunc { .. }
+                    | SSAOp::Cast { .. }
+            )
+        ) {
+            let input_renderable = inst.inputs.iter().all(|i| renderable.contains(i));
+            if input_renderable {
+                renderable.insert(output);
+                ready.push_back(output);
+            } else {
+                eligible[inst.id.0 as usize] = true;
+                missing_inputs[inst.id.0 as usize] = inst
+                    .inputs
+                    .iter()
+                    .filter(|input| !renderable.contains(input))
+                    .count();
+            }
         } else {
             eligible[inst.id.0 as usize] = true;
             missing_inputs[inst.id.0 as usize] = inst
