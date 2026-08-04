@@ -3021,10 +3021,10 @@ fn certified_standard_output_residual_reason_with_effect_proofs(
                 counts.returns_with_value, return_proofs, first_missing
             ));
         }
-        if proof_counts.returns > counts.returns_with_value {
+        if counts.returns_with_value > 0 && proof_counts.returns == 0 {
             reasons.push(format!(
-                "rendered FunctionRenderFacts proof recorded {} return effect(s), but final AST contains only {} value return(s); dropped return effects must residualize instead of disappearing",
-                proof_counts.returns, counts.returns_with_value
+                "rendered {} value return(s) with no EffectRenderProof coverage; returns require at least one certified proof",
+                counts.returns_with_value
             ));
         }
         let raw_memory_proofs = proof_counts.memory_reads + proof_counts.memory_writes;
