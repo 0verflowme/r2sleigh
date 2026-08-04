@@ -514,6 +514,14 @@ static R2ILContext *sleigh_ctx = NULL;
 static char *sleigh_arch = NULL;
 static char *sleigh_arch_override = NULL;
 
+void r2sleigh_set_arch_override(const char *arch) {
+	if (!arch || !*arch || (sleigh_arch_override && !strcmp (sleigh_arch_override, arch))) {
+		return;
+	}
+	free (sleigh_arch_override);
+	sleigh_arch_override = strdup (arch);
+}
+
 typedef struct {
 	bool has_state;
 	char *mode;

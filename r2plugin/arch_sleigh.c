@@ -2,6 +2,7 @@
 
 #include <r_arch.h>
 #include <r_anal.h>
+#include <r_core.h>
 #include <string.h>
 #include "r2sleigh_plugin.h"
 
@@ -104,9 +105,49 @@ static const char *sleigh_fallback_profile(RAnal *anal) {
 	return fallback_profile_generic ();
 }
 
+static RAnal *sleigh_arch_anal(RArchSession *as) {
+	RCore *core = as? (RCore *)as->user: NULL;
+	return core? core->anal: NULL;
+}
+
+static const char *sleigh_arch_name(RArchSession *as) {
+	RCore *core = as? (RCore *)as->user: NULL;
+	RBinInfo *info = core? r_bin_get_info (core->bin): NULL;
+	if (!info || !info->arch) {
+		return NULL;
+	}
+	if (!strcmp (info->arch, "x86")) {
+		return info->bits == 64? "x86-64": "x86";
+	}
+	if (!strcmp (info->arch, "arm64") || !strcmp (info->arch, "aarch64")
+			|| (!strcmp (info->arch, "arm") && info->bits == 64)) {
+		return "arm64";
+	}
+	if (!strcmp (info->arch, "arm")) {
+		return "arm";
+	}
+	if (!strcmp (info->arch, "riscv")) {
+		return info->bits == 64? "riscv64": "riscv32";
+	}
+	if (!strncmp (info->arch, "mips", 4)) {
+		if (info->bits == 64) {
+			return info->big_endian? "mips64be": "mips64le";
+		}
+		return info->big_endian? "mips32be": "mips32le";
+	}
+	return NULL;
+}
+
+static RAnal *sleigh_arch_prepare(RArchSession *as) {
+	const char *arch = sleigh_arch_name (as);
+	if (arch) {
+		r2sleigh_set_arch_override (arch);
+	}
+	return sleigh_arch_anal (as);
+}
+
 static char *sleigh_arch_regs(RArchSession *as) {
-	/* Get the analysis context from the arch session user data */
-	RAnal *anal = (RAnal *)as->user;
+	RAnal *anal = sleigh_arch_prepare (as);
 	const char *fallback = sleigh_fallback_profile (anal);
 	if (!anal) {
 		return strdup (fallback);
@@ -123,8 +164,7 @@ static char *sleigh_arch_regs(RArchSession *as) {
 }
 
 static bool sleigh_arch_decode(RArchSession *as, RAnalOp *op, RArchDecodeMask mask) {
-	/* Get the analysis context from the arch session user data */
-	RAnal *anal = (RAnal *)as->user;
+	RAnal *anal = sleigh_arch_prepare (as);
 	if (!anal) {
 		return false;
 	}
@@ -134,7 +174,7 @@ static bool sleigh_arch_decode(RArchSession *as, RAnalOp *op, RArchDecodeMask ma
 }
 
 static int sleigh_arch_info(RArchSession *as, ut32 query) {
-	RAnal *anal = (RAnal *)as->user;
+	RAnal *anal = sleigh_arch_prepare (as);
 	if (!anal) {
 		return 0;
 	}
@@ -176,7 +216,7 @@ RArchPlugin r_arch_plugin_sleigh_x86 = {
 };
 
 #ifndef R2_PLUGIN_INCORE
-R_API RLibStruct radare_arch_plugin = {
+R_API RLibStruct radare_plugin = {
 	.type = R_LIB_TYPE_ARCH,
 	.data = &r_arch_plugin_sleigh_x86,
 	.version = R2_VERSION,

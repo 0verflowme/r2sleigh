@@ -10,6 +10,18 @@ a:sla
 EOF_CMDS
 RUN
 
+NAME=architecture_plugin_decodes_x86_fixture
+FILE=bins/vuln_test_x86
+ARGS=-a r2sleigh -b 64 -e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+PUSH RBP
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+s `isq~check_secret[0]` >/dev/null
+aoj 1 | jq -r '.[0].opcode'
+EOF_CMDS
+RUN
+
 NAME=plugin_info_shows_arch
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
