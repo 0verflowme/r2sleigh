@@ -164,9 +164,12 @@ pub fn compile_summary_dense_worker_artifact_from_interproc_summary(
         super::native_worker::summaries_from_interproc_summary_unbounded(func.entry, summary);
     let worker_summaries = super::native_worker::bounded_worker_summaries(worker_summaries);
     let named_worker_family = has_named_worker_family(&worker_summaries);
-    let direct_named_worker =
-        super::native_worker::native_worker_summary_route_policy_for_summary(func.entry, summary)
-            .should_use_direct_summary();
+    let route_policy =
+        super::native_worker::native_worker_summary_route_policy_for_summary(func.entry, summary);
+    if route_policy.should_prefer_full() {
+        return None;
+    }
+    let direct_named_worker = route_policy.should_use_direct_summary();
     if worker_summaries.len() < SUMMARY_DENSE_WORKER_ISLAND_MIN
         && !(named_worker_family && direct_named_worker)
     {
@@ -297,6 +300,12 @@ pub fn compile_native_worker_summary_artifact(
     summary: Option<&FunctionSemanticSummary>,
     skipped_large_cfg: bool,
 ) -> Option<SemanticArtifact> {
+    if let Some(summary) = summary
+        && super::native_worker::native_worker_summary_route_policy_for_summary(func.entry, summary)
+            .should_prefer_full()
+    {
+        return None;
+    }
     let mut worker_summaries = Vec::new();
     if let Some(summary) = summary {
         worker_summaries.extend(

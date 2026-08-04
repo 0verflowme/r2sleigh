@@ -920,8 +920,12 @@ fn route_name_has_compatible_evidence(
     if !route_name_requires_compatible_route_evidence(route_name) {
         return true;
     }
-    applicability
-        .route_evidence_kinds
+    let candidate_kinds = if applicability.route_evidence_kinds.is_empty() {
+        &applicability.worker_kinds
+    } else {
+        &applicability.route_evidence_kinds
+    };
+    candidate_kinds
         .iter()
         .any(|kind| route_name_allows_worker_kind(route_name, route_kind, *kind))
 }
@@ -937,6 +941,9 @@ fn route_name_allows_worker_kind(
             NativeWorkerSummaryKind::DiagnosticWrapper
                 | NativeWorkerSummaryKind::ProgramOrchestrator
                 | NativeWorkerSummaryKind::FormatArgumentFetch
+                | NativeWorkerSummaryKind::TableWalk
+                | NativeWorkerSummaryKind::StringScan
+                | NativeWorkerSummaryKind::NumericTransform
         );
     }
     if is_direct_allocation_wrapper(route_name) || is_xalloc_family_name(route_name) {
@@ -1292,7 +1299,7 @@ fn is_direct_allocation_wrapper(name: &str) -> bool {
 }
 
 fn should_prefer_full_native_worker_summary(name: &str) -> bool {
-    matches!(name, "diagnose")
+    name.contains("table_walk") || matches!(name, "diagnose")
 }
 
 pub(super) fn role_identity_from_worker_summaries(
