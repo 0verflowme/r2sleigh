@@ -1472,15 +1472,12 @@ fn expression_leaf_is_renderable(value: &crate::graph::GraphValue) -> bool {
 
 fn expression_inst_is_renderable(
     _function: &SSAFunction,
-    graph: &SsaGraph,
+    _graph: &SsaGraph,
     inst: &crate::graph::GraphInst,
     certified_memory_read_insts: &BTreeSet<InstId>,
 ) -> bool {
     match &inst.payload {
-        InstPayload::Phi { .. } => !inst
-            .inputs
-            .iter()
-            .any(|input| expression_value_depends_on_memory_read(graph, *input)),
+        InstPayload::Phi { .. } => true,
         InstPayload::Op(op) => {
             expression_op_is_pure(op)
                 || (op.is_memory_read() && certified_memory_read_insts.contains(&inst.id))

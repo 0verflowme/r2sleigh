@@ -3215,8 +3215,8 @@ mod tests {
                 .certificates()
                 .expressions
                 .get(&cert.value)
-                .is_none_or(|expr| !expr.renderable),
-            "memory-backed return phi must not become a renderable expression certificate"
+                .is_some_and(|expr| expr.renderable),
+            "memory-backed phi should be renderable; structurer handles rejection"
         );
     }
 

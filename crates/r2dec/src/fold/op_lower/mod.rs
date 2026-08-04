@@ -1056,21 +1056,49 @@ impl<'a> FoldingContext<'a> {
                 return None;
             }
             match &inst.payload {
-                r2ssa::InstPayload::Phi { .. } => {
-                    let mut non_raw_rendered = Vec::new();
-                    for input in &inst.inputs {
-                        if let Some(expr) = self
+                r2ssa::InstPayload::Phi { predecessors } => {
+                    let mut non_raw_rendered: Vec<(Option<bool>, CExpr)> = Vec::new();
+                    for (i, input) in inst.inputs.iter().enumerate() {
+                        let Some(expr) = self
                             .certified_structural_return_expr_for_value(*input, depth + 1, visited)
                             .filter(|expr| {
                                 !self.certified_return_expr_contains_raw_storage_name(expr)
-                                    && !non_raw_rendered.contains(expr)
                             })
-                        {
-                            non_raw_rendered.push(expr);
-                        }
+                        else {
+                            continue;
+                        };
+                        let is_latch = predecessors
+                            .get(i)
+                            .and_then(|pred_id| prepared.graph().block(*pred_id))
+                            .map(|block| block.addr)
+                            .and_then(|pred_addr| {
+                                self.control_facts().and_then(|facts| {
+                                    facts.loops.values().find_map(|fact| {
+                                        fact.latches.contains(&pred_addr).then_some(true)
+                                    })
+                                })
+                            })
+                            .unwrap_or(false);
+                        non_raw_rendered.push((Some(is_latch), expr));
                     }
-                    if non_raw_rendered.len() == 1 {
-                        non_raw_rendered.pop()
+                    let latch_exprs: Vec<_> = non_raw_rendered
+                        .iter()
+                        .filter(|(is_latch, _)| is_latch.unwrap_or(false))
+                        .map(|(_, expr)| expr)
+                        .collect();
+                    let unique_exprs: Vec<_> = non_raw_rendered.iter().map(|(_, expr)| expr).fold(
+                        Vec::<&CExpr>::new(),
+                        |mut acc, expr| {
+                            if !acc.contains(&expr) {
+                                acc.push(expr);
+                            }
+                            acc
+                        },
+                    );
+                    if latch_exprs.len() == 1 {
+                        Some(latch_exprs[0].clone())
+                    } else if unique_exprs.len() == 1 {
+                        Some(unique_exprs[0].clone())
                     } else {
                         None
                     }
