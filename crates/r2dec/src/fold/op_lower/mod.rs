@@ -1057,36 +1057,64 @@ impl<'a> FoldingContext<'a> {
             }
             match &inst.payload {
                 r2ssa::InstPayload::Phi { predecessors } => {
-                    let mut non_raw_rendered: Vec<(Option<bool>, CExpr)> = Vec::new();
+                    let compute_latch = |pred_addr: u64| {
+                        self.control_facts().and_then(|facts| {
+                            facts
+                                .loops
+                                .values()
+                                .find_map(|fact| fact.latches.contains(&pred_addr).then_some(true))
+                        })
+                    };
+                    // First pass: try non-raw inputs only
+                    let mut rendered: Vec<(Option<bool>, CExpr)> = Vec::new();
                     for (i, input) in inst.inputs.iter().enumerate() {
-                        let Some(expr) = self
-                            .certified_structural_return_expr_for_value(*input, depth + 1, visited)
-                            .filter(|expr| {
-                                !self.certified_return_expr_contains_raw_storage_name(expr)
-                            })
-                        else {
+                        let Some(expr) = self.certified_structural_return_expr_for_value(
+                            *input,
+                            depth + 1,
+                            visited,
+                        ) else {
                             continue;
                         };
+                        if self.certified_return_expr_contains_raw_storage_name(&expr) {
+                            continue;
+                        }
                         let is_latch = predecessors
                             .get(i)
                             .and_then(|pred_id| prepared.graph().block(*pred_id))
                             .map(|block| block.addr)
-                            .and_then(|pred_addr| {
-                                self.control_facts().and_then(|facts| {
-                                    facts.loops.values().find_map(|fact| {
-                                        fact.latches.contains(&pred_addr).then_some(true)
-                                    })
-                                })
-                            })
+                            .and_then(compute_latch)
                             .unwrap_or(false);
-                        non_raw_rendered.push((Some(is_latch), expr));
+                        rendered.push((Some(is_latch), expr));
                     }
-                    let latch_exprs: Vec<_> = non_raw_rendered
+                    // Second pass: if empty and structurally backed, accept raw inputs
+                    let has_raw_fallback = rendered.is_empty()
+                        && self.control_facts().is_some_and(|facts| {
+                            !facts.loops.is_empty() || !facts.switches.is_empty()
+                        });
+                    if has_raw_fallback {
+                        for (i, input) in inst.inputs.iter().enumerate() {
+                            let Some(expr) = self.certified_structural_return_expr_for_value(
+                                *input,
+                                depth + 1,
+                                visited,
+                            ) else {
+                                continue;
+                            };
+                            let is_latch = predecessors
+                                .get(i)
+                                .and_then(|pred_id| prepared.graph().block(*pred_id))
+                                .map(|block| block.addr)
+                                .and_then(compute_latch)
+                                .unwrap_or(false);
+                            rendered.push((Some(is_latch), expr));
+                        }
+                    }
+                    let latch_exprs: Vec<_> = rendered
                         .iter()
                         .filter(|(is_latch, _)| is_latch.unwrap_or(false))
                         .map(|(_, expr)| expr)
                         .collect();
-                    let unique_exprs: Vec<_> = non_raw_rendered.iter().map(|(_, expr)| expr).fold(
+                    let unique_exprs: Vec<_> = rendered.iter().map(|(_, expr)| expr).fold(
                         Vec::<&CExpr>::new(),
                         |mut acc, expr| {
                             if !acc.contains(&expr) {
@@ -1099,6 +1127,8 @@ impl<'a> FoldingContext<'a> {
                         Some(latch_exprs[0].clone())
                     } else if unique_exprs.len() == 1 {
                         Some(unique_exprs[0].clone())
+                    } else if !rendered.is_empty() && has_raw_fallback {
+                        rendered.into_iter().next().map(|(_, expr)| expr)
                     } else {
                         None
                     }
@@ -1248,7 +1278,11 @@ impl<'a> FoldingContext<'a> {
     ) -> Option<(CExpr, r2ssa::ValueId)> {
         let cert = self.certified_return_for_op(block_addr, op_idx)?;
         let expr = self.certified_return_expr_for_value(cert.value)?;
-        if self.certified_return_expr_contains_raw_storage_name(&expr) {
+        if self.certified_return_expr_contains_raw_storage_name(&expr)
+            && self
+                .control_facts()
+                .is_none_or(|facts| facts.loops.is_empty() && facts.switches.is_empty())
+        {
             return None;
         }
         Some((expr, cert.value))
