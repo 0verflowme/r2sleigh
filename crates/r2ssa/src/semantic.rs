@@ -1934,33 +1934,46 @@ fn merge_reaching_return_predecessors(
         call_results,
         stack_reloads,
     );
+    let mut all_states = vec![first_state];
     for pred in rest {
-        let pred_state = out_states.get(pred).copied().flatten()?;
-        let pred_candidates = return_identity_candidates_for_block(
-            *pred,
-            pred_state,
-            graph,
-            predicates,
-            call_results,
-            stack_reloads,
-        );
-        common.retain(|identity| pred_candidates.contains(identity));
-        if common.is_empty() {
-            return None;
+        if let Some(pred_state) = out_states.get(pred).copied().flatten() {
+            let pred_candidates = return_identity_candidates_for_block(
+                *pred,
+                pred_state,
+                graph,
+                predicates,
+                call_results,
+                stack_reloads,
+            );
+            common.retain(|identity| pred_candidates.contains(identity));
+            all_states.push(pred_state);
         }
     }
-    let identity = common
+    if !common.is_empty() {
+        let identity = common
+            .iter()
+            .find(|identity| !matches!(identity, ReturnSemanticIdentity::Const(_)))
+            .copied()
+            .or_else(|| common.iter().next().copied())?;
+        let value = preds
+            .iter()
+            .filter_map(|pred| out_states.get(pred).copied().flatten())
+            .find(|state| state.identity == identity)
+            .map(|state| state.value)
+            .unwrap_or(first_state.value);
+        return Some(ReachingReturnValue { value, identity });
+    }
+
+    let non_const_states: Vec<_> = all_states
         .iter()
-        .find(|identity| !matches!(identity, ReturnSemanticIdentity::Const(_)))
+        .filter(|state| !matches!(state.identity, ReturnSemanticIdentity::Const(_)))
         .copied()
-        .or_else(|| common.iter().next().copied())?;
-    let value = preds
-        .iter()
-        .filter_map(|pred| out_states.get(pred).copied().flatten())
-        .find(|state| state.identity == identity)
-        .map(|state| state.value)
-        .unwrap_or(first_state.value);
-    Some(ReachingReturnValue { value, identity })
+        .collect();
+    if non_const_states.len() == 1 {
+        return Some(non_const_states[0]);
+    }
+
+    None
 }
 
 fn process_reaching_return_block(

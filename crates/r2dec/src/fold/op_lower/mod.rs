@@ -1056,20 +1056,23 @@ impl<'a> FoldingContext<'a> {
             }
             match &inst.payload {
                 r2ssa::InstPayload::Phi { .. } => {
-                    let mut rendered = None;
+                    let mut non_raw_rendered = Vec::new();
                     for input in &inst.inputs {
-                        let expr = self.certified_structural_return_expr_for_value(
-                            *input,
-                            depth + 1,
-                            visited,
-                        )?;
-                        match &rendered {
-                            None => rendered = Some(expr),
-                            Some(first) if first == &expr => {}
-                            Some(_) => return None,
+                        if let Some(expr) = self
+                            .certified_structural_return_expr_for_value(*input, depth + 1, visited)
+                            .filter(|expr| {
+                                !self.certified_return_expr_contains_raw_storage_name(expr)
+                                    && !non_raw_rendered.contains(expr)
+                            })
+                        {
+                            non_raw_rendered.push(expr);
                         }
                     }
-                    rendered
+                    if non_raw_rendered.len() == 1 {
+                        non_raw_rendered.pop()
+                    } else {
+                        None
+                    }
                 }
                 r2ssa::InstPayload::Op(op) => match op {
                     SSAOp::Copy { src, .. } => {
