@@ -311,8 +311,22 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         condition_value: Option<ValueId>,
         body: &Region,
     ) -> Option<ControlRenderProof> {
-        let proof = self.loop_render_proof(anchor, condition, condition_value, body);
         let facts = self.fold_ctx.control_facts()?;
+        // Prefer canonical LoopCertificate body/latches/exits when available.
+        // Match on header only: loop header uniquely identifies the natural loop.
+        // condition/condition_value use different ID spaces (r2il vs SSA) and may differ.
+        if let Some(cert) = facts.loops.values().find(|fact| fact.header == anchor) {
+            return Some(ControlRenderProof::loop_proof(
+                anchor,
+                condition,
+                condition_value,
+                cert.body.clone(),
+                cert.latches.clone(),
+                cert.exits.clone(),
+            ));
+        }
+        // Fallback: compute from structurer and require exact match
+        let proof = self.loop_render_proof(anchor, condition, condition_value, body);
         facts
             .loops
             .values()
