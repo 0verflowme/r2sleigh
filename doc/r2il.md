@@ -22,7 +22,7 @@ convertible back to ESIL for backward compatibility with radare2.
 |--------|------|-----------------|--------------|----------------|
 | Typing | Sized varnodes | Sized varnodes | Typed (bitvectors, booleans) | Untyped strings |
 | Address spaces | Yes (5 kinds) | Yes | Yes (variables + memory) | No |
-| Serializable | Yes (serde/bincode) | Binary format | In-memory only | String |
+| Serializable | Yes (serde/postcard) | Binary format | In-memory only | String |
 | SSA-ready | Yes | No | No | No |
 | Executable | Via r2sym | Via Ghidra emulator | Via RzIL VM | Via ESIL VM |
 | Source | Sleigh specifications | Sleigh specifications | Hand-written per arch | Hand-written per arch |
@@ -524,7 +524,8 @@ r2il types derive `serde::Serialize` and `serde::Deserialize`. The standard
 serialization formats are:
 
 - **JSON** (`serde_json`) -- for plugin output and debugging
-- **bincode** -- for compact binary storage
+- **postcard** -- for compact v4 binary storage
+- **bincode** -- optional legacy v1/v2/v3 decoding
 
 The plugin command `a:sla.json` outputs the R2ILBlock for the current
 instruction as JSON.
@@ -532,9 +533,9 @@ instruction as JSON.
 Compatibility Guarantees
 ------------------------
 
-1. Reader compatibility is guaranteed for `.r2il` format versions `v1`, `v2`, and `v3`.
-2. Writer compatibility target is always `v3`.
-3. Legacy `v1`/`v2` artifacts are upgraded in memory on load.
+1. The default reader accepts `.r2il` format version `v4`.
+2. Enabling `r2il/legacy-bincode` adds reader support for `v1`, `v2`, and `v3`.
+3. The writer always emits `v4`; loaded legacy artifacts are upgraded in memory.
 4. Instruction exporter action/format compatibility is strict:
    - `lift`: `json`, `text`, `esil`, `r2cmd`
    - `ssa`: `json`, `text`
@@ -544,6 +545,6 @@ Compatibility Guarantees
 
 Versioning policy:
 
-1. Current writer target is `FORMAT_VERSION = 3`.
-2. Loader accepts v1/v2/v3 and upgrades v1/v2 in memory.
-3. Re-saving loaded artifacts writes v3.
+1. Current writer target is `FORMAT_VERSION = 4`.
+2. The default loader accepts v4; `legacy-bincode` enables v1/v2/v3 loading.
+3. Re-saving loaded legacy artifacts writes v4.
