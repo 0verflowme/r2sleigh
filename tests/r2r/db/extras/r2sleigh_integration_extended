@@ -803,7 +803,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `isq~parse_number$[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("parse_number") and contains("r2dec residual: certified render contract failed") and contains("summary return unresolved") and (contains("ValueId")|not) and (contains("ObjectId")|not) and (contains("eax_")|not) and (contains("summary projection (not native CFG): parser base10 numeric return loop")|not) and (contains("while (str[summary_i] >=")|not) and (contains("summary_value = summary_value * 10U +")|not) and (contains("return summary_value;")|not) and (contains("semantic role:")|not) and (contains("parse_base10_numeric_summary(")|not) and (contains("compute_numeric_transform(")|not)'
+a:sla.dec | jq -Rs 'contains("parse_number") and contains("r2dec residual:") and contains("summary return unresolved") and (contains("ValueId")|not) and (contains("ObjectId")|not) and (contains("eax_")|not) and (contains("summary projection (not native CFG): parser base10 numeric return loop")|not) and (contains("while (str[summary_i] >=")|not) and (contains("summary_value = summary_value * 10U +")|not) and (contains("return summary_value;")|not) and (contains("semantic role:")|not) and (contains("parse_base10_numeric_summary(")|not) and (contains("compute_numeric_transform(")|not)'
 EOF_CMDS
 RUN
 

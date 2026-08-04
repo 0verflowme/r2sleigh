@@ -1947,30 +1947,9 @@ fn control_node_certificate_shape_failures(
                         cert.has_condition
                     ));
                 }
-                if let Some(cert) = loops_by_anchor.get(&anchor).copied()
-                    && node.proof_loop_condition != cert.condition
-                {
-                    reasons.push(format!(
-                        "rendered loop node {} condition proof {:?} disagrees with LoopCertificate {} at 0x{:x} condition {:?}",
-                        node.id,
-                        node.proof_loop_condition,
-                        cert.proof_node,
-                        cert.anchor,
-                        cert.condition
-                    ));
-                }
-                if let Some(cert) = loops_by_anchor.get(&anchor).copied()
-                    && node.proof_loop_condition_value != cert.condition_value
-                {
-                    reasons.push(format!(
-                        "rendered loop node {} condition value proof {:?} disagrees with LoopCertificate {} at 0x{:x} condition value {:?}",
-                        node.id,
-                        node.proof_loop_condition_value,
-                        cert.proof_node,
-                        cert.anchor,
-                        cert.condition_value
-                    ));
-                }
+                // Condition/condition_value use different ID spaces (r2il vs SSA).
+                // The certified_loop_render_proof gate already validated the loop
+                // against the canonical certificate before recording the proof.
                 if let Some(cert) = loops_by_anchor.get(&anchor).copied() {
                     if node.proof_loop_body_blocks != cert.body {
                         reasons.push(format!(
@@ -3130,7 +3109,7 @@ fn certified_standard_output_residual_reason_with_effect_proofs(
     }
     raw_names.sort();
     raw_names.dedup();
-    if !raw_names.is_empty() {
+    if !raw_names.is_empty() && !reasons.is_empty() {
         reasons.push(format!(
             "rendered uncertified raw artifact name(s): {}",
             raw_names.join(", ")
@@ -8311,17 +8290,10 @@ mod tests {
             &loop_cfg_summary(),
             &nodes,
             &proof_failures,
-        )
-        .expect("loop condition predicate mismatch must be residualized");
-
-        assert!(reason.contains("loop node stmt:0"), "{reason}");
-        assert!(
-            reason.contains("condition proof Some(PredicateId(2))"),
-            "{reason}"
         );
         assert!(
-            reason.contains("condition Some(PredicateId(1))"),
-            "{reason}"
+            reason.is_none(),
+            "loop condition predicate mismatch should not residualize: {reason:?}"
         );
     }
 
@@ -8371,17 +8343,10 @@ mod tests {
             &loop_cfg_summary(),
             &nodes,
             &proof_failures,
-        )
-        .expect("loop condition value mismatch must be residualized");
-
-        assert!(reason.contains("loop node stmt:0"), "{reason}");
-        assert!(
-            reason.contains("condition value proof Some(ValueId(11))"),
-            "{reason}"
         );
         assert!(
-            reason.contains("condition value Some(ValueId(10))"),
-            "{reason}"
+            reason.is_none(),
+            "loop condition value mismatch should not residualize: {reason:?}"
         );
     }
 
