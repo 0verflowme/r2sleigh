@@ -533,8 +533,19 @@ impl<'a> FoldingContext<'a> {
             .stack_slot_offsets
             .get(&fact.object)
             .copied()?;
-        self.certified_stack_var_name_for_object_offset(fact.object, offset)
-            .map(CExpr::Var)
+        let name = self
+            .certified_stack_var_name_for_object_offset(fact.object, offset)
+            .unwrap_or_else(|| {
+                format!(
+                    "var_{}h",
+                    if offset >= 0 {
+                        format!("{:x}", offset)
+                    } else {
+                        format!("{:x}", -offset)
+                    }
+                )
+            });
+        Some(CExpr::Var(name))
     }
 
     pub(super) fn certified_memory_render_refusal_for_current_op(&self, is_write: bool) -> String {

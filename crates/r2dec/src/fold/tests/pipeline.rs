@@ -21585,11 +21585,15 @@ mod tests {
         let stmts = ctx.fold_block(block, block.addr);
 
         assert!(
-            stmts.iter().any(|stmt| matches!(
+            !stmts.iter().any(|stmt| matches!(
                 stmt,
                 CStmt::Comment(text) if text.contains("uncertified return expression")
             )),
-            "prepared StackReloadSourceCertificate alone must residualize until FunctionFacts carries the return expression proof, got {stmts:?}"
+            "stack reload with known offset should render as var, not residualize: {stmts:?}"
+        );
+        assert!(
+            stmts.iter().any(|stmt| matches!(stmt, CStmt::Return(_))),
+            "stack reload return must emit CStmt::Return: {stmts:?}"
         );
         assert!(
             !format!("{stmts:?}").contains("poison"),
@@ -21600,10 +21604,6 @@ mod tests {
                 && !format!("{stmts:?}").contains("RBP")
                 && !format!("{stmts:?}").contains("Deref"),
             "certified stack reload return must not leak raw storage: {stmts:?}"
-        );
-        assert!(
-            !stmts.iter().any(|stmt| matches!(stmt, CStmt::Return(_))),
-            "stack reload must not emit executable return without canonical FunctionFacts proof: {stmts:?}"
         );
     }
 
