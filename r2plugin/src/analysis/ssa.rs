@@ -479,17 +479,29 @@ pub extern "C" fn r2ssa_backward_slice_json(
         'outer: for &addr in ssa_func.block_addrs() {
             if let Some(block) = ssa_func.get_block(addr) {
                 for phi in &block.phis {
-                    if phi.dst.display_name() == var_name_str {
+                    if phi.dst.display_name().eq_ignore_ascii_case(&var_name_str) {
                         found = Some(phi.dst.clone());
                         break 'outer;
+                    }
+                    for (_, src) in &phi.sources {
+                        if src.display_name().eq_ignore_ascii_case(&var_name_str) {
+                            found = Some(src.clone());
+                            break 'outer;
+                        }
                     }
                 }
                 for op in &block.ops {
                     if let Some(dst) = op.dst()
-                        && dst.display_name() == var_name_str
+                        && dst.display_name().eq_ignore_ascii_case(&var_name_str)
                     {
                         found = Some(dst.clone());
                         break 'outer;
+                    }
+                    for src in op.sources() {
+                        if src.display_name().eq_ignore_ascii_case(&var_name_str) {
+                            found = Some(src.clone());
+                            break 'outer;
+                        }
                     }
                 }
             }
