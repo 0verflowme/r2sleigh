@@ -218,7 +218,8 @@
       "contains": [
         "int32_t table_walk(Item* head, int8_t* needle)",
         "r2dec residual:",
-        "uncertified structured control",
+        "certified render contract failed",
+        "uncertified return expression",
         "structured C suppressed until canonical facts prove the rendered effects",
         "summary return unresolved"
       ],
