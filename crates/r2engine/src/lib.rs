@@ -5993,7 +5993,11 @@ fn maybe_compile_semantic_artifact_for_analysis(
                 .native_body()
                 .is_some_and(r2sym::NativeArtifactBody::has_primary_summary_islands)
         {
-            return Some(artifact);
+            let cfg = ssa_func.function().cfg_risk_summary();
+            if cfg.block_count <= 12 || cfg.loop_count == 0 || cfg.block_count > 64 {
+                return Some(artifact);
+            }
+            // Small looped function: skip preprobe, use full semantics
         }
     }
     Some(compile_semantic_artifact_for_analysis(
