@@ -132,12 +132,175 @@ impl<'a> FoldingContext<'a> {
         {
             return None;
         }
+        if let Some(expr) =
+            self.render_certified_stack_param_value_expr(value, 0, &mut HashSet::new())
+        {
+            return Some(expr);
+        }
+        if let Some(expr) = self.render_certified_scalar_expr_for_var(var, 0, &mut HashSet::new()) {
+            return Some(expr);
+        }
         let rendered = self.var_name(var);
         Some(
             self.arg_alias_for_rendered_name(&rendered)
                 .map(CExpr::Var)
                 .unwrap_or_else(|| CExpr::Var(rendered)),
         )
+    }
+
+    fn render_certified_scalar_expr_for_var(
+        &self,
+        var: &SSAVar,
+        depth: u32,
+        visited: &mut HashSet<r2ssa::ValueId>,
+    ) -> Option<CExpr> {
+        if depth > Self::MAX_SEMANTIC_RENDER_DEPTH {
+            return None;
+        }
+        if var.is_const() {
+            return self.render_certified_value_expr_for_var(var);
+        }
+        let value = self.prepared_value_id_for_var(var)?;
+        if !self
+            .certified_render_context()
+            .is_some_and(|proof| proof.expression_is_renderable(value))
+        {
+            return None;
+        }
+        if !visited.insert(value) {
+            return None;
+        }
+
+        let result = (|| {
+            let prepared = self.prepared_ssa()?;
+            let inst_id = prepared.graph().def_inst(value)?;
+            let inst = prepared.graph().inst(inst_id)?;
+            let r2ssa::InstPayload::Op(op) = &inst.payload else {
+                return None;
+            };
+            match op {
+                SSAOp::Copy { src, .. }
+                | SSAOp::New { src, .. }
+                | SSAOp::Subpiece { src, .. }
+                | SSAOp::IntZExt { src, .. }
+                | SSAOp::IntSExt { src, .. } => {
+                    self.render_certified_scalar_expr_for_var(src, depth + 1, visited)
+                }
+                SSAOp::Cast { src, .. } => {
+                    self.render_certified_scalar_expr_for_var(src, depth + 1, visited)
+                }
+                SSAOp::Load { dst, .. } => {
+                    let (block_addr, op_idx) = prepared.inst_op_site(inst_id)?;
+                    let proof = self.certified_render_context()?;
+                    let fact = proof.memory_access_for_op(block_addr, op_idx, false)?;
+                    if fact.value != Some(value) {
+                        return None;
+                    }
+                    let elem_ty = self
+                        .type_hint_for_var(dst)
+                        .unwrap_or_else(|| type_from_size(dst.size));
+                    self.render_certified_memory_expr_for_fact(fact, elem_ty)
+                }
+                SSAOp::IntAdd { a, b, .. } => Some(CExpr::binary(
+                    BinaryOp::Add,
+                    self.render_certified_scalar_expr_for_var(a, depth + 1, visited)?,
+                    self.render_certified_scalar_expr_for_var(b, depth + 1, visited)?,
+                )),
+                SSAOp::IntSub { a, b, .. } => Some(CExpr::binary(
+                    BinaryOp::Sub,
+                    self.render_certified_scalar_expr_for_var(a, depth + 1, visited)?,
+                    self.render_certified_scalar_expr_for_var(b, depth + 1, visited)?,
+                )),
+                SSAOp::IntMult { a, b, .. } => Some(CExpr::binary(
+                    BinaryOp::Mul,
+                    self.render_certified_scalar_expr_for_var(a, depth + 1, visited)?,
+                    self.render_certified_scalar_expr_for_var(b, depth + 1, visited)?,
+                )),
+                SSAOp::IntAnd { a, b, .. } => Some(CExpr::binary(
+                    BinaryOp::BitAnd,
+                    self.render_certified_scalar_expr_for_var(a, depth + 1, visited)?,
+                    self.render_certified_scalar_expr_for_var(b, depth + 1, visited)?,
+                )),
+                SSAOp::IntOr { a, b, .. } => Some(CExpr::binary(
+                    BinaryOp::BitOr,
+                    self.render_certified_scalar_expr_for_var(a, depth + 1, visited)?,
+                    self.render_certified_scalar_expr_for_var(b, depth + 1, visited)?,
+                )),
+                SSAOp::IntXor { a, b, .. } => Some(CExpr::binary(
+                    BinaryOp::BitXor,
+                    self.render_certified_scalar_expr_for_var(a, depth + 1, visited)?,
+                    self.render_certified_scalar_expr_for_var(b, depth + 1, visited)?,
+                )),
+                SSAOp::IntLeft { a, b, .. } => Some(CExpr::binary(
+                    BinaryOp::Shl,
+                    self.render_certified_scalar_expr_for_var(a, depth + 1, visited)?,
+                    self.render_certified_scalar_expr_for_var(b, depth + 1, visited)?,
+                )),
+                SSAOp::IntRight { a, b, .. } | SSAOp::IntSRight { a, b, .. } => {
+                    Some(CExpr::binary(
+                        BinaryOp::Shr,
+                        self.render_certified_scalar_expr_for_var(a, depth + 1, visited)?,
+                        self.render_certified_scalar_expr_for_var(b, depth + 1, visited)?,
+                    ))
+                }
+                SSAOp::IntNegate { src, .. } => Some(CExpr::unary(
+                    UnaryOp::Neg,
+                    self.render_certified_scalar_expr_for_var(src, depth + 1, visited)?,
+                )),
+                SSAOp::IntNot { src, .. } => Some(CExpr::unary(
+                    UnaryOp::BitNot,
+                    self.render_certified_scalar_expr_for_var(src, depth + 1, visited)?,
+                )),
+                _ => None,
+            }
+        })();
+
+        visited.remove(&value);
+        result
+    }
+
+    fn render_certified_stack_param_value_expr(
+        &self,
+        value: r2ssa::ValueId,
+        depth: u32,
+        visited: &mut HashSet<r2ssa::ValueId>,
+    ) -> Option<CExpr> {
+        if depth > Self::MAX_SEMANTIC_RENDER_DEPTH || !visited.insert(value) {
+            return None;
+        }
+
+        let result = (|| {
+            let prepared = self.prepared_ssa()?;
+            let inst_id = prepared.graph().def_inst(value)?;
+            let inst = prepared.graph().inst(inst_id)?;
+            let r2ssa::InstPayload::Op(op) = &inst.payload else {
+                return None;
+            };
+            match op {
+                SSAOp::Copy { src, .. }
+                | SSAOp::New { src, .. }
+                | SSAOp::Cast { src, .. }
+                | SSAOp::Subpiece { src, .. }
+                | SSAOp::IntZExt { src, .. }
+                | SSAOp::IntSExt { src, .. } => {
+                    let src_value = self.prepared_value_id_for_var(src)?;
+                    self.render_certified_stack_param_value_expr(src_value, depth + 1, visited)
+                }
+                SSAOp::Load { .. } => {
+                    let (block_addr, op_idx) = prepared.inst_op_site(inst_id)?;
+                    let proof = self.certified_render_context()?;
+                    let fact = proof.memory_access_for_op(block_addr, op_idx, false)?;
+                    if fact.value != Some(value) {
+                        return None;
+                    }
+                    self.certified_stack_owner_expr_for_memory_fact(fact)
+                }
+                _ => None,
+            }
+        })();
+
+        visited.remove(&value);
+        result
     }
 
     pub(super) fn certified_memory_address_expr(
@@ -207,8 +370,7 @@ impl<'a> FoldingContext<'a> {
                     if fact.value != Some(value) {
                         return None;
                     }
-                    self.certified_render_plan(proof)?
-                        .stack_param_expr_for_memory_fact(fact)
+                    self.certified_stack_owner_expr_for_memory_fact(fact)
                 }
                 SSAOp::IntAdd { a, b, .. } => Some(CExpr::binary(
                     BinaryOp::Add,
@@ -220,6 +382,22 @@ impl<'a> FoldingContext<'a> {
                     self.render_certified_address_expr_for_var(a, depth + 1, visited)?,
                     self.render_certified_address_expr_for_var(b, depth + 1, visited)?,
                 )),
+                SSAOp::IntMult { a, b, .. } => Some(CExpr::binary(
+                    BinaryOp::Mul,
+                    self.render_certified_address_expr_for_var(a, depth + 1, visited)?,
+                    self.render_certified_address_expr_for_var(b, depth + 1, visited)?,
+                )),
+                SSAOp::IntLeft { a, b, .. } => {
+                    let shift = self.certified_const_value_for_address_var(b, 0)?;
+                    if shift > 63 {
+                        return None;
+                    }
+                    Some(CExpr::binary(
+                        BinaryOp::Shl,
+                        self.render_certified_address_expr_for_var(a, depth + 1, visited)?,
+                        CExpr::IntLit(shift as i64),
+                    ))
+                }
                 SSAOp::PtrAdd {
                     base,
                     index,
@@ -301,11 +479,7 @@ impl<'a> FoldingContext<'a> {
         fact: &r2types::MemoryAccessRenderFact,
         elem_ty: CType,
     ) -> Option<CExpr> {
-        if let Some(plan) = self
-            .certified_render_context()
-            .and_then(|proof| self.certified_render_plan(proof))
-            && let Some(expr) = plan.stack_param_expr_for_memory_fact(fact)
-        {
+        if let Some(expr) = self.certified_stack_owner_expr_for_memory_fact(fact) {
             return Some(expr);
         }
         let (addr, addr_expr) = self.certified_memory_address_expr(fact)?;
@@ -314,8 +488,13 @@ impl<'a> FoldingContext<'a> {
         self.current_block_addr.set(Some(fact.block_addr));
         self.current_op_idx.set(Some(fact.op_index));
         let mut visited = HashSet::new();
-        let rendered =
-            self.render_memory_access_from_visible_expr(&addr_expr, fact.width, 0, &mut visited);
+        let rendered = self.render_memory_access_from_visible_expr_with_direction(
+            &addr_expr,
+            fact.width,
+            fact.is_write,
+            0,
+            &mut visited,
+        );
         self.current_block_addr.set(previous_block);
         self.current_op_idx.set(previous_op);
         if let Some(rendered) = rendered {
@@ -329,13 +508,91 @@ impl<'a> FoldingContext<'a> {
         Some(CExpr::Deref(Box::new(casted)))
     }
 
-    pub(super) fn render_certified_memory_expr_for_current_op(
+    fn certified_stack_owner_expr_for_memory_fact(
         &self,
-        elem_ty: CType,
-        is_write: bool,
+        fact: &r2types::MemoryAccessRenderFact,
     ) -> Option<CExpr> {
-        let fact = self.certified_memory_access_for_current_op(is_write)?;
-        self.render_certified_memory_expr_for_fact(fact, elem_ty)
+        if fact.width == 0 {
+            return None;
+        }
+        if let Some(plan) = self
+            .certified_render_context()
+            .and_then(|proof| self.certified_render_plan(proof))
+            && let Some(expr) = plan.stack_param_expr_for_memory_fact(fact)
+        {
+            return Some(expr);
+        }
+        let offset = self
+            .inputs
+            .render_facts()?
+            .stack_slot_offsets
+            .get(&fact.object)
+            .copied()?;
+        self.certified_stack_var_name_for_object_offset(fact.object, offset)
+            .map(CExpr::Var)
+    }
+
+    pub(super) fn certified_memory_render_refusal_for_current_op(&self, is_write: bool) -> String {
+        let Some(block_addr) = self.current_block_addr.get() else {
+            return "missing current block".to_string();
+        };
+        let Some(op_idx) = self.current_op_idx.get() else {
+            return "missing current op".to_string();
+        };
+        let Some(_fact) = self.certified_memory_access_for_current_op(is_write) else {
+            return format!("missing FunctionRenderFacts memory fact at 0x{block_addr:x}:{op_idx}");
+        };
+        let (array_fact_count, member_fact_count) = self
+            .inputs
+            .render_facts()
+            .map(|render| {
+                (
+                    render
+                        .array_accesses_by_op
+                        .get(&(block_addr, op_idx, is_write))
+                        .map_or(0, Vec::len),
+                    render
+                        .member_accesses_by_op
+                        .get(&(block_addr, op_idx, is_write))
+                        .map_or(0, Vec::len),
+                )
+            })
+            .unwrap_or((0, 0));
+        format!(
+            "memory access lacks exact typed stack owner or array/member render proof; array_facts {} member_facts {}",
+            array_fact_count, member_fact_count
+        )
+    }
+
+    fn certified_const_value_for_address_var(&self, var: &SSAVar, depth: u32) -> Option<u64> {
+        if depth > 4 {
+            return None;
+        }
+        if let Some(value) = parse_const_value(&var.name) {
+            return Some(value);
+        }
+        let prepared = self.prepared_ssa()?;
+        let value = self.prepared_value_id_for_var(var)?;
+        let inst_id = prepared.graph().def_inst(value)?;
+        let inst = prepared.graph().inst(inst_id)?;
+        let r2ssa::InstPayload::Op(op) = &inst.payload else {
+            return None;
+        };
+        match op {
+            SSAOp::Copy { src, .. }
+            | SSAOp::New { src, .. }
+            | SSAOp::Cast { src, .. }
+            | SSAOp::Subpiece { src, .. }
+            | SSAOp::IntZExt { src, .. }
+            | SSAOp::IntSExt { src, .. } => {
+                self.certified_const_value_for_address_var(src, depth + 1)
+            }
+            SSAOp::IntAnd { a, b, .. } => Some(
+                self.certified_const_value_for_address_var(a, depth + 1)?
+                    & self.certified_const_value_for_address_var(b, depth + 1)?,
+            ),
+            _ => None,
+        }
     }
 
     pub(super) fn render_authoritative_memory_access_by_name(
@@ -522,10 +779,23 @@ impl<'a> FoldingContext<'a> {
         depth: u32,
         visited: &mut HashSet<String>,
     ) -> Option<CExpr> {
+        self.render_memory_access_from_visible_expr_with_direction(
+            expr, elem_size, false, depth, visited,
+        )
+    }
+
+    fn render_memory_access_from_visible_expr_with_direction(
+        &self,
+        expr: &CExpr,
+        elem_size: u32,
+        is_write: bool,
+        depth: u32,
+        visited: &mut HashSet<String>,
+    ) -> Option<CExpr> {
         let mut try_render = |candidate: &CExpr, ctx: &FoldingContext<'_>| {
             let canonical = ctx.canonicalize_visible_address_expr(candidate, depth + 1);
             let addr = ctx.normalized_addr_from_visible_expr(&canonical, depth + 1)?;
-            ctx.render_access_expr_from_addr(&addr, elem_size, false, depth + 1, visited)
+            ctx.render_access_expr_from_addr(&addr, elem_size, is_write, depth + 1, visited)
         };
 
         let mut semantic_visited = HashSet::new();

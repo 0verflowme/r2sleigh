@@ -1,5 +1,6 @@
 use std::fmt::Write as _;
 
+use crate::ast::CType;
 use r2types::FunctionTypeFacts;
 
 fn vm_summary_stats_comment(func_name: &str, vm_step: &r2sym::VmStepSummary) -> String {
@@ -159,9 +160,78 @@ fn render_vm_handler_comment_block(out: &mut String, vm_step: &r2sym::VmStepSumm
     }
 }
 
+fn c_identifier_from_function_name(func_name: &str) -> String {
+    let mut name = func_name.trim();
+    for prefix in ["dbg.", "sym.", "fcn."] {
+        if let Some(stripped) = name.strip_prefix(prefix) {
+            name = stripped;
+            break;
+        }
+    }
+
+    let mut out = String::with_capacity(name.len().max(1));
+    for (idx, ch) in name.chars().enumerate() {
+        if ch == '_' || ch.is_ascii_alphabetic() || ch.is_ascii_digit() && idx > 0 {
+            out.push(ch);
+        } else if idx == 0 && ch.is_ascii_digit() {
+            out.push_str("sub_");
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "vm_summary".to_string()
+    } else {
+        out
+    }
+}
+
+fn vm_summary_signature_comment(func_name: &str, type_facts: &FunctionTypeFacts) -> Option<String> {
+    let signature = type_facts.render_authorized_signature()?;
+    let ret = signature
+        .ret_type
+        .as_ref()
+        .map(crate::type_like_to_ctype)
+        .filter(|ty| !matches!(ty, CType::Unknown))?;
+    let mut params = Vec::new();
+    for param in &signature.params {
+        let name = param.name.trim();
+        if name.is_empty() || crate::is_generic_arg_name(name) {
+            continue;
+        }
+        let Some(ty) = param.ty.as_ref().map(crate::type_like_to_ctype) else {
+            continue;
+        };
+        if matches!(ty, CType::Unknown | CType::Void) {
+            continue;
+        }
+        params.push(format!("{} {}", ty, c_identifier_from_function_name(name)));
+    }
+    let params = if params.is_empty() {
+        "void".to_string()
+    } else {
+        params.join(", ")
+    };
+    Some(format!("{ret} {func_name}({params})"))
+}
+
+fn render_vm_case_labels(out: &mut String, vm_step: &r2sym::VmStepSummary, target: u64) -> bool {
+    let Some(case_values) = vm_step.case_values_by_target.get(&target) else {
+        return false;
+    };
+    if case_values.is_empty() {
+        return false;
+    }
+    for value in case_values {
+        let _ = writeln!(out, "    /* case 0x{value:x}: */");
+    }
+    true
+}
+
 pub(crate) fn render_vm_semantic_summary(
     func_name: &str,
-    _type_facts: &FunctionTypeFacts,
+    type_facts: &FunctionTypeFacts,
     semantic_artifact: &r2sym::SemanticArtifact,
 ) -> Option<String> {
     let vm_body = semantic_artifact.vm_body()?;
@@ -170,28 +240,47 @@ pub(crate) fn render_vm_semantic_summary(
         .as_ref()
         .or(vm_body.transfer_summary.as_ref())?;
     let selector = vm_step.selector.as_deref().unwrap_or("dispatch_selector");
+    let display_name = c_identifier_from_function_name(func_name);
     let mut out = String::new();
 
+    if let Some(signature) = vm_summary_signature_comment(&display_name, type_facts) {
+        let _ = writeln!(out, "/* {signature} */");
+    }
     let _ = writeln!(
         out,
-        "/* VM summary-only route for {}; executable C refused: missing native render proof */",
-        crate::sanitize_comment_text(func_name)
+        "/* VM summary-only route for {}; executable native C not reconstructed */",
+        crate::sanitize_comment_text(&display_name)
     );
     let _ = writeln!(
         out,
         "/* {} */",
-        vm_summary_stats_comment(func_name, vm_step)
+        vm_summary_stats_comment(&display_name, vm_step)
     );
     let _ = writeln!(out, "/* selector: {selector} */");
+    let _ = writeln!(out, "/* switch ({selector}) */");
     for target in &vm_step.dispatch_targets {
+        if !render_vm_case_labels(&mut out, vm_step, *target) {
+            continue;
+        }
         render_vm_handler_comment_block(&mut out, vm_step, *target);
     }
-    if let Some(default_target) = vm_step.default_target
-        && !vm_step.dispatch_targets.contains(&default_target)
-    {
-        let _ = writeln!(out, "/* default_target=0x{:x} */", default_target);
+    if let Some(default_target) = vm_step.default_target {
+        let _ = writeln!(out, "    /* default: */");
+        render_vm_handler_comment_block(&mut out, vm_step, default_target);
     } else if vm_step.default_target.is_none() {
         let _ = writeln!(out, "/* no default target recovered */");
+    }
+    for target in &vm_step.dispatch_targets {
+        if vm_step.default_target == Some(*target)
+            || vm_step
+                .case_values_by_target
+                .get(target)
+                .is_some_and(|values| !values.is_empty())
+        {
+            continue;
+        }
+        let _ = writeln!(out, "    /* unlabeled handler 0x{target:x}: */");
+        render_vm_handler_comment_block(&mut out, vm_step, *target);
     }
     Some(out)
 }

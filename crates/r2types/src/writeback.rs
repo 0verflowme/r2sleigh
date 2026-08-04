@@ -7,9 +7,10 @@ use r2ssa::{
 };
 
 use crate::context::{
-    ExternalStackBase, ExternalStackSlotRole, ExternalStackVarSpec, ParsedExternalContext,
-    StackSlotKey, apply_main_signature_override, canonical_main_signature_spec,
-    is_generic_arg_name, stack_slots_from_legacy_external_stack_vars,
+    ExternalRegisterParamSpec, ExternalStackBase, ExternalStackSlotRole, ExternalStackVarSpec,
+    ParsedExternalContext, StackSlotKey, apply_main_signature_override,
+    canonical_main_signature_spec, is_generic_arg_name,
+    stack_slots_from_legacy_external_stack_vars,
 };
 use crate::convert::CTypeLike;
 use crate::external::{
@@ -3604,9 +3605,16 @@ fn build_type_writeback_analysis_inner(
         input.parsed_context.merged_signature.clone(),
         inferred_signature_spec,
     );
+    let inferred_register_params =
+        inferred_signature_abi_register_params(&input.inferred_signature, input.ptr_bits);
+    let mut canonicalize_register_params = input.parsed_context.register_params.clone();
+    if inferred_register_params.len() > canonicalize_register_params.len() {
+        canonicalize_register_params
+            .extend_from_slice(&inferred_register_params[canonicalize_register_params.len()..]);
+    }
     canonicalize_param_home_stack_slots(
         merged_signature.as_ref(),
-        &input.parsed_context.register_params,
+        &canonicalize_register_params,
         &mut input.parsed_context.stack_slots,
         input.ssa_blocks,
         input.ptr_bits,
@@ -5186,6 +5194,7 @@ fn scalar_array_access_certificates_from_ssa(
     let mut array_addr_exprs: HashMap<String, ScalarArrayAddrExpr> = HashMap::new();
     let mut array_addr_expr_names: HashMap<String, Option<ScalarArrayAddrExpr>> = HashMap::new();
     let mut stack_pointer_values: HashMap<(u64, i64), ScalarPointerValue> = HashMap::new();
+    let mut stack_pointer_values_by_offset: HashMap<i64, ScalarPointerValue> = HashMap::new();
     let mut certificates = ScalarArrayAccessCertificates::default();
 
     let block_ops: HashMap<u64, HashMap<String, SSAOp>> = ssa_blocks
@@ -5490,6 +5499,7 @@ fn scalar_array_access_certificates_from_ssa(
                             let pointer = stack_pointer_values
                                 .get(&(block.addr, offset))
                                 .cloned()
+                                .or_else(|| stack_pointer_values_by_offset.get(&offset).cloned())
                                 .or_else(|| {
                                     scalar_pointer_value_for_stack_slot(
                                         parsed_context,
@@ -5541,7 +5551,14 @@ fn scalar_array_access_certificates_from_ssa(
                                 .get(&key)
                                 .is_none_or(|prev| prev.confidence < pointer.confidence)
                             {
-                                stack_pointer_values.insert(key, pointer);
+                                stack_pointer_values.insert(key, pointer.clone());
+                                changed = true;
+                            }
+                            if stack_pointer_values_by_offset
+                                .get(&offset)
+                                .is_none_or(|prev| prev.confidence < pointer.confidence)
+                            {
+                                stack_pointer_values_by_offset.insert(offset, pointer);
                                 changed = true;
                             }
                         }
@@ -5593,6 +5610,7 @@ fn scalar_array_access_certificates_from_ssa(
                             certificates
                                 .render_candidates
                                 .push(ScalarArrayRenderCandidate {
+                                    slot: expr.pointer.slot,
                                     block_addr: block.addr,
                                     op_index,
                                     is_write: false,
@@ -5638,6 +5656,7 @@ fn scalar_array_access_certificates_from_ssa(
                             certificates
                                 .render_candidates
                                 .push(ScalarArrayRenderCandidate {
+                                    slot: expr.pointer.slot,
                                     block_addr: block.addr,
                                     op_index,
                                     is_write: true,
@@ -6473,6 +6492,18 @@ fn scalar_index_affine_factor(
             let right = scalar_index_affine_factor(block_addr, b, ctx, depth + 1)?;
             combine_affine_terms(left, right, -1)
         }
+        SSAOp::Load { addr, .. } => {
+            let offset = stack_addr_offset_for_var(
+                block_addr,
+                addr,
+                ctx.stack_addr_offsets,
+                ctx.stack_addr_offset_names,
+            )?;
+            Some(AffineIndexFactor {
+                root: Some(format!("stack:{offset}")),
+                scale: 1,
+            })
+        }
         _ => None,
     }
 }
@@ -6872,6 +6903,34 @@ fn backward_memory_term_slot_field(
     Some((slot, term.offset_lo as u64, size_to_type(term.size)))
 }
 
+fn inferred_signature_abi_register_params(
+    signature: &InferredSignature,
+    ptr_bits: u32,
+) -> Vec<ExternalRegisterParamSpec> {
+    if ptr_bits != 64 {
+        return Vec::new();
+    }
+    let arch = signature.arch.trim().to_ascii_lowercase();
+    let callconv = signature.callconv.trim().to_ascii_lowercase();
+    let is_sysv64 = matches!(arch.as_str(), "x86-64" | "x86_64" | "x64" | "amd64")
+        && matches!(callconv.as_str(), "amd64" | "sysv" | "sysv64" | "x86-64");
+    if !is_sysv64 {
+        return Vec::new();
+    }
+    const SYSV64_ARG_REGS: [&str; 6] = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
+    signature
+        .params
+        .iter()
+        .take(SYSV64_ARG_REGS.len())
+        .enumerate()
+        .map(|(idx, param)| ExternalRegisterParamSpec {
+            name: param.name.clone(),
+            ty: parse_type_like_spec(&param.param_type, ptr_bits),
+            reg: SYSV64_ARG_REGS[idx].to_string(),
+        })
+        .collect()
+}
+
 fn canonicalize_param_home_stack_slots(
     merged_signature: Option<&FunctionSignatureSpec>,
     register_params: &[crate::context::ExternalRegisterParamSpec],
@@ -6899,7 +6958,8 @@ fn canonicalize_param_home_stack_slots(
                     }
                 }
                 SSAOp::Store { addr, val, .. } => {
-                    let Some(slot_key) = slot_addr_by_var.get(&addr.display_name()).cloned() else {
+                    let Some(source_slot_key) = slot_addr_by_var.get(&addr.display_name()).cloned()
+                    else {
                         continue;
                     };
                     let rooted_val = resolve_trivial_value_root(&trivial_value_sources, val);
@@ -6919,6 +6979,12 @@ fn canonicalize_param_home_stack_slots(
                         .map(|param| param.name.clone())
                         .filter(|name| !name.is_empty())
                         .unwrap_or_else(|| format!("arg{}", param_index + 1));
+                    let slot_key = canonical_param_home_stack_slot_key(&source_slot_key);
+                    if slot_key != source_slot_key
+                        && let Some(source_slot) = stack_slots.remove(&source_slot_key)
+                    {
+                        stack_slots.entry(slot_key.clone()).or_insert(source_slot);
+                    }
                     let slot_base = slot_key.base.clone();
                     let slot =
                         stack_slots
@@ -6953,6 +7019,16 @@ fn canonicalize_param_home_stack_slots(
                 _ => {}
             }
         }
+    }
+}
+
+fn canonical_param_home_stack_slot_key(slot: &StackSlotKey) -> StackSlotKey {
+    match slot.base {
+        ExternalStackBase::FramePointer => StackSlotKey {
+            base: slot.base.clone(),
+            offset: -slot.offset,
+        },
+        _ => slot.clone(),
     }
 }
 
@@ -7356,7 +7432,16 @@ fn slot_spec_for_recovered_var<'a>(
     stack_slots: &'a BTreeMap<StackSlotKey, ExternalStackVarSpec>,
 ) -> Option<&'a ExternalStackVarSpec> {
     if let Some(slot_key) = stack_slot_key_for_recovered_var(var) {
-        return stack_slots.get(&slot_key);
+        if let Some(slot) = stack_slots.get(&slot_key) {
+            return Some(slot);
+        }
+        if matches!(slot_key.base, ExternalStackBase::FramePointer) {
+            let canonical = StackSlotKey {
+                base: slot_key.base,
+                offset: -slot_key.offset,
+            };
+            return stack_slots.get(&canonical);
+        }
     }
     None
 }
@@ -13420,7 +13505,7 @@ mod tests {
         });
 
         for (offset, expected_name, expected_idx) in
-            [(-8, "arr", 0usize), (-12, "idx", 1), (-16, "v", 2)]
+            [(8, "arr", 0usize), (12, "idx", 1), (16, "v", 2)]
         {
             let slot = analysis
                 .type_facts
@@ -13434,6 +13519,183 @@ mod tests {
             assert_eq!(slot.param_index, Some(expected_idx));
             assert_eq!(slot.param_name.as_deref(), Some(expected_name));
         }
+    }
+
+    #[test]
+    fn partial_register_param_homes_are_completed_from_abi_signature() {
+        let mut parsed_context = ParsedExternalContext {
+            register_params: vec![ExternalRegisterParamSpec {
+                name: "arg0".to_string(),
+                ty: Some(CTypeLike::Pointer(Box::new(CTypeLike::Unknown))),
+                reg: "rdi".to_string(),
+            }],
+            stack_slots: BTreeMap::new(),
+            ..Default::default()
+        };
+        for (offset, name, ty) in [
+            (
+                -8,
+                "var_8h",
+                CTypeLike::Pointer(Box::new(CTypeLike::Unknown)),
+            ),
+            (
+                -12,
+                "var_ch",
+                CTypeLike::Int {
+                    bits: 32,
+                    signedness: Signedness::Signed,
+                },
+            ),
+            (
+                -16,
+                "var_10h",
+                CTypeLike::Int {
+                    bits: 32,
+                    signedness: Signedness::Signed,
+                },
+            ),
+        ] {
+            parsed_context.stack_slots.insert(
+                StackSlotKey {
+                    base: ExternalStackBase::FramePointer,
+                    offset,
+                },
+                ExternalStackVarSpec {
+                    name: name.to_string(),
+                    ty: Some(ty),
+                    base: ExternalStackBase::FramePointer,
+                    role: ExternalStackSlotRole::Local,
+                    param_index: None,
+                    param_name: None,
+                    source_reg: None,
+                },
+            );
+        }
+
+        let ssa_blocks = [SSABlock {
+            addr: 0x1000,
+            size: 4,
+            ops: vec![
+                SSAOp::IntAdd {
+                    dst: SSAVar::new("tmp:slot", 1, 8),
+                    a: SSAVar::new("RBP", 1, 8),
+                    b: SSAVar::new("const:fffffffffffffff8", 0, 8),
+                },
+                SSAOp::Store {
+                    space: "ram".to_string(),
+                    addr: SSAVar::new("tmp:slot", 1, 8),
+                    val: SSAVar::new("RDI", 0, 8),
+                },
+                SSAOp::IntAdd {
+                    dst: SSAVar::new("tmp:slot", 2, 8),
+                    a: SSAVar::new("RBP", 1, 8),
+                    b: SSAVar::new("const:fffffffffffffff4", 0, 8),
+                },
+                SSAOp::Store {
+                    space: "ram".to_string(),
+                    addr: SSAVar::new("tmp:slot", 2, 8),
+                    val: SSAVar::new("ESI", 0, 4),
+                },
+                SSAOp::IntAdd {
+                    dst: SSAVar::new("tmp:slot", 3, 8),
+                    a: SSAVar::new("RBP", 1, 8),
+                    b: SSAVar::new("const:fffffffffffffff0", 0, 8),
+                },
+                SSAOp::Store {
+                    space: "ram".to_string(),
+                    addr: SSAVar::new("tmp:slot", 3, 8),
+                    val: SSAVar::new("EDX", 0, 4),
+                },
+            ],
+        }];
+        let recovered_vars = [
+            RecoveredVariable {
+                name: "var_8h".to_string(),
+                kind: "b".to_string(),
+                delta: -8,
+                var_type: "void *".to_string(),
+                isarg: false,
+                reg: None,
+            },
+            RecoveredVariable {
+                name: "var_ch".to_string(),
+                kind: "b".to_string(),
+                delta: -12,
+                var_type: "int32_t".to_string(),
+                isarg: false,
+                reg: None,
+            },
+            RecoveredVariable {
+                name: "var_10h".to_string(),
+                kind: "b".to_string(),
+                delta: -16,
+                var_type: "int32_t".to_string(),
+                isarg: false,
+                reg: None,
+            },
+        ];
+
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "sym.test_struct_array_index",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "sym.test_struct_array_index".to_string(),
+                signature:
+                    "int32_t sym.test_struct_array_index(DemoStruct * arr, int32_t idx, int32_t v)"
+                        .to_string(),
+                ret_type: "int32_t".to_string(),
+                params: vec![
+                    InferredSignatureParam {
+                        name: "arr".to_string(),
+                        param_type: "DemoStruct *".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "idx".to_string(),
+                        param_type: "int32_t".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "v".to_string(),
+                        param_type: "int32_t".to_string(),
+                    },
+                ],
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 96,
+                callconv_confidence: 92,
+            },
+            recovered_vars: &recovered_vars,
+            ssa_blocks: &ssa_blocks,
+            parsed_context,
+            local_structs: LocalStructArtifacts::default(),
+            interproc_summary_set: None,
+            diagnostics: TypeWritebackDiagnostics::default(),
+        });
+
+        for (offset, expected_name, expected_idx) in
+            [(8, "arr", 0usize), (12, "idx", 1), (16, "v", 2)]
+        {
+            let slot = analysis
+                .type_facts
+                .stack_slots
+                .get(&StackSlotKey {
+                    base: ExternalStackBase::FramePointer,
+                    offset,
+                })
+                .expect("ABI-derived param-home slot");
+            assert_eq!(slot.role, ExternalStackSlotRole::ParamHome);
+            assert_eq!(slot.param_index, Some(expected_idx));
+            assert_eq!(slot.param_name.as_deref(), Some(expected_name));
+        }
+        assert!(
+            analysis.plan.var_type_candidates.is_empty(),
+            "ABI-derived parameter homes must not surface as visible local type writes: {:?}",
+            analysis.plan.var_type_candidates
+        );
+        assert!(
+            analysis.plan.var_rename_candidates.is_empty(),
+            "ABI-derived parameter homes must not surface as visible local renames: {:?}",
+            analysis.plan.var_rename_candidates
+        );
     }
 
     #[test]
@@ -13594,7 +13856,7 @@ mod tests {
         });
 
         for (offset, expected_name, expected_idx) in
-            [(-8, "arr", 0usize), (-12, "idx", 1), (-16, "v", 2)]
+            [(8, "arr", 0usize), (12, "idx", 1), (16, "v", 2)]
         {
             let slot = analysis
                 .type_facts
@@ -17487,6 +17749,7 @@ mod tests {
         assert_eq!(
             analysis.type_facts.scalar_array_render_candidates,
             vec![ScalarArrayRenderCandidate {
+                slot: legacy_array_slot_for_stack_slot(&buf_slot),
                 block_addr: 0x4013b1,
                 op_index: 5,
                 is_write: true,
@@ -17809,6 +18072,157 @@ mod tests {
     }
 
     #[test]
+    fn typed_argument_spill_reload_across_blocks_certifies_scalar_array_index() {
+        let arr_ty = CTypeLike::Pointer(Box::new(CTypeLike::Int {
+            bits: 32,
+            signedness: Signedness::Signed,
+        }));
+        let parsed_context = ParsedExternalContext {
+            register_params: vec![
+                crate::context::ExternalRegisterParamSpec {
+                    name: "arr".to_string(),
+                    ty: Some(arr_ty.clone()),
+                    reg: "RDI".to_string(),
+                },
+                crate::context::ExternalRegisterParamSpec {
+                    name: "idx".to_string(),
+                    ty: Some(CTypeLike::Int {
+                        bits: 32,
+                        signedness: Signedness::Signed,
+                    }),
+                    reg: "RSI".to_string(),
+                },
+            ],
+            merged_signature: Some(FunctionSignatureSpec {
+                ret_type: Some(CTypeLike::Int {
+                    bits: 32,
+                    signedness: Signedness::Signed,
+                }),
+                params: vec![
+                    FunctionParamSpec {
+                        name: "arr".to_string(),
+                        ty: Some(arr_ty),
+                    },
+                    FunctionParamSpec {
+                        name: "idx".to_string(),
+                        ty: Some(CTypeLike::Int {
+                            bits: 32,
+                            signedness: Signedness::Signed,
+                        }),
+                    },
+                ],
+            }),
+            ..ParsedExternalContext::default()
+        };
+        let ssa_blocks = [
+            SSABlock {
+                addr: 0x401000,
+                size: 16,
+                ops: vec![
+                    SSAOp::IntAdd {
+                        dst: SSAVar::new("slot", 1, 8),
+                        a: SSAVar::new("RBP", 0, 8),
+                        b: SSAVar::new("const:ffffffffffffffe8", 0, 8),
+                    },
+                    SSAOp::Store {
+                        space: "ram".to_string(),
+                        addr: SSAVar::new("slot", 1, 8),
+                        val: SSAVar::new("RDI", 0, 8),
+                    },
+                ],
+            },
+            SSABlock {
+                addr: 0x401020,
+                size: 24,
+                ops: vec![
+                    SSAOp::IntAdd {
+                        dst: SSAVar::new("slot", 2, 8),
+                        a: SSAVar::new("RBP", 0, 8),
+                        b: SSAVar::new("const:ffffffffffffffe8", 0, 8),
+                    },
+                    SSAOp::Load {
+                        dst: SSAVar::new("ptr", 1, 8),
+                        space: "ram".to_string(),
+                        addr: SSAVar::new("slot", 2, 8),
+                    },
+                    SSAOp::IntLeft {
+                        dst: SSAVar::new("idx_scaled", 1, 8),
+                        a: SSAVar::new("RSI", 0, 8),
+                        b: SSAVar::new("const:2", 0, 8),
+                    },
+                    SSAOp::IntAdd {
+                        dst: SSAVar::new("elem", 1, 8),
+                        a: SSAVar::new("ptr", 1, 8),
+                        b: SSAVar::new("idx_scaled", 1, 8),
+                    },
+                    SSAOp::Load {
+                        dst: SSAVar::new("EAX", 1, 4),
+                        space: "ram".to_string(),
+                        addr: SSAVar::new("elem", 1, 8),
+                    },
+                ],
+            },
+        ];
+
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "sym.sum_array",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "sym.sum_array".to_string(),
+                signature: "int32_t sym.sum_array(int32_t *arr, int32_t idx)".to_string(),
+                ret_type: "int32_t".to_string(),
+                params: vec![
+                    InferredSignatureParam {
+                        name: "arr".to_string(),
+                        param_type: "int32_t *".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "idx".to_string(),
+                        param_type: "int32_t".to_string(),
+                    },
+                ],
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 96,
+                callconv_confidence: 92,
+            },
+            recovered_vars: &[],
+            ssa_blocks: &ssa_blocks,
+            parsed_context,
+            local_structs: LocalStructArtifacts::default(),
+            interproc_summary_set: None,
+            diagnostics: TypeWritebackDiagnostics::default(),
+        });
+
+        assert!(
+            analysis
+                .type_facts
+                .array_index_certificates
+                .iter()
+                .any(|cert| {
+                    cert.element_stride == 4
+                        && cert.field_offset == 0
+                        && matches!(cert.base, Some(ArrayIndexBase::Param { index: 0 }))
+                }),
+            "expected cross-block spilled pointer array certificate, got {:?}",
+            analysis.type_facts.array_index_certificates
+        );
+        assert_eq!(
+            analysis.type_facts.scalar_array_render_candidates,
+            vec![ScalarArrayRenderCandidate {
+                slot: 0,
+                block_addr: 0x401020,
+                op_index: 4,
+                is_write: false,
+                field_offset: 0,
+                element_stride: 4,
+                access_width: 4,
+            }],
+            "render candidate must preserve the concrete load op identity"
+        );
+    }
+
+    #[test]
     fn external_struct_pointer_strength_reduced_index_certifies_nested_array_fields() {
         let mut parsed_context = ParsedExternalContext::default();
         parsed_context.external_type_db.structs.insert(
@@ -17982,6 +18396,7 @@ mod tests {
             analysis.type_facts.scalar_array_render_candidates,
             vec![
                 ScalarArrayRenderCandidate {
+                    slot: 0,
                     block_addr: 0x4012d0,
                     op_index: 6,
                     is_write: false,
@@ -17990,6 +18405,7 @@ mod tests {
                     access_width: 4,
                 },
                 ScalarArrayRenderCandidate {
+                    slot: 0,
                     block_addr: 0x4012d0,
                     op_index: 8,
                     is_write: false,
@@ -17998,6 +18414,7 @@ mod tests {
                     access_width: 2,
                 },
                 ScalarArrayRenderCandidate {
+                    slot: 0,
                     block_addr: 0x4012d0,
                     op_index: 9,
                     is_write: false,
@@ -18007,6 +18424,158 @@ mod tests {
                 },
             ],
             "render candidates must stay in deterministic op-site order"
+        );
+    }
+
+    #[test]
+    fn stack_home_strength_reduced_index_certifies_struct_array_field_access() {
+        let mut parsed_context = ParsedExternalContext::default();
+        parsed_context.external_type_db.structs.insert(
+            "demostruct".to_string(),
+            ExternalStruct {
+                name: "DemoStruct".to_string(),
+                fields: BTreeMap::from([
+                    (
+                        8,
+                        ExternalField {
+                            name: "third".to_string(),
+                            offset: 8,
+                            ty: Some("int32_t".to_string()),
+                        },
+                    ),
+                    (
+                        0x34,
+                        ExternalField {
+                            name: "fourteenth".to_string(),
+                            offset: 0x34,
+                            ty: Some("int32_t".to_string()),
+                        },
+                    ),
+                ]),
+            },
+        );
+        let ssa_blocks = [SSABlock {
+            addr: 0x401000,
+            size: 64,
+            ops: vec![
+                SSAOp::IntAdd {
+                    dst: SSAVar::new("idx_addr", 1, 8),
+                    a: SSAVar::new("RBP", 1, 8),
+                    b: SSAVar::new("const:fffffffffffffff4", 0, 8),
+                },
+                SSAOp::Load {
+                    dst: SSAVar::new("idx", 1, 4),
+                    space: "ram".to_string(),
+                    addr: SSAVar::new("idx_addr", 1, 8),
+                },
+                SSAOp::IntSExt {
+                    dst: SSAVar::new("idx64", 1, 8),
+                    src: SSAVar::new("idx", 1, 4),
+                },
+                SSAOp::IntLeft {
+                    dst: SSAVar::new("idx_x8", 1, 8),
+                    a: SSAVar::new("idx64", 1, 8),
+                    b: SSAVar::new("const:3", 0, 8),
+                },
+                SSAOp::IntSub {
+                    dst: SSAVar::new("idx_x7", 1, 8),
+                    a: SSAVar::new("idx_x8", 1, 8),
+                    b: SSAVar::new("idx64", 1, 8),
+                },
+                SSAOp::IntLeft {
+                    dst: SSAVar::new("idx_x56", 1, 8),
+                    a: SSAVar::new("idx_x7", 1, 8),
+                    b: SSAVar::new("const:3", 0, 8),
+                },
+                SSAOp::IntAdd {
+                    dst: SSAVar::new("elem", 1, 8),
+                    a: SSAVar::new("RDI", 0, 8),
+                    b: SSAVar::new("idx_x56", 1, 8),
+                },
+                SSAOp::IntAdd {
+                    dst: SSAVar::new("field", 1, 8),
+                    a: SSAVar::new("elem", 1, 8),
+                    b: SSAVar::new("const:34", 0, 8),
+                },
+                SSAOp::Load {
+                    dst: SSAVar::new("value", 1, 4),
+                    space: "ram".to_string(),
+                    addr: SSAVar::new("field", 1, 8),
+                },
+            ],
+        }];
+
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "sym.test_struct_array_index",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "sym.test_struct_array_index".to_string(),
+                signature:
+                    "int32_t sym.test_struct_array_index (DemoStruct * arr, int32_t idx, int32_t v)"
+                        .to_string(),
+                ret_type: "int32_t".to_string(),
+                params: vec![
+                    InferredSignatureParam {
+                        name: "arr".to_string(),
+                        param_type: "DemoStruct *".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "idx".to_string(),
+                        param_type: "int32_t".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "v".to_string(),
+                        param_type: "int32_t".to_string(),
+                    },
+                ],
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 96,
+                callconv_confidence: 92,
+            },
+            recovered_vars: &[],
+            ssa_blocks: &ssa_blocks,
+            parsed_context,
+            local_structs: LocalStructArtifacts::default(),
+            interproc_summary_set: None,
+            diagnostics: TypeWritebackDiagnostics::default(),
+        });
+
+        assert!(
+            analysis
+                .type_facts
+                .array_index_certificates
+                .iter()
+                .any(|cert| {
+                    cert.slot == 0
+                        && cert.element_stride == 56
+                        && cert.field_offset == 0x34
+                        && matches!(cert.base, Some(ArrayIndexBase::Param { index: 0 }))
+                }),
+            "expected stack-home strength-reduced idx * sizeof(DemoStruct) proof, got {:?}",
+            analysis.type_facts.array_index_certificates
+        );
+        assert!(
+            analysis
+                .type_facts
+                .field_access_certificates
+                .iter()
+                .any(|cert| cert.field_offset == 0x34 && cert.field_name == "fourteenth"),
+            "expected external field certificate, got {:?}",
+            analysis.type_facts.field_access_certificates
+        );
+        assert_eq!(
+            analysis.type_facts.scalar_array_render_candidates,
+            vec![ScalarArrayRenderCandidate {
+                slot: 0,
+                block_addr: 0x401000,
+                op_index: 8,
+                is_write: false,
+                field_offset: 0x34,
+                element_stride: 56,
+                access_width: 4,
+            }],
+            "render candidate must preserve the concrete field load op identity"
         );
     }
 }

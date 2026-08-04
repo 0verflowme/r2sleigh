@@ -153,6 +153,10 @@ impl<'a> FoldingContext<'a> {
             .find(|name| {
                 function_facts
                     .authorized_stack_slot_owner_render(object, offset, name)
+                    .or_else(|| {
+                        function_facts
+                            .authorized_recovered_stack_slot_owner_render(object, offset, name)
+                    })
                     .is_some()
             })
     }
@@ -297,6 +301,16 @@ impl<'a> FoldingContext<'a> {
         let lower = reg_name.to_ascii_lowercase();
         if let Some(alias) = self.inputs.param_register_aliases.get(&lower) {
             return Some(alias.clone());
+        }
+        // Width-variant register names (e.g. `rsi` vs alias key `esi`) must
+        // resolve through their canonical argument register before giving up.
+        for (alias_reg, alias) in self.inputs.param_register_aliases {
+            if self
+                .canonical_arg_register_name_for_alias(alias_reg)
+                .eq_ignore_ascii_case(&lower)
+            {
+                return Some(alias.clone());
+            }
         }
         if self.requires_certified_rendering() {
             return None;

@@ -647,6 +647,12 @@ impl<'a> FoldingContext<'a> {
                     .to_ascii_lowercase();
                 let dead_return_register_owner = demote_dead_return_register_calls
                     && self.inputs.arch.is_return_register_name(&target_base);
+                let dead_certified_raw_memory_carrier = self.requires_certified_rendering()
+                    && !target_has_live_use
+                    && self.expr_contains_unresolved_memory(rhs)
+                    && (self.is_low_signal_visible_name(target)
+                        || self.is_transient_visible_name(target)
+                        || self.inputs.arch.is_return_register_name(&target_base));
                 let dead_replayed_call_result = (((!target_has_live_use
                     || replayed_call_result_reuses_target_as_input)
                     && replayed_call_result_has_live_expr)
@@ -682,7 +688,7 @@ impl<'a> FoldingContext<'a> {
                     (reads, def) = self.stmt_reads_and_def(&stmt);
                     false
                 } else {
-                    dead_ephemeral || dead_flag_artifact
+                    dead_ephemeral || dead_flag_artifact || dead_certified_raw_memory_carrier
                 }
             } else {
                 false

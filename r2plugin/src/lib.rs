@@ -20,7 +20,9 @@ mod types;
 #[cfg(test)]
 use analysis::ssa::{r2il_block_defuse_json, r2il_block_to_ssa_json};
 use r2il::serialize::UserOpDef;
-use r2il::{ArchSpec, R2ILBlock, R2ILOp, Varnode, serialize, validate_block_full};
+use r2il::{
+    ArchSpec, R2ILBlock, R2ILOp, SwitchCase, SwitchInfo, Varnode, serialize, validate_block_full,
+};
 use r2sleigh_export::{
     ExportFormat, InstructionAction, InstructionExportInput, export_instruction, op_json_named,
 };
@@ -42,6 +44,14 @@ pub struct R2ILContext {
     disasm: Option<Disassembler>,
     semantic_metadata_enabled: bool,
     error: Option<CString>,
+}
+
+/// C ABI representation of one switch/jump-table case.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct R2ILSwitchCaseFfi {
+    pub value: u64,
+    pub target: u64,
 }
 
 impl R2ILContext {
@@ -558,6 +568,83 @@ pub extern "C" fn r2il_block_validate(ctx: *mut R2ILContext, block: *const R2ILB
             0
         }
     }
+}
+
+/// Attach radare2 switch/jump-table facts to a lifted block.
+///
+/// Returns 1 when switch metadata was accepted, 0 when the input is absent or
+/// cannot satisfy the r2il switch invariants.
+#[unsafe(no_mangle)]
+pub extern "C" fn r2il_block_set_switch_info(
+    block: *mut R2ILBlock,
+    switch_addr: u64,
+    min_val: u64,
+    max_val: u64,
+    default_target: u64,
+    has_default: i32,
+    cases: *const R2ILSwitchCaseFfi,
+    case_count: usize,
+) -> i32 {
+    if block.is_null() || cases.is_null() || case_count == 0 {
+        return 0;
+    }
+
+    let case_slice = unsafe { slice::from_raw_parts(cases, case_count) };
+    let mut normalized = case_slice
+        .iter()
+        .filter_map(|case| {
+            if case.target == u64::MAX {
+                None
+            } else {
+                Some(SwitchCase {
+                    value: case.value,
+                    target: case.target,
+                })
+            }
+        })
+        .collect::<Vec<_>>();
+    if normalized.is_empty() {
+        return 0;
+    }
+
+    normalized.sort_by_key(|case| (case.value, case.target));
+    normalized.dedup();
+    if normalized
+        .windows(2)
+        .any(|window| window[0].value == window[1].value)
+    {
+        return 0;
+    }
+
+    let actual_min = normalized.first().map(|case| case.value).unwrap_or(0);
+    let actual_max = normalized.last().map(|case| case.value).unwrap_or(0);
+    let supplied_range_valid = min_val <= max_val
+        && normalized
+            .iter()
+            .all(|case| case.value >= min_val && case.value <= max_val);
+    let (range_min, range_max) = if supplied_range_valid {
+        (min_val, max_val)
+    } else {
+        (actual_min, actual_max)
+    };
+
+    let default_target = if has_default != 0 && default_target != u64::MAX {
+        Some(default_target)
+    } else {
+        None
+    };
+
+    let info = SwitchInfo {
+        switch_addr,
+        min_val: range_min,
+        max_val: range_max,
+        default_target,
+        cases: normalized,
+    };
+    unsafe {
+        (*block).set_switch_info(info);
+    }
+    1
 }
 
 /// Get the number of operations in a block.
@@ -7148,6 +7235,78 @@ mod tests {
         }
     }
 
+    #[test]
+    fn switch_info_ffi_attaches_normalized_switch_facts() {
+        let mut block = R2ILBlock::new(0x1000, 4);
+        let cases = [
+            R2ILSwitchCaseFfi {
+                value: 7,
+                target: 0x3000,
+            },
+            R2ILSwitchCaseFfi {
+                value: 0,
+                target: 0x2000,
+            },
+            R2ILSwitchCaseFfi {
+                value: 7,
+                target: 0x3000,
+            },
+        ];
+
+        let ok = r2il_block_set_switch_info(
+            &mut block,
+            0x1010,
+            0,
+            7,
+            0x4000,
+            1,
+            cases.as_ptr(),
+            cases.len(),
+        );
+        assert_eq!(ok, 1);
+
+        let info = block.switch_info.as_ref().expect("switch info");
+        assert_eq!(info.switch_addr, 0x1010);
+        assert_eq!(info.min_val, 0);
+        assert_eq!(info.max_val, 7);
+        assert_eq!(info.default_target, Some(0x4000));
+        assert_eq!(
+            info.cases
+                .iter()
+                .map(|case| (case.value, case.target))
+                .collect::<Vec<_>>(),
+            vec![(0, 0x2000), (7, 0x3000)]
+        );
+    }
+
+    #[test]
+    fn switch_info_ffi_rejects_ambiguous_duplicate_case_values() {
+        let mut block = R2ILBlock::new(0x1000, 4);
+        let cases = [
+            R2ILSwitchCaseFfi {
+                value: 1,
+                target: 0x2000,
+            },
+            R2ILSwitchCaseFfi {
+                value: 1,
+                target: 0x3000,
+            },
+        ];
+
+        let ok = r2il_block_set_switch_info(
+            &mut block,
+            0x1010,
+            0,
+            1,
+            u64::MAX,
+            0,
+            cases.as_ptr(),
+            cases.len(),
+        );
+        assert_eq!(ok, 0);
+        assert!(block.switch_info.is_none());
+    }
+
     #[cfg(feature = "x86")]
     unsafe fn c_string_to_owned(ptr: *mut c_char) -> String {
         let out = unsafe { CStr::from_ptr(ptr) }
@@ -11138,7 +11297,7 @@ mod integration_tests {
         .to_string();
 
         let artifact = crate::types::build_detached_function_analysis_artifact(
-            &[block.clone()],
+            std::slice::from_ref(&block),
             "dbg.alloc_wrapper2",
             Some(&arch),
             64,

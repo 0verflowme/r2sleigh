@@ -52,6 +52,7 @@ pub struct ArrayIndexCertificate {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ScalarArrayRenderCandidate {
+    pub slot: usize,
     pub block_addr: u64,
     pub op_index: usize,
     pub is_write: bool,

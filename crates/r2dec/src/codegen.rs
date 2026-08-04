@@ -1120,7 +1120,7 @@ fn positive_product_expr(term: CExpr, magnitude: PositiveLiteralMagnitude) -> Op
 }
 
 fn sanitize_comment_text(text: &str) -> String {
-    text.replace("*/", "* /").replace(['\r', '\n'], " ")
+    crate::sanitize_comment_text(text)
 }
 
 #[cfg(test)]

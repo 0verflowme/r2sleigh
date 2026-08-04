@@ -539,6 +539,20 @@ fn external_stack_slot_role_is_renderable(role: ExternalStackSlotRole) -> bool {
     )
 }
 
+fn recovered_stack_owner_name_is_renderable(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    !lower.is_empty()
+        && lower != "stack"
+        && lower != "slot"
+        && lower != "saved_fp"
+        && lower != "fake_stack_slot"
+        && !lower.starts_with("stack_")
+        && !lower.starts_with("slot_")
+        && !lower.starts_with("local_")
+        && !lower.starts_with("arg_")
+        && !lower.starts_with("var_")
+}
+
 fn remember_stack_param_owner_name(candidate: &mut Option<String>, name: &str) -> Option<()> {
     let name = name.trim();
     if name.is_empty() {
@@ -1338,6 +1352,27 @@ impl FunctionFacts {
         })
     }
 
+    pub fn authorized_recovered_stack_slot_owner_render(
+        &self,
+        object: r2ssa::ObjectId,
+        offset: i64,
+        name: &str,
+    ) -> Option<StackSlotOwnerRenderAuthorization> {
+        let name = name.trim();
+        if !recovered_stack_owner_name_is_renderable(name) {
+            return None;
+        }
+        let render_offset = self.render.stack_slot_offsets.get(&object).copied()?;
+        if render_offset != offset {
+            return None;
+        }
+        Some(StackSlotOwnerRenderAuthorization {
+            object,
+            offset,
+            name: name.to_string(),
+        })
+    }
+
     pub fn set_decompile_route(&mut self, route: Option<DecompileRouteFacts>) {
         self.decompile_route = route;
     }
@@ -1449,7 +1484,9 @@ impl FunctionFacts {
         }
 
         for candidate in self.types.scalar_array_render_candidates.iter().copied() {
-            if candidate.access_width == 0 {
+            if candidate.access_width == 0
+                || !self.scalar_array_render_candidate_has_array_certificate(candidate)
+            {
                 continue;
             }
             let key = (candidate.block_addr, candidate.op_index, candidate.is_write);
@@ -1468,13 +1505,17 @@ impl FunctionFacts {
                 {
                     continue;
                 }
-                let param_slot = prepared_memory_access_param_slot(prepared, memory, param_slots);
+                let prepared_param_slot =
+                    prepared_memory_access_param_slot(prepared, memory, param_slots);
+                if prepared_param_slot.is_some_and(|slot| slot != candidate.slot) {
+                    continue;
+                }
                 let ptr_bits = prepared_memory_access_ptr_bits(prepared, memory);
                 member_facts.extend(self.member_render_facts_for_memory(
                     memory,
                     candidate.field_offset,
                     ptr_bits,
-                    param_slot,
+                    Some(candidate.slot),
                 ));
             }
         }
@@ -1539,13 +1580,20 @@ impl FunctionFacts {
             .collect()
     }
 
-    pub fn populate_array_access_render_facts_from_scalar_candidates(&mut self) {
+    pub fn populate_array_access_render_facts_from_scalar_candidates(
+        &mut self,
+        prepared: &r2ssa::SsaArtifact,
+        param_slots: &ParamSlotResolver,
+    ) {
         if self.types.scalar_array_render_candidates.is_empty() {
             return;
         }
 
         for candidate in self.types.scalar_array_render_candidates.iter().copied() {
-            if candidate.element_stride == 0 || candidate.access_width == 0 {
+            if candidate.element_stride == 0
+                || candidate.access_width == 0
+                || !self.scalar_array_render_candidate_has_array_certificate(candidate)
+            {
                 continue;
             }
             let key = (candidate.block_addr, candidate.op_index, candidate.is_write);
@@ -1563,6 +1611,11 @@ impl FunctionFacts {
                     || memory.width == 0
                     || memory.width != candidate.access_width
                 {
+                    continue;
+                }
+                let prepared_param_slot =
+                    prepared_memory_access_param_slot(prepared, memory, param_slots);
+                if prepared_param_slot.is_some_and(|slot| slot != candidate.slot) {
                     continue;
                 }
                 let fact = ArrayAccessRenderFact {
@@ -1596,6 +1649,21 @@ impl FunctionFacts {
                 )
             });
         }
+    }
+
+    fn scalar_array_render_candidate_has_array_certificate(
+        &self,
+        candidate: crate::facts::ScalarArrayRenderCandidate,
+    ) -> bool {
+        self.types.array_index_certificates.iter().any(|cert| {
+            cert.slot == candidate.slot
+                && cert.field_offset == candidate.field_offset
+                && cert.element_stride == candidate.element_stride
+                && match &cert.base {
+                    Some(crate::facts::ArrayIndexBase::Param { index }) => *index == candidate.slot,
+                    Some(crate::facts::ArrayIndexBase::StackSlot { .. }) | None => true,
+                }
+        })
     }
 
     pub fn type_facts(&self) -> &FunctionTypeFacts {
@@ -2334,11 +2402,33 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
             )
         })
         .collect();
-    let stack_slot_offsets = certificates
+    let mut stack_slot_offsets: BTreeMap<_, _> = certificates
         .stack_slots
         .iter()
         .map(|(object, cert)| (*object, cert.offset))
         .collect();
+    for cert in certificates.memory_accesses.values() {
+        stack_slot_offsets.entry(cert.object).or_insert_with(|| {
+            prepared
+                .objects()
+                .object(cert.object)
+                .and_then(|object| match &object.kind {
+                    r2ssa::ObjectKind::StackSlot { offset, .. }
+                    | r2ssa::ObjectKind::FrameObject { offset, .. } => Some(offset),
+                    _ => None,
+                })
+                .copied()
+                .unwrap_or(0)
+        });
+    }
+    stack_slot_offsets.retain(|object, _| {
+        prepared.objects().object(*object).is_some_and(|object| {
+            matches!(
+                &object.kind,
+                r2ssa::ObjectKind::StackSlot { .. } | r2ssa::ObjectKind::FrameObject { .. }
+            )
+        })
+    });
     FunctionRenderFacts {
         expressions,
         string_literals_by_value: BTreeMap::new(),
@@ -3414,6 +3504,12 @@ mod tests {
         let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
             .expect("prepared");
         let type_facts = FunctionTypeFacts {
+            array_index_certificates: vec![crate::facts::ArrayIndexCertificate {
+                slot: 0,
+                base: Some(crate::facts::ArrayIndexBase::Param { index: 0 }),
+                field_offset: 4,
+                element_stride: 16,
+            }],
             field_access_certificates: vec![crate::facts::FieldAccessCertificate {
                 slot: 0,
                 field_offset: 4,
@@ -3421,6 +3517,7 @@ mod tests {
                 field_type: Some("int32_t".to_string()),
             }],
             scalar_array_render_candidates: vec![crate::facts::ScalarArrayRenderCandidate {
+                slot: 0,
                 block_addr: 0x401000,
                 op_index: 0,
                 is_write: false,
@@ -3437,7 +3534,10 @@ mod tests {
             &prepared,
             &x86_stack_home_param_slots(),
         );
-        facts.populate_array_access_render_facts_from_scalar_candidates();
+        facts.populate_array_access_render_facts_from_scalar_candidates(
+            &prepared,
+            &x86_stack_home_param_slots(),
+        );
 
         let render = facts.render().expect("render facts");
         assert!(
@@ -3465,6 +3565,12 @@ mod tests {
         let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
             .expect("prepared");
         let type_facts_for_slot = |slot| FunctionTypeFacts {
+            array_index_certificates: vec![crate::facts::ArrayIndexCertificate {
+                slot,
+                base: Some(crate::facts::ArrayIndexBase::Param { index: slot }),
+                field_offset: 4,
+                element_stride: 16,
+            }],
             field_access_certificates: vec![crate::facts::FieldAccessCertificate {
                 slot,
                 field_offset: 4,
@@ -3472,6 +3578,7 @@ mod tests {
                 field_type: Some("int32_t".to_string()),
             }],
             scalar_array_render_candidates: vec![crate::facts::ScalarArrayRenderCandidate {
+                slot,
                 block_addr: 0x401000,
                 op_index: 0,
                 is_write: false,
@@ -3758,6 +3865,153 @@ mod tests {
                 .is_none(),
             "a matching offset must not authorize the wrong SSA object"
         );
+    }
+
+    #[test]
+    fn function_render_facts_require_exact_array_access_identity() {
+        let access = r2ssa::StructuredAccessId {
+            inst: r2ssa::InstId(7),
+            ordinal: 0,
+        };
+        let other_access = r2ssa::StructuredAccessId {
+            inst: r2ssa::InstId(8),
+            ordinal: 0,
+        };
+        let object = r2ssa::ObjectId(3);
+        let value = r2ssa::ValueId(51);
+        let render = FunctionRenderFacts {
+            memory_accesses: BTreeMap::from([(
+                access,
+                MemoryAccessRenderFact {
+                    access,
+                    block_addr: 0x401000,
+                    op_index: 4,
+                    object,
+                    address: r2ssa::ValueId(52),
+                    value: Some(value),
+                    is_write: false,
+                    width: 4,
+                },
+            )]),
+            memory_accesses_by_op: BTreeMap::from([((0x401000, 4, false), vec![access])]),
+            array_accesses_by_op: BTreeMap::from([(
+                (0x401000, 4, false),
+                vec![ArrayAccessRenderFact {
+                    access,
+                    block_addr: 0x401000,
+                    op_index: 4,
+                    object,
+                    is_write: false,
+                    field_offset: 0,
+                    element_stride: 4,
+                    access_width: 4,
+                }],
+            )]),
+            ..FunctionRenderFacts::default()
+        };
+
+        assert!(
+            render
+                .array_access_for_op(0x401000, 4, false, 0, 4, Some(4))
+                .is_some(),
+            "exact op/access/object/direction/width/stride identity should authorize array rendering"
+        );
+        assert!(
+            render
+                .array_access_for_op(0x401000, 5, false, 0, 4, Some(4))
+                .is_none(),
+            "wrong op site must not authorize array rendering"
+        );
+        assert!(
+            render
+                .array_access_for_op(0x401000, 4, true, 0, 4, Some(4))
+                .is_none(),
+            "wrong direction must not authorize array rendering"
+        );
+        assert!(
+            render
+                .array_access_for_op(0x401000, 4, false, 4, 4, Some(4))
+                .is_none(),
+            "wrong field offset must not authorize array rendering"
+        );
+        assert!(
+            render
+                .array_access_for_op(0x401000, 4, false, 0, 8, Some(4))
+                .is_none(),
+            "wrong stride must not authorize array rendering"
+        );
+        assert!(
+            render
+                .array_access_for_op(0x401000, 4, false, 0, 4, Some(8))
+                .is_none(),
+            "wrong access width must not authorize array rendering"
+        );
+
+        let mut wrong_object = render.clone();
+        wrong_object
+            .array_accesses_by_op
+            .get_mut(&(0x401000, 4, false))
+            .expect("array fact")
+            .first_mut()
+            .expect("array fact")
+            .object = r2ssa::ObjectId(9);
+        assert!(
+            wrong_object
+                .array_access_for_op(0x401000, 4, false, 0, 4, Some(4))
+                .is_none(),
+            "wrong object identity must not authorize array rendering"
+        );
+
+        let mut wrong_access = render.clone();
+        wrong_access
+            .array_accesses_by_op
+            .get_mut(&(0x401000, 4, false))
+            .expect("array fact")
+            .first_mut()
+            .expect("array fact")
+            .access = other_access;
+        assert!(
+            wrong_access
+                .array_access_for_op(0x401000, 4, false, 0, 4, Some(4))
+                .is_none(),
+            "wrong memory-access identity must not authorize array rendering"
+        );
+    }
+
+    #[test]
+    fn function_facts_authorizes_recovered_stack_owner_only_by_exact_object_offset_and_name() {
+        let object = r2ssa::ObjectId(21);
+        let facts = FunctionFacts::default().with_render(FunctionRenderFacts {
+            stack_slot_offsets: BTreeMap::from([(object, -4)]),
+            ..FunctionRenderFacts::default()
+        });
+
+        let authorization = facts
+            .authorized_recovered_stack_slot_owner_render(object, -4, "i")
+            .expect("a recovered loop scalar with exact object and offset should authorize");
+        assert_eq!(authorization.object, object);
+        assert_eq!(authorization.offset, -4);
+        assert_eq!(authorization.name, "i");
+        assert!(
+            facts
+                .authorized_recovered_stack_slot_owner_render(r2ssa::ObjectId(22), -4, "i")
+                .is_none(),
+            "wrong object must not authorize recovered stack owner rendering"
+        );
+        assert!(
+            facts
+                .authorized_recovered_stack_slot_owner_render(object, 4, "i")
+                .is_none(),
+            "wrong offset must not authorize recovered stack owner rendering"
+        );
+        for placeholder in ["fake_stack_slot", "local_4", "var_4h", "stack_8"] {
+            assert!(
+                facts
+                    .authorized_recovered_stack_slot_owner_render(object, -4, placeholder)
+                    .is_none(),
+                "placeholder name {placeholder} must not authorize recovered stack owner rendering"
+            );
+        }
     }
 
     #[test]

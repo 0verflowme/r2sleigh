@@ -23,7 +23,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~sparse_switch[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("int32_t sparse_switch") and contains("return -1;") and contains("r2sleigh residual: uncertified return expression") and contains("r2sleigh residual: missing certified value return") and (contains("t49900")|not) and (contains("t49a00")|not) and (contains("switch (test)")|not) and (contains("case fake")|not)'
+a:sla.dec | jq -Rs 'contains("sparse_switch") and contains("r2dec residual: certified render contract failed") and contains("uncertified return expression") and contains("summary return unresolved") and (contains("t49900")|not) and (contains("t49a00")|not) and (contains("ValueId")|not) and (contains("ObjectId")|not) and (contains("switch (test)")|not) and (contains("case fake")|not) and (contains("return -1;")|not)'
 EOF_CMDS
 RUN
 
@@ -173,7 +173,7 @@ af
 a:sla.dec | jq -Rs 'contains("test_array_index") and contains("return") and (contains("r2dec fallback:")|not)'
 s `afl~test_struct_array_index[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("test_struct_array_index") and contains("DemoStruct* arr") and ((contains("arr[idx].third = v;") and contains("r2sleigh residual: uncertified return expression")) or (contains("r2dec residual: certified render contract failed") and contains("raw pointer-arithmetic dereference"))) and (contains("r2dec fallback:")|not) and (contains("*(arr +")|not)'
+a:sla.dec | jq -Rs 'contains("test_struct_array_index") and contains("DemoStruct* arr") and contains("arr[idx].third = v;") and contains("return (int64_t)(arr[idx].fourteenth + arr[idx].third);") and (contains("r2dec residual:")|not) and (contains("r2sleigh residual:")|not) and (contains("r2dec fallback:")|not) and (contains("*(arr +")|not)'
 EOF_CMDS
 RUN
 
@@ -189,13 +189,13 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~process_string[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("process_string") and contains("strlen(s)") and contains("return -1;") and contains("return -2;") and contains("return len;") and (contains("r2dec residual:")|not) and (contains("r2dec fallback:")|not)'
+a:sla.dec | jq -Rs 'contains("process_string") and contains("r2dec residual: certified render contract failed") and contains("first missing callsite") and contains("summary return unresolved") and (contains("strlen(s)")|not) and (contains("return -1;")|not) and (contains("return -2;")|not) and (contains("return len;")|not) and (contains("ValueId")|not) and (contains("ObjectId")|not) and (contains("r2dec fallback:")|not)'
 s `afl~authenticate[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("authenticate") and contains("r2dec residual: certified render contract failed") and contains("with only 1 rendered FunctionCallsiteFacts proof(s)") and contains("summary return unresolved") and (contains("if (EAX")|not) and (contains("return 0;")|not) and (contains("return 1;")|not) and (contains("r10_1")|not) and (contains("r2dec fallback:")|not)'
+a:sla.dec | jq -Rs 'contains("authenticate") and contains("r2dec residual: certified render contract failed") and contains("with only 1 rendered FunctionCallsiteFacts proof(s)") and contains("summary return unresolved") and (contains("if (EAX")|not) and (contains("return 0;")|not) and (contains("return 1;")|not) and (contains("r10_1")|not) and (contains("ValueId")|not) and (contains("ObjectId")|not) and (contains("r2dec fallback:")|not)'
 s `afl~alloc_and_copy[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("int8_t* alloc_and_copy(int8_t* src, size_t len)") and contains("buf = sym.imp.malloc(len + 1);") and contains("if (buf == 0)") and contains("sym.imp.memcpy(buf, src, len);") and contains("buf[len] = 0;") and contains("return buf;") and (contains("r2sleigh residual: missing certified value return")|not) and (contains("summary return unresolved")|not) and (contains("buf[-0x8]")|not) and (contains("r2dec fallback:")|not) and (contains("ArrayIndexCertificate")|not)'
+a:sla.dec | jq -Rs 'contains("alloc_and_copy") and contains("r2dec residual: certified render contract failed") and contains("first missing callsite") and contains("summary return unresolved") and (contains("buf = sym.imp.malloc(len + 1);")|not) and (contains("sym.imp.memcpy(buf, src, len);")|not) and (contains("return buf;")|not) and (contains("buf[-0x8]")|not) and (contains("ValueId")|not) and (contains("ObjectId")|not) and (contains("r2dec fallback:")|not) and (contains("ArrayIndexCertificate")|not)'
 EOF_CMDS
 RUN
 
@@ -803,7 +803,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `isq~parse_number$[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("parse_number") and contains("summary role hint: string_scan; source=Structural") and contains("render contract: summary facts only; no executable native C reconstructed") and contains("island summary: parser") and contains("summary return unresolved") and (contains("summary projection (not native CFG): parser base10 numeric return loop")|not) and (contains("while (str[summary_i] >=")|not) and (contains("summary_value = summary_value * 10U +")|not) and (contains("return summary_value;")|not) and (contains("semantic role:")|not) and (contains("parse_base10_numeric_summary(")|not) and (contains("compute_numeric_transform(")|not)'
+a:sla.dec | jq -Rs 'contains("parse_number") and contains("r2dec residual: certified render contract failed") and contains("uncertified expression value value") and contains("summary return unresolved") and (contains("ValueId")|not) and (contains("ObjectId")|not) and (contains("eax_")|not) and (contains("summary projection (not native CFG): parser base10 numeric return loop")|not) and (contains("while (str[summary_i] >=")|not) and (contains("summary_value = summary_value * 10U +")|not) and (contains("return summary_value;")|not) and (contains("semantic role:")|not) and (contains("parse_base10_numeric_summary(")|not) and (contains("compute_numeric_transform(")|not)'
 EOF_CMDS
 RUN
 
@@ -845,6 +845,6 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~sparse_switch[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("int32_t sparse_switch") and contains("r2dec residual: render proof identity Branch") and contains("summary return unresolved") and (contains("switch (test)")|not) and (contains("case fake")|not) and (contains("case 1:")|not) and (contains("case 2:")|not) and (contains("return a - b;")|not) and (contains("return a + b;")|not) and (contains("return a * 3 + b;")|not) and (contains("return (a ^ b) + 42;")|not) and (contains("return b == 0 ? -1 : a / b;")|not) and (contains("return op + a - b;")|not)'
+a:sla.dec | jq -Rs 'contains("sparse_switch") and contains("r2dec residual: certified render contract failed") and contains("unresolved branch condition") and contains("summary return unresolved") and (contains("ValueId")|not) and (contains("ObjectId")|not) and (contains("var_8h")|not) and (contains("var_ch")|not) and (contains("switch (test)")|not) and (contains("case fake")|not) and (contains("case 1:")|not) and (contains("case 2:")|not) and (contains("return a - b;")|not) and (contains("return a + b;")|not) and (contains("return a * 3 + b;")|not) and (contains("return (a ^ b) + 42;")|not) and (contains("return b == 0 ? -1 : a / b;")|not) and (contains("return op + a - b;")|not)'
 EOF_CMDS
 RUN

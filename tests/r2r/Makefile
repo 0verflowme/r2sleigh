@@ -4,6 +4,7 @@
 # miss symbolic-path coverage on stress_parse_number under this workspace/toolchain.
 R2R_JOBS ?= 1
 R2R_TIMEOUT ?= 120
+R2R_ARGS ?= db/extras
 R2R_TMPDIR ?= /tmp/r2sleigh-r2r-tmp
 R2R_PLUGIN_DIR ?= $(R2R_TMPDIR)/plugins
 R2R_RUST_FEATURES ?= all-archs
@@ -21,9 +22,6 @@ else
 SHARED_EXT := so
 endif
 LOCAL_PLUGIN_DIR := $(abspath ../../r2plugin)
-LOCAL_PLUGIN_RUST_LIB := $(abspath ../../target/release/libr2sleigh_plugin.$(SHARED_EXT))
-LOCAL_PLUGIN_ANAL_SO := $(LOCAL_PLUGIN_DIR)/anal_sleigh.$(SHARED_EXT)
-LOCAL_PLUGIN_ARCH_SO := $(LOCAL_PLUGIN_DIR)/arch_sleigh.$(SHARED_EXT)
 LOCAL_R2_DIR ?= ../../../radare2
 LOCAL_R2_ABS := $(abspath $(LOCAL_R2_DIR))
 LOCAL_R2_BIN := $(LOCAL_R2_ABS)/binr/radare2/radare2
@@ -143,13 +141,7 @@ link-bins: build-bins
 install-plugin:
 	@mkdir -p "$(R2R_PLUGIN_DIR)"
 	@mkdir -p "$(R2R_PLUGIN_DIR)/$(R2R_PLUGIN_RUNTIME_SUBDIR)"
-	@if [ -f "$(LOCAL_PLUGIN_RUST_LIB)" ] && [ -f "$(LOCAL_PLUGIN_ANAL_SO)" ] && [ -f "$(LOCAL_PLUGIN_ARCH_SO)" ]; then \
-		cp "$(LOCAL_PLUGIN_RUST_LIB)" "$(R2R_PLUGIN_DIR)/$(R2R_PLUGIN_RUNTIME_SUBDIR)/"; \
-		cp "$(LOCAL_PLUGIN_ANAL_SO)" "$(R2R_PLUGIN_DIR)/"; \
-		cp "$(LOCAL_PLUGIN_ARCH_SO)" "$(R2R_PLUGIN_DIR)/"; \
-	else \
-		$(MAKE) -C ../../r2plugin RUST_FEATURES=$(R2R_RUST_FEATURES) LOCAL_R2_DIR="$(LOCAL_R2_ABS)" R2_PLUGIN_DIR="$(abspath $(R2R_PLUGIN_DIR))" install; \
-	fi
+	$(MAKE) -C ../../r2plugin RUST_FEATURES=$(R2R_RUST_FEATURES) LOCAL_R2_DIR="$(LOCAL_R2_ABS)" R2_PLUGIN_DIR="$(abspath $(R2R_PLUGIN_DIR))" install
 
 run: ensure-tools link-bins
 	@rm -rf "$(R2R_TMPDIR)"
@@ -161,7 +153,7 @@ run: ensure-tools link-bins
 		R2_LIBR_PLUGINS="$(abspath $(R2R_PLUGIN_DIR))" \
 		LD_LIBRARY_PATH="$(R2R_LD_LIBRARY_PATH)$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" \
 		DYLD_LIBRARY_PATH="$(R2R_LD_LIBRARY_PATH)$${DYLD_LIBRARY_PATH:+:$$DYLD_LIBRARY_PATH}" \
-		r2r -t $(R2R_TIMEOUT) -j $(R2R_JOBS) -L db/extras
+		r2r -t $(R2R_TIMEOUT) -j $(R2R_JOBS) -L $(R2R_ARGS)
 
 source-gold: ensure-tools link-bins
 	@rm -rf "$(SOURCE_GOLD_TMPDIR)"

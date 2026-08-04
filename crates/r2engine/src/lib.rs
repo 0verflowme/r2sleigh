@@ -595,6 +595,9 @@ pub struct EngineTypeWritebackPayload {
     pub var_rename_candidates: Vec<r2types::VarRenameCandidate>,
     pub external_struct_names: Vec<String>,
     pub field_access_certificate_names: Vec<String>,
+    pub fact_counts: EngineTypeWritebackFactCounts,
+    pub param_home_stack_slot_offsets: Vec<i64>,
+    pub render_stack_slot_offsets: Vec<i64>,
     pub struct_decls: Vec<r2types::StructDeclCandidate>,
     pub global_type_links: Vec<r2types::GlobalTypeLinkCandidate>,
     pub plans: r2types::AnalysisPlans,
@@ -602,6 +605,22 @@ pub struct EngineTypeWritebackPayload {
     pub assumption_usage: r2types::AssumptionUsageReport,
     pub mutation_plan: r2types::TypeWritebackMutationPlan,
     pub diagnostics: r2types::TypeWritebackDiagnostics,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EngineTypeWritebackFactCounts {
+    pub register_params: usize,
+    pub stack_slots: usize,
+    pub param_home_stack_slots: usize,
+    pub hidden_home_bindings: usize,
+    pub field_access_certificates: usize,
+    pub array_index_certificates: usize,
+    pub scalar_array_render_candidates: usize,
+    pub render_expressions: usize,
+    pub render_memory_accesses: usize,
+    pub render_stack_slot_offsets: usize,
+    pub render_member_accesses: usize,
+    pub render_array_accesses: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -670,6 +689,39 @@ pub struct EngineTypeWritebackDiagnosticsJson {
     pub solver_warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct EngineTypeWritebackFactCountsJson {
+    pub register_params: usize,
+    pub stack_slots: usize,
+    pub param_home_stack_slots: usize,
+    pub hidden_home_bindings: usize,
+    pub field_access_certificates: usize,
+    pub array_index_certificates: usize,
+    pub scalar_array_render_candidates: usize,
+    pub render_expressions: usize,
+    pub render_memory_accesses: usize,
+    pub render_stack_slot_offsets: usize,
+    pub render_member_accesses: usize,
+    pub render_array_accesses: usize,
+}
+
+impl EngineTypeWritebackFactCountsJson {
+    pub fn is_empty(&self) -> bool {
+        self.register_params == 0
+            && self.stack_slots == 0
+            && self.param_home_stack_slots == 0
+            && self.hidden_home_bindings == 0
+            && self.field_access_certificates == 0
+            && self.array_index_certificates == 0
+            && self.scalar_array_render_candidates == 0
+            && self.render_expressions == 0
+            && self.render_memory_accesses == 0
+            && self.render_stack_slot_offsets == 0
+            && self.render_member_accesses == 0
+            && self.render_array_accesses == 0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EngineTypeWritebackJsonCore {
     pub function_name: String,
@@ -694,6 +746,15 @@ pub struct EngineTypeWritebackJsonCore {
     pub external_struct_names: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub field_access_certificate_names: Vec<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "EngineTypeWritebackFactCountsJson::is_empty"
+    )]
+    pub fact_counts: EngineTypeWritebackFactCountsJson,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub param_home_stack_slot_offsets: Vec<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub render_stack_slot_offsets: Vec<i64>,
     pub struct_decls: Vec<EngineStructDeclCandidateJson>,
     pub global_type_links: Vec<EngineGlobalTypeLinkCandidateJson>,
     pub plans: r2types::AnalysisPlans,
@@ -946,6 +1007,9 @@ pub fn type_writeback_payload_from_plan_report(
         field_access_certificate_names: type_writeback_field_access_certificate_names(
             function_facts,
         ),
+        fact_counts: type_writeback_fact_counts(function_facts),
+        param_home_stack_slot_offsets: type_writeback_param_home_stack_slot_offsets(function_facts),
+        render_stack_slot_offsets: type_writeback_render_stack_slot_offsets(function_facts),
         struct_decls: plan
             .struct_decls
             .into_iter()
@@ -1071,6 +1135,22 @@ pub fn type_writeback_json_core(
             .collect(),
         external_struct_names: payload.external_struct_names,
         field_access_certificate_names: payload.field_access_certificate_names,
+        fact_counts: EngineTypeWritebackFactCountsJson {
+            register_params: payload.fact_counts.register_params,
+            stack_slots: payload.fact_counts.stack_slots,
+            param_home_stack_slots: payload.fact_counts.param_home_stack_slots,
+            hidden_home_bindings: payload.fact_counts.hidden_home_bindings,
+            field_access_certificates: payload.fact_counts.field_access_certificates,
+            array_index_certificates: payload.fact_counts.array_index_certificates,
+            scalar_array_render_candidates: payload.fact_counts.scalar_array_render_candidates,
+            render_expressions: payload.fact_counts.render_expressions,
+            render_memory_accesses: payload.fact_counts.render_memory_accesses,
+            render_stack_slot_offsets: payload.fact_counts.render_stack_slot_offsets,
+            render_member_accesses: payload.fact_counts.render_member_accesses,
+            render_array_accesses: payload.fact_counts.render_array_accesses,
+        },
+        param_home_stack_slot_offsets: payload.param_home_stack_slot_offsets,
+        render_stack_slot_offsets: payload.render_stack_slot_offsets,
         struct_decls: payload
             .struct_decls
             .into_iter()
@@ -1484,6 +1564,70 @@ pub fn semantic_fallback_type_writeback_report_json(
         Some(request.type_request.artifact.clone()),
         Some(compiled_semantic_info(request.type_request.artifact)),
     )
+}
+
+pub fn type_writeback_fact_counts(function_facts: &FunctionFacts) -> EngineTypeWritebackFactCounts {
+    let type_facts = function_facts.type_facts();
+    let render = function_facts.render();
+    EngineTypeWritebackFactCounts {
+        register_params: type_facts.register_params.len(),
+        stack_slots: type_facts.stack_slots.len(),
+        param_home_stack_slots: type_facts
+            .stack_slots
+            .values()
+            .filter(|slot| matches!(slot.role, r2types::ExternalStackSlotRole::ParamHome))
+            .count(),
+        hidden_home_bindings: type_facts
+            .visible_bindings
+            .iter()
+            .filter(|binding| matches!(binding.kind, r2types::VisibleBindingKind::HiddenHome))
+            .count(),
+        field_access_certificates: type_facts.field_access_certificates.len(),
+        array_index_certificates: type_facts.array_index_certificates.len(),
+        scalar_array_render_candidates: type_facts.scalar_array_render_candidates.len(),
+        render_expressions: render.map(|facts| facts.expressions.len()).unwrap_or(0),
+        render_memory_accesses: render.map(|facts| facts.memory_accesses.len()).unwrap_or(0),
+        render_stack_slot_offsets: render
+            .map(|facts| facts.stack_slot_offsets.len())
+            .unwrap_or(0),
+        render_member_accesses: render
+            .map(|facts| facts.member_accesses_by_op.values().map(Vec::len).sum())
+            .unwrap_or(0),
+        render_array_accesses: render
+            .map(|facts| facts.array_accesses_by_op.values().map(Vec::len).sum())
+            .unwrap_or(0),
+    }
+}
+
+pub fn type_writeback_param_home_stack_slot_offsets(function_facts: &FunctionFacts) -> Vec<i64> {
+    let mut offsets = function_facts
+        .type_facts()
+        .stack_slots
+        .iter()
+        .filter_map(|(slot_key, slot)| {
+            matches!(slot.role, r2types::ExternalStackSlotRole::ParamHome)
+                .then_some(slot_key.offset)
+        })
+        .collect::<Vec<_>>();
+    offsets.sort_unstable();
+    offsets.dedup();
+    offsets
+}
+
+pub fn type_writeback_render_stack_slot_offsets(function_facts: &FunctionFacts) -> Vec<i64> {
+    let mut offsets = function_facts
+        .render()
+        .map(|render| {
+            render
+                .stack_slot_offsets
+                .values()
+                .copied()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    offsets.sort_unstable();
+    offsets.dedup();
+    offsets
 }
 
 pub fn type_writeback_external_struct_names(function_facts: &FunctionFacts) -> Vec<String> {
@@ -2265,7 +2409,7 @@ pub fn attach_prepared_decompile_evidence(
     function_facts.normalize_field_certificates_from_external_layout();
     function_facts
         .populate_member_access_render_facts_from_field_certificates(prepared, param_slots);
-    function_facts.populate_array_access_render_facts_from_scalar_candidates();
+    function_facts.populate_array_access_render_facts_from_scalar_candidates(prepared, param_slots);
     function_facts
 }
 
@@ -13255,7 +13399,14 @@ mod tests {
         });
         let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&arch)).expect("prepared");
         let type_facts = FunctionTypeFacts {
+            array_index_certificates: vec![r2types::ArrayIndexCertificate {
+                slot: 0,
+                base: Some(r2types::ArrayIndexBase::Param { index: 0 }),
+                field_offset: 0,
+                element_stride: 8,
+            }],
             scalar_array_render_candidates: vec![r2types::ScalarArrayRenderCandidate {
+                slot: 0,
                 block_addr: 0x401000,
                 op_index: 0,
                 is_write: false,
@@ -13366,7 +13517,14 @@ mod tests {
         });
         let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&arch)).expect("prepared");
         let type_facts = FunctionTypeFacts {
+            array_index_certificates: vec![r2types::ArrayIndexCertificate {
+                slot: 0,
+                base: Some(r2types::ArrayIndexBase::Param { index: 0 }),
+                field_offset: 0,
+                element_stride: 8,
+            }],
             scalar_array_render_candidates: vec![r2types::ScalarArrayRenderCandidate {
+                slot: 0,
                 block_addr: 0x401000,
                 op_index: 0,
                 is_write: false,

@@ -20340,6 +20340,16 @@ mod tests {
                 crate::analysis::PreparedCallView {
                     authoritative_args: vec![expr],
                     authoritative_arg_values: vec![value],
+                    render_fact: Some(r2types::CallsiteRenderFact {
+                        callsite: r2types::CallsiteKey {
+                            block_addr: 0x1000,
+                            op_index: 2,
+                        },
+                        target: None,
+                        disposition: r2types::CallsiteRenderDisposition::SideEffectStatement,
+                        proof_values: vec![value],
+                        residual_reason: None,
+                    }),
                     ..crate::analysis::PreparedCallView::default()
                 },
             )]),

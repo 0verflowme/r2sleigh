@@ -619,6 +619,25 @@ impl<'a> CertifiedRenderPlan<'a> {
         if !self.proof.expression_is_renderable(value) {
             return None;
         }
+        let call_view = self.prepared_view.call_view_for_site(site)?;
+        let render_fact = call_view.render_fact.as_ref()?;
+        if render_fact.callsite.block_addr != site.0
+            || render_fact.callsite.op_index != site.1
+            || matches!(
+                render_fact.disposition,
+                r2types::CallsiteRenderDisposition::Suppressed
+                    | r2types::CallsiteRenderDisposition::Residualized
+            )
+        {
+            return None;
+        }
+        let index = call_view
+            .authoritative_arg_values
+            .iter()
+            .position(|candidate| *candidate == value)?;
+        if render_fact.proof_values.get(index).copied() != Some(value) {
+            return None;
+        }
         let expr = self
             .prepared_view
             .authoritative_call_arg_expr_for_value(site, value)?;
@@ -753,7 +772,7 @@ impl<'a> FoldingContext<'a> {
         })
     }
 
-    const MAX_SEMANTIC_RENDER_DEPTH: u32 = 8;
+    const MAX_SEMANTIC_RENDER_DEPTH: u32 = 16;
 
     fn use_info(&self) -> &analysis::UseInfo {
         self.state.analysis_ctx.semantic()
@@ -1190,7 +1209,7 @@ impl<'a> FoldingContext<'a> {
         ))
     }
 
-    fn certified_return_expr_for_op(
+    pub(crate) fn certified_return_expr_for_op(
         &self,
         block_addr: u64,
         op_idx: usize,
@@ -1823,10 +1842,6 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(crate) fn unique_scalar_stack_return_expr(&self) -> Option<CExpr> {
-        if self.requires_certified_rendering() {
-            return None;
-        }
-
         let mut slots = self.state.return_stack_slots.iter().copied();
         let slot = slots.next()?;
         if slots.next().is_some() {
@@ -5670,9 +5685,15 @@ impl<'a> FoldingContext<'a> {
     fn value_ref_from_visible_expr(&self, expr: &CExpr) -> Option<analysis::ValueRef> {
         match expr {
             CExpr::Var(name) => {
+                if let Some(value_ref) = self.certified_stack_owner_value_ref_for_name(name) {
+                    return Some(value_ref);
+                }
                 let prefer_direct_root = Self::is_semantic_binding_name(name)
                     || self.arg_alias_for_rendered_name(name).is_some()
-                    || self.lookup_type_hint(name).is_some();
+                    || self.lookup_type_hint(name).is_some()
+                    || self
+                        .certified_signature_arg_register_for_param_name(name)
+                        .is_some();
                 if !prefer_direct_root && self.stack_offset_for_visible_storage_name(name).is_some()
                 {
                     return None;
@@ -5685,6 +5706,42 @@ impl<'a> FoldingContext<'a> {
             }
             _ => None,
         }
+    }
+
+    fn certified_stack_owner_value_ref_for_name(&self, name: &str) -> Option<analysis::ValueRef> {
+        if !self.requires_certified_rendering()
+            || name.trim().is_empty()
+            || self.is_reserved_param_alias_name(name)
+            || is_generic_stack_placeholder_alias(name)
+        {
+            return None;
+        }
+        let render_facts = self.inputs.render_facts()?;
+        let mut objects = render_facts
+            .stack_slot_offsets
+            .iter()
+            .filter_map(|(object, slot_offset)| {
+                self.certified_stack_var_name_for_object_offset(*object, *slot_offset)
+                    .is_some_and(|owner| owner.eq_ignore_ascii_case(name))
+                    .then_some(*object)
+            })
+            .collect::<Vec<_>>();
+        objects.sort();
+        objects.dedup();
+        let [object] = objects.as_slice() else {
+            return None;
+        };
+        let width = render_facts
+            .memory_accesses
+            .values()
+            .filter(|fact| fact.object == *object && !fact.is_write && fact.width > 0)
+            .map(|fact| fact.width)
+            .min()?;
+        Some(analysis::ValueRef::new(SSAVar::new(
+            name.to_string(),
+            0,
+            width,
+        )))
     }
 
     fn extract_visible_scaled_index(
@@ -5922,7 +5979,10 @@ impl<'a> FoldingContext<'a> {
                                 | CType::Struct(_)
                                 | CType::Union(_)
                         )
-                    });
+                    })
+                    || self
+                        .certified_signature_arg_register_for_param_name(name)
+                        .is_some();
                 if prefer_direct_root && let Some(var) = self.ssa_var_for_visible_name(name) {
                     return Some(analysis::NormalizedAddr {
                         base: analysis::BaseRef::Value(analysis::ValueRef::from(var)),
@@ -6199,7 +6259,10 @@ impl<'a> FoldingContext<'a> {
     fn ssa_var_for_visible_name(&self, name: &str) -> Option<SSAVar> {
         let prefer_direct_root = Self::is_semantic_binding_name(name)
             || self.arg_alias_for_rendered_name(name).is_some()
-            || self.lookup_type_hint(name).is_some();
+            || self.lookup_type_hint(name).is_some()
+            || self
+                .certified_signature_arg_register_for_param_name(name)
+                .is_some();
         if !prefer_direct_root && self.stack_offset_for_visible_storage_name(name).is_some() {
             return None;
         }
@@ -6240,23 +6303,12 @@ impl<'a> FoldingContext<'a> {
 
         for (reg_name, alias) in self.inputs.param_register_aliases {
             if alias.eq_ignore_ascii_case(name) {
-                return Some(SSAVar::new(reg_name, 0, infer_reg_size(reg_name)));
+                let reg_name = self.canonical_arg_register_name_for_alias(reg_name);
+                return Some(SSAVar::new(reg_name.clone(), 0, infer_reg_size(&reg_name)));
             }
         }
 
-        if self.requires_certified_rendering()
-            && let Some(signature) = self
-                .inputs
-                .function_facts
-                .type_facts()
-                .render_authorized_signature()
-            && let Some((idx, _)) = signature
-                .params
-                .iter()
-                .enumerate()
-                .find(|(_, param)| param.name.eq_ignore_ascii_case(name))
-            && let Some(reg_name) = self.inputs.arch.arg_regs.get(idx)
-        {
+        if let Some(reg_name) = self.certified_signature_arg_register_for_param_name(name) {
             return Some(SSAVar::new(reg_name, 0, infer_reg_size(reg_name)));
         }
 
@@ -6309,6 +6361,38 @@ impl<'a> FoldingContext<'a> {
             return Some(var.clone());
         }
         self.guess_ssa_var_from_name(name)
+    }
+
+    pub(super) fn canonical_arg_register_name_for_alias(&self, reg_name: &str) -> String {
+        self.inputs
+            .arch
+            .arg_regs
+            .iter()
+            .find(|arg_reg| {
+                arg_reg.eq_ignore_ascii_case(reg_name)
+                    || crate::register_alias_names(arg_reg)
+                        .into_iter()
+                        .any(|alias| alias.eq_ignore_ascii_case(reg_name))
+            })
+            .cloned()
+            .unwrap_or_else(|| reg_name.to_string())
+    }
+
+    fn certified_signature_arg_register_for_param_name(&self, name: &str) -> Option<&str> {
+        if !self.requires_certified_rendering() {
+            return None;
+        }
+        let signature = self
+            .inputs
+            .function_facts
+            .type_facts()
+            .render_authorized_signature()?;
+        let (idx, _) = signature
+            .params
+            .iter()
+            .enumerate()
+            .find(|(_, param)| param.name.eq_ignore_ascii_case(name))?;
+        self.inputs.arch.arg_regs.get(idx).map(String::as_str)
     }
 
     fn infer_subscript_elem_type(&self, base: &SSAVar, element_size: u32) -> CType {
@@ -13377,15 +13461,33 @@ impl<'a> FoldingContext<'a> {
                     .type_hint_for_var(dst)
                     .unwrap_or_else(|| type_from_size(dst.size));
                 let rhs = if self.requires_certified_rendering() {
-                    let Some(rhs) =
-                        self.render_certified_memory_expr_for_current_op(elem_ty.clone(), false)
-                    else {
+                    let Some(fact) = self.certified_memory_access_for_current_op(false) else {
+                        let refusal = self.certified_memory_render_refusal_for_current_op(false);
                         return Some(self.certified_residual_comment(format!(
-                            "uncertified memory load at 0x{:x}:{}",
+                            "uncertified memory load at 0x{:x}:{} ({})",
                             self.current_block_addr.get().unwrap_or_default(),
-                            self.current_op_idx.get().unwrap_or_default()
+                            self.current_op_idx.get().unwrap_or_default(),
+                            refusal
                         )));
                     };
+                    let Some(rhs) =
+                        self.render_certified_memory_expr_for_fact(fact, elem_ty.clone())
+                    else {
+                        let refusal = self.certified_memory_render_refusal_for_current_op(false);
+                        return Some(self.certified_residual_comment(format!(
+                            "uncertified memory load at 0x{:x}:{} ({})",
+                            self.current_block_addr.get().unwrap_or_default(),
+                            self.current_op_idx.get().unwrap_or_default(),
+                            refusal
+                        )));
+                    };
+                    self.record_effect_render_proof_for_memory(
+                        EffectRenderProofKind::MemoryRead,
+                        fact.block_addr,
+                        fact.op_index,
+                        fact.address,
+                        fact.value,
+                    );
                     rhs
                 } else {
                     self.render_canonical_load_expr(dst, addr, elem_ty.clone())
@@ -13427,16 +13529,30 @@ impl<'a> FoldingContext<'a> {
                 let elem_ty = self
                     .type_hint_for_var(val)
                     .unwrap_or_else(|| type_from_size(val.size));
+                let mut certified_store_fact = None;
                 let lhs = if self.requires_certified_rendering() {
-                    let Some(lhs) =
-                        self.render_certified_memory_expr_for_current_op(elem_ty.clone(), true)
-                    else {
+                    let Some(fact) = self.certified_memory_access_for_current_op(true) else {
+                        let refusal = self.certified_memory_render_refusal_for_current_op(true);
                         return Some(self.certified_residual_comment(format!(
-                            "uncertified memory store at 0x{:x}:{}",
+                            "uncertified memory store at 0x{:x}:{} ({})",
                             self.current_block_addr.get().unwrap_or_default(),
-                            self.current_op_idx.get().unwrap_or_default()
+                            self.current_op_idx.get().unwrap_or_default(),
+                            refusal
                         )));
                     };
+                    let Some(lhs) =
+                        self.render_certified_memory_expr_for_fact(fact, elem_ty.clone())
+                    else {
+                        let refusal = self.certified_memory_render_refusal_for_current_op(true);
+                        return Some(self.certified_residual_comment(format!(
+                            "uncertified memory store at 0x{:x}:{} ({})",
+                            self.current_block_addr.get().unwrap_or_default(),
+                            self.current_op_idx.get().unwrap_or_default(),
+                            refusal
+                        )));
+                    };
+                    certified_store_fact =
+                        Some((fact.block_addr, fact.op_index, fact.address, fact.value));
                     lhs
                 } else {
                     self.render_canonical_store_target_expr(addr, val.size, elem_ty.clone())
@@ -13546,6 +13662,15 @@ impl<'a> FoldingContext<'a> {
                     && !self.looks_like_pointer(&rhs)
                 {
                     rhs = CExpr::cast(val_ty, rhs);
+                }
+                if let Some((block_addr, op_idx, address, value)) = certified_store_fact {
+                    self.record_effect_render_proof_for_memory(
+                        EffectRenderProofKind::MemoryWrite,
+                        block_addr,
+                        op_idx,
+                        address,
+                        value,
+                    );
                 }
                 self.assign_stmt(lhs, rhs)
             }

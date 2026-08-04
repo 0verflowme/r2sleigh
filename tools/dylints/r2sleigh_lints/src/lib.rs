@@ -9611,8 +9611,13 @@ fn r2dec_certified_array_and_semantic_render_do_not_use_aggregate_or_pretty_fall
         .unwrap_or_else(|| panic!("missing field_accesses_are_certified after {verifier_marker}"));
     let verifier = &verifier_rest[..verifier_end];
     assert!(
-        verifier.contains("false"),
-        "array rendering must residualize until render-node identity proves the exact FunctionRenderFacts array-access proof"
+        verifier.contains("effect_render_proofs")
+            && verifier.contains("memory_access_for_op")
+            && verifier.contains("proof.address")
+            && verifier.contains("proof.value")
+            && verifier.contains("array_accesses_by_op")
+            && verifier.contains("array.access == memory.access"),
+        "array rendering must be certified from emitted memory proofs tied to exact FunctionRenderFacts array-access proof"
     );
     for forbidden in [
         "array_index_certificates",

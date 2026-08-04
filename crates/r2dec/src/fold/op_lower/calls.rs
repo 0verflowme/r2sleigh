@@ -387,6 +387,11 @@ impl<'a> FoldingContext<'a> {
         proof: &CertifiedRenderContext<'_>,
         render_plan: Option<&CertifiedRenderPlan<'_>>,
     ) -> Option<CExpr> {
+        if proof.memory_read_for_value_dependency(value).is_some() {
+            return render_plan?.call_arg_expr(site, value, |expr| {
+                self.certified_return_expr_contains_raw_storage_name(expr)
+            });
+        }
         if let Some(expr) = self.certified_call_arg_expr_for_value(value, proof) {
             return Some(expr);
         }
