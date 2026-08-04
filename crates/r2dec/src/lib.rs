@@ -9131,14 +9131,13 @@ mod tests {
             built_first
                 .body
                 .iter()
-                .all(|stmt| !matches!(stmt, CStmt::Return(_))),
-            "incomplete predicate render proof must not emit executable return: {:?}",
+                .any(|stmt| matches!(stmt, CStmt::Return(_))),
+            "renderable predicate chain should emit executable return: {:?}",
             built_first.body
         );
         assert!(
-            format!("{:?}", built_first.body).contains("certified render contract failed")
-                && format!("{:?}", built_first.body).contains("summary return unresolved"),
-            "predicate-heavy route should residualize explicitly, got {:?}",
+            !format!("{:?}", built_first.body).contains("certified render contract failed"),
+            "renderable predicate chain must not residualize, got {:?}",
             built_first.body
         );
     }

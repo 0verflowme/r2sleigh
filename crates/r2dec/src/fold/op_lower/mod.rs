@@ -1030,6 +1030,7 @@ impl<'a> FoldingContext<'a> {
                 let rendered = self.var_name(var);
                 return Some(
                     self.arg_alias_for_rendered_name(&rendered)
+                        .or_else(|| self.certified_signature_arg_alias_for_register(&rendered))
                         .map(CExpr::Var)
                         .unwrap_or_else(|| CExpr::Var(rendered)),
                 );
