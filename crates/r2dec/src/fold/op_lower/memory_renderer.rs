@@ -312,8 +312,13 @@ impl<'a> FoldingContext<'a> {
         let expr = self
             .render_certified_address_expr_for_var(&addr, 0, &mut HashSet::new())
             .or_else(|| self.render_certified_value_expr_for_var(&addr))?;
-        if self.expr_contains_raw_stack_base_arithmetic(&expr)
-            || self.certified_return_expr_contains_raw_storage_name(&expr)
+        if self.expr_contains_raw_stack_base_arithmetic(&expr) {
+            return None;
+        }
+        if self.certified_return_expr_contains_raw_storage_name(&expr)
+            && self
+                .control_facts()
+                .is_none_or(|facts| facts.loops.is_empty() && facts.switches.is_empty())
         {
             return None;
         }
