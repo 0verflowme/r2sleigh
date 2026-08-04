@@ -1401,14 +1401,19 @@ fn collect_renderable_expression_values(
             continue;
         }
 
-        eligible[inst.id.0 as usize] = true;
-        missing_inputs[inst.id.0 as usize] = inst
-            .inputs
-            .iter()
-            .filter(|input| !renderable.contains(input))
-            .count();
-        if missing_inputs[inst.id.0 as usize] == 0 && renderable.insert(output) {
+        if matches!(&inst.payload, InstPayload::Phi { .. }) {
+            renderable.insert(output);
             ready.push_back(output);
+        } else {
+            eligible[inst.id.0 as usize] = true;
+            missing_inputs[inst.id.0 as usize] = inst
+                .inputs
+                .iter()
+                .filter(|input| !renderable.contains(input))
+                .count();
+            if missing_inputs[inst.id.0 as usize] == 0 && renderable.insert(output) {
+                ready.push_back(output);
+            }
         }
     }
 
@@ -1466,13 +1471,16 @@ fn expression_leaf_is_renderable(value: &crate::graph::GraphValue) -> bool {
 }
 
 fn expression_inst_is_renderable(
-    function: &SSAFunction,
+    _function: &SSAFunction,
     graph: &SsaGraph,
     inst: &crate::graph::GraphInst,
     certified_memory_read_insts: &BTreeSet<InstId>,
 ) -> bool {
     match &inst.payload {
-        InstPayload::Phi { .. } => expression_phi_is_renderable(function, graph, inst),
+        InstPayload::Phi { .. } => !inst
+            .inputs
+            .iter()
+            .any(|input| expression_value_depends_on_memory_read(graph, *input)),
         InstPayload::Op(op) => {
             expression_op_is_pure(op)
                 || (op.is_memory_read() && certified_memory_read_insts.contains(&inst.id))

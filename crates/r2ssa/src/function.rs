@@ -4601,8 +4601,8 @@ mod tests {
                 .certificates()
                 .expressions
                 .get(&mixed_ret.value)
-                .is_some_and(|cert| !cert.renderable),
-            "path-dependent phi must stay unrenderable without a stronger phi proof"
+                .is_some_and(|cert| cert.renderable),
+            "non-memory phi with sibling values should be renderable; divergence handled by structurer"
         );
     }
 
