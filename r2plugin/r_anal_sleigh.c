@@ -21,6 +21,10 @@
 /* FFI declarations for r2sleigh Rust library */
 typedef struct R2ILContext R2ILContext;
 typedef struct R2ILBlock R2ILBlock;
+typedef struct {
+	unsigned long long value;
+	unsigned long long target;
+} R2ILSwitchCaseFfi;
 
 /* Context management */
 extern R2ILContext *r2il_arch_init(const char *arch);
@@ -35,6 +39,10 @@ extern R2ILBlock *r2il_lift_block(R2ILContext *ctx, const unsigned char *bytes, 
 extern void r2il_set_semantic_metadata_enabled(R2ILContext *ctx, bool enabled);
 extern void r2il_block_free(R2ILBlock *block);
 extern int r2il_block_validate(R2ILContext *ctx, const R2ILBlock *block);
+extern int r2il_block_set_switch_info(R2ILBlock *block, unsigned long long switch_addr,
+	unsigned long long min_val, unsigned long long max_val,
+	unsigned long long default_target, int has_default,
+	const R2ILSwitchCaseFfi *cases, size_t case_count);
 
 /* Block inspection */
 extern size_t r2il_block_op_count(const R2ILBlock *block);
@@ -1022,8 +1030,8 @@ static bool sleigh_typed_function_context_build(
 								members[member_idx].name = member->name;
 								members[member_idx].type_name = member->type;
 								members[member_idx].offset = member->offset;
-								members[member_idx].size_bits = member->size;
-								members[member_idx].has_size_bits = member->size? 1: 0;
+								members[member_idx].size_bits = member->bitsize;
+								members[member_idx].has_size_bits = member->bitsize? 1: 0;
 								member_idx++;
 							}
 							entry->members = members;
@@ -1047,8 +1055,8 @@ static bool sleigh_typed_function_context_build(
 								members[member_idx].name = member->name;
 								members[member_idx].type_name = member->type;
 								members[member_idx].offset = member->offset;
-								members[member_idx].size_bits = member->size;
-								members[member_idx].has_size_bits = member->size? 1: 0;
+								members[member_idx].size_bits = member->bitsize;
+								members[member_idx].has_size_bits = member->bitsize? 1: 0;
 								member_idx++;
 							}
 							entry->members = members;
@@ -5059,6 +5067,49 @@ static char *format_taint_risk_comment(
 	return comment;
 }
 
+static void attach_switch_info_to_block(R2ILBlock *block, const RAnalBlock *bb) {
+	if (!block || !bb || !bb->switch_op || !bb->switch_op->cases) {
+		return;
+	}
+
+	const RAnalSwitchOp *swop = bb->switch_op;
+	const int ncases = r_list_length (swop->cases);
+	if (ncases <= 0) {
+		return;
+	}
+
+	const size_t case_count = (size_t)ncases;
+	R2ILSwitchCaseFfi *cases = R_NEWS0 (R2ILSwitchCaseFfi, case_count);
+	if (!cases) {
+		return;
+	}
+
+	RListIter *iter;
+	RAnalCaseOp *caseop;
+	size_t i = 0;
+	r_list_foreach (swop->cases, iter, caseop) {
+		if (!caseop) {
+			continue;
+		}
+		if (i >= case_count) {
+			break;
+		}
+		cases[i].value = caseop->value;
+		cases[i].target = caseop->jump;
+		i++;
+	}
+
+	if (i > 0) {
+		const ut64 switch_addr = (swop->jump_addr && swop->jump_addr != UT64_MAX)
+			? swop->jump_addr: swop->addr;
+		const int has_default = swop->def_val != UT64_MAX;
+		(void)r2il_block_set_switch_info (block, switch_addr,
+			swop->min_val, swop->max_val, swop->def_val,
+			has_default, cases, i);
+	}
+	free (cases);
+}
+
 /* Lift all basic blocks of a function */
 static bool lift_function_blocks(
 	RAnal *anal,
@@ -5104,6 +5155,7 @@ static bool lift_function_blocks(
 				out->quality.invalid_blocks++;
 				continue;
 			}
+			attach_switch_info_to_block (block, bb);
 			block_array_push (out, block);
 		} else {
 			out->quality.null_lift_failures++;
