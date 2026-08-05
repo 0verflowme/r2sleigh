@@ -6601,6 +6601,8 @@ impl Decompiler {
         let mut is_linear_fallback = routed_body.is_linear_fallback;
         let mut body_stmt = routed_body.body_stmt;
         if certified_standard_mode {
+            body_stmt = fold_ctx.inline_proved_single_use_carriers_in_stmt(body_stmt);
+            body_stmt = fold_ctx.prune_unread_stack_carriers_in_stmt(body_stmt);
             body_stmt = fold_ctx.prune_unproved_register_carriers_in_stmt(body_stmt);
             body_stmt = ControlFlowStructurer::cleanup_preserving_render_proof_identity(body_stmt);
         }
@@ -9046,6 +9048,8 @@ mod tests {
                 field_offset: fact.field_offset,
                 element_stride: fact.element_stride,
                 access_width: fact.access_width,
+                base: None,
+                index: None,
             });
     }
 

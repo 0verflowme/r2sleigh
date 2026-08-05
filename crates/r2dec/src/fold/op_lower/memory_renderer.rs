@@ -300,6 +300,55 @@ impl<'a> FoldingContext<'a> {
         Some(self.member_access_expr(base, member.field_name.clone()))
     }
 
+    fn render_certified_semantic_array_expr(
+        &self,
+        memory: &r2types::MemoryAccessRenderFact,
+    ) -> Option<CExpr> {
+        let array = self.certified_array_fact_for_memory(memory)?;
+        let (Some(base), Some(index)) = (array.base, array.index) else {
+            return None;
+        };
+        let r2ssa::SemanticId::Parameter(slot) = base else {
+            return None;
+        };
+        let r2ssa::SemanticId::Expression(index) = index else {
+            return None;
+        };
+        let render = self.inputs.render_facts()?;
+        let slot = usize::try_from(slot).ok()?;
+        if render.parameter_values(slot).next().is_none()
+            || !render
+                .certified_expr_for_value(index)
+                .is_some_and(|expr| expr.fact.renderable)
+        {
+            return None;
+        }
+        let base = self
+            .inputs
+            .function_facts
+            .type_facts()
+            .render_authorized_signature()?
+            .params
+            .get(slot)
+            .map(|param| param.name.trim())
+            .filter(|name| !name.is_empty())?;
+        let index_var = self.prepared_ssa()?.value_var(index)?;
+        let index = self.render_certified_value_expr_for_var(index_var)?;
+        let indexed = CExpr::Subscript {
+            base: Box::new(CExpr::Var(base.to_string())),
+            index: Box::new(index),
+        };
+        match self.certified_member_fact_for_memory(memory) {
+            Some(member)
+                if member.field_offset == array.field_offset && member.access == array.access =>
+            {
+                Some(self.member_access_expr(indexed, member.field_name.clone()))
+            }
+            None if array.field_offset == 0 => Some(indexed),
+            _ => None,
+        }
+    }
+
     fn expr_is_store_target_candidate(expr: &CExpr) -> bool {
         match expr {
             CExpr::Var(_)
@@ -702,6 +751,11 @@ impl<'a> FoldingContext<'a> {
     ) -> Option<CExpr> {
         if let Some(expr) = self.certified_stack_owner_expr_for_memory_fact(fact) {
             return Some(expr);
+        }
+        if let Some(array) = self.certified_array_fact_for_memory(fact)
+            && (array.base.is_some() || array.index.is_some())
+        {
+            return self.render_certified_semantic_array_expr(fact);
         }
         let (addr, addr_expr) = self.certified_memory_address_expr(fact)?;
         if let Some(rendered) = self.render_certified_structured_memory_expr(fact, &addr_expr) {

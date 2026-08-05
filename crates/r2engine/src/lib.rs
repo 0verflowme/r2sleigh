@@ -5605,8 +5605,9 @@ fn build_engine_analysis_artifact(
         &analysis,
     )?;
     let mut diagnostics = r2types::TypeWritebackDiagnostics::default();
-    let local_structs = r2types::infer_local_struct_artifacts_from_prepared_ssa(
+    let local_structs = r2types::infer_local_struct_artifacts_from_prepared_views(
         &semantic_analysis.pattern_ssa_func,
+        &semantic_analysis.ssa_func,
         Some(arch_name.as_str()),
         request.ptr_bits,
         &mut diagnostics,
@@ -12774,6 +12775,7 @@ mod tests {
                 field_offset: 0,
                 element_stride: 8,
                 access_width: 8,
+                index_value: None,
             }],
             ..FunctionTypeFacts::default()
         };
@@ -12892,6 +12894,7 @@ mod tests {
                 field_offset: 0,
                 element_stride: 8,
                 access_width: 4,
+                index_value: None,
             }],
             ..FunctionTypeFacts::default()
         };

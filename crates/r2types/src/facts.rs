@@ -60,6 +60,7 @@ pub struct ScalarArrayRenderCandidate {
     pub field_offset: u64,
     pub element_stride: u64,
     pub access_width: u32,
+    pub index_value: Option<r2ssa::ValueId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

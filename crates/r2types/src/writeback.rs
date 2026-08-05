@@ -2,9 +2,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 
 use r2ssa::{
-    FunctionSSABlock, FunctionSemanticSummary, InterprocSummarySet, PhiNode, SSABlock, SSAOp,
-    SSAVar, SsaArtifact, SummaryArgEffect, SummaryMemoryEffect, SummaryMemoryEffectKind,
-    SummaryMemoryRegion, SummaryReturnRelation,
+    FunctionSSABlock, FunctionSemanticSummary, InterprocSummarySet, MemoryVersion, ObjectKind,
+    PhiNode, SSABlock, SSAOp, SSAVar, SsaArtifact, SummaryArgEffect, SummaryMemoryEffect,
+    SummaryMemoryEffectKind, SummaryMemoryRegion, SummaryReturnRelation,
 };
 
 use crate::context::{
@@ -193,6 +193,7 @@ pub struct LocalStructArtifacts {
     pub slot_type_overrides: HashMap<usize, String>,
     pub slot_field_profiles: HashMap<usize, BTreeMap<u64, String>>,
     pub slot_element_strides: HashMap<usize, u64>,
+    pub indexed_accesses: Vec<ScalarArrayRenderCandidate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3814,6 +3815,28 @@ fn build_type_writeback_analysis_inner(
         input.ptr_bits,
     );
     array_index_certificates.extend(scalar_array_access_certificates.array_index);
+    let mut scalar_array_render_candidates = local_structs
+        .indexed_accesses
+        .iter()
+        .filter(|candidate| {
+            local_structs
+                .slot_field_profiles
+                .contains_key(&candidate.slot)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let local_indexed_slots = scalar_array_render_candidates
+        .iter()
+        .map(|candidate| candidate.slot)
+        .collect::<HashSet<_>>();
+    scalar_array_render_candidates.extend(
+        scalar_array_access_certificates
+            .render_candidates
+            .into_iter()
+            .filter(|candidate| !local_indexed_slots.contains(&candidate.slot)),
+    );
+    scalar_array_render_candidates.sort();
+    scalar_array_render_candidates.dedup();
     let mut field_access_certificates =
         field_access_certificates_from_struct_artifacts(&local_structs);
     field_access_certificates.extend(scalar_array_access_certificates.field_access);
@@ -3906,7 +3929,7 @@ fn build_type_writeback_analysis_inner(
             .unwrap_or_default(),
         field_access_certificates,
         array_index_certificates,
-        scalar_array_render_candidates: scalar_array_access_certificates.render_candidates,
+        scalar_array_render_candidates,
         out_param_certificates,
         signature_certificate,
         interproc_diagnostics: input
@@ -4584,6 +4607,77 @@ struct LocalStructInferenceBlock {
 }
 
 #[derive(Default)]
+struct LocalMemoryVersionFacts {
+    stores_by_site: HashMap<(u64, usize), Vec<MemoryVersion>>,
+    loads_by_site: HashMap<(u64, usize), Vec<MemoryVersion>>,
+    phi_inputs: HashMap<MemoryVersion, Vec<MemoryVersion>>,
+    value_ids: HashMap<SSAVar, r2ssa::ValueId>,
+}
+
+impl LocalMemoryVersionFacts {
+    fn from_prepared(prepared: &SsaArtifact) -> Self {
+        let is_stack = |version: MemoryVersion| {
+            prepared
+                .objects()
+                .object(version.object)
+                .is_some_and(|object| {
+                    matches!(
+                        object.kind,
+                        ObjectKind::StackSlot { .. } | ObjectKind::FrameObject { .. }
+                    )
+                })
+        };
+        let mut facts = Self::default();
+        facts.value_ids.extend(
+            prepared
+                .graph()
+                .values
+                .iter()
+                .map(|value| (value.var.clone(), value.id)),
+        );
+        for block in prepared.function().blocks() {
+            for (op_index, _) in block.ops.iter().enumerate() {
+                let store_versions = prepared
+                    .memory_defs_for_op_site(block.addr, op_index)
+                    .into_iter()
+                    .flatten()
+                    .map(|fact| fact.next_version)
+                    .filter(|version| is_stack(*version))
+                    .collect::<Vec<_>>();
+                if !store_versions.is_empty() {
+                    facts
+                        .stores_by_site
+                        .insert((block.addr, op_index), store_versions);
+                }
+                let load_versions = prepared
+                    .memory_uses_for_op_site(block.addr, op_index)
+                    .into_iter()
+                    .flatten()
+                    .map(|fact| fact.version)
+                    .filter(|version| is_stack(*version))
+                    .collect::<Vec<_>>();
+                if !load_versions.is_empty() {
+                    facts
+                        .loads_by_site
+                        .insert((block.addr, op_index), load_versions);
+                }
+            }
+        }
+        for phis in prepared.memory().phis_by_block.values() {
+            for phi in phis {
+                if is_stack(phi.output_version) {
+                    facts.phi_inputs.insert(
+                        phi.output_version,
+                        phi.inputs.iter().map(|(_, version)| *version).collect(),
+                    );
+                }
+            }
+        }
+        facts
+    }
+}
+
+#[derive(Default)]
 struct LocalTypeEquivalence {
     ids: HashMap<SSAVar, usize>,
     vars: Vec<SSAVar>,
@@ -5205,6 +5299,75 @@ fn record_local_index_stride(
     true
 }
 
+fn local_expr_for_memory_version(
+    version: MemoryVersion,
+    values: &HashMap<MemoryVersion, LocalAddrExpr>,
+    phi_inputs: &HashMap<MemoryVersion, Vec<MemoryVersion>>,
+    visiting: &mut HashSet<MemoryVersion>,
+) -> Option<LocalAddrExpr> {
+    if let Some(value) = values.get(&version) {
+        return Some(value.clone());
+    }
+    if !visiting.insert(version) {
+        return None;
+    }
+    let result = (|| {
+        let sources = phi_inputs.get(&version)?;
+        let mut selected: Option<LocalAddrExpr> = None;
+        for source in sources {
+            let value = local_expr_for_memory_version(*source, values, phi_inputs, visiting)?;
+            selected = match selected {
+                None => Some(value),
+                Some(previous)
+                    if previous.slot == value.slot
+                        && previous.offset == value.offset
+                        && previous.index == value.index =>
+                {
+                    Some(LocalAddrExpr {
+                        slot: previous.slot,
+                        offset: previous.offset,
+                        index: previous.index,
+                        confidence: previous.confidence.min(value.confidence),
+                    })
+                }
+                _ => return None,
+            };
+        }
+        selected
+    })();
+    visiting.remove(&version);
+    result
+}
+
+fn local_expr_for_memory_versions(
+    versions: &[MemoryVersion],
+    values: &HashMap<MemoryVersion, LocalAddrExpr>,
+    phi_inputs: &HashMap<MemoryVersion, Vec<MemoryVersion>>,
+) -> Option<LocalAddrExpr> {
+    let mut selected: Option<LocalAddrExpr> = None;
+    for version in versions {
+        let value =
+            local_expr_for_memory_version(*version, values, phi_inputs, &mut HashSet::new())?;
+        selected = match selected {
+            None => Some(value),
+            Some(previous)
+                if previous.slot == value.slot
+                    && previous.offset == value.offset
+                    && previous.index == value.index =>
+            {
+                Some(LocalAddrExpr {
+                    slot: previous.slot,
+                    offset: previous.offset,
+                    index: previous.index,
+                    confidence: previous.confidence.min(value.confidence),
+                })
+            }
+            _ => return None,
+        };
+    }
+    selected
+}
+
 fn local_struct_inference_from_local_blocks(blocks: &[SSABlock]) -> Vec<LocalStructInferenceBlock> {
     blocks
         .iter()
@@ -5235,7 +5398,7 @@ pub fn infer_local_struct_artifacts_from_ssa(
     diagnostics: &mut TypeWritebackDiagnostics,
 ) -> LocalStructArtifacts {
     let blocks = local_struct_inference_from_local_blocks(ssa_blocks);
-    infer_local_struct_artifacts_from_blocks(&blocks, arch_name, ptr_bits, diagnostics)
+    infer_local_struct_artifacts_from_blocks(&blocks, None, arch_name, ptr_bits, diagnostics)
 }
 
 pub fn infer_local_struct_artifacts_from_prepared_ssa(
@@ -5245,11 +5408,44 @@ pub fn infer_local_struct_artifacts_from_prepared_ssa(
     diagnostics: &mut TypeWritebackDiagnostics,
 ) -> LocalStructArtifacts {
     let blocks = local_struct_inference_from_function_blocks(prepared.function().blocks().cloned());
-    infer_local_struct_artifacts_from_blocks(&blocks, arch_name, ptr_bits, diagnostics)
+    let memory_versions = LocalMemoryVersionFacts::from_prepared(prepared);
+    infer_local_struct_artifacts_from_blocks(
+        &blocks,
+        Some(&memory_versions),
+        arch_name,
+        ptr_bits,
+        diagnostics,
+    )
+}
+
+/// Infer layout from the normalized pattern artifact while binding render
+/// candidates to the distinct SSA artifact consumed by the decompiler.
+/// Layout evidence and executable op-site identity have separate owners; a
+/// candidate from one artifact must never be projected onto the other by
+/// block/op coordinates alone.
+pub fn infer_local_struct_artifacts_from_prepared_views(
+    layout: &SsaArtifact,
+    render: &SsaArtifact,
+    arch_name: Option<&str>,
+    ptr_bits: u32,
+    diagnostics: &mut TypeWritebackDiagnostics,
+) -> LocalStructArtifacts {
+    let mut artifacts =
+        infer_local_struct_artifacts_from_prepared_ssa(layout, arch_name, ptr_bits, diagnostics);
+    let mut render_diagnostics = TypeWritebackDiagnostics::default();
+    let render_artifacts = infer_local_struct_artifacts_from_prepared_ssa(
+        render,
+        arch_name,
+        ptr_bits,
+        &mut render_diagnostics,
+    );
+    artifacts.indexed_accesses = render_artifacts.indexed_accesses;
+    artifacts
 }
 
 fn infer_local_struct_artifacts_from_blocks(
     ssa_blocks: &[LocalStructInferenceBlock],
+    memory_versions: Option<&LocalMemoryVersionFacts>,
     arch_name: Option<&str>,
     ptr_bits: u32,
     diagnostics: &mut TypeWritebackDiagnostics,
@@ -5263,8 +5459,10 @@ fn infer_local_struct_artifacts_from_blocks(
     let mut addr_exprs: HashMap<SSAVar, LocalAddrExpr> = HashMap::new();
     let mut stack_addr_offsets: HashMap<SSAVar, i64> = HashMap::new();
     let mut stack_slot_values: HashMap<(u64, i64), LocalAddrExpr> = HashMap::new();
+    let mut memory_version_values = HashMap::<MemoryVersion, LocalAddrExpr>::new();
     let mut slot_field_evidence: LocalFieldEvidenceMap = HashMap::new();
     let mut slot_stride_evidence = HashMap::<usize, BTreeSet<u64>>::new();
+    let mut indexed_accesses = Vec::new();
     let offset_bound = 0x4000i64;
     let definitions = ssa_blocks
         .iter()
@@ -5303,7 +5501,7 @@ fn infer_local_struct_artifacts_from_blocks(
     loop {
         let mut changed = false;
         for block in ssa_blocks {
-            for op in &block.ops {
+            for (op_index, op) in block.ops.iter().enumerate() {
                 let addr_of = |var: &SSAVar, map: &HashMap<SSAVar, LocalAddrExpr>| {
                     if var.version == 0 {
                         let key = var.name.to_ascii_lowercase();
@@ -5576,21 +5774,49 @@ fn infer_local_struct_artifacts_from_blocks(
                             && let Some(mut expr) = addr_of(val, &addr_exprs)
                         {
                             expr.confidence = expr.confidence.saturating_sub(2);
-                            let key = (block.addr, offset);
-                            match stack_slot_values.get(&key).cloned() {
-                                Some(prev) if prev.confidence >= expr.confidence => {}
-                                _ => {
-                                    stack_slot_values.insert(key, expr);
-                                    changed = true;
+                            if let Some(versions) = memory_versions
+                                .and_then(|facts| facts.stores_by_site.get(&(block.addr, op_index)))
+                            {
+                                for version in versions {
+                                    match memory_version_values.get(version) {
+                                        Some(previous)
+                                            if previous.confidence >= expr.confidence => {}
+                                        _ => {
+                                            memory_version_values.insert(*version, expr.clone());
+                                            changed = true;
+                                        }
+                                    }
+                                }
+                            } else if memory_versions.is_none() {
+                                let key = (block.addr, offset);
+                                match stack_slot_values.get(&key) {
+                                    Some(previous) if previous.confidence >= expr.confidence => {}
+                                    _ => {
+                                        stack_slot_values.insert(key, expr);
+                                        changed = true;
+                                    }
                                 }
                             }
                         }
                     }
                     SSAOp::Load { dst, addr, .. } => {
-                        if let Some(offset) = stack_slot_of(addr, &stack_addr_offsets)
-                            && let Some(mut expr) =
+                        let exact_expr = memory_versions
+                            .and_then(|facts| facts.loads_by_site.get(&(block.addr, op_index)))
+                            .and_then(|versions| {
+                                let facts = memory_versions?;
+                                local_expr_for_memory_versions(
+                                    versions,
+                                    &memory_version_values,
+                                    &facts.phi_inputs,
+                                )
+                            });
+                        let fallback_expr = (memory_versions.is_none())
+                            .then(|| stack_slot_of(addr, &stack_addr_offsets))
+                            .flatten()
+                            .and_then(|offset| {
                                 stack_slot_values.get(&(block.addr, offset)).cloned()
-                        {
+                            });
+                        if let Some(mut expr) = exact_expr.or(fallback_expr) {
                             expr.confidence = expr.confidence.saturating_sub(3);
                             changed |= set_expr(dst, expr, &mut addr_exprs);
                         }
@@ -5605,7 +5831,7 @@ fn infer_local_struct_artifacts_from_blocks(
     }
 
     for block in ssa_blocks {
-        for op in &block.ops {
+        for (op_index, op) in block.ops.iter().enumerate() {
             let resolve_addr = |addr: &SSAVar| -> Option<LocalAddrExpr> {
                 if addr.version == 0 {
                     let key = addr.name.to_ascii_lowercase();
@@ -5635,6 +5861,21 @@ fn infer_local_struct_artifacts_from_blocks(
                             diagnostics,
                         ) {
                             continue;
+                        }
+                        if let Some(index) = &expr.index
+                            && let Ok(element_stride) = u64::try_from(index.scale)
+                        {
+                            indexed_accesses.push(ScalarArrayRenderCandidate {
+                                slot: expr.slot,
+                                block_addr: block.addr,
+                                op_index,
+                                is_write: false,
+                                field_offset: expr.offset as u64,
+                                element_stride,
+                                access_width: dst.size,
+                                index_value: memory_versions
+                                    .and_then(|facts| facts.value_ids.get(&index.root).copied()),
+                            });
                         }
                         let entry = slot_field_evidence
                             .entry(expr.slot)
@@ -5669,6 +5910,21 @@ fn infer_local_struct_artifacts_from_blocks(
                         ) {
                             continue;
                         }
+                        if let Some(index) = &expr.index
+                            && let Ok(element_stride) = u64::try_from(index.scale)
+                        {
+                            indexed_accesses.push(ScalarArrayRenderCandidate {
+                                slot: expr.slot,
+                                block_addr: block.addr,
+                                op_index,
+                                is_write: true,
+                                field_offset: expr.offset as u64,
+                                element_stride,
+                                access_width: val.size,
+                                index_value: memory_versions
+                                    .and_then(|facts| facts.value_ids.get(&index.root).copied()),
+                            });
+                        }
                         let entry = slot_field_evidence
                             .entry(expr.slot)
                             .or_default()
@@ -5691,6 +5947,9 @@ fn infer_local_struct_artifacts_from_blocks(
             }
         }
     }
+
+    indexed_accesses.sort();
+    indexed_accesses.dedup();
 
     let mut struct_decls = Vec::new();
     let mut slot_type_overrides = HashMap::new();
@@ -5841,6 +6100,7 @@ fn infer_local_struct_artifacts_from_blocks(
         slot_type_overrides,
         slot_field_profiles,
         slot_element_strides,
+        indexed_accesses,
     }
 }
 
@@ -6377,6 +6637,7 @@ fn scalar_array_access_certificates_from_ssa(
                                     field_offset: expr.field_offset,
                                     element_stride: expr.pointer.element_stride,
                                     access_width,
+                                    index_value: None,
                                 });
                         }
                     }
@@ -6426,6 +6687,7 @@ fn scalar_array_access_certificates_from_ssa(
                                     field_offset: expr.field_offset,
                                     element_stride: expr.pointer.element_stride,
                                     access_width,
+                                    index_value: None,
                                 });
                         }
                     }
@@ -15587,6 +15849,7 @@ mod tests {
                 ]),
             )]),
             slot_element_strides: HashMap::new(),
+            indexed_accesses: Vec::new(),
         };
         let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
             function_name: "sym.f",
@@ -15706,6 +15969,7 @@ mod tests {
                 ]),
             )]),
             slot_element_strides: HashMap::new(),
+            indexed_accesses: Vec::new(),
         };
         let ssa_blocks = [SSABlock {
             addr: 0x401000,
@@ -15799,6 +16063,7 @@ mod tests {
                 field_offset: 8,
                 element_stride: 56,
                 access_width: 4,
+                index_value: None,
             }],
             "scalar array proof must use the reconciled local layout, not stale parsed context"
         );
@@ -15860,6 +16125,7 @@ mod tests {
                 ]),
             )]),
             slot_element_strides: HashMap::new(),
+            indexed_accesses: Vec::new(),
         };
 
         let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
@@ -16003,6 +16269,7 @@ mod tests {
                 ]),
             )]),
             slot_element_strides: HashMap::new(),
+            indexed_accesses: Vec::new(),
         };
 
         let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
@@ -16168,6 +16435,7 @@ mod tests {
                 ]),
             )]),
             slot_element_strides: HashMap::new(),
+            indexed_accesses: Vec::new(),
         };
 
         let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
@@ -18226,6 +18494,7 @@ mod tests {
                 BTreeMap::from([(0u64, "int32_t".to_string()), (8u64, "int32_t".to_string())]),
             )]),
             slot_element_strides: HashMap::new(),
+            indexed_accesses: Vec::new(),
         };
 
         let analysis = build_type_writeback_analysis_with_role_identity(
@@ -18311,6 +18580,7 @@ mod tests {
                 ]),
             )]),
             slot_element_strides: HashMap::new(),
+            indexed_accesses: Vec::new(),
         };
 
         let analysis = build_type_writeback_analysis_with_role_identity(
@@ -18377,6 +18647,7 @@ mod tests {
                 BTreeMap::from([(0u64, "int32_t".to_string())]),
             )]),
             slot_element_strides: HashMap::new(),
+            indexed_accesses: Vec::new(),
         };
 
         let analysis = build_type_writeback_analysis_with_role_identity(
@@ -19116,6 +19387,7 @@ mod tests {
 
         let artifacts = infer_local_struct_artifacts_from_blocks(
             &blocks,
+            None,
             Some("aarch64"),
             64,
             &mut diagnostics,
@@ -19181,6 +19453,7 @@ mod tests {
 
         let artifacts = infer_local_struct_artifacts_from_blocks(
             &blocks,
+            None,
             Some("aarch64"),
             64,
             &mut diagnostics,
@@ -19498,6 +19771,166 @@ mod tests {
     }
 
     #[test]
+    fn local_struct_inference_uses_memory_ssa_for_spilled_element_pointer() {
+        let entry = 0x100000548;
+        let successor = 0x100000594;
+        let stack_pointer = SSAVar::new("SP", 1, 8);
+        let element = SSAVar::new("element", 1, 8);
+        let blocks = [
+            LocalStructInferenceBlock {
+                addr: entry,
+                phis: Vec::new(),
+                ops: vec![
+                    SSAOp::IntSub {
+                        dst: stack_pointer.clone(),
+                        a: SSAVar::new("SP", 0, 8),
+                        b: SSAVar::constant(0x20, 8),
+                    },
+                    SSAOp::IntSExt {
+                        dst: SSAVar::new("idx64", 1, 8),
+                        src: SSAVar::new("W1", 0, 4),
+                    },
+                    SSAOp::IntMult {
+                        dst: SSAVar::new("scaled", 1, 8),
+                        a: SSAVar::new("idx64", 1, 8),
+                        b: SSAVar::constant(0x28, 8),
+                    },
+                    SSAOp::IntAdd {
+                        dst: element.clone(),
+                        a: SSAVar::new("X0", 0, 8),
+                        b: SSAVar::new("scaled", 1, 8),
+                    },
+                    SSAOp::Store {
+                        space: "ram".to_string(),
+                        addr: stack_pointer.clone(),
+                        val: element,
+                    },
+                    SSAOp::Load {
+                        dst: SSAVar::new("element_reload", 1, 8),
+                        space: "ram".to_string(),
+                        addr: stack_pointer.clone(),
+                    },
+                    SSAOp::IntAdd {
+                        dst: SSAVar::new("score_addr", 1, 8),
+                        a: SSAVar::new("element_reload", 1, 8),
+                        b: SSAVar::constant(0x10, 8),
+                    },
+                    SSAOp::Load {
+                        dst: SSAVar::new("score", 1, 4),
+                        space: "ram".to_string(),
+                        addr: SSAVar::new("score_addr", 1, 8),
+                    },
+                    SSAOp::Store {
+                        space: "ram".to_string(),
+                        addr: SSAVar::new("score_addr", 1, 8),
+                        val: SSAVar::new("W2", 0, 4),
+                    },
+                    SSAOp::IntAdd {
+                        dst: SSAVar::new("flags_addr", 1, 8),
+                        a: SSAVar::new("element_reload", 1, 8),
+                        b: SSAVar::constant(4, 8),
+                    },
+                    SSAOp::Load {
+                        dst: SSAVar::new("flags", 1, 2),
+                        space: "ram".to_string(),
+                        addr: SSAVar::new("flags_addr", 1, 8),
+                    },
+                ],
+            },
+            LocalStructInferenceBlock {
+                addr: successor,
+                phis: Vec::new(),
+                ops: vec![
+                    SSAOp::Load {
+                        dst: SSAVar::new("element_reload", 2, 8),
+                        space: "ram".to_string(),
+                        addr: stack_pointer.clone(),
+                    },
+                    SSAOp::IntAdd {
+                        dst: SSAVar::new("scores0_addr", 1, 8),
+                        a: SSAVar::new("element_reload", 2, 8),
+                        b: SSAVar::constant(8, 8),
+                    },
+                    SSAOp::Load {
+                        dst: SSAVar::new("scores0", 1, 4),
+                        space: "ram".to_string(),
+                        addr: SSAVar::new("scores0_addr", 1, 8),
+                    },
+                    SSAOp::Load {
+                        dst: SSAVar::new("element_reload", 3, 8),
+                        space: "ram".to_string(),
+                        addr: stack_pointer.clone(),
+                    },
+                    SSAOp::IntAdd {
+                        dst: SSAVar::new("len_addr", 1, 8),
+                        a: SSAVar::new("element_reload", 3, 8),
+                        b: SSAVar::constant(6, 8),
+                    },
+                    SSAOp::Load {
+                        dst: SSAVar::new("len", 1, 2),
+                        space: "ram".to_string(),
+                        addr: SSAVar::new("len_addr", 1, 8),
+                    },
+                    SSAOp::Load {
+                        dst: SSAVar::new("element_reload", 4, 8),
+                        space: "ram".to_string(),
+                        addr: stack_pointer,
+                    },
+                    SSAOp::Load {
+                        dst: SSAVar::new("id", 1, 4),
+                        space: "ram".to_string(),
+                        addr: SSAVar::new("element_reload", 4, 8),
+                    },
+                ],
+            },
+        ];
+        let stack_version = MemoryVersion {
+            object: r2ssa::ObjectId(1),
+            version: 1,
+        };
+        let memory_versions = LocalMemoryVersionFacts {
+            stores_by_site: HashMap::from([((entry, 4), vec![stack_version])]),
+            loads_by_site: HashMap::from([
+                ((entry, 5), vec![stack_version]),
+                ((successor, 0), vec![stack_version]),
+                ((successor, 3), vec![stack_version]),
+                ((successor, 6), vec![stack_version]),
+            ]),
+            phi_inputs: HashMap::new(),
+            value_ids: HashMap::from([(SSAVar::new("W1", 0, 4), r2ssa::ValueId(1))]),
+        };
+        let mut diagnostics = TypeWritebackDiagnostics::default();
+
+        let artifacts = infer_local_struct_artifacts_from_blocks(
+            &blocks,
+            Some(&memory_versions),
+            Some("aarch64"),
+            64,
+            &mut diagnostics,
+        );
+
+        assert_eq!(
+            artifacts
+                .slot_field_profiles
+                .get(&0)
+                .expect("spilled Item profile")
+                .keys()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([0, 4, 6, 8, 0x10]),
+            "diagnostics={diagnostics:?}"
+        );
+        assert_eq!(artifacts.slot_element_strides.get(&0), Some(&40));
+        assert_eq!(artifacts.indexed_accesses.len(), 6);
+        assert!(
+            artifacts
+                .indexed_accesses
+                .iter()
+                .all(|candidate| candidate.index_value == Some(r2ssa::ValueId(1)))
+        );
+    }
+
+    #[test]
     fn typed_stack_pointer_index_access_certifies_scalar_array_index() {
         let mut parsed_context = ParsedExternalContext::default();
         let buf_slot = StackSlotKey {
@@ -19630,6 +20063,7 @@ mod tests {
                 field_offset: 0,
                 element_stride: 1,
                 access_width: 1,
+                index_value: None,
             }],
             "render candidates must preserve the concrete scalar store op identity"
         );
@@ -20094,6 +20528,7 @@ mod tests {
                 field_offset: 0,
                 element_stride: 4,
                 access_width: 4,
+                index_value: None,
             }],
             "render candidate must preserve the concrete load op identity"
         );
@@ -20280,6 +20715,7 @@ mod tests {
                     field_offset: 0x10,
                     element_stride: 40,
                     access_width: 4,
+                    index_value: None,
                 },
                 ScalarArrayRenderCandidate {
                     slot: 0,
@@ -20289,6 +20725,7 @@ mod tests {
                     field_offset: 4,
                     element_stride: 40,
                     access_width: 2,
+                    index_value: None,
                 },
                 ScalarArrayRenderCandidate {
                     slot: 0,
@@ -20298,6 +20735,7 @@ mod tests {
                     field_offset: 0,
                     element_stride: 40,
                     access_width: 4,
+                    index_value: None,
                 },
             ],
             "render candidates must stay in deterministic op-site order"
@@ -20451,6 +20889,7 @@ mod tests {
                 field_offset: 0x34,
                 element_stride: 56,
                 access_width: 4,
+                index_value: None,
             }],
             "render candidate must preserve the concrete field load op identity"
         );

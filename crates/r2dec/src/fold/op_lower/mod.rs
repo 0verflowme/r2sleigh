@@ -3759,6 +3759,15 @@ impl<'a> FoldingContext<'a> {
             return self.const_to_expr(var);
         }
 
+        if self.requires_certified_rendering()
+            && let Some(value) = self.prepared_value_id_for_var(var)
+            && self.certified_expr_depends_on_semantic_array(value, &mut BTreeSet::new())
+            && let Some(expr) =
+                self.certified_structural_expr_for_value(value, 0, &mut BTreeSet::new())
+        {
+            return expr;
+        }
+
         let fallback = CExpr::Var(self.var_name(var));
         if let Some(expr) = self.signed_divrem_expr_for_value(var) {
             return expr;
@@ -3855,6 +3864,47 @@ impl<'a> FoldingContext<'a> {
 
         // Otherwise return a variable reference
         fallback
+    }
+
+    fn certified_expr_depends_on_semantic_array(
+        &self,
+        value: r2ssa::ValueId,
+        visited: &mut BTreeSet<r2ssa::ValueId>,
+    ) -> bool {
+        if !visited.insert(value) {
+            return false;
+        }
+        let Some(render) = self.inputs.render_facts() else {
+            return false;
+        };
+        let has_exact_array_load = render
+            .memory_accesses()
+            .filter(|memory| !memory.is_write && memory.value == Some(value))
+            .any(|memory| {
+                render
+                    .array_accesses_by_op
+                    .get(&(memory.block_addr, memory.op_index, false))
+                    .into_iter()
+                    .flatten()
+                    .any(|array| {
+                        array.access == memory.access
+                            && array.object == memory.object
+                            && array.access_width == memory.width
+                            && array.base.is_some()
+                            && array.index.is_some()
+                    })
+            });
+        if has_exact_array_load {
+            return true;
+        }
+        render.certified_expr_for_value(value).is_some_and(|expr| {
+            expr.inputs.iter().any(|input| match input {
+                r2ssa::SemanticId::Expression(input) => {
+                    self.certified_expr_depends_on_semantic_array(*input, visited)
+                }
+                _ => false,
+            })
+        })
     }
 
     fn op_to_expr_impl(&self, op: &SSAOp) -> CExpr {

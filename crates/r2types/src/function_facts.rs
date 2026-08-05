@@ -1165,6 +1165,8 @@ pub struct ArrayAccessRenderFact {
     pub field_offset: u64,
     pub element_stride: u64,
     pub access_width: u32,
+    pub base: Option<r2ssa::SemanticId>,
+    pub index: Option<r2ssa::SemanticId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2142,6 +2144,25 @@ impl FunctionFacts {
                 if prepared_param_slot.is_some_and(|slot| slot != candidate.slot) {
                     continue;
                 }
+                let semantic_identity = candidate.index_value.and_then(|index| {
+                    let base = r2ssa::SemanticId::parameter(candidate.slot)?;
+                    (self
+                        .render
+                        .parameter_values(candidate.slot)
+                        .next()
+                        .is_some()
+                        && self
+                            .render
+                            .certified_expr_for_value(index)
+                            .is_some_and(|expr| expr.fact.renderable))
+                    .then_some((base, r2ssa::SemanticId::expression(index)))
+                });
+                if candidate.index_value.is_some() && semantic_identity.is_none() {
+                    continue;
+                }
+                let (base, index) = semantic_identity
+                    .map(|(base, index)| (Some(base), Some(index)))
+                    .unwrap_or((None, None));
                 let fact = ArrayAccessRenderFact {
                     access: memory.access,
                     block_addr: memory.block_addr,
@@ -2151,6 +2172,8 @@ impl FunctionFacts {
                     field_offset: candidate.field_offset,
                     element_stride: candidate.element_stride,
                     access_width: memory.width,
+                    base,
+                    index,
                 };
                 let facts = self.render.array_accesses_by_op.entry(key).or_default();
                 if !facts.contains(&fact) {
@@ -2170,6 +2193,8 @@ impl FunctionFacts {
                     fact.access_width,
                     fact.access,
                     fact.object,
+                    fact.base,
+                    fact.index,
                 )
             });
         }
@@ -5468,6 +5493,10 @@ mod tests {
         });
         let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
             .expect("prepared");
+        let index_value = prepared
+            .memory_certificate_for_op_site(0x401000, 0, false)
+            .expect("array load certificate")
+            .address;
         let type_facts = FunctionTypeFacts {
             array_index_certificates: vec![crate::facts::ArrayIndexCertificate {
                 slot: 0,
@@ -5489,12 +5518,14 @@ mod tests {
                 field_offset: 4,
                 element_stride: 16,
                 access_width: 4,
+                index_value: Some(index_value),
             }],
             ..FunctionTypeFacts::default()
         };
         let mut facts = FunctionFacts::new(type_facts, None);
 
         facts.attach_prepared_decompile_evidence(&prepared);
+        facts.populate_certified_parameter_exprs(&prepared, &x86_stack_home_param_slots());
         facts.populate_member_access_render_facts_from_field_certificates(
             &prepared,
             &x86_stack_home_param_slots(),
@@ -5516,6 +5547,14 @@ mod tests {
                 .array_access_for_op(0x401000, 0, false, 4, 16, Some(4))
                 .is_some(),
             "scalar array candidate must still authorize array rendering"
+        );
+        let array = render
+            .array_access_for_op(0x401000, 0, false, 4, 16, Some(4))
+            .expect("stable array render fact");
+        assert_eq!(array.base, Some(r2ssa::SemanticId::Parameter(0)));
+        assert_eq!(
+            array.index,
+            Some(r2ssa::SemanticId::expression(index_value))
         );
     }
 
@@ -5550,6 +5589,7 @@ mod tests {
                 field_offset: 4,
                 element_stride: 16,
                 access_width: 4,
+                index_value: None,
             }],
             ..FunctionTypeFacts::default()
         };
@@ -5774,6 +5814,8 @@ mod tests {
                     field_offset: 0,
                     element_stride: 8,
                     access_width: 8,
+                    base: None,
+                    index: None,
                 }],
             )]),
         };
@@ -5917,6 +5959,8 @@ mod tests {
                     field_offset: 0,
                     element_stride: 4,
                     access_width: 4,
+                    base: None,
+                    index: None,
                 }],
             )]),
             ..FunctionRenderFacts::default()

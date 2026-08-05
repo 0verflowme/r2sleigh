@@ -9543,6 +9543,133 @@ mod tests {
         );
     }
 
+    #[test]
+    fn certified_structuring_inlines_adjacent_single_use_carrier() {
+        let ctx = FoldingContext::new(64);
+        let value = CExpr::binary(
+            BinaryOp::Sub,
+            CExpr::Member {
+                base: Box::new(CExpr::var("items")),
+                member: "score".to_string(),
+            },
+            CExpr::Member {
+                base: Box::new(CExpr::var("items")),
+                member: "len".to_string(),
+            },
+        );
+        let stmt = CStmt::Block(vec![
+            CStmt::Expr(CExpr::assign(
+                CExpr::Var("t3e580_1".to_string()),
+                value.clone(),
+            )),
+            CStmt::Expr(CExpr::assign(
+                CExpr::Var("result".to_string()),
+                CExpr::Var("t3e580_1".to_string()),
+            )),
+        ]);
+
+        let rewritten = ctx.inline_proved_single_use_carriers_in_stmt(stmt);
+
+        assert_eq!(
+            rewritten,
+            CStmt::Block(vec![CStmt::Expr(CExpr::assign(
+                CExpr::Var("result".to_string()),
+                value,
+            ))]),
+            "adjacent carrier substitution must preserve the certified expression exactly"
+        );
+    }
+
+    #[test]
+    fn certified_structuring_preserves_carrier_with_multiple_reads() {
+        let ctx = FoldingContext::new(64);
+        let assignment = CStmt::Expr(CExpr::assign(
+            CExpr::Var("t3e580_1".to_string()),
+            CExpr::Var("source".to_string()),
+        ));
+        let first_use = CStmt::Expr(CExpr::assign(
+            CExpr::Var("first".to_string()),
+            CExpr::Var("t3e580_1".to_string()),
+        ));
+        let second_use = CStmt::Return(Some(CExpr::Var("t3e580_1".to_string())));
+        let stmt = CStmt::Block(vec![
+            assignment.clone(),
+            first_use.clone(),
+            second_use.clone(),
+        ]);
+
+        let rewritten = ctx.inline_proved_single_use_carriers_in_stmt(stmt);
+
+        assert_eq!(
+            rewritten,
+            CStmt::Block(vec![assignment, first_use, second_use]),
+            "a carrier with any later read must keep its defining assignment"
+        );
+    }
+
+    #[test]
+    fn certified_structuring_prunes_only_globally_unread_stack_carriers() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(1, 8),
+            a: Varnode::register(0x20, 8),
+            b: Varnode::constant(0xffff_ffff_ffff_ffe0, 8),
+        });
+        entry.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::unique(1, 8),
+            val: Varnode::register(0x10, 8),
+        });
+        entry.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(2, 8),
+            a: Varnode::register(0x20, 8),
+            b: Varnode::constant(0xffff_ffff_ffff_fff0, 8),
+        });
+        entry.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::unique(2, 8),
+            val: Varnode::constant(0, 4),
+        });
+        entry.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch);
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        let live_assignment = CStmt::Expr(CExpr::assign(
+            CExpr::Var("var_10h".to_string()),
+            CExpr::binary(
+                BinaryOp::Add,
+                CExpr::Var("var_10h".to_string()),
+                CExpr::IntLit(1),
+            ),
+        ));
+        let stmt = CStmt::Block(vec![
+            CStmt::Expr(CExpr::assign(
+                CExpr::Var("var_20h".to_string()),
+                CExpr::binary(
+                    BinaryOp::Add,
+                    CExpr::Var("arg0".to_string()),
+                    CExpr::IntLit(40),
+                ),
+            )),
+            live_assignment.clone(),
+            CStmt::Return(Some(CExpr::Var("var_10h".to_string()))),
+        ]);
+
+        let rewritten = ctx.prune_unread_stack_carriers_in_stmt(stmt);
+
+        assert_eq!(
+            rewritten,
+            CStmt::Block(vec![
+                live_assignment,
+                CStmt::Return(Some(CExpr::Var("var_10h".to_string()))),
+            ]),
+            "global read evidence must protect live stack state while an unread spill is removed"
+        );
+    }
+
 	#[test]
 	fn prune_before_structuring_keeps_stack_state_written_for_later_blocks() {
 		let mut ctx = FoldingContext::new(64);
