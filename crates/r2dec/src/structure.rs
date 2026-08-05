@@ -123,6 +123,20 @@ impl ControlRenderProof {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlTransferRenderProofKind {
+    Break,
+    Continue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlTransferRenderProof {
+    pub kind: ControlTransferRenderProofKind,
+    pub loop_header: u64,
+    pub source: u64,
+    pub target: u64,
+}
+
 /// Control flow structurer.
 ///
 /// Converts a region tree into structured C statements.
@@ -144,6 +158,8 @@ pub struct ControlFlowStructurer<'a, 'o> {
     safety_reason: Option<String>,
     /// Structured control nodes emitted by this structurer, in render order.
     control_render_proofs: Vec<ControlRenderProof>,
+    /// Exact loop-transfer nodes emitted by this structurer, in render order.
+    control_transfer_render_proofs: Vec<ControlTransferRenderProof>,
     /// Merge blocks owned by enclosing regions and therefore emitted there.
     deferred_merge_blocks: Vec<u64>,
     /// Lexical control context currently being emitted.
@@ -341,6 +357,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             safety_budget_max,
             safety_reason: None,
             control_render_proofs: Vec::new(),
+            control_transfer_render_proofs: Vec::new(),
             deferred_merge_blocks: Vec::new(),
             active_control_guards: Vec::new(),
             active_loops: Vec::new(),
@@ -362,6 +379,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             safety_budget_max,
             safety_reason: None,
             control_render_proofs: Vec::new(),
+            control_transfer_render_proofs: Vec::new(),
             deferred_merge_blocks: Vec::new(),
             active_control_guards: Vec::new(),
             active_loops: Vec::new(),
@@ -412,6 +430,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     pub fn control_render_proofs(&self) -> &[ControlRenderProof] {
         &self.control_render_proofs
+    }
+
+    pub fn control_transfer_render_proofs(&self) -> &[ControlTransferRenderProof] {
+        &self.control_transfer_render_proofs
     }
 
     fn record_branch_render_proof(
@@ -625,6 +647,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     pub(crate) fn structure_preserving_render_proof_identity(&mut self) -> CStmt {
         self.reset_safety_budget();
         self.control_render_proofs.clear();
+        self.control_transfer_render_proofs.clear();
         self.active_control_guards.clear();
         self.active_loops.clear();
         self.rendered_block_domains.clear();
@@ -908,10 +931,40 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             }
             Region::Transfer {
                 loop_header,
-                source: _,
+                source,
                 target,
                 kind,
-            } if *kind == RegionTransferKind::Continue && target == loop_header => CStmt::Continue,
+            } if *kind == RegionTransferKind::Continue && target == loop_header => {
+                self.control_transfer_render_proofs
+                    .push(ControlTransferRenderProof {
+                        kind: ControlTransferRenderProofKind::Continue,
+                        loop_header: *loop_header,
+                        source: *source,
+                        target: *target,
+                    });
+                CStmt::Continue
+            }
+            Region::Transfer {
+                loop_header,
+                source,
+                target,
+                kind,
+            } if *kind == RegionTransferKind::Exit
+                && self
+                    .region_analyzer
+                    .as_ref()
+                    .and_then(|analyzer| analyzer.get_loop_fallthrough(*loop_header))
+                    == Some(*target) =>
+            {
+                self.control_transfer_render_proofs
+                    .push(ControlTransferRenderProof {
+                        kind: ControlTransferRenderProofKind::Break,
+                        loop_header: *loop_header,
+                        source: *source,
+                        target: *target,
+                    });
+                CStmt::Break
+            }
             Region::Transfer {
                 loop_header,
                 source,

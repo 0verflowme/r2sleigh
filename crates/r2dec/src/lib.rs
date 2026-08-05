@@ -52,7 +52,10 @@ pub use codegen::CodeGenConfig;
 pub use fold::lower_ssa_ops_to_stmts;
 pub use highlight::highlight_c_ansi;
 pub use region::{Region, RegionAnalyzer};
-pub use structure::{ControlFlowStructurer, ControlRenderProof, ControlRenderProofKind};
+pub use structure::{
+    ControlFlowStructurer, ControlRenderProof, ControlRenderProofKind, ControlTransferRenderProof,
+    ControlTransferRenderProofKind,
+};
 pub use variable::VariableRecovery;
 
 use crate::codegen::CodeGenerator;
@@ -1361,12 +1364,31 @@ fn certifying_render_residual_reason(
     certifying_render_residual_reason_with_proofs(prepared, control_facts, cfg_summary, func, None)
 }
 
+#[cfg(test)]
 fn certifying_render_residual_reason_with_proofs(
     prepared: Option<&r2ssa::SsaArtifact>,
     control_facts: Option<&r2types::FunctionControlFacts>,
     cfg_summary: &r2ssa::CFGRiskSummary,
     func: &CFunction,
     render_proofs: Option<&[ControlRenderProof]>,
+) -> Option<String> {
+    certifying_render_residual_reason_with_transfer_proofs(
+        prepared,
+        control_facts,
+        cfg_summary,
+        func,
+        render_proofs,
+        None,
+    )
+}
+
+fn certifying_render_residual_reason_with_transfer_proofs(
+    prepared: Option<&r2ssa::SsaArtifact>,
+    control_facts: Option<&r2types::FunctionControlFacts>,
+    cfg_summary: &r2ssa::CFGRiskSummary,
+    func: &CFunction,
+    render_proofs: Option<&[ControlRenderProof]>,
+    transfer_proofs: Option<&[ControlTransferRenderProof]>,
 ) -> Option<String> {
     let (rendered, render_proof_failures) =
         function_control_render_nodes_with_proofs(func, render_proofs);
@@ -1384,7 +1406,11 @@ fn certifying_render_residual_reason_with_proofs(
         reasons.push(reason);
     }
     if render_proofs.is_some()
-        && let Some(reason) = certified_control_transfer_residual_reason(func)
+        && let Some(reason) = certified_control_transfer_residual_reason(
+            func,
+            control_facts,
+            transfer_proofs.unwrap_or_default(),
+        )
     {
         reasons.push(reason);
     }
@@ -1396,10 +1422,46 @@ fn certifying_render_residual_reason_with_proofs(
     }
 }
 
-fn certified_control_transfer_residual_reason(func: &CFunction) -> Option<String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenderedControlTransferKind {
+    Break,
+    Continue,
+    Goto,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RenderedControlTransfer {
+    id: RenderNodeId,
+    kind: RenderedControlTransferKind,
+    label: Option<String>,
+}
+
+fn certified_control_transfer_residual_reason(
+    func: &CFunction,
+    control_facts: Option<&r2types::FunctionControlFacts>,
+    proofs: &[ControlTransferRenderProof],
+) -> Option<String> {
+    let mut rendered = Vec::new();
+    for (index, stmt) in func.body.iter().enumerate() {
+        collect_rendered_control_transfers(stmt, RenderNodeId::root_child(index), &mut rendered);
+    }
+    for (index, transfer) in rendered.iter().enumerate() {
+        let Some(proof) = proofs.get(index) else {
+            return Some(unproved_control_transfer_reason(transfer));
+        };
+        if let Some(reason) = validate_control_transfer_proof(transfer, proof, control_facts) {
+            return Some(reason);
+        }
+    }
+    if let Some(proof) = proofs.get(rendered.len()) {
+        return Some(format!(
+            "control transfer proof {:?} for 0x{:x} -> 0x{:x} was not rendered",
+            proof.kind, proof.source, proof.target
+        ));
+    }
     for (index, stmt) in func.body.iter().enumerate() {
         if let Some(reason) =
-            certified_control_transfer_stmt_residual_reason(stmt, RenderNodeId::root_child(index))
+            certified_switch_fallthrough_residual_reason(stmt, RenderNodeId::root_child(index))
         {
             return Some(reason);
         }
@@ -1407,46 +1469,194 @@ fn certified_control_transfer_residual_reason(func: &CFunction) -> Option<String
     None
 }
 
-fn certified_control_transfer_stmt_residual_reason(
+fn collect_rendered_control_transfers(
     stmt: &CStmt,
     id: RenderNodeId,
-) -> Option<String> {
+    out: &mut Vec<RenderedControlTransfer>,
+) {
     match stmt {
-        CStmt::Break => Some(format!(
-            "unproved control transfer break at {id}; exact case/loop exit facts required"
-        )),
-        CStmt::Continue => Some(format!(
-            "unproved control transfer continue at {id}; exact loop iteration facts required"
-        )),
-        CStmt::Goto(label) => Some(format!(
-            "unproved control transfer goto {label} at {id}; exact irreducible-edge facts required"
-        )),
-        CStmt::Block(stmts) => certified_control_transfer_stmts_residual_reason(stmts, id),
+        CStmt::Break => out.push(RenderedControlTransfer {
+            id,
+            kind: RenderedControlTransferKind::Break,
+            label: None,
+        }),
+        CStmt::Continue => out.push(RenderedControlTransfer {
+            id,
+            kind: RenderedControlTransferKind::Continue,
+            label: None,
+        }),
+        CStmt::Goto(label) => out.push(RenderedControlTransfer {
+            id,
+            kind: RenderedControlTransferKind::Goto,
+            label: Some(label.clone()),
+        }),
+        CStmt::Block(stmts) => collect_rendered_control_transfer_stmts(stmts, id, out),
         CStmt::If {
             then_body,
             else_body,
             ..
         } => {
-            certified_control_transfer_stmt_residual_reason(then_body, id.child(0)).or_else(|| {
-                else_body.as_deref().and_then(|stmt| {
-                    certified_control_transfer_stmt_residual_reason(stmt, id.child(1))
-                })
-            })
+            collect_rendered_control_transfers(then_body, id.child(0), out);
+            if let Some(else_body) = else_body {
+                collect_rendered_control_transfers(else_body, id.child(1), out);
+            }
         }
         CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
-            certified_control_transfer_stmt_residual_reason(body, id.child(0))
+            collect_rendered_control_transfers(body, id.child(0), out);
         }
-        CStmt::For { init, body, .. } => init
-            .as_deref()
-            .and_then(|stmt| certified_control_transfer_stmt_residual_reason(stmt, id.child(0)))
-            .or_else(|| certified_control_transfer_stmt_residual_reason(body, id.child(1))),
+        CStmt::For { init, body, .. } => {
+            if let Some(init) = init {
+                collect_rendered_control_transfers(init, id.child(0), out);
+            }
+            collect_rendered_control_transfers(body, id.child(1), out);
+        }
         CStmt::Switch { cases, default, .. } => {
             for (case_index, case) in cases.iter().enumerate() {
                 let case_id = id.child(case_index);
+                collect_rendered_control_transfer_stmts(&case.body, case_id, out);
+            }
+            if let Some(default_body) = default {
+                let default_id = id.child(cases.len());
+                collect_rendered_control_transfer_stmts(default_body, default_id, out);
+            }
+        }
+        CStmt::Expr(_)
+        | CStmt::Decl { .. }
+        | CStmt::Return(_)
+        | CStmt::Empty
+        | CStmt::Label(_)
+        | CStmt::Comment(_) => {}
+    }
+}
+
+fn collect_rendered_control_transfer_stmts(
+    stmts: &[CStmt],
+    id: RenderNodeId,
+    out: &mut Vec<RenderedControlTransfer>,
+) {
+    for (index, stmt) in stmts.iter().enumerate() {
+        collect_rendered_control_transfers(stmt, id.child(index), out);
+    }
+}
+
+fn unproved_control_transfer_reason(transfer: &RenderedControlTransfer) -> String {
+    match transfer.kind {
+        RenderedControlTransferKind::Break => format!(
+            "unproved control transfer break at {}; exact case/loop exit facts required",
+            transfer.id
+        ),
+        RenderedControlTransferKind::Continue => format!(
+            "unproved control transfer continue at {}; exact loop iteration facts required",
+            transfer.id
+        ),
+        RenderedControlTransferKind::Goto => format!(
+            "unproved control transfer goto {} at {}; exact irreducible-edge facts required",
+            transfer.label.as_deref().unwrap_or("<unknown>"),
+            transfer.id
+        ),
+    }
+}
+
+fn validate_control_transfer_proof(
+    transfer: &RenderedControlTransfer,
+    proof: &ControlTransferRenderProof,
+    control_facts: Option<&r2types::FunctionControlFacts>,
+) -> Option<String> {
+    let expected = match transfer.kind {
+        RenderedControlTransferKind::Break => ControlTransferRenderProofKind::Break,
+        RenderedControlTransferKind::Continue => ControlTransferRenderProofKind::Continue,
+        RenderedControlTransferKind::Goto => {
+            return Some(unproved_control_transfer_reason(transfer));
+        }
+    };
+    if proof.kind != expected {
+        return Some(format!(
+            "control transfer at {} has {:?} proof for rendered {:?}",
+            transfer.id, proof.kind, transfer.kind
+        ));
+    }
+    let Some(control_facts) = control_facts else {
+        return Some(format!(
+            "control transfer at {} lacks FunctionControlFacts",
+            transfer.id
+        ));
+    };
+    let Some(loop_fact) = control_facts
+        .loops
+        .values()
+        .find(|fact| fact.header == proof.loop_header)
+    else {
+        return Some(format!(
+            "control transfer at {} has no loop certificate for 0x{:x}",
+            transfer.id, proof.loop_header
+        ));
+    };
+    let Some(branch) = control_facts.branch_for_block(proof.source) else {
+        return Some(format!(
+            "control transfer at {} has no certified branch at 0x{:x}",
+            transfer.id, proof.source
+        ));
+    };
+    if branch.true_target != proof.target && branch.false_target != proof.target {
+        return Some(format!(
+            "control transfer at {} target 0x{:x} is not a certified edge from 0x{:x}",
+            transfer.id, proof.target, proof.source
+        ));
+    }
+    let valid_loop_edge = match proof.kind {
+        ControlTransferRenderProofKind::Break => {
+            loop_fact.body.contains(&proof.source) && loop_fact.exits.contains(&proof.target)
+        }
+        ControlTransferRenderProofKind::Continue => {
+            proof.target == loop_fact.header && loop_fact.latches.contains(&proof.source)
+        }
+    };
+    (!valid_loop_edge).then(|| {
+        format!(
+            "control transfer at {} edge 0x{:x} -> 0x{:x} disagrees with loop certificate {}",
+            transfer.id, proof.source, proof.target, loop_fact.proof_node
+        )
+    })
+}
+
+fn certified_switch_fallthrough_residual_reason(stmt: &CStmt, id: RenderNodeId) -> Option<String> {
+    match stmt {
+        CStmt::Block(stmts) => {
+            for (index, stmt) in stmts.iter().enumerate() {
                 if let Some(reason) =
-                    certified_control_transfer_stmts_residual_reason(&case.body, case_id.clone())
+                    certified_switch_fallthrough_residual_reason(stmt, id.child(index))
                 {
                     return Some(reason);
+                }
+            }
+            None
+        }
+        CStmt::If {
+            then_body,
+            else_body,
+            ..
+        } => certified_switch_fallthrough_residual_reason(then_body, id.child(0)).or_else(|| {
+            else_body
+                .as_deref()
+                .and_then(|stmt| certified_switch_fallthrough_residual_reason(stmt, id.child(1)))
+        }),
+        CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
+            certified_switch_fallthrough_residual_reason(body, id.child(0))
+        }
+        CStmt::For { init, body, .. } => init
+            .as_deref()
+            .and_then(|stmt| certified_switch_fallthrough_residual_reason(stmt, id.child(0)))
+            .or_else(|| certified_switch_fallthrough_residual_reason(body, id.child(1))),
+        CStmt::Switch { cases, default, .. } => {
+            for (case_index, case) in cases.iter().enumerate() {
+                let case_id = id.child(case_index);
+                for (stmt_index, stmt) in case.body.iter().enumerate() {
+                    if let Some(reason) = certified_switch_fallthrough_residual_reason(
+                        stmt,
+                        case_id.child(stmt_index),
+                    ) {
+                        return Some(reason);
+                    }
                 }
                 if !certified_stmt_list_is_terminal(&case.body) {
                     return Some(format!(
@@ -1456,11 +1666,13 @@ fn certified_control_transfer_stmt_residual_reason(
             }
             if let Some(default_body) = default {
                 let default_id = id.child(cases.len());
-                if let Some(reason) = certified_control_transfer_stmts_residual_reason(
-                    default_body,
-                    default_id.clone(),
-                ) {
-                    return Some(reason);
+                for (stmt_index, stmt) in default_body.iter().enumerate() {
+                    if let Some(reason) = certified_switch_fallthrough_residual_reason(
+                        stmt,
+                        default_id.child(stmt_index),
+                    ) {
+                        return Some(reason);
+                    }
                 }
                 if !certified_stmt_list_is_terminal(default_body) {
                     return Some(format!(
@@ -1473,23 +1685,13 @@ fn certified_control_transfer_stmt_residual_reason(
         CStmt::Expr(_)
         | CStmt::Decl { .. }
         | CStmt::Return(_)
+        | CStmt::Break
+        | CStmt::Continue
+        | CStmt::Goto(_)
         | CStmt::Empty
         | CStmt::Label(_)
         | CStmt::Comment(_) => None,
     }
-}
-
-fn certified_control_transfer_stmts_residual_reason(
-    stmts: &[CStmt],
-    id: RenderNodeId,
-) -> Option<String> {
-    for (index, stmt) in stmts.iter().enumerate() {
-        if let Some(reason) = certified_control_transfer_stmt_residual_reason(stmt, id.child(index))
-        {
-            return Some(reason);
-        }
-    }
-    None
 }
 
 fn certified_stmt_list_is_terminal(stmts: &[CStmt]) -> bool {
@@ -5813,6 +6015,11 @@ impl Decompiler {
         } else {
             Vec::new()
         };
+        let mut control_transfer_render_proofs = if certified_standard_mode {
+            structurer.control_transfer_render_proofs().to_vec()
+        } else {
+            Vec::new()
+        };
         let mut effect_render_proofs = if certified_standard_mode {
             fold_ctx.effect_render_proofs()
         } else {
@@ -5838,6 +6045,7 @@ impl Decompiler {
             is_linear_fallback = empty_fallback.is_linear_fallback;
             body_stmt = empty_fallback.body_stmt;
             control_render_proofs.clear();
+            control_transfer_render_proofs.clear();
             effect_render_proofs.clear();
         }
 
@@ -6207,12 +6415,14 @@ impl Decompiler {
                         })?
                     })
                     .or_else(|| {
-                        certifying_render_residual_reason_with_proofs(
+                        certifying_render_residual_reason_with_transfer_proofs(
                             Some(prepared),
                             self.context.function_facts.control(),
                             &func.cfg_risk_summary(),
                             &c_function,
                             certified_standard_mode.then_some(control_render_proofs.as_slice()),
+                            certified_standard_mode
+                                .then_some(control_transfer_render_proofs.as_slice()),
                         )
                     })
                     .or_else(|| {
@@ -8799,6 +9009,130 @@ mod tests {
 
             assert!(reason.contains(expected), "{reason}");
         }
+    }
+
+    #[test]
+    fn standard_structured_output_accepts_exact_loop_transfer_edges() {
+        let prepared = prepared_from_ops(Vec::new(), &test_arch_for_decompile());
+        let loop_header = 0x401000;
+        let break_source = 0x401010;
+        let continue_source = 0x401018;
+        let exit = 0x401020;
+        let func =
+            CFunction::new("certified_transfers", CType::u64()).with_body(vec![CStmt::while_loop(
+                CExpr::var("loop_cond"),
+                CStmt::Block(vec![
+                    CStmt::if_stmt(CExpr::var("exit_cond"), CStmt::Break, None),
+                    CStmt::if_stmt(CExpr::var("next_cond"), CStmt::Continue, None),
+                ]),
+            )]);
+        let branch_fact =
+            |id, block_addr, true_target, false_target| r2types::BranchPredicateFact {
+                id,
+                block_addr,
+                condition: r2ssa::ValueId(id.0 + 20),
+                comparison: None,
+                evaluated_comparison: None,
+                render_comparison: None,
+                true_target,
+                false_target,
+            };
+        let control = r2types::FunctionControlFacts {
+            branch_predicates: BTreeMap::from([
+                (
+                    break_source,
+                    branch_fact(r2ssa::PredicateId(2), break_source, exit, continue_source),
+                ),
+                (
+                    continue_source,
+                    branch_fact(r2ssa::PredicateId(3), continue_source, loop_header, exit),
+                ),
+            ]),
+            loops: BTreeMap::from([(
+                r2ssa::LoopId(1),
+                r2types::LoopStructureFact {
+                    loop_id: r2ssa::LoopId(1),
+                    proof_node: r2ssa::ProofNodeId::loop_certificate(loop_header, r2ssa::LoopId(1))
+                        .to_string(),
+                    header: loop_header,
+                    condition: Some(r2ssa::PredicateId(1)),
+                    condition_value: Some(r2ssa::ValueId(21)),
+                    body: vec![loop_header, break_source, continue_source],
+                    latches: vec![continue_source],
+                    exits: vec![exit],
+                },
+            )]),
+            ..r2types::FunctionControlFacts::default()
+        };
+        let control_proofs = [
+            ControlRenderProof {
+                kind: ControlRenderProofKind::Loop,
+                anchor: loop_header,
+                branch_condition: None,
+                branch_condition_value: None,
+                loop_condition: Some(r2ssa::PredicateId(1)),
+                loop_condition_value: Some(r2ssa::ValueId(21)),
+                loop_body_blocks: vec![loop_header, break_source, continue_source],
+                loop_latches: vec![continue_source],
+                loop_exits: vec![exit],
+                switch_selector: None,
+                switch_cases: Vec::new(),
+                switch_default: None,
+            },
+            ControlRenderProof {
+                kind: ControlRenderProofKind::Branch,
+                anchor: break_source,
+                branch_condition: Some(r2ssa::PredicateId(2)),
+                branch_condition_value: Some(r2ssa::ValueId(22)),
+                loop_condition: None,
+                loop_condition_value: None,
+                loop_body_blocks: Vec::new(),
+                loop_latches: Vec::new(),
+                loop_exits: Vec::new(),
+                switch_selector: None,
+                switch_cases: Vec::new(),
+                switch_default: None,
+            },
+            ControlRenderProof {
+                kind: ControlRenderProofKind::Branch,
+                anchor: continue_source,
+                branch_condition: Some(r2ssa::PredicateId(3)),
+                branch_condition_value: Some(r2ssa::ValueId(23)),
+                loop_condition: None,
+                loop_condition_value: None,
+                loop_body_blocks: Vec::new(),
+                loop_latches: Vec::new(),
+                loop_exits: Vec::new(),
+                switch_selector: None,
+                switch_cases: Vec::new(),
+                switch_default: None,
+            },
+        ];
+        let transfer_proofs = [
+            ControlTransferRenderProof {
+                kind: ControlTransferRenderProofKind::Break,
+                loop_header,
+                source: break_source,
+                target: exit,
+            },
+            ControlTransferRenderProof {
+                kind: ControlTransferRenderProofKind::Continue,
+                loop_header,
+                source: continue_source,
+                target: loop_header,
+            },
+        ];
+
+        let reason = certifying_render_residual_reason_with_transfer_proofs(
+            Some(&prepared),
+            Some(&control),
+            &loop_cfg_summary(),
+            &func,
+            Some(&control_proofs),
+            Some(&transfer_proofs),
+        );
+
+        assert_eq!(reason, None);
     }
 
     #[test]

@@ -871,6 +871,30 @@ impl<'a> RegionAnalyzer<'a> {
         self.loops.get(&header)
     }
 
+    /// Canonical continuation reached when a structured natural loop finishes
+    /// normally. Other outside edges remain exact `Region::Transfer` nodes.
+    pub fn get_loop_fallthrough(&self, header: u64) -> Option<u64> {
+        let body = self.loops.get(&header)?;
+        if self.pretest_loop_body_entry(header, body).is_some() {
+            return self.unique_outside_successor(header, body);
+        }
+        if let Some((guard, _)) = self.find_precheck_guard(header, body) {
+            return self.unique_outside_successor(guard, body);
+        }
+        let latch = self.unique_loop_latch_condition_block(header, body)?;
+        self.unique_outside_successor(latch, body)
+    }
+
+    fn unique_outside_successor(&self, source: u64, body: &HashSet<u64>) -> Option<u64> {
+        let mut targets = self
+            .func
+            .successors(source)
+            .into_iter()
+            .filter(|target| !body.contains(target));
+        let target = targets.next()?;
+        targets.next().is_none().then_some(target)
+    }
+
     /// Detect a switch statement pattern.
     /// Returns a Switch region if the entry block dispatches to multiple targets.
     fn detect_switch(&mut self, entry: u64, targets: &[u64]) -> Option<Region> {
@@ -1972,7 +1996,7 @@ impl WorkingGraph {
         internal_nodes.extend(absorbed_terminal_exit_nodes);
 
         let mut external_preds = HashSet::new();
-        let mut external_succs = HashSet::new();
+        let mut all_external_succs = HashSet::new();
 
         for node in &internal_nodes {
             if let Some(preds) = self.preds.get(node) {
@@ -1985,7 +2009,7 @@ impl WorkingGraph {
             if let Some(succs) = self.succs.get(node) {
                 for succ in succs {
                     if !internal_nodes.contains(succ) {
-                        external_succs.insert(*succ);
+                        all_external_succs.insert(*succ);
                     }
                 }
             }
@@ -2004,6 +2028,12 @@ impl WorkingGraph {
             }
         }
         let mut outgoing_edge_labels = Vec::new();
+        let canonical_fallthrough = analyzer
+            .get_loop_fallthrough(header)
+            .and_then(|target| self.node_for_block(target))
+            .filter(|target| all_external_succs.contains(target));
+        let external_succs = canonical_fallthrough.into_iter().collect::<HashSet<_>>();
+
         for succ in &external_succs {
             let labels = internal_nodes
                 .iter()
@@ -2055,10 +2085,12 @@ impl WorkingGraph {
                 succs.insert(new_id);
             }
         }
-        for succ in &external_succs {
+        for succ in &all_external_succs {
             if let Some(preds) = self.preds.get_mut(succ) {
                 preds.retain(|id| !internal_nodes.contains(id));
-                preds.insert(new_id);
+                if external_succs.contains(succ) {
+                    preds.insert(new_id);
+                }
             }
         }
 
@@ -2258,7 +2290,9 @@ impl WorkingGraph {
             for source in analyzer.back_edges.get(&loop_header).into_iter().flatten() {
                 if let Some(source_node) = sub.node_for_block(*source) {
                     sub.remove_edge(source_node, header_node);
-                    if Some(*source) != owned_latch_condition {
+                    if Some(*source) != owned_latch_condition
+                        && !Self::is_unconditional_edge(analyzer, *source, loop_header)
+                    {
                         let transfer = sub.add_region_node(
                             loop_header,
                             Region::Transfer {
@@ -2296,6 +2330,11 @@ impl WorkingGraph {
                 } else {
                     RegionTransferKind::Exit
                 };
+                if kind == RegionTransferKind::Continue
+                    && Self::is_unconditional_edge(analyzer, source, target)
+                {
+                    continue;
+                }
                 let transfer = sub.add_region_node(
                     target,
                     Region::Transfer {
@@ -2361,6 +2400,10 @@ impl WorkingGraph {
             1 => regions.remove(0),
             _ => Region::Sequence(regions),
         }
+    }
+
+    fn is_unconditional_edge(analyzer: &RegionAnalyzer<'_>, source: u64, target: u64) -> bool {
+        analyzer.func.successors(source).as_slice() == [target]
     }
 
     /// Create a subgraph containing only the specified node IDs.
@@ -2939,38 +2982,34 @@ mod tests {
         }
     }
 
-    fn region_contains_multi_exit(
-        region: &Region,
-        expected_entry: u64,
-        expected_exits: &[u64],
-    ) -> bool {
+    fn region_contains_multi_exit(region: &Region, expected_entry: u64) -> bool {
         match region {
-            Region::MultiExit { head, exits } => {
-                (head.entry() == expected_entry && exits == expected_exits)
-                    || region_contains_multi_exit(head, expected_entry, expected_exits)
+            Region::MultiExit { head, .. } => {
+                head.entry() == expected_entry || region_contains_multi_exit(head, expected_entry)
             }
             Region::WhileLoop { body, .. } | Region::DoWhileLoop { body, .. } => {
-                region_contains_multi_exit(body, expected_entry, expected_exits)
+                region_contains_multi_exit(body, expected_entry)
             }
             Region::Sequence(regions) => regions
                 .iter()
-                .any(|region| region_contains_multi_exit(region, expected_entry, expected_exits)),
+                .any(|region| region_contains_multi_exit(region, expected_entry)),
             Region::IfThenElse {
                 then_region,
                 else_region,
                 ..
             } => {
-                region_contains_multi_exit(then_region, expected_entry, expected_exits)
-                    || else_region.as_deref().is_some_and(|region| {
-                        region_contains_multi_exit(region, expected_entry, expected_exits)
-                    })
+                region_contains_multi_exit(then_region, expected_entry)
+                    || else_region
+                        .as_deref()
+                        .is_some_and(|region| region_contains_multi_exit(region, expected_entry))
             }
             Region::Switch { cases, default, .. } => {
-                cases.iter().any(|(_, region)| {
-                    region_contains_multi_exit(region, expected_entry, expected_exits)
-                }) || default.as_deref().is_some_and(|region| {
-                    region_contains_multi_exit(region, expected_entry, expected_exits)
-                })
+                cases
+                    .iter()
+                    .any(|(_, region)| region_contains_multi_exit(region, expected_entry))
+                    || default
+                        .as_deref()
+                        .is_some_and(|region| region_contains_multi_exit(region, expected_entry))
             }
             Region::Block(_) | Region::Transfer { .. } | Region::Irreducible { .. } => false,
         }
@@ -3217,8 +3256,8 @@ mod tests {
             "outer-loop continue guards must survive body analysis: {region:?}"
         );
         assert!(
-            region_contains_multi_exit(&region, 0x4014e7, &[0x4014ef, 0x401500, 0x401508]),
-            "inner loop must retain every exact external continuation: {region:?}"
+            !region_contains_multi_exit(&region, 0x4014e7),
+            "canonical loop fallthrough must not degrade to a multi-exit wrapper: {region:?}"
         );
         assert!(
             region_contains_cond_block(&region, 0x4014d8)
