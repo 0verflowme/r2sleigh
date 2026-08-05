@@ -3801,6 +3801,15 @@ fn build_type_writeback_analysis_inner(
         &type_db,
         input.ptr_bits,
     );
+    let mut exact_indexed_access_certificates =
+        exact_indexed_access_certificates_from_local_artifacts(
+            &local_structs,
+            &array_index_certificates,
+            merged_signature.as_ref(),
+            &type_db,
+            input.ptr_bits,
+        );
+    array_index_certificates.append(&mut exact_indexed_access_certificates.array_index);
     let scalar_array_access_certificates = scalar_array_access_certificates_from_ssa(
         input.ssa_blocks,
         &input.parsed_context,
@@ -3815,16 +3824,7 @@ fn build_type_writeback_analysis_inner(
         input.ptr_bits,
     );
     array_index_certificates.extend(scalar_array_access_certificates.array_index);
-    let mut scalar_array_render_candidates = local_structs
-        .indexed_accesses
-        .iter()
-        .filter(|candidate| {
-            local_structs
-                .slot_field_profiles
-                .contains_key(&candidate.slot)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut scalar_array_render_candidates = exact_indexed_access_certificates.render_candidates;
     let local_indexed_slots = scalar_array_render_candidates
         .iter()
         .map(|candidate| candidate.slot)
@@ -3839,6 +3839,7 @@ fn build_type_writeback_analysis_inner(
     scalar_array_render_candidates.dedup();
     let mut field_access_certificates =
         field_access_certificates_from_struct_artifacts(&local_structs);
+    field_access_certificates.append(&mut exact_indexed_access_certificates.field_access);
     field_access_certificates.extend(scalar_array_access_certificates.field_access);
     if let Some(semantic) = semantic_inputs.as_ref() {
         field_access_certificates.extend(summary_field_access_certificates_from_semantics(
@@ -6177,6 +6178,89 @@ fn array_index_certificates_from_struct_artifacts(
     certificates
 }
 
+fn exact_indexed_access_certificates_from_local_artifacts(
+    local_structs: &LocalStructArtifacts,
+    layout_certificates: &[ArrayIndexCertificate],
+    merged_signature: Option<&FunctionSignatureSpec>,
+    type_db: &ExternalTypeDb,
+    ptr_bits: u32,
+) -> ScalarArrayAccessCertificates {
+    let mut certificates = ScalarArrayAccessCertificates::default();
+    for candidate in &local_structs.indexed_accesses {
+        if candidate.access_width == 0 || candidate.element_stride == 0 {
+            continue;
+        }
+        let layout_certified = layout_certificates.iter().any(|certificate| {
+            certificate.slot == candidate.slot
+                && certificate.field_offset == candidate.field_offset
+                && certificate.element_stride == candidate.element_stride
+                && matches!(
+                    certificate.base,
+                    Some(ArrayIndexBase::Param { index }) if index == candidate.slot
+                )
+        });
+        if layout_certified {
+            certificates.render_candidates.push(*candidate);
+            continue;
+        }
+        let Some(signature) = merged_signature else {
+            continue;
+        };
+        let Some(param_ty) = signature
+            .params
+            .get(candidate.slot)
+            .and_then(|param| param.ty.as_ref())
+        else {
+            continue;
+        };
+        if pointer_element_stride(param_ty, type_db, ptr_bits) != Some(candidate.element_stride) {
+            continue;
+        }
+        let field_layout = aggregate_pointee_type_names_from_type(param_ty)
+            .into_iter()
+            .find_map(|type_name| {
+                external_layout_field_access_for_offset(
+                    type_db,
+                    &type_name,
+                    candidate.field_offset,
+                    u64::from(candidate.access_width),
+                    ptr_bits,
+                )
+            });
+        let full_element_access = candidate.field_offset == 0
+            && u64::from(candidate.access_width) == candidate.element_stride;
+        if !full_element_access && field_layout.is_none() {
+            continue;
+        }
+        certificates.array_index.push(ArrayIndexCertificate {
+            slot: candidate.slot,
+            base: Some(ArrayIndexBase::Param {
+                index: candidate.slot,
+            }),
+            field_offset: candidate.field_offset,
+            element_stride: candidate.element_stride,
+        });
+        if let Some(field) = field_layout {
+            certificates
+                .field_access
+                .push(crate::FieldAccessCertificate {
+                    slot: candidate.slot,
+                    field_offset: candidate.field_offset,
+                    field_name: field.name,
+                    field_type: field.ty,
+                });
+        }
+        certificates.render_candidates.push(*candidate);
+    }
+    certificates.array_index.sort();
+    certificates.array_index.dedup();
+    certificates.field_access.sort();
+    certificates.field_access.dedup();
+    certificates.render_candidates.sort();
+    certificates.render_candidates.dedup();
+    certificates
+}
+
 fn scalar_array_access_certificates_from_ssa(
     ssa_blocks: &[SSABlock],
     parsed_context: &ParsedExternalContext,
@@ -6195,8 +6279,6 @@ fn scalar_array_access_certificates_from_ssa(
     let mut pointer_value_names: HashMap<String, Option<ScalarPointerValue>> = HashMap::new();
     let mut array_addr_exprs: HashMap<String, ScalarArrayAddrExpr> = HashMap::new();
     let mut array_addr_expr_names: HashMap<String, Option<ScalarArrayAddrExpr>> = HashMap::new();
-    let mut stack_pointer_values: HashMap<(u64, i64), ScalarPointerValue> = HashMap::new();
-    let mut stack_pointer_values_by_offset: HashMap<i64, ScalarPointerValue> = HashMap::new();
     let mut certificates = ScalarArrayAccessCertificates::default();
 
     let block_ops: HashMap<u64, HashMap<String, SSAOp>> = ssa_blocks
@@ -6510,18 +6592,12 @@ fn scalar_array_access_certificates_from_ssa(
                             &stack_addr_offsets,
                             &stack_addr_offset_names,
                         ) {
-                            let pointer = stack_pointer_values
-                                .get(&(block.addr, offset))
-                                .cloned()
-                                .or_else(|| stack_pointer_values_by_offset.get(&offset).cloned())
-                                .or_else(|| {
-                                    scalar_pointer_value_for_stack_slot(
-                                        parsed_context,
-                                        type_db,
-                                        offset,
-                                        ptr_bits,
-                                    )
-                                });
+                            let pointer = scalar_pointer_value_for_stack_slot(
+                                parsed_context,
+                                type_db,
+                                offset,
+                                ptr_bits,
+                            );
                             if let Some(mut pointer) = pointer {
                                 pointer.confidence = pointer.confidence.saturating_sub(1);
                                 changed |= set_scalar_pointer_value(
@@ -6531,52 +6607,6 @@ fn scalar_array_access_certificates_from_ssa(
                                     &mut pointer_values,
                                     &mut pointer_value_names,
                                 );
-                            }
-                        }
-                    }
-                    SSAOp::Store { addr, val, .. } => {
-                        if let Some(offset) = stack_addr_offset_for_var(
-                            block.addr,
-                            addr,
-                            &stack_addr_offsets,
-                            &stack_addr_offset_names,
-                        ) {
-                            let ctx = ScalarArrayInferenceCtx {
-                                parsed_context,
-                                type_db,
-                                merged_signature,
-                                ptr_bits,
-                                pointer_arg_slot_map: &pointer_arg_slot_map,
-                                local_element_strides,
-                                pointer_values: &pointer_values,
-                                pointer_value_names: &pointer_value_names,
-                                array_addr_exprs: &array_addr_exprs,
-                                array_addr_expr_names: &array_addr_expr_names,
-                                stack_addr_offsets: &stack_addr_offsets,
-                                stack_addr_offset_names: &stack_addr_offset_names,
-                                block_ops: &block_ops,
-                                value_ops: &value_ops,
-                            };
-                            let Some(mut pointer) =
-                                scalar_pointer_value_for_var(block.addr, val, &ctx)
-                            else {
-                                continue;
-                            };
-                            pointer.confidence = pointer.confidence.saturating_sub(1);
-                            let key = (block.addr, offset);
-                            if stack_pointer_values
-                                .get(&key)
-                                .is_none_or(|prev| prev.confidence < pointer.confidence)
-                            {
-                                stack_pointer_values.insert(key, pointer.clone());
-                                changed = true;
-                            }
-                            if stack_pointer_values_by_offset
-                                .get(&offset)
-                                .is_none_or(|prev| prev.confidence < pointer.confidence)
-                            {
-                                stack_pointer_values_by_offset.insert(offset, pointer);
-                                changed = true;
                             }
                         }
                     }
@@ -19931,6 +19961,118 @@ mod tests {
     }
 
     #[test]
+    fn prepared_local_inference_certifies_cross_block_spill_reload() {
+        let mut arch = r2il::ArchSpec::new("x86-64");
+        arch.add_register(r2il::RegisterDef::new("RAX", 0x00, 8));
+        arch.add_register(r2il::RegisterDef::sub("EAX", 0x00, 4, "RAX"));
+        arch.add_register(r2il::RegisterDef::new("RDI", 0x10, 8));
+        arch.add_register(r2il::RegisterDef::new("RSI", 0x18, 8));
+        arch.add_register(r2il::RegisterDef::new("RBP", 0x20, 8));
+        let mut entry = r2il::R2ILBlock::new(0x401000, 0x20);
+        entry.push(r2il::R2ILOp::IntAdd {
+            dst: r2il::Varnode::unique(1, 8),
+            a: r2il::Varnode::register(0x20, 8),
+            b: r2il::Varnode::constant(0xffff_ffff_ffff_ffe8, 8),
+        });
+        entry.push(r2il::R2ILOp::Store {
+            space: r2il::SpaceId::Ram,
+            addr: r2il::Varnode::unique(1, 8),
+            val: r2il::Varnode::register(0x10, 8),
+        });
+        entry.push(r2il::R2ILOp::Branch {
+            target: r2il::Varnode::constant(0x401020, 8),
+        });
+        let mut successor = r2il::R2ILBlock::new(0x401020, 0x20);
+        successor.push(r2il::R2ILOp::IntAdd {
+            dst: r2il::Varnode::unique(2, 8),
+            a: r2il::Varnode::register(0x20, 8),
+            b: r2il::Varnode::constant(0xffff_ffff_ffff_ffe8, 8),
+        });
+        successor.push(r2il::R2ILOp::Load {
+            dst: r2il::Varnode::unique(3, 8),
+            space: r2il::SpaceId::Ram,
+            addr: r2il::Varnode::unique(2, 8),
+        });
+        successor.push(r2il::R2ILOp::IntLeft {
+            dst: r2il::Varnode::unique(4, 8),
+            a: r2il::Varnode::register(0x18, 8),
+            b: r2il::Varnode::constant(2, 8),
+        });
+        successor.push(r2il::R2ILOp::IntAdd {
+            dst: r2il::Varnode::unique(5, 8),
+            a: r2il::Varnode::unique(3, 8),
+            b: r2il::Varnode::unique(4, 8),
+        });
+        successor.push(r2il::R2ILOp::Load {
+            dst: r2il::Varnode::register(0x00, 4),
+            space: r2il::SpaceId::Ram,
+            addr: r2il::Varnode::unique(5, 8),
+        });
+        successor.push(r2il::R2ILOp::Return {
+            target: r2il::Varnode::register(0x00, 4),
+        });
+        let prepared = r2ssa::SsaArtifact::for_decompile(&[entry, successor], Some(&arch))
+            .expect("prepared SSA");
+        let mut diagnostics = TypeWritebackDiagnostics::default();
+
+        let artifacts = infer_local_struct_artifacts_from_prepared_ssa(
+            &prepared,
+            Some("x86-64"),
+            64,
+            &mut diagnostics,
+        );
+
+        assert!(
+            artifacts.indexed_accesses.iter().any(|candidate| {
+                candidate.slot == 0
+                    && candidate.block_addr == 0x401020
+                    && !candidate.is_write
+                    && candidate.field_offset == 0
+                    && candidate.element_stride == 4
+                    && candidate.access_width == 4
+                    && candidate.index_value.is_some()
+            }),
+            "memory SSA must own cross-block spill recovery: {artifacts:?}; diagnostics={diagnostics:?}"
+        );
+        let signature = FunctionSignatureSpec {
+            ret_type: Some(CTypeLike::Int {
+                bits: 32,
+                signedness: Signedness::Signed,
+            }),
+            params: vec![
+                FunctionParamSpec {
+                    name: "arr".to_string(),
+                    ty: Some(CTypeLike::Pointer(Box::new(CTypeLike::Int {
+                        bits: 32,
+                        signedness: Signedness::Signed,
+                    }))),
+                },
+                FunctionParamSpec {
+                    name: "index".to_string(),
+                    ty: Some(CTypeLike::Int {
+                        bits: 64,
+                        signedness: Signedness::Signed,
+                    }),
+                },
+            ],
+        };
+        let certificates = exact_indexed_access_certificates_from_local_artifacts(
+            &artifacts,
+            &[],
+            Some(&signature),
+            &ExternalTypeDb::default(),
+            64,
+        );
+        assert!(certificates.array_index.iter().any(|certificate| {
+            certificate.slot == 0
+                && certificate.field_offset == 0
+                && certificate.element_stride == 4
+                && matches!(certificate.base, Some(ArrayIndexBase::Param { index: 0 }))
+        }));
+        assert_eq!(certificates.render_candidates, artifacts.indexed_accesses);
+    }
+
+    #[test]
     fn typed_stack_pointer_index_access_certifies_scalar_array_index() {
         let mut parsed_context = ParsedExternalContext::default();
         let buf_slot = StackSlotKey {
@@ -20250,7 +20392,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_argument_spill_reload_access_certifies_scalar_array_index() {
+    fn legacy_same_block_spill_reload_requires_memory_ssa() {
         let argv_ty = CTypeLike::Pointer(Box::new(CTypeLike::Pointer(Box::new(CTypeLike::Int {
             bits: 8,
             signedness: Signedness::Signed,
@@ -20365,22 +20507,18 @@ mod tests {
         });
 
         assert!(
-            analysis
+            !analysis
                 .type_facts
                 .array_index_certificates
                 .iter()
-                .any(|cert| {
-                    cert.element_stride == 8
-                        && cert.field_offset == 0
-                        && matches!(cert.base, Some(ArrayIndexBase::Param { index: 1 }))
-                }),
-            "expected typed spilled argv pointer array certificate, got {:?}",
+                .any(|cert| matches!(cert.base, Some(ArrayIndexBase::Param { index: 1 }))),
+            "fixed-point block scans cannot prove store-before-load memory order: {:?}",
             analysis.type_facts.array_index_certificates
         );
     }
 
     #[test]
-    fn typed_argument_spill_reload_across_blocks_certifies_scalar_array_index() {
+    fn legacy_cross_block_spill_reload_requires_memory_ssa() {
         let arr_ty = CTypeLike::Pointer(Box::new(CTypeLike::Int {
             bits: 32,
             signedness: Signedness::Signed,
@@ -20506,31 +20644,22 @@ mod tests {
         });
 
         assert!(
-            analysis
+            !analysis
                 .type_facts
                 .array_index_certificates
                 .iter()
-                .any(|cert| {
-                    cert.element_stride == 4
-                        && cert.field_offset == 0
-                        && matches!(cert.base, Some(ArrayIndexBase::Param { index: 0 }))
-                }),
-            "expected cross-block spilled pointer array certificate, got {:?}",
+                .any(|cert| matches!(cert.base, Some(ArrayIndexBase::Param { index: 0 }))),
+            "raw block coordinates cannot prove that a reload observes a store in another block: {:?}",
             analysis.type_facts.array_index_certificates
         );
-        assert_eq!(
-            analysis.type_facts.scalar_array_render_candidates,
-            vec![ScalarArrayRenderCandidate {
-                slot: 0,
-                block_addr: 0x401020,
-                op_index: 4,
-                is_write: false,
-                field_offset: 0,
-                element_stride: 4,
-                access_width: 4,
-                index_value: None,
-            }],
-            "render candidate must preserve the concrete load op identity"
+        assert!(
+            !analysis
+                .type_facts
+                .scalar_array_render_candidates
+                .iter()
+                .any(|candidate| candidate.slot == 0),
+            "legacy inference must not mint parameter render evidence across blocks without memory SSA: {:?}",
+            analysis.type_facts.scalar_array_render_candidates
         );
     }
 
