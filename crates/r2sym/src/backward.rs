@@ -253,6 +253,7 @@ enum EvalUnsupported {
 struct ValueTranslator<'a, 'ctx> {
     func: &'a SsaArtifact,
     state: &'a SymState<'ctx>,
+    memory_index: &'a BackwardMemoryIndex,
     phi_predecessors: &'a BTreeMap<u64, u64>,
     call_contexts: &'a HashMap<CallSiteId, CallTransformContext<'ctx>>,
     memo: HashMap<ValueId, SymValue<'ctx>>,
@@ -263,6 +264,44 @@ struct ValueTranslator<'a, 'ctx> {
     memory_candidate_enumerations: usize,
     memory_residual_fallbacks: usize,
     used_unsummarized_memory: bool,
+}
+
+#[derive(Default)]
+struct BackwardMemoryIndex {
+    store_values: HashMap<(r2ssa::MemoryVersion, r2ssa::MemoryLocation), Option<r2ssa::SSAVar>>,
+}
+
+impl BackwardMemoryIndex {
+    fn new(func: &SsaArtifact) -> Self {
+        let mut index = Self::default();
+        for (inst_id, defs) in &func.memory().defs_by_inst {
+            let Some(inst) = func.graph().inst(*inst_id) else {
+                continue;
+            };
+            let InstPayload::Op(r2ssa::SSAOp::Store { val, .. }) = &inst.payload else {
+                continue;
+            };
+            for def in defs {
+                let key = (def.next_version, def.location);
+                index
+                    .store_values
+                    .entry(key)
+                    .and_modify(|candidate| {
+                        if candidate.as_ref().is_some_and(|candidate| candidate != val) {
+                            *candidate = None;
+                        }
+                    })
+                    .or_insert_with(|| Some(val.clone()));
+            }
+        }
+        index
+    }
+
+    fn reaching_store(&self, use_fact: &r2ssa::MemoryUseFact) -> Option<&r2ssa::SSAVar> {
+        self.store_values
+            .get(&(use_fact.version, use_fact.location))
+            .and_then(Option::as_ref)
+    }
 }
 
 #[derive(Clone)]
@@ -298,12 +337,14 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
     fn new(
         func: &'a SsaArtifact,
         state: &'a SymState<'ctx>,
+        memory_index: &'a BackwardMemoryIndex,
         phi_predecessors: &'a BTreeMap<u64, u64>,
         call_contexts: &'a HashMap<CallSiteId, CallTransformContext<'ctx>>,
     ) -> Self {
         Self {
             func,
             state,
+            memory_index,
             phi_predecessors,
             call_contexts,
             memo: HashMap::new(),
@@ -452,31 +493,78 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
                 let addr_value = self.eval_ssa_var(addr)?;
                 let structural_locations =
                     self.normalized_memory_locations(addr).unwrap_or_default();
-                let resolved_locations = self
-                    .resolved_memory_locations(&addr_value, dst.size)
-                    .map(|locations| {
-                        locations
+                let call_ctx = self.call_context_for_inst(inst_id, block_addr).cloned();
+                let mut resolved_locations = None;
+                if let Some(call_ctx) = call_ctx {
+                    let resolved = self
+                        .resolved_memory_locations(&addr_value, dst.size)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(is_specific_memory_location)
+                        .collect::<Vec<_>>();
+                    if let Some(summary_value) = self.summary_memory_value(
+                        &call_ctx,
+                        &addr_value,
+                        &resolved,
+                        &structural_locations,
+                        dst.size,
+                    ) {
+                        return Ok(summary_value);
+                    }
+                    resolved_locations = Some(resolved);
+                }
+                if addr_value.as_concrete().is_some() {
+                    let resolved = resolved_locations.take().unwrap_or_else(|| {
+                        self.resolved_memory_locations(&addr_value, dst.size)
+                            .unwrap_or_default()
                             .into_iter()
                             .filter(is_specific_memory_location)
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
+                            .collect()
+                    });
+                    let normalized = if !resolved.is_empty() {
+                        resolved
+                    } else {
+                        structural_locations.clone()
+                    };
+                    let value = self.state.mem_read(&addr_value, dst.size);
+                    if !self.record_memory_term(&normalized, dst.size, &value) {
+                        self.used_unsummarized_memory = true;
+                        self.memory_residual_fallbacks += 1;
+                    }
+                    return Ok(value);
+                }
+                if structural_locations.is_empty() {
+                    let resolved = resolved_locations.get_or_insert_with(|| {
+                        self.resolved_memory_locations(&addr_value, dst.size)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(is_specific_memory_location)
+                            .collect()
+                    });
+                    if !resolved.is_empty() {
+                        let value = self.state.mem_read(&addr_value, dst.size);
+                        if self.record_memory_term(resolved, dst.size, &value) {
+                            return Ok(value);
+                        }
+                    }
+                }
+                if let Some(memory_input) =
+                    self.memory_ssa_input_value(inst_id, dst.size, &structural_locations)
+                {
+                    return Ok(memory_input);
+                }
+                let resolved_locations = resolved_locations.unwrap_or_else(|| {
+                    self.resolved_memory_locations(&addr_value, dst.size)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(is_specific_memory_location)
+                        .collect()
+                });
                 let normalized = if !resolved_locations.is_empty() {
                     resolved_locations.clone()
                 } else {
                     structural_locations.clone()
                 };
-                if let Some(call_ctx) = self.call_context_for_inst(inst_id, block_addr).cloned()
-                    && let Some(summary_value) = self.summary_memory_value(
-                        &call_ctx,
-                        &addr_value,
-                        &resolved_locations,
-                        &structural_locations,
-                        dst.size,
-                    )
-                {
-                    return Ok(summary_value);
-                }
                 let value = self.state.mem_read(&addr_value, dst.size);
                 if self.record_memory_term(&normalized, dst.size, &value) {
                     return Ok(value);
@@ -778,30 +866,62 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
         self.eval_ssa_var(&value).ok()
     }
 
+    fn memory_ssa_input_value(
+        &mut self,
+        inst_id: r2ssa::graph::InstId,
+        size: u32,
+        structural_locations: &[NormalizedMemoryLocation],
+    ) -> Option<SymValue<'ctx>> {
+        let mut matching_uses = self
+            .func
+            .memory()
+            .uses_by_inst
+            .get(&inst_id)?
+            .iter()
+            .filter(|use_fact| use_fact.location.size == size);
+        let use_fact = matching_uses.next()?;
+        if matching_uses.next().is_some() {
+            return None;
+        }
+        let value = SymValue::new_symbolic(
+            self.state.context(),
+            &format!(
+                "memory_object_{}_version_{}_offset_{}_size_{}",
+                use_fact.location.object.0,
+                use_fact.version.version,
+                use_fact.location.offset,
+                use_fact.location.size
+            ),
+            size * 8,
+        );
+        let recorded = self.record_memory_term(structural_locations, size, &value);
+        if !recorded || use_fact.version.version != 0 {
+            self.used_unsummarized_memory = true;
+            self.memory_residual_fallbacks += 1;
+        }
+        Some(value)
+    }
+
     fn local_memory_store_var(
         &self,
         inst_id: r2ssa::graph::InstId,
         size: u32,
     ) -> Option<r2ssa::SSAVar> {
-        let uses = self.func.memory().uses_by_inst.get(&inst_id)?;
-        for use_fact in uses {
-            if use_fact.location.size != size {
-                continue;
-            }
-            for (def_inst, defs) in &self.func.memory().defs_by_inst {
-                for def in defs {
-                    if def.next_version != use_fact.version || def.location != use_fact.location {
-                        continue;
-                    }
-                    let inst = self.func.graph().inst(*def_inst)?;
-                    let InstPayload::Op(r2ssa::SSAOp::Store { val, .. }) = &inst.payload else {
-                        continue;
-                    };
-                    return Some(val.clone());
-                }
+        let mut matching_uses = self
+            .func
+            .memory()
+            .uses_by_inst
+            .get(&inst_id)?
+            .iter()
+            .filter(|use_fact| use_fact.location.size == size);
+        let first = matching_uses.next()?;
+        let candidate = self.memory_index.reaching_store(first)?.clone();
+        for use_fact in matching_uses {
+            if self.memory_index.reaching_store(use_fact) != Some(&candidate) {
+                return None;
             }
         }
-        None
+        Some(candidate)
     }
 
     fn record_memory_term(
@@ -869,6 +989,9 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
         let mut constraints = self.state.constraints().to_vec();
         constraints.extend(self.assumption_constraints.iter().cloned());
         let resolved = self.state.memory.resolve_pointer(addr, size, &constraints);
+        if resolved.truncated {
+            return None;
+        }
         let mut locations = Vec::new();
         for pointer in resolved.pointers {
             let Some(region) = self.region_for_pointer(pointer.region_id) else {
@@ -975,6 +1098,10 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
     }
 
     fn enumerate_bounded_concrete_values(&mut self, value: &SymValue<'ctx>) -> Option<Vec<u64>> {
+        if self.state.constraints().is_empty() && self.assumption_constraints.is_empty() {
+            self.memory_residual_fallbacks += 1;
+            return None;
+        }
         let ctx = self.state.context();
         let bv = value.to_bv(ctx);
         let solver = Solver::new();
@@ -1046,6 +1173,27 @@ pub(crate) fn compile_branch_precondition_with_summaries<'ctx>(
         initial_state,
         reverse_paths,
         Some((predicate, truth)),
+        call_summaries,
+    )
+}
+
+pub(crate) fn compile_branch_preconditions_with_summaries<'ctx>(
+    func: &SsaArtifact,
+    initial_state: &SymState<'ctx>,
+    block_addr: u64,
+    call_summaries: &HashMap<u64, DerivedCallSummaryView<'ctx>>,
+) -> Option<(CompiledBackwardCondition, CompiledBackwardCondition)> {
+    let predicate = func
+        .predicates()
+        .predicates
+        .iter()
+        .find_map(|(id, fact)| (fact.block_addr == block_addr).then_some(*id))?;
+    let reverse_paths = enumerate_reverse_paths(func, block_addr, DEFAULT_REVERSE_PATH_LIMIT)?;
+    compile_reverse_paths_for_branch(
+        func,
+        initial_state,
+        reverse_paths,
+        predicate,
         call_summaries,
     )
 }
@@ -1322,7 +1470,7 @@ fn compile_reverse_paths<'ctx>(
 fn compile_reverse_paths_with_extra<'ctx, F>(
     func: &SsaArtifact,
     initial_state: &SymState<'ctx>,
-    (paths, truncated): (Vec<ReversePath>, bool),
+    reverse_paths: (Vec<ReversePath>, bool),
     extra_predicate: Option<(PredicateId, bool)>,
     call_summaries: &HashMap<u64, DerivedCallSummaryView<'ctx>>,
     mut extra_constraint: F,
@@ -1333,85 +1481,176 @@ where
         &ReversePath,
     ) -> Result<Option<Bool>, EvalUnsupported>,
 {
-    if paths.is_empty() {
+    let mut compiled = compile_reverse_path_alternatives(
+        func,
+        initial_state,
+        reverse_paths,
+        call_summaries,
+        1,
+        |translator, path| {
+            if let Some((predicate, truth)) = extra_predicate {
+                let condition = translator.eval_predicate(predicate, truth)?;
+                translator.note_assumption(condition);
+            }
+            if let Some(condition) = extra_constraint(translator, path)? {
+                translator.note_assumption(condition);
+            }
+            Ok(vec![None])
+        },
+    )?;
+    compiled.pop()
+}
+
+fn compile_reverse_paths_for_branch<'ctx>(
+    func: &SsaArtifact,
+    initial_state: &SymState<'ctx>,
+    reverse_paths: (Vec<ReversePath>, bool),
+    predicate: PredicateId,
+    call_summaries: &HashMap<u64, DerivedCallSummaryView<'ctx>>,
+) -> Option<(CompiledBackwardCondition, CompiledBackwardCondition)> {
+    let mut compiled = compile_reverse_path_alternatives(
+        func,
+        initial_state,
+        reverse_paths,
+        call_summaries,
+        2,
+        |translator, _| {
+            let condition = translator.eval_predicate(predicate, true)?;
+            Ok(vec![Some(condition.clone()), Some(condition.not())])
+        },
+    )?
+    .into_iter();
+    Some((compiled.next()?, compiled.next()?))
+}
+
+fn compile_reverse_path_alternatives<'ctx, F>(
+    func: &SsaArtifact,
+    initial_state: &SymState<'ctx>,
+    (paths, truncated): (Vec<ReversePath>, bool),
+    call_summaries: &HashMap<u64, DerivedCallSummaryView<'ctx>>,
+    alternative_count: usize,
+    mut alternatives: F,
+) -> Option<Vec<CompiledBackwardCondition>>
+where
+    F: for<'a> FnMut(
+        &mut ValueTranslator<'a, 'ctx>,
+        &ReversePath,
+    ) -> Result<Vec<Option<Bool>>, EvalUnsupported>,
+{
+    if paths.is_empty() || alternative_count == 0 {
         return None;
     }
 
-    let mut supported_terms = Vec::new();
+    let mut supported_terms = vec![Vec::new(); alternative_count];
     let mut memory_terms = Vec::new();
     let mut unsupported_paths = 0usize;
     let mut used_unsummarized_memory = false;
     let mut backward_memory_substitutions = 0usize;
     let mut backward_memory_candidate_enumerations = 0usize;
     let mut backward_memory_residual_fallbacks = 0usize;
+    let memory_index = BackwardMemoryIndex::new(func);
+
     for path in &paths {
         let call_contexts =
-            build_call_transform_contexts(func, initial_state, path, call_summaries);
-        let mut translator =
-            ValueTranslator::new(func, initial_state, &path.phi_predecessors, &call_contexts);
-        let mut conjuncts = Vec::new();
-        let mut supported = true;
-        for (predicate, truth) in &path.assumptions {
-            match translator.eval_predicate(*predicate, *truth) {
-                Ok(condition) => {
-                    translator.note_assumption(condition.clone());
-                    conjuncts.push(condition);
-                }
-                Err(_) => {
-                    supported = false;
-                    break;
-                }
-            }
-        }
-        if supported && let Some((predicate, truth)) = extra_predicate {
-            match translator.eval_predicate(predicate, truth) {
-                Ok(condition) => {
-                    translator.note_assumption(condition.clone());
-                    conjuncts.push(condition);
-                }
-                Err(_) => supported = false,
-            }
-        }
-        if supported {
-            match extra_constraint(&mut translator, path) {
-                Ok(Some(condition)) => {
-                    translator.note_assumption(condition.clone());
-                    conjuncts.push(condition);
-                }
-                Ok(None) => {}
-                Err(_) => supported = false,
-            }
-        }
-        if !supported {
+            build_call_transform_contexts(func, initial_state, path, call_summaries, &memory_index);
+        let mut translator = ValueTranslator::new(
+            func,
+            initial_state,
+            &memory_index,
+            &path.phi_predecessors,
+            &call_contexts,
+        );
+        let path_supported = path.assumptions.iter().all(|(predicate, truth)| {
+            let Ok(condition) = translator.eval_predicate(*predicate, *truth) else {
+                return false;
+            };
+            translator.note_assumption(condition);
+            true
+        });
+        if !path_supported {
             unsupported_paths += 1;
             continue;
         }
-        conjuncts.extend(translator.assumption_constraints.iter().cloned());
-        let term = and_all(initial_state.context(), &conjuncts);
+        let Ok(path_alternatives) = alternatives(&mut translator, path) else {
+            unsupported_paths += 1;
+            continue;
+        };
+        if path_alternatives.len() != alternative_count {
+            return None;
+        }
+
+        for (terms, condition) in supported_terms.iter_mut().zip(path_alternatives) {
+            let term = if let Some(condition) = condition {
+                let mut conditions = translator.assumption_constraints.clone();
+                conditions.push(condition);
+                and_all(initial_state.context(), &conditions)
+            } else {
+                and_all(initial_state.context(), &translator.assumption_constraints)
+            };
+            terms.push(term);
+        }
         used_unsummarized_memory |= translator.used_unsummarized_memory;
         backward_memory_substitutions += translator.memory_substitutions;
         backward_memory_candidate_enumerations += translator.memory_candidate_enumerations;
         backward_memory_residual_fallbacks += translator.memory_residual_fallbacks;
-        supported_terms.push(term);
         memory_terms.extend(translator.memory_terms);
     }
 
+    let evidence = ReversePathCompilationEvidence {
+        unsupported_paths,
+        used_unsummarized_memory,
+        memory_terms,
+        backward_memory_substitutions,
+        backward_memory_candidate_enumerations,
+        backward_memory_residual_fallbacks,
+    };
+    supported_terms
+        .into_iter()
+        .map(|terms| {
+            finish_reverse_path_compilation(
+                initial_state.context(),
+                terms,
+                paths.len(),
+                truncated,
+                evidence.clone(),
+            )
+        })
+        .collect()
+}
+
+#[derive(Clone)]
+struct ReversePathCompilationEvidence {
+    unsupported_paths: usize,
+    used_unsummarized_memory: bool,
+    memory_terms: Vec<BackwardMemoryCondition>,
+    backward_memory_substitutions: usize,
+    backward_memory_candidate_enumerations: usize,
+    backward_memory_residual_fallbacks: usize,
+}
+
+fn finish_reverse_path_compilation(
+    ctx: &Context,
+    supported_terms: Vec<Bool>,
+    total_paths: usize,
+    truncated: bool,
+    evidence: ReversePathCompilationEvidence,
+) -> Option<CompiledBackwardCondition> {
     if supported_terms.is_empty() {
         return None;
     }
 
-    let predicate = or_all(initial_state.context(), &supported_terms);
+    let predicate = or_all(ctx, &supported_terms);
     let simplified = predicate.simplify();
-    let precision = if unsupported_paths == 0
+    let precision = if evidence.unsupported_paths == 0
         && !truncated
-        && !used_unsummarized_memory
-        && backward_memory_residual_fallbacks == 0
+        && !evidence.used_unsummarized_memory
+        && evidence.backward_memory_residual_fallbacks == 0
     {
         BackwardConditionPrecision::Exact
-    } else if unsupported_paths > 0
+    } else if evidence.unsupported_paths > 0
         || truncated
-        || used_unsummarized_memory
-        || backward_memory_residual_fallbacks > 0
+        || evidence.used_unsummarized_memory
+        || evidence.backward_memory_residual_fallbacks > 0
     {
         BackwardConditionPrecision::ResidualSearchRequired
     } else {
@@ -1424,13 +1663,13 @@ where
                 .iter()
                 .map(|term| term.simplify().to_string())
                 .collect(),
-            memory_terms,
-            backward_memory_substitutions,
-            backward_memory_candidate_enumerations,
-            backward_memory_residual_fallbacks,
+            memory_terms: evidence.memory_terms,
+            backward_memory_substitutions: evidence.backward_memory_substitutions,
+            backward_memory_candidate_enumerations: evidence.backward_memory_candidate_enumerations,
+            backward_memory_residual_fallbacks: evidence.backward_memory_residual_fallbacks,
             precision,
             supported_paths: supported_terms.len(),
-            total_paths: paths.len(),
+            total_paths,
         },
         predicate: simplified,
     })
@@ -1467,6 +1706,7 @@ fn build_call_transform_contexts<'ctx>(
     initial_state: &SymState<'ctx>,
     path: &ReversePath,
     call_summaries: &HashMap<u64, DerivedCallSummaryView<'ctx>>,
+    memory_index: &BackwardMemoryIndex,
 ) -> HashMap<CallSiteId, CallTransformContext<'ctx>> {
     if call_summaries.is_empty() {
         return HashMap::new();
@@ -1506,6 +1746,7 @@ fn build_call_transform_contexts<'ctx>(
                 let mut translator = ValueTranslator::new(
                     func,
                     initial_state,
+                    memory_index,
                     &path.phi_predecessors,
                     &context_snapshot,
                 );
@@ -2171,7 +2412,7 @@ fn adjust_bits<'ctx>(ctx: &'ctx Context, value: SymValue<'ctx>, bits: u32) -> Sy
 
 #[cfg(test)]
 mod tests {
-    use r2il::{R2ILBlock, R2ILOp, SpaceId, Varnode};
+    use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
     use z3::Context;
 
     use super::*;
@@ -2246,6 +2487,72 @@ mod tests {
             BackwardConditionPrecision::Exact
         );
         assert!(compiled.summary.simplified.contains("1337") || !compiled.summary.terms.is_empty());
+    }
+
+    #[test]
+    fn paired_branch_compilation_preserves_symbolic_memory_input() {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("RDI", 56, 8));
+        let mut branch = R2ILBlock::new(0x1000, 4);
+        branch.push(R2ILOp::Load {
+            dst: Varnode::unique(0x10, 4),
+            space: SpaceId::Ram,
+            addr: make_reg(56, 8),
+        });
+        branch.push(R2ILOp::IntEqual {
+            dst: Varnode::unique(0x20, 1),
+            a: Varnode::unique(0x10, 4),
+            b: make_const(0x41, 4),
+        });
+        branch.push(R2ILOp::CBranch {
+            target: make_const(0x1010, 8),
+            cond: Varnode::unique(0x20, 1),
+        });
+        let mut false_exit = R2ILBlock::new(0x1004, 4);
+        false_exit.push(R2ILOp::Return {
+            target: make_const(0, 8),
+        });
+        let mut true_exit = R2ILBlock::new(0x1010, 4);
+        true_exit.push(R2ILOp::Return {
+            target: make_const(1, 8),
+        });
+        let func =
+            SsaArtifact::for_symbolic(&[branch, false_exit, true_exit], Some(&arch)).expect("ssa");
+        let ctx = Context::thread_local();
+        let mut state = SymState::new(&ctx, 0x1000);
+        crate::runtime::seed_default_state_for_arch(&mut state, &func, Some(&arch));
+
+        let (when_true, when_false) =
+            compile_branch_preconditions_with_summaries(&func, &state, 0x1000, &HashMap::new())
+                .expect("paired branch conditions");
+        let single_true = compile_branch_precondition_with_summaries(
+            &func,
+            &state,
+            0x1000,
+            true,
+            &HashMap::new(),
+        )
+        .expect("true branch condition");
+        let single_false = compile_branch_precondition_with_summaries(
+            &func,
+            &state,
+            0x1000,
+            false,
+            &HashMap::new(),
+        )
+        .expect("false branch condition");
+
+        assert_eq!(when_true.summary, single_true.summary);
+        assert_eq!(when_false.summary, single_false.summary);
+        assert_eq!(
+            when_true.summary.precision,
+            BackwardConditionPrecision::Exact
+        );
+        assert_eq!(when_true.summary.memory_terms.len(), 1);
+        assert!(when_true.summary.simplified.contains("memory_object_"));
+        assert_ne!(when_true.summary.simplified, "true");
+        assert_ne!(when_true.summary.simplified, "false");
     }
 
     #[test]

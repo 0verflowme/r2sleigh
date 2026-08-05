@@ -13,7 +13,7 @@ use z3::Context;
 use crate::SymState;
 use crate::backward::{
     BackwardConditionPrecision, BackwardConditionSummary, BackwardMemoryCondition,
-    BackwardMemoryRegion, compile_branch_precondition_with_summaries,
+    BackwardMemoryRegion, compile_branch_preconditions_with_summaries,
 };
 use crate::path::{ExploreConfig, PathExplorer};
 use crate::runtime::seed_default_state_for_arch;
@@ -810,7 +810,7 @@ where
         let predicate_uses_call_result = predicate_depends_on_call_result(func, block_addr);
 
         let make_state = || {
-            let mut state = SymState::new(ctx, func.entry);
+            let mut state = SymState::new_symbolic(ctx, func.entry);
             seed_default_state_for_arch(&mut state, func, Some(arch));
             state
         };
@@ -818,13 +818,13 @@ where
         let mut true_explorer = symbolic_fact_explorer(ctx);
         install_hooks(&mut true_explorer);
         let true_initial_state = make_state();
-        let (compiled_true_status, true_compiled) = compiled_branch_reachability_status(
-            &true_explorer,
-            func,
-            &true_initial_state,
-            block_addr,
-            true,
-        );
+        let ((compiled_true_status, true_compiled), (compiled_false_status, false_compiled)) =
+            compiled_branch_reachability_statuses(
+                &true_explorer,
+                func,
+                &true_initial_state,
+                block_addr,
+            );
         let true_condition = symbolic_condition_hint(true_compiled.as_ref());
         let true_status = if let Some(status) = compiled_true_status {
             status
@@ -835,22 +835,14 @@ where
             symbolic_reachability_status(paths.len(), true_explorer.budget_exhausted())
         };
 
-        let mut false_explorer = symbolic_fact_explorer(ctx);
-        install_hooks(&mut false_explorer);
-        let false_initial_state = make_state();
-        let (compiled_false_status, false_compiled) = compiled_branch_reachability_status(
-            &false_explorer,
-            func,
-            &false_initial_state,
-            block_addr,
-            false,
-        );
         let false_condition = symbolic_condition_hint(false_compiled.as_ref());
         let false_status = if let Some(status) = compiled_false_status {
             status
         } else if predicate_uses_call_result || func_contains_calls(func) {
             SymbolicReachabilityStatus::Unknown
         } else {
+            let mut false_explorer = symbolic_fact_explorer(ctx);
+            install_hooks(&mut false_explorer);
             let paths = false_explorer.find_paths_to(func, make_state(), false_target);
             symbolic_reachability_status(paths.len(), false_explorer.budget_exhausted())
         };
@@ -938,42 +930,48 @@ fn install_symbolic_fact_hooks<'ctx>(
     let _ = registry.install_known_symbols_for_function(explorer, func, symbol_map);
 }
 
-fn compiled_branch_reachability_status<'ctx>(
+type CompiledReachability = (
+    Option<SymbolicReachabilityStatus>,
+    Option<BackwardConditionSummary>,
+);
+
+fn compiled_branch_reachability_statuses<'ctx>(
     explorer: &PathExplorer<'ctx>,
     func: &SsaArtifact,
     initial_state: &SymState<'ctx>,
     block_addr: u64,
-    truth: bool,
-) -> (
-    Option<SymbolicReachabilityStatus>,
-    Option<BackwardConditionSummary>,
-) {
+) -> (CompiledReachability, CompiledReachability) {
     let derived_summaries = explorer.derived_call_summary_views();
     if func_contains_calls(func) && derived_summaries.is_empty() {
-        return (None, None);
+        return ((None, None), (None, None));
     }
-    let Some(compiled) = compile_branch_precondition_with_summaries(
+    let Some((true_compiled, false_compiled)) = compile_branch_preconditions_with_summaries(
         func,
         initial_state,
         block_addr,
-        truth,
         &derived_summaries,
     ) else {
-        return (None, None);
+        return ((None, None), (None, None));
     };
-    let summary = compiled.summary;
-    if !matches!(summary.precision, BackwardConditionPrecision::Exact) {
-        return (None, Some(summary));
-    }
-    let status = match explorer
-        .solver()
-        .sat_with_constraint(initial_state, &compiled.predicate)
-    {
-        SatResult::Sat => Some(SymbolicReachabilityStatus::Reachable),
-        SatResult::Unsat => Some(SymbolicReachabilityStatus::Unreachable),
-        SatResult::Unknown => None,
+    let evaluate = |compiled: crate::backward::CompiledBackwardCondition| {
+        let status = if matches!(
+            compiled.summary.precision,
+            BackwardConditionPrecision::Exact
+        ) {
+            match explorer
+                .solver()
+                .sat_with_constraint(initial_state, &compiled.predicate)
+            {
+                SatResult::Sat => Some(SymbolicReachabilityStatus::Reachable),
+                SatResult::Unsat => Some(SymbolicReachabilityStatus::Unreachable),
+                SatResult::Unknown => None,
+            }
+        } else {
+            None
+        };
+        (status, Some(compiled.summary))
     };
-    (status, Some(summary))
+    (evaluate(true_compiled), evaluate(false_compiled))
 }
 
 fn func_contains_calls(func: &SsaArtifact) -> bool {
@@ -1317,6 +1315,77 @@ mod tests {
         NativeWorkerSummaryKind, RefinementStage, SemanticArtifactDiagnostics,
     };
     use r2il::{RegisterDef, SpaceId, Varnode};
+
+    #[test]
+    fn residual_memory_branch_does_not_prune_unknown_input() {
+        let mut arch = ArchSpec::new("aarch64");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("x0", 0x00, 8));
+
+        let mut branch = r2il::R2ILBlock::new(0x1000, 4);
+        branch.push(r2il::R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::register(0x00, 8),
+            val: Varnode::constant(0, 4),
+        });
+        branch.push(r2il::R2ILOp::IntAdd {
+            dst: Varnode::unique(0x10, 8),
+            a: Varnode::register(0x00, 8),
+            b: Varnode::constant(4, 8),
+        });
+        branch.push(r2il::R2ILOp::Load {
+            dst: Varnode::unique(0x20, 1),
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x10, 8),
+        });
+        branch.push(r2il::R2ILOp::IntEqual {
+            dst: Varnode::unique(0x30, 1),
+            a: Varnode::unique(0x20, 1),
+            b: Varnode::constant(0x41, 1),
+        });
+        branch.push(r2il::R2ILOp::CBranch {
+            target: Varnode::constant(0x1010, 8),
+            cond: Varnode::unique(0x30, 1),
+        });
+        let mut false_exit = r2il::R2ILBlock::new(0x1004, 4);
+        false_exit.push(r2il::R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let mut true_exit = r2il::R2ILBlock::new(0x1010, 4);
+        true_exit.push(r2il::R2ILOp::Return {
+            target: Varnode::constant(1, 8),
+        });
+        let artifact = SsaArtifact::for_symbolic(&[branch, false_exit, true_exit], Some(&arch))
+            .expect("memory branch fixture should build SSA");
+        let ctx = Context::thread_local();
+
+        let (observations, diagnostics) = collect_branch_observations_for_branch_blocks(
+            &ctx,
+            &artifact,
+            &arch,
+            &[(0x1000, 0x1010, 0x1004)],
+            |_| {},
+        );
+
+        assert_eq!(observations.len(), 1);
+        assert_eq!(
+            observations[0].true_status,
+            SymbolicReachabilityStatus::Reachable
+        );
+        assert_eq!(
+            observations[0].false_status,
+            SymbolicReachabilityStatus::Reachable
+        );
+        assert_eq!(diagnostics.branches_pruned, 0);
+        assert_eq!(diagnostics.branches_unknown, 0);
+        assert!(matches!(
+            observations[0]
+                .true_compiled
+                .as_ref()
+                .map(|compiled| compiled.precision),
+            Some(BackwardConditionPrecision::ResidualSearchRequired)
+        ));
+    }
 
     #[test]
     fn large_cfg_memory_transfer_pass_detects_copy_shaped_store() {

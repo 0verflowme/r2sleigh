@@ -7,7 +7,6 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 
 use serde::{Deserialize, Serialize};
@@ -409,20 +408,26 @@ impl<'ctx> SymMemory<'ctx> {
             };
         }
 
-        let (targets, truncated) = self.enumerate_symbolic_addresses(addr, constraints);
+        let (targets, truncated) = self.enumerate_symbolic_addresses(addr, size, constraints);
         let mut seen = BTreeSet::new();
         let mut pointers = Vec::new();
+        let mut escaped_unknown = false;
         for target in targets {
-            if let Some(pointer) = self.resolve_concrete_pointer(target, addr.bits(), size)
-                && seen.insert((pointer.region_id, pointer.offset))
-            {
+            if let Some(pointer) = self.resolve_concrete_pointer(target, addr.bits(), size) {
+                if pointer.region_id == self.escaped_unknown_region {
+                    escaped_unknown = true;
+                    continue;
+                }
+                if !seen.insert((pointer.region_id, pointer.offset)) {
+                    continue;
+                }
                 pointers.push(pointer);
             }
         }
 
         ResolvedPointerSet {
             pointers,
-            truncated,
+            truncated: truncated || escaped_unknown,
         }
     }
 
@@ -823,37 +828,41 @@ impl<'ctx> SymMemory<'ctx> {
     fn enumerate_symbolic_addresses(
         &self,
         addr: &SymValue<'ctx>,
+        size: u32,
         constraints: &[Bool],
     ) -> (Vec<u64>, bool) {
-        if let Some(affine) = recognize_affine_pointer(addr) {
-            let (targets, truncated) =
-                self.enumerate_symbolic_addresses_sat(&affine.base, constraints);
-            return (
-                targets
-                    .into_iter()
-                    .filter_map(|value| value.checked_add_signed(affine.delta))
-                    .collect(),
-                truncated,
-            );
+        if constraints.is_empty() {
+            return finite_unconstrained_addresses(addr, self.max_symbolic_targets)
+                .map(|targets| (targets, false))
+                .unwrap_or_else(|| (Vec::new(), true));
         }
-        self.enumerate_symbolic_addresses_sat(addr, constraints)
+        self.enumerate_symbolic_addresses_sat(addr, size, constraints)
     }
 
     fn enumerate_symbolic_addresses_sat(
         &self,
         addr: &SymValue<'ctx>,
+        size: u32,
         constraints: &[Bool],
     ) -> (Vec<u64>, bool) {
         if self.max_symbolic_targets == 0 {
             return (Vec::new(), true);
         }
 
+        let addr_bv = addr.to_bv(self.ctx);
+        if !constraints_reference_value(&addr_bv, constraints) {
+            return (Vec::new(), true);
+        }
+        let Some(region_membership) = self.explicit_region_membership(&addr_bv, size) else {
+            return (Vec::new(), true);
+        };
+
         let solver = Solver::new();
         for constraint in constraints {
             solver.assert(constraint);
         }
+        solver.assert(&region_membership);
 
-        let addr_bv = addr.to_bv(self.ctx);
         let mut targets = Vec::new();
         let mut truncated = false;
 
@@ -877,7 +886,44 @@ impl<'ctx> SymMemory<'ctx> {
             truncated = true;
         }
 
+        let outside_solver = Solver::new();
+        for constraint in constraints {
+            outside_solver.assert(constraint);
+        }
+        outside_solver.assert(region_membership.not());
+        if outside_solver.check() != SatResult::Unsat {
+            truncated = true;
+        }
+
         (targets, truncated)
+    }
+
+    fn explicit_region_membership(&self, addr: &BV, size: u32) -> Option<Bool> {
+        let bits = addr.get_size();
+        if bits > 64 {
+            return None;
+        }
+        let max_addr = if bits == 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
+        let mut ranges = self.regions.values().filter_map(|region| {
+            if region.def.kind == MemoryRegionKind::EscapedUnknown {
+                return None;
+            }
+            let base = region.def.base_addr?;
+            let extent = region.def.extent?;
+            let max_start = base.checked_add(extent.checked_sub(u64::from(size))?)?;
+            if base > max_addr || max_start > max_addr {
+                return None;
+            }
+            let lower = addr.bvuge(BV::from_u64(base, bits));
+            let upper = addr.bvule(BV::from_u64(max_start, bits));
+            Some(lower & upper)
+        });
+        let first = ranges.next()?;
+        Some(ranges.fold(first, |combined, range| combined | range))
     }
 }
 
@@ -966,151 +1012,84 @@ impl<'ctx> std::fmt::Debug for SymMemory<'ctx> {
     }
 }
 
-#[derive(Clone)]
-struct AffinePointer<'ctx> {
-    base: SymValue<'ctx>,
-    delta: i64,
-}
-
-fn recognize_affine_pointer<'ctx>(addr: &SymValue<'ctx>) -> Option<AffinePointer<'ctx>> {
-    let ast = addr.as_ast()?;
-    let (base, delta) = recognize_affine_bv(ast)?;
-    Some(AffinePointer {
-        base: SymValue::symbolic_tainted(base, addr.bits(), addr.get_taint()),
-        delta,
-    })
-}
-
-fn recognize_affine_bv(ast: &BV) -> Option<(BV, i64)> {
-    recognize_affine_bv_by_kind(ast).or_else(|| recognize_affine_bv_by_substitution(ast))
-}
-
-fn recognize_affine_bv_by_kind(ast: &BV) -> Option<(BV, i64)> {
-    if ast.as_u64().is_some() {
+fn finite_unconstrained_addresses<'ctx>(addr: &SymValue<'ctx>, limit: usize) -> Option<Vec<u64>> {
+    if limit == 0 {
         return None;
     }
+    let values = finite_bv_values(addr.as_ast()?, limit)?;
+    Some(values.into_iter().collect())
+}
 
-    if is_symbolic_bv_leaf(ast) {
-        return Some((ast.clone(), 0));
+fn finite_bv_values(ast: &BV, limit: usize) -> Option<BTreeSet<u64>> {
+    if let Some(value) = ast.as_u64() {
+        return Some(BTreeSet::from([value]));
     }
-
+    let children = ast.children();
     match ast.decl().kind() {
-        DeclKind::Badd => {
-            let children = ast.children();
-            if children.len() != 2 {
-                return None;
-            }
-            let left = children[0].as_bv()?;
-            let right = children[1].as_bv()?;
-            if let Some(delta) = affine_constant(&right) {
-                let (base, base_delta) = recognize_affine_bv(&left)?;
-                return base_delta
-                    .checked_add(delta)
-                    .map(|combined| (widen_affine_base(&base, ast.get_size()), combined));
-            }
-            if let Some(delta) = affine_constant(&left) {
-                let (base, base_delta) = recognize_affine_bv(&right)?;
-                return base_delta
-                    .checked_add(delta)
-                    .map(|combined| (widen_affine_base(&base, ast.get_size()), combined));
-            }
-            None
+        DeclKind::Ite if children.len() == 3 => {
+            let mut values = finite_bv_values(&children[1].as_bv()?, limit)?;
+            values.extend(finite_bv_values(&children[2].as_bv()?, limit)?);
+            (values.len() <= limit).then_some(values)
         }
-        DeclKind::Bsub => {
-            let children = ast.children();
-            if children.len() != 2 {
-                return None;
+        DeclKind::Badd | DeclKind::Bsub if children.len() == 2 => {
+            let left = finite_bv_values(&children[0].as_bv()?, limit)?;
+            let right = finite_bv_values(&children[1].as_bv()?, limit)?;
+            let bits = ast.get_size();
+            let mask = if bits >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << bits) - 1
+            };
+            let mut values = BTreeSet::new();
+            for lhs in left {
+                for rhs in &right {
+                    let value = if ast.decl().kind() == DeclKind::Badd {
+                        lhs.wrapping_add(*rhs)
+                    } else {
+                        lhs.wrapping_sub(*rhs)
+                    } & mask;
+                    values.insert(value);
+                    if values.len() > limit {
+                        return None;
+                    }
+                }
             }
-            let left = children[0].as_bv()?;
-            let right = children[1].as_bv()?;
-            let delta = affine_constant(&right)?;
-            let (base, base_delta) = recognize_affine_bv(&left)?;
-            base_delta
-                .checked_sub(delta)
-                .map(|combined| (widen_affine_base(&base, ast.get_size()), combined))
-        }
-        DeclKind::ZeroExt | DeclKind::SignExt => {
-            let child = ast.nth_child(0)?.as_bv()?;
-            let (base, delta) = recognize_affine_bv(&child)?;
-            Some((widen_affine_base(&base, ast.get_size()), delta))
+            Some(values)
         }
         _ => None,
     }
 }
 
-fn recognize_affine_bv_by_substitution(ast: &BV) -> Option<(BV, i64)> {
-    let mut leaves = BTreeMap::new();
-    collect_uninterpreted_bv_leaves(ast, &mut leaves);
-    if leaves.len() != 1 {
-        return None;
+fn constraints_reference_value(value: &BV, constraints: &[Bool]) -> bool {
+    let mut value_symbols = BTreeSet::new();
+    collect_uninterpreted_symbols(value, &mut value_symbols);
+    if value_symbols.is_empty() {
+        return true;
     }
-    let base = leaves.into_values().next()?;
-    let zero = BV::from_u64(0, base.get_size());
-    let residual = catch_unwind(AssertUnwindSafe(|| ast.substitute(&[(&base, &zero)])))
-        .ok()?
-        .simplify();
-    let delta = affine_constant(&residual)?;
-    let widened_base = widen_affine_base(&base, ast.get_size());
-    let expected = if delta == 0 {
-        widened_base.clone()
-    } else if delta > 0 {
-        widened_base.bvadd(BV::from_i64(delta, ast.get_size()))
-    } else {
-        widened_base.bvsub(BV::from_i64(delta.saturating_abs(), ast.get_size()))
-    };
-    let solver = Solver::new();
-    solver.assert(expected.eq(ast).not());
-    (solver.check() == SatResult::Unsat).then_some((widened_base, delta))
+    constraints.iter().any(|constraint| {
+        let mut constraint_symbols = BTreeSet::new();
+        collect_uninterpreted_symbols(constraint, &mut constraint_symbols);
+        !value_symbols.is_disjoint(&constraint_symbols)
+    })
 }
 
-fn collect_uninterpreted_bv_leaves(ast: &BV, leaves: &mut BTreeMap<String, BV>) {
-    if ast.as_u64().is_some() {
-        return;
-    }
-    if is_symbolic_bv_leaf(ast) {
-        leaves.entry(ast.to_string()).or_insert_with(|| ast.clone());
-        return;
-    }
-    for child in ast.children() {
-        if let Some(child_bv) = child.as_bv() {
-            collect_uninterpreted_bv_leaves(&child_bv, leaves);
+fn collect_uninterpreted_symbols(ast: &dyn Ast, symbols: &mut BTreeSet<String>) {
+    let children = ast.children();
+    if children.is_empty() {
+        if ast.decl().kind() == DeclKind::Uninterpreted {
+            symbols.insert(ast.decl().name());
         }
+        return;
     }
-}
-
-fn is_symbolic_bv_leaf(ast: &BV) -> bool {
-    ast.as_u64().is_none() && ast.children().is_empty()
-}
-
-fn widen_affine_base(base: &BV, target_bits: u32) -> BV {
-    let base_bits = base.get_size();
-    if base_bits == target_bits {
-        base.clone()
-    } else if base_bits < target_bits {
-        base.zero_ext(target_bits - base_bits)
-    } else {
-        base.extract(target_bits - 1, 0)
+    for child in children {
+        collect_uninterpreted_symbols(&child, symbols);
     }
-}
-
-fn affine_constant(ast: &BV) -> Option<i64> {
-    let value = ast.as_u64()?;
-    if let Ok(delta) = i64::try_from(value) {
-        return Some(delta);
-    }
-    let bits = ast.get_size();
-    if bits == 0 || bits >= 64 {
-        let sign_bit = 1u64 << 63;
-        return (value & sign_bit != 0).then_some(value as i64);
-    }
-    let sign_bit = 1u64 << (bits - 1);
-    (value & sign_bit != 0).then_some(value as i64)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use z3::ast::BV;
+    use z3::ast::{BV, Bool};
     use z3::{SatResult, Solver};
 
     #[test]
@@ -1368,15 +1347,80 @@ mod tests {
     }
 
     #[test]
-    fn test_affine_pointer_recognizer_extracts_symbol_plus_delta() {
+    fn test_unconstrained_symbolic_pointer_stays_residual() {
         let ctx = Context::thread_local();
-        let base = SymValue::new_symbolic(&ctx, "ptr_base", 64);
-        let addr = base.add(&ctx, &SymValue::concrete(0x20, 64));
+        let mut mem = SymMemory::new(&ctx);
+        mem.define_region(
+            MemoryRegionKind::Global,
+            "globals",
+            Some(0x1000),
+            Some(0x100),
+        );
+        let addr = SymValue::new_symbolic(&ctx, "unconstrained_ptr", 64);
 
-        let affine = recognize_affine_pointer(&addr).expect("affine recognizer should match");
-        assert_eq!(affine.delta, 0x20);
-        let same = affine.base.to_bv(&ctx).eq(base.to_bv(&ctx));
-        assert_eq!(same.simplify().as_bool(), Some(true));
+        let resolved = mem.resolve_pointer(&addr, 4, &[]);
+
+        assert!(resolved.pointers.is_empty());
+        assert!(resolved.truncated);
+    }
+
+    #[test]
+    fn test_finite_symbolic_pointer_choices_resolve_without_constraints() {
+        let ctx = Context::thread_local();
+        let mut mem = SymMemory::new(&ctx);
+        let globals = mem.define_region(
+            MemoryRegionKind::Global,
+            "globals",
+            Some(0x1000),
+            Some(0x100),
+        );
+        let choice = Bool::new_const("pointer_choice");
+        let addr = SymValue::symbolic(
+            choice.ite(&BV::from_u64(0x1004, 64), &BV::from_u64(0x1008, 64)),
+            64,
+        );
+
+        let resolved = mem.resolve_pointer(&addr, 4, &[]);
+
+        assert_eq!(resolved.pointers.len(), 2);
+        assert!(
+            resolved
+                .pointers
+                .iter()
+                .all(|pointer| pointer.region_id == globals)
+        );
+        assert_eq!(
+            resolved
+                .pointers
+                .iter()
+                .map(|pointer| pointer.offset)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([4, 8])
+        );
+        assert!(!resolved.truncated);
+    }
+
+    #[test]
+    fn test_region_directed_resolution_marks_unknown_space_residual() {
+        let ctx = Context::thread_local();
+        let mut mem = SymMemory::new(&ctx);
+        let globals = mem.define_region(
+            MemoryRegionKind::Global,
+            "globals",
+            Some(0x1000),
+            Some(0x100),
+        );
+        let addr = SymValue::new_symbolic(&ctx, "maybe_global", 64);
+        let addr_bv = addr.to_bv(&ctx);
+        let constraint =
+            addr_bv.eq(BV::from_u64(0x1004, 64)) | addr_bv.eq(BV::from_u64(0x9000, 64));
+
+        let resolved = mem.resolve_pointer(&addr, 4, &[constraint]);
+
+        assert_eq!(resolved.pointers.len(), 1);
+        assert_eq!(resolved.pointers[0].region_id, globals);
+        assert_eq!(resolved.pointers[0].offset, 4);
+        assert!(resolved.truncated);
     }
 
     #[test]
