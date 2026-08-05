@@ -45,7 +45,9 @@ use crate::ast::{BinaryOp, CExpr, CStmt, CType, UnaryOp};
 use crate::registers::register_family_name;
 
 use super::SSABlock;
-use super::context::{EffectRenderProofKind, FoldingContext};
+use super::context::{
+    EffectRenderProofKind, FoldingContext, PhiEdgeRenderKind, PhiEdgeRenderProof,
+};
 use super::context::{ResolutionGuardKey, ResolutionPhase};
 use super::flags::is_cpu_flag;
 use super::{
@@ -866,13 +868,29 @@ impl<'a> FoldingContext<'a> {
         self.use_info().stable_stack_values.get(&offset)
     }
 
-    pub(super) fn is_certified_materialized_phi_carrier(&self, op: &SSAOp, stmt: &CStmt) -> bool {
-        let SSAOp::Copy { dst, src } = op else {
-            return false;
+    pub(super) fn certified_phi_edge_render_proof(
+        &self,
+        op: &SSAOp,
+        stmt: &CStmt,
+        predecessor: u64,
+    ) -> Option<PhiEdgeRenderProof> {
+        let (dst, src, guarded) = match op {
+            SSAOp::Copy { dst, src } => (dst, src, None),
+            SSAOp::Select {
+                dst,
+                cond,
+                if_true,
+                if_false,
+            } if if_false == dst && if_true != dst => (dst, if_true, Some((cond, true))),
+            SSAOp::Select {
+                dst,
+                cond,
+                if_true,
+                if_false,
+            } if if_true == dst && if_false != dst => (dst, if_false, Some((cond, false))),
+            _ => return None,
         };
-        let Some((target, _)) = Self::assignment_target_and_rhs(stmt) else {
-            return false;
-        };
+        let (target, _) = Self::assignment_target_and_rhs(stmt)?;
         if !target.eq_ignore_ascii_case(&self.var_name(dst))
             && !target.eq_ignore_ascii_case(&dst.display_name())
             && !self
@@ -880,24 +898,83 @@ impl<'a> FoldingContext<'a> {
                 .and_then(|value| self.certified_loop_carrier_name_for_value(value))
                 .is_some_and(|name| target.eq_ignore_ascii_case(&name))
         {
-            return false;
+            return None;
         }
-        let Some(prepared) = self.prepared_ssa() else {
-            return false;
+        let prepared = self.prepared_ssa()?;
+        let dst_id = prepared.graph().value_id_for_var(dst)?;
+        let src_id = prepared.graph().value_id_for_var(src)?;
+        let def_inst = prepared.graph().def_inst(dst_id)?;
+        let inst = prepared.graph().inst(def_inst)?;
+        let r2ssa::InstPayload::Phi { predecessors } = &inst.payload else {
+            return None;
         };
-        let Some(dst_id) = prepared.graph().value_id_for_var(dst) else {
-            return false;
+        let exact_phi_edge = predecessors.iter().zip(&inst.inputs).any(|(pred, input)| {
+            *input == src_id
+                && prepared
+                    .graph()
+                    .block(*pred)
+                    .is_some_and(|block| block.addr == predecessor)
+        });
+        if !inst.inputs.contains(&src_id) {
+            return None;
+        }
+        let phi_block = prepared.graph().block(inst.block)?.addr;
+        let kind = match guarded {
+            None if exact_phi_edge
+                && prepared.successors(predecessor).as_slice() == [phi_block] =>
+            {
+                PhiEdgeRenderKind::Direct
+            }
+            None if exact_phi_edge
+                && prepared.successors(predecessor).contains(&phi_block)
+                && prepared.function().dominates(phi_block, predecessor) =>
+            {
+                PhiEdgeRenderKind::UnconditionalDeadOnOtherEdges
+            }
+            None if matches!(
+                self.certified_render_context()
+                    .and_then(|render| render.render_facts.loop_carrier_for_value(dst_id)),
+                Some(r2types::CertifiedEntity::LoopCarrier {
+                    dominating_initializers,
+                    ..
+                }) if dominating_initializers.iter().any(|initializer| {
+                    initializer.predecessor == predecessor
+                        && initializer.value == src_id
+                })
+            ) =>
+            {
+                PhiEdgeRenderKind::Direct
+            }
+            None => return None,
+            Some((cond, truth)) => {
+                if !exact_phi_edge {
+                    return None;
+                }
+                let condition = prepared.graph().value_id_for_var(cond)?;
+                let edge_truth = match prepared.function().edge_type(predecessor, phi_block) {
+                    Some(r2ssa::CFGEdge::True) => true,
+                    Some(r2ssa::CFGEdge::False) => false,
+                    _ => return None,
+                };
+                if !prepared.function().dominates(phi_block, predecessor)
+                    || edge_truth != truth
+                    || !prepared
+                        .get_block(predecessor)
+                        .and_then(|block| block.ops.last())
+                        .is_some_and(|op| {
+                            matches!(op, SSAOp::CBranch { cond, .. }
+                                if prepared.graph().value_id_for_var(cond) == Some(condition))
+                        })
+                {
+                    return None;
+                }
+                PhiEdgeRenderKind::Guarded { condition, truth }
+            }
         };
-        let Some(src_id) = prepared.graph().value_id_for_var(src) else {
-            return false;
-        };
-        let Some(def_inst) = prepared.graph().def_inst(dst_id) else {
-            return false;
-        };
-        let Some(inst) = prepared.graph().inst(def_inst) else {
-            return false;
-        };
-        matches!(&inst.payload, r2ssa::InstPayload::Phi { .. }) && inst.inputs.contains(&src_id)
+        Some(PhiEdgeRenderProof {
+            source: src_id,
+            kind,
+        })
     }
 
     fn is_certified_loop_carrier_phi_copy(&self, dst: &SSAVar, src: &SSAVar) -> bool {
@@ -3460,6 +3537,25 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn should_inline(&self, var: &SSAVar) -> bool {
+        let var_name = var.display_name();
+        let use_count = self.use_counts_map().get(&var_name).copied().unwrap_or(0);
+        if self.requires_certified_rendering()
+            && (1..=3).contains(&use_count)
+            && self.prepared_value_id_for_var(var).is_some_and(|value| {
+                self.certified_render_context().is_some_and(|render| {
+                    render
+                        .render_facts
+                        .loop_carrier_update_for_value(value)
+                        .is_some()
+                        && render.memory_read_for_value_dependency(value).is_none()
+                })
+            })
+            && self
+                .definition_for_name(&var_name)
+                .is_some_and(|expr| self.expr_is_pure(expr))
+        {
+            return true;
+        }
         if self.requires_certified_rendering()
             && self.prepared_value_id_for_var(var).is_some_and(|value| {
                 self.certified_loop_carrier_name_for_value(value).is_some()
@@ -3468,8 +3564,6 @@ impl<'a> FoldingContext<'a> {
         {
             return false;
         }
-        let var_name = var.display_name();
-        let use_count = self.use_counts_map().get(&var_name).copied().unwrap_or(0);
         if use_count == 0 || use_count > 3 {
             return false;
         }
@@ -14714,10 +14808,19 @@ impl<'a> FoldingContext<'a> {
                 if_false,
             } => {
                 let lhs = self.assignment_lhs_expr(dst);
+                let certified = |var: &SSAVar| {
+                    self.requires_certified_rendering()
+                        .then(|| self.certified_expr_for_prepared_var(var, 0, &mut BTreeSet::new()))
+                        .flatten()
+                };
                 let rhs = CExpr::Ternary {
-                    cond: Box::new(self.get_expr(cond)),
-                    then_expr: Box::new(self.get_expr(if_true)),
-                    else_expr: Box::new(self.get_expr(if_false)),
+                    cond: Box::new(certified(cond).unwrap_or_else(|| self.get_expr(cond))),
+                    then_expr: Box::new(
+                        certified(if_true).unwrap_or_else(|| self.get_expr(if_true)),
+                    ),
+                    else_expr: Box::new(
+                        certified(if_false).unwrap_or_else(|| self.get_expr(if_false)),
+                    ),
                 };
                 let rhs = self.assignment_rhs_with_type_policy(dst, None, rhs);
                 self.assign_stmt(lhs, rhs)

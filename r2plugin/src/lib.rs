@@ -10811,6 +10811,7 @@ mod integration_tests {
                 && response.output.contains("int32_t var_10h = 0;")
                 && response.output.contains("for (int32_t var_14h = 0;")
                 && response.output.contains("var_14h < arg1")
+                && !response.output.contains("memory_value_")
                 && response.output.contains("arg0[var_14h]")
                 && response.output.contains("return var_10h;"),
             "typed spilled array access should render from real lifted bytes; output={} render_facts={:?}",

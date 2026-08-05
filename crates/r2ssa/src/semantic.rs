@@ -4589,8 +4589,10 @@ fn signed_flag_compare_components<'a>(
     signed_overflow_sources: &BTreeMap<SSAVar, (ValueId, ValueId)>,
     signed_sign_sources: &BTreeMap<SSAVar, (ValueId, ValueId)>,
 ) -> Option<(&'a SSAVar, CompareKind, ValueId, ValueId)> {
-    let SSAOp::IntNotEqual { dst, a, b } = op else {
-        return None;
+    let (dst, a, b, equal) = match op {
+        SSAOp::IntNotEqual { dst, a, b } => (dst, a, b, false),
+        SSAOp::IntEqual { dst, a, b } => (dst, a, b, true),
+        _ => return None,
     };
     let overflow = signed_overflow_sources.get(a);
     let sign = signed_sign_sources.get(b);
@@ -4606,7 +4608,11 @@ fn signed_flag_compare_components<'a>(
                 .filter(|(overflow, sign)| overflow == sign)
                 .map(|(overflow, _)| *overflow)
         })?;
-    Some((dst, CompareKind::SignedLess, lhs, rhs))
+    Some(if equal {
+        (dst, CompareKind::SignedLessEqual, rhs, lhs)
+    } else {
+        (dst, CompareKind::SignedLess, lhs, rhs)
+    })
 }
 
 fn compare_components(op: &SSAOp) -> Option<(&SSAVar, CompareKind, &SSAVar, &SSAVar)> {

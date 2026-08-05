@@ -39,6 +39,19 @@ pub(crate) enum EffectRenderProofKind {
     Return,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum PhiEdgeRenderKind {
+    Direct,
+    UnconditionalDeadOnOtherEdges,
+    Guarded { condition: ValueId, truth: bool },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct PhiEdgeRenderProof {
+    pub(crate) source: ValueId,
+    pub(crate) kind: PhiEdgeRenderKind,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct EffectRenderProof {
     pub(crate) kind: EffectRenderProofKind,
@@ -49,7 +62,7 @@ pub(crate) struct EffectRenderProof {
     pub(crate) address: Option<ValueId>,
     pub(crate) value: Option<ValueId>,
     pub(crate) values: Vec<ValueId>,
-    pub(crate) materialized_phi_copy: bool,
+    pub(crate) phi_edge: Option<PhiEdgeRenderProof>,
 }
 
 #[derive(Debug, Clone)]
@@ -298,16 +311,16 @@ impl<'a> FoldingContext<'a> {
                 address: None,
                 value,
                 values: Vec::new(),
-                materialized_phi_copy: false,
+                phi_edge: None,
             });
     }
 
-    pub(crate) fn record_effect_render_proof_for_materialized_phi_copy(
+    pub(crate) fn record_effect_render_proof_for_phi_edge(
         &self,
         block_addr: u64,
         op_idx: usize,
         value: Option<ValueId>,
-        source: Option<ValueId>,
+        phi_edge: PhiEdgeRenderProof,
     ) {
         self.effect_render_proofs
             .borrow_mut()
@@ -319,8 +332,8 @@ impl<'a> FoldingContext<'a> {
                 target: None,
                 address: None,
                 value,
-                values: source.into_iter().collect(),
-                materialized_phi_copy: true,
+                values: Vec::new(),
+                phi_edge: Some(phi_edge),
             });
     }
 
@@ -341,7 +354,7 @@ impl<'a> FoldingContext<'a> {
             address: Some(address),
             value,
             values: Vec::new(),
-            materialized_phi_copy: false,
+            phi_edge: None,
         };
         let mut proofs = self.effect_render_proofs.borrow_mut();
         if !proofs.contains(&proof) {
@@ -368,7 +381,7 @@ impl<'a> FoldingContext<'a> {
                 address: None,
                 value: None,
                 values,
-                materialized_phi_copy: false,
+                phi_edge: None,
             });
     }
 

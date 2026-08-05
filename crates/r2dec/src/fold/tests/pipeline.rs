@@ -20421,7 +20421,7 @@ mod tests {
     }
 
     #[test]
-    fn certified_materialized_phi_carriers_do_not_emit_residual_comments() {
+    fn certified_noncarrier_phis_remain_semantic_expressions() {
         let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x1810, 4);
         entry.push(R2ILOp::CBranch {
@@ -20454,7 +20454,18 @@ mod tests {
 
         let prepared =
             prepared_from_r2il_blocks(&[entry, left, right, exit], &arch).with_name("phi_carrier");
-        let normalized = crate::normalize::materialize_phis(prepared.function());
+        let render_facts = r2types::FunctionRenderFacts::from_prepared(&prepared);
+        let normalized = crate::normalize::materialize_certified_loop_carriers(
+            prepared.function(),
+            &prepared,
+            &render_facts,
+        );
+        assert!(
+            normalized
+                .get_block(0x181c)
+                .is_some_and(|block| !block.phis.is_empty()),
+            "ordinary merge phis must remain immutable certified expressions"
+        );
         let fold_blocks = normalized.blocks().cloned().collect::<Vec<_>>();
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
         ctx.analyze_blocks(&fold_blocks);
@@ -20474,7 +20485,7 @@ mod tests {
             rendered
                 .iter()
                 .all(|stmt| !stmt.contains("r2sleigh residual:")),
-            "materialized SSA phi carriers should stay cleanup candidates, got {rendered:?}"
+            "noncarrier phi predecessors should not invent mutable render effects: {rendered:?}"
         );
     }
 
@@ -20514,7 +20525,12 @@ mod tests {
 
         let prepared = prepared_from_r2il_blocks(&[entry, header, exit, latch], &arch)
             .with_name("certified_loop_carrier_entry");
-        let normalized = crate::normalize::materialize_phis(prepared.function());
+        let render_facts = r2types::FunctionRenderFacts::from_prepared(&prepared);
+        let normalized = crate::normalize::materialize_certified_loop_carriers(
+            prepared.function(),
+            &prepared,
+            &render_facts,
+        );
         let mut ctx = make_aarch64_ctx_with_prepared(&prepared);
         mutate_function_facts(&mut ctx, |facts| {
             facts.populate_certified_parameter_exprs(
@@ -20527,15 +20543,16 @@ mod tests {
         let fold_blocks = normalized.blocks().cloned().collect::<Vec<_>>();
         ctx.analyze_blocks(&fold_blocks);
 
-        let carrier_name = ctx
+        let (carrier_name, update_var) = ctx
             .inputs
             .function_facts
             .render_facts()
             .loop_carriers()
             .find_map(|entity| match entity {
-                r2types::CertifiedEntity::LoopCarrier { phi, .. } => {
-                    Some(crate::certified_loop_carrier_name(*phi))
-                }
+                r2types::CertifiedEntity::LoopCarrier { phi, updates, .. } => Some((
+                    crate::certified_loop_carrier_name(*phi),
+                    prepared.value_var(updates.first()?.value)?.clone(),
+                )),
                 _ => None,
             })
             .expect("observable loop carrier");
@@ -20553,6 +20570,30 @@ mod tests {
                 )
             }),
             "certified entry copy must initialize {carrier_name}: {entry_stmts:?}"
+        );
+        assert!(
+            ctx.should_inline(&update_var),
+            "a pure certified carrier update should feed only its edge assignment"
+        );
+        let latch_stmts = ctx.fold_block(normalized.get_block(0x1010).expect("latch"), 0x1010);
+        assert!(
+            latch_stmts.iter().any(|stmt| {
+                matches!(
+                    stmt,
+                    CStmt::Expr(CExpr::Binary {
+                        op: BinaryOp::Assign,
+                        left,
+                        ..
+                    }) if matches!(left.as_ref(), CExpr::Var(name) if name == &carrier_name)
+                )
+            }),
+            "the inlined update must survive as the certified carrier edge assignment: {latch_stmts:?}"
+        );
+        assert!(
+            !format!("{latch_stmts:?}")
+                .to_ascii_lowercase()
+                .contains(&update_var.display_name().to_ascii_lowercase()),
+            "the raw update producer must not be emitted beside its carrier edge assignment: {latch_stmts:?}"
         );
     }
 

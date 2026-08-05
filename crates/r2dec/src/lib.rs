@@ -60,7 +60,9 @@ pub use variable::VariableRecovery;
 
 use crate::codegen::CodeGenerator;
 use crate::fold::FoldingContext;
-use crate::fold::context::{EffectRenderProof, EffectRenderProofKind, FoldArchConfig, FoldInputs};
+use crate::fold::context::{
+    EffectRenderProof, EffectRenderProofKind, FoldArchConfig, FoldInputs, PhiEdgeRenderKind,
+};
 use r2ssa::SSAFunction;
 use r2ssa::SSAOp;
 use r2ssa::cfg::BlockTerminator;
@@ -3188,6 +3190,331 @@ fn certified_standard_output_residual_reason(
     )
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum AssignmentGuardLiteral {
+    Equality {
+        left: CExpr,
+        right: CExpr,
+        equal: bool,
+    },
+    Expression {
+        expr: CExpr,
+        truth: bool,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct DefiniteAssignmentState {
+    unconditional: BTreeSet<String>,
+    guarded: BTreeMap<String, Vec<Vec<AssignmentGuardLiteral>>>,
+    assumptions: Vec<AssignmentGuardLiteral>,
+}
+
+impl DefiniteAssignmentState {
+    fn new(unconditional: BTreeSet<String>) -> Self {
+        Self {
+            unconditional,
+            guarded: BTreeMap::new(),
+            assumptions: Vec::new(),
+        }
+    }
+
+    fn local_is_assigned(&self, name: &str) -> bool {
+        self.unconditional.contains(name)
+            || self.guarded.get(name).is_some_and(|clauses| {
+                clauses.iter().any(|clause| {
+                    clause.iter().all(|literal| {
+                        self.assumptions
+                            .iter()
+                            .any(|assumption| assignment_guard_literals_match(literal, assumption))
+                    })
+                })
+            })
+    }
+
+    fn record_assignment(&mut self, name: &str) {
+        if self.assumptions.is_empty() {
+            self.unconditional.insert(name.to_string());
+            self.guarded.remove(name);
+            return;
+        }
+        if self.unconditional.contains(name) {
+            return;
+        }
+        let clause = normalized_assignment_guard_clause(self.assumptions.clone());
+        self.guarded
+            .entry(name.to_string())
+            .or_default()
+            .push(clause);
+        self.simplify_guarded_name(name);
+    }
+
+    fn with_assumption(&self, expr: &CExpr, truth: bool) -> Option<Self> {
+        let literal = assignment_guard_literal(expr, truth);
+        if self
+            .assumptions
+            .iter()
+            .any(|assumption| assignment_guard_literals_complement(assumption, &literal))
+        {
+            return None;
+        }
+        let mut state = self.clone();
+        if !state
+            .assumptions
+            .iter()
+            .any(|assumption| assignment_guard_literals_match(assumption, &literal))
+        {
+            state.assumptions.push(literal);
+        }
+        Some(state)
+    }
+
+    fn simplify_guarded_name(&mut self, name: &str) {
+        let Some(mut clauses) = self.guarded.remove(name) else {
+            return;
+        };
+        simplify_assignment_guard_clauses(&mut clauses);
+        if clauses.iter().any(Vec::is_empty) {
+            self.unconditional.insert(name.to_string());
+        } else if !clauses.is_empty() {
+            self.guarded.insert(name.to_string(), clauses);
+        }
+    }
+}
+
+fn assignment_guard_literal(expr: &CExpr, truth: bool) -> AssignmentGuardLiteral {
+    match expr {
+        CExpr::Paren(inner) => assignment_guard_literal(inner, truth),
+        CExpr::Unary {
+            op: UnaryOp::Not,
+            operand,
+        } => assignment_guard_literal(operand, !truth),
+        CExpr::Binary {
+            op: BinaryOp::Eq | BinaryOp::Ne,
+            left,
+            right,
+        } => AssignmentGuardLiteral::Equality {
+            left: (**left).clone(),
+            right: (**right).clone(),
+            equal: if matches!(
+                expr,
+                CExpr::Binary {
+                    op: BinaryOp::Eq,
+                    ..
+                }
+            ) {
+                truth
+            } else {
+                !truth
+            },
+        },
+        _ => AssignmentGuardLiteral::Expression {
+            expr: expr.clone(),
+            truth,
+        },
+    }
+}
+
+fn assignment_guard_literals_same_atom(
+    left: &AssignmentGuardLiteral,
+    right: &AssignmentGuardLiteral,
+) -> bool {
+    match (left, right) {
+        (
+            AssignmentGuardLiteral::Equality {
+                left: left_a,
+                right: left_b,
+                ..
+            },
+            AssignmentGuardLiteral::Equality {
+                left: right_a,
+                right: right_b,
+                ..
+            },
+        ) => left_a == right_a && left_b == right_b || left_a == right_b && left_b == right_a,
+        (
+            AssignmentGuardLiteral::Expression { expr: left, .. },
+            AssignmentGuardLiteral::Expression { expr: right, .. },
+        ) => left == right,
+        _ => false,
+    }
+}
+
+fn assignment_guard_literal_truth(literal: &AssignmentGuardLiteral) -> bool {
+    match literal {
+        AssignmentGuardLiteral::Equality { equal, .. } => *equal,
+        AssignmentGuardLiteral::Expression { truth, .. } => *truth,
+    }
+}
+
+fn assignment_guard_literals_match(
+    left: &AssignmentGuardLiteral,
+    right: &AssignmentGuardLiteral,
+) -> bool {
+    assignment_guard_literals_same_atom(left, right)
+        && assignment_guard_literal_truth(left) == assignment_guard_literal_truth(right)
+}
+
+fn assignment_guard_literals_complement(
+    left: &AssignmentGuardLiteral,
+    right: &AssignmentGuardLiteral,
+) -> bool {
+    assignment_guard_literals_same_atom(left, right)
+        && assignment_guard_literal_truth(left) != assignment_guard_literal_truth(right)
+}
+
+fn normalized_assignment_guard_clause(
+    literals: Vec<AssignmentGuardLiteral>,
+) -> Vec<AssignmentGuardLiteral> {
+    let mut normalized = Vec::new();
+    for literal in literals {
+        if normalized
+            .iter()
+            .any(|existing| assignment_guard_literals_complement(existing, &literal))
+        {
+            return Vec::new();
+        }
+        if !normalized
+            .iter()
+            .any(|existing| assignment_guard_literals_match(existing, &literal))
+        {
+            normalized.push(literal);
+        }
+    }
+    normalized
+}
+
+fn assignment_guard_clause_implies(
+    stronger: &[AssignmentGuardLiteral],
+    weaker: &[AssignmentGuardLiteral],
+) -> bool {
+    weaker.iter().all(|expected| {
+        stronger
+            .iter()
+            .any(|actual| assignment_guard_literals_match(actual, expected))
+    })
+}
+
+fn assignment_guard_consensus(
+    left: &[AssignmentGuardLiteral],
+    right: &[AssignmentGuardLiteral],
+) -> Option<Vec<AssignmentGuardLiteral>> {
+    let mut left_only = left
+        .iter()
+        .filter(|literal| {
+            !right
+                .iter()
+                .any(|other| assignment_guard_literals_match(literal, other))
+        })
+        .collect::<Vec<_>>();
+    let mut right_only = right
+        .iter()
+        .filter(|literal| {
+            !left
+                .iter()
+                .any(|other| assignment_guard_literals_match(literal, other))
+        })
+        .collect::<Vec<_>>();
+    if left_only.len() != 1
+        || right_only.len() != 1
+        || !assignment_guard_literals_complement(left_only.remove(0), right_only.remove(0))
+    {
+        return None;
+    }
+    Some(
+        left.iter()
+            .filter(|literal| {
+                right
+                    .iter()
+                    .any(|other| assignment_guard_literals_match(literal, other))
+            })
+            .cloned()
+            .collect(),
+    )
+}
+
+fn simplify_assignment_guard_clauses(clauses: &mut Vec<Vec<AssignmentGuardLiteral>>) {
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut unique = Vec::<Vec<AssignmentGuardLiteral>>::new();
+        for clause in clauses.drain(..) {
+            if !unique.iter().any(|existing| {
+                assignment_guard_clause_implies(&clause, existing)
+                    && assignment_guard_clause_implies(existing, &clause)
+            }) {
+                unique.push(clause);
+            }
+        }
+        unique = unique
+            .iter()
+            .enumerate()
+            .filter(|(candidate_index, candidate)| {
+                !unique.iter().enumerate().any(|(other_index, other)| {
+                    candidate_index != &other_index
+                        && assignment_guard_clause_implies(candidate, other)
+                })
+            })
+            .map(|(_, clause)| clause.clone())
+            .collect();
+        'consensus: for left in 0..unique.len() {
+            for right in left + 1..unique.len() {
+                let Some(consensus) = assignment_guard_consensus(&unique[left], &unique[right])
+                else {
+                    continue;
+                };
+                if !unique.iter().any(|existing| {
+                    assignment_guard_clause_implies(&consensus, existing)
+                        && assignment_guard_clause_implies(existing, &consensus)
+                }) {
+                    unique.push(consensus);
+                    changed = true;
+                    break 'consensus;
+                }
+            }
+        }
+        *clauses = unique;
+    }
+}
+
+fn merge_definite_assignment_states(
+    base_assumptions: &[AssignmentGuardLiteral],
+    states: impl IntoIterator<Item = DefiniteAssignmentState>,
+) -> DefiniteAssignmentState {
+    let states = states.into_iter().collect::<Vec<_>>();
+    let unconditional = states
+        .first()
+        .map(|first| {
+            states
+                .iter()
+                .skip(1)
+                .fold(first.unconditional.clone(), |current, state| {
+                    current
+                        .intersection(&state.unconditional)
+                        .cloned()
+                        .collect()
+                })
+        })
+        .unwrap_or_default();
+    let mut merged = DefiniteAssignmentState {
+        unconditional,
+        guarded: BTreeMap::new(),
+        assumptions: base_assumptions.to_vec(),
+    };
+    for state in states {
+        for (name, clauses) in state.guarded {
+            if !merged.unconditional.contains(&name) {
+                merged.guarded.entry(name).or_default().extend(clauses);
+            }
+        }
+    }
+    let names = merged.guarded.keys().cloned().collect::<Vec<_>>();
+    for name in names {
+        merged.simplify_guarded_name(&name);
+    }
+    merged
+}
+
 fn definite_assignment_residual_reason(func: &CFunction) -> Option<String> {
     let mut local_names = func
         .locals
@@ -3197,13 +3524,14 @@ fn definite_assignment_residual_reason(func: &CFunction) -> Option<String> {
     for stmt in &func.body {
         collect_declared_local_names(stmt, &mut local_names);
     }
-    let mut assigned = func
+    let assigned = func
         .params
         .iter()
         .map(|param| param.name.clone())
         .collect::<BTreeSet<_>>();
+    let mut state = DefiniteAssignmentState::new(assigned);
     for (index, stmt) in func.body.iter().enumerate() {
-        if let Err(reason) = analyze_definite_assignment_stmt(stmt, &local_names, &mut assigned) {
+        if let Err(reason) = analyze_definite_assignment_stmt(stmt, &local_names, &mut state) {
             return Some(format!(
                 "definite-assignment proof failed at statement {index}: {reason}"
             ));
@@ -3256,7 +3584,7 @@ fn collect_declared_local_names(stmt: &CStmt, names: &mut BTreeSet<String>) {
 fn analyze_definite_assignment_stmt(
     stmt: &CStmt,
     local_names: &BTreeSet<String>,
-    assigned: &mut BTreeSet<String>,
+    state: &mut DefiniteAssignmentState,
 ) -> Result<(), String> {
     match stmt {
         CStmt::Empty
@@ -3266,17 +3594,17 @@ fn analyze_definite_assignment_stmt(
         | CStmt::Label(_)
         | CStmt::Comment(_) => {}
         CStmt::Expr(expr) => {
-            analyze_definite_assignment_expr_stmt(expr, local_names, assigned)?;
+            analyze_definite_assignment_expr(expr, local_names, state)?;
         }
         CStmt::Decl { name, init, .. } => {
             if let Some(init) = init {
-                analyze_definite_assignment_expr(init, local_names, assigned)?;
-                assigned.insert(name.clone());
+                analyze_definite_assignment_expr(init, local_names, state)?;
+                state.record_assignment(name);
             }
         }
         CStmt::Block(stmts) => {
             for stmt in stmts {
-                analyze_definite_assignment_stmt(stmt, local_names, assigned)?;
+                analyze_definite_assignment_stmt(stmt, local_names, state)?;
             }
         }
         CStmt::If {
@@ -3284,28 +3612,30 @@ fn analyze_definite_assignment_stmt(
             then_body,
             else_body,
         } => {
-            analyze_definite_assignment_expr(cond, local_names, assigned)?;
-            let mut then_assigned = assigned.clone();
-            analyze_definite_assignment_stmt(then_body, local_names, &mut then_assigned)?;
-            let mut else_assigned = assigned.clone();
-            if let Some(else_body) = else_body {
-                analyze_definite_assignment_stmt(else_body, local_names, &mut else_assigned)?;
+            analyze_definite_assignment_expr(cond, local_names, state)?;
+            let base_assumptions = state.assumptions.clone();
+            let mut exits = Vec::new();
+            if let Some(mut then_state) = state.with_assumption(cond, true) {
+                analyze_definite_assignment_stmt(then_body, local_names, &mut then_state)?;
+                exits.push(then_state);
             }
-            *assigned = then_assigned
-                .intersection(&else_assigned)
-                .cloned()
-                .collect();
+            if let Some(mut else_state) = state.with_assumption(cond, false) {
+                if let Some(else_body) = else_body {
+                    analyze_definite_assignment_stmt(else_body, local_names, &mut else_state)?;
+                }
+                exits.push(else_state);
+            }
+            *state = merge_definite_assignment_states(&base_assumptions, exits);
         }
         CStmt::While { cond, body } => {
-            analyze_definite_assignment_expr(cond, local_names, assigned)?;
-            let mut body_assigned = assigned.clone();
-            analyze_definite_assignment_stmt(body, local_names, &mut body_assigned)?;
+            analyze_definite_assignment_expr(cond, local_names, state)?;
+            if let Some(mut body_state) = state.with_assumption(cond, true) {
+                analyze_definite_assignment_stmt(body, local_names, &mut body_state)?;
+            }
         }
         CStmt::DoWhile { body, cond } => {
-            let mut body_assigned = assigned.clone();
-            analyze_definite_assignment_stmt(body, local_names, &mut body_assigned)?;
-            analyze_definite_assignment_expr(cond, local_names, &mut body_assigned)?;
-            *assigned = body_assigned;
+            analyze_definite_assignment_stmt(body, local_names, state)?;
+            analyze_definite_assignment_expr(cond, local_names, state)?;
         }
         CStmt::For {
             init,
@@ -3314,15 +3644,18 @@ fn analyze_definite_assignment_stmt(
             body,
         } => {
             if let Some(init) = init {
-                analyze_definite_assignment_stmt(init, local_names, assigned)?;
+                analyze_definite_assignment_stmt(init, local_names, state)?;
             }
             if let Some(cond) = cond {
-                analyze_definite_assignment_expr(cond, local_names, assigned)?;
+                analyze_definite_assignment_expr(cond, local_names, state)?;
             }
-            let mut body_assigned = assigned.clone();
-            analyze_definite_assignment_stmt(body, local_names, &mut body_assigned)?;
+            let mut body_state = cond
+                .as_ref()
+                .and_then(|cond| state.with_assumption(cond, true))
+                .unwrap_or_else(|| state.clone());
+            analyze_definite_assignment_stmt(body, local_names, &mut body_state)?;
             if let Some(update) = update {
-                analyze_definite_assignment_expr_stmt(update, local_names, &mut body_assigned)?;
+                analyze_definite_assignment_expr(update, local_names, &mut body_state)?;
             }
         }
         CStmt::Switch {
@@ -3330,137 +3663,164 @@ fn analyze_definite_assignment_stmt(
             cases,
             default,
         } => {
-            analyze_definite_assignment_expr(expr, local_names, assigned)?;
+            analyze_definite_assignment_expr(expr, local_names, state)?;
+            let base_assumptions = state.assumptions.clone();
             let mut exits = Vec::new();
+            let case_guards = cases
+                .iter()
+                .map(|case| CExpr::binary(BinaryOp::Eq, expr.clone(), case.value.clone()))
+                .collect::<Vec<_>>();
             for case in cases {
-                let mut case_assigned = assigned.clone();
-                for stmt in &case.body {
-                    analyze_definite_assignment_stmt(stmt, local_names, &mut case_assigned)?;
+                let case_guard = CExpr::binary(BinaryOp::Eq, expr.clone(), case.value.clone());
+                if let Some(mut case_state) = state.with_assumption(&case_guard, true) {
+                    for stmt in &case.body {
+                        analyze_definite_assignment_stmt(stmt, local_names, &mut case_state)?;
+                    }
+                    exits.push(case_state);
                 }
-                exits.push(case_assigned);
             }
             if let Some(default) = default {
-                let mut default_assigned = assigned.clone();
+                let any_case = case_guards
+                    .iter()
+                    .cloned()
+                    .reduce(|left, right| CExpr::binary(BinaryOp::Or, left, right));
+                let mut default_state = any_case
+                    .as_ref()
+                    .and_then(|guard| state.with_assumption(guard, false))
+                    .unwrap_or_else(|| state.clone());
                 for stmt in default {
-                    analyze_definite_assignment_stmt(stmt, local_names, &mut default_assigned)?;
+                    analyze_definite_assignment_stmt(stmt, local_names, &mut default_state)?;
                 }
-                exits.push(default_assigned);
+                exits.push(default_state);
             } else {
-                exits.push(assigned.clone());
+                exits.push(state.clone());
             }
-            if let Some(first) = exits.first().cloned() {
-                *assigned = exits[1..].iter().fold(first, |current, exit| {
-                    current.intersection(exit).cloned().collect()
-                });
-            }
+            *state = merge_definite_assignment_states(&base_assumptions, exits);
         }
         CStmt::Return(value) => {
             if let Some(value) = value {
-                analyze_definite_assignment_expr(value, local_names, assigned)?;
+                analyze_definite_assignment_expr(value, local_names, state)?;
             }
         }
     }
     Ok(())
 }
 
-fn analyze_definite_assignment_expr_stmt(
-    expr: &CExpr,
-    local_names: &BTreeSet<String>,
-    assigned: &mut BTreeSet<String>,
-) -> Result<(), String> {
-    analyze_definite_assignment_expr(expr, local_names, assigned)
-}
-
 fn analyze_definite_assignment_expr(
     expr: &CExpr,
     local_names: &BTreeSet<String>,
-    assigned: &mut BTreeSet<String>,
+    state: &mut DefiniteAssignmentState,
 ) -> Result<(), String> {
     match expr {
+        CExpr::Var(name) => {
+            if local_names.contains(name) && !state.local_is_assigned(name) {
+                return Err(format!("local {name} may be read before assignment"));
+            }
+        }
         CExpr::Binary {
             op: BinaryOp::Assign,
             left,
             right,
         } => {
-            analyze_definite_assignment_expr(right, local_names, assigned)?;
-            validate_expr_local_reads(left, local_names, assigned, true)?;
+            analyze_definite_assignment_expr(right, local_names, state)?;
+            if !matches!(left.as_ref(), CExpr::Var(_)) {
+                analyze_definite_assignment_expr(left, local_names, state)?;
+            }
             if let CExpr::Var(name) = left.as_ref()
                 && local_names.contains(name)
             {
-                assigned.insert(name.clone());
+                state.record_assignment(name);
             }
-            Ok(())
+        }
+        CExpr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => {
+            analyze_definite_assignment_expr(left, local_names, state)?;
+            if let Some(mut right_state) = state.with_assumption(left, true) {
+                analyze_definite_assignment_expr(right, local_names, &mut right_state)?;
+                *state = merge_definite_assignment_states(
+                    &state.assumptions,
+                    [state.clone(), right_state],
+                );
+            }
+        }
+        CExpr::Binary {
+            op: BinaryOp::Or,
+            left,
+            right,
+        } => {
+            analyze_definite_assignment_expr(left, local_names, state)?;
+            if let Some(mut right_state) = state.with_assumption(left, false) {
+                analyze_definite_assignment_expr(right, local_names, &mut right_state)?;
+                *state = merge_definite_assignment_states(
+                    &state.assumptions,
+                    [state.clone(), right_state],
+                );
+            }
+        }
+        CExpr::Binary { left, right, .. } => {
+            analyze_definite_assignment_expr(left, local_names, state)?;
+            analyze_definite_assignment_expr(right, local_names, state)?;
         }
         CExpr::Comma(items) => {
             for item in items {
-                analyze_definite_assignment_expr(item, local_names, assigned)?;
+                analyze_definite_assignment_expr(item, local_names, state)?;
             }
-            Ok(())
-        }
-        _ => validate_expr_local_reads(expr, local_names, assigned, false),
-    }
-}
-
-fn validate_expr_local_reads(
-    expr: &CExpr,
-    local_names: &BTreeSet<String>,
-    assigned: &BTreeSet<String>,
-    is_assignment_lhs: bool,
-) -> Result<(), String> {
-    match expr {
-        CExpr::Var(name) => {
-            if !is_assignment_lhs && local_names.contains(name) && !assigned.contains(name) {
-                return Err(format!("local {name} may be read before assignment"));
-            }
-        }
-        CExpr::Unary {
-            op: UnaryOp::PreInc | UnaryOp::PreDec | UnaryOp::PostInc | UnaryOp::PostDec,
-            operand,
-        } => {
-            validate_expr_local_reads(operand, local_names, assigned, false)?;
-        }
-        CExpr::Unary { operand, .. }
-        | CExpr::Cast { expr: operand, .. }
-        | CExpr::Deref(operand)
-        | CExpr::Paren(operand) => {
-            validate_expr_local_reads(operand, local_names, assigned, false)?;
-        }
-        CExpr::AddrOf(operand) => {
-            if !matches!(operand.as_ref(), CExpr::Var(_)) {
-                validate_expr_local_reads(operand, local_names, assigned, false)?;
-            }
-        }
-        CExpr::Binary { op, left, right } => {
-            let lhs_is_write = matches!(op, BinaryOp::Assign);
-            validate_expr_local_reads(left, local_names, assigned, lhs_is_write)?;
-            validate_expr_local_reads(right, local_names, assigned, false)?;
         }
         CExpr::Ternary {
             cond,
             then_expr,
             else_expr,
         } => {
-            validate_expr_local_reads(cond, local_names, assigned, false)?;
-            validate_expr_local_reads(then_expr, local_names, assigned, false)?;
-            validate_expr_local_reads(else_expr, local_names, assigned, false)?;
+            analyze_definite_assignment_expr(cond, local_names, state)?;
+            let base_assumptions = state.assumptions.clone();
+            let mut exits = Vec::new();
+            if let Some(mut then_state) = state.with_assumption(cond, true) {
+                analyze_definite_assignment_expr(then_expr, local_names, &mut then_state)?;
+                exits.push(then_state);
+            }
+            if let Some(mut else_state) = state.with_assumption(cond, false) {
+                analyze_definite_assignment_expr(else_expr, local_names, &mut else_state)?;
+                exits.push(else_state);
+            }
+            *state = merge_definite_assignment_states(&base_assumptions, exits);
+        }
+        CExpr::Unary {
+            op: UnaryOp::PreInc | UnaryOp::PreDec | UnaryOp::PostInc | UnaryOp::PostDec,
+            operand,
+        } => {
+            analyze_definite_assignment_expr(operand, local_names, state)?;
+            if let CExpr::Var(name) = operand.as_ref()
+                && local_names.contains(name)
+            {
+                state.record_assignment(name);
+            }
+        }
+        CExpr::Unary { operand, .. }
+        | CExpr::Cast { expr: operand, .. }
+        | CExpr::Deref(operand)
+        | CExpr::Paren(operand) => {
+            analyze_definite_assignment_expr(operand, local_names, state)?;
+        }
+        CExpr::AddrOf(operand) => {
+            if !matches!(operand.as_ref(), CExpr::Var(_)) {
+                analyze_definite_assignment_expr(operand, local_names, state)?;
+            }
         }
         CExpr::Call { func, args } => {
-            validate_expr_local_reads(func, local_names, assigned, false)?;
+            analyze_definite_assignment_expr(func, local_names, state)?;
             for arg in args {
-                validate_expr_local_reads(arg, local_names, assigned, false)?;
+                analyze_definite_assignment_expr(arg, local_names, state)?;
             }
         }
         CExpr::Subscript { base, index } => {
-            validate_expr_local_reads(base, local_names, assigned, false)?;
-            validate_expr_local_reads(index, local_names, assigned, false)?;
+            analyze_definite_assignment_expr(base, local_names, state)?;
+            analyze_definite_assignment_expr(index, local_names, state)?;
         }
         CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
-            validate_expr_local_reads(base, local_names, assigned, false)?;
-        }
-        CExpr::Comma(items) => {
-            for item in items {
-                validate_expr_local_reads(item, local_names, assigned, false)?;
-            }
+            analyze_definite_assignment_expr(base, local_names, state)?;
         }
         CExpr::Sizeof(_)
         | CExpr::SizeofType(_)
@@ -3545,6 +3905,15 @@ fn certified_standard_output_residual_reason_with_effect_proofs(
                 semantic_ledger.unresolved
             ));
         }
+        let phi_edge_liveness = effect_render_proofs
+            .iter()
+            .any(|proof| {
+                matches!(
+                    proof.phi_edge.map(|edge| edge.kind),
+                    Some(PhiEdgeRenderKind::UnconditionalDeadOnOtherEdges)
+                )
+            })
+            .then(|| normalize::PhiEdgeLiveness::compute(prepared.function()));
         for proof in effect_render_proofs
             .iter()
             .filter(|proof| proof.kind == EffectRenderProofKind::Call)
@@ -3611,9 +3980,10 @@ fn certified_standard_output_residual_reason_with_effect_proofs(
                         .is_some_and(|inst| inst.inputs.contains(&value));
                     if !defined_at_rendered_site
                         && !consumed_at_rendered_site
-                        && !expression_proof_is_materialized_phi_copy(
+                        && !expression_proof_is_phi_edge_materialization(
                             prepared,
                             render_facts,
+                            phi_edge_liveness.as_ref(),
                             proof,
                             value,
                             cert,
@@ -3953,14 +4323,18 @@ fn certified_standard_output_residual_reason_with_effect_proofs(
     }
 }
 
-fn expression_proof_is_materialized_phi_copy(
+fn expression_proof_is_phi_edge_materialization(
     prepared: &r2ssa::SsaArtifact,
     render_facts: &r2types::FunctionRenderFacts,
+    liveness: Option<&normalize::PhiEdgeLiveness>,
     proof: &EffectRenderProof,
     value: r2ssa::ValueId,
     cert: &r2types::ExpressionRenderFact,
 ) -> bool {
-    if !proof.materialized_phi_copy || cert.value != value {
+    let Some(phi_edge) = proof.phi_edge else {
+        return false;
+    };
+    if cert.value != value {
         return false;
     }
     let Some(def_inst) = cert.defining_inst else {
@@ -3975,30 +4349,78 @@ fn expression_proof_is_materialized_phi_copy(
     let r2ssa::InstPayload::Phi { predecessors } = &inst.payload else {
         return false;
     };
-    let [source] = proof.values.as_slice() else {
-        return false;
-    };
     let phi_edge_matches = predecessors.iter().zip(&inst.inputs).any(|(pred, input)| {
-        *input == *source
+        *input == phi_edge.source
             && prepared
                 .graph()
                 .block(*pred)
                 .is_some_and(|block| block.addr == proof.block_addr)
     });
-    if phi_edge_matches {
-        return true;
+    match phi_edge.kind {
+        PhiEdgeRenderKind::Direct if phi_edge_matches => {
+            let Some(phi_block) = prepared.graph().block(inst.block) else {
+                return false;
+            };
+            if prepared.successors(proof.block_addr).as_slice() == [phi_block.addr] {
+                return true;
+            }
+        }
+        PhiEdgeRenderKind::UnconditionalDeadOnOtherEdges if phi_edge_matches => {
+            let Some(phi_block) = prepared.graph().block(inst.block) else {
+                return false;
+            };
+            let Some(dst) = prepared.value_var(value) else {
+                return false;
+            };
+            let Some(liveness) = liveness else {
+                return false;
+            };
+            return liveness.dst_is_dead_on_other_loop_edges(
+                prepared.function(),
+                proof.block_addr,
+                phi_block.addr,
+                dst,
+            );
+        }
+        PhiEdgeRenderKind::Guarded { condition, truth } if phi_edge_matches => {
+            let Some(phi_block) = prepared.graph().block(inst.block) else {
+                return false;
+            };
+            let edge_truth = match prepared
+                .function()
+                .edge_type(proof.block_addr, phi_block.addr)
+            {
+                Some(r2ssa::CFGEdge::True) => true,
+                Some(r2ssa::CFGEdge::False) => false,
+                _ => return false,
+            };
+            return edge_truth == truth
+                && prepared
+                    .function()
+                    .dominates(phi_block.addr, proof.block_addr)
+                && prepared
+                    .get_block(proof.block_addr)
+                    .and_then(|block| block.ops.last())
+                    .is_some_and(|op| {
+                        matches!(op, SSAOp::CBranch { cond, .. }
+                            if prepared.graph().value_id_for_var(cond) == Some(condition))
+                    });
+        }
+        _ => {}
     }
-    matches!(
-        render_facts.loop_carrier_for_value(value),
-        Some(r2types::CertifiedEntity::LoopCarrier {
-            phi,
-            dominating_initializers,
-            ..
-        }) if *phi == value
-            && dominating_initializers.iter().any(|initializer| {
-                initializer.predecessor == proof.block_addr && initializer.value == *source
-            })
-    )
+    matches!(phi_edge.kind, PhiEdgeRenderKind::Direct)
+        && matches!(
+            render_facts.loop_carrier_for_value(value),
+            Some(r2types::CertifiedEntity::LoopCarrier {
+                phi,
+                dominating_initializers,
+                ..
+            }) if *phi == value
+                && dominating_initializers.iter().any(|initializer| {
+                    initializer.predecessor == proof.block_addr
+                        && initializer.value == phi_edge.source
+                })
+        )
 }
 
 fn array_accesses_are_certified(
@@ -5880,8 +6302,11 @@ impl Decompiler {
         prepared: &r2ssa::SsaArtifact,
         semantic_route: &DecompileRouteFacts,
     ) -> CFunction {
-        // Materialize phis on non-critical edges to reduce SSA artifacts in output.
-        let mut normalized_func = normalize::materialize_phis(func);
+        let mut normalized_func = if let Some(render_facts) = self.context.function_facts.render() {
+            normalize::materialize_certified_loop_carriers(func, prepared, render_facts)
+        } else {
+            func.clone()
+        };
         if let Some(render_facts) = self.context.function_facts.render() {
             normalize::materialize_certified_loop_carrier_initializers(
                 &mut normalized_func,
@@ -6529,7 +6954,7 @@ impl Decompiler {
                         address: None,
                         value: Some(value),
                         values: Vec::new(),
-                        materialized_phi_copy: false,
+                        phi_edge: None,
                     });
                 }
             }
@@ -7922,6 +8347,89 @@ mod tests {
         ];
 
         assert_eq!(definite_assignment_residual_reason(&function), None);
+    }
+
+    #[test]
+    fn definite_assignment_uses_complementary_ternary_guard() {
+        let mut function = CFunction::new("guarded_return", CType::i32());
+        function.params.push(crate::ast::CParam {
+            ty: CType::Pointer(Box::new(CType::Void)),
+            name: "arg0".to_string(),
+        });
+        function.locals.push(crate::ast::CLocal {
+            ty: CType::i32(),
+            name: "result".to_string(),
+            stack_offset: None,
+        });
+        let is_null = CExpr::binary(
+            BinaryOp::Eq,
+            CExpr::Var("arg0".to_string()),
+            CExpr::IntLit(0),
+        );
+        function.body = vec![
+            CStmt::If {
+                cond: CExpr::binary(
+                    BinaryOp::Ne,
+                    CExpr::Var("arg0".to_string()),
+                    CExpr::IntLit(0),
+                ),
+                then_body: Box::new(CStmt::Expr(CExpr::assign(
+                    CExpr::Var("result".to_string()),
+                    CExpr::IntLit(1),
+                ))),
+                else_body: None,
+            },
+            CStmt::Return(Some(CExpr::Ternary {
+                cond: Box::new(is_null),
+                then_expr: Box::new(CExpr::IntLit(0)),
+                else_expr: Box::new(CExpr::Var("result".to_string())),
+            })),
+        ];
+
+        assert_eq!(definite_assignment_residual_reason(&function), None);
+    }
+
+    #[test]
+    fn definite_assignment_rejects_wrong_ternary_guard_arm() {
+        let mut function = CFunction::new("unguarded_return", CType::i32());
+        function.params.push(crate::ast::CParam {
+            ty: CType::Pointer(Box::new(CType::Void)),
+            name: "arg0".to_string(),
+        });
+        function.locals.push(crate::ast::CLocal {
+            ty: CType::i32(),
+            name: "result".to_string(),
+            stack_offset: None,
+        });
+        let is_null = CExpr::binary(
+            BinaryOp::Eq,
+            CExpr::Var("arg0".to_string()),
+            CExpr::IntLit(0),
+        );
+        function.body = vec![
+            CStmt::If {
+                cond: CExpr::binary(
+                    BinaryOp::Ne,
+                    CExpr::Var("arg0".to_string()),
+                    CExpr::IntLit(0),
+                ),
+                then_body: Box::new(CStmt::Expr(CExpr::assign(
+                    CExpr::Var("result".to_string()),
+                    CExpr::IntLit(1),
+                ))),
+                else_body: None,
+            },
+            CStmt::Return(Some(CExpr::Ternary {
+                cond: Box::new(is_null),
+                then_expr: Box::new(CExpr::Var("result".to_string())),
+                else_expr: Box::new(CExpr::IntLit(0)),
+            })),
+        ];
+
+        assert!(
+            definite_assignment_residual_reason(&function)
+                .is_some_and(|reason| reason.contains("result may be read before assignment"))
+        );
     }
 
     #[test]
@@ -10739,7 +11247,7 @@ mod tests {
                 address: Some(memory_cert.address),
                 value: memory_cert.value,
                 values: Vec::new(),
-                materialized_phi_copy: false,
+                phi_edge: None,
             },
             EffectRenderProof {
                 kind: EffectRenderProofKind::Return,
@@ -10750,7 +11258,7 @@ mod tests {
                 address: None,
                 value: Some(return_cert.value),
                 values: Vec::new(),
-                materialized_phi_copy: false,
+                phi_edge: None,
             },
         ];
 
@@ -11852,7 +12360,7 @@ mod tests {
             address: None,
             value: Some(value),
             values: Vec::new(),
-            materialized_phi_copy: false,
+            phi_edge: None,
         }];
 
         let reason = certified_standard_output_residual_reason_with_effect_proofs(
@@ -11892,7 +12400,7 @@ mod tests {
             address: None,
             value: Some(r2ssa::ValueId(999)),
             values: Vec::new(),
-            materialized_phi_copy: false,
+            phi_edge: None,
         }];
 
         let reason = certified_standard_output_residual_reason_with_effect_proofs(
@@ -11945,7 +12453,7 @@ mod tests {
             address: None,
             value: Some(first_value),
             values: Vec::new(),
-            materialized_phi_copy: false,
+            phi_edge: None,
         }];
 
         let reason = certified_standard_output_residual_reason_with_effect_proofs(
@@ -12073,7 +12581,7 @@ mod tests {
             address: None,
             value: None,
             values: Vec::new(),
-            materialized_phi_copy: false,
+            phi_edge: None,
         }];
 
         let reason = certified_standard_output_residual_reason_with_effect_proofs(
@@ -12118,7 +12626,7 @@ mod tests {
             address: None,
             value: None,
             values: vec![r2ssa::ValueId(999)],
-            materialized_phi_copy: false,
+            phi_edge: None,
         }];
 
         let reason = certified_standard_output_residual_reason_with_effect_proofs(
@@ -12172,7 +12680,7 @@ mod tests {
             address: None,
             value: None,
             values: Vec::new(),
-            materialized_phi_copy: false,
+            phi_edge: None,
         }];
 
         let reason = certified_standard_output_residual_reason_with_effect_proofs(
@@ -12261,7 +12769,7 @@ mod tests {
             address: None,
             value: None,
             values: vec![first_arg],
-            materialized_phi_copy: false,
+            phi_edge: None,
         }];
 
         let reason = certified_standard_output_residual_reason_with_effect_proofs(
@@ -12300,7 +12808,7 @@ mod tests {
             address: None,
             value: None,
             values: Vec::new(),
-            materialized_phi_copy: false,
+            phi_edge: None,
         }];
 
         let reason = certified_standard_output_residual_reason_with_effect_proofs(
@@ -12373,7 +12881,7 @@ mod tests {
             address: None,
             value: Some(cert.value),
             values: Vec::new(),
-            materialized_phi_copy: false,
+            phi_edge: None,
         }];
 
         let reason = certified_standard_output_residual_reason_with_effect_proofs(
@@ -12424,7 +12932,7 @@ mod tests {
             address: None,
             value: Some(cert.value),
             values: Vec::new(),
-            materialized_phi_copy: false,
+            phi_edge: None,
         }];
 
         let reason = certified_standard_output_residual_reason_with_effect_proofs(
@@ -12463,7 +12971,7 @@ mod tests {
             address: None,
             value: Some(r2ssa::ValueId(999)),
             values: Vec::new(),
-            materialized_phi_copy: false,
+            phi_edge: None,
         }];
 
         let reason = certified_standard_output_residual_reason_with_effect_proofs(
@@ -12523,7 +13031,7 @@ mod tests {
             address: None,
             value: Some(first.value),
             values: Vec::new(),
-            materialized_phi_copy: false,
+            phi_edge: None,
         }];
 
         let reason = certified_standard_output_residual_reason_with_effect_proofs(
@@ -12626,7 +13134,7 @@ mod tests {
             address: Some(first.address),
             value: first.value,
             values: Vec::new(),
-            materialized_phi_copy: false,
+            phi_edge: None,
         }];
 
         let reason = certified_standard_output_residual_reason_with_effect_proofs(
@@ -12673,7 +13181,7 @@ mod tests {
             address: Some(cert.address),
             value: cert.value,
             values: Vec::new(),
-            materialized_phi_copy: false,
+            phi_edge: None,
         }];
 
         let reason = certified_standard_output_residual_reason_with_effect_proofs(
@@ -12710,7 +13218,7 @@ mod tests {
             address: Some(cert.address),
             value: cert.value,
             values: Vec::new(),
-            materialized_phi_copy: false,
+            phi_edge: None,
         }];
         let func = CFunction::new("dropped_memory", CType::Void)
             .with_body(vec![CStmt::Comment("no memory effect".to_string())]);
@@ -12765,7 +13273,7 @@ mod tests {
             address: Some(cert.address),
             value: cert.value,
             values: Vec::new(),
-            materialized_phi_copy: false,
+            phi_edge: None,
         }];
 
         let reason = certified_standard_output_residual_reason_with_effect_proofs(
@@ -12810,7 +13318,7 @@ mod tests {
             address: Some(r2ssa::ValueId(998)),
             value: cert.value.map(|_| r2ssa::ValueId(999)),
             values: Vec::new(),
-            materialized_phi_copy: false,
+            phi_edge: None,
         }];
 
         let reason = certified_standard_output_residual_reason_with_effect_proofs(
@@ -13007,7 +13515,7 @@ mod tests {
                 address: Some(memory_cert.address),
                 value: memory_cert.value,
                 values: Vec::new(),
-                materialized_phi_copy: false,
+                phi_edge: None,
             },
             EffectRenderProof {
                 kind: EffectRenderProofKind::Return,
@@ -13018,7 +13526,7 @@ mod tests {
                 address: None,
                 value: Some(return_cert.value),
                 values: Vec::new(),
-                materialized_phi_copy: false,
+                phi_edge: None,
             },
         ];
 
@@ -13080,7 +13588,7 @@ mod tests {
             address: None,
             value: Some(return_cert.value),
             values: Vec::new(),
-            materialized_phi_copy: false,
+            phi_edge: None,
         }];
 
         let reason = certified_standard_output_residual_reason_with_effect_proofs(
@@ -13155,7 +13663,7 @@ mod tests {
                 address: Some(memory_cert.address),
                 value: memory_cert.value,
                 values: Vec::new(),
-                materialized_phi_copy: false,
+                phi_edge: None,
             },
             EffectRenderProof {
                 kind: EffectRenderProofKind::Return,
@@ -13166,7 +13674,7 @@ mod tests {
                 address: None,
                 value: Some(return_cert.value),
                 values: Vec::new(),
-                materialized_phi_copy: false,
+                phi_edge: None,
             },
         ];
 
@@ -13286,7 +13794,7 @@ mod tests {
                 address: Some(first_memory_cert.address),
                 value: first_memory_cert.value,
                 values: Vec::new(),
-                materialized_phi_copy: false,
+                phi_edge: None,
             },
             EffectRenderProof {
                 kind: EffectRenderProofKind::MemoryRead,
@@ -13297,7 +13805,7 @@ mod tests {
                 address: Some(second_memory_cert.address),
                 value: second_memory_cert.value,
                 values: Vec::new(),
-                materialized_phi_copy: false,
+                phi_edge: None,
             },
             EffectRenderProof {
                 kind: EffectRenderProofKind::Return,
@@ -13308,7 +13816,7 @@ mod tests {
                 address: None,
                 value: Some(return_cert.value),
                 values: Vec::new(),
-                materialized_phi_copy: false,
+                phi_edge: None,
             },
         ];
 
@@ -13803,7 +14311,7 @@ mod tests {
                 address: Some(first_memory_cert.address),
                 value: first_memory_cert.value,
                 values: Vec::new(),
-                materialized_phi_copy: false,
+                phi_edge: None,
             },
             EffectRenderProof {
                 kind: EffectRenderProofKind::MemoryRead,
@@ -13814,7 +14322,7 @@ mod tests {
                 address: Some(second_memory_cert.address),
                 value: second_memory_cert.value,
                 values: Vec::new(),
-                materialized_phi_copy: false,
+                phi_edge: None,
             },
             EffectRenderProof {
                 kind: EffectRenderProofKind::Return,
@@ -13825,7 +14333,7 @@ mod tests {
                 address: None,
                 value: Some(return_cert.value),
                 values: Vec::new(),
-                materialized_phi_copy: false,
+                phi_edge: None,
             },
         ];
 
@@ -14855,7 +15363,7 @@ mod tests {
         decompiler
             .set_function_facts(FunctionFacts::new(type_facts, None).with_decompile_route(route));
 
-        let normalized_func = normalize::materialize_phis(&func);
+        let normalized_func = func.clone();
         let func = &normalized_func;
 
         let mut var_recovery = VariableRecovery::new_with_abi(

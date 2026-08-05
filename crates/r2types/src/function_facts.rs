@@ -685,6 +685,27 @@ impl FunctionRenderFacts {
         carriers.next().is_none().then_some(carrier)
     }
 
+    pub fn loop_carrier_update_for_value(&self, value: r2ssa::ValueId) -> Option<&CertifiedEntity> {
+        let expr = self.certified_expr_for_value(value)?;
+        let mut carriers = expr.bindings.iter().filter_map(|binding| {
+            let r2ssa::SemanticId::LoopCarrier(_) = binding else {
+                return None;
+            };
+            match self.certified_entities.get(binding) {
+                Some(entity @ CertifiedEntity::LoopCarrier { updates, .. })
+                    if updates.iter().any(|update| {
+                        update.value == value || update.identity_values.contains(&value)
+                    }) =>
+                {
+                    Some(entity)
+                }
+                _ => None,
+            }
+        });
+        let carrier = carriers.next()?;
+        carriers.next().is_none().then_some(carrier)
+    }
+
     pub fn loop_carriers(&self) -> impl Iterator<Item = &CertifiedEntity> {
         self.certified_entities
             .values()

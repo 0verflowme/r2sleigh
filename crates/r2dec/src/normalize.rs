@@ -27,52 +27,93 @@ fn is_block_terminator(op: &SSAOp) -> bool {
     )
 }
 
-/// Materialize phi moves on single-successor predecessor edges.
+/// Lower only certified loop-carrier phis into mutable edge assignments.
 ///
-/// For `phi(dst <- src@pred)`, insert `dst = src` at the end of `pred` when
-/// `pred` has only one successor. This keeps semantics without CFG rewriting
-/// and reduces emitted phi artifacts in structured output.
-pub(crate) fn materialize_phis(func: &SSAFunction) -> SSAFunction {
+/// Other phis remain immutable semantic expressions. Lowering every machine
+/// temporary or flag phi creates artificial C effects and obscures the proof
+/// boundary between SSA values and mutable loop state.
+pub(crate) fn materialize_certified_loop_carriers(
+    func: &SSAFunction,
+    prepared: &r2ssa::SsaArtifact,
+    render_facts: &r2types::FunctionRenderFacts,
+) -> SSAFunction {
+    materialize_phis_where(func, |phi| {
+        prepared
+            .graph()
+            .value_id_for_var(&phi.dst)
+            .is_some_and(|value| render_facts.loop_carrier_for_value(value).is_some())
+    })
+}
+
+fn materialize_phis_where(
+    func: &SSAFunction,
+    mut eligible: impl FnMut(&r2ssa::PhiNode) -> bool,
+) -> SSAFunction {
     let mut normalized = func.clone();
-    let liveness = EdgeLiveness::compute(func);
+    let liveness = PhiEdgeLiveness::compute(func);
     let mut copies_by_pred: HashMap<u64, Vec<SSAOp>> = HashMap::new();
-    let mut kept_phis_by_block: HashMap<u64, Vec<r2ssa::PhiNode>> = HashMap::new();
+    let mut materialized_by_block = HashMap::<u64, HashSet<r2ssa::SSAVar>>::new();
 
     for block in func.blocks() {
-        let mut kept = Vec::new();
-
-        for phi in &block.phis {
-            let mut all_materialized = true;
+        let mut moves_by_pred = HashMap::<u64, Vec<PhiMove>>::new();
+        let mut complete = true;
+        let selected = block
+            .phis
+            .iter()
+            .filter(|phi| eligible(phi))
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            continue;
+        }
+        for phi in &selected {
             for (pred, src) in &phi.sources {
                 if src == &phi.dst {
                     continue;
                 }
-                if func.successors(*pred).len() == 1
-                    || can_materialize_loop_backedge_phi(
-                        func, &liveness, *pred, block.addr, &phi.dst,
-                    )
-                {
-                    copies_by_pred.entry(*pred).or_default().push(SSAOp::Copy {
-                        dst: phi.dst.clone(),
-                        src: src.clone(),
-                    });
-                } else {
-                    all_materialized = false;
-                }
+                let Some(op) =
+                    materialized_phi_edge_op(func, &liveness, *pred, block.addr, &phi.dst, src)
+                else {
+                    complete = false;
+                    break;
+                };
+                moves_by_pred.entry(*pred).or_default().push(PhiMove {
+                    dst: phi.dst.clone(),
+                    src: src.clone(),
+                    op,
+                });
             }
-            if !all_materialized {
-                kept.push(phi.clone());
+            if !complete {
+                break;
             }
         }
-
-        if kept.len() != block.phis.len() {
-            kept_phis_by_block.insert(block.addr, kept);
+        if !complete {
+            continue;
+        }
+        let mut scheduled = Vec::new();
+        for (pred, moves) in moves_by_pred {
+            let Some(moves) = schedule_parallel_phi_moves(moves) else {
+                complete = false;
+                break;
+            };
+            scheduled.push((pred, moves));
+        }
+        if complete {
+            materialized_by_block.insert(
+                block.addr,
+                selected.iter().map(|phi| phi.dst.clone()).collect(),
+            );
+            for (pred, moves) in scheduled {
+                copies_by_pred
+                    .entry(pred)
+                    .or_default()
+                    .extend(moves.into_iter().map(|planned| planned.op));
+            }
         }
     }
 
-    for (addr, kept) in kept_phis_by_block {
+    for (addr, materialized) in materialized_by_block {
         if let Some(block) = normalized.get_block_mut(addr) {
-            block.phis = kept;
+            block.phis.retain(|phi| !materialized.contains(&phi.dst));
         }
     }
 
@@ -91,6 +132,235 @@ pub(crate) fn materialize_phis(func: &SSAFunction) -> SSAFunction {
     }
 
     normalized
+}
+
+#[cfg(test)]
+fn materialize_all_phis(func: &SSAFunction) -> SSAFunction {
+    materialize_phis_where(func, |_| true)
+}
+
+struct PhiMove {
+    dst: r2ssa::SSAVar,
+    src: r2ssa::SSAVar,
+    op: SSAOp,
+}
+
+fn materialized_phi_edge_op(
+    func: &SSAFunction,
+    liveness: &PhiEdgeLiveness,
+    pred: u64,
+    target: u64,
+    dst: &r2ssa::SSAVar,
+    src: &r2ssa::SSAVar,
+) -> Option<SSAOp> {
+    let successors = func.successors(pred);
+    if successors.as_slice() == [target] {
+        return Some(SSAOp::Copy {
+            dst: dst.clone(),
+            src: src.clone(),
+        });
+    }
+    if can_materialize_unconditional_loop_backedge(func, liveness, pred, target, dst) {
+        return Some(SSAOp::Copy {
+            dst: dst.clone(),
+            src: src.clone(),
+        });
+    }
+    guarded_loop_backedge_phi_op(func, pred, target, dst, src)
+}
+
+fn guarded_loop_backedge_phi_op(
+    func: &SSAFunction,
+    pred: u64,
+    target: u64,
+    dst: &r2ssa::SSAVar,
+    src: &r2ssa::SSAVar,
+) -> Option<SSAOp> {
+    let successors = func.successors(pred);
+    if successors.len() != 2 || !successors.contains(&target) || !func.dominates(target, pred) {
+        return None;
+    }
+    let cond = match func.get_block(pred)?.ops.last()? {
+        SSAOp::CBranch { cond, .. } if cond != dst => cond.clone(),
+        _ => return None,
+    };
+    let (if_true, if_false) = match func.edge_type(pred, target)? {
+        r2ssa::CFGEdge::True => (src.clone(), dst.clone()),
+        r2ssa::CFGEdge::False => (dst.clone(), src.clone()),
+        r2ssa::CFGEdge::Normal | r2ssa::CFGEdge::Back => return None,
+    };
+    Some(SSAOp::Select {
+        dst: dst.clone(),
+        cond,
+        if_true,
+        if_false,
+    })
+}
+
+/// Order out-of-SSA moves without changing the simultaneous semantics of a
+/// phi bundle. Cyclic bundles stay in SSA until a temporary-backed lowering
+/// can represent them exactly.
+fn schedule_parallel_phi_moves(mut moves: Vec<PhiMove>) -> Option<Vec<PhiMove>> {
+    let mut scheduled = Vec::with_capacity(moves.len());
+    while !moves.is_empty() {
+        let ready = moves.iter().position(|candidate| {
+            !moves
+                .iter()
+                .any(|other| other.dst != candidate.dst && other.src == candidate.dst)
+        })?;
+        scheduled.push(moves.remove(ready));
+    }
+    Some(scheduled)
+}
+
+pub(crate) struct PhiEdgeLiveness {
+    live_in: HashMap<u64, HashSet<r2ssa::SSAVar>>,
+    phi_defs: HashMap<u64, HashSet<r2ssa::SSAVar>>,
+    edge_phi_uses: HashMap<(u64, u64), HashSet<r2ssa::SSAVar>>,
+}
+
+impl PhiEdgeLiveness {
+    pub(crate) fn compute(func: &SSAFunction) -> Self {
+        let mut defs_by_block = HashMap::<u64, HashSet<r2ssa::SSAVar>>::new();
+        let mut uses_by_block = HashMap::<u64, HashSet<r2ssa::SSAVar>>::new();
+        let mut phi_defs = HashMap::<u64, HashSet<r2ssa::SSAVar>>::new();
+        let mut edge_phi_uses = HashMap::<(u64, u64), HashSet<r2ssa::SSAVar>>::new();
+
+        for block in func.blocks() {
+            let mut defs = HashSet::new();
+            let mut uses = HashSet::new();
+            let mut defined = HashSet::new();
+            for phi in &block.phis {
+                defs.insert(phi.dst.clone());
+                defined.insert(phi.dst.clone());
+                phi_defs
+                    .entry(block.addr)
+                    .or_default()
+                    .insert(phi.dst.clone());
+                for (pred, src) in &phi.sources {
+                    edge_phi_uses
+                        .entry((*pred, block.addr))
+                        .or_default()
+                        .insert(src.clone());
+                }
+            }
+            for op in &block.ops {
+                for src in op.sources() {
+                    if !defined.contains(src) {
+                        uses.insert(src.clone());
+                    }
+                }
+                if let Some(dst) = op.dst() {
+                    defs.insert(dst.clone());
+                    defined.insert(dst.clone());
+                }
+            }
+            defs_by_block.insert(block.addr, defs);
+            uses_by_block.insert(block.addr, uses);
+        }
+
+        let mut live_in = func
+            .block_addrs()
+            .iter()
+            .copied()
+            .map(|addr| (addr, HashSet::new()))
+            .collect::<HashMap<_, _>>();
+        let mut live_out = live_in.clone();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &addr in func.block_addrs().iter().rev() {
+                let mut next_out = HashSet::new();
+                for successor in func.successors(addr) {
+                    next_out.extend(edge_live_in(
+                        live_in.get(&successor),
+                        phi_defs.get(&successor),
+                        edge_phi_uses.get(&(addr, successor)),
+                    ));
+                }
+                let mut next_in = uses_by_block.get(&addr).cloned().unwrap_or_default();
+                let defs = defs_by_block.get(&addr).cloned().unwrap_or_default();
+                next_in.extend(
+                    next_out
+                        .iter()
+                        .filter(|value| !defs.contains(*value))
+                        .cloned(),
+                );
+                if live_out.get(&addr) != Some(&next_out) {
+                    live_out.insert(addr, next_out);
+                    changed = true;
+                }
+                if live_in.get(&addr) != Some(&next_in) {
+                    live_in.insert(addr, next_in);
+                    changed = true;
+                }
+            }
+        }
+        Self {
+            live_in,
+            phi_defs,
+            edge_phi_uses,
+        }
+    }
+
+    fn live_on_edge(&self, pred: u64, successor: u64) -> HashSet<r2ssa::SSAVar> {
+        edge_live_in(
+            self.live_in.get(&successor),
+            self.phi_defs.get(&successor),
+            self.edge_phi_uses.get(&(pred, successor)),
+        )
+    }
+
+    pub(crate) fn dst_is_dead_on_other_loop_edges(
+        &self,
+        func: &SSAFunction,
+        pred: u64,
+        target: u64,
+        dst: &r2ssa::SSAVar,
+    ) -> bool {
+        can_materialize_unconditional_loop_backedge(func, self, pred, target, dst)
+    }
+}
+
+fn edge_live_in(
+    successor_live_in: Option<&HashSet<r2ssa::SSAVar>>,
+    successor_phi_defs: Option<&HashSet<r2ssa::SSAVar>>,
+    edge_phi_uses: Option<&HashSet<r2ssa::SSAVar>>,
+) -> HashSet<r2ssa::SSAVar> {
+    let mut live = HashSet::new();
+    if let Some(successor_live_in) = successor_live_in {
+        live.extend(
+            successor_live_in
+                .iter()
+                .filter(|value| successor_phi_defs.is_none_or(|defs| !defs.contains(*value)))
+                .cloned(),
+        );
+    }
+    if let Some(edge_phi_uses) = edge_phi_uses {
+        live.extend(edge_phi_uses.iter().cloned());
+    }
+    live
+}
+
+fn can_materialize_unconditional_loop_backedge(
+    func: &SSAFunction,
+    liveness: &PhiEdgeLiveness,
+    pred: u64,
+    target: u64,
+    dst: &r2ssa::SSAVar,
+) -> bool {
+    let successors = func.successors(pred);
+    successors.len() > 1
+        && successors.contains(&target)
+        && func.dominates(target, pred)
+        && !func
+            .get_block(pred)
+            .and_then(|block| block.ops.last())
+            .is_some_and(|op| op.sources().contains(&dst))
+        && successors
+            .into_iter()
+            .filter(|successor| *successor != target)
+            .all(|successor| !liveness.live_on_edge(pred, successor).contains(dst))
 }
 
 /// Coalesce certified loop carriers across zero-iteration exits.
@@ -170,158 +440,6 @@ pub(crate) fn materialize_certified_loop_carrier_initializers(
     }
 }
 
-struct EdgeLiveness {
-    live_in: HashMap<u64, HashSet<String>>,
-    phi_defs: HashMap<u64, HashSet<String>>,
-    edge_phi_uses: HashMap<(u64, u64), HashSet<String>>,
-}
-
-impl EdgeLiveness {
-    fn compute(func: &SSAFunction) -> Self {
-        let mut defs_by_block = HashMap::<u64, HashSet<String>>::new();
-        let mut uses_by_block = HashMap::<u64, HashSet<String>>::new();
-        let mut phi_defs = HashMap::<u64, HashSet<String>>::new();
-        let mut edge_phi_uses = HashMap::<(u64, u64), HashSet<String>>::new();
-
-        for block in func.blocks() {
-            let mut defs = HashSet::new();
-            let mut uses = HashSet::new();
-            let mut defined = HashSet::new();
-
-            for phi in &block.phis {
-                let dst = phi.dst.display_name();
-                defs.insert(dst.clone());
-                defined.insert(dst.clone());
-                phi_defs.entry(block.addr).or_default().insert(dst);
-                for (pred, src) in &phi.sources {
-                    edge_phi_uses
-                        .entry((*pred, block.addr))
-                        .or_default()
-                        .insert(src.display_name());
-                }
-            }
-
-            for op in &block.ops {
-                for src in op.sources() {
-                    let src = src.display_name();
-                    if !defined.contains(&src) {
-                        uses.insert(src);
-                    }
-                }
-                if let Some(dst) = op.dst() {
-                    let dst = dst.display_name();
-                    defs.insert(dst.clone());
-                    defined.insert(dst);
-                }
-            }
-
-            defs_by_block.insert(block.addr, defs);
-            uses_by_block.insert(block.addr, uses);
-        }
-
-        let mut live_in = HashMap::<u64, HashSet<String>>::new();
-        let mut live_out = HashMap::<u64, HashSet<String>>::new();
-        for &addr in func.block_addrs() {
-            live_in.insert(addr, HashSet::new());
-            live_out.insert(addr, HashSet::new());
-        }
-
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for &addr in func.block_addrs().iter().rev() {
-                let mut next_out = HashSet::new();
-                for succ in func.successors(addr) {
-                    next_out.extend(edge_live_in(
-                        live_in.get(&succ),
-                        phi_defs.get(&succ),
-                        edge_phi_uses.get(&(addr, succ)),
-                    ));
-                }
-
-                let mut next_in = uses_by_block.get(&addr).cloned().unwrap_or_default();
-                let defs = defs_by_block.get(&addr).cloned().unwrap_or_default();
-                next_in.extend(
-                    next_out
-                        .iter()
-                        .filter(|name| !defs.contains(*name))
-                        .cloned(),
-                );
-
-                if live_out.get(&addr) != Some(&next_out) {
-                    live_out.insert(addr, next_out);
-                    changed = true;
-                }
-                if live_in.get(&addr) != Some(&next_in) {
-                    live_in.insert(addr, next_in);
-                    changed = true;
-                }
-            }
-        }
-
-        Self {
-            live_in,
-            phi_defs,
-            edge_phi_uses,
-        }
-    }
-
-    fn edge_live_in(&self, pred: u64, succ: u64) -> HashSet<String> {
-        edge_live_in(
-            self.live_in.get(&succ),
-            self.phi_defs.get(&succ),
-            self.edge_phi_uses.get(&(pred, succ)),
-        )
-    }
-}
-
-fn edge_live_in(
-    succ_live_in: Option<&HashSet<String>>,
-    succ_phi_defs: Option<&HashSet<String>>,
-    edge_phi_uses: Option<&HashSet<String>>,
-) -> HashSet<String> {
-    let mut live = HashSet::new();
-    if let Some(succ_live_in) = succ_live_in {
-        live.extend(
-            succ_live_in
-                .iter()
-                .filter(|name| succ_phi_defs.is_none_or(|defs| !defs.contains(*name)))
-                .cloned(),
-        );
-    }
-    if let Some(edge_phi_uses) = edge_phi_uses {
-        live.extend(edge_phi_uses.iter().cloned());
-    }
-    live
-}
-
-fn can_materialize_loop_backedge_phi(
-    func: &SSAFunction,
-    liveness: &EdgeLiveness,
-    pred: u64,
-    target: u64,
-    dst: &r2ssa::SSAVar,
-) -> bool {
-    let successors = func.successors(pred);
-    if successors.len() <= 1 || !successors.contains(&target) || !func.dominates(target, pred) {
-        return false;
-    }
-
-    if func
-        .get_block(pred)
-        .and_then(|block| block.ops.last())
-        .is_some_and(|op| op.sources().contains(&dst))
-    {
-        return false;
-    }
-
-    let dst_key = dst.display_name();
-    successors
-        .into_iter()
-        .filter(|succ| *succ != target)
-        .all(|succ| !liveness.edge_live_in(pred, succ).contains(&dst_key))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,7 +504,7 @@ mod tests {
         let with_phis = func.blocks().any(|b| !b.phis.is_empty());
         assert!(with_phis, "fixture should include phi nodes");
 
-        let normalized = materialize_phis(&func);
+        let normalized = materialize_all_phis(&func);
         let any_phi = normalized.blocks().any(|b| !b.phis.is_empty());
         assert!(
             !any_phi,
@@ -395,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn materialize_loop_backedge_phi_when_dst_dead_on_exit_edge() {
+    fn lower_loop_backedge_unconditionally_when_dst_is_dead_on_exit_edge() {
         let hash_1 = SSAVar::new("RAX", 1, 8);
         let hash_2 = SSAVar::new("RAX", 2, 8);
         let hash_4 = SSAVar::new("RAX", 4, 8);
@@ -431,19 +549,19 @@ mod tests {
             },
             SSAOp::CBranch {
                 target: SSAVar::new("ram:1004", 0, 8),
-                cond,
+                cond: cond.clone(),
             },
         ];
         func.get_block_mut(0x100c).expect("exit").ops = vec![SSAOp::Return {
             target: SSAVar::new("RIP", 1, 8),
         }];
 
-        let normalized = materialize_phis(&func);
+        let normalized = materialize_all_phis(&func);
         assert!(
             normalized
                 .get_block(0x1004)
                 .is_some_and(|block| block.phis.is_empty()),
-            "loop header phi should be eliminated when all incoming copies are safe"
+            "loop header phi should be eliminated when all edge moves are exact"
         );
         let latch = normalized.get_block(0x1008).expect("latch");
         assert!(
@@ -451,12 +569,12 @@ mod tests {
                 op,
                 SSAOp::Copy { dst, src } if dst == &hash_2 && src == &hash_4
             )),
-            "safe critical backedge must materialize the loop-carried copy"
+            "a value dead on every exit edge may be updated before the branch"
         );
     }
 
     #[test]
-    fn keep_loop_backedge_phi_when_dst_live_on_exit_edge() {
+    fn guard_loop_backedge_phi_when_dst_live_on_exit_edge() {
         let hash_1 = SSAVar::new("RAX", 1, 8);
         let hash_2 = SSAVar::new("RAX", 2, 8);
         let hash_4 = SSAVar::new("RAX", 4, 8);
@@ -492,7 +610,7 @@ mod tests {
             },
             SSAOp::CBranch {
                 target: SSAVar::new("ram:1004", 0, 8),
-                cond,
+                cond: cond.clone(),
             },
         ];
         func.get_block_mut(0x100c).expect("exit").ops = vec![
@@ -505,20 +623,108 @@ mod tests {
             },
         ];
 
-        let normalized = materialize_phis(&func);
+        let normalized = materialize_all_phis(&func);
         assert!(
             normalized
                 .get_block(0x1004)
-                .is_some_and(|block| !block.phis.is_empty()),
-            "critical-edge phi must remain when its destination is live on the exit edge"
+                .is_some_and(|block| block.phis.is_empty()),
+            "an exact guarded backedge move should eliminate the loop-header phi"
         );
         let latch = normalized.get_block(0x1008).expect("latch");
         assert!(
-            !latch.ops.iter().any(|op| matches!(
+            latch.ops.iter().any(|op| matches!(
                 op,
-                SSAOp::Copy { dst, src } if dst == &hash_2 && src == &hash_4
+                SSAOp::Select {
+                    dst,
+                    cond: select_cond,
+                    if_true,
+                    if_false,
+                } if dst == &hash_2
+                    && select_cond == &cond
+                    && if_true == &hash_4
+                    && if_false == &hash_2
             )),
-            "unsafe critical-edge copy must not be inserted before the branch"
+            "the backedge update must execute only when its branch edge is taken"
+        );
+    }
+
+    #[test]
+    fn keep_loop_phi_when_edge_guard_reads_its_destination() {
+        let value_1 = SSAVar::new("RAX", 1, 8);
+        let value_2 = SSAVar::new("RAX", 2, 8);
+        let value_4 = SSAVar::new("RAX", 4, 8);
+        let mut func = loop_backedge_phi_fixture();
+        func.get_block_mut(0x1000).expect("entry").ops = vec![SSAOp::Branch {
+            target: SSAVar::new("ram:1004", 0, 8),
+        }];
+        func.get_block_mut(0x1004).expect("header").phis = vec![PhiNode {
+            dst: value_2.clone(),
+            sources: vec![(0x1000, value_1), (0x1008, value_4.clone())],
+        }];
+        func.get_block_mut(0x1004).expect("header").ops = vec![SSAOp::Branch {
+            target: SSAVar::new("ram:1008", 0, 8),
+        }];
+        func.get_block_mut(0x1008).expect("latch").ops = vec![
+            SSAOp::IntAdd {
+                dst: value_4,
+                a: value_2.clone(),
+                b: SSAVar::new("const:1", 0, 8),
+            },
+            SSAOp::CBranch {
+                target: SSAVar::new("ram:1004", 0, 8),
+                cond: value_2.clone(),
+            },
+        ];
+
+        let normalized = materialize_all_phis(&func);
+
+        assert_eq!(
+            normalized.get_block(0x1004).expect("header").phis.len(),
+            1,
+            "lowering before the branch would overwrite its condition"
+        );
+        assert!(
+            !normalized
+                .get_block(0x1000)
+                .expect("entry")
+                .ops
+                .iter()
+                .any(|op| matches!(op, SSAOp::Copy { dst, .. } if dst == &value_2)),
+            "a rejected phi bundle must not leak its entry-edge copy"
+        );
+    }
+
+    #[test]
+    fn keep_parallel_phi_bundle_when_moves_are_cyclic() {
+        let a = SSAVar::new("RAX", 2, 8);
+        let b = SSAVar::new("RBX", 2, 8);
+        let mut func = loop_backedge_phi_fixture();
+        func.get_block_mut(0x1004).expect("header").phis = vec![
+            PhiNode {
+                dst: a.clone(),
+                sources: vec![(0x1000, SSAVar::new("RAX", 1, 8)), (0x1008, b.clone())],
+            },
+            PhiNode {
+                dst: b.clone(),
+                sources: vec![(0x1000, SSAVar::new("RBX", 1, 8)), (0x1008, a.clone())],
+            },
+        ];
+
+        let normalized = materialize_all_phis(&func);
+
+        assert_eq!(
+            normalized.get_block(0x1004).expect("header").phis.len(),
+            2,
+            "cyclic parallel moves must remain as phis until temporaries are certified"
+        );
+        assert!(
+            !normalized
+                .get_block(0x1000)
+                .expect("entry")
+                .ops
+                .iter()
+                .any(|op| matches!(op, SSAOp::Copy { dst, .. } if dst == &a || dst == &b)),
+            "an incomplete phi bundle must not leak partial edge copies"
         );
     }
 
@@ -565,7 +771,8 @@ mod tests {
             .expect("carrier initializer")
             .clone();
         let render_facts = r2types::FunctionRenderFacts::from_prepared(&prepared);
-        let mut normalized = materialize_phis(prepared.function());
+        let mut normalized =
+            materialize_certified_loop_carriers(prepared.function(), &prepared, &render_facts);
         materialize_certified_loop_carrier_initializers(&mut normalized, &prepared, &render_facts);
 
         let entry = normalized.get_block(0x2000).expect("entry");

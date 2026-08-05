@@ -5119,6 +5119,94 @@ mod tests {
     }
 
     #[test]
+    fn prepared_predicates_recover_signed_greater_equal_from_x86_flags() {
+        let blocks = vec![
+            R2ILBlock {
+                addr: 0x1920,
+                size: 0x4,
+                ops: vec![R2ILOp::CBranch {
+                    target: make_ram(0x1930, 8),
+                    cond: make_const(1, 1),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1924,
+                size: 0x4,
+                ops: vec![R2ILOp::Return {
+                    target: make_const(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1930,
+                size: 0x4,
+                ops: vec![R2ILOp::Return {
+                    target: make_const(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ];
+        let mut function =
+            SSAFunction::from_blocks_raw_no_arch(&blocks).expect("raw SSA should build");
+        let lhs = SSAVar::new("EAX", 0, 4);
+        let rhs = SSAVar::new("ECX", 0, 4);
+        let difference = SSAVar::new("tmp:difference", 1, 4);
+        let overflow = SSAVar::new("OF", 1, 1);
+        let sign = SSAVar::new("SF", 1, 1);
+        let condition = SSAVar::new("tmp:condition", 1, 1);
+        function.get_block_mut(0x1920).expect("branch block").ops = vec![
+            SSAOp::IntSBorrow {
+                dst: overflow.clone(),
+                a: lhs.clone(),
+                b: rhs.clone(),
+            },
+            SSAOp::IntSub {
+                dst: difference.clone(),
+                a: lhs.clone(),
+                b: rhs.clone(),
+            },
+            SSAOp::IntSLess {
+                dst: sign.clone(),
+                a: difference,
+                b: SSAVar::constant(0, 4),
+            },
+            SSAOp::IntEqual {
+                dst: condition.clone(),
+                a: overflow,
+                b: sign,
+            },
+            SSAOp::CBranch {
+                target: SSAVar::new("ram:1930", 0, 8),
+                cond: condition,
+            },
+        ];
+
+        let prepared = SsaArtifact::new(function, FunctionPrepareMode::Raw);
+        let comparison = prepared
+            .predicates()
+            .predicates
+            .values()
+            .find(|predicate| predicate.block_addr == 0x1920)
+            .and_then(|predicate| predicate.comparison.as_ref())
+            .expect("signed flag comparison");
+
+        assert_eq!(comparison.kind, crate::CompareKind::SignedLessEqual);
+        assert_eq!(
+            comparison.lhs,
+            prepared.graph().value_id_for_var(&rhs).unwrap(),
+            "OF == SF means rhs <= lhs"
+        );
+        assert_eq!(
+            comparison.rhs,
+            prepared.graph().value_id_for_var(&lhs).unwrap()
+        );
+    }
+
+    #[test]
     fn loop_carrier_certifies_dominating_initializer_for_zero_iteration_exit() {
         let blocks = vec![
             R2ILBlock {

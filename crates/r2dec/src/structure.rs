@@ -4310,17 +4310,25 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             }
             CExpr::Binary { op, left, right } => {
                 let negated = match op {
-                    BinaryOp::Eq => Some(BinaryOp::Ne),
-                    BinaryOp::Ne => Some(BinaryOp::Eq),
-                    BinaryOp::Lt => Some(BinaryOp::Ge),
-                    BinaryOp::Le => Some(BinaryOp::Gt),
-                    BinaryOp::Gt => Some(BinaryOp::Le),
-                    BinaryOp::Ge => Some(BinaryOp::Lt),
+                    BinaryOp::Eq => Some((BinaryOp::Ne, false)),
+                    BinaryOp::Ne => Some((BinaryOp::Eq, false)),
+                    BinaryOp::Lt => Some((BinaryOp::Ge, false)),
+                    BinaryOp::Le => Some((BinaryOp::Lt, true)),
+                    BinaryOp::Gt => Some((BinaryOp::Le, false)),
+                    BinaryOp::Ge => Some((BinaryOp::Lt, false)),
                     _ => None,
                 };
 
-                if let Some(op) = negated {
-                    CExpr::Binary { op, left, right }
+                if let Some((op, swap)) = negated {
+                    if swap {
+                        CExpr::Binary {
+                            op,
+                            left: right,
+                            right: left,
+                        }
+                    } else {
+                        CExpr::Binary { op, left, right }
+                    }
                 } else {
                     CExpr::unary(UnaryOp::Not, CExpr::Binary { op, left, right })
                 }
@@ -6965,6 +6973,18 @@ mod tests {
                 then_stmt,
                 Some(else_stmt)
             )
+        );
+    }
+
+    #[test]
+    fn negates_less_equal_with_canonical_less_than_orientation() {
+        assert_eq!(
+            ControlFlowStructurer::negate_condition(CExpr::binary(
+                BinaryOp::Le,
+                v("limit"),
+                v("index"),
+            )),
+            CExpr::binary(BinaryOp::Lt, v("index"), v("limit"))
         );
     }
 

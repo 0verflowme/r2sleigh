@@ -273,7 +273,7 @@ impl<'a> FoldingContext<'a> {
             return Some(stmt);
         }
         if self.requires_certified_rendering() && stmt_requires_expression_render_proof(&stmt) {
-            let materialized_phi_copy = self.is_certified_materialized_phi_carrier(op, &stmt);
+            let phi_edge = self.certified_phi_edge_render_proof(op, &stmt, block_addr);
             let value = match op {
                 SSAOp::Store { val, .. } => self.prepared_value_id_for_var(val),
                 _ => op.dst().and_then(|dst| self.prepared_value_id_for_var(dst)),
@@ -284,16 +284,12 @@ impl<'a> FoldingContext<'a> {
                         .certified_render_context()
                         .is_some_and(|proof| proof.expression_is_renderable(value)) =>
                 {
-                    if materialized_phi_copy {
-                        let source = match op {
-                            SSAOp::Copy { src, .. } => self.prepared_value_id_for_var(src),
-                            _ => None,
-                        };
-                        self.record_effect_render_proof_for_materialized_phi_copy(
+                    if let Some(phi_edge) = phi_edge {
+                        self.record_effect_render_proof_for_phi_edge(
                             block_addr,
                             op_idx,
                             Some(value),
-                            source,
+                            phi_edge,
                         );
                     } else {
                         self.record_effect_render_proof_for_value(
