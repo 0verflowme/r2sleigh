@@ -878,6 +878,20 @@ mod tests {
                                 rhs: comparison.rhs,
                             }
                         }),
+                        evaluated_comparison: predicate.evaluated_comparison.as_ref().map(
+                            |comparison| r2types::PredicateComparisonFact {
+                                kind: comparison.kind,
+                                lhs: comparison.lhs,
+                                rhs: comparison.rhs,
+                            },
+                        ),
+                        render_comparison: predicate.comparison.as_ref().map(|comparison| {
+                            r2types::PredicateComparisonFact {
+                                kind: comparison.kind,
+                                lhs: comparison.lhs,
+                                rhs: comparison.rhs,
+                            }
+                        }),
                         true_target: predicate.true_target,
                         false_target: predicate.false_target,
                     },
@@ -19648,10 +19662,15 @@ mod tests {
             space: SpaceId::Ram,
             addr: Varnode::constant(0x5000, 8),
         });
+        entry.push(R2ILOp::IntAdd {
+            dst: Varnode::register(0x08, 8),
+            a: Varnode::register(0x00, 8),
+            b: Varnode::register(0x00, 8),
+        });
         entry.push(R2ILOp::Store {
             space: SpaceId::Ram,
             addr: Varnode::constant(0x6000, 8),
-            val: Varnode::constant(7, 8),
+            val: Varnode::register(0x08, 8),
         });
 
         let prepared =
@@ -19665,14 +19684,34 @@ mod tests {
         let load_stmt = ctx
             .op_to_stmt_with_args(&block.ops[0], block.addr, 0)
             .expect("certified load statement");
+        let load_fact = prepared
+            .memory_certificate_for_op_site(0x1000, 0, false)
+            .expect("load fact");
+        let memory_name = crate::certified_memory_result_name(load_fact.access);
         assert!(
-            matches!(load_stmt, CStmt::Expr(CExpr::Binary { op: BinaryOp::Assign, .. })),
+            matches!(
+                &load_stmt,
+                CStmt::Expr(CExpr::Binary {
+                    op: BinaryOp::Assign,
+                    left,
+                    right,
+                }) if left.as_ref() == &CExpr::Var(memory_name.clone())
+                    && matches!(right.as_ref(), CExpr::Deref(_))
+            ),
             "FunctionRenderFacts memory access must authorize executable certified load assignment: {load_stmt:?}"
         );
+        let SSAOp::Load { dst, .. } = &block.ops[0] else {
+            panic!("expected load");
+        };
+        assert_eq!(
+            ctx.render_certified_value_expr_for_var(dst),
+            Some(CExpr::Var(memory_name)),
+            "later expressions must reference the one effect-owned load result instead of duplicating the memory access"
+        );
 
-        ctx.current_op_idx.set(Some(1));
+        ctx.current_op_idx.set(Some(2));
         let store_stmt = ctx
-            .op_to_stmt_with_args(&block.ops[1], block.addr, 1)
+            .op_to_stmt_with_args(&block.ops[2], block.addr, 2)
             .expect("certified store statement");
         assert!(
             matches!(store_stmt, CStmt::Expr(CExpr::Binary { op: BinaryOp::Assign, .. })),
@@ -22420,6 +22459,12 @@ mod tests {
                 block_addr: 0x5000,
                 condition: lhs_value_id,
                 comparison: Some(r2types::PredicateComparisonFact {
+                    kind: r2ssa::CompareKind::Equal,
+                    lhs: lhs_value_id,
+                    rhs: rhs_value_id,
+                }),
+                evaluated_comparison: None,
+                render_comparison: Some(r2types::PredicateComparisonFact {
                     kind: r2ssa::CompareKind::Equal,
                     lhs: lhs_value_id,
                     rhs: rhs_value_id,

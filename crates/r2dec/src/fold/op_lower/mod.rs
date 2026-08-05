@@ -695,6 +695,22 @@ impl<'a> CertifiedRenderContext<'a> {
             .memory_access_for_op(block_addr, op_idx, is_write)
     }
 
+    fn exact_memory_read_for_value(
+        &self,
+        value: r2ssa::ValueId,
+    ) -> Option<&'a r2types::MemoryAccessRenderFact> {
+        let inst = self.prepared.graph().def_inst(value)?;
+        if !matches!(
+            self.prepared.graph().inst(inst)?.payload,
+            r2ssa::InstPayload::Op(SSAOp::Load { .. })
+        ) {
+            return None;
+        }
+        let (block_addr, op_idx) = self.prepared.inst_op_site(inst)?;
+        let fact = self.memory_access_for_op(block_addr, op_idx, false)?;
+        (fact.value == Some(value) && !fact.is_write && fact.materialize_result).then_some(fact)
+    }
+
     fn memory_read_for_value_dependency(
         &self,
         value: r2ssa::ValueId,
@@ -767,7 +783,7 @@ impl<'a> FoldingContext<'a> {
         let slot = self
             .certified_render_context()?
             .render_facts
-            .unique_parameter_slot_for_value(value)?;
+            .exact_parameter_slot_for_value(value)?;
         let signature = self
             .inputs
             .function_facts
@@ -859,6 +875,10 @@ impl<'a> FoldingContext<'a> {
         };
         if !target.eq_ignore_ascii_case(&self.var_name(dst))
             && !target.eq_ignore_ascii_case(&dst.display_name())
+            && !self
+                .prepared_value_id_for_var(dst)
+                .and_then(|value| self.certified_loop_carrier_name_for_value(value))
+                .is_some_and(|name| target.eq_ignore_ascii_case(&name))
         {
             return false;
         }
@@ -882,6 +902,45 @@ impl<'a> FoldingContext<'a> {
 
     pub(crate) fn certified_residual_comment(&self, reason: impl Into<String>) -> CStmt {
         CStmt::Comment(format!("r2sleigh residual: {}", reason.into()))
+    }
+
+    pub(super) fn certified_loop_carrier_name_for_value(
+        &self,
+        value: r2ssa::ValueId,
+    ) -> Option<String> {
+        let r2types::CertifiedEntity::LoopCarrier { phi, .. } = self
+            .certified_render_context()?
+            .render_facts
+            .loop_carrier_for_value(value)?
+        else {
+            return None;
+        };
+        Some(crate::certified_loop_carrier_name(*phi))
+    }
+
+    pub(super) fn certified_memory_result_name_for_value(
+        &self,
+        value: r2ssa::ValueId,
+    ) -> Option<String> {
+        let fact = self
+            .certified_render_context()?
+            .exact_memory_read_for_value(value)?;
+        Some(crate::certified_memory_result_name(fact.access))
+    }
+
+    pub(crate) fn certified_loop_carrier_update_name_for_value_at_latch(
+        &self,
+        value: r2ssa::ValueId,
+        latch: u64,
+    ) -> Option<String> {
+        let r2types::CertifiedEntity::LoopCarrier { phi, .. } = self
+            .certified_render_context()?
+            .render_facts
+            .loop_carrier_update_for_value_at_latch(value, latch)?
+        else {
+            return None;
+        };
+        Some(crate::certified_loop_carrier_name(*phi))
     }
 
     pub(crate) fn certified_callsite_for_op(
@@ -1024,7 +1083,13 @@ impl<'a> FoldingContext<'a> {
         depth: u32,
         visited: &mut BTreeSet<r2ssa::ValueId>,
     ) -> Option<CExpr> {
-        if depth > Self::MAX_SEMANTIC_RENDER_DEPTH || !visited.insert(value) {
+        if let Some(name) = self.certified_loop_carrier_name_for_value(value) {
+            return Some(CExpr::Var(name));
+        }
+        if let Some(name) = self.certified_memory_result_name_for_value(value) {
+            return Some(CExpr::Var(name));
+        }
+        if !visited.insert(value) {
             return None;
         }
 
@@ -4054,6 +4119,16 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn assignment_lhs_expr(&self, dst: &SSAVar) -> CExpr {
+        if self.requires_certified_rendering()
+            && let Some(value) = self.prepared_value_id_for_var(dst)
+        {
+            if let Some(name) = self.certified_loop_carrier_name_for_value(value) {
+                return CExpr::Var(name);
+            }
+            if let Some(name) = self.certified_memory_result_name_for_value(value) {
+                return CExpr::Var(name);
+            }
+        }
         let rendered = self.var_name(dst);
         if dst.version > 0 && is_generic_arg_name(&rendered) {
             if let Some(alias) = self.var_aliases_map().get(&dst.display_name())

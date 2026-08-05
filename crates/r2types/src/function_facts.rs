@@ -458,18 +458,42 @@ impl FunctionRenderFacts {
             .into_iter()
             .flat_map(|entity| match entity {
                 CertifiedEntity::Parameter { entry_values, .. } => Some(entry_values),
-                CertifiedEntity::StackSlot { .. } => None,
+                CertifiedEntity::StackSlot { .. } | CertifiedEntity::LoopCarrier { .. } => None,
             })
             .flatten()
             .copied()
     }
 
-    /// Resolve an expression to one unambiguous ABI parameter identity.
+    /// Resolve a value carrying a direct parameter binding to one ABI slot.
+    ///
+    /// This deliberately does not walk expression inputs: an expression that
+    /// depends on one parameter is not necessarily identical to that parameter.
+    pub fn exact_parameter_slot_for_value(&self, value: r2ssa::ValueId) -> Option<usize> {
+        let expr = self.certified_expr_for_value(value)?;
+        let mut slots = expr.bindings.iter().filter_map(|binding| {
+            let r2ssa::SemanticId::Parameter(slot) = binding else {
+                return None;
+            };
+            match self.certified_entities.get(binding) {
+                Some(CertifiedEntity::Parameter {
+                    slot: entity_slot, ..
+                }) if entity_slot == slot => usize::try_from(*slot).ok(),
+                _ => None,
+            }
+        });
+        let slot = slots.next()?;
+        slots.next().is_none().then_some(slot)
+    }
+
+    /// Resolve an expression to one unambiguous ABI parameter dependency.
     ///
     /// The walk follows only the certified expression graph and its stable
     /// `SemanticId::Parameter` bindings. Rendered names and register spellings
     /// are deliberately excluded.
-    pub fn unique_parameter_slot_for_value(&self, value: r2ssa::ValueId) -> Option<usize> {
+    pub fn unique_parameter_dependency_slot_for_value(
+        &self,
+        value: r2ssa::ValueId,
+    ) -> Option<usize> {
         let mut pending = vec![r2ssa::SemanticId::expression(value)];
         let mut visited = BTreeSet::new();
         let mut slots = BTreeSet::new();
@@ -586,7 +610,7 @@ impl FunctionRenderFacts {
             CertifiedEntity::StackSlot {
                 base, offset, size, ..
             } => Some((*base, *offset, *size)),
-            CertifiedEntity::Parameter { .. } => None,
+            CertifiedEntity::Parameter { .. } | CertifiedEntity::LoopCarrier { .. } => None,
         }
     }
 
@@ -608,8 +632,59 @@ impl FunctionRenderFacts {
                     size,
                     ..
                 } => Some((*object, *base, *offset, *size)),
-                CertifiedEntity::Parameter { .. } => None,
+                CertifiedEntity::Parameter { .. } | CertifiedEntity::LoopCarrier { .. } => None,
             })
+    }
+
+    pub fn loop_carrier_for_value(&self, value: r2ssa::ValueId) -> Option<&CertifiedEntity> {
+        let expr = self.certified_expr_for_value(value)?;
+        let mut carriers = expr.bindings.iter().filter_map(|binding| {
+            let r2ssa::SemanticId::LoopCarrier(_) = binding else {
+                return None;
+            };
+            match self.certified_entities.get(binding) {
+                Some(
+                    entity @ CertifiedEntity::LoopCarrier {
+                        identity_values, ..
+                    },
+                ) if identity_values.contains(&value) => Some(entity),
+                _ => None,
+            }
+        });
+        let carrier = carriers.next()?;
+        carriers.next().is_none().then_some(carrier)
+    }
+
+    pub fn loop_carrier_update_for_value_at_latch(
+        &self,
+        value: r2ssa::ValueId,
+        latch: u64,
+    ) -> Option<&CertifiedEntity> {
+        let expr = self.certified_expr_for_value(value)?;
+        let mut carriers = expr.bindings.iter().filter_map(|binding| {
+            let r2ssa::SemanticId::LoopCarrier(_) = binding else {
+                return None;
+            };
+            match self.certified_entities.get(binding) {
+                Some(entity @ CertifiedEntity::LoopCarrier { updates, .. })
+                    if updates.iter().any(|update| {
+                        update.predecessor == latch
+                            && (update.value == value || update.identity_values.contains(&value))
+                    }) =>
+                {
+                    Some(entity)
+                }
+                _ => None,
+            }
+        });
+        let carrier = carriers.next()?;
+        carriers.next().is_none().then_some(carrier)
+    }
+
+    pub fn loop_carriers(&self) -> impl Iterator<Item = &CertifiedEntity> {
+        self.certified_entities
+            .values()
+            .filter(|entity| matches!(entity, CertifiedEntity::LoopCarrier { .. }))
     }
 
     pub fn return_for_op(
@@ -890,12 +965,26 @@ pub enum CertifiedEntity {
         offset: i64,
         size: Option<u32>,
     },
+    LoopCarrier {
+        id: r2ssa::SemanticId,
+        loop_id: r2ssa::LoopId,
+        header: u64,
+        phi: r2ssa::ValueId,
+        width: u32,
+        identity_values: BTreeSet<r2ssa::ValueId>,
+        entries: Vec<r2ssa::LoopCarrierEdgeValue>,
+        updates: Vec<r2ssa::LoopCarrierUpdateFact>,
+        dominating_initializers: Vec<r2ssa::LoopCarrierEdgeValue>,
+        ty: Option<CTypeLike>,
+    },
 }
 
 impl CertifiedEntity {
     pub const fn id(&self) -> r2ssa::SemanticId {
         match self {
-            Self::Parameter { id, .. } | Self::StackSlot { id, .. } => *id,
+            Self::Parameter { id, .. }
+            | Self::StackSlot { id, .. }
+            | Self::LoopCarrier { id, .. } => *id,
         }
     }
 }
@@ -971,6 +1060,9 @@ pub struct MemoryAccessRenderFact {
     pub value: Option<r2ssa::ValueId>,
     pub is_write: bool,
     pub width: u32,
+    /// True when one certified expression root contains multiple paths to this
+    /// read and would duplicate the effect if rendered inline.
+    pub materialize_result: bool,
     pub control_domain: r2ssa::ControlDomain,
 }
 
@@ -1027,6 +1119,10 @@ pub struct BranchPredicateFact {
     pub block_addr: u64,
     pub condition: r2ssa::ValueId,
     pub comparison: Option<PredicateComparisonFact>,
+    pub evaluated_comparison: Option<PredicateComparisonFact>,
+    /// Comparison selected by prepared semantics for rendering at the source
+    /// branch program point.
+    pub render_comparison: Option<PredicateComparisonFact>,
     pub true_target: u64,
     pub false_target: u64,
 }
@@ -2146,14 +2242,14 @@ impl FunctionFacts {
             entry.0.insert(value.id);
             entry.1 = entry.1.max(value.var.size);
         }
-        let parameter_slot_by_entry_value = entry_values_by_slot
+        let mut parameter_slot_by_value = entry_values_by_slot
             .iter()
             .flat_map(|(slot, (values, _))| values.iter().map(move |value| (*value, *slot)))
             .collect::<BTreeMap<_, _>>();
         for reload in prepared.certificates().stack_reloads.values() {
             let mut slots = [reload.canonical_source, reload.source]
                 .into_iter()
-                .filter_map(|value| parameter_slot_by_entry_value.get(&value).copied())
+                .filter_map(|value| parameter_slot_by_value.get(&value).copied())
                 .collect::<BTreeSet<_>>();
             let Some(slot) = slots.pop_first() else {
                 continue;
@@ -2169,6 +2265,49 @@ impl FunctionFacts {
                 continue;
             };
             expr.bindings.insert(r2ssa::SemanticId::Parameter(slot));
+            parameter_slot_by_value.insert(reload.value, slot);
+        }
+
+        // Preserve exact parameter identity through same-width copies. This is
+        // an alias relation, unlike the broader expression dependency walk:
+        // arithmetic, loads, casts, and phi nodes never inherit the binding.
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for value in &prepared.graph().values {
+                if parameter_slot_by_value.contains_key(&value.id) {
+                    continue;
+                }
+                let Some(inst) = prepared
+                    .graph()
+                    .def_inst(value.id)
+                    .and_then(|inst| prepared.graph().inst(inst))
+                else {
+                    continue;
+                };
+                let r2ssa::InstPayload::Op(r2ssa::SSAOp::Copy { dst, src }) = &inst.payload else {
+                    continue;
+                };
+                if dst.size != src.size {
+                    continue;
+                }
+                let Some(source) = prepared.graph().value_id_for_var(src) else {
+                    continue;
+                };
+                let Some(slot) = parameter_slot_by_value.get(&source).copied() else {
+                    continue;
+                };
+                let Some(expr) = self
+                    .render
+                    .certified_exprs
+                    .get_mut(&r2ssa::SemanticId::expression(value.id))
+                else {
+                    continue;
+                };
+                expr.bindings.insert(r2ssa::SemanticId::Parameter(slot));
+                parameter_slot_by_value.insert(value.id, slot);
+                changed = true;
+            }
         }
         for (slot, (entry_values, carrier_width)) in entry_values_by_slot {
             let id = r2ssa::SemanticId::Parameter(slot);
@@ -2181,6 +2320,74 @@ impl FunctionFacts {
                     carrier_width,
                 },
             );
+        }
+    }
+
+    /// Attach one unambiguous signature-owned type to each loop carrier.
+    ///
+    /// Carrier identity comes from prepared SSA. Types are projected only from
+    /// an exact parameter or return binding already authorized by the function
+    /// signature; conflicting projections leave the carrier untyped.
+    pub fn populate_certified_loop_carrier_types(&mut self) {
+        let Some(signature) = self.types.render_authorized_signature().cloned() else {
+            return;
+        };
+        let return_values = self
+            .render
+            .return_effects()
+            .map(|fact| fact.value)
+            .collect::<BTreeSet<_>>();
+        let carriers = self
+            .render
+            .loop_carriers()
+            .filter_map(|entity| match entity {
+                CertifiedEntity::LoopCarrier {
+                    id,
+                    phi,
+                    identity_values,
+                    ..
+                } => Some((*id, *phi, identity_values.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        for (id, phi, identity_values) in carriers {
+            let mut candidates = Vec::<CTypeLike>::new();
+            let mut identity_and_entry_values = identity_values;
+            identity_and_entry_values.insert(phi);
+            if let Some(CertifiedEntity::LoopCarrier { entries, .. }) =
+                self.render.certified_entities.get(&id)
+            {
+                identity_and_entry_values.extend(entries.iter().map(|entry| entry.value));
+            }
+            for value in &identity_and_entry_values {
+                if let Some(slot) = self.render.exact_parameter_slot_for_value(*value)
+                    && let Some(ty) = signature
+                        .params
+                        .get(slot)
+                        .and_then(|param| param.ty.clone())
+                    && !candidates.contains(&ty)
+                {
+                    candidates.push(ty);
+                }
+            }
+            if identity_and_entry_values
+                .iter()
+                .any(|value| return_values.contains(value))
+                && let Some(ty) = signature.ret_type.clone()
+                && !candidates.contains(&ty)
+            {
+                candidates.push(ty);
+            }
+            let [ty] = candidates.as_slice() else {
+                continue;
+            };
+            if let Some(CertifiedEntity::LoopCarrier {
+                ty: carrier_type, ..
+            }) = self.render.certified_entities.get_mut(&id)
+            {
+                *carrier_type = Some(ty.clone());
+            }
         }
     }
 
@@ -2202,7 +2409,10 @@ impl FunctionFacts {
                 let Some(hint) = signature.params.get(argument.index) else {
                     continue;
                 };
-                let Some(slot) = self.render.unique_parameter_slot_for_value(argument.value) else {
+                let Some(slot) = self
+                    .render
+                    .unique_parameter_dependency_slot_for_value(argument.value)
+                else {
                     continue;
                 };
                 if conflicted.contains(&slot) {
@@ -2913,9 +3123,33 @@ fn const_var_i64(var: &r2ssa::SSAVar) -> Option<i64> {
     }
 }
 
+fn prepared_predicate_render_comparison<'a>(
+    prepared: &r2ssa::SsaArtifact,
+    predicate: &'a r2ssa::PredicateFact,
+) -> Option<&'a r2ssa::CompareProvenance> {
+    predicate
+        .evaluated_comparison
+        .as_ref()
+        .filter(|comparison| {
+            [comparison.lhs, comparison.rhs].into_iter().any(|value| {
+                prepared
+                    .structured()
+                    .loops
+                    .values()
+                    .flat_map(|loop_fact| &loop_fact.carriers)
+                    .flat_map(|carrier| &carrier.updates)
+                    .any(|update| {
+                        update.predecessor == predicate.block_addr
+                            && (update.value == value || update.identity_values.contains(&value))
+                    })
+            })
+        })
+        .or(predicate.comparison.as_ref())
+}
+
 fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
     let certificates = prepared.certificates();
-    let certified_exprs = certificates
+    let mut certified_exprs = certificates
         .expressions
         .iter()
         .map(|(value, cert)| {
@@ -2952,7 +3186,7 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
             )
         })
         .collect::<BTreeMap<_, _>>();
-    let certified_memory_effects = certificates
+    let mut certified_memory_effects = certificates
         .memory_accesses
         .iter()
         .map(|(access, cert)| {
@@ -2975,6 +3209,7 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
                         value: cert.value,
                         is_write: cert.is_write,
                         width: cert.width,
+                        materialize_result: false,
                         control_domain,
                     },
                 },
@@ -3029,7 +3264,7 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
                 .map(|fact| ((fact.block_addr, fact.op_index), *id))
         })
         .collect();
-    let certified_entities = certificates
+    let mut certified_entities = certificates
         .stack_slots
         .iter()
         .map(|(object, cert)| {
@@ -3046,6 +3281,134 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
             )
         })
         .collect::<BTreeMap<_, _>>();
+    let observable_roots = certificates
+        .returns
+        .iter()
+        .map(|cert| cert.value)
+        .chain(
+            certificates
+                .memory_accesses
+                .values()
+                .flat_map(|cert| std::iter::once(cert.address).chain(cert.value)),
+        )
+        .chain(certificates.callsites.values().flat_map(|cert| {
+            cert.argument_values
+                .iter()
+                .copied()
+                .chain(cert.stack_argument_values.iter().map(|arg| arg.value))
+        }))
+        .chain(
+            prepared
+                .predicates()
+                .predicates
+                .values()
+                .flat_map(|predicate| {
+                    let mut roots = Vec::new();
+                    if let Some(comparison) =
+                        prepared_predicate_render_comparison(prepared, predicate)
+                    {
+                        roots.extend([comparison.lhs, comparison.rhs]);
+                    } else {
+                        roots.push(predicate.condition);
+                    }
+                    roots
+                }),
+        )
+        .chain(
+            prepared
+                .predicates()
+                .switches
+                .values()
+                .filter_map(|switch| switch.selector),
+        )
+        .collect::<BTreeSet<_>>();
+    let mut observable_values = observable_roots.clone();
+    let mut pending = observable_values.iter().copied().collect::<Vec<_>>();
+    while let Some(value) = pending.pop() {
+        let Some(inst) = prepared
+            .graph()
+            .def_inst(value)
+            .and_then(|inst| prepared.graph().inst(inst))
+        else {
+            continue;
+        };
+        for input in &inst.inputs {
+            if observable_values.insert(*input) {
+                pending.push(*input);
+            }
+        }
+    }
+    let mut carrier_update_roots = BTreeSet::new();
+    let mut carrier_identity_values = BTreeSet::new();
+    for carrier in prepared
+        .structured()
+        .loops
+        .values()
+        .flat_map(|loop_fact| loop_fact.carriers.iter())
+        .filter(|carrier| observable_values.contains(&carrier.phi))
+    {
+        carrier_identity_values.extend(carrier.identity_values.iter().copied());
+        carrier_update_roots.extend(carrier.updates.iter().map(|update| update.value));
+        for value in carrier
+            .identity_values
+            .iter()
+            .copied()
+            .chain(carrier.entries.iter().map(|edge| edge.value))
+            .chain(carrier.updates.iter().flat_map(|update| {
+                std::iter::once(update.value).chain(update.identity_values.iter().copied())
+            }))
+        {
+            if let Some(expr) = certified_exprs.get_mut(&r2ssa::SemanticId::expression(value)) {
+                expr.bindings.insert(carrier.id);
+            }
+        }
+        certified_entities.insert(
+            carrier.id,
+            CertifiedEntity::LoopCarrier {
+                id: carrier.id,
+                loop_id: carrier.loop_id,
+                header: carrier.header,
+                phi: carrier.phi,
+                width: carrier.width,
+                identity_values: carrier.identity_values.clone(),
+                entries: carrier.entries.clone(),
+                updates: carrier.updates.clone(),
+                dominating_initializers: carrier.dominating_initializers.clone(),
+                ty: None,
+            },
+        );
+    }
+    let mut consumer_roots = observable_roots;
+    consumer_roots.extend(carrier_update_roots);
+    let stack_reload_accesses = certificates
+        .stack_reloads
+        .values()
+        .map(|reload| reload.load_access)
+        .collect::<BTreeSet<_>>();
+    for effect in certified_memory_effects.values_mut() {
+        let CertifiedEffect::Memory { fact, .. } = effect else {
+            continue;
+        };
+        let Some(value) = fact.value.filter(|_| !fact.is_write) else {
+            continue;
+        };
+        if stack_reload_accesses.contains(&fact.access) {
+            continue;
+        }
+        fact.materialize_result = consumer_roots
+            .iter()
+            .copied()
+            .filter(|root| *root != value)
+            .any(|root| {
+                expression_dependency_path_count(
+                    prepared.graph(),
+                    root,
+                    value,
+                    &carrier_identity_values,
+                    &mut BTreeSet::new(),
+                ) > 1
+            });
+    }
     let mut certified_effects = certified_memory_effects;
     certified_effects.extend(certified_return_effects);
     FunctionRenderFacts {
@@ -3058,6 +3421,42 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
         member_accesses_by_op: BTreeMap::new(),
         array_accesses_by_op: BTreeMap::new(),
     }
+}
+
+fn expression_dependency_path_count(
+    graph: &r2ssa::SsaGraph,
+    current: r2ssa::ValueId,
+    target: r2ssa::ValueId,
+    carrier_identities: &BTreeSet<r2ssa::ValueId>,
+    visiting: &mut BTreeSet<r2ssa::ValueId>,
+) -> u8 {
+    if current == target {
+        return 1;
+    }
+    if carrier_identities.contains(&current) || !visiting.insert(current) {
+        return 0;
+    }
+    let count = graph
+        .def_inst(current)
+        .and_then(|inst| graph.inst(inst))
+        .map(|inst| {
+            inst.inputs.iter().fold(0_u8, |count, input| {
+                if count > 1 {
+                    count
+                } else {
+                    count.saturating_add(expression_dependency_path_count(
+                        graph,
+                        *input,
+                        target,
+                        carrier_identities,
+                        visiting,
+                    ))
+                }
+            })
+        })
+        .unwrap_or_default();
+    visiting.remove(&current);
+    count.min(2)
 }
 
 fn prepared_control_facts(prepared: &r2ssa::SsaArtifact) -> FunctionControlFacts {
@@ -3080,6 +3479,19 @@ fn prepared_control_facts(prepared: &r2ssa::SsaArtifact) -> FunctionControlFacts
                             rhs: comparison.rhs,
                         }
                     }),
+                    evaluated_comparison: predicate.evaluated_comparison.as_ref().map(
+                        |comparison| PredicateComparisonFact {
+                            kind: comparison.kind,
+                            lhs: comparison.lhs,
+                            rhs: comparison.rhs,
+                        },
+                    ),
+                    render_comparison: prepared_predicate_render_comparison(prepared, predicate)
+                        .map(|comparison| PredicateComparisonFact {
+                            kind: comparison.kind,
+                            lhs: comparison.lhs,
+                            rhs: comparison.rhs,
+                        }),
                     true_target: predicate.true_target,
                     false_target: predicate.false_target,
                 },
@@ -4128,8 +4540,13 @@ mod tests {
             space: SpaceId::Ram,
             addr: Varnode::unique(0x100, 8),
         });
+        block.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(0x108, 8),
+            a: Varnode::register(0x00, 8),
+            b: Varnode::register(0x00, 8),
+        });
         block.push(R2ILOp::Return {
-            target: Varnode::register(0x00, 8),
+            target: Varnode::unique(0x108, 8),
         });
         let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
             .expect("prepared");
@@ -4197,6 +4614,15 @@ mod tests {
         );
         assert!(
             render
+                .certified_effects
+                .values()
+                .filter_map(CertifiedEffect::memory_fact)
+                .find(|fact| fact.access == reloaded.load_access)
+                .is_some_and(|fact| !fact.materialize_result),
+            "a certified stack-home reload must render through its stable identity even when the raw value has multiple expression uses"
+        );
+        assert!(
+            render
                 .certified_exprs
                 .values()
                 .all(|expr| !expr.bindings.contains(&r2ssa::SemanticId::Parameter(1))),
@@ -4234,8 +4660,50 @@ mod tests {
         );
         assert_eq!(memory_effects, 2);
         assert!(return_effects >= 1);
-        assert!(render.return_effect_id_for_op(0x401000, 3).is_some());
-        assert!(render.return_for_op(0x401000, 3).is_some());
+        assert!(render.return_effect_id_for_op(0x401000, 4).is_some());
+        assert!(render.return_for_op(0x401000, 4).is_some());
+    }
+
+    #[test]
+    fn parameter_identity_is_distinct_from_single_parameter_dependency() {
+        let mut block = R2ILBlock::new(0x402000, 4);
+        block.push(R2ILOp::Copy {
+            dst: Varnode::unique(0x100, 8),
+            src: Varnode::register(0x10, 8),
+        });
+        block.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(0x108, 8),
+            a: Varnode::unique(0x100, 8),
+            b: Varnode::constant(1, 8),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode::unique(0x108, 8),
+        });
+        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
+            .expect("prepared");
+        let mut facts = FunctionFacts::default();
+        facts.attach_prepared_decompile_evidence(&prepared);
+        facts.populate_certified_parameter_exprs(&prepared, &x86_stack_home_param_slots());
+        let render = facts.render().expect("render facts");
+        let copied = prepared
+            .graph()
+            .values
+            .iter()
+            .find(|value| value.var.name == "tmp:100")
+            .expect("same-width parameter copy");
+        let derived = prepared
+            .graph()
+            .values
+            .iter()
+            .find(|value| value.var.name == "tmp:108")
+            .expect("derived expression");
+
+        assert_eq!(render.exact_parameter_slot_for_value(copied.id), Some(0));
+        assert_eq!(render.exact_parameter_slot_for_value(derived.id), None);
+        assert_eq!(
+            render.unique_parameter_dependency_slot_for_value(derived.id),
+            Some(0)
+        );
     }
 
     fn member_load_prepared_for_register(
@@ -4589,6 +5057,12 @@ mod tests {
                 lhs: r2ssa::ValueId(32),
                 rhs: r2ssa::ValueId(33),
             }),
+            evaluated_comparison: None,
+            render_comparison: Some(PredicateComparisonFact {
+                kind: r2ssa::CompareKind::Equal,
+                lhs: r2ssa::ValueId(32),
+                rhs: r2ssa::ValueId(33),
+            }),
             true_target: 0x401010,
             false_target: 0x401004,
         };
@@ -4708,6 +5182,7 @@ mod tests {
                             value: Some(value),
                             is_write: true,
                             width: 8,
+                            materialize_result: false,
                             control_domain: test_control_domain(),
                         },
                     },
@@ -4888,6 +5363,7 @@ mod tests {
                         value: Some(value),
                         is_write: false,
                         width: 4,
+                        materialize_result: false,
                         control_domain: test_control_domain(),
                     },
                 },

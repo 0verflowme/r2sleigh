@@ -64,6 +64,7 @@ pub(crate) struct PreparedSemanticView {
     pub(crate) authorized_stack_owner_names: BTreeMap<i64, BTreeSet<String>>,
     pub(crate) authorized_stack_owner_names_by_object:
         BTreeMap<(r2ssa::ObjectId, i64), BTreeSet<String>>,
+    pub(crate) certified_loop_carrier_values: BTreeSet<ValueId>,
 }
 
 pub(crate) struct PreparedSemanticViewInputs<'a> {
@@ -109,6 +110,31 @@ impl PreparedSemanticView {
         let mut view = Self {
             param_alias_by_reg: inputs.param_register_aliases.clone(),
             certified_rendering_required,
+            certified_loop_carrier_values: inputs
+                .function_facts
+                .render()
+                .into_iter()
+                .flat_map(r2types::FunctionRenderFacts::loop_carriers)
+                .flat_map(|entity| match entity {
+                    r2types::CertifiedEntity::LoopCarrier {
+                        phi,
+                        identity_values,
+                        entries,
+                        updates,
+                        dominating_initializers,
+                        ..
+                    } => std::iter::once(*phi)
+                        .chain(identity_values.iter().copied())
+                        .chain(entries.iter().map(|edge| edge.value))
+                        .chain(updates.iter().flat_map(|update| {
+                            std::iter::once(update.value)
+                                .chain(update.identity_values.iter().copied())
+                        }))
+                        .chain(dominating_initializers.iter().map(|edge| edge.value))
+                        .collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                })
+                .collect(),
             ..Self::default()
         };
         for (rank, reg) in inputs.abi_arg_regs.iter().enumerate() {
@@ -306,7 +332,7 @@ pub(crate) fn build_prepared_runtime_facts(
     seed_prepared_param_aliases(&mut use_info, blocks, env);
     seed_prepared_stack_facts(&mut use_info, &mut stack_info, prepared, view);
     collect_prepared_runtime_facts(&mut use_info, &mut flag_info, blocks, env, prepared, view);
-    pin_prepared_loop_carried_phi_values(&mut use_info, prepared);
+    pin_prepared_loop_carried_phi_values(&mut use_info, prepared, view);
     pin_aliases_for_prepared_pinned_values(&mut use_info);
     populate_prepared_call_runtime_facts(&mut use_info, blocks, env, prepared, view);
     overlay_local_struct_semantics(&mut use_info, blocks, env);
@@ -322,67 +348,15 @@ pub(crate) fn build_prepared_runtime_facts(
     }
 }
 
-fn pin_prepared_loop_carried_phi_values(use_info: &mut UseInfo, prepared: &SsaArtifact) {
-    let materialized_values = prepared_loop_phi_materialization_values(prepared);
-    for loop_fact in prepared.structured().loops.values() {
-        let Some(header) = prepared.function().get_block(loop_fact.header) else {
-            continue;
-        };
-        for phi in &header.phis {
-            if !phi
-                .sources
-                .iter()
-                .any(|(pred, _)| loop_fact.latches.contains(pred))
-            {
-                continue;
-            }
-            let Some(dst_value) = use_info.value_id_for_var(&phi.dst) else {
-                continue;
-            };
-            if !materialized_values.contains(&dst_value)
-                && !phi.sources.iter().any(|(_, src)| {
-                    use_info
-                        .value_id_for_var(src)
-                        .is_some_and(|value| materialized_values.contains(&value))
-                })
-            {
-                continue;
-            }
-            pin_prepared_phi_materialized_var(use_info, &phi.dst);
-            for (_, src) in &phi.sources {
-                pin_prepared_phi_materialized_var(use_info, src);
-            }
-        }
-    }
-}
-
-fn prepared_loop_phi_materialization_values(prepared: &SsaArtifact) -> BTreeSet<ValueId> {
-    let mut values = BTreeSet::new();
-    for loop_fact in prepared.structured().loops.values() {
-        values.extend(loop_fact.induction_phi);
-        values.extend(loop_fact.induction_init);
-        values.extend(loop_fact.induction_update);
-        values.extend(loop_fact.bound);
-    }
-    for ret in &prepared.certificates().returns {
-        collect_prepared_expression_dependencies(prepared, ret.value, &mut values);
-    }
-    values
-}
-
-fn collect_prepared_expression_dependencies(
+fn pin_prepared_loop_carried_phi_values(
+    use_info: &mut UseInfo,
     prepared: &SsaArtifact,
-    value: ValueId,
-    out: &mut BTreeSet<ValueId>,
+    view: &PreparedSemanticView,
 ) {
-    if !out.insert(value) {
-        return;
-    }
-    let Some(cert) = prepared.certificates().expressions.get(&value) else {
-        return;
-    };
-    for input in &cert.inputs {
-        collect_prepared_expression_dependencies(prepared, *input, out);
+    for value in &view.certified_loop_carrier_values {
+        if let Some(var) = prepared.value_var(*value) {
+            pin_prepared_phi_materialized_var(use_info, var);
+        }
     }
 }
 
@@ -4095,6 +4069,20 @@ mod tests {
                         block_addr: predicate.block_addr,
                         condition: predicate.condition,
                         comparison: predicate.comparison.as_ref().map(|comparison| {
+                            r2types::PredicateComparisonFact {
+                                kind: comparison.kind,
+                                lhs: comparison.lhs,
+                                rhs: comparison.rhs,
+                            }
+                        }),
+                        evaluated_comparison: predicate.evaluated_comparison.as_ref().map(
+                            |comparison| r2types::PredicateComparisonFact {
+                                kind: comparison.kind,
+                                lhs: comparison.lhs,
+                                rhs: comparison.rhs,
+                            },
+                        ),
+                        render_comparison: predicate.comparison.as_ref().map(|comparison| {
                             r2types::PredicateComparisonFact {
                                 kind: comparison.kind,
                                 lhs: comparison.lhs,

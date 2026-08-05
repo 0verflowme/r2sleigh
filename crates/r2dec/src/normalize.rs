@@ -93,6 +93,83 @@ pub(crate) fn materialize_phis(func: &SSAFunction) -> SSAFunction {
     normalized
 }
 
+/// Coalesce certified loop carriers across zero-iteration exits.
+///
+/// Prepared SSA proves the carrier identity and a dominating entry-valued
+/// edge. The renderer only performs the corresponding SSA destruction: one
+/// initialization before the loop decision replaces redundant copies on the
+/// loop-entry edges, while latch updates remain at their original program
+/// point.
+pub(crate) fn materialize_certified_loop_carrier_initializers(
+    func: &mut SSAFunction,
+    prepared: &r2ssa::SsaArtifact,
+    render_facts: &r2types::FunctionRenderFacts,
+) {
+    for entity in render_facts.loop_carriers() {
+        let r2types::CertifiedEntity::LoopCarrier {
+            phi,
+            identity_values,
+            entries,
+            dominating_initializers,
+            ..
+        } = entity
+        else {
+            continue;
+        };
+        if identity_values.len() < 2 {
+            continue;
+        }
+        let [initializer] = dominating_initializers.as_slice() else {
+            continue;
+        };
+        if !entries.iter().any(|entry| entry.value == initializer.value) {
+            continue;
+        }
+        let Some(dst) = prepared.value_var(*phi).cloned() else {
+            continue;
+        };
+        let Some(src) = prepared.value_var(initializer.value).cloned() else {
+            continue;
+        };
+        if dst.size != src.size {
+            continue;
+        }
+
+        for entry in entries {
+            if entry.value != initializer.value
+                || entry.predecessor == initializer.predecessor
+                || !prepared
+                    .function()
+                    .dominates(initializer.predecessor, entry.predecessor)
+            {
+                continue;
+            }
+            if let Some(block) = func.get_block_mut(entry.predecessor) {
+                block.ops.retain(|op| {
+                    !matches!(op, SSAOp::Copy { dst: copy_dst, src: copy_src }
+                        if copy_dst == &dst && copy_src == &src)
+                });
+            }
+        }
+
+        let Some(block) = func.get_block_mut(initializer.predecessor) else {
+            continue;
+        };
+        if block.ops.iter().any(|op| {
+            matches!(op, SSAOp::Copy { dst: copy_dst, src: copy_src }
+                if copy_dst == &dst && copy_src == &src)
+        }) {
+            continue;
+        }
+        let insert_at = block
+            .ops
+            .iter()
+            .rposition(is_block_terminator)
+            .unwrap_or(block.ops.len());
+        block.ops.insert(insert_at, SSAOp::Copy { dst, src });
+    }
+}
+
 struct EdgeLiveness {
     live_in: HashMap<u64, HashSet<String>>,
     phi_defs: HashMap<u64, HashSet<String>>,
@@ -443,6 +520,64 @@ mod tests {
             )),
             "unsafe critical-edge copy must not be inserted before the branch"
         );
+    }
+
+    #[test]
+    fn certified_carrier_initializer_moves_before_zero_iteration_branch() {
+        let mut entry = R2ILBlock::new(0x2000, 4);
+        entry.push(R2ILOp::CBranch {
+            cond: Varnode::constant(1, 1),
+            target: Varnode::constant(0x200c, 8),
+        });
+        let mut preheader = R2ILBlock::new(0x2004, 4);
+        preheader.push(R2ILOp::Branch {
+            target: Varnode::constant(0x2008, 8),
+        });
+        let mut loop_block = R2ILBlock::new(0x2008, 4);
+        loop_block.push(R2ILOp::IntAdd {
+            dst: Varnode::register(0, 8),
+            a: Varnode::register(0, 8),
+            b: Varnode::constant(1, 8),
+        });
+        loop_block.push(R2ILOp::CBranch {
+            cond: Varnode::constant(1, 1),
+            target: Varnode::constant(0x2008, 8),
+        });
+        let mut exit = R2ILBlock::new(0x200c, 4);
+        exit.push(R2ILOp::Return {
+            target: Varnode::register(0, 8),
+        });
+        let prepared = r2ssa::SsaArtifact::raw(&[entry, preheader, loop_block, exit], None)
+            .expect("zero-iteration loop fixture");
+        let carrier = prepared
+            .structured()
+            .loops
+            .values()
+            .flat_map(|loop_fact| loop_fact.carriers.iter())
+            .find(|carrier| !carrier.dominating_initializers.is_empty())
+            .expect("certified loop carrier");
+        let phi = prepared
+            .value_var(carrier.phi)
+            .expect("carrier phi")
+            .clone();
+        let init = prepared
+            .value_var(carrier.dominating_initializers[0].value)
+            .expect("carrier initializer")
+            .clone();
+        let render_facts = r2types::FunctionRenderFacts::from_prepared(&prepared);
+        let mut normalized = materialize_phis(prepared.function());
+        materialize_certified_loop_carrier_initializers(&mut normalized, &prepared, &render_facts);
+
+        let entry = normalized.get_block(0x2000).expect("entry");
+        assert!(entry.ops.iter().any(|op| matches!(
+            op,
+            SSAOp::Copy { dst, src } if dst == &phi && src == &init
+        )));
+        let preheader = normalized.get_block(0x2004).expect("preheader");
+        assert!(!preheader.ops.iter().any(|op| matches!(
+            op,
+            SSAOp::Copy { dst, src } if dst == &phi && src == &init
+        )));
     }
 
     fn loop_backedge_phi_fixture() -> SSAFunction {

@@ -307,6 +307,7 @@ impl<'a> FoldingContext<'a> {
         block_addr: u64,
         op_idx: usize,
         value: Option<ValueId>,
+        source: Option<ValueId>,
     ) {
         self.effect_render_proofs
             .borrow_mut()
@@ -318,7 +319,7 @@ impl<'a> FoldingContext<'a> {
                 target: None,
                 address: None,
                 value,
-                values: Vec::new(),
+                values: source.into_iter().collect(),
                 materialized_phi_copy: true,
             });
     }

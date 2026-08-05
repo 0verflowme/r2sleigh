@@ -2260,6 +2260,7 @@ pub fn attach_prepared_decompile_evidence(
 ) -> FunctionFacts {
     function_facts.attach_prepared_decompile_evidence(prepared);
     function_facts.populate_certified_parameter_exprs(prepared, param_slots);
+    function_facts.populate_certified_loop_carrier_types();
     function_facts.normalize_field_certificates_from_external_layout();
     function_facts
         .populate_member_access_render_facts_from_field_certificates(prepared, param_slots);

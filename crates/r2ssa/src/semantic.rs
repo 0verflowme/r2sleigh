@@ -37,6 +37,7 @@ pub enum SemanticId {
     Expression(ValueId),
     Parameter(u32),
     StackSlot(ObjectId),
+    LoopCarrier(ValueId),
     MemoryAccess(StructuredAccessId),
     Return(InstId),
     Call(CallSiteId),
@@ -56,6 +57,10 @@ impl SemanticId {
 
     pub const fn stack_slot(object: ObjectId) -> Self {
         Self::StackSlot(object)
+    }
+
+    pub const fn loop_carrier(phi: ValueId) -> Self {
+        Self::LoopCarrier(phi)
     }
 
     pub const fn memory_access(access: StructuredAccessId) -> Self {
@@ -89,6 +94,7 @@ impl std::fmt::Display for SemanticId {
             Self::Expression(value) => write!(f, "expr:{}", value.0),
             Self::Parameter(slot) => write!(f, "param:{slot}"),
             Self::StackSlot(object) => write!(f, "stack:{}", object.0),
+            Self::LoopCarrier(phi) => write!(f, "loop-carrier:{}", phi.0),
             Self::MemoryAccess(access) => {
                 write!(f, "memory:{}:{}", access.inst.0, access.ordinal)
             }
@@ -214,6 +220,9 @@ pub struct PredicateFact {
     pub block_addr: u64,
     pub condition: ValueId,
     pub comparison: Option<CompareProvenance>,
+    /// Comparison at the machine branch program point before algebraic
+    /// normalization (for example, `sub_result != 0`).
+    pub evaluated_comparison: Option<CompareProvenance>,
     pub true_target: u64,
     pub false_target: u64,
 }
@@ -353,6 +362,41 @@ pub enum StructuredLoopKind {
     SelfLoop,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LoopCarrierEdgeValue {
+    pub predecessor: u64,
+    pub value: ValueId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LoopCarrierUpdateFact {
+    pub predecessor: u64,
+    pub value: ValueId,
+    /// Values bit-identical to `value` through same-width copy chains.
+    pub identity_values: BTreeSet<ValueId>,
+}
+
+/// A loop-carried mutable value proven directly from header phi edges.
+///
+/// `identity_values` contains phi outputs that denote the carrier state after
+/// structured control flow chooses an incoming edge. Entry and update values
+/// remain expressions; consumers must not globally replace them with the
+/// carrier because their meaning depends on the edge program point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoopCarrierFact {
+    pub id: SemanticId,
+    pub loop_id: LoopId,
+    pub header: u64,
+    pub phi: ValueId,
+    pub width: u32,
+    pub identity_values: BTreeSet<ValueId>,
+    pub entries: Vec<LoopCarrierEdgeValue>,
+    pub updates: Vec<LoopCarrierUpdateFact>,
+    /// Entry-valued predecessor edges that dominate the loop header and can
+    /// initialize the coalesced carrier before zero-iteration exits.
+    pub dominating_initializers: Vec<LoopCarrierEdgeValue>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructuredLoopFact {
     pub id: LoopId,
@@ -362,6 +406,7 @@ pub struct StructuredLoopFact {
     pub body: Vec<u64>,
     pub exits: Vec<u64>,
     pub condition: Option<PredicateId>,
+    pub carriers: Vec<LoopCarrierFact>,
     pub induction_phi: Option<ValueId>,
     pub induction_init: Option<ValueId>,
     pub induction_update: Option<ValueId>,
@@ -3022,8 +3067,9 @@ fn collect_structured_loop_facts(
         let body = body_set.iter().copied().collect::<Vec<_>>();
         let exits = loop_exits(function, &body_set);
         let condition = loop_condition(predicates, header, &body_set, &exits);
+        let carriers = loop_carrier_facts(function, graph, id, header, &latches);
         let (induction_phi, induction_init, induction_update) =
-            loop_induction_values(graph, header, &latches, &body_set);
+            loop_induction_values(graph, predicates, condition, header, &latches, &body_set);
         let bound = loop_bound_value(
             graph,
             predicates,
@@ -3045,6 +3091,7 @@ fn collect_structured_loop_facts(
                 body,
                 exits,
                 condition,
+                carriers,
                 induction_phi,
                 induction_init,
                 induction_update,
@@ -3053,6 +3100,160 @@ fn collect_structured_loop_facts(
         );
     }
     loops
+}
+
+fn loop_carrier_facts(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    loop_id: LoopId,
+    header: u64,
+    latches: &BTreeSet<u64>,
+) -> Vec<LoopCarrierFact> {
+    let Some(header_block) = function.get_block(header) else {
+        return Vec::new();
+    };
+    let mut carriers = header_block
+        .phis
+        .iter()
+        .filter_map(|phi| {
+            let phi_value = graph.value_id_for_var(&phi.dst)?;
+            let mut entries = Vec::new();
+            let mut updates = Vec::new();
+            for (predecessor, source) in &phi.sources {
+                let edge = LoopCarrierEdgeValue {
+                    predecessor: *predecessor,
+                    value: graph.value_id_for_var(source)?,
+                };
+                if latches.contains(predecessor) {
+                    updates.push(LoopCarrierUpdateFact {
+                        predecessor: edge.predecessor,
+                        value: edge.value,
+                        identity_values: exact_copy_identity_values(graph, edge.value),
+                    });
+                } else {
+                    entries.push(edge);
+                }
+            }
+            if entries.is_empty() || updates.is_empty() {
+                return None;
+            }
+            entries.sort_unstable();
+            entries.dedup();
+            updates.sort_unstable();
+            updates.dedup();
+            Some(LoopCarrierFact {
+                id: SemanticId::loop_carrier(phi_value),
+                loop_id,
+                header,
+                phi: phi_value,
+                width: phi.dst.size,
+                identity_values: BTreeSet::from([phi_value]),
+                entries,
+                updates,
+                dominating_initializers: Vec::new(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    // A post-loop phi such as `result = phi(init, update)` denotes the same
+    // mutable carrier after structured control flow. Discover these aliases by
+    // exact ValueId membership, never by storage names.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in function.blocks() {
+            if block.addr == header {
+                continue;
+            }
+            for phi in &block.phis {
+                let Some(output) = graph.value_id_for_var(&phi.dst) else {
+                    continue;
+                };
+                if carriers
+                    .iter()
+                    .any(|carrier| carrier.identity_values.contains(&output))
+                {
+                    continue;
+                }
+                let inputs = phi
+                    .sources
+                    .iter()
+                    .filter_map(|(_, source)| graph.value_id_for_var(source))
+                    .collect::<BTreeSet<_>>();
+                if inputs.len() != phi.sources.len() || inputs.is_empty() {
+                    continue;
+                }
+                let mut matches = carriers.iter_mut().filter(|carrier| {
+                    let state_values = carrier
+                        .identity_values
+                        .iter()
+                        .copied()
+                        .chain(carrier.entries.iter().map(|edge| edge.value))
+                        .chain(carrier.updates.iter().flat_map(|update| {
+                            std::iter::once(update.value)
+                                .chain(update.identity_values.iter().copied())
+                        }))
+                        .collect::<BTreeSet<_>>();
+                    inputs.iter().all(|input| state_values.contains(input))
+                        && inputs.iter().any(|input| {
+                            carrier.identity_values.contains(input)
+                                || carrier.updates.iter().any(|update| {
+                                    update.value == *input || update.identity_values.contains(input)
+                                })
+                        })
+                });
+                let Some(carrier) = matches.next() else {
+                    continue;
+                };
+                if matches.next().is_none() && carrier.identity_values.insert(output) {
+                    for (predecessor, source) in &phi.sources {
+                        let Some(value) = graph.value_id_for_var(source) else {
+                            continue;
+                        };
+                        if carrier.entries.iter().any(|entry| entry.value == value)
+                            && function.dominates(*predecessor, header)
+                        {
+                            carrier.dominating_initializers.push(LoopCarrierEdgeValue {
+                                predecessor: *predecessor,
+                                value,
+                            });
+                        }
+                    }
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    for carrier in &mut carriers {
+        carrier.dominating_initializers.sort_unstable();
+        carrier.dominating_initializers.dedup();
+    }
+    carriers.sort_by_key(|carrier| carrier.phi);
+    carriers
+}
+
+fn exact_copy_identity_values(graph: &SsaGraph, root: ValueId) -> BTreeSet<ValueId> {
+    let mut identities = BTreeSet::from([root]);
+    let mut pending = vec![root];
+    while let Some(value) = pending.pop() {
+        let Some(inst) = graph.def_inst(value).and_then(|inst| graph.inst(inst)) else {
+            continue;
+        };
+        let InstPayload::Op(SSAOp::Copy { dst, src }) = &inst.payload else {
+            continue;
+        };
+        if dst.size != src.size {
+            continue;
+        }
+        let Some(source) = graph.value_id_for_var(src) else {
+            continue;
+        };
+        if identities.insert(source) {
+            pending.push(source);
+        }
+    }
+    identities
 }
 
 fn natural_loop_body(
@@ -3119,6 +3320,8 @@ fn loop_condition(
 
 fn loop_induction_values(
     graph: &SsaGraph,
+    predicates: &PredicateFacts,
+    condition: Option<PredicateId>,
     header: u64,
     latches: &BTreeSet<u64>,
     body: &BTreeSet<u64>,
@@ -3160,19 +3363,30 @@ fn loop_induction_values(
         if init.is_none() || update.is_none() {
             continue;
         }
-        let score = if is_low_value_induction_phi(graph, output) {
-            1
-        } else {
-            0
-        };
-        let candidate = (score, output, init, update);
+        let condition_dependency_rank = condition
+            .and_then(|condition| predicates.predicates.get(&condition))
+            .and_then(|predicate| predicate.comparison.as_ref())
+            .is_some_and(|comparison| {
+                value_depends_on(graph, comparison.lhs, output)
+                    || value_depends_on(graph, comparison.rhs, output)
+            });
+        let low_value_rank = is_low_value_induction_phi(graph, output);
+        let candidate = (
+            usize::from(!condition_dependency_rank),
+            usize::from(low_value_rank),
+            output,
+            init,
+            update,
+        );
         if best.as_ref().is_none_or(
-            |current: &(usize, ValueId, Option<ValueId>, Option<ValueId>)| candidate < *current,
+            |current: &(usize, usize, ValueId, Option<ValueId>, Option<ValueId>)| {
+                candidate < *current
+            },
         ) {
             best = Some(candidate);
         }
     }
-    best.map(|(_, phi, init, update)| (Some(phi), init, update))
+    best.map(|(_, _, phi, init, update)| (Some(phi), init, update))
         .unwrap_or((None, None, None))
 }
 
@@ -3468,6 +3682,8 @@ fn collect_predicate_facts(function: &SSAFunction, graph: &SsaGraph) -> Predicat
     let mut block_assumptions = BTreeMap::<u64, Vec<BlockAssumption>>::new();
     let mut switches = BTreeMap::new();
     let compare_defs = collect_compare_defs(function, graph);
+    let evaluated_compare_defs = &compare_defs.evaluated;
+    let compare_defs = &compare_defs.normalized;
     let mut next_predicate_id = 0u32;
 
     for &block_addr in function.block_addrs() {
@@ -3496,6 +3712,7 @@ fn collect_predicate_facts(function: &SSAFunction, graph: &SsaGraph) -> Predicat
                             .value_id_for_var(cond)
                             .expect("predicate condition in graph"),
                         comparison: compare_defs.get(cond).cloned(),
+                        evaluated_comparison: evaluated_compare_defs.get(cond).cloned(),
                         true_target: *true_target,
                         false_target: *false_target,
                     },
@@ -4042,11 +4259,14 @@ fn canonical_abi_arg_index(name: &str) -> Option<usize> {
     }
 }
 
-fn collect_compare_defs(
-    function: &SSAFunction,
-    graph: &SsaGraph,
-) -> BTreeMap<SSAVar, CompareProvenance> {
-    let mut compare_defs = BTreeMap::<SSAVar, CompareProvenance>::new();
+struct CompareDefinitions {
+    normalized: BTreeMap<SSAVar, CompareProvenance>,
+    evaluated: BTreeMap<SSAVar, CompareProvenance>,
+}
+
+fn collect_compare_defs(function: &SSAFunction, graph: &SsaGraph) -> CompareDefinitions {
+    let mut normalized = BTreeMap::<SSAVar, CompareProvenance>::new();
+    let mut evaluated = BTreeMap::<SSAVar, CompareProvenance>::new();
     let copy_sources = collect_compare_copy_sources(function);
     let mut sub_sources = BTreeMap::<SSAVar, (ValueId, ValueId)>::new();
     let mut signed_overflow_sources = BTreeMap::<SSAVar, (ValueId, ValueId)>::new();
@@ -4094,7 +4314,9 @@ fn collect_compare_defs(
                     &signed_overflow_sources,
                     &signed_sign_sources,
                 ) {
-                    compare_defs.insert(dst.clone(), CompareProvenance { kind, lhs, rhs });
+                    let comparison = CompareProvenance { kind, lhs, rhs };
+                    normalized.insert(dst.clone(), comparison.clone());
+                    evaluated.insert(dst.clone(), comparison);
                 }
                 continue;
             };
@@ -4104,9 +4326,7 @@ fn collect_compare_defs(
             let Some(rhs_id) = canonical_compare_operand(graph, &copy_sources, rhs) else {
                 continue;
             };
-            let (lhs_id, rhs_id) =
-                normalize_zero_sub_compare_operands(kind, lhs, rhs, lhs_id, rhs_id, &sub_sources);
-            compare_defs.insert(
+            evaluated.insert(
                 dst.clone(),
                 CompareProvenance {
                     kind,
@@ -4114,14 +4334,38 @@ fn collect_compare_defs(
                     rhs: rhs_id,
                 },
             );
+            let (normalized_lhs, normalized_rhs) =
+                normalize_zero_sub_compare_operands(kind, lhs, rhs, lhs_id, rhs_id, &sub_sources);
+            normalized.insert(
+                dst.clone(),
+                CompareProvenance {
+                    kind,
+                    lhs: normalized_lhs,
+                    rhs: normalized_rhs,
+                },
+            );
             if let Some((dst, kind, lhs, rhs)) =
                 signed_flag_compare_components(op, &signed_overflow_sources, &signed_sign_sources)
             {
-                compare_defs.insert(dst.clone(), CompareProvenance { kind, lhs, rhs });
+                let comparison = CompareProvenance { kind, lhs, rhs };
+                normalized.insert(dst.clone(), comparison.clone());
+                evaluated.insert(dst.clone(), comparison);
             }
         }
     }
 
+    propagate_compare_definitions(function, &mut normalized);
+    propagate_compare_definitions(function, &mut evaluated);
+    CompareDefinitions {
+        normalized,
+        evaluated,
+    }
+}
+
+fn propagate_compare_definitions(
+    function: &SSAFunction,
+    compare_defs: &mut BTreeMap<SSAVar, CompareProvenance>,
+) {
     loop {
         let mut changed = false;
         for block in function.blocks() {
@@ -4171,7 +4415,6 @@ fn collect_compare_defs(
             break;
         }
     }
-    compare_defs
 }
 
 fn collect_compare_copy_sources(function: &SSAFunction) -> BTreeMap<SSAVar, SSAVar> {

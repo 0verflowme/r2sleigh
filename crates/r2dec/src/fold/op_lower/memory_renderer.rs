@@ -403,6 +403,12 @@ impl<'a> FoldingContext<'a> {
         }
 
         let value = self.prepared_value_id_for_var(var)?;
+        if let Some(name) = self.certified_loop_carrier_name_for_value(value) {
+            return Some(CExpr::Var(name));
+        }
+        if let Some(name) = self.certified_memory_result_name_for_value(value) {
+            return Some(CExpr::Var(name));
+        }
         if self.prepared_ssa().is_some_and(|prepared| {
             prepared
                 .call_result_certificate_for_value(value)

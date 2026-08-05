@@ -246,6 +246,14 @@ fn type_like_to_ctype(ty: &CTypeLike) -> CType {
     }
 }
 
+pub(crate) fn certified_loop_carrier_name(phi: r2ssa::ValueId) -> String {
+    format!("loop_value_{}", phi.0)
+}
+
+pub(crate) fn certified_memory_result_name(access: r2ssa::StructuredAccessId) -> String {
+    format!("memory_value_{}_{}", access.inst.0, access.ordinal)
+}
+
 fn format_vm_target_list(targets: &[u64]) -> String {
     if targets.is_empty() {
         return "[]".to_string();
@@ -2714,6 +2722,55 @@ fn certified_stack_local_type_matches(
         .is_some_and(|certified_ty| certified_ty == *rendered_ty)
 }
 
+fn certified_loop_carrier_local_is_exact(
+    function_facts: &FunctionFacts,
+    local: &ast::CLocal,
+) -> bool {
+    if local.stack_offset.is_some() {
+        return false;
+    }
+    function_facts.render().is_some_and(|render| {
+        render.loop_carriers().any(|entity| {
+            let r2types::CertifiedEntity::LoopCarrier {
+                id, phi, width, ty, ..
+            } = entity
+            else {
+                return false;
+            };
+            let rendered_ty = ty
+                .as_ref()
+                .map(type_like_to_ctype)
+                .or_else(|| (*width > 0).then(|| CType::Int(width.saturating_mul(8))));
+            *id == r2ssa::SemanticId::loop_carrier(*phi)
+                && local.name == certified_loop_carrier_name(*phi)
+                && rendered_ty.is_some_and(|ty| ty == local.ty)
+        })
+    })
+}
+
+fn certified_memory_result_local_is_exact(
+    function_facts: &FunctionFacts,
+    local: &ast::CLocal,
+) -> bool {
+    if local.stack_offset.is_some() {
+        return false;
+    }
+    function_facts.render().is_some_and(|render| {
+        render.certified_effects.values().any(|effect| {
+            let r2types::CertifiedEffect::Memory { id, fact } = effect else {
+                return false;
+            };
+            *id == r2ssa::SemanticId::memory_access(fact.access)
+                && !fact.is_write
+                && fact.value.is_some()
+                && fact.width > 0
+                && fact.materialize_result
+                && local.name == certified_memory_result_name(fact.access)
+                && local.ty == CType::UInt(fact.width.saturating_mul(8))
+        })
+    })
+}
+
 fn typed_stack_local_type_for_name_offset(
     type_facts: &FunctionTypeFacts,
     name: &str,
@@ -3089,6 +3146,8 @@ fn certified_standard_output_residual_reason_with_effect_proofs(
                         offset,
                         &local.ty,
                     ) => {}
+            None if certified_loop_carrier_local_is_exact(function_facts, local) => {}
+            None if certified_memory_result_local_is_exact(function_facts, local) => {}
             Some(offset) => reasons.push(format!(
                 "local {} at stack offset {} lacks exact typed StackSlotCertificate",
                 local.name, offset
@@ -3185,7 +3244,13 @@ fn certified_standard_output_residual_reason_with_effect_proofs(
                         .is_some_and(|inst| inst.inputs.contains(&value));
                     if !defined_at_rendered_site
                         && !consumed_at_rendered_site
-                        && !expression_proof_is_materialized_phi_copy(prepared, proof, value, cert)
+                        && !expression_proof_is_materialized_phi_copy(
+                            prepared,
+                            render_facts,
+                            proof,
+                            value,
+                            cert,
+                        )
                     {
                         match cert.defining_inst.and_then(|inst| prepared.inst_op_site(inst)) {
                             Some((block_addr, op_idx)) => reasons.push(format!(
@@ -3492,7 +3557,7 @@ fn certified_standard_output_residual_reason_with_effect_proofs(
             .any(|param| param.name.eq_ignore_ascii_case(name))
             && !func.locals.iter().any(|local| {
                 local.name.eq_ignore_ascii_case(name)
-                    && local.stack_offset.is_some_and(|offset| {
+                    && (local.stack_offset.is_some_and(|offset| {
                         certified_stack_local_identity_is_exact(function_facts, &local.name, offset)
                             && certified_stack_local_type_matches(
                                 function_facts.type_facts(),
@@ -3500,7 +3565,8 @@ fn certified_standard_output_residual_reason_with_effect_proofs(
                                 offset,
                                 &local.ty,
                             )
-                    })
+                    }) || certified_loop_carrier_local_is_exact(function_facts, local)
+                        || certified_memory_result_local_is_exact(function_facts, local))
             })
     });
     if !raw_names.is_empty() {
@@ -3522,6 +3588,7 @@ fn certified_standard_output_residual_reason_with_effect_proofs(
 
 fn expression_proof_is_materialized_phi_copy(
     prepared: &r2ssa::SsaArtifact,
+    render_facts: &r2types::FunctionRenderFacts,
     proof: &EffectRenderProof,
     value: r2ssa::ValueId,
     cert: &r2types::ExpressionRenderFact,
@@ -3541,12 +3608,30 @@ fn expression_proof_is_materialized_phi_copy(
     let r2ssa::InstPayload::Phi { predecessors } = &inst.payload else {
         return false;
     };
-    predecessors.iter().any(|pred| {
-        prepared
-            .graph()
-            .block(*pred)
-            .is_some_and(|block| block.addr == proof.block_addr)
-    })
+    let [source] = proof.values.as_slice() else {
+        return false;
+    };
+    let phi_edge_matches = predecessors.iter().zip(&inst.inputs).any(|(pred, input)| {
+        *input == *source
+            && prepared
+                .graph()
+                .block(*pred)
+                .is_some_and(|block| block.addr == proof.block_addr)
+    });
+    if phi_edge_matches {
+        return true;
+    }
+    matches!(
+        render_facts.loop_carrier_for_value(value),
+        Some(r2types::CertifiedEntity::LoopCarrier {
+            phi,
+            dominating_initializers,
+            ..
+        }) if *phi == value
+            && dominating_initializers.iter().any(|initializer| {
+                initializer.predecessor == proof.block_addr && initializer.value == *source
+            })
+    )
 }
 
 fn array_accesses_are_certified(
@@ -5429,7 +5514,14 @@ impl Decompiler {
         semantic_route: &DecompileRouteFacts,
     ) -> CFunction {
         // Materialize phis on non-critical edges to reduce SSA artifacts in output.
-        let normalized_func = normalize::materialize_phis(func);
+        let mut normalized_func = normalize::materialize_phis(func);
+        if let Some(render_facts) = self.context.function_facts.render() {
+            normalize::materialize_certified_loop_carrier_initializers(
+                &mut normalized_func,
+                prepared,
+                render_facts,
+            );
+        }
         let func = &normalized_func;
         let func_name = func
             .name
@@ -5797,7 +5889,7 @@ impl Decompiler {
         );
 
         // Collect locals -- on fallback keep locals conservatively.
-        let locals: Vec<ast::CLocal> = if use_conservative_locals {
+        let mut locals: Vec<ast::CLocal> = if use_conservative_locals {
             var_recovery
                 .locals()
                 .iter()
@@ -5903,6 +5995,55 @@ impl Decompiler {
             });
             selected
         };
+        if certified_standard_mode && let Some(render_facts) = self.context.function_facts.render()
+        {
+            let mut existing_names = params
+                .iter()
+                .map(|param| param.name.to_ascii_lowercase())
+                .chain(locals.iter().map(|local| local.name.to_ascii_lowercase()))
+                .collect::<BTreeSet<_>>();
+            for entity in render_facts.loop_carriers() {
+                let r2types::CertifiedEntity::LoopCarrier { phi, width, ty, .. } = entity else {
+                    continue;
+                };
+                let name = certified_loop_carrier_name(*phi);
+                if !existing_names.insert(name.to_ascii_lowercase()) {
+                    continue;
+                }
+                locals.push(ast::CLocal {
+                    ty: ty
+                        .as_ref()
+                        .map(type_like_to_ctype)
+                        .unwrap_or_else(|| match width {
+                            0 => CType::Unknown,
+                            width => CType::Int(width.saturating_mul(8)),
+                        }),
+                    name,
+                    stack_offset: None,
+                });
+            }
+            for effect in render_facts.certified_effects.values() {
+                let r2types::CertifiedEffect::Memory { fact, .. } = effect else {
+                    continue;
+                };
+                if fact.is_write
+                    || fact.value.is_none()
+                    || fact.width == 0
+                    || !fact.materialize_result
+                {
+                    continue;
+                }
+                let name = certified_memory_result_name(fact.access);
+                if !existing_names.insert(name.to_ascii_lowercase()) {
+                    continue;
+                }
+                locals.push(ast::CLocal {
+                    ty: CType::UInt(fact.width.saturating_mul(8)),
+                    name,
+                    stack_offset: None,
+                });
+            }
+        }
 
         let mut c_function = CFunction {
             name: func_name,
@@ -11782,13 +11923,13 @@ mod tests {
             }],
             &arch,
         );
-        let func = CFunction::new("memory_ok", CType::Void).with_body(vec![CStmt::expr(
-            CExpr::assign(CExpr::var("x"), CExpr::deref(CExpr::var("p"))),
-        )]);
         let function_facts = test_function_facts_with_prepared_render(&prepared);
         let cert = prepared
             .memory_certificate_for_op_site(0x1000, 0, false)
             .expect("memory certificate");
+        let func = CFunction::new("memory_ok", CType::Void).with_body(vec![CStmt::expr(
+            CExpr::assign(CExpr::var("x"), CExpr::deref(CExpr::var("p"))),
+        )]);
         let effect_proofs = [EffectRenderProof {
             kind: EffectRenderProofKind::MemoryRead,
             block_addr: 0x1000,

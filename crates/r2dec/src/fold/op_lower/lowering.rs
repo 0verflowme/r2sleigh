@@ -285,10 +285,15 @@ impl<'a> FoldingContext<'a> {
                         .is_some_and(|proof| proof.expression_is_renderable(value)) =>
                 {
                     if materialized_phi_copy {
+                        let source = match op {
+                            SSAOp::Copy { src, .. } => self.prepared_value_id_for_var(src),
+                            _ => None,
+                        };
                         self.record_effect_render_proof_for_materialized_phi_copy(
                             block_addr,
                             op_idx,
                             Some(value),
+                            source,
                         );
                     } else {
                         self.record_effect_render_proof_for_value(

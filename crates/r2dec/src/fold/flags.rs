@@ -839,10 +839,11 @@ impl<'a> FoldingContext<'a> {
         if self.prepared_value_id_for_var(cond) != Some(predicate.condition) {
             return None;
         }
-        let expr = predicate
-            .comparison
-            .as_ref()
-            .and_then(|comparison| self.prepared_compare_provenance_expr(comparison))?;
+        let expr = self
+            .prepared_predicate_comparison_at_block(predicate, block.addr)
+            .and_then(|comparison| {
+                self.prepared_compare_provenance_expr(comparison, Some(block.addr))
+            })?;
         let expr = self.finalize_condition_expr(expr);
         (!self.is_degenerate_constant_condition(&expr)).then_some((
             expr,
@@ -1027,14 +1028,15 @@ impl<'a> FoldingContext<'a> {
                 return Some(resolved);
             }
         }
-        let compare = self
+        let predicate = self
             .control_facts()?
             .branch_predicates
             .values()
-            .find(|predicate| Some(predicate.condition) == self.prepared_value_id_for_var(var))?
-            .comparison
-            .as_ref()?;
-        self.prepared_compare_provenance_expr(compare)
+            .find(|predicate| Some(predicate.condition) == self.prepared_value_id_for_var(var))?;
+        self.prepared_compare_provenance_expr(
+            self.prepared_predicate_comparison_at_block(predicate, predicate.block_addr)?,
+            Some(predicate.block_addr),
+        )
     }
 
     fn prepared_predicate_candidate_for_branch_block(
@@ -1052,10 +1054,9 @@ impl<'a> FoldingContext<'a> {
             }
         }
         let facts = self.control_facts()?;
-        let compare = facts
+        let predicate = facts
             .branch_for_block(block_addr)
             .filter(|predicate| Some(predicate.condition) == self.prepared_value_id_for_var(var))
-            .and_then(|predicate| predicate.comparison.as_ref())
             .or_else(|| {
                 facts
                     .block_assumptions
@@ -1068,9 +1069,21 @@ impl<'a> FoldingContext<'a> {
                             .values()
                             .find(|predicate| predicate.id == assumption.predicate)
                     })
-                    .and_then(|predicate| predicate.comparison.as_ref())
             })?;
-        self.prepared_compare_provenance_expr(compare)
+        let compare = self.prepared_predicate_comparison_at_block(predicate, block_addr)?;
+        self.prepared_compare_provenance_expr(compare, Some(block_addr))
+    }
+
+    fn prepared_predicate_comparison_at_block<'b>(
+        &self,
+        predicate: &'b r2types::BranchPredicateFact,
+        block_addr: u64,
+    ) -> Option<&'b PredicateComparisonFact> {
+        if block_addr == predicate.block_addr {
+            predicate.render_comparison.as_ref()
+        } else {
+            predicate.comparison.as_ref()
+        }
     }
 
     #[cfg(test)]
@@ -1082,9 +1095,13 @@ impl<'a> FoldingContext<'a> {
         self.prepared_predicate_candidate_for_branch_block(block_addr, var)
     }
 
-    fn prepared_compare_provenance_expr(&self, prov: &PredicateComparisonFact) -> Option<CExpr> {
+    fn prepared_compare_provenance_expr(
+        &self,
+        prov: &PredicateComparisonFact,
+        block_addr: Option<u64>,
+    ) -> Option<CExpr> {
         if self.requires_certified_rendering() {
-            return self.certified_compare_provenance_expr(prov);
+            return self.certified_compare_provenance_expr(prov, block_addr);
         }
         let lhs_var = self.prepared_var_for_value_id(prov.lhs)?;
         let rhs_var = self.prepared_var_for_value_id(prov.rhs)?;
@@ -1094,21 +1111,37 @@ impl<'a> FoldingContext<'a> {
         self.compare_provenance_expr_from_operands(prov, lhs, rhs)
     }
 
-    fn certified_compare_provenance_expr(&self, prov: &PredicateComparisonFact) -> Option<CExpr> {
+    fn certified_compare_provenance_expr(
+        &self,
+        prov: &PredicateComparisonFact,
+        block_addr: Option<u64>,
+    ) -> Option<CExpr> {
         let lhs_var = self.prepared_var_for_value_id(prov.lhs)?;
         let rhs_var = self.prepared_var_for_value_id(prov.rhs)?;
         let compare_width = lhs_var.size.max(rhs_var.size);
-        let lhs = self.certified_predicate_operand_expr(lhs_var, compare_width)?;
-        let rhs = self.certified_predicate_operand_expr(rhs_var, compare_width)?;
+        let lhs = self.certified_predicate_operand_expr(lhs_var, compare_width, block_addr)?;
+        let rhs = self.certified_predicate_operand_expr(rhs_var, compare_width, block_addr)?;
         self.compare_provenance_expr_from_operands(prov, lhs, rhs)
     }
 
-    fn certified_predicate_operand_expr(&self, var: &SSAVar, compare_width: u32) -> Option<CExpr> {
+    fn certified_predicate_operand_expr(
+        &self,
+        var: &SSAVar,
+        compare_width: u32,
+        block_addr: Option<u64>,
+    ) -> Option<CExpr> {
         if var.is_const() {
             return Some(utils::compare_const_to_expr_with_width(
                 var,
                 compare_width.max(var.size),
             ));
+        }
+        if let Some(name) = block_addr.and_then(|block_addr| {
+            self.prepared_value_id_for_var(var).and_then(|value| {
+                self.certified_loop_carrier_update_name_for_value_at_latch(value, block_addr)
+            })
+        }) {
+            return Some(CExpr::Var(name));
         }
         self.render_certified_value_expr_for_var(var)
     }

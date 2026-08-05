@@ -2885,7 +2885,7 @@ impl SSABlock {
 mod tests {
     use super::*;
     use crate::semantic::{
-        CallArgumentLocation, CallResultValueRelation, ReturnCarrier, ValueOwner,
+        CallArgumentLocation, CallResultValueRelation, ReturnCarrier, SemanticId, ValueOwner,
     };
     use r2il::{R2ILOp, RegisterDef, SpaceId, SwitchCase, SwitchInfo as R2ILSwitchInfo, Varnode};
 
@@ -4943,6 +4943,7 @@ mod tests {
             SSAFunction::from_blocks_raw_no_arch(&blocks).expect("raw SSA should build");
         let init = SSAVar::new("RAX", 0, 8);
         let phi = SSAVar::new("RAX", 2, 8);
+        let update_source = SSAVar::new("tmp:update", 1, 8);
         let update = SSAVar::new("RAX", 3, 8);
         function.get_block_mut(0x1810).expect("loop header").phis = vec![PhiNode {
             dst: phi.clone(),
@@ -4950,18 +4951,40 @@ mod tests {
         }];
         function.get_block_mut(0x1820).expect("loop latch").ops = vec![
             SSAOp::IntAdd {
-                dst: update,
+                dst: update_source.clone(),
                 a: phi.clone(),
                 b: SSAVar::constant(1, 8),
+            },
+            SSAOp::Copy {
+                dst: update,
+                src: update_source.clone(),
             },
             SSAOp::Branch {
                 target: SSAVar::new("ram:1810", 0, 8),
             },
         ];
-        function.get_block_mut(0x1814).expect("loop exit").ops =
-            vec![SSAOp::Return { target: phi }];
+        function.get_block_mut(0x1814).expect("loop exit").ops = vec![SSAOp::Return {
+            target: phi.clone(),
+        }];
 
         let prepared = SsaArtifact::new(function, FunctionPrepareMode::Raw);
+        let carrier = prepared
+            .structured()
+            .loops
+            .values()
+            .flat_map(|loop_fact| loop_fact.carriers.iter())
+            .find(|carrier| carrier.phi == prepared.graph().value_id_for_var(&phi).unwrap())
+            .expect("loop-carried phi fact");
+        assert_eq!(carrier.id, SemanticId::loop_carrier(carrier.phi));
+        assert_eq!(carrier.entries.len(), 1);
+        assert_eq!(carrier.updates.len(), 1);
+        assert!(
+            carrier.updates[0]
+                .identity_values
+                .contains(&prepared.graph().value_id_for_var(&update_source).unwrap()),
+            "same-width copy sources retain exact update identity at the latch program point"
+        );
+        assert!(carrier.identity_values.contains(&carrier.phi));
         let ret = prepared
             .return_certificate_for_op(0x1814, 0)
             .expect("loop-carried return certificate");
@@ -4972,6 +4995,194 @@ mod tests {
                 .get(&ret.value)
                 .is_some_and(|cert| cert.renderable),
             "loop-header phi is renderable when the loop certificate proves the backedge and the update is pure modulo that phi"
+        );
+    }
+
+    #[test]
+    fn prepared_predicates_preserve_machine_point_comparison_before_normalization() {
+        let blocks = vec![
+            R2ILBlock {
+                addr: 0x1900,
+                size: 0x4,
+                ops: vec![R2ILOp::CBranch {
+                    target: make_ram(0x1910, 8),
+                    cond: make_const(1, 1),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1904,
+                size: 0x4,
+                ops: vec![R2ILOp::Return {
+                    target: make_const(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1910,
+                size: 0x4,
+                ops: vec![R2ILOp::Return {
+                    target: make_const(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ];
+        let mut function =
+            SSAFunction::from_blocks_raw_no_arch(&blocks).expect("raw SSA should build");
+        let before = SSAVar::new("RAX", 0, 8);
+        let one = SSAVar::constant(1, 8);
+        let updated = SSAVar::new("tmp:updated", 1, 8);
+        let zero = SSAVar::constant(0, 8);
+        let condition = SSAVar::new("tmp:condition", 1, 1);
+        function.get_block_mut(0x1900).expect("branch block").ops = vec![
+            SSAOp::IntSub {
+                dst: updated.clone(),
+                a: before.clone(),
+                b: one.clone(),
+            },
+            SSAOp::IntNotEqual {
+                dst: condition.clone(),
+                a: updated.clone(),
+                b: zero.clone(),
+            },
+            SSAOp::CBranch {
+                target: SSAVar::new("ram:1910", 0, 8),
+                cond: condition,
+            },
+        ];
+
+        let prepared = SsaArtifact::new(function, FunctionPrepareMode::Raw);
+        let predicate = prepared
+            .predicates()
+            .predicates
+            .values()
+            .find(|predicate| predicate.block_addr == 0x1900)
+            .expect("branch predicate");
+        let normalized = predicate
+            .comparison
+            .as_ref()
+            .expect("normalized comparison");
+        assert_eq!(normalized.kind, crate::CompareKind::NotEqual);
+        assert_eq!(
+            normalized.lhs,
+            prepared.graph().value_id_for_var(&before).unwrap()
+        );
+        assert_eq!(
+            normalized.rhs,
+            prepared.graph().value_id_for_var(&one).unwrap()
+        );
+        let evaluated = predicate
+            .evaluated_comparison
+            .as_ref()
+            .expect("machine-point comparison");
+        assert_eq!(evaluated.kind, crate::CompareKind::NotEqual);
+        assert_eq!(
+            evaluated.lhs,
+            prepared.graph().value_id_for_var(&updated).unwrap()
+        );
+        assert_eq!(
+            evaluated.rhs,
+            prepared.graph().value_id_for_var(&zero).unwrap()
+        );
+    }
+
+    #[test]
+    fn loop_carrier_certifies_dominating_initializer_for_zero_iteration_exit() {
+        let blocks = vec![
+            R2ILBlock {
+                addr: 0x1a00,
+                size: 0x10,
+                ops: vec![R2ILOp::CBranch {
+                    target: make_ram(0x1a30, 8),
+                    cond: make_const(1, 1),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1a10,
+                size: 0x10,
+                ops: vec![R2ILOp::Branch {
+                    target: make_ram(0x1a20, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1a20,
+                size: 0x10,
+                ops: vec![R2ILOp::CBranch {
+                    target: make_ram(0x1a20, 8),
+                    cond: make_const(1, 1),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1a30,
+                size: 0x4,
+                ops: vec![R2ILOp::Return {
+                    target: make_const(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ];
+        let mut function =
+            SSAFunction::from_blocks_raw_no_arch(&blocks).expect("raw SSA should build");
+        let init = SSAVar::new("RAX", 0, 8);
+        let phi = SSAVar::new("RAX", 2, 8);
+        let update_source = SSAVar::new("tmp:update", 1, 8);
+        let update = SSAVar::new("RAX", 3, 8);
+        let result = SSAVar::new("RAX", 4, 8);
+        function.get_block_mut(0x1a20).expect("loop header").phis = vec![PhiNode {
+            dst: phi.clone(),
+            sources: vec![(0x1a10, init.clone()), (0x1a20, update.clone())],
+        }];
+        function.get_block_mut(0x1a20).expect("loop header").ops = vec![
+            SSAOp::IntAdd {
+                dst: update_source.clone(),
+                a: phi.clone(),
+                b: SSAVar::constant(1, 8),
+            },
+            SSAOp::Copy {
+                dst: update.clone(),
+                src: update_source,
+            },
+            SSAOp::CBranch {
+                target: SSAVar::new("ram:1a20", 0, 8),
+                cond: SSAVar::constant(1, 1),
+            },
+        ];
+        function.get_block_mut(0x1a30).expect("loop exit").phis = vec![PhiNode {
+            dst: result.clone(),
+            sources: vec![(0x1a00, init.clone()), (0x1a20, update)],
+        }];
+        function.get_block_mut(0x1a30).expect("loop exit").ops = vec![SSAOp::Return {
+            target: result.clone(),
+        }];
+
+        let prepared = SsaArtifact::new(function, FunctionPrepareMode::Raw);
+        let phi_value = prepared.graph().value_id_for_var(&phi).unwrap();
+        let init_value = prepared.graph().value_id_for_var(&init).unwrap();
+        let result_value = prepared.graph().value_id_for_var(&result).unwrap();
+        let carrier = prepared
+            .structured()
+            .loops
+            .values()
+            .flat_map(|loop_fact| loop_fact.carriers.iter())
+            .find(|carrier| carrier.phi == phi_value)
+            .expect("loop carrier");
+        assert!(carrier.identity_values.contains(&result_value));
+        assert_eq!(
+            carrier.dominating_initializers,
+            vec![crate::LoopCarrierEdgeValue {
+                predecessor: 0x1a00,
+                value: init_value,
+            }]
         );
     }
 

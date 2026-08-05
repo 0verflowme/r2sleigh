@@ -5040,6 +5040,20 @@ mod tests {
                         rhs: comparison.rhs,
                     }
                 }),
+                evaluated_comparison: predicate.evaluated_comparison.as_ref().map(|comparison| {
+                    r2types::PredicateComparisonFact {
+                        kind: comparison.kind,
+                        lhs: comparison.lhs,
+                        rhs: comparison.rhs,
+                    }
+                }),
+                render_comparison: predicate.comparison.as_ref().map(|comparison| {
+                    r2types::PredicateComparisonFact {
+                        kind: comparison.kind,
+                        lhs: comparison.lhs,
+                        rhs: comparison.rhs,
+                    }
+                }),
                 true_target: predicate.true_target,
                 false_target: predicate.false_target,
             },
