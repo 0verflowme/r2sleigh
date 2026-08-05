@@ -18,7 +18,7 @@ struct CertifiedLinearIndex {
 }
 
 impl<'a> FoldingContext<'a> {
-    fn certified_pointer_parameter_expr(&self, expr: &CExpr) -> bool {
+    fn certified_pointer_base_expr(&self, expr: &CExpr) -> bool {
         let expr = match expr {
             CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => inner.as_ref(),
             _ => expr,
@@ -26,7 +26,8 @@ impl<'a> FoldingContext<'a> {
         let CExpr::Var(name) = expr else {
             return false;
         };
-        self.inputs
+        if self
+            .inputs
             .function_facts
             .type_facts()
             .render_authorized_signature()
@@ -41,12 +42,29 @@ impl<'a> FoldingContext<'a> {
                         })
                 })
             })
+        {
+            return true;
+        }
+        self.inputs.render_facts().is_some_and(|render| {
+            render.loop_carriers().any(|entity| {
+                let r2types::CertifiedEntity::LoopCarrier { phi, ty, .. } = entity else {
+                    return false;
+                };
+                crate::certified_loop_carrier_name(*phi).eq_ignore_ascii_case(name)
+                    && ty.as_ref().is_some_and(|ty| {
+                        matches!(
+                            crate::type_like_to_ctype(ty),
+                            CType::Pointer(_) | CType::Array(_, _)
+                        )
+                    })
+            })
+        })
     }
 
     fn certified_expr_contains_pointer_parameter(&self, expr: &CExpr) -> bool {
         let mut contains = false;
         expr.visit(&mut |node| {
-            if !contains && self.certified_pointer_parameter_expr(node) {
+            if !contains && self.certified_pointer_base_expr(node) {
                 contains = true;
             }
         });
@@ -173,7 +191,7 @@ impl<'a> FoldingContext<'a> {
         let mut base = None;
         let mut index = None::<(CExpr, i64)>;
         for (sign, term) in terms {
-            if self.certified_pointer_parameter_expr(&term) {
+            if self.certified_pointer_base_expr(&term) {
                 if sign != 1 || base.replace(term).is_some() {
                     return None;
                 }
@@ -528,6 +546,9 @@ impl<'a> FoldingContext<'a> {
         }
         let prepared = self.prepared_ssa()?;
         let value = self.prepared_value_id_for_var(var)?;
+        if let Some(name) = self.certified_loop_carrier_name_for_value(value) {
+            return Some(CExpr::Var(name));
+        }
         if var.version == 0 && var.is_register() {
             if let Some(expr) = self.certified_parameter_expr_for_value(value) {
                 return Some(expr);

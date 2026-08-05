@@ -2,8 +2,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use r2ssa::{
-    FunctionSemanticSummary, InterprocSummarySet, SSABlock, SSAOp, SSAVar, SummaryArgEffect,
-    SummaryMemoryEffect, SummaryMemoryEffectKind, SummaryMemoryRegion, SummaryReturnRelation,
+    FunctionSSABlock, FunctionSemanticSummary, InterprocSummarySet, PhiNode, SSABlock, SSAOp,
+    SSAVar, SsaArtifact, SummaryArgEffect, SummaryMemoryEffect, SummaryMemoryEffectKind,
+    SummaryMemoryRegion, SummaryReturnRelation,
 };
 
 use crate::context::{
@@ -4554,6 +4555,70 @@ struct LocalAddrExpr {
     confidence: u8,
 }
 
+#[derive(Debug, Clone)]
+struct LocalStructInferenceBlock {
+    addr: u64,
+    ops: Vec<SSAOp>,
+    phis: Vec<PhiNode>,
+}
+
+#[derive(Default)]
+struct LocalTypeEquivalence {
+    ids: HashMap<String, usize>,
+    names: Vec<String>,
+    parents: Vec<usize>,
+    ranks: Vec<u8>,
+}
+
+impl LocalTypeEquivalence {
+    fn id_for_var(&mut self, var: &SSAVar) -> Option<usize> {
+        if var.is_const() {
+            return None;
+        }
+        let name = var.display_name().to_ascii_lowercase();
+        if let Some(id) = self.ids.get(&name).copied() {
+            return Some(id);
+        }
+        let id = self.parents.len();
+        self.ids.insert(name.clone(), id);
+        self.names.push(name);
+        self.parents.push(id);
+        self.ranks.push(0);
+        Some(id)
+    }
+
+    fn find(&mut self, id: usize) -> usize {
+        let parent = self.parents[id];
+        if parent != id {
+            self.parents[id] = self.find(parent);
+        }
+        self.parents[id]
+    }
+
+    fn union_vars(&mut self, lhs: &SSAVar, rhs: &SSAVar, ptr_bytes: u32) {
+        if lhs.size != ptr_bytes || rhs.size != ptr_bytes {
+            return;
+        }
+        let (Some(lhs), Some(rhs)) = (self.id_for_var(lhs), self.id_for_var(rhs)) else {
+            return;
+        };
+        let lhs = self.find(lhs);
+        let rhs = self.find(rhs);
+        if lhs == rhs {
+            return;
+        }
+        let (root, child) = if self.ranks[lhs] < self.ranks[rhs] {
+            (rhs, lhs)
+        } else {
+            (lhs, rhs)
+        };
+        self.parents[child] = root;
+        if self.ranks[lhs] == self.ranks[rhs] {
+            self.ranks[root] = self.ranks[root].saturating_add(1);
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ScalarPointerValue {
     slot: usize,
@@ -4677,13 +4742,134 @@ fn parse_ssa_const_offset(name: &str, ptr_bits: u32) -> Option<i64> {
     Some(signed_offset_from_const(raw, ptr_bits))
 }
 
+fn local_struct_type_slots(
+    blocks: &[LocalStructInferenceBlock],
+    pointer_arg_slot_map: &HashMap<String, usize>,
+    ptr_bits: u32,
+) -> HashMap<String, usize> {
+    let ptr_bytes = (ptr_bits / 8).max(1);
+    let mut classes = LocalTypeEquivalence::default();
+    let mut seeds = Vec::new();
+
+    let remember_seed =
+        |classes: &mut LocalTypeEquivalence, seeds: &mut Vec<(usize, usize)>, var: &SSAVar| {
+            if var.size != ptr_bytes || var.version != 0 {
+                return;
+            }
+            let Some(slot) = pointer_arg_slot_map
+                .get(var.name.to_ascii_lowercase().as_str())
+                .copied()
+            else {
+                return;
+            };
+            if let Some(id) = classes.id_for_var(var) {
+                seeds.push((id, slot));
+            }
+        };
+
+    for block in blocks {
+        for phi in &block.phis {
+            remember_seed(&mut classes, &mut seeds, &phi.dst);
+            for (_, source) in &phi.sources {
+                remember_seed(&mut classes, &mut seeds, source);
+                classes.union_vars(&phi.dst, source, ptr_bytes);
+            }
+        }
+        for op in &block.ops {
+            if let Some(dst) = op.dst() {
+                remember_seed(&mut classes, &mut seeds, dst);
+            }
+            op.for_each_source(&mut |source| {
+                remember_seed(&mut classes, &mut seeds, source);
+            });
+            match op {
+                SSAOp::Copy { dst, src }
+                | SSAOp::Cast { dst, src }
+                | SSAOp::New { dst, src }
+                | SSAOp::IntZExt { dst, src }
+                | SSAOp::IntSExt { dst, src } => classes.union_vars(dst, src, ptr_bytes),
+                _ => {}
+            }
+        }
+    }
+
+    let mut slots_by_root: HashMap<usize, BTreeSet<usize>> = HashMap::new();
+    for (id, slot) in seeds {
+        let root = classes.find(id);
+        slots_by_root.entry(root).or_default().insert(slot);
+    }
+    let named_ids = classes
+        .names
+        .iter()
+        .cloned()
+        .enumerate()
+        .collect::<Vec<_>>();
+    let mut slots = HashMap::new();
+    for (id, name) in named_ids {
+        let root = classes.find(id);
+        let Some(root_slots) = slots_by_root.get(&root) else {
+            continue;
+        };
+        if root_slots.len() == 1
+            && let Some(slot) = root_slots.first().copied()
+        {
+            slots.insert(name, slot);
+        }
+    }
+    slots
+}
+
+fn local_struct_inference_from_local_blocks(blocks: &[SSABlock]) -> Vec<LocalStructInferenceBlock> {
+    blocks
+        .iter()
+        .map(|block| LocalStructInferenceBlock {
+            addr: block.addr,
+            ops: block.ops.clone(),
+            phis: Vec::new(),
+        })
+        .collect()
+}
+
+fn local_struct_inference_from_function_blocks(
+    blocks: impl Iterator<Item = FunctionSSABlock>,
+) -> Vec<LocalStructInferenceBlock> {
+    blocks
+        .map(|block| LocalStructInferenceBlock {
+            addr: block.addr,
+            ops: block.ops,
+            phis: block.phis,
+        })
+        .collect()
+}
+
 pub fn infer_local_struct_artifacts_from_ssa(
     ssa_blocks: &[SSABlock],
     arch_name: Option<&str>,
     ptr_bits: u32,
     diagnostics: &mut TypeWritebackDiagnostics,
 ) -> LocalStructArtifacts {
+    let blocks = local_struct_inference_from_local_blocks(ssa_blocks);
+    infer_local_struct_artifacts_from_blocks(&blocks, arch_name, ptr_bits, diagnostics)
+}
+
+pub fn infer_local_struct_artifacts_from_prepared_ssa(
+    prepared: &SsaArtifact,
+    arch_name: Option<&str>,
+    ptr_bits: u32,
+    diagnostics: &mut TypeWritebackDiagnostics,
+) -> LocalStructArtifacts {
+    let blocks = local_struct_inference_from_function_blocks(prepared.function().blocks().cloned());
+    infer_local_struct_artifacts_from_blocks(&blocks, arch_name, ptr_bits, diagnostics)
+}
+
+fn infer_local_struct_artifacts_from_blocks(
+    ssa_blocks: &[LocalStructInferenceBlock],
+    arch_name: Option<&str>,
+    ptr_bits: u32,
+    diagnostics: &mut TypeWritebackDiagnostics,
+) -> LocalStructArtifacts {
     let pointer_arg_slot_map = collect_pointer_arg_slot_map(arch_name, ptr_bits);
+    let type_slots = local_struct_type_slots(ssa_blocks, &pointer_arg_slot_map, ptr_bits);
     let (_, stack_bases, frame_bases) = recover_vars_arch_profile(arch_name);
     let mut addr_exprs: HashMap<String, LocalAddrExpr> = HashMap::new();
     let mut stack_addr_offsets: HashMap<String, i64> = HashMap::new();
@@ -4753,22 +4939,29 @@ pub fn infer_local_struct_artifacts_from_ssa(
     }
 
     for block in ssa_blocks {
+        let mut seed_var = |var: &SSAVar| {
+            let key = var.display_name().to_ascii_lowercase();
+            if let Some(slot) = type_slots.get(&key).copied() {
+                addr_exprs
+                    .entry(ssa_var_block_key(block.addr, var))
+                    .or_insert(LocalAddrExpr {
+                        slot,
+                        offset: 0,
+                        confidence: if var.version == 0 { 92 } else { 86 },
+                    });
+            }
+        };
+        for phi in &block.phis {
+            seed_var(&phi.dst);
+            for (_, source) in &phi.sources {
+                seed_var(source);
+            }
+        }
         for op in &block.ops {
-            op.for_each_source(&mut |src: &SSAVar| {
-                if src.version != 0 {
-                    return;
-                }
-                let key = src.name.to_ascii_lowercase();
-                if let Some(slot) = pointer_arg_slot_map.get(key.as_str()).copied() {
-                    addr_exprs
-                        .entry(ssa_var_block_key(block.addr, src))
-                        .or_insert(LocalAddrExpr {
-                            slot,
-                            offset: 0,
-                            confidence: 92,
-                        });
-                }
-            });
+            if let Some(dst) = op.dst() {
+                seed_var(dst);
+            }
+            op.for_each_source(&mut seed_var);
         }
     }
 
@@ -18234,6 +18427,103 @@ mod tests {
                 field_type: Some("int32_t".to_string()),
             }]
         );
+    }
+
+    #[test]
+    fn prepared_phi_preserves_recursive_struct_parameter_type() {
+        let current = SSAVar::new("X0", 1, 8);
+        let next = SSAVar::new("X0", 2, 8);
+        let field_addr = |name: &str, version: u32, offset: u64| SSAOp::IntAdd {
+            dst: SSAVar::new(name, version, 8),
+            a: current.clone(),
+            b: SSAVar::constant(offset, 8),
+        };
+        let blocks = [LocalStructInferenceBlock {
+            addr: 0x1000,
+            phis: vec![PhiNode {
+                dst: current.clone(),
+                sources: vec![(0xff0, SSAVar::new("X0", 0, 8)), (0x1010, next.clone())],
+            }],
+            ops: vec![
+                field_addr("name_addr", 1, 0x18),
+                SSAOp::Load {
+                    dst: SSAVar::new("name", 1, 8),
+                    space: "ram".to_string(),
+                    addr: SSAVar::new("name_addr", 1, 8),
+                },
+                field_addr("next_addr", 1, 0x20),
+                SSAOp::Load {
+                    dst: next,
+                    space: "ram".to_string(),
+                    addr: SSAVar::new("next_addr", 1, 8),
+                },
+            ],
+        }];
+        let mut diagnostics = TypeWritebackDiagnostics::default();
+
+        let artifacts = infer_local_struct_artifacts_from_blocks(
+            &blocks,
+            Some("aarch64"),
+            64,
+            &mut diagnostics,
+        );
+
+        assert_eq!(
+            artifacts.slot_field_profiles.get(&0),
+            Some(&BTreeMap::from([
+                (0x18, "int64_t".to_string()),
+                (0x20, "int64_t".to_string()),
+            ])),
+            "diagnostics={diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn prepared_phi_refuses_conflicting_parameter_type_classes() {
+        let merged = SSAVar::new("X0", 1, 8);
+        let blocks = [LocalStructInferenceBlock {
+            addr: 0x1000,
+            phis: vec![PhiNode {
+                dst: merged.clone(),
+                sources: vec![
+                    (0xff0, SSAVar::new("X0", 0, 8)),
+                    (0xff4, SSAVar::new("X1", 0, 8)),
+                ],
+            }],
+            ops: vec![
+                SSAOp::IntAdd {
+                    dst: SSAVar::new("field0", 1, 8),
+                    a: merged.clone(),
+                    b: SSAVar::constant(0, 8),
+                },
+                SSAOp::Load {
+                    dst: SSAVar::new("value0", 1, 8),
+                    space: "ram".to_string(),
+                    addr: SSAVar::new("field0", 1, 8),
+                },
+                SSAOp::IntAdd {
+                    dst: SSAVar::new("field8", 1, 8),
+                    a: merged,
+                    b: SSAVar::constant(8, 8),
+                },
+                SSAOp::Load {
+                    dst: SSAVar::new("value8", 1, 8),
+                    space: "ram".to_string(),
+                    addr: SSAVar::new("field8", 1, 8),
+                },
+            ],
+        }];
+        let mut diagnostics = TypeWritebackDiagnostics::default();
+
+        let artifacts = infer_local_struct_artifacts_from_blocks(
+            &blocks,
+            Some("aarch64"),
+            64,
+            &mut diagnostics,
+        );
+
+        assert!(artifacts.slot_field_profiles.is_empty());
+        assert!(artifacts.slot_type_overrides.is_empty());
     }
 
     #[test]

@@ -2954,8 +2954,21 @@ fn prepared_address_base_offset(
         return Some(0);
     };
     let inst = graph.inst(def_inst)?;
+    if matches!(inst.payload, r2ssa::InstPayload::Phi { .. }) {
+        let mut resolved = None;
+        for input in &inst.inputs {
+            let Some(offset) = prepared_address_base_offset(prepared, *input, depth + 1) else {
+                continue;
+            };
+            if resolved.is_some_and(|existing| existing != offset) {
+                return None;
+            }
+            resolved = Some(offset);
+        }
+        return resolved;
+    }
     let r2ssa::InstPayload::Op(op) = &inst.payload else {
-        return None;
+        unreachable!("handled phi instruction before op matching");
     };
     match op {
         r2ssa::SSAOp::Copy { src, .. }
@@ -3045,8 +3058,23 @@ fn prepared_address_base_param_slot(
         return param_slots.slot_for_var(var);
     };
     let inst = graph.inst(def_inst)?;
+    if matches!(inst.payload, r2ssa::InstPayload::Phi { .. }) {
+        let mut resolved = None;
+        for input in &inst.inputs {
+            let Some(slot) =
+                prepared_address_base_param_slot(prepared, *input, param_slots, depth + 1)
+            else {
+                continue;
+            };
+            if resolved.is_some_and(|existing| existing != slot) {
+                return None;
+            }
+            resolved = Some(slot);
+        }
+        return resolved;
+    }
     let r2ssa::InstPayload::Op(op) = &inst.payload else {
-        return None;
+        unreachable!("handled phi instruction before op matching");
     };
     match op {
         r2ssa::SSAOp::Copy { src, .. }
@@ -4402,6 +4430,85 @@ mod tests {
                 .is_some()),
             "field certificate plus prepared memory address proof must authorize direct member rendering"
         );
+    }
+
+    #[test]
+    fn field_certificates_follow_loop_carried_parameter_phi() {
+        let mut entry = R2ILBlock::new(0x400ff0, 0x10);
+        entry.push(R2ILOp::Branch {
+            target: Varnode::constant(0x401000, 8),
+        });
+        let mut header = R2ILBlock::new(0x401000, 0x10);
+        header.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(0x100, 8),
+            a: Varnode::register(0x10, 8),
+            b: Varnode::constant(8, 8),
+        });
+        header.push(R2ILOp::Load {
+            dst: Varnode::register(0x00, 8),
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x100, 8),
+        });
+        header.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x401020, 8),
+            cond: Varnode::register(0x80, 1),
+        });
+        let mut latch = R2ILBlock::new(0x401010, 0x10);
+        latch.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(0x200, 8),
+            a: Varnode::register(0x10, 8),
+            b: Varnode::constant(0x10, 8),
+        });
+        latch.push(R2ILOp::Load {
+            dst: Varnode::register(0x10, 8),
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x200, 8),
+        });
+        latch.push(R2ILOp::Branch {
+            target: Varnode::constant(0x401000, 8),
+        });
+        let mut exit = R2ILBlock::new(0x401020, 4);
+        exit.push(R2ILOp::Return {
+            target: Varnode::register(0x08, 8),
+        });
+        let prepared = r2ssa::SsaArtifact::for_decompile(
+            &[entry, header, latch, exit],
+            Some(&x86_stack_home_arch()),
+        )
+        .expect("prepared loop");
+        let type_facts = FunctionTypeFacts {
+            field_access_certificates: vec![
+                crate::facts::FieldAccessCertificate {
+                    slot: 0,
+                    field_offset: 8,
+                    field_name: "value".to_string(),
+                    field_type: Some("uint64_t".to_string()),
+                },
+                crate::facts::FieldAccessCertificate {
+                    slot: 0,
+                    field_offset: 0x10,
+                    field_name: "next".to_string(),
+                    field_type: Some("uint64_t".to_string()),
+                },
+            ],
+            ..FunctionTypeFacts::default()
+        };
+        let mut facts = FunctionFacts::new(type_facts, None);
+
+        facts.attach_prepared_decompile_evidence(&prepared);
+        facts.populate_member_access_render_facts_from_field_certificates(
+            &prepared,
+            &x86_stack_home_param_slots(),
+        );
+
+        assert!(facts.render().is_some_and(|render| {
+            render
+                .member_access_for_op(0x401000, 1, false, "value", 8, Some(8))
+                .is_some()
+                && render
+                    .member_access_for_op(0x401010, 1, false, "next", 0x10, Some(8))
+                    .is_some()
+        }));
     }
 
     #[test]

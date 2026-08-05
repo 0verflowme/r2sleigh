@@ -5605,8 +5605,8 @@ fn build_engine_analysis_artifact(
         &analysis,
     )?;
     let mut diagnostics = r2types::TypeWritebackDiagnostics::default();
-    let local_structs = r2types::infer_local_struct_artifacts_from_ssa(
-        &pattern_ssa_blocks,
+    let local_structs = r2types::infer_local_struct_artifacts_from_prepared_ssa(
+        &semantic_analysis.pattern_ssa_func,
         Some(arch_name.as_str()),
         request.ptr_bits,
         &mut diagnostics,
