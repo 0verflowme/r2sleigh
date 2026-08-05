@@ -889,7 +889,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 if let Some(loop_id) = loop_id {
                     self.active_loops.push(loop_id);
                 }
-                let body_stmt = Self::strip_trailing_continue(self.structure_loop_body(body));
+                let body_stmt = Self::strip_trailing_latch_marker(self.structure_loop_body(body));
                 if loop_id.is_some() {
                     self.active_loops.pop();
                 }
@@ -4570,6 +4570,31 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
     }
 
+    /// Remove the implicit terminal edge marker from a post-tested loop body.
+    ///
+    /// The latch condition owns both the backedge and the exit edge. Region
+    /// analysis may classify that exit edge as a `break`, especially when the
+    /// latch is also a singleton loop header. Emitting that marker inside the
+    /// resulting do-while would force the loop to execute only once.
+    fn strip_trailing_latch_marker(stmt: CStmt) -> CStmt {
+        match stmt {
+            CStmt::Break | CStmt::Continue => CStmt::Empty,
+            CStmt::Block(mut stmts) => {
+                while matches!(stmts.last(), Some(CStmt::Break | CStmt::Continue)) {
+                    stmts.pop();
+                }
+                if stmts.is_empty() {
+                    CStmt::Empty
+                } else if stmts.len() == 1 {
+                    stmts.remove(0)
+                } else {
+                    CStmt::Block(stmts)
+                }
+            }
+            other => other,
+        }
+    }
+
     /// Fix C: Convert `do { if (cond) break; body... } while(1)` into
     /// `while(!cond) { body... }`.
     fn try_convert_do_while_to_while(body: CStmt, cond: CExpr) -> CStmt {
@@ -5673,6 +5698,15 @@ mod tests {
             structurer.control_render_proofs()[0].loop_latches,
             vec![0x1004]
         );
+    }
+
+    #[test]
+    fn post_test_loop_removes_implicit_latch_break() {
+        let body = CStmt::Block(vec![assign("hash", v("next_hash")), CStmt::Break]);
+
+        let stripped = ControlFlowStructurer::strip_trailing_latch_marker(body);
+
+        assert_eq!(stripped, assign("hash", v("next_hash")));
     }
 
     #[test]

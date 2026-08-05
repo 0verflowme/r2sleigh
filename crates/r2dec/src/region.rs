@@ -689,20 +689,14 @@ impl<'a> RegionAnalyzer<'a> {
     fn analyze_loop(&mut self, header: u64, body: &HashSet<u64>) -> Region {
         self.processed.insert(header);
 
-        // Determine loop type (while vs do-while)
-        let succs = self.func.successors(header);
-        let is_while = succs.len() == 2 && succs.iter().any(|s| !body.contains(s));
-
-        if is_while {
+        // A pre-tested loop must enter a distinct body block. A conditional
+        // self-edge executes the header's value/effect operations before its
+        // latch test and is therefore a do-while loop, not an empty while.
+        if let Some(body_entry) = self.pretest_loop_body_entry(header, body) {
             // While loop: header is the condition
-            let body_entry = succs.iter().find(|s| body.contains(s)).copied();
             let mut body_blocks = body.clone();
             body_blocks.remove(&header);
-            let body_region = if let Some(entry) = body_entry {
-                self.analyze_loop_body(entry, &body_blocks)
-            } else {
-                Region::Sequence(Vec::new())
-            };
+            let body_region = self.analyze_loop_body(body_entry, &body_blocks, false);
 
             Region::WhileLoop {
                 header,
@@ -719,7 +713,7 @@ impl<'a> RegionAnalyzer<'a> {
                 if header != guard_block && self.func.successors(header).len() == 1 {
                     body_blocks.remove(&header);
                 }
-                let body_region = self.analyze_loop_body(body_entry, &body_blocks);
+                let body_region = self.analyze_loop_body(body_entry, &body_blocks, false);
                 return Region::WhileLoop {
                     header: guard_block,
                     body: Box::new(body_region),
@@ -732,12 +726,24 @@ impl<'a> RegionAnalyzer<'a> {
             let cond_block = self
                 .unique_loop_latch_condition_block(header, body)
                 .unwrap_or(header);
-            let body_region = self.analyze_loop_body(header, body);
+            let body_region = self.analyze_loop_body(header, body, true);
             Region::DoWhileLoop {
                 body: Box::new(body_region),
                 cond_block,
             }
         }
+    }
+
+    fn pretest_loop_body_entry(&self, header: u64, body: &HashSet<u64>) -> Option<u64> {
+        let successors = self.func.successors(header);
+        if successors.len() != 2 || !successors.iter().any(|addr| !body.contains(addr)) {
+            return None;
+        }
+        let mut entries = successors
+            .into_iter()
+            .filter(|addr| *addr != header && body.contains(addr));
+        let entry = entries.next()?;
+        entries.next().is_none().then_some(entry)
     }
 
     fn unique_loop_latch_condition_block(&self, header: u64, body: &HashSet<u64>) -> Option<u64> {
@@ -758,7 +764,12 @@ impl<'a> RegionAnalyzer<'a> {
         }
     }
 
-    fn analyze_loop_body(&mut self, entry: u64, body: &HashSet<u64>) -> Region {
+    fn analyze_loop_body(
+        &mut self,
+        entry: u64,
+        body: &HashSet<u64>,
+        include_processed_entry: bool,
+    ) -> Region {
         if body.is_empty() {
             return Region::Sequence(Vec::new());
         }
@@ -775,10 +786,14 @@ impl<'a> RegionAnalyzer<'a> {
 
         let mut regions = Vec::new();
         for b in blocks {
-            if self.processed.contains(&b) {
+            if self.processed.contains(&b) && !(include_processed_entry && b == entry) {
                 continue;
             }
-            regions.push(self.analyze_region_recursive(b));
+            regions.push(if include_processed_entry && b == entry {
+                Region::Block(b)
+            } else {
+                self.analyze_region_recursive(b)
+            });
         }
 
         if regions.is_empty() {
@@ -2213,15 +2228,15 @@ impl WorkingGraph {
         let body = &loop_info.body;
         let mut region_body = body.clone();
         region_body.extend(absorbed_terminal_exit_blocks.iter().copied());
-        let succs = analyzer.func.successors(header);
-        let is_while = succs.len() == 2 && succs.iter().any(|s| !body.contains(s));
-
-        if is_while {
-            let body_entry = succs.iter().find(|s| body.contains(s)).copied();
+        if let Some(body_entry) = analyzer.pretest_loop_body_entry(header, body) {
             let mut body_blocks = region_body.clone();
             body_blocks.remove(&header);
-            let loop_body =
-                self.make_loop_body_region(analyzer, internal_nodes, &body_blocks, body_entry);
+            let loop_body = self.make_loop_body_region(
+                analyzer,
+                internal_nodes,
+                &body_blocks,
+                Some(body_entry),
+            );
             return Region::WhileLoop {
                 header,
                 body: Box::new(loop_body),
@@ -2608,6 +2623,43 @@ mod tests {
         func
     }
 
+    fn build_conditional_self_loop_cfg() -> SSAFunction {
+        let mut preheader = R2ILBlock::new(0x1000, 4);
+        preheader.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1010, 8),
+        });
+
+        let mut loop_block = R2ILBlock::new(0x1010, 4);
+        loop_block.push(R2ILOp::IntAdd {
+            dst: Varnode::register(0x208, 8),
+            a: Varnode::register(0x208, 8),
+            b: Varnode::constant(1, 8),
+        });
+        loop_block.push(R2ILOp::CBranch {
+            cond: Varnode::register(0x200, 1),
+            target: Varnode::constant(0x1010, 8),
+        });
+
+        let mut exit = R2ILBlock::new(0x1020, 4);
+        exit.push(R2ILOp::Return {
+            target: Varnode::register(0, 8),
+        });
+
+        let mut func = SSAFunction::from_blocks_raw_no_arch(&[preheader, loop_block, exit])
+            .expect("ssa function");
+        func.cfg_mut()
+            .set_terminator(0x1000, BlockTerminator::Branch { target: 0x1010 });
+        func.cfg_mut().set_terminator(
+            0x1010,
+            BlockTerminator::ConditionalBranch {
+                true_target: 0x1010,
+                false_target: 0x1020,
+            },
+        );
+        func.refresh_after_cfg_mutation();
+        func
+    }
+
     fn build_guarded_latch_condition_loop_cfg() -> SSAFunction {
         let mut entry = R2ILBlock::new(0x1000, 0x10);
         entry.push(R2ILOp::CBranch {
@@ -2912,6 +2964,34 @@ mod tests {
         };
 
         assert_eq!(cond_block, 0x1020);
+    }
+
+    #[test]
+    fn conditional_self_loop_keeps_header_effects_in_do_while_body() {
+        let func = build_conditional_self_loop_cfg();
+        let mut analyzer = RegionAnalyzer::new(&func);
+
+        let region = analyzer.analyze();
+
+        assert!(
+            region_contains_dowhile_cond(&region, 0x1010),
+            "self-edge latch must be a do-while condition: {region:?}"
+        );
+        assert!(
+            region.blocks().contains(&0x1010),
+            "self-loop header effects must remain in the loop body: {region:?}"
+        );
+        let direct = analyzer.analyze_loop(0x1010, &HashSet::from([0x1010]));
+        assert!(
+            matches!(
+                direct,
+                Region::DoWhileLoop {
+                    ref body,
+                    cond_block: 0x1010
+                } if body.blocks() == vec![0x1010]
+            ),
+            "recursive fallback must preserve the self-loop header body: {direct:?}"
+        );
     }
 
     #[test]
