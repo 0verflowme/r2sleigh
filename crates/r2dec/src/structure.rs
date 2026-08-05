@@ -12,7 +12,7 @@ use crate::address::parse_address_from_var_name;
 use crate::ast::{BinaryOp, CExpr, CStmt, UnaryOp};
 use crate::fold::FoldingContext;
 use crate::fold::context::{EffectRenderProof, EffectRenderProofKind};
-use crate::region::{Region, RegionAnalyzer};
+use crate::region::{Region, RegionAnalyzer, RegionTransferKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlRenderProofKind {
@@ -906,6 +906,24 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 ));
                 CStmt::Empty
             }
+            Region::Transfer {
+                loop_header,
+                source: _,
+                target,
+                kind,
+            } if *kind == RegionTransferKind::Continue && target == loop_header => CStmt::Continue,
+            Region::Transfer {
+                loop_header,
+                source,
+                target,
+                kind,
+            } => {
+                self.safety_reason = Some(format!(
+                    "unlowered {:?} edge 0x{:x} -> 0x{:x} in loop 0x{:x}",
+                    kind, source, target, loop_header
+                ));
+                CStmt::Empty
+            }
             Region::Switch {
                 switch_block,
                 cases,
@@ -1423,6 +1441,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 .contains(&target)
                 .then(|| self.structure_region_suffix_from_target(head, target))
                 .flatten(),
+            Region::Transfer {
+                target: transfer_target,
+                ..
+            } => (*transfer_target == target).then_some(CStmt::Empty),
             Region::Switch {
                 switch_block,
                 cases,
@@ -1519,20 +1541,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         // Convert operations to statements
         stmts.extend(self.folded_block_stmts(block, addr));
 
-        // Check for break/continue at block end
-        if let Some(ref analyzer) = self.region_analyzer {
-            if analyzer.is_loop_continue(addr) {
-                stmts.push(CStmt::Continue);
-            } else if analyzer.is_loop_break(addr) {
-                stmts.push(CStmt::Break);
-            } else if analyzer.is_loop_goto(addr)
-                && let Some(target) = analyzer.get_loop_goto_target(addr)
-            {
-                let label = self.ensure_label(target);
-                stmts.push(CStmt::Goto(label));
-            }
-        }
-
         if stmts.is_empty() {
             CStmt::Empty
         } else if stmts.len() == 1 {
@@ -1594,30 +1602,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
         // Convert operations to statements
         stmts.extend(self.folded_block_stmts(block, addr));
-
-        // Check for break/continue at block end
-        if let Some(ref analyzer) = self.region_analyzer {
-            if analyzer.is_loop_continue(addr) {
-                stmts.push(CStmt::Continue);
-            } else if analyzer.is_loop_break(addr) {
-                stmts.push(CStmt::Break);
-            } else if analyzer.is_loop_goto(addr)
-                && let Some(target) = analyzer.get_loop_goto_target(addr)
-            {
-                let label = self.ensure_label(target);
-                stmts.push(CStmt::Goto(label));
-            }
-        }
-    }
-
-    fn ensure_label(&mut self, addr: u64) -> String {
-        if let Some(label) = self.labels.get(&addr) {
-            return label.clone();
-        }
-        let label = format!("L{}", self.label_counter);
-        self.label_counter += 1;
-        self.labels.insert(addr, label.clone());
-        label
     }
 
     /// Emit side-effecting statements for a block without labels or loop markers.
@@ -2943,11 +2927,11 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }) {
             return None;
         }
-        if self.region_analyzer.as_ref().is_some_and(|analyzer| {
-            analyzer.is_loop_continue(addr)
-                || analyzer.is_loop_break(addr)
-                || analyzer.is_loop_goto(addr)
-        }) {
+        if self
+            .region_analyzer
+            .as_ref()
+            .is_some_and(|analyzer| analyzer.block_has_loop_transfer(addr))
+        {
             return None;
         }
         self.block_flows_to_merge(*successor, merge_block)

@@ -50,6 +50,19 @@ pub enum Region {
         /// Distinct external continuation entries.
         exits: Vec<u64>,
     },
+    /// An exact CFG edge that leaves the current one-iteration loop body.
+    /// Rendering must preserve this edge as a certified break, continue, or
+    /// goto; it must never be inferred from the source block alone.
+    Transfer {
+        /// Natural-loop header that owns the transfer.
+        loop_header: u64,
+        /// Source basic block.
+        source: u64,
+        /// Exact CFG target.
+        target: u64,
+        /// Transfer role within the owning loop.
+        kind: RegionTransferKind,
+    },
     /// A switch statement.
     Switch {
         /// The block containing the switch expression.
@@ -80,6 +93,7 @@ impl Region {
             Self::WhileLoop { header, .. } => *header,
             Self::DoWhileLoop { body, .. } => body.entry(),
             Self::MultiExit { head, .. } => head.entry(),
+            Self::Transfer { target, .. } => *target,
             Self::Switch { switch_block, .. } => *switch_block,
             Self::Irreducible { entry, .. } => *entry,
         }
@@ -117,6 +131,7 @@ impl Region {
                 blocks
             }
             Self::MultiExit { head, .. } => head.blocks(),
+            Self::Transfer { .. } => Vec::new(),
             Self::Switch {
                 switch_block,
                 cases,
@@ -140,6 +155,12 @@ impl Region {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionTransferKind {
+    Exit,
+    Continue,
+}
+
 /// Region analyzer for identifying structured control flow.
 pub struct RegionAnalyzer<'a> {
     func: &'a SSAFunction,
@@ -153,12 +174,6 @@ pub struct RegionAnalyzer<'a> {
     post_dominators: HashMap<u64, BTreeSet<u64>>,
     /// Processed blocks.
     processed: HashSet<u64>,
-    /// Blocks that exit a loop (break targets): block_addr -> exit_target.
-    loop_exits: HashMap<u64, u64>,
-    /// Blocks that continue to loop header: block_addr -> header.
-    loop_continues: HashMap<u64, u64>,
-    /// Blocks that need an explicit goto target for cross-loop control flow.
-    loop_gotos: HashMap<u64, u64>,
     /// Optional reason when analysis had to abort/degrade.
     analysis_reason: Option<String>,
     /// Recursion guard for legacy recursive analysis.
@@ -214,9 +229,6 @@ impl<'a> RegionAnalyzer<'a> {
             loops: HashMap::new(),
             post_dominators: HashMap::new(),
             processed: HashSet::new(),
-            loop_exits: HashMap::new(),
-            loop_continues: HashMap::new(),
-            loop_gotos: HashMap::new(),
             analysis_reason: None,
             recursion_depth: 0,
             recursion_depth_limit: (num_blocks.saturating_mul(8)).max(256),
@@ -225,7 +237,6 @@ impl<'a> RegionAnalyzer<'a> {
         analyzer.find_back_edges();
         analyzer.find_loops();
         analyzer.compute_post_dominators();
-        analyzer.find_loop_exits();
         analyzer
     }
 
@@ -316,47 +327,16 @@ impl<'a> RegionAnalyzer<'a> {
         }
     }
 
-    /// Find loop exit and continue edges.
-    fn find_loop_exits(&mut self) {
-        for (&header, body) in &self.loops {
-            for &block in body {
-                // Check successors of each block in the loop
-                for succ in self.func.successors(block) {
-                    if succ == header && block != header {
-                        // This is a continue (jump back to header, not from header itself)
-                        self.loop_continues.insert(block, header);
-                    } else if !body.contains(&succ) {
-                        // This is a break (exit from loop)
-                        self.loop_exits.insert(block, succ);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Check if a block contains a break (loop exit).
-    pub fn is_loop_break(&self, block: u64) -> bool {
-        self.loop_exits.contains_key(&block)
-    }
-
-    /// Check if a block contains a continue (jump to loop header).
-    pub fn is_loop_continue(&self, block: u64) -> bool {
-        self.loop_continues.contains_key(&block)
-    }
-
-    /// Check if a block needs an explicit goto.
-    pub fn is_loop_goto(&self, block: u64) -> bool {
-        self.loop_gotos.contains_key(&block)
-    }
-
-    /// Get the goto target for a block, when present.
-    pub fn get_loop_goto_target(&self, block: u64) -> Option<u64> {
-        self.loop_gotos.get(&block).copied()
-    }
-
-    /// Get the loop exit target for a block.
-    pub fn get_loop_exit_target(&self, block: u64) -> Option<u64> {
-        self.loop_exits.get(&block).copied()
+    /// Whether an exact CFG edge from this block crosses a natural-loop
+    /// iteration boundary. Transfer rendering is owned by `Region::Transfer`;
+    /// this query only prevents unrelated branch-forwarding rewrites.
+    pub fn block_has_loop_transfer(&self, block: u64) -> bool {
+        self.loops.iter().any(|(header, body)| {
+            body.contains(&block)
+                && self.func.successors(block).into_iter().any(|target| {
+                    (target == *header && block != *header) || !body.contains(&target)
+                })
+        })
     }
 
     /// Reason for analysis degradation/short-circuit, if any.
@@ -391,7 +371,6 @@ impl<'a> RegionAnalyzer<'a> {
     /// `SLEIGH_DEC_LEGACY_ANALYZER=1`: force legacy recursive-only (A/B testing).
     pub fn analyze(&mut self) -> Region {
         self.processed.clear();
-        self.loop_gotos.clear();
         self.analysis_reason = None;
         self.recursion_depth = 0;
 
@@ -431,7 +410,6 @@ impl<'a> RegionAnalyzer<'a> {
         // Iterative path failed to converge; fall back to recursive with depth guard.
         self.analysis_reason = None;
         self.processed.clear();
-        self.loop_gotos.clear();
         self.recursion_depth = 0;
 
         // Guard the recursive fallback against complex graphs.
@@ -1379,7 +1357,7 @@ impl<'a> RegionAnalyzer<'a> {
                 return None;
             }
 
-            if graph.collapse_loop(self, loop_info, &all_loops).is_err() {
+            if graph.collapse_loop(self, loop_info).is_err() {
                 return None;
             }
         }
@@ -1876,6 +1854,37 @@ impl WorkingGraph {
         self.edge_labels.remove(&(from, to));
     }
 
+    fn add_region_node(&mut self, entry: u64, region: Region) -> usize {
+        let next_available = self
+            .nodes
+            .keys()
+            .copied()
+            .max()
+            .map(|id| id.saturating_add(1))
+            .unwrap_or(0);
+        let id = self.next_id.max(next_available);
+        self.next_id = id.saturating_add(1);
+        self.nodes.insert(
+            id,
+            WorkingNode {
+                entry,
+                blocks: BTreeSet::new(),
+                region,
+            },
+        );
+        self.preds.insert(id, HashSet::new());
+        self.succs.insert(id, HashSet::new());
+        id
+    }
+
+    fn add_edge(&mut self, from: usize, to: usize, edge: Option<CFGEdge>) {
+        self.succs.entry(from).or_default().insert(to);
+        self.preds.entry(to).or_default().insert(from);
+        if let Some(edge) = edge {
+            self.edge_labels.insert((from, to), edge);
+        }
+    }
+
     fn collect_reachable_limited(
         &self,
         start: usize,
@@ -1928,7 +1937,6 @@ impl WorkingGraph {
         &mut self,
         analyzer: &mut RegionAnalyzer<'_>,
         loop_info: &LoopInfo,
-        all_loops: &[LoopInfo],
     ) -> Result<(), ()> {
         let header = loop_info.header;
         let body = &loop_info.body;
@@ -2008,61 +2016,6 @@ impl WorkingGraph {
             }
         }
 
-        // Classify edges leaving the loop body.
-        //
-        // - Continue: back-edge to this loop's header (from non-header block)
-        // - Break (loop_exit): edge leaving this loop body, normal exit
-        // - Goto: edge that targets a block inside a *different* loop's body
-        //   (cross-nesting jump), excluding our own enclosing loops' headers
-        //   which would be outer-loop continues.
-        for block in body {
-            for succ in analyzer.func.successors(*block) {
-                // Continue: back to this loop header
-                if succ == header && *block != header {
-                    analyzer.loop_continues.insert(*block, header);
-                    continue;
-                }
-                // Internal edge
-                if body.contains(&succ) {
-                    continue;
-                }
-                if absorbed_terminal_exit_blocks.contains(&succ) {
-                    if analyzer
-                        .loop_exits
-                        .get(block)
-                        .is_some_and(|existing| *existing == succ)
-                    {
-                        analyzer.loop_exits.remove(block);
-                    }
-                    continue;
-                }
-                // Already recorded as exit with same target — skip
-                if analyzer
-                    .loop_exits
-                    .get(block)
-                    .is_some_and(|existing| *existing == succ)
-                {
-                    continue;
-                }
-
-                // Determine whether this is a cross-nesting goto or a normal break.
-                // A goto targets a block that is inside a *sibling* or *unrelated*
-                // loop body (not our body, not an enclosing loop's body).
-                let is_cross_nesting = Self::is_cross_nesting_target(succ, header, body, all_loops);
-
-                if is_cross_nesting {
-                    analyzer.loop_gotos.insert(*block, succ);
-                } else {
-                    // Normal break.  If this block already has a loop_exit recorded
-                    // (multi-exit conditional), keep the first and ignore the rest —
-                    // both are normal breaks, not gotos.
-                    if !analyzer.loop_exits.contains_key(block) {
-                        analyzer.loop_exits.insert(*block, succ);
-                    }
-                }
-            }
-        }
-
         let loop_region = self.make_loop_region(
             analyzer,
             loop_info,
@@ -2128,35 +2081,6 @@ impl WorkingGraph {
         }
 
         Ok(())
-    }
-
-    /// Determine whether `target` is a cross-nesting jump target.
-    ///
-    /// A target is cross-nesting if it is inside some other loop's body that
-    /// does NOT enclose our current loop (i.e. it's a sibling or unrelated loop).
-    /// Targets that are simply outside the current loop body (normal breaks)
-    /// or inside an enclosing loop's body are NOT cross-nesting.
-    fn is_cross_nesting_target(
-        target: u64,
-        current_header: u64,
-        current_body: &HashSet<u64>,
-        all_loops: &[LoopInfo],
-    ) -> bool {
-        for other in all_loops {
-            // Skip our own loop
-            if other.header == current_header && other.body == *current_body {
-                continue;
-            }
-            // Skip enclosing loops (they contain our header)
-            if other.body.contains(&current_header) && current_body.is_subset(&other.body) {
-                continue;
-            }
-            // If the target is inside a sibling/unrelated loop's body, it's cross-nesting
-            if other.body.contains(&target) {
-                return true;
-            }
-        }
-        false
     }
 
     fn terminal_return_exit_nodes(
@@ -2251,6 +2175,7 @@ impl WorkingGraph {
                 &body_blocks,
                 Some(body_entry),
                 header,
+                None,
             );
             return Region::WhileLoop {
                 header,
@@ -2270,6 +2195,7 @@ impl WorkingGraph {
                 &body_blocks,
                 Some(body_entry),
                 header,
+                None,
             );
             return Region::WhileLoop {
                 header: guard_block,
@@ -2286,6 +2212,7 @@ impl WorkingGraph {
             &region_body,
             Some(header),
             header,
+            Some(cond_block),
         );
         Region::DoWhileLoop {
             body: Box::new(loop_body),
@@ -2300,6 +2227,7 @@ impl WorkingGraph {
         body_blocks: &HashSet<u64>,
         start_block: Option<u64>,
         loop_header: u64,
+        owned_latch_condition: Option<u64>,
     ) -> Region {
         if body_blocks.is_empty() {
             return Region::Sequence(Vec::new());
@@ -2330,7 +2258,58 @@ impl WorkingGraph {
             for source in analyzer.back_edges.get(&loop_header).into_iter().flatten() {
                 if let Some(source_node) = sub.node_for_block(*source) {
                     sub.remove_edge(source_node, header_node);
+                    if Some(*source) != owned_latch_condition {
+                        let transfer = sub.add_region_node(
+                            loop_header,
+                            Region::Transfer {
+                                loop_header,
+                                source: *source,
+                                target: loop_header,
+                                kind: RegionTransferKind::Continue,
+                            },
+                        );
+                        sub.add_edge(
+                            source_node,
+                            transfer,
+                            analyzer.func.edge_type(*source, loop_header),
+                        );
+                    }
                 }
+            }
+        }
+        for source_node in &relevant_nodes {
+            let Some(Region::Block(source)) = self.node_region(*source_node) else {
+                continue;
+            };
+            if Some(source) == owned_latch_condition {
+                continue;
+            }
+            for target_node in self.sorted_succs(*source_node) {
+                if relevant_nodes.contains(&target_node) {
+                    continue;
+                }
+                let Some(target) = self.node_entry(target_node) else {
+                    continue;
+                };
+                let kind = if target == loop_header {
+                    RegionTransferKind::Continue
+                } else {
+                    RegionTransferKind::Exit
+                };
+                let transfer = sub.add_region_node(
+                    target,
+                    Region::Transfer {
+                        loop_header,
+                        source,
+                        target,
+                        kind,
+                    },
+                );
+                sub.add_edge(
+                    *source_node,
+                    transfer,
+                    self.edge_labels.get(&(*source_node, target_node)).copied(),
+                );
             }
         }
 
@@ -2889,7 +2868,7 @@ mod tests {
                         .as_deref()
                         .is_some_and(|region| region_contains_dowhile_cond(region, expected))
             }
-            Region::Block(_) | Region::Irreducible { .. } => false,
+            Region::Block(_) | Region::Transfer { .. } | Region::Irreducible { .. } => false,
         }
     }
 
@@ -2923,7 +2902,7 @@ mod tests {
                         .as_deref()
                         .is_some_and(|region| region_contains_loop_entry(region, expected))
             }
-            Region::Block(_) | Region::Irreducible { .. } => false,
+            Region::Block(_) | Region::Transfer { .. } | Region::Irreducible { .. } => false,
         }
     }
 
@@ -2956,7 +2935,7 @@ mod tests {
                         .as_deref()
                         .is_some_and(|region| region_contains_cond_block(region, expected))
             }
-            Region::Block(_) | Region::Irreducible { .. } => false,
+            Region::Block(_) | Region::Transfer { .. } | Region::Irreducible { .. } => false,
         }
     }
 
@@ -2993,6 +2972,68 @@ mod tests {
                     region_contains_multi_exit(region, expected_entry, expected_exits)
                 })
             }
+            Region::Block(_) | Region::Transfer { .. } | Region::Irreducible { .. } => false,
+        }
+    }
+
+    fn region_contains_transfer(
+        region: &Region,
+        expected_source: u64,
+        expected_target: u64,
+        expected_kind: RegionTransferKind,
+    ) -> bool {
+        match region {
+            Region::Transfer {
+                source,
+                target,
+                kind,
+                ..
+            } => *source == expected_source && *target == expected_target && *kind == expected_kind,
+            Region::MultiExit { head, .. } => {
+                region_contains_transfer(head, expected_source, expected_target, expected_kind)
+            }
+            Region::WhileLoop { body, .. } | Region::DoWhileLoop { body, .. } => {
+                region_contains_transfer(body, expected_source, expected_target, expected_kind)
+            }
+            Region::Sequence(regions) => regions.iter().any(|region| {
+                region_contains_transfer(region, expected_source, expected_target, expected_kind)
+            }),
+            Region::IfThenElse {
+                then_region,
+                else_region,
+                ..
+            } => {
+                region_contains_transfer(
+                    then_region,
+                    expected_source,
+                    expected_target,
+                    expected_kind,
+                ) || else_region.as_deref().is_some_and(|region| {
+                    region_contains_transfer(
+                        region,
+                        expected_source,
+                        expected_target,
+                        expected_kind,
+                    )
+                })
+            }
+            Region::Switch { cases, default, .. } => {
+                cases.iter().any(|(_, region)| {
+                    region_contains_transfer(
+                        region,
+                        expected_source,
+                        expected_target,
+                        expected_kind,
+                    )
+                }) || default.as_deref().is_some_and(|region| {
+                    region_contains_transfer(
+                        region,
+                        expected_source,
+                        expected_target,
+                        expected_kind,
+                    )
+                })
+            }
             Region::Block(_) | Region::Irreducible { .. } => false,
         }
     }
@@ -3025,7 +3066,7 @@ mod tests {
                         .as_deref()
                         .is_some_and(|region| region_contains_irreducible_entry(region, expected))
             }
-            Region::Block(_) => false,
+            Region::Block(_) | Region::Transfer { .. } => false,
         }
     }
 
@@ -3178,6 +3219,22 @@ mod tests {
         assert!(
             region_contains_multi_exit(&region, 0x4014e7, &[0x4014ef, 0x401500, 0x401508]),
             "inner loop must retain every exact external continuation: {region:?}"
+        );
+        assert!(
+            region_contains_cond_block(&region, 0x4014d8)
+                && region_contains_cond_block(&region, 0x4014de),
+            "inner-loop conditional exits must survive body analysis: {region:?}"
+        );
+        assert!(
+            region_contains_transfer(&region, 0x4014d8, 0x401500, RegionTransferKind::Exit)
+                && region_contains_transfer(&region, 0x4014de, 0x401508, RegionTransferKind::Exit)
+                && region_contains_transfer(
+                    &region,
+                    0x4014de,
+                    0x4014e7,
+                    RegionTransferKind::Continue
+                ),
+            "inner-loop exit and continue edges must retain exact ownership: {region:?}"
         );
 
         let ctx = FoldingContext::new(64);
