@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 
 use r2ssa::{
@@ -4675,9 +4675,39 @@ struct InferredLocalFieldEvidence {
     writes: u32,
     widths: BTreeMap<u32, u32>,
     type_votes: BTreeMap<String, u32>,
+    recursive_pointer_reads: u32,
+    pointee_types: BTreeMap<String, u32>,
 }
 
 type LocalFieldEvidenceMap = HashMap<usize, BTreeMap<u64, InferredLocalFieldEvidence>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InferredLocalFieldType {
+    Concrete(String),
+    SelfPointer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum InferredScalarSignedness {
+    Signed,
+    Unsigned,
+}
+
+impl InferredLocalFieldType {
+    fn shape_key(&self) -> &str {
+        match self {
+            Self::Concrete(ty) => ty,
+            Self::SelfPointer => "self *",
+        }
+    }
+
+    fn render(&self, struct_name: &str) -> String {
+        match self {
+            Self::Concrete(ty) => ty.clone(),
+            Self::SelfPointer => format!("struct {struct_name} *"),
+        }
+    }
+}
 
 fn collect_pointer_arg_slot_map(arch_name: Option<&str>, ptr_bits: u32) -> HashMap<String, usize> {
     let (arg_regs, _, _) = recover_vars_arch_profile(arch_name);
@@ -4819,6 +4849,207 @@ fn local_struct_type_slots(
     slots
 }
 
+/// Compute exact pointee-type evidence for SSA values in one reverse flow.
+///
+/// Edges point from a derived pointer back to its source. Starting at every
+/// memory address operand lets dereference types flow through transparent
+/// aliases, phis, and constant pointer arithmetic without rescanning the
+/// function once per candidate field.
+fn local_pointer_pointee_types(
+    blocks: &[LocalStructInferenceBlock],
+    ptr_bits: u32,
+    scalar_signedness: &HashMap<SSAVar, BTreeSet<InferredScalarSignedness>>,
+) -> HashMap<SSAVar, BTreeSet<String>> {
+    let ptr_bytes = (ptr_bits / 8).max(1);
+    let mut reverse_edges = HashMap::<SSAVar, BTreeSet<SSAVar>>::new();
+    let mut types = HashMap::<SSAVar, BTreeSet<String>>::new();
+    let mut link = |source: &SSAVar, derived: &SSAVar| {
+        if source.size == ptr_bytes && derived.size == ptr_bytes {
+            reverse_edges
+                .entry(derived.clone())
+                .or_default()
+                .insert(source.clone());
+        }
+    };
+
+    for block in blocks {
+        for phi in &block.phis {
+            for (_, source) in &phi.sources {
+                link(source, &phi.dst);
+            }
+        }
+        for op in &block.ops {
+            match op {
+                SSAOp::Copy { dst, src }
+                | SSAOp::Cast { dst, src }
+                | SSAOp::New { dst, src }
+                | SSAOp::IntZExt { dst, src }
+                | SSAOp::IntSExt { dst, src }
+                | SSAOp::Trunc { dst, src } => link(src, dst),
+                SSAOp::Subpiece {
+                    dst,
+                    src,
+                    offset: 0,
+                } => link(src, dst),
+                SSAOp::Phi { dst, sources } => {
+                    for source in sources {
+                        link(source, dst);
+                    }
+                }
+                SSAOp::IntAdd { dst, a, b } => {
+                    if a.is_const() {
+                        link(b, dst);
+                    } else if b.is_const() {
+                        link(a, dst);
+                    }
+                }
+                SSAOp::IntSub { dst, a, b } if b.is_const() => link(a, dst),
+                SSAOp::Load { dst, addr, .. } => {
+                    types
+                        .entry(addr.clone())
+                        .or_default()
+                        .extend(local_scalar_type_names(dst, scalar_signedness));
+                }
+                SSAOp::Store { addr, val, .. } => {
+                    types
+                        .entry(addr.clone())
+                        .or_default()
+                        .extend(local_scalar_type_names(val, scalar_signedness));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut ready = types.keys().cloned().collect::<VecDeque<_>>();
+    while let Some(derived) = ready.pop_front() {
+        let Some(observed) = types.get(&derived).cloned() else {
+            continue;
+        };
+        let Some(sources) = reverse_edges.get(&derived) else {
+            continue;
+        };
+        for source in sources {
+            let entry = types.entry(source.clone()).or_default();
+            let before = entry.len();
+            entry.extend(observed.iter().cloned());
+            if entry.len() != before {
+                ready.push_back(source.clone());
+            }
+        }
+    }
+    types
+}
+
+/// Recover signedness only from operations whose machine semantics distinguish
+/// signed from unsigned values, then flow that evidence backward through exact
+/// same-width aliases. Width alone remains deliberately neutral.
+fn local_scalar_signedness(
+    blocks: &[LocalStructInferenceBlock],
+) -> HashMap<SSAVar, BTreeSet<InferredScalarSignedness>> {
+    let mut reverse_edges = HashMap::<SSAVar, BTreeSet<SSAVar>>::new();
+    let mut signedness = HashMap::<SSAVar, BTreeSet<InferredScalarSignedness>>::new();
+    let mut link = |source: &SSAVar, derived: &SSAVar| {
+        if source.size == derived.size {
+            reverse_edges
+                .entry(derived.clone())
+                .or_default()
+                .insert(source.clone());
+        }
+    };
+    let mut seed = |var: &SSAVar, value: InferredScalarSignedness| {
+        if !var.is_const() {
+            signedness.entry(var.clone()).or_default().insert(value);
+        }
+    };
+
+    for block in blocks {
+        for phi in &block.phis {
+            for (_, source) in &phi.sources {
+                link(source, &phi.dst);
+            }
+        }
+        for op in &block.ops {
+            match op {
+                SSAOp::Copy { dst, src } | SSAOp::Cast { dst, src } | SSAOp::New { dst, src } => {
+                    link(src, dst);
+                }
+                SSAOp::Phi { dst, sources } => {
+                    for source in sources {
+                        link(source, dst);
+                    }
+                }
+                SSAOp::IntZExt { src, .. } => seed(src, InferredScalarSignedness::Unsigned),
+                SSAOp::IntSExt { src, .. } => seed(src, InferredScalarSignedness::Signed),
+                SSAOp::IntLess { a, b, .. }
+                | SSAOp::IntLessEqual { a, b, .. }
+                | SSAOp::IntDiv { a, b, .. }
+                | SSAOp::IntRem { a, b, .. } => {
+                    seed(a, InferredScalarSignedness::Unsigned);
+                    seed(b, InferredScalarSignedness::Unsigned);
+                }
+                SSAOp::IntSLess { a, b, .. }
+                | SSAOp::IntSLessEqual { a, b, .. }
+                | SSAOp::IntSDiv { a, b, .. }
+                | SSAOp::IntSRem { a, b, .. } => {
+                    seed(a, InferredScalarSignedness::Signed);
+                    seed(b, InferredScalarSignedness::Signed);
+                }
+                SSAOp::IntRight { a, .. } => seed(a, InferredScalarSignedness::Unsigned),
+                SSAOp::IntSRight { a, .. } => seed(a, InferredScalarSignedness::Signed),
+                _ => {}
+            }
+        }
+    }
+
+    let mut ready = signedness.keys().cloned().collect::<VecDeque<_>>();
+    while let Some(derived) = ready.pop_front() {
+        let Some(observed) = signedness.get(&derived).cloned() else {
+            continue;
+        };
+        let Some(sources) = reverse_edges.get(&derived) else {
+            continue;
+        };
+        for source in sources {
+            let entry = signedness.entry(source.clone()).or_default();
+            let before = entry.len();
+            entry.extend(observed.iter().copied());
+            if entry.len() != before {
+                ready.push_back(source.clone());
+            }
+        }
+    }
+    signedness
+}
+
+fn local_scalar_type_names(
+    var: &SSAVar,
+    signedness: &HashMap<SSAVar, BTreeSet<InferredScalarSignedness>>,
+) -> BTreeSet<String> {
+    let observed = signedness.get(var);
+    if observed.is_none_or(BTreeSet::is_empty) {
+        return BTreeSet::from([size_to_type(var.size)]);
+    }
+    observed
+        .into_iter()
+        .flatten()
+        .map(|value| match value {
+            InferredScalarSignedness::Signed => size_to_type(var.size),
+            InferredScalarSignedness::Unsigned => size_to_unsigned_type(var.size),
+        })
+        .collect()
+}
+
+fn add_local_scalar_type_votes(
+    votes: &mut BTreeMap<String, u32>,
+    var: &SSAVar,
+    signedness: &HashMap<SSAVar, BTreeSet<InferredScalarSignedness>>,
+) {
+    for ty in local_scalar_type_names(var, signedness) {
+        *votes.entry(ty).or_insert(0) += 1;
+    }
+}
+
 fn local_struct_inference_from_local_blocks(blocks: &[SSABlock]) -> Vec<LocalStructInferenceBlock> {
     blocks
         .iter()
@@ -4870,6 +5101,9 @@ fn infer_local_struct_artifacts_from_blocks(
 ) -> LocalStructArtifacts {
     let pointer_arg_slot_map = collect_pointer_arg_slot_map(arch_name, ptr_bits);
     let type_slots = local_struct_type_slots(ssa_blocks, &pointer_arg_slot_map, ptr_bits);
+    let scalar_signedness = local_scalar_signedness(ssa_blocks);
+    let pointer_pointee_types =
+        local_pointer_pointee_types(ssa_blocks, ptr_bits, &scalar_signedness);
     let (_, stack_bases, frame_bases) = recover_vars_arch_profile(arch_name);
     let mut addr_exprs: HashMap<String, LocalAddrExpr> = HashMap::new();
     let mut stack_addr_offsets: HashMap<String, i64> = HashMap::new();
@@ -5231,6 +5465,9 @@ fn infer_local_struct_artifacts_from_blocks(
                     if let Some(expr) = resolve_addr(addr)
                         && (0..=offset_bound).contains(&expr.offset)
                     {
+                        let recursive_pointer = addr_exprs
+                            .get(&ssa_var_block_key(block.addr, dst))
+                            .is_some_and(|value| value.slot == expr.slot && value.offset == 0);
                         let entry = slot_field_evidence
                             .entry(expr.slot)
                             .or_default()
@@ -5238,13 +5475,24 @@ fn infer_local_struct_artifacts_from_blocks(
                             .or_default();
                         entry.reads = entry.reads.saturating_add(1);
                         *entry.widths.entry(dst.size).or_insert(0) += 1;
-                        *entry.type_votes.entry(size_to_type(dst.size)).or_insert(0) += 1;
+                        add_local_scalar_type_votes(&mut entry.type_votes, dst, &scalar_signedness);
+                        if recursive_pointer {
+                            entry.recursive_pointer_reads =
+                                entry.recursive_pointer_reads.saturating_add(1);
+                        } else if let Some(types) = pointer_pointee_types.get(dst) {
+                            for ty in types {
+                                *entry.pointee_types.entry(ty.clone()).or_insert(0) += 1;
+                            }
+                        }
                     }
                 }
                 SSAOp::Store { addr, val, .. } => {
                     if let Some(expr) = resolve_addr(addr)
                         && (0..=offset_bound).contains(&expr.offset)
                     {
+                        let recursive_pointer = addr_exprs
+                            .get(&ssa_var_block_key(block.addr, val))
+                            .is_some_and(|value| value.slot == expr.slot && value.offset == 0);
                         let entry = slot_field_evidence
                             .entry(expr.slot)
                             .or_default()
@@ -5252,7 +5500,15 @@ fn infer_local_struct_artifacts_from_blocks(
                             .or_default();
                         entry.writes = entry.writes.saturating_add(1);
                         *entry.widths.entry(val.size).or_insert(0) += 1;
-                        *entry.type_votes.entry(size_to_type(val.size)).or_insert(0) += 1;
+                        add_local_scalar_type_votes(&mut entry.type_votes, val, &scalar_signedness);
+                        if recursive_pointer {
+                            entry.recursive_pointer_reads =
+                                entry.recursive_pointer_reads.saturating_add(1);
+                        } else if let Some(types) = pointer_pointee_types.get(val) {
+                            for ty in types {
+                                *entry.pointee_types.entry(ty.clone()).or_insert(0) += 1;
+                            }
+                        }
                     }
                 }
                 _ => {}
@@ -5274,25 +5530,64 @@ fn infer_local_struct_artifacts_from_blocks(
             continue;
         }
         let mut shape = String::new();
-        let mut fields = Vec::new();
-        let mut normalized_fields = BTreeMap::new();
+        let mut selected_fields = Vec::new();
         let mut confidence_acc = 0u32;
         for (offset, evidence) in fields_map {
-            let total_votes: u32 = evidence.type_votes.values().copied().sum();
-            let Some((field_type, field_votes)) = evidence
-                .type_votes
-                .iter()
-                .max_by_key(|(_, count)| **count)
-                .map(|(ty, count)| (ty.clone(), *count))
-            else {
-                continue;
-            };
             if evidence.type_votes.len() > 1 {
                 diagnostics.conflicts.push(format!(
                     "slot {slot} field +0x{offset:x} conflicting type votes {:?}",
                     evidence.type_votes
                 ));
             }
+            let (field_type, total_votes, field_votes) = if evidence.recursive_pointer_reads > 0 {
+                (
+                    InferredLocalFieldType::SelfPointer,
+                    evidence.recursive_pointer_reads,
+                    evidence.recursive_pointer_reads,
+                )
+            } else if !evidence.pointee_types.is_empty() {
+                let total_votes = evidence.pointee_types.values().copied().sum();
+                let field_votes = evidence
+                    .pointee_types
+                    .values()
+                    .copied()
+                    .max()
+                    .unwrap_or_default();
+                let ty = if evidence.pointee_types.len() == 1 {
+                    let pointee = evidence
+                        .pointee_types
+                        .first_key_value()
+                        .expect("non-empty pointee types")
+                        .0;
+                    format!("{pointee} *")
+                } else {
+                    diagnostics.conflicts.push(format!(
+                        "slot {slot} field +0x{offset:x} conflicting pointee types {:?}",
+                        evidence.pointee_types
+                    ));
+                    "void *".to_string()
+                };
+                (
+                    InferredLocalFieldType::Concrete(ty),
+                    total_votes,
+                    field_votes,
+                )
+            } else {
+                let total_votes = evidence.type_votes.values().copied().sum();
+                let Some((field_type, field_votes)) = evidence
+                    .type_votes
+                    .iter()
+                    .max_by_key(|(_, count)| **count)
+                    .map(|(ty, count)| (ty.clone(), *count))
+                else {
+                    continue;
+                };
+                (
+                    InferredLocalFieldType::Concrete(field_type),
+                    total_votes,
+                    field_votes,
+                )
+            };
             let strength = ((field_votes.saturating_mul(100)) / total_votes.max(1)) as u8;
             let rw_bonus = if evidence.reads > 0 && evidence.writes > 0 {
                 10
@@ -5301,26 +5596,33 @@ fn infer_local_struct_artifacts_from_blocks(
             };
             let field_conf = 70u8.saturating_add(strength / 3).saturating_add(rw_bonus);
             confidence_acc = confidence_acc.saturating_add(field_conf as u32);
-            shape.push_str(&format!("{offset:x}:{field_type};"));
-            normalized_fields.insert(*offset, field_type.clone());
-            fields.push(StructFieldCandidate {
-                name: format!("f_{offset:x}"),
-                offset: *offset,
-                field_type,
-                confidence: field_conf,
-            });
+            shape.push_str(&format!("{offset:x}:{};", field_type.shape_key()));
+            selected_fields.push((*offset, field_type, field_conf));
         }
-        if fields.is_empty() {
+        if selected_fields.is_empty() {
             continue;
         }
-        let avg_conf = (confidence_acc / fields.len() as u32).clamp(1, 100) as u8;
-        let allow_single_field = fields.len() == 1 && avg_conf >= 94;
-        if fields.len() < 2 && !allow_single_field {
+        let avg_conf = (confidence_acc / selected_fields.len() as u32).clamp(1, 100) as u8;
+        let allow_single_field = selected_fields.len() == 1 && avg_conf >= 94;
+        if selected_fields.len() < 2 && !allow_single_field {
             continue;
         }
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         shape.hash(&mut hasher);
         let struct_name = format!("sla_struct_{:016x}", hasher.finish());
+        let fields = selected_fields
+            .into_iter()
+            .map(|(offset, field_type, confidence)| StructFieldCandidate {
+                name: format!("f_{offset:x}"),
+                offset,
+                field_type: field_type.render(&struct_name),
+                confidence,
+            })
+            .collect::<Vec<_>>();
+        let normalized_fields = fields
+            .iter()
+            .map(|field| (field.offset, field.field_type.clone()))
+            .collect::<BTreeMap<_, _>>();
         let Some(decl) = build_struct_decl(&struct_name, &fields, ptr_bits) else {
             continue;
         };
@@ -10151,6 +10453,16 @@ fn size_to_type(size: u32) -> String {
         2 => "int16_t".to_string(),
         4 => "int32_t".to_string(),
         8 => "int64_t".to_string(),
+        _ => format!("byte[{size}]"),
+    }
+}
+
+fn size_to_unsigned_type(size: u32) -> String {
+    match size {
+        1 => "uint8_t".to_string(),
+        2 => "uint16_t".to_string(),
+        4 => "uint32_t".to_string(),
+        8 => "uint64_t".to_string(),
         _ => format!("byte[{size}]"),
     }
 }
@@ -18433,6 +18745,8 @@ mod tests {
     fn prepared_phi_preserves_recursive_struct_parameter_type() {
         let current = SSAVar::new("X0", 1, 8);
         let next = SSAVar::new("X0", 2, 8);
+        let name = SSAVar::new("name", 1, 8);
+        let len = SSAVar::new("len", 1, 2);
         let field_addr = |name: &str, version: u32, offset: u64| SSAOp::IntAdd {
             dst: SSAVar::new(name, version, 8),
             a: current.clone(),
@@ -18445,11 +18759,26 @@ mod tests {
                 sources: vec![(0xff0, SSAVar::new("X0", 0, 8)), (0x1010, next.clone())],
             }],
             ops: vec![
+                field_addr("len_addr", 1, 6),
+                SSAOp::Load {
+                    dst: len.clone(),
+                    space: "ram".to_string(),
+                    addr: SSAVar::new("len_addr", 1, 8),
+                },
+                SSAOp::IntZExt {
+                    dst: SSAVar::new("wide_len", 1, 8),
+                    src: len,
+                },
                 field_addr("name_addr", 1, 0x18),
                 SSAOp::Load {
-                    dst: SSAVar::new("name", 1, 8),
+                    dst: name.clone(),
                     space: "ram".to_string(),
                     addr: SSAVar::new("name_addr", 1, 8),
+                },
+                SSAOp::Load {
+                    dst: SSAVar::new("first_byte", 1, 1),
+                    space: "ram".to_string(),
+                    addr: name,
                 },
                 field_addr("next_addr", 1, 0x20),
                 SSAOp::Load {
@@ -18468,13 +18797,24 @@ mod tests {
             &mut diagnostics,
         );
 
-        assert_eq!(
-            artifacts.slot_field_profiles.get(&0),
-            Some(&BTreeMap::from([
-                (0x18, "int64_t".to_string()),
-                (0x20, "int64_t".to_string()),
-            ])),
-            "diagnostics={diagnostics:?}"
+        let profile = artifacts
+            .slot_field_profiles
+            .get(&0)
+            .expect("slot 0 profile");
+        let struct_pointer = artifacts
+            .slot_type_overrides
+            .get(&0)
+            .expect("slot 0 recursive struct pointer");
+        assert_eq!(profile.get(&6).map(String::as_str), Some("uint16_t"));
+        assert_eq!(profile.get(&0x18).map(String::as_str), Some("int8_t *"));
+        assert_eq!(profile.get(&0x20), Some(struct_pointer));
+        assert!(
+            artifacts.struct_decls.iter().any(|decl| {
+                decl.fields
+                    .iter()
+                    .any(|field| field.offset == 0x20 && field.field_type == *struct_pointer)
+            }),
+            "diagnostics={diagnostics:?}; artifacts={artifacts:?}"
         );
     }
 

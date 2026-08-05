@@ -21990,6 +21990,7 @@ mod tests {
                         is_write: false,
                         field_offset: 4,
                         field_name: "hash".to_string(),
+                        field_type: None,
                         access_width: field_load.width,
                     });
                 function_facts.set_render(render_facts);
@@ -22495,6 +22496,7 @@ mod tests {
                 is_write: false,
                 field_offset: 8,
                 field_name: "hash".to_string(),
+                field_type: None,
                 access_width: 8,
             });
         install_function_render_facts(&mut ctx, render_facts);

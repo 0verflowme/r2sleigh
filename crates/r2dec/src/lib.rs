@@ -3120,7 +3120,11 @@ fn certified_memory_result_local_is_exact(
                 && fact.width > 0
                 && fact.materialize_result
                 && local.name == certified_memory_result_name(fact.access)
-                && local.ty == CType::UInt(fact.width.saturating_mul(8))
+                && local.ty
+                    == render
+                        .memory_value_type(fact.access)
+                        .map(type_like_to_ctype)
+                        .unwrap_or_else(|| CType::UInt(fact.width.saturating_mul(8)))
         })
     })
 }
@@ -6836,7 +6840,10 @@ impl Decompiler {
                     continue;
                 }
                 locals.push(ast::CLocal {
-                    ty: CType::UInt(fact.width.saturating_mul(8)),
+                    ty: render_facts
+                        .memory_value_type(fact.access)
+                        .map(type_like_to_ctype)
+                        .unwrap_or_else(|| CType::UInt(fact.width.saturating_mul(8))),
                     name,
                     stack_offset: None,
                 });
@@ -9012,6 +9019,7 @@ mod tests {
                 is_write: fact.is_write,
                 field_offset: fact.field_offset,
                 field_name: fact.field_name.to_string(),
+                field_type: None,
                 access_width: fact.access_width,
             });
     }

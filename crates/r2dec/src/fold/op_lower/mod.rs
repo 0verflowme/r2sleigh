@@ -14199,6 +14199,12 @@ impl<'a> FoldingContext<'a> {
                             refusal
                         )));
                     };
+                    let elem_ty = self
+                        .inputs
+                        .render_facts()
+                        .and_then(|render| render.memory_value_type(fact.access))
+                        .map(crate::type_like_to_ctype)
+                        .unwrap_or(elem_ty);
                     let Some(rhs) =
                         self.render_certified_memory_expr_for_fact(fact, elem_ty.clone())
                     else {
@@ -14274,6 +14280,12 @@ impl<'a> FoldingContext<'a> {
                             refusal
                         )));
                     };
+                    let elem_ty = self
+                        .inputs
+                        .render_facts()
+                        .and_then(|render| render.memory_value_type(fact.access))
+                        .map(crate::type_like_to_ctype)
+                        .unwrap_or(elem_ty);
                     let Some(lhs) =
                         self.render_certified_memory_expr_for_fact(fact, elem_ty.clone())
                     else {

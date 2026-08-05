@@ -597,6 +597,29 @@ impl FunctionRenderFacts {
             .filter_map(CertifiedEffect::memory_fact)
     }
 
+    pub fn member_access(
+        &self,
+        access: r2ssa::StructuredAccessId,
+    ) -> Option<&MemberAccessRenderFact> {
+        let memory = self.memory_access(access)?;
+        let facts = self.member_accesses_by_op.get(&(
+            memory.block_addr,
+            memory.op_index,
+            memory.is_write,
+        ))?;
+        let mut matching = facts.iter().filter(|fact| {
+            fact.access == memory.access
+                && fact.object == memory.object
+                && fact.access_width == memory.width
+        });
+        let first = matching.next()?;
+        matching.next().is_none().then_some(first)
+    }
+
+    pub fn memory_value_type(&self, access: r2ssa::StructuredAccessId) -> Option<&CTypeLike> {
+        self.member_access(access)?.field_type.as_ref()
+    }
+
     pub fn return_effects(&self) -> impl Iterator<Item = &ReturnValueRenderFact> {
         self.certified_effects
             .values()
@@ -1128,6 +1151,7 @@ pub struct MemberAccessRenderFact {
     pub is_write: bool,
     pub field_offset: u64,
     pub field_name: String,
+    pub field_type: Option<CTypeLike>,
     pub access_width: u32,
 }
 
@@ -2067,6 +2091,10 @@ impl FunctionFacts {
                 is_write: memory.is_write,
                 field_offset,
                 field_name: cert.field_name.clone(),
+                field_type: cert
+                    .field_type
+                    .as_deref()
+                    .and_then(|ty| parse_type_like_spec(ty, ptr_bits)),
                 access_width: memory.width,
             })
             .collect()
@@ -2362,15 +2390,36 @@ impl FunctionFacts {
         }
     }
 
-    /// Attach one unambiguous signature-owned type to each loop carrier.
+    /// Attach one unambiguous certified type to each loop carrier.
     ///
     /// Carrier identity comes from prepared SSA. Types are projected only from
     /// an exact parameter or return binding already authorized by the function
-    /// signature; conflicting projections leave the carrier untyped.
+    /// signature, or from an exact typed memory-access certificate. Conflicting
+    /// projections leave the carrier untyped.
     pub fn populate_certified_loop_carrier_types(&mut self) {
-        let Some(signature) = self.types.render_authorized_signature().cloned() else {
-            return;
-        };
+        let signature = self.types.render_authorized_signature().cloned();
+        let mut memory_value_types = BTreeMap::<r2ssa::ValueId, CTypeLike>::new();
+        let mut conflicting_memory_values = BTreeSet::new();
+        for memory in self.render.memory_accesses() {
+            let Some(value) = memory.value.filter(|_| !memory.is_write) else {
+                continue;
+            };
+            let Some(ty) = self.render.memory_value_type(memory.access).cloned() else {
+                continue;
+            };
+            match memory_value_types.get(&value) {
+                None => {
+                    memory_value_types.insert(value, ty);
+                }
+                Some(existing) if *existing == ty => {}
+                Some(_) => {
+                    conflicting_memory_values.insert(value);
+                }
+            }
+        }
+        for value in conflicting_memory_values {
+            memory_value_types.remove(&value);
+        }
         let return_values = self
             .render
             .return_effects()
@@ -2392,28 +2441,39 @@ impl FunctionFacts {
 
         for (id, phi, identity_values) in carriers {
             let mut candidates = Vec::<CTypeLike>::new();
-            let mut identity_and_entry_values = identity_values;
-            identity_and_entry_values.insert(phi);
-            if let Some(CertifiedEntity::LoopCarrier { entries, .. }) =
-                self.render.certified_entities.get(&id)
+            let mut carrier_values = identity_values;
+            carrier_values.insert(phi);
+            if let Some(CertifiedEntity::LoopCarrier {
+                entries, updates, ..
+            }) = self.render.certified_entities.get(&id)
             {
-                identity_and_entry_values.extend(entries.iter().map(|entry| entry.value));
+                carrier_values.extend(entries.iter().map(|entry| entry.value));
+                carrier_values.extend(updates.iter().flat_map(|update| {
+                    std::iter::once(update.value).chain(update.identity_values.iter().copied())
+                }));
             }
-            for value in &identity_and_entry_values {
+            for value in &carrier_values {
                 if let Some(slot) = self.render.exact_parameter_slot_for_value(*value)
                     && let Some(ty) = signature
-                        .params
-                        .get(slot)
+                        .as_ref()
+                        .and_then(|signature| signature.params.get(slot))
                         .and_then(|param| param.ty.clone())
                     && !candidates.contains(&ty)
                 {
                     candidates.push(ty);
                 }
+                if let Some(ty) = memory_value_types.get(value).cloned()
+                    && !candidates.contains(&ty)
+                {
+                    candidates.push(ty);
+                }
             }
-            if identity_and_entry_values
+            if carrier_values
                 .iter()
                 .any(|value| return_values.contains(value))
-                && let Some(ty) = signature.ret_type.clone()
+                && let Some(ty) = signature
+                    .as_ref()
+                    .and_then(|signature| signature.ret_type.clone())
                 && !candidates.contains(&ty)
             {
                 candidates.push(ty);
@@ -4557,6 +4617,7 @@ mod tests {
             is_write: false,
             field_offset: 8,
             field_name: "len".to_string(),
+            field_type: None,
             access_width: 32,
         };
         let existing_render = FunctionRenderFacts {
@@ -4654,12 +4715,16 @@ mod tests {
             &x86_stack_home_param_slots(),
         );
 
-        assert!(
-            facts.render().is_some_and(|render| render
-                .member_access_for_op(0x401000, 1, false, "hash", 8, Some(8))
-                .is_some()),
-            "field certificate plus prepared memory address proof must authorize direct member rendering"
-        );
+        let render = facts.render().expect("prepared render facts");
+        let member = render
+            .member_access_for_op(0x401000, 1, false, "hash", 8, Some(8))
+            .expect("typed member render fact");
+        let expected = CTypeLike::Int {
+            bits: 64,
+            signedness: crate::model::Signedness::Unsigned,
+        };
+        assert_eq!(member.field_type.as_ref(), Some(&expected));
+        assert_eq!(render.memory_value_type(member.access), Some(&expected));
     }
 
     #[test]
@@ -4718,7 +4783,7 @@ mod tests {
                     slot: 0,
                     field_offset: 0x10,
                     field_name: "next".to_string(),
-                    field_type: Some("uint64_t".to_string()),
+                    field_type: Some("struct Node *".to_string()),
                 },
             ],
             ..FunctionTypeFacts::default()
@@ -4730,6 +4795,7 @@ mod tests {
             &prepared,
             &x86_stack_home_param_slots(),
         );
+        facts.populate_certified_loop_carrier_types();
 
         assert!(facts.render().is_some_and(|render| {
             render
@@ -4738,6 +4804,15 @@ mod tests {
                 && render
                     .member_access_for_op(0x401010, 1, false, "next", 0x10, Some(8))
                     .is_some()
+        }));
+        let expected = CTypeLike::Pointer(Box::new(CTypeLike::Struct("Node".to_string())));
+        assert!(facts.render().is_some_and(|render| {
+            render.loop_carriers().any(|carrier| {
+                matches!(
+                    carrier,
+                    CertifiedEntity::LoopCarrier { ty: Some(ty), .. } if *ty == expected
+                )
+            })
         }));
     }
 
@@ -5684,6 +5759,7 @@ mod tests {
                     is_write: true,
                     field_offset: 0,
                     field_name: "value".to_string(),
+                    field_type: None,
                     access_width: 8,
                 }],
             )]),

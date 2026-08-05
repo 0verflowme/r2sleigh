@@ -10949,23 +10949,26 @@ mod integration_tests {
         )
         .expect("analysis artifact");
 
-        assert_eq!(
-            artifact
-                .function_facts
-                .type_facts()
-                .slot_type_overrides
-                .get(&0)
-                .map(String::as_str),
-            Some("struct sla_struct_420703e08f70f00e *"),
-            "expected live-context detached artifact to keep the local struct override, got merged_signature={:?}, slot_overrides={:?}, slot_fields={:?}, type_db={:?}",
-            artifact.function_facts.type_facts().merged_signature,
-            artifact.function_facts.type_facts().slot_type_overrides,
-            artifact.function_facts.type_facts().slot_field_profiles,
-            artifact
-                .function_facts
-                .type_facts()
+        let type_facts = artifact.function_facts.type_facts();
+        let struct_pointer = type_facts
+            .slot_type_overrides
+            .get(&0)
+            .expect("slot 0 local struct override");
+        let struct_name = struct_pointer
+            .strip_prefix("struct ")
+            .and_then(|name| name.strip_suffix(" *"))
+            .filter(|name| name.starts_with("sla_struct_"))
+            .expect("generated local struct pointer");
+        assert!(
+            type_facts
                 .external_type_db
                 .structs
+                .contains_key(struct_name),
+            "expected live-context detached artifact to keep the local struct override, got merged_signature={:?}, slot_overrides={:?}, slot_fields={:?}, type_db={:?}",
+            type_facts.merged_signature,
+            type_facts.slot_type_overrides,
+            type_facts.slot_field_profiles,
+            type_facts.external_type_db.structs
         );
     }
 
@@ -11020,11 +11023,21 @@ mod integration_tests {
         )
         .expect("analysis artifact");
 
+        let type_facts = artifact.function_facts.type_facts();
+        let struct_pointer = type_facts
+            .slot_type_overrides
+            .get(&0)
+            .expect("slot 0 local struct override");
+        let struct_name = struct_pointer
+            .strip_prefix("struct ")
+            .and_then(|name| name.strip_suffix(" *"))
+            .filter(|name| name.starts_with("sla_struct_"))
+            .expect("generated local struct pointer");
         let struct_decl = artifact
             .writeback_plan
             .struct_decls
             .iter()
-            .find(|decl| decl.name == "sla_struct_420703e08f70f00e")
+            .find(|decl| decl.name == struct_name)
             .expect("expected local struct decl");
         let field_offsets = struct_decl
             .fields
@@ -11038,12 +11051,10 @@ mod integration_tests {
             struct_decl.fields
         );
 
-        let db_struct = artifact
-            .function_facts
-            .type_facts()
+        let db_struct = type_facts
             .external_type_db
             .structs
-            .get("sla_struct_420703e08f70f00e")
+            .get(struct_name)
             .expect("expected merged struct in type db");
         assert_eq!(
             db_struct.fields.keys().copied().collect::<Vec<_>>(),
