@@ -900,6 +900,29 @@ impl<'a> FoldingContext<'a> {
         matches!(&inst.payload, r2ssa::InstPayload::Phi { .. }) && inst.inputs.contains(&src_id)
     }
 
+    fn is_certified_loop_carrier_phi_copy(&self, dst: &SSAVar, src: &SSAVar) -> bool {
+        let Some(dst_id) = self.prepared_value_id_for_var(dst) else {
+            return false;
+        };
+        if self.certified_loop_carrier_name_for_value(dst_id).is_none() {
+            return false;
+        }
+        let Some(prepared) = self.prepared_ssa() else {
+            return false;
+        };
+        let Some(src_id) = prepared.graph().value_id_for_var(src) else {
+            return false;
+        };
+        prepared
+            .graph()
+            .def_inst(dst_id)
+            .and_then(|inst| prepared.graph().inst(inst))
+            .is_some_and(|inst| {
+                matches!(&inst.payload, r2ssa::InstPayload::Phi { .. })
+                    && inst.inputs.contains(&src_id)
+            })
+    }
+
     pub(crate) fn certified_residual_comment(&self, reason: impl Into<String>) -> CStmt {
         CStmt::Comment(format!("r2sleigh residual: {}", reason.into()))
     }
@@ -3389,6 +3412,14 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn should_inline(&self, var: &SSAVar) -> bool {
+        if self.requires_certified_rendering()
+            && self
+                .prepared_value_id_for_var(var)
+                .and_then(|value| self.certified_loop_carrier_name_for_value(value))
+                .is_some()
+        {
+            return false;
+        }
         let var_name = var.display_name();
         let use_count = self.use_counts_map().get(&var_name).copied().unwrap_or(0);
         if use_count == 0 || use_count > 3 {
@@ -10133,7 +10164,9 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn is_uninitialized_return_register_copy(&self, dst: &SSAVar, src: &SSAVar) -> bool {
-        self.is_return_register_var(dst) && self.is_uninitialized_return_register_var(src)
+        self.is_return_register_var(dst)
+            && self.is_uninitialized_return_register_var(src)
+            && !self.is_certified_loop_carrier_phi_copy(dst, src)
     }
 
     fn resolve_return_expr_from_defs(

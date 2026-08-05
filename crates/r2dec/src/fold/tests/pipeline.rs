@@ -20416,6 +20416,84 @@ mod tests {
     }
 
     #[test]
+    fn certified_loop_carrier_entry_copy_survives_folding() {
+        let arch = make_test_arch_aarch64_kernel_regs();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1008, 8),
+        });
+
+        let mut header = R2ILBlock::new(0x1008, 4);
+        header.push(R2ILOp::IntNotEqual {
+            dst: Varnode::unique(1, 1),
+            a: Varnode::register(0x4000, 8),
+            b: Varnode::constant(0, 8),
+        });
+        header.push(R2ILOp::CBranch {
+            cond: Varnode::unique(1, 1),
+            target: Varnode::constant(0x1010, 8),
+        });
+
+        let mut exit = R2ILBlock::new(0x100c, 4);
+        exit.push(R2ILOp::Return {
+            target: Varnode::register(0x4000, 8),
+        });
+
+        let mut latch = R2ILBlock::new(0x1010, 4);
+        latch.push(R2ILOp::IntSub {
+            dst: Varnode::register(0x4000, 8),
+            a: Varnode::register(0x4000, 8),
+            b: Varnode::constant(1, 8),
+        });
+        latch.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1008, 8),
+        });
+
+        let prepared = prepared_from_r2il_blocks(&[entry, header, exit, latch], &arch)
+            .with_name("certified_loop_carrier_entry");
+        let normalized = crate::normalize::materialize_phis(prepared.function());
+        let mut ctx = make_aarch64_ctx_with_prepared(&prepared);
+        mutate_function_facts(&mut ctx, |facts| {
+            facts.populate_certified_parameter_exprs(
+                &prepared,
+                &r2types::ParamSlotResolver::from_arch_name(Some("aarch64")),
+            );
+        });
+        install_test_x86_64_signature(&mut ctx);
+        install_certified_function_facts(&mut ctx);
+        let fold_blocks = normalized.blocks().cloned().collect::<Vec<_>>();
+        ctx.analyze_blocks(&fold_blocks);
+
+        let carrier_name = ctx
+            .inputs
+            .function_facts
+            .render_facts()
+            .loop_carriers()
+            .find_map(|entity| match entity {
+                r2types::CertifiedEntity::LoopCarrier { phi, .. } => {
+                    Some(crate::certified_loop_carrier_name(*phi))
+                }
+                _ => None,
+            })
+            .expect("observable loop carrier");
+        let entry_stmts = ctx.fold_block(normalized.get_block(0x1000).expect("entry"), 0x1000);
+
+        assert!(
+            entry_stmts.iter().any(|stmt| {
+                matches!(
+                    stmt,
+                    CStmt::Expr(CExpr::Binary {
+                        op: BinaryOp::Assign,
+                        left,
+                        ..
+                    }) if matches!(left.as_ref(), CExpr::Var(name) if name == &carrier_name)
+                )
+            }),
+            "certified entry copy must initialize {carrier_name}: {entry_stmts:?}"
+        );
+    }
+
+    #[test]
     fn prepared_predicate_candidate_survives_without_legacy_flag_info() {
         let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x1000, 4);
