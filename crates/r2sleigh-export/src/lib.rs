@@ -957,7 +957,7 @@ mod tests {
             ExportFormat::Text,
             normalize_text_output,
         );
-        assert_eq!(ssa_text, "0: Copy dst=RAX_1 src=[RAX_1]");
+        assert_eq!(ssa_text, "0: Copy dst=RAX_1 src=[RAX_0]");
 
         let defuse_json = assert_export_deterministic(
             X86_BYTES_MINIMAL,
@@ -967,7 +967,7 @@ mod tests {
         );
         assert_eq!(
             defuse_json,
-            "{\"inputs\":[],\"live\":[\"RAX_1\"],\"outputs\":[]}"
+            "{\"inputs\":[\"RAX_0\"],\"live\":[],\"outputs\":[\"RAX_1\"]}"
         );
 
         #[cfg(feature = "dec")]

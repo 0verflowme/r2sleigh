@@ -96,6 +96,8 @@ pub struct VariableRecovery {
     used_param_names: HashSet<String>,
     /// Used local variable names (to avoid duplicates).
     used_local_names: HashSet<String>,
+    /// Stable C identity for each recovered stack slot.
+    stack_names_by_offset: HashMap<i64, String>,
     /// Used general variable names (to avoid duplicates).
     used_var_names: HashSet<String>,
     /// Stack pointer register name.
@@ -151,6 +153,7 @@ impl VariableRecovery {
             name_counters: HashMap::new(),
             used_param_names: HashSet::new(),
             used_local_names: HashSet::new(),
+            stack_names_by_offset: HashMap::new(),
             used_var_names: HashSet::new(),
             sp_name: sp_name.to_string(),
             fp_name: fp_name.to_string(),
@@ -195,7 +198,7 @@ impl VariableRecovery {
         let lower = name.to_ascii_lowercase();
         if let Some(rest) = lower.strip_prefix("arg")
             && let Ok(idx) = rest.parse::<usize>()
-            && (1..=self.arg_regs.len()).contains(&idx)
+            && idx < self.arg_regs.len()
         {
             return true;
         }
@@ -506,6 +509,9 @@ impl VariableRecovery {
 
     /// Generate a name for a stack variable.
     fn gen_stack_var_name(&mut self, offset: i64) -> String {
+        if let Some(name) = self.stack_names_by_offset.get(&offset) {
+            return name.clone();
+        }
         let base_name = self
             .external_stack_name_for_offset(offset)
             .unwrap_or_else(|| {
@@ -519,6 +525,7 @@ impl VariableRecovery {
         // Ensure uniqueness
         if !self.used_local_names.contains(&base_name) {
             self.used_local_names.insert(base_name.clone());
+            self.stack_names_by_offset.insert(offset, base_name.clone());
             return base_name;
         }
 
@@ -528,6 +535,7 @@ impl VariableRecovery {
             let candidate = format!("{}_{}", base_name, counter);
             if !self.used_local_names.contains(&candidate) {
                 self.used_local_names.insert(candidate.clone());
+                self.stack_names_by_offset.insert(offset, candidate.clone());
                 return candidate;
             }
             counter += 1;
@@ -583,7 +591,7 @@ impl VariableRecovery {
         // Emit parameters in CC order, stopping at the first gap
         for (idx, cc_reg) in self.arg_regs.clone().into_iter().enumerate() {
             if let Some(var) = seen_v0.get(&cc_reg) {
-                let mut name = format!("arg{}", idx + 1);
+                let mut name = format!("arg{idx}");
                 let mut ty = self.type_from_size(var.size);
                 self.apply_external_param_override(idx, &mut name, &mut ty);
                 let name = self.make_unique_param_name(name);
@@ -605,18 +613,22 @@ impl VariableRecovery {
             }
         }
 
-        let Some(signature) = self.type_facts.render_authorized_signature() else {
-            return;
-        };
-        let Some(ext) = signature.params.get(index) else {
-            return;
-        };
-
-        if !is_generic_arg_name(&ext.name) {
-            *name = ext.name.clone();
-        }
-        if let Some(ext_ty) = &ext.ty {
+        if let Some(ext_ty) = self
+            .type_facts
+            .merged_signature
+            .as_ref()
+            .and_then(|signature| signature.params.get(index))
+            .and_then(|param| param.ty.as_ref())
+        {
             *ty = type_like_to_ctype(ext_ty);
+        }
+        if let Some(ext) = self
+            .type_facts
+            .render_authorized_signature()
+            .and_then(|signature| signature.params.get(index))
+            && !is_generic_arg_name(&ext.name)
+        {
+            *name = ext.name.clone();
         }
     }
 
@@ -626,31 +638,32 @@ impl VariableRecovery {
         // Use register name if it's a common parameter register
         let name = var.name.to_lowercase();
         let base_name = if name.contains("rdi") || name.contains("edi") {
-            "arg1".to_string()
+            "arg0".to_string()
         } else if name.contains("rsi") || name.contains("esi") {
-            "arg2".to_string()
+            "arg1".to_string()
         } else if name.contains("rdx") || name.contains("edx") {
-            "arg3".to_string()
+            "arg2".to_string()
         } else if name.contains("rcx") || name.contains("ecx") {
-            "arg4".to_string()
+            "arg3".to_string()
         } else if name.contains("r8") {
-            "arg5".to_string()
+            "arg4".to_string()
         } else if name.contains("r9") {
-            "arg6".to_string()
+            "arg5".to_string()
         // ARM calling convention
         } else if name.contains("r0") || name.contains("x0") {
-            "arg1".to_string()
+            "arg0".to_string()
         } else if name.contains("r1") || name.contains("x1") {
-            "arg2".to_string()
+            "arg1".to_string()
         } else if name.contains("r2") || name.contains("x2") {
-            "arg3".to_string()
+            "arg2".to_string()
         } else if name.contains("r3") || name.contains("x3") {
-            "arg4".to_string()
+            "arg3".to_string()
         } else {
             // Generic parameter name
             let count = self.name_counters.entry("arg".to_string()).or_insert(0);
+            let name = format!("arg{count}");
             *count += 1;
-            format!("arg{}", count)
+            name
         };
 
         // Ensure uniqueness
@@ -897,10 +910,10 @@ mod tests {
         let mut vr = VariableRecovery::new("rsp", "rbp", 64);
 
         let var_rdi = SSAVar::new("reg:rdi", 0, 64);
-        assert_eq!(vr.gen_param_name(&var_rdi), "arg1");
+        assert_eq!(vr.gen_param_name(&var_rdi), "arg0");
 
         let var_rsi = SSAVar::new("reg:rsi", 0, 64);
-        assert_eq!(vr.gen_param_name(&var_rsi), "arg2");
+        assert_eq!(vr.gen_param_name(&var_rsi), "arg1");
     }
 
     #[test]
@@ -931,6 +944,14 @@ mod tests {
 
         let name = vr.gen_stack_var_name(-8);
         assert_eq!(name, "arg_8");
+    }
+
+    #[test]
+    fn same_stack_slot_reuses_one_c_identity() {
+        let mut vr = VariableRecovery::new("rsp", "rbp", 64);
+
+        assert_eq!(vr.gen_stack_var_name(-8), "arg_8");
+        assert_eq!(vr.gen_stack_var_name(-8), "arg_8");
     }
 
     #[test]

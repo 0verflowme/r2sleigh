@@ -2477,8 +2477,6 @@ struct CertifiedOutputCounts {
 struct CertifiedEffectProofCounts {
     calls: usize,
     expressions: usize,
-    memory_reads: usize,
-    memory_writes: usize,
     returns: usize,
 }
 
@@ -2487,8 +2485,6 @@ fn certified_effect_proof_counts(
 ) -> CertifiedEffectProofCounts {
     let mut call_sites = BTreeSet::new();
     let mut expressions = 0usize;
-    let mut memory_reads = BTreeSet::new();
-    let mut memory_writes = BTreeSet::new();
     let mut returns = 0;
 
     for proof in effect_render_proofs {
@@ -2499,12 +2495,7 @@ fn certified_effect_proof_counts(
             EffectRenderProofKind::Expression => {
                 expressions += 1;
             }
-            EffectRenderProofKind::MemoryRead => {
-                memory_reads.insert((proof.block_addr, proof.op_idx));
-            }
-            EffectRenderProofKind::MemoryWrite => {
-                memory_writes.insert((proof.block_addr, proof.op_idx));
-            }
+            EffectRenderProofKind::MemoryRead | EffectRenderProofKind::MemoryWrite => {}
             EffectRenderProofKind::Return => {
                 returns += 1;
             }
@@ -2514,10 +2505,47 @@ fn certified_effect_proof_counts(
     CertifiedEffectProofCounts {
         calls: call_sites.len(),
         expressions,
-        memory_reads: memory_reads.len(),
-        memory_writes: memory_writes.len(),
         returns,
     }
+}
+
+fn certified_memory_effects_requiring_ast_access(
+    render_facts: &r2types::FunctionRenderFacts,
+    effect_render_proofs: &[EffectRenderProof],
+) -> usize {
+    let mut accesses = BTreeSet::new();
+    for proof in effect_render_proofs.iter().filter(|proof| {
+        matches!(
+            proof.kind,
+            EffectRenderProofKind::MemoryRead | EffectRenderProofKind::MemoryWrite
+        )
+    }) {
+        let is_write = proof.kind == EffectRenderProofKind::MemoryWrite;
+        let Some(memory) =
+            render_facts.memory_access_for_op(proof.block_addr, proof.op_idx, is_write)
+        else {
+            continue;
+        };
+        if proof.address != Some(memory.address) || proof.value != memory.value {
+            continue;
+        }
+        let has_structured_access = render_facts
+            .array_accesses_by_op
+            .get(&(proof.block_addr, proof.op_idx, is_write))
+            .into_iter()
+            .flatten()
+            .any(|fact| fact.access == memory.access)
+            || render_facts
+                .member_accesses_by_op
+                .get(&(proof.block_addr, proof.op_idx, is_write))
+                .into_iter()
+                .flatten()
+                .any(|fact| fact.access == memory.access);
+        if has_structured_access || !render_facts.stack_slot_offsets.contains_key(&memory.object) {
+            accesses.insert((proof.block_addr, proof.op_idx, is_write, memory.access));
+        }
+    }
+    accesses.len()
 }
 
 fn call_render_facts_from_effect_proofs(
@@ -3006,8 +3034,8 @@ fn certified_standard_output_residual_reason_with_effect_proofs(
                 counts.returns_with_value
             ));
         }
-        let raw_memory_proofs = proof_counts.memory_reads + proof_counts.memory_writes;
-        let memory_proofs = raw_memory_proofs;
+        let memory_proofs =
+            certified_memory_effects_requiring_ast_access(render_facts, effect_render_proofs);
         if counts.memory_like_accesses > memory_proofs {
             let first_missing = counts
                 .memory_nodes
@@ -3018,6 +3046,12 @@ fn certified_standard_output_residual_reason_with_effect_proofs(
                 "rendered {} memory-like access(es) with only {} rendered FunctionRenderFacts memory proof(s){}",
                 counts.memory_like_accesses, memory_proofs, first_missing
             ));
+        }
+        if memory_proofs > counts.memory_like_accesses {
+            reasons.push(format!(
+				"rendered FunctionRenderFacts proof recorded {} memory effect(s), but final AST contains only {} memory-like access(es); dropped memory effects must residualize instead of disappearing",
+				memory_proofs, counts.memory_like_accesses
+			));
         }
     } else if counts.calls > 0
         || counts.expression_roots > 0
@@ -3109,7 +3143,25 @@ fn certified_standard_output_residual_reason_with_effect_proofs(
     }
     raw_names.sort();
     raw_names.dedup();
-    if !raw_names.is_empty() && !reasons.is_empty() {
+    raw_names.retain(|name| {
+        !func
+            .params
+            .iter()
+            .any(|param| param.name.eq_ignore_ascii_case(name))
+            && !func.locals.iter().any(|local| {
+                local.name.eq_ignore_ascii_case(name)
+                    && local.stack_offset.is_some_and(|offset| {
+                        certified_stack_local_identity_is_exact(function_facts, &local.name, offset)
+                            && certified_stack_local_type_matches(
+                                function_facts.type_facts(),
+                                &local.name,
+                                offset,
+                                &local.ty,
+                            )
+                    })
+            })
+    });
+    if !raw_names.is_empty() {
         reasons.push(format!(
             "rendered uncertified raw artifact name(s): {}",
             raw_names.join(", ")
@@ -3434,6 +3486,16 @@ fn collect_certified_expr_contract(
     counts: &mut CertifiedOutputCounts,
     raw_names: &mut Vec<String>,
 ) {
+    collect_certified_expr_contract_inner(expr, id, counts, raw_names, false);
+}
+
+fn collect_certified_expr_contract_inner(
+    expr: &CExpr,
+    id: RenderNodeId,
+    counts: &mut CertifiedOutputCounts,
+    raw_names: &mut Vec<String>,
+    inside_memory_access: bool,
+) {
     match expr {
         CExpr::Var(name) => {
             if is_uncertified_render_var_name(name) {
@@ -3443,62 +3505,80 @@ fn collect_certified_expr_contract(
         CExpr::Call { func, args } => {
             counts.calls += 1;
             counts.call_nodes.push(id.clone());
-            collect_certified_expr_contract(func, id.child(0), counts, raw_names);
+            collect_certified_expr_contract_inner(func, id.child(0), counts, raw_names, false);
             for (index, arg) in args.iter().enumerate() {
                 let arg_id = id.child(index + 1);
                 if certified_expr_is_raw_address_call_arg(arg) {
                     counts.raw_address_call_args += 1;
                     counts.raw_address_call_arg_nodes.push(arg_id.clone());
                 }
-                collect_certified_expr_contract(arg, arg_id, counts, raw_names);
+                collect_certified_expr_contract_inner(arg, arg_id, counts, raw_names, false);
             }
         }
         CExpr::Subscript { base, index } => {
-            counts.memory_like_accesses += 1;
+            if !inside_memory_access {
+                counts.memory_like_accesses += 1;
+                counts.memory_nodes.push(id.clone());
+            }
             counts.array_accesses += 1;
-            counts.memory_nodes.push(id.clone());
             counts.array_nodes.push(id.clone());
-            collect_certified_expr_contract(base, id.child(0), counts, raw_names);
-            collect_certified_expr_contract(index, id.child(1), counts, raw_names);
+            collect_certified_expr_contract_inner(base, id.child(0), counts, raw_names, true);
+            collect_certified_expr_contract_inner(index, id.child(1), counts, raw_names, false);
         }
         CExpr::Member { base, member } | CExpr::PtrMember { base, member } => {
+            if !inside_memory_access {
+                counts.memory_like_accesses += 1;
+                counts.memory_nodes.push(id.clone());
+            }
             counts.field_accesses += 1;
             counts.field_members.push(member.clone());
             counts.field_nodes.push((id.clone(), member.clone()));
-            collect_certified_expr_contract(base, id.child(0), counts, raw_names);
+            collect_certified_expr_contract_inner(base, id.child(0), counts, raw_names, true);
         }
         CExpr::Deref(inner) => {
-            counts.memory_like_accesses += 1;
-            counts.memory_nodes.push(id.clone());
+            if !inside_memory_access {
+                counts.memory_like_accesses += 1;
+                counts.memory_nodes.push(id.clone());
+            }
             if certified_expr_is_raw_pointer_arithmetic(inner) {
                 counts.raw_pointer_arithmetic_derefs += 1;
                 counts.raw_pointer_arithmetic_nodes.push(id.clone());
             }
-            collect_certified_expr_contract(inner, id.child(0), counts, raw_names);
+            collect_certified_expr_contract_inner(inner, id.child(0), counts, raw_names, true);
         }
         CExpr::Unary { operand, .. }
         | CExpr::Cast { expr: operand, .. }
         | CExpr::Sizeof(operand)
         | CExpr::AddrOf(operand)
-        | CExpr::Paren(operand) => {
-            collect_certified_expr_contract(operand, id.child(0), counts, raw_names)
-        }
+        | CExpr::Paren(operand) => collect_certified_expr_contract_inner(
+            operand,
+            id.child(0),
+            counts,
+            raw_names,
+            inside_memory_access,
+        ),
         CExpr::Binary { left, right, .. } => {
-            collect_certified_expr_contract(left, id.child(0), counts, raw_names);
-            collect_certified_expr_contract(right, id.child(1), counts, raw_names);
+            collect_certified_expr_contract_inner(left, id.child(0), counts, raw_names, false);
+            collect_certified_expr_contract_inner(right, id.child(1), counts, raw_names, false);
         }
         CExpr::Ternary {
             cond,
             then_expr,
             else_expr,
         } => {
-            collect_certified_expr_contract(cond, id.child(0), counts, raw_names);
-            collect_certified_expr_contract(then_expr, id.child(1), counts, raw_names);
-            collect_certified_expr_contract(else_expr, id.child(2), counts, raw_names);
+            collect_certified_expr_contract_inner(cond, id.child(0), counts, raw_names, false);
+            collect_certified_expr_contract_inner(then_expr, id.child(1), counts, raw_names, false);
+            collect_certified_expr_contract_inner(else_expr, id.child(2), counts, raw_names, false);
         }
         CExpr::Comma(items) => {
             for (index, item) in items.iter().enumerate() {
-                collect_certified_expr_contract(item, id.child(index), counts, raw_names);
+                collect_certified_expr_contract_inner(
+                    item,
+                    id.child(index),
+                    counts,
+                    raw_names,
+                    false,
+                );
             }
         }
         CExpr::IntLit(_)
@@ -3546,8 +3626,12 @@ fn certified_expr_is_raw_pointer_arithmetic(expr: &CExpr) -> bool {
 fn is_uncertified_render_var_name(name: &str) -> bool {
     let stripped = name.trim_start_matches('&');
     let lower = stripped.to_ascii_lowercase();
+    let is_generated_arg = lower
+        .strip_prefix("arg")
+        .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()));
     crate::analysis::utils::is_temporary_name(stripped)
         || stripped == "__r2dec_unresolved_call_arg"
+        || is_generated_arg
         || lower.starts_with("tmp_")
         || lower.starts_with("unique_")
         || lower.starts_with("stack_")
@@ -3864,7 +3948,7 @@ fn merge_params_with_external_signature(
 
     (0..signature.params.len())
         .map(|idx| {
-            let fallback_name = format!("arg{}", idx + 1);
+            let fallback_name = format!("arg{idx}");
             let mut param = recovered_params.get(idx).cloned().unwrap_or(ast::CParam {
                 ty: CType::Int(32),
                 name: fallback_name,
@@ -3911,7 +3995,7 @@ fn params_from_authorized_signature(signature: &FunctionSignatureSpec) -> Vec<as
                 .map(type_like_to_ctype)
                 .expect("render-authorized signature parameter types checked before rendering"),
             name: if param.name.trim().is_empty() || is_generic_arg_name(&param.name) {
-                format!("arg{}", idx + 1)
+                format!("arg{idx}")
             } else {
                 param.name.clone()
             },
@@ -5039,7 +5123,7 @@ impl Decompiler {
             &recovered_param_infos,
             &self.context.type_facts().register_params,
             &self.config.arg_regs,
-            !certified_standard_mode,
+            true,
         );
         for (idx, (_ssa_var, _)) in recovered_param_infos.iter().enumerate() {
             let Some(param) = params.get(idx) else {
@@ -5499,6 +5583,7 @@ impl Decompiler {
             prune_dead_temp_assignments_in_function_body(&mut c_function, &fold_ctx);
             prune_unused_pure_locals(&mut c_function);
         }
+        normalize_redundant_return_carrier_casts(&mut c_function);
         if route_is_standard(semantic_route) {
             let residual_reason =
                 render_permission_residual_reason(self.context.effective_render_permission())
@@ -6030,6 +6115,86 @@ fn normalize_certified_appended_return_expr(
     CExpr::Cast { ty, expr: inner }
 }
 
+fn normalize_redundant_return_carrier_casts(func: &mut CFunction) {
+    fn visit(stmt: &mut CStmt, ret_type: &CType, declared_types: &HashMap<String, CType>) {
+        match stmt {
+            CStmt::Return(Some(expr)) => {
+                let CExpr::Cast { expr: inner, .. } = expr else {
+                    return;
+                };
+                let CExpr::Var(name) = inner.as_ref() else {
+                    return;
+                };
+                if declared_types
+                    .get(&name.to_ascii_lowercase())
+                    .is_some_and(|ty| ty == ret_type)
+                {
+                    *expr = *inner.clone();
+                }
+            }
+            CStmt::Block(stmts) => {
+                for stmt in stmts {
+                    visit(stmt, ret_type, declared_types);
+                }
+            }
+            CStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                visit(then_body, ret_type, declared_types);
+                if let Some(else_body) = else_body {
+                    visit(else_body, ret_type, declared_types);
+                }
+            }
+            CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
+                visit(body, ret_type, declared_types);
+            }
+            CStmt::For { init, body, .. } => {
+                if let Some(init) = init {
+                    visit(init, ret_type, declared_types);
+                }
+                visit(body, ret_type, declared_types);
+            }
+            CStmt::Switch { cases, default, .. } => {
+                for case in cases {
+                    for stmt in &mut case.body {
+                        visit(stmt, ret_type, declared_types);
+                    }
+                }
+                if let Some(default) = default {
+                    for stmt in default {
+                        visit(stmt, ret_type, declared_types);
+                    }
+                }
+            }
+            CStmt::Empty
+            | CStmt::Expr(_)
+            | CStmt::Decl { .. }
+            | CStmt::Return(None)
+            | CStmt::Break
+            | CStmt::Continue
+            | CStmt::Goto(_)
+            | CStmt::Label(_)
+            | CStmt::Comment(_) => {}
+        }
+    }
+
+    let declared_types = func
+        .params
+        .iter()
+        .map(|param| (param.name.to_ascii_lowercase(), param.ty.clone()))
+        .chain(
+            func.locals
+                .iter()
+                .map(|local| (local.name.to_ascii_lowercase(), local.ty.clone())),
+        )
+        .collect::<HashMap<_, _>>();
+    for stmt in &mut func.body {
+        visit(stmt, &func.ret_type, &declared_types);
+    }
+}
+
 fn prune_unused_pure_locals(func: &mut CFunction) {
     loop {
         let live_reads = collect_function_local_reads(func);
@@ -6330,7 +6495,7 @@ pub fn infer_local_struct_field_accesses(
     let mut arg_slot_map = std::collections::HashMap::new();
 
     for (idx, reg_name) in config.arg_regs.iter().enumerate() {
-        let arg_name = format!("arg{}", idx + 1);
+        let arg_name = format!("arg{idx}");
         for alias in register_alias_names(reg_name) {
             let lower = alias.to_ascii_lowercase();
             param_register_aliases.insert(lower.clone(), arg_name.clone());
@@ -8749,6 +8914,43 @@ mod tests {
     }
 
     #[test]
+    fn authorized_signature_canonicalizes_generic_names_by_abi_slot() {
+        let signature = signature_spec(
+            Some(CType::Int(32)),
+            vec![
+                ("arg1", Some(CType::Int(32))),
+                ("arg2", Some(CType::Int(32))),
+            ],
+        );
+        let params = params_from_authorized_signature(&signature);
+
+        assert_eq!(params[0].name, "arg0");
+        assert_eq!(params[1].name, "arg1");
+    }
+
+    #[test]
+    fn redundant_return_carrier_cast_yields_to_declared_c_type() {
+        let mut func = CFunction::new("carrier", CType::Int(32)).with_body(vec![CStmt::if_stmt(
+            CExpr::IntLit(1),
+            CStmt::Return(Some(CExpr::cast(CType::Int(64), CExpr::var("result")))),
+            None,
+        )]);
+        func.locals.push(ast::CLocal {
+            ty: CType::Int(32),
+            name: "result".to_string(),
+            stack_offset: Some(-4),
+        });
+
+        normalize_redundant_return_carrier_casts(&mut func);
+
+        assert!(matches!(
+            &func.body[0],
+            CStmt::If { then_body, .. }
+                if matches!(then_body.as_ref(), CStmt::Return(Some(CExpr::Var(name))) if name == "result")
+        ));
+    }
+
+    #[test]
     fn decompile_is_stable_with_external_param_names_and_local_order() {
         let arch = test_arch_for_decompile();
         let prepared = prepared_from_ops(
@@ -8874,12 +9076,12 @@ mod tests {
                 .is_some()),
             "prepared field certificate should populate member render fact"
         );
-        let func = CFunction::new("field_auto_ok", CType::u64()).with_body(vec![CStmt::Return(
-            Some(CExpr::PtrMember {
+        let func = CFunction::new("field_auto_ok", CType::u64())
+            .with_param(CType::ptr(CType::Struct("record".to_string())), "arg0")
+            .with_body(vec![CStmt::Return(Some(CExpr::PtrMember {
                 base: Box::new(CExpr::var("arg0")),
                 member: "hash".to_string(),
-            }),
-        )]);
+            }))]);
         let memory_cert = prepared
             .memory_certificate_for_op_site(0x1000, 1, false)
             .expect("memory certificate");
@@ -9071,7 +9273,7 @@ mod tests {
             ],
             &arch,
         );
-        let signature = signature_spec(Some(CType::Int(32)), vec![("arg1", Some(CType::Int(64)))]);
+        let signature = signature_spec(Some(CType::Int(32)), vec![("value", Some(CType::Int(64)))]);
         let input = prepared_standard_input_with_type_facts(
             prepared,
             FunctionTypeFacts {
@@ -9199,8 +9401,8 @@ mod tests {
         let signature = signature_spec(
             Some(CType::Int(64)),
             vec![
-                ("arg1", Some(CType::Int(64))),
-                ("arg2", Some(CType::Int(64))),
+                ("left", Some(CType::Int(64))),
+                ("right", Some(CType::Int(64))),
             ],
         );
         let type_facts = FunctionTypeFacts {
@@ -9227,10 +9429,10 @@ mod tests {
 
         assert_eq!(typed_fn.ret_type, CType::Int(64));
         assert_eq!(typed_fn.params.len(), 2);
-        assert_eq!(typed_fn.params[0].name, "arg1");
-        assert_eq!(typed_fn.params[1].name, "arg2");
+        assert_eq!(typed_fn.params[0].name, "left");
+        assert_eq!(typed_fn.params[1].name, "right");
         assert!(
-            typed_text.contains("int64_t stable_demo(int64_t arg1, int64_t arg2)"),
+            typed_text.contains("int64_t stable_demo(int64_t left, int64_t right)"),
             "render-authorized signature should own the certified header, got:\n{typed_text}"
         );
         assert!(
@@ -9255,7 +9457,7 @@ mod tests {
         );
         let signature = signature_spec(
             Some(CType::Int(64)),
-            vec![("arg1", Some(CType::Int(64))), ("arg2", None)],
+            vec![("left", Some(CType::Int(64))), ("right", None)],
         );
         let type_facts = FunctionTypeFacts {
             signature_certificate: external_signature_certificate(&signature),
@@ -9284,7 +9486,7 @@ mod tests {
             "{typed_text}"
         );
         assert!(
-            !typed_text.contains("stable_demo(int64_t arg1, unknown_t arg2)"),
+            !typed_text.contains("stable_demo(int64_t left, unknown_t right)"),
             "certified Standard must residualize incomplete render-authorized signatures:\n{typed_text}"
         );
     }
@@ -9825,6 +10027,7 @@ mod tests {
         assert!(is_uncertified_render_var_name("EAX"));
         assert!(is_uncertified_render_var_name("RAX"));
         assert!(is_uncertified_render_var_name("x0"));
+        assert!(is_uncertified_render_var_name("arg0"));
         assert!(is_uncertified_render_var_name("value_0"));
         assert!(is_uncertified_render_var_name("value_3e480"));
         assert!(!is_uncertified_render_var_name("sha_state"));
@@ -9844,6 +10047,16 @@ mod tests {
             .expect("addressed raw temp should break certified rendering");
         assert!(
             reason.contains("rendered uncertified raw artifact name"),
+            "{reason}"
+        );
+
+        let func = CFunction::new("mismatched_arg", CType::i64())
+            .with_param(CType::i64(), "arg1")
+            .with_body(vec![CStmt::Return(Some(CExpr::var("arg0")))]);
+        let reason = certified_standard_output_residual_reason(&prepared, &function_facts, &func)
+            .expect("an undeclared generated argument should break certified rendering");
+        assert!(
+            reason.contains("rendered uncertified raw artifact name(s): arg0"),
             "{reason}"
         );
     }
@@ -10794,6 +11007,51 @@ mod tests {
     }
 
     #[test]
+    fn certified_standard_output_refuses_dropped_memory_effect() {
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_from_ops(
+            vec![R2ILOp::Load {
+                dst: Varnode::register(0x00, 8),
+                space: SpaceId::Ram,
+                addr: Varnode::register(0x10, 8),
+            }],
+            &arch,
+        );
+        let function_facts = test_function_facts_with_prepared_render(&prepared);
+        let cert = prepared
+            .memory_certificate_for_op_site(0x1000, 0, false)
+            .expect("memory certificate");
+        let effect_proofs = [EffectRenderProof {
+            kind: EffectRenderProofKind::MemoryRead,
+            block_addr: 0x1000,
+            op_idx: 0,
+            call_disposition: None,
+            target: None,
+            address: Some(cert.address),
+            value: cert.value,
+            values: Vec::new(),
+            materialized_phi_copy: false,
+        }];
+        let func = CFunction::new("dropped_memory", CType::Void)
+            .with_body(vec![CStmt::Comment("no memory effect".to_string())]);
+
+        let reason = certified_standard_output_residual_reason_with_effect_proofs(
+            &prepared,
+            &function_facts,
+            &func,
+            Some(&effect_proofs),
+        )
+        .expect("dropped memory effect must break certified rendering");
+
+        assert!(
+            reason.contains(
+                "recorded 1 memory effect(s), but final AST contains only 0 memory-like access(es)"
+            ),
+            "{reason}"
+        );
+    }
+
+    #[test]
     fn certified_standard_output_refuses_raw_pointer_arithmetic_deref() {
         let arch = test_arch_for_decompile();
         let prepared = prepared_from_ops(
@@ -11044,12 +11302,12 @@ mod tests {
                 access_width: 8,
             },
         );
-        let func = CFunction::new("field_ok", CType::i64()).with_body(vec![CStmt::Return(Some(
-            CExpr::Member {
+        let func = CFunction::new("field_ok", CType::i64())
+            .with_param(CType::Struct("record".to_string()), "arg0")
+            .with_body(vec![CStmt::Return(Some(CExpr::Member {
                 base: Box::new(CExpr::var("arg0")),
                 member: "len".to_string(),
-            },
-        ))]);
+            }))]);
         let memory_cert = prepared
             .memory_certificate_for_op_site(0x1000, 0, false)
             .expect("memory certificate");

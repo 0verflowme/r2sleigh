@@ -197,18 +197,6 @@ fn sort_merge_signature(current_param_count: usize) -> FunctionSignatureSpec {
     ))
 }
 
-fn numeric_transform_signature(current_param_count: usize) -> FunctionSignatureSpec {
-    param_only_sig(extend_params_to_count(
-        vec![
-            p("result", void_pointer_type()),
-            p("input", typedef_type("intmax_t")),
-        ],
-        current_param_count,
-        "numeric_arg",
-        typedef_type("intmax_t"),
-    ))
-}
-
 fn memory_transfer_signature(current_param_count: usize) -> FunctionSignatureSpec {
     param_only_sig(extend_params_to_count(
         vec![
@@ -504,9 +492,6 @@ pub fn signature_hint_for_summary_kinds(
     }
     if worker_kinds.contains(&r2sym::NativeWorkerSummaryKind::SortMerge) {
         return Some(sort_merge_signature(current_param_count));
-    }
-    if worker_kinds.contains(&r2sym::NativeWorkerSummaryKind::NumericTransform) {
-        return Some(numeric_transform_signature(current_param_count));
     }
     if worker_kinds.contains(&r2sym::NativeWorkerSummaryKind::MemoryTransfer) {
         return Some(memory_transfer_signature(current_param_count));
@@ -4492,6 +4477,12 @@ mod tests {
         assert_eq!(
             signature.params[1].ty,
             Some(typedef_pointer_type("arguments"))
+        );
+
+        let numeric = BTreeSet::from([r2sym::NativeWorkerSummaryKind::NumericTransform]);
+        assert!(
+            signature_hint_for_summary_kinds(&numeric, 2).is_none(),
+            "a generic numeric summary does not prove concrete parameter roles"
         );
     }
 

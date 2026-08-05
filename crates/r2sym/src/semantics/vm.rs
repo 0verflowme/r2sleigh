@@ -1530,18 +1530,97 @@ fn enclosing_loop_header(func: &SsaArtifact, dispatch_header: u64) -> Option<(u6
     None
 }
 
+fn skip_dispatch_passthrough_blocks(func: &SsaArtifact, mut addr: u64) -> u64 {
+    let mut visited = BTreeSet::new();
+    for _ in 0..3 {
+        if !visited.insert(addr) {
+            break;
+        }
+        let Some(block) = func.cfg().get_block(addr) else {
+            break;
+        };
+        if block.ops.len() > 1 {
+            break;
+        }
+        let next = match block.terminator {
+            BlockTerminator::Branch { target } | BlockTerminator::Fallthrough { next: target } => {
+                target
+            }
+            _ => break,
+        };
+        addr = next;
+    }
+    addr
+}
+
+fn conditional_dispatch_ladder(
+    func: &SsaArtifact,
+    dispatch_header: u64,
+) -> Option<(Vec<u64>, Option<u64>)> {
+    let (loop_header, _) = enclosing_loop_header(func, dispatch_header)?;
+    let mut current = dispatch_header;
+    let mut visited = BTreeSet::new();
+    let mut handlers = Vec::new();
+
+    for _ in 0..32 {
+        if !visited.insert(current) {
+            return None;
+        }
+        let block = func.cfg().get_block(current)?;
+        let BlockTerminator::ConditionalBranch {
+            true_target,
+            false_target,
+        } = block.terminator
+        else {
+            return None;
+        };
+        handlers.push(true_target);
+
+        let continuation = skip_dispatch_passthrough_blocks(func, false_target);
+        if func.cfg().get_block(continuation).is_some_and(|candidate| {
+            matches!(
+                candidate.terminator,
+                BlockTerminator::ConditionalBranch { .. }
+            )
+        }) {
+            current = continuation;
+            continue;
+        }
+
+        let redispatching_handlers = handlers
+            .iter()
+            .filter(|handler| {
+                can_reach_within(func, **handler, loop_header, 8, &mut BTreeSet::new())
+            })
+            .count();
+        if handlers.len() < 4 || redispatching_handlers < 3 {
+            return None;
+        }
+        handlers.push(false_target);
+        handlers.sort_unstable();
+        handlers.dedup();
+        return Some((handlers, Some(false_target)));
+    }
+
+    None
+}
+
+fn interpreter_dispatch_targets(
+    func: &SsaArtifact,
+    interpreter: &InterpreterDispatchSummary,
+) -> (Vec<u64>, Option<u64>) {
+    if let Some((targets, default_target)) =
+        conditional_dispatch_ladder(func, interpreter.dispatch_header)
+    {
+        return (targets, default_target);
+    }
+    let (_, default_target) = case_values_by_target(func, interpreter.dispatch_header);
+    (func.successors(interpreter.dispatch_header), default_target)
+}
+
 pub(crate) fn classify_interpreter_like(func: &SsaArtifact) -> Option<InterpreterDispatchSummary> {
     let summary = func.function().cfg_risk_summary();
     if summary.block_count < 6 || summary.loop_count == 0 {
-        return None;
-    }
-
-    let has_indirect = func
-        .cfg()
-        .block_addrs()
-        .filter_map(|addr| func.cfg().get_block(addr))
-        .any(|block| matches!(block.terminator, BlockTerminator::IndirectBranch));
-    if summary.switch_block_count == 0 && !has_indirect {
         return None;
     }
 
@@ -1563,12 +1642,22 @@ pub(crate) fn classify_interpreter_like(func: &SsaArtifact) -> Option<Interprete
             .function()
             .infer_switch_selector_var(block_addr)
             .map(|var| var.name);
-        let dispatch_targets = func.successors(block_addr);
-        let kind = match block.terminator {
-            BlockTerminator::Switch { .. } => InterpreterKind::SwitchDispatch,
-            BlockTerminator::IndirectBranch => InterpreterKind::IndirectDispatch,
-            _ if dispatch_targets.len() >= 4 && selector.is_some() => {
-                InterpreterKind::SwitchDispatch
+        let direct_dispatch_targets = func.successors(block_addr);
+        let ladder = conditional_dispatch_ladder(func, block_addr);
+        let is_ladder = ladder.is_some();
+        let (kind, dispatch_targets) = match block.terminator {
+            BlockTerminator::Switch { .. } => {
+                (InterpreterKind::SwitchDispatch, direct_dispatch_targets)
+            }
+            BlockTerminator::IndirectBranch => {
+                (InterpreterKind::IndirectDispatch, direct_dispatch_targets)
+            }
+            _ if ladder.is_some() => (
+                InterpreterKind::SwitchDispatch,
+                ladder.map(|(targets, _)| targets).unwrap_or_default(),
+            ),
+            _ if direct_dispatch_targets.len() >= 4 && selector.is_some() => {
+                (InterpreterKind::SwitchDispatch, direct_dispatch_targets)
             }
             _ => continue,
         };
@@ -1588,6 +1677,9 @@ pub(crate) fn classify_interpreter_like(func: &SsaArtifact) -> Option<Interprete
             score += 2;
         }
         if matches!(kind, InterpreterKind::SwitchDispatch) {
+            score += 2;
+        }
+        if is_ladder {
             score += 2;
         }
         if dispatch_fanout >= 4 {
@@ -1611,7 +1703,12 @@ pub(crate) fn classify_interpreter_like(func: &SsaArtifact) -> Option<Interprete
             InterpreterKind::SwitchDispatch => 6,
             InterpreterKind::IndirectDispatch => 5,
         };
-        if score < threshold || score < best_score {
+        let is_better_tie = best.as_ref().is_none_or(|current| {
+            dispatch_fanout > current.dispatch_targets
+                || (dispatch_fanout == current.dispatch_targets
+                    && block_addr < current.dispatch_header)
+        });
+        if score < threshold || score < best_score || (score == best_score && !is_better_tie) {
             continue;
         }
 
@@ -1668,7 +1765,7 @@ pub(crate) fn build_vm_step_summary(
     func: &SsaArtifact,
     interpreter: &InterpreterDispatchSummary,
 ) -> Option<VmStepSummary> {
-    let dispatch_targets = func.successors(interpreter.dispatch_header);
+    let (dispatch_targets, ladder_default_target) = interpreter_dispatch_targets(func, interpreter);
     if dispatch_targets.len() < 2 {
         return None;
     }
@@ -1686,8 +1783,9 @@ pub(crate) fn build_vm_step_summary(
     }
 
     let dispatch_target_set = dispatch_targets.iter().copied().collect::<BTreeSet<_>>();
-    let (case_values_by_target, default_target) =
+    let (case_values_by_target, switch_default_target) =
         case_values_by_target(func, interpreter.dispatch_header);
+    let default_target = switch_default_target.or(ladder_default_target);
     let mut handler_regions = BTreeMap::new();
     let mut handler_state_inputs = BTreeMap::new();
     let mut handler_state_outputs = BTreeMap::new();
@@ -1845,11 +1943,13 @@ mod tests {
     use super::*;
 
     const RAX: u64 = 0;
+    const RDI: u64 = 8;
 
     fn test_arch() -> ArchSpec {
         let mut arch = ArchSpec::new("x86-64");
         arch.addr_size = 8;
         arch.add_register(RegisterDef::new("RAX", RAX, 8));
+        arch.add_register(RegisterDef::new("RDI", RDI, 8));
         arch
     }
 
@@ -1877,6 +1977,81 @@ mod tests {
             target: make_const(target, 8),
         });
         block
+    }
+
+    fn conditional_dispatch_block(addr: u64, case_value: u64, handler: u64) -> R2ILBlock {
+        let mut block = R2ILBlock::new(addr, 4);
+        let cond = Varnode::unique(addr, 1);
+        block.push(R2ILOp::IntEqual {
+            dst: cond.clone(),
+            a: make_reg(RAX, 8),
+            b: make_const(case_value, 8),
+        });
+        block.push(R2ILOp::CBranch {
+            target: make_const(handler, 8),
+            cond,
+        });
+        block
+    }
+
+    fn redispatch_handler(addr: u64, value: u64, loop_header: u64) -> R2ILBlock {
+        let mut block = R2ILBlock::new(addr, 4);
+        block.push(R2ILOp::IntAdd {
+            dst: make_reg(RAX, 8),
+            a: make_reg(RDI, 8),
+            b: make_const(value, 8),
+        });
+        block.push(R2ILOp::Branch {
+            target: make_const(loop_header, 8),
+        });
+        block
+    }
+
+    #[test]
+    fn conditional_dispatch_ladder_is_a_vm_dispatch() {
+        let loop_header = 0x1000;
+        let dispatch_header = 0x1010;
+        let mut blocks = vec![branch_block(loop_header, dispatch_header)];
+        for index in 0..5u64 {
+            blocks.push(conditional_dispatch_block(
+                dispatch_header + index * 4,
+                index,
+                0x2000 + index * 4,
+            ));
+            blocks.push(redispatch_handler(
+                0x2000 + index * 4,
+                index + 1,
+                loop_header,
+            ));
+        }
+        blocks.push(redispatch_handler(dispatch_header + 5 * 4, 6, loop_header));
+        let func = SsaArtifact::for_symbolic(&blocks, Some(&test_arch())).expect("ssa");
+
+        let enclosing = enclosing_loop_header(&func, dispatch_header);
+        assert!(
+            enclosing
+                .as_ref()
+                .is_some_and(|(_, latches)| !latches.is_empty()),
+            "enclosing={enclosing:?} cfg={:?}",
+            func.function().cfg_risk_summary()
+        );
+        assert!(
+            conditional_dispatch_ladder(&func, dispatch_header).is_some(),
+            "cfg={:?}",
+            func.function().cfg_risk_summary()
+        );
+        let interpreter = classify_interpreter_like(&func).expect("dispatch ladder");
+        assert_eq!(interpreter.kind, InterpreterKind::SwitchDispatch);
+        assert_eq!(interpreter.dispatch_header, dispatch_header);
+        assert_eq!(interpreter.dispatch_targets, 6);
+
+        let targets = interpreter_dispatch_targets(&func, &interpreter);
+        assert_eq!(targets.0.len(), 6, "{targets:?}");
+
+        let vm = build_vm_step_summary(&func, &interpreter).expect("vm step summary");
+        assert!(vm.has_strong_vm_evidence(), "{vm:?}");
+        assert_eq!(vm.transfers.len(), 6);
+        assert!(vm.truncated_handlers.is_empty());
     }
 
     #[test]

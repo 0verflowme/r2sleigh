@@ -80,13 +80,13 @@ pub fn recover_vars_from_ssa(
     ssa_blocks: &[r2ssa::SSABlock],
     arch: Option<&r2il::ArchSpec>,
     metadata_reg_type_hints: &HashMap<String, r2types::TypeHint>,
-    semantic_typing_enabled: bool,
+    semantic_metadata_enabled: bool,
 ) -> Vec<r2types::RecoveredVariable> {
     r2types::recover_vars_from_ssa(
         ssa_blocks,
         arch.map(|spec| spec.name.as_str()),
         metadata_reg_type_hints,
-        semantic_typing_enabled,
+        semantic_metadata_enabled,
     )
 }
 
@@ -94,7 +94,7 @@ pub struct EngineRecoverVarsRequest<'a> {
     pub ssa_blocks: &'a [r2ssa::SSABlock],
     pub r2il_blocks: &'a [R2ILBlock],
     pub arch: Option<&'a r2il::ArchSpec>,
-    pub semantic_typing_enabled: bool,
+    pub semantic_metadata_enabled: bool,
     pub metadata_reg_type_hints: HashMap<String, r2types::TypeHint>,
 }
 
@@ -105,7 +105,7 @@ pub fn recover_vars_from_ssa_with_register_names<F>(
 where
     F: FnMut(&r2il::Varnode) -> Option<String>,
 {
-    if request.semantic_typing_enabled {
+    if request.semantic_metadata_enabled {
         for (name, hint) in
             collect_register_type_hints_with_names(request.r2il_blocks, register_name)
         {
@@ -117,7 +117,7 @@ where
         request.ssa_blocks,
         request.arch,
         &request.metadata_reg_type_hints,
-        request.semantic_typing_enabled,
+        request.semantic_metadata_enabled,
     )
 }
 
@@ -1653,9 +1653,7 @@ pub fn type_writeback_field_access_certificate_names(
         .map(|cert| {
             format!(
                 "arg{}+0x{:x}:{}",
-                cert.slot + 1,
-                cert.field_offset,
-                cert.field_name
+                cert.slot, cert.field_offset, cert.field_name
             )
         })
         .collect::<Vec<_>>();
@@ -6110,17 +6108,13 @@ fn infer_signature_from_engine_analysis(
     analysis: &EngineAnalysis,
 ) -> Option<r2types::InferredSignature> {
     let pattern_ssa_blocks = analysis.pattern_ssa_func.local_ssa_blocks();
-    let pointer_arg_slots = if semantic_metadata_enabled {
-        let recovered_vars = r2types::recover_vars_from_ssa(
-            &pattern_ssa_blocks,
-            arch.map(|spec| spec.name.as_str()),
-            reg_type_hints,
-            true,
-        );
-        r2types::collect_pointer_arg_slots(&recovered_vars)
-    } else {
-        std::collections::BTreeSet::new()
-    };
+    let recovered_vars = r2types::recover_vars_from_ssa(
+        &pattern_ssa_blocks,
+        arch.map(|spec| spec.name.as_str()),
+        reg_type_hints,
+        semantic_metadata_enabled,
+    );
+    let pointer_arg_slots = r2types::collect_pointer_arg_slots(&recovered_vars);
     let recovered_params = r2types::recover_signature_params_from_ssa(
         &pattern_ssa_blocks,
         arch.map(|spec| spec.name.as_str()),
@@ -7122,6 +7116,7 @@ fn summary_preprobe_type_payload_prefers_semantic_fallback(
     artifact: &r2sym::SemanticArtifact,
 ) -> bool {
     matches!(artifact.stage, r2sym::RefinementStage::Compiled)
+        && artifact.diagnostics.skipped_large_cfg
         && matches!(
             artifact.granularity,
             r2sym::ArtifactGranularity::SummaryOnly
@@ -7881,7 +7876,7 @@ mod tests {
         assert_eq!(payload.external_struct_names, vec!["Foo".to_string()]);
         assert_eq!(
             payload.field_access_certificate_names,
-            vec!["arg2+0x4:len".to_string()]
+            vec!["arg1+0x4:len".to_string()]
         );
         assert!(
             payload
@@ -8572,7 +8567,7 @@ mod tests {
         );
         assert_eq!(
             type_writeback_field_access_certificate_names(&function_facts),
-            vec!["arg2+0x10:len".to_string()]
+            vec!["arg1+0x10:len".to_string()]
         );
     }
 
@@ -9077,7 +9072,7 @@ mod tests {
                 ssa_blocks: std::slice::from_ref(&ssa_block),
                 r2il_blocks: std::slice::from_ref(&r2il_block),
                 arch: Some(&arch),
-                semantic_typing_enabled: true,
+                semantic_metadata_enabled: true,
                 metadata_reg_type_hints: HashMap::new(),
             },
             |vn| (vn.offset == 0).then(|| "RDI".to_string()),
@@ -11963,6 +11958,21 @@ mod tests {
         });
 
         assert!(response.is_none());
+    }
+
+    #[test]
+    fn small_summary_only_worker_does_not_bypass_full_type_analysis() {
+        let mut artifact = native_linear_predicated_count_artifact();
+        artifact.granularity = r2sym::ArtifactGranularity::SummaryOnly;
+
+        assert!(!summary_preprobe_type_payload_prefers_semantic_fallback(
+            &artifact
+        ));
+
+        artifact.diagnostics.skipped_large_cfg = true;
+        assert!(summary_preprobe_type_payload_prefers_semantic_fallback(
+            &artifact
+        ));
     }
 
     #[test]

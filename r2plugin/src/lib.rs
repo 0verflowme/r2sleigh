@@ -11026,6 +11026,162 @@ mod integration_tests {
 
     #[test]
     #[cfg(feature = "x86")]
+    fn lifted_x86_sum_array_recovers_pointer_and_index_parameters() {
+        fn decode_hex(bytes: &str) -> Vec<u8> {
+            let bytes = bytes.as_bytes();
+            bytes
+                .chunks_exact(2)
+                .map(|pair| {
+                    let hi = (pair[0] as char).to_digit(16).expect("valid hex") as u8;
+                    let lo = (pair[1] as char).to_digit(16).expect("valid hex") as u8;
+                    (hi << 4) | lo
+                })
+                .collect()
+        }
+
+        let (arch, disasm) = create_disassembler_for_arch("x86-64").expect("disassembler");
+        let fixtures = [
+            (
+                0x100000610,
+                "554889e548897df88975f4c745f000000000c745ec00000000",
+            ),
+            (0x100000629, "8b45ec3b45f47d1c"),
+            (
+                0x100000631,
+                "488b45f848634dec8b04880345f08945f08b45ec83c0018945ecebdc",
+            ),
+            (0x10000064d, "8b45f05dc3"),
+        ];
+        let blocks = fixtures
+            .into_iter()
+            .map(|(addr, hex)| {
+                let bytes = decode_hex(hex);
+                disasm
+                    .lift_block(&bytes, addr, bytes.len())
+                    .expect("lifted sum_array block")
+            })
+            .collect::<Vec<_>>();
+        let prepared = r2ssa::SsaArtifact::for_patterns(&blocks, Some(&arch))
+            .expect("pattern SSA for sum_array");
+        let pattern_blocks = prepared.local_ssa_blocks();
+        let params = r2types::recover_signature_params_from_ssa(
+            &pattern_blocks,
+            Some("x86-64"),
+            &std::collections::HashMap::new(),
+            false,
+            64,
+        );
+        let arg0 = params
+            .iter()
+            .find(|param| param.name == "arg0")
+            .expect("rdi array argument");
+        let arg1 = params
+            .iter()
+            .find(|param| param.name == "arg1")
+            .expect("rsi length argument");
+
+        assert!(
+            matches!(arg0.initial_ty, r2types::CTypeLike::Pointer(_)),
+            "array base must be pointer-typed, got params={params:?}, blocks={pattern_blocks:?}"
+        );
+        assert_eq!(
+            r2types::render_signature_type(&arg1.initial_ty, 64),
+            "int32_t"
+        );
+
+        let analysis = r2engine::EngineAnalysis {
+            ssa_func: prepared.clone(),
+            pattern_ssa_func: prepared,
+        };
+        let signature =
+            r2engine::infer_signature_from_analysis(r2engine::EngineSignatureInferenceRequest {
+                function_name: "sum_array",
+                arch: Some(&arch),
+                ptr_bits: 64,
+                semantic_metadata_enabled: false,
+                reg_type_hints: &std::collections::HashMap::new(),
+                analysis: &analysis,
+            })
+            .expect("fast-mode signature");
+        assert_eq!(signature.params[0].param_type, "int32_t*");
+        assert_eq!(signature.params[1].param_type, "int32_t");
+        assert_eq!(signature.ret_type, "int32_t");
+
+        let host_signature = r2types::FunctionSignatureSpec {
+            ret_type: Some(r2types::CTypeLike::Int {
+                bits: 64,
+                signedness: r2types::Signedness::Signed,
+            }),
+            params: vec![r2types::FunctionParamSpec {
+                name: "arg1".to_string(),
+                ty: Some(r2types::CTypeLike::Int {
+                    bits: 64,
+                    signedness: r2types::Signedness::Signed,
+                }),
+            }],
+        };
+        let parsed_context = r2types::ParsedExternalContext {
+            current_signature: Some(host_signature.clone()),
+            merged_signature: Some(host_signature),
+            register_params: vec![r2types::ExternalRegisterParamSpec {
+                name: "arg1".to_string(),
+                ty: Some(r2types::CTypeLike::Int {
+                    bits: 64,
+                    signedness: r2types::Signedness::Signed,
+                }),
+                reg: "RDI".to_string(),
+            }],
+            ..r2types::ParsedExternalContext::default()
+        };
+        let response = r2engine::EngineSession::new(8).decompile_function_from_input(
+            r2engine::EngineFunctionDecompileRequestInput::single_function(
+                r2engine::EngineFunctionInput {
+                    function_name: "sym._sum_array".to_string(),
+                    function_addr: 0x100000610,
+                    blocks,
+                    arch: Some(arch.clone()),
+                    semantic_metadata_enabled: false,
+                },
+                Some(64),
+                parsed_context,
+                0,
+            ),
+        );
+        let len_home_objects = response
+            .function_facts
+            .render_facts()
+            .stack_slot_offsets
+            .iter()
+            .filter_map(|(object, offset)| (*offset == -12).then_some(*object))
+            .collect::<Vec<_>>();
+        let [len_home_object] = len_home_objects.as_slice() else {
+            panic!("expected one -12 parameter home, got {len_home_objects:?}");
+        };
+        let len_home = response
+            .function_facts
+            .authorized_stack_param_owner_render(*len_home_object, -12)
+            .unwrap_or_else(|| {
+                panic!(
+                    "second parameter home should authorize its signature owner; type_facts={:?}",
+                    response.function_facts.type_facts()
+                )
+            });
+        assert_eq!(len_home.name, "arg1");
+        assert!(
+            !response.output.contains("r2dec residual:")
+                && response.output.contains("int32_t var_10h = 0;")
+                && response.output.contains("for (int32_t var_14h = 0;")
+                && response.output.contains("var_14h < arg1")
+                && response.output.contains("arg0[var_14h]")
+                && response.output.contains("return var_10h;"),
+            "typed spilled array access should render from real lifted bytes; output={} render_facts={:?}",
+            response.output,
+            response.function_facts.render_facts()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
     fn lifted_x86_struct_array_analysis_artifact_surfaces_local_struct_override() {
         fn decode_hex(bytes: &str) -> Vec<u8> {
             let bytes = bytes.as_bytes();

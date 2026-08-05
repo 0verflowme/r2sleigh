@@ -631,9 +631,10 @@ fn populate_stack_aliases(
             inputs.visible_bindings,
             inputs.param_register_aliases,
         );
+        let offset = prepared_stack_slot_offset(slot);
         let entry = view
             .stack_aliases_by_offset
-            .entry(slot.offset)
+            .entry(offset)
             .or_insert_with(|| StackAliasView {
                 visible_name: name.to_string(),
                 arg_alias: binding_arg_alias.clone(),
@@ -651,13 +652,12 @@ fn populate_stack_aliases(
     }
 
     for (slot_key, slot) in inputs.stack_slots {
+        let offset = prepared_stack_slot_offset(slot_key);
         let name = prepared_stack_visible_name(slot);
-        let visible_name = name
-            .clone()
-            .unwrap_or_else(|| synthetic_stack_name(slot_key.offset));
+        let visible_name = name.clone().unwrap_or_else(|| synthetic_stack_name(offset));
         let entry = view
             .stack_aliases_by_offset
-            .entry(slot_key.offset)
+            .entry(offset)
             .or_insert_with(|| StackAliasView {
                 visible_name: visible_name.clone(),
                 arg_alias: prepared_stack_arg_alias(slot),
@@ -674,7 +674,7 @@ fn populate_stack_aliases(
 
 fn prepared_stack_slot_offset(slot: &StackSlotKey) -> i64 {
     match slot.base {
-        ExternalStackBase::FramePointer => -slot.offset,
+        ExternalStackBase::FramePointer => slot.offset.saturating_abs().saturating_neg(),
         _ => slot.offset,
     }
 }
@@ -764,26 +764,29 @@ fn prepared_binding_arg_alias(
     param_register_aliases: &HashMap<String, String>,
 ) -> Option<String> {
     match binding.kind {
-        VisibleBindingKind::Param => {
-            let name = binding.name.trim();
-            (!name.is_empty()).then(|| name.to_string())
-        }
-        VisibleBindingKind::HiddenHome => binding
-            .param_index
-            .and_then(|idx| {
-                visible_bindings.iter().find_map(|candidate| {
-                    (candidate.kind == VisibleBindingKind::Param
-                        && candidate.param_index == Some(idx)
-                        && !candidate.name.trim().is_empty())
-                    .then(|| candidate.name.trim().to_string())
-                })
-            })
+        VisibleBindingKind::Param => binding
+            .source_reg
+            .as_deref()
+            .and_then(|reg| param_register_aliases.get(&reg.to_ascii_lowercase()))
+            .cloned()
             .or_else(|| {
-                binding
-                    .source_reg
-                    .as_deref()
-                    .and_then(|reg| param_register_aliases.get(&reg.to_ascii_lowercase()))
-                    .cloned()
+                let name = binding.name.trim();
+                (!name.is_empty()).then(|| name.to_string())
+            }),
+        VisibleBindingKind::HiddenHome => binding
+            .source_reg
+            .as_deref()
+            .and_then(|reg| param_register_aliases.get(&reg.to_ascii_lowercase()))
+            .cloned()
+            .or_else(|| {
+                binding.param_index.and_then(|idx| {
+                    visible_bindings.iter().find_map(|candidate| {
+                        (candidate.kind == VisibleBindingKind::Param
+                            && candidate.param_index == Some(idx)
+                            && !candidate.name.trim().is_empty())
+                        .then(|| candidate.name.trim().to_string())
+                    })
+                })
             }),
         _ => None,
     }
@@ -3725,6 +3728,35 @@ mod tests {
     use super::*;
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
     use r2ssa::InterprocSummarySet;
+
+    #[test]
+    fn canonical_param_home_uses_rendered_header_alias_and_runtime_offset() {
+        let slot = StackSlotKey {
+            base: ExternalStackBase::FramePointer,
+            offset: 8,
+        };
+        let binding = VisibleBinding {
+            name: "arg0_home".to_string(),
+            ty: None,
+            kind: VisibleBindingKind::HiddenHome,
+            stack_slot: Some(slot.clone()),
+            param_index: Some(0),
+            source_reg: Some("RDI".to_string()),
+        };
+        let aliases = HashMap::from([("rdi".to_string(), "arg1".to_string())]);
+
+        assert_eq!(prepared_stack_slot_offset(&slot), -8);
+        assert_eq!(
+            prepared_binding_arg_alias(&binding, &[], &aliases).as_deref(),
+            Some("arg1")
+        );
+
+        let legacy_slot = StackSlotKey {
+            base: ExternalStackBase::FramePointer,
+            offset: -8,
+        };
+        assert_eq!(prepared_stack_slot_offset(&legacy_slot), -8);
+    }
 
     fn test_var(name: &str, version: u32, size: u32) -> SSAVar {
         SSAVar::new(name, version, size)

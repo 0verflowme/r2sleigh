@@ -111,6 +111,32 @@ a:sla.debug.ssa | jq -c 'length>0 and (.[0]|has("op")) and (tostring|contains("R
 EOF_CMDS
 RUN
 
+NAME=instruction_ssa_read_modify_write_uses_incoming_version
+FILE=malloc://64
+ARGS=-a x86 -b 64 -e scr.color=false -e log.level=0
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+wx 4883c001000000000000000000000000
+s 0 >/dev/null
+a:sla.debug.ssa | jq -c '([.[]|select(.op=="IntAdd")]|length)==1 and ([.[]|select(.op=="IntAdd")][0].dst=="RAX_1") and (([.[]|select(.op=="IntAdd")][0].sources|index("RAX_0"))!=null)'
+EOF_CMDS
+RUN
+
+NAME=types_ignore_epilogue_return_address_as_stack_argument
+FILE=bins/vuln_test_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+s `isq~check_secret[0]` >/dev/null
+af
+a:sla.debug.types | jq -c '(.params | length) == 1 and .params[0].name == "arg0" and ([.var_type_candidates[]? | select(.isarg and .name == "arg6")] | length) == 0'
+EOF_CMDS
+RUN
+
 NAME=instruction_defuse_has_expected_fields
 FILE=malloc://64
 ARGS=-a x86 -b 64 -e scr.color=false -e log.level=0
@@ -344,7 +370,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `isq~sum_array$[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("int32_t dbg.sum_array(int32_t* arr, int32_t len)") and contains("for (int32_t i = 0; i < len; i++)") and ((contains("sum += arr[i];") or contains("sum = sum + arr[i];"))) and contains("return sum;") and (contains("r2dec residual:")|not) and (contains("summary return unresolved")|not) and (contains("render contract: summary facts only")|not) and (contains("fake_stack_slot")|not) and (contains("ObjectId")|not) and (contains("ValueId")|not) and (contains("eax_")|not) and (contains("rax_")|not) and (contains("t6a80")|not) and (contains("r2dec fallback:")|not)'
+a:sla.dec | jq -Rs 'contains("int32_t sym._sum_array(int32_t* arg0, int32_t arg1)") and contains("for (int32_t var_14h = 0; var_14h < arg1; var_14h++)") and contains("var_10h += arg0[var_14h];") and contains("return var_10h;") and (contains("r2dec residual:")|not) and (contains("summary return unresolved")|not) and (contains("render contract: summary facts only")|not) and (contains("fake_stack_slot")|not) and (contains("ObjectId")|not) and (contains("ValueId")|not) and (contains("eax_")|not) and (contains("rax_")|not) and (contains("t6a80")|not) and (contains("r2dec fallback:")|not)'
 EOF_CMDS
 RUN
 

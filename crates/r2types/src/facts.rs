@@ -3,8 +3,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use serde::{Deserialize, Serialize};
 
 use crate::context::{
-    ExternalRegisterParamSpec, ExternalStackSlotSpec, ExternalStackVarSpec, StackSlotKey,
-    legacy_external_stack_vars_from_slots, stack_slots_from_legacy_external_stack_vars,
+    ExternalRegisterParamSpec, ExternalStackSlotRole, ExternalStackSlotSpec, ExternalStackVarSpec,
+    StackSlotKey, legacy_external_stack_vars_from_slots,
+    stack_slots_from_legacy_external_stack_vars,
 };
 use crate::convert::CTypeLike;
 use crate::external::ExternalTypeDb;
@@ -155,7 +156,22 @@ impl SignatureCertificate {
             && sources
                 .iter()
                 .any(|source| source.authorizes_signature_writeback());
-        if !(signature_param_count_is_authoritative(signature) || source_authorizes_empty_arity) {
+        let local_evidence_authorizes_inferred_arity = !signature.params.is_empty()
+            && sources.iter().any(|source| {
+                matches!(
+                    source,
+                    SignatureCertificateSource::LocalInference
+                        | SignatureCertificateSource::RecoveredVariable
+                        | SignatureCertificateSource::SlotTypeOverride
+                        | SignatureCertificateSource::SemanticProjection
+                        | SignatureCertificateSource::InterprocSummary
+                )
+            })
+            && signature.params.iter().all(|param| param.ty.is_some());
+        if !(signature_param_count_is_authoritative(signature)
+            || source_authorizes_empty_arity
+            || local_evidence_authorizes_inferred_arity)
+        {
             return None;
         }
 
@@ -866,7 +882,11 @@ pub fn signature_param_count_is_authoritative(signature: &FunctionSignatureSpec)
     if signature.params.is_empty() {
         return false;
     }
-    signature_strength(signature) >= SIGNATURE_PROJECTION_STRONG_CONFIDENCE
+    signature
+        .params
+        .iter()
+        .any(|param| !crate::context::is_generic_arg_name(&param.name))
+        && signature_strength(signature) >= SIGNATURE_PROJECTION_STRONG_CONFIDENCE
 }
 
 pub fn is_generic_signature_type(ty: Option<&CTypeLike>) -> bool {
@@ -1303,19 +1323,19 @@ impl FunctionTypeFactsBuilder {
         out_param_certificates.dedup();
 
         let FunctionTypeFactInputs {
-            merged_signature,
+            mut merged_signature,
             callconv,
             noreturn,
             known_function_signatures,
-            register_params,
+            mut register_params,
             mut stack_slots,
-            visible_bindings,
+            mut visible_bindings,
             callee_facts,
             external_stack_vars,
             external_type_db,
             slot_type_overrides,
             slot_field_profiles,
-            signature_certificate,
+            mut signature_certificate,
             interproc_diagnostics,
             diagnostics,
             ..
@@ -1324,6 +1344,14 @@ impl FunctionTypeFactsBuilder {
         if stack_slots.is_empty() && !external_stack_vars.is_empty() {
             stack_slots = stack_slots_from_legacy_external_stack_vars(&external_stack_vars);
         }
+
+        canonicalize_generic_param_names(
+            &mut merged_signature,
+            &mut signature_certificate,
+            &mut register_params,
+            &mut stack_slots,
+            &mut visible_bindings,
+        );
 
         let external_stack_vars = if stack_slots.is_empty() {
             external_stack_vars
@@ -1355,6 +1383,59 @@ impl FunctionTypeFactsBuilder {
             signature_certificate,
             interproc_diagnostics,
             diagnostics,
+        }
+    }
+}
+
+fn canonical_generic_param_name(index: usize, name: &str) -> String {
+    if crate::context::is_generic_arg_name(name) {
+        format!("arg{index}")
+    } else {
+        name.to_string()
+    }
+}
+
+fn canonicalize_signature_generic_param_names(signature: &mut FunctionSignatureSpec) {
+    for (index, param) in signature.params.iter_mut().enumerate() {
+        param.name = canonical_generic_param_name(index, &param.name);
+    }
+}
+
+fn canonicalize_generic_param_names(
+    merged_signature: &mut Option<FunctionSignatureSpec>,
+    signature_certificate: &mut Option<SignatureCertificate>,
+    register_params: &mut [ExternalRegisterParamSpec],
+    stack_slots: &mut BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
+    visible_bindings: &mut [VisibleBinding],
+) {
+    if let Some(signature) = merged_signature.as_mut() {
+        canonicalize_signature_generic_param_names(signature);
+    }
+    if let Some(certificate) = signature_certificate.as_mut() {
+        canonicalize_signature_generic_param_names(&mut certificate.signature);
+    }
+    for (index, param) in register_params.iter_mut().enumerate() {
+        param.name = canonical_generic_param_name(index, &param.name);
+    }
+    for slot in stack_slots.values_mut() {
+        let Some(index) = slot.param_index else {
+            continue;
+        };
+        if let Some(name) = slot.param_name.as_mut() {
+            *name = canonical_generic_param_name(index, name);
+        }
+        if matches!(slot.role, ExternalStackSlotRole::StackArg)
+            && crate::context::is_generic_arg_name(&slot.name)
+        {
+            slot.name = format!("arg{index}");
+        }
+    }
+    for binding in visible_bindings {
+        let Some(index) = binding.param_index else {
+            continue;
+        };
+        if matches!(binding.kind, VisibleBindingKind::Param) {
+            binding.name = canonical_generic_param_name(index, &binding.name);
         }
     }
 }
@@ -1580,6 +1661,25 @@ mod tests {
             !certificate.authorizes_signature_writeback(),
             "local inference alone is not enough evidence to mutate radare2 signature state"
         );
+    }
+
+    #[test]
+    fn local_inference_certifies_typed_generic_parameter_names_for_rendering() {
+        let signature = FunctionSignatureSpec {
+            ret_type: Some(test_int(32)),
+            params: vec![
+                test_param("arg0", test_int(64)),
+                test_param("arg1", test_int(32)),
+            ],
+        };
+        let certificate = SignatureCertificate::from_signature(
+            &signature,
+            [SignatureCertificateSource::LocalInference],
+        )
+        .expect("SSA-proven typed parameters should certify rendering");
+
+        assert!(certificate.authorizes_signature_render());
+        assert!(!certificate.authorizes_signature_writeback());
     }
 
     #[test]
@@ -1966,6 +2066,60 @@ mod tests {
     }
 
     #[test]
+    fn builder_canonicalizes_generic_parameter_names_by_slot() {
+        let signature = FunctionSignatureSpec {
+            ret_type: Some(test_int(32)),
+            params: vec![
+                FunctionParamSpec {
+                    name: "arg1".to_string(),
+                    ty: Some(test_int(64)),
+                },
+                FunctionParamSpec {
+                    name: "arg2".to_string(),
+                    ty: Some(test_int(32)),
+                },
+            ],
+        };
+        let certificate = SignatureCertificate::from_signature(
+            &signature,
+            [SignatureCertificateSource::LocalInference],
+        );
+        let facts = FunctionTypeFacts::builder(FunctionTypeFactInputs {
+            merged_signature: Some(signature),
+            signature_certificate: certificate,
+            register_params: vec![
+                ExternalRegisterParamSpec {
+                    name: "arg1".to_string(),
+                    ty: Some(test_int(64)),
+                    reg: "rdi".to_string(),
+                },
+                ExternalRegisterParamSpec {
+                    name: "arg2".to_string(),
+                    ty: Some(test_int(32)),
+                    reg: "rsi".to_string(),
+                },
+            ],
+            visible_bindings: vec![VisibleBinding {
+                name: "arg1".to_string(),
+                ty: Some(test_int(64)),
+                kind: VisibleBindingKind::Param,
+                stack_slot: None,
+                param_index: Some(0),
+                source_reg: Some("rdi".to_string()),
+            }],
+            ..FunctionTypeFactInputs::default()
+        })
+        .build();
+
+        let signature = facts.render_authorized_signature().expect("signature");
+        assert_eq!(signature.params[0].name, "arg0");
+        assert_eq!(signature.params[1].name, "arg1");
+        assert_eq!(facts.register_params[0].name, "arg0");
+        assert_eq!(facts.register_params[1].name, "arg1");
+        assert_eq!(facts.visible_bindings[0].name, "arg0");
+    }
+
+    #[test]
     fn builder_derives_legacy_stack_var_view_from_canonical_slots() {
         let spec = ExternalStackSlotSpec {
             name: "count".to_string(),
@@ -2100,6 +2254,21 @@ mod tests {
             Some(SignatureProjectionRejection::WeakAnonymousFunction)
         );
         assert_eq!(facts.merged_signature, Some(original));
+    }
+
+    #[test]
+    fn generated_typed_arg_names_do_not_make_arity_authoritative() {
+        let generated = FunctionSignatureSpec {
+            ret_type: Some(test_int(64)),
+            params: vec![test_param("arg1", test_int(64))],
+        };
+        let named = FunctionSignatureSpec {
+            ret_type: Some(test_int(64)),
+            params: vec![test_param("value", test_int(64))],
+        };
+
+        assert!(!signature_param_count_is_authoritative(&generated));
+        assert!(signature_param_count_is_authoritative(&named));
     }
 
     #[test]

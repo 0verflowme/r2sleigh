@@ -3,7 +3,9 @@ use std::collections::{BTreeMap, HashMap};
 use serde::{Deserialize, Serialize};
 
 use crate::callee::{CalleeIdentityContext, CalleeResolutionFacts, CallsiteKey};
-use crate::context::{ExternalStackBase, ExternalStackSlotRole, StackSlotKey};
+use crate::context::{
+    ExternalStackBase, ExternalStackSlotRole, ExternalStackSlotSpec, StackSlotKey,
+};
 use crate::facts::{
     FunctionSignatureProjection, FunctionSignatureSpec, FunctionTypeFacts,
     OutParamCertificateEvidence, OutParamCertificateSource, SignatureProjectionResult,
@@ -583,6 +585,23 @@ fn signature_param_name_type_is_renderable(
                     .as_ref()
                     .is_some_and(stack_owner_type_is_renderable)
         })
+}
+
+fn indexed_param_home_name<'a>(
+    signature: Option<&'a FunctionSignatureSpec>,
+    slot: &ExternalStackSlotSpec,
+) -> Option<&'a str> {
+    if !matches!(slot.role, ExternalStackSlotRole::ParamHome) {
+        return None;
+    }
+    let param = signature?.params.get(slot.param_index?)?;
+    let name = param.name.trim();
+    (!name.is_empty()
+        && param
+            .ty
+            .as_ref()
+            .is_some_and(stack_owner_type_is_renderable))
+    .then_some(name)
 }
 
 fn type_like_size_bytes(ty: &CTypeLike, ptr_bits: u32) -> Option<u64> {
@@ -1269,6 +1288,12 @@ impl FunctionFacts {
                     ExternalStackSlotRole::StackArg | ExternalStackSlotRole::ParamHome
                 )
             {
+                if let Some(name) =
+                    indexed_param_home_name(self.types.merged_signature.as_ref(), slot)
+                {
+                    remember_stack_param_owner_name(&mut candidate, name)?;
+                    continue;
+                }
                 if let Some(name) = slot
                     .param_name
                     .as_ref()
@@ -1325,6 +1350,14 @@ impl FunctionFacts {
                     .is_some_and(stack_owner_type_is_renderable)
                 && visible_stack_binding_kind_is_renderable(&binding.kind)
         }) || self.types.stack_slots.iter().any(|(slot_key, slot)| {
+            if !stack_slot_matches_offset(slot_key, offset) {
+                return false;
+            }
+            if let Some(canonical_name) =
+                indexed_param_home_name(self.types.merged_signature.as_ref(), slot)
+            {
+                return canonical_name.eq_ignore_ascii_case(name);
+            }
             (slot.name.eq_ignore_ascii_case(name)
                 || (matches!(
                     slot.role,
@@ -1333,7 +1366,6 @@ impl FunctionFacts {
                     .param_name
                     .as_ref()
                     .is_some_and(|param_name| param_name.eq_ignore_ascii_case(name))))
-                && stack_slot_matches_offset(slot_key, offset)
                 && (slot.ty.as_ref().is_some_and(stack_owner_type_is_renderable)
                     || (matches!(slot.role, ExternalStackSlotRole::ParamHome)
                         && slot.param_name.as_ref().is_some_and(|param_name| {
@@ -4212,6 +4244,58 @@ mod tests {
             .authorized_stack_param_owner_render(object, -8)
             .expect("typed parameter home should authorize original parameter owner");
         assert_eq!(authorization.name, "node");
+
+        let stale_named_param_home = FunctionFacts::new(
+            FunctionTypeFacts {
+                merged_signature: Some(FunctionSignatureSpec {
+                    ret_type: Some(CTypeLike::Int {
+                        bits: 32,
+                        signedness: crate::Signedness::Signed,
+                    }),
+                    params: vec![
+                        FunctionParamSpec {
+                            name: "arg0".to_string(),
+                            ty: Some(CTypeLike::Pointer(Box::new(CTypeLike::Int {
+                                bits: 32,
+                                signedness: crate::Signedness::Signed,
+                            }))),
+                        },
+                        FunctionParamSpec {
+                            name: "arg1".to_string(),
+                            ty: Some(CTypeLike::Int {
+                                bits: 32,
+                                signedness: crate::Signedness::Signed,
+                            }),
+                        },
+                    ],
+                }),
+                stack_slots: BTreeMap::from([(
+                    StackSlotKey {
+                        base: ExternalStackBase::FramePointer,
+                        offset: 8,
+                    },
+                    crate::ExternalStackSlotSpec {
+                        name: "arg1_home".to_string(),
+                        ty: None,
+                        base: ExternalStackBase::FramePointer,
+                        role: ExternalStackSlotRole::ParamHome,
+                        param_index: Some(0),
+                        param_name: Some("arg1".to_string()),
+                        source_reg: Some("rdi".to_string()),
+                    },
+                )]),
+                ..FunctionTypeFacts::default()
+            },
+            None,
+        )
+        .with_render(FunctionRenderFacts {
+            stack_slot_offsets: BTreeMap::from([(object, -8)]),
+            ..FunctionRenderFacts::default()
+        });
+        let authorization = stale_named_param_home
+            .authorized_stack_param_owner_render(object, -8)
+            .expect("parameter index should override a stale host-generated name");
+        assert_eq!(authorization.name, "arg0");
         let raw_offset_param_home = param_home.clone().with_render(FunctionRenderFacts {
             stack_slot_offsets: BTreeMap::from([(object, 8)]),
             ..FunctionRenderFacts::default()

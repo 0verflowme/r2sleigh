@@ -90,12 +90,23 @@ mod tests {
         // Verify we got operations
         assert!(!ssa_block.is_empty(), "SSA block should not be empty");
 
-        // The add should produce an IntAdd operation
-        let has_add = ssa_block
+        let add = ssa_block
             .ops
             .iter()
-            .any(|op| matches!(op, SSAOp::IntAdd { .. }));
-        assert!(has_add, "Should have an IntAdd operation");
+            .find_map(|op| match op {
+                SSAOp::IntAdd { dst, a, b } => Some((dst, a, b)),
+                _ => None,
+            })
+            .expect("Should have an IntAdd operation");
+        assert_eq!(add.0.version, 1, "RAX destination should define version 1");
+        assert_eq!(
+            add.1.version, 0,
+            "RAX source should read incoming version 0"
+        );
+        assert_eq!(
+            add.2.version, 0,
+            "RBX source should read incoming version 0"
+        );
     }
 
     #[test]

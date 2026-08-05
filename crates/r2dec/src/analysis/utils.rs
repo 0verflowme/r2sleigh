@@ -528,22 +528,22 @@ pub(crate) fn simplify_stack_access(
 pub(crate) fn arg_alias_for_register_name(reg_name: &str) -> Option<String> {
     let reg = reg_name.to_lowercase();
     if reg.contains("rdi") || reg.contains("edi") {
-        return Some("arg1".to_string());
+        return Some("arg0".to_string());
     }
     if reg.contains("rsi") || reg.contains("esi") {
-        return Some("arg2".to_string());
+        return Some("arg1".to_string());
     }
     if reg.contains("rdx") || reg.contains("edx") {
-        return Some("arg3".to_string());
+        return Some("arg2".to_string());
     }
     if reg.contains("rcx") || reg.contains("ecx") {
-        return Some("arg4".to_string());
+        return Some("arg3".to_string());
     }
     if reg.contains("r8") {
-        return Some("arg5".to_string());
+        return Some("arg4".to_string());
     }
     if reg.contains("r9") {
-        return Some("arg6".to_string());
+        return Some("arg5".to_string());
     }
     None
 }

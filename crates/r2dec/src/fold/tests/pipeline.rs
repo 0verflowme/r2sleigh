@@ -9417,6 +9417,34 @@ mod tests {
         );
     }
 
+	#[test]
+	fn prune_before_structuring_keeps_stack_state_written_for_later_blocks() {
+		let mut ctx = FoldingContext::new(64);
+		ctx.set_external_stack_vars(HashMap::from([(
+			-16,
+			stack_var_spec("var_10h", Some(CType::Int(32)), Some("rbp")),
+		)]));
+		let assignment = CStmt::Expr(CExpr::assign(
+			CExpr::Var("var_10h".to_string()),
+			CExpr::binary(
+				BinaryOp::Add,
+				CExpr::Var("var_10h".to_string()),
+				CExpr::Subscript {
+					base: Box::new(CExpr::Var("arr".to_string())),
+					index: Box::new(CExpr::Var("i".to_string())),
+				},
+			),
+		));
+
+		let pruned = ctx.prune_dead_temp_assignments_before_structuring(vec![assignment.clone()]);
+
+		assert_eq!(
+			pruned,
+			vec![assignment],
+			"a per-block dead-temp pass cannot discard stack state consumed by another block"
+		);
+	}
+
     #[test]
     fn test_prune_dead_temp_assignments_removes_dead_register_ssa_assignment() {
         let ctx = FoldingContext::new(64);
@@ -10176,12 +10204,12 @@ mod tests {
     fn test_copy_suppresses_entry_arg_alias_assignment() {
         let ctx = FoldingContext::new(64);
         let stmt = ctx.op_to_stmt(&SSAOp::Copy {
-            dst: make_var("arg1", 0, 4),
+            dst: make_var("arg0", 0, 4),
             src: make_var("EDI", 0, 4),
         });
         assert!(
             stmt.is_none(),
-            "arg1 = edi entry alias copy should be suppressed"
+            "arg0 = edi entry alias copy should be suppressed"
         );
     }
 
@@ -10211,12 +10239,12 @@ mod tests {
     fn test_assign_stmt_suppresses_entry_arg_alias_assignment() {
         let ctx = FoldingContext::new(64);
         let stmt = ctx.assign_stmt(
-            CExpr::Var("arg1".to_string()),
+            CExpr::Var("arg0".to_string()),
             CExpr::Var("edi".to_string()),
         );
         assert!(
             stmt.is_none(),
-            "arg1 = edi should be suppressed even after non-copy normalization paths"
+            "arg0 = edi should be suppressed even after non-copy normalization paths"
         );
     }
 
@@ -10530,7 +10558,7 @@ mod tests {
             rhs,
             CExpr::binary(
                 BinaryOp::Ne,
-                CExpr::Var("arg1".to_string()),
+                CExpr::Var("arg0".to_string()),
                 CExpr::IntLit(37)
             )
         );
@@ -10631,12 +10659,12 @@ mod tests {
         let mut ctx = FoldingContext::new(64);
         ctx.analyze_blocks(std::slice::from_ref(&block));
 
-        assert_eq!(ctx.stack_vars_map().get(&-4), Some(&"arg1".to_string()));
+        assert_eq!(ctx.stack_vars_map().get(&-4), Some(&"arg0".to_string()));
 
         let mut visited = HashSet::new();
         let resolved =
             ctx.resolve_predicate_operand(&CExpr::Var(loaded.display_name()), 0, &mut visited);
-        assert_eq!(resolved, CExpr::Var("arg1".to_string()));
+        assert_eq!(resolved, CExpr::Var("arg0".to_string()));
     }
 
     #[test]
@@ -17283,12 +17311,12 @@ mod tests {
                     op: BinaryOp::Eq | BinaryOp::Ne,
                     left,
                     right,
-                } if (matches!(left.as_ref(), CExpr::Var(name) if name == "arg1")
+                } if (matches!(left.as_ref(), CExpr::Var(name) if name == "arg0")
                     && matches!(right.as_ref(), CExpr::IntLit(100)))
-                    || (matches!(right.as_ref(), CExpr::Var(name) if name == "arg1")
+                    || (matches!(right.as_ref(), CExpr::Var(name) if name == "arg0")
                         && matches!(left.as_ref(), CExpr::IntLit(100)))
             ),
-            "expected recovered arg1/100 predicate, got {cond:?}"
+            "expected recovered arg0/100 predicate, got {cond:?}"
         );
 
         let one_stmts = ctx.fold_block(func.get_block(0x1004).expect("one"), 0x1004);
@@ -17671,7 +17699,7 @@ mod tests {
                 BinaryOp::Add,
                 CExpr::binary(
                     BinaryOp::Shl,
-                    CExpr::Var("arg1".to_string()),
+                    CExpr::Var("arg0".to_string()),
                     CExpr::IntLit(1),
                 ),
                 CExpr::IntLit(5),
@@ -17928,8 +17956,8 @@ mod tests {
             cond,
             CExpr::binary(
                 BinaryOp::Ne,
+                CExpr::Var("arg0".to_string()),
                 CExpr::Var("arg1".to_string()),
-                CExpr::Var("arg2".to_string()),
             )
         );
 
@@ -17941,8 +17969,8 @@ mod tests {
         let Some(CStmt::Return(Some(else_expr))) = else_stmts.last() else {
             panic!("else block should fold to a scalar return, got {else_stmts:?}");
         };
-        assert_eq!(then_expr, &CExpr::Var("arg1".to_string()));
-        assert_eq!(else_expr, &CExpr::Var("arg2".to_string()));
+        assert_eq!(then_expr, &CExpr::Var("arg0".to_string()));
+        assert_eq!(else_expr, &CExpr::Var("arg1".to_string()));
     }
 
     #[test]
@@ -18443,19 +18471,19 @@ mod tests {
             cond,
             CExpr::binary(
                 BinaryOp::Ne,
+                CExpr::Var("arg0".to_string()),
                 CExpr::Var("arg1".to_string()),
-                CExpr::Var("arg2".to_string()),
             )
         );
         let then_stmts = ctx.fold_block(func.get_block(0x100001082).expect("then"), 0x100001082);
         let else_stmts = ctx.fold_block(func.get_block(0x10000107a).expect("else"), 0x10000107a);
         assert_eq!(
             then_stmts,
-            vec![CStmt::Return(Some(CExpr::Var("arg1".to_string())))]
+            vec![CStmt::Return(Some(CExpr::Var("arg0".to_string())))]
         );
         assert_eq!(
             else_stmts,
-            vec![CStmt::Return(Some(CExpr::Var("arg2".to_string())))]
+            vec![CStmt::Return(Some(CExpr::Var("arg1".to_string())))]
         );
     }
 
@@ -20134,7 +20162,7 @@ mod tests {
             ctx.extract_condition_from_block(entry),
             Some(CExpr::binary(
                 BinaryOp::Ne,
-                CExpr::Var("arg1".to_string()),
+                CExpr::Var("arg0".to_string()),
                 CExpr::IntLit(0),
             ))
         );
@@ -20142,7 +20170,7 @@ mod tests {
             ctx.predicate_candidate_for_var(cond),
             Some(CExpr::binary(
                 BinaryOp::Ne,
-                CExpr::Var("arg1".to_string()),
+                CExpr::Var("arg0".to_string()),
                 CExpr::IntLit(0),
             ))
         );
@@ -21938,7 +21966,7 @@ mod tests {
             ctx.extract_condition_from_block(entry),
             Some(CExpr::binary(
                 BinaryOp::Ne,
-                CExpr::Var("arg1".to_string()),
+                CExpr::Var("arg0".to_string()),
                 CExpr::IntLit(0),
             ))
         );

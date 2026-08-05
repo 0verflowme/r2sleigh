@@ -8,7 +8,7 @@ CMDS=<<EOF_CMDS
 aaaa
 s `isq~test_struct_array_index$[0]` >/dev/null
 af
-afij | jq -c '.[0] | (.name | test("test_struct_array_index$")) and .calltype=="amd64" and .nargs>=3 and ((.signature // "") | contains("test_struct_array_index"))'
+a:sla.debug.types | jq -c '(.function_name | test("test_struct_array_index$")) and .callconv=="amd64" and (.params|length)==3 and (.params[0].type|startswith("struct sla_struct_") and endswith("*")) and .params[1].type=="int32_t" and .params[2].type=="int32_t" and .signature_render_authorized==true and (.signature_certificate_sources|length)>0 and .fact_counts.scalar_array_render_candidates>=3 and .fact_counts.render_array_accesses>=3'
 EOF_CMDS
 RUN
 

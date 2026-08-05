@@ -594,11 +594,14 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             Region::WhileLoop { header, body } => {
                 let (cond, predicate, condition_value) =
                     self.get_branch_condition_with_predicate(*header);
-                let Some(cond) = cond else {
+                let Some(mut cond) = cond else {
                     return CStmt::Block(vec![CStmt::comment(format!(
                         "r2dec residual: unresolved loop condition at 0x{header:x}"
                     ))]);
                 };
+                if self.loop_needs_condition_inversion(*header, body) {
+                    cond = Self::negate_condition(cond);
+                }
                 if self.fold_ctx.requires_certified_rendering() {
                     let Some(proof) =
                         self.certified_loop_render_proof(*header, predicate, condition_value, body)
@@ -617,11 +620,14 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             Region::DoWhileLoop { body, cond_block } => {
                 let (cond, predicate, condition_value) =
                     self.get_branch_condition_with_predicate(*cond_block);
-                let Some(cond) = cond else {
+                let Some(mut cond) = cond else {
                     return CStmt::Block(vec![CStmt::comment(format!(
                         "r2dec residual: unresolved loop condition at 0x{cond_block:x}"
                     ))]);
                 };
+                if self.loop_needs_condition_inversion(*cond_block, body) {
+                    cond = Self::negate_condition(cond);
+                }
                 let anchor = body.entry();
                 if self.fold_ctx.requires_certified_rendering() {
                     let Some(proof) =
@@ -900,6 +906,14 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         };
 
         true_target == merge_block && false_target == then_entry
+    }
+
+    fn loop_needs_condition_inversion(&self, cond_block: u64, body: &Region) -> bool {
+        let Some((true_target, false_target)) = self.resolve_conditional_targets(cond_block) else {
+            return false;
+        };
+        let body_blocks = body.blocks();
+        !body_blocks.contains(&true_target) && body_blocks.contains(&false_target)
     }
 
     fn resolve_conditional_targets(&self, cond_block: u64) -> Option<(u64, u64)> {
@@ -4537,6 +4551,19 @@ mod tests {
         assert!(
             stmt_contains_loop(&certified_stmt),
             "FunctionFacts loop structure should authorize while output, got {certified_stmt:?}"
+        );
+        let CStmt::While { cond, .. } = &certified_stmt else {
+            panic!("expected direct certified while statement, got {certified_stmt:?}");
+        };
+        assert!(
+            matches!(
+                cond,
+                CExpr::Binary {
+                    op: BinaryOp::Ne,
+                    ..
+                }
+            ),
+            "a true edge that exits the loop must invert the branch predicate, got {cond:?}"
         );
 
         let missing_loop_control = control_facts_for_guarded_while_loop(&prepared, false);

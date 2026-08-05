@@ -733,13 +733,13 @@ pub(crate) fn recover_vars_from_ssa(
     ssa_blocks: &[r2ssa::SSABlock],
     arch: Option<&ArchSpec>,
     metadata_reg_type_hints: &std::collections::HashMap<String, TypeHint>,
-    semantic_typing_enabled: bool,
+    semantic_metadata_enabled: bool,
 ) -> Vec<VarProt> {
     r2engine::recover_vars_from_ssa(
         ssa_blocks,
         arch,
         metadata_reg_type_hints,
-        semantic_typing_enabled,
+        semantic_metadata_enabled,
     )
 }
 
@@ -817,7 +817,7 @@ fn recover_vars_for_ffi(
     let input = build_function_input(ctx, blocks, num_blocks, 0, ptr::null())?;
     let ssa_blocks = build_var_recovery_ssa_blocks(input.blocks.as_slice(), input.ctx.arch)?;
 
-    let semantic_typing_enabled = input.ctx.semantic_metadata_enabled;
+    let semantic_metadata_enabled = input.ctx.semantic_metadata_enabled;
 
     if ssa_blocks.is_empty() {
         return None;
@@ -828,7 +828,7 @@ fn recover_vars_for_ffi(
             ssa_blocks: &ssa_blocks,
             r2il_blocks: input.blocks.as_slice(),
             arch: input.ctx.arch,
-            semantic_typing_enabled,
+            semantic_metadata_enabled,
             metadata_reg_type_hints: std::collections::HashMap::new(),
         },
         |vn| input.ctx.disasm.register_name(vn),
@@ -1378,8 +1378,8 @@ mod tests {
             .find(|v| v.reg.as_deref() == Some("rdi"))
             .expect("rdi argument should be recovered");
         assert_eq!(
-            arg0.var_type, "void *",
-            "spill/reload + scaled index should preserve pointer type on arg0"
+            arg0.var_type, "int32_t *",
+            "spill/reload + scaled index should recover pointee width on arg0"
         );
     }
 
@@ -1434,13 +1434,13 @@ mod tests {
             .find(|v| v.reg.as_deref() == Some("rdi"))
             .expect("rdi argument should be recovered");
         assert_eq!(
-            arg0.var_type, "void *",
-            "shift-scaled index should preserve pointer type on arg0"
+            arg0.var_type, "int32_t *",
+            "shift-scaled index should recover pointee width on arg0"
         );
     }
 
     #[test]
-    fn recover_vars_semantic_disable_falls_back_to_integer_types() {
+    fn recover_vars_without_semantic_metadata_still_uses_structural_pointer_evidence() {
         let arch = ArchSpec::new("x86-64");
         let block = r2ssa::SSABlock {
             addr: 0x3000,
@@ -1467,9 +1467,31 @@ mod tests {
             .find(|v| v.reg.as_deref() == Some("rdi"))
             .expect("rdi argument should be recovered");
         assert_eq!(
-            arg0.var_type, "int64_t",
-            "semantic-disabled path should ignore metadata/usage pointer hints"
+            arg0.var_type, "void *",
+            "structural SSA pointer evidence must remain active without semantic metadata"
         );
+    }
+
+    #[test]
+    fn recover_vars_without_semantic_metadata_ignores_metadata_only_pointer_hint() {
+        let arch = ArchSpec::new("x86-64");
+        let block = r2ssa::SSABlock {
+            addr: 0x3000,
+            size: 4,
+            ops: vec![r2ssa::SSAOp::Copy {
+                dst: r2ssa::SSAVar::new("tmp:value", 1, 8),
+                src: r2ssa::SSAVar::new("rdi", 0, 8),
+            }],
+        };
+
+        let mut hints = std::collections::HashMap::new();
+        merge_type_hint(&mut hints, "rdi".to_string(), TypeHint::pointer());
+        let vars = recover_vars_from_ssa(&[block], Some(&arch), &hints, false);
+        let arg0 = vars
+            .iter()
+            .find(|v| v.reg.as_deref() == Some("rdi"))
+            .expect("rdi argument should be recovered");
+        assert_eq!(arg0.var_type, "int64_t");
     }
 
     #[test]
@@ -1709,8 +1731,8 @@ mod tests {
             .find(|v| v.reg.as_deref() == Some("rdi"))
             .expect("rdi argument should be recovered");
         assert_eq!(
-            arg0.var_type, "void *",
-            "two-block spill/reload + scaled-index pattern should mark rdi as pointer"
+            arg0.var_type, "int32_t *",
+            "two-block spill/reload + scaled-index pattern should recover pointee width"
         );
     }
 

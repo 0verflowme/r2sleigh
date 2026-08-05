@@ -3570,8 +3570,13 @@ fn build_type_writeback_analysis_inner(
         semantic_inputs.as_ref().map(|semantic| semantic.artifact),
         input.ptr_bits,
     );
-    let had_external_signature = input.parsed_context.current_signature.is_some()
-        || input.parsed_context.merged_signature.is_some();
+    let authoritative_external_arity = input
+        .parsed_context
+        .current_signature
+        .as_ref()
+        .into_iter()
+        .chain(input.parsed_context.merged_signature.as_ref())
+        .any(signature_param_count_is_authoritative);
 
     let type_assumption_usage = apply_type_hint_assumptions_to_context(
         &mut input.parsed_context,
@@ -3580,7 +3585,7 @@ fn build_type_writeback_analysis_inner(
         Some(&semantic_projection),
     );
     let mut signature_certificate_sources = Vec::new();
-    if had_external_signature {
+    if authoritative_external_arity {
         push_signature_certificate_source(
             &mut signature_certificate_sources,
             SignatureCertificateSource::ExternalContext,
@@ -3594,7 +3599,7 @@ fn build_type_writeback_analysis_inner(
     }
     let inferred_signature_spec =
         inferred_signature_to_spec(&input.inferred_signature, input.ptr_bits);
-    if inferred_signature_spec.is_some() && !had_external_signature {
+    if inferred_signature_spec.is_some() && !authoritative_external_arity {
         push_signature_certificate_source(
             &mut signature_certificate_sources,
             SignatureCertificateSource::LocalInference,
@@ -3777,6 +3782,7 @@ fn build_type_writeback_analysis_inner(
     let scalar_array_access_certificates = scalar_array_access_certificates_from_ssa(
         input.ssa_blocks,
         &input.parsed_context,
+        &type_db,
         merged_signature.as_ref(),
         if input.inferred_signature.arch.is_empty() {
             input.parsed_context.callconv.as_deref()
@@ -4546,6 +4552,7 @@ struct AffineIndexFactor {
 
 struct ScalarArrayInferenceCtx<'a> {
     parsed_context: &'a ParsedExternalContext,
+    type_db: &'a ExternalTypeDb,
     merged_signature: Option<&'a FunctionSignatureSpec>,
     ptr_bits: u32,
     pointer_arg_slot_map: &'a HashMap<String, usize>,
@@ -5180,6 +5187,7 @@ fn array_index_certificates_from_struct_artifacts(
 fn scalar_array_access_certificates_from_ssa(
     ssa_blocks: &[SSABlock],
     parsed_context: &ParsedExternalContext,
+    type_db: &ExternalTypeDb,
     merged_signature: Option<&FunctionSignatureSpec>,
     arch_name: Option<&str>,
     ptr_bits: u32,
@@ -5237,6 +5245,7 @@ fn scalar_array_access_certificates_from_ssa(
                     | SSAOp::Subpiece { dst, src, .. } => {
                         let ctx = ScalarArrayInferenceCtx {
                             parsed_context,
+                            type_db,
                             merged_signature,
                             ptr_bits,
                             pointer_arg_slot_map: &pointer_arg_slot_map,
@@ -5294,6 +5303,7 @@ fn scalar_array_access_certificates_from_ssa(
                     SSAOp::Phi { dst, sources } => {
                         let ctx = ScalarArrayInferenceCtx {
                             parsed_context,
+                            type_db,
                             merged_signature,
                             ptr_bits,
                             pointer_arg_slot_map: &pointer_arg_slot_map,
@@ -5360,6 +5370,7 @@ fn scalar_array_access_certificates_from_ssa(
                         let expr = {
                             let ctx = ScalarArrayInferenceCtx {
                                 parsed_context,
+                                type_db,
                                 merged_signature,
                                 ptr_bits,
                                 pointer_arg_slot_map: &pointer_arg_slot_map,
@@ -5386,6 +5397,7 @@ fn scalar_array_access_certificates_from_ssa(
                         let pointer = {
                             let ctx = ScalarArrayInferenceCtx {
                                 parsed_context,
+                                type_db,
                                 merged_signature,
                                 ptr_bits,
                                 pointer_arg_slot_map: &pointer_arg_slot_map,
@@ -5426,6 +5438,7 @@ fn scalar_array_access_certificates_from_ssa(
                         let pointer_expr = {
                             let ctx = ScalarArrayInferenceCtx {
                                 parsed_context,
+                                type_db,
                                 merged_signature,
                                 ptr_bits,
                                 pointer_arg_slot_map: &pointer_arg_slot_map,
@@ -5465,6 +5478,7 @@ fn scalar_array_access_certificates_from_ssa(
                         let pointer = {
                             let ctx = ScalarArrayInferenceCtx {
                                 parsed_context,
+                                type_db,
                                 merged_signature,
                                 ptr_bits,
                                 pointer_arg_slot_map: &pointer_arg_slot_map,
@@ -5503,6 +5517,7 @@ fn scalar_array_access_certificates_from_ssa(
                                 .or_else(|| {
                                     scalar_pointer_value_for_stack_slot(
                                         parsed_context,
+                                        type_db,
                                         offset,
                                         ptr_bits,
                                     )
@@ -5528,6 +5543,7 @@ fn scalar_array_access_certificates_from_ssa(
                         ) {
                             let ctx = ScalarArrayInferenceCtx {
                                 parsed_context,
+                                type_db,
                                 merged_signature,
                                 ptr_bits,
                                 pointer_arg_slot_map: &pointer_arg_slot_map,
@@ -5578,6 +5594,7 @@ fn scalar_array_access_certificates_from_ssa(
                 SSAOp::Load { dst, addr, .. } => {
                     let ctx = ScalarArrayInferenceCtx {
                         parsed_context,
+                        type_db,
                         merged_signature,
                         ptr_bits,
                         pointer_arg_slot_map: &pointer_arg_slot_map,
@@ -5604,6 +5621,7 @@ fn scalar_array_access_certificates_from_ssa(
                             &expr,
                             u64::from(access_width),
                             parsed_context,
+                            type_db,
                             merged_signature,
                             ptr_bits,
                         ) {
@@ -5624,6 +5642,7 @@ fn scalar_array_access_certificates_from_ssa(
                 SSAOp::Store { addr, val, .. } => {
                     let ctx = ScalarArrayInferenceCtx {
                         parsed_context,
+                        type_db,
                         merged_signature,
                         ptr_bits,
                         pointer_arg_slot_map: &pointer_arg_slot_map,
@@ -5650,6 +5669,7 @@ fn scalar_array_access_certificates_from_ssa(
                             &expr,
                             u64::from(access_width),
                             parsed_context,
+                            type_db,
                             merged_signature,
                             ptr_bits,
                         ) {
@@ -5686,6 +5706,7 @@ fn push_scalar_array_access_certificates(
     expr: &ScalarArrayAddrExpr,
     access_width: u64,
     parsed_context: &ParsedExternalContext,
+    type_db: &ExternalTypeDb,
     merged_signature: Option<&FunctionSignatureSpec>,
     ptr_bits: u32,
 ) -> bool {
@@ -5694,6 +5715,7 @@ fn push_scalar_array_access_certificates(
         expr,
         access_width,
         parsed_context,
+        type_db,
         merged_signature,
         ptr_bits,
     );
@@ -5727,6 +5749,7 @@ fn external_layout_field_access_for_scalar_expr(
     expr: &ScalarArrayAddrExpr,
     access_width: u64,
     parsed_context: &ParsedExternalContext,
+    type_db: &ExternalTypeDb,
     merged_signature: Option<&FunctionSignatureSpec>,
     ptr_bits: u32,
 ) -> Option<ExternalLayoutFieldAccess> {
@@ -5734,7 +5757,7 @@ fn external_layout_field_access_for_scalar_expr(
         .into_iter()
         .find_map(|type_name| {
             external_layout_field_access_for_offset(
-                &parsed_context.external_type_db,
+                type_db,
                 &type_name,
                 expr.field_offset,
                 access_width,
@@ -5878,20 +5901,20 @@ fn scalar_pointer_value_for_var(
                 .get(&block_addr)
                 .is_some_and(|ops| ops.contains_key(&ssa_var_block_key(block_addr, var)));
         if var.version == 0 || !has_local_def {
-            let ty = ctx
+            let element_stride = ctx
                 .parsed_context
                 .register_params
                 .iter()
                 .find(|param| param.reg.eq_ignore_ascii_case(&var.name))
                 .and_then(|param| param.ty.as_ref())
-                .or_else(|| {
+                .into_iter()
+                .chain(
                     ctx.merged_signature
                         .and_then(|signature| signature.params.get(param_index))
-                        .and_then(|param| param.ty.as_ref())
-                });
-            if let Some(element_stride) = ty.and_then(|ty| {
-                pointer_element_stride(ty, &ctx.parsed_context.external_type_db, ctx.ptr_bits)
-            }) {
+                        .and_then(|param| param.ty.as_ref()),
+                )
+                .find_map(|ty| pointer_element_stride(ty, ctx.type_db, ctx.ptr_bits));
+            if let Some(element_stride) = element_stride {
                 return Some(ScalarPointerValue {
                     slot: param_index,
                     base: ArrayIndexBase::Param { index: param_index },
@@ -5913,6 +5936,7 @@ fn scalar_pointer_value_for_var(
 
 fn scalar_pointer_value_for_stack_slot(
     parsed_context: &ParsedExternalContext,
+    type_db: &ExternalTypeDb,
     offset: i64,
     ptr_bits: u32,
 ) -> Option<ScalarPointerValue> {
@@ -5921,9 +5945,10 @@ fn scalar_pointer_value_for_stack_slot(
         .iter()
         .filter(|(key, _)| key.offset == offset)
         .filter_map(|(key, spec)| {
-            let element_stride = spec.ty.as_ref().and_then(|ty| {
-                pointer_element_stride(ty, &parsed_context.external_type_db, ptr_bits)
-            })?;
+            let element_stride = spec
+                .ty
+                .as_ref()
+                .and_then(|ty| pointer_element_stride(ty, type_db, ptr_bits))?;
             Some(ScalarPointerValue {
                 slot: legacy_array_slot_for_stack_slot(key),
                 base: ArrayIndexBase::StackSlot { slot: key.clone() },
@@ -6979,7 +7004,7 @@ fn canonicalize_param_home_stack_slots(
                         .map(|param| param.name.clone())
                         .filter(|name| !name.is_empty())
                         .unwrap_or_else(|| format!("arg{}", param_index + 1));
-                    let slot_key = canonical_param_home_stack_slot_key(&source_slot_key);
+                    let slot_key = canonical_frame_stack_slot_key(&source_slot_key);
                     if slot_key != source_slot_key
                         && let Some(source_slot) = stack_slots.remove(&source_slot_key)
                     {
@@ -7022,11 +7047,11 @@ fn canonicalize_param_home_stack_slots(
     }
 }
 
-fn canonical_param_home_stack_slot_key(slot: &StackSlotKey) -> StackSlotKey {
+fn canonical_frame_stack_slot_key(slot: &StackSlotKey) -> StackSlotKey {
     match slot.base {
         ExternalStackBase::FramePointer => StackSlotKey {
             base: slot.base.clone(),
-            offset: -slot.offset,
+            offset: slot.offset.saturating_abs(),
         },
         _ => slot.clone(),
     }
@@ -7283,6 +7308,7 @@ fn local_param_should_override_external(
 
 fn local_scalar_override_should_apply(local: &CTypeLike, external: &CTypeLike) -> bool {
     match (local, external) {
+        (CTypeLike::Pointer(_), CTypeLike::Int { .. }) => true,
         (CTypeLike::Bool, CTypeLike::Bool) => false,
         (
             CTypeLike::Bool,
@@ -7421,10 +7447,11 @@ fn stack_base_for_recovered_var_kind(kind: &str) -> Option<ExternalStackBase> {
 }
 
 fn stack_slot_key_for_recovered_var(var: &RecoveredVariable) -> Option<StackSlotKey> {
-    Some(StackSlotKey {
+    let key = StackSlotKey {
         base: stack_base_for_recovered_var_kind(&var.kind)?,
         offset: var.delta,
-    })
+    };
+    Some(canonical_frame_stack_slot_key(&key))
 }
 
 fn slot_spec_for_recovered_var<'a>(
@@ -7629,11 +7656,12 @@ fn build_visible_bindings(
     }
 
     for (slot_key, slot_spec) in stack_slots {
+        let canonical_slot_key = canonical_frame_stack_slot_key(slot_key);
         let key = slot_spec
             .param_index
             .filter(|_| matches!(slot_spec.role, ExternalStackSlotRole::StackArg))
             .map(VisibleBindingKey::Param)
-            .unwrap_or_else(|| VisibleBindingKey::Stack(slot_key.clone()));
+            .unwrap_or_else(|| VisibleBindingKey::Stack(canonical_slot_key.clone()));
         let candidate = VisibleBinding {
             name: slot_spec
                 .param_name
@@ -7647,7 +7675,7 @@ fn build_visible_bindings(
                 }),
             ty: slot_spec.ty.clone(),
             kind: visible_binding_kind_for_slot_role(slot_spec.role),
-            stack_slot: Some(slot_key.clone()),
+            stack_slot: Some(canonical_slot_key),
             param_index: slot_spec.param_index,
             source_reg: slot_spec.source_reg.clone(),
         };
@@ -7987,6 +8015,11 @@ fn signature_param_count_is_authoritative(signature: &FunctionSignatureSpec) -> 
     crate::signature_param_count_is_authoritative(signature)
 }
 
+fn signature_has_typed_param_count_evidence(signature: &FunctionSignatureSpec) -> bool {
+    !signature.params.is_empty()
+        && signature_strength(signature) >= crate::SIGNATURE_PROJECTION_STRONG_CONFIDENCE
+}
+
 fn is_generic_signature_type(ty: Option<&CTypeLike>) -> bool {
     crate::is_generic_signature_type(ty)
 }
@@ -8031,7 +8064,7 @@ fn merge_slot_type_overrides_into_signature(
     let max_slot = slot_type_overrides.keys().copied().max()?;
     let sig = signature.get_or_insert_with(Default::default);
     let allow_param_count_extension =
-        !preserve_param_count && !signature_param_count_is_authoritative(sig);
+        !preserve_param_count && !signature_has_typed_param_count_evidence(sig);
     while allow_param_count_extension && sig.params.len() <= max_slot {
         let idx = sig.params.len();
         sig.params.push(FunctionParamSpec {
@@ -9658,6 +9691,17 @@ mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
 
+    #[test]
+    fn canonical_frame_stack_slots_are_idempotent() {
+        let raw = StackSlotKey {
+            base: ExternalStackBase::FramePointer,
+            offset: -16,
+        };
+        let canonical = canonical_frame_stack_slot_key(&raw);
+        assert_eq!(canonical.offset, 16);
+        assert_eq!(canonical_frame_stack_slot_key(&canonical), canonical);
+    }
+
     fn test_signature_spec(param_name: &str, param_bits: u32) -> FunctionSignatureSpec {
         FunctionSignatureSpec {
             ret_type: Some(CTypeLike::Int {
@@ -10394,6 +10438,7 @@ mod tests {
         pointer_values.insert(ssa_var_block_key(block_addr, &right), high);
         let ctx = ScalarArrayInferenceCtx {
             parsed_context: &parsed_context,
+            type_db: &parsed_context.external_type_db,
             merged_signature: None,
             ptr_bits: 64,
             pointer_arg_slot_map: &pointer_arg_slot_map,
@@ -12779,7 +12824,7 @@ mod tests {
                 })
             );
         }
-        assert_eq!(merged.params[6].name, "arg7");
+        assert_eq!(merged.params[6].name, "arg6");
         assert_eq!(
             merged.params[6].ty,
             Some(CTypeLike::Int {
@@ -12789,7 +12834,7 @@ mod tests {
         );
         assert!(
             analysis.type_facts.visible_bindings.iter().any(|binding| {
-                binding.name == "arg7"
+                binding.name == "arg6"
                     && binding.param_index == Some(6)
                     && binding.stack_slot
                         == Some(StackSlotKey {
@@ -13002,6 +13047,60 @@ mod tests {
     }
 
     #[test]
+    fn generated_external_signature_allows_proven_local_param_extension() {
+        let external = FunctionSignatureSpec {
+            ret_type: Some(signed_int_type(64)),
+            params: vec![FunctionParamSpec {
+                name: "arg1".to_string(),
+                ty: Some(signed_int_type(64)),
+            }],
+        };
+        let local = FunctionSignatureSpec {
+            ret_type: Some(signed_int_type(32)),
+            params: vec![
+                FunctionParamSpec {
+                    name: "arg0".to_string(),
+                    ty: Some(signed_int_type(64)),
+                },
+                FunctionParamSpec {
+                    name: "arg1".to_string(),
+                    ty: Some(signed_int_type(32)),
+                },
+            ],
+        };
+
+        let merged = merge_local_signature_into_merged_signature(Some(external), Some(local))
+            .expect("merged signature");
+
+        assert_eq!(merged.params.len(), 2);
+        assert_eq!(merged.ret_type, Some(signed_int_type(32)));
+    }
+
+    #[test]
+    fn generated_external_carrier_param_yields_to_local_pointer_evidence() {
+        let external = FunctionSignatureSpec {
+            ret_type: Some(signed_int_type(64)),
+            params: vec![FunctionParamSpec {
+                name: "arg1".to_string(),
+                ty: Some(signed_int_type(64)),
+            }],
+        };
+        let pointer = CTypeLike::Pointer(Box::new(CTypeLike::Void));
+        let local = FunctionSignatureSpec {
+            ret_type: Some(signed_int_type(64)),
+            params: vec![FunctionParamSpec {
+                name: "arg0".to_string(),
+                ty: Some(pointer.clone()),
+            }],
+        };
+
+        let merged = merge_local_signature_into_merged_signature(Some(external), Some(local))
+            .expect("merged signature");
+
+        assert_eq!(merged.params[0].ty, Some(pointer));
+    }
+
+    #[test]
     fn stack_var_preference_renames_and_types_generic_stack_slots() {
         let mut parsed_context = ParsedExternalContext::default();
         let spec = ExternalStackVarSpec {
@@ -13066,7 +13165,7 @@ mod tests {
                         .stack_slot
                         .as_ref()
                         .is_some_and(|slot| slot.base == ExternalStackBase::FramePointer
-                            && slot.offset == -0x10)
+                            && slot.offset == 0x10)
                     && binding.name == "count"),
             "expected visible local binding for count, got {:?}",
             analysis.type_facts.visible_bindings
@@ -14240,6 +14339,32 @@ mod tests {
                 ]),
             )]),
         };
+        let ssa_blocks = [SSABlock {
+            addr: 0x401000,
+            size: 4,
+            ops: vec![
+                SSAOp::IntMult {
+                    dst: SSAVar::new("scaled", 1, 8),
+                    a: SSAVar::new("RSI", 0, 8),
+                    b: SSAVar::new("const:38", 0, 8),
+                },
+                SSAOp::IntAdd {
+                    dst: SSAVar::new("elem", 1, 8),
+                    a: SSAVar::new("RDI", 0, 8),
+                    b: SSAVar::new("scaled", 1, 8),
+                },
+                SSAOp::IntAdd {
+                    dst: SSAVar::new("field", 1, 8),
+                    a: SSAVar::new("elem", 1, 8),
+                    b: SSAVar::new("const:8", 0, 8),
+                },
+                SSAOp::Load {
+                    dst: SSAVar::new("value", 1, 4),
+                    space: "ram".to_string(),
+                    addr: SSAVar::new("field", 1, 8),
+                },
+            ],
+        }];
 
         let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
             function_name: "sym.test_struct_array_index",
@@ -14258,7 +14383,7 @@ mod tests {
                 callconv_confidence: 90,
             },
             recovered_vars: &[],
-            ssa_blocks: &[],
+            ssa_blocks: &ssa_blocks,
             parsed_context,
             local_structs,
             interproc_summary_set: None,
@@ -14295,6 +14420,19 @@ mod tests {
                 .find(|decl| decl.name == "sla_struct_420703e08f70f00e")
                 .is_some_and(|decl| decl.source == StructDeclSource::LocalInferred),
             "expected plan to keep the current local synthetic struct"
+        );
+        assert_eq!(
+            analysis.type_facts.scalar_array_render_candidates,
+            vec![ScalarArrayRenderCandidate {
+                slot: 0,
+                block_addr: 0x401000,
+                op_index: 3,
+                is_write: false,
+                field_offset: 8,
+                element_stride: 56,
+                access_width: 4,
+            }],
+            "scalar array proof must use the reconciled local layout, not stale parsed context"
         );
     }
 
@@ -18080,8 +18218,11 @@ mod tests {
         let parsed_context = ParsedExternalContext {
             register_params: vec![
                 crate::context::ExternalRegisterParamSpec {
-                    name: "arr".to_string(),
-                    ty: Some(arr_ty.clone()),
+                    name: "arg1".to_string(),
+                    ty: Some(CTypeLike::Int {
+                        bits: 64,
+                        signedness: Signedness::Signed,
+                    }),
                     reg: "RDI".to_string(),
                 },
                 crate::context::ExternalRegisterParamSpec {

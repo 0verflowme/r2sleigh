@@ -823,7 +823,9 @@ fn imported_assumptions_from_context(
         }
     };
     for reg in register_params {
-        if let Some(ty) = reg.ty.as_ref() {
+        if let Some(ty) = reg.ty.as_ref()
+            && context_binding_type_is_meaningful(&reg.name, ty, ptr_bits)
+        {
             maybe_push_type_hints(
                 r2ssa::AssumptionSubject::Register {
                     name: reg.reg.clone(),
@@ -833,7 +835,9 @@ fn imported_assumptions_from_context(
         }
     }
     for (slot_key, slot) in stack_slots {
-        if let Some(ty) = slot.ty.as_ref() {
+        if let Some(ty) = slot.ty.as_ref()
+            && context_binding_type_is_meaningful(&slot.name, ty, ptr_bits)
+        {
             maybe_push_type_hints(
                 r2ssa::AssumptionSubject::StackSlot {
                     base: slot_key
@@ -850,6 +854,20 @@ fn imported_assumptions_from_context(
         }
     }
     assumptions
+}
+
+fn context_binding_type_is_meaningful(name: &str, ty: &CTypeLike, ptr_bits: u32) -> bool {
+    let low_quality_name = is_generic_arg_name(name) || is_low_quality_stack_name(name);
+    if !low_quality_name {
+        return true;
+    }
+    !matches!(
+        ty,
+        CTypeLike::Int { bits, .. } if *bits == ptr_bits
+    ) && !matches!(
+        ty,
+        CTypeLike::Pointer(inner) if matches!(inner.as_ref(), CTypeLike::Unknown | CTypeLike::Void)
+    )
 }
 
 fn parse_signature_json(
@@ -1551,25 +1569,8 @@ fn is_generic_signature_type(ty: Option<&CTypeLike>) -> bool {
     }
 }
 
-fn signature_strength(signature: &FunctionSignatureSpec) -> u8 {
-    let has_type_info =
-        signature.ret_type.is_some() || signature.params.iter().any(|param| param.ty.is_some());
-    let has_named_params = signature
-        .params
-        .iter()
-        .any(|param| !is_generic_arg_name(&param.name));
-    if has_type_info || has_named_params {
-        96
-    } else {
-        80
-    }
-}
-
 fn signature_param_count_is_authoritative(signature: &FunctionSignatureSpec) -> bool {
-    if signature.params.is_empty() {
-        return false;
-    }
-    signature_strength(signature) >= 96
+    crate::facts::signature_param_count_is_authoritative(signature)
 }
 
 #[cfg(test)]
@@ -2276,6 +2277,37 @@ mod tests {
         assert_eq!(stack_arg.param_index, Some(6));
         assert_eq!(stack_arg.param_name.as_deref(), Some("arg7"));
         assert_eq!(stack_arg.name, "arg_8h");
+    }
+
+    #[test]
+    fn generated_carrier_types_do_not_become_imported_type_assumptions() {
+        let ctx = parse_external_context_json(
+            r#"{
+                "signature": {
+                    "ret": "int64_t",
+                    "params": [{"name": "arg1", "type": "int64_t"}]
+                },
+                "vars": [
+                    {
+                        "kind": "register",
+                        "name": "arg1",
+                        "type": "int64_t",
+                        "reg": "rdi",
+                        "is_arg": true
+                    },
+                    {
+                        "kind": "stack",
+                        "name": "var_10h",
+                        "type": "int64_t",
+                        "base": "rbp",
+                        "offset": -16
+                    }
+                ]
+            }"#,
+            64,
+        );
+
+        assert!(ctx.assumptions.is_empty());
     }
 
     #[test]

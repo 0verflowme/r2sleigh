@@ -138,7 +138,7 @@ impl FoldArchConfig {
         let index = self.arg_regs.iter().position(|arg| {
             arg.eq_ignore_ascii_case(canonical) || arg.eq_ignore_ascii_case(&base)
         })?;
-        Some(format!("arg{}", index + 1))
+        Some(format!("arg{index}"))
     }
 
     pub(crate) fn is_return_register_name(&self, name: &str) -> bool {

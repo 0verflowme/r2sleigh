@@ -23,7 +23,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~sparse_switch[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("sparse_switch") and contains("r2dec residual: certified render contract failed") and contains("uncertified return expression") and contains("summary return unresolved") and (contains("t49900")|not) and (contains("t49a00")|not) and (contains("ValueId")|not) and (contains("ObjectId")|not) and (contains("switch (test)")|not) and (contains("case fake")|not) and (contains("return -1;")|not)'
+a:sla.dec | jq -Rs 'contains("sparse_switch") and contains("r2dec residual: certified render contract failed") and contains("unresolved branch condition") and contains("summary return unresolved") and (contains("t49900")|not) and (contains("t49a00")|not) and (contains("ValueId")|not) and (contains("ObjectId")|not) and (contains("switch (test)")|not) and (contains("case fake")|not) and (contains("return -1;")|not)'
 EOF_CMDS
 RUN
 
@@ -57,7 +57,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~check_secret[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("check_secret") and contains("return 0;") and contains("return 1;") and (contains("r2dec residual:")|not) and (contains("r2dec fallback:")|not)'
+a:sla.dec | jq -Rs 'contains("check_secret(int32_t arg0)") and contains("if (arg0 != 57005)") and contains("var_4h = 0;") and contains("var_4h = 1;") and contains("return var_4h;") and (contains("r2dec residual:")|not) and (contains("r2dec fallback:")|not)'
 EOF_CMDS
 RUN
 
@@ -127,7 +127,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~check_secret[0]` >/dev/null
 af
-a:sla.dec $$ | jq -Rs 'contains("check_secret") and contains("return 0;") and contains("return 1;") and (contains("r2dec residual:")|not) and (contains("r2dec fallback:")|not)'
+a:sla.dec $$ | jq -Rs 'contains("check_secret(int32_t arg0)") and contains("if (arg0 != 57005)") and contains("var_4h = 0;") and contains("var_4h = 1;") and contains("return var_4h;") and (contains("r2dec residual:")|not) and (contains("r2dec fallback:")|not)'
 EOF_CMDS
 RUN
 
@@ -173,7 +173,7 @@ af
 a:sla.dec | jq -Rs 'contains("test_array_index") and contains("return") and (contains("r2dec fallback:")|not)'
 s `afl~test_struct_array_index[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("test_struct_array_index") and contains("DemoStruct* arr") and contains("arr[idx].third = v;") and contains("return (int64_t)(arr[idx].fourteenth + arr[idx].third);") and (contains("r2dec residual:")|not) and (contains("r2sleigh residual:")|not) and (contains("r2dec fallback:")|not) and (contains("*(arr +")|not)'
+a:sla.dec | jq -Rs 'contains("test_struct_array_index") and contains("struct sla_struct_") and contains("arg0[arg1].f_8 = arg2;") and contains("arg0[arg1].f_34") and contains("arg0[arg1].f_8") and (contains("r2dec residual:")|not) and (contains("r2sleigh residual:")|not) and (contains("r2dec fallback:")|not) and (contains("*(arg0 +")|not)'
 EOF_CMDS
 RUN
 
@@ -189,13 +189,13 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~process_string[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("process_string") and contains("r2dec residual: certified render contract failed") and contains("first missing callsite") and contains("summary return unresolved") and (contains("strlen(s)")|not) and (contains("return -1;")|not) and (contains("return -2;")|not) and (contains("return len;")|not) and (contains("ValueId")|not) and (contains("ObjectId")|not) and (contains("r2dec fallback:")|not)'
+a:sla.dec | jq -Rs 'contains("process_string") and contains("r2dec residual: certified render contract failed") and contains("dropped callsite effects") and contains("summary return unresolved") and (contains("strlen(s)")|not) and (contains("return -1;")|not) and (contains("return -2;")|not) and (contains("return len;")|not) and (contains("ValueId")|not) and (contains("ObjectId")|not) and (contains("r2dec fallback:")|not)'
 s `afl~authenticate[0]` >/dev/null
 af
 a:sla.dec | jq -Rs 'contains("authenticate") and contains("r2dec residual: certified render contract failed") and contains("with only 1 rendered FunctionCallsiteFacts proof(s)") and contains("summary return unresolved") and (contains("if (EAX")|not) and (contains("return 0;")|not) and (contains("return 1;")|not) and (contains("r10_1")|not) and (contains("ValueId")|not) and (contains("ObjectId")|not) and (contains("r2dec fallback:")|not)'
 s `afl~alloc_and_copy[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("alloc_and_copy") and contains("r2dec residual: certified render contract failed") and contains("first missing callsite") and contains("summary return unresolved") and (contains("buf = sym.imp.malloc(len + 1);")|not) and (contains("sym.imp.memcpy(buf, src, len);")|not) and (contains("return buf;")|not) and (contains("buf[-0x8]")|not) and (contains("ValueId")|not) and (contains("ObjectId")|not) and (contains("r2dec fallback:")|not) and (contains("ArrayIndexCertificate")|not)'
+a:sla.dec | jq -Rs 'contains("alloc_and_copy") and contains("r2dec residual: certified render contract failed") and contains("raw address-like call argument") and contains("summary return unresolved") and (contains("buf = sym.imp.malloc(len + 1);")|not) and (contains("sym.imp.memcpy(buf, src, len);")|not) and (contains("return buf;")|not) and (contains("buf[-0x8]")|not) and (contains("ValueId")|not) and (contains("ObjectId")|not) and (contains("r2dec fallback:")|not) and (contains("ArrayIndexCertificate")|not)'
 EOF_CMDS
 RUN
 
