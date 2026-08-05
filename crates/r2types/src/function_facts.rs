@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -333,6 +333,15 @@ impl FunctionControlFacts {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FunctionRenderFacts {
+    /// Canonical certified expression graph keyed by stable semantic identity.
+    pub certified_exprs: BTreeMap<r2ssa::SemanticId, CertifiedExpr>,
+    /// Canonical certified effect/resource graph keyed by stable semantic identity.
+    pub certified_effects: BTreeMap<r2ssa::SemanticId, CertifiedEffect>,
+    /// ABI parameter slots mapped to every canonical entry value carrying them.
+    pub parameter_values: BTreeMap<u32, BTreeSet<r2ssa::ValueId>>,
+    /// Stable return-effect identity for each canonical SSA op site.
+    pub return_effects_by_op: BTreeMap<OpSiteKey, r2ssa::SemanticId>,
+    /// Compatibility projections used by consumers during the migration.
     pub expressions: BTreeMap<r2ssa::ValueId, ExpressionRenderFact>,
     pub string_literals_by_value: BTreeMap<r2ssa::ValueId, StringLiteralRenderFact>,
     pub memory_accesses: BTreeMap<r2ssa::StructuredAccessId, MemoryAccessRenderFact>,
@@ -352,7 +361,11 @@ pub struct StackSlotOwnerRenderAuthorization {
 
 impl FunctionRenderFacts {
     pub fn is_empty(&self) -> bool {
-        self.expressions.is_empty()
+        self.certified_exprs.is_empty()
+            && self.certified_effects.is_empty()
+            && self.parameter_values.is_empty()
+            && self.return_effects_by_op.is_empty()
+            && self.expressions.is_empty()
             && self.string_literals_by_value.is_empty()
             && self.memory_accesses.is_empty()
             && self.memory_accesses_by_op.is_empty()
@@ -363,7 +376,64 @@ impl FunctionRenderFacts {
     }
 
     pub fn expression_for_value(&self, value: r2ssa::ValueId) -> Option<&ExpressionRenderFact> {
-        self.expressions.get(&value)
+        self.certified_exprs
+            .get(&r2ssa::SemanticId::expression(value))
+            .map(|cert| &cert.fact)
+            .or_else(|| self.expressions.get(&value))
+    }
+
+    pub fn certified_expr_for_value(&self, value: r2ssa::ValueId) -> Option<&CertifiedExpr> {
+        self.certified_exprs
+            .get(&r2ssa::SemanticId::expression(value))
+    }
+
+    pub fn certified_effect(&self, id: r2ssa::SemanticId) -> Option<&CertifiedEffect> {
+        self.certified_effects.get(&id)
+    }
+
+    pub fn parameter_values(&self, slot: usize) -> impl Iterator<Item = r2ssa::ValueId> + '_ {
+        let slot = u32::try_from(slot).ok();
+        slot.into_iter()
+            .flat_map(|slot| self.parameter_values.get(&slot))
+            .flatten()
+            .copied()
+    }
+
+    pub fn return_effect_id_for_op(
+        &self,
+        block_addr: u64,
+        op_index: usize,
+    ) -> Option<r2ssa::SemanticId> {
+        self.return_effects_by_op
+            .get(&(block_addr, op_index))
+            .copied()
+    }
+
+    pub fn memory_effect_id_for_op(
+        &self,
+        block_addr: u64,
+        op_index: usize,
+        is_write: bool,
+        address: r2ssa::ValueId,
+        value: Option<r2ssa::ValueId>,
+    ) -> Option<r2ssa::SemanticId> {
+        let mut matching = self
+            .memory_accesses_by_op
+            .get(&(block_addr, op_index, is_write))?
+            .iter()
+            .filter_map(|access| {
+                let id = r2ssa::SemanticId::memory_access(*access);
+                match self.certified_effects.get(&id) {
+                    Some(CertifiedEffect::Memory { fact, .. })
+                        if fact.address == address && fact.value == value =>
+                    {
+                        Some(id)
+                    }
+                    _ => None,
+                }
+            });
+        let first = matching.next()?;
+        matching.next().is_none().then_some(first)
     }
 
     pub fn expression_is_renderable(&self, value: r2ssa::ValueId) -> bool {
@@ -387,7 +457,12 @@ impl FunctionRenderFacts {
         self.memory_accesses_by_op
             .get(&(block_addr, op_index, is_write))?
             .iter()
-            .filter_map(|access| self.memory_accesses.get(access))
+            .filter_map(|access| {
+                self.certified_effects
+                    .get(&r2ssa::SemanticId::memory_access(*access))
+                    .and_then(CertifiedEffect::memory_fact)
+                    .or_else(|| self.memory_accesses.get(access))
+            })
             .find(|fact| fact.width > 0)
     }
 
@@ -396,7 +471,10 @@ impl FunctionRenderFacts {
         block_addr: u64,
         op_index: usize,
     ) -> Option<&ReturnValueRenderFact> {
-        self.returns_by_op.get(&(block_addr, op_index))
+        self.return_effect_id_for_op(block_addr, op_index)
+            .and_then(|id| self.certified_effects.get(&id))
+            .and_then(CertifiedEffect::return_fact)
+            .or_else(|| self.returns_by_op.get(&(block_addr, op_index)))
     }
 
     pub fn member_access_for_op(
@@ -640,6 +718,81 @@ pub struct ExpressionRenderFact {
     pub defining_inst: Option<r2ssa::InstId>,
     pub width: u32,
     pub renderable: bool,
+}
+
+/// A renderable expression tied to canonical SSA identity and dependencies.
+///
+/// `bindings` records semantic roles such as ABI parameters without replacing
+/// the expression's stable value identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CertifiedExpr {
+    pub id: r2ssa::SemanticId,
+    pub fact: ExpressionRenderFact,
+    pub inputs: Vec<r2ssa::SemanticId>,
+    pub bindings: BTreeSet<r2ssa::SemanticId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CertifiedEffectKind {
+    StackSlot,
+    MemoryRead,
+    MemoryWrite,
+    Return,
+}
+
+/// A certified observable effect or addressable resource.
+///
+/// Variants retain the typed canonical payload, so consumers never need to
+/// recover semantic identity from rendered text or tuple-shaped sidecars.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CertifiedEffect {
+    StackSlot {
+        id: r2ssa::SemanticId,
+        object: r2ssa::ObjectId,
+        base: r2ssa::StackAddressBase,
+        offset: i64,
+        size: Option<u32>,
+    },
+    Memory {
+        id: r2ssa::SemanticId,
+        fact: MemoryAccessRenderFact,
+    },
+    Return {
+        id: r2ssa::SemanticId,
+        at: r2ssa::InstId,
+        fact: ReturnValueRenderFact,
+    },
+}
+
+impl CertifiedEffect {
+    pub const fn id(&self) -> r2ssa::SemanticId {
+        match self {
+            Self::StackSlot { id, .. } | Self::Memory { id, .. } | Self::Return { id, .. } => *id,
+        }
+    }
+
+    pub const fn kind(&self) -> CertifiedEffectKind {
+        match self {
+            Self::StackSlot { .. } => CertifiedEffectKind::StackSlot,
+            Self::Memory { fact, .. } if fact.is_write => CertifiedEffectKind::MemoryWrite,
+            Self::Memory { .. } => CertifiedEffectKind::MemoryRead,
+            Self::Return { .. } => CertifiedEffectKind::Return,
+        }
+    }
+
+    pub const fn memory_fact(&self) -> Option<&MemoryAccessRenderFact> {
+        match self {
+            Self::Memory { fact, .. } => Some(fact),
+            _ => None,
+        }
+    }
+
+    pub const fn return_fact(&self) -> Option<&ReturnValueRenderFact> {
+        match self {
+            Self::Return { fact, .. } => Some(fact),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1783,6 +1936,50 @@ impl FunctionFacts {
         merge_render_facts(&mut self.render, prepared_render);
     }
 
+    /// Bind canonical entry values to ABI parameter-slot semantic identities.
+    ///
+    /// This is a separate step because the ABI profile is owned by the engine,
+    /// while expression identity is owned by prepared SSA. Every entry alias is
+    /// retained; downstream consumers can select a width without guessing from
+    /// register spelling.
+    pub fn populate_certified_parameter_exprs(
+        &mut self,
+        prepared: &r2ssa::SsaArtifact,
+        param_slots: &ParamSlotResolver,
+    ) {
+        let Some(parameter_count) = self
+            .types
+            .render_authorized_signature()
+            .map(|signature| signature.params.len())
+        else {
+            return;
+        };
+        for value in &prepared.graph().values {
+            let Some(slot) = param_slots.slot_for_var(&value.var) else {
+                continue;
+            };
+            if slot >= parameter_count {
+                continue;
+            }
+            let Some(parameter_id) = r2ssa::SemanticId::parameter(slot) else {
+                continue;
+            };
+            let Some(cert) = self
+                .render
+                .certified_exprs
+                .get_mut(&r2ssa::SemanticId::expression(value.id))
+            else {
+                continue;
+            };
+            cert.bindings.insert(parameter_id);
+            self.render
+                .parameter_values
+                .entry(slot as u32)
+                .or_default()
+                .insert(value.id);
+        }
+    }
+
     pub fn interproc_summary_set(&self) -> Option<&r2ssa::InterprocSummarySet> {
         self.summary_view.as_set()
     }
@@ -1977,6 +2174,22 @@ fn merge_control_facts(existing: &mut FunctionControlFacts, prepared: FunctionCo
 }
 
 fn merge_render_facts(existing: &mut FunctionRenderFacts, prepared: FunctionRenderFacts) {
+    for (id, fact) in prepared.certified_exprs {
+        existing.certified_exprs.entry(id).or_insert(fact);
+    }
+    for (id, fact) in prepared.certified_effects {
+        existing.certified_effects.entry(id).or_insert(fact);
+    }
+    for (slot, values) in prepared.parameter_values {
+        existing
+            .parameter_values
+            .entry(slot)
+            .or_default()
+            .extend(values);
+    }
+    for (op, id) in prepared.return_effects_by_op {
+        existing.return_effects_by_op.entry(op).or_insert(id);
+    }
     for (value, fact) in prepared.expressions {
         existing.expressions.entry(value).or_insert(fact);
     }
@@ -2384,56 +2597,120 @@ fn const_var_i64(var: &r2ssa::SSAVar) -> Option<i64> {
 
 fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
     let certificates = prepared.certificates();
-    let expressions = certificates
+    let certified_exprs = certificates
         .expressions
         .iter()
         .map(|(value, cert)| {
+            let fact = ExpressionRenderFact {
+                value: cert.value,
+                defining_inst: cert.defining_inst,
+                width: cert.width,
+                renderable: cert.renderable,
+            };
             (
-                *value,
-                ExpressionRenderFact {
-                    value: cert.value,
-                    defining_inst: cert.defining_inst,
-                    width: cert.width,
-                    renderable: cert.renderable,
+                r2ssa::SemanticId::expression(*value),
+                CertifiedExpr {
+                    id: r2ssa::SemanticId::expression(*value),
+                    fact,
+                    inputs: cert
+                        .inputs
+                        .iter()
+                        .copied()
+                        .map(r2ssa::SemanticId::expression)
+                        .collect(),
+                    bindings: BTreeSet::new(),
                 },
             )
         })
+        .collect::<BTreeMap<_, _>>();
+    let expressions = certified_exprs
+        .values()
+        .map(|cert| (cert.fact.value, cert.fact.clone()))
         .collect();
-    let memory_accesses = certificates
+    let certified_memory_effects = certificates
         .memory_accesses
         .iter()
         .map(|(access, cert)| {
+            let id = r2ssa::SemanticId::memory_access(*access);
             (
-                *access,
-                MemoryAccessRenderFact {
-                    access: cert.access,
-                    block_addr: cert.block_addr,
-                    op_index: cert.op_index,
-                    object: cert.object,
-                    address: cert.address,
-                    value: cert.value,
-                    is_write: cert.is_write,
-                    width: cert.width,
+                id,
+                CertifiedEffect::Memory {
+                    id,
+                    fact: MemoryAccessRenderFact {
+                        access: cert.access,
+                        block_addr: cert.block_addr,
+                        op_index: cert.op_index,
+                        object: cert.object,
+                        address: cert.address,
+                        value: cert.value,
+                        is_write: cert.is_write,
+                        width: cert.width,
+                    },
                 },
             )
         })
+        .collect::<BTreeMap<_, _>>();
+    let memory_accesses = certified_memory_effects
+        .values()
+        .filter_map(|effect| effect.memory_fact().map(|fact| (fact.access, fact.clone())))
         .collect();
     let memory_accesses_by_op = certificates.memory_accesses_by_op.clone();
-    let returns_by_op = certificates
+    let certified_return_effects = certificates
         .returns
         .iter()
         .map(|cert| {
+            let id = r2ssa::SemanticId::return_value(cert.at);
             (
-                (cert.block_addr, cert.op_index),
-                ReturnValueRenderFact {
-                    block_addr: cert.block_addr,
-                    op_index: cert.op_index,
-                    value: cert.value,
-                    width: cert.width,
+                id,
+                CertifiedEffect::Return {
+                    id,
+                    at: cert.at,
+                    fact: ReturnValueRenderFact {
+                        block_addr: cert.block_addr,
+                        op_index: cert.op_index,
+                        value: cert.value,
+                        width: cert.width,
+                    },
                 },
             )
         })
+        .collect::<BTreeMap<_, _>>();
+    let returns_by_op = certified_return_effects
+        .values()
+        .filter_map(|effect| {
+            effect
+                .return_fact()
+                .map(|fact| ((fact.block_addr, fact.op_index), fact.clone()))
+        })
         .collect();
+    let return_effects_by_op = certified_return_effects
+        .iter()
+        .filter_map(|(id, effect)| {
+            effect
+                .return_fact()
+                .map(|fact| ((fact.block_addr, fact.op_index), *id))
+        })
+        .collect();
+    let certified_stack_effects = certificates
+        .stack_slots
+        .iter()
+        .map(|(object, cert)| {
+            let id = r2ssa::SemanticId::stack_slot(*object);
+            (
+                id,
+                CertifiedEffect::StackSlot {
+                    id,
+                    object: *object,
+                    base: cert.base,
+                    offset: cert.offset,
+                    size: cert.size,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut certified_effects = certified_stack_effects;
+    certified_effects.extend(certified_memory_effects);
+    certified_effects.extend(certified_return_effects);
     let mut stack_slot_offsets: BTreeMap<_, _> = certificates
         .stack_slots
         .iter()
@@ -2462,6 +2739,10 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
         })
     });
     FunctionRenderFacts {
+        certified_exprs,
+        certified_effects,
+        parameter_values: BTreeMap::new(),
+        return_effects_by_op,
         expressions,
         string_literals_by_value: BTreeMap::new(),
         memory_accesses,
@@ -3308,6 +3589,107 @@ mod tests {
         ParamSlotResolver::from_arch_name(Some("x86-64"))
     }
 
+    #[test]
+    fn prepared_render_facts_certify_params_stack_memory_and_returns_by_semantic_id() {
+        let mut block = R2ILBlock::new(0x401000, 4);
+        block.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(0x100, 8),
+            a: Varnode::register(0x20, 8),
+            b: Varnode::constant(0xffff_ffff_ffff_fff8, 8),
+        });
+        block.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x100, 8),
+            val: Varnode::register(0x10, 8),
+        });
+        block.push(R2ILOp::Load {
+            dst: Varnode::register(0x00, 8),
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x100, 8),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode::register(0x00, 8),
+        });
+        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
+            .expect("prepared");
+        let signature = FunctionSignatureSpec {
+            ret_type: Some(CTypeLike::Int {
+                bits: 64,
+                signedness: crate::Signedness::Unsigned,
+            }),
+            params: vec![FunctionParamSpec {
+                name: "buffer".to_string(),
+                ty: Some(CTypeLike::Int {
+                    bits: 64,
+                    signedness: crate::Signedness::Unsigned,
+                }),
+            }],
+        };
+        let mut facts = FunctionFacts::new(
+            FunctionTypeFacts {
+                merged_signature: Some(signature.clone()),
+                signature_certificate: crate::SignatureCertificate::from_signature(
+                    &signature,
+                    [crate::SignatureCertificateSource::ExternalContext],
+                ),
+                ..FunctionTypeFacts::default()
+            },
+            None,
+        );
+        facts.attach_prepared_decompile_evidence(&prepared);
+        facts.populate_certified_parameter_exprs(&prepared, &x86_stack_home_param_slots());
+        let render = facts.render().expect("certified render facts");
+
+        let rdi = prepared
+            .graph()
+            .values
+            .iter()
+            .find(|value| value.var.name.eq_ignore_ascii_case("rdi") && value.var.version == 0)
+            .expect("entry rdi value");
+        let param_id = r2ssa::SemanticId::parameter(0).expect("parameter ID");
+        assert!(
+            render
+                .certified_expr_for_value(rdi.id)
+                .is_some_and(|expr| expr.bindings.contains(&param_id)),
+            "entry parameter binding must use ABI slot identity"
+        );
+        assert!(render.parameter_values(0).any(|value| value == rdi.id));
+        assert_eq!(render.parameter_values.len(), 1);
+        assert!(
+            render
+                .certified_exprs
+                .values()
+                .all(|expr| !expr.bindings.contains(&r2ssa::SemanticId::Parameter(1))),
+            "unused ABI entry registers beyond signature arity must not become parameters"
+        );
+
+        let stack_effects = render
+            .certified_effects
+            .values()
+            .filter(|effect| effect.kind() == CertifiedEffectKind::StackSlot)
+            .count();
+        let memory_effects = render
+            .certified_effects
+            .values()
+            .filter(|effect| {
+                matches!(
+                    effect.kind(),
+                    CertifiedEffectKind::MemoryRead | CertifiedEffectKind::MemoryWrite
+                )
+            })
+            .count();
+        let return_effects = render
+            .certified_effects
+            .values()
+            .filter(|effect| effect.kind() == CertifiedEffectKind::Return)
+            .count();
+        assert_eq!(stack_effects, 1);
+        assert_eq!(memory_effects, 2);
+        assert!(return_effects >= 1);
+        assert!(render.return_effect_id_for_op(0x401000, 3).is_some());
+        assert!(render.return_for_op(0x401000, 3).is_some());
+    }
+
     fn member_load_prepared_for_register(
         arch: &ArchSpec,
         register_offset: u64,
@@ -3803,6 +4185,7 @@ mod tests {
                 },
             )]),
             stack_slot_offsets: BTreeMap::from([(object, -8)]),
+            ..FunctionRenderFacts::default()
         };
 
         let facts = FunctionFacts::default().with_render(render);

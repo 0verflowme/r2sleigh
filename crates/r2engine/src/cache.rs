@@ -24,18 +24,15 @@ impl CacheCounters {
 pub struct EngineSessionCacheMetrics {
     pub analysis: CacheCounters,
     pub artifacts: CacheCounters,
-    pub renders: CacheCounters,
 }
 
 impl EngineSessionCacheMetrics {
     pub fn total(self) -> CacheCounters {
         CacheCounters {
-            hits: self.analysis.hits + self.artifacts.hits + self.renders.hits,
-            misses: self.analysis.misses + self.artifacts.misses + self.renders.misses,
-            insertions: self.analysis.insertions
-                + self.artifacts.insertions
-                + self.renders.insertions,
-            evictions: self.analysis.evictions + self.artifacts.evictions + self.renders.evictions,
+            hits: self.analysis.hits + self.artifacts.hits,
+            misses: self.analysis.misses + self.artifacts.misses,
+            insertions: self.analysis.insertions + self.artifacts.insertions,
+            evictions: self.analysis.evictions + self.artifacts.evictions,
         }
     }
 
@@ -43,7 +40,6 @@ impl EngineSessionCacheMetrics {
         match layer {
             EngineCacheLayer::Analysis => self.analysis,
             EngineCacheLayer::Artifact => self.artifacts,
-            EngineCacheLayer::Render => self.renders,
             EngineCacheLayer::MetricsSnapshot => self.total(),
         }
     }
@@ -115,20 +111,6 @@ where
             .write()
             .expect("engine cache counters write lock poisoned") = CacheCounters::default();
     }
-
-    pub fn clear_entries(&self) {
-        self.inner
-            .write()
-            .expect("engine cache write lock poisoned")
-            .clear();
-    }
-
-    pub fn len(&self) -> usize {
-        self.inner
-            .read()
-            .expect("engine cache read lock poisoned")
-            .len()
-    }
 }
 
 impl<K, V> SessionCache<K, V>
@@ -176,12 +158,6 @@ where
         ticket
     }
 
-    fn clear(&mut self) {
-        self.entries.clear();
-        self.order.clear();
-        self.next_ticket = 1;
-    }
-
     fn get(&mut self, key: &K) -> Option<Arc<V>> {
         let new_ticket = self.allocate_ticket();
         let (value, old_ticket) = self.entries.get_mut(key)?;
@@ -218,9 +194,5 @@ where
             value,
             evicted_count,
         }
-    }
-
-    fn len(&self) -> usize {
-        self.entries.len()
     }
 }

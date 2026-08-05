@@ -4,7 +4,284 @@ use r2ssa::SSAVar;
 
 use super::*;
 
+#[derive(Debug, Clone, PartialEq)]
+struct CertifiedLinearAddress {
+    base: CExpr,
+    index: Option<CertifiedLinearIndex>,
+    offset: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct CertifiedLinearIndex {
+    expr: CExpr,
+    stride: i64,
+}
+
 impl<'a> FoldingContext<'a> {
+    fn certified_pointer_parameter_expr(&self, expr: &CExpr) -> bool {
+        let expr = match expr {
+            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => inner.as_ref(),
+            _ => expr,
+        };
+        let CExpr::Var(name) = expr else {
+            return false;
+        };
+        self.inputs
+            .function_facts
+            .type_facts()
+            .render_authorized_signature()
+            .is_some_and(|signature| {
+                signature.params.iter().any(|param| {
+                    param.name.eq_ignore_ascii_case(name)
+                        && param.ty.as_ref().is_some_and(|ty| {
+                            matches!(
+                                crate::type_like_to_ctype(ty),
+                                CType::Pointer(_) | CType::Array(_, _)
+                            )
+                        })
+                })
+            })
+    }
+
+    fn certified_expr_contains_pointer_parameter(&self, expr: &CExpr) -> bool {
+        let mut contains = false;
+        expr.visit(&mut |node| {
+            if !contains && self.certified_pointer_parameter_expr(node) {
+                contains = true;
+            }
+        });
+        contains
+    }
+
+    fn collect_certified_address_terms(
+        &self,
+        expr: &CExpr,
+        sign: i64,
+        constant: &mut i64,
+        terms: &mut Vec<(i64, CExpr)>,
+    ) -> Option<()> {
+        match expr {
+            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
+                self.collect_certified_address_terms(inner, sign, constant, terms)
+            }
+            CExpr::Binary {
+                op: BinaryOp::Add,
+                left,
+                right,
+            } => {
+                self.collect_certified_address_terms(left, sign, constant, terms)?;
+                self.collect_certified_address_terms(right, sign, constant, terms)
+            }
+            CExpr::Binary {
+                op: BinaryOp::Sub,
+                left,
+                right,
+            } => {
+                self.collect_certified_address_terms(left, sign, constant, terms)?;
+                self.collect_certified_address_terms(right, sign.checked_neg()?, constant, terms)
+            }
+            _ => {
+                if let Some(value) = self.literal_to_i64(expr) {
+                    *constant = constant.checked_add(value.checked_mul(sign)?)?;
+                } else {
+                    terms.push((sign, expr.clone()));
+                }
+                Some(())
+            }
+        }
+    }
+
+    fn certified_index_atom_and_coefficient(&self, expr: &CExpr) -> Option<(CExpr, i64)> {
+        match expr {
+            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
+                self.certified_index_atom_and_coefficient(inner)
+            }
+            CExpr::Unary {
+                op: UnaryOp::Neg,
+                operand,
+            } => {
+                let (atom, coefficient) = self.certified_index_atom_and_coefficient(operand)?;
+                Some((atom, coefficient.checked_neg()?))
+            }
+            CExpr::Binary {
+                op: BinaryOp::Mul,
+                left,
+                right,
+            } => {
+                if let Some(multiplier) = self.literal_to_i64(left) {
+                    let (atom, coefficient) = self.certified_index_atom_and_coefficient(right)?;
+                    return Some((atom, coefficient.checked_mul(multiplier)?));
+                }
+                let multiplier = self.literal_to_i64(right)?;
+                let (atom, coefficient) = self.certified_index_atom_and_coefficient(left)?;
+                Some((atom, coefficient.checked_mul(multiplier)?))
+            }
+            CExpr::Binary {
+                op: BinaryOp::Shl,
+                left,
+                right,
+            } => {
+                let shift = self.literal_to_i64(right)?;
+                if !(0..=62).contains(&shift) {
+                    return None;
+                }
+                let (atom, coefficient) = self.certified_index_atom_and_coefficient(left)?;
+                Some((
+                    atom,
+                    coefficient.checked_mul(1_i64.checked_shl(shift as u32)?)?,
+                ))
+            }
+            CExpr::Binary {
+                op: BinaryOp::Add | BinaryOp::Sub,
+                left,
+                right,
+            } => {
+                let (left_atom, left_coefficient) =
+                    self.certified_index_atom_and_coefficient(left)?;
+                let (right_atom, right_coefficient) =
+                    self.certified_index_atom_and_coefficient(right)?;
+                if left_atom != right_atom {
+                    return None;
+                }
+                let coefficient = if matches!(
+                    expr,
+                    CExpr::Binary {
+                        op: BinaryOp::Add,
+                        ..
+                    }
+                ) {
+                    left_coefficient.checked_add(right_coefficient)?
+                } else {
+                    left_coefficient.checked_sub(right_coefficient)?
+                };
+                Some((left_atom, coefficient))
+            }
+            _ if self.literal_to_i64(expr).is_some()
+                || self.certified_expr_contains_pointer_parameter(expr) =>
+            {
+                None
+            }
+            _ => Some((expr.clone(), 1)),
+        }
+    }
+
+    fn certified_linear_address_components(&self, expr: &CExpr) -> Option<CertifiedLinearAddress> {
+        let mut constant = 0_i64;
+        let mut terms = Vec::new();
+        self.collect_certified_address_terms(expr, 1, &mut constant, &mut terms)?;
+
+        let mut base = None;
+        let mut index = None::<(CExpr, i64)>;
+        for (sign, term) in terms {
+            if self.certified_pointer_parameter_expr(&term) {
+                if sign != 1 || base.replace(term).is_some() {
+                    return None;
+                }
+                continue;
+            }
+            let (atom, coefficient) = self.certified_index_atom_and_coefficient(&term)?;
+            let coefficient = coefficient.checked_mul(sign)?;
+            match &mut index {
+                Some((existing_atom, existing_coefficient)) if *existing_atom == atom => {
+                    *existing_coefficient = existing_coefficient.checked_add(coefficient)?;
+                }
+                Some(_) => return None,
+                None => index = Some((atom, coefficient)),
+            }
+        }
+        Some(CertifiedLinearAddress {
+            base: base?,
+            index: index.map(|(expr, stride)| CertifiedLinearIndex { expr, stride }),
+            offset: constant,
+        })
+    }
+
+    fn certified_member_fact_for_memory(
+        &self,
+        memory: &r2types::MemoryAccessRenderFact,
+    ) -> Option<&r2types::MemberAccessRenderFact> {
+        let facts = self.inputs.render_facts()?.member_accesses_by_op.get(&(
+            memory.block_addr,
+            memory.op_index,
+            memory.is_write,
+        ))?;
+        let mut matching = facts.iter().filter(|fact| {
+            fact.access == memory.access
+                && fact.object == memory.object
+                && fact.access_width == memory.width
+        });
+        let first = matching.next()?;
+        matching.next().is_none().then_some(first)
+    }
+
+    fn certified_array_fact_for_memory(
+        &self,
+        memory: &r2types::MemoryAccessRenderFact,
+    ) -> Option<&r2types::ArrayAccessRenderFact> {
+        let facts = self.inputs.render_facts()?.array_accesses_by_op.get(&(
+            memory.block_addr,
+            memory.op_index,
+            memory.is_write,
+        ))?;
+        let mut matching = facts.iter().filter(|fact| {
+            fact.access == memory.access
+                && fact.object == memory.object
+                && fact.access_width == memory.width
+                && fact.element_stride > 0
+        });
+        let first = matching.next()?;
+        matching.next().is_none().then_some(first)
+    }
+
+    fn render_certified_structured_memory_expr(
+        &self,
+        memory: &r2types::MemoryAccessRenderFact,
+        address: &CExpr,
+    ) -> Option<CExpr> {
+        let member = self.certified_member_fact_for_memory(memory);
+        let array = self.certified_array_fact_for_memory(memory);
+        if member.is_none() && array.is_none() {
+            return None;
+        }
+        let CertifiedLinearAddress {
+            base,
+            index,
+            offset,
+        } = self.certified_linear_address_components(address)?;
+
+        if let Some(array) = array {
+            let expected_offset = i64::try_from(array.field_offset).ok()?;
+            let expected_stride = i64::try_from(array.element_stride).ok()?;
+            let CertifiedLinearIndex {
+                expr: index,
+                stride,
+            } = index?;
+            if offset != expected_offset || stride != expected_stride {
+                return None;
+            }
+            let indexed = CExpr::Subscript {
+                base: Box::new(base),
+                index: Box::new(index),
+            };
+            return match member {
+                Some(member)
+                    if member.field_offset == array.field_offset
+                        && member.access == array.access =>
+                {
+                    Some(self.member_access_expr(indexed, member.field_name.clone()))
+                }
+                None if array.field_offset == 0 => Some(indexed),
+                _ => None,
+            };
+        }
+
+        let member = member?;
+        if index.is_some() || offset != i64::try_from(member.field_offset).ok()? {
+            return None;
+        }
+        Some(self.member_access_expr(base, member.field_name.clone()))
+    }
+
     fn expr_is_store_target_candidate(expr: &CExpr) -> bool {
         match expr {
             CExpr::Var(_)
@@ -132,6 +409,9 @@ impl<'a> FoldingContext<'a> {
         {
             return None;
         }
+        if let Some(expr) = self.certified_parameter_expr_for_value(value) {
+            return Some(expr);
+        }
         if let Some(expr) =
             self.render_certified_stack_param_value_expr(value, 0, &mut HashSet::new())
         {
@@ -139,6 +419,9 @@ impl<'a> FoldingContext<'a> {
         }
         if let Some(expr) = self.render_certified_scalar_expr_for_var(var, 0, &mut HashSet::new()) {
             return Some(expr);
+        }
+        if var.version == 0 && var.is_register() && self.stable_semantic_ids_are_required() {
+            return None;
         }
         let rendered = self.var_name(var);
         Some(
@@ -166,6 +449,9 @@ impl<'a> FoldingContext<'a> {
             .is_some_and(|proof| proof.expression_is_renderable(value))
         {
             return None;
+        }
+        if let Some(expr) = self.certified_parameter_expr_for_value(value) {
+            return Some(expr);
         }
         if !visited.insert(value) {
             return None;
@@ -271,6 +557,9 @@ impl<'a> FoldingContext<'a> {
 
         let result = (|| {
             let prepared = self.prepared_ssa()?;
+            if let Some(expr) = self.certified_parameter_expr_for_value(value) {
+                return Some(expr);
+            }
             let inst_id = prepared.graph().def_inst(value)?;
             let inst = prepared.graph().inst(inst_id)?;
             let r2ssa::InstPayload::Op(op) = &inst.payload else {
@@ -337,7 +626,15 @@ impl<'a> FoldingContext<'a> {
         if var.is_const() {
             return self.render_certified_value_expr_for_var(var);
         }
+        let prepared = self.prepared_ssa()?;
+        let value = self.prepared_value_id_for_var(var)?;
         if var.version == 0 && var.is_register() {
+            if let Some(expr) = self.certified_parameter_expr_for_value(value) {
+                return Some(expr);
+            }
+            if self.stable_semantic_ids_are_required() {
+                return None;
+            }
             let rendered = self.var_name(var);
             return Some(
                 self.arg_alias_for_rendered_name(&rendered)
@@ -347,8 +644,6 @@ impl<'a> FoldingContext<'a> {
             );
         }
 
-        let prepared = self.prepared_ssa()?;
-        let value = self.prepared_value_id_for_var(var)?;
         if !visited.insert(value) {
             return None;
         }
@@ -488,21 +783,7 @@ impl<'a> FoldingContext<'a> {
             return Some(expr);
         }
         let (addr, addr_expr) = self.certified_memory_address_expr(fact)?;
-        let previous_block = self.current_block_addr.get();
-        let previous_op = self.current_op_idx.get();
-        self.current_block_addr.set(Some(fact.block_addr));
-        self.current_op_idx.set(Some(fact.op_index));
-        let mut visited = HashSet::new();
-        let rendered = self.render_memory_access_from_visible_expr_with_direction(
-            &addr_expr,
-            fact.width,
-            fact.is_write,
-            0,
-            &mut visited,
-        );
-        self.current_block_addr.set(previous_block);
-        self.current_op_idx.set(previous_op);
-        if let Some(rendered) = rendered {
+        if let Some(rendered) = self.render_certified_structured_memory_expr(fact, &addr_expr) {
             return Some(rendered);
         }
         if matches!(addr_expr, CExpr::Binary { .. }) {

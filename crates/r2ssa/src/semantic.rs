@@ -23,6 +23,63 @@ pub struct PredicateId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CallSiteId(pub u32);
 
+/// Stable identity for a semantic entity inside one prepared SSA artifact.
+///
+/// These IDs are derived only from canonical SSA/object identities and ABI
+/// parameter slots. They deliberately do not depend on rendered names, AST
+/// positions, or traversal order in downstream consumers. Re-preparing the
+/// same canonical [`SSAFunction`] therefore produces the same semantic IDs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum SemanticId {
+    Expression(ValueId),
+    Parameter(u32),
+    StackSlot(ObjectId),
+    MemoryAccess(StructuredAccessId),
+    Return(InstId),
+    Call(CallSiteId),
+}
+
+impl SemanticId {
+    pub const fn expression(value: ValueId) -> Self {
+        Self::Expression(value)
+    }
+
+    pub fn parameter(slot: usize) -> Option<Self> {
+        u32::try_from(slot).ok().map(Self::Parameter)
+    }
+
+    pub const fn stack_slot(object: ObjectId) -> Self {
+        Self::StackSlot(object)
+    }
+
+    pub const fn memory_access(access: StructuredAccessId) -> Self {
+        Self::MemoryAccess(access)
+    }
+
+    pub const fn return_value(at: InstId) -> Self {
+        Self::Return(at)
+    }
+
+    pub const fn call(call_site: CallSiteId) -> Self {
+        Self::Call(call_site)
+    }
+}
+
+impl std::fmt::Display for SemanticId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Expression(value) => write!(f, "expr:{}", value.0),
+            Self::Parameter(slot) => write!(f, "param:{slot}"),
+            Self::StackSlot(object) => write!(f, "stack:{}", object.0),
+            Self::MemoryAccess(access) => {
+                write!(f, "memory:{}:{}", access.inst.0, access.ordinal)
+            }
+            Self::Return(at) => write!(f, "return:{}", at.0),
+            Self::Call(call_site) => write!(f, "call:{}", call_site.0),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GlobalObjectKey {
     pub space: String,
@@ -249,7 +306,7 @@ pub struct StructuredLoopFact {
     pub bound: Option<ValueId>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct StructuredAccessId {
     pub inst: InstId,
     pub ordinal: u32,
@@ -3862,7 +3919,8 @@ fn stack_base_root_for_name(name: &str) -> Option<StackAddressRoot> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LoopId, ProofNodeId};
+    use super::{CallSiteId, LoopId, ObjectId, ProofNodeId, SemanticId, StructuredAccessId};
+    use crate::{InstId, ValueId};
 
     #[test]
     fn proof_node_ids_are_owner_qualified_and_stable() {
@@ -3879,5 +3937,39 @@ mod tests {
         assert_eq!(switch_node.anchor, 0x401020);
         assert_eq!(switch_node.ordinal, 0);
         assert_eq!(switch_node.to_string(), "r2ssa:switch:0x401020:0");
+    }
+
+    #[test]
+    fn semantic_ids_are_typed_and_render_name_independent() {
+        let access = StructuredAccessId {
+            inst: InstId(9),
+            ordinal: 2,
+        };
+        let ids = [
+            SemanticId::expression(ValueId(4)),
+            SemanticId::parameter(1).expect("ABI parameter slot"),
+            SemanticId::stack_slot(ObjectId(3)),
+            SemanticId::memory_access(access),
+            SemanticId::return_value(InstId(12)),
+            SemanticId::call(CallSiteId(5)),
+        ];
+
+        assert_eq!(ids[0].to_string(), "expr:4");
+        assert_eq!(ids[1].to_string(), "param:1");
+        assert_eq!(ids[2].to_string(), "stack:3");
+        assert_eq!(ids[3].to_string(), "memory:9:2");
+        assert_eq!(ids[4].to_string(), "return:12");
+        assert_eq!(ids[5].to_string(), "call:5");
+        assert_eq!(
+            ids,
+            [
+                SemanticId::Expression(ValueId(4)),
+                SemanticId::Parameter(1),
+                SemanticId::StackSlot(ObjectId(3)),
+                SemanticId::MemoryAccess(access),
+                SemanticId::Return(InstId(12)),
+                SemanticId::Call(CallSiteId(5)),
+            ]
+        );
     }
 }

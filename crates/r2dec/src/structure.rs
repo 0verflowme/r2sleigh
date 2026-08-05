@@ -144,6 +144,8 @@ pub struct ControlFlowStructurer<'a, 'o> {
     safety_reason: Option<String>,
     /// Structured control nodes emitted by this structurer, in render order.
     control_render_proofs: Vec<ControlRenderProof>,
+    /// Merge blocks owned by enclosing regions and therefore emitted there.
+    deferred_merge_blocks: Vec<u64>,
 }
 
 struct SwitchRegionView<'r> {
@@ -172,6 +174,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             safety_budget_max,
             safety_reason: None,
             control_render_proofs: Vec::new(),
+            deferred_merge_blocks: Vec::new(),
         }
     }
 
@@ -189,6 +192,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             safety_budget_max,
             safety_reason: None,
             control_render_proofs: Vec::new(),
+            deferred_merge_blocks: Vec::new(),
         }
     }
 
@@ -498,7 +502,19 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 else_region,
                 merge_block,
             } => {
-                if !self.fold_ctx.requires_certified_rendering() {
+                let merge_owned_by_ancestor =
+                    merge_block.is_some_and(|merge| self.deferred_merge_blocks.contains(&merge));
+                if !merge_owned_by_ancestor
+                    && let Some(rewritten) = self.try_structure_if_with_shared_default_arm(
+                        *cond_block,
+                        then_region,
+                        else_region.as_deref(),
+                        *merge_block,
+                    )
+                {
+                    return rewritten;
+                }
+                if !merge_owned_by_ancestor && !self.fold_ctx.requires_certified_rendering() {
                     if let Some(rewritten) = self.try_structure_symbolic_actionable_if(
                         *cond_block,
                         then_region,
@@ -516,12 +532,14 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                         return rewritten;
                     }
                 }
-                if let Some(rewritten) = self.try_structure_if_else_with_register_merge_returns(
-                    *cond_block,
-                    then_region,
-                    else_region.as_deref(),
-                    *merge_block,
-                ) {
+                if !merge_owned_by_ancestor
+                    && let Some(rewritten) = self.try_structure_if_else_with_register_merge_returns(
+                        *cond_block,
+                        then_region,
+                        else_region.as_deref(),
+                        *merge_block,
+                    )
+                {
                     return rewritten;
                 }
                 if !self.fold_ctx.requires_certified_rendering()
@@ -569,10 +587,16 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 } else {
                     self.record_branch_render_proof(*cond_block, predicate, condition_value);
                 }
+                if let Some(merge) = merge_block {
+                    self.deferred_merge_blocks.push(*merge);
+                }
                 let then_stmt = self.structure_branch_region(*cond_block, then_region);
                 let else_stmt = else_region
                     .as_ref()
                     .map(|r| self.structure_branch_region(*cond_block, r));
+                if let Some(merge) = merge_block {
+                    debug_assert_eq!(self.deferred_merge_blocks.pop(), Some(*merge));
+                }
                 let branches_terminate = else_stmt.as_ref().is_some_and(|else_stmt| {
                     Self::stmt_guarantees_termination(&then_stmt)
                         && Self::stmt_guarantees_termination(else_stmt)
@@ -582,6 +606,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 prefix.push(if_stmt);
                 if let Some(merge_addr) = merge_block
                     && !branches_terminate
+                    && !merge_owned_by_ancestor
                 {
                     Self::append_stmt_body_flat(&mut prefix, self.structure_block(*merge_addr));
                 }
@@ -671,6 +696,285 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         match region {
             Region::Block(addr) => self.structure_block_from_predecessor(*addr, pred_block),
             _ => self.structure_region(region),
+        }
+    }
+
+    fn try_structure_if_with_shared_default_arm(
+        &mut self,
+        cond_block: u64,
+        then_region: &Region,
+        else_region: Option<&Region>,
+        merge_block: Option<u64>,
+    ) -> Option<CStmt> {
+        let merge_block = merge_block?;
+        let else_region = else_region?;
+        self.try_structure_shared_default_orientation(
+            cond_block,
+            then_region,
+            else_region,
+            merge_block,
+        )
+        .or_else(|| {
+            self.try_structure_shared_default_orientation(
+                cond_block,
+                else_region,
+                then_region,
+                merge_block,
+            )
+        })
+    }
+
+    fn try_structure_shared_default_orientation(
+        &mut self,
+        cond_block: u64,
+        default_region: &Region,
+        nested_region: &Region,
+        merge_block: u64,
+    ) -> Option<CStmt> {
+        let Region::IfThenElse {
+            cond_block: _,
+            then_region: nested_then,
+            else_region: nested_else,
+            merge_block: nested_merge,
+        } = nested_region
+        else {
+            return None;
+        };
+        if *nested_merge != Some(merge_block) {
+            return None;
+        }
+        let default_entry = default_region.entry();
+        let then_reaches_default = self
+            .unique_region_predecessor_to_merge(nested_then, default_entry)
+            .is_some();
+        let else_reaches_default = nested_else.as_deref().is_some_and(|region| {
+            self.unique_region_predecessor_to_merge(region, default_entry)
+                .is_some()
+        });
+        if then_reaches_default == else_reaches_default {
+            return None;
+        }
+
+        let (true_target, false_target) = self.resolve_conditional_targets(cond_block)?;
+        let true_is_default = self.transparent_target_reaches(true_target, default_entry);
+        let false_is_default = self.transparent_target_reaches(false_target, default_entry);
+        if true_is_default == false_is_default {
+            return None;
+        }
+
+        let (cond, predicate, condition_value) =
+            self.get_branch_condition_with_predicate(cond_block);
+        let cond = cond?;
+        if !Self::expr_is_reorderable_scalar_condition(&cond) {
+            return None;
+        }
+        let branch_proof = if self.fold_ctx.requires_certified_rendering() {
+            Some(self.certified_branch_render_proof(cond_block, predicate, condition_value)?)
+        } else {
+            None
+        };
+
+        let default_stmt = self.structure_region(default_region);
+        let default_targets = Self::pure_local_assignment_targets(&default_stmt)?;
+        if default_targets.is_empty()
+            || !Self::collect_expr_vars(&cond).is_disjoint(&default_targets)
+        {
+            return None;
+        }
+
+        let control_proof_checkpoint = self.control_render_proofs.len();
+        if let Some(proof) = branch_proof {
+            self.control_render_proofs.push(proof);
+        } else {
+            self.record_branch_render_proof(cond_block, predicate, condition_value);
+        }
+        self.deferred_merge_blocks.push(merge_block);
+        let nested_stmt = self.structure_region(nested_region);
+        debug_assert_eq!(self.deferred_merge_blocks.pop(), Some(merge_block));
+        if !Self::stmt_writes_only_local_targets(&nested_stmt, &default_targets)
+            || !Self::stmt_writes_any_local_target(&nested_stmt, &default_targets)
+        {
+            self.control_render_proofs
+                .truncate(control_proof_checkpoint);
+            return None;
+        }
+        let cleaned_nested = Self::cleanup(nested_stmt.clone());
+        let nested_stmt = if Self::stmt_control_node_count(&cleaned_nested)
+            == Self::stmt_control_node_count(&nested_stmt)
+            && Self::stmt_writes_only_local_targets(&cleaned_nested, &default_targets)
+            && Self::stmt_writes_any_local_target(&cleaned_nested, &default_targets)
+        {
+            cleaned_nested
+        } else {
+            nested_stmt
+        };
+
+        let execute_nested = if true_is_default {
+            Self::negate_condition(cond)
+        } else {
+            cond
+        };
+        let mut prefix = self.structure_block_prefix_stmts(cond_block);
+        Self::append_stmt_body_flat(&mut prefix, default_stmt);
+        prefix.push(CStmt::if_stmt(execute_nested, nested_stmt, None));
+        Self::append_stmt_body_flat(&mut prefix, self.structure_block(merge_block));
+        Some(if prefix.len() == 1 {
+            prefix.into_iter().next().unwrap_or(CStmt::Empty)
+        } else {
+            CStmt::Block(prefix)
+        })
+    }
+
+    fn transparent_target_reaches(&self, mut current: u64, target: u64) -> bool {
+        let mut visited = HashSet::new();
+        while visited.insert(current) {
+            if current == target {
+                return true;
+            }
+            let Some(block) = self.func.get_block(current) else {
+                return false;
+            };
+            if !block
+                .ops
+                .iter()
+                .all(|op| self.is_transparent_branch_forwarder_op(op))
+            {
+                return false;
+            }
+            let successors = self.transparent_branch_successors(current, block);
+            let [successor] = successors.as_slice() else {
+                return false;
+            };
+            current = *successor;
+        }
+        false
+    }
+
+    fn pure_local_assignment_targets(stmt: &CStmt) -> Option<HashSet<String>> {
+        match stmt {
+            CStmt::Expr(CExpr::Binary {
+                op: BinaryOp::Assign,
+                left,
+                right,
+            }) => {
+                let CExpr::Var(name) = left.as_ref() else {
+                    return None;
+                };
+                Self::expr_is_side_effect_free(right).then(|| HashSet::from([name.clone()]))
+            }
+            CStmt::Block(stmts) if !stmts.is_empty() => {
+                let mut targets = HashSet::new();
+                for stmt in stmts {
+                    targets.extend(Self::pure_local_assignment_targets(stmt)?);
+                }
+                Some(targets)
+            }
+            _ => None,
+        }
+    }
+
+    fn expr_is_reorderable_scalar_condition(expr: &CExpr) -> bool {
+        let mut reorderable = Self::expr_is_side_effect_free(expr);
+        expr.visit(&mut |node| {
+            if matches!(
+                node,
+                CExpr::Call { .. }
+                    | CExpr::Deref(_)
+                    | CExpr::Subscript { .. }
+                    | CExpr::Member { .. }
+                    | CExpr::PtrMember { .. }
+            ) {
+                reorderable = false;
+            }
+        });
+        reorderable
+    }
+
+    fn stmt_writes_only_local_targets(stmt: &CStmt, targets: &HashSet<String>) -> bool {
+        match stmt {
+            CStmt::Empty => true,
+            CStmt::Expr(CExpr::Binary {
+                op: BinaryOp::Assign,
+                left,
+                right,
+            }) => {
+                matches!(left.as_ref(), CExpr::Var(name) if targets.contains(name))
+                    && Self::expr_is_side_effect_free(right)
+            }
+            CStmt::Block(stmts) => stmts
+                .iter()
+                .all(|stmt| Self::stmt_writes_only_local_targets(stmt, targets)),
+            CStmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                Self::expr_is_reorderable_scalar_condition(cond)
+                    && Self::collect_expr_vars(cond).is_disjoint(targets)
+                    && Self::stmt_writes_only_local_targets(then_body, targets)
+                    && else_body
+                        .as_deref()
+                        .is_none_or(|stmt| Self::stmt_writes_only_local_targets(stmt, targets))
+            }
+            _ => false,
+        }
+    }
+
+    fn stmt_writes_any_local_target(stmt: &CStmt, targets: &HashSet<String>) -> bool {
+        match stmt {
+            CStmt::Expr(CExpr::Binary {
+                op: BinaryOp::Assign,
+                left,
+                ..
+            }) => matches!(left.as_ref(), CExpr::Var(name) if targets.contains(name)),
+            CStmt::Block(stmts) => stmts
+                .iter()
+                .any(|stmt| Self::stmt_writes_any_local_target(stmt, targets)),
+            CStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                Self::stmt_writes_any_local_target(then_body, targets)
+                    || else_body
+                        .as_deref()
+                        .is_some_and(|stmt| Self::stmt_writes_any_local_target(stmt, targets))
+            }
+            _ => false,
+        }
+    }
+
+    fn stmt_control_node_count(stmt: &CStmt) -> usize {
+        match stmt {
+            CStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                1 + Self::stmt_control_node_count(then_body)
+                    + else_body
+                        .as_deref()
+                        .map(Self::stmt_control_node_count)
+                        .unwrap_or(0)
+            }
+            CStmt::While { body, .. } | CStmt::DoWhile { body, .. } | CStmt::For { body, .. } => {
+                1 + Self::stmt_control_node_count(body)
+            }
+            CStmt::Switch { cases, default, .. } => {
+                1 + cases
+                    .iter()
+                    .flat_map(|case| &case.body)
+                    .map(Self::stmt_control_node_count)
+                    .sum::<usize>()
+                    + default
+                        .as_ref()
+                        .into_iter()
+                        .flatten()
+                        .map(Self::stmt_control_node_count)
+                        .sum::<usize>()
+            }
+            CStmt::Block(stmts) => stmts.iter().map(Self::stmt_control_node_count).sum(),
+            _ => 0,
         }
     }
 
@@ -835,6 +1139,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         default: Option<&Region>,
         merge_block: Option<u64>,
     ) -> CStmt {
+        let merge_owned_by_ancestor =
+            merge_block.is_some_and(|merge| self.deferred_merge_blocks.contains(&merge));
         let Some((switch_expr, switch_selector)) = self.get_switch_expression(switch_block) else {
             return CStmt::Block(vec![CStmt::comment(format!(
                 "r2dec residual: unresolved switch selector at 0x{switch_block:x}"
@@ -858,6 +1164,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             self.record_switch_render_proof(switch_block, switch_selector, cases, default);
         }
 
+        if let Some(merge) = merge_block {
+            self.deferred_merge_blocks.push(merge);
+        }
         let mut switch_cases = Vec::new();
         for (case_value, case_region) in cases {
             let Some(case_value) = case_value else {
@@ -877,6 +1186,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
 
         let default_body = default.map(|region| vec![self.structure_region(region)]);
+        if let Some(merge) = merge_block {
+            debug_assert_eq!(self.deferred_merge_blocks.pop(), Some(merge));
+        }
         let switch_stmt = CStmt::Switch {
             expr: switch_expr,
             cases: switch_cases,
@@ -885,7 +1197,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
         let mut prefix = self.structure_block_prefix_stmts(switch_block);
         prefix.push(switch_stmt);
-        if let Some(merge_addr) = merge_block {
+        if let Some(merge_addr) = merge_block.filter(|_| !merge_owned_by_ancestor) {
             Self::append_stmt_body_flat(&mut prefix, self.structure_block(merge_addr));
         }
         if prefix.len() == 1 {
@@ -2014,6 +2326,23 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             then_pred.is_some_and(|pred| self.has_merged_register_return_expr(merge_block, pred));
         let mut else_can_rewrite =
             else_pred.is_some_and(|pred| self.has_merged_register_return_expr(merge_block, pred));
+        let certified_branch = if self.fold_ctx.requires_certified_rendering() {
+            if !then_can_rewrite || !else_can_rewrite {
+                return None;
+            }
+            let (cond, predicate, condition_value) =
+                self.get_branch_condition_with_predicate(cond_block);
+            let cond = cond?;
+            let proof =
+                self.certified_branch_render_proof(cond_block, predicate, condition_value)?;
+            Some((cond, proof))
+        } else {
+            None
+        };
+        let control_proof_checkpoint = self.control_render_proofs.len();
+        if let Some((_, proof)) = &certified_branch {
+            self.control_render_proofs.push(proof.clone());
+        }
 
         let mut then_stmt = self.structure_region(then_region);
         let mut else_stmt = self.structure_region(else_region);
@@ -2024,6 +2353,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             self.stmt_has_predecessor_return_register_certificate(&else_stmt, pred)
         });
         if !then_can_rewrite && !else_can_rewrite {
+            self.control_render_proofs
+                .truncate(control_proof_checkpoint);
             return None;
         }
         let mut rewrote_any = false;
@@ -2048,25 +2379,23 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             || !Self::stmt_guarantees_termination(&then_stmt)
             || !Self::stmt_guarantees_termination(&else_stmt)
         {
+            self.control_render_proofs
+                .truncate(control_proof_checkpoint);
             return None;
         }
 
-        let (cond, predicate, condition_value) =
-            self.get_branch_condition_with_predicate(cond_block);
-        let cond = cond?;
-        let branch_proof = if self.fold_ctx.requires_certified_rendering() {
-            Some(self.certified_branch_render_proof(cond_block, predicate, condition_value)?)
+        let (cond, predicate, condition_value) = if let Some((cond, _)) = certified_branch {
+            (Some(cond), None, None)
         } else {
-            None
+            self.get_branch_condition_with_predicate(cond_block)
         };
+        let cond = cond?;
         let if_stmt = CStmt::If {
             cond,
             then_body: Box::new(then_stmt),
             else_body: Some(Box::new(else_stmt)),
         };
-        if let Some(proof) = branch_proof {
-            self.control_render_proofs.push(proof);
-        } else {
+        if !self.fold_ctx.requires_certified_rendering() {
             self.record_branch_render_proof(cond_block, predicate, condition_value);
         }
         let mut prefix = self.structure_block_prefix_stmts(cond_block);

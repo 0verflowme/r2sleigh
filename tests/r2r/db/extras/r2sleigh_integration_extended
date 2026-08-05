@@ -84,7 +84,7 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 a:sla >/dev/null
 aaaa
-a:sla.debug.profilej | jq -c '.enabled==true and .max==20 and .count>0 and (.decompile_cache|has("hits") and has("misses")) and (.functions|type=="array") and (.functions|length>0) and (.functions[0]|has("addr") and has("total_us") and has("lift_us") and has("typed_context_us") and has("session_us") and has("mutation_us") and has("xref_us") and has("taint_us") and has("decompile_us"))'
+a:sla.debug.profilej | jq -c '.enabled==true and .max==20 and .count>0 and (.engine_cache.analysis|has("hits") and has("misses")) and (.engine_cache.artifacts|has("hits") and has("misses")) and (.functions|type=="array") and (.functions|length>0) and (.functions[0]|has("addr") and has("total_us") and has("lift_us") and has("typed_context_us") and has("session_us") and has("mutation_us") and has("xref_us") and has("taint_us") and has("decompile_us"))'
 EOF_CMDS
 RUN
 
@@ -98,22 +98,6 @@ CMDS=<<EOF_CMDS
 a:sla >/dev/null
 aaa
 a:sla.debug.profilej | jq -c '.enabled==true and .max==20 and .count>0'
-EOF_CMDS
-RUN
-
-NAME=repeated_dec_reports_shared_render_cache_hit
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s `afl~check_secret[0]` >/dev/null
-af
-a:sla.dec >/dev/null
-a:sla.dec >/dev/null
-a:sla.debug.profilej | jq -c '.decompile_cache.hits >= 1 and .decompile_cache.misses >= 1'
 EOF_CMDS
 RUN
 
@@ -173,7 +157,7 @@ af
 a:sla.dec | jq -Rs 'contains("test_array_index") and contains("return") and (contains("r2dec fallback:")|not)'
 s `afl~test_struct_array_index[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("test_struct_array_index") and contains("struct sla_struct_") and contains("arg0[arg1].f_8 = arg2;") and contains("arg0[arg1].f_34") and contains("arg0[arg1].f_8") and (contains("r2dec residual:")|not) and (contains("r2sleigh residual:")|not) and (contains("r2dec fallback:")|not) and (contains("*(arg0 +")|not)'
+a:sla.dec | jq -Rs 'contains("test_struct_array_index") and contains("struct sla_struct_") and contains("arg0[arg1].f_8 = arg2;") and contains("arg0[arg1].f_34") and contains("arg0[arg1].f_8") and (contains("r2dec residual:")|not) and (contains("r2sleigh residual:")|not) and (contains("r2dec fallback:")|not) and (contains("*(arg0 +")|not) and (contains("(int64_t)")|not)'
 EOF_CMDS
 RUN
 
@@ -189,7 +173,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~process_string[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("process_string") and contains("r2dec residual: certified render contract failed") and contains("dropped callsite effects") and contains("summary return unresolved") and (contains("strlen(s)")|not) and (contains("return -1;")|not) and (contains("return -2;")|not) and (contains("return len;")|not) and (contains("ValueId")|not) and (contains("ObjectId")|not) and (contains("r2dec fallback:")|not)'
+a:sla.dec | jq -Rs 'contains("process_string") and contains("r2dec residual: certified render contract failed") and contains("missing callsite effects") and contains("summary return unresolved") and (contains("strlen(s)")|not) and (contains("return -1;")|not) and (contains("return -2;")|not) and (contains("return len;")|not) and (contains("ValueId")|not) and (contains("ObjectId")|not) and (contains("r2dec fallback:")|not)'
 s `afl~authenticate[0]` >/dev/null
 af
 a:sla.dec | jq -Rs 'contains("authenticate") and contains("r2dec residual: certified render contract failed") and contains("with only 1 rendered FunctionCallsiteFacts proof(s)") and contains("summary return unresolved") and (contains("if (EAX")|not) and (contains("return 0;")|not) and (contains("return 1;")|not) and (contains("r10_1")|not) and (contains("ValueId")|not) and (contains("ObjectId")|not) and (contains("r2dec fallback:")|not)'

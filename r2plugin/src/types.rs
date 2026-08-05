@@ -161,15 +161,6 @@ fn cache_counters_json(counters: r2engine::CacheCounters) -> String {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_decompile_render_cache_stats_json() -> *mut c_char {
-    let profile = engine_session().profile(r2engine::EngineProfileRequest {
-        reset_after_read: false,
-    });
-    let json = cache_counters_json(profile.metrics.renders);
-    CString::new(json).map_or(ptr::null_mut(), |c| c.into_raw())
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn r2sleigh_engine_cache_stats_json() -> *mut c_char {
     let profile = engine_session().profile(r2engine::EngineProfileRequest {
         reset_after_read: false,
@@ -177,23 +168,14 @@ pub extern "C" fn r2sleigh_engine_cache_stats_json() -> *mut c_char {
     let metrics = profile.metrics;
     let analysis = metrics.analysis;
     let artifacts = metrics.artifacts;
-    let renders = metrics.renders;
     let total = profile.total;
     let json = format!(
-        "{{\"analysis\":{},\"artifacts\":{},\"renders\":{},\"total\":{}}}",
+        "{{\"analysis\":{},\"artifacts\":{},\"total\":{}}}",
         cache_counters_json(analysis),
         cache_counters_json(artifacts),
-        cache_counters_json(renders),
         cache_counters_json(total)
     );
     CString::new(json).map_or(ptr::null_mut(), |c| c.into_raw())
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_decompile_render_cache_stats_reset() {
-    let _ = engine_session().profile(r2engine::EngineProfileRequest {
-        reset_after_read: true,
-    });
 }
 
 #[unsafe(no_mangle)]

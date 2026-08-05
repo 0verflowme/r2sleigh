@@ -1029,40 +1029,12 @@ rustc_session::declare_lint!(
 rustc_session::declare_lint!(
     /// ### What it does
     ///
-    /// Warns when `r2engine::decompile_function` computes a decompile render
-    /// cache key before stamping the route/refusal decision into
-    /// `FunctionFacts`.
-    ///
-    /// ### Why is this bad?
-    ///
-    /// The render cache key hashes the canonical facts contract. If the key is
-    /// built before `FunctionFacts::decompile_route` is attached, cache identity
-    /// can ignore the route/refusal state that the renderer consumes, allowing
-    /// standard and fallback renders to share a stale key shape.
-    ///
-    /// ### Example
-    ///
-    /// ```rust
-    /// let render_cache_key = decompile_render_cache_key(...);
-    /// function_facts.set_decompile_route(...);
-    /// ```
-    ///
-    /// Attach `FunctionFacts::decompile_route` before calling
-    /// `decompile_render_cache_key(...)`.
-    pub R2ENGINE_DECOMPILE_RENDER_CACHE_PRE_ROUTE_FACTS,
-    Warn,
-    "r2engine must hash decompile render cache keys after route facts are attached"
-);
-
-rustc_session::declare_lint!(
-    /// ### What it does
-    ///
     /// Warns when production `r2engine` exposes direct artifact-cache mutation
     /// APIs outside the normal request path.
     ///
     /// ### Why is this bad?
     ///
-    /// Analysis/decompile cache reuse is session policy. Public cache-key or
+    /// Analysis/artifact cache reuse is session policy. Public cache-key or
     /// alias invalidation APIs let plugin glue decide engine cache ownership
     /// and can bypass the typed request/FunctionFacts identity.
     ///
@@ -2571,10 +2543,10 @@ rustc_session::declare_lint!(
     ///
     /// ### Why is this bad?
     ///
-    /// Decompile metadata affects callee identity, render cache keys, and the
-    /// public function name passed through `FunctionFacts`/`r2engine`. If the
-    /// plugin parses aliases or picks display names, the radare2 command path
-    /// can drift from engine-owned route and cache policy.
+    /// Decompile metadata affects callee identity, artifact cache keys, and
+    /// the public function name passed through `FunctionFacts`/`r2engine`. If
+    /// the plugin parses aliases or picks display names, the radare2 command
+    /// path can drift from engine-owned route and cache policy.
     ///
     /// ### Example
     ///
@@ -2783,10 +2755,10 @@ rustc_session::declare_lint!(
     ///
     /// ### Why is this bad?
     ///
-    /// Plugin glue must not own route selection, fallback policy, render cache
-    /// identity, or the final `FunctionFacts` contract. Direct renderer use lets
-    /// the plugin bypass `r2engine::EngineFunctionDecompileRequest`, so missing
-    /// evidence can become executable C again.
+    /// Plugin glue must not own route selection, fallback policy, or the final
+    /// `FunctionFacts` contract. Direct renderer use lets the plugin bypass
+    /// `r2engine::EngineFunctionDecompileRequest`, so missing evidence can
+    /// become executable C again.
     ///
     /// ### Example
     ///
@@ -3211,7 +3183,6 @@ rustc_session::declare_lint_pass!(R2sleighLintPass => [
     R2ENGINE_RENDER_TIME_SEMANTICS_SUPPRESSION,
     R2ENGINE_DECOMPILE_TYPE_OVERRIDE_SIDE_CHANNEL,
     R2ENGINE_DECOMPILE_FALLBACK_COMMENT_SIDE_CHANNEL,
-    R2ENGINE_DECOMPILE_RENDER_CACHE_PRE_ROUTE_FACTS,
     R2ENGINE_ARTIFACTS_FACTS_SIDE_CHANNEL,
     R2ENGINE_DECOMPILE_ROUTE_TYPE_FACTS_SIDE_CHANNEL,
     R2ENGINE_DECOMPILER_INPUT_ROUTE_REPLAN_SIDE_CHANNEL,
@@ -3334,7 +3305,6 @@ pub fn register_lints(sess: &rustc_session::Session, lint_store: &mut rustc_lint
         R2ENGINE_RENDER_TIME_SEMANTICS_SUPPRESSION,
         R2ENGINE_DECOMPILE_TYPE_OVERRIDE_SIDE_CHANNEL,
         R2ENGINE_DECOMPILE_FALLBACK_COMMENT_SIDE_CHANNEL,
-        R2ENGINE_DECOMPILE_RENDER_CACHE_PRE_ROUTE_FACTS,
         R2ENGINE_CACHE_POLICY_OWNERSHIP,
         R2ENGINE_ARTIFACTS_FACTS_SIDE_CHANNEL,
         R2ENGINE_DECOMPILE_ROUTE_TYPE_FACTS_SIDE_CHANNEL,
@@ -3942,7 +3912,6 @@ impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
                 "certified r2dec render validation must read render proof from FunctionFacts, not prepared certificates",
             );
         }
-
     }
 
     fn check_impl_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx ImplItem<'tcx>) {
@@ -3955,18 +3924,6 @@ impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
                 R2DEC_DIRECT_TYPE_FACTS_MUTATOR,
                 item.span,
                 "r2dec production methods must not mutate type facts outside FunctionFacts",
-            );
-        }
-
-        if is_r2engine_span(cx, item.span)
-            && !impl_item_is_test_only(cx, item)
-            && engine_decompile_render_cache_pre_route_facts_impl_item(cx, item.span)
-        {
-            span_lint(
-                cx,
-                R2ENGINE_DECOMPILE_RENDER_CACHE_PRE_ROUTE_FACTS,
-                item.span,
-                "r2engine must attach FunctionFacts route facts before computing the decompile render cache key",
             );
         }
 
@@ -5007,7 +4964,8 @@ impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
             );
         }
 
-        if is_r2types_non_role_registry_path(cx, expr) && r2types_role_name_signature_hint_expr(expr)
+        if is_r2types_non_role_registry_path(cx, expr)
+            && r2types_role_name_signature_hint_expr(expr)
         {
             span_lint(
                 cx,
@@ -5065,31 +5023,31 @@ fn plugin_type_writeback_policy_expr(cx: &LateContext<'_>, expr: &Expr<'_>) -> b
             if [
                 "signature_writeback_decision",
                 "type_writeback_mutation_plan",
-                    "type_writeback_mutation_plan_with_policy",
-                    "type_writeback_authority_report",
-                    "type_writeback_authority_report_with_policy",
-                    "type_writeback_authority_report_for_policy",
-                    "type_writeback_plan_report_for_policy",
-                    "bounded_cfg_type_writeback_plan",
-                    "bounded_cfg_type_writeback_plan_report",
-                    "semantic_fallback_type_writeback_plan",
-                    "semantic_fallback_type_writeback_plan_report",
-                    "type_writeback_external_struct_names",
-                    "type_writeback_field_access_certificate_names",
-                    "writeback_var_name_is_generated",
-                    "type_writeback_var_type_apply_decision",
-                    "type_writeback_global_type_link_apply_decision",
-                    "type_writeback_var_rename_apply_decision",
-                    "signature_writeback_arch_supported",
-                    "callconv_writeback_arch_supported",
-                    "signature_register_arg_var_score",
-                    "signature_register_arg_rename_decision",
-                    "signature_register_arg_type_apply_required",
-                    "signature_register_arg_stack_conflict_delete_required",
-                    "type_writeback_stack_arg_name_conflict_delete_required",
-                    "signature_register_arg_duplicate_delete_required",
-                    "signature_writeback_size_eligible",
-                ]
+                "type_writeback_mutation_plan_with_policy",
+                "type_writeback_authority_report",
+                "type_writeback_authority_report_with_policy",
+                "type_writeback_authority_report_for_policy",
+                "type_writeback_plan_report_for_policy",
+                "bounded_cfg_type_writeback_plan",
+                "bounded_cfg_type_writeback_plan_report",
+                "semantic_fallback_type_writeback_plan",
+                "semantic_fallback_type_writeback_plan_report",
+                "type_writeback_external_struct_names",
+                "type_writeback_field_access_certificate_names",
+                "writeback_var_name_is_generated",
+                "type_writeback_var_type_apply_decision",
+                "type_writeback_global_type_link_apply_decision",
+                "type_writeback_var_rename_apply_decision",
+                "signature_writeback_arch_supported",
+                "callconv_writeback_arch_supported",
+                "signature_register_arg_var_score",
+                "signature_register_arg_rename_decision",
+                "signature_register_arg_type_apply_required",
+                "signature_register_arg_stack_conflict_delete_required",
+                "type_writeback_stack_arg_name_conflict_delete_required",
+                "signature_register_arg_duplicate_delete_required",
+                "signature_writeback_size_eligible",
+            ]
             .iter()
             .any(|name| expr_path_last_segment_is(callee, name))
             {
@@ -5423,7 +5381,8 @@ fn plugin_variable_recovery_ownership_expr(cx: &LateContext<'_>, expr: &Expr<'_>
     {
         return true;
     }
-    if !expr_path_last_segment_is(callee, "new") && !expr_path_last_segment_is(callee, "new_with_abi")
+    if !expr_path_last_segment_is(callee, "new")
+        && !expr_path_last_segment_is(callee, "new_with_abi")
     {
         return false;
     }
@@ -5437,7 +5396,8 @@ fn engine_r2dec_variable_recovery_ownership_expr(cx: &LateContext<'_>, expr: &Ex
     let ExprKind::Call(callee, _) = expr.kind else {
         return false;
     };
-    if !expr_path_last_segment_is(callee, "new") && !expr_path_last_segment_is(callee, "new_with_abi")
+    if !expr_path_last_segment_is(callee, "new")
+        && !expr_path_last_segment_is(callee, "new_with_abi")
     {
         return false;
     }
@@ -5483,10 +5443,7 @@ fn plugin_metadata_type_hint_policy_item(cx: &LateContext<'_>, item: &Item<'_>) 
         })
 }
 
-fn plugin_semantic_report_projection_ownership_item(
-    cx: &LateContext<'_>,
-    item: &Item<'_>,
-) -> bool {
+fn plugin_semantic_report_projection_ownership_item(cx: &LateContext<'_>, item: &Item<'_>) -> bool {
     cx.sess()
         .source_map()
         .span_to_snippet(item.span)
@@ -5564,10 +5521,7 @@ fn plugin_type_writeback_report_assembly_ownership_item(
         })
 }
 
-fn plugin_semantic_report_projection_ownership_expr(
-    cx: &LateContext<'_>,
-    expr: &Expr<'_>,
-) -> bool {
+fn plugin_semantic_report_projection_ownership_expr(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
     let ExprKind::Call(callee, _) = expr.kind else {
         return false;
     };
@@ -5601,7 +5555,7 @@ fn plugin_metadata_type_hint_policy_expr(cx: &LateContext<'_>, expr: &Expr<'_>) 
                 "PointerHint::",
             ]
             .iter()
-                .any(|needle| snippet.contains(needle))
+            .any(|needle| snippet.contains(needle))
         })
 }
 
@@ -5630,10 +5584,7 @@ fn r2dec_route_policy_ownership_item(cx: &LateContext<'_>, item: &Item<'_>) -> b
         })
 }
 
-fn r2dec_missing_route_defaults_to_standard_item(
-    cx: &LateContext<'_>,
-    item: &Item<'_>,
-) -> bool {
+fn r2dec_missing_route_defaults_to_standard_item(cx: &LateContext<'_>, item: &Item<'_>) -> bool {
     if !matches!(item.kind, rustc_hir::ItemKind::Fn { .. }) {
         return false;
     }
@@ -5660,18 +5611,15 @@ fn r2dec_build_function_requires_route_item(cx: &LateContext<'_>, item: &Item<'_
             if snippet.contains("pub fn build_function(&self, func: &SSAFunction) -> CFunction") {
                 return true;
             }
-            snippet
-                .contains("pub fn build_function_from_input(&self, input: &DecompilerInput) -> CFunction")
-                && (!snippet.contains("let Some(semantic_route)")
-                    || !snippet.contains("function_facts.decompile_route()")
-                    || !snippet.contains("render_permission_residual_reason"))
+            snippet.contains(
+                "pub fn build_function_from_input(&self, input: &DecompilerInput) -> CFunction",
+            ) && (!snippet.contains("let Some(semantic_route)")
+                || !snippet.contains("function_facts.decompile_route()")
+                || !snippet.contains("render_permission_residual_reason"))
         })
 }
 
-fn r2dec_summary_render_route_side_channel_item(
-    cx: &LateContext<'_>,
-    item: &Item<'_>,
-) -> bool {
+fn r2dec_summary_render_route_side_channel_item(cx: &LateContext<'_>, item: &Item<'_>) -> bool {
     if !matches!(item.kind, rustc_hir::ItemKind::Fn { .. }) {
         return false;
     }
@@ -5679,7 +5627,9 @@ fn r2dec_summary_render_route_side_channel_item(
         .source_map()
         .span_to_snippet(item.span)
         .is_ok_and(|snippet| {
-            let signature = snippet.split_once('{').map_or(snippet.as_str(), |(sig, _)| sig);
+            let signature = snippet
+                .split_once('{')
+                .map_or(snippet.as_str(), |(sig, _)| sig);
             if snippet.contains("pub fn render_semantic_worker_summary(") {
                 return signature.contains("SemanticRoutePlan")
                     || !signature.contains("FunctionFacts")
@@ -5778,10 +5728,7 @@ fn r2dec_route_policy_ownership_expr(expr: &Expr<'_>) -> bool {
     }
 }
 
-fn r2dec_switch_case_value_ownership_item(
-    cx: &LateContext<'_>,
-    span: rustc_span::Span,
-) -> bool {
+fn r2dec_switch_case_value_ownership_item(cx: &LateContext<'_>, span: rustc_span::Span) -> bool {
     cx.sess()
         .source_map()
         .span_to_snippet(span)
@@ -5864,10 +5811,7 @@ fn r2dec_certified_prepared_switch_selector_proof_item(
         .is_none_or(|guard_at| guard_at > prepared_selector_at)
 }
 
-fn r2dec_prepared_direct_target_reparse_item(
-    cx: &LateContext<'_>,
-    span: rustc_span::Span,
-) -> bool {
+fn r2dec_prepared_direct_target_reparse_item(cx: &LateContext<'_>, span: rustc_span::Span) -> bool {
     cx.sess()
         .source_map()
         .span_to_snippet(span)
@@ -5897,10 +5841,7 @@ fn r2dec_prepared_call_view_direct_target_side_channel_item(
         })
 }
 
-fn r2dec_direct_prepared_callsite_certificates_item(
-    cx: &LateContext<'_>,
-    item: &Item<'_>,
-) -> bool {
+fn r2dec_direct_prepared_callsite_certificates_item(cx: &LateContext<'_>, item: &Item<'_>) -> bool {
     if !matches!(item.kind, rustc_hir::ItemKind::Fn { .. }) {
         return false;
     }
@@ -5914,10 +5855,7 @@ fn r2dec_direct_prepared_callsite_certificates_item(
         })
 }
 
-fn r2dec_certified_call_arg_prefix_proof_item(
-    cx: &LateContext<'_>,
-    item: &Item<'_>,
-) -> bool {
+fn r2dec_certified_call_arg_prefix_proof_item(cx: &LateContext<'_>, item: &Item<'_>) -> bool {
     if !matches!(item.kind, rustc_hir::ItemKind::Fn { .. }) {
         return false;
     }
@@ -5931,10 +5869,7 @@ fn r2dec_certified_call_arg_prefix_proof_item(
         })
 }
 
-fn r2dec_direct_prepared_render_certificates_item(
-    cx: &LateContext<'_>,
-    item: &Item<'_>,
-) -> bool {
+fn r2dec_direct_prepared_render_certificates_item(cx: &LateContext<'_>, item: &Item<'_>) -> bool {
     if !matches!(item.kind, rustc_hir::ItemKind::Fn { .. }) {
         return false;
     }
@@ -6011,10 +5946,7 @@ fn r2dec_uncertified_switch_selector_root_fallback_item(
         .is_none_or(|guard_at| guard_at > root_fallback_at)
 }
 
-fn r2dec_call_result_stack_owner_fallback_expr(
-    cx: &LateContext<'_>,
-    expr: &Expr<'_>,
-) -> bool {
+fn r2dec_call_result_stack_owner_fallback_expr(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
     match expr.kind {
         ExprKind::Call(callee, _) => expr_path_last_segment_is(
             callee,
@@ -6248,10 +6180,7 @@ fn r2dec_certified_stack_return_render_facts_item(
         && !snippet.contains("render_facts")
 }
 
-fn r2dec_certified_stack_local_identity_item(
-    cx: &LateContext<'_>,
-    span: rustc_span::Span,
-) -> bool {
+fn r2dec_certified_stack_local_identity_item(cx: &LateContext<'_>, span: rustc_span::Span) -> bool {
     let Ok(snippet) = cx.sess().source_map().span_to_snippet(span) else {
         return false;
     };
@@ -6260,7 +6189,7 @@ fn r2dec_certified_stack_local_identity_item(
         && !snippet.contains("certified_stack_local_identity_is_exact"))
         || (snippet.contains("fn build_function")
             && snippet.contains("body_visible_stack_offsets")
-        && !snippet.contains("certified_recovered_stack_local_is_exact"))
+            && !snippet.contains("certified_recovered_stack_local_is_exact"))
         || (snippet.contains("fn stack_offset_for_visible_storage_name")
             && (snippet.contains("strip_prefix(\"local_\")")
                 || snippet.contains("strip_prefix(\"arg_\")"))
@@ -6273,7 +6202,7 @@ fn r2dec_certified_stack_local_identity_item(
             && !snippet.contains("certified_stack_offset_for_visible_storage_name"))
         || (snippet.contains("fn stack_slot_provenance_for_var")
             && snippet.contains("render_stack_slot_for_name"))
-    }
+}
 
 fn r2dec_certified_stack_local_type_ownership_item(
     cx: &LateContext<'_>,
@@ -6314,10 +6243,7 @@ fn r2dec_certified_member_field_certificate_item(
         || snippet.contains("array_access_for_op_any_direction")
 }
 
-fn r2dec_certified_branch_render_proof_item(
-    cx: &LateContext<'_>,
-    span: rustc_span::Span,
-) -> bool {
+fn r2dec_certified_branch_render_proof_item(cx: &LateContext<'_>, span: rustc_span::Span) -> bool {
     let Ok(snippet) = cx.sess().source_map().span_to_snippet(span) else {
         return false;
     };
@@ -6468,10 +6394,7 @@ fn r2dec_certified_call_render_proof_local_equality_item(
     .any(|needle| snippet.contains(needle))
 }
 
-fn r2dec_direct_zero_arg_call_fallback_item(
-    cx: &LateContext<'_>,
-    span: rustc_span::Span,
-) -> bool {
+fn r2dec_direct_zero_arg_call_fallback_item(cx: &LateContext<'_>, span: rustc_span::Span) -> bool {
     let Ok(snippet) = cx.sess().source_map().span_to_snippet(span) else {
         return false;
     };
@@ -6481,9 +6404,7 @@ fn r2dec_direct_zero_arg_call_fallback_item(
     {
         return false;
     }
-    let fallback_at = snippet
-        .find("CExpr::call(func_expr, vec![])")
-        .unwrap_or(0);
+    let fallback_at = snippet.find("CExpr::call(func_expr, vec![])").unwrap_or(0);
     snippet
         .find("requires_certified_rendering")
         .is_none_or(|guard_at| guard_at > fallback_at)
@@ -6641,12 +6562,14 @@ fn r2dec_direct_prepared_call_result_certificates_expr(
 ) -> bool {
     match expr.kind {
         ExprKind::Field(_, field) => {
-            matches!(field.name.as_str(), "call_results" | "call_results_by_callsite")
-                && cx
-                    .sess()
-                    .source_map()
-                    .span_to_snippet(expr.span)
-                    .is_ok_and(|snippet| snippet.contains("certificates()."))
+            matches!(
+                field.name.as_str(),
+                "call_results" | "call_results_by_callsite"
+            ) && cx
+                .sess()
+                .source_map()
+                .span_to_snippet(expr.span)
+                .is_ok_and(|snippet| snippet.contains("certificates()."))
         }
         ExprKind::MethodCall(method, _, _, _) => {
             method.ident.as_str() == "call_result_certificates_for_callsite"
@@ -6822,9 +6745,9 @@ fn plugin_engine_policy_ownership_expr(cx: &LateContext<'_>, expr: &Expr<'_>) ->
         }
         ExprKind::Struct(qpath, fields, _) => {
             (qpath_last_segment_is(qpath, "EngineTypeAnalysisRequest")
-                && fields.iter().any(|field| {
-                    field.ident.name.as_str() == "caller_prefers_bounded_type_plan"
-                }))
+                && fields
+                    .iter()
+                    .any(|field| field.ident.name.as_str() == "caller_prefers_bounded_type_plan"))
                 || (qpath_last_segment_is(qpath, "EngineSummaryDecompileRequest")
                     && fields
                         .iter()
@@ -6834,15 +6757,16 @@ fn plugin_engine_policy_ownership_expr(cx: &LateContext<'_>, expr: &Expr<'_>) ->
                 || qpath_last_segment_is(qpath, "EngineAnalyzeRequest")
                 || qpath_last_segment_is(qpath, "EngineSummaryPreprobeRequest")
         }
-        ExprKind::Path(_) => cx
-            .sess()
-            .source_map()
-            .span_to_snippet(expr.span)
-            .is_ok_and(|snippet| {
-                snippet.ends_with("EngineSemanticMode::Full")
-                    || snippet.ends_with("EngineSemanticMode::Optional")
-                    || snippet.ends_with("EngineSemanticRoutePlan")
-            }),
+        ExprKind::Path(_) => {
+            cx.sess()
+                .source_map()
+                .span_to_snippet(expr.span)
+                .is_ok_and(|snippet| {
+                    snippet.ends_with("EngineSemanticMode::Full")
+                        || snippet.ends_with("EngineSemanticMode::Optional")
+                        || snippet.ends_with("EngineSemanticRoutePlan")
+                })
+        }
         _ => false,
     }
 }
@@ -6953,10 +6877,7 @@ fn raw_attach_prepared_decompile_evidence_signature_impl_item(
         .is_ok_and(|snippet| raw_attach_prepared_decompile_evidence_signature(&snippet))
 }
 
-fn engine_summary_decompile_route_side_channel_item(
-    cx: &LateContext<'_>,
-    item: &Item<'_>,
-) -> bool {
+fn engine_summary_decompile_route_side_channel_item(cx: &LateContext<'_>, item: &Item<'_>) -> bool {
     let Ok(snippet) = cx.sess().source_map().span_to_snippet(item.span) else {
         return false;
     };
@@ -6977,17 +6898,16 @@ fn engine_summary_only_decompile_api_item(cx: &LateContext<'_>, item: &Item<'_>)
         .source_map()
         .span_to_snippet(item.span)
         .is_ok_and(|snippet| {
-            let header = snippet.split_once('{').map_or(snippet.as_str(), |(head, _)| head);
+            let header = snippet
+                .split_once('{')
+                .map_or(snippet.as_str(), |(head, _)| head);
             header.contains("EngineSummaryDecompileRequest")
                 || header.contains("fn decompile_summary(")
                 || header.contains("fn decompile_summary_preprobe(")
         })
 }
 
-fn engine_summary_only_decompile_api_impl_item(
-    cx: &LateContext<'_>,
-    item: &ImplItem<'_>,
-) -> bool {
+fn engine_summary_only_decompile_api_impl_item(cx: &LateContext<'_>, item: &ImplItem<'_>) -> bool {
     if engine_summary_only_decompile_api_name(item.ident.name.as_str()) {
         return true;
     }
@@ -7014,9 +6934,7 @@ fn engine_summary_only_decompile_api_expr(cx: &LateContext<'_>, expr: &Expr<'_>)
         ExprKind::Struct(qpath, ..) => {
             qpath_last_segment_is(qpath, "EngineSummaryDecompileRequest")
         }
-        ExprKind::Path(ref qpath) => {
-            qpath_last_segment_is(qpath, "EngineSummaryDecompileRequest")
-        }
+        ExprKind::Path(ref qpath) => qpath_last_segment_is(qpath, "EngineSummaryDecompileRequest"),
         _ => false,
     }
 }
@@ -7028,10 +6946,7 @@ fn engine_summary_only_decompile_api_name(name: &str) -> bool {
     )
 }
 
-fn engine_lower_level_decompile_api_bypass_item(
-    cx: &LateContext<'_>,
-    item: &Item<'_>,
-) -> bool {
+fn engine_lower_level_decompile_api_bypass_item(cx: &LateContext<'_>, item: &Item<'_>) -> bool {
     let Ok(snippet) = cx.sess().source_map().span_to_snippet(item.span) else {
         return false;
     };
@@ -7071,10 +6986,7 @@ fn engine_render_time_semantics_suppression_item(cx: &LateContext<'_>, item: &It
         || snippet.contains("fn should_suppress_unrenderable_standard_summary_artifact")
 }
 
-fn engine_decompile_type_override_side_channel_item(
-    cx: &LateContext<'_>,
-    item: &Item<'_>,
-) -> bool {
+fn engine_decompile_type_override_side_channel_item(cx: &LateContext<'_>, item: &Item<'_>) -> bool {
     let Ok(snippet) = cx.sess().source_map().span_to_snippet(item.span) else {
         return false;
     };
@@ -7142,32 +7054,7 @@ fn engine_decompiler_input_helper_not_test_support_only_item(
         && !snippet.contains("#[cfg(test)]")
 }
 
-fn engine_decompile_render_cache_pre_route_facts_impl_item(
-    cx: &LateContext<'_>,
-    span: rustc_span::Span,
-) -> bool {
-    let Ok(snippet) = cx.sess().source_map().span_to_snippet(span) else {
-        return false;
-    };
-    if !snippet.contains("fn decompile_function") {
-        return false;
-    }
-    let Some(cache_at) = snippet.find("decompile_render_cache_key") else {
-        return false;
-    };
-    let route_at = snippet
-        .find("function_facts_for_decompile(")
-        .or_else(|| snippet.find(".set_decompile_route(Some(decompile_route_facts_from_decision"));
-    let Some(route_at) = route_at else {
-        return true;
-    };
-    cache_at < route_at
-}
-
-fn r2dec_decompiler_context_route_side_channel_item(
-    cx: &LateContext<'_>,
-    item: &Item<'_>,
-) -> bool {
+fn r2dec_decompiler_context_route_side_channel_item(cx: &LateContext<'_>, item: &Item<'_>) -> bool {
     let Ok(snippet) = cx.sess().source_map().span_to_snippet(item.span) else {
         return false;
     };
@@ -7208,10 +7095,7 @@ fn r2dec_local_signature_enrichment_item(cx: &LateContext<'_>, item: &Item<'_>) 
         })
 }
 
-fn r2dec_direct_type_facts_mutator_impl_item(
-    cx: &LateContext<'_>,
-    item: &ImplItem<'_>,
-) -> bool {
+fn r2dec_direct_type_facts_mutator_impl_item(cx: &LateContext<'_>, item: &ImplItem<'_>) -> bool {
     let name = item.ident.name.as_str();
     if !matches!(
         name,
@@ -7257,10 +7141,7 @@ fn plugin_unprepared_decompile_oracle_expr(cx: &LateContext<'_>, expr: &Expr<'_>
         .is_ok_and(|snippet| snippet.contains("artifact.ssa_func"))
 }
 
-fn plugin_decompiler_input_executable_c_oracle_item(
-    cx: &LateContext<'_>,
-    item: &Item<'_>,
-) -> bool {
+fn plugin_decompiler_input_executable_c_oracle_item(cx: &LateContext<'_>, item: &Item<'_>) -> bool {
     if !matches!(item.kind, rustc_hir::ItemKind::Fn { .. }) {
         return false;
     }
@@ -7319,10 +7200,7 @@ fn plugin_executable_c_body_oracle_line(line: &str) -> bool {
     .any(|needle| line.contains(needle))
 }
 
-fn plugin_decompile_metadata_policy_ownership_item(
-    cx: &LateContext<'_>,
-    item: &Item<'_>,
-) -> bool {
+fn plugin_decompile_metadata_policy_ownership_item(cx: &LateContext<'_>, item: &Item<'_>) -> bool {
     if !matches!(item.kind, rustc_hir::ItemKind::Fn { .. }) {
         return false;
     }
@@ -7334,8 +7212,8 @@ fn plugin_decompile_metadata_policy_ownership_item(
                 || snippet.contains("fn resolve_decompiler_display_name")
                 || snippet.contains("fn strip_display_name_prefixes")
                 || snippet.contains("EngineFunctionDecompileRequest")
-                && (snippet.contains("parse_addr_name_map")
-                    || snippet.contains("resolve_decompiler_display_name"))
+                    && (snippet.contains("parse_addr_name_map")
+                        || snippet.contains("resolve_decompiler_display_name"))
         })
 }
 
@@ -7396,10 +7274,7 @@ fn plugin_direct_r2dec_fallback_comment_expr(cx: &LateContext<'_>, expr: &Expr<'
         .is_ok_and(|snippet| snippet.contains("r2dec::"))
 }
 
-fn plugin_direct_r2dec_decompiler_ownership_expr(
-    cx: &LateContext<'_>,
-    expr: &Expr<'_>,
-) -> bool {
+fn plugin_direct_r2dec_decompiler_ownership_expr(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
     match expr.kind {
         ExprKind::Call(callee, _) => cx
             .sess()
@@ -7416,10 +7291,7 @@ fn plugin_direct_r2dec_decompiler_ownership_expr(
     }
 }
 
-fn plugin_decompile_one_function_direct_r2dec_expr(
-    cx: &LateContext<'_>,
-    expr: &Expr<'_>,
-) -> bool {
+fn plugin_decompile_one_function_direct_r2dec_expr(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
     if !enclosing_item_snippet_contains(cx, expr, "decompile_one_function")
         && !enclosing_item_snippet_contains(cx, expr, "r2dec_function")
     {
@@ -7531,8 +7403,7 @@ fn r2dec_default_true_branch_condition_expr(cx: &LateContext<'_>, expr: &Expr<'_
         .source_map()
         .span_to_snippet(expr.span)
         .is_ok_and(|snippet| {
-            snippet.contains("extract_condition_from_block")
-                && snippet.contains("CExpr::IntLit(1)")
+            snippet.contains("extract_condition_from_block") && snippet.contains("CExpr::IntLit(1)")
         })
 }
 
@@ -7708,8 +7579,7 @@ fn item_is_test_only(cx: &LateContext<'_>, item: &Item<'_>) -> bool {
 }
 
 fn impl_item_is_test_only(cx: &LateContext<'_>, item: &ImplItem<'_>) -> bool {
-    cx
-        .sess()
+    cx.sess()
         .source_map()
         .span_to_snippet(item.span)
         .is_ok_and(|snippet| snippet.contains("#[cfg(test)]") || snippet.contains("#[test]"))
@@ -7866,14 +7736,12 @@ fn call_target_address_prefix_literal(expr: &Expr<'_>) -> bool {
 
 fn call_target_policy_ownership_expr(expr: &Expr<'_>) -> bool {
     match expr.kind {
-        ExprKind::Call(callee, _) => {
-            [
-                "is_modeled_callee_identity",
-                "modeled_callee_addr_for_identity",
-            ]
-            .iter()
-            .any(|name| expr_path_last_segment_is(callee, name))
-        }
+        ExprKind::Call(callee, _) => [
+            "is_modeled_callee_identity",
+            "modeled_callee_addr_for_identity",
+        ]
+        .iter()
+        .any(|name| expr_path_last_segment_is(callee, name)),
         ExprKind::MethodCall(method, receiver, _, _)
             if method.ident.as_str() == "contains_key"
                 && expr_references_callee_facts(receiver) =>
@@ -7977,7 +7845,9 @@ fn call_arg_source_name_authority_expr(cx: &LateContext<'_>, expr: &Expr<'_>) ->
             .sess()
             .source_map()
             .span_to_snippet(expr.span)
-            .is_ok_and(|snippet| snippet.contains("source_var_name_has_prepared_call_arg_authority"))
+            .is_ok_and(|snippet| {
+                snippet.contains("source_var_name_has_prepared_call_arg_authority")
+            })
     {
         return false;
     }
@@ -8048,9 +7918,7 @@ fn expr_references_call_arg_source_call(expr: &Expr<'_>) -> bool {
             expr_references_call_arg_source_call(callee)
                 || args.iter().any(expr_references_call_arg_source_call)
         }
-        ExprKind::Block(block, _) => block
-            .expr
-            .is_some_and(expr_references_call_arg_source_call),
+        ExprKind::Block(block, _) => block.expr.is_some_and(expr_references_call_arg_source_call),
         ExprKind::AddrOf(_, _, inner)
         | ExprKind::Unary(_, inner)
         | ExprKind::Cast(inner, _)
@@ -8371,7 +8239,8 @@ fn is_r2types_span(cx: &LateContext<'_>, span: rustc_span::Span) -> bool {
 fn is_r2types_non_role_registry_path(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
     let filename = cx.sess().source_map().span_to_filename(expr.span);
     let filename = format!("{filename:?}");
-    filename.contains("crates/r2types/src/") && !filename.contains("crates/r2types/src/role_registry.rs")
+    filename.contains("crates/r2types/src/")
+        && !filename.contains("crates/r2types/src/role_registry.rs")
 }
 
 fn is_canonical_ssa_var_classifier(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
@@ -8694,9 +8563,7 @@ fn r2plugin_renderer_dependency_stays_deleted() {
         !manifest.contains("r2dec = { path = \"../crates/r2dec\" }"),
         "r2plugin must not depend on renderer/decompiler directly, even in dev-dependencies"
     );
-    for forbidden in [
-        "features = [\"dec\"]",
-    ] {
+    for forbidden in ["features = [\"dec\"]"] {
         assert!(
             !dependencies.contains(forbidden),
             "r2plugin production manifest must not link renderer/decompiler edge {forbidden:?}"
@@ -8737,9 +8604,12 @@ fn r2dec_certified_render_context_uses_function_render_facts_for_exprs_and_retur
         .find("pub(crate) struct CertifiedRenderContext")
         .unwrap_or_else(|| panic!("missing CertifiedRenderContext in {}", path.display()));
     let rest = &source[start..];
-    let end = rest
-        .find("\nimpl LowerFrame")
-        .unwrap_or_else(|| panic!("missing CertifiedRenderContext end marker in {}", path.display()));
+    let end = rest.find("\nimpl LowerFrame").unwrap_or_else(|| {
+        panic!(
+            "missing CertifiedRenderContext end marker in {}",
+            path.display()
+        )
+    });
     let body = &rest[..end];
 
     assert!(
@@ -8899,15 +8769,10 @@ fn r2dec_raw_address_rendering_does_not_use_function_string_symbol_maps() {
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", op_lower_path.display()));
     let calls = std::fs::read_to_string(&calls_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", calls_path.display()));
-    let memory_renderer = std::fs::read_to_string(&memory_renderer_path).unwrap_or_else(|err| {
-        panic!(
-            "failed to read {}: {err}",
-            memory_renderer_path.display()
-        )
-    });
-    let return_resolver = std::fs::read_to_string(&return_resolver_path).unwrap_or_else(|err| {
-        panic!("failed to read {}: {err}", return_resolver_path.display())
-    });
+    let memory_renderer = std::fs::read_to_string(&memory_renderer_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", memory_renderer_path.display()));
+    let return_resolver = std::fs::read_to_string(&return_resolver_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", return_resolver_path.display()));
     let lower = std::fs::read_to_string(&lower_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", lower_path.display()));
 
@@ -8928,7 +8793,8 @@ fn r2dec_raw_address_rendering_does_not_use_function_string_symbol_maps() {
         "fn evaluate_hex_digit_offset_call_arg_expr",
     );
     let const_to_expr = extract_source(&return_resolver, "pub(crate) fn const_to_expr", "\n}");
-    let resolve_addr_literal = extract_source(&lower, "fn resolve_addr_literal", "\n    fn binary_expr");
+    let resolve_addr_literal =
+        extract_source(&lower, "fn resolve_addr_literal", "\n    fn binary_expr");
 
     for (name, body) in [
         ("get_expr", get_expr),
@@ -8991,10 +8857,11 @@ fn r2dec_certified_render_gate_uses_engine_permission_not_prepared_presence() {
     let start = op_lower
         .find(marker)
         .unwrap_or_else(|| panic!("missing {marker} in {}", op_lower_path.display()));
-    let body = &op_lower[start..op_lower[start..]
-        .find("\n    pub(super) fn is_certified_materialized_phi_carrier")
-        .map(|offset| start + offset)
-        .unwrap_or_else(|| panic!("missing certified render gate end marker"))];
+    let body = &op_lower[start
+        ..op_lower[start..]
+            .find("\n    pub(super) fn is_certified_materialized_phi_carrier")
+            .map(|offset| start + offset)
+            .unwrap_or_else(|| panic!("missing certified render gate end marker"))];
 
     let field = "pub(crate) certified_rendering_required: bool";
     if let Some(field_at) = context.find(field) {
@@ -9166,10 +9033,11 @@ fn r2dec_production_foldinputs_authority_reads_use_functionfacts_accessors() {
     let accessor_block_start = context
         .find("impl<'a> FoldInputs<'a>")
         .unwrap_or_else(|| panic!("missing FoldInputs accessors in {}", context_path.display()));
-    let accessor_block = &context[accessor_block_start..context[accessor_block_start..]
-        .find("\n#[derive(Debug, Clone, Default)]")
-        .map(|offset| accessor_block_start + offset)
-        .unwrap_or_else(|| panic!("missing FoldInputs accessor block end marker"))];
+    let accessor_block = &context[accessor_block_start
+        ..context[accessor_block_start..]
+            .find("\n#[derive(Debug, Clone, Default)]")
+            .map(|offset| accessor_block_start + offset)
+            .unwrap_or_else(|| panic!("missing FoldInputs accessor block end marker"))];
     let struct_start = context
         .find("pub(crate) struct FoldInputs<'a>")
         .unwrap_or_else(|| panic!("missing FoldInputs struct in {}", context_path.display()));
@@ -9475,7 +9343,9 @@ fn r2dec_certified_member_render_uses_function_render_facts() {
     let verifier_rest = &lib[verifier_start..];
     let verifier_end = verifier_rest
         .find("fn collect_certified_stmt_contract")
-        .unwrap_or_else(|| panic!("missing collect_certified_stmt_contract after {verifier_marker}"));
+        .unwrap_or_else(|| {
+            panic!("missing collect_certified_stmt_contract after {verifier_marker}")
+        });
     let verifier = &verifier_rest[..verifier_end];
 
     assert!(
@@ -9511,24 +9381,24 @@ fn r2dec_certified_array_and_semantic_render_do_not_use_aggregate_or_pretty_fall
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", op_lower_path.display()));
 
     let memory_renderer_path = root.join("crates/r2dec/src/fold/op_lower/memory_renderer.rs");
-    let memory_renderer = std::fs::read_to_string(&memory_renderer_path).unwrap_or_else(|err| {
-        panic!(
-            "failed to read {}: {err}",
-            memory_renderer_path.display()
-        )
-    });
+    let memory_renderer = std::fs::read_to_string(&memory_renderer_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", memory_renderer_path.display()));
     let certified_memory_marker = "fn certified_memory_address_expr";
-    let certified_memory_start = memory_renderer.find(certified_memory_marker).unwrap_or_else(|| {
-        panic!(
-            "missing {certified_memory_marker} in {}",
-            memory_renderer_path.display()
-        )
-    });
+    let certified_memory_start = memory_renderer
+        .find(certified_memory_marker)
+        .unwrap_or_else(|| {
+            panic!(
+                "missing {certified_memory_marker} in {}",
+                memory_renderer_path.display()
+            )
+        });
     let certified_memory_rest = &memory_renderer[certified_memory_start..];
     let certified_memory_end = certified_memory_rest
         .find("pub(super) fn render_authoritative_memory_access_by_name")
         .unwrap_or_else(|| {
-            panic!("missing render_authoritative_memory_access_by_name after {certified_memory_marker}")
+            panic!(
+                "missing render_authoritative_memory_access_by_name after {certified_memory_marker}"
+            )
         });
     let certified_memory = &certified_memory_rest[..certified_memory_end];
 
@@ -9570,17 +9440,19 @@ fn r2dec_certified_array_and_semantic_render_do_not_use_aggregate_or_pretty_fall
     }
 
     let indexed_marker = "pub(super) fn indexed_pointer_add_expr";
-    let indexed_start = memory_renderer
-        .find(indexed_marker)
-        .unwrap_or_else(|| panic!("missing {indexed_marker} in {}", memory_renderer_path.display()));
+    let indexed_start = memory_renderer.find(indexed_marker).unwrap_or_else(|| {
+        panic!(
+            "missing {indexed_marker} in {}",
+            memory_renderer_path.display()
+        )
+    });
     let indexed_rest = &memory_renderer[indexed_start..];
     let indexed_end = indexed_rest
         .find("fn scaled_index_expr")
         .unwrap_or_else(|| panic!("missing scaled_index_expr after {indexed_marker}"));
     let indexed = &indexed_rest[..indexed_end];
     assert!(
-        indexed.contains("self.requires_certified_rendering()")
-            && indexed.contains("return None"),
+        indexed.contains("self.requires_certified_rendering()") && indexed.contains("return None"),
         "certified mode must not turn pointer arithmetic into [] without exact array render proof"
     );
 
@@ -9653,7 +9525,9 @@ fn r2dec_certified_local_post_call_source_refuses_before_raw_scan() {
         .unwrap_or_else(|| panic!("{marker} must branch on certified rendering"));
     let raw_at = body
         .find("raw_local_post_call_source_for_ssa_name_in_block")
-        .unwrap_or_else(|| panic!("{marker} must call the raw local scanner for non-certified mode"));
+        .unwrap_or_else(|| {
+            panic!("{marker} must call the raw local scanner for non-certified mode")
+        });
     assert!(
         certified_at < raw_at,
         "certified local post-call source lookup must refuse before raw SSA adjacency scanning"
@@ -9725,9 +9599,9 @@ fn r2dec_prepared_branch_extraction_uses_functionfacts_control_gate() {
     let body = &rest[..end];
 
     let prepared_gate = "self.requires_certified_rendering() || self.inputs.prepared_ssa.is_some()";
-    let prepared_gate_at = body
-        .find(prepared_gate)
-        .unwrap_or_else(|| panic!("{marker} must gate prepared SSA through certified control facts"));
+    let prepared_gate_at = body.find(prepared_gate).unwrap_or_else(|| {
+        panic!("{marker} must gate prepared SSA through certified control facts")
+    });
     let certified_call_at = body
         .find("certified_branch_condition_from_block(block)")
         .unwrap_or_else(|| panic!("{marker} must call certified_branch_condition_from_block"));
@@ -9921,7 +9795,7 @@ fn r2plugin_sla_dec_does_not_build_interproc_scope_in_c() {
 }
 
 #[test]
-fn r2plugin_decompile_path_does_not_repair_cfg_or_switches() {
+fn r2plugin_decompile_path_does_not_repair_cfg_or_invent_switches() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let path = root.join("r2plugin/r_anal_sleigh.c");
     let rust_path = root.join("r2plugin/src/lib.rs");
@@ -9954,12 +9828,33 @@ fn r2plugin_decompile_path_does_not_repair_cfg_or_switches() {
         decompile_block.contains("lift_function_blocks (anal, fcn, ctx, &blocks)"),
         "sla.dec must use the strict function-block lifter before engine handoff"
     );
+    for required in [
+        "if (!block || !bb || !bb->switch_op || !bb->switch_op->cases)",
+        "r_list_foreach (swop->cases, iter, caseop)",
+        "cases[i].value = caseop->value",
+        "cases[i].target = caseop->jump",
+        "attach_switch_info_to_block (block, bb)",
+    ] {
+        assert!(
+            source.contains(required),
+            "plugin switch integration must only project existing typed radare2 facts: {required:?}"
+        );
+    }
+    for required in [
+        "normalized.sort_by_key(|case| (case.value, case.target))",
+        ".any(|window| window[0].value == window[1].value)",
+        "(*block).set_switch_info(info)",
+    ] {
+        assert!(
+            rust_source.contains(required),
+            "plugin switch FFI must validate typed case facts before attaching them: {required:?}"
+        );
+    }
     for forbidden in [
         "recover_missing_switch_ops",
         "recover_missing_delta_switch_op",
         "split_missing_switch_case_targets",
         "find_best_switch_metadata_block",
-        "r2il_block_set_switch_info",
         "lift_function_block_healed",
         "lift_function_linear_gap_blocks",
         "include_linear_gap_blocks",
@@ -10149,12 +10044,8 @@ fn r2engine_decompile_raw_request_stays_private() {
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
     let plugin_lib = std::fs::read_to_string(&plugin_lib_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", plugin_lib_path.display()));
-    let plugin_decompiler = std::fs::read_to_string(&plugin_decompiler_path).unwrap_or_else(|err| {
-        panic!(
-            "failed to read {}: {err}",
-            plugin_decompiler_path.display()
-        )
-    });
+    let plugin_decompiler = std::fs::read_to_string(&plugin_decompiler_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", plugin_decompiler_path.display()));
     let request_start = source
         .find("pub(crate) struct EngineFunctionDecompileRequest")
         .unwrap_or_else(|| panic!("missing raw decompile request"));
@@ -10290,7 +10181,7 @@ fn r2engine_raw_decompiler_input_helper_is_test_only() {
 }
 
 #[test]
-fn r2engine_render_cache_mutation_is_crate_private() {
+fn r2engine_artifact_cache_is_private_and_render_cache_is_absent() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let engine_path = root.join("crates/r2engine/src/lib.rs");
     let plugin_lib_path = root.join("r2plugin/src/lib.rs");
@@ -10300,23 +10191,14 @@ fn r2engine_render_cache_mutation_is_crate_private() {
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", engine_path.display()));
     let plugin_lib = std::fs::read_to_string(&plugin_lib_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", plugin_lib_path.display()));
-    let plugin_decompiler = std::fs::read_to_string(&plugin_decompiler_path).unwrap_or_else(|err| {
-        panic!(
-            "failed to read {}: {err}",
-            plugin_decompiler_path.display()
-        )
-    });
+    let plugin_decompiler = std::fs::read_to_string(&plugin_decompiler_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", plugin_decompiler_path.display()));
     let plugin_types = std::fs::read_to_string(&plugin_types_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", plugin_types_path.display()));
 
     for forbidden in [
         "pub use cache::{CacheCounters, EngineSessionCacheMetrics, SessionCache}",
         "pub use cache::SessionCache",
-        "pub struct DecompileRenderCacheKeyInput",
-        "pub fn decompile_render_cache_key",
-        "pub fn cached_render",
-        "pub fn cached_render_with_decision",
-        "pub fn insert_render",
         "pub fn cached_artifacts",
         "pub fn cached_artifacts_with_decision",
         "pub fn insert_artifacts",
@@ -10327,18 +10209,17 @@ fn r2engine_render_cache_mutation_is_crate_private() {
         );
     }
 
-    let render_key_start = engine_source
-        .find("impl RenderCacheKey")
-        .unwrap_or_else(|| panic!("missing RenderCacheKey impl"));
-    let render_key_rest = &engine_source[render_key_start..];
-    let render_key_end = render_key_rest
-        .find("\n}\n\npub(crate) struct DecompileRenderCacheKeyInput")
-        .unwrap_or_else(|| panic!("missing RenderCacheKey impl end"));
-    let render_key_impl = &render_key_rest[..render_key_end];
-    for forbidden in ["pub fn from_artifact(", "pub fn from_payload("] {
+    for forbidden in [
+        "RenderCacheKey",
+        "DecompileRenderCacheKeyInput",
+        "decompile_render_cache_key",
+        "cached_render",
+        "insert_render",
+        "render_cache:",
+    ] {
         assert!(
-            !render_key_impl.contains(forbidden),
-            "render cache keys must be minted only inside r2engine: {forbidden:?}"
+            !engine_source.contains(forbidden),
+            "r2engine must not retain exact rendered-output cache logic: {forbidden:?}"
         );
     }
 
@@ -10376,12 +10257,8 @@ fn r2engine_decompile_route_helpers_are_not_public_plugin_api() {
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", engine_route_path.display()));
     let plugin_lib = std::fs::read_to_string(&plugin_lib_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", plugin_lib_path.display()));
-    let plugin_decompiler = std::fs::read_to_string(&plugin_decompiler_path).unwrap_or_else(|err| {
-        panic!(
-            "failed to read {}: {err}",
-            plugin_decompiler_path.display()
-        )
-    });
+    let plugin_decompiler = std::fs::read_to_string(&plugin_decompiler_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", plugin_decompiler_path.display()));
 
     let pub_route_start = engine_lib
         .find("pub use route::{")
@@ -10806,10 +10683,7 @@ fn r2plugin_symbolic_scope_caps_are_engine_owned() {
         "C symbolic scope builder must ask r2engine-owned function admission policy through FFI"
     );
     assert!(
-        source.contains(concat!(
-            "r2sleigh_",
-            "runtime_materialized_source_plan"
-        )),
+        source.contains(concat!("r2sleigh_", "runtime_materialized_source_plan")),
         "C runtime-materialized source lifting must ask r2engine-owned cap policy through FFI"
     );
 
@@ -11055,7 +10929,8 @@ fn r2dec_certified_structuring_skips_slot_merge_return_repair() {
         .unwrap_or_else(|| panic!("missing Region::WhileLoop after {marker}"));
     let if_then_else = &rest[..end];
     let non_certified_at = if_then_else
-        .find("if !self.fold_ctx.requires_certified_rendering()")
+        .find("&& !self.fold_ctx.requires_certified_rendering()")
+        .or_else(|| if_then_else.find("if !self.fold_ctx.requires_certified_rendering()"))
         .unwrap_or_else(|| panic!("if/else structuring must have a non-certified repair block"));
     let slot_repair_at = if_then_else
         .find("self.try_structure_if_else_with_slot_merge_returns")
@@ -11071,16 +10946,6 @@ fn r2dec_certified_structuring_skips_slot_merge_return_repair() {
     assert!(
         before_slot.contains("try_structure_symbolic_actionable_if"),
         "slot-merge return repair must stay inside the non-certified local repair block"
-    );
-    let register_marker = "if let Some(rewritten) = self.try_structure_if_else_with_register_merge_returns";
-    let non_certified_block_end = if_then_else[non_certified_at..]
-        .find(register_marker)
-        .map(|offset| non_certified_at + offset)
-        .unwrap_or_else(|| panic!("missing register-merge call after non-certified block"));
-    let non_certified_block = &if_then_else[non_certified_at..non_certified_block_end];
-    assert!(
-        non_certified_block.contains("self.try_structure_if_else_with_slot_merge_returns"),
-        "slot-merge return repair must be textually inside the non-certified repair block"
     );
     let between_slot_and_register = &if_then_else[slot_repair_at..register_repair_at];
     assert!(
@@ -11098,7 +10963,9 @@ fn r2dec_certified_structuring_skips_slot_merge_return_repair() {
     let slot_fn = &slot_fn_rest[..slot_fn_end];
     let certified_refusal_at = slot_fn
         .find("if self.fold_ctx.requires_certified_rendering()")
-        .unwrap_or_else(|| panic!("slot-merge return repair must defensively refuse certified mode"));
+        .unwrap_or_else(|| {
+            panic!("slot-merge return repair must defensively refuse certified mode")
+        });
     let frame_slot_at = slot_fn
         .find(".frame_slot_merges_map()")
         .unwrap_or_else(|| panic!("slot-merge return repair must read frame_slot_merges_map"));
@@ -11127,10 +10994,14 @@ fn r2dec_certified_structuring_skips_slot_merge_return_repair() {
     let append_body = &append_rest[..append_end];
     let append_certified_at = append_body
         .find("if self.fold_ctx.requires_certified_rendering()")
-        .unwrap_or_else(|| panic!("append_merged_slot_return_if_needed must refuse certified mode"));
+        .unwrap_or_else(|| {
+            panic!("append_merged_slot_return_if_needed must refuse certified mode")
+        });
     let append_return_at = append_body
         .find("CStmt::Return(Some(expr))")
-        .unwrap_or_else(|| panic!("append_merged_slot_return_if_needed must append return in non-certified mode"));
+        .unwrap_or_else(|| {
+            panic!("append_merged_slot_return_if_needed must append return in non-certified mode")
+        });
     assert!(
         append_certified_at < append_return_at,
         "slot merge append helper must refuse certified mode before constructing executable returns"
@@ -11174,7 +11045,9 @@ fn r2dec_certified_switch_selector_uses_render_facts_only() {
     let local_at = body[certified_at..]
         .find("let rooted = self")
         .map(|offset| certified_at + offset)
-        .unwrap_or_else(|| panic!("{marker} must keep local selector rendering after certified branch"));
+        .unwrap_or_else(|| {
+            panic!("{marker} must keep local selector rendering after certified branch")
+        });
     let certified_branch = &body[certified_at..local_at];
 
     assert!(
@@ -11251,7 +11124,9 @@ fn r2dec_certified_final_return_normalization_does_not_recover_local_semantics()
     let legacy_at = return_arm[certified_at..]
         .find("normalize_final_return_expr_candidate(expr)")
         .map(|offset| certified_at + offset)
-        .unwrap_or_else(|| panic!("return arm must keep legacy return normalization after certified branch"));
+        .unwrap_or_else(|| {
+            panic!("return arm must keep legacy return normalization after certified branch")
+        });
     let certified_branch = &return_arm[certified_at..legacy_at];
 
     for forbidden in [
@@ -11348,8 +11223,9 @@ fn r2dec_certified_call_result_materialization_uses_functionfacts_owner_only() {
         .unwrap_or_else(|| panic!("missing non-certified owner-name path"));
     let certified_branch = &materialize[certified_at..local_at];
     assert!(
-        certified_branch
-            .contains("return self.certified_assigned_call_result_owner_expr_for_source(source_call);"),
+        certified_branch.contains(
+            "return self.certified_assigned_call_result_owner_expr_for_source(source_call);"
+        ),
         "certified call-result materialization must delegate to the FunctionFacts owner gate"
     );
     for forbidden in [
@@ -11428,8 +11304,9 @@ fn r2dec_certified_call_result_owner_lookups_bypass_local_ownership_tables() {
         .find("let resolved_name = self")
         .unwrap_or_else(|| panic!("missing non-certified visible-name lookup path"));
     assert!(
-        source_lookup[certified_at..local_at]
-            .contains("return self.certified_materialized_call_result_source_for_visible_name(name);"),
+        source_lookup[certified_at..local_at].contains(
+            "return self.certified_materialized_call_result_source_for_visible_name(name);"
+        ),
         "certified visible owner source lookup must bypass local ownership tables"
     );
 
@@ -11474,7 +11351,8 @@ fn r2dec_certified_call_result_owner_lookups_bypass_local_ownership_tables() {
         .unwrap_or_else(|| panic!("missing non-certified source lookup path"));
     let certified_branch = &source_name_lookup[certified_at..local_at];
     assert!(
-        certified_branch.contains("return self.certified_call_result_source_for_ssa_name(ssa_name);"),
+        certified_branch
+            .contains("return self.certified_call_result_source_for_ssa_name(ssa_name);"),
         "certified SSA-name source lookup must delegate before local source discovery"
     );
     for forbidden in [
@@ -11604,8 +11482,9 @@ fn r2dec_certified_stack_home_store_suppression_uses_value_owner_fact_only() {
         .find("let Some(offset) = self")
         .unwrap_or_else(|| panic!("missing non-certified stack-home suppression path"));
     assert!(
-        wrapper[certified_at..local_at]
-            .contains("return self.is_certified_materialized_call_result_stack_home_store(addr, val);"),
+        wrapper[certified_at..local_at].contains(
+            "return self.is_certified_materialized_call_result_stack_home_store(addr, val);"
+        ),
         "certified stack-home suppression must bypass local source recovery"
     );
 

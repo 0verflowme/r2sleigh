@@ -75,7 +75,7 @@ pub use semantic::{
     MemoryUseFact, MemoryVersion, ObjectFact, ObjectId, ObjectKind, ObjectModel, PredicateFact,
     PredicateFacts, PredicateId, PreparedAssumptionBinding, PreparedAssumptionBindingKind,
     PreparedFunctionCertificates, PreparedFunctionFacts, PreparedProofFailure, ProofNodeId,
-    ReturnCarrier, ReturnValueCertificate, StackSlotCertificate, StructuredAccessId,
+    ReturnCarrier, ReturnValueCertificate, SemanticId, StackSlotCertificate, StructuredAccessId,
     StructuredDataflowFacts, StructuredLoopFact, StructuredLoopKind, StructuredMemoryAccessFact,
     StructuredRecursiveCallFact, SwitchCertificate, SwitchPredicateFact, ValueOwner,
 };

@@ -69,14 +69,14 @@ pub use facts::{
 pub use function_facts::{
     AnalysisPlans, ArrayAccessRenderFact, BranchPredicateFact, CallArgumentValueFact,
     CallResultFact, CallsiteArgumentFacts, CallsiteRenderDisposition, CallsiteRenderFact,
-    ControlBlockAssumptionFact, DecompileCapabilityView, DecompileRouteFacts, DecompileRouteKind,
-    ExpressionRenderFact, FunctionCallRenderFacts, FunctionCallResultFacts, FunctionCallsiteFacts,
-    FunctionControlFacts, FunctionFacts, FunctionInputQualityFacts, FunctionRenderFacts,
-    InterprocSummaryView, LoopStructureFact, MemberAccessRenderFact, MemoryAccessRenderFact,
-    MemoryOpSiteKey, OpSiteKey, ParamSlotResolver, PredicateComparisonFact,
-    RegisterCallArgumentLocationFact, ReturnValueRenderFact, StackCallArgumentLocationFact,
-    StackSlotOwnerRenderAuthorization, SummaryEffectRollup, SummaryHelperView, SummaryOutParamFact,
-    SwitchSelectorFact,
+    CertifiedEffect, CertifiedEffectKind, CertifiedExpr, ControlBlockAssumptionFact,
+    DecompileCapabilityView, DecompileRouteFacts, DecompileRouteKind, ExpressionRenderFact,
+    FunctionCallRenderFacts, FunctionCallResultFacts, FunctionCallsiteFacts, FunctionControlFacts,
+    FunctionFacts, FunctionInputQualityFacts, FunctionRenderFacts, InterprocSummaryView,
+    LoopStructureFact, MemberAccessRenderFact, MemoryAccessRenderFact, MemoryOpSiteKey, OpSiteKey,
+    ParamSlotResolver, PredicateComparisonFact, RegisterCallArgumentLocationFact,
+    ReturnValueRenderFact, StackCallArgumentLocationFact, StackSlotOwnerRenderAuthorization,
+    SummaryEffectRollup, SummaryHelperView, SummaryOutParamFact, SwitchSelectorFact,
 };
 pub use inference::{CombinedTypeOracle, TypeInference};
 pub use model::{Signedness, StructField, StructShape, Type, TypeArena, TypeId};

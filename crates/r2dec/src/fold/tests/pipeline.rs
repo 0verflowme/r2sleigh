@@ -972,6 +972,7 @@ mod tests {
                 .iter()
                 .map(|(object, cert)| (*object, cert.offset))
                 .collect(),
+			..r2types::FunctionRenderFacts::default()
         }
     }
 
@@ -21407,6 +21408,23 @@ mod tests {
 
         mutate_function_facts(ctx, |function_facts| {
             let mut type_facts = function_facts.type_facts().clone();
+            let signature = r2types::FunctionSignatureSpec {
+                ret_type: Some(r2types::CTypeLike::Int {
+                    bits: 32,
+                    signedness: r2types::Signedness::Unsigned,
+                }),
+                params: vec![r2types::FunctionParamSpec {
+                    name: "node".to_string(),
+                    ty: Some(r2types::CTypeLike::Pointer(Box::new(
+                        r2types::CTypeLike::Struct("Node".to_string()),
+                    ))),
+                }],
+            };
+            type_facts.signature_certificate = r2types::SignatureCertificate::from_signature(
+                &signature,
+                [r2types::SignatureCertificateSource::ExternalContext],
+            );
+            type_facts.merged_signature = Some(signature);
             type_facts.visible_bindings.push(VisibleBinding {
                 name: "node".to_string(),
                 ty: Some(r2types::CTypeLike::Pointer(Box::new(
@@ -21421,6 +21439,10 @@ mod tests {
                 source_reg: Some("rdi".to_string()),
             });
             function_facts.replace_type_facts(type_facts);
+            function_facts.populate_certified_parameter_exprs(
+                prepared,
+                &r2types::ParamSlotResolver::from_arch_name(Some("x86-64")),
+            );
 
             if install_member_fact {
                 let mut render_facts = function_facts.render_facts().clone();
@@ -21632,6 +21654,92 @@ mod tests {
                 && !format!("{stmts:?}").contains("RBP")
                 && !format!("{stmts:?}").contains("Deref"),
             "certified stack reload return must not leak raw storage: {stmts:?}"
+        );
+    }
+
+    #[test]
+    fn certified_return_drops_only_root_abi_widening_carrier() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0x00, 4),
+            src: Varnode::constant(7, 4),
+        });
+        entry.push(R2ILOp::IntZExt {
+            dst: Varnode::register(0x00, 8),
+            src: Varnode::register(0x00, 4),
+        });
+        entry.push(R2ILOp::Return {
+            target: Varnode::register(0x00, 8),
+        });
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch).with_name("abi_return_carrier");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        ctx.inputs.function_return_type = Some(Box::leak(Box::new(CType::Int(32))));
+        let return_cert = prepared
+            .return_certificate_for_op(0x1000, 2)
+            .expect("return certificate");
+
+        let (expr, _) = ctx
+            .certified_return_expr_for_op(return_cert.block_addr, return_cert.op_index)
+            .expect("certified return expression");
+
+        assert!(
+            matches!(expr, CExpr::IntLit(7) | CExpr::UIntLit(7)),
+            "top-level 32-to-64 ABI carrier should not leak into an int32 return: {expr:?}"
+        );
+    }
+
+    #[test]
+    fn certified_return_preserves_nested_semantic_widening() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0x00, 4),
+            src: Varnode::constant(7, 4),
+        });
+        entry.push(R2ILOp::IntZExt {
+            dst: Varnode::unique(0x100, 8),
+            src: Varnode::register(0x00, 4),
+        });
+        entry.push(R2ILOp::IntDiv {
+            dst: Varnode::unique(0x108, 8),
+            a: Varnode::unique(0x100, 8),
+            b: Varnode::constant(2, 8),
+        });
+        entry.push(R2ILOp::Trunc {
+            dst: Varnode::register(0x00, 4),
+            src: Varnode::unique(0x108, 8),
+        });
+        entry.push(R2ILOp::IntZExt {
+            dst: Varnode::register(0x00, 8),
+            src: Varnode::register(0x00, 4),
+        });
+        entry.push(R2ILOp::Return {
+            target: Varnode::register(0x00, 8),
+        });
+        let prepared =
+            prepared_from_r2il_blocks(&[entry], &arch).with_name("semantic_widening_return");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        ctx.inputs.function_return_type = Some(Box::leak(Box::new(CType::Int(32))));
+        let return_cert = prepared
+            .return_certificate_for_op(0x1000, 5)
+            .expect("return certificate");
+
+        let (expr, _) = ctx
+            .certified_return_expr_for_op(return_cert.block_addr, return_cert.op_index)
+            .expect("certified return expression");
+        let mut has_nested_i64_cast = false;
+        expr.visit(&mut |node| {
+            if matches!(node, CExpr::Cast { ty: CType::Int(64), .. }) {
+                has_nested_i64_cast = true;
+            }
+        });
+
+        assert!(
+            has_nested_i64_cast,
+            "widening used by 64-bit return arithmetic is semantic, not an ABI carrier: {expr:?}"
         );
     }
 

@@ -257,7 +257,7 @@ Use this map by default:
 - `crates/r2engine`
   - typed session orchestration
   - route selection for decompile/type/query/profile requests
-  - artifact/render cache keys and invalidation boundaries
+  - analysis/artifact cache keys and invalidation boundaries
   - shared cost/metrics/refusal policy
   - cross-crate request/response API used by plugin glue
 - `crates/r2dec`
@@ -293,7 +293,7 @@ These are the preferred subsystem seams:
   - canonical type/layout/signature payload
 - `r2types::FunctionFacts`
   - canonical combined type+semantic payload
-- `r2engine::{AnalysisCacheKey, ArtifactCacheKey, RenderCacheKey}`
+- `r2engine::{AnalysisCacheKey, ArtifactCacheKey}`
   - canonical session cache/invalidation surfaces
 - `r2engine` typed request/response APIs
   - canonical orchestration surface for plugin command paths

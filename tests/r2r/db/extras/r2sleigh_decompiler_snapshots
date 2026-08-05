@@ -12,7 +12,7 @@ a:sla.dec | jq -Rs 'contains("test_bool_carrier_chain") and contains("if") and c
 EOF_CMDS
 RUN
 
-NAME=decompiler_complex_check_stable_header_and_local_prefix
+NAME=decompiler_complex_check_preserves_shared_default_arm
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
@@ -22,6 +22,6 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~complex_check[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("complex_check") and contains("r2dec residual: certified render contract failed") and contains("value return(s)") and contains("memory-like access(es)") and contains("summary return unresolved") and (contains("diff = a - b;")|not) and (contains("return 1;")|not) and (contains("r2dec fallback:")|not)'
+a:sla.dec | jq -Rs 'contains("int32_t sym._complex_check(int32_t arg0, int32_t arg1)") and contains("int32_t var_10h = arg0 + arg1;") and contains("int32_t var_14h = arg0 - arg1;") and contains("int32_t var_4h = 0;") and contains("if (var_10h == 100)") and contains("if (var_14h == 20)") and contains("var_4h = 1;") and contains("return var_4h;") and (contains("r2dec residual:")|not) and (contains("r2sleigh residual:")|not) and (contains("r2dec fallback:")|not) and (contains("*arg0")|not) and (contains("*arg1")|not)'
 EOF_CMDS
 RUN

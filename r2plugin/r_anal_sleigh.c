@@ -81,8 +81,6 @@ extern char *r2il_block_to_esil(const R2ILContext *ctx, const R2ILBlock *block);
 extern char *r2il_block_mnemonic(const R2ILContext *ctx, const unsigned char *bytes, size_t len, unsigned long long addr);
 extern char *r2il_block_op_json_named(const R2ILContext *ctx, const R2ILBlock *block, size_t index);
 extern void r2il_string_free(char *s);
-extern char *r2sleigh_decompile_render_cache_stats_json(void);
-extern void r2sleigh_decompile_render_cache_stats_reset(void);
 extern char *r2sleigh_engine_cache_stats_json(void);
 extern void r2sleigh_engine_cache_stats_reset(void);
 typedef struct {
@@ -5278,7 +5276,6 @@ static char *sleigh_profile_json(RAnal *anal) {
 	}
 	size_t max_items = SLEIGH_PROFILE_MAX_DEFAULT;
 	SleighProfileEntry **items = NULL;
-	char *decompile_cache = r2sleigh_decompile_render_cache_stats_json ();
 	char *engine_cache = r2sleigh_engine_cache_stats_json ();
 	if (sleigh_profile_count > 0) {
 		items = calloc (sleigh_profile_count, sizeof (*items));
@@ -5293,10 +5290,6 @@ static char *sleigh_profile_json(RAnal *anal) {
 	pj_kb (pj, "enabled", true);
 	pj_kn (pj, "count", sleigh_profile_count);
 	pj_kn (pj, "max", max_items);
-	if (decompile_cache && *decompile_cache) {
-		pj_k (pj, "decompile_cache");
-		pj_raw (pj, decompile_cache);
-	}
 	if (engine_cache && *engine_cache) {
 		pj_k (pj, "engine_cache");
 		pj_raw (pj, engine_cache);
@@ -5323,9 +5316,6 @@ static char *sleigh_profile_json(RAnal *anal) {
 	pj_end (pj);
 	pj_end (pj);
 	free (items);
-	if (decompile_cache) {
-		r2il_string_free (decompile_cache);
-	}
 	if (engine_cache) {
 		r2il_string_free (engine_cache);
 	}

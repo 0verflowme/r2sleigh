@@ -275,7 +275,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
                     cmd_result("int check_secret(void) {\n  return 1;\n}\n"),
                     cmd_result("int check_secret(void) {\n  return 1;\n}\n"),
                     cmd_result('{"ret_type":"int","params":[],"mutation_plan":{"mutations":[]}}\n'),
-                    cmd_result('{"count":1,"decompile_cache":{"hits":0,"misses":1}}\n'),
+                    cmd_result('{"count":1}\n'),
                 ]
             )
 
@@ -575,7 +575,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
                     cmd_result("int check_secret(void) {\n  return 1;\n}\n"),
                     cmd_result("int check_secret(void) {\n  return 1;\n}\n"),
                     cmd_result('{"ret_type":"int","params":[],"mutation_plan":{"mutations":[]}}\n'),
-                    cmd_result('{"count":1,"decompile_cache":{"hits":0,"misses":1}}\n'),
+                    cmd_result('{"count":1}\n'),
                 ]
             )
 
@@ -971,7 +971,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertIn(("done", 0), completed)
         self.assertNotIn(("partial", 0), completed)
 
-    def test_run_case_batched_scores_clean_outputs_and_reports_cache_hits(self):
+    def test_run_case_batched_scores_clean_outputs_and_reports_artifact_cache_hits(self):
         with tempfile.TemporaryDirectory() as tmp:
             binary = Path(tmp) / "sample"
             binary.write_bytes(b"\x00")
@@ -989,11 +989,9 @@ class ReversingBenchmarkTests(unittest.TestCase):
                     benchmark.batched_section_start("t0_profile", 0),
                     (
                         '{"count":1,'
-                        '"decompile_cache":{"hits":1,"misses":1,"lookups":2,"insertions":1,"evictions":0},'
                         '"engine_cache":{"analysis":{"hits":1,"misses":2,"lookups":3,"insertions":2,"evictions":0},'
-                        '"artifacts":{"hits":0,"misses":1,"lookups":1,"insertions":1,"evictions":0},'
-                        '"renders":{"hits":1,"misses":1,"lookups":2,"insertions":1,"evictions":0},'
-                        '"total":{"hits":2,"misses":4,"lookups":6,"insertions":4,"evictions":0}}}'
+                        '"artifacts":{"hits":1,"misses":1,"lookups":2,"insertions":1,"evictions":0},'
+                        '"total":{"hits":2,"misses":3,"lookups":5,"insertions":3,"evictions":0}}}'
                     ),
                     benchmark.batched_section_end("t0_profile", 0),
                 ]
@@ -1034,10 +1032,13 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertEqual(target["execution_mode"], "batched")
         self.assertIn("setup_event", target)
         self.assertEqual(result["score"], 100)
-        self.assertEqual(target["commands"]["profile"]["profile_metrics"]["cache_hits"], 1)
         self.assertEqual(
             target["commands"]["profile"]["profile_metrics"]["engine_cache"]["total"]["hits"],
             2,
+        )
+        self.assertEqual(
+            target["commands"]["profile"]["profile_metrics"]["engine_cache"]["artifacts"]["hits"],
+            1,
         )
         self.assertEqual(
             target["commands"]["decompile_pdd"]["decompile_quality"]["classification"],
@@ -1110,7 +1111,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
                         0,
                         '{"ret_type":"int","params":[],"mutation_plan":{"mutations":[]}}',
                     ),
-                    ("t0_profile", 0, '{"count":1,"decompile_cache":{"hits":1,"misses":0}}'),
+                    ("t0_profile", 0, '{"count":1}'),
                 ]
             )
             responses = iter(
@@ -1279,8 +1280,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
                                     "engine_cache": {
                                         "analysis": {"hits": 1, "misses": 2},
                                         "artifacts": {"hits": 3, "misses": 4},
-                                        "renders": {"hits": 5, "misses": 6},
-                                        "total": {"hits": 9, "misses": 12},
+                                        "total": {"hits": 4, "misses": 6},
                                     }
                                 },
                             },
@@ -1297,8 +1297,8 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertEqual(summary["timing"]["case_setup_s"], 3.0)
         self.assertEqual(summary["timing"]["target_setup_s"], 0.5)
         self.assertEqual(summary["timing"]["command_s"], 4.75)
-        self.assertEqual(summary["cache"]["engine"]["total"]["hits"], 9)
-        self.assertEqual(summary["cache"]["engine"]["renders"]["misses"], 6)
+        self.assertEqual(summary["cache"]["engine"]["total"]["hits"], 4)
+        self.assertEqual(summary["cache"]["engine"]["artifacts"]["misses"], 4)
         self.assertEqual(
             summary["quality"]["decompile_by_family"],
             {"unknown": {"fallback": 1, "structured": 1}},
@@ -1352,7 +1352,6 @@ class ReversingBenchmarkTests(unittest.TestCase):
                                     "runtime_bucket": "fast",
                                     "cache_metrics": {
                                         "summary_cache": {"hits": 4, "misses": 1, "lookups": 5},
-                                        "decompile_cache": {"hits": 2, "misses": 0, "lookups": 2},
                                     },
                                     "fast_path_metrics": {
                                         "cache_hit": True,
@@ -1375,7 +1374,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
         )
 
         self.assertEqual(summary["cache"]["summary"]["hits"], 4)
-        self.assertEqual(summary["cache"]["decompile"]["hits"], 2)
+        self.assertNotIn("decompile", summary["cache"])
         self.assertEqual(summary["fast_paths"]["summary_fast_path_count"], 1)
         self.assertEqual(summary["fast_paths"]["summary_only_count"], 1)
         self.assertEqual(summary["fast_paths"]["cache_hit_commands"], 1)

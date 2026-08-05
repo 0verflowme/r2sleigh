@@ -2480,6 +2480,149 @@ struct CertifiedEffectProofCounts {
     returns: usize,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CertifiedSemanticLedger {
+    ids: BTreeMap<r2ssa::SemanticId, usize>,
+    unresolved: usize,
+}
+
+impl CertifiedSemanticLedger {
+    fn from_effect_proofs(function_facts: &FunctionFacts, proofs: &[EffectRenderProof]) -> Self {
+        let mut ledger = Self::default();
+        for proof in proofs {
+            let id = match proof.kind {
+                EffectRenderProofKind::Call => function_facts
+                    .callsites()
+                    .and_then(|facts| {
+                        facts.arguments_for_site(r2types::CallsiteKey {
+                            block_addr: proof.block_addr,
+                            op_index: proof.op_idx,
+                        })
+                    })
+                    .map(|fact| r2ssa::SemanticId::call(fact.call_site_id)),
+                EffectRenderProofKind::Expression => proof.value.and_then(|value| {
+                    function_facts
+                        .render_facts()
+                        .certified_expr_for_value(value)
+                        .map(|cert| cert.id)
+                }),
+                EffectRenderProofKind::MemoryRead | EffectRenderProofKind::MemoryWrite => {
+                    proof.address.and_then(|address| {
+                        function_facts.render_facts().memory_effect_id_for_op(
+                            proof.block_addr,
+                            proof.op_idx,
+                            proof.kind == EffectRenderProofKind::MemoryWrite,
+                            address,
+                            proof.value,
+                        )
+                    })
+                }
+                EffectRenderProofKind::Return => function_facts
+                    .render_facts()
+                    .return_effect_id_for_op(proof.block_addr, proof.op_idx),
+            };
+            if let Some(id) = id {
+                *ledger.ids.entry(id).or_default() += 1;
+            } else {
+                ledger.unresolved += 1;
+            }
+        }
+        ledger
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CertifiedStructuringFootprint {
+    semantic_ledger: CertifiedSemanticLedger,
+    control: ControlRenderCounts,
+    calls: usize,
+    returns_with_value: usize,
+    memory_like_accesses: usize,
+    field_accesses: usize,
+    array_accesses: usize,
+    raw_address_call_args: usize,
+    raw_pointer_arithmetic_derefs: usize,
+}
+
+impl CertifiedStructuringFootprint {
+    fn preserves_observable_semantics(&self, after: &Self) -> bool {
+        self.semantic_ledger == after.semantic_ledger
+            && self.control == after.control
+            && self.calls == after.calls
+            && self.returns_with_value == after.returns_with_value
+            && self.memory_like_accesses == after.memory_like_accesses
+            && self.field_accesses == after.field_accesses
+            && self.array_accesses == after.array_accesses
+            && after.raw_address_call_args <= self.raw_address_call_args
+            && after.raw_pointer_arithmetic_derefs <= self.raw_pointer_arithmetic_derefs
+    }
+}
+
+fn certified_structuring_footprint(
+    stmt: &CStmt,
+    function_facts: &FunctionFacts,
+    proofs: &[EffectRenderProof],
+) -> CertifiedStructuringFootprint {
+    let mut counts = CertifiedOutputCounts::default();
+    let mut raw_names = Vec::new();
+    collect_certified_stmt_contract(
+        stmt,
+        RenderNodeId::root_child(0),
+        &mut counts,
+        &mut raw_names,
+    );
+    let mut control_nodes = Vec::new();
+    collect_stmt_control_render_nodes(stmt, RenderNodeId::root_child(0), &mut control_nodes);
+    CertifiedStructuringFootprint {
+        semantic_ledger: CertifiedSemanticLedger::from_effect_proofs(function_facts, proofs),
+        control: control_render_counts_from_nodes(&control_nodes),
+        calls: counts.calls,
+        returns_with_value: counts.returns_with_value,
+        memory_like_accesses: counts.memory_like_accesses,
+        field_accesses: counts.field_accesses,
+        array_accesses: counts.array_accesses,
+        raw_address_call_args: counts.raw_address_call_args,
+        raw_pointer_arithmetic_derefs: counts.raw_pointer_arithmetic_derefs,
+    }
+}
+
+/// Run one AST cleanup transaction and keep it only when the complete
+/// certified semantic/control footprint is preserved. This gives certified
+/// mode a real structuring pass without allowing cleanup to silently delete or
+/// synthesize effects.
+#[cfg(test)]
+fn cleanup_preserving_certified_semantics(
+    stmt: CStmt,
+    function_facts: &FunctionFacts,
+    proofs: &[EffectRenderProof],
+) -> CStmt {
+    transform_preserving_certified_semantics(stmt, function_facts, proofs, |stmt| {
+        ControlFlowStructurer::cleanup(stmt)
+    })
+}
+
+fn transform_preserving_certified_semantics<F>(
+    stmt: CStmt,
+    function_facts: &FunctionFacts,
+    proofs: &[EffectRenderProof],
+    transform: F,
+) -> CStmt
+where
+    F: FnOnce(CStmt) -> CStmt,
+{
+    let before = certified_structuring_footprint(&stmt, function_facts, proofs);
+    if before.semantic_ledger.unresolved > 0 {
+        return stmt;
+    }
+    let transformed = transform(stmt.clone());
+    let after = certified_structuring_footprint(&transformed, function_facts, proofs);
+    if before.preserves_observable_semantics(&after) {
+        transformed
+    } else {
+        stmt
+    }
+}
+
 fn certified_effect_proof_counts(
     effect_render_proofs: &[EffectRenderProof],
 ) -> CertifiedEffectProofCounts {
@@ -2777,6 +2920,14 @@ fn certified_standard_output_residual_reason_with_effect_proofs(
     }
 
     if let Some(effect_render_proofs) = effect_render_proofs {
+        let semantic_ledger =
+            CertifiedSemanticLedger::from_effect_proofs(function_facts, effect_render_proofs);
+        if !render_facts.certified_effects.is_empty() && semantic_ledger.unresolved > 0 {
+            reasons.push(format!(
+                "{} rendered proof(s) lack stable semantic identity",
+                semantic_ledger.unresolved
+            ));
+        }
         for proof in effect_render_proofs
             .iter()
             .filter(|proof| proof.kind == EffectRenderProofKind::Call)
@@ -5123,7 +5274,7 @@ impl Decompiler {
             &recovered_param_infos,
             &self.context.type_facts().register_params,
             &self.config.arg_regs,
-            true,
+            !certified_standard_mode,
         );
         for (idx, (_ssa_var, _)) in recovered_param_infos.iter().enumerate() {
             let Some(param) = params.get(idx) else {
@@ -5282,8 +5433,15 @@ impl Decompiler {
         }
 
         if certified_standard_mode && route_is_standard(semantic_route) {
-            body_stmt = fold_ctx.prune_dead_temp_assignments_in_stmt(body_stmt);
-            body_stmt = ControlFlowStructurer::cleanup(body_stmt);
+            body_stmt = transform_preserving_certified_semantics(
+                body_stmt,
+                &self.context.function_facts,
+                &effect_render_proofs,
+                |body| {
+                    let body = fold_ctx.prune_dead_temp_assignments_in_stmt(body);
+                    ControlFlowStructurer::cleanup(body)
+                },
+            );
         } else if route_is_standard(semantic_route) {
             body_stmt = fold_ctx.normalize_final_stmt_calls(body_stmt);
             body_stmt = fold_ctx.prune_dead_temp_assignments_in_stmt(body_stmt);
@@ -6704,6 +6862,111 @@ mod tests {
         })
     }
 
+    fn certified_return_facts(
+        sites: &[(u64, usize, r2ssa::InstId, r2ssa::ValueId)],
+    ) -> FunctionFacts {
+        let mut render = FunctionRenderFacts::default();
+        for (block_addr, op_index, at, value) in sites {
+            let expression_id = r2ssa::SemanticId::expression(*value);
+            let expression = r2types::ExpressionRenderFact {
+                value: *value,
+                defining_inst: None,
+                width: 4,
+                renderable: true,
+            };
+            render.certified_exprs.insert(
+                expression_id,
+                r2types::CertifiedExpr {
+                    id: expression_id,
+                    fact: expression.clone(),
+                    inputs: Vec::new(),
+                    bindings: BTreeSet::new(),
+                },
+            );
+            render.expressions.insert(*value, expression);
+            let effect_id = r2ssa::SemanticId::return_value(*at);
+            let return_fact = r2types::ReturnValueRenderFact {
+                block_addr: *block_addr,
+                op_index: *op_index,
+                value: *value,
+                width: 4,
+            };
+            render.certified_effects.insert(
+                effect_id,
+                r2types::CertifiedEffect::Return {
+                    id: effect_id,
+                    at: *at,
+                    fact: return_fact.clone(),
+                },
+            );
+            render
+                .return_effects_by_op
+                .insert((*block_addr, *op_index), effect_id);
+            render
+                .returns_by_op
+                .insert((*block_addr, *op_index), return_fact);
+        }
+        FunctionFacts::default().with_render(render)
+    }
+
+    fn return_effect_proof(
+        block_addr: u64,
+        op_idx: usize,
+        value: r2ssa::ValueId,
+    ) -> EffectRenderProof {
+        EffectRenderProof {
+            kind: EffectRenderProofKind::Return,
+            block_addr,
+            op_idx,
+            call_disposition: None,
+            target: None,
+            address: None,
+            value: Some(value),
+            values: Vec::new(),
+            materialized_phi_copy: false,
+        }
+    }
+
+    #[test]
+    fn certified_cleanup_flattens_containers_when_semantic_ids_are_preserved() {
+        let value = r2ssa::ValueId(4);
+        let facts = certified_return_facts(&[(0x401000, 2, r2ssa::InstId(7), value)]);
+        let proof = return_effect_proof(0x401000, 2, value);
+        let input = CStmt::Block(vec![CStmt::Block(vec![CStmt::Return(Some(CExpr::Var(
+            "result".to_string(),
+        )))])]);
+
+        let cleaned = cleanup_preserving_certified_semantics(input, &facts, &[proof]);
+
+        assert!(matches!(cleaned, CStmt::Return(Some(_))));
+    }
+
+    #[test]
+    fn certified_cleanup_rolls_back_when_a_return_semantic_id_would_be_lost() {
+        let zero = r2ssa::ValueId(4);
+        let one = r2ssa::ValueId(5);
+        let facts = certified_return_facts(&[
+            (0x401000, 2, r2ssa::InstId(7), zero),
+            (0x401010, 3, r2ssa::InstId(8), one),
+        ]);
+        let proofs = [
+            return_effect_proof(0x401000, 2, zero),
+            return_effect_proof(0x401010, 3, one),
+        ];
+        let input = CStmt::If {
+            cond: CExpr::Var("ok".to_string()),
+            then_body: Box::new(CStmt::Return(Some(CExpr::IntLit(0)))),
+            else_body: Some(Box::new(CStmt::Return(Some(CExpr::IntLit(1))))),
+        };
+
+        let cleaned = cleanup_preserving_certified_semantics(input, &facts, &proofs);
+
+        assert!(
+            matches!(cleaned, CStmt::If { .. }),
+            "two certified return effects must not collapse into one ternary return"
+        );
+    }
+
     #[test]
     fn certified_source_aliases_normalize_strength_reduced_array_member_address() {
         let arch = FoldArchConfig {
@@ -7236,6 +7499,7 @@ mod tests {
                 .iter()
                 .map(|(object, cert)| (*object, cert.offset))
                 .collect(),
+            ..r2types::FunctionRenderFacts::default()
         }
     }
 

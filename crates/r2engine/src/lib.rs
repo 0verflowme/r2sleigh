@@ -9,7 +9,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::OpenOptions;
 use std::hash::Hash;
 use std::io::Write;
-use std::sync::LazyLock;
 use std::time::Duration;
 
 use r2il::R2ILBlock;
@@ -62,7 +61,6 @@ pub const SYMBOLIC_PATHS_TIMEOUT_MS: u64 = 500;
 pub const SYMBOLIC_PATHS_SOLUTION_LIMIT: usize = 4;
 pub const RADARE2_ANALYSIS_DEPTH_BASIC: u32 = 1;
 pub const RADARE2_ANALYSIS_DEPTH_AGGRESSIVE: u32 = 3;
-pub const DATA_REF_CACHE_LIMIT: usize = 4096;
 pub const POST_ANALYSIS_FAST_BUDGET_USEC: u64 = 2 * 1_000_000;
 pub const POST_ANALYSIS_BALANCED_BUDGET_USEC: u64 = 10 * 1_000_000;
 pub const POST_ANALYSIS_AGGRESSIVE_BUDGET_USEC: u64 = 30 * 1_000_000;
@@ -621,6 +619,11 @@ pub struct EngineTypeWritebackFactCounts {
     pub render_stack_slot_offsets: usize,
     pub render_member_accesses: usize,
     pub render_array_accesses: usize,
+    pub certified_expressions: usize,
+    pub certified_parameters: usize,
+    pub certified_stack_slots: usize,
+    pub certified_memory_accesses: usize,
+    pub certified_returns: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -703,6 +706,11 @@ pub struct EngineTypeWritebackFactCountsJson {
     pub render_stack_slot_offsets: usize,
     pub render_member_accesses: usize,
     pub render_array_accesses: usize,
+    pub certified_expressions: usize,
+    pub certified_parameters: usize,
+    pub certified_stack_slots: usize,
+    pub certified_memory_accesses: usize,
+    pub certified_returns: usize,
 }
 
 impl EngineTypeWritebackFactCountsJson {
@@ -719,6 +727,11 @@ impl EngineTypeWritebackFactCountsJson {
             && self.render_stack_slot_offsets == 0
             && self.render_member_accesses == 0
             && self.render_array_accesses == 0
+            && self.certified_expressions == 0
+            && self.certified_parameters == 0
+            && self.certified_stack_slots == 0
+            && self.certified_memory_accesses == 0
+            && self.certified_returns == 0
     }
 }
 
@@ -1148,6 +1161,11 @@ pub fn type_writeback_json_core(
             render_stack_slot_offsets: payload.fact_counts.render_stack_slot_offsets,
             render_member_accesses: payload.fact_counts.render_member_accesses,
             render_array_accesses: payload.fact_counts.render_array_accesses,
+            certified_expressions: payload.fact_counts.certified_expressions,
+            certified_parameters: payload.fact_counts.certified_parameters,
+            certified_stack_slots: payload.fact_counts.certified_stack_slots,
+            certified_memory_accesses: payload.fact_counts.certified_memory_accesses,
+            certified_returns: payload.fact_counts.certified_returns,
         },
         param_home_stack_slot_offsets: payload.param_home_stack_slot_offsets,
         render_stack_slot_offsets: payload.render_stack_slot_offsets,
@@ -1596,6 +1614,43 @@ pub fn type_writeback_fact_counts(function_facts: &FunctionFacts) -> EngineTypeW
         render_array_accesses: render
             .map(|facts| facts.array_accesses_by_op.values().map(Vec::len).sum())
             .unwrap_or(0),
+        certified_expressions: render.map(|facts| facts.certified_exprs.len()).unwrap_or(0),
+        certified_parameters: render
+            .map(|facts| facts.parameter_values.len())
+            .unwrap_or(0),
+        certified_stack_slots: render
+            .map(|facts| {
+                facts
+                    .certified_effects
+                    .values()
+                    .filter(|effect| effect.kind() == r2types::CertifiedEffectKind::StackSlot)
+                    .count()
+            })
+            .unwrap_or(0),
+        certified_memory_accesses: render
+            .map(|facts| {
+                facts
+                    .certified_effects
+                    .values()
+                    .filter(|effect| {
+                        matches!(
+                            effect.kind(),
+                            r2types::CertifiedEffectKind::MemoryRead
+                                | r2types::CertifiedEffectKind::MemoryWrite
+                        )
+                    })
+                    .count()
+            })
+            .unwrap_or(0),
+        certified_returns: render
+            .map(|facts| {
+                facts
+                    .certified_effects
+                    .values()
+                    .filter(|effect| effect.kind() == r2types::CertifiedEffectKind::Return)
+                    .count()
+            })
+            .unwrap_or(0),
     }
 }
 
@@ -1805,51 +1860,6 @@ pub fn auto_callback_plan_for_radare2_depth(
     metrics: EngineAutoCallbackMetrics,
 ) -> EngineAutoCallbackPlan {
     auto_callback_plan_for_policy(analysis_policy_for_radare2_depth(depth), kind, metrics)
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EngineDataRefCacheEntry {
-    pub key: u64,
-    pub payload_hash: u64,
-    pub ref_count: i32,
-}
-
-static DATA_REF_CACHE: LazyLock<SessionCache<u64, EngineDataRefCacheEntry>> =
-    LazyLock::new(|| SessionCache::new(DATA_REF_CACHE_LIMIT));
-
-pub fn engine_data_ref_cache_clear() {
-    DATA_REF_CACHE.clear_entries();
-}
-
-pub fn engine_data_ref_cache_len() -> usize {
-    DATA_REF_CACHE.len()
-}
-
-pub fn engine_data_ref_cache_get(addr: u64) -> Option<EngineDataRefCacheEntry> {
-    DATA_REF_CACHE.get_cloned(&addr)
-}
-
-pub fn engine_data_ref_cache_put(addr: u64, entry: EngineDataRefCacheEntry) {
-    DATA_REF_CACHE.insert(addr, entry);
-}
-
-pub fn data_ref_cache_key(
-    function_addr: u64,
-    basic_block_count: usize,
-    linear_size: u64,
-    context_hash: u64,
-    blocks: &[R2ILBlock],
-    mode: EngineAnalysisMode,
-) -> u64 {
-    stable_fnv1a_hash(&(
-        "r2sleigh-data-ref-cache-key-v1",
-        function_addr,
-        basic_block_count,
-        linear_size,
-        context_hash,
-        stable_blocks_hash(blocks),
-        mode.level(),
-    ))
 }
 
 pub fn engine_normalized_arch_name(arch: Option<&r2il::ArchSpec>) -> Option<String> {
@@ -2073,13 +2083,11 @@ impl AnalysisCacheKey {
 pub enum EngineCacheLayer {
     Analysis,
     Artifact,
-    Render,
     MetricsSnapshot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EngineCacheReuse {
-    Disabled,
     Miss,
     Hit,
 }
@@ -2113,8 +2121,9 @@ impl EngineCachePlan {
 
     pub fn for_request(request: EngineRequestKind) -> Self {
         match request {
-            EngineRequestKind::Decompile => Self::lookup_store(request, EngineCacheLayer::Render),
-            EngineRequestKind::Types | EngineRequestKind::SymbolicQuery => {
+            EngineRequestKind::Decompile
+            | EngineRequestKind::Types
+            | EngineRequestKind::SymbolicQuery => {
                 Self::lookup_store(request, EngineCacheLayer::Artifact)
             }
             EngineRequestKind::DebugFacts => {
@@ -2132,23 +2141,9 @@ pub struct EngineCacheReuseDecision {
     pub request: EngineRequestKind,
     pub layer: EngineCacheLayer,
     pub reuse: EngineCacheReuse,
-    pub reason: Option<String>,
 }
 
 impl EngineCacheReuseDecision {
-    pub fn disabled(
-        request: EngineRequestKind,
-        layer: EngineCacheLayer,
-        reason: impl Into<String>,
-    ) -> Self {
-        Self {
-            request,
-            layer,
-            reuse: EngineCacheReuse::Disabled,
-            reason: Some(reason.into()),
-        }
-    }
-
     pub fn from_lookup(
         request: EngineRequestKind,
         layer: EngineCacheLayer,
@@ -2162,7 +2157,6 @@ impl EngineCacheReuseDecision {
             } else {
                 EngineCacheReuse::Miss
             },
-            reason: None,
         }
     }
 
@@ -2240,152 +2234,6 @@ impl ArtifactCacheKey {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct RenderCacheKey {
-    pub artifact: ArtifactCacheKey,
-    pub render_payload_hash: u64,
-    pub render_config_hash: u64,
-    pub render_schema_version: u32,
-}
-
-impl RenderCacheKey {
-    pub(crate) fn from_artifact(
-        artifact: ArtifactCacheKey,
-        render_payload_hash: u64,
-        render_config_hash: u64,
-    ) -> Self {
-        Self {
-            artifact,
-            render_payload_hash,
-            render_config_hash,
-            render_schema_version: ENGINE_SCHEMA_VERSION,
-        }
-    }
-}
-
-pub(crate) struct DecompileRenderCacheKeyInput<'a> {
-    blocks: &'a [R2ILBlock],
-    function_name: &'a str,
-    arch: Option<&'a r2il::ArchSpec>,
-    ptr_bits: u32,
-    function_facts: &'a FunctionFacts,
-}
-
-pub(crate) fn decompile_render_cache_key(
-    input: DecompileRenderCacheKeyInput<'_>,
-) -> RenderCacheKey {
-    let analysis = AnalysisCacheKey::from_hashes(
-        0,
-        stable_fnv1a_hash(input.function_name),
-        stable_fnv1a_debug_hash(&input.arch),
-        stable_blocks_hash(input.blocks),
-        stable_function_facts_render_hash(input.function_facts),
-        u64::from(input.ptr_bits),
-        stable_fnv1a_hash("decompile-render-v2-claim-schema"),
-    );
-    let artifact = ArtifactCacheKey::from_hashes(analysis, 0, 0);
-    let render_payload_hash = stable_fnv1a_hash("decompile-render-payload-v3-functionfacts-only");
-    let render_config_hash = stable_fnv1a_hash(&(
-        "decompile-render-config-v1",
-        stable_fnv1a_debug_hash(&input.arch),
-        input.ptr_bits,
-        r2sym::SEMANTIC_CLAIM_SCHEMA_VERSION,
-        r2sym::PROOF_COVERAGE_SCHEMA_VERSION,
-    ));
-    RenderCacheKey::from_artifact(artifact, render_payload_hash, render_config_hash)
-}
-
-fn stable_function_facts_render_hash(function_facts: &FunctionFacts) -> u64 {
-    stable_fnv1a_hash(&[
-        stable_fnv1a_hash("function-facts-render-v1"),
-        stable_function_type_facts_render_hash(function_facts.type_facts()),
-        stable_fnv1a_debug_hash(&function_facts.semantic_artifact()),
-        stable_fnv1a_debug_hash(function_facts.proof_coverage()),
-        stable_fnv1a_debug_hash(&function_facts.decompile_route()),
-        stable_fnv1a_debug_hash(&function_facts.input_quality()),
-        stable_fnv1a_debug_hash(&function_facts.callee_resolution()),
-        stable_fnv1a_debug_hash(&function_facts.callsites()),
-        stable_fnv1a_debug_hash(&function_facts.call_results()),
-        stable_fnv1a_debug_hash(&function_facts.call_render()),
-        stable_fnv1a_debug_hash(function_facts.control_facts()),
-        stable_fnv1a_debug_hash(function_facts.render_facts()),
-        stable_fnv1a_debug_hash(function_facts.assumptions()),
-        stable_fnv1a_debug_hash(function_facts.plans()),
-        stable_fnv1a_debug_hash(function_facts.summary_view()),
-        stable_fnv1a_debug_hash(&function_facts.diagnostics()),
-        stable_fnv1a_debug_hash(function_facts.assumption_usage()),
-    ])
-}
-
-fn stable_function_type_facts_render_hash(type_facts: &FunctionTypeFacts) -> u64 {
-    let known_function_signatures = type_facts
-        .known_function_signatures
-        .iter()
-        .collect::<BTreeMap<_, _>>();
-    let external_stack_vars = type_facts
-        .external_stack_vars
-        .iter()
-        .collect::<BTreeMap<_, _>>();
-    let external_structs = type_facts
-        .external_type_db
-        .structs
-        .iter()
-        .collect::<BTreeMap<_, _>>();
-    let external_unions = type_facts
-        .external_type_db
-        .unions
-        .iter()
-        .collect::<BTreeMap<_, _>>();
-    let external_enums = type_facts
-        .external_type_db
-        .enums
-        .iter()
-        .collect::<BTreeMap<_, _>>();
-    let slot_type_overrides = type_facts
-        .slot_type_overrides
-        .iter()
-        .collect::<BTreeMap<_, _>>();
-    let slot_field_profiles = type_facts
-        .slot_field_profiles
-        .iter()
-        .collect::<BTreeMap<_, _>>();
-    let mut field_access_certificates = type_facts.field_access_certificates.clone();
-    field_access_certificates.sort();
-    let mut array_index_certificates = type_facts.array_index_certificates.clone();
-    array_index_certificates.sort();
-    let mut scalar_array_render_candidates = type_facts.scalar_array_render_candidates.clone();
-    scalar_array_render_candidates.sort();
-    let mut out_param_certificates = type_facts.out_param_certificates.clone();
-    out_param_certificates.sort();
-
-    stable_fnv1a_hash(&[
-        stable_fnv1a_hash("function-type-facts-render-v1"),
-        stable_fnv1a_debug_hash(&type_facts.merged_signature),
-        stable_fnv1a_debug_hash(&type_facts.callconv),
-        u64::from(type_facts.noreturn),
-        stable_fnv1a_debug_hash(&known_function_signatures),
-        stable_fnv1a_debug_hash(&type_facts.register_params),
-        stable_fnv1a_debug_hash(&type_facts.stack_slots),
-        stable_fnv1a_debug_hash(&type_facts.visible_bindings),
-        stable_fnv1a_debug_hash(&type_facts.callee_facts),
-        stable_fnv1a_debug_hash(&external_stack_vars),
-        stable_fnv1a_debug_hash(&external_structs),
-        stable_fnv1a_debug_hash(&external_unions),
-        stable_fnv1a_debug_hash(&external_enums),
-        stable_fnv1a_debug_hash(&type_facts.external_type_db.typedefs),
-        stable_fnv1a_debug_hash(&type_facts.external_type_db.diagnostics),
-        stable_fnv1a_debug_hash(&slot_type_overrides),
-        stable_fnv1a_debug_hash(&slot_field_profiles),
-        stable_fnv1a_debug_hash(&field_access_certificates),
-        stable_fnv1a_debug_hash(&array_index_certificates),
-        stable_fnv1a_debug_hash(&scalar_array_render_candidates),
-        stable_fnv1a_debug_hash(&out_param_certificates),
-        stable_fnv1a_debug_hash(&type_facts.signature_certificate),
-        stable_fnv1a_debug_hash(&type_facts.interproc_diagnostics),
-        stable_fnv1a_debug_hash(&type_facts.diagnostics),
-    ])
-}
-
 pub fn decompile_callee_resolution_facts(
     prepared: &SsaArtifact,
     function_facts: &FunctionFacts,
@@ -2404,6 +2252,7 @@ pub fn attach_prepared_decompile_evidence(
     param_slots: &ParamSlotResolver,
 ) -> FunctionFacts {
     function_facts.attach_prepared_decompile_evidence(prepared);
+    function_facts.populate_certified_parameter_exprs(prepared, param_slots);
     function_facts.normalize_field_certificates_from_external_layout();
     function_facts
         .populate_member_access_render_facts_from_field_certificates(prepared, param_slots);
@@ -2466,9 +2315,6 @@ pub struct EngineArtifacts {
     pub pattern_ssa: Option<SsaArtifact>,
     pub function_facts: Option<FunctionFacts>,
     pub writeback_plan: Option<TypeWritebackPlan>,
-    pub rendered: Option<String>,
-    pub metrics: EngineMetrics,
-    pub diagnostics: EngineDiagnostics,
 }
 
 #[derive(Debug, Clone)]
@@ -3131,12 +2977,9 @@ mod kani_proofs {
 
         assert_eq!(plan.request, request);
         match request {
-            EngineRequestKind::Decompile => {
-                assert_eq!(plan.layer, EngineCacheLayer::Render);
-                assert!(plan.lookup);
-                assert!(plan.store_on_miss);
-            }
-            EngineRequestKind::Types | EngineRequestKind::SymbolicQuery => {
+            EngineRequestKind::Decompile
+            | EngineRequestKind::Types
+            | EngineRequestKind::SymbolicQuery => {
                 assert_eq!(plan.layer, EngineCacheLayer::Artifact);
                 assert!(plan.lookup);
                 assert!(plan.store_on_miss);
@@ -3258,7 +3101,7 @@ mod kani_proofs {
     }
 
     #[kani::proof]
-    fn artifact_and_render_cache_keys_include_orchestration_and_render_payloads() {
+    fn artifact_cache_keys_include_analysis_and_orchestration_inputs() {
         let analysis = AnalysisCacheKey::from_hashes(
             kani::any(),
             kani::any(),
@@ -3270,8 +3113,6 @@ mod kani_proofs {
         );
         let interproc_budget_hash = kani::any::<u64>();
         let symbolic_scope_hash = kani::any::<u64>();
-        let render_payload_hash = kani::any::<u64>();
-        let render_config_hash = kani::any::<u64>();
 
         let artifact = ArtifactCacheKey::from_hashes(
             analysis.clone(),
@@ -3308,40 +3149,6 @@ mod kani_proofs {
                     analysis,
                     interproc_budget_hash,
                     symbolic_scope_hash.wrapping_add(1),
-                )
-        );
-
-        let render = RenderCacheKey::from_artifact(
-            artifact.clone(),
-            render_payload_hash,
-            render_config_hash,
-        );
-        assert!(
-            render
-                != RenderCacheKey::from_artifact(
-                    artifact.clone(),
-                    render_payload_hash.wrapping_add(1),
-                    render_config_hash,
-                )
-        );
-        assert!(
-            render
-                != RenderCacheKey::from_artifact(
-                    artifact.clone(),
-                    render_payload_hash,
-                    render_config_hash.wrapping_add(1),
-                )
-        );
-        assert!(
-            render
-                != RenderCacheKey::from_artifact(
-                    ArtifactCacheKey::from_hashes(
-                        artifact.analysis,
-                        artifact.interproc_budget_hash.wrapping_add(1),
-                        artifact.symbolic_scope_hash,
-                    ),
-                    render_payload_hash,
-                    render_config_hash,
                 )
         );
     }
@@ -3895,7 +3702,6 @@ struct EngineDecompileRequest {
     pub prepared_ssa: SsaArtifact,
     pub function_facts: FunctionFacts,
     pub render_target: EngineRenderTarget,
-    pub render_cache_key: Option<RenderCacheKey>,
 }
 
 #[derive(Debug, Clone)]
@@ -4433,7 +4239,6 @@ pub struct EngineDecompileResponse {
 pub struct EngineSession {
     analysis_cache: SessionCache<AnalysisCacheKey, EngineArtifacts>,
     artifact_cache: SessionCache<ArtifactCacheKey, EngineArtifacts>,
-    render_cache: SessionCache<RenderCacheKey, String>,
 }
 
 impl Default for EngineSession {
@@ -4447,7 +4252,6 @@ impl EngineSession {
         Self {
             analysis_cache: SessionCache::new(cache_limit),
             artifact_cache: SessionCache::new(cache_limit),
-            render_cache: SessionCache::new(cache_limit),
         }
     }
 
@@ -4505,52 +4309,16 @@ impl EngineSession {
         self.artifact_cache.insert_cloned(key, artifacts)
     }
 
-    #[cfg(test)]
-    pub(crate) fn cached_render(&self, key: &RenderCacheKey) -> Option<String> {
-        self.cached_render_with_decision(EngineRequestKind::Decompile, Some(key))
-            .value
-    }
-
-    pub(crate) fn cached_render_with_decision(
-        &self,
-        request: EngineRequestKind,
-        key: Option<&RenderCacheKey>,
-    ) -> EngineCacheLookup<String> {
-        let Some(key) = key else {
-            return EngineCacheLookup {
-                value: None,
-                decision: EngineCacheReuseDecision::disabled(
-                    request,
-                    EngineCacheLayer::Render,
-                    "render cache key unavailable",
-                ),
-            };
-        };
-        let value = self.render_cache.get_cloned(key);
-        let decision = EngineCacheReuseDecision::from_lookup(
-            request,
-            EngineCacheLayer::Render,
-            value.is_some(),
-        );
-        EngineCacheLookup { value, decision }
-    }
-
-    pub(crate) fn insert_render(&self, key: RenderCacheKey, rendered: String) -> String {
-        self.render_cache.insert_cloned(key, rendered)
-    }
-
     pub fn cache_metrics(&self) -> EngineSessionCacheMetrics {
         EngineSessionCacheMetrics {
             analysis: self.analysis_cache.counters(),
             artifacts: self.artifact_cache.counters(),
-            renders: self.render_cache.counters(),
         }
     }
 
     pub fn reset_cache_metrics(&self) {
         self.analysis_cache.reset_counters();
         self.artifact_cache.reset_counters();
-        self.render_cache.reset_counters();
     }
 
     pub fn profile(&self, request: EngineProfileRequest) -> EngineProfileResponse {
@@ -4921,19 +4689,11 @@ impl EngineSession {
             artifact.function_facts,
             &param_slots,
         );
-        let render_cache_key = decompile_render_cache_key(DecompileRenderCacheKeyInput {
-            blocks: &analysis_request.blocks,
-            function_name: &display_name,
-            arch: analysis_request.arch.as_ref(),
-            ptr_bits: analysis_request.ptr_bits,
-            function_facts: &artifact.function_facts,
-        });
         self.decompile(EngineDecompileRequest {
             function_name: display_name,
             prepared_ssa: artifact.ssa_func,
             function_facts: artifact.function_facts,
             render_target,
-            render_cache_key: Some(render_cache_key),
         })
     }
 
@@ -4968,29 +4728,9 @@ impl EngineSession {
         let diagnostics = decompile_diagnostics_from_function_facts(&request.function_facts);
         let planning_time = started.elapsed();
 
-        let cache_lookup = self.cached_render_with_decision(
-            EngineRequestKind::Decompile,
-            request.render_cache_key.as_ref(),
-        );
-        if let Some(output) = cache_lookup.value {
-            return EngineDecompileResponse {
-                output,
-                function_facts: request.function_facts.clone(),
-                metrics: EngineMetrics {
-                    cache_hit: true,
-                    planning_time,
-                    ..EngineMetrics::default()
-                },
-                diagnostics,
-            };
-        }
-
         let render_started = std::time::Instant::now();
         let output = render_engine_decompile_request(&request);
         let render_time = render_started.elapsed();
-        if let Some(cache_key) = request.render_cache_key {
-            self.insert_render(cache_key, output.clone());
-        }
 
         EngineDecompileResponse {
             output,
@@ -5668,7 +5408,6 @@ fn engine_analysis_artifact_to_artifacts(artifact: EngineAnalysisArtifact) -> En
         pattern_ssa: Some(artifact.pattern_ssa_func),
         function_facts: Some(artifact.function_facts),
         writeback_plan: Some(artifact.writeback_plan),
-        ..EngineArtifacts::default()
     }
 }
 
@@ -7310,9 +7049,6 @@ fn count_prepared_callsites(ssa_blocks: &[r2ssa::SSABlock]) -> usize {
 mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet, HashMap};
-    use std::sync::{LazyLock, Mutex};
-
-    static DATA_REF_CACHE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     fn test_decompile_route(
         kind: r2types::DecompileRouteKind,
@@ -8796,102 +8532,6 @@ mod tests {
     }
 
     #[test]
-    fn data_ref_cache_is_engine_owned_and_address_keyed() {
-        let _guard = DATA_REF_CACHE_TEST_LOCK
-            .lock()
-            .expect("data ref cache test lock poisoned");
-        engine_data_ref_cache_clear();
-        assert_eq!(engine_data_ref_cache_len(), 0);
-
-        let first = EngineDataRefCacheEntry {
-            key: 0xaa,
-            payload_hash: 0xbb,
-            ref_count: 3,
-        };
-        engine_data_ref_cache_put(0x401000, first);
-        assert_eq!(engine_data_ref_cache_len(), 1);
-        assert_eq!(engine_data_ref_cache_get(0x401000), Some(first));
-
-        let replacement = EngineDataRefCacheEntry {
-            key: 0xcc,
-            payload_hash: 0xdd,
-            ref_count: 5,
-        };
-        engine_data_ref_cache_put(0x401000, replacement);
-        assert_eq!(engine_data_ref_cache_len(), 1);
-        assert_eq!(engine_data_ref_cache_get(0x401000), Some(replacement));
-
-        engine_data_ref_cache_clear();
-    }
-
-    #[test]
-    fn data_ref_cache_evicts_oldest_entry_deterministically() {
-        let _guard = DATA_REF_CACHE_TEST_LOCK
-            .lock()
-            .expect("data ref cache test lock poisoned");
-        engine_data_ref_cache_clear();
-
-        for idx in 0..DATA_REF_CACHE_LIMIT as u64 {
-            engine_data_ref_cache_put(
-                0x700000 + idx,
-                EngineDataRefCacheEntry {
-                    key: idx,
-                    payload_hash: idx + 1,
-                    ref_count: idx.min(i32::MAX as u64) as i32,
-                },
-            );
-        }
-        assert_eq!(engine_data_ref_cache_len(), DATA_REF_CACHE_LIMIT);
-
-        assert!(engine_data_ref_cache_get(0x700000).is_some());
-        let new_entry = EngineDataRefCacheEntry {
-            key: 9,
-            payload_hash: 10,
-            ref_count: 11,
-        };
-        engine_data_ref_cache_put(0x800000, new_entry);
-        assert_eq!(engine_data_ref_cache_len(), DATA_REF_CACHE_LIMIT);
-        assert!(engine_data_ref_cache_get(0x700000).is_some());
-        assert_eq!(engine_data_ref_cache_get(0x700001), None);
-        assert_eq!(engine_data_ref_cache_get(0x800000), Some(new_entry));
-
-        engine_data_ref_cache_clear();
-    }
-
-    #[test]
-    fn data_ref_cache_key_hashes_full_il_payload_not_only_block_shape() {
-        let mut first = R2ILBlock::new(0x401000, 4);
-        first.push(r2il::R2ILOp::Copy {
-            dst: r2il::Varnode::unique(0, 8),
-            src: r2il::Varnode::constant(0x10000, 8),
-        });
-        let mut second = R2ILBlock::new(0x401000, 4);
-        second.push(r2il::R2ILOp::Copy {
-            dst: r2il::Varnode::unique(0, 8),
-            src: r2il::Varnode::constant(0x20000, 8),
-        });
-
-        let first_key = data_ref_cache_key(
-            0x401000,
-            1,
-            4,
-            0xdead_beef,
-            &[first],
-            EngineAnalysisMode::Full,
-        );
-        let second_key = data_ref_cache_key(
-            0x401000,
-            1,
-            4,
-            0xdead_beef,
-            &[second],
-            EngineAnalysisMode::Full,
-        );
-
-        assert_ne!(first_key, second_key);
-    }
-
-    #[test]
     fn signature_inference_is_engine_owned_and_canonicalizes_arch() {
         let mut arch = r2il::ArchSpec::new("amd64");
         arch.addr_size = 8;
@@ -9910,7 +9550,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_keys_partition_analysis_artifact_and_render_inputs() {
+    fn cache_keys_partition_analysis_and_artifact_inputs() {
         let arch = r2il::ArchSpec::new("x86-64");
         let blocks = const_return_blocks(0x401000, 0);
         let analysis = AnalysisCacheKey::from_parts(
@@ -9950,13 +9590,6 @@ mod tests {
 
         assert_ne!(artifact, changed_interproc_budget);
         assert_ne!(artifact, changed_symbolic_scope);
-
-        let render = RenderCacheKey::from_artifact(artifact.clone(), 0x50, 0x60);
-        let changed_render_payload = RenderCacheKey::from_artifact(artifact.clone(), 0x51, 0x60);
-        let changed_render_config = RenderCacheKey::from_artifact(artifact, 0x50, 0x61);
-
-        assert_ne!(render, changed_render_payload);
-        assert_ne!(render, changed_render_config);
     }
 
     #[test]
@@ -9968,28 +9601,10 @@ mod tests {
         let key3 = EngineFunctionKey::from_parts(0x1002, "c", None, &blocks, 0, 0, 0, None, "aa");
 
         assert!(session.cached_artifacts(&key1).is_none());
-        session.insert_artifacts(
-            key1.clone(),
-            EngineArtifacts {
-                rendered: Some("one".to_string()),
-                ..EngineArtifacts::default()
-            },
-        );
-        session.insert_artifacts(
-            key2.clone(),
-            EngineArtifacts {
-                rendered: Some("two".to_string()),
-                ..EngineArtifacts::default()
-            },
-        );
+        session.insert_artifacts(key1.clone(), EngineArtifacts::default());
+        session.insert_artifacts(key2.clone(), EngineArtifacts::default());
         assert!(session.cached_artifacts(&key1).is_some());
-        session.insert_artifacts(
-            key3,
-            EngineArtifacts {
-                rendered: Some("three".to_string()),
-                ..EngineArtifacts::default()
-            },
-        );
+        session.insert_artifacts(key3, EngineArtifacts::default());
         assert!(session.cached_artifacts(&key2).is_none());
 
         let metrics = session.cache_metrics();
@@ -10006,346 +9621,24 @@ mod tests {
     }
 
     #[test]
-    fn session_cache_metrics_are_partitioned_by_cache_kind() {
+    fn session_cache_metrics_are_partitioned_by_reusable_artifact_kind() {
         let session = EngineSession::new(4);
         let blocks = const_return_blocks(0x2000, 0);
         let analysis = AnalysisCacheKey::from_parts(0x2000, "a", None, &blocks, 1, 2, "types-only");
         let artifact = ArtifactCacheKey::from_hashes(analysis.clone(), 3, 4);
-        let render = RenderCacheKey::from_artifact(artifact.clone(), 5, 6);
 
         assert!(session.cached_analysis(&analysis).is_none());
-        session.insert_analysis(
-            analysis.clone(),
-            EngineArtifacts {
-                rendered: Some("analysis".to_string()),
-                ..EngineArtifacts::default()
-            },
-        );
+        session.insert_analysis(analysis.clone(), EngineArtifacts::default());
         assert!(session.cached_analysis(&analysis).is_some());
 
         assert!(session.cached_artifacts(&artifact).is_none());
-        session.insert_artifacts(
-            artifact,
-            EngineArtifacts {
-                rendered: Some("artifact".to_string()),
-                ..EngineArtifacts::default()
-            },
-        );
-
-        assert!(session.cached_render(&render).is_none());
-        session.insert_render(render.clone(), "rendered".to_string());
-        assert_eq!(session.cached_render(&render), Some("rendered".to_string()));
+        session.insert_artifacts(artifact, EngineArtifacts::default());
 
         let metrics = session.cache_metrics();
         assert_eq!(metrics.analysis.hits, 1);
         assert_eq!(metrics.analysis.misses, 1);
         assert_eq!(metrics.artifacts.hits, 0);
         assert_eq!(metrics.artifacts.misses, 1);
-        assert_eq!(metrics.renders.hits, 1);
-        assert_eq!(metrics.renders.misses, 1);
-    }
-
-    #[test]
-    fn engine_session_decompile_owns_render_cache() {
-        let session = EngineSession::new(4);
-        let blocks = const_return_blocks(0x401000, 0);
-        let prepared = r2ssa::SsaArtifact::for_decompile(&blocks, None)
-            .expect("prepared")
-            .with_name("sym.zero");
-        let analysis =
-            AnalysisCacheKey::from_parts(0x401000, "sym.zero", None, &blocks, 1, 2, "aa");
-        let artifact = ArtifactCacheKey::from_hashes(analysis, 3, 4);
-        let render = RenderCacheKey::from_artifact(artifact, 5, 6);
-        let request = EngineDecompileRequest {
-            function_name: "sym.zero".to_string(),
-            prepared_ssa: prepared,
-            function_facts: FunctionFacts::default(),
-            render_target: EngineRenderTarget::default(),
-            render_cache_key: Some(render),
-        };
-
-        let first = session.decompile(request.clone());
-        let second = session.decompile(request);
-
-        assert!(!first.metrics.cache_hit);
-        assert!(second.metrics.cache_hit);
-        assert_eq!(first.output, second.output);
-        assert_eq!(
-            first
-                .function_facts
-                .decompile_route()
-                .map(|route| route.kind),
-            second
-                .function_facts
-                .decompile_route()
-                .map(|route| route.kind)
-        );
-        let metrics = session.cache_metrics();
-        assert_eq!(metrics.renders.hits, 1);
-        assert_eq!(metrics.renders.misses, 1);
-        assert_eq!(metrics.renders.insertions, 1);
-    }
-
-    #[test]
-    fn decompile_render_cache_key_hashes_canonical_callee_resolution() {
-        let blocks = direct_call_return_blocks(0x401000, 0x5000);
-        let prepared = r2ssa::SsaArtifact::for_decompile(&blocks, None)
-            .expect("prepared")
-            .with_name("sym.caller");
-        let function_facts = FunctionFacts::default();
-        let mut printf_facts = function_facts.clone();
-        printf_facts.__test_type_facts_mut().callee_facts.insert(
-            0x5000,
-            r2types::CalleeFact {
-                function_id: 0x5000,
-                name: Some("sym.imp.printf".to_string()),
-                linkage: r2types::CalleeLinkage::Imported,
-                signature: None,
-                signature_callconv: None,
-                signature_noreturn: false,
-                model_policy_evidence: BTreeSet::new(),
-                direct_callees: Vec::new(),
-                callsite_count: 0,
-                has_unknown_calls: false,
-                arg_effects: BTreeMap::new(),
-                memory_effects: Vec::new(),
-                transfer_effects: Vec::new(),
-                allocation_effects: Vec::new(),
-                lifetime_effects: Vec::new(),
-                sync_effects: Vec::new(),
-                atomic_effects: Vec::new(),
-                param_type_hints: BTreeMap::new(),
-                return_type_hint: None,
-                return_relation: r2types::CalleeReturnRelation::Unknown,
-                reads_global_memory: false,
-                writes_global_memory: false,
-                touches_unknown_memory: false,
-            },
-        );
-        let mut memcpy_facts = function_facts.clone();
-        memcpy_facts.__test_type_facts_mut().callee_facts.insert(
-            0x5000,
-            r2types::CalleeFact {
-                function_id: 0x5000,
-                name: Some("sym.imp.memcpy".to_string()),
-                linkage: r2types::CalleeLinkage::Imported,
-                signature: None,
-                signature_callconv: None,
-                signature_noreturn: false,
-                model_policy_evidence: BTreeSet::new(),
-                direct_callees: Vec::new(),
-                callsite_count: 0,
-                has_unknown_calls: false,
-                arg_effects: BTreeMap::new(),
-                memory_effects: Vec::new(),
-                transfer_effects: Vec::new(),
-                allocation_effects: Vec::new(),
-                lifetime_effects: Vec::new(),
-                sync_effects: Vec::new(),
-                atomic_effects: Vec::new(),
-                param_type_hints: BTreeMap::new(),
-                return_type_hint: None,
-                return_relation: r2types::CalleeReturnRelation::Unknown,
-                reads_global_memory: false,
-                writes_global_memory: false,
-                touches_unknown_memory: false,
-            },
-        );
-        let printf_resolution = decompile_callee_resolution_facts(&prepared, &printf_facts);
-        let memcpy_resolution = decompile_callee_resolution_facts(&prepared, &memcpy_facts);
-
-        assert!(printf_resolution.identity_for_name("printf").is_some());
-        assert!(memcpy_resolution.identity_for_name("memcpy").is_some());
-
-        let printf_facts = function_facts
-            .clone()
-            .with_callee_resolution(printf_resolution.clone());
-        let memcpy_facts = function_facts
-            .clone()
-            .with_callee_resolution(memcpy_resolution.clone());
-
-        let printf_key = decompile_render_cache_key(DecompileRenderCacheKeyInput {
-            blocks: &blocks,
-            function_name: "sym.caller",
-            arch: None,
-            ptr_bits: 64,
-            function_facts: &printf_facts,
-        });
-        let memcpy_key = decompile_render_cache_key(DecompileRenderCacheKeyInput {
-            blocks: &blocks,
-            function_name: "sym.caller",
-            arch: None,
-            ptr_bits: 64,
-            function_facts: &memcpy_facts,
-        });
-        let missing_resolution_key = decompile_render_cache_key(DecompileRenderCacheKeyInput {
-            blocks: &blocks,
-            function_name: "sym.caller",
-            arch: None,
-            ptr_bits: 64,
-            function_facts: &function_facts,
-        });
-
-        assert_ne!(printf_key, memcpy_key);
-        assert_ne!(printf_key, missing_resolution_key);
-    }
-
-    #[test]
-    fn decompile_render_cache_key_hashes_decompile_route_facts() {
-        let blocks = const_return_blocks(0x401000, 0);
-        let base_facts = FunctionFacts::default();
-        let standard_facts =
-            FunctionFacts::default().with_decompile_route(r2types::DecompileRouteFacts {
-                kind: r2types::DecompileRouteKind::Standard,
-                reason: None,
-                fallback_comment: None,
-                skip_runtime_type_inference: false,
-                use_prepared_semantic_view: true,
-                proof_coverage: r2sym::ProofCoverage::default(),
-                render_permission: r2sym::RenderPermission::certified(
-                    r2sym::ProofOwner::R2engine,
-                    "standard route",
-                ),
-            });
-        let fallback_facts =
-            FunctionFacts::default().with_decompile_route(r2types::DecompileRouteFacts {
-                kind: r2types::DecompileRouteKind::FallbackComment,
-                reason: Some("missing proof".to_string()),
-                fallback_comment: Some("/* facts-owned fallback */".to_string()),
-                skip_runtime_type_inference: true,
-                use_prepared_semantic_view: false,
-                proof_coverage: r2sym::ProofCoverage::default(),
-                render_permission: r2sym::RenderPermission::refuse(
-                    r2sym::ProofOwner::R2engine,
-                    "missing proof",
-                ),
-            });
-
-        let key_for = |function_facts: &FunctionFacts| {
-            decompile_render_cache_key(DecompileRenderCacheKeyInput {
-                blocks: &blocks,
-                function_name: "sym.zero",
-                arch: None,
-                ptr_bits: 64,
-                function_facts,
-            })
-        };
-
-        assert_ne!(key_for(&base_facts), key_for(&standard_facts));
-        assert_ne!(key_for(&standard_facts), key_for(&fallback_facts));
-    }
-
-    #[test]
-    fn decompile_render_cache_key_hashes_input_quality_facts() {
-        let blocks = const_return_blocks(0x401000, 0);
-        let complete_facts =
-            FunctionFacts::default().with_input_quality(r2types::FunctionInputQualityFacts {
-                expected_blocks: 1,
-                lifted_blocks: 1,
-                actual_lifted_blocks: 1,
-                read_failures: 0,
-                invalid_blocks: 0,
-                null_lift_failures: 0,
-                truncated_blocks: 0,
-                refusal_reason: None,
-            });
-        let refused_facts =
-            FunctionFacts::default().with_input_quality(r2types::FunctionInputQualityFacts {
-                expected_blocks: 2,
-                lifted_blocks: 1,
-                actual_lifted_blocks: 1,
-                read_failures: 1,
-                invalid_blocks: 0,
-                null_lift_failures: 0,
-                truncated_blocks: 0,
-                refusal_reason: Some("incomplete lifted function input".to_string()),
-            });
-
-        let key_for = |function_facts: &FunctionFacts| {
-            decompile_render_cache_key(DecompileRenderCacheKeyInput {
-                blocks: &blocks,
-                function_name: "sym.zero",
-                arch: None,
-                ptr_bits: 64,
-                function_facts,
-            })
-        };
-
-        assert_ne!(key_for(&complete_facts), key_for(&refused_facts));
-    }
-
-    #[test]
-    fn decompile_render_cache_key_canonicalizes_unordered_type_facts() {
-        let blocks = const_return_blocks(0x401000, 0);
-        let malloc_sig = r2types::FunctionType {
-            return_type: r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Void)),
-            params: vec![r2types::CTypeLike::Typedef("size_t".to_string())],
-            variadic: false,
-        };
-        let memcpy_sig = r2types::FunctionType {
-            return_type: r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Void)),
-            params: vec![
-                r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Void)),
-                r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Void)),
-                r2types::CTypeLike::Typedef("size_t".to_string()),
-            ],
-            variadic: false,
-        };
-
-        let mut first = FunctionFacts::default();
-        first
-            .__test_type_facts_mut()
-            .known_function_signatures
-            .insert("malloc".to_string(), malloc_sig.clone());
-        first
-            .__test_type_facts_mut()
-            .known_function_signatures
-            .insert("memcpy".to_string(), memcpy_sig.clone());
-        first
-            .__test_type_facts_mut()
-            .slot_type_overrides
-            .insert(1, "struct item *".to_string());
-        first
-            .__test_type_facts_mut()
-            .slot_type_overrides
-            .insert(0, "uint8_t *".to_string());
-
-        let mut second = FunctionFacts::default();
-        second
-            .__test_type_facts_mut()
-            .known_function_signatures
-            .insert("memcpy".to_string(), memcpy_sig.clone());
-        second
-            .__test_type_facts_mut()
-            .known_function_signatures
-            .insert("malloc".to_string(), malloc_sig);
-        second
-            .__test_type_facts_mut()
-            .slot_type_overrides
-            .insert(0, "uint8_t *".to_string());
-        second
-            .__test_type_facts_mut()
-            .slot_type_overrides
-            .insert(1, "struct item *".to_string());
-
-        let mut changed = second.clone();
-        changed
-            .__test_type_facts_mut()
-            .slot_type_overrides
-            .insert(1, "struct other *".to_string());
-
-        let key_for = |function_facts: &FunctionFacts| {
-            decompile_render_cache_key(DecompileRenderCacheKeyInput {
-                blocks: &blocks,
-                function_name: "sym.cache",
-                arch: None,
-                ptr_bits: 64,
-                function_facts,
-            })
-        };
-
-        assert_eq!(key_for(&first), key_for(&second));
-        assert_ne!(key_for(&second), key_for(&changed));
     }
 
     #[test]
@@ -10618,41 +9911,14 @@ mod tests {
         let key2 = EngineFunctionKey::from_parts(0x1001, "b", None, &blocks, 0, 0, 0, None, "aa");
         let key3 = EngineFunctionKey::from_parts(0x1002, "c", None, &blocks, 0, 0, 0, None, "aa");
 
-        session.insert_artifacts(
-            key1.clone(),
-            EngineArtifacts {
-                rendered: Some("one".to_string()),
-                ..EngineArtifacts::default()
-            },
-        );
-        session.insert_artifacts(
-            key2.clone(),
-            EngineArtifacts {
-                rendered: Some("two".to_string()),
-                ..EngineArtifacts::default()
-            },
-        );
-        assert_eq!(
-            session.cached_artifacts(&key1).and_then(|a| a.rendered),
-            Some("one".to_string())
-        );
-        session.insert_artifacts(
-            key3.clone(),
-            EngineArtifacts {
-                rendered: Some("three".to_string()),
-                ..EngineArtifacts::default()
-            },
-        );
+        session.insert_artifacts(key1.clone(), EngineArtifacts::default());
+        session.insert_artifacts(key2.clone(), EngineArtifacts::default());
+        assert!(session.cached_artifacts(&key1).is_some());
+        session.insert_artifacts(key3.clone(), EngineArtifacts::default());
 
-        assert_eq!(
-            session.cached_artifacts(&key1).and_then(|a| a.rendered),
-            Some("one".to_string())
-        );
+        assert!(session.cached_artifacts(&key1).is_some());
         assert!(session.cached_artifacts(&key2).is_none());
-        assert_eq!(
-            session.cached_artifacts(&key3).and_then(|a| a.rendered),
-            Some("three".to_string())
-        );
+        assert!(session.cached_artifacts(&key3).is_some());
     }
 
     #[test]
@@ -12728,7 +11994,7 @@ mod tests {
             plan_decompile_request("sym.simple", &function_facts, Some(&prepared), &cfg_summary);
         assert_eq!(decompile.request(), EngineRequestKind::Decompile);
         assert_eq!(decompile.engine_plan(), EnginePlan::FastLocal);
-        assert_eq!(decompile.cache.layer, EngineCacheLayer::Render);
+        assert_eq!(decompile.cache.layer, EngineCacheLayer::Artifact);
         assert!(decompile.cache.lookup);
         assert!(decompile.cache.store_on_miss);
         assert_eq!(decompile.diagnostics().plan, Some(EnginePlan::FastLocal));
@@ -12923,9 +12189,7 @@ mod tests {
         let analysis =
             AnalysisCacheKey::from_parts(0x403000, "sym.profile", None, &blocks, 1, 2, "aa");
         let artifact = ArtifactCacheKey::from_hashes(analysis, 3, 4);
-        let render = RenderCacheKey::from_artifact(artifact, 5, 6);
-
-        let _ = session.cached_render_with_decision(EngineRequestKind::Decompile, Some(&render));
+        let _ = session.cached_artifacts_with_decision(EngineRequestKind::Decompile, &artifact);
         let profile = session.profile(EngineProfileRequest {
             reset_after_read: true,
         });
@@ -12934,7 +12198,7 @@ mod tests {
             profile.route_decision.kind,
             EngineProfileRouteKind::MetricsSnapshot
         );
-        assert_eq!(profile.metrics.renders.misses, 1);
+        assert_eq!(profile.metrics.artifacts.misses, 1);
         assert_eq!(profile.total.misses, 1);
         assert_eq!(
             session
@@ -12963,7 +12227,7 @@ mod tests {
         let diagnostics = request_plan.diagnostics();
 
         assert_eq!(request_plan.engine_plan(), EnginePlan::RefuseWithEvidence);
-        assert_eq!(request_plan.cache.layer, EngineCacheLayer::Render);
+        assert_eq!(request_plan.cache.layer, EngineCacheLayer::Artifact);
         assert_eq!(diagnostics.refusal, Some(comment.clone()));
         assert_eq!(diagnostics.route_reason, Some(comment.clone()));
         assert_eq!(
@@ -13129,24 +12393,19 @@ mod tests {
         let analysis =
             AnalysisCacheKey::from_parts(0x403000, "sym.cache", None, &blocks, 1, 2, "aa");
         let artifact = ArtifactCacheKey::from_hashes(analysis, 3, 4);
-        let render = RenderCacheKey::from_artifact(artifact, 5, 6);
 
-        let disabled = session.cached_render_with_decision(EngineRequestKind::Decompile, None);
-        assert_eq!(disabled.value, None);
-        assert_eq!(disabled.decision.reuse, EngineCacheReuse::Disabled);
-
-        let miss = session.cached_render_with_decision(EngineRequestKind::Decompile, Some(&render));
-        assert_eq!(miss.value, None);
+        let miss = session.cached_artifacts_with_decision(EngineRequestKind::Decompile, &artifact);
+        assert!(miss.value.is_none());
         assert_eq!(miss.decision.reuse, EngineCacheReuse::Miss);
 
-        session.insert_render(render.clone(), "cached output".to_string());
-        let hit = session.cached_render_with_decision(EngineRequestKind::Decompile, Some(&render));
-        assert_eq!(hit.value.as_deref(), Some("cached output"));
+        session.insert_artifacts(artifact.clone(), EngineArtifacts::default());
+        let hit = session.cached_artifacts_with_decision(EngineRequestKind::Decompile, &artifact);
+        assert!(hit.value.is_some());
         assert!(hit.decision.is_hit());
 
         let metrics = session.cache_metrics();
         assert_eq!(
-            metrics.counters_for_layer(EngineCacheLayer::Render),
+            metrics.counters_for_layer(EngineCacheLayer::Artifact),
             CacheCounters {
                 hits: 1,
                 misses: 1,

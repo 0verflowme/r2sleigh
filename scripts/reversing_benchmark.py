@@ -286,7 +286,6 @@ CANONICAL_GOLD_OWNERS = frozenset(owner for owner in OWNER_ACTIONS if owner != "
 CACHE_COUNTER_FIELDS = ("hits", "misses", "lookups", "insertions", "evictions")
 TARGET_ALIAS_PREFIXES = {"sym", "dbg"}
 CACHE_METRIC_KEYS = (
-    "decompile_cache",
     "summary_cache",
     "semantic_summary_cache",
     "interproc_summary_cache",
@@ -652,7 +651,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "run a repeated decompile/types/profile sequence to measure same-session "
-            "engine artifact and render cache reuse"
+            "engine analysis and artifact cache reuse"
         ),
     )
     parser.add_argument(
@@ -2171,7 +2170,7 @@ def engine_cache_metrics(payload: Any) -> dict[str, dict[str, int]] | None:
     if not isinstance(payload, dict):
         return None
     out: dict[str, dict[str, int]] = {}
-    for partition in ("analysis", "artifacts", "renders", "total"):
+    for partition in ("analysis", "artifacts", "total"):
         counters = cache_counter_metrics(payload.get(partition))
         if counters:
             out[partition] = counters
@@ -2356,11 +2355,6 @@ def command_summary(
                     entry["fast_path_metrics"] = fast_path_metrics
             if name == "profile" and isinstance(payload, dict):
                 cache_metrics = entry.get("cache_metrics") if isinstance(entry.get("cache_metrics"), dict) else {}
-                decompile_cache = (
-                    cache_metrics.get("decompile_cache")
-                    if isinstance(cache_metrics.get("decompile_cache"), dict)
-                    else None
-                )
                 engine_cache = (
                     cache_metrics.get("engine_cache")
                     if isinstance(cache_metrics.get("engine_cache"), dict)
@@ -2368,11 +2362,7 @@ def command_summary(
                 )
                 profile_metrics = {
                     "count": payload.get("count") if isinstance(payload.get("count"), int) else None,
-                    "cache_hits": decompile_cache.get("hits") if decompile_cache else None,
-                    "cache_misses": decompile_cache.get("misses") if decompile_cache else None,
                 }
-                if decompile_cache:
-                    profile_metrics["decompile_cache"] = decompile_cache
                 if engine_cache:
                     profile_metrics["engine_cache"] = engine_cache
                 entry["profile_metrics"] = {
@@ -4129,7 +4119,7 @@ def add_cache_counter_totals(dest: dict[str, int], source: dict[str, Any]) -> No
 def add_engine_cache_totals(
     dest: dict[str, dict[str, int]], source: dict[str, Any]
 ) -> None:
-    for partition in ("analysis", "artifacts", "renders", "total"):
+    for partition in ("analysis", "artifacts", "total"):
         counters = source.get(partition)
         if isinstance(counters, dict):
             add_cache_counter_totals(dest.setdefault(partition, {}), counters)
@@ -4137,7 +4127,6 @@ def add_engine_cache_totals(
 
 def cache_total_name(name: str) -> str:
     aliases = {
-        "decompile_cache": "decompile",
         "summary_cache": "summary",
         "engine_cache": "engine",
     }
@@ -5006,12 +4995,6 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
                 if isinstance(cache_metrics, dict):
                     add_cache_metrics_totals(engine_cache_totals, cache_totals, cache_metrics)
                 elif isinstance(profile_metrics, dict):
-                    decompile_cache = profile_metrics.get("decompile_cache")
-                    if isinstance(decompile_cache, dict):
-                        add_cache_counter_totals(
-                            cache_totals.setdefault("decompile", {}),
-                            decompile_cache,
-                        )
                     engine_cache = profile_metrics.get("engine_cache")
                     if isinstance(engine_cache, dict):
                         add_engine_cache_totals(engine_cache_totals, engine_cache)
@@ -5518,10 +5501,6 @@ def compare_reports(before: dict[str, Any], after: dict[str, Any]) -> dict[str, 
         "engine_cache_total_misses": _metric_delta(
             _summary_metric(before, ("summary", "cache", "engine", "total", "misses")),
             _summary_metric(after, ("summary", "cache", "engine", "total", "misses")),
-        ),
-        "decompile_cache_hits": _metric_delta(
-            _summary_metric(before, ("summary", "cache", "decompile", "hits")),
-            _summary_metric(after, ("summary", "cache", "decompile", "hits")),
         ),
         "summary_cache_hits": _metric_delta(
             _summary_metric(before, ("summary", "cache", "summary", "hits")),

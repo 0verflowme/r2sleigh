@@ -665,6 +665,27 @@ impl<'a> CertifiedRenderPlan<'a> {
             .authorized_stack_param_owner_render(fact.object, offset)?;
         Some(CExpr::Var(authorization.name))
     }
+
+    fn parameter_expr_for_value(&self, value: r2ssa::ValueId) -> Option<CExpr> {
+        let certified = self.proof.render_facts.certified_expr_for_value(value)?;
+        let mut slots = certified
+            .bindings
+            .iter()
+            .filter_map(|binding| match binding {
+                r2ssa::SemanticId::Parameter(slot) => usize::try_from(*slot).ok(),
+                _ => None,
+            });
+        let slot = slots.next()?;
+        if slots.next().is_some() {
+            return None;
+        }
+        let signature = self
+            .function_facts
+            .type_facts()
+            .render_authorized_signature()?;
+        let parameter = signature.params.get(slot)?;
+        (!parameter.name.trim().is_empty()).then(|| CExpr::Var(parameter.name.clone()))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -763,6 +784,23 @@ impl LowerFrame {
 }
 
 impl<'a> FoldingContext<'a> {
+    fn certified_parameter_expr_for_value(&self, value: r2ssa::ValueId) -> Option<CExpr> {
+        let prepared = self.prepared_ssa()?;
+        let plan = self
+            .certified_render_context()
+            .and_then(|proof| self.certified_render_plan(proof))?;
+        plan.parameter_expr_for_value(value).or_else(|| {
+            prepared
+                .stack_reload_certificate_for_value(value)
+                .and_then(|reload| plan.parameter_expr_for_value(reload.canonical_source))
+        })
+    }
+
+    fn stable_semantic_ids_are_required(&self) -> bool {
+        self.certified_render_context()
+            .is_some_and(|proof| !proof.render_facts.certified_exprs.is_empty())
+    }
+
     fn certified_const_expr(&self, var: &SSAVar) -> Option<CExpr> {
         let value = parse_const_value(&var.name)?;
         Some(if value > 0x7fff_ffff {
@@ -1027,6 +1065,12 @@ impl<'a> FoldingContext<'a> {
                 if !expression_renderable {
                     return None;
                 }
+                if let Some(expr) = self.certified_parameter_expr_for_value(value) {
+                    return Some(expr);
+                }
+                if self.stable_semantic_ids_are_required() {
+                    return None;
+                }
                 let rendered = self.var_name(var);
                 return Some(
                     self.arg_alias_for_rendered_name(&rendered)
@@ -1226,9 +1270,18 @@ impl<'a> FoldingContext<'a> {
                     SSAOp::IntZExt { dst, src }
                     | SSAOp::IntSExt { dst, src }
                     | SSAOp::Trunc { dst, src }
-                    | SSAOp::Cast { dst, src } => self
-                        .certified_expr_for_prepared_var(src, depth + 1, visited)
-                        .map(|expr| CExpr::cast(type_from_size(dst.size), expr)),
+                    | SSAOp::Cast { dst, src } => {
+                        let expr = self.certified_expr_for_prepared_var(src, depth + 1, visited)?;
+                        let source_already_matches_return = depth == 0
+                            && dst.size > src.size
+                            && self.inputs.function_return_type.and_then(CType::bits)
+                                == Some(src.size.saturating_mul(8));
+                        Some(if source_already_matches_return {
+                            expr
+                        } else {
+                            CExpr::cast(type_from_size(dst.size), expr)
+                        })
+                    }
                     _ => None,
                 },
             }
