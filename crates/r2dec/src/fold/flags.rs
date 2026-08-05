@@ -852,6 +852,24 @@ impl<'a> FoldingContext<'a> {
         ))
     }
 
+    pub(super) fn certified_predicate_expr_for_id(
+        &self,
+        predicate_id: r2ssa::PredicateId,
+    ) -> Option<CExpr> {
+        let predicate = self
+            .control_facts()?
+            .branch_predicates
+            .values()
+            .find(|predicate| predicate.id == predicate_id)?;
+        let expr = self
+            .prepared_predicate_comparison_at_block(predicate, predicate.block_addr)
+            .and_then(|comparison| {
+                self.prepared_compare_provenance_expr(comparison, Some(predicate.block_addr))
+            })?;
+        let expr = self.finalize_condition_expr(expr);
+        (!self.is_degenerate_constant_condition(&expr)).then_some(expr)
+    }
+
     fn branch_compare_provenance_expr(
         &self,
         block: &FunctionSSABlock,

@@ -12244,6 +12244,7 @@ mod tests {
                         },
                         inputs: Vec::new(),
                         bindings: BTreeSet::new(),
+                        guarded_phi: None,
                     },
                 )]),
                 ..r2types::FunctionRenderFacts::default()

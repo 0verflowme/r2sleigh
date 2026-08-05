@@ -14559,6 +14559,68 @@ mod tests {
     }
 
     #[test]
+    fn certified_control_return_renders_guarded_phi() {
+        use r2il::{R2ILBlock, R2ILOp, Varnode};
+
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x2200, 4);
+        entry.push(R2ILOp::IntEqual {
+            dst: Varnode::unique(0x300, 1),
+            a: Varnode::register(0x10, 8),
+            b: Varnode::constant(0, 8),
+        });
+        entry.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x2208, 8),
+            cond: Varnode::unique(0x300, 1),
+        });
+        let mut when_false = R2ILBlock::new(0x2204, 4);
+        when_false.push(R2ILOp::Copy {
+            dst: Varnode::register(0x10, 8),
+            src: Varnode::constant(1, 8),
+        });
+        when_false.push(R2ILOp::Branch {
+            target: Varnode::constant(0x220c, 8),
+        });
+        let mut when_true = R2ILBlock::new(0x2208, 4);
+        when_true.push(R2ILOp::Branch {
+            target: Varnode::constant(0x220c, 8),
+        });
+        let mut exit = R2ILBlock::new(0x220c, 4);
+        exit.push(R2ILOp::Return {
+            target: Varnode::register(0x10, 8),
+        });
+        let prepared =
+            prepared_from_r2il_blocks(&[entry, when_false, when_true, exit], &arch);
+        let func = prepared.function();
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        install_test_x86_64_signature(&mut ctx);
+        ctx.analyze_blocks(&func.blocks().cloned().collect::<Vec<_>>());
+        ctx.analyze_function_structure(func);
+
+        let exit_block = func.get_block(0x220c).expect("exit block");
+        let stmts = ctx.fold_block(exit_block, exit_block.addr);
+        assert!(
+            stmts.iter().any(|stmt| {
+                matches!(
+                    stmt,
+                    CStmt::Return(Some(CExpr::Ternary {
+                        then_expr,
+                        else_expr,
+                        ..
+                    })) if **then_expr == CExpr::IntLit(0)
+                        && **else_expr == CExpr::IntLit(1)
+                )
+            }),
+            "a complete certified branch partition should render the divergent phi: {stmts:?}"
+        );
+        assert!(
+            !stmts.iter().any(|stmt| matches!(stmt, CStmt::Comment(_))),
+            "a certified guarded phi must not residualize: {stmts:?}"
+        );
+    }
+
+    #[test]
     fn test_return_register_write_keeps_semantic_indexed_load_shape() {
         let idx_src = make_var("ESI", 0, 4);
         let arr_src = make_var("RDI", 0, 8);
@@ -19406,6 +19468,7 @@ mod tests {
                 },
                 inputs: Vec::new(),
                 bindings: BTreeSet::new(),
+                guarded_phi: None,
             });
         install_function_render_facts(&mut ctx, render_facts);
 
@@ -20784,6 +20847,7 @@ mod tests {
                         },
                         inputs: Vec::new(),
                         bindings: BTreeSet::new(),
+                        guarded_phi: None,
                     },
                 )]),
                 ..r2types::FunctionRenderFacts::default()

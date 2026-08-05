@@ -1171,6 +1171,54 @@ impl<'a> FoldingContext<'a> {
             }
             match &inst.payload {
                 r2ssa::InstPayload::Phi { predecessors } => {
+                    if let Some(guarded) = self
+                        .certified_render_context()
+                        .and_then(|render| render.render_facts.guarded_phi_for_value(value))
+                    {
+                        let expected_sources = inst
+                            .inputs
+                            .iter()
+                            .copied()
+                            .map(r2ssa::SemanticId::expression)
+                            .collect::<BTreeSet<_>>();
+                        let rendered_sources = guarded
+                            .when_true
+                            .sources
+                            .iter()
+                            .chain(&guarded.when_false.sources)
+                            .copied()
+                            .collect::<BTreeSet<_>>();
+                        let r2ssa::SemanticId::Predicate(predicate) = guarded.predicate else {
+                            return None;
+                        };
+                        let r2ssa::SemanticId::Expression(when_true) = guarded.when_true.rendered
+                        else {
+                            return None;
+                        };
+                        let r2ssa::SemanticId::Expression(when_false) = guarded.when_false.rendered
+                        else {
+                            return None;
+                        };
+                        if expected_sources != rendered_sources
+                            || guarded.when_true.sources.is_empty()
+                            || guarded.when_false.sources.is_empty()
+                        {
+                            return None;
+                        }
+                        return Some(CExpr::Ternary {
+                            cond: Box::new(self.certified_predicate_expr_for_id(predicate)?),
+                            then_expr: Box::new(self.certified_structural_expr_for_value(
+                                when_true,
+                                depth + 1,
+                                visited,
+                            )?),
+                            else_expr: Box::new(self.certified_structural_expr_for_value(
+                                when_false,
+                                depth + 1,
+                                visited,
+                            )?),
+                        });
+                    }
                     let compute_latch = |pred_addr: u64| {
                         self.control_facts().and_then(|facts| {
                             facts

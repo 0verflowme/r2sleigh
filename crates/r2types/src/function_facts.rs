@@ -447,6 +447,10 @@ impl FunctionRenderFacts {
             .get(&r2ssa::SemanticId::expression(value))
     }
 
+    pub fn guarded_phi_for_value(&self, value: r2ssa::ValueId) -> Option<&GuardedPhiRenderFact> {
+        self.certified_expr_for_value(value)?.guarded_phi.as_ref()
+    }
+
     pub fn certified_effect(&self, id: r2ssa::SemanticId) -> Option<&CertifiedEffect> {
         self.certified_effects.get(&id)
     }
@@ -946,6 +950,20 @@ pub struct CertifiedExpr {
     pub fact: ExpressionRenderFact,
     pub inputs: Vec<r2ssa::SemanticId>,
     pub bindings: BTreeSet<r2ssa::SemanticId>,
+    pub guarded_phi: Option<GuardedPhiRenderFact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuardedPhiRenderFact {
+    pub predicate: r2ssa::SemanticId,
+    pub when_true: GuardedPhiArmRenderFact,
+    pub when_false: GuardedPhiArmRenderFact,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuardedPhiArmRenderFact {
+    pub sources: Vec<r2ssa::SemanticId>,
+    pub rendered: r2ssa::SemanticId,
 }
 
 /// A certified addressable resource. Resources have identity and layout but do
@@ -3175,6 +3193,157 @@ fn prepared_predicate_render_comparison<'a>(
         .or(predicate.comparison.as_ref())
 }
 
+fn prepared_guarded_phi_render_fact(
+    prepared: &r2ssa::SsaArtifact,
+    value: r2ssa::ValueId,
+) -> Option<GuardedPhiRenderFact> {
+    let graph = prepared.graph();
+    let inst = graph.inst(graph.def_inst(value)?)?;
+    let r2ssa::InstPayload::Phi { predecessors } = &inst.payload else {
+        return None;
+    };
+    if predecessors.len() < 2 || predecessors.len() != inst.inputs.len() {
+        return None;
+    }
+    let merge_block = graph.block(inst.block)?.addr;
+    let predicates = prepared.predicates();
+    let mut arms = Vec::with_capacity(predecessors.len());
+    for (predecessor, source) in predecessors.iter().zip(inst.inputs.iter().copied()) {
+        let predecessor = graph.block(*predecessor)?.addr;
+        let domain = prepared.control_domains().for_block(predecessor)?;
+        if !domain.complete {
+            return None;
+        }
+        let mut truths = BTreeMap::new();
+        let mut conflicts = BTreeSet::new();
+        for guard in &domain.guards {
+            let r2ssa::ControlGuard::Branch { predicate, truth } = guard else {
+                continue;
+            };
+            record_guarded_phi_truth(&mut truths, &mut conflicts, *predicate, *truth);
+        }
+        for assumption in predicates
+            .block_assumptions
+            .get(&merge_block)
+            .into_iter()
+            .flatten()
+            .filter(|assumption| assumption.predecessor == predecessor)
+        {
+            record_guarded_phi_truth(
+                &mut truths,
+                &mut conflicts,
+                assumption.predicate,
+                assumption.truth,
+            );
+        }
+        for conflict in conflicts {
+            truths.remove(&conflict);
+        }
+        arms.push((source, truths));
+    }
+
+    let mut candidates = arms.first()?.1.keys().copied().collect::<BTreeSet<_>>();
+    for (_, truths) in arms.iter().skip(1) {
+        candidates.retain(|predicate| truths.contains_key(predicate));
+    }
+    for predicate in candidates {
+        let mut when_true = Vec::new();
+        let mut when_false = Vec::new();
+        for (source, truths) in &arms {
+            let truth = *truths.get(&predicate)?;
+            let rendered = prepared_guarded_phi_arm_value(prepared, predicate, truth, *source);
+            if truth {
+                when_true.push((*source, rendered));
+            } else {
+                when_false.push((*source, rendered));
+            }
+        }
+        if when_true.is_empty() || when_false.is_empty() {
+            continue;
+        }
+        let true_rendered = when_true[0].1;
+        let false_rendered = when_false[0].1;
+        if when_true
+            .iter()
+            .any(|(_, rendered)| *rendered != true_rendered)
+            || when_false
+                .iter()
+                .any(|(_, rendered)| *rendered != false_rendered)
+        {
+            continue;
+        }
+        return Some(GuardedPhiRenderFact {
+            predicate: r2ssa::SemanticId::predicate(predicate),
+            when_true: GuardedPhiArmRenderFact {
+                sources: when_true
+                    .into_iter()
+                    .map(|(source, _)| r2ssa::SemanticId::expression(source))
+                    .collect(),
+                rendered: r2ssa::SemanticId::expression(true_rendered),
+            },
+            when_false: GuardedPhiArmRenderFact {
+                sources: when_false
+                    .into_iter()
+                    .map(|(source, _)| r2ssa::SemanticId::expression(source))
+                    .collect(),
+                rendered: r2ssa::SemanticId::expression(false_rendered),
+            },
+        });
+    }
+    None
+}
+
+fn record_guarded_phi_truth(
+    truths: &mut BTreeMap<r2ssa::PredicateId, bool>,
+    conflicts: &mut BTreeSet<r2ssa::PredicateId>,
+    predicate: r2ssa::PredicateId,
+    truth: bool,
+) {
+    if truths
+        .insert(predicate, truth)
+        .is_some_and(|existing| existing != truth)
+    {
+        conflicts.insert(predicate);
+    }
+}
+
+fn prepared_guarded_phi_arm_value(
+    prepared: &r2ssa::SsaArtifact,
+    predicate: r2ssa::PredicateId,
+    truth: bool,
+    source: r2ssa::ValueId,
+) -> r2ssa::ValueId {
+    let Some(comparison) = prepared
+        .predicates()
+        .predicates
+        .get(&predicate)
+        .and_then(|predicate| predicate.comparison.as_ref())
+    else {
+        return source;
+    };
+    if !matches!(
+        (comparison.kind, truth),
+        (r2ssa::CompareKind::Equal, true) | (r2ssa::CompareKind::NotEqual, false)
+    ) {
+        return source;
+    }
+    let replacement = if comparison.lhs == source {
+        comparison.rhs
+    } else if comparison.rhs == source {
+        comparison.lhs
+    } else {
+        return source;
+    };
+    if prepared
+        .value_var(replacement)
+        .is_some_and(r2ssa::SSAVar::is_const)
+    {
+        replacement
+    } else {
+        source
+    }
+}
+
 fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
     let certificates = prepared.certificates();
     let mut certified_exprs = certificates
@@ -3210,6 +3379,7 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
                         .map(r2ssa::SemanticId::expression)
                         .collect(),
                     bindings,
+                    guarded_phi: prepared_guarded_phi_render_fact(prepared, *value),
                 },
             )
         })
@@ -4052,6 +4222,7 @@ mod tests {
                 },
                 inputs: Vec::new(),
                 bindings: BTreeSet::from([r2ssa::SemanticId::Parameter(0)]),
+                guarded_phi: None,
             },
         );
         let signature = FunctionSignatureSpec {
@@ -4810,6 +4981,64 @@ mod tests {
     }
 
     #[test]
+    fn prepared_render_facts_certify_branch_guarded_phi() {
+        let mut entry = R2ILBlock::new(0x401000, 4);
+        entry.push(R2ILOp::IntEqual {
+            dst: Varnode::unique(0x300, 1),
+            a: Varnode::register(0x10, 8),
+            b: Varnode::constant(0, 8),
+        });
+        entry.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x401008, 8),
+            cond: Varnode::unique(0x300, 1),
+        });
+        let mut when_false = R2ILBlock::new(0x401004, 4);
+        when_false.push(R2ILOp::Copy {
+            dst: Varnode::register(0x10, 8),
+            src: Varnode::constant(1, 8),
+        });
+        when_false.push(R2ILOp::Branch {
+            target: Varnode::constant(0x40100c, 8),
+        });
+        let mut when_true = R2ILBlock::new(0x401008, 4);
+        when_true.push(R2ILOp::Branch {
+            target: Varnode::constant(0x40100c, 8),
+        });
+        let mut exit = R2ILBlock::new(0x40100c, 4);
+        exit.push(R2ILOp::Return {
+            target: Varnode::register(0x10, 8),
+        });
+        let prepared = r2ssa::SsaArtifact::for_decompile(
+            &[entry, when_false, when_true, exit],
+            Some(&x86_stack_home_arch()),
+        )
+        .expect("prepared");
+        let phi = prepared
+            .function()
+            .get_block(0x40100c)
+            .and_then(|block| block.phis.iter().find(|phi| phi.dst.name == "rdi"))
+            .and_then(|phi| prepared.graph().value_id_for_var(&phi.dst))
+            .expect("return phi");
+        let render = FunctionRenderFacts::from_prepared(&prepared);
+        let guarded = render.guarded_phi_for_value(phi).expect("guarded phi");
+
+        assert_eq!(
+            guarded.predicate,
+            r2ssa::SemanticId::predicate(r2ssa::PredicateId(0))
+        );
+        let r2ssa::SemanticId::Expression(true_value) = guarded.when_true.rendered else {
+            panic!("guarded phi arm must render an expression identity");
+        };
+        assert_eq!(
+            prepared.value_var(true_value),
+            Some(&r2ssa::SSAVar::constant(0, 8)),
+            "the true equality edge should substitute the proven constant"
+        );
+        assert_eq!(guarded.when_false.sources.len(), 1);
+        assert_eq!(guarded.when_false.rendered, guarded.when_false.sources[0]);
+    }
+
+    #[test]
     fn prepared_render_facts_materialize_load_for_distinct_consumers() {
         let mut block = R2ILBlock::new(0x402000, 4);
         block.push(R2ILOp::Load {
@@ -5366,6 +5595,7 @@ mod tests {
                     },
                     inputs: Vec::new(),
                     bindings: BTreeSet::new(),
+                    guarded_phi: None,
                 },
             )]),
             certified_entities: BTreeMap::from([(
