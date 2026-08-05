@@ -99,6 +99,41 @@ struct SSAFunctionJson {
     blocks: Vec<SSABlockJson>,
 }
 
+#[derive(Serialize)]
+struct PreparedFormalParameterJson {
+    value: String,
+    parameter: usize,
+}
+
+#[derive(Serialize)]
+struct PreparedAddressTermJson {
+    value_id: u32,
+    value: String,
+    coefficient: i64,
+}
+
+#[derive(Serialize)]
+struct PreparedParameterAddressJson {
+    value_id: u32,
+    value: String,
+    parameter: usize,
+    terms: Vec<PreparedAddressTermJson>,
+    offset: i64,
+}
+
+#[derive(Serialize)]
+struct PreparedSsaFactsJson {
+    formal_parameters: Vec<PreparedFormalParameterJson>,
+    parameter_addresses: Vec<PreparedParameterAddressJson>,
+}
+
+#[derive(Serialize)]
+struct PreparedSSAFunctionJson {
+    #[serde(flatten)]
+    function: SSAFunctionJson,
+    prepared: PreparedSsaFactsJson,
+}
+
 fn build_ssa_function_json(ssa_func: &r2ssa::SSAFunction) -> SSAFunctionJson {
     let mut json_blocks = Vec::new();
     for &addr in ssa_func.block_addrs() {
@@ -134,8 +169,51 @@ fn build_ssa_function_json(ssa_func: &r2ssa::SSAFunction) -> SSAFunctionJson {
     }
 }
 
-fn ssa_function_json_string(ssa_func: &r2ssa::SSAFunction) -> Option<String> {
-    serde_json::to_string_pretty(&build_ssa_function_json(ssa_func)).ok()
+fn prepared_ssa_function_json_string(artifact: &r2ssa::SsaArtifact) -> Option<String> {
+    let graph = artifact.graph();
+    let formal_parameters = artifact
+        .function()
+        .decompile_prep_facts()
+        .into_iter()
+        .flat_map(|facts| &facts.formal_parameters)
+        .map(|(value, parameter)| PreparedFormalParameterJson {
+            value: value.display_name(),
+            parameter: *parameter,
+        })
+        .collect();
+    let parameter_addresses = artifact
+        .addresses()
+        .parameter_expressions
+        .iter()
+        .map(|(value_id, expression)| {
+            let value = graph.value(*value_id)?;
+            Some(PreparedParameterAddressJson {
+                value_id: value_id.0,
+                value: value.var.display_name(),
+                parameter: expression.parameter,
+                terms: expression
+                    .terms
+                    .iter()
+                    .map(|term| {
+                        Some(PreparedAddressTermJson {
+                            value_id: term.value.0,
+                            value: graph.value(term.value)?.var.display_name(),
+                            coefficient: term.coefficient,
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+                offset: expression.offset,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    serde_json::to_string_pretty(&PreparedSSAFunctionJson {
+        function: build_ssa_function_json(artifact.function()),
+        prepared: PreparedSsaFactsJson {
+            formal_parameters,
+            parameter_addresses,
+        },
+    })
+    .ok()
 }
 
 /// Get function-level SSA as JSON (includes phi nodes).
@@ -154,12 +232,12 @@ pub extern "C" fn r2ssa_function_json(
     };
     let ctx_ref = unsafe { &*ctx };
 
-    let ssa_func =
-        match r2ssa::SSAFunction::from_blocks_with_arch(blocks.as_slice(), ctx_ref.arch.as_ref()) {
-            Some(f) => f,
-            None => return ptr::null_mut(),
-        };
-    let Some(json) = ssa_function_json_string(&ssa_func) else {
+    let artifact = match r2ssa::SsaArtifact::for_decompile(blocks.as_slice(), ctx_ref.arch.as_ref())
+    {
+        Some(f) => f,
+        None => return ptr::null_mut(),
+    };
+    let Some(json) = prepared_ssa_function_json_string(&artifact) else {
         return ptr::null_mut();
     };
     CString::new(json).map_or(ptr::null_mut(), |c| c.into_raw())

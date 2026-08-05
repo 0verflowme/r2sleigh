@@ -198,7 +198,7 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 s `isq~check_secret[0]` >/dev/null
 af
-a:sla.debug.ssa.func | jq -c 'has("blocks") and has("entry_hex") and (.blocks|type=="array") and ((.blocks|length)>0) and ((.blocks|map(has("phis"))|all))'
+a:sla.debug.ssa.func | jq -c 'has("blocks") and has("entry_hex") and (.blocks|type=="array") and ((.blocks|length)>0) and ((.blocks|map(has("phis"))|all)) and (.prepared|has("formal_parameters") and has("parameter_addresses"))'
 EOF_CMDS
 RUN
 

@@ -4930,7 +4930,7 @@ impl<'a> FoldingContext<'a> {
         match &object.kind {
             ObjectKind::Global { .. } => None,
             ObjectKind::StackSlot { offset, .. } | ObjectKind::FrameObject { offset, .. }
-                if location.offset == 0 =>
+                if location.address.exact_offset() == Some(0) =>
             {
                 self.resolve_stack_var(*offset).map(CExpr::Var)
             }
@@ -4973,7 +4973,7 @@ impl<'a> FoldingContext<'a> {
                 })?;
                 self.prepared_named_expr_for_memory_location(&MemoryLocation {
                     object,
-                    offset: 0,
+                    address: r2ssa::RelativeMemoryAddress::Exact(0),
                     size: 0,
                 })
             }

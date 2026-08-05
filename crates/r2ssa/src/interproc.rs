@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use r2il::{ArchSpec, MemoryOrdering};
 use serde::{Deserialize, Serialize};
 
+use crate::abi::AbiProfile;
 use crate::function::{SSAFunction, SsaArtifact};
 use crate::graph::{InstPayload, ValueId};
 use crate::op::SSAOp;
@@ -452,179 +453,8 @@ pub struct InterprocFunctionInput<'a> {
     pub prepared: &'a SsaArtifact,
 }
 
-#[derive(Debug, Clone)]
-struct AbiSlot {
-    _primary: String,
-    _size: u32,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct AbiProfile {
-    args: Vec<AbiSlot>,
-    ret_aliases: BTreeSet<String>,
-    alias_to_arg: BTreeMap<String, usize>,
-    alias_is_ret: BTreeSet<String>,
-}
-
-impl AbiProfile {
-    pub fn from_arch(arch: Option<&ArchSpec>) -> Self {
-        let Some(arch) = arch else {
-            return Self::default();
-        };
-        let lower = arch.name.to_ascii_lowercase();
-        match lower.as_str() {
-            "x86-64" | "x86_64" | "x64" | "amd64" => Self::new(
-                vec![
-                    ("rdi", 8, &["edi", "di", "dil"][..]),
-                    ("rsi", 8, &["esi", "si", "sil"][..]),
-                    ("rdx", 8, &["edx", "dx", "dl"][..]),
-                    ("rcx", 8, &["ecx", "cx", "cl"][..]),
-                    ("r8", 8, &["r8d", "r8w", "r8b"][..]),
-                    ("r9", 8, &["r9d", "r9w", "r9b"][..]),
-                ],
-                &[("rax", &["eax", "ax", "al"][..])],
-            ),
-            name if name.starts_with("x86:")
-                && (arch.addr_size == 8 || name.split(':').any(|part| part == "64")) =>
-            {
-                Self::new(
-                    vec![
-                        ("rdi", 8, &["edi", "di", "dil"][..]),
-                        ("rsi", 8, &["esi", "si", "sil"][..]),
-                        ("rdx", 8, &["edx", "dx", "dl"][..]),
-                        ("rcx", 8, &["ecx", "cx", "cl"][..]),
-                        ("r8", 8, &["r8d", "r8w", "r8b"][..]),
-                        ("r9", 8, &["r9d", "r9w", "r9b"][..]),
-                    ],
-                    &[("rax", &["eax", "ax", "al"][..])],
-                )
-            }
-            name if name.starts_with("x86:") => {
-                Self::new(Vec::new(), &[("eax", &["ax", "al"][..])])
-            }
-            "x86" | "x86-32" | "i386" | "i686" => {
-                Self::new(Vec::new(), &[("eax", &["ax", "al"][..])])
-            }
-            "arm" if arch.addr_size == 4 => Self::new(
-                vec![
-                    ("r0", 4, &[]),
-                    ("r1", 4, &[]),
-                    ("r2", 4, &[]),
-                    ("r3", 4, &[]),
-                ],
-                &[("r0", &[])],
-            ),
-            "aarch64" | "arm64" => Self::new(
-                vec![
-                    ("x0", 8, &["w0"][..]),
-                    ("x1", 8, &["w1"][..]),
-                    ("x2", 8, &["w2"][..]),
-                    ("x3", 8, &["w3"][..]),
-                    ("x4", 8, &["w4"][..]),
-                    ("x5", 8, &["w5"][..]),
-                    ("x6", 8, &["w6"][..]),
-                    ("x7", 8, &["w7"][..]),
-                ],
-                &[("x0", &["w0"][..])],
-            ),
-            name if name.starts_with("aarch64:") || name.starts_with("arm64:") => Self::new(
-                vec![
-                    ("x0", 8, &["w0"][..]),
-                    ("x1", 8, &["w1"][..]),
-                    ("x2", 8, &["w2"][..]),
-                    ("x3", 8, &["w3"][..]),
-                    ("x4", 8, &["w4"][..]),
-                    ("x5", 8, &["w5"][..]),
-                    ("x6", 8, &["w6"][..]),
-                    ("x7", 8, &["w7"][..]),
-                ],
-                &[("x0", &["w0"][..])],
-            ),
-            "riscv32" | "riscv" if arch.addr_size == 4 => Self::new(
-                vec![
-                    ("a0", 4, &["x10"][..]),
-                    ("a1", 4, &["x11"][..]),
-                    ("a2", 4, &["x12"][..]),
-                    ("a3", 4, &["x13"][..]),
-                    ("a4", 4, &["x14"][..]),
-                    ("a5", 4, &["x15"][..]),
-                    ("a6", 4, &["x16"][..]),
-                    ("a7", 4, &["x17"][..]),
-                ],
-                &[("a0", &["x10"][..])],
-            ),
-            "riscv64" | "riscv" => Self::new(
-                vec![
-                    ("a0", 8, &["x10"][..]),
-                    ("a1", 8, &["x11"][..]),
-                    ("a2", 8, &["x12"][..]),
-                    ("a3", 8, &["x13"][..]),
-                    ("a4", 8, &["x14"][..]),
-                    ("a5", 8, &["x15"][..]),
-                    ("a6", 8, &["x16"][..]),
-                    ("a7", 8, &["x17"][..]),
-                ],
-                &[("a0", &["x10"][..])],
-            ),
-            _ => Self::default(),
-        }
-    }
-
-    pub fn windows_x64() -> Self {
-        Self::new(
-            vec![
-                ("rcx", 8, &["ecx", "cx", "cl"][..]),
-                ("rdx", 8, &["edx", "dx", "dl"][..]),
-                ("r8", 8, &["r8d", "r8w", "r8b"][..]),
-                ("r9", 8, &["r9d", "r9w", "r9b"][..]),
-            ],
-            &[("rax", &["eax", "ax", "al"][..])],
-        )
-    }
-
-    fn new(
-        args: Vec<(&'static str, u32, &'static [&'static str])>,
-        rets: &[(&'static str, &'static [&'static str])],
-    ) -> Self {
-        let mut out = Self::default();
-        for (idx, (primary, size, aliases)) in args.into_iter().enumerate() {
-            out.args.push(AbiSlot {
-                _primary: primary.to_string(),
-                _size: size,
-            });
-            out.alias_to_arg.insert(primary.to_string(), idx);
-            for alias in aliases {
-                out.alias_to_arg.insert((*alias).to_string(), idx);
-            }
-        }
-        for (primary, aliases) in rets {
-            out.ret_aliases.insert((*primary).to_string());
-            out.alias_is_ret.insert((*primary).to_string());
-            for alias in *aliases {
-                out.ret_aliases.insert((*alias).to_string());
-                out.alias_is_ret.insert((*alias).to_string());
-            }
-        }
-        out
-    }
-
-    fn arg_index_for_name(&self, name: &str) -> Option<usize> {
-        self.alias_to_arg.get(&name.to_ascii_lowercase()).copied()
-    }
-
-    fn is_ret_name(&self, name: &str) -> bool {
-        self.alias_is_ret.contains(&name.to_ascii_lowercase())
-    }
-
-    fn arg_len(&self) -> usize {
-        self.args.len()
-    }
-}
-
 fn formal_arg_index_for_var(abi: &AbiProfile, var: &SSAVar) -> Option<usize> {
-    (var.version == 0)
-        .then(|| abi.arg_index_for_name(&var.name))
-        .flatten()
+    abi.formal_argument_index(var)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1314,10 +1144,9 @@ fn collect_local_summary_facts(prepared: &SsaArtifact, abi: &AbiProfile) -> Loca
         match call.direct_target {
             Some(target) => {
                 out.direct_callees.insert(target);
-                let args = state_by_call
-                    .get(call_id)
-                    .cloned()
-                    .unwrap_or_else(|| (0..abi.arg_len()).map(SummaryOperand::Arg).collect());
+                let args = state_by_call.get(call_id).cloned().unwrap_or_else(|| {
+                    (0..abi.argument_count()).map(SummaryOperand::Arg).collect()
+                });
                 out.call_observations
                     .insert(*call_id, CallObservation { target, args });
             }
@@ -1363,53 +1192,30 @@ fn collect_local_summary_facts(prepared: &SsaArtifact, abi: &AbiProfile) -> Loca
                 SSAOp::Load { addr, dst, .. }
                 | SSAOp::LoadLinked { addr, dst, .. }
                 | SSAOp::LoadGuarded { addr, dst, .. } => {
-                    let operand = prepared
-                        .graph()
-                        .value_id_for_var(addr)
-                        .map(|value_id| classify_value_operand(prepared, abi, value_id, 0))
-                        .unwrap_or_else(|| classify_var_operand(prepared, abi, addr, 0));
-                    if let SummaryOperand::Arg(idx) = operand {
-                        out.arg_effects.entry(idx).or_default().mark_read();
-                        out.memory_effects.insert(SummaryMemoryEffect {
-                            kind: SummaryMemoryEffectKind::Read,
-                            location: arg_location(idx, None, None),
-                        });
+                    if memory_access_is_local_stack(prepared, addr) {
+                        continue;
                     }
+                    let location = classify_memory_access_location(prepared, abi, addr, dst.size);
+                    mark_location_arg_effect(&mut out.arg_effects, location, true, false);
                     out.memory_effects.insert(SummaryMemoryEffect {
                         kind: SummaryMemoryEffectKind::Read,
-                        location: classify_memory_access_location(prepared, abi, addr, dst.size),
+                        location,
                     });
                     if let SSAOp::LoadLinked { ordering, .. } = op {
                         out.atomic_effects.insert(SummaryAtomicEffect {
                             op: SummaryAtomicOp::LoadLinked,
-                            location: classify_memory_access_location(
-                                prepared, abi, addr, dst.size,
-                            ),
+                            location,
                             ordering: summary_atomic_ordering(*ordering),
                         });
                     }
                 }
                 SSAOp::AtomicCAS { addr, expected, .. } => {
-                    let operand = prepared
-                        .graph()
-                        .value_id_for_var(addr)
-                        .map(|value_id| classify_value_operand(prepared, abi, value_id, 0))
-                        .unwrap_or_else(|| classify_var_operand(prepared, abi, addr, 0));
+                    if memory_access_is_local_stack(prepared, addr) {
+                        continue;
+                    }
                     let location =
                         classify_memory_access_location(prepared, abi, addr, expected.size);
-                    if let SummaryOperand::Arg(idx) = operand {
-                        let effect = out.arg_effects.entry(idx).or_default();
-                        effect.mark_read();
-                        effect.mark_write();
-                        out.memory_effects.insert(SummaryMemoryEffect {
-                            kind: SummaryMemoryEffectKind::Read,
-                            location: arg_location(idx, None, None),
-                        });
-                        out.memory_effects.insert(SummaryMemoryEffect {
-                            kind: SummaryMemoryEffectKind::Write,
-                            location: arg_location(idx, None, None),
-                        });
-                    }
+                    mark_location_arg_effect(&mut out.arg_effects, location, true, true);
                     out.memory_effects.insert(SummaryMemoryEffect {
                         kind: SummaryMemoryEffectKind::Read,
                         location,
@@ -1429,25 +1235,11 @@ fn collect_local_summary_facts(prepared: &SsaArtifact, abi: &AbiProfile) -> Loca
                     });
                 }
                 SSAOp::StoreConditional { addr, val, .. } => {
-                    let operand = prepared
-                        .graph()
-                        .value_id_for_var(addr)
-                        .map(|value_id| classify_value_operand(prepared, abi, value_id, 0))
-                        .unwrap_or_else(|| classify_var_operand(prepared, abi, addr, 0));
-                    let location = classify_memory_access_location(prepared, abi, addr, val.size);
-                    if let SummaryOperand::Arg(idx) = operand {
-                        let effect = out.arg_effects.entry(idx).or_default();
-                        effect.mark_read();
-                        effect.mark_write();
-                        out.memory_effects.insert(SummaryMemoryEffect {
-                            kind: SummaryMemoryEffectKind::Read,
-                            location: arg_location(idx, None, None),
-                        });
-                        out.memory_effects.insert(SummaryMemoryEffect {
-                            kind: SummaryMemoryEffectKind::Write,
-                            location: arg_location(idx, None, None),
-                        });
+                    if memory_access_is_local_stack(prepared, addr) {
+                        continue;
                     }
+                    let location = classify_memory_access_location(prepared, abi, addr, val.size);
+                    mark_location_arg_effect(&mut out.arg_effects, location, true, true);
                     out.memory_effects.insert(SummaryMemoryEffect {
                         kind: SummaryMemoryEffectKind::Read,
                         location,
@@ -1474,21 +1266,14 @@ fn collect_local_summary_facts(prepared: &SsaArtifact, abi: &AbiProfile) -> Loca
                     });
                 }
                 SSAOp::Store { addr, val, .. } | SSAOp::StoreGuarded { addr, val, .. } => {
-                    let operand = prepared
-                        .graph()
-                        .value_id_for_var(addr)
-                        .map(|value_id| classify_value_operand(prepared, abi, value_id, 0))
-                        .unwrap_or_else(|| classify_var_operand(prepared, abi, addr, 0));
-                    if let SummaryOperand::Arg(idx) = operand {
-                        out.arg_effects.entry(idx).or_default().mark_write();
-                        out.memory_effects.insert(SummaryMemoryEffect {
-                            kind: SummaryMemoryEffectKind::Write,
-                            location: arg_location(idx, None, None),
-                        });
+                    if memory_access_is_local_stack(prepared, addr) {
+                        continue;
                     }
+                    let location = classify_memory_access_location(prepared, abi, addr, val.size);
+                    mark_location_arg_effect(&mut out.arg_effects, location, false, true);
                     out.memory_effects.insert(SummaryMemoryEffect {
                         kind: SummaryMemoryEffectKind::Write,
-                        location: classify_memory_access_location(prepared, abi, addr, val.size),
+                        location,
                     });
                 }
                 SSAOp::Return { target } => {
@@ -1508,6 +1293,36 @@ fn collect_local_summary_facts(prepared: &SsaArtifact, abi: &AbiProfile) -> Loca
     }
 
     out
+}
+
+fn memory_access_is_local_stack(prepared: &SsaArtifact, addr: &SSAVar) -> bool {
+    prepared
+        .object_for_var(addr)
+        .and_then(|object| prepared.objects().object(object))
+        .is_some_and(|object| {
+            matches!(
+                object.kind,
+                ObjectKind::StackSlot { .. } | ObjectKind::FrameObject { .. }
+            )
+        })
+}
+
+fn mark_location_arg_effect(
+    effects: &mut BTreeMap<usize, SummaryArgEffect>,
+    location: SummaryMemoryLocation,
+    read: bool,
+    write: bool,
+) {
+    let SummaryMemoryRegion::Arg { index } = location.region else {
+        return;
+    };
+    let effect = effects.entry(index).or_default();
+    if read {
+        effect.mark_read();
+    }
+    if write {
+        effect.mark_write();
+    }
 }
 
 fn classify_memory_access_location(
@@ -1540,6 +1355,13 @@ fn classify_memory_access_location_value(
     }
 
     for candidate in &candidates {
+        if let Some(expression) = prepared.addresses().parameter_expression(*candidate) {
+            return arg_location(
+                expression.parameter,
+                expression.terms.is_empty().then_some(expression.offset),
+                expression.terms.is_empty().then_some(width),
+            );
+        }
         if let Some(var) = prepared.value_var(*candidate) {
             if let Some(idx) = formal_arg_index_for_var(abi, var) {
                 return arg_location(idx, Some(0), Some(width));
@@ -1553,6 +1375,9 @@ fn classify_memory_access_location_value(
             && let Some(object) = prepared.objects().object(object_id)
         {
             match object.kind {
+                ObjectKind::Parameter { index } => {
+                    return arg_location(index, None, None);
+                }
                 ObjectKind::Global { address, .. } => {
                     return global_location(address, Some(0), Some(width));
                 }
@@ -1724,7 +1549,7 @@ fn collect_call_arg_state(
                 continue;
             };
             for phi in &block.phis {
-                if let Some(idx) = abi.arg_index_for_name(&phi.dst.name)
+                if let Some(idx) = abi.argument_index(&phi.dst.name)
                     && let Some(value_id) = graph.value_id_for_var(&phi.dst)
                 {
                     state.insert(idx, value_id);
@@ -1737,7 +1562,7 @@ fn collect_call_arg_state(
 
             for op in &block.ops {
                 if let Some(dst) = op.dst()
-                    && let Some(idx) = abi.arg_index_for_name(&dst.name)
+                    && let Some(idx) = abi.argument_index(&dst.name)
                     && let Some(value_id) = graph.value_id_for_var(dst)
                 {
                     state.insert(idx, value_id);
@@ -1761,7 +1586,7 @@ fn collect_call_arg_state(
         };
         let mut state = in_states.get(&block_addr).cloned().unwrap_or_default();
         for phi in &block.phis {
-            if let Some(idx) = abi.arg_index_for_name(&phi.dst.name)
+            if let Some(idx) = abi.argument_index(&phi.dst.name)
                 && let Some(value_id) = graph.value_id_for_var(&phi.dst)
             {
                 state.insert(idx, value_id);
@@ -1769,7 +1594,7 @@ fn collect_call_arg_state(
         }
         for (op_idx, op) in block.ops.iter().enumerate() {
             if op_idx == call_op_idx {
-                let args = (0..abi.arg_len())
+                let args = (0..abi.argument_count())
                     .map(|idx| {
                         state
                             .get(&idx)
@@ -1782,7 +1607,7 @@ fn collect_call_arg_state(
                 break;
             }
             if let Some(dst) = op.dst()
-                && let Some(idx) = abi.arg_index_for_name(&dst.name)
+                && let Some(idx) = abi.argument_index(&dst.name)
                 && let Some(value_id) = graph.value_id_for_var(dst)
             {
                 state.insert(idx, value_id);
@@ -1928,7 +1753,7 @@ fn recover_return_observation_from_epilogue(
                 let Some(dst) = op.dst() else {
                     continue;
                 };
-                if !abi.is_ret_name(&dst.name) {
+                if !abi.is_return_register(&dst.name) {
                     continue;
                 }
                 if let Some(dst_id) = prepared.graph().value_id_for_var(dst) {
@@ -1981,7 +1806,7 @@ fn return_call_site_for_value(
     };
     let graph = prepared.graph();
     let var = prepared.value_var(value_id)?;
-    if !abi.is_ret_name(&var.name) {
+    if !abi.is_return_register(&var.name) {
         return None;
     }
 
@@ -2246,8 +2071,8 @@ mod tests {
         arch.addr_size = 8;
         let profile = AbiProfile::from_arch(Some(&arch));
 
-        assert_eq!(profile.alias_to_arg.get("x0"), Some(&0));
-        assert_eq!(profile.alias_to_arg.get("w1"), Some(&1));
+        assert_eq!(profile.argument_index("x0"), Some(0));
+        assert_eq!(profile.argument_index("w1"), Some(1));
     }
 
     #[test]
@@ -2255,8 +2080,8 @@ mod tests {
         let arch = ArchSpec::new("x86:LE:64:default");
         let profile = AbiProfile::from_arch(Some(&arch));
 
-        assert_eq!(profile.alias_to_arg.get("rdi"), Some(&0));
-        assert!(profile.alias_is_ret.contains("rax"));
+        assert_eq!(profile.argument_index("rdi"), Some(0));
+        assert!(profile.is_return_register("rax"));
     }
 
     #[test]
@@ -2264,9 +2089,9 @@ mod tests {
         let arch = ArchSpec::new("x86-64");
         let profile = AbiProfile::from_arch(Some(&arch));
 
-        assert_eq!(profile.alias_to_arg.get("rdi"), Some(&0));
-        assert_eq!(profile.alias_to_arg.get("rsi"), Some(&1));
-        assert!(profile.alias_is_ret.contains("rax"));
+        assert_eq!(profile.argument_index("rdi"), Some(0));
+        assert_eq!(profile.argument_index("rsi"), Some(1));
+        assert!(profile.is_return_register("rax"));
     }
 
     fn reg(offset: u64, size: u32) -> Varnode {

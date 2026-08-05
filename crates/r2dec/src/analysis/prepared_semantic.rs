@@ -923,8 +923,9 @@ fn populate_owner_exprs(view: &mut PreparedSemanticView, inputs: &PreparedSemant
                             .memory_uses_for_op_site(block.addr, op_idx)
                             .and_then(|facts| facts.first())
                             .and_then(|fact| {
-                                alias_for_memory_location(view, fact.location)
-                                    .map(|alias| (CExpr::Var(alias), Some(fact.location.offset)))
+                                let offset = fact.location.address.exact_offset()?;
+                                alias_for_memory_location(view, &fact.location)
+                                    .map(|alias| (CExpr::Var(alias), Some(offset)))
                             })
                     })
                     .or_else(|| {
@@ -1164,8 +1165,9 @@ fn refine_load_owner_exprs(
                         .memory_uses_for_op_site(block.addr, op_idx)
                         .and_then(|facts| facts.first())
                         .and_then(|fact| {
-                            alias_for_memory_location(view, fact.location)
-                                .map(|alias| (CExpr::Var(alias), Some(fact.location.offset)))
+                            let offset = fact.location.address.exact_offset()?;
+                            alias_for_memory_location(view, &fact.location)
+                                .map(|alias| (CExpr::Var(alias), Some(offset)))
                         })
                 })
                 .or_else(|| {
@@ -1997,9 +1999,9 @@ fn assign_certified_call_result_owner(
 
 fn alias_for_memory_location(
     view: &PreparedSemanticView,
-    location: MemoryLocation,
+    location: &MemoryLocation,
 ) -> Option<String> {
-    prepared_stack_alias_name_for_offset(view, location.offset)
+    prepared_stack_alias_name_for_offset(view, location.address.exact_offset()?)
 }
 
 fn prepared_stack_owner_recovery_allowed(

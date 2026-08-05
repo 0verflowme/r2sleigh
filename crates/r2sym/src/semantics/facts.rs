@@ -1317,7 +1317,7 @@ mod tests {
     use r2il::{RegisterDef, SpaceId, Varnode};
 
     #[test]
-    fn residual_memory_branch_does_not_prune_unknown_input() {
+    fn disjoint_parameter_store_preserves_exact_branch_input() {
         let mut arch = ArchSpec::new("aarch64");
         arch.addr_size = 8;
         arch.add_register(RegisterDef::new("x0", 0x00, 8));
@@ -1383,8 +1383,21 @@ mod tests {
                 .true_compiled
                 .as_ref()
                 .map(|compiled| compiled.precision),
-            Some(BackwardConditionPrecision::ResidualSearchRequired)
+            Some(BackwardConditionPrecision::Exact)
         ));
+        let memory_terms = &observations[0]
+            .true_compiled
+            .as_ref()
+            .expect("compiled branch")
+            .memory_terms;
+        assert_eq!(memory_terms.len(), 1);
+        assert!(matches!(
+            memory_terms[0].region,
+            crate::BackwardMemoryRegion::Argument { index: 0 }
+        ));
+        assert_eq!(memory_terms[0].offset_lo, 4);
+        assert_eq!(memory_terms[0].offset_hi, 4);
+        assert!(memory_terms[0].exact_offset);
     }
 
     #[test]

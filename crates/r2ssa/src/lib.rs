@@ -16,6 +16,8 @@
 //! - [`taint`]: Taint analysis on SSA def-use chains
 //! - [`var`]: SSA variable representation
 
+pub mod abi;
+pub mod address;
 pub mod assumption;
 pub mod block;
 pub mod cfg;
@@ -34,6 +36,8 @@ pub mod semantic;
 pub mod taint;
 pub mod var;
 
+pub use abi::AbiProfile;
+pub use address::{AddressProvenanceFacts, AffineAddressTerm, ParameterAddressExpression};
 pub use assumption::{
     AnalysisAssumption, AnalysisAssumptionConflict, AssumptionProvenance, AssumptionScope,
     AssumptionSet, AssumptionSubject, AssumptionUsageReport, AssumptionValue,
@@ -56,14 +60,13 @@ pub use graph::{
     BlockId, GraphBlock, GraphInst, GraphValue, InstId, InstPayload, SsaGraph, UseSite, ValueId,
 };
 pub use interproc::{
-    AbiProfile, CallArgObservation, FunctionSemanticLinkage, FunctionSemanticSummary,
-    InterprocFunctionId, InterprocFunctionInput, InterprocSolveConfig, InterprocSummaryDiagnostics,
-    InterprocSummarySet, SummaryAllocationEffect, SummaryArgEffect, SummaryAtomicEffect,
-    SummaryAtomicOp, SummaryAtomicOrdering, SummaryLifetimeEffect, SummaryLifetimeOp,
-    SummaryMemoryEffect, SummaryMemoryEffectKind, SummaryMemoryLocation, SummaryMemoryRange,
-    SummaryMemoryRegion, SummaryReturnRelation, SummarySyncEffect, SummarySyncOp,
-    SummaryTransferEffect, SummaryTransferLength, observe_call_arguments,
-    solve_interproc_summary_set,
+    CallArgObservation, FunctionSemanticLinkage, FunctionSemanticSummary, InterprocFunctionId,
+    InterprocFunctionInput, InterprocSolveConfig, InterprocSummaryDiagnostics, InterprocSummarySet,
+    SummaryAllocationEffect, SummaryArgEffect, SummaryAtomicEffect, SummaryAtomicOp,
+    SummaryAtomicOrdering, SummaryLifetimeEffect, SummaryLifetimeOp, SummaryMemoryEffect,
+    SummaryMemoryEffectKind, SummaryMemoryLocation, SummaryMemoryRange, SummaryMemoryRegion,
+    SummaryReturnRelation, SummarySyncEffect, SummarySyncOp, SummaryTransferEffect,
+    SummaryTransferLength, observe_call_arguments, solve_interproc_summary_set,
 };
 pub use op::SSAOp;
 pub use optimize::{DecompilePrepConfig, OptimizationConfig, OptimizationStats, optimize_function};
@@ -76,7 +79,7 @@ pub use semantic::{
     MemoryDefFact, MemoryLocation, MemoryPhiFact, MemorySSAFacts, MemoryUseFact, MemoryVersion,
     ObjectFact, ObjectId, ObjectKind, ObjectModel, PredicateFact, PredicateFacts, PredicateId,
     PreparedAssumptionBinding, PreparedAssumptionBindingKind, PreparedFunctionCertificates,
-    PreparedFunctionFacts, PreparedProofFailure, ProofNodeId, ReturnCarrier,
+    PreparedFunctionFacts, PreparedProofFailure, ProofNodeId, RelativeMemoryAddress, ReturnCarrier,
     ReturnValueCertificate, SemanticId, StackSlotCertificate, StructuredAccessId,
     StructuredDataflowFacts, StructuredLoopFact, StructuredLoopKind, StructuredMemoryAccessFact,
     StructuredRecursiveCallFact, SwitchCertificate, SwitchPredicateFact, ValueOwner,

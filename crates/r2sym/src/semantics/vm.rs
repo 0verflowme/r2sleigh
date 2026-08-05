@@ -973,6 +973,7 @@ fn vm_memory_region_ref_from_object(
         ObjectKind::Global { space, address } => {
             (MemoryRegionKind::Global, format!("{space}:0x{address:x}"))
         }
+        ObjectKind::Parameter { index } => (MemoryRegionKind::Input, format!("arg{index}")),
         ObjectKind::HeapAlloc { call_site } => (
             MemoryRegionKind::Heap,
             format!("heap_alloc@{}", call_site.0),
@@ -1049,22 +1050,25 @@ fn vm_memory_conditions_for_op(
             residual = true;
             return (reads, writes, residual);
         };
-        for use_fact in uses {
-            let Some(region) = vm_memory_region_ref_from_object(func, use_fact.location.object)
-            else {
+        let locations = uses
+            .iter()
+            .map(|use_fact| &use_fact.location)
+            .collect::<BTreeSet<_>>();
+        for location in locations {
+            let Some(region) = vm_memory_region_ref_from_object(func, location.object) else {
                 residual = true;
                 continue;
             };
-            let binding = Some(vm_memory_binding_name(
-                &region,
-                use_fact.location.offset,
-                use_fact.location.size,
-            ));
+            let r2ssa::RelativeMemoryAddress::Exact(offset) = &location.address else {
+                residual = true;
+                continue;
+            };
+            let binding = Some(vm_memory_binding_name(&region, *offset, location.size));
             reads.push(VmMemoryCondition {
                 region,
-                offset_lo: use_fact.location.offset,
-                offset_hi: use_fact.location.offset,
-                size: use_fact.location.size,
+                offset_lo: *offset,
+                offset_hi: *offset,
+                size: location.size,
                 exact_offset: true,
                 binding,
                 expr: expr.clone(),
@@ -1087,21 +1091,25 @@ fn vm_memory_conditions_for_op(
         ) {
             residual = true;
         }
-        for def in defs {
-            let Some(region) = vm_memory_region_ref_from_object(func, def.location.object) else {
+        let locations = defs
+            .iter()
+            .map(|def| &def.location)
+            .collect::<BTreeSet<_>>();
+        for location in locations {
+            let Some(region) = vm_memory_region_ref_from_object(func, location.object) else {
                 residual = true;
                 continue;
             };
-            let binding = Some(vm_memory_binding_name(
-                &region,
-                def.location.offset,
-                def.location.size,
-            ));
+            let r2ssa::RelativeMemoryAddress::Exact(offset) = &location.address else {
+                residual = true;
+                continue;
+            };
+            let binding = Some(vm_memory_binding_name(&region, *offset, location.size));
             writes.push(VmMemoryCondition {
                 region,
-                offset_lo: def.location.offset,
-                offset_hi: def.location.offset,
-                size: def.location.size,
+                offset_lo: *offset,
+                offset_hi: *offset,
+                size: location.size,
                 exact_offset: true,
                 binding,
                 expr: expr.clone(),

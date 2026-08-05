@@ -64,6 +64,10 @@ pub struct StackAddressRoot {
 pub struct DecompilePrepFacts {
     pub canonical_value_roots: BTreeMap<SSAVar, SSAVar>,
     pub stack_address_roots: BTreeMap<SSAVar, StackAddressRoot>,
+    /// Entry SSA values bound to canonical ABI parameter slots.
+    pub formal_parameters: BTreeMap<SSAVar, usize>,
+    /// Full-width entry ABI values that may serve as parameter address bases.
+    pub formal_parameter_bases: BTreeMap<SSAVar, usize>,
 }
 
 /// Typed preparation mode for downstream SSA consumers.
@@ -175,6 +179,10 @@ impl SsaArtifact {
 
     pub fn objects(&self) -> &ObjectModel {
         &self.facts.objects
+    }
+
+    pub fn addresses(&self) -> &crate::AddressProvenanceFacts {
+        &self.facts.addresses
     }
 
     pub fn memory(&self) -> &MemorySSAFacts {
@@ -434,6 +442,10 @@ impl DecompilePrepFacts {
 
     pub fn stack_address_root_of(&self, var: &SSAVar) -> Option<&StackAddressRoot> {
         self.stack_address_roots.get(var)
+    }
+
+    pub fn formal_parameter_of(&self, var: &SSAVar) -> Option<usize> {
+        self.formal_parameters.get(var).copied()
     }
 }
 
@@ -1491,6 +1503,7 @@ impl SSAFunction {
     }
 
     fn collect_decompile_prep_facts(&self, arch: Option<&ArchSpec>) -> DecompilePrepFacts {
+        let abi = crate::AbiProfile::from_arch(arch);
         let cached_family_info = arch.map(cached_register_family_info);
         let empty_family_info = RegisterFamilyInfo::default();
         let family_info = cached_family_info.as_deref().unwrap_or(&empty_family_info);
@@ -1500,6 +1513,40 @@ impl SSAFunction {
             self.compute_decompile_family_in_states(family_info)
         };
         let mut facts = DecompilePrepFacts::default();
+        for block in self.blocks() {
+            for phi in &block.phis {
+                for var in
+                    std::iter::once(&phi.dst).chain(phi.sources.iter().map(|(_, source)| source))
+                {
+                    if let Some(index) = abi.formal_argument_index(var) {
+                        facts.formal_parameters.insert(var.clone(), index);
+                    }
+                    if let Some(index) = abi.formal_address_argument_index(var) {
+                        facts.formal_parameter_bases.insert(var.clone(), index);
+                    }
+                }
+            }
+            for op in &block.ops {
+                if let Some(dst) = op.dst()
+                    && let Some(index) = abi.formal_argument_index(dst)
+                {
+                    facts.formal_parameters.insert(dst.clone(), index);
+                }
+                if let Some(dst) = op.dst()
+                    && let Some(index) = abi.formal_address_argument_index(dst)
+                {
+                    facts.formal_parameter_bases.insert(dst.clone(), index);
+                }
+                op.for_each_source(&mut |source| {
+                    if let Some(index) = abi.formal_argument_index(source) {
+                        facts.formal_parameters.insert(source.clone(), index);
+                    }
+                    if let Some(index) = abi.formal_address_argument_index(source) {
+                        facts.formal_parameter_bases.insert(source.clone(), index);
+                    }
+                });
+            }
+        }
 
         let mut changed = true;
         while changed {

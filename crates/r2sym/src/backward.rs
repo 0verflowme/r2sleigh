@@ -282,7 +282,7 @@ impl BackwardMemoryIndex {
                 continue;
             };
             for def in defs {
-                let key = (def.next_version, def.location);
+                let key = (def.next_version, def.location.clone());
                 index
                     .store_values
                     .entry(key)
@@ -299,7 +299,7 @@ impl BackwardMemoryIndex {
 
     fn reaching_store(&self, use_fact: &r2ssa::MemoryUseFact) -> Option<&r2ssa::SSAVar> {
         self.store_values
-            .get(&(use_fact.version, use_fact.location))
+            .get(&(use_fact.version, use_fact.location.clone()))
             .and_then(Option::as_ref)
     }
 }
@@ -886,10 +886,10 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
         let value = SymValue::new_symbolic(
             self.state.context(),
             &format!(
-                "memory_object_{}_version_{}_offset_{}_size_{}",
+                "memory_object_{}_version_{}_address_{}_size_{}",
                 use_fact.location.object.0,
                 use_fact.version.version,
-                use_fact.location.offset,
+                memory_address_symbol_component(&use_fact.location.address),
                 use_fact.location.size
             ),
             size * 8,
@@ -971,13 +971,17 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
         &mut self,
         addr: &r2ssa::SSAVar,
     ) -> Option<Vec<NormalizedMemoryLocation>> {
-        if let Some(arg_index) = ssa_formal_arg_index(addr) {
+        let value_id = self.func.graph().value_id_for_var(addr)?;
+        if let Some(expression) = self.func.addresses().parameter_expression(value_id)
+            && expression.terms.is_empty()
+        {
             return Some(vec![NormalizedMemoryLocation {
-                region: BackwardMemoryRegion::Argument { index: arg_index },
-                offset: 0,
+                region: BackwardMemoryRegion::Argument {
+                    index: expression.parameter,
+                },
+                offset: expression.offset,
             }]);
         }
-        let value_id = self.func.graph().value_id_for_var(addr)?;
         self.normalized_memory_location_value_id(value_id)
     }
 
@@ -2262,14 +2266,23 @@ fn is_specific_memory_location(location: &NormalizedMemoryLocation) -> bool {
     )
 }
 
-fn ssa_formal_arg_index(var: &r2ssa::SSAVar) -> Option<usize> {
-    (var.version == 0)
-        .then(|| ssa_register_arg_index(var))
-        .flatten()
-}
-
 fn ssa_call_arg_slot_index(var: &r2ssa::SSAVar) -> Option<usize> {
     ssa_register_arg_index(var)
+}
+
+fn memory_address_symbol_component(address: &r2ssa::RelativeMemoryAddress) -> String {
+    match address {
+        r2ssa::RelativeMemoryAddress::Exact(offset) => format!("exact_{offset}"),
+        r2ssa::RelativeMemoryAddress::Affine { terms, offset } => {
+            let terms = terms
+                .iter()
+                .map(|term| format!("v{}_c{}", term.value.0, term.coefficient))
+                .collect::<Vec<_>>()
+                .join("_");
+            format!("affine_{terms}_offset_{offset}")
+        }
+        r2ssa::RelativeMemoryAddress::Unknown => "unknown".to_string(),
+    }
 }
 
 fn ssa_register_arg_index(var: &r2ssa::SSAVar) -> Option<usize> {
@@ -2596,20 +2609,6 @@ mod tests {
             (1usize, BTreeSet::from([0i64])),
         ]);
         assert!(select_best_translated_arg(translated).is_none());
-    }
-
-    #[test]
-    fn ssa_formal_arg_index_requires_entry_version() {
-        assert_eq!(
-            ssa_formal_arg_index(&r2ssa::SSAVar::new("RDI", 0, 8)),
-            Some(0)
-        );
-        assert_eq!(
-            ssa_formal_arg_index(&r2ssa::SSAVar::new("EDX", 0, 4)),
-            Some(2)
-        );
-        assert_eq!(ssa_formal_arg_index(&r2ssa::SSAVar::new("RDI", 1, 8)), None);
-        assert_eq!(ssa_formal_arg_index(&r2ssa::SSAVar::new("EDX", 3, 4)), None);
     }
 
     #[test]

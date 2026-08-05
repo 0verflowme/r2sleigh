@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
+use crate::address::{AddressProvenanceFacts, collect_address_provenance};
 use crate::assumption::{AssumptionSet, AssumptionSubject, AssumptionUsageReport, AssumptionValue};
 use crate::cfg::BlockTerminator;
 use crate::function::{DecompilePrepFacts, SSAFunction, StackAddressBase, StackAddressRoot};
@@ -117,6 +118,7 @@ pub struct GlobalObjectKey {
 pub enum ObjectKind {
     StackSlot { base: StackAddressBase, offset: i64 },
     FrameObject { base: StackAddressBase, offset: i64 },
+    Parameter { index: usize },
     Global { space: String, address: u64 },
     HeapAlloc { call_site: CallSiteId },
     EscapedUnknown,
@@ -133,6 +135,7 @@ pub struct ObjectModel {
     pub objects: BTreeMap<ObjectId, ObjectFact>,
     pub value_objects: BTreeMap<ValueId, ObjectId>,
     pub stack_objects: BTreeMap<StackAddressRoot, ObjectId>,
+    pub parameter_objects: BTreeMap<usize, ObjectId>,
     pub global_objects: BTreeMap<GlobalObjectKey, ObjectId>,
     pub escaped_unknown: Option<ObjectId>,
 }
@@ -163,10 +166,36 @@ pub struct MemoryVersion {
     pub version: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RelativeMemoryAddress {
+    Exact(i64),
+    Affine {
+        terms: Vec<crate::AffineAddressTerm>,
+        offset: i64,
+    },
+    Unknown,
+}
+
+impl RelativeMemoryAddress {
+    pub fn exact_offset(&self) -> Option<i64> {
+        match self {
+            Self::Exact(offset) => Some(*offset),
+            Self::Affine { .. } | Self::Unknown => None,
+        }
+    }
+
+    pub fn constant_offset(&self) -> Option<i64> {
+        match self {
+            Self::Exact(offset) | Self::Affine { offset, .. } => Some(*offset),
+            Self::Unknown => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MemoryLocation {
     pub object: ObjectId,
-    pub offset: i64,
+    pub address: RelativeMemoryAddress,
     pub size: u32,
 }
 
@@ -186,6 +215,7 @@ pub struct MemoryDefFact {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryPhiFact {
     pub object: ObjectId,
+    pub location: MemoryLocation,
     pub output_version: MemoryVersion,
     pub inputs: Vec<(u64, MemoryVersion)>,
 }
@@ -671,6 +701,7 @@ pub struct PreparedAssumptionBinding {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PreparedFunctionFacts {
+    pub addresses: AddressProvenanceFacts,
     pub objects: ObjectModel,
     pub memory: MemorySSAFacts,
     pub predicates: PredicateFacts,
@@ -693,8 +724,10 @@ impl PreparedFunctionFacts {
         graph: &SsaGraph,
         assumptions: &AssumptionSet,
     ) -> Self {
+        let addresses = collect_address_provenance(function, graph);
         let call_sites = collect_call_sites(function, graph, function.decompile_prep_facts());
-        let (objects, memory) = collect_object_and_memory_facts(function, graph, &call_sites);
+        let (objects, memory) =
+            collect_object_and_memory_facts(function, graph, &addresses, &call_sites);
         let predicates = apply_assumptions_to_predicate_facts(
             collect_predicate_facts(function, graph),
             assumptions,
@@ -720,6 +753,7 @@ impl PreparedFunctionFacts {
         let (applied_assumption_bindings, assumption_usage) =
             collect_prepared_assumption_usage(graph, &objects, &predicates, assumptions);
         Self {
+            addresses,
             objects,
             memory,
             predicates,
@@ -894,16 +928,18 @@ fn collect_prepared_assumption_usage(
 #[derive(Debug, Clone)]
 struct ObjectModelBuilder<'a> {
     facts: Option<&'a DecompilePrepFacts>,
+    addresses: &'a AddressProvenanceFacts,
     objects: BTreeMap<ObjectId, ObjectFact>,
     value_objects: BTreeMap<ValueId, ObjectId>,
     stack_objects: BTreeMap<StackAddressRoot, ObjectId>,
+    parameter_objects: BTreeMap<usize, ObjectId>,
     global_objects: BTreeMap<GlobalObjectKey, ObjectId>,
     escaped_unknown: ObjectId,
     next_object_id: u32,
 }
 
 impl<'a> ObjectModelBuilder<'a> {
-    fn new(facts: Option<&'a DecompilePrepFacts>) -> Self {
+    fn new(facts: Option<&'a DecompilePrepFacts>, addresses: &'a AddressProvenanceFacts) -> Self {
         let escaped_unknown = ObjectId(0);
         let mut objects = BTreeMap::new();
         objects.insert(
@@ -915,9 +951,11 @@ impl<'a> ObjectModelBuilder<'a> {
         );
         Self {
             facts,
+            addresses,
             objects,
             value_objects: BTreeMap::new(),
             stack_objects: BTreeMap::new(),
+            parameter_objects: BTreeMap::new(),
             global_objects: BTreeMap::new(),
             escaped_unknown,
             next_object_id: 1,
@@ -936,6 +974,15 @@ impl<'a> ObjectModelBuilder<'a> {
             for var in facts.stack_address_roots.keys() {
                 let _ = self.object_for_address_value(graph, var, "ram");
             }
+        }
+        let parameter_indices = self
+            .addresses
+            .parameter_expressions
+            .values()
+            .map(|expression| expression.parameter)
+            .collect::<BTreeSet<_>>();
+        for parameter in parameter_indices {
+            self.ensure_parameter_object(parameter);
         }
 
         for block in function.blocks() {
@@ -959,6 +1006,7 @@ impl<'a> ObjectModelBuilder<'a> {
             objects: self.objects,
             value_objects: self.value_objects,
             stack_objects: self.stack_objects,
+            parameter_objects: self.parameter_objects,
             global_objects: self.global_objects,
             escaped_unknown: Some(self.escaped_unknown),
         }
@@ -979,6 +1027,12 @@ impl<'a> ObjectModelBuilder<'a> {
 
         if let Some(root) = resolve_stack_root(self.facts, value) {
             let object = self.ensure_stack_object(root);
+            self.value_objects.insert(value_id, object);
+            return object;
+        }
+
+        if let Some(expression) = self.addresses.parameter_expression(value_id) {
+            let object = self.ensure_parameter_object(expression.parameter);
             self.value_objects.insert(value_id, object);
             return object;
         }
@@ -1034,6 +1088,22 @@ impl<'a> ObjectModelBuilder<'a> {
         id
     }
 
+    fn ensure_parameter_object(&mut self, index: usize) -> ObjectId {
+        if let Some(object) = self.parameter_objects.get(&index).copied() {
+            return object;
+        }
+        let id = self.alloc_object_id();
+        self.objects.insert(
+            id,
+            ObjectFact {
+                id,
+                kind: ObjectKind::Parameter { index },
+            },
+        );
+        self.parameter_objects.insert(index, id);
+        id
+    }
+
     fn alloc_object_id(&mut self) -> ObjectId {
         let id = ObjectId(self.next_object_id);
         self.next_object_id = self.next_object_id.saturating_add(1);
@@ -1050,13 +1120,14 @@ struct AccessSummary {
 fn collect_object_and_memory_facts(
     function: &SSAFunction,
     graph: &SsaGraph,
+    addresses: &AddressProvenanceFacts,
     call_sites: &CallSiteFacts,
 ) -> (ObjectModel, MemorySSAFacts) {
     let facts = function.decompile_prep_facts();
-    let builder = ObjectModelBuilder::new(facts);
+    let builder = ObjectModelBuilder::new(facts, addresses);
     let object_model = builder.build(function, graph);
     let access_summaries =
-        collect_access_summaries(function, graph, facts, &object_model, call_sites);
+        collect_access_summaries(function, graph, facts, addresses, &object_model, call_sites);
     let memory = build_memory_ssa(function, graph, &object_model, access_summaries);
     (object_model, memory)
 }
@@ -1065,6 +1136,7 @@ fn collect_access_summaries(
     function: &SSAFunction,
     graph: &SsaGraph,
     prep_facts: Option<&DecompilePrepFacts>,
+    addresses: &AddressProvenanceFacts,
     object_model: &ObjectModel,
     call_sites: &CallSiteFacts,
 ) -> BTreeMap<InstId, AccessSummary> {
@@ -1088,6 +1160,7 @@ fn collect_access_summaries(
                 } => {
                     uses.push(memory_location_for_addr(
                         prep_facts,
+                        addresses,
                         object_model,
                         graph,
                         addr,
@@ -1101,6 +1174,7 @@ fn collect_access_summaries(
                 } => {
                     defs.push(memory_location_for_addr(
                         prep_facts,
+                        addresses,
                         object_model,
                         graph,
                         addr,
@@ -1113,13 +1187,14 @@ fn collect_access_summaries(
                 } => {
                     let location = memory_location_for_addr(
                         prep_facts,
+                        addresses,
                         object_model,
                         graph,
                         addr,
                         space,
                         val.size,
                     );
-                    uses.push(location);
+                    uses.push(location.clone());
                     defs.push(location);
                 }
                 SSAOp::AtomicCAS {
@@ -1131,23 +1206,24 @@ fn collect_access_summaries(
                 } => {
                     let location = memory_location_for_addr(
                         prep_facts,
+                        addresses,
                         object_model,
                         graph,
                         addr,
                         space,
                         expected.size.max(replacement.size),
                     );
-                    uses.push(location);
+                    uses.push(location.clone());
                     defs.push(location);
                 }
                 SSAOp::Call { .. } | SSAOp::CallInd { .. } => {
                     if call_sites.by_inst.contains_key(&inst_id) {
                         let location = MemoryLocation {
                             object: escaped_unknown,
-                            offset: 0,
+                            address: RelativeMemoryAddress::Unknown,
                             size: 0,
                         };
-                        uses.push(location);
+                        uses.push(location.clone());
                         defs.push(location);
                     }
                 }
@@ -1196,11 +1272,10 @@ fn build_memory_ssa(
         def_versions.insert(*inst_id, versions);
     }
 
-    let object_ids = object_model.objects.keys().copied().collect::<Vec<_>>();
-    let mut in_states = BTreeMap::<u64, BTreeMap<ObjectId, MemoryVersion>>::new();
-    let mut out_states = BTreeMap::<u64, BTreeMap<ObjectId, MemoryVersion>>::new();
-    let mut phi_versions = BTreeMap::<(u64, ObjectId), MemoryVersion>::new();
-    let mut phi_inputs = BTreeMap::<(u64, ObjectId), Vec<(u64, MemoryVersion)>>::new();
+    let mut in_states = BTreeMap::<u64, BTreeMap<MemoryLocation, MemoryVersion>>::new();
+    let mut out_states = BTreeMap::<u64, BTreeMap<MemoryLocation, MemoryVersion>>::new();
+    let mut phi_versions = BTreeMap::<(u64, MemoryLocation), MemoryVersion>::new();
+    let mut phi_inputs = BTreeMap::<(u64, MemoryLocation), Vec<(u64, MemoryVersion)>>::new();
     let (uses_by_inst, defs_by_inst) = loop {
         let mut changed = false;
         let mut uses_by_inst = BTreeMap::<InstId, Vec<MemoryUseFact>>::new();
@@ -1210,15 +1285,20 @@ fn build_memory_ssa(
             let mut in_state = BTreeMap::new();
 
             if !preds.is_empty() {
-                for object in &object_ids {
+                let locations = preds
+                    .iter()
+                    .filter_map(|pred| out_states.get(pred))
+                    .flat_map(|state| state.keys().cloned())
+                    .collect::<BTreeSet<_>>();
+                for location in locations {
                     let inputs = preds
                         .iter()
                         .map(|pred| {
                             let version = out_states
                                 .get(pred)
-                                .and_then(|state| state.get(object).copied())
+                                .and_then(|state| state.get(&location).copied())
                                 .unwrap_or(MemoryVersion {
-                                    object: *object,
+                                    object: location.object,
                                     version: 0,
                                 });
                             (*pred, version)
@@ -1231,11 +1311,11 @@ fn build_memory_ssa(
                     {
                         first_version.expect("inputs is not empty")
                     } else {
-                        let key = (block_addr, *object);
-                        let phi = phi_versions.entry(key).or_insert_with(|| {
-                            let next = next_version_by_object.entry(*object).or_insert(1);
+                        let key = (block_addr, location.clone());
+                        let phi = phi_versions.entry(key.clone()).or_insert_with(|| {
+                            let next = next_version_by_object.entry(location.object).or_insert(1);
                             let version = MemoryVersion {
-                                object: *object,
+                                object: location.object,
                                 version: *next,
                             };
                             *next = next.saturating_add(1);
@@ -1245,7 +1325,7 @@ fn build_memory_ssa(
                         *phi
                     };
                     if merged.version != 0 {
-                        in_state.insert(*object, merged);
+                        in_state.insert(location, merged);
                     }
                 }
             }
@@ -1267,42 +1347,60 @@ fn build_memory_ssa(
                     continue;
                 };
                 for location in &summary.uses {
-                    let version = state
-                        .get(&location.object)
-                        .copied()
-                        .unwrap_or(MemoryVersion {
+                    let mut reaching = state
+                        .iter()
+                        .filter(|(candidate, _)| {
+                            memory_locations_may_alias(object_model, candidate, location)
+                        })
+                        .map(|(_, version)| *version)
+                        .collect::<BTreeSet<_>>();
+                    if reaching.is_empty() {
+                        reaching.insert(MemoryVersion {
                             object: location.object,
                             version: 0,
                         });
-                    uses_by_inst
-                        .entry(inst_id)
-                        .or_default()
-                        .push(MemoryUseFact {
-                            location: *location,
-                            version,
-                        });
+                    }
+                    for version in reaching {
+                        uses_by_inst
+                            .entry(inst_id)
+                            .or_default()
+                            .push(MemoryUseFact {
+                                location: location.clone(),
+                                version,
+                            });
+                    }
                 }
                 if let Some(def_versions_for_op) = def_versions.get(&inst_id) {
                     for (location, next_version) in
                         summary.defs.iter().zip(def_versions_for_op.iter())
                     {
-                        let previous_version =
-                            state
-                                .get(&location.object)
-                                .copied()
-                                .unwrap_or(MemoryVersion {
-                                    object: location.object,
-                                    version: 0,
-                                });
-                        defs_by_inst
-                            .entry(inst_id)
-                            .or_default()
-                            .push(MemoryDefFact {
-                                location: *location,
-                                previous_version,
-                                next_version: *next_version,
+                        let mut previous = state
+                            .iter()
+                            .filter(|(candidate, _)| {
+                                memory_locations_may_alias(object_model, candidate, location)
+                            })
+                            .map(|(_, version)| *version)
+                            .collect::<BTreeSet<_>>();
+                        if previous.is_empty() {
+                            previous.insert(MemoryVersion {
+                                object: location.object,
+                                version: 0,
                             });
-                        state.insert(location.object, *next_version);
+                        }
+                        for previous_version in previous {
+                            defs_by_inst
+                                .entry(inst_id)
+                                .or_default()
+                                .push(MemoryDefFact {
+                                    location: location.clone(),
+                                    previous_version,
+                                    next_version: *next_version,
+                                });
+                        }
+                        state.retain(|candidate, _| {
+                            !memory_locations_may_alias(object_model, candidate, location)
+                        });
+                        state.insert(location.clone(), *next_version);
                     }
                 }
             }
@@ -1318,13 +1416,16 @@ fn build_memory_ssa(
         }
     };
 
-    for ((block_addr, object), output_version) in phi_versions {
-        let inputs = phi_inputs.remove(&(block_addr, object)).unwrap_or_default();
+    for ((block_addr, location), output_version) in phi_versions {
+        let inputs = phi_inputs
+            .remove(&(block_addr, location.clone()))
+            .unwrap_or_default();
         phis_by_block
             .entry(block_addr)
             .or_insert_with(Vec::new)
             .push(MemoryPhiFact {
-                object,
+                object: location.object,
+                location,
                 output_version,
                 inputs,
             });
@@ -1335,6 +1436,168 @@ fn build_memory_ssa(
         defs_by_inst,
         phis_by_block,
     }
+}
+
+fn memory_locations_may_alias(
+    objects: &ObjectModel,
+    left: &MemoryLocation,
+    right: &MemoryLocation,
+) -> bool {
+    let Some(left_object) = objects.object(left.object) else {
+        return true;
+    };
+    let Some(right_object) = objects.object(right.object) else {
+        return true;
+    };
+    if left.object == right.object {
+        return relative_memory_ranges_may_overlap(
+            &left.address,
+            left.size,
+            &right.address,
+            right.size,
+        );
+    }
+    match (&left_object.kind, &right_object.kind) {
+        (ObjectKind::EscapedUnknown, _) | (_, ObjectKind::EscapedUnknown) => true,
+        (
+            ObjectKind::Parameter { .. },
+            ObjectKind::StackSlot { .. } | ObjectKind::FrameObject { .. },
+        )
+        | (
+            ObjectKind::StackSlot { .. } | ObjectKind::FrameObject { .. },
+            ObjectKind::Parameter { .. },
+        ) => false,
+        (ObjectKind::Parameter { .. }, _) | (_, ObjectKind::Parameter { .. }) => true,
+        (
+            ObjectKind::Global {
+                address: left_base, ..
+            },
+            ObjectKind::Global {
+                address: right_base,
+                ..
+            },
+        ) => absolute_memory_ranges_may_overlap(
+            i128::from(*left_base),
+            &left.address,
+            left.size,
+            i128::from(*right_base),
+            &right.address,
+            right.size,
+        ),
+        (
+            ObjectKind::StackSlot {
+                base: left_base,
+                offset: left_offset,
+            }
+            | ObjectKind::FrameObject {
+                base: left_base,
+                offset: left_offset,
+            },
+            ObjectKind::StackSlot {
+                base: right_base,
+                offset: right_offset,
+            }
+            | ObjectKind::FrameObject {
+                base: right_base,
+                offset: right_offset,
+            },
+        ) if left_base == right_base => absolute_memory_ranges_may_overlap(
+            i128::from(*left_offset),
+            &left.address,
+            left.size,
+            i128::from(*right_offset),
+            &right.address,
+            right.size,
+        ),
+        (
+            ObjectKind::StackSlot { .. } | ObjectKind::FrameObject { .. },
+            ObjectKind::StackSlot { .. } | ObjectKind::FrameObject { .. },
+        ) => true,
+        (ObjectKind::HeapAlloc { call_site: left }, ObjectKind::HeapAlloc { call_site: right }) => {
+            left == right
+        }
+        _ => false,
+    }
+}
+
+fn absolute_memory_ranges_may_overlap(
+    left_base: i128,
+    left: &RelativeMemoryAddress,
+    left_size: u32,
+    right_base: i128,
+    right: &RelativeMemoryAddress,
+    right_size: u32,
+) -> bool {
+    let (Some(left), Some(right)) = (left.exact_offset(), right.exact_offset()) else {
+        return true;
+    };
+    ranges_overlap_i128(
+        left_base + i128::from(left),
+        left_size,
+        right_base + i128::from(right),
+        right_size,
+    )
+}
+
+fn relative_memory_ranges_may_overlap(
+    left: &RelativeMemoryAddress,
+    left_size: u32,
+    right: &RelativeMemoryAddress,
+    right_size: u32,
+) -> bool {
+    let (Some((left_terms, left_offset)), Some((right_terms, right_offset))) =
+        (relative_affine_parts(left), relative_affine_parts(right))
+    else {
+        return true;
+    };
+    let mut difference = BTreeMap::<ValueId, i128>::new();
+    for term in left_terms {
+        *difference.entry(term.value).or_default() += i128::from(term.coefficient);
+    }
+    for term in right_terms {
+        *difference.entry(term.value).or_default() -= i128::from(term.coefficient);
+    }
+    difference.retain(|_, coefficient| *coefficient != 0);
+    let constant = i128::from(left_offset) - i128::from(right_offset);
+    let low = -i128::from(left_size.saturating_sub(1));
+    let high = i128::from(right_size.saturating_sub(1));
+    let modulus = difference
+        .values()
+        .map(|coefficient| coefficient.unsigned_abs())
+        .fold(0u128, gcd_u128);
+    if modulus == 0 {
+        return constant >= low && constant <= high;
+    }
+    let Ok(modulus) = i128::try_from(modulus) else {
+        return true;
+    };
+    let candidate = low + (constant.rem_euclid(modulus) - low).rem_euclid(modulus);
+    candidate <= high
+}
+
+fn relative_affine_parts(
+    address: &RelativeMemoryAddress,
+) -> Option<(&[crate::AffineAddressTerm], i64)> {
+    match address {
+        RelativeMemoryAddress::Exact(offset) => Some((&[], *offset)),
+        RelativeMemoryAddress::Affine { terms, offset } => Some((terms, *offset)),
+        RelativeMemoryAddress::Unknown => None,
+    }
+}
+
+fn ranges_overlap_i128(left: i128, left_size: u32, right: i128, right_size: u32) -> bool {
+    let left_end = left.saturating_add(i128::from(left_size.max(1)));
+    let right_end = right.saturating_add(i128::from(right_size.max(1)));
+    left < right_end && right < left_end
+}
+
+fn gcd_u128(mut left: u128, mut right: u128) -> u128 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
 }
 
 fn collect_structured_dataflow_facts(
@@ -1478,6 +1741,7 @@ fn collect_prepared_function_certificates(
                 ))
             }
             ObjectKind::Global { .. }
+            | ObjectKind::Parameter { .. }
             | ObjectKind::HeapAlloc { .. }
             | ObjectKind::EscapedUnknown => None,
         })
@@ -4629,12 +4893,16 @@ fn compare_components(op: &SSAOp) -> Option<(&SSAVar, CompareKind, &SSAVar, &SSA
 
 fn memory_location_for_addr(
     prep_facts: Option<&DecompilePrepFacts>,
+    addresses: &AddressProvenanceFacts,
     object_model: &ObjectModel,
     graph: &SsaGraph,
     addr: &SSAVar,
     space: &str,
     size: u32,
 ) -> MemoryLocation {
+    let parameter_expression = graph
+        .value_id_for_var(addr)
+        .and_then(|value| addresses.parameter_expression(value));
     let object = object_model
         .object_for_var(graph, addr)
         .or_else(|| {
@@ -4656,7 +4924,29 @@ fn memory_location_for_addr(
         .unwrap_or(ObjectId(0));
     MemoryLocation {
         object,
-        offset: 0,
+        address: parameter_expression.map_or_else(
+            || {
+                if matches!(
+                    object_model.object(object).map(|fact| &fact.kind),
+                    Some(ObjectKind::StackSlot { .. } | ObjectKind::FrameObject { .. })
+                        | Some(ObjectKind::Global { .. })
+                ) {
+                    RelativeMemoryAddress::Exact(0)
+                } else {
+                    RelativeMemoryAddress::Unknown
+                }
+            },
+            |expression| {
+                if expression.terms.is_empty() {
+                    RelativeMemoryAddress::Exact(expression.offset)
+                } else {
+                    RelativeMemoryAddress::Affine {
+                        terms: expression.terms.clone(),
+                        offset: expression.offset,
+                    }
+                }
+            },
+        ),
         size,
     }
 }
