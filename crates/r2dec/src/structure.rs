@@ -213,13 +213,14 @@ pub struct ControlFlowStructurer<'a, 'o> {
     control_transfer_render_proofs: Vec<ControlTransferRenderProof>,
     /// Merge blocks owned by enclosing regions and therefore emitted there.
     deferred_merge_blocks: Vec<u64>,
-    /// Lexical control context currently being emitted.
-    active_control_guards: Vec<ControlGuard>,
-    active_loops: Vec<LoopId>,
+    /// Exact lexical control-domain alternatives currently being emitted.
+    /// A labeled side entry can join another certified alternative without
+    /// weakening the domain checks for downstream blocks.
+    active_domains: Vec<RenderedBlockDomain>,
     /// Every lexical domain in which a source block was emitted. Shared CFG
     /// blocks may be duplicated by structuring, so coverage is checked only
     /// after all occurrences are known.
-    rendered_block_domains: BTreeMap<u64, Vec<RenderedBlockDomain>>,
+    rendered_block_domains: BTreeMap<u64, Vec<RenderedBlockOccurrence>>,
     /// Basic blocks owned by the current structured region tree.
     structured_region_blocks: BTreeSet<u64>,
     /// Exact side-entry domains that reach a labeled block through a certified
@@ -233,10 +234,15 @@ struct FoldedBlock {
     effect_proofs: Vec<EffectRenderProof>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct RenderedBlockDomain {
     guards: Vec<ControlGuard>,
     loops: Vec<LoopId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RenderedBlockOccurrence {
+    alternatives: Vec<RenderedBlockDomain>,
 }
 
 const BDD_FALSE: usize = 0;
@@ -347,6 +353,34 @@ impl ControlBdd {
         self.apply(BddOp::Or, lhs, rhs)
     }
 
+    fn exists(
+        &mut self,
+        value: usize,
+        variables: &BTreeSet<PredicateId>,
+        cache: &mut HashMap<usize, usize>,
+    ) -> Result<usize, String> {
+        if value == BDD_FALSE || value == BDD_TRUE {
+            return Ok(value);
+        }
+        if let Some(cached) = cache.get(&value).copied() {
+            return Ok(cached);
+        }
+        let node = self
+            .nodes
+            .get(value)
+            .and_then(|node| *node)
+            .ok_or_else(|| format!("invalid control coverage BDD node {value}"))?;
+        let low = self.exists(node.low, variables, cache)?;
+        let high = self.exists(node.high, variables, cache)?;
+        let result = if variables.contains(&node.variable) {
+            self.or(low, high)?
+        } else {
+            self.make_node(node.variable, low, high)?
+        };
+        cache.insert(value, result);
+        Ok(result)
+    }
+
     fn apply(&mut self, op: BddOp, lhs: usize, rhs: usize) -> Result<usize, String> {
         let (lhs, rhs) = if lhs <= rhs { (lhs, rhs) } else { (rhs, lhs) };
         let terminal = match op {
@@ -416,8 +450,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             control_render_proofs: Vec::new(),
             control_transfer_render_proofs: Vec::new(),
             deferred_merge_blocks: Vec::new(),
-            active_control_guards: Vec::new(),
-            active_loops: Vec::new(),
+            active_domains: vec![RenderedBlockDomain::default()],
             rendered_block_domains: BTreeMap::new(),
             structured_region_blocks: BTreeSet::new(),
             transfer_target_domains: BTreeMap::new(),
@@ -441,8 +474,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             control_render_proofs: Vec::new(),
             control_transfer_render_proofs: Vec::new(),
             deferred_merge_blocks: Vec::new(),
-            active_control_guards: Vec::new(),
-            active_loops: Vec::new(),
+            active_domains: vec![RenderedBlockDomain::default()],
             rendered_block_domains: BTreeMap::new(),
             structured_region_blocks: BTreeSet::new(),
             transfer_target_domains: BTreeMap::new(),
@@ -710,8 +742,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         self.reset_safety_budget();
         self.control_render_proofs.clear();
         self.control_transfer_render_proofs.clear();
-        self.active_control_guards.clear();
-        self.active_loops.clear();
+        self.active_domains = vec![RenderedBlockDomain::default()];
         self.rendered_block_domains.clear();
         self.emitted_labels.clear();
         self.structured_region_blocks.clear();
@@ -746,6 +777,77 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         if !self.consume_safety_budget(1) {
             return CStmt::Empty;
         }
+        let inherited_domains = self.active_domains.clone();
+        if let Some(domains) = self.transfer_target_domains.remove(&region.entry()) {
+            self.certify_transfer_domain_join(region.entry(), domains);
+        }
+        let stmt = self.structure_region_in_active_domains(region);
+        self.active_domains = inherited_domains;
+        stmt
+    }
+
+    fn certify_transfer_domain_join(
+        &mut self,
+        block_addr: u64,
+        incoming: Vec<RenderedBlockDomain>,
+    ) {
+        let mut alternatives = self.active_domains.clone();
+        alternatives.extend(incoming);
+        Self::normalize_rendered_domains(&mut alternatives);
+        let Some(source) = self
+            .fold_ctx
+            .control_facts()
+            .and_then(|facts| facts.control_domain_for_block(block_addr))
+            .cloned()
+        else {
+            self.safety_reason = Some(format!(
+                "missing source control domain for transfer join at 0x{block_addr:x}"
+            ));
+            return;
+        };
+        if !source.complete {
+            self.safety_reason = Some(format!(
+                "incomplete source control domain for transfer join at 0x{block_addr:x}"
+            ));
+            return;
+        }
+        if alternatives.iter().any(|alternative| {
+            !self.rendered_loop_domain_matches_source(block_addr, &source.loops, &alternative.loops)
+        }) {
+            self.safety_reason = Some(format!(
+                "loop-domain mismatch for transfer join at 0x{block_addr:x}"
+            ));
+            return;
+        }
+        let occurrence = RenderedBlockOccurrence {
+            alternatives: alternatives.clone(),
+        };
+        match self.rendered_branch_occurrences_cover_source(block_addr, &[occurrence]) {
+            Ok(true) => {
+                self.active_domains = vec![RenderedBlockDomain {
+                    guards: source.guards,
+                    loops: source.loops,
+                }];
+            }
+            Ok(false) => {
+                self.safety_reason = Some(format!(
+                    "control-domain coverage mismatch for transfer join at 0x{block_addr:x}: source guards {:?}; rendered guard alternatives {:?}",
+                    source.guards,
+                    alternatives
+                        .iter()
+                        .map(|alternative| alternative.guards.clone())
+                        .collect::<Vec<_>>()
+                ));
+            }
+            Err(reason) => {
+                self.safety_reason = Some(format!(
+                    "control-domain coverage proof failed for transfer join at 0x{block_addr:x}: {reason}"
+                ));
+            }
+        }
+    }
+
+    fn structure_region_in_active_domains(&mut self, region: &Region) -> CStmt {
         match region {
             Region::Block(addr) => self.structure_block(*addr),
             Region::Sequence(regions) => {
@@ -922,19 +1024,15 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     ));
                     return CStmt::Empty;
                 }
+                let outer_domains = self.active_domains.clone();
                 if let Some(loop_id) = loop_id {
-                    self.active_loops.push(loop_id);
+                    self.push_active_loop(loop_id);
                 }
                 if let Some(guard) = &body_guard {
-                    self.active_control_guards.push(guard.clone());
+                    self.push_active_guard(guard.clone());
                 }
                 let body_stmt = Self::strip_trailing_continue(self.structure_loop_body(body));
-                if body_guard.is_some() {
-                    self.active_control_guards.pop();
-                }
-                if loop_id.is_some() {
-                    self.active_loops.pop();
-                }
+                self.active_domains = outer_domains;
                 CStmt::while_loop(cond, body_stmt)
             }
             Region::DoWhileLoop { body, cond_block } => {
@@ -975,8 +1073,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     ));
                     return CStmt::Empty;
                 }
+                let outer_domains = self.active_domains.clone();
                 if let Some(loop_id) = loop_id {
-                    self.active_loops.push(loop_id);
+                    self.push_active_loop(loop_id);
                 }
                 let cond_owned_by_body = Self::region_owns_block_emission(body, *cond_block);
                 if !cond_owned_by_body {
@@ -990,9 +1089,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     Self::append_stmt_body_flat(&mut stmts, self.structure_block(*cond_block));
                     body_stmt = Self::stmt_from_vec(stmts);
                 }
-                if loop_id.is_some() {
-                    self.active_loops.pop();
-                }
+                self.active_domains = outer_domains;
                 CStmt::DoWhile {
                     body: Box::new(body_stmt),
                     cond,
@@ -1117,13 +1214,14 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             ));
             return CStmt::Empty;
         };
-        self.active_control_guards.push(guard);
+        let outer_domains = self.active_domains.clone();
+        self.push_active_guard(guard);
         let stmt = if direct_successor {
             self.structure_region_from_predecessor(region, pred_block)
         } else {
             self.structure_region(region)
         };
-        self.active_control_guards.pop();
+        self.active_domains = outer_domains;
         stmt
     }
 
@@ -1371,6 +1469,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
         let mut switch_cases = Vec::new();
         for (case_value, case_region) in cases {
+            let outer_domains = self.active_domains.clone();
             let Some(case_value) = case_value else {
                 continue;
             };
@@ -1392,12 +1491,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 return CStmt::Empty;
             }
             if let Some(guard) = &guard {
-                self.active_control_guards.push(guard.clone());
+                self.push_active_guard(guard.clone());
             }
             let case_stmt = self.structure_region(case_region);
-            if guard.is_some() {
-                self.active_control_guards.pop();
-            }
+            self.active_domains = outer_domains;
             let body = if self.fold_ctx.requires_certified_rendering() {
                 vec![case_stmt]
             } else {
@@ -1410,6 +1507,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
 
         let default_body = if let Some(region) = default {
+            let outer_domains = self.active_domains.clone();
             let guard = if self.fold_ctx.requires_certified_rendering() {
                 self.certified_switch_guard_for_region(switch_block, region, None, true)
             } else {
@@ -1422,12 +1520,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 return CStmt::Empty;
             }
             if let Some(guard) = &guard {
-                self.active_control_guards.push(guard.clone());
+                self.push_active_guard(guard.clone());
             }
             let stmt = self.structure_region(region);
-            if guard.is_some() {
-                self.active_control_guards.pop();
-            }
+            self.active_domains = outer_domains;
             Some(vec![stmt])
         } else {
             None
@@ -1885,22 +1981,45 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             ));
             return false;
         };
-        let mut guards = self.active_control_guards.clone();
-        guards.sort();
-        guards.dedup();
-        let mut loops = self
-            .active_loops
-            .iter()
-            .copied()
-            .filter(|active| *active != loop_id)
-            .collect::<Vec<_>>();
-        loops.sort_unstable();
-        loops.dedup();
-        self.transfer_target_domains
-            .entry(target)
-            .or_default()
-            .push(RenderedBlockDomain { guards, loops });
+        let mut domains = self.active_domains.clone();
+        for domain in &mut domains {
+            domain.loops.retain(|active| *active != loop_id);
+        }
+        Self::normalize_rendered_domains(&mut domains);
+        let target_domains = self.transfer_target_domains.entry(target).or_default();
+        target_domains.extend(domains);
+        Self::normalize_rendered_domains(target_domains);
         true
+    }
+
+    fn push_active_guard(&mut self, guard: ControlGuard) {
+        for domain in &mut self.active_domains {
+            domain.guards.push(guard.clone());
+        }
+        Self::normalize_rendered_domains(&mut self.active_domains);
+    }
+
+    fn push_active_loop(&mut self, loop_id: LoopId) {
+        for domain in &mut self.active_domains {
+            domain.loops.push(loop_id);
+        }
+        Self::normalize_rendered_domains(&mut self.active_domains);
+    }
+
+    fn normalize_rendered_domains(domains: &mut Vec<RenderedBlockDomain>) {
+        for domain in domains.iter_mut() {
+            domain.guards.sort();
+            domain.guards.dedup();
+            domain.loops.sort_unstable();
+            domain.loops.dedup();
+        }
+        let mut unique = Vec::new();
+        for domain in domains.drain(..) {
+            if !unique.contains(&domain) {
+                unique.push(domain);
+            }
+        }
+        *domains = unique;
     }
 
     /// Emit side-effecting statements for a block without labels or loop markers.
@@ -1959,28 +2078,21 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             ));
             return;
         };
-        let mut guards = self.active_control_guards.clone();
-        guards.sort();
-        guards.dedup();
-        let mut loops = self.active_loops.clone();
-        loops.sort_unstable();
-        loops.dedup();
         if !source.complete {
             self.safety_reason = Some(format!(
                 "incomplete source control domain for emitted block 0x{block_addr:x}"
             ));
             return;
         }
+        let mut alternatives = self.active_domains.clone();
+        if let Some(domains) = self.transfer_target_domains.remove(&block_addr) {
+            alternatives.extend(domains);
+        }
+        Self::normalize_rendered_domains(&mut alternatives);
         self.rendered_block_domains
             .entry(block_addr)
             .or_default()
-            .push(RenderedBlockDomain { guards, loops });
-        if let Some(domains) = self.transfer_target_domains.remove(&block_addr) {
-            self.rendered_block_domains
-                .entry(block_addr)
-                .or_default()
-                .extend(domains);
-        }
+            .push(RenderedBlockOccurrence { alternatives });
     }
 
     fn validate_rendered_block_domain_coverage(&mut self) {
@@ -2007,26 +2119,32 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 return;
             }
             if occurrences.iter().any(|occurrence| {
-                !self.rendered_loop_domain_matches_source(
-                    block_addr,
-                    &source.loops,
-                    &occurrence.loops,
-                )
+                occurrence.alternatives.iter().any(|alternative| {
+                    !self.rendered_loop_domain_matches_source(
+                        block_addr,
+                        &source.loops,
+                        &alternative.loops,
+                    )
+                })
             }) {
                 self.safety_reason = Some(format!(
                     "loop-domain mismatch for emitted block 0x{block_addr:x}: source loops {:?}; rendered loops {:?}",
                     source.loops,
                     occurrences
                         .iter()
-                        .map(|occurrence| occurrence.loops.clone())
+                        .flat_map(|occurrence| occurrence.alternatives.iter())
+                        .map(|alternative| alternative.loops.clone())
                         .collect::<Vec<_>>()
                 ));
                 return;
             }
-            if occurrences.len() == 1 && occurrences[0].guards == source.guards {
+            if occurrences.len() == 1
+                && occurrences[0].alternatives.len() == 1
+                && occurrences[0].alternatives[0].guards == source.guards
+            {
                 continue;
             }
-            match self.rendered_branch_domains_cover_source(block_addr, &occurrences) {
+            match self.rendered_branch_occurrences_cover_source(block_addr, &occurrences) {
                 Ok(true) => {}
                 Ok(false) => {
                     self.safety_reason = Some(format!(
@@ -2034,7 +2152,13 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                         source.guards,
                         occurrences
                             .iter()
-                            .map(|occurrence| occurrence.guards.clone())
+                            .map(|occurrence| {
+                                occurrence
+                                    .alternatives
+                                    .iter()
+                                    .map(|alternative| alternative.guards.clone())
+                                    .collect::<Vec<_>>()
+                            })
                             .collect::<Vec<_>>()
                     ));
                     return;
@@ -2080,26 +2204,49 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         })
     }
 
-    fn rendered_branch_domains_cover_source(
+    fn rendered_branch_occurrences_cover_source(
         &mut self,
         block_addr: u64,
-        occurrences: &[RenderedBlockDomain],
+        occurrences: &[RenderedBlockOccurrence],
     ) -> Result<bool, String> {
         let facts = self
             .fold_ctx
             .control_facts()
             .ok_or_else(|| "missing canonical control facts".to_string())?;
+        // A predicate in a completed inner loop is evaluated once per dynamic
+        // iteration, not once per static CFG node. Project those predicates out
+        // before comparing path coverage at a block outside that loop. Loop
+        // membership still proves execution multiplicity separately.
+        let varying_predicates = facts
+            .branch_predicates
+            .values()
+            .filter(|predicate| {
+                facts.loops.values().any(|loop_fact| {
+                    loop_fact.body.contains(&predicate.block_addr)
+                        && !loop_fact.body.contains(&block_addr)
+                })
+            })
+            .map(|predicate| predicate.id)
+            .collect::<BTreeSet<_>>();
         let mut bdd = ControlBdd::new(self.safety_budget_remaining);
         let mut rendered_formula = BDD_FALSE;
         for occurrence in occurrences {
-            let mut occurrence_formula = BDD_TRUE;
-            for guard in &occurrence.guards {
-                let ControlGuard::Branch { predicate, truth } = guard else {
-                    return Err("aggregate proof currently requires branch-only guards".to_string());
-                };
-                let literal = bdd.variable(*predicate, *truth)?;
-                occurrence_formula = bdd.and(occurrence_formula, literal)?;
+            let mut occurrence_formula = BDD_FALSE;
+            for alternative in &occurrence.alternatives {
+                let mut alternative_formula = BDD_TRUE;
+                for guard in &alternative.guards {
+                    let ControlGuard::Branch { predicate, truth } = guard else {
+                        return Err(
+                            "aggregate proof currently requires branch-only guards".to_string()
+                        );
+                    };
+                    let literal = bdd.variable(*predicate, *truth)?;
+                    alternative_formula = bdd.and(alternative_formula, literal)?;
+                }
+                occurrence_formula = bdd.or(occurrence_formula, alternative_formula)?;
             }
+            occurrence_formula =
+                bdd.exists(occurrence_formula, &varying_predicates, &mut HashMap::new())?;
             if bdd.and(rendered_formula, occurrence_formula)? != BDD_FALSE {
                 return Ok(false);
             }
@@ -2148,7 +2295,11 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 }
             }
         }
-        let source_formula = reach.get(&block_addr).copied().unwrap_or(BDD_FALSE);
+        let source_formula = bdd.exists(
+            reach.get(&block_addr).copied().unwrap_or(BDD_FALSE),
+            &varying_predicates,
+            &mut HashMap::new(),
+        )?;
         let created_nodes = bdd.created_nodes();
         if !self.consume_safety_budget(created_nodes) {
             return Err("control coverage exhausted structuring safety budget".to_string());
@@ -5016,7 +5167,7 @@ mod tests {
     use crate::region::Region;
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, Varnode};
     use r2ssa::{BlockTerminator, PhiNode, PredicateId, SSAFunction, SSAOp, SSAVar, SsaArtifact};
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
 
     #[test]
     fn control_bdd_proves_disjoint_duplicated_path_coverage() {
@@ -5029,6 +5180,24 @@ mod tests {
             BDD_FALSE
         );
         assert_eq!(bdd.or(positive, negative).expect("literal union"), BDD_TRUE);
+    }
+
+    #[test]
+    fn control_bdd_projects_repeated_loop_predicates() {
+        let mut bdd = ControlBdd::new(64);
+        let repeated = PredicateId(0);
+        let stable = PredicateId(1);
+        let repeated_false = bdd.variable(repeated, false).expect("repeated literal");
+        let stable_true = bdd.variable(stable, true).expect("stable literal");
+        let path = bdd
+            .and(repeated_false, stable_true)
+            .expect("path conjunction");
+
+        assert_eq!(
+            bdd.exists(path, &BTreeSet::from([repeated]), &mut HashMap::new())
+                .expect("existential projection"),
+            stable_true
+        );
     }
 
     fn v(name: &str) -> CExpr {
