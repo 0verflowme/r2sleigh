@@ -7965,7 +7965,7 @@ fn backward_memory_term_slot_field(
         r2sym::BackwardMemoryRegion::Argument { index } => *index,
         r2sym::BackwardMemoryRegion::Region(_) => return None,
     };
-    if !term.exact_offset && term.offset_lo != term.offset_hi {
+    if !term.has_exact_address() {
         return None;
     }
     if term.offset_lo < 0 || term.offset_hi < 0 || term.offset_lo != term.offset_hi {
@@ -13538,6 +13538,7 @@ mod tests {
             offset_hi: offset,
             size,
             exact_offset: true,
+            address_terms: Vec::new(),
             evidence: r2sym::SemanticEvidence::exact(),
             binding: None,
             expr: format!("*(arg0 + {offset})"),

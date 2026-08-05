@@ -68,6 +68,8 @@ pub struct MemorySummaryInfo {
     pub offset_hi: i64,
     pub size: u32,
     pub exact_offset: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub address_terms: Vec<r2ssa::AffineAddressTerm>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binding: Option<String>,
     pub expr: String,
@@ -586,6 +588,7 @@ fn semantic_memory_summaries(native: Option<&crate::NativeArtifactBody>) -> Vec<
                     offset_hi: term.offset_hi,
                     size: term.size,
                     exact_offset: term.exact_offset,
+                    address_terms: term.address_terms.clone(),
                     binding: term.binding.clone(),
                     expr: term.expr.clone(),
                     value_expr: term.value_expr.clone(),

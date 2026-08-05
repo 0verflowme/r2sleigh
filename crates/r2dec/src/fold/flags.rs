@@ -452,7 +452,7 @@ impl<'a> FoldingContext<'a> {
             (
                 evidence_rank,
                 term.exact_value,
-                term.exact_offset,
+                term.has_exact_address(),
                 -(term.offset_hi - term.offset_lo),
                 -term.offset_lo.abs(),
             )

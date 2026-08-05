@@ -2396,6 +2396,7 @@ mod tests {
                 offset_hi: 0,
                 size: 1,
                 exact_offset: true,
+                address_terms: Vec::new(),
                 evidence: crate::SemanticEvidence::exact(),
                 binding: None,
                 expr: "*arg0".to_string(),

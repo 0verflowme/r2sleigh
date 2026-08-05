@@ -10745,6 +10745,7 @@ mod tests {
             offset_hi: offset,
             size,
             exact_offset: true,
+            address_terms: Vec::new(),
             evidence,
             binding: None,
             expr: if offset == 0 {

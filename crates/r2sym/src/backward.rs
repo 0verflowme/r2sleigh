@@ -79,10 +79,17 @@ impl BackwardConditionSummary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackwardMemoryCondition {
     pub region: BackwardMemoryRegion,
+    /// Constant component or bounded concrete-offset range.
     pub offset_lo: i64,
     pub offset_hi: i64,
     pub size: u32,
+    /// True only when the address is one concrete region-relative offset.
     pub exact_offset: bool,
+    /// Non-empty terms certify an exact affine address whose constant
+    /// displacement is `offset_lo == offset_hi`; it is exact but not directly
+    /// seedable without values for the referenced SSA terms.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub address_terms: Vec<r2ssa::AffineAddressTerm>,
     #[serde(default, skip_serializing_if = "SemanticEvidence::is_default_exact")]
     pub evidence: SemanticEvidence,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -95,8 +102,18 @@ pub struct BackwardMemoryCondition {
 }
 
 impl BackwardMemoryCondition {
+    pub fn has_exact_address(&self) -> bool {
+        self.offset_lo == self.offset_hi && (self.exact_offset || !self.address_terms.is_empty())
+    }
+
+    pub fn concrete_offset_range(&self) -> Option<(i64, i64)> {
+        self.address_terms
+            .is_empty()
+            .then_some((self.offset_lo, self.offset_hi))
+    }
+
     pub fn evidence(&self) -> SemanticEvidence {
-        if self.evidence.is_default_exact() && !self.exact_offset {
+        if self.evidence.is_default_exact() && !self.has_exact_address() {
             inferred_memory_term_evidence(
                 &self.region,
                 self.offset_lo,
@@ -210,8 +227,26 @@ fn backward_memory_term_expr(
     region: &BackwardMemoryRegion,
     offset_lo: i64,
     offset_hi: i64,
+    address_terms: &[r2ssa::AffineAddressTerm],
     fallback: &str,
 ) -> String {
+    if !address_terms.is_empty() && offset_lo == offset_hi {
+        let base = match region {
+            BackwardMemoryRegion::Argument { index } => format!("arg{index}"),
+            BackwardMemoryRegion::Region(region) => region.name.clone(),
+        };
+        let terms = address_terms
+            .iter()
+            .map(|term| format!("{}*v{}", term.coefficient, term.value.0))
+            .collect::<Vec<_>>();
+        let mut components = Vec::with_capacity(terms.len() + 2);
+        components.push(base);
+        components.extend(terms);
+        if offset_lo != 0 {
+            components.push(offset_lo.to_string());
+        }
+        return format!("*({})", components.join(" + "));
+    }
     if offset_lo == offset_hi {
         format_backward_memory_location(region, offset_lo)
     } else {
@@ -894,7 +929,8 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
             ),
             size * 8,
         );
-        let recorded = self.record_memory_term(structural_locations, size, &value);
+        let recorded = self.record_memory_term(structural_locations, size, &value)
+            || self.record_prepared_memory_term(&use_fact.location, &value);
         if !recorded || use_fact.version.version != 0 {
             self.used_unsummarized_memory = true;
             self.memory_residual_fallbacks += 1;
@@ -948,7 +984,7 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
             let offset_hi = offsets.iter().copied().max().unwrap_or(0);
             let exact_offset = offset_lo == offset_hi;
             let value_expr = value.to_string();
-            let expr = backward_memory_term_expr(&region, offset_lo, offset_hi, &value_expr);
+            let expr = backward_memory_term_expr(&region, offset_lo, offset_hi, &[], &value_expr);
             let evidence =
                 inferred_memory_term_evidence(&region, offset_lo, offset_hi, exact_offset);
             self.memory_terms.push(BackwardMemoryCondition {
@@ -957,6 +993,7 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
                 offset_hi,
                 size,
                 exact_offset,
+                address_terms: Vec::new(),
                 evidence,
                 binding: None,
                 expr,
@@ -964,6 +1001,47 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
                 exact_value: value.is_concrete(),
             });
         }
+        true
+    }
+
+    fn record_prepared_memory_term(
+        &mut self,
+        location: &r2ssa::MemoryLocation,
+        value: &SymValue<'ctx>,
+    ) -> bool {
+        let Some(r2ssa::ObjectKind::Parameter { index }) = self
+            .func
+            .objects()
+            .object(location.object)
+            .map(|object| &object.kind)
+        else {
+            return false;
+        };
+        let (offset, exact_offset, address_terms) = match &location.address {
+            r2ssa::RelativeMemoryAddress::Exact(offset) => (*offset, true, Vec::new()),
+            r2ssa::RelativeMemoryAddress::Affine { terms, offset } if !terms.is_empty() => {
+                (*offset, false, terms.clone())
+            }
+            r2ssa::RelativeMemoryAddress::Affine { .. } | r2ssa::RelativeMemoryAddress::Unknown => {
+                return false;
+            }
+        };
+        let region = BackwardMemoryRegion::Argument { index: *index };
+        let value_expr = value.to_string();
+        let expr = backward_memory_term_expr(&region, offset, offset, &address_terms, &value_expr);
+        self.memory_terms.push(BackwardMemoryCondition {
+            region,
+            offset_lo: offset,
+            offset_hi: offset,
+            size: location.size,
+            exact_offset,
+            address_terms,
+            evidence: SemanticEvidence::exact(),
+            binding: None,
+            expr,
+            value_expr: Some(value_expr),
+            exact_value: value.is_concrete(),
+        });
         true
     }
 
@@ -1103,7 +1181,6 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
 
     fn enumerate_bounded_concrete_values(&mut self, value: &SymValue<'ctx>) -> Option<Vec<u64>> {
         if self.state.constraints().is_empty() && self.assumption_constraints.is_empty() {
-            self.memory_residual_fallbacks += 1;
             return None;
         }
         let ctx = self.state.context();
@@ -1124,16 +1201,12 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
                     let concrete = model.eval(&bv, true)?.as_u64()?;
                     values.insert(concrete);
                     if values.len() > DEFAULT_MAX_NORMALIZED_OFFSETS {
-                        self.memory_residual_fallbacks += 1;
                         return None;
                     }
                     solver.assert(bv.eq(BV::from_u64(concrete, value.bits())).not());
                 }
                 Z3SatResult::Unsat => break,
-                Z3SatResult::Unknown => {
-                    self.memory_residual_fallbacks += 1;
-                    return None;
-                }
+                Z3SatResult::Unknown => return None,
             }
         }
 
@@ -1331,6 +1404,7 @@ where
                     offset_hi: offset,
                     size,
                     exact_offset: true,
+                    address_terms: Vec::new(),
                     evidence: if matches!(
                         summary.completion,
                         crate::sim::DerivedSummaryCompletion::Exact
@@ -1354,6 +1428,7 @@ where
             offset_hi: offset,
             size,
             exact_offset: true,
+            address_terms: Vec::new(),
             evidence: if matches!(
                 summary.completion,
                 crate::sim::DerivedSummaryCompletion::Exact

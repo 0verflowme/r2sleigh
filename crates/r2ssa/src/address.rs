@@ -6,10 +6,12 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
+use serde::{Deserialize, Serialize};
+
 use crate::data_ref::parse_const_value;
 use crate::{SSAFunction, SSAOp, SSAVar, SsaGraph, StackAddressRoot, ValueId};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct AffineAddressTerm {
     pub value: ValueId,
     pub coefficient: i64,

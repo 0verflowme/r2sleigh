@@ -1738,6 +1738,7 @@ mod tests {
                 offset_hi: tag as i64,
                 size: 8,
                 exact_offset: true,
+                address_terms: Vec::new(),
                 evidence: SemanticEvidence::exact(),
                 binding: Some(format!("arg0_{tag}")),
                 expr: format!("*(arg0 + 0x{tag:x})"),

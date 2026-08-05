@@ -248,6 +248,7 @@ fn append_large_cfg_memory_transfer_terms(
             offset_hi: 0,
             size: transfer.size,
             exact_offset: false,
+            address_terms: Vec::new(),
             evidence: SemanticEvidence::likely(SemanticEvidenceReason::SummaryBudget)
                 .with_coverage(SemanticEvidenceCoverage::Bounded)
                 .with_provenance(SemanticEvidenceProvenance::Stable)
@@ -405,6 +406,7 @@ fn materialize_joined_large_cfg_memory_term(
         offset_hi: term.offset_hi,
         size: term.key.size,
         exact_offset: term.exact_offset,
+        address_terms: Vec::new(),
         evidence: joined_large_cfg_memory_term_evidence(&term),
         binding: Some(summary_effect_binding(term.key.kind, &term.key.region)),
         expr: summary_effect_range_expr(
@@ -671,6 +673,7 @@ fn derive_summary_memory_terms_by_anchor<'ctx>(
                     offset_hi: write.offset,
                     size: write.size,
                     exact_offset: matches!(summary.completion, DerivedSummaryCompletion::Exact),
+                    address_terms: Vec::new(),
                     evidence,
                     binding: None,
                     expr: summary_memory_location_expr(write.arg_index, write.offset),
@@ -1398,6 +1401,118 @@ mod tests {
         assert_eq!(memory_terms[0].offset_lo, 4);
         assert_eq!(memory_terms[0].offset_hi, 4);
         assert!(memory_terms[0].exact_offset);
+    }
+
+    #[test]
+    fn disjoint_affine_parameter_store_preserves_exact_branch_input() {
+        let mut arch = ArchSpec::new("aarch64");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("x0", 0x00, 8));
+        arch.add_register(RegisterDef::new("w1", 0x08, 4));
+        arch.add_register(RegisterDef::new("sp", 0x10, 8));
+
+        let mut branch = r2il::R2ILBlock::new(0x1000, 4);
+        branch.push(r2il::R2ILOp::IntSub {
+            dst: Varnode::unique(0x10, 8),
+            a: Varnode::register(0x10, 8),
+            b: Varnode::constant(8, 8),
+        });
+        branch.push(r2il::R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x10, 8),
+            val: Varnode::register(0x00, 8),
+        });
+        branch.push(r2il::R2ILOp::Load {
+            dst: Varnode::unique(0x20, 8),
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x10, 8),
+        });
+        branch.push(r2il::R2ILOp::IntSExt {
+            dst: Varnode::unique(0x30, 8),
+            src: Varnode::register(0x08, 4),
+        });
+        branch.push(r2il::R2ILOp::IntMult {
+            dst: Varnode::unique(0x40, 8),
+            a: Varnode::unique(0x30, 8),
+            b: Varnode::constant(40, 8),
+        });
+        branch.push(r2il::R2ILOp::IntAdd {
+            dst: Varnode::unique(0x50, 8),
+            a: Varnode::unique(0x20, 8),
+            b: Varnode::unique(0x40, 8),
+        });
+        branch.push(r2il::R2ILOp::IntAdd {
+            dst: Varnode::unique(0x60, 8),
+            a: Varnode::unique(0x50, 8),
+            b: Varnode::constant(16, 8),
+        });
+        branch.push(r2il::R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x60, 8),
+            val: Varnode::constant(0, 4),
+        });
+        branch.push(r2il::R2ILOp::IntAdd {
+            dst: Varnode::unique(0x70, 8),
+            a: Varnode::unique(0x50, 8),
+            b: Varnode::constant(4, 8),
+        });
+        branch.push(r2il::R2ILOp::Load {
+            dst: Varnode::unique(0x80, 2),
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x70, 8),
+        });
+        branch.push(r2il::R2ILOp::IntEqual {
+            dst: Varnode::unique(0x90, 1),
+            a: Varnode::unique(0x80, 2),
+            b: Varnode::constant(0x4241, 2),
+        });
+        branch.push(r2il::R2ILOp::CBranch {
+            target: Varnode::constant(0x1010, 8),
+            cond: Varnode::unique(0x90, 1),
+        });
+        let mut false_exit = r2il::R2ILBlock::new(0x1004, 4);
+        false_exit.push(r2il::R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let mut true_exit = r2il::R2ILBlock::new(0x1010, 4);
+        true_exit.push(r2il::R2ILOp::Return {
+            target: Varnode::constant(1, 8),
+        });
+        let artifact = SsaArtifact::for_symbolic(&[branch, false_exit, true_exit], Some(&arch))
+            .expect("affine memory branch fixture should build SSA");
+        let ctx = Context::thread_local();
+
+        let (observations, diagnostics) = collect_branch_observations_for_branch_blocks(
+            &ctx,
+            &artifact,
+            &arch,
+            &[(0x1000, 0x1010, 0x1004)],
+            |_| {},
+        );
+
+        assert_eq!(observations.len(), 1);
+        assert_eq!(diagnostics.branches_unknown, 0);
+        let compiled = observations[0]
+            .true_compiled
+            .as_ref()
+            .expect("compiled affine branch");
+        assert_eq!(
+            compiled.precision,
+            BackwardConditionPrecision::Exact,
+            "{compiled:#?}"
+        );
+        assert_eq!(compiled.backward_memory_residual_fallbacks, 0);
+        assert_eq!(compiled.memory_terms.len(), 1);
+        let term = &compiled.memory_terms[0];
+        assert!(matches!(
+            term.region,
+            crate::BackwardMemoryRegion::Argument { index: 0 }
+        ));
+        assert_eq!((term.offset_lo, term.offset_hi), (4, 4));
+        assert!(!term.exact_offset);
+        assert!(term.has_exact_address());
+        assert_eq!(term.address_terms.len(), 1);
+        assert_eq!(term.address_terms[0].coefficient, 40);
     }
 
     #[test]

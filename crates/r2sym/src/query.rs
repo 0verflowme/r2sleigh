@@ -1174,9 +1174,9 @@ fn constrain_region_backed_memory_term<'ctx>(
     if !term.exact_value {
         return false;
     }
-    let (base_addr, offset_values) = match &term.region {
-        crate::backward::BackwardMemoryRegion::Region(region)
-            if term.offset_hi >= term.offset_lo =>
+    let (base_addr, offset_values) = match (&term.region, term.concrete_offset_range()) {
+        (crate::backward::BackwardMemoryRegion::Region(region), Some((offset_lo, offset_hi)))
+            if offset_hi >= offset_lo =>
         {
             let Some(def) = narrowed.memory.region_def(region.id) else {
                 return false;
@@ -1184,14 +1184,14 @@ fn constrain_region_backed_memory_term<'ctx>(
             let Some(base_addr) = def.base_addr else {
                 return false;
             };
-            let offset_values = if term.exact_offset || term.offset_lo == term.offset_hi {
-                vec![term.offset_lo]
+            let offset_values = if term.exact_offset || offset_lo == offset_hi {
+                vec![offset_lo]
             } else {
-                let span = term.offset_hi - term.offset_lo;
+                let span = offset_hi - offset_lo;
                 if span > 8 {
                     return false;
                 }
-                (term.offset_lo..=term.offset_hi).collect::<Vec<_>>()
+                (offset_lo..=offset_hi).collect::<Vec<_>>()
             };
             (base_addr, offset_values)
         }
@@ -2318,7 +2318,7 @@ mod tests {
     use r2il::{R2ILBlock, R2ILOp, SpaceId, Varnode};
     use r2ssa::{
         AnalysisAssumption, AssumptionProvenance, AssumptionScope, AssumptionSet,
-        AssumptionSubject, AssumptionValue, SsaArtifact,
+        AssumptionSubject, AssumptionValue, SsaArtifact, ValueId,
     };
     use z3::Context;
     use z3::ast::BV;
@@ -2992,6 +2992,7 @@ mod tests {
             offset_hi: 0,
             size: 1,
             exact_offset: true,
+            address_terms: Vec::new(),
             evidence: SemanticEvidence::exact(),
             binding: Some("sym_mem".to_string()),
             expr: "0x2a".to_string(),
@@ -3004,6 +3005,7 @@ mod tests {
             offset_hi: 0,
             size: 1,
             exact_offset: true,
+            address_terms: Vec::new(),
             evidence: SemanticEvidence::exact(),
             binding: Some("sym_mem".to_string()),
             expr: "0x2b".to_string(),
@@ -3160,6 +3162,7 @@ mod tests {
             offset_hi: 0,
             size: 1,
             exact_offset: true,
+            address_terms: Vec::new(),
             evidence: SemanticEvidence::exact(),
             binding: None,
             expr: "*(ram:0x2000 + 0)".to_string(),
@@ -3176,6 +3179,7 @@ mod tests {
             offset_hi: 0,
             size: 1,
             exact_offset: true,
+            address_terms: Vec::new(),
             evidence: SemanticEvidence::exact(),
             binding: None,
             expr: "*(ram:0x2000 + 0)".to_string(),
@@ -3305,6 +3309,47 @@ mod tests {
     }
 
     #[test]
+    fn affine_region_memory_term_refuses_concrete_seed_without_index_value() {
+        let ctx = Context::thread_local();
+        let mut state = SymState::new(&ctx, 0x1000);
+        let symbolic_byte = state.new_symbolic_input("global_byte", 8);
+        let global_region = state.define_memory_region(
+            crate::MemoryRegionKind::Global,
+            "ram:0x2000",
+            Some(0x2000),
+            Some(1),
+        );
+        state.mem_write(&crate::SymValue::concrete(0x2000, 64), &symbolic_byte, 1);
+        let original_constraints = state.num_constraints();
+        let term = BackwardMemoryCondition {
+            region: BackwardMemoryRegion::Region(crate::backward::BackwardRegionRef {
+                id: global_region,
+                kind: crate::MemoryRegionKind::Global,
+                name: "ram:0x2000".to_string(),
+            }),
+            offset_lo: 4,
+            offset_hi: 4,
+            size: 1,
+            exact_offset: false,
+            address_terms: vec![r2ssa::AffineAddressTerm {
+                value: ValueId(7),
+                coefficient: 40,
+            }],
+            evidence: SemanticEvidence::exact(),
+            binding: None,
+            expr: "*(ram:0x2000 + 40*v7 + 4)".to_string(),
+            value_expr: Some("0x2a".to_string()),
+            exact_value: true,
+        };
+
+        assert!(term.has_exact_address());
+        assert!(!super::constrain_region_backed_memory_term(
+            &mut state, &term, 0x2a
+        ));
+        assert_eq!(state.num_constraints(), original_constraints);
+    }
+
+    #[test]
     fn region_memory_bag_without_target_local_compiled_memory_does_not_seed_narrowed_state() {
         let blocks = make_residual_precondition_blocks();
         let func = SsaArtifact::for_symbolic(&blocks, None).expect("ssa");
@@ -3348,6 +3393,7 @@ mod tests {
                             offset_hi: 0,
                             size: 1,
                             exact_offset: true,
+                            address_terms: Vec::new(),
                             evidence: SemanticEvidence::exact(),
                             binding: Some("sym_mem".to_string()),
                             expr: "0x2a".to_string(),
@@ -3401,6 +3447,7 @@ mod tests {
             offset_hi: 0,
             size: 1,
             exact_offset: true,
+            address_terms: Vec::new(),
             evidence: SemanticEvidence::exact(),
             binding: Some("sym_mem".to_string()),
             expr: "0x2a".to_string(),
@@ -3536,6 +3583,7 @@ mod tests {
                             offset_hi: 0,
                             size: 1,
                             exact_offset: true,
+                            address_terms: Vec::new(),
                             evidence: SemanticEvidence::exact(),
                             binding: Some("reg:56_0".to_string()),
                             expr: "0x1".to_string(),
@@ -3662,6 +3710,7 @@ mod tests {
                                     offset_hi: 0,
                                     size: 1,
                                     exact_offset: true,
+                                    address_terms: Vec::new(),
                                     evidence: exact.clone(),
                                     binding: Some("sym_mem".to_string()),
                                     expr: "0x2a".to_string(),
@@ -3697,6 +3746,7 @@ mod tests {
                                     offset_hi: 0,
                                     size: 1,
                                     exact_offset: true,
+                                    address_terms: Vec::new(),
                                     evidence: likely.clone(),
                                     binding: Some("sym_mem".to_string()),
                                     expr: "0x2b".to_string(),
@@ -3801,6 +3851,7 @@ mod tests {
                                     offset_hi: 0,
                                     size: 1,
                                     exact_offset: true,
+                                    address_terms: Vec::new(),
                                     evidence: likely.clone(),
                                     binding: Some("sym_mem".to_string()),
                                     expr: "0x2a".to_string(),
