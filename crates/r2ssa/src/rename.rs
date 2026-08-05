@@ -1231,6 +1231,26 @@ fn rename_op(
                 position: pos_ssa,
             }
         }
+
+        Select {
+            dst,
+            cond,
+            if_true,
+            if_false,
+        } => {
+            let cond_ssa = read_varnode(cond, ctx, reg_names);
+            let true_ssa = read_varnode(if_true, ctx, reg_names);
+            let false_ssa = read_varnode(if_false, ctx, reg_names);
+            let dst_name = varnode_to_name(dst, reg_names);
+            let dst_ssa = ctx.write_var(&dst_name);
+            defined_vars.push(dst_name);
+            SSAOp::Select {
+                dst: dst_ssa,
+                cond: cond_ssa,
+                if_true: true_ssa,
+                if_false: false_ssa,
+            }
+        }
     }
 }
 

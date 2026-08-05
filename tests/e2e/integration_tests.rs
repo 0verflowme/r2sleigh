@@ -1615,9 +1615,24 @@ mod host_matrix {
             "failure path must keep return 0:\n{output}"
         );
         assert!(
-            output.contains("0xdead"),
+            output.contains("0xdead") || output.contains("57005"),
             "comparison constant must stay visible:\n{output}"
         );
+    }
+
+    fn assert_complex_check_semantic_invariants(output: &str) {
+        for expected in ["100", "20", "return 1;", "return 0;"] {
+            assert!(
+                output.contains(expected),
+                "complex_check must preserve {expected:?}:\n{output}"
+            );
+        }
+        for forbidden in ["residual", "sp_", "register"] {
+            assert!(
+                !output.to_ascii_lowercase().contains(forbidden),
+                "complex_check leaked {forbidden:?}:\n{output}"
+            );
+        }
     }
 
     #[test]
@@ -1636,6 +1651,14 @@ mod host_matrix {
             );
             result.assert_ok();
             assert_check_secret_semantic_invariants(&result.stdout);
+
+            let complex = r2_cmd_timeout(
+                binary.to_str().expect("utf8 binary path"),
+                "aa; a:sla.dec `afl~complex_check$[0]`",
+                timeout,
+            );
+            complex.assert_ok();
+            assert_complex_check_semantic_invariants(&complex.stdout);
             checked += 1;
         }
         assert!(

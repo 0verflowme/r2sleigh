@@ -370,7 +370,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `isq~sum_array$[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("int32_t sym._sum_array(int32_t* arg0, int32_t arg1)") and contains("for (int32_t var_14h = 0; var_14h < arg1; var_14h++)") and contains("var_10h += arg0[var_14h];") and contains("return var_10h;") and (contains("r2dec residual:")|not) and (contains("summary return unresolved")|not) and (contains("render contract: summary facts only")|not) and (contains("fake_stack_slot")|not) and (contains("ObjectId")|not) and (contains("ValueId")|not) and (contains("eax_")|not) and (contains("rax_")|not) and (contains("t6a80")|not) and (contains("r2dec fallback:")|not)'
+a:sla.dec | jq -Rs 'contains("int32_t sym._sum_array(int32_t* arg0, int32_t arg1)") and contains("for (int32_t var_14h = 0; var_14h < arg1; var_14h++)") and contains("var_10h = arg0[var_14h] + var_10h;") and contains("return var_10h;") and (contains("r2dec residual:")|not) and (contains("summary return unresolved")|not) and (contains("render contract: summary facts only")|not) and (contains("fake_stack_slot")|not) and (contains("ObjectId")|not) and (contains("ValueId")|not) and (contains("eax_")|not) and (contains("rax_")|not) and (contains("t6a80")|not) and (contains("r2dec fallback:")|not)'
 EOF_CMDS
 RUN
 

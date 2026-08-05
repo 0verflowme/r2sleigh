@@ -161,6 +161,7 @@ impl SignatureCertificate {
                 matches!(
                     source,
                     SignatureCertificateSource::LocalInference
+                        | SignatureCertificateSource::CalleeSignature
                         | SignatureCertificateSource::RecoveredVariable
                         | SignatureCertificateSource::SlotTypeOverride
                         | SignatureCertificateSource::SemanticProjection
@@ -223,6 +224,7 @@ fn signature_param_type_uncertified(ty: Option<&CTypeLike>, allow_void_pointer: 
 pub enum SignatureCertificateSource {
     ExternalContext,
     LocalInference,
+    CalleeSignature,
     TypeAssumption,
     RecoveredVariable,
     SlotTypeOverride,
@@ -237,6 +239,7 @@ impl SignatureCertificateSource {
         match self {
             Self::ExternalContext => "external_context",
             Self::LocalInference => "local_inference",
+            Self::CalleeSignature => "callee_signature",
             Self::TypeAssumption => "type_assumption",
             Self::RecoveredVariable => "recovered_variable",
             Self::SlotTypeOverride => "slot_type_override",

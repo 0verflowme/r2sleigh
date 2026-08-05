@@ -35,6 +35,7 @@ use crate::prepare::recover_vars_arch_profile;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WritebackSource {
     LocalInferred,
+    CalleeSignature,
     SignatureRegistry,
     ExistingState,
     ExternalTypeDb,
@@ -45,6 +46,7 @@ impl WritebackSource {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::LocalInferred => "local_inferred",
+            Self::CalleeSignature => "callee_signature",
             Self::SignatureRegistry => "signature_registry",
             Self::ExistingState => "existing_state",
             Self::ExternalTypeDb => "external_type_db",
@@ -56,6 +58,8 @@ impl WritebackSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WritebackEvidence {
     SsaVarRecovery,
+    CertifiedCallArgument,
+    CanonicalStackAccessWidth,
     ExternalSignatureCurrent,
     CanonicalMainSignature,
     SsaFieldOffsetPattern,
@@ -69,6 +73,8 @@ impl WritebackEvidence {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::SsaVarRecovery => "ssa-var-recovery",
+            Self::CertifiedCallArgument => "certified-call-argument",
+            Self::CanonicalStackAccessWidth => "canonical-stack-access-width",
             Self::ExternalSignatureCurrent => "afcfj-current",
             Self::CanonicalMainSignature => "canonical-main-signature",
             Self::SsaFieldOffsetPattern => "ssa-field-offset-pattern",
@@ -2350,6 +2356,7 @@ struct VarTypeCandidateContext<'a> {
     slot_type_overrides: &'a HashMap<usize, String>,
     stack_slots: &'a BTreeMap<StackSlotKey, ExternalStackVarSpec>,
     existing_types: &'a HashMap<String, String>,
+    stack_access_widths: &'a BTreeMap<StackSlotKey, BTreeSet<u32>>,
     ptr_bits: u32,
     is_main_signature: bool,
 }
@@ -3556,6 +3563,7 @@ fn apply_type_hint_assumptions_to_context(
 fn build_type_writeback_analysis_inner(
     mut input: TypeWritebackAnalysisInput<'_>,
     semantic_inputs: Option<TypeWritebackSemanticInputs<'_>>,
+    prep_facts: Option<&r2ssa::DecompilePrepFacts>,
 ) -> TypeWritebackAnalysis {
     if input.parsed_context.stack_slots.is_empty()
         && !input.parsed_context.external_stack_vars.is_empty()
@@ -3617,11 +3625,18 @@ fn build_type_writeback_analysis_inner(
         canonicalize_register_params
             .extend_from_slice(&inferred_register_params[canonicalize_register_params.len()..]);
     }
+    canonicalize_external_stack_slots_with_prep_facts(
+        &mut input.parsed_context.stack_slots,
+        input.ssa_blocks,
+        prep_facts,
+        input.ptr_bits,
+    );
     canonicalize_param_home_stack_slots(
         merged_signature.as_ref(),
         &canonicalize_register_params,
         &mut input.parsed_context.stack_slots,
         input.ssa_blocks,
+        prep_facts,
         input.ptr_bits,
     );
     hide_unproven_stack_pointer_frame_slots(&mut input.parsed_context.stack_slots);
@@ -3822,6 +3837,7 @@ fn build_type_writeback_analysis_inner(
     );
     let existing_types =
         parse_existing_var_types_from_specs(&input.parsed_context.stack_slots, input.ptr_bits);
+    let stack_access_widths = canonical_stack_access_widths(input.ssa_blocks, prep_facts);
     let is_main_signature = merged_signature
         .as_ref()
         .is_some_and(is_canonical_main_signature_spec);
@@ -3831,11 +3847,18 @@ fn build_type_writeback_analysis_inner(
         slot_type_overrides: &local_structs.slot_type_overrides,
         stack_slots: &input.parsed_context.stack_slots,
         existing_types: &existing_types,
+        stack_access_widths: &stack_access_widths,
         ptr_bits: input.ptr_bits,
         is_main_signature,
     };
     let var_type_candidates =
         build_var_type_candidates(input.recovered_vars, &var_type_ctx, &mut diagnostics);
+    apply_canonical_stack_width_types(
+        &mut input.parsed_context.stack_slots,
+        input.recovered_vars,
+        &var_type_candidates,
+        input.ptr_bits,
+    );
     let var_rename_candidates = build_var_rename_candidates(
         input.recovered_vars,
         &current_context_maps.param_names,
@@ -3938,14 +3961,29 @@ fn build_type_writeback_analysis_inner(
 pub fn build_type_writeback_analysis(
     input: TypeWritebackAnalysisInput<'_>,
 ) -> TypeWritebackAnalysis {
-    build_type_writeback_analysis_inner(input, None)
+    build_type_writeback_analysis_inner(input, None, None)
+}
+
+pub fn build_type_writeback_analysis_with_prep_facts(
+    input: TypeWritebackAnalysisInput<'_>,
+    prep_facts: &r2ssa::DecompilePrepFacts,
+) -> TypeWritebackAnalysis {
+    build_type_writeback_analysis_inner(input, None, Some(prep_facts))
 }
 
 pub fn build_type_writeback_analysis_with_semantics(
     input: TypeWritebackAnalysisInput<'_>,
     semantic_inputs: TypeWritebackSemanticInputs<'_>,
 ) -> TypeWritebackAnalysis {
-    build_type_writeback_analysis_inner(input, Some(semantic_inputs))
+    build_type_writeback_analysis_inner(input, Some(semantic_inputs), None)
+}
+
+pub fn build_type_writeback_analysis_with_semantics_and_prep_facts(
+    input: TypeWritebackAnalysisInput<'_>,
+    semantic_inputs: TypeWritebackSemanticInputs<'_>,
+    prep_facts: &r2ssa::DecompilePrepFacts,
+) -> TypeWritebackAnalysis {
+    build_type_writeback_analysis_inner(input, Some(semantic_inputs), Some(prep_facts))
 }
 
 pub fn augment_function_type_facts_with_summary_evidence(
@@ -6956,11 +6994,142 @@ fn inferred_signature_abi_register_params(
         .collect()
 }
 
+fn stack_slot_key_from_prepared_root(root: r2ssa::StackAddressRoot) -> StackSlotKey {
+    StackSlotKey {
+        base: match root.base {
+            r2ssa::StackAddressBase::FramePointer => ExternalStackBase::FramePointer,
+            r2ssa::StackAddressBase::StackPointer => ExternalStackBase::StackPointer,
+        },
+        offset: root.offset,
+    }
+}
+
+fn canonical_stack_access_widths(
+    ssa_blocks: &[SSABlock],
+    prep_facts: Option<&r2ssa::DecompilePrepFacts>,
+) -> BTreeMap<StackSlotKey, BTreeSet<u32>> {
+    let Some(prep_facts) = prep_facts else {
+        return BTreeMap::new();
+    };
+    let mut widths = BTreeMap::<StackSlotKey, BTreeSet<u32>>::new();
+    for op in ssa_blocks.iter().flat_map(|block| &block.ops) {
+        let (addr, size) = match op {
+            SSAOp::Load { dst, addr, .. } => (addr, dst.size),
+            SSAOp::Store { addr, val, .. } => (addr, val.size),
+            _ => continue,
+        };
+        if size == 0 {
+            continue;
+        }
+        let Some(root) = prep_facts.stack_address_root_of(addr).copied() else {
+            continue;
+        };
+        widths
+            .entry(stack_slot_key_from_prepared_root(root))
+            .or_default()
+            .insert(size);
+    }
+    widths
+}
+
+fn merge_rebased_stack_slot(
+    target: &mut ExternalStackVarSpec,
+    source: ExternalStackVarSpec,
+    canonical_base: ExternalStackBase,
+) {
+    target.base = canonical_base;
+    if target.ty.is_none() {
+        target.ty = source.ty;
+    }
+    if matches!(target.role, ExternalStackSlotRole::Unknown) {
+        target.role = source.role;
+    }
+    if (target.name.is_empty() || is_low_quality_stack_name(&target.name))
+        && !source.name.is_empty()
+    {
+        target.name = source.name;
+    }
+    if target.param_index.is_none() {
+        target.param_index = source.param_index;
+    }
+    if target.param_name.is_none() {
+        target.param_name = source.param_name;
+    }
+    if target.source_reg.is_none() {
+        target.source_reg = source.source_reg;
+    }
+}
+
+fn canonicalize_external_stack_slots_with_prep_facts(
+    stack_slots: &mut BTreeMap<StackSlotKey, ExternalStackVarSpec>,
+    ssa_blocks: &[SSABlock],
+    prep_facts: Option<&r2ssa::DecompilePrepFacts>,
+    ptr_bits: u32,
+) {
+    let Some(prep_facts) = prep_facts else {
+        return;
+    };
+    let data_addresses = ssa_blocks
+        .iter()
+        .flat_map(|block| &block.ops)
+        .filter_map(|op| match op {
+            SSAOp::Load { addr, .. } | SSAOp::Store { addr, .. } => Some(addr.clone()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let mut canonical_candidates = BTreeMap::<StackSlotKey, BTreeSet<StackSlotKey>>::new();
+    for op in ssa_blocks.iter().flat_map(|block| &block.ops) {
+        let (dst, raw_slot) = match op {
+            SSAOp::IntAdd { dst, a, b } if data_addresses.contains(dst) => {
+                (dst, stack_slot_key_from_add_sub(a, b, false, ptr_bits))
+            }
+            SSAOp::IntSub { dst, a, b } if data_addresses.contains(dst) => {
+                (dst, stack_slot_key_from_add_sub(a, b, true, ptr_bits))
+            }
+            _ => continue,
+        };
+        let Some(raw_slot) = raw_slot else {
+            continue;
+        };
+        let Some(root) = prep_facts.stack_address_root_of(dst).copied() else {
+            continue;
+        };
+        let canonical_slot = stack_slot_key_from_prepared_root(root);
+        if canonical_slot != raw_slot {
+            canonical_candidates
+                .entry(raw_slot)
+                .or_default()
+                .insert(canonical_slot);
+        }
+    }
+
+    let rebases = canonical_candidates
+        .into_iter()
+        .filter_map(|(raw, candidates)| {
+            let mut candidates = candidates.into_iter();
+            let canonical = candidates.next()?;
+            candidates.next().is_none().then_some((raw, canonical))
+        })
+        .collect::<Vec<_>>();
+    for (raw, canonical) in rebases {
+        let Some(mut source) = stack_slots.remove(&raw) else {
+            continue;
+        };
+        source.base = canonical.base.clone();
+        if let Some(target) = stack_slots.get_mut(&canonical) {
+            merge_rebased_stack_slot(target, source, canonical.base);
+        } else {
+            stack_slots.insert(canonical, source);
+        }
+    }
+}
+
 fn canonicalize_param_home_stack_slots(
     merged_signature: Option<&FunctionSignatureSpec>,
     register_params: &[crate::context::ExternalRegisterParamSpec],
     stack_slots: &mut BTreeMap<StackSlotKey, ExternalStackVarSpec>,
     ssa_blocks: &[SSABlock],
+    prep_facts: Option<&r2ssa::DecompilePrepFacts>,
     ptr_bits: u32,
 ) {
     if register_params.is_empty() || ssa_blocks.is_empty() {
@@ -6973,17 +7142,35 @@ fn canonicalize_param_home_stack_slots(
         for op in &block.ops {
             match op {
                 SSAOp::IntAdd { dst, a, b } => {
-                    if let Some(slot_key) = stack_slot_key_from_add_sub(a, b, false, ptr_bits) {
+                    let slot_key = prep_facts
+                        .and_then(|facts| facts.stack_address_root_of(dst))
+                        .copied()
+                        .map(stack_slot_key_from_prepared_root)
+                        .or_else(|| stack_slot_key_from_add_sub(a, b, false, ptr_bits));
+                    if let Some(slot_key) = slot_key {
                         slot_addr_by_var.insert(dst.display_name(), slot_key);
                     }
                 }
                 SSAOp::IntSub { dst, a, b } => {
-                    if let Some(slot_key) = stack_slot_key_from_add_sub(a, b, true, ptr_bits) {
+                    let slot_key = prep_facts
+                        .and_then(|facts| facts.stack_address_root_of(dst))
+                        .copied()
+                        .map(stack_slot_key_from_prepared_root)
+                        .or_else(|| stack_slot_key_from_add_sub(a, b, true, ptr_bits));
+                    if let Some(slot_key) = slot_key {
                         slot_addr_by_var.insert(dst.display_name(), slot_key);
                     }
                 }
                 SSAOp::Store { addr, val, .. } => {
-                    let Some(source_slot_key) = slot_addr_by_var.get(&addr.display_name()).cloned()
+                    let Some(source_slot_key) = slot_addr_by_var
+                        .get(&addr.display_name())
+                        .cloned()
+                        .or_else(|| {
+                            prep_facts
+                                .and_then(|facts| facts.stack_address_root_of(addr))
+                                .copied()
+                                .map(stack_slot_key_from_prepared_root)
+                        })
                     else {
                         continue;
                     };
@@ -7048,13 +7235,7 @@ fn canonicalize_param_home_stack_slots(
 }
 
 fn canonical_frame_stack_slot_key(slot: &StackSlotKey) -> StackSlotKey {
-    match slot.base {
-        ExternalStackBase::FramePointer => StackSlotKey {
-            base: slot.base.clone(),
-            offset: slot.offset.saturating_abs(),
-        },
-        _ => slot.clone(),
-    }
+    slot.clone()
 }
 
 fn hide_unproven_stack_pointer_frame_slots(
@@ -7149,7 +7330,7 @@ fn register_family_matches(expected: &str, actual: &str) -> bool {
         return true;
     }
 
-    fn family(name: &str) -> Option<&str> {
+    fn x86_family(name: &str) -> Option<&str> {
         match name {
             "rax" | "eax" | "ax" | "al" | "ah" => Some("ax"),
             "rbx" | "ebx" | "bx" | "bl" | "bh" => Some("bx"),
@@ -7171,7 +7352,39 @@ fn register_family_matches(expected: &str, actual: &str) -> bool {
         }
     }
 
-    family(&expected) == family(&actual)
+    if let (Some(expected), Some(actual)) = (x86_family(&expected), x86_family(&actual)) {
+        return expected == actual;
+    }
+
+    fn numbered_register(name: &str, prefixes: &[char], max_index: u8) -> Option<u8> {
+        let mut chars = name.chars();
+        let prefix = chars.next()?;
+        if !prefixes.contains(&prefix) {
+            return None;
+        }
+        let index = chars.as_str();
+        if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        index.parse::<u8>().ok().filter(|index| *index <= max_index)
+    }
+
+    let expected_gpr = numbered_register(&expected, &['x', 'w'], 30);
+    let actual_gpr = numbered_register(&actual, &['x', 'w'], 30);
+    if let (Some(expected), Some(actual)) = (expected_gpr, actual_gpr) {
+        return expected == actual;
+    }
+
+    let expected_vector = numbered_register(&expected, &['v', 'q', 'd', 's', 'h', 'b'], 31);
+    let actual_vector = numbered_register(&actual, &['v', 'q', 'd', 's', 'h', 'b'], 31);
+    if let (Some(expected), Some(actual)) = (expected_vector, actual_vector) {
+        return expected == actual;
+    }
+
+    matches!(
+        (expected.as_str(), actual.as_str()),
+        ("sp", "wsp") | ("wsp", "sp") | ("xzr", "wzr") | ("wzr", "xzr")
+    )
 }
 
 fn parse_signature_type_preserving_c_typedefs(ty: &str, ptr_bits: u32) -> Option<CTypeLike> {
@@ -7458,17 +7671,10 @@ fn slot_spec_for_recovered_var<'a>(
     var: &RecoveredVariable,
     stack_slots: &'a BTreeMap<StackSlotKey, ExternalStackVarSpec>,
 ) -> Option<&'a ExternalStackVarSpec> {
-    if let Some(slot_key) = stack_slot_key_for_recovered_var(var) {
-        if let Some(slot) = stack_slots.get(&slot_key) {
-            return Some(slot);
-        }
-        if matches!(slot_key.base, ExternalStackBase::FramePointer) {
-            let canonical = StackSlotKey {
-                base: slot_key.base,
-                offset: -slot_key.offset,
-            };
-            return stack_slots.get(&canonical);
-        }
+    if let Some(slot_key) = stack_slot_key_for_recovered_var(var)
+        && let Some(slot) = stack_slots.get(&slot_key)
+    {
+        return Some(slot);
     }
     None
 }
@@ -7736,6 +7942,75 @@ fn build_visible_bindings(
     bindings.into_values().collect()
 }
 
+fn integer_type_bits(ty: &str, ptr_bits: u32) -> Option<u32> {
+    match parse_type_like_spec(ty, ptr_bits)? {
+        CTypeLike::Int { bits, .. } => Some(bits),
+        _ => None,
+    }
+}
+
+fn exact_stack_access_bits(
+    var: &RecoveredVariable,
+    widths: &BTreeMap<StackSlotKey, BTreeSet<u32>>,
+) -> Option<u32> {
+    let slot = stack_slot_key_for_recovered_var(var)?;
+    let widths = widths.get(&slot)?;
+    let mut widths = widths.iter().copied();
+    let bytes = widths.next()?;
+    if widths.next().is_some() {
+        return None;
+    }
+    bytes.checked_mul(8)
+}
+
+fn apply_canonical_stack_width_types(
+    stack_slots: &mut BTreeMap<StackSlotKey, ExternalStackVarSpec>,
+    vars: &[RecoveredVariable],
+    candidates: &[VarTypeCandidate],
+    ptr_bits: u32,
+) {
+    let candidates = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate
+                .evidence
+                .contains(&WritebackEvidence::CanonicalStackAccessWidth)
+        })
+        .map(|candidate| (RecoveredVarKey::for_type_candidate(candidate), candidate))
+        .collect::<BTreeMap<_, _>>();
+    for var in vars {
+        let Some(slot_key) = stack_slot_key_for_recovered_var(var) else {
+            continue;
+        };
+        let Some(slot) = stack_slots.get_mut(&slot_key) else {
+            continue;
+        };
+        let Some(candidate) = candidates.get(&RecoveredVarKey::for_recovered_var(var)) else {
+            continue;
+        };
+        let Some(candidate_ty) = parse_type_like_spec(&candidate.var_type, ptr_bits) else {
+            continue;
+        };
+        let CTypeLike::Int {
+            bits: candidate_bits,
+            ..
+        } = &candidate_ty
+        else {
+            continue;
+        };
+        let Some(CTypeLike::Int {
+            bits: existing_bits,
+            ..
+        }) = slot.ty.as_ref()
+        else {
+            continue;
+        };
+        if existing_bits != candidate_bits {
+            slot.ty = Some(candidate_ty);
+        }
+    }
+}
+
 fn build_var_type_candidates(
     vars: &[RecoveredVariable],
     ctx: &VarTypeCandidateContext<'_>,
@@ -7813,15 +8088,39 @@ fn build_var_type_candidates(
             }
         }
 
+        let exact_access_bits = exact_stack_access_bits(var, ctx.stack_access_widths);
+        if exact_access_bits
+            .is_some_and(|bits| integer_type_bits(&chosen_type, ctx.ptr_bits) == Some(bits))
+        {
+            confidence = confidence.max(96);
+            source = WritebackSource::DataflowRanked;
+            evidence.push(WritebackEvidence::CanonicalStackAccessWidth);
+        }
+
         if let Some(ext) = slot_spec
             && let Some(ext_ty) = ext.ty.as_ref()
             && slot_role_allows_external_local_identity(ext.role)
         {
             let ext_ty_str = render_signature_type(ext_ty, ctx.ptr_bits);
+            let external_conflicts_with_exact_integer_width =
+                exact_access_bits.is_some_and(|bits| {
+                    integer_type_bits(&chosen_type, ctx.ptr_bits) == Some(bits)
+                        && integer_type_bits(&ext_ty_str, ctx.ptr_bits)
+                            .is_some_and(|external_bits| external_bits != bits)
+                });
             let external_should_override = !is_generic_type_string(&ext_ty_str)
+                && !external_conflicts_with_exact_integer_width
                 && (is_generic_type_string(&chosen_type)
                     || (matches!(source, WritebackSource::LocalInferred)
                         && is_low_signal_storage_scalar_type(&chosen_type, ctx.ptr_bits)));
+            if external_conflicts_with_exact_integer_width {
+                diagnostics.conflicts.push(format!(
+                    "var `{}` external stack type `{}` conflicts with canonical {}-bit memory accesses",
+                    var.name,
+                    ext_ty_str,
+                    exact_access_bits.unwrap()
+                ));
+            }
             if external_should_override {
                 chosen_type = ext_ty_str;
                 confidence = 97;
@@ -9692,14 +9991,317 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     #[test]
-    fn canonical_frame_stack_slots_are_idempotent() {
+    fn canonical_frame_stack_slots_preserve_signed_displacement() {
         let raw = StackSlotKey {
             base: ExternalStackBase::FramePointer,
             offset: -16,
         };
         let canonical = canonical_frame_stack_slot_key(&raw);
-        assert_eq!(canonical.offset, 16);
+        assert_eq!(canonical.offset, -16);
         assert_eq!(canonical_frame_stack_slot_key(&canonical), canonical);
+    }
+
+    #[test]
+    fn register_families_require_an_explicit_architecture_identity() {
+        assert!(register_family_matches("rdi", "edi"));
+        assert!(register_family_matches("x0", "w0"));
+        assert!(register_family_matches("v7", "s7"));
+        assert!(!register_family_matches("x0", "w8"));
+        assert!(!register_family_matches("foo", "bar"));
+    }
+
+    #[test]
+    fn prepared_stack_roots_separate_arm64_param_homes_from_return_locals() {
+        let home_addr = SSAVar::new("tmp:home", 1, 8);
+        let return_addr = SSAVar::new("tmp:return", 1, 8);
+        let ssa_blocks = [SSABlock {
+            addr: 0x1000,
+            size: 16,
+            ops: vec![
+                SSAOp::IntAdd {
+                    dst: home_addr.clone(),
+                    a: SSAVar::new("sp", 1, 8),
+                    b: SSAVar::constant(8, 8),
+                },
+                SSAOp::Store {
+                    space: "ram".to_string(),
+                    addr: home_addr.clone(),
+                    val: SSAVar::new("w0", 0, 4),
+                },
+                SSAOp::IntAdd {
+                    dst: return_addr.clone(),
+                    a: SSAVar::new("sp", 1, 8),
+                    b: SSAVar::constant(12, 8),
+                },
+                SSAOp::Store {
+                    space: "ram".to_string(),
+                    addr: return_addr.clone(),
+                    val: SSAVar::new("w8", 0, 4),
+                },
+            ],
+        }];
+        let prep_facts = r2ssa::DecompilePrepFacts {
+            stack_address_roots: [
+                (
+                    home_addr,
+                    r2ssa::StackAddressRoot {
+                        base: r2ssa::StackAddressBase::StackPointer,
+                        offset: -8,
+                    },
+                ),
+                (
+                    return_addr,
+                    r2ssa::StackAddressRoot {
+                        base: r2ssa::StackAddressBase::StackPointer,
+                        offset: -4,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..r2ssa::DecompilePrepFacts::default()
+        };
+        let mut stack_slots = [(8, "var_8h"), (12, "var_ch")]
+            .into_iter()
+            .map(|(offset, name)| {
+                (
+                    StackSlotKey {
+                        base: ExternalStackBase::StackPointer,
+                        offset,
+                    },
+                    ExternalStackVarSpec {
+                        name: name.to_string(),
+                        ty: Some(CTypeLike::Int {
+                            bits: 32,
+                            signedness: Signedness::Signed,
+                        }),
+                        base: ExternalStackBase::StackPointer,
+                        role: ExternalStackSlotRole::Local,
+                        param_index: None,
+                        param_name: None,
+                        source_reg: None,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let signature = test_signature_spec("arg0", 32);
+        let register_params = [ExternalRegisterParamSpec {
+            name: "arg0".to_string(),
+            ty: signature.params[0].ty.clone(),
+            reg: "x0".to_string(),
+        }];
+
+        canonicalize_external_stack_slots_with_prep_facts(
+            &mut stack_slots,
+            &ssa_blocks,
+            Some(&prep_facts),
+            64,
+        );
+        canonicalize_param_home_stack_slots(
+            Some(&signature),
+            &register_params,
+            &mut stack_slots,
+            &ssa_blocks,
+            Some(&prep_facts),
+            64,
+        );
+
+        let home = stack_slots
+            .get(&StackSlotKey {
+                base: ExternalStackBase::StackPointer,
+                offset: -8,
+            })
+            .expect("canonical parameter home");
+        let return_local = stack_slots
+            .get(&StackSlotKey {
+                base: ExternalStackBase::StackPointer,
+                offset: -4,
+            })
+            .expect("canonical return local");
+        assert_eq!(home.role, ExternalStackSlotRole::ParamHome);
+        assert_eq!(home.param_name.as_deref(), Some("arg0"));
+        assert_eq!(return_local.role, ExternalStackSlotRole::Local);
+        assert!(return_local.param_index.is_none());
+        assert!(!stack_slots.keys().any(|slot| slot.offset > 0));
+    }
+
+    #[test]
+    fn canonical_stack_access_width_overrides_generic_host_integer_width() {
+        let addr = SSAVar::new("tmp:sum", 1, 8);
+        let blocks = [SSABlock {
+            addr: 0x1000,
+            size: 4,
+            ops: vec![SSAOp::Store {
+                space: "ram".to_string(),
+                addr: addr.clone(),
+                val: SSAVar::new("w8", 1, 4),
+            }],
+        }];
+        let prep_facts = r2ssa::DecompilePrepFacts {
+            stack_address_roots: [(
+                addr,
+                r2ssa::StackAddressRoot {
+                    base: r2ssa::StackAddressBase::StackPointer,
+                    offset: -16,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..r2ssa::DecompilePrepFacts::default()
+        };
+        let mut parsed_context = ParsedExternalContext::default();
+        parsed_context.stack_slots.insert(
+            StackSlotKey {
+                base: ExternalStackBase::StackPointer,
+                offset: -16,
+            },
+            ExternalStackVarSpec {
+                name: "var_10h".to_string(),
+                ty: Some(CTypeLike::Int {
+                    bits: 64,
+                    signedness: Signedness::Signed,
+                }),
+                base: ExternalStackBase::StackPointer,
+                role: ExternalStackSlotRole::Local,
+                param_index: None,
+                param_name: None,
+                source_reg: None,
+            },
+        );
+        let vars = [RecoveredVariable {
+            name: "var_10h".to_string(),
+            kind: "s".to_string(),
+            delta: -16,
+            var_type: "int32_t".to_string(),
+            isarg: false,
+            reg: None,
+        }];
+
+        let analysis = build_type_writeback_analysis_with_prep_facts(
+            TypeWritebackAnalysisInput {
+                function_name: "sym._sum_array",
+                ptr_bits: 64,
+                inferred_signature: InferredSignature {
+                    function_name: "sym._sum_array".to_string(),
+                    signature: "void sym._sum_array ()".to_string(),
+                    ret_type: "void".to_string(),
+                    params: Vec::new(),
+                    callconv: String::new(),
+                    arch: "aarch64".to_string(),
+                    confidence: 0,
+                    callconv_confidence: 0,
+                },
+                recovered_vars: &vars,
+                ssa_blocks: &blocks,
+                parsed_context,
+                local_structs: LocalStructArtifacts::default(),
+                interproc_summary_set: None,
+                diagnostics: TypeWritebackDiagnostics::default(),
+            },
+            &prep_facts,
+        );
+
+        let candidate = &analysis.plan.var_type_candidates[0];
+        assert_eq!(candidate.var_type, "int32_t");
+        assert_eq!(candidate.source, WritebackSource::DataflowRanked);
+        assert!(
+            candidate
+                .evidence
+                .contains(&WritebackEvidence::CanonicalStackAccessWidth)
+        );
+        let slot = analysis
+            .type_facts
+            .stack_slots
+            .get(&StackSlotKey {
+                base: ExternalStackBase::StackPointer,
+                offset: -16,
+            })
+            .expect("canonical stack slot");
+        assert_eq!(
+            slot.ty,
+            Some(CTypeLike::Int {
+                bits: 32,
+                signedness: Signedness::Signed,
+            })
+        );
+        assert!(analysis.type_facts.visible_bindings.iter().any(|binding| {
+            binding.name == "var_10h"
+                && binding.ty == slot.ty
+                && binding.stack_slot.as_ref()
+                    == Some(&StackSlotKey {
+                        base: ExternalStackBase::StackPointer,
+                        offset: -16,
+                    })
+        }));
+    }
+
+    #[test]
+    fn prepared_direct_stack_base_store_is_a_parameter_home() {
+        let stack_addr = SSAVar::new("sp", 1, 8);
+        let blocks = [SSABlock {
+            addr: 0x1000,
+            size: 4,
+            ops: vec![SSAOp::Store {
+                space: "ram".to_string(),
+                addr: stack_addr.clone(),
+                val: SSAVar::new("w2", 0, 4),
+            }],
+        }];
+        let prep_facts = r2ssa::DecompilePrepFacts {
+            stack_address_roots: [(
+                stack_addr,
+                r2ssa::StackAddressRoot {
+                    base: r2ssa::StackAddressBase::StackPointer,
+                    offset: -16,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..r2ssa::DecompilePrepFacts::default()
+        };
+        let signature = FunctionSignatureSpec {
+            ret_type: Some(CTypeLike::Int {
+                bits: 32,
+                signedness: Signedness::Signed,
+            }),
+            params: (0..3)
+                .map(|index| FunctionParamSpec {
+                    name: format!("arg{index}"),
+                    ty: Some(CTypeLike::Int {
+                        bits: 32,
+                        signedness: Signedness::Signed,
+                    }),
+                })
+                .collect(),
+        };
+        let register_params = (0..3)
+            .map(|index| ExternalRegisterParamSpec {
+                name: format!("arg{index}"),
+                ty: signature.params[index].ty.clone(),
+                reg: format!("x{index}"),
+            })
+            .collect::<Vec<_>>();
+        let mut stack_slots = BTreeMap::new();
+
+        canonicalize_param_home_stack_slots(
+            Some(&signature),
+            &register_params,
+            &mut stack_slots,
+            &blocks,
+            Some(&prep_facts),
+            64,
+        );
+
+        let home = stack_slots
+            .get(&StackSlotKey {
+                base: ExternalStackBase::StackPointer,
+                offset: -16,
+            })
+            .expect("direct stack-base parameter home");
+        assert_eq!(home.role, ExternalStackSlotRole::ParamHome);
+        assert_eq!(home.param_index, Some(2));
+        assert_eq!(home.param_name.as_deref(), Some("arg2"));
+        assert_eq!(home.source_reg.as_deref(), Some("x2"));
     }
 
     fn test_signature_spec(param_name: &str, param_bits: u32) -> FunctionSignatureSpec {
@@ -13165,7 +13767,7 @@ mod tests {
                         .stack_slot
                         .as_ref()
                         .is_some_and(|slot| slot.base == ExternalStackBase::FramePointer
-                            && slot.offset == 0x10)
+                            && slot.offset == -0x10)
                     && binding.name == "count"),
             "expected visible local binding for count, got {:?}",
             analysis.type_facts.visible_bindings
@@ -13604,7 +14206,7 @@ mod tests {
         });
 
         for (offset, expected_name, expected_idx) in
-            [(8, "arr", 0usize), (12, "idx", 1), (16, "v", 2)]
+            [(-8, "arr", 0usize), (-12, "idx", 1), (-16, "v", 2)]
         {
             let slot = analysis
                 .type_facts
@@ -13771,7 +14373,7 @@ mod tests {
         });
 
         for (offset, expected_name, expected_idx) in
-            [(8, "arr", 0usize), (12, "idx", 1), (16, "v", 2)]
+            [(-8, "arr", 0usize), (-12, "idx", 1), (-16, "v", 2)]
         {
             let slot = analysis
                 .type_facts
@@ -13955,7 +14557,7 @@ mod tests {
         });
 
         for (offset, expected_name, expected_idx) in
-            [(8, "arr", 0usize), (12, "idx", 1), (16, "v", 2)]
+            [(-8, "arr", 0usize), (-12, "idx", 1), (-16, "v", 2)]
         {
             let slot = analysis
                 .type_facts

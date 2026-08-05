@@ -1,7 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use r2ssa::cfg::BlockTerminator;
-use r2ssa::{CFGEdge, ObjectKind, SSAOp, SSAVar, SsaArtifact, StackAddressBase};
+use r2ssa::{
+    CFGEdge, CompareKind, InstPayload, ObjectKind, SSAOp, SSAVar, SsaArtifact, StackAddressBase,
+    ValueId,
+};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -69,6 +72,11 @@ pub enum VmValueExpr {
         lhs: Box<VmValueExpr>,
         rhs: Box<VmValueExpr>,
     },
+    Select {
+        cond: Box<VmValueExpr>,
+        if_true: Box<VmValueExpr>,
+        if_false: Box<VmValueExpr>,
+    },
     Expr(String),
 }
 
@@ -115,6 +123,16 @@ impl VmValueExpr {
                 Self::render_binary(op),
                 rhs.render()
             ),
+            Self::Select {
+                cond,
+                if_true,
+                if_false,
+            } => format!(
+                "({} ? {} : {})",
+                cond.render(),
+                if_true.render(),
+                if_false.render()
+            ),
         }
     }
 
@@ -123,6 +141,11 @@ impl VmValueExpr {
             Self::Const(_) | Self::Var(_) => true,
             Self::Unary { arg, .. } => arg.is_exact(),
             Self::Binary { lhs, rhs, .. } => lhs.is_exact() && rhs.is_exact(),
+            Self::Select {
+                cond,
+                if_true,
+                if_false,
+            } => cond.is_exact() && if_true.is_exact() && if_false.is_exact(),
             Self::Expr(_) => false,
         }
     }
@@ -171,6 +194,17 @@ impl VmValueExpr {
                     VmBinaryOp::BoolAnd => u64::from(lhs != 0 && rhs != 0),
                     VmBinaryOp::BoolOr => u64::from(lhs != 0 || rhs != 0),
                 })
+            }
+            Self::Select {
+                cond,
+                if_true,
+                if_false,
+            } => {
+                if cond.evaluate_u64(bindings)? != 0 {
+                    if_true.evaluate_u64(bindings)
+                } else {
+                    if_false.evaluate_u64(bindings)
+                }
             }
             Self::Expr(_) => None,
         }
@@ -449,24 +483,23 @@ impl VmStepSummary {
                     .iter()
                     .any(|transfer| transfer.selector_update.is_some())
         });
-        let handler_call_count = self.handler_calls.values().sum::<usize>();
-        let handler_state_update_count = self
-            .handler_state_updates
+        let distinct_cases = self
+            .case_values_by_target
             .values()
-            .map(Vec::len)
-            .sum::<usize>();
-        let logical_state_output_count = logical_state_name_count(&self.state_outputs);
-        let has_compact_state_machine_evidence = self.dispatch_targets.len() <= 16
-            && logical_state_output_count <= 64
-            && handler_call_count == 0
-            && handler_state_update_count >= self.dispatch_targets.len().min(5);
+            .flatten()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let has_proven_dispatch_partition = self.selector.is_some()
+            && distinct_cases.len() >= self.dispatch_targets.len().saturating_sub(1)
+            && !distinct_cases.is_empty();
         let has_usable_transfer = self.transfers.iter().any(|transfer| !transfer.truncated);
 
         has_dispatch
             && has_redispatch
             && has_handler_transfer_graph
             && has_state_update_evidence
-            && (has_selector_update_evidence || has_compact_state_machine_evidence)
+            && has_proven_dispatch_partition
+            && (has_selector_update_evidence || !self.loop_latches.is_empty())
             && has_usable_transfer
     }
 }
@@ -573,9 +606,14 @@ fn case_values_by_target(
     func: &SsaArtifact,
     dispatch_header: u64,
 ) -> (BTreeMap<u64, Vec<u64>>, Option<u64>) {
-    let Some((cases, default_target)) = func.function().switch_info(dispatch_header) else {
-        return (BTreeMap::new(), None);
-    };
+    let (cases, default_target) =
+        if let Some((cases, default_target)) = func.function().switch_info(dispatch_header) {
+            (cases, default_target)
+        } else if let Some(ladder) = conditional_dispatch_ladder(func, dispatch_header) {
+            return (ladder.case_values_by_target, Some(ladder.default_target));
+        } else {
+            return (BTreeMap::new(), None);
+        };
     let mut case_values_by_target = BTreeMap::<u64, Vec<u64>>::new();
     for (value, target) in cases {
         case_values_by_target.entry(target).or_default().push(value);
@@ -604,14 +642,6 @@ fn same_logical_name(left: &str, right: &str) -> bool {
     split_version(left)
         .0
         .eq_ignore_ascii_case(split_version(right).0)
-}
-
-fn logical_state_name_count(names: &[String]) -> usize {
-    names
-        .iter()
-        .map(|name| split_version(name).0.to_ascii_lowercase())
-        .collect::<BTreeSet<_>>()
-        .len()
 }
 
 fn render_vm_var_expr(func: &SsaArtifact, var: &SSAVar, depth: u32) -> String {
@@ -769,6 +799,17 @@ fn render_vm_op_expr(func: &SsaArtifact, op: &SSAOp, depth: u32) -> Option<Strin
             render_vm_var_expr(func, src, depth + 1),
             offset
         ),
+        Select {
+            cond,
+            if_true,
+            if_false,
+            ..
+        } => format!(
+            "({} ? {} : {})",
+            render_vm_var_expr(func, cond, depth + 1),
+            render_vm_var_expr(func, if_true, depth + 1),
+            render_vm_var_expr(func, if_false, depth + 1)
+        ),
         _ => return None,
     })
 }
@@ -886,6 +927,16 @@ fn classify_vm_op_value(func: &SsaArtifact, op: &SSAOp, depth: u32) -> Option<Vm
         BoolNot { src, .. } => VmValueExpr::Unary {
             op: VmUnaryOp::BoolNot,
             arg: Box::new(classify_vm_var_value(func, src, depth + 1)),
+        },
+        Select {
+            cond,
+            if_true,
+            if_false,
+            ..
+        } => VmValueExpr::Select {
+            cond: Box::new(classify_vm_var_value(func, cond, depth + 1)),
+            if_true: Box::new(classify_vm_var_value(func, if_true, depth + 1)),
+            if_false: Box::new(classify_vm_var_value(func, if_false, depth + 1)),
         },
         _ => VmValueExpr::Expr(render_vm_op_expr(func, op, depth + 1)?),
     })
@@ -1553,14 +1604,25 @@ fn skip_dispatch_passthrough_blocks(func: &SsaArtifact, mut addr: u64) -> u64 {
     addr
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConditionalDispatchLadder {
+    handlers: Vec<u64>,
+    default_target: u64,
+    selector: ValueId,
+    case_values_by_target: BTreeMap<u64, Vec<u64>>,
+}
+
 fn conditional_dispatch_ladder(
     func: &SsaArtifact,
     dispatch_header: u64,
-) -> Option<(Vec<u64>, Option<u64>)> {
+) -> Option<ConditionalDispatchLadder> {
     let (loop_header, _) = enclosing_loop_header(func, dispatch_header)?;
     let mut current = dispatch_header;
     let mut visited = BTreeSet::new();
     let mut handlers = Vec::new();
+    let mut selector = None;
+    let mut case_values_by_target = BTreeMap::<u64, Vec<u64>>::new();
+    let mut seen_case_values = BTreeSet::new();
 
     for _ in 0..32 {
         if !visited.insert(current) {
@@ -1574,9 +1636,35 @@ fn conditional_dispatch_ladder(
         else {
             return None;
         };
-        handlers.push(true_target);
+        let predicate = func
+            .predicates()
+            .predicates
+            .values()
+            .find(|predicate| predicate.block_addr == current)?;
+        let comparison = predicate.comparison.as_ref()?;
+        let (raw_selector, case_value) = comparison_selector_and_constant(func, comparison)?;
+        let canonical_selector = canonical_vm_selector(func, raw_selector);
+        if selector
+            .replace(canonical_selector)
+            .is_some_and(|existing| existing != canonical_selector)
+        {
+            return None;
+        }
+        if !seen_case_values.insert(case_value) {
+            return None;
+        }
+        let (handler, next) = match comparison.kind {
+            CompareKind::Equal => (true_target, false_target),
+            CompareKind::NotEqual => (false_target, true_target),
+            _ => return None,
+        };
+        handlers.push(handler);
+        case_values_by_target
+            .entry(handler)
+            .or_default()
+            .push(case_value);
 
-        let continuation = skip_dispatch_passthrough_blocks(func, false_target);
+        let continuation = skip_dispatch_passthrough_blocks(func, next);
         if func.cfg().get_block(continuation).is_some_and(|candidate| {
             matches!(
                 candidate.terminator,
@@ -1596,23 +1684,89 @@ fn conditional_dispatch_ladder(
         if handlers.len() < 4 || redispatching_handlers < 3 {
             return None;
         }
-        handlers.push(false_target);
+        let default_target = next;
+        handlers.push(default_target);
         handlers.sort_unstable();
         handlers.dedup();
-        return Some((handlers, Some(false_target)));
+        for values in case_values_by_target.values_mut() {
+            values.sort_unstable();
+            values.dedup();
+        }
+        return Some(ConditionalDispatchLadder {
+            handlers,
+            default_target,
+            selector: selector?,
+            case_values_by_target,
+        });
     }
 
     None
+}
+
+fn comparison_selector_and_constant(
+    func: &SsaArtifact,
+    comparison: &r2ssa::CompareProvenance,
+) -> Option<(ValueId, u64)> {
+    let lhs_const = graph_value_constant(func, comparison.lhs);
+    let rhs_const = graph_value_constant(func, comparison.rhs);
+    match (lhs_const, rhs_const) {
+        (None, Some(value)) => Some((comparison.lhs, value)),
+        (Some(value), None) => Some((comparison.rhs, value)),
+        _ => None,
+    }
+}
+
+fn graph_value_constant(func: &SsaArtifact, value: ValueId) -> Option<u64> {
+    let var = &func.graph().value(value)?.var;
+    var.is_const()
+        .then(|| r2ssa::parse_const_value(&var.name))
+        .flatten()
+}
+
+fn canonical_vm_selector(func: &SsaArtifact, value: ValueId) -> ValueId {
+    let mut current = value;
+    let mut visited = BTreeSet::new();
+    while visited.insert(current) {
+        if let Some(reload) = func.certificates().stack_reloads.get(&current) {
+            current = reload.canonical_source;
+            continue;
+        }
+        let Some(inst) = func
+            .graph()
+            .def_inst(current)
+            .and_then(|id| func.graph().inst(id))
+        else {
+            break;
+        };
+        let InstPayload::Op(op) = &inst.payload else {
+            break;
+        };
+        let follows_first_input = matches!(
+            op,
+            SSAOp::Copy { .. }
+                | SSAOp::IntZExt { .. }
+                | SSAOp::IntSExt { .. }
+                | SSAOp::Trunc { .. }
+                | SSAOp::Cast { .. }
+                | SSAOp::Subpiece { offset: 0, .. }
+        );
+        if !follows_first_input {
+            break;
+        }
+        let Some(input) = inst.inputs.first().copied() else {
+            break;
+        };
+        current = input;
+    }
+    current
 }
 
 fn interpreter_dispatch_targets(
     func: &SsaArtifact,
     interpreter: &InterpreterDispatchSummary,
 ) -> (Vec<u64>, Option<u64>) {
-    if let Some((targets, default_target)) =
-        conditional_dispatch_ladder(func, interpreter.dispatch_header)
-    {
-        return (targets, default_target);
+    if let Some(ladder) = conditional_dispatch_ladder(func, interpreter.dispatch_header) {
+        return (ladder.handlers, Some(ladder.default_target));
     }
     let (_, default_target) = case_values_by_target(func, interpreter.dispatch_header);
     (func.successors(interpreter.dispatch_header), default_target)
@@ -1638,12 +1792,20 @@ pub(crate) fn classify_interpreter_like(func: &SsaArtifact) -> Option<Interprete
         let Some(block) = func.cfg().get_block(block_addr) else {
             continue;
         };
-        let selector = func
+        let mut selector = func
             .function()
             .infer_switch_selector_var(block_addr)
             .map(|var| var.name);
         let direct_dispatch_targets = func.successors(block_addr);
         let ladder = conditional_dispatch_ladder(func, block_addr);
+        if selector.is_none()
+            && let Some(ladder) = &ladder
+        {
+            selector = func
+                .graph()
+                .value(ladder.selector)
+                .map(|value| value.var.display_name());
+        }
         let is_ladder = ladder.is_some();
         let (kind, dispatch_targets) = match block.terminator {
             BlockTerminator::Switch { .. } => {
@@ -1654,7 +1816,10 @@ pub(crate) fn classify_interpreter_like(func: &SsaArtifact) -> Option<Interprete
             }
             _ if ladder.is_some() => (
                 InterpreterKind::SwitchDispatch,
-                ladder.map(|(targets, _)| targets).unwrap_or_default(),
+                ladder
+                    .as_ref()
+                    .map(|ladder| ladder.handlers.clone())
+                    .unwrap_or_default(),
             ),
             _ if direct_dispatch_targets.len() >= 4 && selector.is_some() => {
                 (InterpreterKind::SwitchDispatch, direct_dispatch_targets)
@@ -1980,11 +2145,20 @@ mod tests {
     }
 
     fn conditional_dispatch_block(addr: u64, case_value: u64, handler: u64) -> R2ILBlock {
+        conditional_dispatch_block_with_selector(addr, case_value, handler, RAX)
+    }
+
+    fn conditional_dispatch_block_with_selector(
+        addr: u64,
+        case_value: u64,
+        handler: u64,
+        selector: u64,
+    ) -> R2ILBlock {
         let mut block = R2ILBlock::new(addr, 4);
         let cond = Varnode::unique(addr, 1);
         block.push(R2ILOp::IntEqual {
             dst: cond.clone(),
-            a: make_reg(RAX, 8),
+            a: make_reg(selector, 8),
             b: make_const(case_value, 8),
         });
         block.push(R2ILOp::CBranch {
@@ -2052,6 +2226,33 @@ mod tests {
         assert!(vm.has_strong_vm_evidence(), "{vm:?}");
         assert_eq!(vm.transfers.len(), 6);
         assert!(vm.truncated_handlers.is_empty());
+    }
+
+    #[test]
+    fn conditional_ladder_with_different_selectors_is_not_a_vm_dispatch() {
+        let loop_header = 0x1000;
+        let dispatch_header = 0x1010;
+        let mut blocks = vec![branch_block(loop_header, dispatch_header)];
+        for index in 0..5u64 {
+            let selector = if index == 2 { RDI } else { RAX };
+            blocks.push(conditional_dispatch_block_with_selector(
+                dispatch_header + index * 4,
+                index,
+                0x2000 + index * 4,
+                selector,
+            ));
+            blocks.push(redispatch_handler(
+                0x2000 + index * 4,
+                index + 1,
+                loop_header,
+            ));
+        }
+        blocks.push(redispatch_handler(dispatch_header + 5 * 4, 6, loop_header));
+        let func = SsaArtifact::for_symbolic(&blocks, Some(&test_arch())).expect("ssa");
+
+        assert!(conditional_dispatch_ladder(&func, dispatch_header).is_none());
+        assert!(classify_interpreter_like(&func).is_none());
+        assert!(!has_strong_vm_evidence(&func));
     }
 
     #[test]

@@ -50,7 +50,7 @@ pub use stable_hash::{
     stable_blocks_hash, stable_fnv1a_bytes, stable_fnv1a_debug_hash, stable_fnv1a_hash,
 };
 
-pub const ENGINE_SCHEMA_VERSION: u32 = 2;
+pub const ENGINE_SCHEMA_VERSION: u32 = 3;
 pub const DEFAULT_ENGINE_CACHE_LIMIT: usize = 256;
 pub const SYMBOLIC_PATHS_LIMIT: usize = 32;
 pub const SYMBOLIC_PATHS_CALL_FREE_MAX_STATES: usize = 16;
@@ -595,7 +595,7 @@ pub struct EngineTypeWritebackPayload {
     pub field_access_certificate_names: Vec<String>,
     pub fact_counts: EngineTypeWritebackFactCounts,
     pub param_home_stack_slot_offsets: Vec<i64>,
-    pub render_stack_slot_offsets: Vec<i64>,
+    pub certified_stack_slot_offsets: Vec<i64>,
     pub struct_decls: Vec<r2types::StructDeclCandidate>,
     pub global_type_links: Vec<r2types::GlobalTypeLinkCandidate>,
     pub plans: r2types::AnalysisPlans,
@@ -614,9 +614,6 @@ pub struct EngineTypeWritebackFactCounts {
     pub field_access_certificates: usize,
     pub array_index_certificates: usize,
     pub scalar_array_render_candidates: usize,
-    pub render_expressions: usize,
-    pub render_memory_accesses: usize,
-    pub render_stack_slot_offsets: usize,
     pub render_member_accesses: usize,
     pub render_array_accesses: usize,
     pub certified_expressions: usize,
@@ -624,6 +621,8 @@ pub struct EngineTypeWritebackFactCounts {
     pub certified_stack_slots: usize,
     pub certified_memory_accesses: usize,
     pub certified_returns: usize,
+    pub certified_control_domains: usize,
+    pub incomplete_control_domains: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -701,9 +700,6 @@ pub struct EngineTypeWritebackFactCountsJson {
     pub field_access_certificates: usize,
     pub array_index_certificates: usize,
     pub scalar_array_render_candidates: usize,
-    pub render_expressions: usize,
-    pub render_memory_accesses: usize,
-    pub render_stack_slot_offsets: usize,
     pub render_member_accesses: usize,
     pub render_array_accesses: usize,
     pub certified_expressions: usize,
@@ -711,6 +707,8 @@ pub struct EngineTypeWritebackFactCountsJson {
     pub certified_stack_slots: usize,
     pub certified_memory_accesses: usize,
     pub certified_returns: usize,
+    pub certified_control_domains: usize,
+    pub incomplete_control_domains: usize,
 }
 
 impl EngineTypeWritebackFactCountsJson {
@@ -722,9 +720,6 @@ impl EngineTypeWritebackFactCountsJson {
             && self.field_access_certificates == 0
             && self.array_index_certificates == 0
             && self.scalar_array_render_candidates == 0
-            && self.render_expressions == 0
-            && self.render_memory_accesses == 0
-            && self.render_stack_slot_offsets == 0
             && self.render_member_accesses == 0
             && self.render_array_accesses == 0
             && self.certified_expressions == 0
@@ -732,6 +727,8 @@ impl EngineTypeWritebackFactCountsJson {
             && self.certified_stack_slots == 0
             && self.certified_memory_accesses == 0
             && self.certified_returns == 0
+            && self.certified_control_domains == 0
+            && self.incomplete_control_domains == 0
     }
 }
 
@@ -767,7 +764,7 @@ pub struct EngineTypeWritebackJsonCore {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub param_home_stack_slot_offsets: Vec<i64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub render_stack_slot_offsets: Vec<i64>,
+    pub certified_stack_slot_offsets: Vec<i64>,
     pub struct_decls: Vec<EngineStructDeclCandidateJson>,
     pub global_type_links: Vec<EngineGlobalTypeLinkCandidateJson>,
     pub plans: r2types::AnalysisPlans,
@@ -1022,7 +1019,7 @@ pub fn type_writeback_payload_from_plan_report(
         ),
         fact_counts: type_writeback_fact_counts(function_facts),
         param_home_stack_slot_offsets: type_writeback_param_home_stack_slot_offsets(function_facts),
-        render_stack_slot_offsets: type_writeback_render_stack_slot_offsets(function_facts),
+        certified_stack_slot_offsets: type_writeback_certified_stack_slot_offsets(function_facts),
         struct_decls: plan
             .struct_decls
             .into_iter()
@@ -1156,9 +1153,6 @@ pub fn type_writeback_json_core(
             field_access_certificates: payload.fact_counts.field_access_certificates,
             array_index_certificates: payload.fact_counts.array_index_certificates,
             scalar_array_render_candidates: payload.fact_counts.scalar_array_render_candidates,
-            render_expressions: payload.fact_counts.render_expressions,
-            render_memory_accesses: payload.fact_counts.render_memory_accesses,
-            render_stack_slot_offsets: payload.fact_counts.render_stack_slot_offsets,
             render_member_accesses: payload.fact_counts.render_member_accesses,
             render_array_accesses: payload.fact_counts.render_array_accesses,
             certified_expressions: payload.fact_counts.certified_expressions,
@@ -1166,9 +1160,11 @@ pub fn type_writeback_json_core(
             certified_stack_slots: payload.fact_counts.certified_stack_slots,
             certified_memory_accesses: payload.fact_counts.certified_memory_accesses,
             certified_returns: payload.fact_counts.certified_returns,
+            certified_control_domains: payload.fact_counts.certified_control_domains,
+            incomplete_control_domains: payload.fact_counts.incomplete_control_domains,
         },
         param_home_stack_slot_offsets: payload.param_home_stack_slot_offsets,
-        render_stack_slot_offsets: payload.render_stack_slot_offsets,
+        certified_stack_slot_offsets: payload.certified_stack_slot_offsets,
         struct_decls: payload
             .struct_decls
             .into_iter()
@@ -1603,11 +1599,6 @@ pub fn type_writeback_fact_counts(function_facts: &FunctionFacts) -> EngineTypeW
         field_access_certificates: type_facts.field_access_certificates.len(),
         array_index_certificates: type_facts.array_index_certificates.len(),
         scalar_array_render_candidates: type_facts.scalar_array_render_candidates.len(),
-        render_expressions: render.map(|facts| facts.expressions.len()).unwrap_or(0),
-        render_memory_accesses: render.map(|facts| facts.memory_accesses.len()).unwrap_or(0),
-        render_stack_slot_offsets: render
-            .map(|facts| facts.stack_slot_offsets.len())
-            .unwrap_or(0),
         render_member_accesses: render
             .map(|facts| facts.member_accesses_by_op.values().map(Vec::len).sum())
             .unwrap_or(0),
@@ -1616,14 +1607,20 @@ pub fn type_writeback_fact_counts(function_facts: &FunctionFacts) -> EngineTypeW
             .unwrap_or(0),
         certified_expressions: render.map(|facts| facts.certified_exprs.len()).unwrap_or(0),
         certified_parameters: render
-            .map(|facts| facts.parameter_values.len())
+            .map(|facts| {
+                facts
+                    .certified_entities
+                    .values()
+                    .filter(|entity| matches!(entity, r2types::CertifiedEntity::Parameter { .. }))
+                    .count()
+            })
             .unwrap_or(0),
         certified_stack_slots: render
             .map(|facts| {
                 facts
-                    .certified_effects
+                    .certified_entities
                     .values()
-                    .filter(|effect| effect.kind() == r2types::CertifiedEffectKind::StackSlot)
+                    .filter(|entity| matches!(entity, r2types::CertifiedEntity::StackSlot { .. }))
                     .count()
             })
             .unwrap_or(0),
@@ -1651,6 +1648,17 @@ pub fn type_writeback_fact_counts(function_facts: &FunctionFacts) -> EngineTypeW
                     .count()
             })
             .unwrap_or(0),
+        certified_control_domains: function_facts
+            .control()
+            .map_or(0, |facts| facts.control_domains.domains.len()),
+        incomplete_control_domains: function_facts.control().map_or(0, |facts| {
+            facts
+                .control_domains
+                .domains
+                .values()
+                .filter(|domain| !domain.complete)
+                .count()
+        }),
     }
 }
 
@@ -1669,14 +1677,13 @@ pub fn type_writeback_param_home_stack_slot_offsets(function_facts: &FunctionFac
     offsets
 }
 
-pub fn type_writeback_render_stack_slot_offsets(function_facts: &FunctionFacts) -> Vec<i64> {
+pub fn type_writeback_certified_stack_slot_offsets(function_facts: &FunctionFacts) -> Vec<i64> {
     let mut offsets = function_facts
         .render()
         .map(|render| {
             render
-                .stack_slot_offsets
-                .values()
-                .copied()
+                .stack_slots()
+                .map(|(_, _, offset, _)| offset)
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -5648,8 +5655,9 @@ fn build_engine_analysis_artifact(
             )
         })
     });
-    let recovered_vars = r2types::recover_vars_from_ssa(
+    let recovered_vars = r2types::recover_vars_from_ssa_with_prep_facts(
         &pattern_ssa_blocks,
+        semantic_analysis.pattern_ssa_func.decompile_prep_facts(),
         request.arch.as_ref().map(|spec| spec.name.as_str()),
         &request.reg_type_hints,
         request.semantic_metadata_enabled,
@@ -5666,7 +5674,19 @@ fn build_engine_analysis_artifact(
         interproc_summary_set,
         diagnostics,
     };
-    let writeback = if let Some(semantic_artifact) = semantic_artifact.as_ref() {
+    let prep_facts = semantic_analysis.pattern_ssa_func.decompile_prep_facts();
+    let writeback = if let Some(semantic_artifact) = semantic_artifact.as_ref()
+        && let Some(prep_facts) = prep_facts
+    {
+        r2types::build_type_writeback_analysis_with_semantics_and_prep_facts(
+            writeback_input,
+            r2types::TypeWritebackSemanticInputs {
+                artifact: semantic_artifact,
+                local_field_accesses: &local_field_accesses,
+            },
+            prep_facts,
+        )
+    } else if let Some(semantic_artifact) = semantic_artifact.as_ref() {
         r2types::build_type_writeback_analysis_with_semantics(
             writeback_input,
             r2types::TypeWritebackSemanticInputs {
@@ -5674,10 +5694,13 @@ fn build_engine_analysis_artifact(
                 local_field_accesses: &local_field_accesses,
             },
         )
+    } else if let Some(prep_facts) = prep_facts {
+        r2types::build_type_writeback_analysis_with_prep_facts(writeback_input, prep_facts)
     } else {
         r2types::build_type_writeback_analysis(writeback_input)
     };
     let mut function_facts = writeback.function_facts;
+    let mut writeback_plan = writeback.plan;
     let mut usage = semantic_analysis.ssa_func.facts().assumption_usage.clone();
     usage.extend(function_facts.assumption_usage());
     function_facts = function_facts.with_assumption_usage(usage);
@@ -5692,11 +5715,74 @@ fn build_engine_analysis_artifact(
         function_facts,
         &param_slots,
     );
+    let constrained_params =
+        function_facts.apply_certified_call_argument_type_constraints(request.ptr_bits);
+    if constrained_params > 0
+        && let Some(signature) = function_facts
+            .type_facts()
+            .render_authorized_signature()
+            .cloned()
+    {
+        let prior_confidence = writeback_plan.signature.confidence;
+        let prior_callconv_confidence = writeback_plan.signature.callconv_confidence;
+        writeback_plan.signature = r2types::inferred_signature_from_signature_spec(
+            &request.function_name,
+            &arch_name,
+            request.ptr_bits,
+            function_facts.type_facts().callconv.as_deref(),
+            &signature,
+        );
+        writeback_plan.signature.confidence =
+            writeback_plan.signature.confidence.max(prior_confidence);
+        writeback_plan.signature.callconv_confidence = writeback_plan
+            .signature
+            .callconv_confidence
+            .max(prior_callconv_confidence);
+        for candidate in writeback_plan
+            .var_type_candidates
+            .iter_mut()
+            .filter(|candidate| candidate.isarg)
+        {
+            let slot = function_facts
+                .type_facts()
+                .register_params
+                .iter()
+                .position(|param| {
+                    candidate
+                        .reg
+                        .as_ref()
+                        .is_some_and(|reg| param.reg.eq_ignore_ascii_case(reg))
+                        || param.name.eq_ignore_ascii_case(&candidate.name)
+                })
+                .or_else(|| {
+                    signature
+                        .params
+                        .iter()
+                        .position(|param| param.name.eq_ignore_ascii_case(&candidate.name))
+                });
+            let Some(ty) = slot
+                .and_then(|slot| signature.params.get(slot))
+                .and_then(|param| param.ty.as_ref())
+            else {
+                continue;
+            };
+            candidate.var_type = r2types::render_signature_type(ty, request.ptr_bits);
+            candidate.source = r2types::WritebackSource::CalleeSignature;
+            if !candidate
+                .evidence
+                .contains(&r2types::WritebackEvidence::CertifiedCallArgument)
+            {
+                candidate
+                    .evidence
+                    .push(r2types::WritebackEvidence::CertifiedCallArgument);
+            }
+        }
+    }
     Some(EngineAnalysisArtifact {
         ssa_func: semantic_analysis.ssa_func,
         pattern_ssa_func: semantic_analysis.pattern_ssa_func,
         function_facts,
-        writeback_plan: writeback.plan,
+        writeback_plan,
     })
 }
 
@@ -5847,8 +5933,9 @@ fn infer_signature_from_engine_analysis(
     analysis: &EngineAnalysis,
 ) -> Option<r2types::InferredSignature> {
     let pattern_ssa_blocks = analysis.pattern_ssa_func.local_ssa_blocks();
-    let recovered_vars = r2types::recover_vars_from_ssa(
+    let recovered_vars = r2types::recover_vars_from_ssa_with_prep_facts(
         &pattern_ssa_blocks,
+        analysis.pattern_ssa_func.decompile_prep_facts(),
         arch.map(|spec| spec.name.as_str()),
         reg_type_hints,
         semantic_metadata_enabled,

@@ -26,6 +26,7 @@
 pub mod context;
 pub mod disasm;
 pub mod esil;
+mod internal_control;
 pub mod pcode;
 pub mod sleigh;
 pub mod translate;

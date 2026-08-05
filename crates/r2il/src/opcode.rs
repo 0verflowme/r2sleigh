@@ -492,6 +492,15 @@ pub enum R2ILOp {
         value: Varnode,
         position: Varnode,
     },
+
+    /// Conditional value merge produced when instruction-local P-code control
+    /// flow is normalized into the linear r2il value graph.
+    Select {
+        dst: Varnode,
+        cond: Varnode,
+        if_true: Varnode,
+        if_false: Varnode,
+    },
 }
 
 impl R2ILOp {
@@ -528,6 +537,22 @@ impl R2ILOp {
                 | R2ILOp::StoreGuarded { .. }
                 | R2ILOp::AtomicCAS { .. }
         )
+    }
+
+    /// Returns true when this value operation may be evaluated speculatively.
+    ///
+    /// This is intentionally narrower than "has an output": reads, writes,
+    /// allocation, CPU state queries, calls, and control flow may be observable
+    /// even when their result is later discarded.
+    pub fn is_speculatable_value(&self) -> bool {
+        self.output().is_some()
+            && !self.is_control_flow()
+            && !self.is_memory_read()
+            && !self.is_memory_write()
+            && !matches!(
+                self,
+                R2ILOp::CallOther { .. } | R2ILOp::CpuId { .. } | R2ILOp::New { .. }
+            )
     }
 
     /// Returns the output varnode if this operation has one.
@@ -600,7 +625,8 @@ impl R2ILOp {
             | R2ILOp::New { dst, .. }
             | R2ILOp::Cast { dst, .. }
             | R2ILOp::Extract { dst, .. }
-            | R2ILOp::Insert { dst, .. } => Some(dst),
+            | R2ILOp::Insert { dst, .. }
+            | R2ILOp::Select { dst, .. } => Some(dst),
             R2ILOp::StoreConditional { result, .. } => result.as_ref(),
             R2ILOp::CallOther { output, .. } => output.as_ref(),
             _ => None,
@@ -677,7 +703,8 @@ impl R2ILOp {
             | R2ILOp::New { dst, .. }
             | R2ILOp::Cast { dst, .. }
             | R2ILOp::Extract { dst, .. }
-            | R2ILOp::Insert { dst, .. } => Some(dst),
+            | R2ILOp::Insert { dst, .. }
+            | R2ILOp::Select { dst, .. } => Some(dst),
             R2ILOp::StoreConditional { result, .. } => result.as_mut(),
             R2ILOp::CallOther { output, .. } => output.as_mut(),
             _ => None,
@@ -800,6 +827,12 @@ impl R2ILOp {
                 position,
                 ..
             } => vec![src, value, position],
+            R2ILOp::Select {
+                cond,
+                if_true,
+                if_false,
+                ..
+            } => vec![cond, if_true, if_false],
         }
     }
 
@@ -918,6 +951,12 @@ impl R2ILOp {
                 position,
                 ..
             } => vec![src, value, position],
+            R2ILOp::Select {
+                cond,
+                if_true,
+                if_false,
+                ..
+            } => vec![cond, if_true, if_false],
         }
     }
 }
@@ -1157,6 +1196,12 @@ impl std::fmt::Display for R2ILOp {
             } => {
                 write!(f, "{} = INSERT({}, {}, {})", dst, src, value, position)
             }
+            R2ILOp::Select {
+                dst,
+                cond,
+                if_true,
+                if_false,
+            } => write!(f, "{} = SELECT({}, {}, {})", dst, cond, if_true, if_false),
         }
     }
 }

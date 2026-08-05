@@ -160,6 +160,47 @@ impl<'ctx> SymExecutor<'ctx> {
                 Ok(vec![])
             }
 
+            Select {
+                dst,
+                cond,
+                if_true,
+                if_false,
+            } => {
+                let cond_value = self.read_var(state, cond);
+                let true_value = self.read_var(state, if_true);
+                let false_value = self.read_var(state, if_false);
+                let value = if let Some(concrete) = cond_value.as_concrete() {
+                    if concrete != 0 {
+                        true_value.clone()
+                    } else {
+                        false_value.clone()
+                    }
+                } else {
+                    let cond_bv = cond_value.to_bv(self.ctx);
+                    let zero = BV::from_i64(0, cond_value.bits());
+                    let cond_bool = cond_bv.eq(&zero).not();
+                    let merged =
+                        cond_bool.ite(&true_value.to_bv(self.ctx), &false_value.to_bv(self.ctx));
+                    SymValue::symbolic_tainted(
+                        merged,
+                        true_value.bits(),
+                        true_value.get_taint() | false_value.get_taint(),
+                    )
+                };
+                self.write_var(state, dst, value);
+                let provenance = if let Some(concrete) = cond_value.as_concrete() {
+                    self.read_var_provenance(state, if concrete != 0 { if_true } else { if_false })
+                } else {
+                    let true_provenance = self.read_var_provenance(state, if_true);
+                    let false_provenance = self.read_var_provenance(state, if_false);
+                    (true_provenance == false_provenance)
+                        .then_some(true_provenance)
+                        .flatten()
+                };
+                self.propagate_var_provenance(state, dst, provenance);
+                Ok(vec![])
+            }
+
             CallDefine { dst } => {
                 let value = SymValue::new_symbolic(
                     self.ctx,
@@ -1385,6 +1426,7 @@ fn op_def(op: &SSAOp) -> Option<&SSAVar> {
         | SSAOp::BoolXor { dst, .. }
         | SSAOp::Piece { dst, .. }
         | SSAOp::Subpiece { dst, .. }
+        | SSAOp::Select { dst, .. }
         | SSAOp::PopCount { dst, .. }
         | SSAOp::Lzcount { dst, .. }
         | SSAOp::CallDefine { dst }
@@ -1857,6 +1899,45 @@ mod tests {
 
         let dst_val = state.get_register("DST_1");
         assert_eq!(dst_val.as_concrete(), Some(42));
+    }
+
+    #[test]
+    fn test_select_concrete_and_symbolic() {
+        let ctx = Context::thread_local();
+        let executor = SymExecutor::new(&ctx);
+        let select = SSAOp::Select {
+            dst: SSAVar::new("result", 1, 8),
+            cond: SSAVar::new("cond", 0, 1),
+            if_true: SSAVar::new("when_true", 0, 8),
+            if_false: SSAVar::new("when_false", 0, 8),
+        };
+
+        let mut concrete = SymState::new(&ctx, 0x1000);
+        concrete.set_register("COND_0", SymValue::concrete(1, 8));
+        concrete.set_register("WHEN_TRUE_0", SymValue::concrete(42, 64));
+        concrete.set_register("WHEN_FALSE_0", SymValue::concrete(7, 64));
+        executor
+            .step(&mut concrete, &select)
+            .expect("concrete select should execute");
+        assert_eq!(concrete.get_register("RESULT_1").as_concrete(), Some(42));
+
+        let mut symbolic = SymState::new(&ctx, 0x1000);
+        symbolic.set_register("COND_0", SymValue::new_symbolic(&ctx, "cond", 8));
+        symbolic.set_register("WHEN_TRUE_0", SymValue::concrete(42, 64));
+        symbolic.set_register("WHEN_FALSE_0", SymValue::concrete(7, 64));
+        executor
+            .step(&mut symbolic, &select)
+            .expect("symbolic select should execute");
+        let result = symbolic.get_register("RESULT_1").to_bv(&ctx);
+        let solver = z3::Solver::new();
+        solver.assert(
+            symbolic
+                .get_register("COND_0")
+                .to_bv(&ctx)
+                .eq(BV::from_u64(1, 8)),
+        );
+        solver.assert(result.ne(BV::from_u64(42, 64)));
+        assert_eq!(solver.check(), z3::SatResult::Unsat);
     }
 
     #[test]

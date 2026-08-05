@@ -3795,6 +3795,15 @@ pub fn semantic_typedef_is_authoritative(name: &str) -> bool {
     )
 }
 
+/// Semantic typedefs whose role contract is a machine pointer even though the
+/// public C spelling is intentionally preserved as a typedef.
+pub fn semantic_typedef_is_pointer(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "allocation_ptr" | "memory_ptr"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

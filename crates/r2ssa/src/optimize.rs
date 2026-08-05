@@ -1530,29 +1530,6 @@ fn common_subexpr_elim(func: &mut SSAFunction, stats: &mut OptimizationStats) ->
     changed
 }
 
-fn op_has_side_effects(op: &SSAOp, preserve_memory_reads: bool) -> bool {
-    if op.is_control_flow() || op.is_memory_write() {
-        return true;
-    }
-    if matches!(
-        op,
-        SSAOp::Fence { .. } | SSAOp::LoadLinked { .. } | SSAOp::LoadGuarded { .. }
-    ) {
-        return true;
-    }
-    if preserve_memory_reads && op.is_memory_read() {
-        return true;
-    }
-    matches!(
-        op,
-        SSAOp::CallOther { .. }
-            | SSAOp::Breakpoint
-            | SSAOp::Unimplemented
-            | SSAOp::CpuId { .. }
-            | SSAOp::New { .. }
-    )
-}
-
 fn dead_code_elim(
     func: &mut SSAFunction,
     config: &OptimizationConfig,
@@ -1575,7 +1552,7 @@ fn dead_code_elim(
                 if let Some(dst) = op.dst() {
                     let key = VarKey::from_var(dst);
                     if !use_set.contains(&key)
-                        && !op_has_side_effects(op, config.preserve_memory_reads)
+                        && !op.has_observable_effects(config.preserve_memory_reads)
                     {
                         stats.dce_removed_ops += 1;
                         return false;
@@ -2104,6 +2081,17 @@ where
             src: map(src),
             value: map(value),
             position: map(position),
+        },
+        Select {
+            dst,
+            cond,
+            if_true,
+            if_false,
+        } => Select {
+            dst: dst.clone(),
+            cond: map(cond),
+            if_true: map(if_true),
+            if_false: map(if_false),
         },
         Nop => Nop,
         Unimplemented => Unimplemented,

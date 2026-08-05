@@ -687,6 +687,23 @@ fn convert_op(op: &R2ILOp, disasm: &Disassembler, ctx: &mut SSAContext) -> SSAOp
             value: read_var(value, disasm, ctx),
             position: read_var(position, disasm, ctx),
         },
+
+        Select {
+            dst,
+            cond,
+            if_true,
+            if_false,
+        } => {
+            let cond = read_var(cond, disasm, ctx);
+            let if_true = read_var(if_true, disasm, ctx);
+            let if_false = read_var(if_false, disasm, ctx);
+            SSAOp::Select {
+                dst: write_var(dst, disasm, ctx),
+                cond,
+                if_true,
+                if_false,
+            }
+        }
     }
 }
 

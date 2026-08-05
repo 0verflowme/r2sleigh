@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use r2ssa::SSAVar;
 
@@ -403,6 +403,13 @@ impl<'a> FoldingContext<'a> {
         }
 
         let value = self.prepared_value_id_for_var(var)?;
+        if self.prepared_ssa().is_some_and(|prepared| {
+            prepared
+                .call_result_certificate_for_value(value)
+                .is_some_and(|result| result.relation.is_identity())
+        }) {
+            return self.certified_call_result_expr_for_value(value);
+        }
         if !self
             .certified_render_context()
             .is_some_and(|proof| proof.expression_is_renderable(value))
@@ -417,7 +424,8 @@ impl<'a> FoldingContext<'a> {
         {
             return Some(expr);
         }
-        if let Some(expr) = self.render_certified_scalar_expr_for_var(var, 0, &mut HashSet::new()) {
+        if let Some(expr) = self.certified_structural_expr_for_value(value, 0, &mut BTreeSet::new())
+        {
             return Some(expr);
         }
         if var.version == 0 && var.is_register() && self.stable_semantic_ids_are_required() {
@@ -429,120 +437,6 @@ impl<'a> FoldingContext<'a> {
                 .map(CExpr::Var)
                 .unwrap_or_else(|| CExpr::Var(rendered)),
         )
-    }
-
-    fn render_certified_scalar_expr_for_var(
-        &self,
-        var: &SSAVar,
-        depth: u32,
-        visited: &mut HashSet<r2ssa::ValueId>,
-    ) -> Option<CExpr> {
-        if depth > Self::MAX_SEMANTIC_RENDER_DEPTH {
-            return None;
-        }
-        if var.is_const() {
-            return self.render_certified_value_expr_for_var(var);
-        }
-        let value = self.prepared_value_id_for_var(var)?;
-        if !self
-            .certified_render_context()
-            .is_some_and(|proof| proof.expression_is_renderable(value))
-        {
-            return None;
-        }
-        if let Some(expr) = self.certified_parameter_expr_for_value(value) {
-            return Some(expr);
-        }
-        if !visited.insert(value) {
-            return None;
-        }
-
-        let result = (|| {
-            let prepared = self.prepared_ssa()?;
-            let inst_id = prepared.graph().def_inst(value)?;
-            let inst = prepared.graph().inst(inst_id)?;
-            let r2ssa::InstPayload::Op(op) = &inst.payload else {
-                return None;
-            };
-            match op {
-                SSAOp::Copy { src, .. }
-                | SSAOp::New { src, .. }
-                | SSAOp::Subpiece { src, .. }
-                | SSAOp::IntZExt { src, .. }
-                | SSAOp::IntSExt { src, .. } => {
-                    self.render_certified_scalar_expr_for_var(src, depth + 1, visited)
-                }
-                SSAOp::Cast { src, .. } => {
-                    self.render_certified_scalar_expr_for_var(src, depth + 1, visited)
-                }
-                SSAOp::Load { dst, .. } => {
-                    let (block_addr, op_idx) = prepared.inst_op_site(inst_id)?;
-                    let proof = self.certified_render_context()?;
-                    let fact = proof.memory_access_for_op(block_addr, op_idx, false)?;
-                    if fact.value != Some(value) {
-                        return None;
-                    }
-                    let elem_ty = self
-                        .type_hint_for_var(dst)
-                        .unwrap_or_else(|| type_from_size(dst.size));
-                    self.render_certified_memory_expr_for_fact(fact, elem_ty)
-                }
-                SSAOp::IntAdd { a, b, .. } => Some(CExpr::binary(
-                    BinaryOp::Add,
-                    self.render_certified_scalar_expr_for_var(a, depth + 1, visited)?,
-                    self.render_certified_scalar_expr_for_var(b, depth + 1, visited)?,
-                )),
-                SSAOp::IntSub { a, b, .. } => Some(CExpr::binary(
-                    BinaryOp::Sub,
-                    self.render_certified_scalar_expr_for_var(a, depth + 1, visited)?,
-                    self.render_certified_scalar_expr_for_var(b, depth + 1, visited)?,
-                )),
-                SSAOp::IntMult { a, b, .. } => Some(CExpr::binary(
-                    BinaryOp::Mul,
-                    self.render_certified_scalar_expr_for_var(a, depth + 1, visited)?,
-                    self.render_certified_scalar_expr_for_var(b, depth + 1, visited)?,
-                )),
-                SSAOp::IntAnd { a, b, .. } => Some(CExpr::binary(
-                    BinaryOp::BitAnd,
-                    self.render_certified_scalar_expr_for_var(a, depth + 1, visited)?,
-                    self.render_certified_scalar_expr_for_var(b, depth + 1, visited)?,
-                )),
-                SSAOp::IntOr { a, b, .. } => Some(CExpr::binary(
-                    BinaryOp::BitOr,
-                    self.render_certified_scalar_expr_for_var(a, depth + 1, visited)?,
-                    self.render_certified_scalar_expr_for_var(b, depth + 1, visited)?,
-                )),
-                SSAOp::IntXor { a, b, .. } => Some(CExpr::binary(
-                    BinaryOp::BitXor,
-                    self.render_certified_scalar_expr_for_var(a, depth + 1, visited)?,
-                    self.render_certified_scalar_expr_for_var(b, depth + 1, visited)?,
-                )),
-                SSAOp::IntLeft { a, b, .. } => Some(CExpr::binary(
-                    BinaryOp::Shl,
-                    self.render_certified_scalar_expr_for_var(a, depth + 1, visited)?,
-                    self.render_certified_scalar_expr_for_var(b, depth + 1, visited)?,
-                )),
-                SSAOp::IntRight { a, b, .. } | SSAOp::IntSRight { a, b, .. } => {
-                    Some(CExpr::binary(
-                        BinaryOp::Shr,
-                        self.render_certified_scalar_expr_for_var(a, depth + 1, visited)?,
-                        self.render_certified_scalar_expr_for_var(b, depth + 1, visited)?,
-                    ))
-                }
-                SSAOp::IntNegate { src, .. } => Some(CExpr::unary(
-                    UnaryOp::Neg,
-                    self.render_certified_scalar_expr_for_var(src, depth + 1, visited)?,
-                )),
-                SSAOp::IntNot { src, .. } => Some(CExpr::unary(
-                    UnaryOp::BitNot,
-                    self.render_certified_scalar_expr_for_var(src, depth + 1, visited)?,
-                )),
-                _ => None,
-            }
-        })();
-
-        visited.remove(&value);
-        result
     }
 
     fn render_certified_stack_param_value_expr(
@@ -808,12 +702,7 @@ impl<'a> FoldingContext<'a> {
         {
             return Some(expr);
         }
-        let offset = self
-            .inputs
-            .render_facts()?
-            .stack_slot_offsets
-            .get(&fact.object)
-            .copied()?;
+        let offset = self.inputs.render_facts()?.stack_slot_offset(fact.object)?;
         let name = self
             .certified_stack_var_name_for_object_offset(fact.object, offset)
             .unwrap_or_else(|| {
@@ -922,6 +811,33 @@ impl<'a> FoldingContext<'a> {
         addr: &SSAVar,
         elem_ty: CType,
     ) -> CExpr {
+        let memo_key = self
+            .prepared_value_id_for_var(dst)
+            .map(|value| (value, elem_ty.to_string()));
+        if let Some(cached) = memo_key
+            .as_ref()
+            .and_then(|key| self.load_expr_memo.borrow().get(key).cloned())
+        {
+            return cached;
+        }
+        let rendered = self.render_canonical_load_expr_uncached(dst, addr, elem_ty);
+        if let Some(key) = memo_key {
+            self.load_expr_memo
+                .borrow_mut()
+                .insert(key, rendered.clone());
+        }
+        rendered
+    }
+
+    fn render_canonical_load_expr_uncached(
+        &self,
+        dst: &SSAVar,
+        addr: &SSAVar,
+        elem_ty: CType,
+    ) -> CExpr {
+        if let Some(named) = self.prepared_named_memory_expr_for_value(dst) {
+            return named;
+        }
         let pointee_load = dst.size < addr.size;
         let fallback_addr_expr = self
             .lookup_definition(&addr.display_name())
@@ -960,8 +876,6 @@ impl<'a> FoldingContext<'a> {
             best = Some(fallback_structured);
         }
         best = self.choose_preferred_visible_expr(best, fallback_rendered);
-        best = self
-            .choose_preferred_visible_expr(best, self.prepared_named_memory_expr_for_current_op());
         if let Some(expr) = best {
             if let CExpr::Deref(inner) = &expr
                 && let Some(indexed) = self.indexed_pointer_add_expr(inner, &elem_ty)

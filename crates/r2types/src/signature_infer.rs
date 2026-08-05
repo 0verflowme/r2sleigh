@@ -95,7 +95,10 @@ pub fn infer_signature_from_prepared_ssa(
     recovered_params: &[RecoveredSignatureParam],
     pointer_arg_slots: &BTreeSet<usize>,
 ) -> InferredSignature {
-    let evidence_ctx = crate::prepare::collect_signature_type_evidence_context(pattern_ssa_blocks);
+    let evidence_ctx = crate::prepare::collect_signature_type_evidence_context_with_arch(
+        pattern_ssa_blocks,
+        Some(arch_name),
+    );
     let mut type_inference = TypeInference::new(ptr_bits);
     type_inference.set_prepared_ssa(prepared);
     type_inference.infer_function(prepared);
@@ -545,6 +548,7 @@ pub fn infer_signature_return_type(
 ) -> (CTypeLike, SignatureTypeEvidence) {
     let mut candidates = Vec::new();
     let mut candidate_evidence = Vec::new();
+    let mut candidate_constants = Vec::new();
 
     for block in func.blocks() {
         for op in &block.ops {
@@ -565,6 +569,7 @@ pub fn infer_signature_return_type(
                 evidence.width_bits = bits;
                 candidates.push(ty);
                 candidate_evidence.push(evidence);
+                candidate_constants.push(None);
                 continue;
             }
 
@@ -579,6 +584,7 @@ pub fn infer_signature_return_type(
             );
             candidates.push(ty);
             candidate_evidence.push(evidence);
+            candidate_constants.push(r2ssa::parse_const_value(&target.name));
         }
     }
 
@@ -614,6 +620,11 @@ pub fn infer_signature_return_type(
             .find(|e| e.width_bits >= 32)
             .unwrap_or_default();
         return (float_ty, evidence);
+    }
+    if let Some((ty, evidence)) =
+        scalar_return_type_join(&candidates, &candidate_evidence, &candidate_constants)
+    {
+        return (ty, evidence);
     }
     let evidence = candidate_evidence.into_iter().next().unwrap_or_default();
     (meaningful.remove(0), evidence)
@@ -689,6 +700,7 @@ fn infer_signature_return_type_from_vars(
 ) -> (CTypeLike, SignatureTypeEvidence) {
     let mut candidates = Vec::new();
     let mut candidate_evidence = Vec::new();
+    let mut candidate_constants = Vec::new();
     for value in return_vars {
         let target_name = value.name.to_ascii_lowercase();
         if target_name.starts_with("xmm0") || target_name.starts_with("st0") {
@@ -703,6 +715,7 @@ fn infer_signature_return_type_from_vars(
             evidence.width_bits = bits;
             candidates.push(ty);
             candidate_evidence.push(evidence);
+            candidate_constants.push(None);
             continue;
         }
 
@@ -712,13 +725,20 @@ fn infer_signature_return_type_from_vars(
             resolve_evidence_driven_signature_type(initial_ty, value.size, ptr_bits, &evidence);
         candidates.push(ty);
         candidate_evidence.push(evidence);
+        candidate_constants.push(r2ssa::parse_const_value(&value.name));
     }
-    choose_signature_return_type(candidates, candidate_evidence, ptr_bits)
+    choose_signature_return_type(
+        candidates,
+        candidate_evidence,
+        candidate_constants,
+        ptr_bits,
+    )
 }
 
 fn choose_signature_return_type(
     candidates: Vec<CTypeLike>,
     candidate_evidence: Vec<SignatureTypeEvidence>,
+    candidate_constants: Vec<Option<u64>>,
     ptr_bits: u32,
 ) -> (CTypeLike, SignatureTypeEvidence) {
     if candidates.is_empty() {
@@ -753,8 +773,91 @@ fn choose_signature_return_type(
             .unwrap_or_default();
         return (float_ty, evidence);
     }
+    if let Some((ty, evidence)) =
+        scalar_return_type_join(&candidates, &candidate_evidence, &candidate_constants)
+    {
+        return (ty, evidence);
+    }
     let evidence = candidate_evidence.into_iter().next().unwrap_or_default();
     (meaningful.remove(0), evidence)
+}
+
+fn scalar_return_type_join(
+    candidates: &[CTypeLike],
+    evidence: &[SignatureTypeEvidence],
+    constants: &[Option<u64>],
+) -> Option<(CTypeLike, SignatureTypeEvidence)> {
+    if candidates.len() != evidence.len() || candidates.len() != constants.len() {
+        return None;
+    }
+
+    let mut semantic_width = candidates
+        .iter()
+        .zip(constants)
+        .filter_map(|(ty, constant)| match (ty, constant) {
+            (CTypeLike::Int { bits, .. }, None) => Some(*bits),
+            _ => None,
+        })
+        .max()?;
+
+    for (ty, constant) in candidates.iter().zip(constants) {
+        let CTypeLike::Int { bits, .. } = ty else {
+            return None;
+        };
+        if *bits > semantic_width
+            && !constant.is_some_and(|value| unsigned_value_fits_bits(value, semantic_width))
+        {
+            semantic_width = *bits;
+        }
+    }
+
+    let mut saw_signed = false;
+    let mut saw_unsigned = false;
+    let mut saw_unknown = false;
+    for (ty, constant) in candidates.iter().zip(constants) {
+        if constant.is_some() {
+            continue;
+        }
+        let CTypeLike::Int { signedness, .. } = ty else {
+            return None;
+        };
+        match signedness {
+            Signedness::Signed => saw_signed = true,
+            Signedness::Unsigned => saw_unsigned = true,
+            Signedness::Unknown => saw_unknown = true,
+        }
+    }
+    let signedness = if saw_signed {
+        Signedness::Signed
+    } else if saw_unknown {
+        Signedness::Unknown
+    } else if saw_unsigned {
+        Signedness::Unsigned
+    } else {
+        return None;
+    };
+
+    let mut joined_evidence = SignatureTypeEvidence::default();
+    for item in evidence {
+        joined_evidence.pointer_proven = joined_evidence.pointer_proven.max(item.pointer_proven);
+        joined_evidence.pointer_likely = joined_evidence.pointer_likely.max(item.pointer_likely);
+        joined_evidence.scalar_proven = joined_evidence.scalar_proven.max(item.scalar_proven);
+        joined_evidence.scalar_likely = joined_evidence.scalar_likely.max(item.scalar_likely);
+        joined_evidence.bool_like = joined_evidence.bool_like.max(item.bool_like);
+    }
+    joined_evidence.width_bits = semantic_width;
+
+    Some((
+        CTypeLike::Int {
+            bits: semantic_width,
+            signedness,
+        },
+        joined_evidence,
+    ))
+}
+
+fn unsigned_value_fits_bits(value: u64, bits: u32) -> bool {
+    bits >= 64 || (bits > 0 && value < (1u64 << bits))
 }
 
 fn canonical_x86_64_arg_reg(name: &str) -> Option<&'static str> {
@@ -1218,6 +1321,72 @@ mod tests {
         );
 
         assert_eq!(inferred.ret_type, "void");
+    }
+
+    #[test]
+    fn scalar_return_join_narrows_wide_constant_to_nonconstant_semantic_width() {
+        let candidates = vec![
+            CTypeLike::Int {
+                bits: 64,
+                signedness: Signedness::Signed,
+            },
+            CTypeLike::Int {
+                bits: 32,
+                signedness: Signedness::Signed,
+            },
+        ];
+        let evidence = vec![
+            SignatureTypeEvidence {
+                scalar_likely: 1,
+                width_bits: 64,
+                ..Default::default()
+            },
+            SignatureTypeEvidence {
+                scalar_proven: 1,
+                width_bits: 32,
+                ..Default::default()
+            },
+        ];
+
+        let (ty, joined_evidence) =
+            scalar_return_type_join(&candidates, &evidence, &[Some(0xffff_ffff), None])
+                .expect("integer return join");
+
+        assert_eq!(
+            ty,
+            CTypeLike::Int {
+                bits: 32,
+                signedness: Signedness::Signed,
+            }
+        );
+        assert_eq!(joined_evidence.width_bits, 32);
+        assert_eq!(joined_evidence.scalar_proven, 1);
+    }
+
+    #[test]
+    fn scalar_return_join_keeps_genuine_wide_nonconstant_path() {
+        let candidates = vec![
+            CTypeLike::Int {
+                bits: 32,
+                signedness: Signedness::Signed,
+            },
+            CTypeLike::Int {
+                bits: 64,
+                signedness: Signedness::Signed,
+            },
+        ];
+        let evidence = vec![SignatureTypeEvidence::default(); 2];
+
+        let (ty, _) = scalar_return_type_join(&candidates, &evidence, &[None, None])
+            .expect("integer return join");
+
+        assert_eq!(
+            ty,
+            CTypeLike::Int {
+                bits: 64,
+                signedness: Signedness::Signed,
+            }
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::OnceLock;
 
 use crate::analysis;
-use crate::ast::CType;
+use crate::ast::{CExpr, CType};
 use r2ssa::{MemorySSAFacts, ObjectModel, SsaArtifact, ValueId};
 #[cfg(test)]
 use r2types::ExternalStackVarSpec;
@@ -155,6 +155,7 @@ pub struct FoldingContext<'a> {
     pub(crate) preferred_entry_arg_lookup_cache:
         std::cell::RefCell<HashMap<String, Option<String>>>,
     pub(crate) forwarded_source_cache: std::cell::RefCell<HashMap<String, Option<r2ssa::SSAVar>>>,
+    pub(crate) load_expr_memo: std::cell::RefCell<HashMap<(ValueId, String), CExpr>>,
     pub(crate) call_result_owner_name_cache:
         std::cell::RefCell<BTreeMap<(u64, usize), Option<String>>>,
     pub(crate) owned_call_visible_names_cache: std::cell::RefCell<Option<HashSet<String>>>,
@@ -235,6 +236,7 @@ impl<'a> FoldingContext<'a> {
             rendered_alias_lookup_cache: std::cell::RefCell::new(HashMap::new()),
             preferred_entry_arg_lookup_cache: std::cell::RefCell::new(HashMap::new()),
             forwarded_source_cache: std::cell::RefCell::new(HashMap::new()),
+            load_expr_memo: std::cell::RefCell::new(HashMap::new()),
             call_result_owner_name_cache: std::cell::RefCell::new(BTreeMap::new()),
             owned_call_visible_names_cache: std::cell::RefCell::new(None),
             prepared_semantic_view_cache: OnceCell::new(),
@@ -254,6 +256,28 @@ impl<'a> FoldingContext<'a> {
 
     pub(crate) fn effect_render_proofs(&self) -> Vec<EffectRenderProof> {
         self.effect_render_proofs.borrow().clone()
+    }
+
+    pub(crate) fn effect_render_proofs_since(&self, checkpoint: usize) -> Vec<EffectRenderProof> {
+        self.effect_render_proofs
+            .borrow()
+            .get(checkpoint..)
+            .unwrap_or_default()
+            .to_vec()
+    }
+
+    pub(crate) fn append_effect_render_proofs(&self, proofs: &[EffectRenderProof]) {
+        self.effect_render_proofs
+            .borrow_mut()
+            .extend_from_slice(proofs);
+    }
+
+    pub(crate) fn effect_render_proof_checkpoint(&self) -> usize {
+        self.effect_render_proofs.borrow().len()
+    }
+
+    pub(crate) fn truncate_effect_render_proofs(&self, checkpoint: usize) {
+        self.effect_render_proofs.borrow_mut().truncate(checkpoint);
     }
 
     pub(crate) fn record_effect_render_proof_for_value(

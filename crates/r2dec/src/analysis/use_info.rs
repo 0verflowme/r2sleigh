@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
 
-use r2ssa::{SSAFunction, SSAOp, SSAVar, SSAVarNameKind, ValueId};
+use r2ssa::{ObjectKind, SSAFunction, SSAOp, SSAVar, SSAVarNameKind, SsaArtifact, ValueId};
 use r2types::{
     CalleeCallArgPolicy, CalleeResolutionFacts, CalleeTargetIdentityRequest,
     CalleeTargetPolicyDecision, CalleeTargetResolutionRequest, CallsiteKey,
@@ -1204,6 +1204,7 @@ pub(crate) fn populate_frame_slot_merges(
     info: &mut UseInfo,
     func: &SSAFunction,
     env: &PassEnv<'_>,
+    prepared: Option<&SsaArtifact>,
 ) {
     info.frame_slot_merges.clear();
 
@@ -1217,12 +1218,16 @@ pub(crate) fn populate_frame_slot_merges(
             let SSAOp::Load { dst, addr, .. } = op else {
                 continue;
             };
-            let Some(slot_offset) = utils::extract_stack_offset_from_var(
-                addr,
-                &info.definitions,
-                env.fp_name,
-                env.sp_name,
-            ) else {
+            let prepared_offset =
+                prepared.and_then(|prepared| prepared_stack_offset_for_var(prepared, addr));
+            let Some(slot_offset) = prepared_offset.or_else(|| {
+                utils::extract_stack_offset_from_var(
+                    addr,
+                    &info.definitions,
+                    env.fp_name,
+                    env.sp_name,
+                )
+            }) else {
                 continue;
             };
 
@@ -1234,7 +1239,7 @@ pub(crate) fn populate_frame_slot_merges(
                     break;
                 };
                 let Some(value) =
-                    merged_slot_store_value_for_pred(info, pred_block, slot_offset, env)
+                    merged_slot_store_value_for_pred(info, pred_block, slot_offset, env, prepared)
                 else {
                     complete = false;
                     break;
@@ -1256,6 +1261,17 @@ pub(crate) fn populate_frame_slot_merges(
                 },
             );
         }
+    }
+}
+
+fn prepared_stack_offset_for_var(prepared: &SsaArtifact, var: &SSAVar) -> Option<i64> {
+    let object = prepared.object_for_var(var)?;
+    let object = prepared.objects().object(object)?;
+    match object.kind {
+        ObjectKind::StackSlot { offset, .. } | ObjectKind::FrameObject { offset, .. } => {
+            Some(offset)
+        }
+        _ => None,
     }
 }
 
@@ -1816,7 +1832,8 @@ fn switch_selector_value_for_load(
         let mut best = None;
         for pred_addr in ctx.preds {
             let pred_block = ctx.func.get_block(*pred_addr)?;
-            let candidate = merged_slot_store_value_for_pred(info, pred_block, offset, ctx.env);
+            let candidate =
+                merged_slot_store_value_for_pred(info, pred_block, offset, ctx.env, None);
             best = preferred_switch_selector_value(info, best, candidate);
         }
         best
@@ -2618,15 +2635,21 @@ fn merged_slot_store_value_for_pred(
     block: &SSABlock,
     slot_offset: i64,
     env: &PassEnv<'_>,
+    prepared: Option<&SsaArtifact>,
 ) -> Option<SemanticValue> {
     for (idx, op) in block.ops.iter().enumerate().rev() {
         if let SSAOp::Store { addr, val, .. } = op
-            && utils::extract_stack_offset_from_var(
-                addr,
-                &info.definitions,
-                env.fp_name,
-                env.sp_name,
-            ) == Some(slot_offset)
+            && prepared
+                .and_then(|prepared| prepared_stack_offset_for_var(prepared, addr))
+                .or_else(|| {
+                    utils::extract_stack_offset_from_var(
+                        addr,
+                        &info.definitions,
+                        env.fp_name,
+                        env.sp_name,
+                    )
+                })
+                == Some(slot_offset)
         {
             let base = semantic_stack_store_value(info, val, env);
             let family = (slot_offset >= 0)
@@ -12039,7 +12062,7 @@ mod tests {
 
         let blocks = func.blocks().cloned().collect::<Vec<_>>();
         let mut info = analyze(&blocks, &env);
-        populate_frame_slot_merges(&mut info, &func, &env);
+        populate_frame_slot_merges(&mut info, &func, &env, None);
 
         let summary = info
             .frame_slot_merges
@@ -12196,7 +12219,7 @@ mod tests {
 
         let blocks = func.blocks().cloned().collect::<Vec<_>>();
         let mut info = analyze(&blocks, &env);
-        populate_frame_slot_merges(&mut info, &func, &env);
+        populate_frame_slot_merges(&mut info, &func, &env, None);
 
         let summary = info
             .frame_slot_merges
@@ -12316,7 +12339,7 @@ mod tests {
 
         let blocks = func.blocks().cloned().collect::<Vec<_>>();
         let mut info = analyze(&blocks, &env);
-        populate_frame_slot_merges(&mut info, &func, &env);
+        populate_frame_slot_merges(&mut info, &func, &env, None);
 
         let summary = info
             .frame_slot_merges

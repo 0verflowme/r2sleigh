@@ -401,6 +401,16 @@ impl<'a> LowerCtx<'a> {
                 CExpr::cast(CType::Float(dst.size), self.get_expr(src))
             }
             SSAOp::Cast { dst, src } => CExpr::cast(type_from_size(dst.size), self.get_expr(src)),
+            SSAOp::Select {
+                cond,
+                if_true,
+                if_false,
+                ..
+            } => CExpr::Ternary {
+                cond: Box::new(self.get_expr(cond)),
+                then_expr: Box::new(self.get_expr(if_true)),
+                else_expr: Box::new(self.get_expr(if_false)),
+            },
             SSAOp::Call { target } => CExpr::call(self.get_expr(target), vec![]),
             SSAOp::CallInd { target } => {
                 CExpr::call(CExpr::Deref(Box::new(self.get_expr(target))), vec![])
@@ -1508,6 +1518,48 @@ mod tests {
         });
 
         assert_eq!(expr, CExpr::Var("x30".to_string()));
+    }
+
+    #[test]
+    fn op_to_expr_preserves_select_value_semantics() {
+        let function_names = HashMap::new();
+        let strings = HashMap::new();
+        let symbols = HashMap::new();
+        let definitions = HashMap::new();
+        let use_counts = HashMap::new();
+        let condition_vars = HashSet::new();
+        let pinned = HashSet::new();
+        let var_aliases = HashMap::new();
+        let ptr_arith = HashMap::new();
+        let stack_slots = HashMap::new();
+        let forwarded_values = HashMap::new();
+        let ctx = make_ctx(
+            &definitions,
+            &use_counts,
+            &condition_vars,
+            &pinned,
+            &var_aliases,
+            &ptr_arith,
+            &stack_slots,
+            &forwarded_values,
+            &function_names,
+            &strings,
+            &symbols,
+        );
+
+        assert_eq!(
+            ctx.op_to_expr(&SSAOp::Select {
+                dst: SSAVar::new("tmp:result", 1, 4),
+                cond: SSAVar::new("cond", 0, 1),
+                if_true: SSAVar::new("when_true", 0, 4),
+                if_false: SSAVar::new("when_false", 0, 4),
+            }),
+            CExpr::Ternary {
+                cond: Box::new(CExpr::Var("cond".to_string())),
+                then_expr: Box::new(CExpr::Var("when_true".to_string())),
+                else_expr: Box::new(CExpr::Var("when_false".to_string())),
+            }
+        );
     }
 
     #[test]

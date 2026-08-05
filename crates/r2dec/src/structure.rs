@@ -3,15 +3,15 @@
 //! This module converts unstructured control flow (gotos, CFG edges) into
 //! structured high-level constructs (if-then-else, while, for, etc.).
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use r2ssa::cfg::BlockTerminator;
-use r2ssa::{CFGEdge, PredicateId, SSAFunction, SSAOp, ValueId};
+use r2ssa::{CFGEdge, ControlGuard, LoopId, PredicateId, SSAFunction, SSAOp, ValueId};
 
 use crate::address::parse_address_from_var_name;
 use crate::ast::{BinaryOp, CExpr, CStmt, UnaryOp};
 use crate::fold::FoldingContext;
-use crate::fold::context::EffectRenderProofKind;
+use crate::fold::context::{EffectRenderProof, EffectRenderProofKind};
 use crate::region::{Region, RegionAnalyzer};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,7 +131,7 @@ pub struct ControlFlowStructurer<'a, 'o> {
     /// Folding context for expression optimization.
     fold_ctx: &'o FoldingContext<'o>,
     /// Cached folded statements per basic block.
-    folded_block_cache: HashMap<u64, Vec<CStmt>>,
+    folded_block_cache: HashMap<u64, FoldedBlock>,
     /// Labels for blocks that need gotos.
     labels: HashMap<u64, String>,
     /// Counter for generating unique labels.
@@ -146,6 +146,173 @@ pub struct ControlFlowStructurer<'a, 'o> {
     control_render_proofs: Vec<ControlRenderProof>,
     /// Merge blocks owned by enclosing regions and therefore emitted there.
     deferred_merge_blocks: Vec<u64>,
+    /// Lexical control context currently being emitted.
+    active_control_guards: Vec<ControlGuard>,
+    active_loops: Vec<LoopId>,
+    /// Every lexical domain in which a source block was emitted. Shared CFG
+    /// blocks may be duplicated by structuring, so coverage is checked only
+    /// after all occurrences are known.
+    rendered_block_domains: BTreeMap<u64, Vec<RenderedBlockDomain>>,
+}
+
+#[derive(Debug, Clone)]
+struct FoldedBlock {
+    stmts: Vec<CStmt>,
+    effect_proofs: Vec<EffectRenderProof>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RenderedBlockDomain {
+    guards: Vec<ControlGuard>,
+    loops: Vec<LoopId>,
+}
+
+const BDD_FALSE: usize = 0;
+const BDD_TRUE: usize = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum BddOp {
+    And,
+    Or,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct BddNode {
+    variable: PredicateId,
+    low: usize,
+    high: usize,
+}
+
+struct ControlBdd {
+    nodes: Vec<Option<BddNode>>,
+    unique: HashMap<BddNode, usize>,
+    apply_cache: HashMap<(BddOp, usize, usize), usize>,
+    not_cache: HashMap<usize, usize>,
+    node_limit: usize,
+}
+
+impl ControlBdd {
+    fn new(node_limit: usize) -> Self {
+        Self {
+            nodes: vec![None, None],
+            unique: HashMap::new(),
+            apply_cache: HashMap::new(),
+            not_cache: HashMap::new(),
+            node_limit,
+        }
+    }
+
+    fn created_nodes(&self) -> usize {
+        self.nodes.len().saturating_sub(2)
+    }
+
+    fn variable(&mut self, variable: PredicateId, truth: bool) -> Result<usize, String> {
+        let positive = self.make_node(variable, BDD_FALSE, BDD_TRUE)?;
+        if truth {
+            Ok(positive)
+        } else {
+            self.not(positive)
+        }
+    }
+
+    fn make_node(
+        &mut self,
+        variable: PredicateId,
+        low: usize,
+        high: usize,
+    ) -> Result<usize, String> {
+        if low == high {
+            return Ok(low);
+        }
+        let node = BddNode {
+            variable,
+            low,
+            high,
+        };
+        if let Some(existing) = self.unique.get(&node).copied() {
+            return Ok(existing);
+        }
+        if self.created_nodes() >= self.node_limit {
+            return Err(format!(
+                "control coverage BDD exceeded structuring safety budget ({})",
+                self.node_limit
+            ));
+        }
+        let id = self.nodes.len();
+        self.nodes.push(Some(node));
+        self.unique.insert(node, id);
+        Ok(id)
+    }
+
+    fn not(&mut self, value: usize) -> Result<usize, String> {
+        if value == BDD_FALSE {
+            return Ok(BDD_TRUE);
+        }
+        if value == BDD_TRUE {
+            return Ok(BDD_FALSE);
+        }
+        if let Some(cached) = self.not_cache.get(&value).copied() {
+            return Ok(cached);
+        }
+        let node = self
+            .nodes
+            .get(value)
+            .and_then(|node| *node)
+            .ok_or_else(|| format!("invalid control coverage BDD node {value}"))?;
+        let low = self.not(node.low)?;
+        let high = self.not(node.high)?;
+        let result = self.make_node(node.variable, low, high)?;
+        self.not_cache.insert(value, result);
+        self.not_cache.insert(result, value);
+        Ok(result)
+    }
+
+    fn and(&mut self, lhs: usize, rhs: usize) -> Result<usize, String> {
+        self.apply(BddOp::And, lhs, rhs)
+    }
+
+    fn or(&mut self, lhs: usize, rhs: usize) -> Result<usize, String> {
+        self.apply(BddOp::Or, lhs, rhs)
+    }
+
+    fn apply(&mut self, op: BddOp, lhs: usize, rhs: usize) -> Result<usize, String> {
+        let (lhs, rhs) = if lhs <= rhs { (lhs, rhs) } else { (rhs, lhs) };
+        let terminal = match op {
+            BddOp::And if lhs == BDD_FALSE => Some(BDD_FALSE),
+            BddOp::And if lhs == BDD_TRUE => Some(rhs),
+            BddOp::Or if lhs == BDD_FALSE => Some(rhs),
+            BddOp::Or if lhs == BDD_TRUE => Some(BDD_TRUE),
+            _ if lhs == rhs => Some(lhs),
+            _ => None,
+        };
+        if let Some(result) = terminal {
+            return Ok(result);
+        }
+        if let Some(cached) = self.apply_cache.get(&(op, lhs, rhs)).copied() {
+            return Ok(cached);
+        }
+        let lhs_node = self.nodes.get(lhs).and_then(|node| *node);
+        let rhs_node = self.nodes.get(rhs).and_then(|node| *node);
+        let variable = lhs_node
+            .map(|node| node.variable)
+            .into_iter()
+            .chain(rhs_node.map(|node| node.variable))
+            .min()
+            .ok_or_else(|| "control coverage BDD apply had no variable".to_string())?;
+        let (lhs_low, lhs_high) = lhs_node
+            .filter(|node| node.variable == variable)
+            .map(|node| (node.low, node.high))
+            .unwrap_or((lhs, lhs));
+        let (rhs_low, rhs_high) = rhs_node
+            .filter(|node| node.variable == variable)
+            .map(|node| (node.low, node.high))
+            .unwrap_or((rhs, rhs));
+        let low = self.apply(op, lhs_low, rhs_low)?;
+        let high = self.apply(op, lhs_high, rhs_high)?;
+        let result = self.make_node(variable, low, high)?;
+        self.apply_cache.insert((op, lhs, rhs), result);
+        Ok(result)
+    }
 }
 
 struct SwitchRegionView<'r> {
@@ -175,6 +342,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             safety_reason: None,
             control_render_proofs: Vec::new(),
             deferred_merge_blocks: Vec::new(),
+            active_control_guards: Vec::new(),
+            active_loops: Vec::new(),
+            rendered_block_domains: BTreeMap::new(),
         }
     }
 
@@ -193,6 +363,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             safety_reason: None,
             control_render_proofs: Vec::new(),
             deferred_merge_blocks: Vec::new(),
+            active_control_guards: Vec::new(),
+            active_loops: Vec::new(),
+            rendered_block_domains: BTreeMap::new(),
         }
     }
 
@@ -452,6 +625,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     pub(crate) fn structure_preserving_render_proof_identity(&mut self) -> CStmt {
         self.reset_safety_budget();
         self.control_render_proofs.clear();
+        self.active_control_guards.clear();
+        self.active_loops.clear();
+        self.rendered_block_domains.clear();
         if self.region_analyzer.is_none() {
             self.region_analyzer = Some(RegionAnalyzer::new(self.func));
         }
@@ -469,6 +645,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             }
         };
         let stmt = self.structure_region(&region);
+        self.validate_rendered_block_domain_coverage();
         if self.safety_reason.is_some() {
             return CStmt::Empty;
         }
@@ -504,23 +681,15 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             } => {
                 let merge_owned_by_ancestor =
                     merge_block.is_some_and(|merge| self.deferred_merge_blocks.contains(&merge));
-                if !merge_owned_by_ancestor
-                    && let Some(rewritten) = self.try_structure_if_with_shared_default_arm(
-                        *cond_block,
-                        then_region,
-                        else_region.as_deref(),
-                        *merge_block,
-                    )
-                {
-                    return rewritten;
-                }
-                if !merge_owned_by_ancestor && !self.fold_ctx.requires_certified_rendering() {
-                    if let Some(rewritten) = self.try_structure_symbolic_actionable_if(
-                        *cond_block,
-                        then_region,
-                        else_region.as_deref(),
-                        *merge_block,
-                    ) {
+                if !merge_owned_by_ancestor {
+                    if !self.fold_ctx.requires_certified_rendering()
+                        && let Some(rewritten) = self.try_structure_symbolic_actionable_if(
+                            *cond_block,
+                            then_region,
+                            else_region.as_deref(),
+                            *merge_block,
+                        )
+                    {
                         return rewritten;
                     }
                     if let Some(rewritten) = self.try_structure_if_else_with_slot_merge_returns(
@@ -639,7 +808,44 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 } else {
                     self.record_loop_render_proof(*header, predicate, condition_value, body);
                 }
-                let body_stmt = self.structure_loop_body(body);
+                let loop_id = if self.fold_ctx.requires_certified_rendering() {
+                    self.fold_ctx
+                        .control_facts()
+                        .and_then(|facts| facts.loops_for_header(*header).next())
+                        .map(|fact| fact.loop_id)
+                } else {
+                    None
+                };
+                if self.fold_ctx.requires_certified_rendering() && loop_id.is_none() {
+                    self.safety_reason = Some(format!(
+                        "missing certified loop domain for header 0x{header:x}"
+                    ));
+                    return CStmt::Empty;
+                }
+                let body_guard = if self.fold_ctx.requires_certified_rendering() {
+                    self.certified_branch_guard_for_region(*header, body)
+                } else {
+                    None
+                };
+                if self.fold_ctx.requires_certified_rendering() && body_guard.is_none() {
+                    self.safety_reason = Some(format!(
+                        "missing certified loop-body control domain for header 0x{header:x}"
+                    ));
+                    return CStmt::Empty;
+                }
+                if let Some(loop_id) = loop_id {
+                    self.active_loops.push(loop_id);
+                }
+                if let Some(guard) = &body_guard {
+                    self.active_control_guards.push(guard.clone());
+                }
+                let body_stmt = Self::strip_trailing_continue(self.structure_loop_body(body));
+                if body_guard.is_some() {
+                    self.active_control_guards.pop();
+                }
+                if loop_id.is_some() {
+                    self.active_loops.pop();
+                }
                 CStmt::while_loop(cond, body_stmt)
             }
             Region::DoWhileLoop { body, cond_block } => {
@@ -666,7 +872,27 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 } else {
                     self.record_loop_render_proof(anchor, predicate, condition_value, body);
                 }
-                let body_stmt = self.structure_loop_body(body);
+                let loop_id = if self.fold_ctx.requires_certified_rendering() {
+                    self.fold_ctx
+                        .control_facts()
+                        .and_then(|facts| facts.loops_for_header(anchor).next())
+                        .map(|fact| fact.loop_id)
+                } else {
+                    None
+                };
+                if self.fold_ctx.requires_certified_rendering() && loop_id.is_none() {
+                    self.safety_reason = Some(format!(
+                        "missing certified loop domain for header 0x{anchor:x}"
+                    ));
+                    return CStmt::Empty;
+                }
+                if let Some(loop_id) = loop_id {
+                    self.active_loops.push(loop_id);
+                }
+                let body_stmt = Self::strip_trailing_continue(self.structure_loop_body(body));
+                if loop_id.is_some() {
+                    self.active_loops.pop();
+                }
                 CStmt::DoWhile {
                     body: Box::new(body_stmt),
                     cond,
@@ -685,11 +911,50 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     fn structure_branch_region(&mut self, pred_block: u64, region: &Region) -> CStmt {
-        if self.func.successors(pred_block).contains(&region.entry()) {
+        let direct_successor = self.func.successors(pred_block).contains(&region.entry());
+        if !self.fold_ctx.requires_certified_rendering() {
+            return if direct_successor {
+                self.structure_region_from_predecessor(region, pred_block)
+            } else {
+                self.structure_region(region)
+            };
+        }
+        let Some(guard) = self.certified_branch_guard_for_region(pred_block, region) else {
+            self.safety_reason = Some(format!(
+                "missing certified branch-domain edge from 0x{pred_block:x} to region 0x{:x}",
+                region.entry()
+            ));
+            return CStmt::Empty;
+        };
+        self.active_control_guards.push(guard);
+        let stmt = if direct_successor {
             self.structure_region_from_predecessor(region, pred_block)
         } else {
             self.structure_region(region)
+        };
+        self.active_control_guards.pop();
+        stmt
+    }
+
+    fn certified_branch_guard_for_region(
+        &self,
+        pred_block: u64,
+        region: &Region,
+    ) -> Option<ControlGuard> {
+        let predicate = self
+            .fold_ctx
+            .control_facts()?
+            .branch_for_block(pred_block)?;
+        let entry = region.entry();
+        let reaches_true = self.transparent_target_reaches(predicate.true_target, entry);
+        let reaches_false = self.transparent_target_reaches(predicate.false_target, entry);
+        if reaches_true == reaches_false {
+            return None;
         }
+        Some(ControlGuard::Branch {
+            predicate: predicate.id,
+            truth: reaches_true,
+        })
     }
 
     fn structure_region_from_predecessor(&mut self, region: &Region, pred_block: u64) -> CStmt {
@@ -697,132 +962,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             Region::Block(addr) => self.structure_block_from_predecessor(*addr, pred_block),
             _ => self.structure_region(region),
         }
-    }
-
-    fn try_structure_if_with_shared_default_arm(
-        &mut self,
-        cond_block: u64,
-        then_region: &Region,
-        else_region: Option<&Region>,
-        merge_block: Option<u64>,
-    ) -> Option<CStmt> {
-        let merge_block = merge_block?;
-        let else_region = else_region?;
-        self.try_structure_shared_default_orientation(
-            cond_block,
-            then_region,
-            else_region,
-            merge_block,
-        )
-        .or_else(|| {
-            self.try_structure_shared_default_orientation(
-                cond_block,
-                else_region,
-                then_region,
-                merge_block,
-            )
-        })
-    }
-
-    fn try_structure_shared_default_orientation(
-        &mut self,
-        cond_block: u64,
-        default_region: &Region,
-        nested_region: &Region,
-        merge_block: u64,
-    ) -> Option<CStmt> {
-        let Region::IfThenElse {
-            cond_block: _,
-            then_region: nested_then,
-            else_region: nested_else,
-            merge_block: nested_merge,
-        } = nested_region
-        else {
-            return None;
-        };
-        if *nested_merge != Some(merge_block) {
-            return None;
-        }
-        let default_entry = default_region.entry();
-        let then_reaches_default = self
-            .unique_region_predecessor_to_merge(nested_then, default_entry)
-            .is_some();
-        let else_reaches_default = nested_else.as_deref().is_some_and(|region| {
-            self.unique_region_predecessor_to_merge(region, default_entry)
-                .is_some()
-        });
-        if then_reaches_default == else_reaches_default {
-            return None;
-        }
-
-        let (true_target, false_target) = self.resolve_conditional_targets(cond_block)?;
-        let true_is_default = self.transparent_target_reaches(true_target, default_entry);
-        let false_is_default = self.transparent_target_reaches(false_target, default_entry);
-        if true_is_default == false_is_default {
-            return None;
-        }
-
-        let (cond, predicate, condition_value) =
-            self.get_branch_condition_with_predicate(cond_block);
-        let cond = cond?;
-        if !Self::expr_is_reorderable_scalar_condition(&cond) {
-            return None;
-        }
-        let branch_proof = if self.fold_ctx.requires_certified_rendering() {
-            Some(self.certified_branch_render_proof(cond_block, predicate, condition_value)?)
-        } else {
-            None
-        };
-
-        let default_stmt = self.structure_region(default_region);
-        let default_targets = Self::pure_local_assignment_targets(&default_stmt)?;
-        if default_targets.is_empty()
-            || !Self::collect_expr_vars(&cond).is_disjoint(&default_targets)
-        {
-            return None;
-        }
-
-        let control_proof_checkpoint = self.control_render_proofs.len();
-        if let Some(proof) = branch_proof {
-            self.control_render_proofs.push(proof);
-        } else {
-            self.record_branch_render_proof(cond_block, predicate, condition_value);
-        }
-        self.deferred_merge_blocks.push(merge_block);
-        let nested_stmt = self.structure_region(nested_region);
-        debug_assert_eq!(self.deferred_merge_blocks.pop(), Some(merge_block));
-        if !Self::stmt_writes_only_local_targets(&nested_stmt, &default_targets)
-            || !Self::stmt_writes_any_local_target(&nested_stmt, &default_targets)
-        {
-            self.control_render_proofs
-                .truncate(control_proof_checkpoint);
-            return None;
-        }
-        let cleaned_nested = Self::cleanup(nested_stmt.clone());
-        let nested_stmt = if Self::stmt_control_node_count(&cleaned_nested)
-            == Self::stmt_control_node_count(&nested_stmt)
-            && Self::stmt_writes_only_local_targets(&cleaned_nested, &default_targets)
-            && Self::stmt_writes_any_local_target(&cleaned_nested, &default_targets)
-        {
-            cleaned_nested
-        } else {
-            nested_stmt
-        };
-
-        let execute_nested = if true_is_default {
-            Self::negate_condition(cond)
-        } else {
-            cond
-        };
-        let mut prefix = self.structure_block_prefix_stmts(cond_block);
-        Self::append_stmt_body_flat(&mut prefix, default_stmt);
-        prefix.push(CStmt::if_stmt(execute_nested, nested_stmt, None));
-        Self::append_stmt_body_flat(&mut prefix, self.structure_block(merge_block));
-        Some(if prefix.len() == 1 {
-            prefix.into_iter().next().unwrap_or(CStmt::Empty)
-        } else {
-            CStmt::Block(prefix)
-        })
     }
 
     fn transparent_target_reaches(&self, mut current: u64, target: u64) -> bool {
@@ -848,134 +987,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             current = *successor;
         }
         false
-    }
-
-    fn pure_local_assignment_targets(stmt: &CStmt) -> Option<HashSet<String>> {
-        match stmt {
-            CStmt::Expr(CExpr::Binary {
-                op: BinaryOp::Assign,
-                left,
-                right,
-            }) => {
-                let CExpr::Var(name) = left.as_ref() else {
-                    return None;
-                };
-                Self::expr_is_side_effect_free(right).then(|| HashSet::from([name.clone()]))
-            }
-            CStmt::Block(stmts) if !stmts.is_empty() => {
-                let mut targets = HashSet::new();
-                for stmt in stmts {
-                    targets.extend(Self::pure_local_assignment_targets(stmt)?);
-                }
-                Some(targets)
-            }
-            _ => None,
-        }
-    }
-
-    fn expr_is_reorderable_scalar_condition(expr: &CExpr) -> bool {
-        let mut reorderable = Self::expr_is_side_effect_free(expr);
-        expr.visit(&mut |node| {
-            if matches!(
-                node,
-                CExpr::Call { .. }
-                    | CExpr::Deref(_)
-                    | CExpr::Subscript { .. }
-                    | CExpr::Member { .. }
-                    | CExpr::PtrMember { .. }
-            ) {
-                reorderable = false;
-            }
-        });
-        reorderable
-    }
-
-    fn stmt_writes_only_local_targets(stmt: &CStmt, targets: &HashSet<String>) -> bool {
-        match stmt {
-            CStmt::Empty => true,
-            CStmt::Expr(CExpr::Binary {
-                op: BinaryOp::Assign,
-                left,
-                right,
-            }) => {
-                matches!(left.as_ref(), CExpr::Var(name) if targets.contains(name))
-                    && Self::expr_is_side_effect_free(right)
-            }
-            CStmt::Block(stmts) => stmts
-                .iter()
-                .all(|stmt| Self::stmt_writes_only_local_targets(stmt, targets)),
-            CStmt::If {
-                cond,
-                then_body,
-                else_body,
-            } => {
-                Self::expr_is_reorderable_scalar_condition(cond)
-                    && Self::collect_expr_vars(cond).is_disjoint(targets)
-                    && Self::stmt_writes_only_local_targets(then_body, targets)
-                    && else_body
-                        .as_deref()
-                        .is_none_or(|stmt| Self::stmt_writes_only_local_targets(stmt, targets))
-            }
-            _ => false,
-        }
-    }
-
-    fn stmt_writes_any_local_target(stmt: &CStmt, targets: &HashSet<String>) -> bool {
-        match stmt {
-            CStmt::Expr(CExpr::Binary {
-                op: BinaryOp::Assign,
-                left,
-                ..
-            }) => matches!(left.as_ref(), CExpr::Var(name) if targets.contains(name)),
-            CStmt::Block(stmts) => stmts
-                .iter()
-                .any(|stmt| Self::stmt_writes_any_local_target(stmt, targets)),
-            CStmt::If {
-                then_body,
-                else_body,
-                ..
-            } => {
-                Self::stmt_writes_any_local_target(then_body, targets)
-                    || else_body
-                        .as_deref()
-                        .is_some_and(|stmt| Self::stmt_writes_any_local_target(stmt, targets))
-            }
-            _ => false,
-        }
-    }
-
-    fn stmt_control_node_count(stmt: &CStmt) -> usize {
-        match stmt {
-            CStmt::If {
-                then_body,
-                else_body,
-                ..
-            } => {
-                1 + Self::stmt_control_node_count(then_body)
-                    + else_body
-                        .as_deref()
-                        .map(Self::stmt_control_node_count)
-                        .unwrap_or(0)
-            }
-            CStmt::While { body, .. } | CStmt::DoWhile { body, .. } | CStmt::For { body, .. } => {
-                1 + Self::stmt_control_node_count(body)
-            }
-            CStmt::Switch { cases, default, .. } => {
-                1 + cases
-                    .iter()
-                    .flat_map(|case| &case.body)
-                    .map(Self::stmt_control_node_count)
-                    .sum::<usize>()
-                    + default
-                        .as_ref()
-                        .into_iter()
-                        .flatten()
-                        .map(Self::stmt_control_node_count)
-                        .sum::<usize>()
-            }
-            CStmt::Block(stmts) => stmts.iter().map(Self::stmt_control_node_count).sum(),
-            _ => 0,
-        }
     }
 
     fn structure_block_from_predecessor(&mut self, addr: u64, pred_block: u64) -> CStmt {
@@ -1173,7 +1184,29 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 continue;
             };
             let value_expr = CExpr::IntLit(*case_value as i64);
+            let guard = if self.fold_ctx.requires_certified_rendering() {
+                self.certified_switch_guard_for_region(
+                    switch_block,
+                    case_region,
+                    Some(*case_value),
+                    false,
+                )
+            } else {
+                None
+            };
+            if self.fold_ctx.requires_certified_rendering() && guard.is_none() {
+                self.safety_reason = Some(format!(
+                    "missing certified switch-domain arm at 0x{switch_block:x} for case {case_value}"
+                ));
+                return CStmt::Empty;
+            }
+            if let Some(guard) = &guard {
+                self.active_control_guards.push(guard.clone());
+            }
             let case_stmt = self.structure_region(case_region);
+            if guard.is_some() {
+                self.active_control_guards.pop();
+            }
             let body = if self.fold_ctx.requires_certified_rendering() {
                 vec![case_stmt]
             } else {
@@ -1185,7 +1218,29 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             });
         }
 
-        let default_body = default.map(|region| vec![self.structure_region(region)]);
+        let default_body = if let Some(region) = default {
+            let guard = if self.fold_ctx.requires_certified_rendering() {
+                self.certified_switch_guard_for_region(switch_block, region, None, true)
+            } else {
+                None
+            };
+            if self.fold_ctx.requires_certified_rendering() && guard.is_none() {
+                self.safety_reason = Some(format!(
+                    "missing certified switch-domain default at 0x{switch_block:x}"
+                ));
+                return CStmt::Empty;
+            }
+            if let Some(guard) = &guard {
+                self.active_control_guards.push(guard.clone());
+            }
+            let stmt = self.structure_region(region);
+            if guard.is_some() {
+                self.active_control_guards.pop();
+            }
+            Some(vec![stmt])
+        } else {
+            None
+        };
         if let Some(merge) = merge_block {
             debug_assert_eq!(self.deferred_merge_blocks.pop(), Some(merge));
         }
@@ -1568,13 +1623,227 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     fn folded_block_stmts(&mut self, block: &r2ssa::FunctionSSABlock, addr: u64) -> Vec<CStmt> {
-        if let Some(stmts) = self.folded_block_cache.get(&addr) {
-            return stmts.clone();
+        let stmts = if let Some(folded) = self.folded_block_cache.get(&addr) {
+            self.fold_ctx
+                .append_effect_render_proofs(&folded.effect_proofs);
+            folded.stmts.clone()
+        } else {
+            let proof_checkpoint = self.fold_ctx.effect_render_proof_checkpoint();
+            let stmts = self.fold_ctx.fold_block(block, addr);
+            let effect_proofs = self.fold_ctx.effect_render_proofs_since(proof_checkpoint);
+            self.folded_block_cache.insert(
+                addr,
+                FoldedBlock {
+                    stmts: stmts.clone(),
+                    effect_proofs,
+                },
+            );
+            stmts
+        };
+        self.validate_certified_block_domain(addr, &stmts);
+        stmts
+    }
+
+    fn validate_certified_block_domain(&mut self, block_addr: u64, stmts: &[CStmt]) {
+        if !self.fold_ctx.requires_certified_rendering() || stmts.is_empty() {
+            return;
+        }
+        let Some(source) = self
+            .fold_ctx
+            .control_facts()
+            .and_then(|facts| facts.control_domain_for_block(block_addr))
+        else {
+            self.safety_reason = Some(format!(
+                "missing source control domain for emitted block 0x{block_addr:x}"
+            ));
+            return;
+        };
+        let mut guards = self.active_control_guards.clone();
+        guards.sort();
+        guards.dedup();
+        let mut loops = self.active_loops.clone();
+        loops.sort_unstable();
+        loops.dedup();
+        if !source.complete {
+            self.safety_reason = Some(format!(
+                "incomplete source control domain for emitted block 0x{block_addr:x}"
+            ));
+            return;
+        }
+        self.rendered_block_domains
+            .entry(block_addr)
+            .or_default()
+            .push(RenderedBlockDomain { guards, loops });
+    }
+
+    fn validate_rendered_block_domain_coverage(&mut self) {
+        if !self.fold_ctx.requires_certified_rendering() || self.safety_reason.is_some() {
+            return;
+        }
+        let rendered = self.rendered_block_domains.clone();
+        for (block_addr, occurrences) in rendered {
+            let Some(source) = self
+                .fold_ctx
+                .control_facts()
+                .and_then(|facts| facts.control_domain_for_block(block_addr))
+                .cloned()
+            else {
+                self.safety_reason = Some(format!(
+                    "missing source control domain for emitted block 0x{block_addr:x}"
+                ));
+                return;
+            };
+            if !source.complete {
+                self.safety_reason = Some(format!(
+                    "incomplete source control domain for emitted block 0x{block_addr:x}"
+                ));
+                return;
+            }
+            if occurrences
+                .iter()
+                .any(|occurrence| occurrence.loops != source.loops)
+            {
+                self.safety_reason = Some(format!(
+                    "loop-domain mismatch for emitted block 0x{block_addr:x}: source loops {:?}; rendered loops {:?}",
+                    source.loops,
+                    occurrences
+                        .iter()
+                        .map(|occurrence| occurrence.loops.clone())
+                        .collect::<Vec<_>>()
+                ));
+                return;
+            }
+            if occurrences.len() == 1 && occurrences[0].guards == source.guards {
+                continue;
+            }
+            match self.rendered_branch_domains_cover_source(block_addr, &occurrences) {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.safety_reason = Some(format!(
+                        "control-domain coverage mismatch for emitted block 0x{block_addr:x}: source guards {:?}; rendered guard alternatives {:?}",
+                        source.guards,
+                        occurrences
+                            .iter()
+                            .map(|occurrence| occurrence.guards.clone())
+                            .collect::<Vec<_>>()
+                    ));
+                    return;
+                }
+                Err(reason) => {
+                    self.safety_reason = Some(format!(
+                        "control-domain coverage proof failed for emitted block 0x{block_addr:x}: {reason}"
+                    ));
+                    return;
+                }
+            }
+        }
+    }
+
+    fn rendered_branch_domains_cover_source(
+        &mut self,
+        block_addr: u64,
+        occurrences: &[RenderedBlockDomain],
+    ) -> Result<bool, String> {
+        let facts = self
+            .fold_ctx
+            .control_facts()
+            .ok_or_else(|| "missing canonical control facts".to_string())?;
+        let mut bdd = ControlBdd::new(self.safety_budget_remaining);
+        let mut rendered_formula = BDD_FALSE;
+        for occurrence in occurrences {
+            let mut occurrence_formula = BDD_TRUE;
+            for guard in &occurrence.guards {
+                let ControlGuard::Branch { predicate, truth } = guard else {
+                    return Err("aggregate proof currently requires branch-only guards".to_string());
+                };
+                let literal = bdd.variable(*predicate, *truth)?;
+                occurrence_formula = bdd.and(occurrence_formula, literal)?;
+            }
+            if bdd.and(rendered_formula, occurrence_formula)? != BDD_FALSE {
+                return Ok(false);
+            }
+            rendered_formula = bdd.or(rendered_formula, occurrence_formula)?;
         }
 
-        let stmts = self.fold_ctx.fold_block(block, addr);
-        self.folded_block_cache.insert(addr, stmts.clone());
-        stmts
+        let mut reach = self
+            .func
+            .block_addrs()
+            .iter()
+            .copied()
+            .map(|addr| (addr, BDD_FALSE))
+            .collect::<BTreeMap<_, _>>();
+        reach.insert(self.func.entry, BDD_TRUE);
+        let mut worklist = VecDeque::from([self.func.entry]);
+        let mut queued = BTreeSet::from([self.func.entry]);
+        while let Some(from) = worklist.pop_front() {
+            queued.remove(&from);
+            let from_formula = reach.get(&from).copied().unwrap_or(BDD_FALSE);
+            for to in self.func.successors(from) {
+                let edge_formula = if self.func.successors(from).len() <= 1 {
+                    BDD_TRUE
+                } else {
+                    let predicate = facts
+                        .branch_for_block(from)
+                        .ok_or_else(|| format!("non-branch multi-successor block 0x{from:x}"))?;
+                    let truth = if predicate.true_target == to {
+                        true
+                    } else if predicate.false_target == to {
+                        false
+                    } else {
+                        return Err(format!(
+                            "successor 0x{to:x} is absent from predicate at 0x{from:x}"
+                        ));
+                    };
+                    bdd.variable(predicate.id, truth)?
+                };
+                let candidate = bdd.and(from_formula, edge_formula)?;
+                let previous = reach.get(&to).copied().unwrap_or(BDD_FALSE);
+                let joined = bdd.or(previous, candidate)?;
+                if joined != previous {
+                    reach.insert(to, joined);
+                    if queued.insert(to) {
+                        worklist.push_back(to);
+                    }
+                }
+            }
+        }
+        let source_formula = reach.get(&block_addr).copied().unwrap_or(BDD_FALSE);
+        let created_nodes = bdd.created_nodes();
+        if !self.consume_safety_budget(created_nodes) {
+            return Err("control coverage exhausted structuring safety budget".to_string());
+        }
+        Ok(source_formula == rendered_formula)
+    }
+
+    fn certified_switch_guard_for_region(
+        &self,
+        switch_block: u64,
+        region: &Region,
+        case_value: Option<u64>,
+        is_default: bool,
+    ) -> Option<ControlGuard> {
+        let domain = self
+            .fold_ctx
+            .control_facts()?
+            .control_domain_for_block(region.entry())?;
+        domain.guards.iter().find_map(|guard| {
+            let ControlGuard::SwitchArm {
+                block_addr,
+                case_values,
+                includes_default,
+            } = guard
+            else {
+                return None;
+            };
+            let matches = block_addr == &switch_block
+                && if is_default {
+                    *includes_default && case_values.is_empty()
+                } else {
+                    !includes_default
+                        && case_value.is_some_and(|value| case_values.contains(&value))
+                };
+            matches.then(|| guard.clone())
+        })
     }
 
     /// Get the branch condition from a block.
@@ -1657,6 +1926,88 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     pub(crate) fn cleanup(stmt: CStmt) -> CStmt {
         // Recurse first, then simplify
         let stmt = Self::cleanup_recurse(stmt);
+        Self::flatten(stmt)
+    }
+
+    /// Normalize a certified statement tree without changing its control or
+    /// effect inventory.  The only loop rewrite is the canonical equivalence
+    /// `init; while (cond) { body; update; }` -> `for (init; cond; update)`;
+    /// branch inversion, guard factoring, and tail truncation are deliberately
+    /// excluded because they require their own proof transformations.
+    pub(crate) fn cleanup_preserving_render_proof_identity(stmt: CStmt) -> CStmt {
+        let stmt = match stmt {
+            CStmt::Block(stmts) => {
+                let cleaned = stmts
+                    .into_iter()
+                    .map(Self::cleanup_preserving_render_proof_identity)
+                    .filter(|stmt| !matches!(stmt, CStmt::Empty))
+                    .collect();
+                let rewritten = Self::rewrite_block_loops_to_for(cleaned);
+                Self::stmt_from_vec(rewritten)
+            }
+            CStmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => CStmt::If {
+                cond,
+                then_body: Box::new(Self::cleanup_preserving_render_proof_identity(*then_body)),
+                else_body: else_body
+                    .map(|body| Box::new(Self::cleanup_preserving_render_proof_identity(*body))),
+            },
+            CStmt::While { cond, body } => CStmt::While {
+                cond,
+                body: Box::new(Self::strip_trailing_continue(
+                    Self::cleanup_preserving_render_proof_identity(*body),
+                )),
+            },
+            CStmt::DoWhile { body, cond } => CStmt::DoWhile {
+                body: Box::new(Self::strip_trailing_continue(
+                    Self::cleanup_preserving_render_proof_identity(*body),
+                )),
+                cond,
+            },
+            CStmt::For {
+                init,
+                cond,
+                update,
+                body,
+            } => CStmt::For {
+                init: init
+                    .map(|stmt| Box::new(Self::cleanup_preserving_render_proof_identity(*stmt))),
+                cond,
+                update,
+                body: Box::new(Self::strip_trailing_continue(
+                    Self::cleanup_preserving_render_proof_identity(*body),
+                )),
+            },
+            CStmt::Switch {
+                expr,
+                cases,
+                default,
+            } => CStmt::Switch {
+                expr,
+                cases: cases
+                    .into_iter()
+                    .map(|case| crate::ast::SwitchCase {
+                        value: case.value,
+                        body: case
+                            .body
+                            .into_iter()
+                            .map(Self::cleanup_preserving_render_proof_identity)
+                            .filter(|stmt| !matches!(stmt, CStmt::Empty))
+                            .collect(),
+                    })
+                    .collect(),
+                default: default.map(|body| {
+                    body.into_iter()
+                        .map(Self::cleanup_preserving_render_proof_identity)
+                        .filter(|stmt| !matches!(stmt, CStmt::Empty))
+                        .collect()
+                }),
+            },
+            other => other,
+        };
         Self::flatten(stmt)
     }
 
@@ -2240,11 +2591,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         else_region: Option<&Region>,
         merge_block: Option<u64>,
     ) -> Option<CStmt> {
-        if self.fold_ctx.requires_certified_rendering() {
-            return None;
-        }
         let merge_block = merge_block?;
         let else_region = else_region?;
+        let certified = self.fold_ctx.requires_certified_rendering();
 
         let summaries = self
             .fold_ctx
@@ -2258,30 +2607,72 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
         let then_pred = self.unique_region_predecessor_to_merge(then_region, merge_block);
         let else_pred = self.unique_region_predecessor_to_merge(else_region, merge_block);
-        let then_can_rewrite =
-            then_pred.is_some_and(|pred| self.has_merged_slot_return_expr(pred, summary));
-        let else_can_rewrite =
-            else_pred.is_some_and(|pred| self.has_merged_slot_return_expr(pred, summary));
+        let then_can_rewrite = then_pred
+            .is_some_and(|pred| self.has_merged_slot_return_expr(then_region, pred, summary));
+        let else_can_rewrite = else_pred
+            .is_some_and(|pred| self.has_merged_slot_return_expr(else_region, pred, summary));
         if !then_can_rewrite && !else_can_rewrite {
             return None;
         }
+        if certified
+            && (!self.certified_region_terminates_with_slot_merge(then_region, summary)
+                || !self.certified_region_terminates_with_slot_merge(else_region, summary))
+        {
+            return None;
+        }
 
-        let mut then_stmt = self.structure_region(then_region);
-        let mut else_stmt = self.structure_region(else_region);
+        let certified_branch = if certified {
+            let (cond, predicate, condition_value) =
+                self.get_branch_condition_with_predicate(cond_block);
+            let cond = cond?;
+            let proof =
+                self.certified_branch_render_proof(cond_block, predicate, condition_value)?;
+            Some((cond, proof))
+        } else {
+            None
+        };
+        let control_proof_checkpoint = self.control_render_proofs.len();
+        let effect_proof_checkpoint = self.fold_ctx.effect_render_proof_checkpoint();
+        if let Some((_, proof)) = &certified_branch {
+            self.control_render_proofs.push(proof.clone());
+        }
+
+        let mut then_stmt = if certified && then_can_rewrite {
+            CStmt::Empty
+        } else if certified {
+            self.structure_branch_region(cond_block, then_region)
+        } else {
+            self.structure_region(then_region)
+        };
+        let mut else_stmt = if certified && else_can_rewrite {
+            CStmt::Empty
+        } else if certified {
+            self.structure_branch_region(cond_block, else_region)
+        } else {
+            self.structure_region(else_region)
+        };
         let mut rewrote_any = false;
 
         if then_can_rewrite
             && let Some(pred) = then_pred
-            && let Some(rewritten) =
-                self.append_merged_slot_return_if_needed(then_stmt.clone(), pred, summary)
+            && let Some(rewritten) = self.append_merged_slot_return_if_needed(
+                then_stmt.clone(),
+                then_region,
+                pred,
+                summary,
+            )
         {
             then_stmt = rewritten;
             rewrote_any = true;
         }
         if else_can_rewrite
             && let Some(pred) = else_pred
-            && let Some(rewritten) =
-                self.append_merged_slot_return_if_needed(else_stmt.clone(), pred, summary)
+            && let Some(rewritten) = self.append_merged_slot_return_if_needed(
+                else_stmt.clone(),
+                else_region,
+                pred,
+                summary,
+            )
         {
             else_stmt = rewritten;
             rewrote_any = true;
@@ -2290,18 +2681,35 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             || !Self::stmt_guarantees_termination(&then_stmt)
             || !Self::stmt_guarantees_termination(&else_stmt)
         {
+            if certified {
+                if self.safety_reason.is_none() {
+                    self.safety_reason = Some(format!(
+                        "certified stack-slot return merge at 0x{merge_block:x} did not preserve terminating paths"
+                    ));
+                }
+                return Some(CStmt::Empty);
+            }
+            self.control_render_proofs
+                .truncate(control_proof_checkpoint);
+            self.fold_ctx
+                .truncate_effect_render_proofs(effect_proof_checkpoint);
             return None;
         }
 
-        let (cond, predicate, condition_value) =
-            self.get_branch_condition_with_predicate(cond_block);
+        let (cond, predicate, condition_value) = if let Some((cond, _)) = certified_branch {
+            (Some(cond), None, None)
+        } else {
+            self.get_branch_condition_with_predicate(cond_block)
+        };
         let cond = cond?;
         let if_stmt = CStmt::If {
             cond,
             then_body: Box::new(then_stmt),
             else_body: Some(Box::new(else_stmt)),
         };
-        self.record_branch_render_proof(cond_block, predicate, condition_value);
+        if !certified {
+            self.record_branch_render_proof(cond_block, predicate, condition_value);
+        }
         let mut prefix = self.structure_block_prefix_stmts(cond_block);
         prefix.push(if_stmt);
         Some(if prefix.len() == 1 {
@@ -2512,11 +2920,14 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     fn transparent_branch_successor_to_merge(&self, addr: u64, merge_block: u64) -> Option<u64> {
         let block = self.func.get_block(addr)?;
-        if !block
-            .ops
-            .iter()
-            .all(|op| self.is_transparent_branch_forwarder_op(op))
-        {
+        let successors = self.transparent_branch_successors(addr, block);
+        let [successor] = successors.as_slice() else {
+            return None;
+        };
+        if !block.ops.iter().all(|op| {
+            self.is_transparent_branch_forwarder_op(op)
+                || self.is_materialized_phi_edge_copy(addr, *successor, op)
+        }) {
             return None;
         }
         if self.region_analyzer.as_ref().is_some_and(|analyzer| {
@@ -2526,12 +2937,23 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }) {
             return None;
         }
-        let successors = self.transparent_branch_successors(addr, block);
-        let [successor] = successors.as_slice() else {
-            return None;
-        };
         self.block_flows_to_merge(*successor, merge_block)
             .then_some(*successor)
+    }
+
+    fn is_materialized_phi_edge_copy(&self, pred_addr: u64, successor: u64, op: &SSAOp) -> bool {
+        let SSAOp::Copy { dst, src } = op else {
+            return false;
+        };
+        self.func.get_block(successor).is_some_and(|block| {
+            block.phis.iter().any(|phi| {
+                phi.dst == *dst
+                    && phi
+                        .sources
+                        .iter()
+                        .any(|(pred, value)| *pred == pred_addr && value == src)
+            })
+        })
     }
 
     fn is_transparent_branch_forwarder_op(&self, op: &SSAOp) -> bool {
@@ -2585,6 +3007,15 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         let Some(block) = self.func.get_block(addr) else {
             return false;
         };
+        if block.ops.iter().any(|op| {
+            matches!(
+                op,
+                SSAOp::Branch { target }
+                    if parse_address_from_var_name(&target.name) == Some(merge_block)
+            )
+        }) {
+            return true;
+        }
         if block.addr.checked_add(u64::from(block.size)) != Some(merge_block) {
             return false;
         }
@@ -2599,11 +3030,50 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     fn append_merged_slot_return_if_needed(
         &self,
         stmt: CStmt,
+        region: &Region,
         pred_addr: u64,
         summary: &crate::analysis::FrameSlotMergeSummary,
     ) -> Option<CStmt> {
         if self.fold_ctx.requires_certified_rendering() {
-            return None;
+            let (expr, source, proof_block, proof_op, proof_value) = self
+                .fold_ctx
+                .certified_merged_slot_return_candidate_for_region(
+                    summary.merge_block_addr,
+                    pred_addr,
+                    summary.slot_offset,
+                    &region.blocks(),
+                )?;
+            let return_stmt = CStmt::Return(Some(expr.clone()));
+            self.fold_ctx
+                .record_certified_call_render_proofs_for_stmt(&return_stmt)?;
+            if let Some((read_block, read_op, address, read_value)) = self
+                .fold_ctx
+                .certified_memory_read_for_value_dependency(source)
+                .map(|cert| (cert.block_addr, cert.op_index, cert.address, cert.value))
+            {
+                self.fold_ctx.record_effect_render_proof_for_memory(
+                    EffectRenderProofKind::MemoryRead,
+                    read_block,
+                    read_op,
+                    address,
+                    read_value,
+                );
+            }
+            self.record_return_value_render_proof(proof_block, proof_op, proof_value);
+            if let Some(rewritten) = self.rewrite_trailing_return_with_merged_expr(&stmt, &expr) {
+                return Some(rewritten);
+            }
+            if Self::single_terminator_stmt(&stmt).is_some() {
+                return Some(stmt);
+            }
+            let mut stmts = Vec::new();
+            Self::append_stmt_body_flat(&mut stmts, stmt);
+            stmts.push(return_stmt);
+            return Some(if stmts.len() == 1 {
+                stmts.into_iter().next().unwrap_or(CStmt::Empty)
+            } else {
+                CStmt::Block(stmts)
+            });
         }
         let mut visited = std::collections::HashSet::new();
         let expr = summary
@@ -2633,14 +3103,53 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     fn has_merged_slot_return_expr(
         &self,
+        region: &Region,
         pred_addr: u64,
         summary: &crate::analysis::FrameSlotMergeSummary,
     ) -> bool {
+        if self.fold_ctx.requires_certified_rendering() {
+            return self
+                .fold_ctx
+                .certified_merged_slot_return_candidate_for_region(
+                    summary.merge_block_addr,
+                    pred_addr,
+                    summary.slot_offset,
+                    &region.blocks(),
+                )
+                .is_some();
+        }
         summary.incoming.contains_key(&pred_addr)
             || self
                 .fold_ctx
                 .merged_return_candidate_for_block_slot(pred_addr, summary.slot_offset)
                 .is_some()
+    }
+
+    fn certified_region_terminates_with_slot_merge(
+        &self,
+        region: &Region,
+        summary: &crate::analysis::FrameSlotMergeSummary,
+    ) -> bool {
+        let predecessor = self.unique_region_predecessor_to_merge(region, summary.merge_block_addr);
+        if let Some(pred) = predecessor
+            && self.has_merged_slot_return_expr(region, pred, summary)
+        {
+            return true;
+        }
+        match region {
+            Region::Sequence(regions) => regions.last().is_some_and(|tail| {
+                self.certified_region_terminates_with_slot_merge(tail, summary)
+            }),
+            Region::IfThenElse {
+                then_region,
+                else_region: Some(else_region),
+                ..
+            } => {
+                self.certified_region_terminates_with_slot_merge(then_region, summary)
+                    && self.certified_region_terminates_with_slot_merge(else_region, summary)
+            }
+            _ => false,
+        }
     }
 
     fn append_merged_register_return_if_needed(
@@ -4149,13 +4658,26 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
 #[cfg(test)]
 mod tests {
-    use super::ControlFlowStructurer;
+    use super::{BDD_FALSE, BDD_TRUE, ControlBdd, ControlFlowStructurer};
     use crate::ast::{BinaryOp, CExpr, CStmt, CType, UnaryOp};
     use crate::fold::FoldingContext;
     use crate::region::Region;
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, Varnode};
-    use r2ssa::{BlockTerminator, SSAFunction, SsaArtifact};
+    use r2ssa::{BlockTerminator, PhiNode, PredicateId, SSAFunction, SSAOp, SSAVar, SsaArtifact};
     use std::collections::{BTreeMap, BTreeSet};
+
+    #[test]
+    fn control_bdd_proves_disjoint_duplicated_path_coverage() {
+        let mut bdd = ControlBdd::new(64);
+        let predicate = PredicateId(0);
+        let positive = bdd.variable(predicate, true).expect("positive literal");
+        let negative = bdd.variable(predicate, false).expect("negative literal");
+        assert_eq!(
+            bdd.and(positive, negative).expect("literal intersection"),
+            BDD_FALSE
+        );
+        assert_eq!(bdd.or(positive, negative).expect("literal union"), BDD_TRUE);
+    }
 
     fn v(name: &str) -> CExpr {
         CExpr::Var(name.to_string())
@@ -4214,10 +4736,37 @@ mod tests {
         control: r2types::FunctionControlFacts,
         render: r2types::FunctionRenderFacts,
     ) -> r2types::FunctionFacts {
-        r2types::FunctionFacts::default()
+        let mut facts = r2types::FunctionFacts::default()
             .with_control(control)
             .with_render(render)
-            .with_decompile_route(certified_standard_route_for_test("test certified Standard"))
+            .with_decompile_route(certified_standard_route_for_test("test certified Standard"));
+        add_test_x86_64_signature(&mut facts);
+        facts
+    }
+
+    fn add_test_x86_64_signature(facts: &mut r2types::FunctionFacts) {
+        let signature = r2types::FunctionSignatureSpec {
+            ret_type: Some(r2types::CTypeLike::Int {
+                bits: 64,
+                signedness: r2types::Signedness::Signed,
+            }),
+            params: vec![r2types::FunctionParamSpec {
+                name: "arg1".to_string(),
+                ty: Some(r2types::CTypeLike::Int {
+                    bits: 64,
+                    signedness: r2types::Signedness::Signed,
+                }),
+            }],
+        };
+        let certificate = r2types::SignatureCertificate::from_signature(
+            &signature,
+            [r2types::SignatureCertificateSource::LocalInference],
+        )
+        .expect("typed test signature");
+        let mut types = facts.type_facts().clone();
+        types.merged_signature = Some(signature);
+        types.signature_certificate = Some(certificate);
+        facts.replace_type_facts(types);
     }
 
     fn test_arch() -> ArchSpec {
@@ -4433,25 +4982,13 @@ mod tests {
     }
 
     fn render_facts_for_prepared(prepared: &SsaArtifact) -> r2types::FunctionRenderFacts {
-        r2types::FunctionRenderFacts {
-            expressions: prepared
-                .certificates()
-                .expressions
-                .iter()
-                .map(|(value, cert)| {
-                    (
-                        *value,
-                        r2types::ExpressionRenderFact {
-                            value: cert.value,
-                            defining_inst: cert.defining_inst,
-                            width: cert.width,
-                            renderable: cert.renderable,
-                        },
-                    )
-                })
-                .collect(),
-            ..r2types::FunctionRenderFacts::default()
-        }
+        let mut facts = r2types::FunctionFacts::default()
+            .with_render(r2types::FunctionRenderFacts::from_prepared(prepared));
+        facts.populate_certified_parameter_exprs(
+            prepared,
+            &r2types::ParamSlotResolver::from_arch_name(Some("x86-64")),
+        );
+        facts.render_facts().clone()
     }
 
     fn control_facts_for_guarded_while_loop(
@@ -4497,6 +5034,7 @@ mod tests {
                 },
             );
         }
+        facts.control_domains = prepared.control_domains().clone();
         facts
     }
 
@@ -4526,6 +5064,7 @@ mod tests {
                     default: None,
                 },
             )]),
+            control_domains: prepared.control_domains().clone(),
             ..r2types::FunctionControlFacts::default()
         }
     }
@@ -4601,6 +5140,29 @@ mod tests {
         SSAFunction::from_blocks_with_arch(&[branch, value_pred, merge], Some(&test_arch()))
             .expect("ssa function")
             .with_name("transparent_branch_demo")
+    }
+
+    fn function_with_materialized_phi_branch_to_merge() -> SSAFunction {
+        let mut func = function_with_transparent_branch_to_merge();
+        let source = SSAVar::new("x8", 1, 8);
+        let destination = SSAVar::new("x8", 2, 8);
+        let branch = func.get_block_mut(0x1000).expect("branch block");
+        let branch_index = branch.ops.len().saturating_sub(1);
+        branch.ops.insert(
+            branch_index,
+            SSAOp::Copy {
+                dst: destination.clone(),
+                src: source.clone(),
+            },
+        );
+        func.get_block_mut(0x1010)
+            .expect("phi successor")
+            .phis
+            .push(PhiNode {
+                dst: destination,
+                sources: vec![(0x1000, source)],
+            });
+        func
     }
 
     fn function_with_terminating_if_and_shared_merge() -> SSAFunction {
@@ -4767,6 +5329,36 @@ mod tests {
         }
     }
 
+    fn stmt_contains_unproved_control_transfer(stmt: &CStmt) -> bool {
+        match stmt {
+            CStmt::Break | CStmt::Continue | CStmt::Goto(_) => true,
+            CStmt::Block(stmts) => stmts.iter().any(stmt_contains_unproved_control_transfer),
+            CStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                stmt_contains_unproved_control_transfer(then_body)
+                    || else_body
+                        .as_deref()
+                        .is_some_and(stmt_contains_unproved_control_transfer)
+            }
+            CStmt::While { body, .. } | CStmt::DoWhile { body, .. } | CStmt::For { body, .. } => {
+                stmt_contains_unproved_control_transfer(body)
+            }
+            CStmt::Switch { cases, default, .. } => {
+                cases.iter().any(|case| {
+                    case.body
+                        .iter()
+                        .any(stmt_contains_unproved_control_transfer)
+                }) || default
+                    .as_ref()
+                    .is_some_and(|body| body.iter().any(stmt_contains_unproved_control_transfer))
+            }
+            _ => false,
+        }
+    }
+
     fn first_switch_case_values(stmt: &CStmt) -> Option<Vec<i64>> {
         match stmt {
             CStmt::Switch { cases, .. } => Some(
@@ -4822,6 +5414,7 @@ mod tests {
         let mut certified_ctx = FoldingContext::new(64);
         certified_ctx.inputs.prepared_ssa = Some(&prepared);
         function_facts.set_render(render_facts_for_prepared(&prepared));
+        add_test_x86_64_signature(&mut function_facts);
         install_function_facts(
             &mut certified_ctx,
             function_facts
@@ -4939,7 +5532,7 @@ mod tests {
             "FunctionFacts switch selector/cases should authorize switch output, got {certified_stmt:?}"
         );
         assert!(
-            !ControlFlowStructurer::stmt_contains_control_transfer(&certified_stmt),
+            !stmt_contains_unproved_control_transfer(&certified_stmt),
             "certified switch structuring must not synthesize case exits without exact transfer facts: {certified_stmt:?}"
         );
 
@@ -4990,6 +5583,18 @@ mod tests {
     #[test]
     fn merge_predecessor_follows_transparent_branch_only_region() {
         let func = function_with_transparent_branch_to_merge();
+        let ctx = FoldingContext::new(64);
+        let structurer = ControlFlowStructurer::new(&func, &ctx);
+
+        assert_eq!(
+            structurer.unique_region_predecessor_to_merge(&Region::Block(0x1000), 0x1020),
+            Some(0x1010)
+        );
+    }
+
+    #[test]
+    fn merge_predecessor_accepts_exact_materialized_phi_edge_copies() {
+        let func = function_with_materialized_phi_branch_to_merge();
         let ctx = FoldingContext::new(64);
         let structurer = ControlFlowStructurer::new(&func, &ctx);
 

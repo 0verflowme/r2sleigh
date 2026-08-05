@@ -69,14 +69,15 @@ pub use facts::{
 pub use function_facts::{
     AnalysisPlans, ArrayAccessRenderFact, BranchPredicateFact, CallArgumentValueFact,
     CallResultFact, CallsiteArgumentFacts, CallsiteRenderDisposition, CallsiteRenderFact,
-    CertifiedEffect, CertifiedEffectKind, CertifiedExpr, ControlBlockAssumptionFact,
-    DecompileCapabilityView, DecompileRouteFacts, DecompileRouteKind, ExpressionRenderFact,
-    FunctionCallRenderFacts, FunctionCallResultFacts, FunctionCallsiteFacts, FunctionControlFacts,
-    FunctionFacts, FunctionInputQualityFacts, FunctionRenderFacts, InterprocSummaryView,
-    LoopStructureFact, MemberAccessRenderFact, MemoryAccessRenderFact, MemoryOpSiteKey, OpSiteKey,
-    ParamSlotResolver, PredicateComparisonFact, RegisterCallArgumentLocationFact,
-    ReturnValueRenderFact, StackCallArgumentLocationFact, StackSlotOwnerRenderAuthorization,
-    SummaryEffectRollup, SummaryHelperView, SummaryOutParamFact, SwitchSelectorFact,
+    CertifiedEffect, CertifiedEffectKind, CertifiedEntity, CertifiedExpr,
+    ControlBlockAssumptionFact, DecompileCapabilityView, DecompileRouteFacts, DecompileRouteKind,
+    ExpressionRenderFact, FunctionCallRenderFacts, FunctionCallResultFacts, FunctionCallsiteFacts,
+    FunctionControlFacts, FunctionFacts, FunctionInputQualityFacts, FunctionRenderFacts,
+    InterprocSummaryView, LoopStructureFact, MemberAccessRenderFact, MemoryAccessRenderFact,
+    MemoryOpSiteKey, OpSiteKey, ParamSlotResolver, PredicateComparisonFact,
+    RegisterCallArgumentLocationFact, ReturnValueRenderFact, StackCallArgumentLocationFact,
+    StackSlotOwnerRenderAuthorization, SummaryEffectRollup, SummaryHelperView, SummaryOutParamFact,
+    SwitchSelectorFact,
 };
 pub use inference::{CombinedTypeOracle, TypeInference};
 pub use model::{Signedness, StructField, StructShape, Type, TypeArena, TypeId};
@@ -84,15 +85,17 @@ pub use oracle::{LayoutOracle, TypeOracle};
 pub use prepare::{
     ArgAliasMap, BaseRegList, MetadataScalarKind, SignatureTypeEvidenceContext, TypeHint,
     TypeHintRank, X86_ARG_REGS, X86_FRAME_BASES, collect_pointer_arg_slots,
-    collect_signature_type_evidence_context, merge_type_hint, recover_signature_params_from_ssa,
-    recover_vars_arch_profile, recover_vars_from_ssa, scalar_metadata_type_hint,
+    collect_signature_type_evidence_context, collect_signature_type_evidence_context_with_arch,
+    merge_type_hint, recover_signature_params_from_ssa, recover_vars_arch_profile,
+    recover_vars_from_ssa, recover_vars_from_ssa_with_prep_facts, scalar_metadata_type_hint,
     scalar_register_family_key, size_to_signed_int_type, size_to_type, size_to_unsigned_int_type,
     ssa_var_block_key, ssa_var_key, type_hint_from_value_metadata,
 };
 pub use r2ssa::AssumptionUsageReport;
 pub use role_registry::{
-    normalize_role_name, semantic_typedef_is_authoritative, signature_hint_for_role_identity,
-    signature_hint_for_summary_kinds, type_projection_for_role_identity,
+    normalize_role_name, semantic_typedef_is_authoritative, semantic_typedef_is_pointer,
+    signature_hint_for_role_identity, signature_hint_for_summary_kinds,
+    type_projection_for_role_identity,
 };
 pub use signature::{ResolvedSignature, SignatureRegistry};
 pub use signature_infer::{
@@ -123,14 +126,15 @@ pub use writeback::{
     apply_semantic_artifact_signature_hint_to_inferred,
     augment_function_type_facts_with_summary_evidence,
     augment_local_struct_artifacts_with_semantics, build_semantic_type_fallback_plan,
-    build_type_writeback_analysis, build_type_writeback_analysis_with_semantics,
-    callconv_writeback_arch_supported, canonicalize_writeback_apply_type_name,
-    field_access_certificates_from_struct_artifacts, infer_local_struct_artifacts_from_ssa,
-    inferred_signature_to_function_type_facts, local_field_accesses_from_struct_artifacts,
-    semantic_artifact_prefers_bounded_type_plan, signature_certificate_source_names,
-    signature_hint_for_semantic_artifact, signature_projection_for_semantic_artifact,
-    signature_register_arg_duplicate_delete_required, signature_register_arg_rename_decision,
-    signature_register_arg_stack_conflict_delete_required,
+    build_type_writeback_analysis, build_type_writeback_analysis_with_prep_facts,
+    build_type_writeback_analysis_with_semantics,
+    build_type_writeback_analysis_with_semantics_and_prep_facts, callconv_writeback_arch_supported,
+    canonicalize_writeback_apply_type_name, field_access_certificates_from_struct_artifacts,
+    infer_local_struct_artifacts_from_ssa, inferred_signature_to_function_type_facts,
+    local_field_accesses_from_struct_artifacts, semantic_artifact_prefers_bounded_type_plan,
+    signature_certificate_source_names, signature_hint_for_semantic_artifact,
+    signature_projection_for_semantic_artifact, signature_register_arg_duplicate_delete_required,
+    signature_register_arg_rename_decision, signature_register_arg_stack_conflict_delete_required,
     signature_register_arg_type_apply_required, signature_register_arg_var_score,
     signature_writeback_action_decision, signature_writeback_arch_supported,
     signature_writeback_decision, signature_writeback_size_eligible,

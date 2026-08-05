@@ -289,6 +289,7 @@ impl Disassembler {
 
         // Translate P-code to r2il
         let mut block = self.translate_pcode(pcode, addr)?;
+        crate::internal_control::normalize_instruction_local_control(&mut block);
         let mnemonic = self
             .disasm_native(bytes, addr)
             .map(|(m, _)| m)

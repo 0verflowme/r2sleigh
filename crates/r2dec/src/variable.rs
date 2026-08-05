@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use r2ssa::{SSAFunction, SSAOp, SSAVar};
+use r2ssa::{ObjectKind, SSAFunction, SSAOp, SSAVar, SsaArtifact};
 use r2types::{
     CTypeLike, ExternalStackBase, ExternalStackSlotRole, FunctionFacts, FunctionTypeFacts,
     StackSlotKey, VisibleBinding, VisibleBindingKind,
@@ -98,6 +98,8 @@ pub struct VariableRecovery {
     used_local_names: HashSet<String>,
     /// Stable C identity for each recovered stack slot.
     stack_names_by_offset: HashMap<i64, String>,
+    /// Stack storage objects keyed independently from the SSA values stored in them.
+    stack_locals_by_offset: HashMap<i64, VarInfo>,
     /// Used general variable names (to avoid duplicates).
     used_var_names: HashSet<String>,
     /// Stack pointer register name.
@@ -154,6 +156,7 @@ impl VariableRecovery {
             used_param_names: HashSet::new(),
             used_local_names: HashSet::new(),
             stack_names_by_offset: HashMap::new(),
+            stack_locals_by_offset: HashMap::new(),
             used_var_names: HashSet::new(),
             sp_name: sp_name.to_string(),
             fp_name: fp_name.to_string(),
@@ -293,8 +296,19 @@ impl VariableRecovery {
     /// Recover variables from an SSA function.
     pub fn recover(&mut self, func: &SSAFunction) {
         // First pass: identify stack variables
-        self.find_stack_variables(func);
+        self.find_stack_variables(func, None);
 
+        self.recover_non_stack_variables(func);
+    }
+
+    /// Recover variables from the canonical prepared SSA artifact.
+    pub fn recover_prepared(&mut self, prepared: &SsaArtifact) {
+        let func = prepared.function();
+        self.find_stack_variables(func, Some(prepared));
+        self.recover_non_stack_variables(func);
+    }
+
+    fn recover_non_stack_variables(&mut self, func: &SSAFunction) {
         // Second pass: identify parameters
         self.find_parameters(func);
 
@@ -428,27 +442,23 @@ impl VariableRecovery {
     }
 
     /// Find stack variables (loads/stores relative to SP/FP).
-    fn find_stack_variables(&mut self, func: &SSAFunction) {
+    fn find_stack_variables(&mut self, func: &SSAFunction, prepared: Option<&SsaArtifact>) {
         let definitions = self.collect_definitions(func);
         for block in func.blocks() {
             for op in &block.ops {
                 match op {
                     SSAOp::Load { dst, addr, .. } => {
-                        if let Some(offset) = self.get_stack_offset(addr, &definitions) {
-                            let name = self.gen_stack_var_name(offset);
-                            let ty = self
-                                .visible_stack_type_for_offset(offset)
-                                .unwrap_or_else(|| self.type_from_size(dst.size));
-                            self.insert_var_info(dst.clone(), name, ty, VarAttrs::local(offset));
+                        if let Some(offset) =
+                            self.get_stack_offset(func, prepared, addr, &definitions)
+                        {
+                            self.ensure_stack_local(offset, dst.size);
                         }
                     }
                     SSAOp::Store { addr, val, .. } => {
-                        if let Some(offset) = self.get_stack_offset(addr, &definitions) {
-                            let name = self.gen_stack_var_name(offset);
-                            let ty = self
-                                .visible_stack_type_for_offset(offset)
-                                .unwrap_or_else(|| self.type_from_size(val.size));
-                            self.insert_var_info(val.clone(), name, ty, VarAttrs::local(offset));
+                        if let Some(offset) =
+                            self.get_stack_offset(func, prepared, addr, &definitions)
+                        {
+                            self.ensure_stack_local(offset, val.size);
                         }
                     }
                     _ => {}
@@ -457,8 +467,46 @@ impl VariableRecovery {
         }
     }
 
+    fn ensure_stack_local(&mut self, offset: i64, size: u32) {
+        if self.stack_locals_by_offset.contains_key(&offset) {
+            return;
+        }
+        let name = self.gen_stack_var_name(offset);
+        let ty = self
+            .visible_stack_type_for_offset(offset)
+            .unwrap_or_else(|| self.type_from_size(size));
+        let synthetic = SSAVar::new(format!("stack:{offset}"), 0, size);
+        let info = self.make_var_info(synthetic, name, ty, VarAttrs::local(offset));
+        self.stack_locals_by_offset.insert(offset, info);
+    }
+
     /// Get stack offset from an address variable.
-    fn get_stack_offset(&self, addr: &SSAVar, definitions: &HashMap<String, CExpr>) -> Option<i64> {
+    fn get_stack_offset(
+        &self,
+        func: &SSAFunction,
+        prepared: Option<&SsaArtifact>,
+        addr: &SSAVar,
+        definitions: &HashMap<String, CExpr>,
+    ) -> Option<i64> {
+        if let Some(offset) = prepared
+            .and_then(|artifact| artifact.object_for_var(addr))
+            .and_then(|object| prepared?.objects().object(object))
+            .and_then(|object| match object.kind {
+                ObjectKind::StackSlot { offset, .. } | ObjectKind::FrameObject { offset, .. } => {
+                    Some(offset)
+                }
+                _ => None,
+            })
+        {
+            return Some(offset);
+        }
+        if let Some(offset) = func
+            .decompile_prep_facts()
+            .and_then(|facts| facts.stack_address_root_of(addr))
+            .map(|root| root.offset)
+        {
+            return Some(offset);
+        }
         utils::extract_stack_offset_from_var(addr, definitions, &self.fp_name, &self.sp_name)
     }
 
@@ -784,7 +832,11 @@ impl VariableRecovery {
 
     /// Get all local variables.
     pub fn locals(&self) -> Vec<&VarInfo> {
-        let mut locals: Vec<_> = self.vars.values().filter(|v| v.is_local).collect();
+        let mut locals: Vec<_> = self
+            .stack_locals_by_offset
+            .values()
+            .chain(self.vars.values().filter(|v| v.is_local))
+            .collect();
         locals.sort_by(|a, b| {
             match (a.stack_offset, b.stack_offset) {
                 (Some(a_off), Some(b_off)) => a_off.cmp(&b_off),
@@ -1220,7 +1272,11 @@ mod tests {
             local_names.iter().any(|name| name == "sum"),
             "expected temp-address store to recover named stack local, got {local_names:?}"
         );
-        assert_eq!(vr.get_name(&SSAVar::new("EAX", 1, 4)), "sum");
+        assert_ne!(
+            vr.get_name(&SSAVar::new("EAX", 1, 4)),
+            "sum",
+            "a stored SSA value must not inherit the identity of its destination object"
+        );
     }
 
     #[test]

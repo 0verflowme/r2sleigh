@@ -776,6 +776,300 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
+    /// Remove versioned register carriers which deliberately bypass expression
+    /// proof recording and become dead only after control-flow structuring.
+    ///
+    /// This pass is intentionally narrower than the general temporary cleanup:
+    /// certified expressions, memory accesses, and calls remain untouched, so
+    /// their render-proof ledger stays exact.  Structured liveness is solved to
+    /// a fixed point for loops before any carrier is removed.
+    pub(crate) fn prune_unproved_register_carriers_in_stmt(&self, stmt: CStmt) -> CStmt {
+        self.prune_unproved_register_carriers(stmt, &HashSet::new())
+    }
+
+    pub(super) fn stmt_is_side_effect_free_versioned_register_carrier(&self, stmt: &CStmt) -> bool {
+        let Some(name) = super::side_effect_free_assignment_name(stmt) else {
+            return false;
+        };
+        let lower = name.to_ascii_lowercase();
+        let Some((base, version)) = lower.rsplit_once('_') else {
+            return false;
+        };
+        !version.is_empty()
+            && version.bytes().all(|byte| byte.is_ascii_digit())
+            && self.inputs.arch.is_register_like_base_name(base)
+    }
+
+    fn unproved_register_carrier_target<'b>(&self, stmt: &'b CStmt) -> Option<&'b str> {
+        if !self.stmt_is_side_effect_free_versioned_register_carrier(stmt) {
+            return None;
+        }
+        match stmt {
+            CStmt::Expr(CExpr::Binary {
+                op: BinaryOp::Assign,
+                left,
+                ..
+            }) => match left.as_ref() {
+                CExpr::Var(name) => Some(name),
+                _ => None,
+            },
+            CStmt::Decl { name, .. } => Some(name),
+            _ => None,
+        }
+    }
+
+    fn live_before_unproved_register_carriers(
+        &self,
+        stmt: &CStmt,
+        live_out: &HashSet<String>,
+    ) -> HashSet<String> {
+        match stmt {
+            CStmt::Block(stmts) => {
+                self.live_before_unproved_register_carrier_block(stmts, live_out)
+            }
+            CStmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                let mut live = self.live_before_unproved_register_carriers(then_body, live_out);
+                live.extend(
+                    else_body
+                        .as_deref()
+                        .map(|body| self.live_before_unproved_register_carriers(body, live_out))
+                        .unwrap_or_else(|| live_out.clone()),
+                );
+                self.collect_expr_reads(cond, &mut live);
+                live
+            }
+            CStmt::While { cond, body } => {
+                let mut header_live = live_out.clone();
+                self.collect_expr_reads(cond, &mut header_live);
+                loop {
+                    let mut next = live_out.clone();
+                    self.collect_expr_reads(cond, &mut next);
+                    next.extend(self.live_before_unproved_register_carriers(body, &header_live));
+                    if next == header_live {
+                        return next;
+                    }
+                    header_live = next;
+                }
+            }
+            CStmt::DoWhile { body, cond } => {
+                let mut header_live = live_out.clone();
+                self.collect_expr_reads(cond, &mut header_live);
+                loop {
+                    let mut body_out = live_out.clone();
+                    body_out.extend(header_live.iter().cloned());
+                    self.collect_expr_reads(cond, &mut body_out);
+                    let next = self.live_before_unproved_register_carriers(body, &body_out);
+                    if next == header_live {
+                        return next;
+                    }
+                    header_live = next;
+                }
+            }
+            CStmt::For {
+                init,
+                cond,
+                update,
+                body,
+            } => {
+                let mut header_live = live_out.clone();
+                if let Some(cond) = cond {
+                    self.collect_expr_reads(cond, &mut header_live);
+                }
+                loop {
+                    let mut body_out = header_live.clone();
+                    if let Some(update) = update {
+                        self.collect_expr_reads(update, &mut body_out);
+                    }
+                    let mut next = live_out.clone();
+                    if let Some(cond) = cond {
+                        self.collect_expr_reads(cond, &mut next);
+                    }
+                    next.extend(self.live_before_unproved_register_carriers(body, &body_out));
+                    if next == header_live {
+                        break;
+                    }
+                    header_live = next;
+                }
+                init.as_deref()
+                    .map(|stmt| self.live_before_unproved_register_carriers(stmt, &header_live))
+                    .unwrap_or(header_live)
+            }
+            CStmt::Switch {
+                expr,
+                cases,
+                default,
+            } => {
+                let mut live = live_out.clone();
+                for case in cases {
+                    live.extend(
+                        self.live_before_unproved_register_carrier_block(&case.body, live_out),
+                    );
+                }
+                if let Some(default) = default {
+                    live.extend(
+                        self.live_before_unproved_register_carrier_block(default, live_out),
+                    );
+                }
+                self.collect_expr_reads(expr, &mut live);
+                live
+            }
+            CStmt::Return(Some(expr)) => {
+                let mut live = HashSet::new();
+                self.collect_expr_reads(expr, &mut live);
+                live
+            }
+            CStmt::Return(None) => HashSet::new(),
+            _ => {
+                if let Some(target) = self.unproved_register_carrier_target(stmt)
+                    && !live_out.contains(target)
+                {
+                    return live_out.clone();
+                }
+                let (reads, def) = self.stmt_reads_and_def(stmt);
+                let mut live = live_out.clone();
+                if let Some(def) = def {
+                    live.remove(&def);
+                }
+                live.extend(reads);
+                live
+            }
+        }
+    }
+
+    fn live_before_unproved_register_carrier_block(
+        &self,
+        stmts: &[CStmt],
+        live_out: &HashSet<String>,
+    ) -> HashSet<String> {
+        let mut live = live_out.clone();
+        for stmt in stmts.iter().rev() {
+            live = self.live_before_unproved_register_carriers(stmt, &live);
+        }
+        live
+    }
+
+    fn prune_unproved_register_carriers(&self, stmt: CStmt, live_out: &HashSet<String>) -> CStmt {
+        match stmt {
+            CStmt::Block(stmts) => {
+                CStmt::Block(self.prune_unproved_register_carrier_block(stmts, live_out))
+            }
+            CStmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => CStmt::If {
+                cond,
+                then_body: Box::new(self.prune_unproved_register_carriers(*then_body, live_out)),
+                else_body: else_body
+                    .map(|body| Box::new(self.prune_unproved_register_carriers(*body, live_out))),
+            },
+            CStmt::While { cond, body } => {
+                let loop_live = self.live_before_unproved_register_carriers(
+                    &CStmt::While {
+                        cond: cond.clone(),
+                        body: body.clone(),
+                    },
+                    live_out,
+                );
+                CStmt::While {
+                    cond,
+                    body: Box::new(self.prune_unproved_register_carriers(*body, &loop_live)),
+                }
+            }
+            CStmt::DoWhile { body, cond } => {
+                let loop_live = self.live_before_unproved_register_carriers(
+                    &CStmt::DoWhile {
+                        body: body.clone(),
+                        cond: cond.clone(),
+                    },
+                    live_out,
+                );
+                let mut body_live = live_out.clone();
+                body_live.extend(loop_live);
+                self.collect_expr_reads(&cond, &mut body_live);
+                CStmt::DoWhile {
+                    body: Box::new(self.prune_unproved_register_carriers(*body, &body_live)),
+                    cond,
+                }
+            }
+            CStmt::For {
+                init,
+                cond,
+                update,
+                body,
+            } => {
+                let loop_stmt = CStmt::For {
+                    init: init.clone(),
+                    cond: cond.clone(),
+                    update: update.clone(),
+                    body: body.clone(),
+                };
+                let loop_live = self.live_before_unproved_register_carriers(&loop_stmt, live_out);
+                let mut body_live = loop_live.clone();
+                if let Some(update) = &update {
+                    self.collect_expr_reads(update, &mut body_live);
+                }
+                CStmt::For {
+                    init: init.map(|stmt| {
+                        Box::new(self.prune_unproved_register_carriers(*stmt, &loop_live))
+                    }),
+                    cond,
+                    update,
+                    body: Box::new(self.prune_unproved_register_carriers(*body, &body_live)),
+                }
+            }
+            CStmt::Switch {
+                expr,
+                cases,
+                default,
+            } => CStmt::Switch {
+                expr,
+                cases: cases
+                    .into_iter()
+                    .map(|case| crate::ast::SwitchCase {
+                        value: case.value,
+                        body: self.prune_unproved_register_carrier_block(case.body, live_out),
+                    })
+                    .collect(),
+                default: default
+                    .map(|body| self.prune_unproved_register_carrier_block(body, live_out)),
+            },
+            other => {
+                if self
+                    .unproved_register_carrier_target(&other)
+                    .is_some_and(|target| !live_out.contains(target))
+                {
+                    CStmt::Empty
+                } else {
+                    other
+                }
+            }
+        }
+    }
+
+    fn prune_unproved_register_carrier_block(
+        &self,
+        stmts: Vec<CStmt>,
+        live_out: &HashSet<String>,
+    ) -> Vec<CStmt> {
+        let mut live = live_out.clone();
+        let mut kept = Vec::with_capacity(stmts.len());
+        for stmt in stmts.into_iter().rev() {
+            let live_before = self.live_before_unproved_register_carriers(&stmt, &live);
+            let pruned = self.prune_unproved_register_carriers(stmt, &live);
+            if !matches!(pruned, CStmt::Empty) {
+                kept.push(pruned);
+            }
+            live = live_before;
+        }
+        kept.reverse();
+        kept
+    }
+
     fn prune_dead_temp_assignments_in_block(&self, stmts: Vec<CStmt>) -> Vec<CStmt> {
         let rewritten = stmts
             .into_iter()

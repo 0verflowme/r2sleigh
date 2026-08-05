@@ -519,6 +519,7 @@ fn prepared_op_has_render_definition(op: &SSAOp) -> bool {
             | SSAOp::Subpiece { .. }
             | SSAOp::FloatFloat { .. }
             | SSAOp::Cast { .. }
+            | SSAOp::Select { .. }
             | SSAOp::PtrAdd { .. }
             | SSAOp::PtrSub { .. }
             | SSAOp::CallOther {
@@ -688,9 +689,8 @@ fn record_authorized_stack_owner_name(
     let name = name.trim();
     for object in function_facts
         .render_facts()
-        .stack_slot_offsets
-        .iter()
-        .filter_map(|(object, slot_offset)| (*slot_offset == offset).then_some(*object))
+        .stack_slots()
+        .filter_map(|(object, _, slot_offset, _)| (slot_offset == offset).then_some(object))
     {
         if let Some(authorization) =
             function_facts.authorized_stack_slot_owner_render(object, offset, name)
@@ -3729,6 +3729,27 @@ mod tests {
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
     use r2ssa::InterprocSummarySet;
 
+    fn test_stack_render_facts(
+        object: r2ssa::ObjectId,
+        base: r2ssa::StackAddressBase,
+        offset: i64,
+    ) -> r2types::FunctionRenderFacts {
+        let id = r2ssa::SemanticId::stack_slot(object);
+        r2types::FunctionRenderFacts {
+            certified_entities: BTreeMap::from([(
+                id,
+                r2types::CertifiedEntity::StackSlot {
+                    id,
+                    object,
+                    base,
+                    offset,
+                    size: None,
+                },
+            )]),
+            ..r2types::FunctionRenderFacts::default()
+        }
+    }
+
     #[test]
     fn canonical_param_home_uses_rendered_header_alias_and_runtime_offset() {
         let slot = StackSlotKey {
@@ -4012,6 +4033,7 @@ mod tests {
                     at: cert.at,
                     value: cert.value,
                     width: cert.width,
+                    relation: cert.relation,
                     carrier: cert.carrier.clone(),
                     owner: cert.owner.clone(),
                 },
@@ -4043,10 +4065,11 @@ mod tests {
             None,
         )
         .with_call_results(call_result_facts)
-        .with_render(r2types::FunctionRenderFacts {
-            stack_slot_offsets: BTreeMap::from([(object, offset)]),
-            ..r2types::FunctionRenderFacts::default()
-        })
+        .with_render(test_stack_render_facts(
+            object,
+            r2ssa::StackAddressBase::StackPointer,
+            offset,
+        ))
     }
 
     fn leak_function_facts(facts: FunctionFacts) -> &'static FunctionFacts {
@@ -4145,6 +4168,7 @@ mod tests {
             block_assumptions,
             loops,
             switches,
+            control_domains: prepared.control_domains().clone(),
         }
     }
 
@@ -4860,10 +4884,11 @@ mod tests {
             function_facts: leak_function_facts(FunctionFacts::default()),
             certified_rendering_required: true,
         });
-        let render_facts = r2types::FunctionRenderFacts {
-            stack_slot_offsets: BTreeMap::from([(r2ssa::ObjectId(1), -8)]),
-            ..r2types::FunctionRenderFacts::default()
-        };
+        let render_facts = test_stack_render_facts(
+            r2ssa::ObjectId(1),
+            r2ssa::StackAddressBase::FramePointer,
+            -8,
+        );
         let function_facts = FunctionFacts::new(
             r2types::FunctionTypeFacts {
                 visible_bindings: visible_bindings.clone(),
@@ -5249,5 +5274,15 @@ mod tests {
             prepared_signed_dividend_expr(&view, &producers, &dividend),
             Some(CExpr::Var("a".to_string()))
         );
+    }
+
+    #[test]
+    fn prepared_select_has_render_definition() {
+        assert!(prepared_op_has_render_definition(&SSAOp::Select {
+            dst: test_var("tmp:result", 1, 4),
+            cond: test_var("tmp:cond", 1, 1),
+            if_true: test_var("W0", 1, 4),
+            if_false: test_var("W1", 1, 4),
+        }));
     }
 }

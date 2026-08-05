@@ -250,6 +250,7 @@ impl<'a> FoldingContext<'a> {
         let mut frame = LowerFrame::for_stmt(block_addr, op_idx, true);
         let stmt = self.lowered_to_stmt(self.lower_op(op, &mut frame))?;
         if self.requires_certified_rendering()
+            && !matches!(op, SSAOp::Call { .. } | SSAOp::CallInd { .. })
             && self
                 .record_certified_call_render_proofs_for_stmt_with_current(
                     &stmt,
@@ -267,7 +268,7 @@ impl<'a> FoldingContext<'a> {
             return None;
         }
         if self.requires_certified_rendering()
-            && stmt_is_side_effect_free_versioned_register_carrier(&stmt)
+            && self.stmt_is_side_effect_free_versioned_register_carrier(&stmt)
         {
             return Some(stmt);
         }

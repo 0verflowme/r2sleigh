@@ -430,6 +430,21 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
 
         match op {
             Copy { src, .. } | Cast { src, .. } => self.eval_ssa_var(src),
+            Select {
+                cond,
+                if_true,
+                if_false,
+                ..
+            } => {
+                let cond = self.eval_ssa_var(cond)?;
+                let when_true = self.eval_ssa_var(if_true)?;
+                let when_false = self.eval_ssa_var(if_false)?;
+                if let Some(cond) = cond.as_concrete() {
+                    return Ok(if cond != 0 { when_true } else { when_false });
+                }
+                let guard = cond.to_bv(ctx).eq(BV::from_u64(0, cond.bits())).not();
+                Ok(ite_value(ctx, &guard, &when_true, &when_false))
+            }
             Load { dst, addr, .. } => {
                 if let Some(local_value) = self.local_memory_value(inst_id, dst.size) {
                     return Ok(local_value);

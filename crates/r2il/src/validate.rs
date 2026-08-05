@@ -514,6 +514,39 @@ pub fn validate_op_semantic(
                 src.size,
             );
         }
+        R2ILOp::Select {
+            dst,
+            cond,
+            if_true,
+            if_false,
+        } => {
+            check_size_const(
+                &mut issues,
+                "op.select.cond_width_mismatch",
+                op_index,
+                "cond.size",
+                cond.size,
+                1,
+            );
+            check_size_eq(
+                &mut issues,
+                "op.select.width_mismatch",
+                op_index,
+                "dst.size",
+                dst.size,
+                "if_true.size",
+                if_true.size,
+            );
+            check_size_eq(
+                &mut issues,
+                "op.select.width_mismatch",
+                op_index,
+                "dst.size",
+                dst.size,
+                "if_false.size",
+                if_false.size,
+            );
+        }
 
         // Integer arithmetic/bitwise rules
         R2ILOp::IntAdd { dst, a, b }
@@ -1666,6 +1699,29 @@ mod tests {
             err.issues
                 .iter()
                 .any(|i| i.code == "op.intadd.width_mismatch")
+        );
+    }
+
+    #[test]
+    fn select_width_mismatch_fails() {
+        let arch = valid_archspec();
+        let mut block = R2ILBlock::new(0x1000, 1);
+        block.push(R2ILOp::Select {
+            dst: Varnode::register(0, 8),
+            cond: Varnode::register(8, 4),
+            if_true: Varnode::register(16, 8),
+            if_false: Varnode::register(24, 4),
+        });
+        let err = validate_block_semantic(&block, &arch).expect_err("semantic should fail");
+        assert!(
+            err.issues
+                .iter()
+                .any(|issue| issue.code == "op.select.cond_width_mismatch")
+        );
+        assert!(
+            err.issues
+                .iter()
+                .any(|issue| issue.code == "op.select.width_mismatch")
         );
     }
 

@@ -375,8 +375,7 @@ impl<'a> FoldingContext<'a> {
             return Some(owner);
         }
 
-        let expr =
-            self.certified_structural_return_expr_for_value(value, 0, &mut BTreeSet::new())?;
+        let expr = self.certified_structural_expr_for_value(value, 0, &mut BTreeSet::new())?;
         Some(expr)
     }
 

@@ -231,6 +231,16 @@ fn render_vm_value_expr(value: &crate::VmValueExpr) -> String {
                 render_vm_value_expr(rhs)
             )
         }
+        crate::VmValueExpr::Select {
+            cond,
+            if_true,
+            if_false,
+        } => format!(
+            "({} ? {} : {})",
+            render_vm_value_expr(cond),
+            render_vm_value_expr(if_true),
+            render_vm_value_expr(if_false)
+        ),
     }
 }
 

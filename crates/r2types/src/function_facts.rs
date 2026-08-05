@@ -3,13 +3,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use serde::{Deserialize, Serialize};
 
 use crate::callee::{CalleeIdentityContext, CalleeResolutionFacts, CallsiteKey};
-use crate::context::{
-    ExternalStackBase, ExternalStackSlotRole, ExternalStackSlotSpec, StackSlotKey,
-};
+use crate::context::{ExternalStackSlotRole, ExternalStackSlotSpec, StackSlotKey};
 use crate::facts::{
     FunctionSignatureProjection, FunctionSignatureSpec, FunctionTypeFacts,
-    OutParamCertificateEvidence, OutParamCertificateSource, SignatureProjectionResult,
-    VisibleBindingKind,
+    OutParamCertificateEvidence, OutParamCertificateSource, SignatureCertificateSource,
+    SignatureProjectionResult, VisibleBindingKind,
 };
 use crate::{CTypeLike, normalize_external_type_name, parse_type_like_spec};
 
@@ -247,13 +245,68 @@ impl FunctionCallResultFacts {
     }
 
     pub fn owner_for_site(&self, callsite: CallsiteKey) -> Option<&r2ssa::ValueOwner> {
-        self.results_for_site(callsite)
-            .find_map(|result| result.owner.as_ref())
+        let direct_stack_owner = self.unique_owner_for_site_matching(callsite, |result, owner| {
+            result.relation.is_identity()
+                && matches!(&result.carrier, r2ssa::ReturnCarrier::Register { .. })
+                && matches!(owner, r2ssa::ValueOwner::StackSlot { .. })
+        });
+        match direct_stack_owner {
+            Ok(Some(owner)) => return Some(owner),
+            Err(()) => return None,
+            Ok(None) => {}
+        }
+
+        let carrier_stack_owner = self.unique_owner_for_site_matching(callsite, |result, owner| {
+            result.relation.is_identity()
+                && matches!(
+                (&result.carrier, owner),
+                (
+                    r2ssa::ReturnCarrier::StackSlot {
+                        object: carrier_object,
+                        offset: carrier_offset,
+                        ..
+                    },
+                    r2ssa::ValueOwner::StackSlot {
+                        object: owner_object,
+                        offset: owner_offset,
+                    }
+                ) if carrier_object == owner_object && carrier_offset == owner_offset
+                )
+        });
+        match carrier_stack_owner {
+            Ok(Some(owner)) => return Some(owner),
+            Err(()) => return None,
+            Ok(None) => {}
+        }
+
+        self.unique_owner_for_site_matching(callsite, |result, owner| {
+            result.relation.is_identity() && matches!(owner, r2ssa::ValueOwner::StackSlot { .. })
+        })
+        .ok()
+        .flatten()
     }
 
     pub fn owner_for_value(&self, value: r2ssa::ValueId) -> Option<&r2ssa::ValueOwner> {
         self.result_for_value(value)
             .and_then(|result| result.owner.as_ref())
+    }
+
+    fn unique_owner_for_site_matching(
+        &self,
+        callsite: CallsiteKey,
+        accept: impl Fn(&CallResultFact, &r2ssa::ValueOwner) -> bool,
+    ) -> Result<Option<&r2ssa::ValueOwner>, ()> {
+        let mut selected = None;
+        for result in self.results_for_site(callsite) {
+            let Some(owner) = result.owner.as_ref().filter(|owner| accept(result, owner)) else {
+                continue;
+            };
+            if selected.is_some_and(|existing| existing != owner) {
+                return Err(());
+            }
+            selected = Some(owner);
+        }
+        Ok(selected)
     }
 }
 
@@ -296,6 +349,7 @@ pub struct FunctionControlFacts {
     pub block_assumptions: BTreeMap<u64, Vec<ControlBlockAssumptionFact>>,
     pub loops: BTreeMap<r2ssa::LoopId, LoopStructureFact>,
     pub switches: BTreeMap<u64, SwitchSelectorFact>,
+    pub control_domains: r2ssa::ControlDomainFacts,
 }
 
 impl FunctionControlFacts {
@@ -304,6 +358,7 @@ impl FunctionControlFacts {
             && self.block_assumptions.is_empty()
             && self.loops.is_empty()
             && self.switches.is_empty()
+            && self.control_domains.by_block.is_empty()
     }
 
     pub fn branch_for_block(&self, block_addr: u64) -> Option<&BranchPredicateFact> {
@@ -312,6 +367,10 @@ impl FunctionControlFacts {
 
     pub fn switch_for_block(&self, block_addr: u64) -> Option<&SwitchSelectorFact> {
         self.switches.get(&block_addr)
+    }
+
+    pub fn control_domain_for_block(&self, block_addr: u64) -> Option<&r2ssa::ControlDomain> {
+        self.control_domains.for_block(block_addr)
     }
 
     pub fn loops_for_header(&self, header: u64) -> impl Iterator<Item = &LoopStructureFact> + '_ {
@@ -335,21 +394,19 @@ impl FunctionControlFacts {
 pub struct FunctionRenderFacts {
     /// Canonical certified expression graph keyed by stable semantic identity.
     pub certified_exprs: BTreeMap<r2ssa::SemanticId, CertifiedExpr>,
-    /// Canonical certified effect/resource graph keyed by stable semantic identity.
+    /// Canonical certified addressable entities keyed by stable semantic identity.
+    pub certified_entities: BTreeMap<r2ssa::SemanticId, CertifiedEntity>,
+    /// Canonical certified observable-effect graph keyed by stable semantic identity.
     pub certified_effects: BTreeMap<r2ssa::SemanticId, CertifiedEffect>,
-    /// ABI parameter slots mapped to every canonical entry value carrying them.
-    pub parameter_values: BTreeMap<u32, BTreeSet<r2ssa::ValueId>>,
     /// Stable return-effect identity for each canonical SSA op site.
     pub return_effects_by_op: BTreeMap<OpSiteKey, r2ssa::SemanticId>,
-    /// Compatibility projections used by consumers during the migration.
-    pub expressions: BTreeMap<r2ssa::ValueId, ExpressionRenderFact>,
+    /// Stable memory-effect identities for each canonical SSA op site.
+    pub memory_effects_by_op: BTreeMap<MemoryOpSiteKey, Vec<r2ssa::SemanticId>>,
+    /// Value annotations that supplement, rather than duplicate, certified expressions.
     pub string_literals_by_value: BTreeMap<r2ssa::ValueId, StringLiteralRenderFact>,
-    pub memory_accesses: BTreeMap<r2ssa::StructuredAccessId, MemoryAccessRenderFact>,
-    pub memory_accesses_by_op: BTreeMap<MemoryOpSiteKey, Vec<r2ssa::StructuredAccessId>>,
+    /// Type-owner render projections tied back to canonical memory-effect identities.
     pub member_accesses_by_op: BTreeMap<MemoryOpSiteKey, Vec<MemberAccessRenderFact>>,
     pub array_accesses_by_op: BTreeMap<MemoryOpSiteKey, Vec<ArrayAccessRenderFact>>,
-    pub returns_by_op: BTreeMap<OpSiteKey, ReturnValueRenderFact>,
-    pub stack_slot_offsets: BTreeMap<r2ssa::ObjectId, i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -360,26 +417,29 @@ pub struct StackSlotOwnerRenderAuthorization {
 }
 
 impl FunctionRenderFacts {
+    /// Project one prepared SSA artifact into the canonical render contract.
+    ///
+    /// This is the only owner for translating prepared certificates into
+    /// certified expressions, entities, effects, and op-site indexes.
+    pub fn from_prepared(prepared: &r2ssa::SsaArtifact) -> Self {
+        prepared_render_facts(prepared)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.certified_exprs.is_empty()
+            && self.certified_entities.is_empty()
             && self.certified_effects.is_empty()
-            && self.parameter_values.is_empty()
             && self.return_effects_by_op.is_empty()
-            && self.expressions.is_empty()
+            && self.memory_effects_by_op.is_empty()
             && self.string_literals_by_value.is_empty()
-            && self.memory_accesses.is_empty()
-            && self.memory_accesses_by_op.is_empty()
             && self.member_accesses_by_op.is_empty()
             && self.array_accesses_by_op.is_empty()
-            && self.returns_by_op.is_empty()
-            && self.stack_slot_offsets.is_empty()
     }
 
     pub fn expression_for_value(&self, value: r2ssa::ValueId) -> Option<&ExpressionRenderFact> {
         self.certified_exprs
             .get(&r2ssa::SemanticId::expression(value))
             .map(|cert| &cert.fact)
-            .or_else(|| self.expressions.get(&value))
     }
 
     pub fn certified_expr_for_value(&self, value: r2ssa::ValueId) -> Option<&CertifiedExpr> {
@@ -392,11 +452,43 @@ impl FunctionRenderFacts {
     }
 
     pub fn parameter_values(&self, slot: usize) -> impl Iterator<Item = r2ssa::ValueId> + '_ {
-        let slot = u32::try_from(slot).ok();
-        slot.into_iter()
-            .flat_map(|slot| self.parameter_values.get(&slot))
+        let entity =
+            r2ssa::SemanticId::parameter(slot).and_then(|id| self.certified_entities.get(&id));
+        entity
+            .into_iter()
+            .flat_map(|entity| match entity {
+                CertifiedEntity::Parameter { entry_values, .. } => Some(entry_values),
+                CertifiedEntity::StackSlot { .. } => None,
+            })
             .flatten()
             .copied()
+    }
+
+    /// Resolve an expression to one unambiguous ABI parameter identity.
+    ///
+    /// The walk follows only the certified expression graph and its stable
+    /// `SemanticId::Parameter` bindings. Rendered names and register spellings
+    /// are deliberately excluded.
+    pub fn unique_parameter_slot_for_value(&self, value: r2ssa::ValueId) -> Option<usize> {
+        let mut pending = vec![r2ssa::SemanticId::expression(value)];
+        let mut visited = BTreeSet::new();
+        let mut slots = BTreeSet::new();
+        while let Some(id) = pending.pop() {
+            if !visited.insert(id) {
+                continue;
+            }
+            let Some(expr) = self.certified_exprs.get(&id) else {
+                continue;
+            };
+            for binding in &expr.bindings {
+                if let r2ssa::SemanticId::Parameter(slot) = binding {
+                    slots.insert(usize::try_from(*slot).ok()?);
+                }
+            }
+            pending.extend(expr.inputs.iter().copied());
+        }
+        let slot = slots.pop_first()?;
+        slots.is_empty().then_some(slot)
     }
 
     pub fn return_effect_id_for_op(
@@ -418,19 +510,16 @@ impl FunctionRenderFacts {
         value: Option<r2ssa::ValueId>,
     ) -> Option<r2ssa::SemanticId> {
         let mut matching = self
-            .memory_accesses_by_op
+            .memory_effects_by_op
             .get(&(block_addr, op_index, is_write))?
             .iter()
-            .filter_map(|access| {
-                let id = r2ssa::SemanticId::memory_access(*access);
-                match self.certified_effects.get(&id) {
-                    Some(CertifiedEffect::Memory { fact, .. })
-                        if fact.address == address && fact.value == value =>
-                    {
-                        Some(id)
-                    }
-                    _ => None,
+            .filter_map(|id| match self.certified_effects.get(id) {
+                Some(CertifiedEffect::Memory { fact, .. })
+                    if fact.address == address && fact.value == value =>
+                {
+                    Some(*id)
                 }
+                _ => None,
             });
         let first = matching.next()?;
         matching.next().is_none().then_some(first)
@@ -454,16 +543,73 @@ impl FunctionRenderFacts {
         op_index: usize,
         is_write: bool,
     ) -> Option<&MemoryAccessRenderFact> {
-        self.memory_accesses_by_op
+        self.memory_effects_by_op
             .get(&(block_addr, op_index, is_write))?
             .iter()
-            .filter_map(|access| {
+            .filter_map(|id| {
                 self.certified_effects
-                    .get(&r2ssa::SemanticId::memory_access(*access))
+                    .get(id)
                     .and_then(CertifiedEffect::memory_fact)
-                    .or_else(|| self.memory_accesses.get(access))
             })
             .find(|fact| fact.width > 0)
+    }
+
+    pub fn memory_access(
+        &self,
+        access: r2ssa::StructuredAccessId,
+    ) -> Option<&MemoryAccessRenderFact> {
+        self.certified_effects
+            .get(&r2ssa::SemanticId::memory_access(access))
+            .and_then(CertifiedEffect::memory_fact)
+    }
+
+    pub fn memory_accesses(&self) -> impl Iterator<Item = &MemoryAccessRenderFact> {
+        self.certified_effects
+            .values()
+            .filter_map(CertifiedEffect::memory_fact)
+    }
+
+    pub fn return_effects(&self) -> impl Iterator<Item = &ReturnValueRenderFact> {
+        self.certified_effects
+            .values()
+            .filter_map(CertifiedEffect::return_fact)
+    }
+
+    pub fn stack_slot(
+        &self,
+        object: r2ssa::ObjectId,
+    ) -> Option<(r2ssa::StackAddressBase, i64, Option<u32>)> {
+        match self
+            .certified_entities
+            .get(&r2ssa::SemanticId::stack_slot(object))?
+        {
+            CertifiedEntity::StackSlot {
+                base, offset, size, ..
+            } => Some((*base, *offset, *size)),
+            CertifiedEntity::Parameter { .. } => None,
+        }
+    }
+
+    pub fn stack_slot_offset(&self, object: r2ssa::ObjectId) -> Option<i64> {
+        self.stack_slot(object).map(|(_, offset, _)| offset)
+    }
+
+    pub fn stack_slots(
+        &self,
+    ) -> impl Iterator<Item = (r2ssa::ObjectId, r2ssa::StackAddressBase, i64, Option<u32>)> + '_
+    {
+        self.certified_entities
+            .values()
+            .filter_map(|entity| match entity {
+                CertifiedEntity::StackSlot {
+                    object,
+                    base,
+                    offset,
+                    size,
+                    ..
+                } => Some((*object, *base, *offset, *size)),
+                CertifiedEntity::Parameter { .. } => None,
+            })
     }
 
     pub fn return_for_op(
@@ -474,7 +620,6 @@ impl FunctionRenderFacts {
         self.return_effect_id_for_op(block_addr, op_index)
             .and_then(|id| self.certified_effects.get(&id))
             .and_then(CertifiedEffect::return_fact)
-            .or_else(|| self.returns_by_op.get(&(block_addr, op_index)))
     }
 
     pub fn member_access_for_op(
@@ -490,7 +635,7 @@ impl FunctionRenderFacts {
             .get(&(block_addr, op_index, is_write))?
             .iter()
             .find(|fact| {
-                let Some(memory) = self.memory_accesses.get(&fact.access) else {
+                let Some(memory) = self.memory_access(fact.access) else {
                     return false;
                 };
                 memory.block_addr == block_addr
@@ -545,7 +690,7 @@ impl FunctionRenderFacts {
             .get(&(block_addr, op_index, is_write))?
             .iter()
             .find(|fact| {
-                let Some(memory) = self.memory_accesses.get(&fact.access) else {
+                let Some(memory) = self.memory_access(fact.access) else {
                     return false;
                 };
                 memory.block_addr == block_addr
@@ -588,17 +733,13 @@ impl FunctionRenderFacts {
     }
 
     pub fn has_stack_slot_offset(&self, offset: i64) -> bool {
-        self.stack_slot_offsets
-            .values()
-            .any(|slot_offset| *slot_offset == offset)
+        self.stack_slots()
+            .any(|(_, _, slot_offset, _)| slot_offset == offset)
     }
 }
 
 fn stack_slot_offset(slot: &StackSlotKey) -> i64 {
-    match slot.base {
-        ExternalStackBase::FramePointer => -slot.offset,
-        _ => slot.offset,
-    }
+    slot.offset
 }
 
 fn stack_slot_matches_offset(slot: &StackSlotKey, offset: i64) -> bool {
@@ -732,9 +873,35 @@ pub struct CertifiedExpr {
     pub bindings: BTreeSet<r2ssa::SemanticId>,
 }
 
+/// A certified addressable resource. Resources have identity and layout but do
+/// not execute, so they must never be counted as observable effects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CertifiedEntity {
+    Parameter {
+        id: r2ssa::SemanticId,
+        slot: u32,
+        entry_values: BTreeSet<r2ssa::ValueId>,
+        carrier_width: u32,
+    },
+    StackSlot {
+        id: r2ssa::SemanticId,
+        object: r2ssa::ObjectId,
+        base: r2ssa::StackAddressBase,
+        offset: i64,
+        size: Option<u32>,
+    },
+}
+
+impl CertifiedEntity {
+    pub const fn id(&self) -> r2ssa::SemanticId {
+        match self {
+            Self::Parameter { id, .. } | Self::StackSlot { id, .. } => *id,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CertifiedEffectKind {
-    StackSlot,
     MemoryRead,
     MemoryWrite,
     Return,
@@ -746,13 +913,6 @@ pub enum CertifiedEffectKind {
 /// recover semantic identity from rendered text or tuple-shaped sidecars.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CertifiedEffect {
-    StackSlot {
-        id: r2ssa::SemanticId,
-        object: r2ssa::ObjectId,
-        base: r2ssa::StackAddressBase,
-        offset: i64,
-        size: Option<u32>,
-    },
     Memory {
         id: r2ssa::SemanticId,
         fact: MemoryAccessRenderFact,
@@ -767,16 +927,22 @@ pub enum CertifiedEffect {
 impl CertifiedEffect {
     pub const fn id(&self) -> r2ssa::SemanticId {
         match self {
-            Self::StackSlot { id, .. } | Self::Memory { id, .. } | Self::Return { id, .. } => *id,
+            Self::Memory { id, .. } | Self::Return { id, .. } => *id,
         }
     }
 
     pub const fn kind(&self) -> CertifiedEffectKind {
         match self {
-            Self::StackSlot { .. } => CertifiedEffectKind::StackSlot,
             Self::Memory { fact, .. } if fact.is_write => CertifiedEffectKind::MemoryWrite,
             Self::Memory { .. } => CertifiedEffectKind::MemoryRead,
             Self::Return { .. } => CertifiedEffectKind::Return,
+        }
+    }
+
+    pub const fn control_domain(&self) -> &r2ssa::ControlDomain {
+        match self {
+            Self::Memory { fact, .. } => &fact.control_domain,
+            Self::Return { fact, .. } => &fact.control_domain,
         }
     }
 
@@ -805,6 +971,7 @@ pub struct MemoryAccessRenderFact {
     pub value: Option<r2ssa::ValueId>,
     pub is_write: bool,
     pub width: u32,
+    pub control_domain: r2ssa::ControlDomain,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -851,6 +1018,7 @@ pub struct ReturnValueRenderFact {
     pub op_index: usize,
     pub value: r2ssa::ValueId,
     pub width: u32,
+    pub control_domain: r2ssa::ControlDomain,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -905,6 +1073,7 @@ pub struct CallResultFact {
     pub at: r2ssa::InstId,
     pub value: r2ssa::ValueId,
     pub width: u32,
+    pub relation: r2ssa::CallResultValueRelation,
     pub carrier: r2ssa::ReturnCarrier,
     pub owner: Option<r2ssa::ValueOwner>,
 }
@@ -1389,7 +1558,7 @@ impl FunctionFacts {
         if name.is_empty() {
             return None;
         }
-        let render_offset = self.render.stack_slot_offsets.get(&object).copied()?;
+        let render_offset = self.render.stack_slot_offset(object)?;
         if render_offset != offset || !self.stack_owner_name_is_renderable(offset, name) {
             return None;
         }
@@ -1407,9 +1576,8 @@ impl FunctionFacts {
     ) -> Option<StackSlotOwnerRenderAuthorization> {
         let mut matching_objects = self
             .render
-            .stack_slot_offsets
-            .iter()
-            .filter_map(|(object, slot_offset)| (*slot_offset == offset).then_some(*object));
+            .stack_slots()
+            .filter_map(|(object, _, slot_offset, _)| (slot_offset == offset).then_some(object));
         let object = matching_objects.next()?;
         if matching_objects.next().is_some() {
             return None;
@@ -1422,7 +1590,7 @@ impl FunctionFacts {
         object: r2ssa::ObjectId,
         offset: i64,
     ) -> Option<StackSlotOwnerRenderAuthorization> {
-        let render_offset = self.render.stack_slot_offsets.get(&object).copied()?;
+        let render_offset = self.render.stack_slot_offset(object)?;
         if render_offset != offset {
             return None;
         }
@@ -1547,7 +1715,7 @@ impl FunctionFacts {
         if !recovered_stack_owner_name_is_renderable(name) {
             return None;
         }
-        let render_offset = self.render.stack_slot_offsets.get(&object).copied()?;
+        let render_offset = self.render.stack_slot_offset(object)?;
         if render_offset != offset {
             return None;
         }
@@ -1651,7 +1819,7 @@ impl FunctionFacts {
         }
 
         let mut member_facts = Vec::new();
-        for memory in self.render.memory_accesses.values() {
+        for memory in self.render.memory_accesses() {
             if memory.width == 0 {
                 continue;
             }
@@ -1675,11 +1843,15 @@ impl FunctionFacts {
                 continue;
             }
             let key = (candidate.block_addr, candidate.op_index, candidate.is_write);
-            let Some(accesses) = self.render.memory_accesses_by_op.get(&key) else {
+            let Some(effect_ids) = self.render.memory_effects_by_op.get(&key) else {
                 continue;
             };
-            for access in accesses {
-                let Some(memory) = self.render.memory_accesses.get(access) else {
+            for effect_id in effect_ids {
+                let Some(memory) = self
+                    .render
+                    .certified_effect(*effect_id)
+                    .and_then(CertifiedEffect::memory_fact)
+                else {
                     continue;
                 };
                 if memory.block_addr != candidate.block_addr
@@ -1782,12 +1954,16 @@ impl FunctionFacts {
                 continue;
             }
             let key = (candidate.block_addr, candidate.op_index, candidate.is_write);
-            let Some(accesses) = self.render.memory_accesses_by_op.get(&key) else {
+            let Some(effect_ids) = self.render.memory_effects_by_op.get(&key) else {
                 continue;
             };
-            let accesses = accesses.clone();
-            for access in accesses {
-                let Some(memory) = self.render.memory_accesses.get(&access) else {
+            let effect_ids = effect_ids.clone();
+            for effect_id in effect_ids {
+                let Some(memory) = self
+                    .render
+                    .certified_effect(effect_id)
+                    .and_then(CertifiedEffect::memory_fact)
+                else {
                     continue;
                 };
                 if memory.block_addr != candidate.block_addr
@@ -1804,7 +1980,7 @@ impl FunctionFacts {
                     continue;
                 }
                 let fact = ArrayAccessRenderFact {
-                    access,
+                    access: memory.access,
                     block_addr: memory.block_addr,
                     op_index: memory.op_index,
                     object: memory.object,
@@ -1926,7 +2102,7 @@ impl FunctionFacts {
         let prepared_call_results = prepared_call_result_facts(prepared);
         let prepared_call_render = prepared_call_render_facts(prepared, &prepared_call_results);
         let prepared_control = prepared_control_facts(prepared);
-        let prepared_render = prepared_render_facts(prepared);
+        let prepared_render = FunctionRenderFacts::from_prepared(prepared);
 
         merge_callee_resolution_facts(&mut self.callee_resolution, prepared_callee_resolution);
         merge_callsite_facts(&mut self.callsites, prepared_callsites);
@@ -1947,20 +2123,14 @@ impl FunctionFacts {
         prepared: &r2ssa::SsaArtifact,
         param_slots: &ParamSlotResolver,
     ) {
-        let Some(parameter_count) = self
-            .types
-            .render_authorized_signature()
-            .map(|signature| signature.params.len())
-        else {
-            return;
-        };
+        let mut entry_values_by_slot = BTreeMap::<u32, (BTreeSet<r2ssa::ValueId>, u32)>::new();
         for value in &prepared.graph().values {
+            if value.var.version != 0 || !parameter_entry_value_has_live_use(prepared, value.id) {
+                continue;
+            }
             let Some(slot) = param_slots.slot_for_var(&value.var) else {
                 continue;
             };
-            if slot >= parameter_count {
-                continue;
-            }
             let Some(parameter_id) = r2ssa::SemanticId::parameter(slot) else {
                 continue;
             };
@@ -1972,12 +2142,145 @@ impl FunctionFacts {
                 continue;
             };
             cert.bindings.insert(parameter_id);
-            self.render
-                .parameter_values
-                .entry(slot as u32)
-                .or_default()
-                .insert(value.id);
+            let entry = entry_values_by_slot.entry(slot as u32).or_default();
+            entry.0.insert(value.id);
+            entry.1 = entry.1.max(value.var.size);
         }
+        let parameter_slot_by_entry_value = entry_values_by_slot
+            .iter()
+            .flat_map(|(slot, (values, _))| values.iter().map(move |value| (*value, *slot)))
+            .collect::<BTreeMap<_, _>>();
+        for reload in prepared.certificates().stack_reloads.values() {
+            let mut slots = [reload.canonical_source, reload.source]
+                .into_iter()
+                .filter_map(|value| parameter_slot_by_entry_value.get(&value).copied())
+                .collect::<BTreeSet<_>>();
+            let Some(slot) = slots.pop_first() else {
+                continue;
+            };
+            if !slots.is_empty() {
+                continue;
+            }
+            let Some(expr) = self
+                .render
+                .certified_exprs
+                .get_mut(&r2ssa::SemanticId::expression(reload.value))
+            else {
+                continue;
+            };
+            expr.bindings.insert(r2ssa::SemanticId::Parameter(slot));
+        }
+        for (slot, (entry_values, carrier_width)) in entry_values_by_slot {
+            let id = r2ssa::SemanticId::Parameter(slot);
+            self.render.certified_entities.insert(
+                id,
+                CertifiedEntity::Parameter {
+                    id,
+                    slot,
+                    entry_values,
+                    carrier_width,
+                },
+            );
+        }
+    }
+
+    /// Project exact callee parameter types back onto caller parameters.
+    ///
+    /// A constraint is accepted only when the callsite argument has a unique
+    /// certified path to one ABI parameter and the callee identity carries a
+    /// typed signature. Conflicting callees leave the caller type unchanged.
+    pub fn apply_certified_call_argument_type_constraints(&mut self, ptr_bits: u32) -> usize {
+        let mut constraints = BTreeMap::<usize, CTypeLike>::new();
+        let mut conflicted = BTreeSet::new();
+        for (callsite, arguments) in &self.callsites.by_callsite {
+            let identity = self.callee_resolution.identity_for_callsite(*callsite);
+            let signature = identity.and_then(crate::CalleeIdentity::known_signature);
+            let Some(signature) = signature else {
+                continue;
+            };
+            for argument in &arguments.argument_values {
+                let Some(hint) = signature.params.get(argument.index) else {
+                    continue;
+                };
+                let Some(slot) = self.render.unique_parameter_slot_for_value(argument.value) else {
+                    continue;
+                };
+                if conflicted.contains(&slot) {
+                    continue;
+                }
+                match constraints.get(&slot) {
+                    None => {
+                        constraints.insert(slot, hint.clone());
+                    }
+                    Some(existing) if existing == hint => {}
+                    Some(existing)
+                        if crate::signature_hint_can_replace_existing(
+                            existing,
+                            Some(hint),
+                            ptr_bits,
+                        ) =>
+                    {
+                        constraints.insert(slot, hint.clone());
+                    }
+                    Some(existing)
+                        if crate::signature_hint_can_replace_existing(
+                            hint,
+                            Some(existing),
+                            ptr_bits,
+                        ) => {}
+                    Some(_) => {
+                        constraints.remove(&slot);
+                        conflicted.insert(slot);
+                    }
+                }
+            }
+        }
+
+        let protects_existing = self.types.writeback_authorized_signature().is_some();
+        let Some(signature) = self.types.merged_signature.as_mut() else {
+            return 0;
+        };
+        let mut applied = BTreeMap::new();
+        for (slot, hint) in constraints {
+            let Some(param) = signature.params.get_mut(slot) else {
+                continue;
+            };
+            let replace = match param.ty.as_ref() {
+                None => true,
+                Some(existing) if existing == &hint => false,
+                Some(existing) => {
+                    !protects_existing
+                        && crate::signature_hint_can_replace_existing(
+                            existing,
+                            Some(&hint),
+                            ptr_bits,
+                        )
+                }
+            };
+            if replace {
+                param.ty = Some(hint.clone());
+                applied.insert(slot, hint);
+            }
+        }
+        if applied.is_empty() {
+            return 0;
+        }
+        for (slot, hint) in &applied {
+            if let Some(param) = self.types.register_params.get_mut(*slot) {
+                param.ty = Some(hint.clone());
+            }
+            for binding in self
+                .types
+                .visible_bindings
+                .iter_mut()
+                .filter(|binding| binding.param_index == Some(*slot))
+            {
+                binding.ty = Some(hint.clone());
+            }
+        }
+        self.types
+            .certify_current_signature_with_source(SignatureCertificateSource::CalleeSignature);
+        applied.len()
     }
 
     pub fn interproc_summary_set(&self) -> Option<&r2ssa::InterprocSummarySet> {
@@ -2052,6 +2355,30 @@ impl FunctionFacts {
         capability.residual_reasons = semantics.diagnostics.residual_reasons.clone();
         capability
     }
+}
+
+fn parameter_entry_value_has_live_use(prepared: &r2ssa::SsaArtifact, root: r2ssa::ValueId) -> bool {
+    let graph = prepared.graph();
+    let mut pending = vec![root];
+    let mut visited = BTreeSet::new();
+    while let Some(value) = pending.pop() {
+        if !visited.insert(value) {
+            continue;
+        }
+        for use_site in graph.use_sites(value) {
+            let Some(inst) = graph.inst(use_site.inst) else {
+                continue;
+            };
+            if matches!(inst.payload, r2ssa::InstPayload::Phi { .. }) {
+                if let Some(output) = inst.output {
+                    pending.push(output);
+                }
+                continue;
+            }
+            return true;
+        }
+    }
+    false
 }
 
 fn struct_name_from_pointer_type(ty: Option<&CTypeLike>) -> Option<&str> {
@@ -2171,44 +2498,40 @@ fn merge_control_facts(existing: &mut FunctionControlFacts, prepared: FunctionCo
     for (block, fact) in prepared.switches {
         existing.switches.entry(block).or_insert(fact);
     }
+    for (id, domain) in prepared.control_domains.domains {
+        existing.control_domains.domains.entry(id).or_insert(domain);
+    }
+    for (block, id) in prepared.control_domains.by_block {
+        existing.control_domains.by_block.entry(block).or_insert(id);
+    }
 }
 
 fn merge_render_facts(existing: &mut FunctionRenderFacts, prepared: FunctionRenderFacts) {
     for (id, fact) in prepared.certified_exprs {
         existing.certified_exprs.entry(id).or_insert(fact);
     }
+    for (id, fact) in prepared.certified_entities {
+        existing.certified_entities.entry(id).or_insert(fact);
+    }
     for (id, fact) in prepared.certified_effects {
         existing.certified_effects.entry(id).or_insert(fact);
-    }
-    for (slot, values) in prepared.parameter_values {
-        existing
-            .parameter_values
-            .entry(slot)
-            .or_default()
-            .extend(values);
     }
     for (op, id) in prepared.return_effects_by_op {
         existing.return_effects_by_op.entry(op).or_insert(id);
     }
-    for (value, fact) in prepared.expressions {
-        existing.expressions.entry(value).or_insert(fact);
+    for (op, ids) in prepared.memory_effects_by_op {
+        let existing_ids = existing.memory_effects_by_op.entry(op).or_default();
+        for id in ids {
+            if !existing_ids.contains(&id) {
+                existing_ids.push(id);
+            }
+        }
     }
     for (value, fact) in prepared.string_literals_by_value {
         existing
             .string_literals_by_value
             .entry(value)
             .or_insert(fact);
-    }
-    for (access, fact) in prepared.memory_accesses {
-        existing.memory_accesses.entry(access).or_insert(fact);
-    }
-    for (op, accesses) in prepared.memory_accesses_by_op {
-        let existing_accesses = existing.memory_accesses_by_op.entry(op).or_default();
-        for access in accesses {
-            if !existing_accesses.contains(&access) {
-                existing_accesses.push(access);
-            }
-        }
     }
     for (op, facts) in prepared.member_accesses_by_op {
         let existing_facts = existing.member_accesses_by_op.entry(op).or_default();
@@ -2225,12 +2548,6 @@ fn merge_render_facts(existing: &mut FunctionRenderFacts, prepared: FunctionRend
                 existing_facts.push(fact);
             }
         }
-    }
-    for (op, fact) in prepared.returns_by_op {
-        existing.returns_by_op.entry(op).or_insert(fact);
-    }
-    for (object, offset) in prepared.stack_slot_offsets {
-        existing.stack_slot_offsets.entry(object).or_insert(offset);
     }
 }
 
@@ -2327,6 +2644,7 @@ fn prepared_call_result_facts(prepared: &r2ssa::SsaArtifact) -> FunctionCallResu
                 at: cert.at,
                 value: cert.value,
                 width: cert.width,
+                relation: cert.relation,
                 carrier: cert.carrier.clone(),
                 owner: cert.owner.clone(),
             },
@@ -2601,11 +2919,22 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
         .expressions
         .iter()
         .map(|(value, cert)| {
+            let call_result = certificates.call_results.get(value);
+            let mut bindings = BTreeSet::new();
+            if let Some(result) = call_result {
+                bindings.insert(r2ssa::SemanticId::call(result.call_site));
+                if let r2ssa::ReturnCarrier::StackSlot { object, .. } = &result.carrier {
+                    bindings.insert(r2ssa::SemanticId::stack_slot(*object));
+                }
+                if let Some(r2ssa::ValueOwner::StackSlot { object, .. }) = &result.owner {
+                    bindings.insert(r2ssa::SemanticId::stack_slot(*object));
+                }
+            }
             let fact = ExpressionRenderFact {
                 value: cert.value,
                 defining_inst: cert.defining_inst,
                 width: cert.width,
-                renderable: cert.renderable,
+                renderable: cert.renderable || call_result.is_some(),
             };
             (
                 r2ssa::SemanticId::expression(*value),
@@ -2618,20 +2947,21 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
                         .copied()
                         .map(r2ssa::SemanticId::expression)
                         .collect(),
-                    bindings: BTreeSet::new(),
+                    bindings,
                 },
             )
         })
         .collect::<BTreeMap<_, _>>();
-    let expressions = certified_exprs
-        .values()
-        .map(|cert| (cert.fact.value, cert.fact.clone()))
-        .collect();
     let certified_memory_effects = certificates
         .memory_accesses
         .iter()
         .map(|(access, cert)| {
             let id = r2ssa::SemanticId::memory_access(*access);
+            let control_domain = prepared
+                .control_domains()
+                .for_block(cert.block_addr)
+                .expect("memory certificate block has a control domain")
+                .clone();
             (
                 id,
                 CertifiedEffect::Memory {
@@ -2645,21 +2975,36 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
                         value: cert.value,
                         is_write: cert.is_write,
                         width: cert.width,
+                        control_domain,
                     },
                 },
             )
         })
         .collect::<BTreeMap<_, _>>();
-    let memory_accesses = certified_memory_effects
-        .values()
-        .filter_map(|effect| effect.memory_fact().map(|fact| (fact.access, fact.clone())))
+    let memory_effects_by_op = certificates
+        .memory_accesses_by_op
+        .iter()
+        .map(|(op, accesses)| {
+            (
+                *op,
+                accesses
+                    .iter()
+                    .copied()
+                    .map(r2ssa::SemanticId::memory_access)
+                    .collect(),
+            )
+        })
         .collect();
-    let memory_accesses_by_op = certificates.memory_accesses_by_op.clone();
     let certified_return_effects = certificates
         .returns
         .iter()
         .map(|cert| {
             let id = r2ssa::SemanticId::return_value(cert.at);
+            let control_domain = prepared
+                .control_domains()
+                .for_block(cert.block_addr)
+                .expect("return certificate block has a control domain")
+                .clone();
             (
                 id,
                 CertifiedEffect::Return {
@@ -2670,19 +3015,12 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
                         op_index: cert.op_index,
                         value: cert.value,
                         width: cert.width,
+                        control_domain,
                     },
                 },
             )
         })
         .collect::<BTreeMap<_, _>>();
-    let returns_by_op = certified_return_effects
-        .values()
-        .filter_map(|effect| {
-            effect
-                .return_fact()
-                .map(|fact| ((fact.block_addr, fact.op_index), fact.clone()))
-        })
-        .collect();
     let return_effects_by_op = certified_return_effects
         .iter()
         .filter_map(|(id, effect)| {
@@ -2691,14 +3029,14 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
                 .map(|fact| ((fact.block_addr, fact.op_index), *id))
         })
         .collect();
-    let certified_stack_effects = certificates
+    let certified_entities = certificates
         .stack_slots
         .iter()
         .map(|(object, cert)| {
             let id = r2ssa::SemanticId::stack_slot(*object);
             (
                 id,
-                CertifiedEffect::StackSlot {
+                CertifiedEntity::StackSlot {
                     id,
                     object: *object,
                     base: cert.base,
@@ -2708,49 +3046,17 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
             )
         })
         .collect::<BTreeMap<_, _>>();
-    let mut certified_effects = certified_stack_effects;
-    certified_effects.extend(certified_memory_effects);
+    let mut certified_effects = certified_memory_effects;
     certified_effects.extend(certified_return_effects);
-    let mut stack_slot_offsets: BTreeMap<_, _> = certificates
-        .stack_slots
-        .iter()
-        .map(|(object, cert)| (*object, cert.offset))
-        .collect();
-    for cert in certificates.memory_accesses.values() {
-        stack_slot_offsets.entry(cert.object).or_insert_with(|| {
-            prepared
-                .objects()
-                .object(cert.object)
-                .and_then(|object| match &object.kind {
-                    r2ssa::ObjectKind::StackSlot { offset, .. }
-                    | r2ssa::ObjectKind::FrameObject { offset, .. } => Some(offset),
-                    _ => None,
-                })
-                .copied()
-                .unwrap_or(0)
-        });
-    }
-    stack_slot_offsets.retain(|object, _| {
-        prepared.objects().object(*object).is_some_and(|object| {
-            matches!(
-                &object.kind,
-                r2ssa::ObjectKind::StackSlot { .. } | r2ssa::ObjectKind::FrameObject { .. }
-            )
-        })
-    });
     FunctionRenderFacts {
         certified_exprs,
+        certified_entities,
         certified_effects,
-        parameter_values: BTreeMap::new(),
         return_effects_by_op,
-        expressions,
+        memory_effects_by_op,
         string_literals_by_value: BTreeMap::new(),
-        memory_accesses,
-        memory_accesses_by_op,
         member_accesses_by_op: BTreeMap::new(),
         array_accesses_by_op: BTreeMap::new(),
-        returns_by_op,
-        stack_slot_offsets,
     }
 }
 
@@ -2842,6 +3148,7 @@ fn prepared_control_facts(prepared: &r2ssa::SsaArtifact) -> FunctionControlFacts
         block_assumptions,
         loops,
         switches,
+        control_domains: prepared.control_domains().clone(),
     }
 }
 
@@ -3035,9 +3342,42 @@ fn push_structured_summary_pointer_indices(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::FunctionParamSpec;
+    use crate::{ExternalStackBase, FunctionParamSpec};
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
     use std::collections::{BTreeMap, HashMap};
+
+    fn test_control_domain() -> r2ssa::ControlDomain {
+        r2ssa::ControlDomain {
+            id: r2ssa::ControlDomainId(0),
+            guards: Vec::new(),
+            loops: Vec::new(),
+            complete: true,
+        }
+    }
+
+    fn test_render_with_stack_slots<const N: usize>(
+        slots: [(r2ssa::ObjectId, r2ssa::StackAddressBase, i64); N],
+    ) -> FunctionRenderFacts {
+        FunctionRenderFacts {
+            certified_entities: slots
+                .into_iter()
+                .map(|(object, base, offset)| {
+                    let id = r2ssa::SemanticId::stack_slot(object);
+                    (
+                        id,
+                        CertifiedEntity::StackSlot {
+                            id,
+                            object,
+                            base,
+                            offset,
+                            size: None,
+                        },
+                    )
+                })
+                .collect(),
+            ..FunctionRenderFacts::default()
+        }
+    }
 
     #[test]
     fn function_facts_owns_input_quality_evidence() {
@@ -3176,6 +3516,112 @@ mod tests {
     }
 
     #[test]
+    fn certified_call_argument_projects_callee_pointer_type_to_caller_parameter() {
+        let callsite = crate::CallsiteKey {
+            block_addr: 0x401000,
+            op_index: 7,
+        };
+        let value = r2ssa::ValueId(11);
+        let signed_byte = CTypeLike::Int {
+            bits: 8,
+            signedness: crate::Signedness::Signed,
+        };
+        let pointer = CTypeLike::Pointer(Box::new(signed_byte));
+        let function_names = HashMap::from([(0x402000, "strlen".to_string())]);
+        let symbols = HashMap::new();
+        let known_function_signatures = HashMap::from([(
+            "strlen".to_string(),
+            crate::FunctionType {
+                return_type: CTypeLike::Typedef("size_t".to_string()),
+                params: vec![pointer.clone()],
+                variadic: false,
+            },
+        )]);
+        let callee_facts = BTreeMap::new();
+        let identity_ctx = crate::CalleeIdentityContext {
+            function_names: &function_names,
+            symbols: &symbols,
+            callee_facts: &callee_facts,
+            known_function_signatures: &known_function_signatures,
+        };
+        let resolution =
+            CalleeResolutionFacts::from_direct_call_targets([(callsite, 0x402000)], &identity_ctx);
+        let callsites = FunctionCallsiteFacts {
+            by_callsite: BTreeMap::from([(
+                callsite,
+                CallsiteArgumentFacts {
+                    callsite,
+                    call_site_id: r2ssa::CallSiteId(2),
+                    at: r2ssa::InstId(5),
+                    target: r2ssa::ValueId(10),
+                    direct_target: Some(0x402000),
+                    argument_values: vec![CallArgumentValueFact { index: 0, value }],
+                    register_argument_locations: Vec::new(),
+                    stack_argument_locations: Vec::new(),
+                },
+            )]),
+        };
+        let mut render = FunctionRenderFacts::default();
+        render.certified_exprs.insert(
+            r2ssa::SemanticId::expression(value),
+            CertifiedExpr {
+                id: r2ssa::SemanticId::expression(value),
+                fact: ExpressionRenderFact {
+                    value,
+                    defining_inst: Some(r2ssa::InstId(4)),
+                    width: 8,
+                    renderable: true,
+                },
+                inputs: Vec::new(),
+                bindings: BTreeSet::from([r2ssa::SemanticId::Parameter(0)]),
+            },
+        );
+        let signature = FunctionSignatureSpec {
+            ret_type: Some(CTypeLike::Int {
+                bits: 64,
+                signedness: crate::Signedness::Signed,
+            }),
+            params: vec![FunctionParamSpec {
+                name: "arg0".to_string(),
+                ty: Some(CTypeLike::Int {
+                    bits: 64,
+                    signedness: crate::Signedness::Signed,
+                }),
+            }],
+        };
+        let mut facts = FunctionFacts::new(
+            FunctionTypeFacts {
+                merged_signature: Some(signature.clone()),
+                signature_certificate: crate::SignatureCertificate::from_signature(
+                    &signature,
+                    [crate::SignatureCertificateSource::LocalInference],
+                ),
+                ..FunctionTypeFacts::default()
+            },
+            None,
+        )
+        .with_callee_resolution(resolution)
+        .with_callsites(callsites)
+        .with_render(render);
+
+        assert_eq!(facts.apply_certified_call_argument_type_constraints(64), 1);
+        let typed = facts
+            .type_facts()
+            .render_authorized_signature()
+            .and_then(|signature| signature.params[0].ty.as_ref());
+        assert_eq!(typed, Some(&pointer));
+        assert!(
+            facts
+                .type_facts()
+                .signature_certificate
+                .as_ref()
+                .is_some_and(|certificate| certificate
+                    .sources
+                    .contains(&crate::SignatureCertificateSource::CalleeSignature))
+        );
+    }
+
+    #[test]
     fn function_facts_owns_canonical_call_render_disposition() {
         let callsite = crate::CallsiteKey {
             block_addr: 0x401000,
@@ -3272,26 +3718,48 @@ mod tests {
             op_index: 7,
         };
         let value = r2ssa::ValueId(21);
+        let derived_value = r2ssa::ValueId(22);
         let owner = r2ssa::ValueOwner::StackSlot {
             object: r2ssa::ObjectId(3),
             offset: -8,
         };
         let call_results = FunctionCallResultFacts {
-            by_value: BTreeMap::from([(
-                value,
-                CallResultFact {
-                    callsite,
-                    call_site_id: r2ssa::CallSiteId(2),
-                    at: r2ssa::InstId(8),
+            by_value: BTreeMap::from([
+                (
                     value,
-                    width: 8,
-                    carrier: r2ssa::ReturnCarrier::Register {
-                        name: "rax".to_string(),
+                    CallResultFact {
+                        callsite,
+                        call_site_id: r2ssa::CallSiteId(2),
+                        at: r2ssa::InstId(8),
+                        value,
+                        width: 8,
+                        relation: r2ssa::CallResultValueRelation::Identity,
+                        carrier: r2ssa::ReturnCarrier::Register {
+                            name: "rax".to_string(),
+                        },
+                        owner: Some(owner.clone()),
                     },
-                    owner: Some(owner.clone()),
-                },
-            )]),
-            by_callsite: BTreeMap::from([(callsite, vec![value])]),
+                ),
+                (
+                    derived_value,
+                    CallResultFact {
+                        callsite,
+                        call_site_id: r2ssa::CallSiteId(2),
+                        at: r2ssa::InstId(9),
+                        value: derived_value,
+                        width: 4,
+                        relation: r2ssa::CallResultValueRelation::Derived,
+                        carrier: r2ssa::ReturnCarrier::Register {
+                            name: "eax".to_string(),
+                        },
+                        owner: Some(r2ssa::ValueOwner::StackSlot {
+                            object: r2ssa::ObjectId(4),
+                            offset: -4,
+                        }),
+                    },
+                ),
+            ]),
+            by_callsite: BTreeMap::from([(callsite, vec![value, derived_value])]),
         };
 
         let facts = FunctionFacts::default().with_call_results(call_results);
@@ -3307,8 +3775,15 @@ mod tests {
         assert_eq!(
             facts
                 .call_results()
+                .and_then(|results| results.owner_for_site(callsite)),
+            Some(&owner),
+            "derived values must not replace the identity result's stable owner"
+        );
+        assert_eq!(
+            facts
+                .call_results()
                 .map(|results| results.results_for_site(callsite).count()),
-            Some(1),
+            Some(2),
             "call-result site index must travel through FunctionFacts"
         );
         assert_eq!(
@@ -3318,6 +3793,52 @@ mod tests {
             Some(&owner),
             "call-result owner lookup must be available by callsite"
         );
+    }
+
+    #[test]
+    fn prepared_call_results_bind_certified_exprs_to_stable_call_ids() {
+        let mut block = R2ILBlock::new(0x401000, 4);
+        block.push(R2ILOp::Call {
+            target: Varnode::constant(0x402000, 8),
+        });
+        block.push(R2ILOp::IntSub {
+            dst: Varnode::unique(0x100, 8),
+            a: Varnode::register(0x20, 8),
+            b: Varnode::constant(8, 8),
+        });
+        block.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x100, 8),
+            val: Varnode::register(0x00, 8),
+        });
+        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
+            .expect("prepared");
+        let mut facts = FunctionFacts::default();
+        facts.attach_prepared_decompile_evidence(&prepared);
+
+        let store_value = prepared
+            .function()
+            .get_block(0x401000)
+            .expect("entry block")
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                r2ssa::SSAOp::Store { val, .. } => prepared.graph().value_id_for_var(val),
+                _ => None,
+            })
+            .expect("stored call result");
+        let result = facts
+            .call_results()
+            .and_then(|results| results.result_for_value(store_value))
+            .expect("canonical call-result fact");
+        let binding = r2ssa::SemanticId::call(result.call_site_id);
+        let certified = facts
+            .render()
+            .and_then(|render| render.certified_expr_for_value(store_value))
+            .expect("certified call-result expression");
+
+        assert!(certified.fact.renderable);
+        assert!(certified.bindings.contains(&binding));
     }
 
     #[test]
@@ -3654,7 +4175,26 @@ mod tests {
             "entry parameter binding must use ABI slot identity"
         );
         assert!(render.parameter_values(0).any(|value| value == rdi.id));
-        assert_eq!(render.parameter_values.len(), 1);
+        assert_eq!(
+            render
+                .certified_entities
+                .values()
+                .filter(|entity| matches!(entity, CertifiedEntity::Parameter { .. }))
+                .count(),
+            1
+        );
+        let reloaded = prepared
+            .certificates()
+            .stack_reloads
+            .values()
+            .find(|reload| reload.canonical_source == rdi.id)
+            .expect("certified parameter-home reload");
+        assert!(
+            render
+                .certified_expr_for_value(reloaded.value)
+                .is_some_and(|expr| expr.bindings.contains(&param_id)),
+            "parameter identity must cross its certified stack-home reload"
+        );
         assert!(
             render
                 .certified_exprs
@@ -3663,11 +4203,7 @@ mod tests {
             "unused ABI entry registers beyond signature arity must not become parameters"
         );
 
-        let stack_effects = render
-            .certified_effects
-            .values()
-            .filter(|effect| effect.kind() == CertifiedEffectKind::StackSlot)
-            .count();
+        let certified_entities = render.certified_entities.len();
         let memory_effects = render
             .certified_effects
             .values()
@@ -3683,7 +4219,19 @@ mod tests {
             .values()
             .filter(|effect| effect.kind() == CertifiedEffectKind::Return)
             .count();
-        assert_eq!(stack_effects, 1);
+        assert_eq!(certified_entities, 2);
+        assert!(
+            render
+                .certified_entities
+                .values()
+                .any(|entity| matches!(entity, CertifiedEntity::Parameter { slot: 0, .. }))
+        );
+        assert!(
+            render
+                .certified_entities
+                .values()
+                .any(|entity| matches!(entity, CertifiedEntity::StackSlot { offset: -8, .. }))
+        );
         assert_eq!(memory_effects, 2);
         assert!(return_effects >= 1);
         assert!(render.return_effect_id_for_op(0x401000, 3).is_some());
@@ -4074,6 +4622,7 @@ mod tests {
             )]),
             loops: BTreeMap::from([(loop_fact.loop_id, loop_fact.clone())]),
             switches: BTreeMap::from([(switch.block_addr, switch.clone())]),
+            control_domains: r2ssa::ControlDomainFacts::default(),
         };
 
         let facts = FunctionFacts::default().with_control(control);
@@ -4116,16 +4665,70 @@ mod tests {
             ordinal: 0,
         };
         let object = r2ssa::ObjectId(3);
+        let expression_id = r2ssa::SemanticId::expression(value);
+        let memory_id = r2ssa::SemanticId::memory_access(access);
+        let return_at = r2ssa::InstId(9);
+        let return_id = r2ssa::SemanticId::return_value(return_at);
         let render = FunctionRenderFacts {
-            expressions: BTreeMap::from([(
-                value,
-                ExpressionRenderFact {
-                    value,
-                    defining_inst: Some(r2ssa::InstId(8)),
-                    width: 8,
-                    renderable: true,
+            certified_exprs: BTreeMap::from([(
+                expression_id,
+                CertifiedExpr {
+                    id: expression_id,
+                    fact: ExpressionRenderFact {
+                        value,
+                        defining_inst: Some(r2ssa::InstId(8)),
+                        width: 8,
+                        renderable: true,
+                    },
+                    inputs: Vec::new(),
+                    bindings: BTreeSet::new(),
                 },
             )]),
+            certified_entities: BTreeMap::from([(
+                r2ssa::SemanticId::stack_slot(object),
+                CertifiedEntity::StackSlot {
+                    id: r2ssa::SemanticId::stack_slot(object),
+                    object,
+                    base: r2ssa::StackAddressBase::FramePointer,
+                    offset: -8,
+                    size: None,
+                },
+            )]),
+            certified_effects: BTreeMap::from([
+                (
+                    memory_id,
+                    CertifiedEffect::Memory {
+                        id: memory_id,
+                        fact: MemoryAccessRenderFact {
+                            access,
+                            block_addr: 0x401000,
+                            op_index: 4,
+                            object,
+                            address: r2ssa::ValueId(52),
+                            value: Some(value),
+                            is_write: true,
+                            width: 8,
+                            control_domain: test_control_domain(),
+                        },
+                    },
+                ),
+                (
+                    return_id,
+                    CertifiedEffect::Return {
+                        id: return_id,
+                        at: return_at,
+                        fact: ReturnValueRenderFact {
+                            block_addr: 0x401010,
+                            op_index: 2,
+                            value,
+                            width: 8,
+                            control_domain: test_control_domain(),
+                        },
+                    },
+                ),
+            ]),
+            return_effects_by_op: BTreeMap::from([((0x401010, 2), return_id)]),
+            memory_effects_by_op: BTreeMap::from([((0x401000, 4, true), vec![memory_id])]),
             string_literals_by_value: BTreeMap::from([(
                 value,
                 StringLiteralRenderFact {
@@ -4135,20 +4738,6 @@ mod tests {
                     source: StringLiteralRenderSource::TypedFunctionFacts,
                 },
             )]),
-            memory_accesses: BTreeMap::from([(
-                access,
-                MemoryAccessRenderFact {
-                    access,
-                    block_addr: 0x401000,
-                    op_index: 4,
-                    object,
-                    address: r2ssa::ValueId(52),
-                    value: Some(value),
-                    is_write: true,
-                    width: 8,
-                },
-            )]),
-            memory_accesses_by_op: BTreeMap::from([((0x401000, 4, true), vec![access])]),
             member_accesses_by_op: BTreeMap::from([(
                 (0x401000, 4, true),
                 vec![MemberAccessRenderFact {
@@ -4175,17 +4764,6 @@ mod tests {
                     access_width: 8,
                 }],
             )]),
-            returns_by_op: BTreeMap::from([(
-                (0x401010, 2),
-                ReturnValueRenderFact {
-                    block_addr: 0x401010,
-                    op_index: 2,
-                    value,
-                    width: 8,
-                },
-            )]),
-            stack_slot_offsets: BTreeMap::from([(object, -8)]),
-            ..FunctionRenderFacts::default()
         };
 
         let facts = FunctionFacts::default().with_render(render);
@@ -4254,7 +4832,7 @@ mod tests {
                     kind: VisibleBindingKind::Local,
                     stack_slot: Some(StackSlotKey {
                         base: ExternalStackBase::FramePointer,
-                        offset: 8,
+                        offset: -8,
                     }),
                     param_index: None,
                     source_reg: None,
@@ -4263,10 +4841,11 @@ mod tests {
             },
             None,
         )
-        .with_render(FunctionRenderFacts {
-            stack_slot_offsets: BTreeMap::from([(object, -8)]),
-            ..FunctionRenderFacts::default()
-        });
+        .with_render(test_render_with_stack_slots([(
+            object,
+            r2ssa::StackAddressBase::FramePointer,
+            -8,
+        )]));
 
         let authorization = facts
             .authorized_stack_slot_owner_render(object, -8, "LOCAL_BUF")
@@ -4294,21 +4873,26 @@ mod tests {
         };
         let object = r2ssa::ObjectId(3);
         let value = r2ssa::ValueId(51);
+        let memory_id = r2ssa::SemanticId::memory_access(access);
         let render = FunctionRenderFacts {
-            memory_accesses: BTreeMap::from([(
-                access,
-                MemoryAccessRenderFact {
-                    access,
-                    block_addr: 0x401000,
-                    op_index: 4,
-                    object,
-                    address: r2ssa::ValueId(52),
-                    value: Some(value),
-                    is_write: false,
-                    width: 4,
+            certified_effects: BTreeMap::from([(
+                memory_id,
+                CertifiedEffect::Memory {
+                    id: memory_id,
+                    fact: MemoryAccessRenderFact {
+                        access,
+                        block_addr: 0x401000,
+                        op_index: 4,
+                        object,
+                        address: r2ssa::ValueId(52),
+                        value: Some(value),
+                        is_write: false,
+                        width: 4,
+                        control_domain: test_control_domain(),
+                    },
                 },
             )]),
-            memory_accesses_by_op: BTreeMap::from([((0x401000, 4, false), vec![access])]),
+            memory_effects_by_op: BTreeMap::from([((0x401000, 4, false), vec![memory_id])]),
             array_accesses_by_op: BTreeMap::from([(
                 (0x401000, 4, false),
                 vec![ArrayAccessRenderFact {
@@ -4396,10 +4980,11 @@ mod tests {
     #[test]
     fn function_facts_authorizes_recovered_stack_owner_only_by_exact_object_offset_and_name() {
         let object = r2ssa::ObjectId(21);
-        let facts = FunctionFacts::default().with_render(FunctionRenderFacts {
-            stack_slot_offsets: BTreeMap::from([(object, -4)]),
-            ..FunctionRenderFacts::default()
-        });
+        let facts = FunctionFacts::default().with_render(test_render_with_stack_slots([(
+            object,
+            r2ssa::StackAddressBase::FramePointer,
+            -4,
+        )]));
 
         let authorization = facts
             .authorized_recovered_stack_slot_owner_render(object, -4, "i")
@@ -4468,10 +5053,11 @@ mod tests {
             },
             None,
         )
-        .with_render(FunctionRenderFacts {
-            stack_slot_offsets: BTreeMap::from([(object, 8)]),
-            ..FunctionRenderFacts::default()
-        });
+        .with_render(test_render_with_stack_slots([(
+            object,
+            r2ssa::StackAddressBase::StackPointer,
+            8,
+        )]));
 
         let authorization = facts
             .authorized_stack_param_owner_render(object, 8)
@@ -4528,10 +5114,11 @@ mod tests {
             },
             None,
         )
-        .with_render(FunctionRenderFacts {
-            stack_slot_offsets: BTreeMap::from([(object, 8)]),
-            ..FunctionRenderFacts::default()
-        });
+        .with_render(test_render_with_stack_slots([(
+            object,
+            r2ssa::StackAddressBase::StackPointer,
+            8,
+        )]));
         assert!(
             ambiguous
                 .authorized_stack_param_owner_render(object, 8)
@@ -4577,10 +5164,11 @@ mod tests {
             },
             None,
         )
-        .with_render(FunctionRenderFacts {
-            stack_slot_offsets: BTreeMap::from([(object, 8)]),
-            ..FunctionRenderFacts::default()
-        });
+        .with_render(test_render_with_stack_slots([(
+            object,
+            r2ssa::StackAddressBase::StackPointer,
+            8,
+        )]));
         let authorization = canonical_slot
             .authorized_stack_param_owner_render(object, 8)
             .expect("canonical stack slot name should authorize");
@@ -4603,7 +5191,7 @@ mod tests {
                 stack_slots: BTreeMap::from([(
                     StackSlotKey {
                         base: ExternalStackBase::FramePointer,
-                        offset: 8,
+                        offset: -8,
                     },
                     crate::ExternalStackSlotSpec {
                         name: "node_home".to_string(),
@@ -4619,10 +5207,11 @@ mod tests {
             },
             None,
         )
-        .with_render(FunctionRenderFacts {
-            stack_slot_offsets: BTreeMap::from([(object, -8)]),
-            ..FunctionRenderFacts::default()
-        });
+        .with_render(test_render_with_stack_slots([(
+            object,
+            r2ssa::StackAddressBase::FramePointer,
+            -8,
+        )]));
         let authorization = param_home
             .authorized_stack_param_owner_render(object, -8)
             .expect("typed parameter home should authorize original parameter owner");
@@ -4655,7 +5244,7 @@ mod tests {
                 stack_slots: BTreeMap::from([(
                     StackSlotKey {
                         base: ExternalStackBase::FramePointer,
-                        offset: 8,
+                        offset: -8,
                     },
                     crate::ExternalStackSlotSpec {
                         name: "arg1_home".to_string(),
@@ -4671,18 +5260,22 @@ mod tests {
             },
             None,
         )
-        .with_render(FunctionRenderFacts {
-            stack_slot_offsets: BTreeMap::from([(object, -8)]),
-            ..FunctionRenderFacts::default()
-        });
+        .with_render(test_render_with_stack_slots([(
+            object,
+            r2ssa::StackAddressBase::FramePointer,
+            -8,
+        )]));
         let authorization = stale_named_param_home
             .authorized_stack_param_owner_render(object, -8)
             .expect("parameter index should override a stale host-generated name");
         assert_eq!(authorization.name, "arg0");
-        let raw_offset_param_home = param_home.clone().with_render(FunctionRenderFacts {
-            stack_slot_offsets: BTreeMap::from([(object, 8)]),
-            ..FunctionRenderFacts::default()
-        });
+        let raw_offset_param_home = param_home
+            .clone()
+            .with_render(test_render_with_stack_slots([(
+                object,
+                r2ssa::StackAddressBase::FramePointer,
+                8,
+            )]));
         assert!(
             raw_offset_param_home
                 .authorized_stack_param_owner_render(object, 8)
@@ -4721,13 +5314,18 @@ mod tests {
             },
             None,
         )
-        .with_render(FunctionRenderFacts {
-            stack_slot_offsets: BTreeMap::from([
-                (r2ssa::ObjectId(1), -8),
-                (r2ssa::ObjectId(2), -8),
-            ]),
-            ..FunctionRenderFacts::default()
-        });
+        .with_render(test_render_with_stack_slots([
+            (
+                r2ssa::ObjectId(1),
+                r2ssa::StackAddressBase::StackPointer,
+                -8,
+            ),
+            (
+                r2ssa::ObjectId(2),
+                r2ssa::StackAddressBase::StackPointer,
+                -8,
+            ),
+        ]));
         assert!(
             ambiguous
                 .authorized_stack_slot_owner_render_by_offset(-8, "local_buf")
@@ -4748,10 +5346,11 @@ mod tests {
             },
             None,
         )
-        .with_render(FunctionRenderFacts {
-            stack_slot_offsets: BTreeMap::from([(r2ssa::ObjectId(3), -8)]),
-            ..FunctionRenderFacts::default()
-        });
+        .with_render(test_render_with_stack_slots([(
+            r2ssa::ObjectId(3),
+            r2ssa::StackAddressBase::StackPointer,
+            -8,
+        )]));
         assert!(
             unknown_role
                 .authorized_stack_slot_owner_render_by_offset(-8, "local_buf")
@@ -4772,10 +5371,11 @@ mod tests {
             },
             None,
         )
-        .with_render(FunctionRenderFacts {
-            stack_slot_offsets: BTreeMap::from([(r2ssa::ObjectId(4), -8)]),
-            ..FunctionRenderFacts::default()
-        });
+        .with_render(test_render_with_stack_slots([(
+            r2ssa::ObjectId(4),
+            r2ssa::StackAddressBase::StackPointer,
+            -8,
+        )]));
         assert!(
             untyped
                 .authorized_stack_slot_owner_render_by_offset(-8, "local_buf")

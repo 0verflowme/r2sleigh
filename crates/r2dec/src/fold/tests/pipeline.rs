@@ -42,6 +42,35 @@ mod tests {
         SSAVar::new(name, version, size)
     }
 
+    fn insert_test_stack_slot(
+        render: &mut r2types::FunctionRenderFacts,
+        object: r2ssa::ObjectId,
+        base: r2ssa::StackAddressBase,
+        offset: i64,
+    ) {
+        let id = r2ssa::SemanticId::stack_slot(object);
+        render.certified_entities.insert(
+            id,
+            r2types::CertifiedEntity::StackSlot {
+                id,
+                object,
+                base,
+                offset,
+                size: None,
+            },
+        );
+    }
+
+    fn test_stack_render_facts(
+        object: r2ssa::ObjectId,
+        base: r2ssa::StackAddressBase,
+        offset: i64,
+    ) -> r2types::FunctionRenderFacts {
+        let mut render = r2types::FunctionRenderFacts::default();
+        insert_test_stack_slot(&mut render, object, base, offset);
+        render
+    }
+
     fn make_block(ops: Vec<SSAOp>) -> SSABlock {
         SSABlock {
             addr: 0x1000,
@@ -741,6 +770,7 @@ mod tests {
                     at: cert.at,
                     value: cert.value,
                     width: cert.width,
+                    relation: cert.relation,
                     carrier: cert.carrier.clone(),
                     owner: cert.owner.clone(),
                 },
@@ -791,7 +821,12 @@ mod tests {
                 offset: owner_offset,
             }) = fact.owner
             {
-                render_facts.stack_slot_offsets.insert(object, owner_offset);
+                insert_test_stack_slot(
+                    &mut render_facts,
+                    object,
+                    r2ssa::StackAddressBase::StackPointer,
+                    owner_offset,
+                );
             }
         }
         mutate_function_facts(ctx, |function_facts| {
@@ -903,77 +938,23 @@ mod tests {
                 )
             })
             .collect();
-        r2types::FunctionControlFacts {
-            branch_predicates,
-            block_assumptions,
-            loops,
-            switches,
-        }
+		r2types::FunctionControlFacts {
+			branch_predicates,
+			block_assumptions,
+			loops,
+			switches,
+			control_domains: prepared.control_domains().clone(),
+		}
     }
 
     fn test_render_facts(prepared: &r2ssa::SsaArtifact) -> r2types::FunctionRenderFacts {
-        let certificates = prepared.certificates();
-        r2types::FunctionRenderFacts {
-            expressions: certificates
-                .expressions
-                .iter()
-                .map(|(value, cert)| {
-                    (
-                        *value,
-                        r2types::ExpressionRenderFact {
-                            value: cert.value,
-                            defining_inst: cert.defining_inst,
-                            width: cert.width,
-                            renderable: cert.renderable,
-                        },
-                    )
-                })
-                .collect(),
-            string_literals_by_value: BTreeMap::new(),
-            memory_accesses: certificates
-                .memory_accesses
-                .iter()
-                .map(|(access, cert)| {
-                    (
-                        *access,
-                        r2types::MemoryAccessRenderFact {
-                            access: cert.access,
-                            block_addr: cert.block_addr,
-                            op_index: cert.op_index,
-                            object: cert.object,
-                            address: cert.address,
-                            value: cert.value,
-                            is_write: cert.is_write,
-                            width: cert.width,
-                        },
-                    )
-                })
-                .collect(),
-            memory_accesses_by_op: certificates.memory_accesses_by_op.clone(),
-            member_accesses_by_op: BTreeMap::new(),
-            array_accesses_by_op: BTreeMap::new(),
-            returns_by_op: certificates
-                .returns
-                .iter()
-                .map(|cert| {
-                    (
-                        (cert.block_addr, cert.op_index),
-                        r2types::ReturnValueRenderFact {
-                            block_addr: cert.block_addr,
-                            op_index: cert.op_index,
-                            value: cert.value,
-                            width: cert.width,
-                        },
-                    )
-                })
-                .collect(),
-            stack_slot_offsets: certificates
-                .stack_slots
-                .iter()
-                .map(|(object, cert)| (*object, cert.offset))
-                .collect(),
-			..r2types::FunctionRenderFacts::default()
-        }
+        let mut facts = r2types::FunctionFacts::default()
+            .with_render(r2types::FunctionRenderFacts::from_prepared(prepared));
+        facts.populate_certified_parameter_exprs(
+            prepared,
+            &r2types::ParamSlotResolver::from_arch_name(Some("x86-64")),
+        );
+        facts.render_facts().clone()
     }
 
     fn install_function_facts(ctx: &mut FoldingContext<'_>, facts: r2types::FunctionFacts) {
@@ -1083,6 +1064,33 @@ mod tests {
             .with_decompile_route(certified_standard_route_for_test("test certified Standard"));
         install_function_facts(ctx, facts);
         ctx.inputs.certified_rendering_required = false;
+    }
+
+    fn install_test_x86_64_signature(ctx: &mut FoldingContext<'_>) {
+        let signature = r2types::FunctionSignatureSpec {
+            ret_type: Some(r2types::CTypeLike::Int {
+                bits: 64,
+                signedness: r2types::Signedness::Signed,
+            }),
+            params: vec![r2types::FunctionParamSpec {
+                name: "arg1".to_string(),
+                ty: Some(r2types::CTypeLike::Int {
+                    bits: 64,
+                    signedness: r2types::Signedness::Signed,
+                }),
+            }],
+        };
+        let certificate = r2types::SignatureCertificate::from_signature(
+            &signature,
+            [r2types::SignatureCertificateSource::LocalInference],
+        )
+        .expect("typed test signature");
+        mutate_function_facts(ctx, |function_facts| {
+            let mut types = function_facts.type_facts().clone();
+            types.merged_signature = Some(signature);
+            types.signature_certificate = Some(certificate);
+            function_facts.replace_type_facts(types);
+        });
     }
 
     fn install_string_literal_render_fact(
@@ -1304,9 +1312,12 @@ mod tests {
         });
         let prepared =
             prepared_from_r2il_blocks(&[entry], &arch).with_name("certified_stack_name");
-        let render_facts = || r2types::FunctionRenderFacts {
-            stack_slot_offsets: BTreeMap::from([(r2ssa::ObjectId(1), -8)]),
-            ..r2types::FunctionRenderFacts::default()
+        let render_facts = || {
+            test_stack_render_facts(
+                r2ssa::ObjectId(1),
+                r2ssa::StackAddressBase::FramePointer,
+                -8,
+            )
         };
         let stack_binding = |ty| VisibleBinding {
             name: "buf".to_string(),
@@ -5655,6 +5666,18 @@ mod tests {
         assert!(ctx.inputs.arch.is_register_like_base_name("x8"));
         assert!(ctx.inputs.arch.is_register_like_base_name("w9"));
         assert!(ctx.inputs.arch.is_register_like_base_name("x30"));
+
+        let carrier = CStmt::Expr(CExpr::assign(
+            CExpr::Var("x8_9".to_string()),
+            CExpr::IntLit(1),
+        ));
+        assert!(ctx.stmt_is_side_effect_free_versioned_register_carrier(&carrier));
+
+        let local = CStmt::Expr(CExpr::assign(
+            CExpr::Var("var_8h".to_string()),
+            CExpr::IntLit(1),
+        ));
+        assert!(!ctx.stmt_is_side_effect_free_versioned_register_carrier(&local));
     }
 
     #[test]
@@ -5766,6 +5789,7 @@ mod tests {
             )]),
             ..r2types::FunctionControlFacts::default()
         });
+        install_test_x86_64_signature(&mut ctx);
         install_certified_function_facts(&mut ctx);
 
         let (expr, proof_selector) = ctx
@@ -5774,7 +5798,7 @@ mod tests {
 
         assert_eq!(proof_selector, Some(selector));
         assert!(
-            matches!(expr, CExpr::Var(ref name) if name.eq_ignore_ascii_case("rdi") || name == "arg1"),
+            matches!(expr, CExpr::Var(ref name) if name.eq_ignore_ascii_case("rdi") || name == "arg0"),
             "expected selector from canonical FunctionFacts control evidence, got {expr:?}"
         );
     }
@@ -6865,6 +6889,66 @@ mod tests {
         assert!(
             matches!(index.as_ref(), CExpr::Var(name) if name == "i"),
             "scalar operand must be the subscript index, got base={base:?} index={index:?}"
+        );
+    }
+
+    #[test]
+    fn prepared_stack_load_uses_defining_op_owner_not_current_consumer() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(0x100, 8),
+            a: Varnode::register(0x20, 8),
+            b: Varnode::constant(u64::MAX - 3, 8),
+        });
+        entry.push(R2ILOp::Load {
+            dst: Varnode::unique(0x200, 4),
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x100, 8),
+        });
+        entry.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(0x300, 8),
+            a: Varnode::register(0x20, 8),
+            b: Varnode::constant(u64::MAX - 7, 8),
+        });
+        entry.push(R2ILOp::Load {
+            dst: Varnode::unique(0x400, 4),
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x300, 8),
+        });
+        entry.push(R2ILOp::Return {
+            target: Varnode::unique(0x400, 4),
+        });
+        let prepared =
+            prepared_from_r2il_blocks(&[entry], &arch).with_name("defining_load_owner");
+        let block = prepared
+            .function()
+            .get_block(0x1000)
+            .expect("prepared entry block");
+        let loads = block
+            .ops
+            .iter()
+            .enumerate()
+            .filter_map(|(op_idx, op)| match op {
+                SSAOp::Load { dst, addr, .. } => Some((op_idx, dst.clone(), addr.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(loads.len(), 2, "fixture should contain two distinct loads");
+
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        ctx.inputs.visible_bindings = Box::leak(Box::new(vec![
+            visible_stack_binding("first_slot", Some(CType::i32()), -4),
+            visible_stack_binding("second_slot", Some(CType::i32()), -8),
+        ]));
+        ctx.current_block_addr.set(Some(0x1000));
+        ctx.current_op_idx.set(Some(loads[1].0));
+
+        let expr = ctx.render_canonical_load_expr(&loads[0].1, &loads[0].2, CType::i32());
+        assert_eq!(
+            expr,
+            CExpr::Var("first_slot".to_string()),
+            "nested rendering must use the load definition's memory fact, not the ambient consumer op"
         );
     }
 
@@ -8128,6 +8212,18 @@ mod tests {
     }
 
     #[test]
+    fn typed_signed_assignment_normalizes_all_ones_literal() {
+        let dst = make_var("tmp:assigned", 1, 4);
+        let mut ctx = make_x86_64_ctx();
+        ctx.set_type_hints(HashMap::from([(dst.display_name(), CType::i32())]));
+
+        assert_eq!(
+            ctx.assignment_rhs_with_type_policy(&dst, None, CExpr::UIntLit(0xffff_ffff)),
+            CExpr::IntLit(-1)
+        );
+    }
+
+    #[test]
     fn test_simplify_predicate_rewrites_ne_ge_zero_to_gt_zero() {
         let ctx = FoldingContext::new(64);
         let expr = CExpr::binary(
@@ -8414,6 +8510,21 @@ mod tests {
             CExpr::IntLit(-0x20),
         );
         assert_eq!(ctx.rewrite_stack_expr(expr.clone()), expr);
+    }
+
+    #[test]
+    fn bound_stack_name_wins_over_legacy_encoded_offset() {
+        let mut ctx = FoldingContext::new(64);
+        ctx.set_external_stack_vars(HashMap::from([
+            (-20, stack_var_spec("var_ch", None, Some("SP"))),
+            (-12, stack_var_spec("other", None, Some("SP"))),
+        ]));
+        ctx.analyze_blocks(&[]);
+
+        assert_eq!(
+            ctx.rewrite_stack_expr(CExpr::Var("var_ch".to_string())),
+            CExpr::Var("var_ch".to_string())
+        );
     }
 
     #[test]
@@ -18921,6 +19032,136 @@ mod tests {
     }
 
     #[test]
+    fn certified_stack_store_renders_call_result_from_stable_call_binding() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(1, 8),
+            src: Varnode::constant(0x401050, 8),
+        });
+        entry.push(R2ILOp::Call {
+            target: Varnode::unique(1, 8),
+        });
+        entry.push(R2ILOp::IntSub {
+            dst: Varnode::unique(2, 8),
+            a: Varnode::register(0x20, 8),
+            b: Varnode::constant(8, 8),
+        });
+        entry.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::unique(2, 8),
+            val: Varnode::register(0x00, 8),
+        });
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch)
+            .with_name("certified_call_result_store");
+        let source_call = (0x1000, 1);
+        let mut facts = r2types::FunctionFacts::default();
+        facts.attach_prepared_decompile_evidence(&prepared);
+        facts.replace_type_facts(r2types::FunctionTypeFacts {
+            stack_slots: BTreeMap::from([(
+                StackSlotKey {
+                    base: ExternalStackBase::FramePointer,
+                    offset: -8,
+                },
+                r2types::ExternalStackSlotSpec {
+                    name: "call_result".to_string(),
+                    ty: Some(r2types::CTypeLike::Int {
+                        bits: 64,
+                        signedness: r2types::Signedness::Unsigned,
+                    }),
+                    role: r2types::ExternalStackSlotRole::Local,
+                    ..r2types::ExternalStackSlotSpec::default()
+                },
+            )]),
+            ..r2types::FunctionTypeFacts::default()
+        });
+
+        let mut ctx = make_x86_64_ctx();
+        ctx.inputs.prepared_ssa = Some(&prepared);
+        install_function_facts(&mut ctx, facts);
+        ctx.set_external_stack_vars(HashMap::from([(
+            -8,
+            stack_var_spec("call_result", Some(CType::Int(64)), Some("rbp")),
+        )]));
+        ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
+        install_minimal_import_callee_facts(&mut ctx, &[(0x401050, "sym.helper")]);
+        install_callsite_resolution(&mut ctx, source_call, 0x401050, "sym.helper", None);
+        install_certified_function_facts(&mut ctx);
+        let blocks = prepared.function().blocks().cloned().collect::<Vec<_>>();
+        ctx.analyze_blocks(&blocks);
+
+        let stored = prepared
+            .function()
+            .get_block(0x1000)
+            .expect("entry block")
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                SSAOp::Store { val, .. } => prepared.graph().value_id_for_var(val),
+                _ => None,
+            })
+            .expect("stored call-result value");
+        let callsite = r2types::CallsiteKey {
+            block_addr: source_call.0,
+            op_index: source_call.1,
+        };
+        assert_eq!(
+            ctx.inputs
+                .call_render_facts()
+                .and_then(|facts| facts.fact_for_site(callsite))
+                .map(|fact| fact.disposition),
+            Some(r2types::CallsiteRenderDisposition::AssignedResult)
+        );
+        assert!(matches!(
+            ctx.inputs
+                .call_result_facts()
+                .and_then(|facts| facts.owner_for_site(callsite)),
+            Some(r2ssa::ValueOwner::StackSlot { offset: -8, .. })
+        ));
+
+        assert_eq!(
+            ctx.should_materialize_call_result_at_source(source_call),
+            Some(CExpr::Var("call_result".to_string())),
+            "assigned-result disposition must select the certified stack owner at the source call"
+        );
+        assert_eq!(
+            ctx.certified_call_result_expr_for_value(stored),
+            Some(CExpr::Var("call_result".to_string())),
+            "uses of an assigned identity result must reference its certified owner instead of replaying the call"
+        );
+        assert_eq!(
+            ctx.assign_stmt(
+                CExpr::Var("call_result".to_string()),
+                CExpr::Var("call_result".to_string())
+            ),
+            None,
+            "certified owner plumbing must stay an identity instead of being semanticized into another call"
+        );
+        let call_op = prepared
+            .function()
+            .get_block(source_call.0)
+            .and_then(|block| block.ops.get(source_call.1))
+            .expect("source call op");
+        ctx.clear_effect_render_proofs();
+        assert!(matches!(
+            ctx.op_to_stmt_with_args(call_op, source_call.0, source_call.1),
+            Some(CStmt::Expr(CExpr::Binary {
+                op: BinaryOp::Assign,
+                ..
+            }))
+        ));
+        let call_proofs = ctx
+            .effect_render_proofs()
+            .into_iter()
+            .filter(|proof| proof.kind == EffectRenderProofKind::Call)
+            .count();
+        assert_eq!(
+            call_proofs, 1,
+            "the source call lowerer must record its effect exactly once"
+        );
+    }
+
+    #[test]
     fn certified_statement_call_disposition_overrides_local_assignment_materialization() {
         let prepared = prepared_zero_arg_helper_call("certified_call_disposition_side_effect");
         let source_call = (0x1000, 1);
@@ -18946,10 +19187,14 @@ mod tests {
             )]),
             ..PreparedSemanticView::default()
         })));
-        install_function_render_facts(&mut ctx, r2types::FunctionRenderFacts {
-            stack_slot_offsets: BTreeMap::from([(r2ssa::ObjectId(1), -8)]),
-            ..r2types::FunctionRenderFacts::default()
-        });
+        install_function_render_facts(
+            &mut ctx,
+            test_stack_render_facts(
+                r2ssa::ObjectId(1),
+                r2ssa::StackAddressBase::StackPointer,
+                -8,
+            ),
+        );
         ctx.inputs.visible_bindings =
             Box::leak(Box::new(vec![visible_stack_binding("buf", Some(CType::Int(32)), 8)]));
         ctx.state
@@ -19132,15 +19377,21 @@ mod tests {
             ..PreparedSemanticView::default()
         })));
         let mut render_facts = test_render_facts(&prepared);
+        let arg_id = r2ssa::SemanticId::expression(call_cert.argument_values[0]);
         render_facts
-            .expressions
-            .entry(call_cert.argument_values[0])
-            .and_modify(|fact| fact.renderable = true)
-            .or_insert(r2types::ExpressionRenderFact {
-                value: call_cert.argument_values[0],
-                defining_inst: None,
-                width: 8,
-                renderable: true,
+            .certified_exprs
+            .entry(arg_id)
+            .and_modify(|cert| cert.fact.renderable = true)
+            .or_insert(r2types::CertifiedExpr {
+                id: arg_id,
+                fact: r2types::ExpressionRenderFact {
+                    value: call_cert.argument_values[0],
+                    defining_inst: None,
+                    width: 8,
+                    renderable: true,
+                },
+                inputs: Vec::new(),
+                bindings: BTreeSet::new(),
             });
         install_function_render_facts(&mut ctx, render_facts);
 
@@ -19236,10 +19487,11 @@ mod tests {
             Some(Box::leak(Box::new(prepared_view())));
         install_function_render_facts(
             &mut certified_alias_ctx,
-            r2types::FunctionRenderFacts {
-                stack_slot_offsets: BTreeMap::from([(r2ssa::ObjectId(1), -8)]),
-                ..r2types::FunctionRenderFacts::default()
-            },
+            test_stack_render_facts(
+                r2ssa::ObjectId(1),
+                r2ssa::StackAddressBase::StackPointer,
+                -8,
+            ),
         );
         certified_alias_ctx.inputs.visible_bindings =
             Box::leak(Box::new(vec![visible_stack_binding(
@@ -19388,7 +19640,7 @@ mod tests {
     }
 
     #[test]
-    fn certified_memory_load_store_authorized_by_function_render_memory_accesses() {
+    fn certified_memory_load_store_authorized_by_certified_effects() {
         let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x1000, 4);
         entry.push(R2ILOp::Load {
@@ -19452,8 +19704,12 @@ mod tests {
             .memory_certificate_for_op_site(0x1000, 1, true)
             .expect("store memory certificate");
         let mut render_facts = test_render_facts(&prepared);
-        render_facts.memory_accesses.remove(&load_cert.access);
-        render_facts.memory_accesses.remove(&store_cert.access);
+        render_facts
+            .certified_effects
+            .remove(&r2ssa::SemanticId::memory_access(load_cert.access));
+        render_facts
+            .certified_effects
+            .remove(&r2ssa::SemanticId::memory_access(store_cert.access));
 
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
         install_certified_function_facts(&mut ctx);
@@ -19467,7 +19723,7 @@ mod tests {
             .expect("certified load residual");
         assert!(
             matches!(&load_stmt, CStmt::Comment(text) if text.contains("uncertified memory load at 0x1000:0")),
-            "memory_accesses_by_op without matching FunctionRenderFacts.memory_accesses entry must residualize load: {load_stmt:?}"
+            "memory_effects_by_op without matching certified memory effect must residualize load: {load_stmt:?}"
         );
 
         ctx.current_op_idx.set(Some(1));
@@ -19476,7 +19732,7 @@ mod tests {
             .expect("certified store residual");
         assert!(
             matches!(&store_stmt, CStmt::Comment(text) if text.contains("uncertified memory store at 0x1000:1")),
-            "memory_accesses_by_op without matching FunctionRenderFacts.memory_accesses entry must residualize store: {store_stmt:?}"
+            "memory_effects_by_op without matching certified memory effect must residualize store: {store_stmt:?}"
         );
     }
 
@@ -20351,17 +20607,25 @@ mod tests {
             .callsite_certificate_for_op(0x1000, 2)
             .expect("prepared callsite certificate")
             .argument_values[0];
-        let render_facts = |renderable| r2types::FunctionRenderFacts {
-            expressions: BTreeMap::from([(
-                arg_value,
-                r2types::ExpressionRenderFact {
-                    value: arg_value,
-                    defining_inst: None,
-                    width: 8,
-                    renderable,
-                },
-            )]),
-            ..r2types::FunctionRenderFacts::default()
+        let render_facts = |renderable| {
+            let id = r2ssa::SemanticId::expression(arg_value);
+            r2types::FunctionRenderFacts {
+                certified_exprs: BTreeMap::from([(
+                    id,
+                    r2types::CertifiedExpr {
+                        id,
+                        fact: r2types::ExpressionRenderFact {
+                            value: arg_value,
+                            defining_inst: None,
+                            width: 8,
+                            renderable,
+                        },
+                        inputs: Vec::new(),
+                        bindings: BTreeSet::new(),
+                    },
+                )]),
+                ..r2types::FunctionRenderFacts::default()
+            }
         };
         let prepared_view = |value, expr| PreparedSemanticView {
             call_view_by_site: BTreeMap::from([(
@@ -21125,7 +21389,9 @@ mod tests {
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
         install_certified_function_facts(&mut ctx);
         let mut render_facts = ctx.inputs.function_facts.render_facts().clone();
-        render_facts.returns_by_op.remove(&(0x1000, 1));
+        if let Some(id) = render_facts.return_effects_by_op.remove(&(0x1000, 1)) {
+            render_facts.certified_effects.remove(&id);
+        }
         install_function_render_facts(&mut ctx, render_facts);
 
         let block = prepared.function().get_block(0x1000).expect("entry");
@@ -21243,8 +21509,8 @@ mod tests {
             ctx.inputs
                 .function_facts
                 .render_facts()
-                .stack_slot_offsets
-                .contains_key(&load_cert.object),
+                .stack_slot(load_cert.object)
+                .is_some(),
             "the test must use the prepared stack-object proof for the loaded argument"
         );
     }
@@ -21401,8 +21667,7 @@ mod tests {
             .inputs
             .function_facts
             .render_facts()
-            .memory_accesses
-            .get(&field_load.access)
+            .memory_access(field_load.access)
             .expect("field load render fact")
             .clone();
 
@@ -21433,7 +21698,7 @@ mod tests {
                 kind: VisibleBindingKind::Param,
                 stack_slot: Some(StackSlotKey {
                     base: ExternalStackBase::FramePointer,
-                    offset: 8,
+                    offset: -8,
                 }),
                 param_index: Some(0),
                 source_reg: Some("rdi".to_string()),
@@ -21516,7 +21781,7 @@ mod tests {
 
         assert!(
             stmts.iter().any(|stmt| {
-                matches!(stmt, CStmt::Comment(text) if text.contains("uncertified return expression"))
+                matches!(stmt, CStmt::Comment(text) if text.contains("r2sleigh residual"))
             }),
             "missing member FunctionRenderFacts proof must residualize: {stmts:?}"
         );
@@ -21549,7 +21814,9 @@ mod tests {
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
         install_certified_function_facts(&mut ctx);
         let mut render_facts = ctx.inputs.function_facts.render_facts().clone();
-        render_facts.memory_accesses.remove(&load_cert.access);
+        render_facts
+            .certified_effects
+            .remove(&r2ssa::SemanticId::memory_access(load_cert.access));
         install_function_render_facts(&mut ctx, render_facts);
 
         let block = prepared.function().get_block(0x1000).expect("entry");
@@ -21566,7 +21833,7 @@ mod tests {
             !stmts
                 .iter()
                 .any(|stmt| matches!(stmt, CStmt::Return(Some(CExpr::Deref(_))))),
-            "memory_accesses_by_op index alone must not authorize certified load return: {stmts:?}"
+            "memory_effects_by_op index alone must not authorize certified load return: {stmts:?}"
         );
     }
 
@@ -21747,6 +22014,9 @@ mod tests {
     fn certified_return_call_requires_function_call_result_fact() {
         let prepared = prepared_zero_arg_helper_return("certified_return_call_result");
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        mutate_function_facts(&mut ctx, |facts| {
+            facts.attach_prepared_decompile_evidence(&prepared)
+        });
         install_certified_function_facts(&mut ctx);
         let source_call = (0x1000, 1);
         ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
@@ -21757,11 +22027,26 @@ mod tests {
             .returns
             .first()
             .expect("return certificate");
+        let prepared_result = prepared
+            .call_result_certificate_for_value(return_cert.value)
+            .expect("fixture must return the certified call-result value");
         assert!(
-            prepared
-                .call_result_certificate_for_value(return_cert.value)
-                .is_some(),
+            prepared_result.relation.is_identity(),
             "fixture must return the certified call-result value"
+        );
+        let function_result = ctx
+            .certified_call_result_fact_for_value(return_cert.value)
+            .expect("FunctionFacts must retain the exact call-result value");
+        assert_eq!(function_result.relation, prepared_result.relation);
+        assert!(
+            ctx.inputs
+                .function_facts
+                .render_facts()
+                .certified_expr_for_value(return_cert.value)
+                .is_some_and(|cert| cert.bindings.contains(&r2ssa::SemanticId::call(
+                    prepared_result.call_site
+                ))),
+            "the result expression must remain bound to its stable call identity"
         );
 
         assert_eq!(

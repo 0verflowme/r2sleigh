@@ -21,6 +21,9 @@ pub struct ObjectId(pub u32);
 pub struct PredicateId(pub u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ControlDomainId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CallSiteId(pub u32);
 
 /// Stable identity for a semantic entity inside one prepared SSA artifact.
@@ -37,6 +40,9 @@ pub enum SemanticId {
     MemoryAccess(StructuredAccessId),
     Return(InstId),
     Call(CallSiteId),
+    Predicate(PredicateId),
+    ControlDomain(ControlDomainId),
+    Effect(InstId),
 }
 
 impl SemanticId {
@@ -63,6 +69,18 @@ impl SemanticId {
     pub const fn call(call_site: CallSiteId) -> Self {
         Self::Call(call_site)
     }
+
+    pub const fn predicate(predicate: PredicateId) -> Self {
+        Self::Predicate(predicate)
+    }
+
+    pub const fn control_domain(domain: ControlDomainId) -> Self {
+        Self::ControlDomain(domain)
+    }
+
+    pub const fn effect(at: InstId) -> Self {
+        Self::Effect(at)
+    }
 }
 
 impl std::fmt::Display for SemanticId {
@@ -76,6 +94,9 @@ impl std::fmt::Display for SemanticId {
             }
             Self::Return(at) => write!(f, "return:{}", at.0),
             Self::Call(call_site) => write!(f, "call:{}", call_site.0),
+            Self::Predicate(predicate) => write!(f, "predicate:{}", predicate.0),
+            Self::ControlDomain(domain) => write!(f, "domain:{}", domain.0),
+            Self::Effect(at) => write!(f, "effect:{}", at.0),
         }
     }
 }
@@ -245,8 +266,49 @@ pub struct CallSiteFacts {
     pub by_inst: BTreeMap<InstId, CallSiteId>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct LoopId(pub u32);
+
+/// A control-flow fact that must hold whenever a block executes.
+///
+/// Switch arms retain all values targeting one edge because a multi-label arm
+/// is a disjunction, not several independent guards.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ControlGuard {
+    Branch {
+        predicate: PredicateId,
+        truth: bool,
+    },
+    SwitchArm {
+        block_addr: u64,
+        case_values: Vec<u64>,
+        includes_default: bool,
+    },
+}
+
+/// Canonical control context shared by every path reaching a block.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ControlDomain {
+    pub id: ControlDomainId,
+    pub guards: Vec<ControlGuard>,
+    pub loops: Vec<LoopId>,
+    /// False means the CFG had no fully representable path proof for this block.
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ControlDomainFacts {
+    pub domains: BTreeMap<ControlDomainId, ControlDomain>,
+    pub by_block: BTreeMap<u64, ControlDomainId>,
+}
+
+impl ControlDomainFacts {
+    pub fn for_block(&self, block_addr: u64) -> Option<&ControlDomain> {
+        self.by_block
+            .get(&block_addr)
+            .and_then(|id| self.domains.get(id))
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProofNodeId {
@@ -438,8 +500,21 @@ pub struct CallResultCertificate {
     pub op_index: usize,
     pub value: ValueId,
     pub width: u32,
+    pub relation: CallResultValueRelation,
     pub carrier: ReturnCarrier,
     pub owner: Option<ValueOwner>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallResultValueRelation {
+    Identity,
+    Derived,
+}
+
+impl CallResultValueRelation {
+    pub fn is_identity(self) -> bool {
+        self == Self::Identity
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -556,6 +631,7 @@ pub struct PreparedFunctionFacts {
     pub predicates: PredicateFacts,
     pub call_sites: CallSiteFacts,
     pub structured: StructuredDataflowFacts,
+    pub control_domains: ControlDomainFacts,
     pub certificates: PreparedFunctionCertificates,
     pub assumptions: AssumptionSet,
     pub applied_assumption_bindings: Vec<PreparedAssumptionBinding>,
@@ -586,6 +662,7 @@ impl PreparedFunctionFacts {
             &predicates,
             &call_sites,
         );
+        let control_domains = collect_control_domain_facts(function, &predicates, &structured);
         let certificates = collect_prepared_function_certificates(
             function,
             graph,
@@ -603,6 +680,7 @@ impl PreparedFunctionFacts {
             predicates,
             call_sites,
             structured,
+            control_domains,
             certificates,
             assumptions: assumptions.clone(),
             applied_assumption_bindings,
@@ -1804,6 +1882,7 @@ fn expression_op_is_pure(op: &SSAOp) -> bool {
             | SSAOp::Cast { .. }
             | SSAOp::Extract { .. }
             | SSAOp::Insert { .. }
+            | SSAOp::Select { .. }
     )
 }
 
@@ -1854,8 +1933,10 @@ fn collect_return_value_certificates(
 
     for block in function.blocks() {
         let mut last_return_value_write = None;
+        let mut has_explicit_return = false;
         for (op_idx, op) in block.ops.iter().enumerate() {
             if let SSAOp::Return { target } = op {
+                has_explicit_return = true;
                 if is_return_value_register(target) {
                     push_return_value_certificate(
                         graph,
@@ -1913,11 +1994,21 @@ fn collect_return_value_certificates(
                 && let Some(dst) = op.dst()
                 && is_return_value_register(dst)
             {
-                last_return_value_write = Some((op_idx, dst));
+                let preserve_wider_call_alias = matches!(op, SSAOp::CallDefine { .. })
+                    && last_return_value_write.is_some_and(|(_, current)| {
+                        synthetic_call_results_share_site(graph, call_results, current, dst)
+                            && current.size > dst.size
+                    });
+                if !preserve_wider_call_alias {
+                    last_return_value_write = Some((op_idx, dst));
+                }
             }
         }
 
-        if let Some((op_idx, dst)) = last_return_value_write {
+        if !has_explicit_return
+            && return_blocks.contains(&block.addr)
+            && let Some((op_idx, dst)) = last_return_value_write
+        {
             push_return_value_certificate(
                 graph,
                 &mut returns,
@@ -2084,10 +2175,42 @@ fn process_reaching_return_block(
         if let Some(dst) = op.dst()
             && is_return_value_register(dst)
         {
-            state = reaching_return_value_for_var(graph, call_results, stack_reloads, dst);
+            let candidate = reaching_return_value_for_var(graph, call_results, stack_reloads, dst);
+            let preserve_wider_call_alias = matches!(op, SSAOp::CallDefine { .. })
+                && state.is_some_and(|current| {
+                    candidate.is_some_and(|candidate| {
+                        current.identity == candidate.identity
+                            && graph
+                                .value(current.value)
+                                .zip(graph.value(candidate.value))
+                                .is_some_and(|(current, candidate)| {
+                                    current.var.size > candidate.var.size
+                                })
+                    })
+                });
+            if !preserve_wider_call_alias {
+                state = candidate;
+            }
         }
     }
     (state, returns_by_op)
+}
+
+fn synthetic_call_results_share_site(
+    graph: &SsaGraph,
+    call_results: &BTreeMap<ValueId, CallResultCertificate>,
+    lhs: &SSAVar,
+    rhs: &SSAVar,
+) -> bool {
+    graph
+        .value_id_for_var(lhs)
+        .and_then(|value| call_results.get(&value))
+        .zip(
+            graph
+                .value_id_for_var(rhs)
+                .and_then(|value| call_results.get(&value)),
+        )
+        .is_some_and(|(lhs, rhs)| lhs.call_site == rhs.call_site)
 }
 
 fn reaching_return_value_for_var(
@@ -2566,6 +2689,7 @@ fn process_call_result_flow_block(
                     op_index,
                     value,
                     width: dst.size,
+                    relation: CallResultValueRelation::Identity,
                     carrier,
                     owner: Some(ValueOwner::Value(value)),
                 };
@@ -2577,8 +2701,38 @@ fn process_call_result_flow_block(
                     cert,
                 );
             }
-            SSAOp::Copy { dst, src }
-            | SSAOp::IntZExt { dst, src }
+            SSAOp::Copy { dst, src } => {
+                let Some(src_value) = graph.value_id_for_var(src) else {
+                    continue;
+                };
+                let Some(source) = state.tracked.get(&src_value) else {
+                    continue;
+                };
+                let Some(dst_value) = graph.value_id_for_var(dst) else {
+                    continue;
+                };
+                let cert = CallResultCertificate {
+                    call_site: source.call_site,
+                    at: graph
+                        .inst_id_for_op_site(block.addr, op_index)
+                        .unwrap_or(source.at),
+                    block_addr: block.addr,
+                    op_index,
+                    value: dst_value,
+                    width: dst.size,
+                    relation: source.relation,
+                    carrier: source.carrier.clone(),
+                    owner: source.owner.clone().or(Some(ValueOwner::Value(src_value))),
+                };
+                insert_call_result_certificate(
+                    call_results,
+                    call_results_by_inst,
+                    call_results_by_callsite,
+                    &mut state.tracked,
+                    cert,
+                );
+            }
+            SSAOp::IntZExt { dst, src }
             | SSAOp::IntSExt { dst, src }
             | SSAOp::Trunc { dst, src }
             | SSAOp::Cast { dst, src, .. }
@@ -2601,6 +2755,7 @@ fn process_call_result_flow_block(
                     op_index,
                     value: dst_value,
                     width: dst.size,
+                    relation: CallResultValueRelation::Derived,
                     carrier: source.carrier.clone(),
                     owner: source.owner.clone().or(Some(ValueOwner::Value(src_value))),
                 };
@@ -2681,6 +2836,7 @@ fn process_call_result_flow_block(
                     op_index,
                     value: dst_value,
                     width: dst.size,
+                    relation: source.relation,
                     carrier: ReturnCarrier::StackSlot {
                         object,
                         offset,
@@ -3385,6 +3541,229 @@ fn collect_predicate_facts(function: &SSAFunction, graph: &SsaGraph) -> Predicat
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ControlDomainState {
+    guards: BTreeSet<ControlGuard>,
+    complete: bool,
+}
+
+fn collect_control_domain_facts(
+    function: &SSAFunction,
+    predicates: &PredicateFacts,
+    structured: &StructuredDataflowFacts,
+) -> ControlDomainFacts {
+    let mut guard_universe = BTreeSet::new();
+    for &predecessor in function.block_addrs() {
+        for successor in function.successors(predecessor) {
+            if let (Some(guard), _) =
+                control_guard_for_edge(function, predicates, predecessor, successor)
+            {
+                guard_universe.insert(guard);
+            }
+        }
+    }
+    let mut states = function
+        .block_addrs()
+        .iter()
+        .copied()
+        .map(|addr| {
+            (
+                addr,
+                Some(ControlDomainState {
+                    guards: guard_universe.clone(),
+                    complete: true,
+                }),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    states.insert(
+        function.entry,
+        Some(ControlDomainState {
+            guards: BTreeSet::new(),
+            complete: true,
+        }),
+    );
+
+    let iteration_limit = function
+        .num_blocks()
+        .saturating_mul(guard_universe.len().saturating_add(2))
+        .max(8);
+    for _ in 0..iteration_limit {
+        let previous = states.clone();
+        let mut changed = false;
+        for &block_addr in function.block_addrs() {
+            if block_addr == function.entry {
+                continue;
+            }
+            let predecessors = function.predecessors(block_addr);
+            if predecessors.is_empty() {
+                let state = Some(ControlDomainState {
+                    guards: BTreeSet::new(),
+                    complete: false,
+                });
+                if states.get(&block_addr) != Some(&state) {
+                    states.insert(block_addr, state);
+                    changed = true;
+                }
+                continue;
+            }
+
+            let mut incoming = Vec::new();
+            for predecessor in predecessors {
+                let Some(mut state) = previous.get(&predecessor).cloned().flatten() else {
+                    continue;
+                };
+                let (guard, edge_complete) =
+                    control_guard_for_edge(function, predicates, predecessor, block_addr);
+                if let Some(guard) = guard {
+                    state.guards.insert(guard);
+                }
+                state.complete &= edge_complete;
+                incoming.push(state);
+            }
+            if incoming.is_empty() {
+                continue;
+            }
+
+            let mut guards = incoming[0].guards.clone();
+            for state in &incoming[1..] {
+                guards = guards.intersection(&state.guards).cloned().collect();
+            }
+            let state = Some(ControlDomainState {
+                guards,
+                complete: incoming.iter().all(|state| state.complete),
+            });
+            if states.get(&block_addr) != Some(&state) {
+                states.insert(block_addr, state);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut loops_by_block = BTreeMap::<u64, Vec<LoopId>>::new();
+    for (loop_id, loop_fact) in &structured.loops {
+        for block_addr in &loop_fact.body {
+            loops_by_block
+                .entry(*block_addr)
+                .or_default()
+                .push(*loop_id);
+        }
+    }
+    for loops in loops_by_block.values_mut() {
+        loops.sort_unstable();
+        loops.dedup();
+    }
+
+    let mut domain_ids = BTreeMap::<(Vec<ControlGuard>, Vec<LoopId>, bool), ControlDomainId>::new();
+    let mut domains = BTreeMap::new();
+    let mut by_block = BTreeMap::new();
+    for &block_addr in function.block_addrs() {
+        let state = states
+            .remove(&block_addr)
+            .flatten()
+            .unwrap_or(ControlDomainState {
+                guards: BTreeSet::new(),
+                complete: false,
+            });
+        let guards = state.guards.into_iter().collect::<Vec<_>>();
+        let loops = loops_by_block.remove(&block_addr).unwrap_or_default();
+        let key = (guards.clone(), loops.clone(), state.complete);
+        let id = if let Some(id) = domain_ids.get(&key).copied() {
+            id
+        } else {
+            let id = ControlDomainId(domain_ids.len() as u32);
+            domain_ids.insert(key, id);
+            domains.insert(
+                id,
+                ControlDomain {
+                    id,
+                    guards,
+                    loops,
+                    complete: state.complete,
+                },
+            );
+            id
+        };
+        by_block.insert(block_addr, id);
+    }
+    ControlDomainFacts { domains, by_block }
+}
+
+fn control_guard_for_edge(
+    function: &SSAFunction,
+    predicates: &PredicateFacts,
+    predecessor: u64,
+    successor: u64,
+) -> (Option<ControlGuard>, bool) {
+    let Some(block) = function.cfg().get_block(predecessor) else {
+        return (None, false);
+    };
+    match &block.terminator {
+        BlockTerminator::ConditionalBranch {
+            true_target,
+            false_target,
+        } => {
+            if true_target == false_target {
+                return (None, *true_target == successor);
+            }
+            let predicate = predicates
+                .predicates
+                .values()
+                .find(|fact| fact.block_addr == predecessor)
+                .map(|fact| fact.id);
+            let Some(predicate) = predicate else {
+                return (None, false);
+            };
+            if *true_target == successor {
+                (
+                    Some(ControlGuard::Branch {
+                        predicate,
+                        truth: true,
+                    }),
+                    true,
+                )
+            } else if *false_target == successor {
+                (
+                    Some(ControlGuard::Branch {
+                        predicate,
+                        truth: false,
+                    }),
+                    true,
+                )
+            } else {
+                (None, false)
+            }
+        }
+        BlockTerminator::Switch { cases, default } => {
+            let mut case_values = cases
+                .iter()
+                .filter_map(|(value, target)| (*target == successor).then_some(*value))
+                .collect::<Vec<_>>();
+            case_values.sort_unstable();
+            case_values.dedup();
+            let includes_default = *default == Some(successor);
+            if case_values.is_empty() && !includes_default {
+                return (None, false);
+            }
+            (
+                Some(ControlGuard::SwitchArm {
+                    block_addr: predecessor,
+                    case_values,
+                    includes_default,
+                }),
+                true,
+            )
+        }
+        BlockTerminator::IndirectBranch if function.successors(predecessor).len() > 1 => {
+            (None, false)
+        }
+        _ => (None, function.successors(predecessor).contains(&successor)),
+    }
+}
+
 fn collect_call_sites(
     function: &SSAFunction,
     graph: &SsaGraph,
@@ -3668,47 +4047,47 @@ fn collect_compare_defs(
     graph: &SsaGraph,
 ) -> BTreeMap<SSAVar, CompareProvenance> {
     let mut compare_defs = BTreeMap::<SSAVar, CompareProvenance>::new();
+    let copy_sources = collect_compare_copy_sources(function);
     let mut sub_sources = BTreeMap::<SSAVar, (ValueId, ValueId)>::new();
     let mut signed_overflow_sources = BTreeMap::<SSAVar, (ValueId, ValueId)>::new();
     let mut signed_sign_sources = BTreeMap::<SSAVar, (ValueId, ValueId)>::new();
+
     for block in function.blocks() {
         for op in &block.ops {
-            match op {
-                SSAOp::IntSub { dst, a, b } => {
-                    if let (Some(lhs), Some(rhs)) =
-                        (graph.value_id_for_var(a), graph.value_id_for_var(b))
-                    {
-                        sub_sources.insert(dst.clone(), (lhs, rhs));
-                    }
-                }
-                SSAOp::IntSBorrow { dst, a, b } => {
-                    if let (Some(lhs), Some(rhs)) =
-                        (graph.value_id_for_var(a), graph.value_id_for_var(b))
-                    {
-                        signed_overflow_sources.insert(dst.clone(), (lhs, rhs));
-                    }
-                }
-                SSAOp::IntSLess { dst, a, b } if const_value(b) == Some(0) => {
-                    if let Some((lhs, rhs)) = sub_sources.get(a).copied() {
-                        signed_sign_sources.insert(dst.clone(), (lhs, rhs));
-                    }
-                }
-                SSAOp::BoolNot { dst, src } => {
-                    if let Some(compare) = compare_defs.get(src).cloned()
-                        && let Some(kind) = invert_compare_kind(compare.kind)
-                    {
-                        compare_defs.insert(
-                            dst.clone(),
-                            CompareProvenance {
-                                kind,
-                                lhs: compare.lhs,
-                                rhs: compare.rhs,
-                            },
-                        );
-                    }
-                }
-                _ => {}
+            if let SSAOp::IntSub { dst, a, b } = op
+                && let (Some(lhs), Some(rhs)) = (
+                    canonical_compare_operand(graph, &copy_sources, a),
+                    canonical_compare_operand(graph, &copy_sources, b),
+                )
+            {
+                sub_sources.insert(dst.clone(), (lhs, rhs));
             }
+        }
+    }
+
+    for block in function.blocks() {
+        for op in &block.ops {
+            if let SSAOp::IntSBorrow { dst, a, b } = op
+                && let (Some(lhs), Some(rhs)) = (
+                    canonical_compare_operand(graph, &copy_sources, a),
+                    canonical_compare_operand(graph, &copy_sources, b),
+                )
+            {
+                signed_overflow_sources.insert(dst.clone(), (lhs, rhs));
+            }
+            if let SSAOp::IntSLess { dst, a, b } = op
+                && const_value(b) == Some(0)
+                && let Some((lhs, rhs)) = sub_sources.get(a).copied()
+            {
+                signed_sign_sources.insert(dst.clone(), (lhs, rhs));
+            }
+        }
+    }
+    propagate_compare_source_aliases(function, &mut signed_overflow_sources);
+    propagate_compare_source_aliases(function, &mut signed_sign_sources);
+
+    for block in function.blocks() {
+        for op in &block.ops {
             let Some((dst, kind, lhs, rhs)) = compare_components(op) else {
                 if let Some((dst, kind, lhs, rhs)) = signed_flag_compare_components(
                     op,
@@ -3719,10 +4098,10 @@ fn collect_compare_defs(
                 }
                 continue;
             };
-            let Some(lhs_id) = graph.value_id_for_var(lhs) else {
+            let Some(lhs_id) = canonical_compare_operand(graph, &copy_sources, lhs) else {
                 continue;
             };
-            let Some(rhs_id) = graph.value_id_for_var(rhs) else {
+            let Some(rhs_id) = canonical_compare_operand(graph, &copy_sources, rhs) else {
                 continue;
             };
             let (lhs_id, rhs_id) =
@@ -3742,15 +4121,200 @@ fn collect_compare_defs(
             }
         }
     }
+
+    loop {
+        let mut changed = false;
+        for block in function.blocks() {
+            for op in &block.ops {
+                let propagated = match op {
+                    SSAOp::Copy { dst, src }
+                    | SSAOp::Cast { dst, src }
+                    | SSAOp::IntZExt { dst, src }
+                    | SSAOp::IntSExt { dst, src }
+                    | SSAOp::Trunc { dst, src } => compare_defs
+                        .get(src)
+                        .cloned()
+                        .map(|comparison| (dst, comparison)),
+                    SSAOp::Subpiece {
+                        dst,
+                        src,
+                        offset: 0,
+                    } => compare_defs
+                        .get(src)
+                        .cloned()
+                        .map(|comparison| (dst, comparison)),
+                    SSAOp::BoolNot { dst, src } => compare_defs.get(src).and_then(|comparison| {
+                        invert_compare_provenance(comparison).map(|comparison| (dst, comparison))
+                    }),
+                    SSAOp::BoolAnd { dst, a, b } => compare_defs
+                        .get(a)
+                        .zip(compare_defs.get(b))
+                        .and_then(|(lhs, rhs)| combine_compare_provenance(lhs, rhs, false))
+                        .map(|comparison| (dst, comparison)),
+                    SSAOp::BoolOr { dst, a, b } => compare_defs
+                        .get(a)
+                        .zip(compare_defs.get(b))
+                        .and_then(|(lhs, rhs)| combine_compare_provenance(lhs, rhs, true))
+                        .map(|comparison| (dst, comparison)),
+                    _ => None,
+                };
+                let Some((dst, comparison)) = propagated else {
+                    continue;
+                };
+                if compare_defs.get(dst) != Some(&comparison) {
+                    compare_defs.insert(dst.clone(), comparison);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
     compare_defs
 }
 
-fn invert_compare_kind(kind: CompareKind) -> Option<CompareKind> {
-    match kind {
-        CompareKind::Equal => Some(CompareKind::NotEqual),
-        CompareKind::NotEqual => Some(CompareKind::Equal),
-        _ => None,
+fn collect_compare_copy_sources(function: &SSAFunction) -> BTreeMap<SSAVar, SSAVar> {
+    let mut sources = BTreeMap::new();
+    for block in function.blocks() {
+        for op in &block.ops {
+            if let SSAOp::Copy { dst, src } = op {
+                sources.insert(dst.clone(), src.clone());
+            }
+        }
     }
+    sources
+}
+
+fn canonical_compare_operand(
+    graph: &SsaGraph,
+    copy_sources: &BTreeMap<SSAVar, SSAVar>,
+    var: &SSAVar,
+) -> Option<ValueId> {
+    let mut current = var;
+    let mut visited = BTreeSet::new();
+    for _ in 0..32 {
+        if !visited.insert(current) {
+            return None;
+        }
+        let Some(source) = copy_sources.get(current) else {
+            return graph.value_id_for_var(current);
+        };
+        current = source;
+    }
+    None
+}
+
+fn propagate_compare_source_aliases(
+    function: &SSAFunction,
+    sources: &mut BTreeMap<SSAVar, (ValueId, ValueId)>,
+) {
+    loop {
+        let mut changed = false;
+        for block in function.blocks() {
+            for op in &block.ops {
+                let (dst, src) = match op {
+                    SSAOp::Copy { dst, src }
+                    | SSAOp::Cast { dst, src }
+                    | SSAOp::IntZExt { dst, src }
+                    | SSAOp::IntSExt { dst, src }
+                    | SSAOp::Trunc { dst, src } => (dst, src),
+                    SSAOp::Subpiece {
+                        dst,
+                        src,
+                        offset: 0,
+                    } => (dst, src),
+                    _ => continue,
+                };
+                let Some(source) = sources.get(src).copied() else {
+                    continue;
+                };
+                if sources.get(dst) != Some(&source) {
+                    sources.insert(dst.clone(), source);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+fn invert_compare_provenance(comparison: &CompareProvenance) -> Option<CompareProvenance> {
+    let (kind, swap_operands) = match comparison.kind {
+        CompareKind::Equal => (CompareKind::NotEqual, false),
+        CompareKind::NotEqual => (CompareKind::Equal, false),
+        CompareKind::Less => (CompareKind::LessEqual, true),
+        CompareKind::SignedLess => (CompareKind::SignedLessEqual, true),
+        CompareKind::LessEqual => (CompareKind::Less, true),
+        CompareKind::SignedLessEqual => (CompareKind::SignedLess, true),
+    };
+    Some(CompareProvenance {
+        kind,
+        lhs: if swap_operands {
+            comparison.rhs
+        } else {
+            comparison.lhs
+        },
+        rhs: if swap_operands {
+            comparison.lhs
+        } else {
+            comparison.rhs
+        },
+    })
+}
+
+fn combine_compare_provenance(
+    lhs: &CompareProvenance,
+    rhs: &CompareProvenance,
+    is_or: bool,
+) -> Option<CompareProvenance> {
+    if lhs == rhs {
+        return Some(lhs.clone());
+    }
+
+    let equality_operands_match = |ordered: &CompareProvenance, equality: &CompareProvenance| {
+        ordered.lhs == equality.lhs && ordered.rhs == equality.rhs
+            || ordered.lhs == equality.rhs && ordered.rhs == equality.lhs
+    };
+    let (ordered, equality) = if matches!(
+        lhs.kind,
+        CompareKind::Less
+            | CompareKind::SignedLess
+            | CompareKind::LessEqual
+            | CompareKind::SignedLessEqual
+    ) && matches!(rhs.kind, CompareKind::Equal | CompareKind::NotEqual)
+    {
+        (lhs, rhs)
+    } else if matches!(
+        rhs.kind,
+        CompareKind::Less
+            | CompareKind::SignedLess
+            | CompareKind::LessEqual
+            | CompareKind::SignedLessEqual
+    ) && matches!(lhs.kind, CompareKind::Equal | CompareKind::NotEqual)
+    {
+        (rhs, lhs)
+    } else {
+        return None;
+    };
+    if !equality_operands_match(ordered, equality) {
+        return None;
+    }
+
+    let kind = match (is_or, ordered.kind, equality.kind) {
+        (true, CompareKind::Less, CompareKind::Equal) => CompareKind::LessEqual,
+        (true, CompareKind::SignedLess, CompareKind::Equal) => CompareKind::SignedLessEqual,
+        (false, CompareKind::LessEqual, CompareKind::NotEqual) => CompareKind::Less,
+        (false, CompareKind::SignedLessEqual, CompareKind::NotEqual) => CompareKind::SignedLess,
+        _ => return None,
+    };
+    Some(CompareProvenance {
+        kind,
+        lhs: ordered.lhs,
+        rhs: ordered.rhs,
+    })
 }
 
 fn normalize_zero_sub_compare_operands(
@@ -3919,8 +4483,45 @@ fn stack_base_root_for_name(name: &str) -> Option<StackAddressRoot> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CallSiteId, LoopId, ObjectId, ProofNodeId, SemanticId, StructuredAccessId};
-    use crate::{InstId, ValueId};
+    use super::{
+        CallSiteId, CompareKind, CompareProvenance, ControlGuard, LoopId, ObjectId, PredicateId,
+        ProofNodeId, SemanticId, StructuredAccessId, combine_compare_provenance,
+        invert_compare_provenance,
+    };
+    use crate::{InstId, SsaArtifact, ValueId};
+    use r2il::{R2ILBlock, R2ILOp, SpaceId, Varnode};
+
+    #[test]
+    fn comparison_algebra_recovers_signed_le_and_complement() {
+        let lhs = ValueId(1);
+        let rhs = ValueId(2);
+        let signed_less = CompareProvenance {
+            kind: CompareKind::SignedLess,
+            lhs,
+            rhs,
+        };
+        let equal = CompareProvenance {
+            kind: CompareKind::Equal,
+            lhs: rhs,
+            rhs: lhs,
+        };
+        assert_eq!(
+            combine_compare_provenance(&equal, &signed_less, true),
+            Some(CompareProvenance {
+                kind: CompareKind::SignedLessEqual,
+                lhs,
+                rhs,
+            })
+        );
+        assert_eq!(
+            invert_compare_provenance(&signed_less),
+            Some(CompareProvenance {
+                kind: CompareKind::SignedLessEqual,
+                lhs: rhs,
+                rhs: lhs,
+            })
+        );
+    }
 
     #[test]
     fn proof_node_ids_are_owner_qualified_and_stable() {
@@ -3952,6 +4553,9 @@ mod tests {
             SemanticId::memory_access(access),
             SemanticId::return_value(InstId(12)),
             SemanticId::call(CallSiteId(5)),
+            SemanticId::predicate(PredicateId(6)),
+            SemanticId::control_domain(super::ControlDomainId(7)),
+            SemanticId::effect(InstId(13)),
         ];
 
         assert_eq!(ids[0].to_string(), "expr:4");
@@ -3960,6 +4564,9 @@ mod tests {
         assert_eq!(ids[3].to_string(), "memory:9:2");
         assert_eq!(ids[4].to_string(), "return:12");
         assert_eq!(ids[5].to_string(), "call:5");
+        assert_eq!(ids[6].to_string(), "predicate:6");
+        assert_eq!(ids[7].to_string(), "domain:7");
+        assert_eq!(ids[8].to_string(), "effect:13");
         assert_eq!(
             ids,
             [
@@ -3969,7 +4576,258 @@ mod tests {
                 SemanticId::MemoryAccess(access),
                 SemanticId::Return(InstId(12)),
                 SemanticId::Call(CallSiteId(5)),
+                SemanticId::Predicate(PredicateId(6)),
+                SemanticId::ControlDomain(super::ControlDomainId(7)),
+                SemanticId::Effect(InstId(13)),
             ]
         );
+    }
+
+    #[test]
+    fn predicate_comparison_survives_boolean_flag_copy_and_inversion() {
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        let difference = Varnode::unique(0x10, 8);
+        let equal = Varnode::unique(0x20, 1);
+        let copied_flag = Varnode::unique(0x30, 1);
+        let condition = Varnode::unique(0x40, 1);
+        entry.push(R2ILOp::IntSub {
+            dst: difference.clone(),
+            a: test_reg(0),
+            b: test_const(0xdead),
+        });
+        entry.push(R2ILOp::IntEqual {
+            dst: equal.clone(),
+            a: difference,
+            b: test_const(0),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: copied_flag.clone(),
+            src: equal,
+        });
+        entry.push(R2ILOp::BoolNot {
+            dst: condition.clone(),
+            src: copied_flag,
+        });
+        entry.push(R2ILOp::CBranch {
+            target: test_const(0x1008),
+            cond: condition,
+        });
+        let mut fallthrough = R2ILBlock::new(0x1004, 4);
+        fallthrough.push(R2ILOp::Return {
+            target: test_const(0),
+        });
+        let mut taken = R2ILBlock::new(0x1008, 4);
+        taken.push(R2ILOp::Return {
+            target: test_const(0),
+        });
+
+        let artifact =
+            SsaArtifact::for_decompile(&[entry, fallthrough, taken], None).expect("prepared SSA");
+        let predicate = artifact
+            .predicates()
+            .predicates
+            .values()
+            .next()
+            .expect("branch predicate");
+        let comparison = predicate.comparison.as_ref().expect("comparison proof");
+        assert_eq!(comparison.kind, CompareKind::NotEqual);
+        assert_eq!(
+            artifact
+                .graph()
+                .value(comparison.lhs)
+                .map(|value| value.var.name.as_str()),
+            Some("reg:0")
+        );
+        assert_eq!(
+            artifact
+                .graph()
+                .value(comparison.rhs)
+                .map(|value| value.var.name.as_str()),
+            Some("const:dead")
+        );
+    }
+
+    #[test]
+    fn predicate_comparison_recovers_aarch64_signed_less_equal_flags() {
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        let lhs = Varnode::new(SpaceId::Register, 0, 4);
+        let rhs = Varnode::constant(2, 4);
+        let copied_rhs = Varnode::unique(0x08, 4);
+        let overflow = Varnode::unique(0x10, 1);
+        let difference = Varnode::unique(0x20, 4);
+        let negative = Varnode::unique(0x30, 1);
+        let zero = Varnode::unique(0x40, 1);
+        let signed_less = Varnode::unique(0x50, 1);
+        let condition = Varnode::unique(0x60, 1);
+        let copied_negative = Varnode::register(0x100, 1);
+        let copied_zero = Varnode::register(0x101, 1);
+        let copied_overflow = Varnode::register(0x102, 1);
+        entry.push(R2ILOp::Copy {
+            dst: copied_rhs.clone(),
+            src: rhs.clone(),
+        });
+        entry.push(R2ILOp::IntSBorrow {
+            dst: overflow.clone(),
+            a: lhs.clone(),
+            b: rhs.clone(),
+        });
+        entry.push(R2ILOp::IntSub {
+            dst: difference.clone(),
+            a: lhs,
+            b: copied_rhs,
+        });
+        entry.push(R2ILOp::IntSLess {
+            dst: negative.clone(),
+            a: difference.clone(),
+            b: Varnode::constant(0, 4),
+        });
+        entry.push(R2ILOp::IntEqual {
+            dst: zero.clone(),
+            a: difference,
+            b: Varnode::constant(0, 4),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: copied_negative.clone(),
+            src: negative,
+        });
+        entry.push(R2ILOp::Copy {
+            dst: copied_zero.clone(),
+            src: zero,
+        });
+        entry.push(R2ILOp::Copy {
+            dst: copied_overflow.clone(),
+            src: overflow,
+        });
+        entry.push(R2ILOp::IntNotEqual {
+            dst: signed_less.clone(),
+            a: copied_negative,
+            b: copied_overflow,
+        });
+        entry.push(R2ILOp::BoolOr {
+            dst: condition.clone(),
+            a: copied_zero,
+            b: signed_less,
+        });
+        entry.push(R2ILOp::CBranch {
+            target: test_const(0x1008),
+            cond: condition,
+        });
+        let fallthrough = R2ILBlock::new(0x1004, 4);
+        let taken = R2ILBlock::new(0x1008, 4);
+
+        let artifact =
+            SsaArtifact::for_decompile(&[entry, fallthrough, taken], None).expect("prepared SSA");
+        let comparison = artifact
+            .predicates()
+            .predicates
+            .values()
+            .next()
+            .and_then(|predicate| predicate.comparison.as_ref())
+            .expect("signed less-equal comparison proof");
+        assert_eq!(comparison.kind, CompareKind::SignedLessEqual);
+        assert_eq!(
+            artifact
+                .graph()
+                .value(comparison.lhs)
+                .map(|value| value.var.name.as_str()),
+            Some("reg:0")
+        );
+        assert_eq!(
+            artifact
+                .graph()
+                .value(comparison.rhs)
+                .map(|value| value.var.name.as_str()),
+            Some("const:2")
+        );
+    }
+
+    fn test_reg(offset: u64) -> Varnode {
+        Varnode::new(SpaceId::Register, offset, 8)
+    }
+
+    fn test_const(value: u64) -> Varnode {
+        Varnode::constant(value, 8)
+    }
+
+    fn conditional_block(addr: u64, selector: u64, target: u64) -> R2ILBlock {
+        let mut block = R2ILBlock::new(addr, 4);
+        let cond = Varnode::unique(addr, 1);
+        block.push(R2ILOp::IntEqual {
+            dst: cond.clone(),
+            a: test_reg(selector),
+            b: test_const(1),
+        });
+        block.push(R2ILOp::CBranch {
+            target: test_const(target),
+            cond,
+        });
+        block
+    }
+
+    fn branch_block(addr: u64, target: u64) -> R2ILBlock {
+        let mut block = R2ILBlock::new(addr, 4);
+        block.push(R2ILOp::Branch {
+            target: test_const(target),
+        });
+        block
+    }
+
+    #[test]
+    fn control_domains_intersect_shared_default_paths() {
+        let blocks = vec![
+            conditional_block(0x1000, 0, 0x1040),
+            branch_block(0x1004, 0x1044),
+            conditional_block(0x1040, 8, 0x1080),
+            branch_block(0x1044, 0x10c0),
+            branch_block(0x1080, 0x10c0),
+            R2ILBlock::new(0x10c0, 4),
+        ];
+        let artifact = SsaArtifact::for_decompile(&blocks, None).expect("prepared SSA");
+        let root_predicate = artifact
+            .predicates()
+            .predicates
+            .values()
+            .find(|predicate| predicate.block_addr == 0x1000)
+            .expect("root predicate")
+            .id;
+        let nested_predicate = artifact
+            .predicates()
+            .predicates
+            .values()
+            .find(|predicate| predicate.block_addr == 0x1040)
+            .expect("nested predicate")
+            .id;
+
+        let nested = artifact
+            .control_domains()
+            .for_block(0x1080)
+            .expect("nested true domain");
+        assert!(nested.complete);
+        assert_eq!(
+            nested.guards,
+            vec![
+                ControlGuard::Branch {
+                    predicate: root_predicate,
+                    truth: true,
+                },
+                ControlGuard::Branch {
+                    predicate: nested_predicate,
+                    truth: true,
+                },
+            ]
+        );
+
+        let shared_default = artifact
+            .control_domains()
+            .for_block(0x1044)
+            .expect("shared default domain");
+        assert!(shared_default.complete);
+        assert!(shared_default.guards.is_empty());
+        let merge = artifact
+            .control_domains()
+            .for_block(0x10c0)
+            .expect("merge domain");
+        assert!(merge.complete);
+        assert!(merge.guards.is_empty());
     }
 }

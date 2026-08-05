@@ -69,8 +69,9 @@ pub use op::SSAOp;
 pub use optimize::{DecompilePrepConfig, OptimizationConfig, OptimizationStats, optimize_function};
 pub use semantic::{
     BlockAssumption, CallArgumentCertificate, CallArgumentLocation, CallMemoryEffect,
-    CallResultCertificate, CallSiteFact, CallSiteFacts, CallSiteId, CallsiteCertificate,
-    CompareKind, CompareProvenance, GlobalObjectKey, IfRegionCertificate, LoopCertificate, LoopId,
+    CallResultCertificate, CallResultValueRelation, CallSiteFact, CallSiteFacts, CallSiteId,
+    CallsiteCertificate, CompareKind, CompareProvenance, ControlDomain, ControlDomainFacts,
+    ControlDomainId, ControlGuard, GlobalObjectKey, IfRegionCertificate, LoopCertificate, LoopId,
     MemoryAccessCertificate, MemoryDefFact, MemoryLocation, MemoryPhiFact, MemorySSAFacts,
     MemoryUseFact, MemoryVersion, ObjectFact, ObjectId, ObjectKind, ObjectModel, PredicateFact,
     PredicateFacts, PredicateId, PreparedAssumptionBinding, PreparedAssumptionBindingKind,

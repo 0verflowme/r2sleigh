@@ -63,9 +63,8 @@ use r2ssa::SSAOp;
 use r2ssa::cfg::BlockTerminator;
 use r2types::{
     CTypeLike, DecompileRouteFacts, DecompileRouteKind, ExternalRegisterParamSpec,
-    ExternalStackBase, ExternalStackSlotRole, FunctionFacts, FunctionSignatureSpec,
-    FunctionTypeFacts, ParamSlotResolver, StackSlotKey, TypeInference, TypeOracle, VisibleBinding,
-    VisibleBindingKind,
+    ExternalStackSlotRole, FunctionFacts, FunctionSignatureSpec, FunctionTypeFacts,
+    ParamSlotResolver, StackSlotKey, TypeInference, TypeOracle, VisibleBinding, VisibleBindingKind,
 };
 #[cfg(test)]
 use r2types::{ExternalTypeDb, FunctionType};
@@ -297,6 +296,16 @@ fn format_vm_value_expr(value: &r2sym::VmValueExpr) -> String {
                 format_vm_value_expr(rhs)
             )
         }
+        r2sym::VmValueExpr::Select {
+            cond,
+            if_true,
+            if_false,
+        } => format!(
+            "({} ? {} : {})",
+            format_vm_value_expr(cond),
+            format_vm_value_expr(if_true),
+            format_vm_value_expr(if_false)
+        ),
     }
 }
 
@@ -2531,109 +2540,17 @@ impl CertifiedSemanticLedger {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct CertifiedStructuringFootprint {
-    semantic_ledger: CertifiedSemanticLedger,
-    control: ControlRenderCounts,
-    calls: usize,
-    returns_with_value: usize,
-    memory_like_accesses: usize,
-    field_accesses: usize,
-    array_accesses: usize,
-    raw_address_call_args: usize,
-    raw_pointer_arithmetic_derefs: usize,
-}
-
-impl CertifiedStructuringFootprint {
-    fn preserves_observable_semantics(&self, after: &Self) -> bool {
-        self.semantic_ledger == after.semantic_ledger
-            && self.control == after.control
-            && self.calls == after.calls
-            && self.returns_with_value == after.returns_with_value
-            && self.memory_like_accesses == after.memory_like_accesses
-            && self.field_accesses == after.field_accesses
-            && self.array_accesses == after.array_accesses
-            && after.raw_address_call_args <= self.raw_address_call_args
-            && after.raw_pointer_arithmetic_derefs <= self.raw_pointer_arithmetic_derefs
-    }
-}
-
-fn certified_structuring_footprint(
-    stmt: &CStmt,
-    function_facts: &FunctionFacts,
-    proofs: &[EffectRenderProof],
-) -> CertifiedStructuringFootprint {
-    let mut counts = CertifiedOutputCounts::default();
-    let mut raw_names = Vec::new();
-    collect_certified_stmt_contract(
-        stmt,
-        RenderNodeId::root_child(0),
-        &mut counts,
-        &mut raw_names,
-    );
-    let mut control_nodes = Vec::new();
-    collect_stmt_control_render_nodes(stmt, RenderNodeId::root_child(0), &mut control_nodes);
-    CertifiedStructuringFootprint {
-        semantic_ledger: CertifiedSemanticLedger::from_effect_proofs(function_facts, proofs),
-        control: control_render_counts_from_nodes(&control_nodes),
-        calls: counts.calls,
-        returns_with_value: counts.returns_with_value,
-        memory_like_accesses: counts.memory_like_accesses,
-        field_accesses: counts.field_accesses,
-        array_accesses: counts.array_accesses,
-        raw_address_call_args: counts.raw_address_call_args,
-        raw_pointer_arithmetic_derefs: counts.raw_pointer_arithmetic_derefs,
-    }
-}
-
-/// Run one AST cleanup transaction and keep it only when the complete
-/// certified semantic/control footprint is preserved. This gives certified
-/// mode a real structuring pass without allowing cleanup to silently delete or
-/// synthesize effects.
-#[cfg(test)]
-fn cleanup_preserving_certified_semantics(
-    stmt: CStmt,
-    function_facts: &FunctionFacts,
-    proofs: &[EffectRenderProof],
-) -> CStmt {
-    transform_preserving_certified_semantics(stmt, function_facts, proofs, |stmt| {
-        ControlFlowStructurer::cleanup(stmt)
-    })
-}
-
-fn transform_preserving_certified_semantics<F>(
-    stmt: CStmt,
-    function_facts: &FunctionFacts,
-    proofs: &[EffectRenderProof],
-    transform: F,
-) -> CStmt
-where
-    F: FnOnce(CStmt) -> CStmt,
-{
-    let before = certified_structuring_footprint(&stmt, function_facts, proofs);
-    if before.semantic_ledger.unresolved > 0 {
-        return stmt;
-    }
-    let transformed = transform(stmt.clone());
-    let after = certified_structuring_footprint(&transformed, function_facts, proofs);
-    if before.preserves_observable_semantics(&after) {
-        transformed
-    } else {
-        stmt
-    }
-}
-
 fn certified_effect_proof_counts(
     effect_render_proofs: &[EffectRenderProof],
 ) -> CertifiedEffectProofCounts {
-    let mut call_sites = BTreeSet::new();
+    let mut calls = 0usize;
     let mut expressions = 0usize;
     let mut returns = 0;
 
     for proof in effect_render_proofs {
         match proof.kind {
             EffectRenderProofKind::Call => {
-                call_sites.insert((proof.block_addr, proof.op_idx));
+                calls += 1;
             }
             EffectRenderProofKind::Expression => {
                 expressions += 1;
@@ -2646,7 +2563,7 @@ fn certified_effect_proof_counts(
     }
 
     CertifiedEffectProofCounts {
-        calls: call_sites.len(),
+        calls,
         expressions,
         returns,
     }
@@ -2684,7 +2601,7 @@ fn certified_memory_effects_requiring_ast_access(
                 .into_iter()
                 .flatten()
                 .any(|fact| fact.access == memory.access);
-        if has_structured_access || !render_facts.stack_slot_offsets.contains_key(&memory.object) {
+        if has_structured_access || render_facts.stack_slot(memory.object).is_none() {
             accesses.insert((proof.block_addr, proof.op_idx, is_write, memory.access));
         }
     }
@@ -2764,19 +2681,12 @@ fn certified_stack_local_identity_is_exact(
         .or_else(|| function_facts.authorized_stack_slot_owner_render_by_offset(-offset, name))
         .is_some()
         || function_facts.render().is_some_and(|render| {
-            render
-                .stack_slot_offsets
-                .iter()
-                .any(|(object, slot_offset)| {
-                    (*slot_offset == offset || *slot_offset == -offset)
-                        && function_facts
-                            .authorized_recovered_stack_slot_owner_render(
-                                *object,
-                                *slot_offset,
-                                name,
-                            )
-                            .is_some()
-                })
+            render.stack_slots().any(|(object, _, slot_offset, _)| {
+                (slot_offset == offset || slot_offset == -offset)
+                    && function_facts
+                        .authorized_recovered_stack_slot_owner_render(object, slot_offset, name)
+                        .is_some()
+            })
         })
 }
 
@@ -2853,7 +2763,6 @@ fn typed_stack_local_type_for_name_offset(
 
 fn stack_slot_key_matches_offset(slot: &StackSlotKey, offset: i64) -> bool {
     slot.offset == offset
-        || (matches!(slot.base, ExternalStackBase::FramePointer) && -slot.offset == offset)
 }
 
 #[cfg(test)]
@@ -2870,6 +2779,276 @@ fn certified_standard_output_residual_reason(
     )
 }
 
+fn definite_assignment_residual_reason(func: &CFunction) -> Option<String> {
+    let mut local_names = func
+        .locals
+        .iter()
+        .map(|local| local.name.clone())
+        .collect::<BTreeSet<_>>();
+    for stmt in &func.body {
+        collect_declared_local_names(stmt, &mut local_names);
+    }
+    let mut assigned = func
+        .params
+        .iter()
+        .map(|param| param.name.clone())
+        .collect::<BTreeSet<_>>();
+    for (index, stmt) in func.body.iter().enumerate() {
+        if let Err(reason) = analyze_definite_assignment_stmt(stmt, &local_names, &mut assigned) {
+            return Some(format!(
+                "definite-assignment proof failed at statement {index}: {reason}"
+            ));
+        }
+    }
+    None
+}
+
+fn collect_declared_local_names(stmt: &CStmt, names: &mut BTreeSet<String>) {
+    match stmt {
+        CStmt::Decl { name, .. } => {
+            names.insert(name.clone());
+        }
+        CStmt::Block(stmts) => {
+            for stmt in stmts {
+                collect_declared_local_names(stmt, names);
+            }
+        }
+        CStmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            collect_declared_local_names(then_body, names);
+            if let Some(else_body) = else_body {
+                collect_declared_local_names(else_body, names);
+            }
+        }
+        CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
+            collect_declared_local_names(body, names);
+        }
+        CStmt::For { init, body, .. } => {
+            if let Some(init) = init {
+                collect_declared_local_names(init, names);
+            }
+            collect_declared_local_names(body, names);
+        }
+        CStmt::Switch { cases, default, .. } => {
+            for stmt in cases.iter().flat_map(|case| &case.body) {
+                collect_declared_local_names(stmt, names);
+            }
+            for stmt in default.iter().flatten() {
+                collect_declared_local_names(stmt, names);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn analyze_definite_assignment_stmt(
+    stmt: &CStmt,
+    local_names: &BTreeSet<String>,
+    assigned: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    match stmt {
+        CStmt::Empty
+        | CStmt::Break
+        | CStmt::Continue
+        | CStmt::Goto(_)
+        | CStmt::Label(_)
+        | CStmt::Comment(_) => {}
+        CStmt::Expr(expr) => {
+            analyze_definite_assignment_expr_stmt(expr, local_names, assigned)?;
+        }
+        CStmt::Decl { name, init, .. } => {
+            if let Some(init) = init {
+                validate_expr_local_reads(init, local_names, assigned, false)?;
+                assigned.insert(name.clone());
+            }
+        }
+        CStmt::Block(stmts) => {
+            for stmt in stmts {
+                analyze_definite_assignment_stmt(stmt, local_names, assigned)?;
+            }
+        }
+        CStmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            validate_expr_local_reads(cond, local_names, assigned, false)?;
+            let mut then_assigned = assigned.clone();
+            analyze_definite_assignment_stmt(then_body, local_names, &mut then_assigned)?;
+            let mut else_assigned = assigned.clone();
+            if let Some(else_body) = else_body {
+                analyze_definite_assignment_stmt(else_body, local_names, &mut else_assigned)?;
+            }
+            *assigned = then_assigned
+                .intersection(&else_assigned)
+                .cloned()
+                .collect();
+        }
+        CStmt::While { cond, body } => {
+            validate_expr_local_reads(cond, local_names, assigned, false)?;
+            let mut body_assigned = assigned.clone();
+            analyze_definite_assignment_stmt(body, local_names, &mut body_assigned)?;
+        }
+        CStmt::DoWhile { body, cond } => {
+            let mut body_assigned = assigned.clone();
+            analyze_definite_assignment_stmt(body, local_names, &mut body_assigned)?;
+            validate_expr_local_reads(cond, local_names, &body_assigned, false)?;
+            *assigned = body_assigned;
+        }
+        CStmt::For {
+            init,
+            cond,
+            update,
+            body,
+        } => {
+            if let Some(init) = init {
+                analyze_definite_assignment_stmt(init, local_names, assigned)?;
+            }
+            if let Some(cond) = cond {
+                validate_expr_local_reads(cond, local_names, assigned, false)?;
+            }
+            let mut body_assigned = assigned.clone();
+            analyze_definite_assignment_stmt(body, local_names, &mut body_assigned)?;
+            if let Some(update) = update {
+                analyze_definite_assignment_expr_stmt(update, local_names, &mut body_assigned)?;
+            }
+        }
+        CStmt::Switch {
+            expr,
+            cases,
+            default,
+        } => {
+            validate_expr_local_reads(expr, local_names, assigned, false)?;
+            let mut exits = Vec::new();
+            for case in cases {
+                let mut case_assigned = assigned.clone();
+                for stmt in &case.body {
+                    analyze_definite_assignment_stmt(stmt, local_names, &mut case_assigned)?;
+                }
+                exits.push(case_assigned);
+            }
+            if let Some(default) = default {
+                let mut default_assigned = assigned.clone();
+                for stmt in default {
+                    analyze_definite_assignment_stmt(stmt, local_names, &mut default_assigned)?;
+                }
+                exits.push(default_assigned);
+            } else {
+                exits.push(assigned.clone());
+            }
+            if let Some(first) = exits.first().cloned() {
+                *assigned = exits[1..].iter().fold(first, |current, exit| {
+                    current.intersection(exit).cloned().collect()
+                });
+            }
+        }
+        CStmt::Return(value) => {
+            if let Some(value) = value {
+                validate_expr_local_reads(value, local_names, assigned, false)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn analyze_definite_assignment_expr_stmt(
+    expr: &CExpr,
+    local_names: &BTreeSet<String>,
+    assigned: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    if let CExpr::Binary {
+        op: BinaryOp::Assign,
+        left,
+        right,
+    } = expr
+    {
+        validate_expr_local_reads(right, local_names, assigned, false)?;
+        validate_expr_local_reads(left, local_names, assigned, true)?;
+        if let CExpr::Var(name) = left.as_ref()
+            && local_names.contains(name)
+        {
+            assigned.insert(name.clone());
+        }
+        return Ok(());
+    }
+    validate_expr_local_reads(expr, local_names, assigned, false)
+}
+
+fn validate_expr_local_reads(
+    expr: &CExpr,
+    local_names: &BTreeSet<String>,
+    assigned: &BTreeSet<String>,
+    is_assignment_lhs: bool,
+) -> Result<(), String> {
+    match expr {
+        CExpr::Var(name) => {
+            if !is_assignment_lhs && local_names.contains(name) && !assigned.contains(name) {
+                return Err(format!("local {name} may be read before assignment"));
+            }
+        }
+        CExpr::Unary {
+            op: UnaryOp::PreInc | UnaryOp::PreDec | UnaryOp::PostInc | UnaryOp::PostDec,
+            operand,
+        } => {
+            validate_expr_local_reads(operand, local_names, assigned, false)?;
+        }
+        CExpr::Unary { operand, .. }
+        | CExpr::Cast { expr: operand, .. }
+        | CExpr::Deref(operand)
+        | CExpr::Paren(operand) => {
+            validate_expr_local_reads(operand, local_names, assigned, false)?;
+        }
+        CExpr::AddrOf(operand) => {
+            if !matches!(operand.as_ref(), CExpr::Var(_)) {
+                validate_expr_local_reads(operand, local_names, assigned, false)?;
+            }
+        }
+        CExpr::Binary { op, left, right } => {
+            let lhs_is_write = matches!(op, BinaryOp::Assign);
+            validate_expr_local_reads(left, local_names, assigned, lhs_is_write)?;
+            validate_expr_local_reads(right, local_names, assigned, false)?;
+        }
+        CExpr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            validate_expr_local_reads(cond, local_names, assigned, false)?;
+            validate_expr_local_reads(then_expr, local_names, assigned, false)?;
+            validate_expr_local_reads(else_expr, local_names, assigned, false)?;
+        }
+        CExpr::Call { func, args } => {
+            validate_expr_local_reads(func, local_names, assigned, false)?;
+            for arg in args {
+                validate_expr_local_reads(arg, local_names, assigned, false)?;
+            }
+        }
+        CExpr::Subscript { base, index } => {
+            validate_expr_local_reads(base, local_names, assigned, false)?;
+            validate_expr_local_reads(index, local_names, assigned, false)?;
+        }
+        CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
+            validate_expr_local_reads(base, local_names, assigned, false)?;
+        }
+        CExpr::Comma(items) => {
+            for item in items {
+                validate_expr_local_reads(item, local_names, assigned, false)?;
+            }
+        }
+        CExpr::Sizeof(_)
+        | CExpr::SizeofType(_)
+        | CExpr::IntLit(_)
+        | CExpr::UIntLit(_)
+        | CExpr::FloatLit(_)
+        | CExpr::StringLit(_)
+        | CExpr::CharLit(_) => {}
+    }
+    Ok(())
+}
+
 fn certified_standard_output_residual_reason_with_effect_proofs(
     prepared: &r2ssa::SsaArtifact,
     function_facts: &FunctionFacts,
@@ -2883,9 +3062,22 @@ fn certified_standard_output_residual_reason_with_effect_proofs(
     let empty_render = r2types::FunctionRenderFacts::default();
     let render_facts = function_facts.render().unwrap_or(&empty_render);
     let mut reasons = Vec::new();
+    for effect in render_facts.certified_effects.values() {
+        let domain = effect.control_domain();
+        if !domain.complete {
+            reasons.push(format!(
+                "certified effect {} has incomplete control domain {}",
+                effect.id(),
+                domain.id.0
+            ));
+        }
+    }
 
     if func.body.is_empty() {
         reasons.push("certified standard route produced no body".to_string());
+    }
+    if let Some(reason) = definite_assignment_residual_reason(func) {
+        reasons.push(reason);
     }
     for local in &func.locals {
         match local.stack_offset {
@@ -2918,7 +3110,6 @@ fn certified_standard_output_residual_reason_with_effect_proofs(
             &mut raw_names,
         );
     }
-
     if let Some(effect_render_proofs) = effect_render_proofs {
         let semantic_ledger =
             CertifiedSemanticLedger::from_effect_proofs(function_facts, effect_render_proofs);
@@ -4120,24 +4311,9 @@ fn merge_params_with_external_signature(
 }
 
 fn params_from_authorized_signature(signature: &FunctionSignatureSpec) -> Vec<ast::CParam> {
-    let mut param_count = signature.params.len();
-    if signature
-        .params
-        .iter()
-        .any(|param| !param.name.trim().is_empty() && !is_generic_arg_name(&param.name))
-    {
-        while param_count > 0
-            && signature.params.get(param_count - 1).is_some_and(|param| {
-                param.name.trim().is_empty() || is_generic_arg_name(&param.name)
-            })
-        {
-            param_count -= 1;
-        }
-    }
     signature
         .params
         .iter()
-        .take(param_count)
         .enumerate()
         .map(|(idx, param)| ast::CParam {
             ty: param
@@ -4161,6 +4337,130 @@ fn signature_has_complete_render_param_types(signature: &FunctionSignatureSpec) 
             .as_ref()
             .is_some_and(|ty| !matches!(type_like_to_ctype(ty), CType::Unknown))
     })
+}
+
+fn certified_signature_entity_residual_reason(
+    signature: &FunctionSignatureSpec,
+    render: &r2types::FunctionRenderFacts,
+    ptr_bits: u32,
+) -> Option<String> {
+    let params = params_from_authorized_signature(signature);
+    let mut entities = BTreeMap::<u32, u32>::new();
+    for entity in render.certified_entities.values() {
+        if let r2types::CertifiedEntity::Parameter {
+            slot,
+            carrier_width,
+            ..
+        } = entity
+        {
+            entities.insert(*slot, *carrier_width);
+        }
+    }
+    if entities.len() != params.len()
+        || entities
+            .keys()
+            .copied()
+            .ne((0..params.len()).map(|slot| slot as u32))
+    {
+        return Some(format!(
+            "certified ABI parameter slots {:?} disagree with rendered signature arity {}",
+            entities.keys().collect::<Vec<_>>(),
+            params.len()
+        ));
+    }
+    for (slot, param) in params.iter().enumerate() {
+        let source_type = signature.params[slot]
+            .ty
+            .as_ref()
+            .expect("render-authorized parameter type checked before ABI certification");
+        let Some(type_bits) = certified_type_width(source_type, ptr_bits) else {
+            return Some(format!(
+                "parameter {slot} type {} has no certified width",
+                param.ty
+            ));
+        };
+        let carrier_bits = entities
+            .get(&(slot as u32))
+            .copied()
+            .unwrap_or(0)
+            .saturating_mul(8);
+        let width_matches = if certified_type_is_pointer(source_type) {
+            type_bits == carrier_bits
+        } else {
+            type_bits > 0 && type_bits <= carrier_bits
+        };
+        if !width_matches {
+            return Some(format!(
+                "parameter {slot} type width {type_bits} disagrees with ABI carrier width {carrier_bits}"
+            ));
+        }
+    }
+
+    let source_ret_type = signature.ret_type.as_ref()?;
+    let ret_type = type_like_to_ctype(source_ret_type);
+    let return_widths = render
+        .certified_effects
+        .values()
+        .filter_map(|effect| effect.return_fact().map(|fact| fact.width))
+        .collect::<BTreeSet<_>>();
+    if matches!(ret_type, CType::Void) {
+        if !return_widths.is_empty() {
+            return Some(format!(
+                "void signature has certified value-return widths {:?}",
+                return_widths
+            ));
+        }
+        return None;
+    }
+    let Some(ret_bits) = certified_type_width(source_ret_type, ptr_bits) else {
+        return Some(format!("return type {ret_type} has no certified width"));
+    };
+    let return_width_matches = !return_widths.is_empty()
+        && return_widths.iter().all(|width| {
+            let carrier_bits = width.saturating_mul(8);
+            if certified_type_is_pointer(source_ret_type) {
+                ret_bits == carrier_bits
+            } else {
+                ret_bits > 0 && ret_bits <= carrier_bits
+            }
+        });
+    if !return_width_matches {
+        return Some(format!(
+            "signature return width {} bit(s) disagrees with certified carrier widths {:?}",
+            ret_bits,
+            render
+                .certified_effects
+                .values()
+                .filter_map(|effect| effect.return_fact().map(|fact| fact.width))
+                .collect::<BTreeSet<_>>()
+        ));
+    }
+    None
+}
+
+fn certified_type_width(ty: &r2types::CTypeLike, ptr_bits: u32) -> Option<u32> {
+    match ty {
+        r2types::CTypeLike::Bool => Some(1),
+        r2types::CTypeLike::Int { bits, .. } | r2types::CTypeLike::Float(bits) => Some(*bits),
+        r2types::CTypeLike::Pointer(_) => Some(ptr_bits),
+        r2types::CTypeLike::Typedef(name) if r2types::semantic_typedef_is_pointer(name) => {
+            Some(ptr_bits)
+        }
+        r2types::CTypeLike::Typedef(name) => {
+            let resolved = r2types::parse_external_type_like_spec(name, ptr_bits)?;
+            if &resolved == ty {
+                None
+            } else {
+                certified_type_width(&resolved, ptr_bits)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn certified_type_is_pointer(ty: &r2types::CTypeLike) -> bool {
+    matches!(ty, r2types::CTypeLike::Pointer(_))
+        || matches!(ty, r2types::CTypeLike::Typedef(name) if r2types::semantic_typedef_is_pointer(name))
 }
 
 fn register_alias_names(reg_name: &str) -> Vec<String> {
@@ -5166,8 +5466,17 @@ impl Decompiler {
                     "r2dec residual: certified Standard header has incomplete FunctionTypeFacts render-authorized parameter types",
                 );
             }
+            if let Some(reason) = certified_signature_entity_residual_reason(
+                signature,
+                self.context.function_facts.render_facts(),
+                self.config.ptr_size,
+            ) {
+                return residual_function_for_render_boundary(
+                    &func_name,
+                    &format!("r2dec residual: {reason}"),
+                );
+            }
         }
-
         // Recover variables
         let mut var_recovery = VariableRecovery::new_with_abi(
             &self.config.sp_name,
@@ -5177,8 +5486,7 @@ impl Decompiler {
             self.config.ret_regs.clone(),
         );
         var_recovery.set_function_facts(&self.context.function_facts);
-        var_recovery.recover(func);
-
+        var_recovery.recover_prepared(prepared);
         let skip_runtime_type_inference = self.context.skip_runtime_type_inference(prepared);
         let type_inference = (!skip_runtime_type_inference).then(|| {
             let mut type_inference = TypeInference::new_with_abi(
@@ -5237,7 +5545,6 @@ impl Decompiler {
         let type_oracle = combined_type_oracle
             .as_ref()
             .map(|oracle| oracle as &dyn TypeOracle);
-
         let recovered_param_infos: Vec<_> = var_recovery
             .parameters()
             .iter()
@@ -5405,6 +5712,10 @@ impl Decompiler {
         let mut use_conservative_locals = routed_body.use_conservative_locals;
         let mut is_linear_fallback = routed_body.is_linear_fallback;
         let mut body_stmt = routed_body.body_stmt;
+        if certified_standard_mode {
+            body_stmt = fold_ctx.prune_unproved_register_carriers_in_stmt(body_stmt);
+            body_stmt = ControlFlowStructurer::cleanup_preserving_render_proof_identity(body_stmt);
+        }
         let mut control_render_proofs = if certified_standard_mode {
             structurer.control_render_proofs().to_vec()
         } else {
@@ -5415,6 +5726,12 @@ impl Decompiler {
         } else {
             Vec::new()
         };
+        let structuring_proof_failure = certified_standard_mode
+            .then(|| structurer.safety_reason().map(str::to_string))
+            .flatten();
+        if let Some(reason) = structuring_proof_failure.as_deref() {
+            body_stmt = CStmt::Comment(format!("r2sleigh residual: {reason}"));
+        }
 
         if !certified_standard_mode
             && route_is_standard(semantic_route)
@@ -5432,17 +5749,7 @@ impl Decompiler {
             effect_render_proofs.clear();
         }
 
-        if certified_standard_mode && route_is_standard(semantic_route) {
-            body_stmt = transform_preserving_certified_semantics(
-                body_stmt,
-                &self.context.function_facts,
-                &effect_render_proofs,
-                |body| {
-                    let body = fold_ctx.prune_dead_temp_assignments_in_stmt(body);
-                    ControlFlowStructurer::cleanup(body)
-                },
-            );
-        } else if route_is_standard(semantic_route) {
+        if !certified_standard_mode && route_is_standard(semantic_route) {
             body_stmt = fold_ctx.normalize_final_stmt_calls(body_stmt);
             body_stmt = fold_ctx.prune_dead_temp_assignments_in_stmt(body_stmt);
             if !is_linear_fallback {
@@ -5622,6 +5929,7 @@ impl Decompiler {
         }
         if certified_standard_mode
             && route_is_standard(semantic_route)
+            && structuring_proof_failure.is_none()
             && !matches!(c_function.ret_type, CType::Void | CType::Unknown)
             && !c_function.body.iter().any(summary_stmt_contains_return)
         {
@@ -5631,7 +5939,7 @@ impl Decompiler {
                     .function_facts
                     .render()
                     .into_iter()
-                    .flat_map(|render| render.returns_by_op.values())
+                    .flat_map(r2types::FunctionRenderFacts::return_effects)
                     .filter_map(|fact| {
                         fold_ctx
                             .certified_return_expr_for_op(fact.block_addr, fact.op_index)
@@ -5675,7 +5983,7 @@ impl Decompiler {
                     .function_facts
                     .render()
                     .into_iter()
-                    .flat_map(|render| render.returns_by_op.values())
+                    .flat_map(r2types::FunctionRenderFacts::return_effects)
                     .filter_map(|fact| {
                         fold_ctx
                             .certified_return_expr_for_op(fact.block_addr, fact.op_index)
@@ -5739,9 +6047,11 @@ impl Decompiler {
         if !certified_standard_mode {
             rewrite_stack_synonym_uses_to_declared_locals(&mut c_function, &fold_ctx);
             prune_dead_temp_assignments_in_function_body(&mut c_function, &fold_ctx);
-            prune_unused_pure_locals(&mut c_function);
         }
+        prune_unused_pure_locals(&mut c_function);
+        prune_unreferenced_local_declarations(&mut c_function);
         normalize_redundant_return_carrier_casts(&mut c_function);
+        normalize_declared_assignment_literals(&mut c_function);
         if route_is_standard(semantic_route) {
             let residual_reason =
                 render_permission_residual_reason(self.context.effective_render_permission())
@@ -6353,6 +6663,204 @@ fn normalize_redundant_return_carrier_casts(func: &mut CFunction) {
     }
 }
 
+fn typed_integer_literal_expr(value: u64, is_signed: bool, bits: u32) -> CExpr {
+    let mask = if bits == 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
+    let truncated = value & mask;
+    if is_signed {
+        let sign_bit = 1u64 << (bits - 1);
+        if truncated & sign_bit != 0 {
+            return CExpr::IntLit((truncated | (!mask)) as i64);
+        }
+        return CExpr::IntLit(truncated as i64);
+    }
+    if bits == 64 || truncated > 0x7fff_ffff {
+        CExpr::UIntLit(truncated)
+    } else {
+        CExpr::IntLit(truncated as i64)
+    }
+}
+
+fn normalize_literal_for_declared_type(expr: &mut CExpr, ty: &CType) {
+    let (is_signed, bits) = match ty {
+        CType::Int(bits) => (true, *bits),
+        CType::UInt(bits) => (false, *bits),
+        CType::Bool => (false, 1),
+        _ => return,
+    };
+    if bits == 0 || bits > 64 {
+        return;
+    }
+    match expr {
+        CExpr::UIntLit(value) => {
+            *expr = typed_integer_literal_expr(*value, is_signed, bits);
+        }
+        CExpr::IntLit(value) if *value >= 0 => {
+            *expr = typed_integer_literal_expr(*value as u64, is_signed, bits);
+        }
+        CExpr::Paren(inner) => normalize_literal_for_declared_type(inner, ty),
+        _ => {}
+    }
+}
+
+fn normalize_declared_assignment_literals(func: &mut CFunction) {
+    fn visit_expr(expr: &mut CExpr, declared_types: &HashMap<String, CType>) {
+        match expr {
+            CExpr::Unary { operand, .. }
+            | CExpr::Cast { expr: operand, .. }
+            | CExpr::Sizeof(operand)
+            | CExpr::AddrOf(operand)
+            | CExpr::Deref(operand)
+            | CExpr::Paren(operand) => visit_expr(operand, declared_types),
+            CExpr::Binary { left, right, .. } => {
+                visit_expr(left, declared_types);
+                visit_expr(right, declared_types);
+            }
+            CExpr::Ternary {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                visit_expr(cond, declared_types);
+                visit_expr(then_expr, declared_types);
+                visit_expr(else_expr, declared_types);
+            }
+            CExpr::Call { func, args } => {
+                visit_expr(func, declared_types);
+                for arg in args {
+                    visit_expr(arg, declared_types);
+                }
+            }
+            CExpr::Subscript { base, index } => {
+                visit_expr(base, declared_types);
+                visit_expr(index, declared_types);
+            }
+            CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
+                visit_expr(base, declared_types);
+            }
+            CExpr::Comma(exprs) => {
+                for expr in exprs {
+                    visit_expr(expr, declared_types);
+                }
+            }
+            CExpr::IntLit(_)
+            | CExpr::UIntLit(_)
+            | CExpr::FloatLit(_)
+            | CExpr::StringLit(_)
+            | CExpr::CharLit(_)
+            | CExpr::Var(_)
+            | CExpr::SizeofType(_) => {}
+        }
+
+        let CExpr::Binary {
+            op: BinaryOp::Assign,
+            left,
+            right,
+        } = expr
+        else {
+            return;
+        };
+        let CExpr::Var(name) = left.as_ref() else {
+            return;
+        };
+        if let Some(ty) = declared_types.get(&name.to_ascii_lowercase()) {
+            normalize_literal_for_declared_type(right, ty);
+        }
+    }
+
+    fn visit_stmt(stmt: &mut CStmt, declared_types: &HashMap<String, CType>) {
+        match stmt {
+            CStmt::Expr(expr) => visit_expr(expr, declared_types),
+            CStmt::Decl { ty, init, .. } => {
+                if let Some(init) = init {
+                    visit_expr(init, declared_types);
+                    normalize_literal_for_declared_type(init, ty);
+                }
+            }
+            CStmt::Block(stmts) => {
+                for stmt in stmts {
+                    visit_stmt(stmt, declared_types);
+                }
+            }
+            CStmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                visit_expr(cond, declared_types);
+                visit_stmt(then_body, declared_types);
+                if let Some(else_body) = else_body {
+                    visit_stmt(else_body, declared_types);
+                }
+            }
+            CStmt::While { cond, body } | CStmt::DoWhile { body, cond } => {
+                visit_expr(cond, declared_types);
+                visit_stmt(body, declared_types);
+            }
+            CStmt::For {
+                init,
+                cond,
+                update,
+                body,
+            } => {
+                if let Some(init) = init {
+                    visit_stmt(init, declared_types);
+                }
+                if let Some(cond) = cond {
+                    visit_expr(cond, declared_types);
+                }
+                if let Some(update) = update {
+                    visit_expr(update, declared_types);
+                }
+                visit_stmt(body, declared_types);
+            }
+            CStmt::Switch {
+                expr,
+                cases,
+                default,
+            } => {
+                visit_expr(expr, declared_types);
+                for case in cases {
+                    visit_expr(&mut case.value, declared_types);
+                    for stmt in &mut case.body {
+                        visit_stmt(stmt, declared_types);
+                    }
+                }
+                if let Some(default) = default {
+                    for stmt in default {
+                        visit_stmt(stmt, declared_types);
+                    }
+                }
+            }
+            CStmt::Return(Some(expr)) => visit_expr(expr, declared_types),
+            CStmt::Empty
+            | CStmt::Return(None)
+            | CStmt::Break
+            | CStmt::Continue
+            | CStmt::Goto(_)
+            | CStmt::Label(_)
+            | CStmt::Comment(_) => {}
+        }
+    }
+
+    let declared_types = func
+        .params
+        .iter()
+        .map(|param| (param.name.to_ascii_lowercase(), param.ty.clone()))
+        .chain(
+            func.locals
+                .iter()
+                .map(|local| (local.name.to_ascii_lowercase(), local.ty.clone())),
+        )
+        .collect::<HashMap<_, _>>();
+    for stmt in &mut func.body {
+        visit_stmt(stmt, &declared_types);
+    }
+}
+
 fn prune_unused_pure_locals(func: &mut CFunction) {
     loop {
         let live_reads = collect_function_local_reads(func);
@@ -6371,6 +6879,15 @@ fn prune_unused_pure_locals(func: &mut CFunction) {
             .retain(|local| !dead_locals.contains(&local.name.to_ascii_lowercase()));
         prune_unused_pure_local_stmts(&mut func.body, &dead_locals);
     }
+}
+
+fn prune_unreferenced_local_declarations(func: &mut CFunction) {
+    let referenced = collect_stmt_var_names(&func.body)
+        .into_iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    func.locals
+        .retain(|local| referenced.contains(&local.name.to_ascii_lowercase()));
 }
 
 fn collect_function_local_reads(func: &CFunction) -> HashSet<String> {
@@ -6818,6 +7335,79 @@ mod tests {
     };
     use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+    fn test_stack_render_facts(
+        object: r2ssa::ObjectId,
+        base: r2ssa::StackAddressBase,
+        offset: i64,
+    ) -> FunctionRenderFacts {
+        let id = r2ssa::SemanticId::stack_slot(object);
+        FunctionRenderFacts {
+            certified_entities: BTreeMap::from([(
+                id,
+                r2types::CertifiedEntity::StackSlot {
+                    id,
+                    object,
+                    base,
+                    offset,
+                    size: None,
+                },
+            )]),
+            ..FunctionRenderFacts::default()
+        }
+    }
+
+    #[test]
+    fn definite_assignment_rejects_partial_branch_initialization() {
+        let mut function = CFunction::new("unlock", CType::i32());
+        function.locals.push(crate::ast::CLocal {
+            ty: CType::i32(),
+            name: "result".to_string(),
+            stack_offset: Some(-4),
+        });
+        function.body = vec![
+            CStmt::If {
+                cond: CExpr::Var("condition".to_string()),
+                then_body: Box::new(CStmt::Expr(CExpr::assign(
+                    CExpr::Var("result".to_string()),
+                    CExpr::IntLit(1),
+                ))),
+                else_body: None,
+            },
+            CStmt::Return(Some(CExpr::Var("result".to_string()))),
+        ];
+
+        assert!(
+            definite_assignment_residual_reason(&function)
+                .is_some_and(|reason| reason.contains("result may be read before assignment"))
+        );
+    }
+
+    #[test]
+    fn definite_assignment_accepts_complete_branch_initialization() {
+        let mut function = CFunction::new("unlock", CType::i32());
+        function.locals.push(crate::ast::CLocal {
+            ty: CType::i32(),
+            name: "result".to_string(),
+            stack_offset: Some(-4),
+        });
+        let assignment = |value| {
+            CStmt::Expr(CExpr::assign(
+                CExpr::Var("result".to_string()),
+                CExpr::IntLit(value),
+            ))
+        };
+        function.body = vec![
+            CStmt::If {
+                cond: CExpr::Var("condition".to_string()),
+                then_body: Box::new(assignment(1)),
+                else_body: Some(Box::new(assignment(0))),
+            },
+            CStmt::Return(Some(CExpr::Var("result".to_string()))),
+        ];
+
+        assert_eq!(definite_assignment_residual_reason(&function), None);
+    }
+
     fn x86_64_param_slot_resolver() -> ParamSlotResolver {
         ParamSlotResolver::from_arg_regs(DecompilerConfig::x86_64().arg_regs)
     }
@@ -6860,111 +7450,6 @@ mod tests {
             prepared_objects: None,
             prepared_memory: None,
         })
-    }
-
-    fn certified_return_facts(
-        sites: &[(u64, usize, r2ssa::InstId, r2ssa::ValueId)],
-    ) -> FunctionFacts {
-        let mut render = FunctionRenderFacts::default();
-        for (block_addr, op_index, at, value) in sites {
-            let expression_id = r2ssa::SemanticId::expression(*value);
-            let expression = r2types::ExpressionRenderFact {
-                value: *value,
-                defining_inst: None,
-                width: 4,
-                renderable: true,
-            };
-            render.certified_exprs.insert(
-                expression_id,
-                r2types::CertifiedExpr {
-                    id: expression_id,
-                    fact: expression.clone(),
-                    inputs: Vec::new(),
-                    bindings: BTreeSet::new(),
-                },
-            );
-            render.expressions.insert(*value, expression);
-            let effect_id = r2ssa::SemanticId::return_value(*at);
-            let return_fact = r2types::ReturnValueRenderFact {
-                block_addr: *block_addr,
-                op_index: *op_index,
-                value: *value,
-                width: 4,
-            };
-            render.certified_effects.insert(
-                effect_id,
-                r2types::CertifiedEffect::Return {
-                    id: effect_id,
-                    at: *at,
-                    fact: return_fact.clone(),
-                },
-            );
-            render
-                .return_effects_by_op
-                .insert((*block_addr, *op_index), effect_id);
-            render
-                .returns_by_op
-                .insert((*block_addr, *op_index), return_fact);
-        }
-        FunctionFacts::default().with_render(render)
-    }
-
-    fn return_effect_proof(
-        block_addr: u64,
-        op_idx: usize,
-        value: r2ssa::ValueId,
-    ) -> EffectRenderProof {
-        EffectRenderProof {
-            kind: EffectRenderProofKind::Return,
-            block_addr,
-            op_idx,
-            call_disposition: None,
-            target: None,
-            address: None,
-            value: Some(value),
-            values: Vec::new(),
-            materialized_phi_copy: false,
-        }
-    }
-
-    #[test]
-    fn certified_cleanup_flattens_containers_when_semantic_ids_are_preserved() {
-        let value = r2ssa::ValueId(4);
-        let facts = certified_return_facts(&[(0x401000, 2, r2ssa::InstId(7), value)]);
-        let proof = return_effect_proof(0x401000, 2, value);
-        let input = CStmt::Block(vec![CStmt::Block(vec![CStmt::Return(Some(CExpr::Var(
-            "result".to_string(),
-        )))])]);
-
-        let cleaned = cleanup_preserving_certified_semantics(input, &facts, &[proof]);
-
-        assert!(matches!(cleaned, CStmt::Return(Some(_))));
-    }
-
-    #[test]
-    fn certified_cleanup_rolls_back_when_a_return_semantic_id_would_be_lost() {
-        let zero = r2ssa::ValueId(4);
-        let one = r2ssa::ValueId(5);
-        let facts = certified_return_facts(&[
-            (0x401000, 2, r2ssa::InstId(7), zero),
-            (0x401010, 3, r2ssa::InstId(8), one),
-        ]);
-        let proofs = [
-            return_effect_proof(0x401000, 2, zero),
-            return_effect_proof(0x401010, 3, one),
-        ];
-        let input = CStmt::If {
-            cond: CExpr::Var("ok".to_string()),
-            then_body: Box::new(CStmt::Return(Some(CExpr::IntLit(0)))),
-            else_body: Some(Box::new(CStmt::Return(Some(CExpr::IntLit(1))))),
-        };
-
-        let cleaned = cleanup_preserving_certified_semantics(input, &facts, &proofs);
-
-        assert!(
-            matches!(cleaned, CStmt::If { .. }),
-            "two certified return effects must not collapse into one ternary return"
-        );
     }
 
     #[test]
@@ -7287,17 +7772,14 @@ mod tests {
         type_facts: FunctionTypeFacts,
         reason: &str,
     ) -> DecompilerInput {
-        let mut function_facts = FunctionFacts::new(type_facts, None)
-            .with_callsites(test_callsite_facts(&prepared))
-            .with_call_results(test_call_result_facts(&prepared))
-            .with_call_render(test_call_render_facts(&prepared))
-            .with_render(test_render_facts(&prepared))
-            .with_decompile_route(test_decompile_route(
+        let mut function_facts =
+            FunctionFacts::new(type_facts, None).with_decompile_route(test_decompile_route(
                 r2types::DecompileRouteKind::Standard,
                 reason,
                 None,
                 r2sym::RenderPermission::certified(r2sym::ProofOwner::R2engine, reason),
             ));
+        function_facts.attach_prepared_decompile_evidence(&prepared);
         function_facts.normalize_field_certificates_from_external_layout();
         function_facts.populate_member_access_render_facts_from_field_certificates(
             &prepared,
@@ -7307,6 +7789,7 @@ mod tests {
             &prepared,
             &x86_64_param_slot_resolver(),
         );
+        function_facts.populate_certified_parameter_exprs(&prepared, &x86_64_param_slot_resolver());
         DecompilerInput::new(
             prepared,
             DecompilerContext::default().with_function_facts(function_facts),
@@ -7393,6 +7876,7 @@ mod tests {
                     at: cert.at,
                     value: cert.value,
                     width: cert.width,
+                    relation: cert.relation,
                     carrier: cert.carrier.clone(),
                     owner: cert.owner.clone(),
                 },
@@ -7439,68 +7923,7 @@ mod tests {
     }
 
     fn test_render_facts(prepared: &r2ssa::SsaArtifact) -> r2types::FunctionRenderFacts {
-        let certificates = prepared.certificates();
-        r2types::FunctionRenderFacts {
-            expressions: certificates
-                .expressions
-                .iter()
-                .map(|(value, cert)| {
-                    (
-                        *value,
-                        r2types::ExpressionRenderFact {
-                            value: cert.value,
-                            defining_inst: cert.defining_inst,
-                            width: cert.width,
-                            renderable: cert.renderable,
-                        },
-                    )
-                })
-                .collect(),
-            string_literals_by_value: BTreeMap::new(),
-            memory_accesses: certificates
-                .memory_accesses
-                .iter()
-                .map(|(access, cert)| {
-                    (
-                        *access,
-                        r2types::MemoryAccessRenderFact {
-                            access: cert.access,
-                            block_addr: cert.block_addr,
-                            op_index: cert.op_index,
-                            object: cert.object,
-                            address: cert.address,
-                            value: cert.value,
-                            is_write: cert.is_write,
-                            width: cert.width,
-                        },
-                    )
-                })
-                .collect(),
-            memory_accesses_by_op: certificates.memory_accesses_by_op.clone(),
-            member_accesses_by_op: BTreeMap::new(),
-            array_accesses_by_op: BTreeMap::new(),
-            returns_by_op: certificates
-                .returns
-                .iter()
-                .map(|cert| {
-                    (
-                        (cert.block_addr, cert.op_index),
-                        r2types::ReturnValueRenderFact {
-                            block_addr: cert.block_addr,
-                            op_index: cert.op_index,
-                            value: cert.value,
-                            width: cert.width,
-                        },
-                    )
-                })
-                .collect(),
-            stack_slot_offsets: certificates
-                .stack_slots
-                .iter()
-                .map(|(object, cert)| (*object, cert.offset))
-                .collect(),
-            ..r2types::FunctionRenderFacts::default()
-        }
+        r2types::FunctionRenderFacts::from_prepared(prepared)
     }
 
     struct TestMemberRenderFact<'a> {
@@ -9215,6 +9638,83 @@ mod tests {
     }
 
     #[test]
+    fn declared_assignment_type_normalizes_only_root_integer_literals() {
+        let mut func = CFunction::new("typed_assignments", CType::Int(32)).with_body(vec![
+            CStmt::Expr(CExpr::binary(
+                BinaryOp::Assign,
+                CExpr::var("signed_value"),
+                CExpr::UIntLit(0xffff_ffff),
+            )),
+            CStmt::Expr(CExpr::binary(
+                BinaryOp::Assign,
+                CExpr::var("unsigned_value"),
+                CExpr::UIntLit(0xffff_ffff),
+            )),
+            CStmt::Expr(CExpr::binary(
+                BinaryOp::Assign,
+                CExpr::var("signed_value"),
+                CExpr::binary(BinaryOp::Add, CExpr::UIntLit(0xffff_ffff), CExpr::IntLit(1)),
+            )),
+        ]);
+        func.locals = vec![
+            ast::CLocal {
+                ty: CType::Int(32),
+                name: "signed_value".to_string(),
+                stack_offset: Some(-4),
+            },
+            ast::CLocal {
+                ty: CType::UInt(32),
+                name: "unsigned_value".to_string(),
+                stack_offset: Some(-8),
+            },
+        ];
+
+        normalize_declared_assignment_literals(&mut func);
+
+        let CStmt::Expr(CExpr::Binary { right, .. }) = &func.body[0] else {
+            panic!("expected signed assignment");
+        };
+        assert_eq!(right.as_ref(), &CExpr::IntLit(-1));
+        let CStmt::Expr(CExpr::Binary { right, .. }) = &func.body[1] else {
+            panic!("expected unsigned assignment");
+        };
+        assert_eq!(right.as_ref(), &CExpr::UIntLit(0xffff_ffff));
+        let CStmt::Expr(CExpr::Binary { right, .. }) = &func.body[2] else {
+            panic!("expected compound rhs assignment");
+        };
+        assert!(matches!(
+            right.as_ref(),
+            CExpr::Binary {
+                op: BinaryOp::Add,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn unreferenced_local_declaration_is_removed_without_touching_live_locals() {
+        let mut func = CFunction::new("locals", CType::Int(32))
+            .with_body(vec![CStmt::Return(Some(CExpr::var("live")))]);
+        func.locals = vec![
+            ast::CLocal {
+                ty: CType::Int(32),
+                name: "dead_return_slot".to_string(),
+                stack_offset: Some(-4),
+            },
+            ast::CLocal {
+                ty: CType::Int(32),
+                name: "live".to_string(),
+                stack_offset: Some(-8),
+            },
+        ];
+
+        prune_unreferenced_local_declarations(&mut func);
+
+        assert_eq!(func.locals.len(), 1);
+        assert_eq!(func.locals[0].name, "live");
+    }
+
+    #[test]
     fn decompile_is_stable_with_external_param_names_and_local_order() {
         let arch = test_arch_for_decompile();
         let prepared = prepared_from_ops(
@@ -9275,7 +9775,10 @@ mod tests {
         let second = decompiler.decompile_input(&input);
 
         assert_eq!(first, second, "decompiled text should be byte-stable");
-        assert!(first.contains("stable_demo(int64_t zzz_first, int64_t aaa_second)"));
+        assert!(
+            first.contains("stable_demo(int64_t zzz_first, int64_t aaa_second)"),
+            "{first}"
+        );
         assert_eq!(
             built_first
                 .params
@@ -9574,6 +10077,44 @@ mod tests {
     }
 
     #[test]
+    fn certified_signed_return_renders_all_ones_literal_as_negative_one() {
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_from_ops(
+            vec![
+                R2ILOp::Copy {
+                    dst: Varnode::register(0x00, 8),
+                    src: Varnode::constant(0xffff_ffff, 8),
+                },
+                R2ILOp::Return {
+                    target: Varnode::register(0x00, 8),
+                },
+            ],
+            &arch,
+        );
+        let signature = signature_spec(Some(CType::Int(32)), Vec::new());
+        let input = prepared_standard_input_with_type_facts(
+            prepared,
+            FunctionTypeFacts {
+                signature_certificate: external_signature_certificate(&signature),
+                merged_signature: Some(signature),
+                ..FunctionTypeFacts::default()
+            },
+            "signed literal return normalization",
+        );
+
+        let built = Decompiler::new(DecompilerConfig::x86_64()).build_function_from_input(&input);
+
+        assert!(
+            built
+                .body
+                .iter()
+                .any(|stmt| matches!(stmt, CStmt::Return(Some(CExpr::IntLit(-1))))),
+            "expected signed literal return, got {:?}",
+            built.body
+        );
+    }
+
+    #[test]
     fn decompile_input_residualizes_uncertified_header_and_return_memory() {
         let arch = test_arch_for_decompile();
         let ops = vec![
@@ -9644,7 +10185,7 @@ mod tests {
     }
 
     #[test]
-    fn decompile_input_preserves_render_authorized_header_but_residualizes_uncertified_body() {
+    fn decompile_input_residualizes_signature_without_certified_abi_entities() {
         let arch = test_arch_for_decompile();
         let ops = vec![
             R2ILOp::Load {
@@ -9691,18 +10232,13 @@ mod tests {
         let typed_fn = typed.build_function_from_input(&input);
         let typed_text = typed.decompile_input(&input);
 
-        assert_eq!(typed_fn.ret_type, CType::Int(64));
-        assert_eq!(typed_fn.params.len(), 2);
-        assert_eq!(typed_fn.params[0].name, "left");
-        assert_eq!(typed_fn.params[1].name, "right");
+        assert_eq!(typed_fn.ret_type, CType::Unknown);
+        assert!(typed_fn.params.is_empty());
         assert!(
-            typed_text.contains("int64_t stable_demo(int64_t left, int64_t right)"),
-            "render-authorized signature should own the certified header, got:\n{typed_text}"
-        );
-        assert!(
-            typed_text.contains("certified render contract failed")
-                || typed_text.contains("uncertified return expression"),
-            "body must still residualize without effect proof, got:\n{typed_text}"
+            typed_text.contains(
+                "certified ABI parameter slots [] disagree with rendered signature arity 2"
+            ),
+            "a friendly signature without certified ABI entities must residualize, got:\n{typed_text}"
         );
         assert!(
             !typed_text.contains("\n    return "),
@@ -10822,13 +11358,18 @@ mod tests {
                 )]),
             })
             .with_render(r2types::FunctionRenderFacts {
-                expressions: BTreeMap::from([(
-                    first_arg,
-                    r2types::ExpressionRenderFact {
-                        value: first_arg,
-                        defining_inst: None,
-                        width: 64,
-                        renderable: true,
+                certified_exprs: BTreeMap::from([(
+                    r2ssa::SemanticId::expression(first_arg),
+                    r2types::CertifiedExpr {
+                        id: r2ssa::SemanticId::expression(first_arg),
+                        fact: r2types::ExpressionRenderFact {
+                            value: first_arg,
+                            defining_inst: None,
+                            width: 64,
+                            renderable: true,
+                        },
+                        inputs: Vec::new(),
+                        bindings: BTreeSet::new(),
                     },
                 )]),
                 ..r2types::FunctionRenderFacts::default()
@@ -11094,7 +11635,7 @@ mod tests {
         assert_eq!(
             function_facts
                 .render()
-                .map(|render| render.returns_by_op.len()),
+                .map(|render| render.return_effects().count()),
             Some(2),
             "fixture must expose two source return facts"
         );
@@ -11197,7 +11738,7 @@ mod tests {
         assert_eq!(
             function_facts
                 .render()
-                .map(|render| render.memory_accesses.len()),
+                .map(|render| render.memory_accesses().count()),
             Some(2),
             "fixture must expose two source memory facts"
         );
@@ -11419,10 +11960,11 @@ mod tests {
     fn certified_standard_output_rejects_stack_local_with_offset_only_evidence() {
         let arch = test_arch_for_decompile();
         let prepared = prepared_from_ops(Vec::new(), &arch);
-        let render = FunctionRenderFacts {
-            stack_slot_offsets: BTreeMap::from([(r2ssa::ObjectId(1), -8)]),
-            ..FunctionRenderFacts::default()
-        };
+        let render = test_stack_render_facts(
+            r2ssa::ObjectId(1),
+            r2ssa::StackAddressBase::FramePointer,
+            -8,
+        );
         let function_facts =
             FunctionFacts::new(FunctionTypeFacts::default(), None).with_render(render);
         let mut func = CFunction::new("local_offset_only", CType::Void)
@@ -11446,15 +11988,16 @@ mod tests {
     fn certified_standard_output_accepts_exact_typed_stack_local_identity() {
         let arch = test_arch_for_decompile();
         let prepared = prepared_from_ops(Vec::new(), &arch);
-        let render = FunctionRenderFacts {
-            stack_slot_offsets: BTreeMap::from([(r2ssa::ObjectId(1), -8)]),
-            ..FunctionRenderFacts::default()
-        };
+        let render = test_stack_render_facts(
+            r2ssa::ObjectId(1),
+            r2ssa::StackAddressBase::FramePointer,
+            -8,
+        );
         let type_facts = FunctionTypeFacts {
             stack_slots: BTreeMap::from([(
                 StackSlotKey {
                     base: ExternalStackBase::FramePointer,
-                    offset: 8,
+                    offset: -8,
                 },
                 ExternalStackSlotSpec {
                     name: "buf".to_string(),
@@ -11487,15 +12030,16 @@ mod tests {
     fn certified_standard_output_rejects_stack_local_type_mismatch() {
         let arch = test_arch_for_decompile();
         let prepared = prepared_from_ops(Vec::new(), &arch);
-        let render = FunctionRenderFacts {
-            stack_slot_offsets: BTreeMap::from([(r2ssa::ObjectId(1), -8)]),
-            ..FunctionRenderFacts::default()
-        };
+        let render = test_stack_render_facts(
+            r2ssa::ObjectId(1),
+            r2ssa::StackAddressBase::FramePointer,
+            -8,
+        );
         let type_facts = FunctionTypeFacts {
             stack_slots: BTreeMap::from([(
                 StackSlotKey {
                     base: ExternalStackBase::FramePointer,
-                    offset: 8,
+                    offset: -8,
                 },
                 ExternalStackSlotSpec {
                     name: "buf".to_string(),

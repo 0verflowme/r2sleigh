@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
-use r2ssa::{SSABlock, SSAOp, SSAVar, SSAVarNameKind};
+use r2ssa::{DecompilePrepFacts, SSABlock, SSAOp, SSAVar, SSAVarNameKind, StackAddressBase};
 
 use crate::facts::parse_type_like_spec;
 use crate::signature_infer::RecoveredSignatureParam;
@@ -320,8 +320,17 @@ pub fn merge_type_hint(hints: &mut HashMap<String, TypeHint>, key: String, incom
 pub fn collect_signature_type_evidence_context(
     ssa_blocks: &[SSABlock],
 ) -> SignatureTypeEvidenceContext {
-    let pointer_vars = infer_pointer_var_keys_from_ssa(ssa_blocks);
-    let pointer_pointee_width_bytes = infer_pointer_pointee_width_bytes(ssa_blocks, &pointer_vars);
+    collect_signature_type_evidence_context_with_arch(ssa_blocks, None)
+}
+
+pub fn collect_signature_type_evidence_context_with_arch(
+    ssa_blocks: &[SSABlock],
+    arch_name: Option<&str>,
+) -> SignatureTypeEvidenceContext {
+    let (_, stack_bases, _) = recover_vars_arch_profile(arch_name);
+    let pointer_vars = infer_pointer_var_keys_from_ssa(ssa_blocks, stack_bases);
+    let pointer_pointee_width_bytes =
+        infer_pointer_pointee_width_bytes(ssa_blocks, &pointer_vars, stack_bases);
     let (scalar_proven_vars, scalar_likely_vars, bool_like_vars, mut width_bits) =
         infer_scalar_var_evidence_from_ssa(ssa_blocks);
     let register_versions = collect_register_version_keys(ssa_blocks);
@@ -361,8 +370,10 @@ pub fn recover_signature_params_from_ssa(
         return Vec::new();
     }
 
-    let signature_evidence = collect_signature_type_evidence_context(ssa_blocks);
-    let (usage_reg_type_hints, _pointer_var_keys) = infer_usage_register_type_hints(ssa_blocks);
+    let signature_evidence =
+        collect_signature_type_evidence_context_with_arch(ssa_blocks, arch_name);
+    let (usage_reg_type_hints, _pointer_var_keys) =
+        infer_usage_register_type_hints(ssa_blocks, arch_name);
     let empty_metadata_hints = HashMap::new();
     let enabled_metadata_hints = if semantic_metadata_enabled {
         metadata_reg_type_hints
@@ -464,6 +475,22 @@ pub fn recover_vars_from_ssa(
     metadata_reg_type_hints: &HashMap<String, TypeHint>,
     semantic_metadata_enabled: bool,
 ) -> Vec<RecoveredVariable> {
+    recover_vars_from_ssa_with_prep_facts(
+        ssa_blocks,
+        None,
+        arch_name,
+        metadata_reg_type_hints,
+        semantic_metadata_enabled,
+    )
+}
+
+pub fn recover_vars_from_ssa_with_prep_facts(
+    ssa_blocks: &[SSABlock],
+    prep_facts: Option<&DecompilePrepFacts>,
+    arch_name: Option<&str>,
+    metadata_reg_type_hints: &HashMap<String, TypeHint>,
+    semantic_metadata_enabled: bool,
+) -> Vec<RecoveredVariable> {
     let mut vars = Vec::new();
     let mut seen_slots: HashMap<(bool, i64), usize> = HashMap::new();
     let mut seen_arg_regs: HashSet<String> = HashSet::new();
@@ -473,8 +500,10 @@ pub fn recover_vars_from_ssa(
     } else {
         0
     };
-    let signature_evidence = collect_signature_type_evidence_context(ssa_blocks);
-    let (usage_reg_type_hints, pointer_var_keys) = infer_usage_register_type_hints(ssa_blocks);
+    let signature_evidence =
+        collect_signature_type_evidence_context_with_arch(ssa_blocks, arch_name);
+    let (usage_reg_type_hints, pointer_var_keys) =
+        infer_usage_register_type_hints(ssa_blocks, arch_name);
     let empty_metadata_hints = HashMap::new();
     let enabled_metadata_hints = if semantic_metadata_enabled {
         metadata_reg_type_hints
@@ -484,21 +513,30 @@ pub fn recover_vars_from_ssa(
     let reg_type_hints =
         merge_register_type_hints(enabled_metadata_hints, &usage_reg_type_hints, arg_regs);
 
-    let mut stack_addr_temps: HashMap<String, (SSAVar, i64)> = HashMap::new();
+    let mut stack_addr_temps: HashMap<String, (SSAVar, i64, bool)> = HashMap::new();
     let control_return_targets = collect_control_return_targets(ssa_blocks);
 
     for block in ssa_blocks {
         for op in &block.ops {
             match op {
                 SSAOp::IntAdd { dst, .. } | SSAOp::IntSub { dst, .. } => {
-                    if let Some((_, base, offset)) = stack_addr_temp(op, stack_bases) {
+                    if let Some((_, base, raw_offset)) = stack_addr_temp(op, stack_bases) {
+                        let canonical_root = prep_facts
+                            .and_then(|facts| facts.stack_address_root_of(dst))
+                            .copied();
+                        let offset = canonical_root.map(|root| root.offset).unwrap_or(raw_offset);
+                        let is_frame_base = canonical_root
+                            .map(|root| matches!(root.base, StackAddressBase::FramePointer))
+                            .unwrap_or_else(|| {
+                                frame_bases.contains(&base.name.to_ascii_lowercase().as_str())
+                            });
                         let dst_key = ssa_var_block_key(block.addr, dst);
-                        stack_addr_temps.insert(dst_key, (base.clone(), offset));
+                        stack_addr_temps.insert(dst_key, (base.clone(), offset, is_frame_base));
                     }
                 }
                 SSAOp::Store { addr, val, .. } => {
                     let addr_key = ssa_var_block_key(block.addr, addr);
-                    if let Some((base, offset)) = stack_addr_temps.get(&addr_key) {
+                    if let Some((base, offset, is_frame_base)) = stack_addr_temps.get(&addr_key) {
                         let type_override = if pointer_var_keys.contains(&ssa_var_key(val)) {
                             Some("void *".to_string())
                         } else {
@@ -507,8 +545,7 @@ pub fn recover_vars_from_ssa(
                         add_stack_var(
                             &mut vars,
                             &mut seen_slots,
-                            &base.name.to_ascii_lowercase(),
-                            frame_bases,
+                            *is_frame_base,
                             *offset,
                             val.size,
                             StackVarRecoveryHint {
@@ -527,7 +564,7 @@ pub fn recover_vars_from_ssa(
                 SSAOp::Load { dst, addr, .. } => {
                     let addr_key = ssa_var_block_key(block.addr, addr);
                     if !control_return_targets.contains(&ssa_var_key(dst))
-                        && let Some((base, offset)) = stack_addr_temps.get(&addr_key)
+                        && let Some((base, offset, is_frame_base)) = stack_addr_temps.get(&addr_key)
                     {
                         let type_override = if pointer_var_keys.contains(&ssa_var_key(dst)) {
                             Some("void *".to_string())
@@ -537,8 +574,7 @@ pub fn recover_vars_from_ssa(
                         add_stack_var(
                             &mut vars,
                             &mut seen_slots,
-                            &base.name.to_ascii_lowercase(),
-                            frame_bases,
+                            *is_frame_base,
                             *offset,
                             dst.size,
                             StackVarRecoveryHint {
@@ -777,8 +813,7 @@ fn merge_register_type_hints(
 fn add_stack_var(
     vars: &mut Vec<RecoveredVariable>,
     seen_slots: &mut HashMap<(bool, i64), usize>,
-    base_reg: &str,
-    frame_bases: &[&str],
+    is_frame_base: bool,
     offset: i64,
     size: u32,
     hint: StackVarRecoveryHint,
@@ -787,7 +822,6 @@ fn add_stack_var(
         type_override,
         stack_arg_index,
     } = hint;
-    let is_frame_base = frame_bases.contains(&base_reg);
     let slot_key = (is_frame_base, offset);
     if let Some(existing_idx) = seen_slots.get(&slot_key).copied() {
         if let Some(override_ty) = type_override
@@ -972,24 +1006,21 @@ fn propagate_normalized_scalar_result_widths(
     changed
 }
 
-fn ssa_var_is_stack_base(var: &SSAVar) -> bool {
-    matches!(
-        var.name.to_ascii_lowercase().as_str(),
-        "rbp" | "rsp" | "ebp" | "esp" | "sp" | "fp" | "bp" | "s0" | "x2" | "x8"
-    )
+fn ssa_var_is_stack_base(var: &SSAVar, stack_bases: BaseRegList) -> bool {
+    stack_bases.contains(&var.name.to_ascii_lowercase().as_str())
 }
 
-fn infer_pointer_width_bytes(ssa_blocks: &[SSABlock]) -> u32 {
+fn infer_pointer_width_bytes(ssa_blocks: &[SSABlock], stack_bases: BaseRegList) -> u32 {
     let mut width = 0u32;
     for block in ssa_blocks {
         for op in &block.ops {
             if let Some(dst) = op.dst()
-                && ssa_var_is_stack_base(dst)
+                && ssa_var_is_stack_base(dst, stack_bases)
             {
                 width = width.max(dst.size);
             }
             op.for_each_source(|src| {
-                if ssa_var_is_stack_base(src) {
+                if ssa_var_is_stack_base(src, stack_bases) {
                     width = width.max(src.size);
                 }
             });
@@ -1053,11 +1084,14 @@ fn infer_index_like_var_keys(ssa_blocks: &[SSABlock]) -> HashSet<String> {
     index_like
 }
 
-fn infer_pointer_var_keys_from_ssa(ssa_blocks: &[SSABlock]) -> HashSet<String> {
+fn infer_pointer_var_keys_from_ssa(
+    ssa_blocks: &[SSABlock],
+    stack_bases: BaseRegList,
+) -> HashSet<String> {
     let mut pointer_vars: HashSet<String> = HashSet::new();
     let register_versions = collect_register_version_keys(ssa_blocks);
     let index_like_vars = infer_index_like_var_keys(ssa_blocks);
-    let pointer_width = infer_pointer_width_bytes(ssa_blocks);
+    let pointer_width = infer_pointer_width_bytes(ssa_blocks, stack_bases);
     let mut stack_addr_slots: HashMap<String, String> = HashMap::new();
     let mut pointer_stack_slots: HashSet<String> = HashSet::new();
 
@@ -1065,8 +1099,8 @@ fn infer_pointer_var_keys_from_ssa(ssa_blocks: &[SSABlock]) -> HashSet<String> {
         for op in &block.ops {
             match op {
                 SSAOp::IntAdd { dst, a, b } | SSAOp::IntSub { dst, a, b } => {
-                    let a_is_stack = ssa_var_is_stack_base(a);
-                    let b_is_stack = ssa_var_is_stack_base(b);
+                    let a_is_stack = ssa_var_is_stack_base(a, stack_bases);
+                    let b_is_stack = ssa_var_is_stack_base(b, stack_bases);
                     let a_const = parse_const_value(&a.name);
                     let b_const = parse_const_value(&b.name);
 
@@ -1246,15 +1280,16 @@ fn infer_pointer_var_keys_from_ssa(ssa_blocks: &[SSABlock]) -> HashSet<String> {
 fn infer_pointer_pointee_width_bytes(
     ssa_blocks: &[SSABlock],
     pointer_vars: &HashSet<String>,
+    stack_bases: BaseRegList,
 ) -> HashMap<String, u32> {
     let mut stack_addr_slots: HashMap<String, String> = HashMap::new();
     for block in ssa_blocks {
         for op in &block.ops {
             match op {
                 SSAOp::IntAdd { dst, a, b } => {
-                    let (base, offset) = if ssa_var_is_stack_base(a) {
+                    let (base, offset) = if ssa_var_is_stack_base(a, stack_bases) {
                         (a, parse_const_value(&b.name).map(|value| value as i64))
-                    } else if ssa_var_is_stack_base(b) {
+                    } else if ssa_var_is_stack_base(b, stack_bases) {
                         (b, parse_const_value(&a.name).map(|value| value as i64))
                     } else {
                         continue;
@@ -1266,7 +1301,7 @@ fn infer_pointer_pointee_width_bytes(
                         );
                     }
                 }
-                SSAOp::IntSub { dst, a, b } if ssa_var_is_stack_base(a) => {
+                SSAOp::IntSub { dst, a, b } if ssa_var_is_stack_base(a, stack_bases) => {
                     if let Some(offset) = parse_const_value(&b.name) {
                         stack_addr_slots.insert(
                             ssa_var_block_key(block.addr, dst),
@@ -1297,12 +1332,12 @@ fn infer_pointer_pointee_width_bytes(
                 SSAOp::IntAdd { dst, a, b } | SSAOp::IntSub { dst, a, b } => {
                     let b_is_nonzero_const =
                         parse_const_value(&b.name).is_some_and(|value| value != 0);
-                    if !ssa_var_is_stack_base(a) && !b_is_nonzero_const {
+                    if !ssa_var_is_stack_base(a, stack_bases) && !b_is_nonzero_const {
                         add_pointer_pointee_flow_edge(&mut adjacency, pointer_vars, dst, a);
                     }
                     let a_is_nonzero_const =
                         parse_const_value(&a.name).is_some_and(|value| value != 0);
-                    if !ssa_var_is_stack_base(b)
+                    if !ssa_var_is_stack_base(b, stack_bases)
                         && !a_is_nonzero_const
                         && !matches!(op, SSAOp::IntSub { .. })
                     {
@@ -1699,8 +1734,10 @@ fn infer_scalar_var_evidence_from_ssa(
 
 fn infer_usage_register_type_hints(
     ssa_blocks: &[SSABlock],
+    arch_name: Option<&str>,
 ) -> (HashMap<String, TypeHint>, HashSet<String>) {
-    let pointer_vars = infer_pointer_var_keys_from_ssa(ssa_blocks);
+    let (_, stack_bases, _) = recover_vars_arch_profile(arch_name);
+    let pointer_vars = infer_pointer_var_keys_from_ssa(ssa_blocks, stack_bases);
     let mut hints = HashMap::new();
 
     for block in ssa_blocks {
@@ -1978,6 +2015,79 @@ mod tests {
     }
 
     #[test]
+    fn arm64_pointer_pointee_width_flows_through_stack_home_and_shifted_index() {
+        let home = SSAVar::new("tmp:home", 1, 8);
+        let reload = SSAVar::new("tmp:reload", 1, 8);
+        let base = SSAVar::new("x8", 4, 8);
+        let index = SSAVar::new("tmp:index", 1, 4);
+        let wide_index = SSAVar::new("x9", 3, 8);
+        let scaled = SSAVar::new("tmp:scaled", 1, 8);
+        let element = SSAVar::new("tmp:element", 1, 8);
+        let entry = SSABlock {
+            addr: 0x1000,
+            size: 8,
+            ops: vec![
+                SSAOp::IntAdd {
+                    dst: home.clone(),
+                    a: SSAVar::new("sp", 1, 8),
+                    b: SSAVar::constant(24, 8),
+                },
+                SSAOp::Store {
+                    addr: home,
+                    val: SSAVar::new("x0", 0, 8),
+                    space: "ram".to_string(),
+                },
+            ],
+        };
+        let body = SSABlock {
+            addr: 0x1010,
+            size: 20,
+            ops: vec![
+                SSAOp::IntAdd {
+                    dst: reload.clone(),
+                    a: SSAVar::new("sp", 1, 8),
+                    b: SSAVar::constant(24, 8),
+                },
+                SSAOp::Load {
+                    dst: base.clone(),
+                    addr: reload,
+                    space: "ram".to_string(),
+                },
+                SSAOp::IntSExt {
+                    dst: wide_index.clone(),
+                    src: index,
+                },
+                SSAOp::IntLeft {
+                    dst: scaled.clone(),
+                    a: wide_index,
+                    b: SSAVar::constant(2, 8),
+                },
+                SSAOp::IntAdd {
+                    dst: element.clone(),
+                    a: base,
+                    b: scaled,
+                },
+                SSAOp::Load {
+                    dst: SSAVar::new("tmp:value", 1, 4),
+                    addr: element,
+                    space: "ram".to_string(),
+                },
+            ],
+        };
+
+        let evidence =
+            collect_signature_type_evidence_context_with_arch(&[entry, body], Some("aarch64"));
+        assert!(evidence.pointer_vars.contains("x0_0"));
+        assert_eq!(
+            evidence.pointer_pointee_width_bytes.get("x0_0"),
+            Some(&4),
+            "pointer_vars={:?} pointee_widths={:?}",
+            evidence.pointer_vars,
+            evidence.pointer_pointee_width_bytes
+        );
+    }
+
+    #[test]
     fn recover_vars_from_ssa_marks_x86_64_stack_pointer_arg_slot() {
         let block = SSABlock {
             addr: 0x401000,
@@ -2005,6 +2115,55 @@ mod tests {
         assert_eq!(stack_arg.name, "arg6");
         assert!(stack_arg.isarg);
         assert_eq!(stack_arg.var_type, "int64_t");
+    }
+
+    #[test]
+    fn prepared_stack_roots_recover_entry_relative_arm64_locals() {
+        let slot_addr = SSAVar::new("tmp:slot", 1, 8);
+        let block = SSABlock {
+            addr: 0x1000,
+            size: 8,
+            ops: vec![
+                SSAOp::IntAdd {
+                    dst: slot_addr.clone(),
+                    a: SSAVar::new("sp", 1, 8),
+                    b: SSAVar::constant(12, 8),
+                },
+                SSAOp::Store {
+                    space: "ram".to_string(),
+                    addr: slot_addr.clone(),
+                    val: SSAVar::constant(1, 4),
+                },
+            ],
+        };
+        let prep_facts = DecompilePrepFacts {
+            stack_address_roots: [(
+                slot_addr,
+                r2ssa::StackAddressRoot {
+                    base: StackAddressBase::StackPointer,
+                    offset: -4,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..DecompilePrepFacts::default()
+        };
+
+        let vars = recover_vars_from_ssa_with_prep_facts(
+            &[block],
+            Some(&prep_facts),
+            Some("aarch64"),
+            &HashMap::new(),
+            true,
+        );
+        let local = vars
+            .iter()
+            .find(|var| var.kind == "s")
+            .expect("canonical stack local");
+
+        assert_eq!(local.delta, -4);
+        assert_eq!(local.name, "var_4h");
+        assert!(!local.isarg);
     }
 
     #[test]
