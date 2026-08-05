@@ -41,6 +41,15 @@ pub enum Region {
         /// The condition block.
         cond_block: u64,
     },
+    /// A structured region whose control can leave through more than one
+    /// distinct target. The head remains structurally valid; `exits` records
+    /// the exact continuation entries that still require transfer lowering.
+    MultiExit {
+        /// Structured control region before the transfers.
+        head: Box<Region>,
+        /// Distinct external continuation entries.
+        exits: Vec<u64>,
+    },
     /// A switch statement.
     Switch {
         /// The block containing the switch expression.
@@ -70,6 +79,7 @@ impl Region {
             Self::IfThenElse { cond_block, .. } => *cond_block,
             Self::WhileLoop { header, .. } => *header,
             Self::DoWhileLoop { body, .. } => body.entry(),
+            Self::MultiExit { head, .. } => head.entry(),
             Self::Switch { switch_block, .. } => *switch_block,
             Self::Irreducible { entry, .. } => *entry,
         }
@@ -106,6 +116,7 @@ impl Region {
                 blocks.push(*cond_block);
                 blocks
             }
+            Self::MultiExit { head, .. } => head.blocks(),
             Self::Switch {
                 switch_block,
                 cases,
@@ -1447,17 +1458,7 @@ impl<'a> RegionAnalyzer<'a> {
                     let cond_block = match &base {
                         Region::Block(addr) => *addr,
                         _ => {
-                            let mut blocks = graph.node_blocks(node);
-                            blocks.extend(succs.iter().flat_map(|id| graph.node_blocks(*id)));
-                            blocks.sort_unstable();
-                            blocks.dedup();
-                            region_map.insert(
-                                node,
-                                Region::Irreducible {
-                                    entry: graph.node_entry(node).unwrap_or(self.func.entry),
-                                    blocks,
-                                },
-                            );
+                            region_map.insert(node, Self::multi_exit_region(base, &succs, graph));
                             continue;
                         }
                     };
@@ -1502,17 +1503,7 @@ impl<'a> RegionAnalyzer<'a> {
                     let switch_block = match &base {
                         Region::Block(addr) => *addr,
                         _ => {
-                            let mut blocks = graph.node_blocks(node);
-                            blocks.extend(succs.iter().flat_map(|id| graph.node_blocks(*id)));
-                            blocks.sort_unstable();
-                            blocks.dedup();
-                            region_map.insert(
-                                node,
-                                Region::Irreducible {
-                                    entry: graph.node_entry(node).unwrap_or(self.func.entry),
-                                    blocks,
-                                },
-                            );
+                            region_map.insert(node, Self::multi_exit_region(base, &succs, graph));
                             continue;
                         }
                     };
@@ -1615,6 +1606,19 @@ impl<'a> RegionAnalyzer<'a> {
                 Region::Sequence(out)
             }
             (a, b) => Region::Sequence(vec![a, b]),
+        }
+    }
+
+    fn multi_exit_region(head: Region, succs: &[usize], graph: &WorkingGraph) -> Region {
+        let mut exits = succs
+            .iter()
+            .filter_map(|succ| graph.node_entry(*succ))
+            .collect::<Vec<_>>();
+        exits.sort_unstable();
+        exits.dedup();
+        Region::MultiExit {
+            head: Box::new(head),
+            exits,
         }
     }
 
@@ -1860,6 +1864,16 @@ impl WorkingGraph {
 
     fn preds_len(&self, node: usize) -> usize {
         self.preds.get(&node).map_or(0, HashSet::len)
+    }
+
+    fn remove_edge(&mut self, from: usize, to: usize) {
+        if let Some(succs) = self.succs.get_mut(&from) {
+            succs.remove(&to);
+        }
+        if let Some(preds) = self.preds.get_mut(&to) {
+            preds.remove(&from);
+        }
+        self.edge_labels.remove(&(from, to));
     }
 
     fn collect_reachable_limited(
@@ -2236,6 +2250,7 @@ impl WorkingGraph {
                 internal_nodes,
                 &body_blocks,
                 Some(body_entry),
+                header,
             );
             return Region::WhileLoop {
                 header,
@@ -2254,6 +2269,7 @@ impl WorkingGraph {
                 internal_nodes,
                 &body_blocks,
                 Some(body_entry),
+                header,
             );
             return Region::WhileLoop {
                 header: guard_block,
@@ -2264,8 +2280,13 @@ impl WorkingGraph {
         let cond_block = analyzer
             .unique_loop_latch_condition_block(header, body)
             .unwrap_or(header);
-        let loop_body =
-            self.make_loop_body_region(analyzer, internal_nodes, &region_body, Some(header));
+        let loop_body = self.make_loop_body_region(
+            analyzer,
+            internal_nodes,
+            &region_body,
+            Some(header),
+            header,
+        );
         Region::DoWhileLoop {
             body: Box::new(loop_body),
             cond_block,
@@ -2278,6 +2299,7 @@ impl WorkingGraph {
         internal_nodes: &HashSet<usize>,
         body_blocks: &HashSet<u64>,
         start_block: Option<u64>,
+        loop_header: u64,
     ) -> Region {
         if body_blocks.is_empty() {
             return Region::Sequence(Vec::new());
@@ -2298,8 +2320,19 @@ impl WorkingGraph {
             return Region::Sequence(Vec::new());
         }
 
-        // Build a subgraph of just the relevant body nodes.
-        let sub = self.subgraph(&relevant_nodes);
+        // Build a subgraph of just the relevant body nodes. A loop region owns
+        // its natural backedges, so its body represents one iteration and must
+        // be analyzed without those edges. Keeping them here makes the body
+        // cyclic and forces the flat DFS fallback, which erases conditional
+        // continue regions.
+        let mut sub = self.subgraph(&relevant_nodes);
+        if let Some(header_node) = sub.node_for_block(loop_header) {
+            for source in analyzer.back_edges.get(&loop_header).into_iter().flatten() {
+                if let Some(source_node) = sub.node_for_block(*source) {
+                    sub.remove_edge(source_node, header_node);
+                }
+            }
+        }
 
         // Try structured composition via topological ordering.
         let entry = start_block.and_then(|b| sub.node_for_block(b));
@@ -2834,6 +2867,7 @@ mod tests {
                 *cond_block == expected || region_contains_dowhile_cond(body, expected)
             }
             Region::WhileLoop { body, .. } => region_contains_dowhile_cond(body, expected),
+            Region::MultiExit { head, .. } => region_contains_dowhile_cond(head, expected),
             Region::Sequence(regions) => regions
                 .iter()
                 .any(|region| region_contains_dowhile_cond(region, expected)),
@@ -2867,6 +2901,7 @@ mod tests {
             Region::WhileLoop { header, body } => {
                 *header == expected || region_contains_loop_entry(body, expected)
             }
+            Region::MultiExit { head, .. } => region_contains_loop_entry(head, expected),
             Region::Sequence(regions) => regions
                 .iter()
                 .any(|region| region_contains_loop_entry(region, expected)),
@@ -2892,12 +2927,83 @@ mod tests {
         }
     }
 
+    fn region_contains_cond_block(region: &Region, expected: u64) -> bool {
+        match region {
+            Region::IfThenElse {
+                cond_block,
+                then_region,
+                else_region,
+                ..
+            } => {
+                *cond_block == expected
+                    || region_contains_cond_block(then_region, expected)
+                    || else_region
+                        .as_deref()
+                        .is_some_and(|region| region_contains_cond_block(region, expected))
+            }
+            Region::WhileLoop { body, .. } | Region::DoWhileLoop { body, .. } => {
+                region_contains_cond_block(body, expected)
+            }
+            Region::MultiExit { head, .. } => region_contains_cond_block(head, expected),
+            Region::Sequence(regions) => regions
+                .iter()
+                .any(|region| region_contains_cond_block(region, expected)),
+            Region::Switch { cases, default, .. } => {
+                cases
+                    .iter()
+                    .any(|(_, region)| region_contains_cond_block(region, expected))
+                    || default
+                        .as_deref()
+                        .is_some_and(|region| region_contains_cond_block(region, expected))
+            }
+            Region::Block(_) | Region::Irreducible { .. } => false,
+        }
+    }
+
+    fn region_contains_multi_exit(
+        region: &Region,
+        expected_entry: u64,
+        expected_exits: &[u64],
+    ) -> bool {
+        match region {
+            Region::MultiExit { head, exits } => {
+                (head.entry() == expected_entry && exits == expected_exits)
+                    || region_contains_multi_exit(head, expected_entry, expected_exits)
+            }
+            Region::WhileLoop { body, .. } | Region::DoWhileLoop { body, .. } => {
+                region_contains_multi_exit(body, expected_entry, expected_exits)
+            }
+            Region::Sequence(regions) => regions
+                .iter()
+                .any(|region| region_contains_multi_exit(region, expected_entry, expected_exits)),
+            Region::IfThenElse {
+                then_region,
+                else_region,
+                ..
+            } => {
+                region_contains_multi_exit(then_region, expected_entry, expected_exits)
+                    || else_region.as_deref().is_some_and(|region| {
+                        region_contains_multi_exit(region, expected_entry, expected_exits)
+                    })
+            }
+            Region::Switch { cases, default, .. } => {
+                cases.iter().any(|(_, region)| {
+                    region_contains_multi_exit(region, expected_entry, expected_exits)
+                }) || default.as_deref().is_some_and(|region| {
+                    region_contains_multi_exit(region, expected_entry, expected_exits)
+                })
+            }
+            Region::Block(_) | Region::Irreducible { .. } => false,
+        }
+    }
+
     fn region_contains_irreducible_entry(region: &Region, expected: u64) -> bool {
         match region {
             Region::Irreducible { entry, .. } => *entry == expected,
             Region::WhileLoop { body, .. } | Region::DoWhileLoop { body, .. } => {
                 region_contains_irreducible_entry(body, expected)
             }
+            Region::MultiExit { head, .. } => region_contains_irreducible_entry(head, expected),
             Region::Sequence(regions) => regions
                 .iter()
                 .any(|region| region_contains_irreducible_entry(region, expected)),
@@ -3063,6 +3169,15 @@ mod tests {
         assert!(
             region_contains_loop_entry(&region, 0x4014e7),
             "inner string-match natural loop must survive in the region tree: {region:?}"
+        );
+        assert!(
+            region_contains_cond_block(&region, 0x4014a9)
+                && region_contains_cond_block(&region, 0x4014b9),
+            "outer-loop continue guards must survive body analysis: {region:?}"
+        );
+        assert!(
+            region_contains_multi_exit(&region, 0x4014e7, &[0x4014ef, 0x401500, 0x401508]),
+            "inner loop must retain every exact external continuation: {region:?}"
         );
 
         let ctx = FoldingContext::new(64);

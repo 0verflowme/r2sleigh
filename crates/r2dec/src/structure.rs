@@ -898,6 +898,14 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     cond,
                 }
             }
+            Region::MultiExit { head, exits } => {
+                self.safety_reason = Some(format!(
+                    "structured region at 0x{:x} has unlowered exits {:?}",
+                    head.entry(),
+                    exits
+                ));
+                CStmt::Empty
+            }
             Region::Switch {
                 switch_block,
                 cases,
@@ -1410,6 +1418,11 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     CStmt::Block(stmts)
                 })
             }
+            Region::MultiExit { head, .. } => head
+                .blocks()
+                .contains(&target)
+                .then(|| self.structure_region_suffix_from_target(head, target))
+                .flatten(),
             Region::Switch {
                 switch_block,
                 cases,
