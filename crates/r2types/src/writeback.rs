@@ -192,6 +192,7 @@ pub struct LocalStructArtifacts {
     pub struct_decls: Vec<StructDeclCandidate>,
     pub slot_type_overrides: HashMap<usize, String>,
     pub slot_field_profiles: HashMap<usize, BTreeMap<u64, String>>,
+    pub slot_element_strides: HashMap<usize, u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3756,11 +3757,14 @@ fn build_type_writeback_analysis_inner(
         input.ptr_bits,
     );
     let array_index_field_profiles = local_structs.slot_field_profiles.clone();
+    let indexed_local_struct_refinement_slots =
+        indexed_local_struct_refinement_slots(&local_structs, &signature_certificate_sources);
     prune_conflicting_local_struct_overrides(
         &merged_signature,
         &mut local_structs.struct_decls,
         &mut local_structs.slot_type_overrides,
         &mut local_structs.slot_field_profiles,
+        &indexed_local_struct_refinement_slots,
         &input.parsed_context.external_type_db,
         input.ptr_bits,
     );
@@ -3778,6 +3782,7 @@ fn build_type_writeback_analysis_inner(
     let merged_signature = merge_slot_type_overrides_into_signature(
         merged_signature,
         &local_structs.slot_type_overrides,
+        &indexed_local_struct_refinement_slots,
         &type_db,
         input.ptr_bits,
         role_hint_has_authoritative_empty_params,
@@ -3800,6 +3805,7 @@ fn build_type_writeback_analysis_inner(
         &input.parsed_context,
         &type_db,
         merged_signature.as_ref(),
+        &local_structs.slot_element_strides,
         if input.inferred_signature.arch.is_empty() {
             input.parsed_context.callconv.as_deref()
         } else {
@@ -4390,6 +4396,7 @@ pub fn build_semantic_type_fallback_plan(
     if let Some(merged_signature) = merge_slot_type_overrides_into_signature(
         inferred_signature_to_spec(&signature, ptr_bits),
         &local_structs.slot_type_overrides,
+        &HashSet::new(),
         &ExternalTypeDb::default(),
         ptr_bits,
         false,
@@ -4548,11 +4555,25 @@ pub fn apply_semantic_artifact_signature_hint_to_inferred(
     true
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct LocalAddrExpr {
     slot: usize,
     offset: i64,
+    index: Option<LocalIndexExpr>,
     confidence: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalIndexExpr {
+    root: SSAVar,
+    scale: i128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalAffineValue {
+    root: Option<SSAVar>,
+    scale: i128,
+    constant: i128,
 }
 
 #[derive(Debug, Clone)]
@@ -4564,8 +4585,8 @@ struct LocalStructInferenceBlock {
 
 #[derive(Default)]
 struct LocalTypeEquivalence {
-    ids: HashMap<String, usize>,
-    names: Vec<String>,
+    ids: HashMap<SSAVar, usize>,
+    vars: Vec<SSAVar>,
     parents: Vec<usize>,
     ranks: Vec<u8>,
 }
@@ -4575,13 +4596,12 @@ impl LocalTypeEquivalence {
         if var.is_const() {
             return None;
         }
-        let name = var.display_name().to_ascii_lowercase();
-        if let Some(id) = self.ids.get(&name).copied() {
+        if let Some(id) = self.ids.get(var).copied() {
             return Some(id);
         }
         let id = self.parents.len();
-        self.ids.insert(name.clone(), id);
-        self.names.push(name);
+        self.ids.insert(var.clone(), id);
+        self.vars.push(var.clone());
         self.parents.push(id);
         self.ranks.push(0);
         Some(id)
@@ -4659,6 +4679,7 @@ struct ScalarArrayInferenceCtx<'a> {
     merged_signature: Option<&'a FunctionSignatureSpec>,
     ptr_bits: u32,
     pointer_arg_slot_map: &'a HashMap<String, usize>,
+    local_element_strides: &'a HashMap<usize, u64>,
     pointer_values: &'a HashMap<String, ScalarPointerValue>,
     pointer_value_names: &'a HashMap<String, Option<ScalarPointerValue>>,
     array_addr_exprs: &'a HashMap<String, ScalarArrayAddrExpr>,
@@ -4776,7 +4797,7 @@ fn local_struct_type_slots(
     blocks: &[LocalStructInferenceBlock],
     pointer_arg_slot_map: &HashMap<String, usize>,
     ptr_bits: u32,
-) -> HashMap<String, usize> {
+) -> HashMap<SSAVar, usize> {
     let ptr_bytes = (ptr_bits / 8).max(1);
     let mut classes = LocalTypeEquivalence::default();
     let mut seeds = Vec::new();
@@ -4828,14 +4849,9 @@ fn local_struct_type_slots(
         let root = classes.find(id);
         slots_by_root.entry(root).or_default().insert(slot);
     }
-    let named_ids = classes
-        .names
-        .iter()
-        .cloned()
-        .enumerate()
-        .collect::<Vec<_>>();
+    let named_ids = classes.vars.iter().cloned().enumerate().collect::<Vec<_>>();
     let mut slots = HashMap::new();
-    for (id, name) in named_ids {
+    for (id, var) in named_ids {
         let root = classes.find(id);
         let Some(root_slots) = slots_by_root.get(&root) else {
             continue;
@@ -4843,7 +4859,7 @@ fn local_struct_type_slots(
         if root_slots.len() == 1
             && let Some(slot) = root_slots.first().copied()
         {
-            slots.insert(name, slot);
+            slots.insert(var, slot);
         }
     }
     slots
@@ -5050,6 +5066,145 @@ fn add_local_scalar_type_votes(
     }
 }
 
+fn combine_local_affine_values(
+    left: LocalAffineValue,
+    right: LocalAffineValue,
+    right_sign: i128,
+) -> Option<LocalAffineValue> {
+    let root = match (&left.root, &right.root) {
+        (Some(left), Some(right)) if left == right => Some(left.clone()),
+        (Some(left), None) => Some(left.clone()),
+        (None, Some(right)) => Some(right.clone()),
+        (None, None) => None,
+        _ => return None,
+    };
+    let scale = left
+        .scale
+        .checked_add(right.scale.checked_mul(right_sign)?)?;
+    let constant = left
+        .constant
+        .checked_add(right.constant.checked_mul(right_sign)?)?;
+    Some(LocalAffineValue {
+        root: (scale != 0).then_some(root).flatten(),
+        scale,
+        constant,
+    })
+}
+
+fn multiply_local_affine_value(
+    value: LocalAffineValue,
+    multiplier: i128,
+) -> Option<LocalAffineValue> {
+    Some(LocalAffineValue {
+        root: value.root,
+        scale: value.scale.checked_mul(multiplier)?,
+        constant: value.constant.checked_mul(multiplier)?,
+    })
+}
+
+fn local_affine_value(
+    var: &SSAVar,
+    definitions: &HashMap<SSAVar, SSAOp>,
+    ptr_bits: u32,
+    memo: &mut HashMap<SSAVar, Option<LocalAffineValue>>,
+    visiting: &mut HashSet<SSAVar>,
+) -> Option<LocalAffineValue> {
+    if let Some(value) = memo.get(var) {
+        return value.clone();
+    }
+    if let Some(constant) = parse_ssa_const_offset(&var.name, ptr_bits) {
+        return Some(LocalAffineValue {
+            root: None,
+            scale: 0,
+            constant: i128::from(constant),
+        });
+    }
+    if !visiting.insert(var.clone()) {
+        return None;
+    }
+    let result = (|| match definitions.get(var) {
+        None | Some(SSAOp::Load { .. }) | Some(SSAOp::Phi { .. }) => Some(LocalAffineValue {
+            root: Some(var.clone()),
+            scale: 1,
+            constant: 0,
+        }),
+        Some(
+            SSAOp::Copy { src, .. }
+            | SSAOp::Cast { src, .. }
+            | SSAOp::New { src, .. }
+            | SSAOp::IntZExt { src, .. }
+            | SSAOp::IntSExt { src, .. }
+            | SSAOp::Trunc { src, .. }
+            | SSAOp::Subpiece { src, .. },
+        ) => local_affine_value(src, definitions, ptr_bits, memo, visiting),
+        Some(SSAOp::IntNegate { src, .. }) => {
+            let value = local_affine_value(src, definitions, ptr_bits, memo, visiting)?;
+            multiply_local_affine_value(value, -1)
+        }
+        Some(SSAOp::IntAdd { a, b, .. }) => {
+            let left = local_affine_value(a, definitions, ptr_bits, memo, visiting)?;
+            let right = local_affine_value(b, definitions, ptr_bits, memo, visiting)?;
+            combine_local_affine_values(left, right, 1)
+        }
+        Some(SSAOp::IntSub { a, b, .. }) => {
+            let left = local_affine_value(a, definitions, ptr_bits, memo, visiting)?;
+            let right = local_affine_value(b, definitions, ptr_bits, memo, visiting)?;
+            combine_local_affine_values(left, right, -1)
+        }
+        Some(SSAOp::IntMult { a, b, .. }) => {
+            let left = local_affine_value(a, definitions, ptr_bits, memo, visiting)?;
+            let right = local_affine_value(b, definitions, ptr_bits, memo, visiting)?;
+            if left.root.is_none() && left.scale == 0 {
+                multiply_local_affine_value(right, left.constant)
+            } else if right.root.is_none() && right.scale == 0 {
+                multiply_local_affine_value(left, right.constant)
+            } else {
+                None
+            }
+        }
+        Some(SSAOp::IntLeft { a, b, .. }) => {
+            let shift = parse_ssa_const_offset(&b.name, ptr_bits)?;
+            let shift = u32::try_from(shift).ok()?;
+            let multiplier = 1i128.checked_shl(shift)?;
+            let value = local_affine_value(a, definitions, ptr_bits, memo, visiting)?;
+            multiply_local_affine_value(value, multiplier)
+        }
+        Some(_) => None,
+    })();
+    visiting.remove(var);
+    memo.insert(var.clone(), result.clone());
+    result
+}
+
+fn record_local_index_stride(
+    expr: &LocalAddrExpr,
+    access_size: u32,
+    evidence: &mut HashMap<usize, BTreeSet<u64>>,
+    diagnostics: &mut TypeWritebackDiagnostics,
+) -> bool {
+    let Some(index) = &expr.index else {
+        return true;
+    };
+    let Ok(stride) = u64::try_from(index.scale) else {
+        return false;
+    };
+    let Some(end_offset) = u64::try_from(expr.offset)
+        .ok()
+        .and_then(|offset| offset.checked_add(u64::from(access_size)))
+    else {
+        return false;
+    };
+    if stride == 0 || access_size == 0 || end_offset > stride {
+        diagnostics.warnings.push(format!(
+            "slot {} indexed access +0x{:x}/{} exceeds stride 0x{stride:x}",
+            expr.slot, expr.offset, access_size
+        ));
+        return false;
+    }
+    evidence.entry(expr.slot).or_default().insert(stride);
+    true
+}
+
 fn local_struct_inference_from_local_blocks(blocks: &[SSABlock]) -> Vec<LocalStructInferenceBlock> {
     blocks
         .iter()
@@ -5105,84 +5260,28 @@ fn infer_local_struct_artifacts_from_blocks(
     let pointer_pointee_types =
         local_pointer_pointee_types(ssa_blocks, ptr_bits, &scalar_signedness);
     let (_, stack_bases, frame_bases) = recover_vars_arch_profile(arch_name);
-    let mut addr_exprs: HashMap<String, LocalAddrExpr> = HashMap::new();
-    let mut stack_addr_offsets: HashMap<String, i64> = HashMap::new();
+    let mut addr_exprs: HashMap<SSAVar, LocalAddrExpr> = HashMap::new();
+    let mut stack_addr_offsets: HashMap<SSAVar, i64> = HashMap::new();
     let mut stack_slot_values: HashMap<(u64, i64), LocalAddrExpr> = HashMap::new();
     let mut slot_field_evidence: LocalFieldEvidenceMap = HashMap::new();
+    let mut slot_stride_evidence = HashMap::<usize, BTreeSet<u64>>::new();
     let offset_bound = 0x4000i64;
-    let block_ops: HashMap<u64, HashMap<String, SSAOp>> = ssa_blocks
+    let definitions = ssa_blocks
         .iter()
-        .map(|block| {
-            let ops = block
-                .ops
-                .iter()
-                .filter_map(|op| {
-                    op.dst()
-                        .map(|dst| (ssa_var_block_key(block.addr, dst), op.clone()))
-                })
-                .collect::<HashMap<_, _>>();
-            (block.addr, ops)
-        })
-        .collect();
-    fn is_scaled_index_like(
-        block_addr: u64,
-        var: &SSAVar,
-        ops_by_block: &HashMap<u64, HashMap<String, SSAOp>>,
-        addr_exprs: &HashMap<String, LocalAddrExpr>,
-        depth: u32,
-    ) -> bool {
-        if depth > 8 || var.is_const() {
-            return false;
-        }
-        let key = ssa_var_block_key(block_addr, var);
-        if addr_exprs.contains_key(&key) {
-            return false;
-        }
-        let Some(op) = ops_by_block.get(&block_addr).and_then(|ops| ops.get(&key)) else {
-            return true;
-        };
-        match op {
-            SSAOp::Copy { src, .. }
-            | SSAOp::Cast { src, .. }
-            | SSAOp::New { src, .. }
-            | SSAOp::IntZExt { src, .. }
-            | SSAOp::IntSExt { src, .. }
-            | SSAOp::Trunc { src, .. }
-            | SSAOp::Subpiece { src, .. } => {
-                is_scaled_index_like(block_addr, src, ops_by_block, addr_exprs, depth + 1)
-            }
-            SSAOp::IntMult { a, b, .. } => {
-                (parse_ssa_const_offset(&a.name, 64).is_some()
-                    && is_scaled_index_like(block_addr, b, ops_by_block, addr_exprs, depth + 1))
-                    || (parse_ssa_const_offset(&b.name, 64).is_some()
-                        && is_scaled_index_like(block_addr, a, ops_by_block, addr_exprs, depth + 1))
-            }
-            SSAOp::IntLeft { a, b, .. } => {
-                parse_ssa_const_offset(&b.name, 64).is_some()
-                    && is_scaled_index_like(block_addr, a, ops_by_block, addr_exprs, depth + 1)
-            }
-            SSAOp::IntSub { a, b, .. } => {
-                (parse_ssa_const_offset(&a.name, 64) == Some(0)
-                    && is_scaled_index_like(block_addr, b, ops_by_block, addr_exprs, depth + 1))
-                    || (is_scaled_index_like(block_addr, a, ops_by_block, addr_exprs, depth + 1)
-                        && is_scaled_index_like(block_addr, b, ops_by_block, addr_exprs, depth + 1))
-            }
-            SSAOp::Load { .. } | SSAOp::Phi { .. } => true,
-            _ => false,
-        }
-    }
+        .flat_map(|block| block.ops.iter())
+        .filter_map(|op| op.dst().map(|dst| (dst.clone(), op.clone())))
+        .collect::<HashMap<_, _>>();
+    let mut affine_memo = HashMap::<SSAVar, Option<LocalAffineValue>>::new();
 
     for block in ssa_blocks {
         let mut seed_var = |var: &SSAVar| {
-            let key = var.display_name().to_ascii_lowercase();
-            if let Some(slot) = type_slots.get(&key).copied() {
-                addr_exprs
-                    .entry(ssa_var_block_key(block.addr, var))
-                    .or_insert(LocalAddrExpr {
-                        slot,
-                        offset: 0,
-                        confidence: if var.version == 0 { 92 } else { 86 },
-                    });
+            if let Some(slot) = type_slots.get(var).copied() {
+                addr_exprs.entry(var.clone()).or_insert(LocalAddrExpr {
+                    slot,
+                    offset: 0,
+                    index: None,
+                    confidence: if var.version == 0 { 92 } else { 86 },
+                });
             }
         };
         for phi in &block.phis {
@@ -5201,49 +5300,49 @@ fn infer_local_struct_artifacts_from_blocks(
 
     let is_stack_base = |name: &str| stack_bases.contains(&name) || frame_bases.contains(&name);
 
-    for _ in 0..6 {
+    loop {
         let mut changed = false;
         for block in ssa_blocks {
             for op in &block.ops {
-                let addr_of = |var: &SSAVar, map: &HashMap<String, LocalAddrExpr>| {
+                let addr_of = |var: &SSAVar, map: &HashMap<SSAVar, LocalAddrExpr>| {
                     if var.version == 0 {
                         let key = var.name.to_ascii_lowercase();
                         if let Some(slot) = pointer_arg_slot_map.get(key.as_str()).copied() {
                             return Some(LocalAddrExpr {
                                 slot,
                                 offset: 0,
+                                index: None,
                                 confidence: 92,
                             });
                         }
                     }
-                    map.get(&ssa_var_block_key(block.addr, var)).copied()
+                    map.get(var).cloned()
                 };
-                let stack_slot_of = |var: &SSAVar, stack_map: &HashMap<String, i64>| {
-                    stack_map.get(&ssa_var_block_key(block.addr, var)).copied()
-                };
+                let stack_slot_of =
+                    |var: &SSAVar, stack_map: &HashMap<SSAVar, i64>| stack_map.get(var).copied();
                 let set_expr =
                     |dst: &SSAVar,
                      expr: LocalAddrExpr,
-                     map: &mut HashMap<String, LocalAddrExpr>| {
-                        let key = ssa_var_block_key(block.addr, dst);
-                        match map.get(&key).copied() {
+                     map: &mut HashMap<SSAVar, LocalAddrExpr>| {
+                        match map.get(dst) {
                             Some(prev) if prev.confidence >= expr.confidence => false,
                             _ => {
-                                map.insert(key, expr);
+                                map.insert(dst.clone(), expr);
                                 true
                             }
                         }
                     };
-                let set_stack_slot = |dst: &SSAVar, offset: i64, map: &mut HashMap<String, i64>| {
-                    let key = ssa_var_block_key(block.addr, dst);
-                    match map.get(&key).copied() {
+                let set_stack_slot =
+                    |dst: &SSAVar, offset: i64, map: &mut HashMap<SSAVar, i64>| match map
+                        .get(dst)
+                        .copied()
+                    {
                         Some(prev) if prev == offset => false,
                         _ => {
-                            map.insert(key, offset);
+                            map.insert(dst.clone(), offset);
                             true
                         }
-                    }
-                };
+                    };
 
                 match op {
                     SSAOp::Copy { dst, src }
@@ -5270,11 +5369,14 @@ fn infer_local_struct_artifacts_from_blocks(
                             selected = match selected {
                                 None => Some(expr),
                                 Some(prev)
-                                    if prev.slot == expr.slot && prev.offset == expr.offset =>
+                                    if prev.slot == expr.slot
+                                        && prev.offset == expr.offset
+                                        && prev.index == expr.index =>
                                 {
                                     Some(LocalAddrExpr {
                                         slot: prev.slot,
                                         offset: prev.offset,
+                                        index: prev.index,
                                         confidence: prev.confidence.max(expr.confidence),
                                     })
                                 }
@@ -5324,23 +5426,42 @@ fn infer_local_struct_artifacts_from_blocks(
                                     LocalAddrExpr {
                                         slot: base.slot,
                                         offset: off,
+                                        index: base.index,
                                         confidence: base.confidence.saturating_sub(1),
                                     },
                                     &mut addr_exprs,
                                 );
                             }
                         } else if let Some(base) = addr_of(a, &addr_exprs)
-                            && is_scaled_index_like(block.addr, b, &block_ops, &addr_exprs, 0)
+                            && base.index.is_none()
+                            && let Some(affine) = local_affine_value(
+                                b,
+                                &definitions,
+                                ptr_bits,
+                                &mut affine_memo,
+                                &mut HashSet::new(),
+                            )
+                            && let Some(root) = affine.root
+                            && affine.scale > 0
+                            && let (Ok(delta), Ok(scale)) =
+                                (i64::try_from(affine.constant), u64::try_from(affine.scale))
                         {
-                            changed |= set_expr(
-                                dst,
-                                LocalAddrExpr {
-                                    slot: base.slot,
-                                    offset: base.offset,
-                                    confidence: base.confidence.saturating_sub(4),
-                                },
-                                &mut addr_exprs,
-                            );
+                            let off = base.offset.saturating_add(delta);
+                            if (-offset_bound..=offset_bound).contains(&off) {
+                                changed |= set_expr(
+                                    dst,
+                                    LocalAddrExpr {
+                                        slot: base.slot,
+                                        offset: off,
+                                        index: Some(LocalIndexExpr {
+                                            root,
+                                            scale: i128::from(scale),
+                                        }),
+                                        confidence: base.confidence.saturating_sub(2),
+                                    },
+                                    &mut addr_exprs,
+                                );
+                            }
                         } else if let Some(base) = addr_of(b, &addr_exprs)
                             && let Some(delta) = parse_ssa_const_offset(&a.name, ptr_bits)
                         {
@@ -5351,23 +5472,42 @@ fn infer_local_struct_artifacts_from_blocks(
                                     LocalAddrExpr {
                                         slot: base.slot,
                                         offset: off,
+                                        index: base.index,
                                         confidence: base.confidence.saturating_sub(1),
                                     },
                                     &mut addr_exprs,
                                 );
                             }
                         } else if let Some(base) = addr_of(b, &addr_exprs)
-                            && is_scaled_index_like(block.addr, a, &block_ops, &addr_exprs, 0)
+                            && base.index.is_none()
+                            && let Some(affine) = local_affine_value(
+                                a,
+                                &definitions,
+                                ptr_bits,
+                                &mut affine_memo,
+                                &mut HashSet::new(),
+                            )
+                            && let Some(root) = affine.root
+                            && affine.scale > 0
+                            && let (Ok(delta), Ok(scale)) =
+                                (i64::try_from(affine.constant), u64::try_from(affine.scale))
                         {
-                            changed |= set_expr(
-                                dst,
-                                LocalAddrExpr {
-                                    slot: base.slot,
-                                    offset: base.offset,
-                                    confidence: base.confidence.saturating_sub(4),
-                                },
-                                &mut addr_exprs,
-                            );
+                            let off = base.offset.saturating_add(delta);
+                            if (-offset_bound..=offset_bound).contains(&off) {
+                                changed |= set_expr(
+                                    dst,
+                                    LocalAddrExpr {
+                                        slot: base.slot,
+                                        offset: off,
+                                        index: Some(LocalIndexExpr {
+                                            root,
+                                            scale: i128::from(scale),
+                                        }),
+                                        confidence: base.confidence.saturating_sub(2),
+                                    },
+                                    &mut addr_exprs,
+                                );
+                            }
                         }
                     }
                     SSAOp::IntSub { dst, a, b } => {
@@ -5391,23 +5531,44 @@ fn infer_local_struct_artifacts_from_blocks(
                                     LocalAddrExpr {
                                         slot: base.slot,
                                         offset: off,
+                                        index: base.index,
                                         confidence: base.confidence.saturating_sub(1),
                                     },
                                     &mut addr_exprs,
                                 );
                             }
                         } else if let Some(base) = addr_of(a, &addr_exprs)
-                            && is_scaled_index_like(block.addr, b, &block_ops, &addr_exprs, 0)
+                            && base.index.is_none()
+                            && let Some(affine) = local_affine_value(
+                                b,
+                                &definitions,
+                                ptr_bits,
+                                &mut affine_memo,
+                                &mut HashSet::new(),
+                            )
+                            && let Some(root) = affine.root
+                            && affine.scale < 0
+                            && let (Some(delta), Some(scale)) =
+                                (affine.constant.checked_neg(), affine.scale.checked_neg())
+                            && let (Ok(delta), Ok(scale)) =
+                                (i64::try_from(delta), u64::try_from(scale))
                         {
-                            changed |= set_expr(
-                                dst,
-                                LocalAddrExpr {
-                                    slot: base.slot,
-                                    offset: base.offset,
-                                    confidence: base.confidence.saturating_sub(4),
-                                },
-                                &mut addr_exprs,
-                            );
+                            let off = base.offset.saturating_add(delta);
+                            if (-offset_bound..=offset_bound).contains(&off) {
+                                changed |= set_expr(
+                                    dst,
+                                    LocalAddrExpr {
+                                        slot: base.slot,
+                                        offset: off,
+                                        index: Some(LocalIndexExpr {
+                                            root,
+                                            scale: i128::from(scale),
+                                        }),
+                                        confidence: base.confidence.saturating_sub(2),
+                                    },
+                                    &mut addr_exprs,
+                                );
+                            }
                         }
                     }
                     SSAOp::Store { addr, val, .. } => {
@@ -5416,7 +5577,7 @@ fn infer_local_struct_artifacts_from_blocks(
                         {
                             expr.confidence = expr.confidence.saturating_sub(2);
                             let key = (block.addr, offset);
-                            match stack_slot_values.get(&key).copied() {
+                            match stack_slot_values.get(&key).cloned() {
                                 Some(prev) if prev.confidence >= expr.confidence => {}
                                 _ => {
                                     stack_slot_values.insert(key, expr);
@@ -5428,7 +5589,7 @@ fn infer_local_struct_artifacts_from_blocks(
                     SSAOp::Load { dst, addr, .. } => {
                         if let Some(offset) = stack_slot_of(addr, &stack_addr_offsets)
                             && let Some(mut expr) =
-                                stack_slot_values.get(&(block.addr, offset)).copied()
+                                stack_slot_values.get(&(block.addr, offset)).cloned()
                         {
                             expr.confidence = expr.confidence.saturating_sub(3);
                             changed |= set_expr(dst, expr, &mut addr_exprs);
@@ -5452,22 +5613,29 @@ fn infer_local_struct_artifacts_from_blocks(
                         return Some(LocalAddrExpr {
                             slot,
                             offset: 0,
+                            index: None,
                             confidence: 92,
                         });
                     }
                 }
-                addr_exprs
-                    .get(&ssa_var_block_key(block.addr, addr))
-                    .copied()
+                addr_exprs.get(addr).cloned()
             };
             match op {
                 SSAOp::Load { dst, addr, .. } => {
                     if let Some(expr) = resolve_addr(addr)
                         && (0..=offset_bound).contains(&expr.offset)
                     {
-                        let recursive_pointer = addr_exprs
-                            .get(&ssa_var_block_key(block.addr, dst))
-                            .is_some_and(|value| value.slot == expr.slot && value.offset == 0);
+                        let recursive_pointer = addr_exprs.get(dst).is_some_and(|value| {
+                            value.slot == expr.slot && value.offset == 0 && value.index.is_none()
+                        });
+                        if !record_local_index_stride(
+                            &expr,
+                            dst.size,
+                            &mut slot_stride_evidence,
+                            diagnostics,
+                        ) {
+                            continue;
+                        }
                         let entry = slot_field_evidence
                             .entry(expr.slot)
                             .or_default()
@@ -5490,9 +5658,17 @@ fn infer_local_struct_artifacts_from_blocks(
                     if let Some(expr) = resolve_addr(addr)
                         && (0..=offset_bound).contains(&expr.offset)
                     {
-                        let recursive_pointer = addr_exprs
-                            .get(&ssa_var_block_key(block.addr, val))
-                            .is_some_and(|value| value.slot == expr.slot && value.offset == 0);
+                        let recursive_pointer = addr_exprs.get(val).is_some_and(|value| {
+                            value.slot == expr.slot && value.offset == 0 && value.index.is_none()
+                        });
+                        if !record_local_index_stride(
+                            &expr,
+                            val.size,
+                            &mut slot_stride_evidence,
+                            diagnostics,
+                        ) {
+                            continue;
+                        }
                         let entry = slot_field_evidence
                             .entry(expr.slot)
                             .or_default()
@@ -5519,6 +5695,7 @@ fn infer_local_struct_artifacts_from_blocks(
     let mut struct_decls = Vec::new();
     let mut slot_type_overrides = HashMap::new();
     let mut slot_field_profiles = HashMap::new();
+    let mut slot_element_strides = HashMap::new();
     let mut slots: Vec<usize> = slot_field_evidence.keys().copied().collect();
     slots.sort_unstable();
 
@@ -5530,6 +5707,19 @@ fn infer_local_struct_artifacts_from_blocks(
             continue;
         }
         let mut shape = String::new();
+        let element_stride = match slot_stride_evidence.get(&slot) {
+            Some(strides) if strides.len() == 1 => strides.first().copied(),
+            Some(strides) if !strides.is_empty() => {
+                diagnostics.conflicts.push(format!(
+                    "slot {slot} has conflicting indexed element strides {strides:?}"
+                ));
+                None
+            }
+            _ => None,
+        };
+        if let Some(stride) = element_stride {
+            shape.push_str(&format!("stride:{stride:x};"));
+        }
         let mut selected_fields = Vec::new();
         let mut confidence_acc = 0u32;
         for (offset, evidence) in fields_map {
@@ -5603,7 +5793,8 @@ fn infer_local_struct_artifacts_from_blocks(
             continue;
         }
         let avg_conf = (confidence_acc / selected_fields.len() as u32).clamp(1, 100) as u8;
-        let allow_single_field = selected_fields.len() == 1 && avg_conf >= 94;
+        let allow_single_field =
+            element_stride.is_none() && selected_fields.len() == 1 && avg_conf >= 94;
         if selected_fields.len() < 2 && !allow_single_field {
             continue;
         }
@@ -5623,7 +5814,12 @@ fn infer_local_struct_artifacts_from_blocks(
             .iter()
             .map(|field| (field.offset, field.field_type.clone()))
             .collect::<BTreeMap<_, _>>();
-        let Some(decl) = build_struct_decl(&struct_name, &fields, ptr_bits) else {
+        let Some(decl) =
+            build_struct_decl_with_size(&struct_name, &fields, ptr_bits, element_stride)
+        else {
+            diagnostics.conflicts.push(format!(
+                "slot {slot} inferred fields exceed indexed element stride {element_stride:?}"
+            ));
             continue;
         };
         struct_decls.push(StructDeclCandidate {
@@ -5635,12 +5831,16 @@ fn infer_local_struct_artifacts_from_blocks(
         });
         slot_field_profiles.insert(slot, normalized_fields);
         slot_type_overrides.insert(slot, format!("struct {struct_name} *"));
+        if let Some(stride) = element_stride {
+            slot_element_strides.insert(slot, stride);
+        }
     }
 
     LocalStructArtifacts {
         struct_decls,
         slot_type_overrides,
         slot_field_profiles,
+        slot_element_strides,
     }
 }
 
@@ -5722,6 +5922,7 @@ fn scalar_array_access_certificates_from_ssa(
     parsed_context: &ParsedExternalContext,
     type_db: &ExternalTypeDb,
     merged_signature: Option<&FunctionSignatureSpec>,
+    local_element_strides: &HashMap<usize, u64>,
     arch_name: Option<&str>,
     ptr_bits: u32,
 ) -> ScalarArrayAccessCertificates {
@@ -5782,6 +5983,7 @@ fn scalar_array_access_certificates_from_ssa(
                             merged_signature,
                             ptr_bits,
                             pointer_arg_slot_map: &pointer_arg_slot_map,
+                            local_element_strides,
                             pointer_values: &pointer_values,
                             pointer_value_names: &pointer_value_names,
                             array_addr_exprs: &array_addr_exprs,
@@ -5840,6 +6042,7 @@ fn scalar_array_access_certificates_from_ssa(
                             merged_signature,
                             ptr_bits,
                             pointer_arg_slot_map: &pointer_arg_slot_map,
+                            local_element_strides,
                             pointer_values: &pointer_values,
                             pointer_value_names: &pointer_value_names,
                             array_addr_exprs: &array_addr_exprs,
@@ -5907,6 +6110,7 @@ fn scalar_array_access_certificates_from_ssa(
                                 merged_signature,
                                 ptr_bits,
                                 pointer_arg_slot_map: &pointer_arg_slot_map,
+                                local_element_strides,
                                 pointer_values: &pointer_values,
                                 pointer_value_names: &pointer_value_names,
                                 array_addr_exprs: &array_addr_exprs,
@@ -5934,6 +6138,7 @@ fn scalar_array_access_certificates_from_ssa(
                                 merged_signature,
                                 ptr_bits,
                                 pointer_arg_slot_map: &pointer_arg_slot_map,
+                                local_element_strides,
                                 pointer_values: &pointer_values,
                                 pointer_value_names: &pointer_value_names,
                                 array_addr_exprs: &array_addr_exprs,
@@ -5975,6 +6180,7 @@ fn scalar_array_access_certificates_from_ssa(
                                 merged_signature,
                                 ptr_bits,
                                 pointer_arg_slot_map: &pointer_arg_slot_map,
+                                local_element_strides,
                                 pointer_values: &pointer_values,
                                 pointer_value_names: &pointer_value_names,
                                 array_addr_exprs: &array_addr_exprs,
@@ -6015,6 +6221,7 @@ fn scalar_array_access_certificates_from_ssa(
                                 merged_signature,
                                 ptr_bits,
                                 pointer_arg_slot_map: &pointer_arg_slot_map,
+                                local_element_strides,
                                 pointer_values: &pointer_values,
                                 pointer_value_names: &pointer_value_names,
                                 array_addr_exprs: &array_addr_exprs,
@@ -6080,6 +6287,7 @@ fn scalar_array_access_certificates_from_ssa(
                                 merged_signature,
                                 ptr_bits,
                                 pointer_arg_slot_map: &pointer_arg_slot_map,
+                                local_element_strides,
                                 pointer_values: &pointer_values,
                                 pointer_value_names: &pointer_value_names,
                                 array_addr_exprs: &array_addr_exprs,
@@ -6131,6 +6339,7 @@ fn scalar_array_access_certificates_from_ssa(
                         merged_signature,
                         ptr_bits,
                         pointer_arg_slot_map: &pointer_arg_slot_map,
+                        local_element_strides,
                         pointer_values: &pointer_values,
                         pointer_value_names: &pointer_value_names,
                         array_addr_exprs: &array_addr_exprs,
@@ -6179,6 +6388,7 @@ fn scalar_array_access_certificates_from_ssa(
                         merged_signature,
                         ptr_bits,
                         pointer_arg_slot_map: &pointer_arg_slot_map,
+                        local_element_strides,
                         pointer_values: &pointer_values,
                         pointer_value_names: &pointer_value_names,
                         array_addr_exprs: &array_addr_exprs,
@@ -6435,18 +6645,23 @@ fn scalar_pointer_value_for_var(
                 .is_some_and(|ops| ops.contains_key(&ssa_var_block_key(block_addr, var)));
         if var.version == 0 || !has_local_def {
             let element_stride = ctx
-                .parsed_context
-                .register_params
-                .iter()
-                .find(|param| param.reg.eq_ignore_ascii_case(&var.name))
-                .and_then(|param| param.ty.as_ref())
-                .into_iter()
-                .chain(
-                    ctx.merged_signature
-                        .and_then(|signature| signature.params.get(param_index))
-                        .and_then(|param| param.ty.as_ref()),
-                )
-                .find_map(|ty| pointer_element_stride(ty, ctx.type_db, ctx.ptr_bits));
+                .local_element_strides
+                .get(&param_index)
+                .copied()
+                .or_else(|| {
+                    ctx.parsed_context
+                        .register_params
+                        .iter()
+                        .find(|param| param.reg.eq_ignore_ascii_case(&var.name))
+                        .and_then(|param| param.ty.as_ref())
+                        .into_iter()
+                        .chain(
+                            ctx.merged_signature
+                                .and_then(|signature| signature.params.get(param_index))
+                                .and_then(|param| param.ty.as_ref()),
+                        )
+                        .find_map(|ty| pointer_element_stride(ty, ctx.type_db, ctx.ptr_bits))
+                });
             if let Some(element_stride) = element_stride {
                 return Some(ScalarPointerValue {
                     slot: param_index,
@@ -7184,18 +7399,24 @@ fn aggregate_stride_for_slot(
     ptr_bits: u32,
 ) -> Option<u64> {
     local_structs
-        .slot_type_overrides
+        .slot_element_strides
         .get(&slot)
-        .into_iter()
-        .flat_map(|raw_ty| aggregate_pointee_type_names_from_str(raw_ty, ptr_bits))
-        .chain(
-            merged_signature
-                .and_then(|signature| signature.params.get(slot))
-                .and_then(|param| param.ty.as_ref())
+        .copied()
+        .or_else(|| {
+            local_structs
+                .slot_type_overrides
+                .get(&slot)
                 .into_iter()
-                .flat_map(aggregate_pointee_type_names_from_type),
-        )
-        .find_map(|name| external_aggregate_size(type_db, &name, ptr_bits))
+                .flat_map(|raw_ty| aggregate_pointee_type_names_from_str(raw_ty, ptr_bits))
+                .chain(
+                    merged_signature
+                        .and_then(|signature| signature.params.get(slot))
+                        .and_then(|param| param.ty.as_ref())
+                        .into_iter()
+                        .flat_map(aggregate_pointee_type_names_from_type),
+                )
+                .find_map(|name| external_aggregate_size(type_db, &name, ptr_bits))
+        })
 }
 
 fn aggregate_pointee_type_names_from_str(raw_ty: &str, ptr_bits: u32) -> Vec<String> {
@@ -8844,9 +9065,24 @@ fn signature_param_allows_local_struct_override(
         )
 }
 
+fn indexed_local_struct_refinement_slots(
+    local_structs: &LocalStructArtifacts,
+    signature_sources: &[SignatureCertificateSource],
+) -> HashSet<usize> {
+    if signature_sources.is_empty()
+        || signature_sources
+            .iter()
+            .any(|source| *source != SignatureCertificateSource::LocalInference)
+    {
+        return HashSet::new();
+    }
+    local_structs.slot_element_strides.keys().copied().collect()
+}
+
 fn merge_slot_type_overrides_into_signature(
     mut signature: Option<FunctionSignatureSpec>,
     slot_type_overrides: &HashMap<usize, String>,
+    indexed_local_struct_refinement_slots: &HashSet<usize>,
     type_db: &ExternalTypeDb,
     ptr_bits: u32,
     preserve_param_count: bool,
@@ -8875,12 +9111,13 @@ fn merge_slot_type_overrides_into_signature(
             continue;
         };
         let param = &mut sig.params[*slot];
-        if !signature_param_blocks_generated_local_struct_override(
-            Some(param),
-            raw_ty,
-            type_db,
-            ptr_bits,
-        ) && signature_param_allows_local_struct_override(Some(param), ptr_bits)
+        if indexed_local_struct_refinement_slots.contains(slot)
+            || (!signature_param_blocks_generated_local_struct_override(
+                Some(param),
+                raw_ty,
+                type_db,
+                ptr_bits,
+            ) && signature_param_allows_local_struct_override(Some(param), ptr_bits))
         {
             param.ty = Some(parsed);
         }
@@ -9129,19 +9366,21 @@ fn prune_conflicting_local_struct_overrides(
     struct_decls: &mut Vec<StructDeclCandidate>,
     slot_type_overrides: &mut HashMap<usize, String>,
     slot_field_profiles: &mut HashMap<usize, BTreeMap<u64, String>>,
+    indexed_local_struct_refinement_slots: &HashSet<usize>,
     type_db: &ExternalTypeDb,
     ptr_bits: u32,
 ) {
     let blocked_slots = slot_type_overrides
         .iter()
         .filter_map(|(slot, raw_ty)| {
-            signature_param_blocks_local_struct_override(
-                merged_signature,
-                *slot,
-                raw_ty,
-                type_db,
-                ptr_bits,
-            )
+            (!indexed_local_struct_refinement_slots.contains(slot)
+                && signature_param_blocks_local_struct_override(
+                    merged_signature,
+                    *slot,
+                    raw_ty,
+                    type_db,
+                    ptr_bits,
+                ))
             .then_some(*slot)
         })
         .collect::<Vec<_>>();
@@ -9892,6 +10131,15 @@ fn build_struct_decl(
     fields: &[StructFieldCandidate],
     ptr_bits: u32,
 ) -> Option<String> {
+    build_struct_decl_with_size(struct_name, fields, ptr_bits, None)
+}
+
+fn build_struct_decl_with_size(
+    struct_name: &str,
+    fields: &[StructFieldCandidate],
+    ptr_bits: u32,
+    exact_size: Option<u64>,
+) -> Option<String> {
     if fields.is_empty() {
         return None;
     }
@@ -9910,6 +10158,15 @@ fn build_struct_decl(
         let field_type = normalize_external_type_name(&field.field_type);
         lines.push(format!("    {} {};", field_type, field.name));
         cursor = cursor.saturating_add(estimate_c_type_size_bytes(&field_type, ptr_bits));
+    }
+    if let Some(exact_size) = exact_size {
+        if cursor > exact_size {
+            return None;
+        }
+        if cursor < exact_size {
+            let gap = exact_size - cursor;
+            lines.push(format!("    uint8_t _pad_{cursor:x}[{gap}];"));
+        }
     }
 
     let body = lines.join("\n");
@@ -11522,6 +11779,7 @@ mod tests {
         let right = SSAVar::new("right_ptr", 1, 8);
         let parsed_context = ParsedExternalContext::default();
         let pointer_arg_slot_map = HashMap::new();
+        let local_element_strides = HashMap::new();
         let mut pointer_values = HashMap::new();
         let pointer_value_names = HashMap::new();
         let array_addr_exprs = HashMap::new();
@@ -11549,6 +11807,7 @@ mod tests {
             merged_signature: None,
             ptr_bits: 64,
             pointer_arg_slot_map: &pointer_arg_slot_map,
+            local_element_strides: &local_element_strides,
             pointer_values: &pointer_values,
             pointer_value_names: &pointer_value_names,
             array_addr_exprs: &array_addr_exprs,
@@ -15327,6 +15586,7 @@ mod tests {
                     (8u64, "struct node *".to_string()),
                 ]),
             )]),
+            slot_element_strides: HashMap::new(),
         };
         let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
             function_name: "sym.f",
@@ -15445,6 +15705,7 @@ mod tests {
                     (0x34u64, "int32_t".to_string()),
                 ]),
             )]),
+            slot_element_strides: HashMap::new(),
         };
         let ssa_blocks = [SSABlock {
             addr: 0x401000,
@@ -15598,6 +15859,7 @@ mod tests {
                     (0x34u64, "int32_t".to_string()),
                 ]),
             )]),
+            slot_element_strides: HashMap::new(),
         };
 
         let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
@@ -15740,6 +16002,7 @@ mod tests {
                     (12u64, "int32_t".to_string()),
                 ]),
             )]),
+            slot_element_strides: HashMap::new(),
         };
 
         let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
@@ -15904,6 +16167,7 @@ mod tests {
                     (52u64, "int32_t".to_string()),
                 ]),
             )]),
+            slot_element_strides: HashMap::new(),
         };
 
         let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
@@ -15949,6 +16213,63 @@ mod tests {
                 "sla_struct_deadbeef".to_string(),
             ))))
         );
+    }
+
+    #[test]
+    fn indexed_local_struct_refinement_respects_signature_provenance() {
+        let local_structs = LocalStructArtifacts {
+            slot_type_overrides: HashMap::from([(0, "struct sla_struct_deadbeef *".to_string())]),
+            slot_element_strides: HashMap::from([(0, 40)]),
+            ..LocalStructArtifacts::default()
+        };
+        let signature = FunctionSignatureSpec {
+            ret_type: Some(CTypeLike::Int {
+                bits: 32,
+                signedness: Signedness::Signed,
+            }),
+            params: vec![FunctionParamSpec {
+                name: "arg0".to_string(),
+                ty: Some(CTypeLike::Pointer(Box::new(CTypeLike::Int {
+                    bits: 32,
+                    signedness: Signedness::Signed,
+                }))),
+            }],
+        };
+        let local_slots = indexed_local_struct_refinement_slots(
+            &local_structs,
+            &[SignatureCertificateSource::LocalInference],
+        );
+        let external_slots = indexed_local_struct_refinement_slots(
+            &local_structs,
+            &[SignatureCertificateSource::ExternalContext],
+        );
+
+        let locally_refined = merge_slot_type_overrides_into_signature(
+            Some(signature.clone()),
+            &local_structs.slot_type_overrides,
+            &local_slots,
+            &ExternalTypeDb::default(),
+            64,
+            false,
+        )
+        .expect("local signature");
+        let externally_protected = merge_slot_type_overrides_into_signature(
+            Some(signature.clone()),
+            &local_structs.slot_type_overrides,
+            &external_slots,
+            &ExternalTypeDb::default(),
+            64,
+            false,
+        )
+        .expect("external signature");
+
+        assert_eq!(
+            locally_refined.params[0].ty,
+            Some(CTypeLike::Pointer(Box::new(CTypeLike::Struct(
+                "sla_struct_deadbeef".to_string(),
+            ))))
+        );
+        assert_eq!(externally_protected, signature);
     }
 
     #[test]
@@ -17904,6 +18225,7 @@ mod tests {
                 1usize,
                 BTreeMap::from([(0u64, "int32_t".to_string()), (8u64, "int32_t".to_string())]),
             )]),
+            slot_element_strides: HashMap::new(),
         };
 
         let analysis = build_type_writeback_analysis_with_role_identity(
@@ -17988,6 +18310,7 @@ mod tests {
                     (52u64, "int32_t".to_string()),
                 ]),
             )]),
+            slot_element_strides: HashMap::new(),
         };
 
         let analysis = build_type_writeback_analysis_with_role_identity(
@@ -18053,6 +18376,7 @@ mod tests {
                 2usize,
                 BTreeMap::from([(0u64, "int32_t".to_string())]),
             )]),
+            slot_element_strides: HashMap::new(),
         };
 
         let analysis = build_type_writeback_analysis_with_role_identity(
@@ -18984,12 +19308,192 @@ mod tests {
             BTreeMap::from([(8, "int32_t".to_string()), (0x34, "int32_t".to_string())]),
             "diagnostics={diagnostics:?}"
         );
+        let override_ty = local_structs
+            .slot_type_overrides
+            .get(&0)
+            .expect("indexed aggregate type override");
+        assert!(
+            override_ty.starts_with("struct sla_struct_") && override_ty.ends_with(" *"),
+            "{override_ty}"
+        );
+        assert_eq!(local_structs.slot_element_strides.get(&0), Some(&56));
+    }
+
+    #[test]
+    fn local_struct_inference_preserves_aarch64_index_stride_across_blocks() {
+        let element = SSAVar::new("X8", 2, 8);
+        let score_addr = SSAVar::new("score_addr", 1, 8);
+        let ssa_blocks = [
+            SSABlock {
+                addr: 0x1000004a8,
+                size: 28,
+                ops: vec![
+                    SSAOp::IntSExt {
+                        dst: SSAVar::new("idx64", 1, 8),
+                        src: SSAVar::new("W1", 0, 4),
+                    },
+                    SSAOp::IntMult {
+                        dst: SSAVar::new("scaled", 1, 8),
+                        a: SSAVar::new("idx64", 1, 8),
+                        b: SSAVar::constant(0x28, 8),
+                    },
+                    SSAOp::IntAdd {
+                        dst: element.clone(),
+                        a: SSAVar::new("X0", 0, 8),
+                        b: SSAVar::new("scaled", 1, 8),
+                    },
+                    SSAOp::IntAdd {
+                        dst: score_addr.clone(),
+                        a: element.clone(),
+                        b: SSAVar::constant(0x10, 8),
+                    },
+                    SSAOp::Load {
+                        dst: SSAVar::new("score", 1, 4),
+                        space: "ram".to_string(),
+                        addr: score_addr.clone(),
+                    },
+                    SSAOp::Store {
+                        space: "ram".to_string(),
+                        addr: score_addr,
+                        val: SSAVar::new("W2", 0, 4),
+                    },
+                    SSAOp::IntAdd {
+                        dst: SSAVar::new("flags_addr", 1, 8),
+                        a: element.clone(),
+                        b: SSAVar::constant(4, 8),
+                    },
+                    SSAOp::Load {
+                        dst: SSAVar::new("flags", 1, 2),
+                        space: "ram".to_string(),
+                        addr: SSAVar::new("flags_addr", 1, 8),
+                    },
+                ],
+            },
+            SSABlock {
+                addr: 0x1000004c4,
+                size: 16,
+                ops: vec![
+                    SSAOp::IntAdd {
+                        dst: SSAVar::new("scores0_addr", 1, 8),
+                        a: element.clone(),
+                        b: SSAVar::constant(8, 8),
+                    },
+                    SSAOp::Load {
+                        dst: SSAVar::new("scores0", 1, 4),
+                        space: "ram".to_string(),
+                        addr: SSAVar::new("scores0_addr", 1, 8),
+                    },
+                    SSAOp::IntAdd {
+                        dst: SSAVar::new("len_addr", 1, 8),
+                        a: element.clone(),
+                        b: SSAVar::constant(6, 8),
+                    },
+                    SSAOp::Load {
+                        dst: SSAVar::new("len", 1, 2),
+                        space: "ram".to_string(),
+                        addr: SSAVar::new("len_addr", 1, 8),
+                    },
+                ],
+            },
+            SSABlock {
+                addr: 0x1000004d4,
+                size: 4,
+                ops: vec![SSAOp::Load {
+                    dst: SSAVar::new("id", 1, 4),
+                    space: "ram".to_string(),
+                    addr: element,
+                }],
+            },
+        ];
+        let mut diagnostics = TypeWritebackDiagnostics::default();
+
+        let local_structs = infer_local_struct_artifacts_from_ssa(
+            &ssa_blocks,
+            Some("aarch64"),
+            64,
+            &mut diagnostics,
+        );
+
+        let profile = local_structs
+            .slot_field_profiles
+            .get(&0)
+            .expect("indexed Item profile");
         assert_eq!(
+            profile.keys().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from([0, 4, 6, 8, 0x10]),
+            "diagnostics={diagnostics:?}"
+        );
+        assert_eq!(local_structs.slot_element_strides.get(&0), Some(&40));
+        assert!(
             local_structs
-                .slot_type_overrides
-                .get(&0)
-                .map(String::as_str),
-            Some("struct sla_struct_420703e08f70f00e *")
+                .struct_decls
+                .iter()
+                .any(|decl| decl.decl.contains("uint8_t _pad_14[20];")),
+            "generated Item declaration must preserve sizeof(Item)=40"
+        );
+
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "sym.struct_nested_array",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "sym.struct_nested_array".to_string(),
+                signature:
+                    "int32_t sym.struct_nested_array(int32_t *arg0, int32_t arg1, int32_t arg2)"
+                        .to_string(),
+                ret_type: "int32_t".to_string(),
+                params: vec![
+                    InferredSignatureParam {
+                        name: "arg0".to_string(),
+                        param_type: "int32_t *".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "arg1".to_string(),
+                        param_type: "int32_t".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "arg2".to_string(),
+                        param_type: "int32_t".to_string(),
+                    },
+                ],
+                callconv: "aarch64".to_string(),
+                arch: "aarch64".to_string(),
+                confidence: 90,
+                callconv_confidence: 90,
+            },
+            recovered_vars: &[],
+            ssa_blocks: &ssa_blocks,
+            parsed_context: ParsedExternalContext::default(),
+            local_structs,
+            interproc_summary_set: None,
+            diagnostics,
+        });
+
+        assert!(
+            analysis.signature.params[0]
+                .param_type
+                .starts_with("struct sla_struct_"),
+            "locally inferred int32_t* must refine to the certified indexed aggregate: {}",
+            analysis.signature.params[0].param_type
+        );
+        assert!(
+            analysis
+                .type_facts
+                .array_index_certificates
+                .iter()
+                .any(|cert| cert.element_stride == 40 && cert.field_offset == 0x10),
+            "{:?}",
+            analysis.type_facts.array_index_certificates
+        );
+        assert!(
+            analysis
+                .type_facts
+                .scalar_array_render_candidates
+                .iter()
+                .any(|candidate| {
+                    candidate.element_stride == 40 && candidate.field_offset == 0x10
+                }),
+            "{:?}",
+            analysis.type_facts.scalar_array_render_candidates
         );
     }
 
