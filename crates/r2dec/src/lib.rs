@@ -1408,6 +1408,7 @@ fn certifying_render_residual_reason_with_transfer_proofs(
     if render_proofs.is_some()
         && let Some(reason) = certified_control_transfer_residual_reason(
             func,
+            prepared,
             control_facts,
             transfer_proofs.unwrap_or_default(),
         )
@@ -1438,25 +1439,36 @@ struct RenderedControlTransfer {
 
 fn certified_control_transfer_residual_reason(
     func: &CFunction,
+    prepared: Option<&r2ssa::SsaArtifact>,
     control_facts: Option<&r2types::FunctionControlFacts>,
     proofs: &[ControlTransferRenderProof],
 ) -> Option<String> {
     let mut rendered = Vec::new();
+    let mut rendered_labels = BTreeMap::new();
     for (index, stmt) in func.body.iter().enumerate() {
         collect_rendered_control_transfers(stmt, RenderNodeId::root_child(index), &mut rendered);
+        collect_rendered_labels(stmt, &mut rendered_labels);
     }
     for (index, transfer) in rendered.iter().enumerate() {
         let Some(proof) = proofs.get(index) else {
             return Some(unproved_control_transfer_reason(transfer));
         };
-        if let Some(reason) = validate_control_transfer_proof(transfer, proof, control_facts) {
+        if let Some(reason) = validate_control_transfer_proof(
+            transfer,
+            proof,
+            prepared,
+            control_facts,
+            &rendered_labels,
+        ) {
             return Some(reason);
         }
     }
     if let Some(proof) = proofs.get(rendered.len()) {
         return Some(format!(
             "control transfer proof {:?} for 0x{:x} -> 0x{:x} was not rendered",
-            proof.kind, proof.source, proof.target
+            proof.kind(),
+            proof.source(),
+            proof.target()
         ));
     }
     for (index, stmt) in func.body.iter().enumerate() {
@@ -1539,6 +1551,58 @@ fn collect_rendered_control_transfer_stmts(
     }
 }
 
+fn collect_rendered_labels(stmt: &CStmt, out: &mut BTreeMap<String, usize>) {
+    match stmt {
+        CStmt::Label(label) => {
+            *out.entry(label.clone()).or_default() += 1;
+        }
+        CStmt::Block(stmts) => {
+            for stmt in stmts {
+                collect_rendered_labels(stmt, out);
+            }
+        }
+        CStmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            collect_rendered_labels(then_body, out);
+            if let Some(else_body) = else_body {
+                collect_rendered_labels(else_body, out);
+            }
+        }
+        CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
+            collect_rendered_labels(body, out);
+        }
+        CStmt::For { init, body, .. } => {
+            if let Some(init) = init {
+                collect_rendered_labels(init, out);
+            }
+            collect_rendered_labels(body, out);
+        }
+        CStmt::Switch { cases, default, .. } => {
+            for case in cases {
+                for stmt in &case.body {
+                    collect_rendered_labels(stmt, out);
+                }
+            }
+            if let Some(default) = default {
+                for stmt in default {
+                    collect_rendered_labels(stmt, out);
+                }
+            }
+        }
+        CStmt::Expr(_)
+        | CStmt::Decl { .. }
+        | CStmt::Return(_)
+        | CStmt::Break
+        | CStmt::Continue
+        | CStmt::Goto(_)
+        | CStmt::Empty
+        | CStmt::Comment(_) => {}
+    }
+}
+
 fn unproved_control_transfer_reason(transfer: &RenderedControlTransfer) -> String {
     match transfer.kind {
         RenderedControlTransferKind::Break => format!(
@@ -1560,21 +1624,26 @@ fn unproved_control_transfer_reason(transfer: &RenderedControlTransfer) -> Strin
 fn validate_control_transfer_proof(
     transfer: &RenderedControlTransfer,
     proof: &ControlTransferRenderProof,
+    prepared: Option<&r2ssa::SsaArtifact>,
     control_facts: Option<&r2types::FunctionControlFacts>,
+    rendered_labels: &BTreeMap<String, usize>,
 ) -> Option<String> {
     let expected = match transfer.kind {
         RenderedControlTransferKind::Break => ControlTransferRenderProofKind::Break,
         RenderedControlTransferKind::Continue => ControlTransferRenderProofKind::Continue,
-        RenderedControlTransferKind::Goto => {
-            return Some(unproved_control_transfer_reason(transfer));
-        }
+        RenderedControlTransferKind::Goto => ControlTransferRenderProofKind::Goto,
     };
-    if proof.kind != expected {
+    if proof.kind() != expected {
         return Some(format!(
             "control transfer at {} has {:?} proof for rendered {:?}",
-            transfer.id, proof.kind, transfer.kind
+            transfer.id,
+            proof.kind(),
+            transfer.kind
         ));
     }
+    let loop_header = proof.loop_header();
+    let source = proof.source();
+    let target = proof.target();
     let Some(control_facts) = control_facts else {
         return Some(format!(
             "control transfer at {} lacks FunctionControlFacts",
@@ -1584,39 +1653,120 @@ fn validate_control_transfer_proof(
     let Some(loop_fact) = control_facts
         .loops
         .values()
-        .find(|fact| fact.header == proof.loop_header)
+        .find(|fact| fact.header == loop_header)
     else {
         return Some(format!(
             "control transfer at {} has no loop certificate for 0x{:x}",
-            transfer.id, proof.loop_header
+            transfer.id, loop_header
         ));
     };
-    let Some(branch) = control_facts.branch_for_block(proof.source) else {
+    let Some(branch) = control_facts.branch_for_block(source) else {
         return Some(format!(
             "control transfer at {} has no certified branch at 0x{:x}",
-            transfer.id, proof.source
+            transfer.id, source
         ));
     };
-    if branch.true_target != proof.target && branch.false_target != proof.target {
+    if branch.true_target != target && branch.false_target != target {
         return Some(format!(
             "control transfer at {} target 0x{:x} is not a certified edge from 0x{:x}",
-            transfer.id, proof.target, proof.source
+            transfer.id, target, source
         ));
     }
-    let valid_loop_edge = match proof.kind {
-        ControlTransferRenderProofKind::Break => {
-            loop_fact.body.contains(&proof.source) && loop_fact.exits.contains(&proof.target)
+    let valid_loop_edge = match proof.kind() {
+        ControlTransferRenderProofKind::Break | ControlTransferRenderProofKind::Goto => {
+            loop_fact.body.contains(&source) && loop_fact.exits.contains(&target)
         }
         ControlTransferRenderProofKind::Continue => {
-            proof.target == loop_fact.header && loop_fact.latches.contains(&proof.source)
+            target == loop_fact.header && loop_fact.latches.contains(&source)
         }
     };
     (!valid_loop_edge).then(|| {
         format!(
             "control transfer at {} edge 0x{:x} -> 0x{:x} disagrees with loop certificate {}",
-            transfer.id, proof.source, proof.target, loop_fact.proof_node
+            transfer.id, source, target, loop_fact.proof_node
         )
+    })?;
+    if let ControlTransferRenderProof::Goto {
+        lowered_target,
+        path,
+        label,
+        ..
+    } = proof
+    {
+        if transfer.label.as_deref() != Some(label) {
+            return Some(format!(
+                "control transfer at {} label {:?} disagrees with proof label {label}",
+                transfer.id, transfer.label
+            ));
+        }
+        if rendered_labels.get(label).copied() != Some(1) {
+            return Some(format!(
+                "control transfer at {} targets label {label} rendered {} time(s)",
+                transfer.id,
+                rendered_labels.get(label).copied().unwrap_or(0)
+            ));
+        }
+        let Some(prepared) = prepared else {
+            return Some(format!(
+                "control transfer at {} lacks prepared SSA for goto path proof",
+                transfer.id
+            ));
+        };
+        if !transparent_transfer_path_is_exact(prepared.function(), target, *lowered_target, path) {
+            return Some(format!(
+                "control transfer at {} has invalid transparent path {:?}",
+                transfer.id, path
+            ));
+        }
+    }
+    None
+}
+
+fn transparent_transfer_path_is_exact(
+    function: &r2ssa::SSAFunction,
+    target: u64,
+    lowered_target: u64,
+    path: &[u64],
+) -> bool {
+    if path.first().copied() != Some(target) || path.last().copied() != Some(lowered_target) {
+        return false;
+    }
+    path.windows(2).all(|edge| {
+        let [from, to] = edge else {
+            return false;
+        };
+        function.get_block(*from).is_some_and(|block| {
+            block.phis.is_empty()
+                && block
+                    .ops
+                    .iter()
+                    .all(|op| transparent_forwarder_op_is_exact(function, *from, *to, op))
+                && function.successors(*from).as_slice() == [*to]
+        })
     })
+}
+
+fn transparent_forwarder_op_is_exact(
+    function: &r2ssa::SSAFunction,
+    predecessor: u64,
+    successor: u64,
+    op: &r2ssa::SSAOp,
+) -> bool {
+    match op {
+        r2ssa::SSAOp::Branch { .. } | r2ssa::SSAOp::Nop => true,
+        r2ssa::SSAOp::Copy { dst, src } => {
+            function.get_block(successor).is_some_and(|block| {
+                block.phis.iter().any(|phi| {
+                    phi.dst == *dst
+                        && phi
+                            .sources
+                            .iter()
+                            .any(|(source, value)| *source == predecessor && value == src)
+                })
+            }) || !function.has_noncarrier_use(dst)
+        }
+        _ => false,
+    }
 }
 
 fn certified_switch_fallthrough_residual_reason(stmt: &CStmt, id: RenderNodeId) -> Option<String> {
@@ -9109,14 +9259,12 @@ mod tests {
             },
         ];
         let transfer_proofs = [
-            ControlTransferRenderProof {
-                kind: ControlTransferRenderProofKind::Break,
+            ControlTransferRenderProof::Break {
                 loop_header,
                 source: break_source,
                 target: exit,
             },
-            ControlTransferRenderProof {
-                kind: ControlTransferRenderProofKind::Continue,
+            ControlTransferRenderProof::Continue {
                 loop_header,
                 source: continue_source,
                 target: loop_header,
@@ -9133,6 +9281,219 @@ mod tests {
         );
 
         assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn standard_structured_output_accepts_exact_goto_through_transparent_forwarder() {
+        let loop_header = 0x401000;
+        let exit_source = 0x401010;
+        let latch = 0x401014;
+        let exit = 0x401020;
+        let lowered_target = 0x401030;
+        let blocks = [
+            R2ILBlock {
+                addr: loop_header,
+                size: 4,
+                ops: vec![R2ILOp::Branch {
+                    target: Varnode::constant(exit_source, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: exit_source,
+                size: 4,
+                ops: vec![R2ILOp::CBranch {
+                    target: Varnode::constant(exit, 8),
+                    cond: Varnode::constant(1, 1),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: latch,
+                size: 4,
+                ops: vec![R2ILOp::Branch {
+                    target: Varnode::constant(loop_header, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: exit,
+                size: 4,
+                ops: vec![R2ILOp::Branch {
+                    target: Varnode::constant(lowered_target, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock::new(lowered_target, 4),
+        ];
+        let prepared =
+            r2ssa::SsaArtifact::for_decompile(&blocks, None).expect("prepared SSA should build");
+        let func = CFunction::new("certified_goto", CType::u64()).with_body(vec![
+            CStmt::while_loop(
+                CExpr::var("loop_cond"),
+                CStmt::if_stmt(CExpr::var("exit_cond"), CStmt::Goto("L0".to_string()), None),
+            ),
+            CStmt::Label("L0".to_string()),
+        ]);
+        let control = r2types::FunctionControlFacts {
+            branch_predicates: BTreeMap::from([(
+                exit_source,
+                r2types::BranchPredicateFact {
+                    id: r2ssa::PredicateId(2),
+                    block_addr: exit_source,
+                    condition: r2ssa::ValueId(22),
+                    comparison: None,
+                    evaluated_comparison: None,
+                    render_comparison: None,
+                    true_target: exit,
+                    false_target: latch,
+                },
+            )]),
+            loops: BTreeMap::from([(
+                r2ssa::LoopId(1),
+                r2types::LoopStructureFact {
+                    loop_id: r2ssa::LoopId(1),
+                    proof_node: r2ssa::ProofNodeId::loop_certificate(loop_header, r2ssa::LoopId(1))
+                        .to_string(),
+                    header: loop_header,
+                    condition: Some(r2ssa::PredicateId(1)),
+                    condition_value: Some(r2ssa::ValueId(21)),
+                    body: vec![loop_header, exit_source, latch],
+                    latches: vec![latch],
+                    exits: vec![exit],
+                },
+            )]),
+            ..r2types::FunctionControlFacts::default()
+        };
+        let control_proofs = [
+            ControlRenderProof {
+                kind: ControlRenderProofKind::Loop,
+                anchor: loop_header,
+                branch_condition: None,
+                branch_condition_value: None,
+                loop_condition: Some(r2ssa::PredicateId(1)),
+                loop_condition_value: Some(r2ssa::ValueId(21)),
+                loop_body_blocks: vec![loop_header, exit_source, latch],
+                loop_latches: vec![latch],
+                loop_exits: vec![exit],
+                switch_selector: None,
+                switch_cases: Vec::new(),
+                switch_default: None,
+            },
+            ControlRenderProof {
+                kind: ControlRenderProofKind::Branch,
+                anchor: exit_source,
+                branch_condition: Some(r2ssa::PredicateId(2)),
+                branch_condition_value: Some(r2ssa::ValueId(22)),
+                loop_condition: None,
+                loop_condition_value: None,
+                loop_body_blocks: Vec::new(),
+                loop_latches: Vec::new(),
+                loop_exits: Vec::new(),
+                switch_selector: None,
+                switch_cases: Vec::new(),
+                switch_default: None,
+            },
+        ];
+        let transfer_proofs = [ControlTransferRenderProof::Goto {
+            loop_header,
+            source: exit_source,
+            target: exit,
+            lowered_target,
+            path: vec![exit, lowered_target],
+            label: "L0".to_string(),
+        }];
+
+        let reason = certifying_render_residual_reason_with_transfer_proofs(
+            Some(&prepared),
+            Some(&control),
+            &loop_cfg_summary(),
+            &func,
+            Some(&control_proofs),
+            Some(&transfer_proofs),
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn transparent_goto_path_refuses_effectful_forwarder() {
+        let exit = 0x401020;
+        let lowered_target = 0x401030;
+        let mut forwarder = R2ILBlock::new(exit, 4);
+        forwarder.push(R2ILOp::Copy {
+            dst: Varnode::unique(0x10, 8),
+            src: Varnode::constant(1, 8),
+        });
+        forwarder.push(R2ILOp::Branch {
+            target: Varnode::constant(lowered_target, 8),
+        });
+        let mut consumer = R2ILBlock::new(lowered_target, 4);
+        consumer.push(R2ILOp::Return {
+            target: Varnode::unique(0x10, 8),
+        });
+        let prepared = r2ssa::SsaArtifact::for_decompile(&[forwarder, consumer], None)
+            .expect("prepared SSA should build");
+
+        assert!(!transparent_transfer_path_is_exact(
+            prepared.function(),
+            exit,
+            lowered_target,
+            &[exit, lowered_target],
+        ));
+    }
+
+    #[test]
+    fn transparent_goto_path_accepts_exact_materialized_phi_edge_copy() {
+        let exit = 0x401020;
+        let lowered_target = 0x401030;
+        let prepared = r2ssa::SsaArtifact::for_decompile(
+            &[
+                R2ILBlock {
+                    addr: exit,
+                    size: 4,
+                    ops: vec![R2ILOp::Branch {
+                        target: Varnode::constant(lowered_target, 8),
+                    }],
+                    switch_info: None,
+                    op_metadata: Default::default(),
+                },
+                R2ILBlock::new(lowered_target, 4),
+            ],
+            None,
+        )
+        .expect("prepared SSA should build");
+        let mut function = prepared.into_function();
+        let source = r2ssa::SSAVar::new("x8", 1, 8);
+        let destination = r2ssa::SSAVar::new("x8", 2, 8);
+        let forwarder = function.get_block_mut(exit).expect("forwarder block");
+        let branch_index = forwarder.ops.len().saturating_sub(1);
+        forwarder.ops.insert(
+            branch_index,
+            r2ssa::SSAOp::Copy {
+                dst: destination.clone(),
+                src: source.clone(),
+            },
+        );
+        function
+            .get_block_mut(lowered_target)
+            .expect("phi target")
+            .phis
+            .push(r2ssa::PhiNode {
+                dst: destination,
+                sources: vec![(exit, source)],
+            });
+
+        assert!(transparent_transfer_path_is_exact(
+            &function,
+            exit,
+            lowered_target,
+            &[exit, lowered_target],
+        ));
     }
 
     #[test]

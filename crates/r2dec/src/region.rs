@@ -159,6 +159,7 @@ impl Region {
 pub enum RegionTransferKind {
     Exit,
     Continue,
+    Latch,
 }
 
 /// Region analyzer for identifying structured control flow.
@@ -1445,7 +1446,7 @@ impl<'a> RegionAnalyzer<'a> {
                 0 => base,
                 1 => {
                     let next = succs[0];
-                    if graph.preds_len(next) == 1 {
+                    if graph.preds_len_within(next, &reachable) == 1 {
                         if let Some(next_region) = region_map.remove(&next) {
                             Self::sequence_merge(base, next_region)
                         } else {
@@ -1467,7 +1468,10 @@ impl<'a> RegionAnalyzer<'a> {
                     let (true_succ, false_succ) = graph
                         .conditional_succs(node)
                         .unwrap_or((succs[0], succs[1]));
-                    let merge = self.find_working_merge_point(true_succ, false_succ, graph);
+                    let merge = [true_succ, false_succ]
+                        .into_iter()
+                        .find(|node| graph.node_is_latch_transfer(*node))
+                        .or_else(|| self.find_working_merge_point(true_succ, false_succ, graph));
                     let then_region = if Some(true_succ) != merge {
                         region_map.remove(&true_succ).map(Box::new)
                     } else {
@@ -1822,6 +1826,16 @@ impl WorkingGraph {
         self.nodes.get(&node).map(|n| n.region.clone())
     }
 
+    fn node_is_latch_transfer(&self, node: usize) -> bool {
+        matches!(
+            self.nodes.get(&node).map(|node| &node.region),
+            Some(Region::Transfer {
+                kind: RegionTransferKind::Latch,
+                ..
+            })
+        )
+    }
+
     fn node_entry(&self, node: usize) -> Option<u64> {
         self.nodes.get(&node).map(|n| n.entry)
     }
@@ -1864,8 +1878,10 @@ impl WorkingGraph {
         Some((true_succ?, false_succ?))
     }
 
-    fn preds_len(&self, node: usize) -> usize {
-        self.preds.get(&node).map_or(0, HashSet::len)
+    fn preds_len_within(&self, node: usize, allowed: &HashSet<usize>) -> usize {
+        self.preds.get(&node).map_or(0, |preds| {
+            preds.iter().filter(|pred| allowed.contains(pred)).count()
+        })
     }
 
     fn remove_edge(&mut self, from: usize, to: usize) {
@@ -2238,10 +2254,14 @@ impl WorkingGraph {
         let cond_block = analyzer
             .unique_loop_latch_condition_block(header, body)
             .unwrap_or(header);
+        let mut iteration_body = region_body;
+        if cond_block != header {
+            iteration_body.remove(&cond_block);
+        }
         let loop_body = self.make_loop_body_region(
             analyzer,
             internal_nodes,
-            &region_body,
+            &iteration_body,
             Some(header),
             header,
             Some(cond_block),
@@ -2325,7 +2345,9 @@ impl WorkingGraph {
                 let Some(target) = self.node_entry(target_node) else {
                     continue;
                 };
-                let kind = if target == loop_header {
+                let kind = if Some(target) == owned_latch_condition {
+                    RegionTransferKind::Latch
+                } else if target == loop_header {
                     RegionTransferKind::Continue
                 } else {
                     RegionTransferKind::Exit
@@ -2490,6 +2512,39 @@ mod tests {
         ]);
         let blocks = region.blocks();
         assert_eq!(blocks, vec![0x1000, 0x1004, 0x1008]);
+    }
+
+    #[test]
+    fn iterative_composition_ignores_disconnected_predecessors() {
+        let blocks = [0x1000, 0x1010, 0x1020, 0x1030]
+            .into_iter()
+            .map(|addr| {
+                let mut block = R2ILBlock::new(addr, 4);
+                block.push(R2ILOp::Nop);
+                block
+            })
+            .collect::<Vec<_>>();
+        let mut func = SSAFunction::from_blocks_raw_no_arch(&blocks).expect("ssa function");
+        func.cfg_mut()
+            .set_terminator(0x1000, BlockTerminator::Branch { target: 0x1010 });
+        func.cfg_mut()
+            .set_terminator(0x1010, BlockTerminator::Branch { target: 0x1030 });
+        func.cfg_mut()
+            .set_terminator(0x1020, BlockTerminator::Branch { target: 0x1030 });
+        func.cfg_mut()
+            .set_terminator(0x1030, BlockTerminator::Return);
+        func.refresh_after_cfg_mutation();
+
+        let mut analyzer = RegionAnalyzer::new(&func);
+        let graph = WorkingGraph::from_function(&func);
+        let topo = graph.topological_order().expect("acyclic graph");
+        let entry = graph.node_for_block(0x1000).expect("entry node");
+        let region = analyzer.analyze_post_collapse_iterative(entry, &graph, &topo);
+
+        assert!(
+            region.blocks().contains(&0x1030),
+            "reachable successor must not be detached by an unreachable predecessor: {region:?}"
+        );
     }
 
     #[test]

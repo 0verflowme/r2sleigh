@@ -127,14 +127,63 @@ impl ControlRenderProof {
 pub enum ControlTransferRenderProofKind {
     Break,
     Continue,
+    Goto,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ControlTransferRenderProof {
-    pub kind: ControlTransferRenderProofKind,
-    pub loop_header: u64,
-    pub source: u64,
-    pub target: u64,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlTransferRenderProof {
+    Break {
+        loop_header: u64,
+        source: u64,
+        target: u64,
+    },
+    Continue {
+        loop_header: u64,
+        source: u64,
+        target: u64,
+    },
+    Goto {
+        loop_header: u64,
+        source: u64,
+        target: u64,
+        lowered_target: u64,
+        path: Vec<u64>,
+        label: String,
+    },
+}
+
+impl ControlTransferRenderProof {
+    pub const fn kind(&self) -> ControlTransferRenderProofKind {
+        match self {
+            Self::Break { .. } => ControlTransferRenderProofKind::Break,
+            Self::Continue { .. } => ControlTransferRenderProofKind::Continue,
+            Self::Goto { .. } => ControlTransferRenderProofKind::Goto,
+        }
+    }
+
+    pub const fn loop_header(&self) -> u64 {
+        match self {
+            Self::Break { loop_header, .. }
+            | Self::Continue { loop_header, .. }
+            | Self::Goto { loop_header, .. } => *loop_header,
+        }
+    }
+
+    pub const fn source(&self) -> u64 {
+        match self {
+            Self::Break { source, .. }
+            | Self::Continue { source, .. }
+            | Self::Goto { source, .. } => *source,
+        }
+    }
+
+    pub const fn target(&self) -> u64 {
+        match self {
+            Self::Break { target, .. }
+            | Self::Continue { target, .. }
+            | Self::Goto { target, .. } => *target,
+        }
+    }
 }
 
 /// Control flow structurer.
@@ -148,6 +197,8 @@ pub struct ControlFlowStructurer<'a, 'o> {
     folded_block_cache: HashMap<u64, FoldedBlock>,
     /// Labels for blocks that need gotos.
     labels: HashMap<u64, String>,
+    /// Labels already attached to a concrete AST occurrence.
+    emitted_labels: BTreeSet<u64>,
     /// Counter for generating unique labels.
     label_counter: usize,
     /// Region analyzer for detecting breaks/continues.
@@ -169,6 +220,11 @@ pub struct ControlFlowStructurer<'a, 'o> {
     /// blocks may be duplicated by structuring, so coverage is checked only
     /// after all occurrences are known.
     rendered_block_domains: BTreeMap<u64, Vec<RenderedBlockDomain>>,
+    /// Basic blocks owned by the current structured region tree.
+    structured_region_blocks: BTreeSet<u64>,
+    /// Exact side-entry domains that reach a labeled block through a certified
+    /// noncanonical loop exit.
+    transfer_target_domains: BTreeMap<u64, Vec<RenderedBlockDomain>>,
 }
 
 #[derive(Debug, Clone)]
@@ -351,6 +407,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             fold_ctx,
             folded_block_cache: HashMap::new(),
             labels: HashMap::new(),
+            emitted_labels: BTreeSet::new(),
             label_counter: 0,
             region_analyzer: Some(region_analyzer),
             safety_budget_remaining: safety_budget_max,
@@ -362,6 +419,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             active_control_guards: Vec::new(),
             active_loops: Vec::new(),
             rendered_block_domains: BTreeMap::new(),
+            structured_region_blocks: BTreeSet::new(),
+            transfer_target_domains: BTreeMap::new(),
         }
     }
 
@@ -373,6 +432,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             fold_ctx,
             folded_block_cache: HashMap::new(),
             labels: HashMap::new(),
+            emitted_labels: BTreeSet::new(),
             label_counter: 0,
             region_analyzer: Some(RegionAnalyzer::new(func)),
             safety_budget_remaining: safety_budget_max,
@@ -384,6 +444,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             active_control_guards: Vec::new(),
             active_loops: Vec::new(),
             rendered_block_domains: BTreeMap::new(),
+            structured_region_blocks: BTreeSet::new(),
+            transfer_target_domains: BTreeMap::new(),
         }
     }
 
@@ -651,6 +713,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         self.active_control_guards.clear();
         self.active_loops.clear();
         self.rendered_block_domains.clear();
+        self.emitted_labels.clear();
+        self.structured_region_blocks.clear();
+        self.transfer_target_domains.clear();
         if self.region_analyzer.is_none() {
             self.region_analyzer = Some(RegionAnalyzer::new(self.func));
         }
@@ -667,6 +732,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 blocks: self.func.block_addrs().to_vec(),
             }
         };
+        self.structured_region_blocks = region.blocks().into_iter().collect();
         let stmt = self.structure_region(&region);
         self.validate_rendered_block_domain_coverage();
         if self.safety_reason.is_some() {
@@ -912,7 +978,18 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 if let Some(loop_id) = loop_id {
                     self.active_loops.push(loop_id);
                 }
-                let body_stmt = Self::strip_trailing_latch_marker(self.structure_loop_body(body));
+                let cond_owned_by_body = Self::region_owns_block_emission(body, *cond_block);
+                if !cond_owned_by_body {
+                    self.deferred_merge_blocks.push(*cond_block);
+                }
+                let mut body_stmt =
+                    Self::strip_trailing_latch_marker(self.structure_loop_body(body));
+                if !cond_owned_by_body {
+                    debug_assert_eq!(self.deferred_merge_blocks.pop(), Some(*cond_block));
+                    let mut stmts = Self::stmt_into_vec(body_stmt);
+                    Self::append_stmt_body_flat(&mut stmts, self.structure_block(*cond_block));
+                    body_stmt = Self::stmt_from_vec(stmts);
+                }
                 if loop_id.is_some() {
                     self.active_loops.pop();
                 }
@@ -936,8 +1013,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 kind,
             } if *kind == RegionTransferKind::Continue && target == loop_header => {
                 self.control_transfer_render_proofs
-                    .push(ControlTransferRenderProof {
-                        kind: ControlTransferRenderProofKind::Continue,
+                    .push(ControlTransferRenderProof::Continue {
                         loop_header: *loop_header,
                         source: *source,
                         target: *target,
@@ -957,8 +1033,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     == Some(*target) =>
             {
                 self.control_transfer_render_proofs
-                    .push(ControlTransferRenderProof {
-                        kind: ControlTransferRenderProofKind::Break,
+                    .push(ControlTransferRenderProof::Break {
                         loop_header: *loop_header,
                         source: *source,
                         target: *target,
@@ -966,15 +1041,52 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 CStmt::Break
             }
             Region::Transfer {
+                kind: RegionTransferKind::Latch,
+                ..
+            } => CStmt::Empty,
+            Region::Transfer {
                 loop_header,
                 source,
                 target,
                 kind,
             } => {
-                self.safety_reason = Some(format!(
-                    "unlowered {:?} edge 0x{:x} -> 0x{:x} in loop 0x{:x}",
-                    kind, source, target, loop_header
-                ));
+                let transfer_path_reason = if *kind == RegionTransferKind::Exit {
+                    match self.transparent_transfer_path(*target) {
+                        Ok(path) => {
+                            let lowered_target = *path
+                                .last()
+                                .expect("transparent transfer paths are never empty");
+                            let label = self.ensure_label(lowered_target);
+                            if !self.record_transfer_target_domain(*loop_header, lowered_target) {
+                                return CStmt::Empty;
+                            }
+                            self.control_transfer_render_proofs.push(
+                                ControlTransferRenderProof::Goto {
+                                    loop_header: *loop_header,
+                                    source: *source,
+                                    target: *target,
+                                    lowered_target,
+                                    path,
+                                    label: label.clone(),
+                                },
+                            );
+                            return CStmt::Goto(label);
+                        }
+                        Err(reason) => Some(reason),
+                    }
+                } else {
+                    None
+                };
+                self.safety_reason = Some(match transfer_path_reason {
+                    Some(reason) => format!(
+                        "unlowered {:?} edge 0x{:x} -> 0x{:x} in loop 0x{:x}: {reason}",
+                        kind, source, target, loop_header
+                    ),
+                    None => format!(
+                        "unlowered {:?} edge 0x{:x} -> 0x{:x} in loop 0x{:x}",
+                        kind, source, target, loop_header
+                    ),
+                });
                 CStmt::Empty
             }
             Region::Switch {
@@ -1587,8 +1699,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         let mut stmts = Vec::new();
 
         // Add label if needed
-        if let Some(label) = self.labels.get(&addr) {
-            stmts.push(CStmt::Label(label.clone()));
+        if let Some(label) = self.take_block_label(addr) {
+            stmts.push(CStmt::Label(label));
         }
 
         // Convert operations to statements
@@ -1637,6 +1749,50 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
     }
 
+    fn region_owns_block_emission(region: &Region, addr: u64) -> bool {
+        match region {
+            Region::Block(block) => *block == addr,
+            Region::Sequence(regions) => regions
+                .iter()
+                .any(|region| Self::region_owns_block_emission(region, addr)),
+            Region::IfThenElse {
+                cond_block,
+                then_region,
+                else_region,
+                ..
+            } => {
+                *cond_block == addr
+                    || Self::region_owns_block_emission(then_region, addr)
+                    || else_region
+                        .as_deref()
+                        .is_some_and(|region| Self::region_owns_block_emission(region, addr))
+            }
+            Region::WhileLoop { header, body } => {
+                *header == addr || Self::region_owns_block_emission(body, addr)
+            }
+            Region::DoWhileLoop { body, cond_block } => {
+                *cond_block == addr || Self::region_owns_block_emission(body, addr)
+            }
+            Region::MultiExit { head, .. } => Self::region_owns_block_emission(head, addr),
+            Region::Transfer { .. } => false,
+            Region::Switch {
+                switch_block,
+                cases,
+                default,
+                ..
+            } => {
+                *switch_block == addr
+                    || cases
+                        .iter()
+                        .any(|(_, region)| Self::region_owns_block_emission(region, addr))
+                    || default
+                        .as_deref()
+                        .is_some_and(|region| Self::region_owns_block_emission(region, addr))
+            }
+            Region::Irreducible { blocks, .. } => blocks.contains(&addr),
+        }
+    }
+
     /// Emit statements for a block directly into an existing statement list
     /// (without wrapping in CStmt::Block). Used for loop body flattening.
     fn structure_block_stmts_into(&mut self, addr: u64, stmts: &mut Vec<CStmt>) {
@@ -1649,12 +1805,102 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         };
 
         // Add label if needed
-        if let Some(label) = self.labels.get(&addr) {
-            stmts.push(CStmt::Label(label.clone()));
+        if let Some(label) = self.take_block_label(addr) {
+            stmts.push(CStmt::Label(label));
         }
 
         // Convert operations to statements
         stmts.extend(self.folded_block_stmts(block, addr));
+    }
+
+    fn ensure_label(&mut self, addr: u64) -> String {
+        if let Some(label) = self.labels.get(&addr) {
+            return label.clone();
+        }
+        let label = format!("L{}", self.label_counter);
+        self.label_counter += 1;
+        self.labels.insert(addr, label.clone());
+        label
+    }
+
+    fn take_block_label(&mut self, addr: u64) -> Option<String> {
+        let label = self.labels.get(&addr)?.clone();
+        self.emitted_labels.insert(addr).then_some(label)
+    }
+
+    fn transparent_transfer_path(&self, start: u64) -> Result<Vec<u64>, String> {
+        let mut path = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut current = start;
+        loop {
+            if !seen.insert(current) {
+                return Err(format!(
+                    "transparent forwarder path cycles at 0x{current:x}"
+                ));
+            }
+            path.push(current);
+            if self.structured_region_blocks.contains(&current) {
+                return Ok(path);
+            }
+            let Some(block) = self.func.get_block(current) else {
+                return Err(format!("missing forwarder block 0x{current:x}"));
+            };
+            if !block.phis.is_empty() {
+                return Err(format!(
+                    "forwarder block 0x{current:x} owns {} phi node(s)",
+                    block.phis.len()
+                ));
+            }
+            let successors = self.func.successors(current);
+            let [next] = successors.as_slice() else {
+                return Err(format!(
+                    "forwarder block 0x{current:x} has {} successors",
+                    successors.len()
+                ));
+            };
+            if !block.ops.iter().all(|op| {
+                self.is_transparent_branch_forwarder_op(op)
+                    || self.is_materialized_phi_edge_copy(current, *next, op)
+            }) {
+                return Err(format!(
+                    "forwarder block 0x{current:x} owns live non-phi SSA effects"
+                ));
+            }
+            current = *next;
+        }
+    }
+
+    fn record_transfer_target_domain(&mut self, loop_header: u64, target: u64) -> bool {
+        if !self.fold_ctx.requires_certified_rendering() {
+            return true;
+        }
+        let Some(loop_id) = self
+            .fold_ctx
+            .control_facts()
+            .and_then(|facts| facts.loops_for_header(loop_header).next())
+            .map(|fact| fact.loop_id)
+        else {
+            self.safety_reason = Some(format!(
+                "missing certified loop domain for transfer from 0x{loop_header:x}"
+            ));
+            return false;
+        };
+        let mut guards = self.active_control_guards.clone();
+        guards.sort();
+        guards.dedup();
+        let mut loops = self
+            .active_loops
+            .iter()
+            .copied()
+            .filter(|active| *active != loop_id)
+            .collect::<Vec<_>>();
+        loops.sort_unstable();
+        loops.dedup();
+        self.transfer_target_domains
+            .entry(target)
+            .or_default()
+            .push(RenderedBlockDomain { guards, loops });
+        true
     }
 
     /// Emit side-effecting statements for a block without labels or loop markers.
@@ -1669,7 +1915,12 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             None => return Vec::new(),
         };
 
-        self.folded_block_stmts(block, addr)
+        let mut stmts = Vec::new();
+        if let Some(label) = self.take_block_label(addr) {
+            stmts.push(CStmt::Label(label));
+        }
+        stmts.extend(self.folded_block_stmts(block, addr));
+        stmts
     }
 
     fn folded_block_stmts(&mut self, block: &r2ssa::FunctionSSABlock, addr: u64) -> Vec<CStmt> {
@@ -1724,6 +1975,12 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             .entry(block_addr)
             .or_default()
             .push(RenderedBlockDomain { guards, loops });
+        if let Some(domains) = self.transfer_target_domains.remove(&block_addr) {
+            self.rendered_block_domains
+                .entry(block_addr)
+                .or_default()
+                .extend(domains);
+        }
     }
 
     fn validate_rendered_block_domain_coverage(&mut self) {
@@ -1749,10 +2006,13 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 ));
                 return;
             }
-            if occurrences
-                .iter()
-                .any(|occurrence| occurrence.loops != source.loops)
-            {
+            if occurrences.iter().any(|occurrence| {
+                !self.rendered_loop_domain_matches_source(
+                    block_addr,
+                    &source.loops,
+                    &occurrence.loops,
+                )
+            }) {
                 self.safety_reason = Some(format!(
                     "loop-domain mismatch for emitted block 0x{block_addr:x}: source loops {:?}; rendered loops {:?}",
                     source.loops,
@@ -1787,6 +2047,37 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 }
             }
         }
+    }
+
+    fn rendered_loop_domain_matches_source(
+        &self,
+        block_addr: u64,
+        source_loops: &[LoopId],
+        rendered_loops: &[LoopId],
+    ) -> bool {
+        if rendered_loops == source_loops {
+            return true;
+        }
+        let Some(block) = self.func.cfg().get_block(block_addr) else {
+            return false;
+        };
+        if !matches!(block.terminator, r2ssa::BlockTerminator::Return) {
+            return false;
+        }
+        let source = source_loops.iter().copied().collect::<BTreeSet<_>>();
+        let rendered = rendered_loops.iter().copied().collect::<BTreeSet<_>>();
+        if !source.is_subset(&rendered) {
+            return false;
+        }
+        let Some(facts) = self.fold_ctx.control_facts() else {
+            return false;
+        };
+        rendered.difference(&source).all(|loop_id| {
+            facts
+                .loops
+                .get(loop_id)
+                .is_some_and(|loop_fact| loop_fact.exits.contains(&block_addr))
+        })
     }
 
     fn rendered_branch_domains_cover_source(
@@ -3008,24 +3299,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     fn is_transparent_branch_forwarder_op(&self, op: &SSAOp) -> bool {
         match op {
-            SSAOp::Branch { .. } => true,
-            SSAOp::Copy { dst, .. } => {
-                !self
-                    .fold_ctx
-                    .inputs
-                    .arch
-                    .is_return_register_name(&dst.name.to_ascii_lowercase())
-                    && (dst.is_temp() || Self::is_status_flag_name(&dst.name))
-            }
+            SSAOp::Branch { .. } | SSAOp::Nop => true,
+            SSAOp::Copy { dst, .. } => !self.func.has_noncarrier_use(dst),
             _ => false,
         }
-    }
-
-    fn is_status_flag_name(name: &str) -> bool {
-        matches!(
-            name.to_ascii_lowercase().as_str(),
-            "cf" | "of" | "pf" | "sf" | "zf" | "af" | "df" | "if"
-        )
     }
 
     fn transparent_branch_successors(
@@ -5694,6 +5971,45 @@ mod tests {
     }
 
     #[test]
+    fn transparent_transfer_path_accepts_exact_materialized_phi_edge_copy() {
+        let mut forwarder = R2ILBlock::new(0x1000, 4);
+        forwarder.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1010, 8),
+        });
+        let mut func = SSAFunction::from_blocks_with_arch(
+            &[forwarder, R2ILBlock::new(0x1010, 4)],
+            Some(&test_arch()),
+        )
+        .expect("ssa function");
+        let source = SSAVar::new("x8", 1, 8);
+        let destination = SSAVar::new("x8", 2, 8);
+        let branch = func.get_block_mut(0x1000).expect("forwarder block");
+        let branch_index = branch.ops.len().saturating_sub(1);
+        branch.ops.insert(
+            branch_index,
+            SSAOp::Copy {
+                dst: destination.clone(),
+                src: source.clone(),
+            },
+        );
+        func.get_block_mut(0x1010)
+            .expect("phi target")
+            .phis
+            .push(PhiNode {
+                dst: destination,
+                sources: vec![(0x1000, source)],
+            });
+        let ctx = FoldingContext::new(64);
+        let mut structurer = ControlFlowStructurer::new(&func, &ctx);
+        structurer.structured_region_blocks.insert(0x1010);
+
+        assert_eq!(
+            structurer.transparent_transfer_path(0x1000),
+            Ok(vec![0x1000, 0x1010])
+        );
+    }
+
+    #[test]
     fn terminating_if_else_does_not_append_unreachable_merge_block() {
         let func = function_with_terminating_if_and_shared_merge();
         let ctx = FoldingContext::new(64);
@@ -5771,6 +6087,26 @@ mod tests {
         let stripped = ControlFlowStructurer::strip_trailing_latch_marker(body);
 
         assert_eq!(stripped, assign("hash", v("next_hash")));
+    }
+
+    #[test]
+    fn merge_metadata_does_not_own_block_emission() {
+        let region = Region::IfThenElse {
+            cond_block: 0x1000,
+            then_region: Box::new(Region::Block(0x1010)),
+            else_region: None,
+            merge_block: Some(0x1020),
+        };
+
+        assert!(ControlFlowStructurer::region_owns_block_emission(
+            &region, 0x1000
+        ));
+        assert!(ControlFlowStructurer::region_owns_block_emission(
+            &region, 0x1010
+        ));
+        assert!(!ControlFlowStructurer::region_owns_block_emission(
+            &region, 0x1020
+        ));
     }
 
     #[test]

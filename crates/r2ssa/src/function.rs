@@ -1356,6 +1356,42 @@ impl SSAFunction {
             .unwrap_or_default()
     }
 
+    /// Return whether a value reaches any use other than a pure SSA carrier.
+    ///
+    /// Copy destinations and phi destinations are followed transitively. This
+    /// makes dead carrier cycles removable without relying on register names,
+    /// while conservatively treating malformed use locations as meaningful.
+    pub fn has_noncarrier_use(&self, var: &SSAVar) -> bool {
+        let mut pending = vec![var.clone()];
+        let mut visited = HashSet::new();
+        while let Some(current) = pending.pop() {
+            if !visited.insert(current.clone()) {
+                continue;
+            }
+            for (block_addr, location) in self.find_uses(&current) {
+                let Some(block) = self.get_block(block_addr) else {
+                    return true;
+                };
+                let carrier = match location {
+                    UseLocation::Phi { phi_idx, .. } => {
+                        block.phis.get(phi_idx).map(|phi| phi.dst.clone())
+                    }
+                    UseLocation::Op { op_idx, .. } => {
+                        block.ops.get(op_idx).and_then(|op| match op {
+                            SSAOp::Copy { dst, .. } => Some(dst.clone()),
+                            _ => None,
+                        })
+                    }
+                };
+                let Some(carrier) = carrier else {
+                    return true;
+                };
+                pending.push(carrier);
+            }
+        }
+        false
+    }
+
     /// Iterate over all source uses in all blocks.
     pub fn for_each_source<F: FnMut(u64, SourceRef<'_>)>(&self, mut f: F) {
         for block in self.blocks() {
@@ -5554,6 +5590,38 @@ mod tests {
         // Find uses of reg:0 v1
         let uses = func.find_uses(&var);
         assert!(!uses.is_empty());
+    }
+
+    #[test]
+    fn noncarrier_use_follows_copy_and_phi_chains() {
+        let blocks = [R2ILBlock::new(0x1000, 4), R2ILBlock::new(0x1004, 4)];
+        let mut func = SSAFunction::from_blocks_raw_no_arch(&blocks).expect("raw SSA function");
+        let source = SSAVar::new("flag", 1, 1);
+        let copied = SSAVar::new("flag", 2, 1);
+        let merged = SSAVar::new("flag", 3, 1);
+        let forwarded = SSAVar::new("flag", 4, 1);
+        func.get_block_mut(0x1000).expect("copy block").ops = vec![SSAOp::Copy {
+            dst: copied.clone(),
+            src: source.clone(),
+        }];
+        let merge = func.get_block_mut(0x1004).expect("merge block");
+        merge.phis = vec![PhiNode {
+            dst: merged.clone(),
+            sources: vec![(0x1000, copied)],
+        }];
+        merge.ops = vec![SSAOp::Copy {
+            dst: forwarded.clone(),
+            src: merged,
+        }];
+
+        assert!(!func.has_noncarrier_use(&source));
+
+        func.get_block_mut(0x1004)
+            .expect("consumer block")
+            .ops
+            .push(SSAOp::Return { target: forwarded });
+
+        assert!(func.has_noncarrier_use(&source));
     }
 
     #[test]
