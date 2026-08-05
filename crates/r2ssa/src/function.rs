@@ -2183,19 +2183,12 @@ fn meet_family_states(
     preds: &[u64],
     out_states: &HashMap<u64, FamilyRootState>,
 ) -> FamilyRootState {
-    let mut pred_iter = preds.iter();
-    let Some(first_pred) = pred_iter.next() else {
+    let mut pred_states = preds.iter().filter_map(|pred| out_states.get(pred));
+    let Some(first_state) = pred_states.next() else {
         return HashMap::new();
     };
-    let Some(first_state) = out_states.get(first_pred).cloned() else {
-        return HashMap::new();
-    };
-
-    let mut merged = first_state;
-    for pred in pred_iter {
-        let Some(state) = out_states.get(pred) else {
-            return HashMap::new();
-        };
+    let mut merged = first_state.clone();
+    for state in pred_states {
         merged.retain(|slot, root| state.get(slot) == Some(root));
     }
     merged
@@ -6287,6 +6280,71 @@ mod tests {
                 }
                 other => panic!("expected Copy, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn test_decompile_normalization_preserves_loop_invariant_family_root() {
+        let blocks = vec![
+            R2ILBlock {
+                addr: 0x1000,
+                size: 4,
+                ops: vec![
+                    R2ILOp::IntZExt {
+                        dst: make_reg(0x80, 8),
+                        src: make_unique(0x100, 4),
+                    },
+                    R2ILOp::Branch {
+                        target: make_ram(0x1004, 8),
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1004,
+                size: 4,
+                ops: vec![R2ILOp::CBranch {
+                    target: make_ram(0x100c, 8),
+                    cond: make_unique(0x180, 1),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1008,
+                size: 4,
+                ops: vec![R2ILOp::Branch {
+                    target: make_ram(0x1004, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x100c,
+                size: 4,
+                ops: vec![
+                    R2ILOp::Copy {
+                        dst: make_unique(0x200, 4),
+                        src: make_reg(0x80, 4),
+                    },
+                    R2ILOp::Return {
+                        target: make_ram(0, 8),
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ];
+
+        let func = SSAFunction::from_blocks_raw(&blocks, Some(&make_arm64_alias_arch()))
+            .expect("loop SSA should build");
+        let ops = &func.get_block(0x100c).expect("loop exit block").ops;
+        match &ops[0] {
+            SSAOp::Copy { src, .. } => {
+                assert_eq!(src, &SSAVar::new("tmp:100", 0, 4));
+            }
+            other => panic!("expected narrow alias copy, got {other:?}"),
         }
     }
 
