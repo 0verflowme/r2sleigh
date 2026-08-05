@@ -3413,10 +3413,10 @@ impl<'a> FoldingContext<'a> {
 
     fn should_inline(&self, var: &SSAVar) -> bool {
         if self.requires_certified_rendering()
-            && self
-                .prepared_value_id_for_var(var)
-                .and_then(|value| self.certified_loop_carrier_name_for_value(value))
-                .is_some()
+            && self.prepared_value_id_for_var(var).is_some_and(|value| {
+                self.certified_loop_carrier_name_for_value(value).is_some()
+                    || self.certified_memory_result_name_for_value(value).is_some()
+            })
         {
             return false;
         }

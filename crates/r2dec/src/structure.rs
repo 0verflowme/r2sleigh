@@ -1028,6 +1028,17 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 if let Some(loop_id) = loop_id {
                     self.push_active_loop(loop_id);
                 }
+                let prefix = self.structure_block_prefix_stmts(*header);
+                let cond = match Self::combine_loop_condition_prefix(prefix, cond) {
+                    Ok(cond) => cond,
+                    Err(reason) => {
+                        self.safety_reason = Some(format!(
+                            "loop header 0x{header:x} effects cannot be preserved: {reason}"
+                        ));
+                        self.active_domains = outer_domains;
+                        return CStmt::Empty;
+                    }
+                };
                 if let Some(guard) = &body_guard {
                     self.push_active_guard(guard.clone());
                 }
@@ -2040,6 +2051,28 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
         stmts.extend(self.folded_block_stmts(block, addr));
         stmts
+    }
+
+    fn combine_loop_condition_prefix(
+        prefix: Vec<CStmt>,
+        condition: CExpr,
+    ) -> Result<CExpr, String> {
+        let mut expressions = Vec::with_capacity(prefix.len().saturating_add(1));
+        for stmt in prefix {
+            match stmt {
+                CStmt::Expr(expr) => expressions.push(expr),
+                CStmt::Empty => {}
+                CStmt::Comment(reason) => return Err(reason),
+                other => {
+                    return Err(format!("unsupported condition-prefix statement {other:?}"));
+                }
+            }
+        }
+        if expressions.is_empty() {
+            return Ok(condition);
+        }
+        expressions.push(condition);
+        Ok(CExpr::Comma(expressions))
     }
 
     fn folded_block_stmts(&mut self, block: &r2ssa::FunctionSSABlock, addr: u64) -> Vec<CStmt> {
@@ -5210,6 +5243,20 @@ mod tests {
 
     fn assign(lhs: &str, rhs: CExpr) -> CStmt {
         expr_stmt(CExpr::assign(v(lhs), rhs))
+    }
+
+    #[test]
+    fn loop_condition_prefix_preserves_sequential_effects() {
+        let load = CExpr::assign(v("byte"), CExpr::Deref(Box::new(v("cursor"))));
+        let condition = CExpr::binary(BinaryOp::Ne, v("byte"), CExpr::IntLit(0));
+
+        assert_eq!(
+            ControlFlowStructurer::combine_loop_condition_prefix(
+                vec![CStmt::Expr(load.clone())],
+                condition.clone(),
+            ),
+            Ok(CExpr::Comma(vec![load, condition]))
+        );
     }
 
     fn test_structured_worker_route(reason: &str) -> r2types::DecompileRouteFacts {

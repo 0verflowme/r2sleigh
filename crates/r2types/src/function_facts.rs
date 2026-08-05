@@ -3366,7 +3366,7 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
             }
         }
     }
-    let mut carrier_update_roots = BTreeSet::new();
+    let mut carrier_edge_roots = Vec::new();
     let mut carrier_identity_values = BTreeSet::new();
     for carrier in prepared
         .structured()
@@ -3376,7 +3376,8 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
         .filter(|carrier| observable_values.contains(&carrier.phi))
     {
         carrier_identity_values.extend(carrier.identity_values.iter().copied());
-        carrier_update_roots.extend(carrier.updates.iter().map(|update| update.value));
+        carrier_edge_roots.extend(carrier.entries.iter().map(|entry| entry.value));
+        carrier_edge_roots.extend(carrier.updates.iter().map(|update| update.value));
         for value in carrier
             .identity_values
             .iter()
@@ -3406,8 +3407,7 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
             },
         );
     }
-    let mut consumer_roots = observable_roots;
-    consumer_roots.extend(carrier_update_roots);
+    let consumer_roots = prepared_render_consumer_occurrences(prepared, carrier_edge_roots);
     let stack_reload_accesses = certificates
         .stack_reloads
         .values()
@@ -3423,19 +3423,19 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
         if stack_reload_accesses.contains(&fact.access) {
             continue;
         }
-        fact.materialize_result = consumer_roots
-            .iter()
-            .copied()
-            .filter(|root| *root != value)
-            .any(|root| {
-                expression_dependency_path_count(
-                    prepared.graph(),
-                    root,
-                    value,
-                    &carrier_identity_values,
-                    &mut BTreeSet::new(),
-                ) > 1
-            });
+        let dependency_occurrences = consumer_roots.iter().copied().fold(0_u8, |count, root| {
+            if count > 1 {
+                return count;
+            }
+            count.saturating_add(expression_dependency_path_count(
+                prepared.graph(),
+                root,
+                value,
+                &carrier_identity_values,
+                &mut BTreeSet::new(),
+            ))
+        });
+        fact.materialize_result = dependency_occurrences > 1;
     }
     let mut certified_effects = certified_memory_effects;
     certified_effects.extend(certified_return_effects);
@@ -3449,6 +3449,44 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
         member_accesses_by_op: BTreeMap::new(),
         array_accesses_by_op: BTreeMap::new(),
     }
+}
+
+fn prepared_render_consumer_occurrences(
+    prepared: &r2ssa::SsaArtifact,
+    carrier_edge_roots: impl IntoIterator<Item = r2ssa::ValueId>,
+) -> Vec<r2ssa::ValueId> {
+    let certificates = prepared.certificates();
+    let mut roots = certificates
+        .returns
+        .iter()
+        .map(|cert| cert.value)
+        .collect::<Vec<_>>();
+    for cert in certificates.memory_accesses.values() {
+        roots.push(cert.address);
+        if cert.is_write {
+            roots.extend(cert.value);
+        }
+    }
+    for cert in certificates.callsites.values() {
+        roots.extend(cert.argument_values.iter().copied());
+        roots.extend(cert.stack_argument_values.iter().map(|arg| arg.value));
+    }
+    for predicate in prepared.predicates().predicates.values() {
+        if let Some(comparison) = prepared_predicate_render_comparison(prepared, predicate) {
+            roots.extend([comparison.lhs, comparison.rhs]);
+        } else {
+            roots.push(predicate.condition);
+        }
+    }
+    roots.extend(
+        prepared
+            .predicates()
+            .switches
+            .values()
+            .filter_map(|switch| switch.selector),
+    );
+    roots.extend(carrier_edge_roots);
+    roots
 }
 
 fn expression_dependency_path_count(
@@ -4769,6 +4807,71 @@ mod tests {
         assert!(return_effects >= 1);
         assert!(render.return_effect_id_for_op(0x401000, 4).is_some());
         assert!(render.return_for_op(0x401000, 4).is_some());
+    }
+
+    #[test]
+    fn prepared_render_facts_materialize_load_for_distinct_consumers() {
+        let mut block = R2ILBlock::new(0x402000, 4);
+        block.push(R2ILOp::Load {
+            dst: Varnode::register(0x00, 8),
+            space: SpaceId::Ram,
+            addr: Varnode::register(0x10, 8),
+        });
+        block.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::register(0x18, 8),
+            val: Varnode::register(0x00, 8),
+        });
+        block.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::register(0x18, 8),
+            val: Varnode::register(0x00, 8),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
+            .expect("prepared");
+        let render = FunctionRenderFacts::from_prepared(&prepared);
+        let read = render
+            .memory_accesses()
+            .find(|fact| !fact.is_write)
+            .expect("certified load");
+
+        assert!(
+            read.materialize_result,
+            "one certified load consumed by two rendered stores must be evaluated once"
+        );
+    }
+
+    #[test]
+    fn prepared_render_facts_keep_single_consumer_load_inline() {
+        let mut block = R2ILBlock::new(0x402000, 4);
+        block.push(R2ILOp::Load {
+            dst: Varnode::register(0x00, 8),
+            space: SpaceId::Ram,
+            addr: Varnode::register(0x10, 8),
+        });
+        block.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::register(0x18, 8),
+            val: Varnode::register(0x00, 8),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
+            .expect("prepared");
+        let render = FunctionRenderFacts::from_prepared(&prepared);
+        let read = render
+            .memory_accesses()
+            .find(|fact| !fact.is_write)
+            .expect("certified load");
+
+        assert!(
+            !read.materialize_result,
+            "a single rendered consumer should keep the load inline"
+        );
     }
 
     #[test]

@@ -20494,6 +20494,51 @@ mod tests {
     }
 
     #[test]
+    fn certified_materialized_memory_result_is_not_inlined() {
+        let arch = make_test_arch_x86_64();
+        let mut block = R2ILBlock::new(0x2000, 4);
+        block.push(R2ILOp::Load {
+            dst: Varnode::register(0x00, 8),
+            space: r2il::SpaceId::Ram,
+            addr: Varnode::register(0x10, 8),
+        });
+        block.push(R2ILOp::Store {
+            space: r2il::SpaceId::Ram,
+            addr: Varnode::register(0x18, 8),
+            val: Varnode::register(0x00, 8),
+        });
+        block.push(R2ILOp::Store {
+            space: r2il::SpaceId::Ram,
+            addr: Varnode::register(0x18, 8),
+            val: Varnode::register(0x00, 8),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let prepared = prepared_from_r2il_blocks(&[block], &arch);
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        let blocks = prepared.function().blocks().cloned().collect::<Vec<_>>();
+        ctx.analyze_blocks(&blocks);
+        let fact = ctx
+            .inputs
+            .function_facts
+            .render_facts()
+            .memory_accesses()
+            .find(|fact| !fact.is_write)
+            .expect("certified load");
+        assert!(fact.materialize_result);
+        let value = fact.value.expect("load result");
+        let var = prepared.value_var(value).expect("prepared load result");
+
+        assert!(
+            !ctx.should_inline(var),
+            "certified memory result {} must remain a single evaluated assignment",
+            crate::certified_memory_result_name(fact.access)
+        );
+    }
+
+    #[test]
     fn prepared_predicate_candidate_survives_without_legacy_flag_info() {
         let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x1000, 4);

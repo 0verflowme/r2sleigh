@@ -3270,7 +3270,7 @@ fn analyze_definite_assignment_stmt(
         }
         CStmt::Decl { name, init, .. } => {
             if let Some(init) = init {
-                validate_expr_local_reads(init, local_names, assigned, false)?;
+                analyze_definite_assignment_expr(init, local_names, assigned)?;
                 assigned.insert(name.clone());
             }
         }
@@ -3284,7 +3284,7 @@ fn analyze_definite_assignment_stmt(
             then_body,
             else_body,
         } => {
-            validate_expr_local_reads(cond, local_names, assigned, false)?;
+            analyze_definite_assignment_expr(cond, local_names, assigned)?;
             let mut then_assigned = assigned.clone();
             analyze_definite_assignment_stmt(then_body, local_names, &mut then_assigned)?;
             let mut else_assigned = assigned.clone();
@@ -3297,14 +3297,14 @@ fn analyze_definite_assignment_stmt(
                 .collect();
         }
         CStmt::While { cond, body } => {
-            validate_expr_local_reads(cond, local_names, assigned, false)?;
+            analyze_definite_assignment_expr(cond, local_names, assigned)?;
             let mut body_assigned = assigned.clone();
             analyze_definite_assignment_stmt(body, local_names, &mut body_assigned)?;
         }
         CStmt::DoWhile { body, cond } => {
             let mut body_assigned = assigned.clone();
             analyze_definite_assignment_stmt(body, local_names, &mut body_assigned)?;
-            validate_expr_local_reads(cond, local_names, &body_assigned, false)?;
+            analyze_definite_assignment_expr(cond, local_names, &mut body_assigned)?;
             *assigned = body_assigned;
         }
         CStmt::For {
@@ -3317,7 +3317,7 @@ fn analyze_definite_assignment_stmt(
                 analyze_definite_assignment_stmt(init, local_names, assigned)?;
             }
             if let Some(cond) = cond {
-                validate_expr_local_reads(cond, local_names, assigned, false)?;
+                analyze_definite_assignment_expr(cond, local_names, assigned)?;
             }
             let mut body_assigned = assigned.clone();
             analyze_definite_assignment_stmt(body, local_names, &mut body_assigned)?;
@@ -3330,7 +3330,7 @@ fn analyze_definite_assignment_stmt(
             cases,
             default,
         } => {
-            validate_expr_local_reads(expr, local_names, assigned, false)?;
+            analyze_definite_assignment_expr(expr, local_names, assigned)?;
             let mut exits = Vec::new();
             for case in cases {
                 let mut case_assigned = assigned.clone();
@@ -3356,7 +3356,7 @@ fn analyze_definite_assignment_stmt(
         }
         CStmt::Return(value) => {
             if let Some(value) = value {
-                validate_expr_local_reads(value, local_names, assigned, false)?;
+                analyze_definite_assignment_expr(value, local_names, assigned)?;
             }
         }
     }
@@ -3368,22 +3368,37 @@ fn analyze_definite_assignment_expr_stmt(
     local_names: &BTreeSet<String>,
     assigned: &mut BTreeSet<String>,
 ) -> Result<(), String> {
-    if let CExpr::Binary {
-        op: BinaryOp::Assign,
-        left,
-        right,
-    } = expr
-    {
-        validate_expr_local_reads(right, local_names, assigned, false)?;
-        validate_expr_local_reads(left, local_names, assigned, true)?;
-        if let CExpr::Var(name) = left.as_ref()
-            && local_names.contains(name)
-        {
-            assigned.insert(name.clone());
+    analyze_definite_assignment_expr(expr, local_names, assigned)
+}
+
+fn analyze_definite_assignment_expr(
+    expr: &CExpr,
+    local_names: &BTreeSet<String>,
+    assigned: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    match expr {
+        CExpr::Binary {
+            op: BinaryOp::Assign,
+            left,
+            right,
+        } => {
+            analyze_definite_assignment_expr(right, local_names, assigned)?;
+            validate_expr_local_reads(left, local_names, assigned, true)?;
+            if let CExpr::Var(name) = left.as_ref()
+                && local_names.contains(name)
+            {
+                assigned.insert(name.clone());
+            }
+            Ok(())
         }
-        return Ok(());
+        CExpr::Comma(items) => {
+            for item in items {
+                analyze_definite_assignment_expr(item, local_names, assigned)?;
+            }
+            Ok(())
+        }
+        _ => validate_expr_local_reads(expr, local_names, assigned, false),
     }
-    validate_expr_local_reads(expr, local_names, assigned, false)
 }
 
 fn validate_expr_local_reads(
@@ -7905,6 +7920,29 @@ mod tests {
             },
             CStmt::Return(Some(CExpr::Var("result".to_string()))),
         ];
+
+        assert_eq!(definite_assignment_residual_reason(&function), None);
+    }
+
+    #[test]
+    fn definite_assignment_accepts_sequential_loop_condition_assignment() {
+        let mut function = CFunction::new("scan", CType::i32());
+        function.locals.push(crate::ast::CLocal {
+            ty: CType::i32(),
+            name: "byte".to_string(),
+            stack_offset: None,
+        });
+        function.body = vec![CStmt::While {
+            cond: CExpr::Comma(vec![
+                CExpr::assign(CExpr::Var("byte".to_string()), CExpr::IntLit(1)),
+                CExpr::binary(
+                    BinaryOp::Ne,
+                    CExpr::Var("byte".to_string()),
+                    CExpr::IntLit(0),
+                ),
+            ]),
+            body: Box::new(CStmt::Empty),
+        }];
 
         assert_eq!(definite_assignment_residual_reason(&function), None);
     }
