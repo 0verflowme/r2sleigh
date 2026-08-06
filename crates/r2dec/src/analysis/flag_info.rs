@@ -3,9 +3,8 @@ use std::collections::{HashMap, HashSet};
 use r2ssa::SSAOp;
 
 use super::lower::LowerCtx;
-use super::{FlagCompareKind, FlagCompareProvenance, FlagInfo, PassEnv, UseInfo, utils};
+use super::{FlagCompareKind, FlagCompareProvenance, FlagInfo, PassEnv, SSABlock, UseInfo, utils};
 use crate::ast::{BinaryOp, CExpr, UnaryOp};
-use crate::fold::SSABlock;
 
 #[derive(Debug, Default)]
 pub(crate) struct FlagScratch {
@@ -27,9 +26,6 @@ pub(crate) fn analyze(blocks: &[SSABlock], use_info: &UseInfo, env: &PassEnv<'_>
         ptr_arith: &use_info.ptr_arith,
         stack_slots: &use_info.stack_slots,
         forwarded_values: &use_info.forwarded_values,
-        function_names: env.function_names,
-        strings: env.strings,
-        symbols: env.symbols,
         type_oracle: env.type_oracle,
     };
 

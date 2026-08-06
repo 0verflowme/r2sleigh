@@ -1,0 +1,40 @@
+warning: source_call proves provenance only; call-argument rendering needs certified argument evidence
+  --> $DIR/call_arg_source_call_authority.rs:14:46
+   |
+LL |         binding.source_value_id.is_some() || binding.source_call.is_some()
+   |                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(r2dec_call_arg_source_call_authority)]` on by default
+
+warning: source_call proves provenance only; call-argument rendering needs certified argument evidence
+  --> $DIR/call_arg_source_call_authority.rs:18:9
+   |
+LL |         binding.source_call.is_none()
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: source_call proves provenance only; call-argument rendering needs certified argument evidence
+  --> $DIR/call_arg_source_call_authority.rs:19:16
+   |
+LL |             || Some(&binding.source_call).is_some()
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: source_call proves provenance only; call-argument rendering needs certified argument evidence
+  --> $DIR/call_arg_source_call_authority.rs:20:16
+   |
+LL |             || (&binding.source_call).is_some()
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: source_call proves provenance only; call-argument rendering needs certified argument evidence
+  --> $DIR/call_arg_source_call_authority.rs:21:16
+   |
+LL |             || wrapper(binding.source_call.as_ref()).is_some()
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: source_call proves provenance only; call-argument rendering needs certified argument evidence
+  --> $DIR/call_arg_source_call_authority.rs:25:9
+   |
+LL |         binding.source_call.is_some()
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: 6 warnings emitted
+

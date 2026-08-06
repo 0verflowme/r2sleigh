@@ -1,0 +1,28 @@
+warning: r2plugin decompile-one-function paths must call r2engine instead of constructing or lowering through r2dec
+  --> $DIR/decompile_one_function_direct_r2dec.rs:12:17
+   |
+LL |     let input = r2dec::DecompilerInput { prepared: true };
+   |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(r2plugin_decompile_one_function_direct_r2dec)]` on by default
+
+warning: r2plugin decompile-one-function paths must call r2engine instead of constructing or lowering through r2dec
+  --> $DIR/decompile_one_function_direct_r2dec.rs:13:13
+   |
+LL |     let _ = r2dec::lower_function_to_c(&input);
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2plugin decompile-one-function paths must call r2engine instead of constructing or lowering through r2dec
+  --> $DIR/decompile_one_function_direct_r2dec.rs:18:17
+   |
+LL |     let input = r2dec::DecompilerInput { prepared: true };
+   |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2plugin decompile-one-function paths must call r2engine instead of constructing or lowering through r2dec
+  --> $DIR/decompile_one_function_direct_r2dec.rs:19:13
+   |
+LL |     let _ = r2dec::lower_function_to_c(&input);
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: 4 warnings emitted
+

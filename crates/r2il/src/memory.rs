@@ -50,6 +50,35 @@ impl MemoryRange {
     }
 }
 
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    #[kani::proof]
+    fn contains_interval_matches_half_open_math() {
+        let range = MemoryRange {
+            start: kani::any(),
+            end: kani::any(),
+        };
+        let start: u64 = kani::any();
+        let size: u32 = kani::any();
+
+        let got = range.contains_interval(start, size);
+        let expected = start
+            .checked_add(size as u64)
+            .is_some_and(|end| start >= range.start && end <= range.end);
+
+        assert_eq!(got, expected);
+
+        if got {
+            let end = start.checked_add(size as u64).unwrap();
+            assert!(range.start <= start);
+            assert!(start <= end);
+            assert!(end <= range.end);
+        }
+    }
+}
+
 /// Atomic operation kind hint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]

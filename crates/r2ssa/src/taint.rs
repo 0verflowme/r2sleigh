@@ -843,7 +843,9 @@ mod tests {
             "Call sink should include tainted call argument register"
         );
         assert!(
-            !names.iter().any(|name| name.starts_with("const:")),
+            !names.iter().any(|name| {
+                crate::var::SSAVarNameKind::classify(&name.to_ascii_lowercase()).is_constant()
+            }),
             "Call target constant should not be treated as a tainted argument source"
         );
     }

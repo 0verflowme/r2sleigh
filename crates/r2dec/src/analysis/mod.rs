@@ -1,10 +1,14 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    sync::OnceLock,
+};
 
-use r2ssa::{SSAVar, ValueId};
-use r2types::TypeOracle;
+use r2ssa::{FunctionSSABlock, SSAVar, ValueId};
+use r2types::{CalleeFact, CalleeResolutionFacts, InterprocSummaryView, TypeOracle};
 
 use crate::ast::{CExpr, CType};
-use crate::fold::{PtrArith, SSABlock};
+
+pub(crate) type SSABlock = FunctionSSABlock;
 
 // Pass dependency invariant:
 // UseInfo -> (FlagInfo, StackInfo) -> PredicateSimplifier -> statement emit.
@@ -20,11 +24,25 @@ pub(crate) mod utils;
 pub(crate) use ownership::{
     CallOwner, CallOwnerKind, CallOwnershipFact, CallSiteId, SemanticOwnershipFacts,
 };
-pub(crate) use predicate::PredicateSimplifier;
+pub(crate) use predicate::{PredicateAnalysisView, PredicateSimplifier};
 pub(crate) use prepared_semantic::{
     PreparedCallView, PreparedSemanticView, PreparedSemanticViewInputs,
     build_prepared_runtime_facts,
 };
+
+static EMPTY_CALLEE_FACTS: OnceLock<BTreeMap<u64, CalleeFact>> = OnceLock::new();
+
+pub(crate) fn empty_callee_facts() -> &'static BTreeMap<u64, CalleeFact> {
+    EMPTY_CALLEE_FACTS.get_or_init(BTreeMap::new)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PtrArith {
+    pub(crate) base: SSAVar,
+    pub(crate) index: SSAVar,
+    pub(crate) element_size: u32,
+    pub(crate) is_sub: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UseInfoAnalysisMode {
@@ -70,9 +88,15 @@ pub(crate) struct PassEnv<'a> {
     pub(crate) sp_name: &'a str,
     pub(crate) fp_name: &'a str,
     pub(crate) ret_reg_name: &'a str,
+    #[cfg(test)]
     pub(crate) function_names: &'a HashMap<u64, String>,
+    #[cfg(test)]
     pub(crate) strings: &'a HashMap<u64, String>,
+    #[cfg(test)]
     pub(crate) symbols: &'a HashMap<u64, String>,
+    pub(crate) callee_facts: &'a BTreeMap<u64, CalleeFact>,
+    pub(crate) callee_resolution: Option<&'a CalleeResolutionFacts>,
+    pub(crate) summary_view: Option<&'a InterprocSummaryView>,
     pub(crate) arg_regs: &'a [String],
     pub(crate) param_register_aliases: &'a HashMap<String, String>,
     pub(crate) caller_saved_regs: &'a HashSet<String>,
@@ -186,7 +210,6 @@ impl CallArgBinding {
         self
     }
 
-    #[allow(dead_code)]
     pub(crate) fn with_source_value_id(mut self, value_id: ValueId) -> Self {
         self.source_value_id = Some(value_id);
         self
@@ -414,6 +437,10 @@ impl StackSlotProvenance {
         self.value_kind == StackSlotValueKind::Scalar
     }
 
+    pub(crate) fn is_address_like(self) -> bool {
+        self.value_kind == StackSlotValueKind::AddressLike
+    }
+
     pub(crate) fn is_scalar_predicate_carrier(self) -> bool {
         self.predicate_carrier && self.is_scalar()
     }
@@ -467,7 +494,9 @@ impl UseInfo {
     pub(crate) fn bind_value_id(&mut self, var: &SSAVar, value_id: ValueId) {
         let display = var.display_name();
         self.value_ids_by_name.insert(display.clone(), value_id);
-        self.value_ids_by_name.insert(var.name.clone(), value_id);
+        if var.version == 0 {
+            self.value_ids_by_name.insert(var.name.clone(), value_id);
+        }
         self.vars_by_value_id
             .entry(value_id)
             .or_insert_with(|| var.clone());
@@ -628,10 +657,20 @@ impl UseInfo {
     }
 
     pub(crate) fn value_id_for_var(&self, var: &SSAVar) -> Option<ValueId> {
-        self.value_ids_by_name
-            .get(&var.display_name())
-            .copied()
-            .or_else(|| self.value_ids_by_name.get(&var.name).copied())
+        self.exact_value_id_for_var(var).or_else(|| {
+            (var.version == 0)
+                .then(|| self.value_ids_by_name.get(&var.name).copied())
+                .flatten()
+        })
+    }
+
+    pub(crate) fn exact_value_id_for_var(&self, var: &SSAVar) -> Option<ValueId> {
+        let display = var.display_name();
+        let value_id = self.value_ids_by_name.get(&display).copied()?;
+        self.vars_by_value_id
+            .get(&value_id)
+            .filter(|stored| stored.display_name() == display)
+            .map(|_| value_id)
     }
 
     pub(crate) fn value_id_for_name(&self, name: &str) -> Option<ValueId> {
@@ -648,6 +687,7 @@ impl UseInfo {
             .or_else(|| self.definitions.get(&var.display_name()))
     }
 
+    #[cfg(test)]
     pub(crate) fn display_name_for_value_id(&self, value_id: ValueId) -> Option<String> {
         self.var_for_value_id(value_id).map(SSAVar::display_name)
     }
@@ -782,14 +822,6 @@ impl UseInfo {
 
     pub(crate) fn stack_slots(&self) -> impl Iterator<Item = StackSlotProvenance> + '_ {
         self.stack_slots.values().copied()
-    }
-
-    pub(crate) fn has_stack_slots(&self) -> bool {
-        !self.stack_slots.is_empty() || !self.stack_slots_by_value.is_empty()
-    }
-
-    pub(crate) fn has_definitions(&self) -> bool {
-        !self.definitions.is_empty() || !self.definitions_by_value.is_empty()
     }
 
     pub(crate) fn render_stack_slot_for_name(&self, name: &str) -> Option<StackSlotProvenance> {

@@ -1,0 +1,34 @@
+warning: r2dec call arguments must require certified nested-call proof instead of rendered imported/modeled callee policy
+  --> $DIR/call_arg_policy.rs:13:9
+   |
+LL |         is_modeled_call_target(func)
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(r2dec_uncertified_call_arg_call_policy)]` on by default
+
+warning: r2dec call arguments must require certified nested-call proof instead of rendered imported/modeled callee policy
+  --> $DIR/call_arg_policy.rs:37:12
+   |
+LL |         if self.is_imported_call_target(func) {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2dec call arguments must require certified nested-call proof instead of rendered imported/modeled callee policy
+  --> $DIR/call_arg_policy.rs:40:12
+   |
+LL |         if self.is_modeled_call_target(func) {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2dec call arguments must require certified nested-call proof instead of rendered imported/modeled callee policy
+  --> $DIR/call_arg_policy.rs:43:12
+   |
+LL |         if is_imported_call_target(func) {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2dec call arguments must require certified nested-call proof instead of rendered imported/modeled callee policy
+  --> $DIR/call_arg_policy.rs:50:9
+   |
+LL |         self.imported_or_modeled_call_target_for_optional_site(None)
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: 5 warnings emitted
+

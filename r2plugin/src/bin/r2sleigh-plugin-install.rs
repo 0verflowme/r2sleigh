@@ -90,6 +90,6 @@ fn print_help() {
     println!(
         "r2sleigh-plugin-install\n\n\
 Usage:\n  r2sleigh-plugin-install [--features <list>] [--target <release|debug>]\n\n\
-Options:\n  --features <list>  Sleigh features (x86, arm[ARM32+AArch64], riscv, all-archs)\n  --target <name>    RUST_TARGET for Makefile (release or debug)\n  -h, --help         Show this help message"
+Options:\n  --features <list>  Sleigh features (x86, arm[ARM32+AArch64], mips, riscv, all-archs)\n  --target <name>    RUST_TARGET for Makefile (release or debug)\n  -h, --help         Show this help message"
     );
 }

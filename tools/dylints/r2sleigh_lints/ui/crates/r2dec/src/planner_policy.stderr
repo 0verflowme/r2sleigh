@@ -1,0 +1,48 @@
+warning: r2dec must not define route/refusal policy helpers; r2engine owns route selection
+  --> $DIR/planner_policy.rs:6:1
+   |
+LL | / fn cfg_guard_reason_from_summary(block_count: usize) -> Option<String> {
+LL | |     (block_count > 32).then(|| "large cfg".to_string())
+LL | | }
+   | |_^
+   |
+   = note: `#[warn(r2dec_route_policy_ownership)]` on by default
+
+warning: r2dec must not define route/refusal policy helpers; r2engine owns route selection
+  --> $DIR/planner_policy.rs:10:1
+   |
+LL | / fn preferred_semantic_summary_islands_reason(block_count: usize) -> Option<String> {
+LL | |     cfg_guard_reason_from_summary(block_count)
+LL | | }
+   | |_^
+
+warning: r2dec must receive route/refusal decisions from r2engine instead of selecting them locally
+  --> $DIR/planner_policy.rs:11:5
+   |
+LL |     cfg_guard_reason_from_summary(block_count)
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2dec must not define route/refusal policy helpers; r2engine owns route selection
+  --> $DIR/planner_policy.rs:14:1
+   |
+LL | / fn semantic_route_plan(block_count: usize) -> SemanticRoutePlan {
+LL | |     if let Some(reason) = preferred_semantic_summary_islands_reason(block_count) {
+LL | |         return SemanticRoutePlan::SummaryIslands { reason };
+...  |
+LL | | }
+   | |_^
+
+warning: r2dec must receive route/refusal decisions from r2engine instead of selecting them locally
+  --> $DIR/planner_policy.rs:15:27
+   |
+LL |     if let Some(reason) = preferred_semantic_summary_islands_reason(block_count) {
+   |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2dec must receive route/refusal decisions from r2engine instead of selecting them locally
+  --> $DIR/planner_policy.rs:34:17
+   |
+LL |     let route = semantic_route_plan(64);
+   |                 ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: 6 warnings emitted
+

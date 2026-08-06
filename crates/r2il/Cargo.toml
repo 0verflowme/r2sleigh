@@ -17,3 +17,6 @@ serde_json.workspace = true
 [features]
 default = []
 legacy-bincode = ["dep:bincode"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }

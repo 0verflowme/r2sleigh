@@ -8,6 +8,7 @@ members = [
     "crates/r2ssa",
     "crates/r2sym",
     "crates/r2types",
+    "crates/r2engine",
     "crates/r2dec",
     "r2plugin",
 ]
@@ -26,12 +27,19 @@ thiserror = "2.0"
 clap = { version = "4", features = ["derive"] }
 libsla = "1.2"
 sleigh-config = "1.0"
-sleigh-compiler = "2.0"
-libloading = "0.9"
 serde_json = "1"
+hex = "0.4"
+z3 = "0.20.0"
 
 [profile.release]
-lto = true
-codegen-units = 1
+# Keep everyday release builds fast enough for local iteration and CI.
+# Use `--profile dist` when a maximum-optimized distributable artifact is needed.
+lto = false
+codegen-units = 16
 panic = "abort"
 strip = true
+
+[profile.dist]
+inherits = "release"
+lto = true
+codegen-units = 1

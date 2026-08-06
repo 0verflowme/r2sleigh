@@ -1,17 +1,19 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
 
-use r2ssa::{SSAFunction, SSAOp, SSAVar, ValueId};
+use r2ssa::{ObjectKind, SSAFunction, SSAOp, SSAVar, SSAVarNameKind, SsaArtifact, ValueId};
+use r2types::{
+    CalleeCallArgPolicy, CalleeResolutionFacts, CalleeTargetIdentityRequest,
+    CalleeTargetPolicyDecision, CalleeTargetResolutionRequest, CallsiteKey,
+};
 
 use super::{
     BaseRef, CallArgBinding, CallArgRole, FrameObjectFieldKey, FrameSlotMergeSummary,
-    NormalizedAddr, PassEnv, ScalarValue, SemanticCallArg, SemanticValue, StackSlotProvenance,
-    StackSlotValueKind, UseInfo, UseInfoAnalysisMode, ValueProvenance, ValueRef, lower::LowerCtx,
-    utils,
+    NormalizedAddr, PassEnv, PtrArith, SSABlock, ScalarValue, SemanticCallArg, SemanticValue,
+    StackSlotProvenance, StackSlotValueKind, UseInfo, UseInfoAnalysisMode, ValueProvenance,
+    ValueRef, lower::LowerCtx, utils,
 };
 use crate::ast::{BinaryOp, CExpr, CType};
-use crate::fold::op_lower::parse_const_value;
-use crate::fold::{PtrArith, SSABlock};
 use crate::registers::register_family_name;
 
 #[derive(Debug, Default)]
@@ -89,6 +91,7 @@ fn analyze_with_definition_overrides_mode(
     for block in blocks {
         count_uses_and_conditions(&mut scratch, block);
     }
+    pin_loop_carried_phi_values(&mut scratch, blocks);
     for block in blocks {
         collect_definitions(&mut scratch, block, env, definition_overrides);
     }
@@ -105,6 +108,7 @@ fn analyze_with_definition_overrides_mode(
     rerun_semantic_call_analysis_after_result_binding(&mut scratch, blocks, env);
     if matches!(mode, UseInfoAnalysisMode::Full) {
         coalesce_variables(&mut scratch, blocks, env);
+        pin_aliases_for_pinned_values(&mut scratch.info);
         build_formatted_defs(&mut scratch, env);
     }
     rebuild_id_mirrors_from_name_maps(&mut scratch.info);
@@ -271,6 +275,33 @@ struct StackHomeQuery<'a, 'b> {
     env: &'a PassEnv<'b>,
 }
 
+fn bind_call_arg_source_var(
+    info: &UseInfo,
+    binding: CallArgBinding,
+    source_var: &SSAVar,
+) -> CallArgBinding {
+    let binding = binding.with_source_var(source_var);
+    if let Some(value_id) = exact_call_arg_source_value_id(info, source_var) {
+        binding.with_source_value_id(value_id)
+    } else {
+        binding
+    }
+}
+
+fn exact_call_arg_source_value_id(info: &UseInfo, source_var: &SSAVar) -> Option<ValueId> {
+    info.exact_value_id_for_var(source_var)
+}
+
+fn same_register_family_call_arg_source(src: &SSAVar, dst: &SSAVar) -> bool {
+    let Some(src_family) = register_family_name(&src.name) else {
+        return false;
+    };
+    let Some(dst_family) = register_family_name(&dst.name) else {
+        return false;
+    };
+    src_family == dst_family
+}
+
 fn push_unique_casefold(names: &mut Vec<String>, name: String) {
     if !names
         .iter()
@@ -326,6 +357,20 @@ pub(crate) fn preserve_authoritative_facts(info: &mut UseInfo, baseline: &UseInf
         }
     }
 
+    for (key, expr) in &baseline.definitions {
+        let should_replace = info
+            .definitions
+            .get(key)
+            .is_some_and(|current| expr_contains_call(current) && !expr_contains_call(expr));
+        if should_replace {
+            info.definitions.insert(key.clone(), expr.clone());
+            info.formatted_defs.insert(key.clone(), expr.clone());
+            if let Some(value_id) = info.value_id_for_name(key) {
+                info.definitions_by_value.insert(value_id, expr.clone());
+            }
+        }
+    }
+
     for (key, args) in &baseline.call_args {
         let should_replace = match info.call_args.get(key) {
             None => true,
@@ -353,6 +398,31 @@ pub(crate) fn preserve_authoritative_facts(info: &mut UseInfo, baseline: &UseInf
     for (alias, source_call) in &baseline.call_result_source_by_alias {
         if !info.call_result_source_by_alias.contains_key(alias) {
             info.insert_call_result_source_alias(alias, *source_call);
+        }
+    }
+    for aliases in baseline.call_result_aliases.values() {
+        for alias in aliases {
+            if baseline.direct_call_result_aliases.contains(alias) {
+                continue;
+            }
+            info.direct_call_result_aliases.remove(alias);
+            info.direct_call_result_aliases
+                .remove(&alias.to_ascii_lowercase());
+            info.direct_call_result_aliases
+                .remove(&alias.to_ascii_uppercase());
+            if let Some(expr) = baseline
+                .definitions
+                .get(alias)
+                .or_else(|| baseline.definitions.get(&alias.to_ascii_lowercase()))
+                .or_else(|| baseline.definitions.get(&alias.to_ascii_uppercase()))
+                .cloned()
+            {
+                info.definitions.insert(alias.clone(), expr.clone());
+                info.formatted_defs.insert(alias.clone(), expr.clone());
+                if let Some(value_id) = info.value_id_for_name(alias) {
+                    info.definitions_by_value.insert(value_id, expr);
+                }
+            }
         }
     }
     info.direct_call_result_aliases
@@ -408,6 +478,30 @@ pub(crate) fn preserve_authoritative_facts(info: &mut UseInfo, baseline: &UseInf
     }
 }
 
+fn expr_contains_call(expr: &CExpr) -> bool {
+    let mut contains = false;
+    expr.visit(&mut |node| {
+        if matches!(node, CExpr::Call { .. }) {
+            contains = true;
+        }
+    });
+    contains
+}
+
+fn semantic_value_contains_call(value: &SemanticValue) -> bool {
+    match value {
+        SemanticValue::Scalar(ScalarValue::Expr(expr)) => expr_contains_call(expr),
+        SemanticValue::Address(addr) | SemanticValue::Load { addr, .. } => {
+            normalized_addr_contains_call(addr)
+        }
+        SemanticValue::Scalar(ScalarValue::Root(_)) | SemanticValue::Unknown => false,
+    }
+}
+
+fn normalized_addr_contains_call(addr: &NormalizedAddr) -> bool {
+    matches!(&addr.base, BaseRef::Raw(expr) if expr_contains_call(expr))
+}
+
 fn record_call_result_alias(info: &mut UseInfo, source_call: (u64, usize), alias: &str) {
     if alias.is_empty() {
         return;
@@ -441,6 +535,12 @@ fn preserve_semantic_fact_map<K>(
     for (key, value) in baseline {
         let should_replace = match current.get(key) {
             None => true,
+            Some(existing)
+                if semantic_value_contains_call(existing)
+                    && !semantic_value_contains_call(value) =>
+            {
+                true
+            }
             Some(existing) => {
                 semantic_value_preservation_score(value)
                     > semantic_value_preservation_score(existing)
@@ -721,8 +821,7 @@ fn call_arg_expr_preservation_score(expr: &CExpr, depth: u32) -> i32 {
                 -120
             } else if is_call_arg_transient_name(name) {
                 -60
-            } else if name.starts_with("sym.")
-                || name.starts_with("obj.")
+            } else if is_symbol_or_object_name(name)
                 || name.eq_ignore_ascii_case("argc")
                 || name.eq_ignore_ascii_case("argv")
                 || name.eq_ignore_ascii_case("envp")
@@ -1105,6 +1204,7 @@ pub(crate) fn populate_frame_slot_merges(
     info: &mut UseInfo,
     func: &SSAFunction,
     env: &PassEnv<'_>,
+    prepared: Option<&SsaArtifact>,
 ) {
     info.frame_slot_merges.clear();
 
@@ -1118,12 +1218,16 @@ pub(crate) fn populate_frame_slot_merges(
             let SSAOp::Load { dst, addr, .. } = op else {
                 continue;
             };
-            let Some(slot_offset) = utils::extract_stack_offset_from_var(
-                addr,
-                &info.definitions,
-                env.fp_name,
-                env.sp_name,
-            ) else {
+            let prepared_offset =
+                prepared.and_then(|prepared| prepared_stack_offset_for_var(prepared, addr));
+            let Some(slot_offset) = prepared_offset.or_else(|| {
+                utils::extract_stack_offset_from_var(
+                    addr,
+                    &info.definitions,
+                    env.fp_name,
+                    env.sp_name,
+                )
+            }) else {
                 continue;
             };
 
@@ -1135,7 +1239,7 @@ pub(crate) fn populate_frame_slot_merges(
                     break;
                 };
                 let Some(value) =
-                    merged_slot_store_value_for_pred(info, pred_block, slot_offset, env)
+                    merged_slot_store_value_for_pred(info, pred_block, slot_offset, env, prepared)
                 else {
                     complete = false;
                     break;
@@ -1157,6 +1261,17 @@ pub(crate) fn populate_frame_slot_merges(
                 },
             );
         }
+    }
+}
+
+fn prepared_stack_offset_for_var(prepared: &SsaArtifact, var: &SSAVar) -> Option<i64> {
+    let object = prepared.object_for_var(var)?;
+    let object = prepared.objects().object(object)?;
+    match object.kind {
+        ObjectKind::StackSlot { offset, .. } | ObjectKind::FrameObject { offset, .. } => {
+            Some(offset)
+        }
+        _ => None,
     }
 }
 
@@ -1529,7 +1644,7 @@ fn block_value_is_scalar_or_predicate(
 }
 
 fn var_is_zero_constant(var: &SSAVar) -> bool {
-    parse_const_value(&var.name).is_some_and(|value| value == 0)
+    utils::parse_const_value(&var.name).is_some_and(|value| value == 0)
 }
 
 fn stack_slot_value_kind_from_return_slot_stores(
@@ -1717,7 +1832,8 @@ fn switch_selector_value_for_load(
         let mut best = None;
         for pred_addr in ctx.preds {
             let pred_block = ctx.func.get_block(*pred_addr)?;
-            let candidate = merged_slot_store_value_for_pred(info, pred_block, offset, ctx.env);
+            let candidate =
+                merged_slot_store_value_for_pred(info, pred_block, offset, ctx.env, None);
             best = preferred_switch_selector_value(info, best, candidate);
         }
         best
@@ -2027,6 +2143,12 @@ fn seed_entry_param_aliases(scratch: &mut UseScratch, blocks: &[SSABlock], env: 
 }
 
 fn count_uses_and_conditions(scratch: &mut UseScratch, block: &SSABlock) {
+    for phi in &block.phis {
+        for (_, src) in &phi.sources {
+            scratch.info.note_use_for_var(src);
+        }
+    }
+
     for op in &block.ops {
         for src in op.sources() {
             scratch.info.note_use_for_var(src);
@@ -2036,6 +2158,136 @@ fn count_uses_and_conditions(scratch: &mut UseScratch, block: &SSABlock) {
             scratch.info.note_condition_var(cond);
         }
     }
+}
+
+fn pin_loop_carried_phi_values(scratch: &mut UseScratch, blocks: &[SSABlock]) {
+    if blocks.is_empty() {
+        return;
+    }
+
+    let block_set: HashSet<u64> = blocks.iter().map(|block| block.addr).collect();
+    let mut successors = BTreeMap::new();
+    for (idx, block) in blocks.iter().enumerate() {
+        let mut succs = infer_successors(block, idx, blocks, &block_set);
+        succs.sort_unstable();
+        succs.dedup();
+        successors.insert(block.addr, succs);
+    }
+    let components = strongly_connected_components(&successors);
+
+    for block in blocks {
+        let Some(block_component) = components.get(&block.addr).copied() else {
+            continue;
+        };
+        for phi in &block.phis {
+            let is_loop_carried = phi.sources.iter().any(|(pred, _)| {
+                components.get(pred).copied() == Some(block_component)
+                    && successors
+                        .get(pred)
+                        .is_some_and(|succs| succs.contains(&block.addr))
+            });
+            if !is_loop_carried {
+                continue;
+            }
+
+            pin_phi_materialized_var(&mut scratch.info, &phi.dst);
+            for (_, src) in &phi.sources {
+                pin_phi_materialized_var(&mut scratch.info, src);
+            }
+        }
+    }
+}
+
+fn pin_phi_materialized_var(info: &mut UseInfo, var: &SSAVar) {
+    if var.is_const() || var.is_temp() || utils::is_cpu_flag(&var.name.to_ascii_lowercase()) {
+        return;
+    }
+    let display = var.display_name();
+    info.pinned.insert(display.clone());
+    info.pinned.insert(display.to_ascii_lowercase());
+}
+
+fn pin_aliases_for_pinned_values(info: &mut UseInfo) {
+    let mut aliases = Vec::new();
+    for pinned in &info.pinned {
+        if let Some(alias) = info.var_aliases.get(pinned)
+            && !alias.trim().is_empty()
+        {
+            aliases.push(alias.clone());
+        }
+    }
+    for alias in aliases {
+        info.pinned.insert(alias);
+    }
+}
+
+fn strongly_connected_components(successors: &BTreeMap<u64, Vec<u64>>) -> HashMap<u64, usize> {
+    let mut visited = HashSet::new();
+    let mut order = Vec::with_capacity(successors.len());
+    for start in successors.keys().copied() {
+        if visited.contains(&start) {
+            continue;
+        }
+        let mut stack = vec![(start, false)];
+        while let Some((node, exiting)) = stack.pop() {
+            if exiting {
+                order.push(node);
+                continue;
+            }
+            if !visited.insert(node) {
+                continue;
+            }
+            stack.push((node, true));
+            if let Some(succs) = successors.get(&node) {
+                for succ in succs.iter().rev().copied() {
+                    if successors.contains_key(&succ) && !visited.contains(&succ) {
+                        stack.push((succ, false));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut reverse: BTreeMap<u64, Vec<u64>> = successors
+        .keys()
+        .copied()
+        .map(|addr| (addr, Vec::new()))
+        .collect();
+    for (src, succs) in successors {
+        for succ in succs {
+            if reverse.contains_key(succ) {
+                reverse.entry(*succ).or_default().push(*src);
+            }
+        }
+    }
+    for preds in reverse.values_mut() {
+        preds.sort_unstable();
+        preds.dedup();
+    }
+
+    let mut components = HashMap::new();
+    let mut next_component = 0usize;
+    while let Some(start) = order.pop() {
+        if components.contains_key(&start) {
+            continue;
+        }
+        let mut stack = vec![start];
+        while let Some(node) = stack.pop() {
+            if components.insert(node, next_component).is_some() {
+                continue;
+            }
+            if let Some(preds) = reverse.get(&node) {
+                for pred in preds.iter().rev().copied() {
+                    if !components.contains_key(&pred) {
+                        stack.push(pred);
+                    }
+                }
+            }
+        }
+        next_component += 1;
+    }
+
+    components
 }
 
 fn collect_definitions(
@@ -2236,9 +2488,6 @@ fn collect_definitions(
                         ptr_arith: &scratch.info.ptr_arith,
                         stack_slots: &scratch.info.stack_slots,
                         forwarded_values: &scratch.info.forwarded_values,
-                        function_names: env.function_names,
-                        strings: env.strings,
-                        symbols: env.symbols,
                         type_oracle: env.type_oracle,
                     };
                     if let Some(prov) = scratch.info.forwarded_values.get(&key) {
@@ -2313,9 +2562,6 @@ fn rebuild_definitions(
                     ptr_arith: &scratch.info.ptr_arith,
                     stack_slots: &scratch.info.stack_slots,
                     forwarded_values: &scratch.info.forwarded_values,
-                    function_names: env.function_names,
-                    strings: env.strings,
-                    symbols: env.symbols,
                     type_oracle: env.type_oracle,
                 };
                 if let Some(prov) = scratch.info.forwarded_values.get(&key) {
@@ -2389,15 +2635,21 @@ fn merged_slot_store_value_for_pred(
     block: &SSABlock,
     slot_offset: i64,
     env: &PassEnv<'_>,
+    prepared: Option<&SsaArtifact>,
 ) -> Option<SemanticValue> {
     for (idx, op) in block.ops.iter().enumerate().rev() {
         if let SSAOp::Store { addr, val, .. } = op
-            && utils::extract_stack_offset_from_var(
-                addr,
-                &info.definitions,
-                env.fp_name,
-                env.sp_name,
-            ) == Some(slot_offset)
+            && prepared
+                .and_then(|prepared| prepared_stack_offset_for_var(prepared, addr))
+                .or_else(|| {
+                    utils::extract_stack_offset_from_var(
+                        addr,
+                        &info.definitions,
+                        env.fp_name,
+                        env.sp_name,
+                    )
+                })
+                == Some(slot_offset)
         {
             let base = semantic_stack_store_value(info, val, env);
             let family = (slot_offset >= 0)
@@ -2474,7 +2726,7 @@ fn preserve_temp_copy_root_identity(
     match value {
         SemanticValue::Scalar(ScalarValue::Root(root))
             if root.var == *src
-                && dst.name.starts_with("tmp:")
+                && utils::is_temporary_name(&dst.name)
                 && src.version == 0
                 && register_family_name(&src.name).is_some() =>
         {
@@ -3605,7 +3857,7 @@ fn semantic_addr_for_var_with_depth(
         Some(SemanticValue::Scalar(_)) | Some(SemanticValue::Load { .. })
     );
     if !has_non_address_semantic
-        && (copy_root != key || key.starts_with("tmp:"))
+        && (copy_root != key || utils::is_temporary_name(&key))
         && let Some(offset) =
             utils::extract_stack_offset_from_var(var, &info.definitions, env.fp_name, env.sp_name)
     {
@@ -3818,8 +4070,7 @@ fn semantic_source_value_for_var(info: &UseInfo, var: &SSAVar) -> Option<Semanti
     if lower == "stack"
         || lower == "saved_fp"
         || lower.starts_with("stack_")
-        || var.name.starts_with("tmp:")
-        || var.name.starts_with("ram:")
+        || is_raw_temporary_or_memory_like_name(&var.name)
     {
         return None;
     }
@@ -3891,8 +4142,7 @@ fn semantic_or_scalar_source_value(info: &UseInfo, source_name: &str) -> Option<
 
     let rendered = utils::format_traced_name(&root, &info.var_aliases);
     let lower = rendered.to_ascii_lowercase();
-    if root.starts_with("tmp:")
-        || root.starts_with("ram:")
+    if is_raw_temporary_or_memory_like_name(&root)
         || lower == "stack"
         || lower == "saved_fp"
         || lower.starts_with("stack_")
@@ -4118,12 +4368,34 @@ fn is_generic_stack_alias_name(name: &str) -> bool {
         || name == "saved_fp"
 }
 
+fn is_raw_ssa_storage_or_register_name(name: &str) -> bool {
+    matches!(
+        utils::ssa_name_kind(name),
+        SSAVarNameKind::RegisterAlias
+            | SSAVarNameKind::Temporary
+            | SSAVarNameKind::Constant
+            | SSAVarNameKind::Memory
+            | SSAVarNameKind::AddressSpace
+    )
+}
+
+fn is_raw_temporary_or_memory_like_name(name: &str) -> bool {
+    matches!(
+        utils::ssa_name_kind(name),
+        SSAVarNameKind::Temporary | SSAVarNameKind::Memory | SSAVarNameKind::AddressSpace
+    )
+}
+
+fn is_symbol_or_object_name(name: &str) -> bool {
+    matches!(
+        SSAVarNameKind::classify(name),
+        SSAVarNameKind::Symbol | SSAVarNameKind::Object
+    )
+}
+
 fn is_low_signal_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    lower.starts_with("tmp:")
-        || lower.starts_with("const:")
-        || lower.starts_with("ram:")
-        || lower.starts_with("reg:")
+    is_raw_ssa_storage_or_register_name(name)
         || lower.starts_with('t')
             && lower
                 .trim_start_matches('t')
@@ -4147,10 +4419,7 @@ fn is_semantic_binding_base(base: &str) -> bool {
         || lower.starts_with("str.")
         || lower.starts_with("0x")
         || lower.contains('.')
-        || lower.starts_with("tmp:")
-        || lower.starts_with("const:")
-        || lower.starts_with("ram:")
-        || lower.starts_with("reg:")
+        || is_raw_ssa_storage_or_register_name(base)
 }
 
 fn is_decimal_suffix(name: &str, prefix: &str) -> bool {
@@ -4321,21 +4590,7 @@ fn is_register_candidate_var(var: &r2ssa::SSAVar, env: &PassEnv<'_>) -> bool {
 }
 
 fn parse_target_addr(target: &r2ssa::SSAVar) -> Option<u64> {
-    let raw = target.name.as_str();
-    let candidate = if let Some(rest) = raw.strip_prefix("ram:") {
-        rest
-    } else if let Some(rest) = raw.strip_prefix("const:") {
-        rest
-    } else if let Some(rest) = raw.strip_prefix("0x") {
-        return u64::from_str_radix(rest, 16).ok();
-    } else {
-        raw
-    };
-
-    if let Ok(v) = u64::from_str_radix(candidate, 16) {
-        return Some(v);
-    }
-    candidate.parse::<u64>().ok()
+    crate::address::parse_address_from_var_name(&target.name)
 }
 
 fn infer_successors(
@@ -4871,9 +5126,6 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                 ptr_arith: &scratch.info.ptr_arith,
                 stack_slots: &scratch.info.stack_slots,
                 forwarded_values: &scratch.info.forwarded_values,
-                function_names: env.function_names,
-                strings: env.strings,
-                symbols: env.symbols,
                 type_oracle: env.type_oracle,
             };
             let post_call_query = PostCallResultQuery {
@@ -4934,13 +5186,13 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                                     .with_source_call(block.addr, result_call_idx)
                             })
                             .unwrap_or_else(|| {
-                                CallArgBinding::input(semantic_call_arg_for_var(
+                                let binding = CallArgBinding::input(semantic_call_arg_for_var(
                                     &scratch.info,
                                     input_var,
                                     input_expr.clone(),
                                     env,
-                                ))
-                                .with_source_var(input_var)
+                                ));
+                                bind_call_arg_source_var(&scratch.info, binding, input_var)
                             });
                         let binding_has_stable_negative_source =
                             canonicalize_call_arg_binding_to_negative_stack_load(
@@ -4952,6 +5204,7 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                             .is_some();
                         if !binding.is_result()
                             && !binding_has_stable_negative_source
+                            && same_register_family_call_arg_source(input_var, dst)
                             && let Some(family_value) = same_register_family_semantic_value_before(
                                 &scratch.info,
                                 ops,
@@ -5042,7 +5295,8 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
 
             let mut args = Vec::new();
             let mut consumed_keys = Vec::new();
-            let imported_call_target = call_target_is_imported(op, env);
+            let imported_like_call_target =
+                call_target_uses_imported_like_args(block.addr, call_idx, op, env);
             scratch
                 .info
                 .inlined_call_results
@@ -5060,10 +5314,11 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                         && !phi.dst.name.eq_ignore_ascii_case(env.fp_name)
                 }) {
                     let dst_key = phi.dst.display_name();
-                    args.push(
-                        CallArgBinding::input(SemanticCallArg::value_root(phi.dst.clone()))
-                            .with_source_var(&phi.dst),
-                    );
+                    args.push(bind_call_arg_source_var(
+                        &scratch.info,
+                        CallArgBinding::input(SemanticCallArg::value_root(phi.dst.clone())),
+                        &phi.dst,
+                    ));
                     consumed_keys.push(dst_key);
                 } else {
                     break;
@@ -5082,7 +5337,7 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                 .info
                 .inlined_call_results
                 .extend(inlined_call_results);
-            if imported_call_target
+            if imported_like_call_target
                 || should_append_unknown_stack_args(&scratch.info, &args, &stack_args, env)
             {
                 for (_, arg, value_key, addr_key) in &stack_args {
@@ -5119,13 +5374,16 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                     ptr_arith: &scratch.info.ptr_arith,
                     stack_slots: &scratch.info.stack_slots,
                     forwarded_values: &scratch.info.forwarded_values,
-                    function_names: env.function_names,
-                    strings: env.strings,
-                    symbols: env.symbols,
                     type_oracle: env.type_oracle,
                 };
-                let call_expr =
-                    call_result_expr_for_call_at(&scratch.info, &lower, block.addr, call_idx, op);
+                let call_expr = call_result_expr_for_call_at(
+                    &scratch.info,
+                    &lower,
+                    block.addr,
+                    call_idx,
+                    op,
+                    env,
+                );
                 if let Some(call_expr) = call_expr {
                     record_call_result_expr(&mut scratch.info, (block.addr, call_idx), &call_expr);
                     bind_call_result_alias_definitions(
@@ -5201,13 +5459,10 @@ fn bind_single_use_call_result_definitions(
                 ptr_arith: &scratch.info.ptr_arith,
                 stack_slots: &scratch.info.stack_slots,
                 forwarded_values: &scratch.info.forwarded_values,
-                function_names: env.function_names,
-                strings: env.strings,
-                symbols: env.symbols,
                 type_oracle: env.type_oracle,
             };
             let call_expr =
-                call_result_expr_for_call_at(&scratch.info, &lower, block.addr, op_idx, op);
+                call_result_expr_for_call_at(&scratch.info, &lower, block.addr, op_idx, op, env);
             let Some(call_expr) = call_expr else {
                 continue;
             };
@@ -5311,9 +5566,6 @@ fn bind_call_result_alias_definitions(
                     ptr_arith: &info.ptr_arith,
                     stack_slots: &info.stack_slots,
                     forwarded_values: &info.forwarded_values,
-                    function_names: env.function_names,
-                    strings: env.strings,
-                    symbols: env.symbols,
                     type_oracle: env.type_oracle,
                 };
                 let query = PostCallResultQuery {
@@ -5418,6 +5670,7 @@ fn call_result_expr_for_call_at(
     block_addr: u64,
     op_idx: usize,
     op: &SSAOp,
+    env: &PassEnv<'_>,
 ) -> Option<CExpr> {
     let bindings = info
         .call_args
@@ -5431,19 +5684,50 @@ fn call_result_expr_for_call_at(
         args.push(rendered);
     }
 
-    let func = match op {
-        SSAOp::Call { target } => lower.get_expr(target),
-        SSAOp::CallInd { target } => {
-            let resolved = lower.get_expr(target);
-            match resolved {
-                CExpr::Var(_) => resolved,
-                other => CExpr::Deref(Box::new(other)),
+    let func = if let Some(identity) = resolved_callee_expr_for_site(block_addr, op_idx, env) {
+        identity
+    } else {
+        match op {
+            SSAOp::Call { target } => lower.get_expr(target),
+            SSAOp::CallInd { target } => {
+                let resolved = lower.get_expr(target);
+                match resolved {
+                    CExpr::Var(_) => resolved,
+                    other => CExpr::Deref(Box::new(other)),
+                }
             }
+            _ => return None,
         }
-        _ => return None,
     };
 
     Some(CExpr::call(func, args))
+}
+
+fn resolved_callee_expr_for_site(
+    block_addr: u64,
+    op_idx: usize,
+    env: &PassEnv<'_>,
+) -> Option<CExpr> {
+    let resolved = CalleeResolutionFacts::resolve_target_policy(CalleeTargetResolutionRequest {
+        identity: CalleeTargetIdentityRequest {
+            resolution: env.callee_resolution,
+            callsite: Some(CallsiteKey {
+                block_addr,
+                op_index: op_idx,
+            }),
+            prepared_identity: None,
+            prepared_direct_target: None,
+            direct_target_context: None,
+        },
+        callee_facts: env.callee_facts,
+    })?;
+    Some(CExpr::Var(
+        resolved
+            .identity
+            .display_name
+            .clone()
+            .unwrap_or_else(|| resolved.identity.primary_key()),
+    ))
 }
 
 fn call_arg_expr_for_definition(
@@ -5459,25 +5743,7 @@ fn call_arg_expr_for_definition(
             0,
             &mut HashSet::new(),
         ),
-        SemanticCallArg::StringAddr(addr) => Some(
-            lower
-                .strings
-                .get(&addr)
-                .map(|s| CExpr::StringLit(s.clone()))
-                .or_else(|| {
-                    lower
-                        .symbols
-                        .get(&addr)
-                        .map(|name| CExpr::Var(name.clone()))
-                })
-                .or_else(|| {
-                    lower
-                        .function_names
-                        .get(&addr)
-                        .map(|name| CExpr::Var(name.clone()))
-                })
-                .unwrap_or(CExpr::UIntLit(addr)),
-        ),
+        SemanticCallArg::StringAddr(_) => None,
         SemanticCallArg::FallbackExpr(expr) => Some(expr),
     }?;
 
@@ -5744,7 +6010,7 @@ fn normalize_call_arg_var_for_definition(
         return Some(CExpr::Var(name));
     }
 
-    let rendered = if parse_const_value(&name).is_some()
+    let rendered = if utils::parse_const_value(&name).is_some()
         || crate::address::parse_address_from_var_name(&name).is_some()
     {
         Some(lower.expr_for_ssa_name(&name))
@@ -5827,23 +6093,49 @@ fn rewrite_call_result_binding(
     })
 }
 
-fn call_target_is_imported(op: &SSAOp, env: &PassEnv<'_>) -> bool {
-    let Some(name) = call_target_name(op, env) else {
-        return false;
-    };
-    let lower = name.to_ascii_lowercase();
-    lower.starts_with("sym.imp.") || lower.starts_with("imp.")
+#[cfg(test)]
+fn call_target_is_imported(
+    block_addr: u64,
+    op_index: usize,
+    op: &SSAOp,
+    env: &PassEnv<'_>,
+) -> bool {
+    call_target_policy_decision(block_addr, op_index, op, env).is_some_and(|policy| policy.imported)
 }
 
-fn call_target_name<'a>(op: &SSAOp, env: &'a PassEnv<'_>) -> Option<&'a String> {
-    let target = match op {
-        SSAOp::Call { target } | SSAOp::CallInd { target } => target,
-        _ => return None,
-    };
-    let addr = parse_target_addr(target)?;
-    env.function_names
-        .get(&addr)
-        .or_else(|| env.symbols.get(&addr))
+fn call_target_uses_imported_like_args(
+    block_addr: u64,
+    op_index: usize,
+    op: &SSAOp,
+    env: &PassEnv<'_>,
+) -> bool {
+    call_target_policy_decision(block_addr, op_index, op, env)
+        .is_some_and(|policy| policy.arg_policy() == CalleeCallArgPolicy::ImportedLike)
+}
+
+fn call_target_policy_decision(
+    block_addr: u64,
+    op_index: usize,
+    op: &SSAOp,
+    env: &PassEnv<'_>,
+) -> Option<CalleeTargetPolicyDecision> {
+    if !matches!(op, SSAOp::Call { .. } | SSAOp::CallInd { .. }) {
+        return None;
+    }
+    CalleeResolutionFacts::resolve_target_policy(CalleeTargetResolutionRequest {
+        identity: CalleeTargetIdentityRequest {
+            resolution: env.callee_resolution,
+            callsite: Some(CallsiteKey {
+                block_addr,
+                op_index,
+            }),
+            prepared_identity: None,
+            prepared_direct_target: None,
+            direct_target_context: None,
+        },
+        callee_facts: env.callee_facts,
+    })
+    .map(|resolved| resolved.policy)
 }
 
 fn should_append_unknown_stack_args(
@@ -5986,10 +6278,10 @@ fn collect_immediate_stack_call_args(
                                         .with_source_call(block_addr, call_idx)
                                 })
                                 .unwrap_or_else(|| {
-                                    CallArgBinding::input(preferred_stack_input_call_arg(
-                                        info, val, &expr, env,
-                                    ))
-                                    .with_source_var(val)
+                                    let binding = CallArgBinding::input(
+                                        preferred_stack_input_call_arg(info, val, &expr, env),
+                                    );
+                                    bind_call_arg_source_var(info, binding, val)
                                 })
                         })
                         .with_stack_offset(offset);
@@ -6055,14 +6347,6 @@ fn collect_immediate_stack_call_args(
     }
 
     args.sort_by_key(|(offset, _, _, _)| *offset);
-    let stack_home_query = StackHomeQuery {
-        ops,
-        producers,
-        info,
-        lower,
-        env,
-    };
-    repair_duplicate_negative_stack_home_inputs(&mut args, &stack_home_query);
     (args, inlined_call_results)
 }
 
@@ -6100,6 +6384,7 @@ fn preserved_input_binding_from_stack_home(
             }
             _ => None,
         })?;
+    let preserved_input_value = exact_call_arg_source_value_id(query.info, &preserved_input)?;
     let expr = visible_call_arg_seed_expr(query.lower, &preserved_input);
     let mut binding = CallArgBinding::input(preferred_stack_input_call_arg(
         query.info,
@@ -6108,6 +6393,7 @@ fn preserved_input_binding_from_stack_home(
         query.env,
     ))
     .with_source_var(&preserved_input)
+    .with_source_value_id(preserved_input_value)
     .with_stack_offset(printf_stack_offset);
     canonicalize_call_arg_binding_to_negative_stack_load(
         query.info,
@@ -6125,58 +6411,6 @@ fn duplicate_result_input_binding_from_preserved_stack_home(
     printf_stack_offset: i64,
 ) -> Option<CallArgBinding> {
     preserved_input_binding_from_stack_home(query, val, result_call_idx, printf_stack_offset)
-}
-
-fn repair_duplicate_negative_stack_home_inputs(
-    args: &mut [(i64, CallArgBinding, String, String)],
-    query: &StackHomeQuery<'_, '_>,
-) {
-    let mut seen_negative_offsets = HashSet::new();
-
-    for (printf_stack_offset, binding, value_key, _) in args.iter_mut() {
-        if binding.is_result() {
-            continue;
-        }
-
-        let current_negative_offset =
-            call_arg_semantic_source_offset(query.info, &binding.arg, 0, &mut HashSet::new())
-                .filter(|offset| *offset < 0);
-
-        let Some(current_negative_offset) = current_negative_offset else {
-            continue;
-        };
-
-        if seen_negative_offsets.insert(current_negative_offset) {
-            continue;
-        }
-
-        let Some(source_var) = ssa_var_from_display_name(value_key, 8) else {
-            continue;
-        };
-        let Some((_, load_idx)) = producer_entry_for_var(query.producers, &source_var) else {
-            continue;
-        };
-        let Some(candidate) = preserved_input_binding_from_stack_home(
-            query,
-            &source_var,
-            load_idx,
-            *printf_stack_offset,
-        ) else {
-            continue;
-        };
-        let candidate_negative_offset =
-            call_arg_semantic_source_offset(query.info, &candidate.arg, 0, &mut HashSet::new())
-                .filter(|offset| *offset < 0);
-        let Some(candidate_negative_offset) = candidate_negative_offset else {
-            continue;
-        };
-        if candidate_negative_offset == current_negative_offset {
-            continue;
-        }
-
-        *binding = candidate;
-        seen_negative_offsets.insert(candidate_negative_offset);
-    }
 }
 
 fn preferred_stack_input_call_arg(
@@ -6250,13 +6484,13 @@ fn improve_call_arg_binding_from_copy_root(
     }
 
     let root_expr = visible_call_arg_seed_expr(lower, &root_var);
-    let mut root_binding = CallArgBinding::input(semantic_call_arg_for_var(
+    let root_binding = CallArgBinding::input(semantic_call_arg_for_var(
         info,
         &root_var,
         root_expr.clone(),
         env,
-    ))
-    .with_source_var(&root_var);
+    ));
+    let mut root_binding = bind_call_arg_source_var(info, root_binding, &root_var);
     let root_has_stable_negative_source = canonicalize_call_arg_binding_to_negative_stack_load(
         info,
         &mut root_binding,
@@ -6280,15 +6514,6 @@ fn improve_call_arg_binding_from_copy_root(
 fn visible_call_arg_seed_expr(lower: &LowerCtx<'_>, var: &SSAVar) -> CExpr {
     if var.is_const() {
         return lower.get_expr(var);
-    }
-
-    if let Some(addr) = crate::address::parse_address_from_var_name(&var.name)
-        && let Some(name) = lower
-            .function_names
-            .get(&addr)
-            .or_else(|| lower.symbols.get(&addr))
-    {
-        return CExpr::Var(name.clone());
     }
 
     CExpr::Var(lower.var_name(var))
@@ -6344,6 +6569,9 @@ fn call_result_expr_for_post_call_source(
                 if register_family_name(&dst.name).as_deref() == Some(ret_family.as_str())
         )
     });
+    if producer_is_call_define && !producer_idx.is_some_and(|idx| call_idx < idx && idx < use_idx) {
+        return None;
+    }
     if producer_idx.is_some_and(|idx| call_idx <= idx) && !producer_is_call_define {
         return None;
     }
@@ -6368,8 +6596,15 @@ fn call_result_expr_for_post_call_source(
     }
 
     let call_op = query.ops.get(call_idx)?;
-    call_result_expr_for_call_at(query.info, query.lower, query.block_addr, call_idx, call_op)
-        .map(|expr| (call_idx, expr))
+    call_result_expr_for_call_at(
+        query.info,
+        query.lower,
+        query.block_addr,
+        call_idx,
+        call_op,
+        query.env,
+    )
+    .map(|expr| (call_idx, expr))
 }
 
 fn is_post_call_result_alias_for_call(
@@ -6400,6 +6635,13 @@ fn is_post_call_result_alias_for_call(
         Some(SSAOp::CallDefine { dst })
             if register_family_name(&dst.name).as_deref() == Some(ret_family)
     );
+    if source_is_call_define
+        && !source_entry
+            .as_ref()
+            .is_some_and(|(_, source_idx)| call_idx < *source_idx && *source_idx < use_idx)
+    {
+        return false;
+    }
     if source_entry
         .as_ref()
         .is_some_and(|(_, source_idx)| *source_idx >= call_idx)
@@ -6671,8 +6913,15 @@ fn latest_preceding_call_expr(
         .take(use_idx)
         .rev()
         .find(|(_, op)| matches!(op, SSAOp::Call { .. } | SSAOp::CallInd { .. }))?;
-    call_result_expr_for_call_at(query.info, query.lower, query.block_addr, call_idx, call_op)
-        .map(|expr| (call_idx, expr))
+    call_result_expr_for_call_at(
+        query.info,
+        query.lower,
+        query.block_addr,
+        call_idx,
+        call_op,
+        query.env,
+    )
+    .map(|expr| (call_idx, expr))
 }
 
 fn merge_arm64_stack_home_call_args(
@@ -6990,7 +7239,7 @@ fn is_plausible_call_home_base(name: &str, env: &PassEnv<'_>) -> bool {
         return false;
     }
 
-    name.starts_with("tmp:")
+    utils::is_temporary_name(name)
         || name.starts_with('x')
         || name.starts_with('w')
         || name.starts_with('r')
@@ -7432,24 +7681,11 @@ fn semantic_call_arg_string_addr_inner(
         return None;
     }
 
-    if let Some(addr) = call_arg_expr_literal_value(expr, 0)
-        && (env.strings.contains_key(&addr) || env.symbols.contains_key(&addr))
-    {
-        return Some(addr);
-    }
-
     if let Some(addr) = constish_call_arg_address(expr, env) {
         return Some(addr);
     }
 
     if let Some(addr) = hex_digit_offset_call_arg_address(expr, env, 0) {
-        return Some(addr);
-    }
-
-    if var.is_const()
-        && let Some(addr) = parse_const_value(&var.name)
-        && (env.strings.contains_key(&addr) || env.symbols.contains_key(&addr))
-    {
         return Some(addr);
     }
 
@@ -7530,12 +7766,6 @@ fn semantic_call_arg_addr_from_expr(
 
     match expr {
         CExpr::Var(name) => {
-            if let Some(addr) = parse_const_value(name)
-                && (env.strings.contains_key(&addr) || env.symbols.contains_key(&addr))
-            {
-                return Some(addr);
-            }
-
             if !visited.insert(name.clone()) {
                 return None;
             }
@@ -7646,28 +7876,8 @@ fn lookup_call_arg_definition_expr(info: &UseInfo, name: &str) -> Option<CExpr> 
         })
 }
 
-fn constish_call_arg_address(expr: &CExpr, env: &PassEnv<'_>) -> Option<u64> {
-    let addr = match expr {
-        CExpr::UIntLit(value) => Some(*value),
-        CExpr::IntLit(value) if *value >= 0 => Some(*value as u64),
-        CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
-            constish_call_arg_address(inner, env)
-        }
-        CExpr::Binary {
-            op: BinaryOp::Add,
-            left,
-            right,
-        } => match (
-            constish_call_arg_address(left, env),
-            constish_call_arg_address(right, env),
-        ) {
-            (Some(a), Some(b)) => a.checked_add(b),
-            _ => None,
-        },
-        _ => None,
-    }?;
-
-    (env.strings.contains_key(&addr) || env.symbols.contains_key(&addr)).then_some(addr)
+fn constish_call_arg_address(_expr: &CExpr, _env: &PassEnv<'_>) -> Option<u64> {
+    None
 }
 
 fn hex_digit_offset_call_arg_address(expr: &CExpr, env: &PassEnv<'_>, depth: u32) -> Option<u64> {
@@ -7703,7 +7913,8 @@ fn hex_digit_offset_call_arg_address(expr: &CExpr, env: &PassEnv<'_>, depth: u32
         _ => return None,
     };
 
-    (env.strings.contains_key(&addr) || env.symbols.contains_key(&addr)).then_some(addr)
+    let _ = (addr, env);
+    None
 }
 
 fn reinterpret_decimal_digits_as_hex_call_arg(expr: &CExpr, depth: u32) -> Option<u64> {
@@ -8195,11 +8406,8 @@ fn call_arg_expr_resolves_to_literal(expr: &CExpr, env: &PassEnv<'_>, depth: u32
         _ => None,
     };
 
-    addr.is_some_and(|value| {
-        env.function_names.contains_key(&value)
-            || env.strings.contains_key(&value)
-            || env.symbols.contains_key(&value)
-    })
+    let _ = (addr, env);
+    false
 }
 
 fn call_arg_expr_literal_value(expr: &CExpr, depth: u32) -> Option<u64> {
@@ -8242,9 +8450,7 @@ fn is_call_arg_low_quality_name(name: &str) -> bool {
 
 fn is_call_arg_transient_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    lower.starts_with("tmp:")
-        || lower.starts_with("ram:")
-        || lower.starts_with("const:")
+    utils::is_temporary_constant_or_memory_name(name)
         || utils::is_cpu_flag(&lower)
         || lower.starts_with("eax")
         || lower.starts_with("rax")
@@ -8304,6 +8510,8 @@ mod tests {
         function_names: HashMap<u64, String>,
         strings: HashMap<u64, String>,
         symbols: HashMap<u64, String>,
+        callee_facts: BTreeMap<u64, r2types::CalleeFact>,
+        summary_view: Option<r2types::InterprocSummaryView>,
         arg_regs: Vec<String>,
         caller_saved_regs: HashSet<String>,
         type_hints: HashMap<String, CType>,
@@ -8318,6 +8526,8 @@ mod tests {
                 function_names: HashMap::new(),
                 strings: HashMap::new(),
                 symbols: HashMap::new(),
+                callee_facts: BTreeMap::new(),
+                summary_view: None,
                 arg_regs: Vec::new(),
                 caller_saved_regs: HashSet::new(),
                 type_hints: HashMap::new(),
@@ -8352,6 +8562,9 @@ mod tests {
                 function_names: &self.function_names,
                 strings: &self.strings,
                 symbols: &self.symbols,
+                callee_facts: &self.callee_facts,
+                callee_resolution: None,
+                summary_view: self.summary_view.as_ref(),
                 arg_regs: &self.arg_regs,
                 param_register_aliases: &self.param_register_aliases,
                 caller_saved_regs: &self.caller_saved_regs,
@@ -8397,6 +8610,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn value_id_for_var_does_not_use_ambiguous_base_register_versions() {
+        let x8_0 = mk("X8", 0, 8);
+        let x8_1 = mk("X8", 1, 8);
+        let x8_2 = mk("X8", 2, 8);
+        let info = analyze_info(vec![single_block(vec![
+            SSAOp::Copy {
+                dst: x8_1.clone(),
+                src: x8_0.clone(),
+            },
+            SSAOp::Copy {
+                dst: x8_2.clone(),
+                src: x8_1.clone(),
+            },
+        ])]);
+
+        let entry_id = info
+            .value_id_for_var(&x8_0)
+            .expect("entry register value id");
+        assert_eq!(info.value_id_for_name("X8"), Some(entry_id));
+        assert_eq!(
+            info.exact_value_id_for_var(&x8_1),
+            info.value_id_for_var(&x8_1)
+        );
+        assert_eq!(
+            info.exact_value_id_for_var(&x8_2),
+            info.value_id_for_var(&x8_2)
+        );
+        assert_ne!(info.value_id_for_var(&x8_1), Some(entry_id));
+        assert_ne!(info.value_id_for_var(&x8_2), Some(entry_id));
+    }
+
     fn single_block(ops: Vec<SSAOp>) -> SSABlock {
         SSABlock {
             addr: 0x1000,
@@ -8404,6 +8649,398 @@ mod tests {
             phis: Vec::new(),
             ops,
         }
+    }
+
+    fn minimal_callee_fact(addr: u64, name: &str) -> r2types::CalleeFact {
+        minimal_callee_fact_with_linkage(addr, name, r2types::CalleeLinkage::Unknown)
+    }
+
+    fn minimal_callee_fact_with_linkage(
+        addr: u64,
+        name: &str,
+        linkage: r2types::CalleeLinkage,
+    ) -> r2types::CalleeFact {
+        r2types::CalleeFact {
+            function_id: addr,
+            name: Some(name.to_string()),
+            linkage,
+            signature: None,
+            signature_callconv: None,
+            signature_noreturn: false,
+            model_policy_evidence: BTreeSet::new(),
+            direct_callees: Vec::new(),
+            callsite_count: 0,
+            has_unknown_calls: false,
+            arg_effects: BTreeMap::new(),
+            memory_effects: Vec::new(),
+            transfer_effects: Vec::new(),
+            allocation_effects: Vec::new(),
+            lifetime_effects: Vec::new(),
+            sync_effects: Vec::new(),
+            atomic_effects: Vec::new(),
+            param_type_hints: BTreeMap::new(),
+            return_type_hint: None,
+            return_relation: r2types::CalleeReturnRelation::Unknown,
+            reads_global_memory: false,
+            writes_global_memory: false,
+            touches_unknown_memory: false,
+        }
+    }
+
+    fn imported_callee_fact(addr: u64, name: &str) -> r2types::CalleeFact {
+        minimal_callee_fact_with_linkage(addr, name, r2types::CalleeLinkage::Imported)
+    }
+
+    #[test]
+    fn call_target_import_policy_uses_typed_callee_identity() {
+        let op = SSAOp::Call {
+            target: mk("ram:401000", 0, 8),
+        };
+
+        for name in ["sym.imp.printf", "imp.printf"] {
+            let mut fixture = TestEnvFixture::default();
+            fixture.function_names.insert(0x401000, name.to_string());
+            let env = fixture.env();
+            assert!(
+                !call_target_is_imported(0x1000, 0, &op, &env),
+                "raw function-name fallback must not own import policy: {name}"
+            );
+        }
+        let mut fixture = TestEnvFixture::default();
+        fixture
+            .symbols
+            .insert(0x401000, "sym.imp.printf".to_string());
+        let env = fixture.env();
+        assert!(
+            !call_target_is_imported(0x1000, 0, &op, &env),
+            "raw symbol fallback must not own import policy"
+        );
+
+        for name in ["sym.helper", "fcn.401000", "plain_helper"] {
+            let mut fixture = TestEnvFixture::default();
+            fixture.function_names.insert(0x401000, name.to_string());
+            let env = fixture.env();
+            assert!(!call_target_is_imported(0x1000, 0, &op, &env), "{name}");
+        }
+
+        let mut fixture = TestEnvFixture::default();
+        fixture
+            .function_names
+            .insert(0x401000, "sym.imp.printf".to_string());
+        let base_env = fixture.env();
+        let empty_resolution = r2types::CalleeResolutionFacts::default();
+        let env = PassEnv {
+            callee_resolution: Some(&empty_resolution),
+            ..base_env
+        };
+        assert!(
+            !call_target_is_imported(0x1000, 0, &op, &env),
+            "typed resolution miss must not inherit raw function-name import policy"
+        );
+
+        let mut fixture = TestEnvFixture::default();
+        fixture
+            .symbols
+            .insert(0x401000, "sym.imp.printf".to_string());
+        let base_env = fixture.env();
+        let env = PassEnv {
+            callee_resolution: Some(&empty_resolution),
+            ..base_env
+        };
+        assert!(
+            !call_target_is_imported(0x1000, 0, &op, &env),
+            "typed resolution miss must not inherit raw symbol import policy"
+        );
+
+        let fallback_function_names = HashMap::from([(0x401000, "sym.helper".to_string())]);
+        let typed_function_names = HashMap::from([(0x401000, "sym.imp.printf".to_string())]);
+        let symbols = HashMap::new();
+        let callee_facts = BTreeMap::new();
+        let known_function_signatures = HashMap::new();
+        let resolution = r2types::CalleeResolutionFacts::from_direct_call_targets(
+            [(
+                CallsiteKey {
+                    block_addr: 0x1000,
+                    op_index: 0,
+                },
+                0x401000,
+            )],
+            &r2types::CalleeIdentityContext {
+                function_names: &typed_function_names,
+                symbols: &symbols,
+                callee_facts: &callee_facts,
+                known_function_signatures: &known_function_signatures,
+            },
+        );
+        let fixture = TestEnvFixture {
+            function_names: fallback_function_names,
+            ..TestEnvFixture::default()
+        };
+        let base_env = fixture.env();
+        let env = PassEnv {
+            callee_facts: &callee_facts,
+            callee_resolution: Some(&resolution),
+            ..base_env
+        };
+        assert!(
+            !call_target_is_imported(0x1000, 0, &op, &env),
+            "typed function names remain import hints until callee facts certify import linkage"
+        );
+
+        let fallback_function_names = HashMap::from([(0x401000, "sym.helper".to_string())]);
+        let typed_function_names = HashMap::new();
+        let callee_facts =
+            BTreeMap::from([(0x401000, imported_callee_fact(0x401000, "sym.imp.printf"))]);
+        let known_function_signatures = HashMap::new();
+        let resolution = r2types::CalleeResolutionFacts::from_direct_call_targets(
+            [(
+                CallsiteKey {
+                    block_addr: 0x1000,
+                    op_index: 0,
+                },
+                0x401000,
+            )],
+            &r2types::CalleeIdentityContext {
+                function_names: &typed_function_names,
+                symbols: &symbols,
+                callee_facts: &callee_facts,
+                known_function_signatures: &known_function_signatures,
+            },
+        );
+        let fixture = TestEnvFixture {
+            function_names: fallback_function_names,
+            ..TestEnvFixture::default()
+        };
+        let base_env = fixture.env();
+        let env = PassEnv {
+            callee_facts: &callee_facts,
+            callee_resolution: Some(&resolution),
+            ..base_env
+        };
+        assert!(
+            call_target_is_imported(0x1000, 0, &op, &env),
+            "callee facts can certify import policy only through typed resolution"
+        );
+
+        let fallback_function_names = HashMap::from([(0x401000, "sym.helper".to_string())]);
+        let typed_function_names = HashMap::new();
+        let mut modeled_fact = minimal_callee_fact(0x401000, "sym.imp.printf");
+        modeled_fact
+            .model_policy_evidence
+            .insert(r2types::CalleeModelPolicyEvidence::InterprocSummary);
+        let callee_facts = BTreeMap::from([(0x401000, modeled_fact)]);
+        let known_function_signatures = HashMap::new();
+        let resolution = r2types::CalleeResolutionFacts::from_direct_call_targets(
+            [(
+                CallsiteKey {
+                    block_addr: 0x1000,
+                    op_index: 0,
+                },
+                0x401000,
+            )],
+            &r2types::CalleeIdentityContext {
+                function_names: &typed_function_names,
+                symbols: &symbols,
+                callee_facts: &callee_facts,
+                known_function_signatures: &known_function_signatures,
+            },
+        );
+        let fixture = TestEnvFixture {
+            function_names: fallback_function_names,
+            ..TestEnvFixture::default()
+        };
+        let base_env = fixture.env();
+        let env = PassEnv {
+            callee_facts: &callee_facts,
+            callee_resolution: Some(&resolution),
+            ..base_env
+        };
+        assert!(
+            !call_target_is_imported(0x1000, 0, &op, &env),
+            "import-looking callee fact names need explicit import linkage evidence"
+        );
+        assert!(
+            call_target_uses_imported_like_args(0x1000, 0, &op, &env),
+            "modeled callee facts use imported-like argument collection without import linkage"
+        );
+
+        let fallback_function_names = HashMap::from([(0x401000, "sym.imp.printf".to_string())]);
+        let typed_function_names = HashMap::from([(0x401000, "sym.helper".to_string())]);
+        let callee_facts = BTreeMap::new();
+        let known_function_signatures = HashMap::new();
+        let resolution = r2types::CalleeResolutionFacts::from_direct_call_targets(
+            [(
+                CallsiteKey {
+                    block_addr: 0x1000,
+                    op_index: 0,
+                },
+                0x401000,
+            )],
+            &r2types::CalleeIdentityContext {
+                function_names: &typed_function_names,
+                symbols: &symbols,
+                callee_facts: &callee_facts,
+                known_function_signatures: &known_function_signatures,
+            },
+        );
+        let fixture = TestEnvFixture {
+            function_names: fallback_function_names,
+            ..TestEnvFixture::default()
+        };
+        let base_env = fixture.env();
+        let env = PassEnv {
+            callee_facts: &callee_facts,
+            callee_resolution: Some(&resolution),
+            ..base_env
+        };
+        assert!(!call_target_is_imported(0x1000, 0, &op, &env));
+    }
+
+    #[test]
+    fn call_target_import_policy_requires_callsite_resolution_not_raw_direct_address() {
+        let op = SSAOp::Call {
+            target: mk("ram:402000", 0, 8),
+        };
+        let function_names = HashMap::new();
+        let symbols = HashMap::new();
+        let callee_facts =
+            BTreeMap::from([(0x402000, imported_callee_fact(0x402000, "sym.imp.printf"))]);
+        let known_function_signatures = HashMap::new();
+        let resolution =
+            r2types::CalleeResolutionFacts::from_context(&r2types::CalleeIdentityContext {
+                function_names: &function_names,
+                symbols: &symbols,
+                callee_facts: &callee_facts,
+                known_function_signatures: &known_function_signatures,
+            });
+        let fixture = TestEnvFixture::default();
+        let base_env = fixture.env();
+        let env = PassEnv {
+            callee_facts: &callee_facts,
+            callee_resolution: Some(&resolution),
+            ..base_env
+        };
+
+        assert!(
+            !call_target_is_imported(0x1000, 0, &op, &env),
+            "stale direct-address identity must not authorize import policy without a callsite binding"
+        );
+        assert!(
+            !call_target_uses_imported_like_args(0x1000, 0, &op, &env),
+            "stale direct-address identity must not authorize imported-like argument collection"
+        );
+    }
+
+    #[test]
+    fn call_target_import_policy_uses_callsite_resolution_over_raw_import_address() {
+        let op = SSAOp::Call {
+            target: mk("ram:402000", 0, 8),
+        };
+        let callsite = CallsiteKey {
+            block_addr: 0x1000,
+            op_index: 0,
+        };
+        let function_names = HashMap::from([(0x401000, "sym.local_helper".to_string())]);
+        let symbols = HashMap::new();
+        let callee_facts =
+            BTreeMap::from([(0x402000, imported_callee_fact(0x402000, "sym.imp.printf"))]);
+        let known_function_signatures = HashMap::new();
+        let resolution = r2types::CalleeResolutionFacts::from_direct_call_targets(
+            [(callsite, 0x401000)],
+            &r2types::CalleeIdentityContext {
+                function_names: &function_names,
+                symbols: &symbols,
+                callee_facts: &callee_facts,
+                known_function_signatures: &known_function_signatures,
+            },
+        );
+        let fixture = TestEnvFixture::default();
+        let base_env = fixture.env();
+        let env = PassEnv {
+            callee_facts: &callee_facts,
+            callee_resolution: Some(&resolution),
+            ..base_env
+        };
+
+        assert!(
+            !call_target_is_imported(0x1000, 0, &op, &env),
+            "engine callsite identity should reject import policy when the rendered target names a different imported address"
+        );
+        assert!(
+            !call_target_uses_imported_like_args(0x1000, 0, &op, &env),
+            "engine callsite identity should reject imported-like argument collection for a conflicting raw import address"
+        );
+    }
+
+    #[test]
+    fn call_target_import_policy_uses_callsite_resolution_over_raw_local_address() {
+        let op = SSAOp::Call {
+            target: mk("ram:402000", 0, 8),
+        };
+        let callsite = CallsiteKey {
+            block_addr: 0x1000,
+            op_index: 0,
+        };
+        let function_names = HashMap::from([(0x402000, "sym.local_raw_target".to_string())]);
+        let symbols = HashMap::new();
+        let callee_facts =
+            BTreeMap::from([(0x401000, imported_callee_fact(0x401000, "sym.imp.printf"))]);
+        let known_function_signatures = HashMap::new();
+        let resolution = r2types::CalleeResolutionFacts::from_direct_call_targets(
+            [(callsite, 0x401000)],
+            &r2types::CalleeIdentityContext {
+                function_names: &function_names,
+                symbols: &symbols,
+                callee_facts: &callee_facts,
+                known_function_signatures: &known_function_signatures,
+            },
+        );
+        let fixture = TestEnvFixture::default();
+        let base_env = fixture.env();
+        let env = PassEnv {
+            callee_facts: &callee_facts,
+            callee_resolution: Some(&resolution),
+            ..base_env
+        };
+
+        assert!(
+            call_target_is_imported(0x1000, 0, &op, &env),
+            "engine callsite identity should authorize import policy even when the rendered target names a different local address"
+        );
+        assert!(
+            call_target_uses_imported_like_args(0x1000, 0, &op, &env),
+            "engine callsite identity should drive imported-like argument collection"
+        );
+    }
+
+    #[test]
+    fn call_target_import_policy_uses_typed_indirect_callsite_identity() {
+        let op = SSAOp::CallInd {
+            target: mk("X16", 0, 8),
+        };
+        let callsite = CallsiteKey {
+            block_addr: 0x1000,
+            op_index: 0,
+        };
+        let key = r2types::CalleeIdentityKey::IndirectSite(callsite);
+        let mut resolution = r2types::CalleeResolutionFacts::default();
+        resolution.by_key.insert(
+            key.clone(),
+            r2types::CalleeIdentity::from_name("sym.imp.printf").with_import_linkage_evidence(),
+        );
+        resolution.by_callsite.insert(callsite, key);
+
+        let fixture = TestEnvFixture::default();
+        let base_env = fixture.env();
+        let env = PassEnv {
+            callee_resolution: Some(&resolution),
+            ..base_env
+        };
+
+        assert!(
+            call_target_is_imported(0x1000, 0, &op, &env),
+            "indirect calls must use typed callsite identity when no address can be parsed"
+        );
     }
 
     #[test]
@@ -8922,7 +9559,7 @@ mod tests {
             SSAOp::Store {
                 space: "ram".to_string(),
                 addr: preserved_home.clone(),
-                val: local_arg,
+                val: local_arg.clone(),
             },
             SSAOp::Call {
                 target: mk("ram:10000081c", 0, 8),
@@ -8943,7 +9580,7 @@ mod tests {
             SSAOp::Store {
                 space: "ram".to_string(),
                 addr: call_home0,
-                val: reloaded_home,
+                val: reloaded_home.clone(),
             },
             SSAOp::IntAdd {
                 dst: call_home1.clone(),
@@ -8960,7 +9597,55 @@ mod tests {
             },
         ]);
 
-        let info = analyze(&[block], &env);
+        let info = analyze(std::slice::from_ref(&block), &env);
+        let lower = LowerCtx {
+            use_info: Some(&info),
+            definitions: &info.definitions,
+            semantic_values: &info.semantic_values,
+            use_counts: &info.use_counts,
+            condition_vars: &info.condition_vars,
+            pinned: &info.pinned,
+            var_aliases: &info.var_aliases,
+            param_register_aliases: env.param_register_aliases,
+            type_hints: &info.type_hints,
+            ptr_arith: &info.ptr_arith,
+            stack_slots: &info.stack_slots,
+            forwarded_values: &info.forwarded_values,
+            type_oracle: env.type_oracle,
+        };
+        let producers = block
+            .ops
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, op)| op.dst().map(|dst| (dst.display_name(), idx)))
+            .collect::<HashMap<_, _>>();
+        let (_, reloaded_home_idx) =
+            producer_entry_for_var(&producers, &reloaded_home).expect("reloaded home producer");
+        let stack_home_query = StackHomeQuery {
+            ops: &block.ops,
+            producers: &producers,
+            info: &info,
+            lower: &lower,
+            env: &env,
+        };
+        let preserved = preserved_input_binding_from_stack_home(
+            &stack_home_query,
+            &reloaded_home,
+            reloaded_home_idx,
+            0,
+        )
+        .expect("preserved stack-home binding");
+        let local_arg_name = local_arg.display_name();
+        assert_eq!(
+            preserved.source_var_name.as_deref(),
+            Some(local_arg_name.as_str())
+        );
+        assert_eq!(
+            preserved.source_value_id,
+            info.value_id_for_var(&local_arg),
+            "stack-home repair candidates must be backed by canonical ValueId provenance"
+        );
+
         let args = info.call_args.get(&(0x1000, 13)).expect("printf args");
         assert!(
             !matches!(
@@ -8985,6 +9670,19 @@ mod tests {
             ),
             "first post-helper printf arg should not regress to a stack placeholder fallback, got {args:?}"
         );
+        let repaired = args
+            .get(1)
+            .expect("first post-helper printf arg should stay bound");
+        if let Some(source_value_id) = repaired.source_value_id {
+            let resolved_name = info
+                .display_name_for_value_id(source_value_id)
+                .expect("post-helper printf arg ValueId should resolve");
+            assert_eq!(
+                repaired.source_var_name.as_deref(),
+                Some(resolved_name.as_str()),
+                "post-helper printf arg source variable and ValueId must agree, binding={repaired:?}"
+            );
+        }
     }
 
     #[test]
@@ -9004,9 +9702,30 @@ mod tests {
         fixture
             .type_hints
             .insert("argv".to_string(), CType::ptr(CType::ptr(CType::Int(8))));
+        let callsite = CallsiteKey {
+            block_addr: 0x1000,
+            op_index: 2,
+        };
+        let callee_facts = BTreeMap::from([(
+            0x1000025d8,
+            imported_callee_fact(0x1000025d8, "sym.imp.atoi"),
+        )]);
+        let symbols = HashMap::new();
+        let known_function_signatures = HashMap::new();
+        let resolution = r2types::CalleeResolutionFacts::from_direct_call_targets(
+            [(callsite, 0x1000025d8)],
+            &r2types::CalleeIdentityContext {
+                function_names: &fixture.function_names,
+                symbols: &symbols,
+                callee_facts: &callee_facts,
+                known_function_signatures: &known_function_signatures,
+            },
+        );
         let base_env = fixture.env();
         let env = PassEnv {
             ret_reg_name: "x0",
+            callee_facts: &callee_facts,
+            callee_resolution: Some(&resolution),
             ..base_env
         };
 
@@ -9249,9 +9968,6 @@ mod tests {
             ptr_arith: &info.ptr_arith,
             stack_slots: &info.stack_slots,
             forwarded_values: &info.forwarded_values,
-            function_names: env.function_names,
-            strings: env.strings,
-            symbols: env.symbols,
             type_oracle: env.type_oracle,
         };
         let helper_idx = block
@@ -9265,10 +9981,11 @@ mod tests {
             block.addr,
             helper_idx,
             &block.ops[helper_idx],
+            &env,
         );
         assert!(
-            expr.is_some(),
-            "expected helper call expression synthesis to succeed for direct-X0 reuse shape, helper args={:?}, x8_32={:?}, load_10={:?}",
+            expr.is_none(),
+            "direct-X0 reuse shape must not synthesize helper call-result expressions without canonical call-result ownership proof, helper args={:?}, x8_32={:?}, load_10={:?}",
             info.call_args.get(&(block.addr, helper_idx)),
             info.semantic_values.get("X8_32"),
             info.semantic_values.get("tmp:24d00_10")
@@ -9494,6 +10211,193 @@ mod tests {
         assert_eq!(aliases.get("EAX_1"), Some(&"eax".to_string()));
         assert_eq!(aliases.get("EAX_2"), Some(&"eax".to_string()));
         assert_eq!(aliases.get("EAX_3"), Some(&"eax".to_string()));
+    }
+
+    #[test]
+    fn semantic_name_filters_use_typed_ssa_storage_and_register_kinds() {
+        for name in [
+            "tmp:1",
+            "TMP:1",
+            "const:1",
+            "ram:401000",
+            "reg:10",
+            "space1:20",
+        ] {
+            assert!(
+                is_low_signal_name(name),
+                "{name} should be low-signal raw SSA storage/register"
+            );
+            assert!(
+                is_semantic_binding_base(name),
+                "{name} should be a semantic binding base"
+            );
+        }
+
+        assert!(is_low_signal_name("t42"));
+        assert!(!is_semantic_binding_base("t42"));
+        assert!(is_semantic_binding_base("local_4"));
+        assert!(is_semantic_binding_base("arg1"));
+        assert!(is_semantic_binding_base("sym.helper"));
+        assert!(!is_low_signal_name("value"));
+        assert!(!is_semantic_binding_base("value"));
+    }
+
+    #[test]
+    fn call_arg_name_filters_use_typed_ssa_storage_kinds() {
+        let fixture = TestEnvFixture::new();
+        let env = fixture.env();
+
+        assert!(is_plausible_call_home_base("tmp:home", &env));
+        assert!(is_plausible_call_home_base("TMP:home", &env));
+        assert!(is_plausible_call_home_base("x8", &env));
+        assert!(is_plausible_call_home_base("r10", &env));
+        assert!(!is_plausible_call_home_base("rsp", &env));
+        assert!(!is_plausible_call_home_base("rbp", &env));
+        assert!(!is_plausible_call_home_base("rdi", &env));
+
+        for name in [
+            "tmp:1",
+            "TMP:1",
+            "const:1",
+            "CONST:1",
+            "ram:401000",
+            "RAM:401000",
+        ] {
+            assert!(
+                is_call_arg_transient_name(name),
+                "{name} should be a transient call-argument carrier"
+            );
+        }
+
+        assert!(is_call_arg_transient_name("rax_1"));
+        assert!(is_call_arg_transient_name("x8_0"));
+        assert!(!is_call_arg_transient_name("space1:20"));
+        assert!(!is_call_arg_transient_name("value"));
+    }
+
+    #[test]
+    fn call_arg_preservation_score_uses_typed_symbol_and_object_names() {
+        assert_eq!(
+            call_arg_expr_preservation_score(&CExpr::Var("tmp:1".to_string()), 0),
+            -60
+        );
+        assert_eq!(
+            call_arg_expr_preservation_score(&CExpr::Var("sym.helper".to_string()), 0),
+            180
+        );
+        assert_eq!(
+            call_arg_expr_preservation_score(&CExpr::Var("obj.global".to_string()), 0),
+            180
+        );
+        assert_eq!(
+            call_arg_expr_preservation_score(&CExpr::Var("data.global".to_string()), 0),
+            70
+        );
+        assert_eq!(
+            call_arg_expr_preservation_score(&CExpr::Var("got.slot".to_string()), 0),
+            70
+        );
+    }
+
+    #[test]
+    fn semantic_source_values_reject_raw_temporary_and_memory_storage_names() {
+        let info = UseInfo::default();
+
+        for var in [
+            mk("tmp:1", 0, 8),
+            mk("ram:401000", 0, 8),
+            mk("space1:20", 0, 8),
+            mk("stack", 0, 8),
+            mk("saved_fp", 0, 8),
+            mk("stack_10", 0, 8),
+        ] {
+            assert_eq!(
+                semantic_source_value_for_var(&info, &var),
+                None,
+                "{} should not become a semantic root",
+                var.display_name()
+            );
+            assert_eq!(
+                semantic_or_scalar_source_value(&info, &var.display_name()),
+                None,
+                "{} should not become a fallback scalar expression",
+                var.display_name()
+            );
+        }
+
+        let ordinary = mk("value", 0, 8);
+        assert!(matches!(
+            semantic_source_value_for_var(&info, &ordinary),
+            Some(SemanticValue::Scalar(ScalarValue::Root(root))) if root.var == ordinary
+        ));
+        assert!(matches!(
+            semantic_or_scalar_source_value(&info, "value_0"),
+            Some(SemanticValue::Scalar(ScalarValue::Expr(CExpr::Var(name)))) if name == "value"
+        ));
+        assert!(matches!(
+            semantic_or_scalar_source_value(&info, "const:1_0"),
+            Some(SemanticValue::Scalar(ScalarValue::Expr(CExpr::IntLit(1))))
+        ));
+    }
+
+    #[test]
+    fn semantic_source_addresses_recover_stack_slots_without_overriding_scalar_semantics() {
+        let fixture = TestEnvFixture::new();
+        let env = fixture.env();
+        let temp_slot = mk("tmp:slot", 1, 8);
+        let alias_slot = mk("alias", 1, 8);
+        let mut info = UseInfo::default();
+        info.definitions.insert(
+            temp_slot.display_name(),
+            CExpr::binary(
+                BinaryOp::Add,
+                CExpr::Var("rsp_0".to_string()),
+                CExpr::IntLit(0x20),
+            ),
+        );
+        info.definitions.insert(
+            alias_slot.display_name(),
+            CExpr::binary(
+                BinaryOp::Add,
+                CExpr::Var("rsp_0".to_string()),
+                CExpr::IntLit(0x28),
+            ),
+        );
+        info.copy_sources
+            .insert(alias_slot.display_name(), "source_1".to_string());
+
+        assert_eq!(
+            semantic_addr_for_var_with_depth(&info, &temp_slot, &env, 0),
+            Some(NormalizedAddr {
+                base: BaseRef::StackSlot(0x20),
+                index: None,
+                scale_bytes: 0,
+                offset_bytes: 0,
+            })
+        );
+        assert_eq!(
+            semantic_addr_for_var_with_depth(&info, &alias_slot, &env, 0),
+            Some(NormalizedAddr {
+                base: BaseRef::StackSlot(0x28),
+                index: None,
+                scale_bytes: 0,
+                offset_bytes: 0,
+            })
+        );
+
+        info.semantic_values.insert(
+            temp_slot.display_name(),
+            SemanticValue::Scalar(ScalarValue::Expr(CExpr::Var("semantic".to_string()))),
+        );
+        assert!(matches!(
+            semantic_addr_for_var_with_depth(&info, &temp_slot, &env, 0),
+            Some(NormalizedAddr {
+                base: BaseRef::Raw(_),
+                index: None,
+                scale_bytes: 0,
+                offset_bytes: 0,
+            })
+        ));
     }
 
     #[test]
@@ -9906,7 +10810,7 @@ mod tests {
                     name != "stack" && name != "saved_fp" && !name.starts_with("local_")
                 }
                 Some(SemanticValue::Scalar(ScalarValue::Root(value_ref))) => {
-                    !value_ref.var.name.starts_with("tmp:")
+                    !value_ref.var.name_kind().is_temporary()
                         && !value_ref.var.name.eq_ignore_ascii_case("stack")
                         && !value_ref.var.name.eq_ignore_ascii_case("saved_fp")
                 }
@@ -11158,7 +12062,7 @@ mod tests {
 
         let blocks = func.blocks().cloned().collect::<Vec<_>>();
         let mut info = analyze(&blocks, &env);
-        populate_frame_slot_merges(&mut info, &func, &env);
+        populate_frame_slot_merges(&mut info, &func, &env, None);
 
         let summary = info
             .frame_slot_merges
@@ -11173,6 +12077,37 @@ mod tests {
             summary.incoming.get(&0x1008),
             Some(SemanticValue::Scalar(ScalarValue::Expr(CExpr::IntLit(1))))
         ));
+    }
+
+    #[test]
+    fn preserve_temp_copy_root_identity_requires_raw_temp_copy_from_entry_register() {
+        let dst = mk("tmp:retcopy", 1, 4);
+        let src = mk("W8", 0, 4);
+        let root = SemanticValue::Scalar(ScalarValue::Root(ValueRef::from(src.clone())));
+
+        assert_eq!(
+            preserve_temp_copy_root_identity(&dst, &src, root.clone()),
+            SemanticValue::Scalar(ScalarValue::Root(ValueRef::from(dst.clone())))
+        );
+        assert_eq!(
+            preserve_temp_copy_root_identity(&mk("local_retcopy", 1, 4), &src, root.clone()),
+            root
+        );
+
+        let other_src = mk("W9", 0, 4);
+        let other_root = SemanticValue::Scalar(ScalarValue::Root(ValueRef::from(other_src)));
+        assert_eq!(
+            preserve_temp_copy_root_identity(&dst, &src, other_root.clone()),
+            other_root
+        );
+
+        let versioned_src = mk("W8", 1, 4);
+        let versioned_root =
+            SemanticValue::Scalar(ScalarValue::Root(ValueRef::from(versioned_src.clone())));
+        assert_eq!(
+            preserve_temp_copy_root_identity(&dst, &versioned_src, versioned_root.clone()),
+            versioned_root
+        );
     }
 
     #[test]
@@ -11284,7 +12219,7 @@ mod tests {
 
         let blocks = func.blocks().cloned().collect::<Vec<_>>();
         let mut info = analyze(&blocks, &env);
-        populate_frame_slot_merges(&mut info, &func, &env);
+        populate_frame_slot_merges(&mut info, &func, &env, None);
 
         let summary = info
             .frame_slot_merges
@@ -11404,7 +12339,7 @@ mod tests {
 
         let blocks = func.blocks().cloned().collect::<Vec<_>>();
         let mut info = analyze(&blocks, &env);
-        populate_frame_slot_merges(&mut info, &func, &env);
+        populate_frame_slot_merges(&mut info, &func, &env, None);
 
         let summary = info
             .frame_slot_merges

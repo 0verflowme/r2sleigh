@@ -1,0 +1,40 @@
+warning: summary route rendering must stay comment/fact-only until native CFG/control/dataflow proof exists
+  --> $DIR/consumer_vm.rs:5:27
+   |
+LL |     let _ = writeln!(out, "    case 0x1:");
+   |                           ^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(r2dec_summary_route_executable_c)]` on by default
+
+warning: summary route rendering must stay comment/fact-only until native CFG/control/dataflow proof exists
+  --> $DIR/consumer_vm.rs:6:27
+   |
+LL |     let _ = writeln!(out, "    default:");
+   |                           ^^^^^^^^^^^^^^
+
+warning: summary route rendering must stay comment/fact-only until native CFG/control/dataflow proof exists
+  --> $DIR/consumer_vm.rs:7:27
+   |
+LL |     let _ = writeln!(out, "        break;");
+   |                           ^^^^^^^^^^^^^^^^
+
+warning: summary route rendering must stay comment/fact-only until native CFG/control/dataflow proof exists
+  --> $DIR/consumer_vm.rs:8:13
+   |
+LL |     let _ = "return vm_result;";
+   |             ^^^^^^^^^^^^^^^^^^^
+
+warning: summary route rendering must stay comment/fact-only until native CFG/control/dataflow proof exists
+  --> $DIR/consumer_vm.rs:15:5
+   |
+LL |     Return()
+   |     ^^^^^^^^
+
+warning: summary route rendering must stay comment/fact-only until native CFG/control/dataflow proof exists
+  --> $DIR/consumer_vm.rs:19:5
+   |
+LL |     Expr()
+   |     ^^^^^^
+
+warning: 6 warnings emitted
+

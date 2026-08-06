@@ -1,0 +1,16 @@
+warning: summary route rendering must stay comment/fact-only until native CFG/control/dataflow proof exists
+  --> $DIR/consumer_linear.rs:19:41
+   |
+LL |     let _ = writeln!(&mut out, "{} {{", plan.signature.signature);
+   |                                         ^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(r2dec_summary_route_executable_c)]` on by default
+
+warning: summary route rendering must stay comment/fact-only until native CFG/control/dataflow proof exists
+  --> $DIR/consumer_linear.rs:21:42
+   |
+LL |         let _ = writeln!(&mut out, "{}", decl.decl);
+   |                                          ^^^^^^^^^
+
+warning: 2 warnings emitted
+

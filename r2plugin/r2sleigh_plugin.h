@@ -14,6 +14,7 @@ typedef struct R2ILContext R2ILContext;
 
 /* Function declarations shared between plugins */
 R2ILContext *get_context(RAnal *anal);
+void r2sleigh_set_arch_override(const char *arch);
 char *r2il_get_reg_profile(R2ILContext *ctx);
 int sleigh_op(RAnal *anal, RAnalOp *op, ut64 addr, const ut8 *data, int len, int mask);
 

@@ -47,6 +47,8 @@ make RUST_FEATURES=all-archs install
 ```
 
 For a smaller build, you can still choose one architecture (for example, `RUST_FEATURES=x86`).
+Use `RUST_TARGET=debug` for faster local iteration, or `RUST_TARGET=dist` when
+you need the old fat-LTO distributable build.
 
 ### First commands
 
@@ -110,6 +112,7 @@ Documentation
 | [doc/taint.md](doc/taint.md) | Taint analysis |
 | [doc/symex.md](doc/symex.md) | Symbolic execution |
 | [doc/plugin.md](doc/plugin.md) | radare2 plugin and commands |
+| [doc/plugin-rfe-2026.md](doc/plugin-rfe-2026.md) | plugin feature and integration RFE |
 | [doc/types.md](doc/types.md) | Type inference |
 | [doc/testing.md](doc/testing.md) | Testing strategy |
 

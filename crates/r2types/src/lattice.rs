@@ -6,6 +6,16 @@ use crate::model::{Signedness, StructField, StructShape, Type, TypeArena, TypeId
 pub struct TypeLattice;
 
 impl TypeLattice {
+    fn meet_integer_shape(
+        a_bits: u32,
+        a_sign: Signedness,
+        b_bits: u32,
+        b_sign: Signedness,
+    ) -> Option<(u32, Signedness)> {
+        let bits = a_bits.min(b_bits);
+        (a_sign == b_sign).then_some((bits, a_sign))
+    }
+
     pub fn is_subtype(arena: &TypeArena, sub: TypeId, sup: TypeId) -> bool {
         if sub == sup {
             return true;
@@ -194,13 +204,13 @@ impl TypeLattice {
                     signedness: b_sign,
                 },
             ) => {
-                let bits = a_bits.min(b_bits);
-                let signedness = if a_sign == b_sign {
-                    a_sign
+                if let Some((bits, signedness)) =
+                    Self::meet_integer_shape(a_bits, a_sign, b_bits, b_sign)
+                {
+                    arena.int(bits, signedness)
                 } else {
-                    Signedness::Unknown
-                };
-                arena.int(bits, signedness)
+                    arena.bottom()
+                }
             }
             (Type::Ptr(a_inner), Type::Ptr(b_inner)) => {
                 let inner = Self::meet(arena, a_inner, b_inner);
@@ -234,6 +244,15 @@ mod tests {
     }
 
     #[test]
+    fn meet_signed_unsigned_is_bottom() {
+        let mut arena = TypeArena::default();
+        let signed = arena.int(32, Signedness::Signed);
+        let unsigned = arena.int(32, Signedness::Unsigned);
+        let meet = TypeLattice::meet(&mut arena, signed, unsigned);
+        assert_eq!(meet, arena.bottom());
+    }
+
+    #[test]
     fn struct_join_merges_fields() {
         let mut arena = TypeArena::default();
         let i32_ty = arena.int(32, Signedness::Signed);
@@ -252,18 +271,12 @@ mod tests {
     }
 
     #[test]
-    fn meet_signed_unsigned_becomes_unknown_with_narrower_bits() {
+    fn meet_signed_unsigned_with_different_widths_is_bottom() {
         let mut arena = TypeArena::default();
         let a = arena.int(64, Signedness::Signed);
         let b = arena.int(32, Signedness::Unsigned);
         let met = TypeLattice::meet(&mut arena, a, b);
-        assert_eq!(
-            arena.get(met),
-            &Type::Int {
-                bits: 32,
-                signedness: Signedness::Unknown
-            }
-        );
+        assert_eq!(met, arena.bottom());
     }
 
     #[test]
@@ -293,5 +306,41 @@ mod tests {
         let f64_ty = arena.float(64);
         let met = TypeLattice::meet(&mut arena, i32_ty, f64_ty);
         assert_eq!(arena.get(met), &Type::Bottom);
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    fn pick_signedness(tag: u8) -> Signedness {
+        match tag % 3 {
+            0 => Signedness::Signed,
+            1 => Signedness::Unsigned,
+            _ => Signedness::Unknown,
+        }
+    }
+
+    #[kani::proof]
+    fn integer_meet_shape_is_sound() {
+        let a_bits: u32 = kani::any();
+        let b_bits: u32 = kani::any();
+        let a_sign = pick_signedness(kani::any());
+        let b_sign = pick_signedness(kani::any());
+
+        let result = TypeLattice::meet_integer_shape(a_bits, a_sign, b_bits, b_sign);
+
+        if a_sign == b_sign {
+            match result {
+                Some((bits, signedness)) => {
+                    assert_eq!(bits, a_bits.min(b_bits));
+                    assert_eq!(signedness, a_sign);
+                    assert_eq!(signedness, b_sign);
+                }
+                None => unreachable!("equal signedness must produce an integer meet"),
+            }
+        } else {
+            assert!(result.is_none());
+        }
     }
 }

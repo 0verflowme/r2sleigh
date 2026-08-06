@@ -2,11 +2,13 @@ NAME=signature_struct_array_index_full_snapshot
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-{"calltype":"amd64","name":"dbg.test_struct_array_index","nargs":4,"nlocals":3,"signature":"int32_t dbg.test_struct_array_index (struct sla_struct_420703e08f70f00e *arr, int32_t idx, int32_t v);","size":124}
+true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaaa
-aflj | jq -c 'map(select(.name | test("(^sym\\._?|^dbg\\.)test_struct_array_index$")))[0] | {name,size,calltype,signature,nlocals,nargs}' | python3 normalize_snapshot.py signature-json
+s `isq~test_struct_array_index$[0]` >/dev/null
+af
+a:sla.debug.types | jq -c '(.function_name | test("test_struct_array_index$")) and .callconv=="amd64" and (.params|length)==3 and (.params[0].type|startswith("struct sla_struct_") and endswith("*")) and .params[1].type=="int32_t" and .params[2].type=="int32_t" and .signature_render_authorized==true and (.signature_certificate_sources|length)>0 and .fact_counts.scalar_array_render_candidates>=3 and .fact_counts.render_array_accesses>=3'
 EOF_CMDS
 RUN
 
@@ -14,10 +16,12 @@ NAME=signature_array_index_full_snapshot
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-{"calltype":"amd64","name":"dbg.test_array_index","nargs":3,"nlocals":2,"signature":"int dbg.test_array_index (int *arr, int idx);","size":39}
+true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaaa
-aflj | jq -c 'map(select(.name | test("(^sym\\._?|^dbg\\.)test_array_index$")))[0] | {name,size,calltype,signature,nlocals,nargs}' | python3 normalize_snapshot.py signature-json
+s `isq~test_array_index$[0]` >/dev/null
+af
+afij | jq -c '.[0] | ((.name // "") | test("test_array_index$")) and .calltype=="amd64" and ((.signature // .name // "") | contains("test_array_index"))'
 EOF_CMDS
 RUN

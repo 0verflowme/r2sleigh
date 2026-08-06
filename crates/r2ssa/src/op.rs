@@ -347,6 +347,14 @@ pub enum SSAOp {
         value: SSAVar,
         position: SSAVar,
     },
+
+    /// Conditional merge of two values from instruction-local P-code control.
+    Select {
+        dst: SSAVar,
+        cond: SSAVar,
+        if_true: SSAVar,
+        if_false: SSAVar,
+    },
 }
 
 impl SSAOp {
@@ -421,6 +429,7 @@ impl SSAOp {
             | Cast { dst, .. }
             | Extract { dst, .. }
             | Insert { dst, .. }
+            | Select { dst, .. }
             | CallDefine { dst } => Some(dst),
 
             CallOther { output, .. } | StoreConditional { result: output, .. } => output.as_ref(),
@@ -562,6 +571,17 @@ impl SSAOp {
                 f(position);
             }
 
+            Select {
+                cond,
+                if_true,
+                if_false,
+                ..
+            } => {
+                f(cond);
+                f(if_true);
+                f(if_false);
+            }
+
             PtrAdd { base, index, .. } | PtrSub { base, index, .. } => {
                 f(base);
                 f(index);
@@ -634,6 +654,34 @@ impl SSAOp {
                 | SSAOp::StoreConditional { .. }
                 | SSAOp::StoreGuarded { .. }
                 | SSAOp::AtomicCAS { .. }
+        )
+    }
+
+    /// Returns true when removing this operation can change observable behavior.
+    ///
+    /// Ordinary loads are optional because some consumers can prove that a load
+    /// reads only compiler-owned stack plumbing. Atomic and guarded loads remain
+    /// observable regardless of that policy.
+    pub fn has_observable_effects(&self, preserve_memory_reads: bool) -> bool {
+        if self.is_control_flow() || self.is_memory_write() {
+            return true;
+        }
+        if matches!(
+            self,
+            SSAOp::Fence { .. } | SSAOp::LoadLinked { .. } | SSAOp::LoadGuarded { .. }
+        ) {
+            return true;
+        }
+        if preserve_memory_reads && self.is_memory_read() {
+            return true;
+        }
+        matches!(
+            self,
+            SSAOp::CallOther { .. }
+                | SSAOp::Breakpoint
+                | SSAOp::Unimplemented
+                | SSAOp::CpuId { .. }
+                | SSAOp::New { .. }
         )
     }
 
@@ -835,6 +883,12 @@ impl std::fmt::Display for SSAOp {
                 value,
                 position,
             } => write!(f, "{} = INSERT({}, {}, {})", dst, src, value, position),
+            SSAOp::Select {
+                dst,
+                cond,
+                if_true,
+                if_false,
+            } => write!(f, "{} = SELECT({}, {}, {})", dst, cond, if_true, if_false),
         }
     }
 }
@@ -856,6 +910,32 @@ mod tests {
 
         let op = SSAOp::Nop;
         assert_eq!(op.dst(), None);
+    }
+
+    #[test]
+    fn observable_effect_classification_distinguishes_plain_and_atomic_loads() {
+        let load = SSAOp::Load {
+            dst: SSAVar::new("RAX", 1, 8),
+            space: "ram".to_string(),
+            addr: SSAVar::new("RSP", 0, 8),
+        };
+        assert!(!load.has_observable_effects(false));
+        assert!(load.has_observable_effects(true));
+
+        let linked = SSAOp::LoadLinked {
+            dst: SSAVar::new("RAX", 1, 8),
+            space: "ram".to_string(),
+            addr: SSAVar::new("RSP", 0, 8),
+            ordering: r2il::MemoryOrdering::Relaxed,
+        };
+        assert!(linked.has_observable_effects(false));
+
+        let call_other = SSAOp::CallOther {
+            output: None,
+            userop: 1,
+            inputs: Vec::new(),
+        };
+        assert!(call_other.has_observable_effects(false));
     }
 
     #[test]

@@ -1,0 +1,16 @@
+warning: summary route rendering must not call semantic worker structuring without certified native render permission
+  --> $DIR/consumer_structured.rs:23:39
+   |
+LL |             if let Some(structured) = structurer.structure_semantic_worker_islands(6) {
+   |                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(r2dec_summary_route_executable_c)]` on by default
+
+warning: summary route rendering must not call semantic worker structuring without certified native render permission
+  --> $DIR/consumer_structured.rs:24:17
+   |
+LL |                 semantic_worker_structured_body(reason, structured);
+   |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: 2 warnings emitted
+

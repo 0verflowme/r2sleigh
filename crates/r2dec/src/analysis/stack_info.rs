@@ -2,9 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use r2ssa::SSAOp;
 
-use super::{PassEnv, StackInfo, UseInfo, lower::LowerCtx, utils};
+use super::{PassEnv, PtrArith, SSABlock, StackInfo, UseInfo, lower::LowerCtx, utils};
 use crate::ast::CExpr;
-use crate::fold::SSABlock;
 
 #[derive(Debug, Default)]
 pub(crate) struct StackScratch {
@@ -267,7 +266,7 @@ fn stack_var_for_addr_var(
 
     let empty_counts: HashMap<String, usize> = HashMap::new();
     let empty_names: HashSet<String> = HashSet::new();
-    let empty_ptrs: HashMap<String, crate::fold::PtrArith> = HashMap::new();
+    let empty_ptrs: HashMap<String, PtrArith> = HashMap::new();
     let empty_semantic_values: HashMap<String, crate::analysis::SemanticValue> = HashMap::new();
     let lower = LowerCtx {
         use_info: None,
@@ -282,9 +281,6 @@ fn stack_var_for_addr_var(
         ptr_arith: &empty_ptrs,
         stack_slots: inputs.stack_slots,
         forwarded_values: &HashMap::new(),
-        function_names: inputs.env.function_names,
-        strings: inputs.env.strings,
-        symbols: inputs.env.symbols,
         type_oracle: inputs.env.type_oracle,
     };
     let rendered = lower.var_name(addr);
@@ -462,7 +458,7 @@ fn forwarded_expr_for_value(
     let prov = use_info.forwarded_values.get(value_key)?;
     let empty_counts: HashMap<String, usize> = HashMap::new();
     let empty_names: HashSet<String> = HashSet::new();
-    let empty_ptrs: HashMap<String, crate::fold::PtrArith> = HashMap::new();
+    let empty_ptrs: HashMap<String, PtrArith> = HashMap::new();
     let lower = LowerCtx {
         use_info: Some(use_info),
         definitions,
@@ -476,9 +472,6 @@ fn forwarded_expr_for_value(
         ptr_arith: &empty_ptrs,
         stack_slots: &use_info.stack_slots,
         forwarded_values: &use_info.forwarded_values,
-        function_names: env.function_names,
-        strings: env.strings,
-        symbols: env.symbols,
         type_oracle: env.type_oracle,
     };
     Some(lower.expr_for_ssa_name(&prov.source))
@@ -639,6 +632,9 @@ mod tests {
             function_names: &function_names,
             strings: &strings,
             symbols: &symbols,
+            callee_facts: crate::analysis::empty_callee_facts(),
+            callee_resolution: None,
+            summary_view: None,
             arg_regs: &arch.arg_regs,
             param_register_aliases: &param_aliases,
             caller_saved_regs: &arch.caller_saved_regs,

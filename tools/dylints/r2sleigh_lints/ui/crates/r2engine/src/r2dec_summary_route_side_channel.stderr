@@ -1,0 +1,36 @@
+warning: r2engine must not define route conversion helpers or depend on r2dec route types
+  --> $DIR/r2dec_summary_route_side_channel.rs:11:1
+   |
+LL | / impl EngineSemanticRoutePlan {
+LL | |     fn to_decompiler_route(&self) -> SemanticRoutePlan {
+LL | |         SemanticRoutePlan
+LL | |     }
+LL | | }
+   | |_^
+   |
+   = note: `#[warn(r2engine_r2dec_summary_render_route_side_channel)]` on by default
+
+warning: r2engine must not pass EngineSemanticRoutePlan/SemanticRoutePlan as a r2dec summary render side channel
+  --> $DIR/r2dec_summary_route_side_channel.rs:51:50
+   |
+LL |           EngineSemanticRoutePlan::LinearWorker => r2dec::render_semantic_worker_summary(
+   |  __________________________________________________^
+LL | |             function_name,
+LL | |             function_facts,
+LL | |             &route.to_decompiler_route(),
+LL | |             config.to_decompiler_config(),
+LL | |         ),
+   | |_________^
+
+warning: r2engine must not pass EngineSemanticRoutePlan/SemanticRoutePlan as a r2dec summary render side channel
+  --> $DIR/r2dec_summary_route_side_channel.rs:58:13
+   |
+LL | /             r2dec::render_vm_semantic_summary(
+LL | |                 function_name,
+LL | |                 function_facts,
+LL | |                 &route.to_decompiler_route(),
+LL | |             )
+   | |_____________^
+
+warning: 3 warnings emitted
+

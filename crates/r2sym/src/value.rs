@@ -9,7 +9,8 @@ use std::fmt;
 
 use std::marker::PhantomData;
 use z3::Context;
-use z3::ast::BV;
+use z3::DeclKind;
+use z3::ast::{Ast, BV, Dynamic};
 
 /// A symbolic value that can be concrete, symbolic, or unknown.
 ///
@@ -276,6 +277,57 @@ impl<'ctx> SymValue<'ctx> {
         }
     }
 
+    pub(crate) fn symbolic_key(&self) -> Option<String> {
+        match self {
+            Self::Symbolic { ast, bits, .. } => Some(format!("{bits}:{}", ast)),
+            _ => None,
+        }
+    }
+
+    fn is_concrete_value(&self, expected: u64) -> bool {
+        matches!(self, Self::Concrete { value, .. } if *value == expected)
+    }
+
+    fn mask_for_bits(bits: u32) -> u64 {
+        if bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        }
+    }
+
+    fn concrete_logical_shift_left(value: u64, bits: u32, amount: u64) -> u64 {
+        if bits == 0 || amount >= u64::from(bits) {
+            return 0;
+        }
+        value.wrapping_shl(amount as u32) & Self::mask_for_bits(bits)
+    }
+
+    fn concrete_logical_shift_right(value: u64, bits: u32, amount: u64) -> u64 {
+        if bits == 0 || amount >= u64::from(bits) {
+            return 0;
+        }
+        value >> (amount as u32)
+    }
+
+    fn is_all_ones_for(&self, bits: u32) -> bool {
+        match self {
+            Self::Concrete {
+                value,
+                bits: value_bits,
+                ..
+            } => *value_bits == bits && *value == Self::mask_for_bits(bits),
+            _ => false,
+        }
+    }
+
+    fn same_symbolic_ast(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Symbolic { ast: a, .. }, Self::Symbolic { ast: b, .. }) => a.ast_eq(b),
+            _ => false,
+        }
+    }
+
     /// Convert to a Z3 bitvector (concretizing if needed).
     pub fn to_bv(&self, _ctx: &'ctx Context) -> BV {
         match self {
@@ -309,7 +361,23 @@ impl<'ctx> SymValue<'ctx> {
                 taint,
                 ..
             } => {
-                let new_ast = ast.zero_ext(extend_by);
+                let new_ast = {
+                    let dyn_ast = Dynamic::from_ast(ast);
+                    if matches!(
+                        dyn_ast.safe_decl().map(|decl| decl.kind()),
+                        Ok(DeclKind::ZeroExt)
+                    ) {
+                        if let Some(child) =
+                            dyn_ast.children().first().and_then(|child| child.as_bv())
+                        {
+                            child.zero_ext(new_bits - child.get_size())
+                        } else {
+                            ast.zero_ext(extend_by)
+                        }
+                    } else {
+                        ast.zero_ext(extend_by)
+                    }
+                };
                 Self::Symbolic {
                     ast: new_ast,
                     bits: new_bits,
@@ -357,7 +425,23 @@ impl<'ctx> SymValue<'ctx> {
                 }
             }
             Self::Symbolic { ast, .. } => {
-                let new_ast = ast.sign_ext(extend_by);
+                let new_ast = {
+                    let dyn_ast = Dynamic::from_ast(ast);
+                    if matches!(
+                        dyn_ast.safe_decl().map(|decl| decl.kind()),
+                        Ok(DeclKind::SignExt)
+                    ) {
+                        if let Some(child) =
+                            dyn_ast.children().first().and_then(|child| child.as_bv())
+                        {
+                            child.sign_ext(new_bits - child.get_size())
+                        } else {
+                            ast.sign_ext(extend_by)
+                        }
+                    } else {
+                        ast.sign_ext(extend_by)
+                    }
+                };
                 Self::Symbolic {
                     ast: new_ast,
                     bits: new_bits,
@@ -384,6 +468,9 @@ impl<'ctx> SymValue<'ctx> {
             return Self::Unknown { bits: 1, taint };
         }
         let new_bits = clamped_high - low + 1;
+        if low == 0 && clamped_high + 1 == src_bits {
+            return self.clone();
+        }
         match self {
             Self::Concrete { value, .. } => {
                 if new_bits > 64 || clamped_high >= 64 {
@@ -403,6 +490,20 @@ impl<'ctx> SymValue<'ctx> {
                 }
             }
             Self::Symbolic { ast, .. } => {
+                if low == 0 {
+                    let dyn_ast = Dynamic::from_ast(ast);
+                    if matches!(
+                        dyn_ast.safe_decl().map(|decl| decl.kind()),
+                        Ok(DeclKind::ZeroExt | DeclKind::SignExt)
+                    ) {
+                        let children = dyn_ast.children();
+                        if let Some(child) = children.first().and_then(|child| child.as_bv())
+                            && child.get_size() == new_bits
+                        {
+                            return Self::symbolic_tainted(child, new_bits, taint);
+                        }
+                    }
+                }
                 let new_ast = ast.extract(clamped_high, low);
                 Self::Symbolic {
                     ast: new_ast,
@@ -480,6 +581,8 @@ impl<'ctx> SymValue<'ctx> {
                     taint,
                 }
             }
+            (_, rhs) if rhs.is_zero() => self.clone().with_taint(taint),
+            (lhs, _) if lhs.is_zero() => other.clone().with_taint(taint),
             _ => {
                 let (a_bv, b_bv, result_bits) = self.normalize_widths(ctx, other);
                 Self::Symbolic {
@@ -516,6 +619,12 @@ impl<'ctx> SymValue<'ctx> {
                     taint,
                 }
             }
+            (_, rhs) if rhs.is_zero() => self.clone().with_taint(taint),
+            (lhs, rhs) if lhs.same_symbolic_ast(rhs) => Self::Concrete {
+                value: 0,
+                bits: self.bits().max(other.bits()),
+                taint,
+            },
             _ => {
                 let (a_bv, b_bv, result_bits) = self.normalize_widths(ctx, other);
                 Self::Symbolic {
@@ -552,6 +661,18 @@ impl<'ctx> SymValue<'ctx> {
                     taint,
                 }
             }
+            (_, rhs) if rhs.is_zero() => Self::Concrete {
+                value: 0,
+                bits: self.bits().max(other.bits()),
+                taint,
+            },
+            (lhs, _) if lhs.is_zero() => Self::Concrete {
+                value: 0,
+                bits: self.bits().max(other.bits()),
+                taint,
+            },
+            (_, rhs) if rhs.is_concrete_value(1) => self.clone().with_taint(taint),
+            (lhs, _) if lhs.is_concrete_value(1) => other.clone().with_taint(taint),
             _ => {
                 let (a_bv, b_bv, result_bits) = self.normalize_widths(ctx, other);
                 Self::Symbolic {
@@ -590,6 +711,7 @@ impl<'ctx> SymValue<'ctx> {
                     }
                 }
             }
+            (_, rhs) if rhs.is_concrete_value(1) => self.clone().with_taint(taint),
             _ => {
                 let (a_bv, b_bv, result_bits) = self.normalize_widths(ctx, other);
                 Self::Symbolic {
@@ -605,6 +727,9 @@ impl<'ctx> SymValue<'ctx> {
     /// Signed division.
     pub fn sdiv(&self, ctx: &'ctx Context, other: &Self) -> Self {
         let taint = self.get_taint() | other.get_taint();
+        if other.is_concrete_value(1) {
+            return self.clone().with_taint(taint);
+        }
         let (a_bv, b_bv, result_bits) = self.normalize_widths_signed(ctx, other);
         Self::Symbolic {
             ast: a_bv.bvsdiv(&b_bv),
@@ -640,6 +765,11 @@ impl<'ctx> SymValue<'ctx> {
                     }
                 }
             }
+            (_, rhs) if rhs.is_concrete_value(1) => Self::Concrete {
+                value: 0,
+                bits: self.bits().max(other.bits()),
+                taint,
+            },
             _ => {
                 let (a_bv, b_bv, result_bits) = self.normalize_widths(ctx, other);
                 Self::Symbolic {
@@ -655,6 +785,13 @@ impl<'ctx> SymValue<'ctx> {
     /// Signed remainder.
     pub fn srem(&self, ctx: &'ctx Context, other: &Self) -> Self {
         let taint = self.get_taint() | other.get_taint();
+        if other.is_concrete_value(1) {
+            return Self::Concrete {
+                value: 0,
+                bits: self.bits().max(other.bits()),
+                taint,
+            };
+        }
         let (a_bv, b_bv, result_bits) = self.normalize_widths_signed(ctx, other);
         Self::Symbolic {
             ast: a_bv.bvsrem(&b_bv),
@@ -697,6 +834,7 @@ impl<'ctx> SymValue<'ctx> {
     /// Bitwise AND.
     pub fn and(&self, ctx: &'ctx Context, other: &Self) -> Self {
         let taint = self.get_taint() | other.get_taint();
+        let result_bits = self.bits().max(other.bits());
         match (self, other) {
             (
                 Self::Concrete { value: a, bits, .. },
@@ -710,6 +848,19 @@ impl<'ctx> SymValue<'ctx> {
                 bits: (*bits).max(*b_bits),
                 taint,
             },
+            (_, rhs) if rhs.is_zero() => Self::Concrete {
+                value: 0,
+                bits: self.bits().max(other.bits()),
+                taint,
+            },
+            (lhs, _) if lhs.is_zero() => Self::Concrete {
+                value: 0,
+                bits: self.bits().max(other.bits()),
+                taint,
+            },
+            (_, rhs) if rhs.is_all_ones_for(result_bits) => self.clone().with_taint(taint),
+            (lhs, _) if lhs.is_all_ones_for(result_bits) => other.clone().with_taint(taint),
+            (lhs, rhs) if lhs.same_symbolic_ast(rhs) => self.clone().with_taint(taint),
             _ => {
                 let (a_bv, b_bv, result_bits) = self.normalize_widths(ctx, other);
                 Self::Symbolic {
@@ -725,6 +876,7 @@ impl<'ctx> SymValue<'ctx> {
     /// Bitwise OR.
     pub fn or(&self, ctx: &'ctx Context, other: &Self) -> Self {
         let taint = self.get_taint() | other.get_taint();
+        let result_bits = self.bits().max(other.bits());
         match (self, other) {
             (
                 Self::Concrete { value: a, bits, .. },
@@ -738,6 +890,19 @@ impl<'ctx> SymValue<'ctx> {
                 bits: (*bits).max(*b_bits),
                 taint,
             },
+            (_, rhs) if rhs.is_zero() => self.clone().with_taint(taint),
+            (lhs, _) if lhs.is_zero() => other.clone().with_taint(taint),
+            (_, rhs) if rhs.is_all_ones_for(result_bits) => Self::Concrete {
+                value: Self::mask_for_bits(result_bits),
+                bits: result_bits,
+                taint,
+            },
+            (lhs, _) if lhs.is_all_ones_for(result_bits) => Self::Concrete {
+                value: Self::mask_for_bits(result_bits),
+                bits: result_bits,
+                taint,
+            },
+            (lhs, rhs) if lhs.same_symbolic_ast(rhs) => self.clone().with_taint(taint),
             _ => {
                 let (a_bv, b_bv, result_bits) = self.normalize_widths(ctx, other);
                 Self::Symbolic {
@@ -764,6 +929,13 @@ impl<'ctx> SymValue<'ctx> {
             ) => Self::Concrete {
                 value: *a ^ *b,
                 bits: (*bits).max(*b_bits),
+                taint,
+            },
+            (_, rhs) if rhs.is_zero() => self.clone().with_taint(taint),
+            (lhs, _) if lhs.is_zero() => other.clone().with_taint(taint),
+            (lhs, rhs) if lhs.same_symbolic_ast(rhs) => Self::Concrete {
+                value: 0,
+                bits: self.bits().max(other.bits()),
                 taint,
             },
             _ => {
@@ -806,20 +978,35 @@ impl<'ctx> SymValue<'ctx> {
         }
     }
 
+    /// Logical boolean NOT: returns 1 when this value is zero, otherwise 0.
+    pub fn bool_not(&self, ctx: &'ctx Context) -> Self {
+        let taint = self.get_taint();
+        match self.as_concrete() {
+            Some(value) => Self::Concrete {
+                value: if value == 0 { 1 } else { 0 },
+                bits: 1,
+                taint,
+            },
+            None => {
+                let bv = self.to_bv(ctx);
+                let zero_check = bv.eq(BV::from_u64(0, Self::normalize_bv_bits(self.bits())));
+                let one = BV::from_u64(1, 1);
+                let zero = BV::from_u64(0, 1);
+                Self::symbolic_tainted(zero_check.ite(&one, &zero), 1, taint)
+            }
+        }
+    }
+
     // ==================== Shift Operations ====================
 
     /// Logical left shift.
     pub fn shl(&self, ctx: &'ctx Context, amount: &Self) -> Self {
         let taint = self.get_taint() | amount.get_taint();
         match (self, amount) {
+            (_, amt) if amt.is_zero() => self.clone().with_taint(taint),
             (Self::Concrete { value, bits, .. }, Self::Concrete { value: amt, .. }) => {
-                let mask = if *bits >= 64 {
-                    u64::MAX
-                } else {
-                    (1u64 << *bits) - 1
-                };
                 Self::Concrete {
-                    value: (*value << (*amt as u32)) & mask,
+                    value: Self::concrete_logical_shift_left(*value, *bits, *amt),
                     bits: *bits,
                     taint,
                 }
@@ -841,9 +1028,10 @@ impl<'ctx> SymValue<'ctx> {
     pub fn lshr(&self, ctx: &'ctx Context, amount: &Self) -> Self {
         let taint = self.get_taint() | amount.get_taint();
         match (self, amount) {
+            (_, amt) if amt.is_zero() => self.clone().with_taint(taint),
             (Self::Concrete { value, bits, .. }, Self::Concrete { value: amt, .. }) => {
                 Self::Concrete {
-                    value: *value >> (*amt as u32),
+                    value: Self::concrete_logical_shift_right(*value, *bits, *amt),
                     bits: *bits,
                     taint,
                 }
@@ -864,6 +1052,9 @@ impl<'ctx> SymValue<'ctx> {
     /// Arithmetic right shift.
     pub fn ashr(&self, ctx: &'ctx Context, amount: &Self) -> Self {
         let taint = self.get_taint() | amount.get_taint();
+        if amount.is_zero() {
+            return self.clone().with_taint(taint);
+        }
         let a_bv = self.to_bv(ctx);
         let b_bv = self.normalize_shift_amount(ctx, amount);
         Self::Symbolic {
@@ -882,6 +1073,11 @@ impl<'ctx> SymValue<'ctx> {
         match (self, other) {
             (Self::Concrete { value: a, .. }, Self::Concrete { value: b, .. }) => Self::Concrete {
                 value: if *a == *b { 1 } else { 0 },
+                bits: 1,
+                taint,
+            },
+            (lhs, rhs) if lhs.same_symbolic_ast(rhs) => Self::Concrete {
+                value: 1,
                 bits: 1,
                 taint,
             },
@@ -909,6 +1105,11 @@ impl<'ctx> SymValue<'ctx> {
                 bits: 1,
                 taint,
             },
+            (lhs, rhs) if lhs.same_symbolic_ast(rhs) => Self::Concrete {
+                value: 0,
+                bits: 1,
+                taint,
+            },
             _ => {
                 let (a_bv, b_bv, _) = self.normalize_widths(ctx, other);
                 let cond = a_bv.bvult(&b_bv);
@@ -933,6 +1134,11 @@ impl<'ctx> SymValue<'ctx> {
                 bits: 1,
                 taint,
             },
+            (lhs, rhs) if lhs.same_symbolic_ast(rhs) => Self::Concrete {
+                value: 1,
+                bits: 1,
+                taint,
+            },
             _ => {
                 let (a_bv, b_bv, _) = self.normalize_widths(ctx, other);
                 let cond = a_bv.bvule(&b_bv);
@@ -951,6 +1157,13 @@ impl<'ctx> SymValue<'ctx> {
     /// Signed less than comparison.
     pub fn slt(&self, ctx: &'ctx Context, other: &Self) -> Self {
         let taint = self.get_taint() | other.get_taint();
+        if self.same_symbolic_ast(other) {
+            return Self::Concrete {
+                value: 0,
+                bits: 1,
+                taint,
+            };
+        }
         let (a_bv, b_bv, _) = self.normalize_widths_signed(ctx, other);
         let cond = a_bv.bvslt(&b_bv);
         let one = BV::from_i64(1, 1);
@@ -966,6 +1179,13 @@ impl<'ctx> SymValue<'ctx> {
     /// Signed less than or equal comparison.
     pub fn sle(&self, ctx: &'ctx Context, other: &Self) -> Self {
         let taint = self.get_taint() | other.get_taint();
+        if self.same_symbolic_ast(other) {
+            return Self::Concrete {
+                value: 1,
+                bits: 1,
+                taint,
+            };
+        }
         let (a_bv, b_bv, _) = self.normalize_widths_signed(ctx, other);
         let cond = a_bv.bvsle(&b_bv);
         let one = BV::from_i64(1, 1);
@@ -1044,6 +1264,7 @@ impl<'ctx> fmt::Display for SymValue<'ctx> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use z3::{SatResult, Solver};
 
     #[test]
     fn test_concrete_ops() {
@@ -1115,6 +1336,103 @@ mod tests {
     }
 
     #[test]
+    fn test_symbolic_identity_fast_paths() {
+        let ctx = Context::thread_local();
+
+        let sym = SymValue::new_symbolic(&ctx, "x", 64);
+        let zero = SymValue::concrete(0, 64);
+        let one = SymValue::concrete(1, 64);
+
+        let add = sym.add(&ctx, &zero);
+        let sub = sym.sub(&ctx, &zero);
+        let mul = sym.mul(&ctx, &one);
+        let and = sym.and(&ctx, &SymValue::concrete(u64::MAX, 64));
+        let or = sym.or(&ctx, &zero);
+        let xor = sym.xor(&ctx, &zero);
+        let shl = sym.shl(&ctx, &zero);
+        let lshr = sym.lshr(&ctx, &zero);
+        let ashr = sym.ashr(&ctx, &zero);
+
+        assert!(add.same_symbolic_ast(&sym));
+        assert!(sub.same_symbolic_ast(&sym));
+        assert!(mul.same_symbolic_ast(&sym));
+        assert!(and.same_symbolic_ast(&sym));
+        assert!(or.same_symbolic_ast(&sym));
+        assert!(xor.same_symbolic_ast(&sym));
+        assert!(shl.same_symbolic_ast(&sym));
+        assert!(lshr.same_symbolic_ast(&sym));
+        assert!(ashr.same_symbolic_ast(&sym));
+    }
+
+    #[test]
+    fn test_symbolic_division_remainder_fast_paths() {
+        let ctx = Context::thread_local();
+
+        let sym = SymValue::new_symbolic(&ctx, "x", 64);
+        let one = SymValue::concrete(1, 64);
+
+        let udiv = sym.udiv(&ctx, &one);
+        let sdiv = sym.sdiv(&ctx, &one);
+        let urem = sym.urem(&ctx, &one);
+        let srem = sym.srem(&ctx, &one);
+
+        assert!(udiv.same_symbolic_ast(&sym));
+        assert!(sdiv.same_symbolic_ast(&sym));
+        assert_eq!(urem.as_concrete(), Some(0));
+        assert_eq!(srem.as_concrete(), Some(0));
+    }
+
+    #[test]
+    fn test_symbolic_self_rules() {
+        let ctx = Context::thread_local();
+
+        let sym = SymValue::new_symbolic(&ctx, "x", 64);
+
+        assert_eq!(sym.sub(&ctx, &sym).as_concrete(), Some(0));
+        assert_eq!(sym.xor(&ctx, &sym).as_concrete(), Some(0));
+        assert_eq!(sym.eq(&ctx, &sym).as_concrete(), Some(1));
+        assert_eq!(sym.ult(&ctx, &sym).as_concrete(), Some(0));
+        assert_eq!(sym.ule(&ctx, &sym).as_concrete(), Some(1));
+        assert_eq!(sym.slt(&ctx, &sym).as_concrete(), Some(0));
+        assert_eq!(sym.sle(&ctx, &sym).as_concrete(), Some(1));
+    }
+
+    #[test]
+    fn bool_not_is_logical_for_symbolic_byte_flags() {
+        let ctx = Context::thread_local();
+
+        let flag = SymValue::new_symbolic(&ctx, "flag", 8);
+        let negated = flag.bool_not(&ctx);
+
+        assert_eq!(negated.bits(), 1);
+
+        let flag_bv = flag.to_bv(&ctx);
+        let negated_bv = negated.to_bv(&ctx);
+        for (input, expected) in [(0, 1), (1, 0), (0xff, 0)] {
+            let solver = Solver::new();
+            solver.assert(flag_bv.eq(BV::from_u64(input, 8)));
+            solver.assert(negated_bv.eq(BV::from_u64(expected, 1)).not());
+            assert_eq!(solver.check(), SatResult::Unsat);
+        }
+    }
+
+    #[test]
+    fn test_all_ones_fast_paths_require_full_result_width() {
+        let ctx = Context::thread_local();
+
+        let sym = SymValue::new_symbolic(&ctx, "x", 64);
+        let byte_ones = SymValue::concrete(0xff, 8);
+
+        let and = sym.and(&ctx, &byte_ones);
+        let or = sym.or(&ctx, &byte_ones);
+
+        assert!(and.is_symbolic());
+        assert!(or.is_symbolic());
+        assert!(!and.same_symbolic_ast(&sym));
+        assert!(!or.same_symbolic_ast(&sym));
+    }
+
+    #[test]
     fn test_extension() {
         let ctx = Context::thread_local();
 
@@ -1141,6 +1459,50 @@ mod tests {
 
         let high = a.extract(&ctx, 15, 8);
         assert_eq!(high.as_concrete(), Some(0xAB));
+    }
+
+    #[test]
+    fn test_extract_full_width_returns_same_symbolic_ast() {
+        let ctx = Context::thread_local();
+        let sym = SymValue::new_symbolic(&ctx, "x", 32);
+        let extracted = sym.extract(&ctx, 31, 0);
+        assert!(extracted.same_symbolic_ast(&sym));
+    }
+
+    #[test]
+    fn test_extract_zero_extend_low_bits_returns_original_ast() {
+        let ctx = Context::thread_local();
+        let sym = SymValue::new_symbolic(&ctx, "x", 32);
+        let widened = sym.zero_extend(&ctx, 64);
+        let extracted = widened.extract(&ctx, 31, 0);
+        assert!(extracted.same_symbolic_ast(&sym));
+    }
+
+    #[test]
+    fn test_extract_sign_extend_low_bits_returns_original_ast() {
+        let ctx = Context::thread_local();
+        let sym = SymValue::new_symbolic(&ctx, "x", 32);
+        let widened = sym.sign_extend(&ctx, 64);
+        let extracted = widened.extract(&ctx, 31, 0);
+        assert!(extracted.same_symbolic_ast(&sym));
+    }
+
+    #[test]
+    fn test_zero_extend_flattens_nested_extensions() {
+        let ctx = Context::thread_local();
+        let sym = SymValue::new_symbolic(&ctx, "x", 16);
+        let widened = sym.zero_extend(&ctx, 32).zero_extend(&ctx, 64);
+        let direct = sym.zero_extend(&ctx, 64);
+        assert!(widened.same_symbolic_ast(&direct));
+    }
+
+    #[test]
+    fn test_sign_extend_flattens_nested_extensions() {
+        let ctx = Context::thread_local();
+        let sym = SymValue::new_symbolic(&ctx, "x", 16);
+        let widened = sym.sign_extend(&ctx, 32).sign_extend(&ctx, 64);
+        let direct = sym.sign_extend(&ctx, 64);
+        assert!(widened.same_symbolic_ast(&direct));
     }
 }
 
@@ -1175,6 +1537,25 @@ mod bitwidth_tests {
         let result = val64.shl(&ctx, &shift8);
         assert_eq!(result.as_concrete(), Some(20)); // 5 << 2 = 20
         assert_eq!(result.bits(), 64); // Result keeps value's width
+    }
+
+    #[test]
+    fn test_concrete_shifts_past_bitwidth_zero_fill_instead_of_panicking() {
+        let ctx = Context::thread_local();
+
+        let val64 = SymValue::concrete(0x1234_5678_9abc_def0, 64);
+        let shift64 = SymValue::concrete(64, 64);
+        let shift65 = SymValue::concrete(65, 8);
+
+        assert_eq!(val64.shl(&ctx, &shift64).as_concrete(), Some(0));
+        assert_eq!(val64.lshr(&ctx, &shift64).as_concrete(), Some(0));
+        assert_eq!(val64.shl(&ctx, &shift65).as_concrete(), Some(0));
+        assert_eq!(val64.lshr(&ctx, &shift65).as_concrete(), Some(0));
+
+        let val8 = SymValue::concrete(0b1111_0000, 8);
+        let shift8 = SymValue::concrete(8, 8);
+        assert_eq!(val8.shl(&ctx, &shift8).as_concrete(), Some(0));
+        assert_eq!(val8.lshr(&ctx, &shift8).as_concrete(), Some(0));
     }
 
     #[test]
@@ -1312,5 +1693,53 @@ mod bitwidth_tests {
         let out = v.extract(&ctx, 15, 16);
         assert_eq!(out.bits(), 1);
         assert!(out.is_unknown());
+    }
+
+    #[test]
+    fn test_symbolic_identity_normalization() {
+        let ctx = Context::thread_local();
+        let x = SymValue::new_symbolic(&ctx, "x", 32);
+        let zero = SymValue::concrete(0, 32);
+        let one = SymValue::concrete(1, 32);
+
+        let add = x.add(&ctx, &zero);
+        assert!(add.is_symbolic());
+        assert!(add.as_ast().unwrap().ast_eq(x.as_ast().unwrap()));
+
+        let mul = x.mul(&ctx, &one);
+        assert!(mul.is_symbolic());
+        assert!(mul.as_ast().unwrap().ast_eq(x.as_ast().unwrap()));
+
+        let shl = x.shl(&ctx, &zero);
+        assert!(shl.is_symbolic());
+        assert!(shl.as_ast().unwrap().ast_eq(x.as_ast().unwrap()));
+    }
+
+    #[test]
+    fn test_symbolic_self_rewrite_rules() {
+        let ctx = Context::thread_local();
+        let x = SymValue::new_symbolic(&ctx, "x", 32);
+
+        assert_eq!(x.sub(&ctx, &x).as_concrete(), Some(0));
+        assert_eq!(x.xor(&ctx, &x).as_concrete(), Some(0));
+        assert_eq!(x.eq(&ctx, &x).as_concrete(), Some(1));
+        assert_eq!(x.ult(&ctx, &x).as_concrete(), Some(0));
+        assert_eq!(x.ule(&ctx, &x).as_concrete(), Some(1));
+    }
+
+    #[test]
+    fn test_all_ones_normalization_is_width_sensitive() {
+        let ctx = Context::thread_local();
+        let x = SymValue::new_symbolic(&ctx, "x", 32);
+        let mask8 = SymValue::concrete(0xff, 8);
+        let mask32 = SymValue::concrete(u32::MAX as u64, 32);
+
+        let narrowed = x.and(&ctx, &mask8);
+        assert!(narrowed.is_symbolic());
+        assert!(!narrowed.as_ast().unwrap().ast_eq(x.as_ast().unwrap()));
+
+        let widened = x.and(&ctx, &mask32);
+        assert!(widened.is_symbolic());
+        assert!(widened.as_ast().unwrap().ast_eq(x.as_ast().unwrap()));
     }
 }

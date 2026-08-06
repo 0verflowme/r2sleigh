@@ -1,0 +1,44 @@
+warning: r2engine must carry decompile route/callee evidence through FunctionFacts, not request or context side channels
+  --> $DIR/decompiler_context_side_channel.rs:3:1
+   |
+LL | / struct EngineDecompileRequest {
+LL | |     callee_resolution: Option<usize>,
+LL | | }
+   | |_^
+   |
+   = note: `#[warn(r2engine_decompiler_context_route_side_channel)]` on by default
+
+warning: r2engine must carry decompile route/callee evidence through FunctionFacts, not request or context side channels
+  --> $DIR/decompiler_context_side_channel.rs:7:1
+   |
+LL | / struct DecompileRenderCacheKeyInput {
+LL | |     callee_resolution: Option<usize>,
+LL | | }
+   | |_^
+
+warning: r2engine must write decompile route/refusal decisions into FunctionFacts, not legacy DecompilerContext policy fields
+  --> $DIR/decompiler_context_side_channel.rs:31:15
+   |
+LL |     let ctx = ctx.with_semantic_route();
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2engine must write decompile route/refusal decisions into FunctionFacts, not legacy DecompilerContext policy fields
+  --> $DIR/decompiler_context_side_channel.rs:32:15
+   |
+LL |     let ctx = ctx.with_render_permission();
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2engine must write decompile route/refusal decisions into FunctionFacts, not legacy DecompilerContext policy fields
+  --> $DIR/decompiler_context_side_channel.rs:33:15
+   |
+LL |     let ctx = ctx.with_runtime_type_inference_policy();
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2engine must write decompile route/refusal decisions into FunctionFacts, not legacy DecompilerContext policy fields
+  --> $DIR/decompiler_context_side_channel.rs:34:13
+   |
+LL |     let _ = ctx.with_prepared_semantic_view_policy();
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: 6 warnings emitted
+

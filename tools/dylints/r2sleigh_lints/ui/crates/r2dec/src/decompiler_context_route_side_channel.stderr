@@ -1,0 +1,47 @@
+warning: r2dec DecompilerContext must not store route/render policy outside FunctionFacts
+  --> $DIR/decompiler_context_route_side_channel.rs:4:1
+   |
+LL | / struct DecompilerContext {
+LL | |     semantic_route: Option<SemanticRoutePlan>,
+LL | |     skip_runtime_type_inference: Option<bool>,
+LL | |     use_prepared_semantic_view: Option<bool>,
+LL | |     render_permission: Option<RenderPermission>,
+LL | | }
+   | |_^
+   |
+   = note: `#[warn(r2dec_decompiler_context_route_side_channel)]` on by default
+
+warning: r2dec DecompilerContext must not expose route/render policy side-channel mutators
+  --> $DIR/decompiler_context_route_side_channel.rs:12:5
+   |
+LL | /     fn with_semantic_route(self, _route: Option<SemanticRoutePlan>) -> Self {
+LL | |         self
+LL | |     }
+   | |_____^
+
+warning: r2dec DecompilerContext must not expose route/render policy side-channel mutators
+  --> $DIR/decompiler_context_route_side_channel.rs:16:5
+   |
+LL | /     fn with_render_permission(self, _permission: Option<RenderPermission>) -> Self {
+LL | |         self
+LL | |     }
+   | |_____^
+
+warning: r2dec DecompilerContext must not expose route/render policy side-channel mutators
+  --> $DIR/decompiler_context_route_side_channel.rs:20:5
+   |
+LL | /     fn with_runtime_type_inference_policy(self, _skip: Option<bool>) -> Self {
+LL | |         self
+LL | |     }
+   | |_____^
+
+warning: r2dec DecompilerContext must not expose route/render policy side-channel mutators
+  --> $DIR/decompiler_context_route_side_channel.rs:24:5
+   |
+LL | /     fn with_prepared_semantic_view_policy(self, _use_view: Option<bool>) -> Self {
+LL | |         self
+LL | |     }
+   | |_____^
+
+warning: 5 warnings emitted
+

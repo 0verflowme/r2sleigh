@@ -177,7 +177,7 @@ fn run_r2_with_env(
 ) -> R2Result {
     let retries = parse_retry_count(std::env::var("R2SLEIGH_E2E_RETRIES").ok());
     for attempt in 0..=retries {
-        let mut command = Command::new("r2");
+        let mut command = Command::new(radare2_binary());
         command.args(["-q", "-e", "bin.relocs.apply=true", "-c", cmd, binary]);
         configure_plugin_env(&mut command);
 
@@ -201,6 +201,26 @@ fn run_r2_with_env(
     unreachable!("retry loop must return in all paths");
 }
 
+fn radare2_binary() -> PathBuf {
+    if let Ok(path) =
+        std::env::var("R2SLEIGH_E2E_RADARE2").or_else(|_| std::env::var("R2R_RADARE2"))
+        && !path.trim().is_empty()
+    {
+        return PathBuf::from(path);
+    }
+    for candidate in [
+        "../radare2/binr/radare2/radare2",
+        "../../radare2/binr/radare2/radare2",
+        "/Users/priyanshu/code/radare2/binr/radare2/radare2",
+    ] {
+        let path = PathBuf::from(candidate);
+        if path.exists() {
+            return path;
+        }
+    }
+    PathBuf::from("r2")
+}
+
 fn should_retry_transient_crash(result: &R2Result, attempt: u32, retries: u32) -> bool {
     // Retry only likely-transient signal exits; keep deterministic failures immediate.
     if attempt >= retries || result.panicked || !result.crashed {
@@ -209,7 +229,10 @@ fn should_retry_transient_crash(result: &R2Result, attempt: u32, retries: u32) -
     #[cfg(unix)]
     let signal_crash = result.exit_code.is_none();
     #[cfg(not(unix))]
-    let signal_crash = matches!(result.exit_code, Some(134) | Some(136) | Some(137) | Some(139));
+    let signal_crash = matches!(
+        result.exit_code,
+        Some(134) | Some(136) | Some(137) | Some(139)
+    );
     signal_crash
 }
 
@@ -234,7 +257,9 @@ pub fn r2_at_addr(binary: &str, addr: u64, cmd: &str) -> R2Result {
 
 fn scaled_timeout(timeout: Duration) -> Duration {
     timeout
-        .checked_mul(parse_timeout_factor(std::env::var("R2SLEIGH_E2E_TIMEOUT_FACTOR").ok()))
+        .checked_mul(parse_timeout_factor(
+            std::env::var("R2SLEIGH_E2E_TIMEOUT_FACTOR").ok(),
+        ))
         .unwrap_or(Duration::MAX)
 }
 
@@ -275,9 +300,12 @@ fn configure_plugin_env(command: &mut Command) {
             }
         }
         let plugin_src = plugin_src?;
-        let home_dir = std::env::temp_dir().join("r2sleigh-e2e-home");
+        let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_else(|_| "local".to_string());
+        let home_dir =
+            std::env::temp_dir().join(format!("r2sleigh-e2e-home-{}-{run_id}", std::process::id()));
         let plugin_dst = home_dir.join(".local/share/radare2/plugins");
         let runtime_dst = plugin_dst.join(RUST_PLUGIN_SUBDIR);
+        let _ = fs::remove_dir_all(&home_dir);
         fs::create_dir_all(&plugin_dst).ok()?;
         fs::create_dir_all(&runtime_dst).ok()?;
         fs::copy(
@@ -333,14 +361,70 @@ fn configure_plugin_env(command: &mut Command) {
     if let Some(home_dir) = home_override {
         let plugins = home_dir.join(".local/share/radare2/plugins");
         command.env("HOME", home_dir);
-        command.env("R2_USER_PLUGINS", plugins);
+        command.env("R2_USER_PLUGINS", &plugins);
+        command.env("R2_LIBR_PLUGINS", plugins);
+        configure_local_radare2_library_path(command);
         return;
     }
 
     if let Ok(home) = std::env::var("HOME") {
         let plugin_dir = format!("{}/.local/share/radare2/plugins", home);
-        command.env("R2_USER_PLUGINS", plugin_dir);
+        command.env("R2_USER_PLUGINS", &plugin_dir);
+        command.env("R2_LIBR_PLUGINS", plugin_dir);
     }
+    configure_local_radare2_library_path(command);
+}
+
+fn configure_local_radare2_library_path(command: &mut Command) {
+    let Some(lib_path) = local_radare2_library_path() else {
+        return;
+    };
+    prepend_env_path(command, "LD_LIBRARY_PATH", &lib_path);
+    #[cfg(target_os = "macos")]
+    prepend_env_path(command, "DYLD_LIBRARY_PATH", &lib_path);
+}
+
+fn prepend_env_path(command: &mut Command, key: &str, prefix: &str) {
+    if prefix.is_empty() {
+        return;
+    }
+    let value = match std::env::var(key) {
+        Ok(existing) if !existing.is_empty() => format!("{prefix}:{existing}"),
+        _ => prefix.to_string(),
+    };
+    command.env(key, value);
+}
+
+fn local_radare2_library_path() -> Option<String> {
+    if let Ok(path) =
+        std::env::var("R2SLEIGH_E2E_R2_LIB_PATH").or_else(|_| std::env::var("R2R_LD_LIBRARY_PATH"))
+        && !path.trim().is_empty()
+    {
+        return Some(path);
+    }
+
+    let binary = radare2_binary();
+    let root = binary.parent()?.parent()?.parent()?;
+    let libr = root.join("libr");
+    if !libr.is_dir() {
+        return None;
+    }
+    let mut dirs = fs::read_dir(libr)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    dirs.sort();
+    if dirs.is_empty() {
+        return None;
+    }
+    Some(
+        dirs.into_iter()
+            .filter_map(|path| path.to_str().map(ToOwned::to_owned))
+            .collect::<Vec<_>>()
+            .join(":"),
+    )
 }
 
 fn run_command_with_timeout(mut command: Command, timeout: Duration) -> R2Result {
@@ -505,5 +589,4 @@ mod tests {
         assert_eq!(parse_timeout_factor(Some("2".to_string())), 2);
         assert_eq!(parse_timeout_factor(Some("  4  ".to_string())), 4);
     }
-
 }

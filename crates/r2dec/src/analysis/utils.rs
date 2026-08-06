@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use r2ssa::SSAVar;
+use r2ssa::{SSAVar, SSAVarNameKind};
 
 use crate::ast::{BinaryOp, CExpr};
 
@@ -73,34 +73,30 @@ pub(crate) fn parse_const_value(name: &str) -> Option<u64> {
     {
         dec.parse().ok()
     } else if val_str.chars().all(|c| c.is_ascii_hexdigit()) {
-        if val_str.chars().any(|c| c.is_ascii_alphabetic()) || val_str.len() > 4 {
-            u64::from_str_radix(val_str, 16).ok()
-        } else {
-            val_str.parse().ok()
-        }
+        u64::from_str_radix(val_str, 16).ok()
     } else {
         val_str.parse().ok()
     }
 }
 
+pub(crate) fn is_generic_stack_placeholder_alias(existing: &str) -> bool {
+    let normalized = existing.trim_start_matches('&');
+    normalized == "stack"
+        || normalized.starts_with("stack_")
+        || normalized == "slot"
+        || normalized.starts_with("slot_")
+        || normalized == "saved_fp"
+}
+
 pub(crate) fn parse_compare_const_value_with_width(
     var: &SSAVar,
-    compare_width: u32,
+    _compare_width: u32,
 ) -> Option<u64> {
     let raw = var.name.strip_prefix("const:")?;
     let raw = raw.split('_').next().unwrap_or(raw);
 
     if let Some(dec) = raw.strip_prefix("0d").or_else(|| raw.strip_prefix("0D")) {
         return dec.parse().ok();
-    }
-
-    if compare_width >= 8
-        && raw.len() > 1
-        && raw.chars().all(|c| c.is_ascii_hexdigit())
-        && !raw.starts_with("0x")
-        && !raw.starts_with("0X")
-    {
-        return u64::from_str_radix(raw, 16).ok();
     }
 
     parse_const_value(&var.name)
@@ -174,7 +170,11 @@ pub(crate) fn format_traced_name(key: &str, var_aliases: &HashMap<String, String
         return alias.clone();
     }
 
-    if !key.starts_with("tmp:") && !key.starts_with("const:") && !key.starts_with("ram:") {
+    let kind = SSAVarNameKind::classify(key);
+    if !matches!(
+        kind,
+        SSAVarNameKind::Temporary | SSAVarNameKind::Constant | SSAVarNameKind::Memory
+    ) {
         if let Some((base, version)) = key.rsplit_once('_') {
             if version == "0" {
                 return base.to_lowercase();
@@ -184,8 +184,10 @@ pub(crate) fn format_traced_name(key: &str, var_aliases: &HashMap<String, String
         return key.to_lowercase();
     }
 
-    if key.starts_with("tmp:")
-        && let Some((base, version_str)) = key.trim_start_matches("tmp:").rsplit_once('_')
+    if kind.is_temporary()
+        && let Some((base, version_str)) = SSAVarNameKind::strip_temporary_prefix(key)
+            .unwrap_or(key)
+            .rsplit_once('_')
     {
         if let Ok(ver) = version_str.parse::<u32>() {
             return if ver > 0 {
@@ -198,6 +200,71 @@ pub(crate) fn format_traced_name(key: &str, var_aliases: &HashMap<String, String
     }
 
     key.to_string()
+}
+
+pub(crate) fn ssa_name_kind(name: &str) -> SSAVarNameKind {
+    let lower = name.to_ascii_lowercase();
+    SSAVarNameKind::classify(&lower)
+}
+
+pub(crate) fn is_temporary_name(name: &str) -> bool {
+    ssa_name_kind(name).is_temporary()
+}
+
+pub(crate) fn is_temporary_or_constant_name(name: &str) -> bool {
+    matches!(
+        ssa_name_kind(name),
+        SSAVarNameKind::Temporary | SSAVarNameKind::Constant
+    )
+}
+
+pub(crate) fn is_temporary_or_memory_name(name: &str) -> bool {
+    matches!(
+        ssa_name_kind(name),
+        SSAVarNameKind::Temporary | SSAVarNameKind::Memory
+    )
+}
+
+pub(crate) fn is_temporary_constant_or_memory_name(name: &str) -> bool {
+    matches!(
+        ssa_name_kind(name),
+        SSAVarNameKind::Temporary | SSAVarNameKind::Constant | SSAVarNameKind::Memory
+    )
+}
+
+pub(crate) fn is_constant_or_memory_name(name: &str) -> bool {
+    matches!(
+        ssa_name_kind(name),
+        SSAVarNameKind::Constant | SSAVarNameKind::Memory | SSAVarNameKind::AddressSpace
+    )
+}
+
+pub(crate) fn is_low_signal_ssa_storage_name(name: &str) -> bool {
+    matches!(
+        ssa_name_kind(name),
+        SSAVarNameKind::Temporary
+            | SSAVarNameKind::Constant
+            | SSAVarNameKind::Memory
+            | SSAVarNameKind::AddressSpace
+    )
+}
+
+pub(crate) fn ssa_render_base_name(var: &SSAVar) -> String {
+    match var.name_kind() {
+        SSAVarNameKind::RegisterAlias => {
+            let reg = var.name.strip_prefix("reg:").unwrap_or(&var.name);
+            if is_hex_name(reg) {
+                format!("r{}", reg)
+            } else {
+                reg.to_string()
+            }
+        }
+        SSAVarNameKind::Temporary => {
+            let tmp = SSAVarNameKind::strip_temporary_prefix(&var.name).unwrap_or(&var.name);
+            format!("t{}", tmp)
+        }
+        _ => var.name.to_lowercase(),
+    }
 }
 
 pub(crate) fn trace_ssa_var_to_source(
@@ -461,22 +528,22 @@ pub(crate) fn simplify_stack_access(
 pub(crate) fn arg_alias_for_register_name(reg_name: &str) -> Option<String> {
     let reg = reg_name.to_lowercase();
     if reg.contains("rdi") || reg.contains("edi") {
-        return Some("arg1".to_string());
+        return Some("arg0".to_string());
     }
     if reg.contains("rsi") || reg.contains("esi") {
-        return Some("arg2".to_string());
+        return Some("arg1".to_string());
     }
     if reg.contains("rdx") || reg.contains("edx") {
-        return Some("arg3".to_string());
+        return Some("arg2".to_string());
     }
     if reg.contains("rcx") || reg.contains("ecx") {
-        return Some("arg4".to_string());
+        return Some("arg3".to_string());
     }
     if reg.contains("r8") {
-        return Some("arg5".to_string());
+        return Some("arg4".to_string());
     }
     if reg.contains("r9") {
-        return Some("arg6".to_string());
+        return Some("arg5".to_string());
     }
     None
 }
@@ -533,33 +600,59 @@ pub(crate) fn arg_alias_for_store_source(
         .or_else(|| arg_alias_for_register_name(&traced))
 }
 
+fn is_hex_name(value: &str) -> bool {
+    !value.is_empty() && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use r2ssa::SSAVar;
 
     #[test]
-    fn parse_const_value_keeps_existing_general_behavior() {
-        assert_eq!(parse_const_value("const:100"), Some(100));
+    fn parse_const_value_uses_ssa_hex_payload_by_default() {
+        assert_eq!(parse_const_value("const:100"), Some(0x100));
         assert_eq!(parse_const_value("const:0x100"), Some(0x100));
         assert_eq!(parse_const_value("const:0d100"), Some(100));
     }
 
     #[test]
-    fn parse_compare_const_value_keeps_lifted_wide_hex_immediates_and_narrow_decimal_tests() {
+    fn generic_stack_placeholder_alias_covers_all_generic_forms() {
+        for name in ["stack", "stack_10", "slot", "slot_20", "saved_fp"] {
+            assert!(
+                is_generic_stack_placeholder_alias(name),
+                "{name} should be classified as a generic stack placeholder"
+            );
+            let addr_name = format!("&{name}");
+            assert!(
+                is_generic_stack_placeholder_alias(&addr_name),
+                "{addr_name} should be classified after address-of trimming"
+            );
+        }
+
+        for name in ["local_10", "arg0", "real_slot_name", "saved_lr"] {
+            assert!(
+                !is_generic_stack_placeholder_alias(name),
+                "{name} should not be treated as a generic stack placeholder"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_compare_const_value_keeps_lifted_hex_immediates_and_explicit_decimal_tests() {
         let wide = SSAVar::new("const:64", 0, 8);
         let narrow = SSAVar::new("const:64", 0, 4);
         let explicit_decimal = SSAVar::new("const:0d64", 0, 8);
 
         assert_eq!(parse_compare_const_value(&wide), Some(0x64));
-        assert_eq!(parse_compare_const_value(&narrow), Some(64));
+        assert_eq!(parse_compare_const_value(&narrow), Some(0x64));
         assert_eq!(parse_compare_const_value(&explicit_decimal), Some(64));
     }
 
     #[test]
     fn parse_compare_const_value_with_width_prefers_hex_for_wide_comparisons() {
         let narrow = SSAVar::new("const:64", 0, 4);
-        let decimal = SSAVar::new("const:100", 0, 4);
+        let decimal = SSAVar::new("const:0d100", 0, 4);
 
         assert_eq!(parse_compare_const_value_with_width(&narrow, 8), Some(0x64));
         assert_eq!(parse_compare_const_value_with_width(&decimal, 4), Some(100));
@@ -625,10 +718,84 @@ mod tests {
 
     #[test]
     fn format_traced_name_keeps_temp_base_identity() {
+        assert_eq!(format_traced_name("tmp:11f80_0", &HashMap::new()), "t0");
         assert_eq!(
             format_traced_name("tmp:11f80_19", &HashMap::new()),
             "t11f80_19"
         );
         assert_eq!(format_traced_name("tmp:foo_2", &HashMap::new()), "tfoo_2");
+        assert_eq!(
+            format_traced_name("unique:11f80_19", &HashMap::new()),
+            "t11f80_19"
+        );
+    }
+
+    #[test]
+    fn format_traced_name_uses_typed_name_kinds_for_visibility() {
+        assert_eq!(format_traced_name("RAX_0", &HashMap::new()), "rax");
+        assert_eq!(format_traced_name("RAX_2", &HashMap::new()), "rax_2");
+        assert_eq!(
+            format_traced_name("const:2a_0", &HashMap::new()),
+            "const:2a_0"
+        );
+        assert_eq!(
+            format_traced_name("ram:401000_0", &HashMap::new()),
+            "ram:401000_0"
+        );
+
+        let aliases = HashMap::from([(String::from("tmp:11f80_19"), String::from("idx"))]);
+        assert_eq!(format_traced_name("tmp:11f80_19", &aliases), "idx");
+    }
+
+    #[test]
+    fn ssa_render_base_name_uses_typed_name_kinds() {
+        assert_eq!(ssa_render_base_name(&SSAVar::new("reg:10", 0, 8)), "r10");
+        assert_eq!(ssa_render_base_name(&SSAVar::new("reg:zf", 0, 1)), "zf");
+        assert_eq!(
+            ssa_render_base_name(&SSAVar::new("tmp:11f80", 2, 8)),
+            "t11f80"
+        );
+        assert_eq!(
+            ssa_render_base_name(&SSAVar::new("unique:11f80", 2, 8)),
+            "t11f80"
+        );
+        assert_eq!(ssa_render_base_name(&SSAVar::new("RAX", 1, 8)), "rax");
+    }
+
+    #[test]
+    fn ssa_name_kind_helpers_classify_prefixed_storage_names() {
+        for name in ["tmp:1", "TMP:1", "unique:1", "UNIQUE:1"] {
+            assert!(is_temporary_name(name));
+            assert!(is_temporary_or_constant_name(name));
+            assert!(is_temporary_or_memory_name(name));
+            assert!(is_temporary_constant_or_memory_name(name));
+            assert!(!is_constant_or_memory_name(name));
+            assert!(is_low_signal_ssa_storage_name(name));
+        }
+        for name in ["const:1", "CONST:1"] {
+            assert!(!is_temporary_name(name));
+            assert!(is_temporary_or_constant_name(name));
+            assert!(!is_temporary_or_memory_name(name));
+            assert!(is_temporary_constant_or_memory_name(name));
+            assert!(is_constant_or_memory_name(name));
+            assert!(is_low_signal_ssa_storage_name(name));
+        }
+        for name in ["ram:401000", "RAM:401000"] {
+            assert!(!is_temporary_or_constant_name(name));
+            assert!(is_temporary_or_memory_name(name));
+            assert!(is_temporary_constant_or_memory_name(name));
+            assert!(is_constant_or_memory_name(name));
+            assert!(is_low_signal_ssa_storage_name(name));
+        }
+        assert!(!is_temporary_or_constant_name("space1:20"));
+        assert!(!is_temporary_or_memory_name("space1:20"));
+        assert!(!is_temporary_constant_or_memory_name("space1:20"));
+        assert!(is_constant_or_memory_name("space1:20"));
+        assert!(is_low_signal_ssa_storage_name("space1:20"));
+
+        assert!(!is_temporary_or_memory_name("rax"));
+        assert!(!is_temporary_constant_or_memory_name("rax"));
+        assert!(!is_constant_or_memory_name("rax"));
+        assert!(!is_low_signal_ssa_storage_name("rax"));
     }
 }

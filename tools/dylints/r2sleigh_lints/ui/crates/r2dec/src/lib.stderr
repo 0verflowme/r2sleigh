@@ -1,0 +1,74 @@
+warning: r2dec must not synthesize CalleeResolutionFacts from raw call targets; pass the r2engine-owned resolution contract
+  --> $DIR/lib.rs:31:13
+   |
+LL |     let _ = CalleeResolutionFacts::from_direct_call_targets();
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(r2dec_callee_resolution_fallback_ownership)]` on by default
+
+warning: r2dec must not synthesize CalleeResolutionFacts from raw call targets; pass the r2engine-owned resolution contract
+  --> $DIR/lib.rs:32:13
+   |
+LL |     let _ = CalleeResolutionFacts::identity_for_direct_target_in_context();
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2dec must not synthesize CalleeResolutionFacts from raw call targets; pass the r2engine-owned resolution contract
+  --> $DIR/lib.rs:33:13
+   |
+LL |     let _ = CalleeResolutionFacts::identity_for_name_in_context();
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2dec summary render APIs must derive route permission from FunctionFacts::decompile_route
+  --> $DIR/lib.rs:36:1
+   |
+LL | / pub fn render_semantic_worker_summary(
+LL | |     _func_name: &str,
+LL | |     _function_facts: &FunctionFacts,
+LL | |     _route: &SemanticRoutePlan,
+...  |
+LL | |     Some("summary".to_string())
+LL | | }
+   | |_^
+   |
+   = note: `#[warn(r2dec_summary_render_route_side_channel)]` on by default
+
+warning: r2dec summary render APIs must derive route permission from FunctionFacts::decompile_route
+  --> $DIR/lib.rs:45:1
+   |
+LL | / pub fn render_vm_semantic_summary(
+LL | |     _func_name: &str,
+LL | |     _type_facts: &FunctionTypeFacts,
+LL | |     _semantic_artifact: &SemanticArtifact,
+LL | | ) -> Option<String> {
+LL | |     Some("vm summary".to_string())
+LL | | }
+   | |_^
+
+warning: certified r2dec fold inputs must not consume local type hints or local type oracle
+  --> $DIR/lib.rs:54:5
+   |
+LL | /     fn build_function_internal(
+LL | |         &self,
+LL | |         certified_standard_mode: bool,
+LL | |         inferred_ret_type: String,
+...  |
+LL | |     }
+   | |_____^
+   |
+   = note: `#[warn(r2dec_certified_local_type_hints)]` on by default
+
+warning: r2dec must not repair certified headers from local recovery or inference
+  --> $DIR/lib.rs:75:1
+   |
+LL | / fn build_function_with_header_repair(
+LL | |     certified_standard_mode: bool,
+LL | |     inferred_ret_type: String,
+LL | | ) -> CFunction {
+...  |
+LL | | }
+   | |_^
+   |
+   = note: `#[warn(r2dec_local_header_arity_repair)]` on by default
+
+warning: 7 warnings emitted
+

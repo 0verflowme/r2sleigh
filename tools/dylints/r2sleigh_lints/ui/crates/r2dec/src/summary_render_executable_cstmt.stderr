@@ -1,0 +1,56 @@
+warning: summary/VM renderers must not construct executable CStmt bodies without CertifiedC permission
+  --> $DIR/summary_render_executable_cstmt.rs:39:9
+   |
+LL |         CStmt::Return(Some(CExpr::IntLit(1))),
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(r2dec_summary_render_executable_cstmt)]` on by default
+
+warning: summary/VM renderers must not construct executable CStmt bodies without CertifiedC permission
+  --> $DIR/summary_render_executable_cstmt.rs:40:9
+   |
+LL | /         CStmt::If {
+LL | |             cond: CExpr::Var("summary_cond"),
+LL | |             then_body: Box::new(CStmt::comment("then fact")),
+LL | |             else_body: None,
+LL | |         },
+   | |_________^
+
+warning: summary/VM renderers must not construct executable CStmt bodies without CertifiedC permission
+  --> $DIR/summary_render_executable_cstmt.rs:45:9
+   |
+LL | /         CStmt::While {
+LL | |             cond: CExpr::Var("summary_loop"),
+LL | |             body: Box::new(CStmt::comment("loop fact")),
+LL | |         },
+   | |_________^
+
+warning: summary/VM renderers must not construct executable CStmt bodies without CertifiedC permission
+  --> $DIR/summary_render_executable_cstmt.rs:49:9
+   |
+LL | /         CStmt::For {
+LL | |             init: None,
+LL | |             body: Box::new(CStmt::comment("for fact")),
+LL | |         },
+   | |_________^
+
+warning: summary/VM renderers must not construct executable CStmt bodies without CertifiedC permission
+  --> $DIR/summary_render_executable_cstmt.rs:53:9
+   |
+LL | /         CStmt::Switch {
+LL | |             expr: CExpr::Var("summary_selector"),
+LL | |             cases: vec![CStmt::comment("case fact")],
+LL | |         },
+   | |_________^
+
+warning: summary/VM renderers must not construct executable CStmt bodies without CertifiedC permission
+  --> $DIR/summary_render_executable_cstmt.rs:57:9
+   |
+LL | /         CStmt::Expr(CExpr::Assign(
+LL | |             Box::new(CExpr::Var("summary_dst")),
+LL | |             Box::new(CExpr::IntLit(1)),
+LL | |         )),
+   | |__________^
+
+warning: 6 warnings emitted
+

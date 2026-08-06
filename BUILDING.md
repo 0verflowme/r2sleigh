@@ -59,11 +59,14 @@ cd r2plugin
 # Build release with x86 (default)
 make
 
+# Build a fast debug version for local iteration
+make RUST_TARGET=debug
+
 # Build with all architectures
 make RUST_FEATURES=all-archs
 
-# Build debug version
-make RUST_TARGET=debug
+# Build maximum-optimized distributable artifacts
+make RUST_TARGET=dist
 ```
 
 ### Make Targets
@@ -81,7 +84,7 @@ make RUST_TARGET=debug
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `RUST_TARGET` | `release` | `release` or `debug` |
+| `RUST_TARGET` | `release` | `debug`, `release`, or `dist` |
 | `RUST_FEATURES` | `x86` | Sleigh feature flags |
 
 Installation
@@ -215,18 +218,31 @@ sudo apt install radare2-dev libstdc++-dev
 sudo dnf install radare2-devel libstdc++-devel
 ```
 
-Release Builds
---------------
+Release And Dist Builds
+-----------------------
 
-The workspace `Cargo.toml` enables LTO, single codegen unit, and symbol
-stripping for release builds:
+The workspace `release` profile is tuned for normal local and CI iteration:
+optimized code, parallel codegen, abort-on-panic, and stripped artifacts.
+Use `dist` only when a maximum-optimized distributable artifact is worth the
+extra link time.
 
 ```toml
 [profile.release]
-lto = true
-codegen-units = 1
+lto = false
+codegen-units = 16
 panic = "abort"
 strip = true
+
+[profile.dist]
+inherits = "release"
+lto = true
+codegen-units = 1
 ```
 
-This produces smaller, faster binaries at the cost of longer compile times.
+Examples:
+
+```bash
+cargo build --release -p r2sleigh-plugin --features x86
+cargo build --profile dist -p r2sleigh-plugin --features all-archs
+make -C r2plugin RUST_TARGET=dist RUST_FEATURES=all-archs
+```

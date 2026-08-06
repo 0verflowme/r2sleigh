@@ -25,6 +25,8 @@ pub struct SSABlock {
 pub struct SSAContext {
     /// Current version for each variable name.
     versions: HashMap<String, u32>,
+    /// Versions allocated by the current operation but not yet visible to reads.
+    pending_versions: HashMap<String, u32>,
 }
 
 impl SSAContext {
@@ -45,6 +47,23 @@ impl SSAContext {
         let entry = self.versions.entry(name.to_string()).or_insert(0);
         *entry += 1;
         *entry
+    }
+
+    fn defer_version(&mut self, name: &str) -> u32 {
+        let current = self
+            .pending_versions
+            .get(name)
+            .copied()
+            .unwrap_or_else(|| self.current_version(name));
+        let version = current + 1;
+        self.pending_versions.insert(name.to_string(), version);
+        version
+    }
+
+    fn commit_deferred_versions(&mut self) {
+        for (name, version) in self.pending_versions.drain() {
+            self.versions.insert(name, version);
+        }
     }
 
     /// Get all variables that have been defined (version > 0).
@@ -103,6 +122,7 @@ pub fn to_ssa(block: &R2ILBlock, disasm: &Disassembler) -> SSABlock {
 
     for op in &block.ops {
         let ssa_op = convert_op(op, disasm, &mut ctx);
+        ctx.commit_deferred_versions();
         ssa_block.push(ssa_op);
     }
 
@@ -134,10 +154,13 @@ fn read_var(vn: &Varnode, disasm: &Disassembler, ctx: &SSAContext) -> SSAVar {
     SSAVar::new(name, version, vn.size)
 }
 
-/// Convert a varnode to an SSA variable for writing (allocates new version).
+/// Convert a varnode to an SSA variable for writing.
+///
+/// The new version remains invisible to reads until the current operation is
+/// fully converted.
 fn write_var(vn: &Varnode, disasm: &Disassembler, ctx: &mut SSAContext) -> SSAVar {
     let name = varnode_to_name(vn, disasm);
-    let version = ctx.new_version(&name);
+    let version = ctx.defer_version(&name);
     SSAVar::new(name, version, vn.size)
 }
 
@@ -664,6 +687,23 @@ fn convert_op(op: &R2ILOp, disasm: &Disassembler, ctx: &mut SSAContext) -> SSAOp
             value: read_var(value, disasm, ctx),
             position: read_var(position, disasm, ctx),
         },
+
+        Select {
+            dst,
+            cond,
+            if_true,
+            if_false,
+        } => {
+            let cond = read_var(cond, disasm, ctx);
+            let if_true = read_var(if_true, disasm, ctx);
+            let if_false = read_var(if_false, disasm, ctx);
+            SSAOp::Select {
+                dst: write_var(dst, disasm, ctx),
+                cond,
+                if_true,
+                if_false,
+            }
+        }
     }
 }
 
@@ -689,6 +729,16 @@ mod tests {
 
         // Different variable starts at 0
         assert_eq!(ctx.current_version("RBX"), 0);
+    }
+
+    #[test]
+    fn test_deferred_write_is_not_visible_to_same_op_reads() {
+        let mut ctx = SSAContext::new();
+
+        assert_eq!(ctx.defer_version("RAX"), 1);
+        assert_eq!(ctx.current_version("RAX"), 0);
+        ctx.commit_deferred_versions();
+        assert_eq!(ctx.current_version("RAX"), 1);
     }
 
     #[test]

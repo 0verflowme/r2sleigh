@@ -29,7 +29,7 @@ sleigh_op: Lifts instructions during aaa. Generates ESIL.
 sleigh_recover_vars: Provides SSA-derived variables for afva.
 sleigh_analyze_fcn: Per-function SSA analysis after af (also auto-applies DATA xrefs).
 sleigh_get_data_refs: Def-use xrefs callback used by radare2 during aar when supported.
-sleigh_post_analysis: Auto-taint + signature/CC write-back during aaaa.
+sleigh_post_analysis: Native post-analysis enrichment during aa/aaa/aaaa.
 
 Command Reference
 -----------------
@@ -117,27 +117,42 @@ SLEIGH_SIG_WRITEBACK_MAX_BLOCKS: Max blocks for automatic signature/CC write-bac
 SLEIGH_SIG_MIN_CONFIDENCE: Minimum confidence for signature overwrite. Default 70.
 SLEIGH_CC_MIN_CONFIDENCE: Minimum confidence for calling convention overwrite. Default 80.
 
-Runtime analysis profile:
+Native analysis depth:
 
-- `anal.sla.mode` (default `balanced`)
-- Accepted values: `full`, `balanced`, `fast`
+| Command | r2sleigh behavior |
+|---|---|
+| `aa` | basic bounded post-analysis |
+| `aaa` | balanced signatures, xrefs, and type facts |
+| `aaaa` | aggressive taint, interproc, and type write-back |
 
-Mode semantics:
+r2sleigh does not expose public `anal.*` tuning keys. Detailed engine inspection
+lives under debug commands such as `a:sla.debug.profilej` and
+`a:sla.debug.types`.
 
-| Context | `full` | `balanced` | `fast` |
-|---|---|---|---|
-| `aa` / `aaa` callbacks | full behavior | balanced behavior | reduced behavior |
-| `aaaa` post-analysis | full behavior | full behavior (forced) | reduced behavior |
+Kernel smoke harness:
 
-Behavior by mode:
+```bash
+R2SLEIGH_KERNELCACHE=/path/to/kernelcache \
+  scripts/kernel_smoke.py \
+  --r2 /Users/priyanshu/code/radare2/binr/radare2/radare2 \
+  --analysis aaaa \
+  --strict \
+  --out /tmp/r2sleigh-kernel-smoke.json
+```
 
-| Pass | `full` | `balanced` | `fast` |
-|---|---|---|---|
-| semantic comments | on | on | off |
-| recover vars | on | on | off |
-| computed data xrefs | on | on | off |
-| post taint | on | on | off |
-| post signature/callconv write-back | on | on | off |
+The harness is advisory and local-only: no kernel binaries or generated smoke
+reports are committed. It probes representative kernel helpers and records
+normalized decompile, type, profile, and symex output for regression triage.
+By default the report keeps hashes, sizes, and line counts while redacting the
+local kernel path and stdout/stderr previews. Use `--include-sensitive` only for
+local triage when full paths and text previews are needed.
+
+Strict mode returns non-zero for missing requested targets, zero discovered
+functions, malformed profile/type/symex JSON, decompiler fallback comments, and
+radare2 command return failures. The harness mirrors the r2r/e2e plugin
+isolation knobs where practical: `--plugin-dir` defaults to
+`R2SLEIGH_PLUGIN_DIR`, `R2R_PLUGIN_DIR`, or `R2_LIBR_PLUGINS`, and `--tmpdir`
+sets a temporary HOME/XDG/TMP root for radare2 subprocesses.
 
 Automatic Signature Write-Back (aaaa)
 -------------------------------------

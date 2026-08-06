@@ -1,0 +1,90 @@
+warning: r2plugin must not compute or inspect type writeback apply thresholds; consume r2types mutation plans
+  --> $DIR/type_writeback_policy.rs:21:9
+   |
+LL |         self.type_min_confidence
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(r2plugin_type_writeback_apply_threshold_ownership)]` on by default
+
+warning: r2plugin must not compute or inspect type writeback apply thresholds; consume r2types mutation plans
+  --> $DIR/type_writeback_policy.rs:25:9
+   |
+LL |         self.struct_min_confidence
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2plugin must not decide type writeback authority or construct apply policy directly; use r2engine/r2types owner APIs
+  --> $DIR/type_writeback_policy.rs:38:13
+   |
+LL |     let _ = certificate.authorizes_signature_writeback();
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(r2plugin_type_writeback_policy_ownership)]` on by default
+
+warning: r2plugin must not decide type writeback authority or construct apply policy directly; use r2engine/r2types owner APIs
+  --> $DIR/type_writeback_policy.rs:39:13
+   |
+LL |     let _ = certificate.render_authorized_signature();
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2plugin must not decide type writeback authority or construct apply policy directly; use r2engine/r2types owner APIs
+  --> $DIR/type_writeback_policy.rs:40:13
+   |
+LL |     let _ = "signature mutation refused: stale certificate";
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2plugin must not decide type writeback authority or construct apply policy directly; use r2engine/r2types owner APIs
+  --> $DIR/type_writeback_policy.rs:41:5
+   |
+LL |     r2types::signature_writeback_decision();
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2plugin must not decide type writeback authority or construct apply policy directly; use r2engine/r2types owner APIs
+  --> $DIR/type_writeback_policy.rs:42:5
+   |
+LL |     r2types::type_writeback_mutation_plan();
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2plugin must not decide type writeback authority or construct apply policy directly; use r2engine/r2types owner APIs
+  --> $DIR/type_writeback_policy.rs:43:5
+   |
+LL |     r2types::type_writeback_mutation_plan_with_policy();
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2plugin must not decide type writeback authority or construct apply policy directly; use r2engine/r2types owner APIs
+  --> $DIR/type_writeback_policy.rs:44:5
+   |
+LL |     r2types::type_writeback_authority_report_with_policy();
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2plugin must not compute or inspect type writeback apply thresholds; consume r2types mutation plans
+  --> $DIR/type_writeback_policy.rs:51:13
+   |
+LL |     let _ = policy.mutation_min_confidence();
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2plugin must not compute or inspect type writeback apply thresholds; consume r2types mutation plans
+  --> $DIR/type_writeback_policy.rs:52:13
+   |
+LL |     let _ = policy.effective_threshold();
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2plugin must not compute or inspect type writeback apply thresholds; consume r2types mutation plans
+  --> $DIR/type_writeback_policy.rs:53:13
+   |
+LL |     let _ = policy.type_min_confidence;
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2plugin must not compute or inspect type writeback apply thresholds; consume r2types mutation plans
+  --> $DIR/type_writeback_policy.rs:54:13
+   |
+LL |     let _ = policy.rename_min_confidence;
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2plugin must not compute or inspect type writeback apply thresholds; consume r2types mutation plans
+  --> $DIR/type_writeback_policy.rs:55:13
+   |
+LL |     let _ = policy.struct_min_confidence;
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: 14 warnings emitted
+

@@ -15,18 +15,22 @@ r2sleigh-export = { path = "../crates/r2sleigh-export" }
 r2ssa = { path = "../crates/r2ssa" }
 r2sym = { path = "../crates/r2sym" }
 r2types = { path = "../crates/r2types" }
-r2dec = { path = "../crates/r2dec" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-z3 = "0.20.0"
+r2engine = { path = "../crates/r2engine" }
+serde.workspace = true
+serde_json.workspace = true
+z3.workspace = true
+
+[dev-dependencies]
+r2engine = { path = "../crates/r2engine" }
 
 [dependencies.sleigh-config]
-version = "1.0"
+workspace = true
 optional = true
 
 [features]
 default = ["x86"]
 x86 = ["sleigh-config/x86"]
 arm = ["sleigh-config/ARM", "sleigh-config/AARCH64"]
+mips = ["sleigh-config/MIPS"]
 riscv = ["sleigh-config/RISCV"]
-all-archs = ["x86", "arm", "riscv"]
+all-archs = ["x86", "arm", "mips", "riscv"]

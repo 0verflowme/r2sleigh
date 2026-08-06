@@ -1,20 +1,18 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 
-use r2ssa::{
-    CompareKind as PreparedCompareKind, CompareProvenance, FunctionSSABlock, SSAOp, SSAVar,
-};
-
-use crate::analysis;
-use crate::analysis::{FlagCompareKind, FlagCompareProvenance, utils};
-use crate::ast::{BinaryOp, CExpr, CType, UnaryOp};
+use r2ssa::{CompareKind as PreparedCompareKind, FunctionSSABlock, SSAOp, SSAVar};
+use r2types::PredicateComparisonFact;
 
 use super::context::FoldingContext;
-use super::op_lower::parse_const_value;
+use super::op_lower::{is_generic_arg_name, parse_const_value};
 use super::{
     MAX_COND_STACK_ALIAS_DEPTH, MAX_PREDICATE_OPERAND_DEPTH, MAX_PREDICATE_SIMPLIFY_DEPTH,
     MAX_SF_SURROGATE_DEPTH, MAX_SUB_LIKE_DEPTH,
 };
+use crate::analysis;
+use crate::analysis::{FlagCompareKind, FlagCompareProvenance, utils};
+use crate::ast::{BinaryOp, CExpr, CType, UnaryOp};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CompareContext {
@@ -30,12 +28,361 @@ pub(super) struct CompareTuple {
     context: CompareContext,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SymbolicConditionToken {
+    Atom(String),
+    LParen,
+    RParen,
+    Not,
+    BitNot,
+    Star,
+    Slash,
+    Percent,
+    Plus,
+    Minus,
+    Shl,
+    Shr,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
+    BitAnd,
+    BitXor,
+    BitOr,
+    And,
+    Or,
+}
+
+#[cfg(test)]
+struct SymbolicConditionExprParser<'ctx, 'a> {
+    ctx: &'ctx FoldingContext<'a>,
+    tokens: Vec<SymbolicConditionToken>,
+    pos: usize,
+}
+
+#[cfg(test)]
+impl<'ctx, 'a> SymbolicConditionExprParser<'ctx, 'a> {
+    fn new(ctx: &'ctx FoldingContext<'a>, text: &str) -> Option<Self> {
+        Some(Self {
+            ctx,
+            tokens: tokenize_symbolic_condition(text)?,
+            pos: 0,
+        })
+    }
+
+    fn parse(mut self) -> Option<CExpr> {
+        let expr = self.parse_logical_or()?;
+        (self.pos == self.tokens.len()).then_some(expr)
+    }
+
+    fn peek(&self) -> Option<&SymbolicConditionToken> {
+        self.tokens.get(self.pos)
+    }
+
+    fn next(&mut self) -> Option<SymbolicConditionToken> {
+        let token = self.tokens.get(self.pos)?.clone();
+        self.pos += 1;
+        Some(token)
+    }
+
+    fn parse_logical_or(&mut self) -> Option<CExpr> {
+        let mut expr = self.parse_logical_and()?;
+        while matches!(self.peek(), Some(SymbolicConditionToken::Or)) {
+            self.next();
+            let rhs = self.parse_logical_and()?;
+            expr = CExpr::binary(BinaryOp::Or, expr, rhs);
+        }
+        Some(expr)
+    }
+
+    fn parse_logical_and(&mut self) -> Option<CExpr> {
+        let mut expr = self.parse_bit_or()?;
+        while matches!(self.peek(), Some(SymbolicConditionToken::And)) {
+            self.next();
+            let rhs = self.parse_bit_or()?;
+            expr = CExpr::binary(BinaryOp::And, expr, rhs);
+        }
+        Some(expr)
+    }
+
+    fn parse_bit_or(&mut self) -> Option<CExpr> {
+        let mut expr = self.parse_bit_xor()?;
+        while matches!(self.peek(), Some(SymbolicConditionToken::BitOr)) {
+            self.next();
+            let rhs = self.parse_bit_xor()?;
+            expr = CExpr::binary(BinaryOp::BitOr, expr, rhs);
+        }
+        Some(expr)
+    }
+
+    fn parse_bit_xor(&mut self) -> Option<CExpr> {
+        let mut expr = self.parse_bit_and()?;
+        while matches!(self.peek(), Some(SymbolicConditionToken::BitXor)) {
+            self.next();
+            let rhs = self.parse_bit_and()?;
+            expr = CExpr::binary(BinaryOp::BitXor, expr, rhs);
+        }
+        Some(expr)
+    }
+
+    fn parse_bit_and(&mut self) -> Option<CExpr> {
+        let mut expr = self.parse_equality()?;
+        while matches!(self.peek(), Some(SymbolicConditionToken::BitAnd)) {
+            self.next();
+            let rhs = self.parse_equality()?;
+            expr = CExpr::binary(BinaryOp::BitAnd, expr, rhs);
+        }
+        Some(expr)
+    }
+
+    fn parse_equality(&mut self) -> Option<CExpr> {
+        let mut expr = self.parse_relational()?;
+        loop {
+            let op = match self.peek() {
+                Some(SymbolicConditionToken::Eq) => BinaryOp::Eq,
+                Some(SymbolicConditionToken::Ne) => BinaryOp::Ne,
+                _ => break,
+            };
+            self.next();
+            let rhs = self.parse_relational()?;
+            expr = CExpr::binary(op, expr, rhs);
+        }
+        Some(expr)
+    }
+
+    fn parse_relational(&mut self) -> Option<CExpr> {
+        let mut expr = self.parse_shift()?;
+        loop {
+            let op = match self.peek() {
+                Some(SymbolicConditionToken::Lt) => BinaryOp::Lt,
+                Some(SymbolicConditionToken::Le) => BinaryOp::Le,
+                Some(SymbolicConditionToken::Gt) => BinaryOp::Gt,
+                Some(SymbolicConditionToken::Ge) => BinaryOp::Ge,
+                _ => break,
+            };
+            self.next();
+            let rhs = self.parse_shift()?;
+            expr = CExpr::binary(op, expr, rhs);
+        }
+        Some(expr)
+    }
+
+    fn parse_shift(&mut self) -> Option<CExpr> {
+        let mut expr = self.parse_additive()?;
+        loop {
+            let op = match self.peek() {
+                Some(SymbolicConditionToken::Shl) => BinaryOp::Shl,
+                Some(SymbolicConditionToken::Shr) => BinaryOp::Shr,
+                _ => break,
+            };
+            self.next();
+            let rhs = self.parse_additive()?;
+            expr = CExpr::binary(op, expr, rhs);
+        }
+        Some(expr)
+    }
+
+    fn parse_additive(&mut self) -> Option<CExpr> {
+        let mut expr = self.parse_multiplicative()?;
+        loop {
+            let op = match self.peek() {
+                Some(SymbolicConditionToken::Plus) => BinaryOp::Add,
+                Some(SymbolicConditionToken::Minus) => BinaryOp::Sub,
+                _ => break,
+            };
+            self.next();
+            let rhs = self.parse_multiplicative()?;
+            expr = CExpr::binary(op, expr, rhs);
+        }
+        Some(expr)
+    }
+
+    fn parse_multiplicative(&mut self) -> Option<CExpr> {
+        let mut expr = self.parse_unary()?;
+        loop {
+            let op = match self.peek() {
+                Some(SymbolicConditionToken::Star) => BinaryOp::Mul,
+                Some(SymbolicConditionToken::Slash) => BinaryOp::Div,
+                Some(SymbolicConditionToken::Percent) => BinaryOp::Mod,
+                _ => break,
+            };
+            self.next();
+            let rhs = self.parse_unary()?;
+            expr = CExpr::binary(op, expr, rhs);
+        }
+        Some(expr)
+    }
+
+    fn parse_unary(&mut self) -> Option<CExpr> {
+        match self.peek() {
+            Some(SymbolicConditionToken::Not) => {
+                self.next();
+                Some(CExpr::unary(UnaryOp::Not, self.parse_unary()?))
+            }
+            Some(SymbolicConditionToken::BitNot) => {
+                self.next();
+                Some(CExpr::unary(UnaryOp::BitNot, self.parse_unary()?))
+            }
+            Some(SymbolicConditionToken::Minus) => {
+                self.next();
+                Some(CExpr::unary(UnaryOp::Neg, self.parse_unary()?))
+            }
+            Some(SymbolicConditionToken::Star) => {
+                self.next();
+                Some(CExpr::deref(self.parse_unary()?))
+            }
+            _ => self.parse_primary(),
+        }
+    }
+
+    fn parse_primary(&mut self) -> Option<CExpr> {
+        match self.next()? {
+            SymbolicConditionToken::LParen => {
+                let expr = self.parse_logical_or()?;
+                matches!(self.next(), Some(SymbolicConditionToken::RParen)).then_some(expr)
+            }
+            SymbolicConditionToken::Atom(atom) => {
+                let lower = atom.to_ascii_lowercase();
+                if lower == "true" {
+                    Some(CExpr::IntLit(1))
+                } else if lower == "false" {
+                    Some(CExpr::IntLit(0))
+                } else {
+                    Some(
+                        self.ctx
+                            .parse_expr_from_name(&atom)
+                            .unwrap_or(CExpr::Var(atom)),
+                    )
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+fn tokenize_symbolic_condition(text: &str) -> Option<Vec<SymbolicConditionToken>> {
+    let mut tokens = Vec::new();
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        let rest = &chars[i..];
+        let push_two = |token: SymbolicConditionToken, i: &mut usize, tokens: &mut Vec<_>| {
+            tokens.push(token);
+            *i += 2;
+        };
+        if rest.len() >= 2 {
+            match (rest[0], rest[1]) {
+                ('|', '|') => {
+                    push_two(SymbolicConditionToken::Or, &mut i, &mut tokens);
+                    continue;
+                }
+                ('&', '&') => {
+                    push_two(SymbolicConditionToken::And, &mut i, &mut tokens);
+                    continue;
+                }
+                ('=', '=') => {
+                    push_two(SymbolicConditionToken::Eq, &mut i, &mut tokens);
+                    continue;
+                }
+                ('!', '=') => {
+                    push_two(SymbolicConditionToken::Ne, &mut i, &mut tokens);
+                    continue;
+                }
+                ('<', '=') => {
+                    push_two(SymbolicConditionToken::Le, &mut i, &mut tokens);
+                    continue;
+                }
+                ('>', '=') => {
+                    push_two(SymbolicConditionToken::Ge, &mut i, &mut tokens);
+                    continue;
+                }
+                ('<', '<') => {
+                    push_two(SymbolicConditionToken::Shl, &mut i, &mut tokens);
+                    continue;
+                }
+                ('>', '>') => {
+                    push_two(SymbolicConditionToken::Shr, &mut i, &mut tokens);
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        match ch {
+            '(' => tokens.push(SymbolicConditionToken::LParen),
+            ')' => tokens.push(SymbolicConditionToken::RParen),
+            '!' => tokens.push(SymbolicConditionToken::Not),
+            '~' => tokens.push(SymbolicConditionToken::BitNot),
+            '*' => tokens.push(SymbolicConditionToken::Star),
+            '/' => tokens.push(SymbolicConditionToken::Slash),
+            '%' => tokens.push(SymbolicConditionToken::Percent),
+            '+' => tokens.push(SymbolicConditionToken::Plus),
+            '-' => tokens.push(SymbolicConditionToken::Minus),
+            '<' => tokens.push(SymbolicConditionToken::Lt),
+            '>' => tokens.push(SymbolicConditionToken::Gt),
+            '&' => tokens.push(SymbolicConditionToken::BitAnd),
+            '^' => tokens.push(SymbolicConditionToken::BitXor),
+            '|' => tokens.push(SymbolicConditionToken::BitOr),
+            '=' => return None,
+            _ => {
+                let start = i;
+                while i < chars.len() {
+                    let ch = chars[i];
+                    if ch.is_whitespace()
+                        || matches!(
+                            ch,
+                            '(' | ')'
+                                | '!'
+                                | '~'
+                                | '*'
+                                | '/'
+                                | '%'
+                                | '+'
+                                | '-'
+                                | '<'
+                                | '>'
+                                | '&'
+                                | '^'
+                                | '|'
+                                | '='
+                        )
+                    {
+                        break;
+                    }
+                    i += 1;
+                }
+                if start == i {
+                    return None;
+                }
+                tokens.push(SymbolicConditionToken::Atom(
+                    chars[start..i].iter().collect(),
+                ));
+                continue;
+            }
+        }
+        i += 1;
+    }
+    Some(tokens)
+}
+
 impl<'a> FoldingContext<'a> {
     fn finalize_condition_expr(&self, expr: CExpr) -> CExpr {
         let expr = self.normalize_local_branch_expr(expr);
         let expr = self.rewrite_stack_expr(expr);
         let expr = self.rewrite_condition_stack_aliases(expr);
-        let expr = self.expand_generic_scalar_predicate_aliases(expr, 0);
+        let expr = if self.requires_certified_rendering() {
+            expr
+        } else {
+            self.expand_generic_scalar_predicate_aliases(expr, 0)
+        };
         let expr = self.rewrite_call_result_predicate_owners(expr, 0);
         let expr = self.simplify_condition_expr(expr);
         let expr = self.rewrite_call_result_predicate_owners(expr, 0);
@@ -47,35 +394,23 @@ impl<'a> FoldingContext<'a> {
             return expr;
         }
 
-        let owner_name_for_source = |ctx: &FoldingContext<'_>, source: (u64, usize)| {
-            ctx.stable_owned_call_result_name_for_source(source)
-                .filter(|name| {
-                    !ctx.is_low_signal_visible_name(name)
-                        && !ctx.is_transient_visible_name(name)
-                        && !name.ends_with("_home")
-                        && !name.starts_with("var_")
-                        && !name.starts_with("local_")
-                        && !name.starts_with("stack_")
-                        && !name.starts_with("arg_")
-                })
-        };
-
         match expr {
             CExpr::Var(name) => self
                 .call_result_source_for_ssa_name(&name)
                 .or_else(|| self.local_post_call_source_for_ssa_name(&name))
-                .and_then(|source| owner_name_for_source(self, source))
-                .map(CExpr::Var)
+                .and_then(|source| self.predicate_owned_call_result_expr_for_source(source))
                 .unwrap_or(CExpr::Var(name)),
-            call @ CExpr::Call { .. } => self
-                .source_call_for_call_expr(&call)
-                .and_then(|source| owner_name_for_source(self, source))
-                .map(CExpr::Var)
-                .unwrap_or_else(|| {
-                    call.map_children(&mut |child| {
-                        self.rewrite_call_result_predicate_owners(child, depth + 1)
-                    })
-                }),
+            CExpr::Deref(inner)
+                if matches!(
+                    inner.as_ref(),
+                    CExpr::Var(name) if self.should_preserve_owned_call_result_visible_name(name)
+                ) =>
+            {
+                *inner
+            }
+            call @ CExpr::Call { .. } => call.map_children(&mut |child| {
+                self.rewrite_call_result_predicate_owners(child, depth + 1)
+            }),
             other => other.map_children(&mut |child| {
                 self.rewrite_call_result_predicate_owners(child, depth + 1)
             }),
@@ -85,6 +420,59 @@ impl<'a> FoldingContext<'a> {
     fn prepared_branch_condition_expr(&self, block_addr: u64) -> Option<CExpr> {
         self.prepared_predicate_view()
             .and_then(|view| view.branch_expr_for_block(block_addr).cloned())
+    }
+
+    #[cfg(test)]
+    fn symbolic_actionable_compiled_condition(
+        &self,
+        block_addr: u64,
+    ) -> Option<&r2sym::BackwardConditionSummary> {
+        self.inputs
+            .semantic_artifact()?
+            .actionable_compiled_condition_for_block(block_addr)
+    }
+
+    #[cfg(test)]
+    fn symbolic_actionable_compiled_condition_expr(&self, block_addr: u64) -> Option<CExpr> {
+        let compiled = self.symbolic_actionable_compiled_condition(block_addr)?;
+        SymbolicConditionExprParser::new(self, compiled.simplified.trim())
+            .and_then(SymbolicConditionExprParser::parse)
+            .map(|expr| self.finalize_condition_expr(expr))
+    }
+
+    #[cfg(test)]
+    fn symbolic_actionable_memory_condition_expr(&self, block_addr: u64) -> Option<CExpr> {
+        fn memory_term_rank(term: &r2sym::BackwardMemoryCondition) -> (u8, bool, bool, i128, i128) {
+            let evidence_rank = match term.evidence().tier {
+                r2sym::SemanticConfidence::Exact => 3,
+                r2sym::SemanticConfidence::Likely => 2,
+                r2sym::SemanticConfidence::Heuristic => 1,
+                r2sym::SemanticConfidence::Residual => 0,
+            };
+            (
+                evidence_rank,
+                term.exact_value,
+                term.has_exact_address(),
+                -(i128::from(term.address.offset_hi()) - i128::from(term.address.offset_lo())),
+                -i128::from(term.address.offset_lo()).abs(),
+            )
+        }
+
+        let term = self
+            .inputs
+            .semantic_artifact()?
+            .actionable_memory_terms_for_block(block_addr)
+            .into_iter()
+            .filter(|term| {
+                term.value_expr
+                    .as_ref()
+                    .is_some_and(|value| value != &term.expr)
+            })
+            .max_by_key(|term| memory_term_rank(term))?;
+        let condition = format!("({} == {})", term.expr.trim(), term.value_expr.as_deref()?);
+        SymbolicConditionExprParser::new(self, &condition)
+            .and_then(SymbolicConditionExprParser::parse)
+            .map(|expr| self.finalize_condition_expr(expr))
     }
 
     fn prepared_predicate_view(&self) -> Option<Cow<'_, analysis::PreparedSemanticView>> {
@@ -223,6 +611,8 @@ impl<'a> FoldingContext<'a> {
                     CExpr::Binary { left, right, .. } => recurse(ctx, left) && recurse(ctx, right),
                     CExpr::Var(name) => {
                         ctx.is_generic_stack_local_owner_name(name)
+                            || is_generic_arg_name(name)
+                            || ctx.inputs.arch.is_return_register_name(name)
                             || name.starts_with("local_")
                             || name.starts_with("var_")
                             || name.starts_with("stack_")
@@ -231,7 +621,7 @@ impl<'a> FoldingContext<'a> {
                     CExpr::IntLit(_)
                     | CExpr::UIntLit(_)
                     | CExpr::FloatLit(_)
-                    | CExpr::CharLit(_) => true,
+                    | CExpr::CharLit(_) => false,
                     _ => false,
                 }
             }
@@ -292,6 +682,11 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub fn extract_condition_from_block(&self, block: &FunctionSSABlock) -> Option<CExpr> {
+        if self.requires_certified_rendering() || self.inputs.prepared_ssa.is_some() {
+            return self
+                .certified_branch_condition_from_block(block)
+                .map(|(expr, _, _)| expr);
+        }
         let (branch_idx, cond) =
             block
                 .ops
@@ -306,6 +701,30 @@ impl<'a> FoldingContext<'a> {
         let prepared_block_candidate =
             self.prepared_predicate_candidate_for_branch_block(block.addr, cond);
         let prepared_var_candidate = self.prepared_predicate_candidate_for_var(cond);
+
+        let prev_block_addr = self.current_block_addr.replace(Some(block.addr));
+        let prev_op_idx = self.current_op_idx.replace(Some(branch_idx));
+        let local_branch_candidate = self.local_branch_condition_expr(block, branch_idx, cond, 0);
+        let strong_prepared = [
+            local_branch_candidate,
+            prepared_block_candidate.clone(),
+            prepared_var_candidate.clone(),
+            prepared_branch_candidate.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(|expr| {
+            let finalized = self.finalize_condition_expr(expr);
+            (!self.is_degenerate_constant_condition(&finalized)
+                && !self.prepared_candidate_needs_legacy_compare_help(&finalized))
+            .then_some(finalized)
+        });
+        self.current_block_addr.set(prev_block_addr);
+        self.current_op_idx.set(prev_op_idx);
+        if strong_prepared.is_some() {
+            return strong_prepared;
+        }
+
         let allow_legacy_flag_provenance = ![
             prepared_branch_candidate.as_ref(),
             prepared_block_candidate.as_ref(),
@@ -330,6 +749,13 @@ impl<'a> FoldingContext<'a> {
                             result = Some(finalized);
                             return;
                         }
+                        if result.as_ref().is_some_and(|current| {
+                            self.prepared_candidate_needs_legacy_compare_help(current)
+                                && !self.prepared_candidate_needs_legacy_compare_help(&finalized)
+                        }) {
+                            result = Some(finalized);
+                            return;
+                        }
                         result = self
                             .choose_preferred_scalar_predicate_expr(result.take(), Some(finalized));
                     }
@@ -341,6 +767,7 @@ impl<'a> FoldingContext<'a> {
             consider(prepared_var_candidate);
         }
         if result.is_some() && !allow_legacy_flag_provenance {
+            let result = result.map(|expr| self.finalize_condition_expr(expr));
             self.current_block_addr.set(prev_block_addr);
             self.current_op_idx.set(prev_op_idx);
             return result;
@@ -379,6 +806,10 @@ impl<'a> FoldingContext<'a> {
                     Some(current)
                 } else if self.structured_predicate_candidate_should_win(&current, &fallback) {
                     Some(fallback)
+                } else if self.prepared_candidate_needs_legacy_compare_help(&fallback)
+                    && !self.prepared_candidate_needs_legacy_compare_help(&current)
+                {
+                    Some(current)
                 } else {
                     self.choose_preferred_scalar_predicate_expr(
                         Some(current),
@@ -389,10 +820,54 @@ impl<'a> FoldingContext<'a> {
             }
             None => Some(fallback),
         };
+        let result = result.map(|expr| self.finalize_condition_expr(expr));
 
         self.current_block_addr.set(prev_block_addr);
         self.current_op_idx.set(prev_op_idx);
         result
+    }
+
+    pub(super) fn certified_branch_condition_from_block(
+        &self,
+        block: &FunctionSSABlock,
+    ) -> Option<(CExpr, r2ssa::PredicateId, r2ssa::ValueId)> {
+        let cond = block.ops.iter().rev().find_map(|op| match op {
+            SSAOp::CBranch { cond, .. } => Some(cond),
+            _ => None,
+        })?;
+        let predicate = self.control_facts()?.branch_for_block(block.addr)?;
+        if self.prepared_value_id_for_var(cond) != Some(predicate.condition) {
+            return None;
+        }
+        let expr = self
+            .prepared_predicate_comparison_at_block(predicate, block.addr)
+            .and_then(|comparison| {
+                self.prepared_compare_provenance_expr(comparison, Some(block.addr))
+            })?;
+        let expr = self.finalize_condition_expr(expr);
+        (!self.is_degenerate_constant_condition(&expr)).then_some((
+            expr,
+            predicate.id,
+            predicate.condition,
+        ))
+    }
+
+    pub(super) fn certified_predicate_expr_for_id(
+        &self,
+        predicate_id: r2ssa::PredicateId,
+    ) -> Option<CExpr> {
+        let predicate = self
+            .control_facts()?
+            .branch_predicates
+            .values()
+            .find(|predicate| predicate.id == predicate_id)?;
+        let expr = self
+            .prepared_predicate_comparison_at_block(predicate, predicate.block_addr)
+            .and_then(|comparison| {
+                self.prepared_compare_provenance_expr(comparison, Some(predicate.block_addr))
+            })?;
+        let expr = self.finalize_condition_expr(expr);
+        (!self.is_degenerate_constant_condition(&expr)).then_some(expr)
     }
 
     fn branch_compare_provenance_expr(
@@ -450,33 +925,10 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn normalize_assignment_predicate_rhs(&self, rhs: CExpr) -> CExpr {
-        let rhs = if self.is_assignment_predicate_expr(&rhs) {
+        if self.is_assignment_predicate_expr(&rhs) {
             self.finalize_condition_expr(rhs)
         } else {
             rhs
-        };
-
-        match rhs {
-            CExpr::Binary { op, left, right }
-                if matches!(
-                    op,
-                    BinaryOp::Eq
-                        | BinaryOp::Ne
-                        | BinaryOp::Lt
-                        | BinaryOp::Le
-                        | BinaryOp::Gt
-                        | BinaryOp::Ge
-                ) =>
-            {
-                let left = self
-                    .stable_owned_call_result_expr_for_call_expr(&left)
-                    .unwrap_or(*left);
-                let right = self
-                    .stable_owned_call_result_expr_for_call_expr(&right)
-                    .unwrap_or(*right);
-                CExpr::binary(op, left, right)
-            }
-            other => other,
         }
     }
 
@@ -510,10 +962,10 @@ impl<'a> FoldingContext<'a> {
         let key = var.display_name();
         let prepared_value_id = self.prepared_value_id_for_var(var);
         let prepared = self
-            .prepared_predicates()
+            .control_facts()
             .and_then(|facts| {
                 facts
-                    .predicates
+                    .branch_predicates
                     .values()
                     .find(|predicate| Some(predicate.condition) == prepared_value_id)
                     .and_then(|predicate| self.prepared_branch_condition_expr(predicate.block_addr))
@@ -575,27 +1027,34 @@ impl<'a> FoldingContext<'a> {
             .prepared_predicate_view()
             .and_then(|view| view.predicate_expr_for_cond(var).cloned())
         {
-            return Some(self.resolve_predicate_expr_tree(&expr));
+            let resolved = self.resolve_predicate_expr_tree(&expr);
+            if !self.prepared_candidate_needs_legacy_compare_help(&resolved) {
+                return Some(resolved);
+            }
         }
         if let Some(predicate) = self
-            .prepared_predicates()?
-            .predicates
+            .control_facts()?
+            .branch_predicates
             .values()
             .find(|predicate| Some(predicate.condition) == self.prepared_value_id_for_var(var))
             && let Some(expr) = self
                 .prepared_predicate_view()
                 .and_then(|view| view.branch_expr_for_block(predicate.block_addr).cloned())
         {
-            return Some(self.resolve_predicate_expr_tree(&expr));
+            let resolved = self.resolve_predicate_expr_tree(&expr);
+            if !self.prepared_candidate_needs_legacy_compare_help(&resolved) {
+                return Some(resolved);
+            }
         }
-        let compare = self
-            .prepared_predicates()?
-            .predicates
+        let predicate = self
+            .control_facts()?
+            .branch_predicates
             .values()
-            .find(|predicate| Some(predicate.condition) == self.prepared_value_id_for_var(var))?
-            .comparison
-            .as_ref()?;
-        self.prepared_compare_provenance_expr(compare)
+            .find(|predicate| Some(predicate.condition) == self.prepared_value_id_for_var(var))?;
+        self.prepared_compare_provenance_expr(
+            self.prepared_predicate_comparison_at_block(predicate, predicate.block_addr)?,
+            Some(predicate.block_addr),
+        )
     }
 
     fn prepared_predicate_candidate_for_branch_block(
@@ -607,35 +1066,110 @@ impl<'a> FoldingContext<'a> {
             .prepared_predicate_view()
             .and_then(|view| view.branch_expr_for_block(block_addr).cloned())
         {
-            return Some(self.resolve_predicate_expr_tree(&expr));
+            let resolved = self.resolve_predicate_expr_tree(&expr);
+            if !self.prepared_candidate_needs_legacy_compare_help(&resolved) {
+                return Some(resolved);
+            }
         }
-        let facts = self.prepared_predicates()?;
-        let compare = facts
-            .predicates
-            .values()
-            .find(|predicate| {
-                predicate.block_addr == block_addr
-                    && Some(predicate.condition) == self.prepared_value_id_for_var(var)
-            })
-            .and_then(|predicate| predicate.comparison.as_ref())
+        let facts = self.control_facts()?;
+        let predicate = facts
+            .branch_for_block(block_addr)
+            .filter(|predicate| Some(predicate.condition) == self.prepared_value_id_for_var(var))
             .or_else(|| {
                 facts
                     .block_assumptions
                     .values()
                     .flat_map(|assumptions| assumptions.iter())
                     .find(|assumption| assumption.predecessor == block_addr)
-                    .and_then(|assumption| facts.predicates.get(&assumption.predicate))
-                    .and_then(|predicate| predicate.comparison.as_ref())
+                    .and_then(|assumption| {
+                        facts
+                            .branch_predicates
+                            .values()
+                            .find(|predicate| predicate.id == assumption.predicate)
+                    })
             })?;
-        self.prepared_compare_provenance_expr(compare)
+        let compare = self.prepared_predicate_comparison_at_block(predicate, block_addr)?;
+        self.prepared_compare_provenance_expr(compare, Some(block_addr))
     }
 
-    fn prepared_compare_provenance_expr(&self, prov: &CompareProvenance) -> Option<CExpr> {
+    fn prepared_predicate_comparison_at_block<'b>(
+        &self,
+        predicate: &'b r2types::BranchPredicateFact,
+        block_addr: u64,
+    ) -> Option<&'b PredicateComparisonFact> {
+        if block_addr == predicate.block_addr {
+            predicate.render_comparison.as_ref()
+        } else {
+            predicate.comparison.as_ref()
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn prepared_predicate_candidate_for_branch_block_for_test(
+        &self,
+        block_addr: u64,
+        var: &SSAVar,
+    ) -> Option<CExpr> {
+        self.prepared_predicate_candidate_for_branch_block(block_addr, var)
+    }
+
+    fn prepared_compare_provenance_expr(
+        &self,
+        prov: &PredicateComparisonFact,
+        block_addr: Option<u64>,
+    ) -> Option<CExpr> {
+        if self.requires_certified_rendering() {
+            return self.certified_compare_provenance_expr(prov, block_addr);
+        }
         let lhs_var = self.prepared_var_for_value_id(prov.lhs)?;
         let rhs_var = self.prepared_var_for_value_id(prov.rhs)?;
         let compare_width = lhs_var.size.max(rhs_var.size);
         let lhs = self.resolve_prepared_predicate_operand_with_width(lhs_var, compare_width);
         let rhs = self.resolve_prepared_predicate_operand_with_width(rhs_var, compare_width);
+        self.compare_provenance_expr_from_operands(prov, lhs, rhs)
+    }
+
+    fn certified_compare_provenance_expr(
+        &self,
+        prov: &PredicateComparisonFact,
+        block_addr: Option<u64>,
+    ) -> Option<CExpr> {
+        let lhs_var = self.prepared_var_for_value_id(prov.lhs)?;
+        let rhs_var = self.prepared_var_for_value_id(prov.rhs)?;
+        let compare_width = lhs_var.size.max(rhs_var.size);
+        let lhs = self.certified_predicate_operand_expr(lhs_var, compare_width, block_addr)?;
+        let rhs = self.certified_predicate_operand_expr(rhs_var, compare_width, block_addr)?;
+        self.compare_provenance_expr_from_operands(prov, lhs, rhs)
+    }
+
+    fn certified_predicate_operand_expr(
+        &self,
+        var: &SSAVar,
+        compare_width: u32,
+        block_addr: Option<u64>,
+    ) -> Option<CExpr> {
+        if var.is_const() {
+            return Some(utils::compare_const_to_expr_with_width(
+                var,
+                compare_width.max(var.size),
+            ));
+        }
+        if let Some(name) = block_addr.and_then(|block_addr| {
+            self.prepared_value_id_for_var(var).and_then(|value| {
+                self.certified_loop_carrier_update_name_for_value_at_latch(value, block_addr)
+            })
+        }) {
+            return Some(CExpr::Var(name));
+        }
+        self.render_certified_value_expr_for_var(var)
+    }
+
+    fn compare_provenance_expr_from_operands(
+        &self,
+        prov: &PredicateComparisonFact,
+        lhs: CExpr,
+        rhs: CExpr,
+    ) -> Option<CExpr> {
         match prov.kind {
             PreparedCompareKind::Equal => Some(CExpr::binary(BinaryOp::Eq, lhs, rhs)),
             PreparedCompareKind::NotEqual => Some(CExpr::binary(BinaryOp::Ne, lhs, rhs)),
@@ -670,6 +1204,7 @@ impl<'a> FoldingContext<'a> {
         let original_name = var.display_name();
         let rooted_name = rooted.display_name();
         let mut best = None;
+        let mut best_from_call_result = false;
 
         for candidate in [var, &rooted] {
             let candidate_name = candidate.display_name();
@@ -704,17 +1239,13 @@ impl<'a> FoldingContext<'a> {
             {
                 best = self.choose_preferred_scalar_predicate_expr(best, Some(CExpr::Var(alias)));
             }
-            best = self.choose_preferred_scalar_predicate_expr(
-                best,
-                self.call_result_source_for_ssa_name(&candidate_name)
-                    .or_else(|| self.local_post_call_source_for_ssa_name(&candidate_name))
-                    .and_then(|source| {
-                        self.stable_owned_call_result_name_for_source(source)
-                            .map(CExpr::Var)
-                            .or_else(|| self.stable_owned_call_result_expr_for_source(source))
-                            .or_else(|| self.synthesized_call_expr_for_source_call(source))
-                    }),
-            );
+            if let Some(call_result_candidate) =
+                self.predicate_owned_call_result_expr_for_name(&candidate_name)
+            {
+                best =
+                    self.choose_preferred_scalar_predicate_expr(best, Some(call_result_candidate));
+                best_from_call_result = true;
+            }
             best = self.choose_preferred_scalar_predicate_expr(
                 best,
                 self.stack_slot_provenance_for_name(&candidate_name)
@@ -759,6 +1290,11 @@ impl<'a> FoldingContext<'a> {
                 0,
                 &mut HashSet::new(),
             );
+            if best_from_call_result
+                && self.prepared_predicate_operand_is_generic_entry_or_return(&original_resolved)
+            {
+                return best.expect("call-result predicate operand should be present");
+            }
             if let Some(current) = best.as_ref()
                 && self.structured_predicate_candidate_should_win(current, &original_resolved)
             {
@@ -767,6 +1303,11 @@ impl<'a> FoldingContext<'a> {
                 best = self.choose_preferred_scalar_predicate_expr(best, Some(original_resolved));
             }
         }
+        if best_from_call_result
+            && self.prepared_predicate_operand_is_generic_entry_or_return(&resolved)
+        {
+            return best.expect("call-result predicate operand should be present");
+        }
         if let Some(current) = best.as_ref()
             && self.structured_predicate_candidate_should_win(current, &resolved)
         {
@@ -774,6 +1315,20 @@ impl<'a> FoldingContext<'a> {
         }
         self.choose_preferred_scalar_predicate_expr(best, Some(resolved.clone()))
             .unwrap_or(resolved)
+    }
+
+    fn prepared_predicate_operand_is_generic_entry_or_return(&self, expr: &CExpr) -> bool {
+        match expr {
+            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
+                self.prepared_predicate_operand_is_generic_entry_or_return(inner)
+            }
+            CExpr::Var(name) => {
+                is_generic_arg_name(name)
+                    || name.starts_with("arg_")
+                    || self.inputs.arch.is_return_register_name(name)
+            }
+            _ => false,
+        }
     }
 
     fn resolve_predicate_expr_tree(&self, expr: &CExpr) -> CExpr {
@@ -965,15 +1520,23 @@ impl<'a> FoldingContext<'a> {
             return Some(CExpr::Var(lower_name));
         }
 
-        if let Some(owner) = self.stable_owned_call_result_expr_for_name(&var.display_name(), true)
-        {
-            return Some(owner);
+        if var.version != 0 {
+            let var_name = var.display_name();
+            if let Some(source) = self
+                .call_result_source_for_ssa_name(&var_name)
+                .or_else(|| self.local_post_call_source_for_ssa_name_in_block(block, &var_name, 0))
+            {
+                return self.predicate_owned_call_result_expr_for_source(source);
+            }
         }
 
         if depth > 0
             && self.inputs.arch.is_return_register_name(&lower_name)
             && self.local_return_register_chain_is_call_result(block, before_idx, var, 0)
         {
+            if self.requires_certified_rendering() {
+                return None;
+            }
             if let Some(call_expr) = self
                 .lookup_definition(&var.display_name())
                 .filter(|expr| matches!(expr, CExpr::Call { .. }))
@@ -1537,6 +2100,11 @@ impl<'a> FoldingContext<'a> {
                 right,
             } if self.is_zero_expr(right.as_ref()) => *left,
             CExpr::Binary {
+                op: BinaryOp::Shl | BinaryOp::Shr,
+                left,
+                right,
+            } if self.is_zero_expr(right.as_ref()) => *left,
+            CExpr::Binary {
                 op: BinaryOp::Eq,
                 left,
                 right,
@@ -1765,6 +2333,10 @@ impl<'a> FoldingContext<'a> {
         left: CExpr,
         right: CExpr,
     ) -> CExpr {
+        if let Some(rewritten) = self.rewrite_boolean_literal_comparison(cmp_op, &left, &right) {
+            return rewritten;
+        }
+
         if self.is_zero_expr(&right) {
             if self.is_boolean_value_expr(&left) {
                 return match cmp_op {
@@ -1820,6 +2392,41 @@ impl<'a> FoldingContext<'a> {
         }
 
         CExpr::binary(cmp_op, left, right)
+    }
+
+    fn rewrite_boolean_literal_comparison(
+        &self,
+        cmp_op: BinaryOp,
+        left: &CExpr,
+        right: &CExpr,
+    ) -> Option<CExpr> {
+        let (bool_expr, lit_is_one) = if self.is_boolean_value_expr(left) {
+            if self.is_predicate_one_expr(right) {
+                (left.clone(), true)
+            } else if self.is_zero_expr(right) {
+                (left.clone(), false)
+            } else {
+                return None;
+            }
+        } else if self.is_boolean_value_expr(right) {
+            if self.is_predicate_one_expr(left) {
+                (right.clone(), true)
+            } else if self.is_zero_expr(left) {
+                (right.clone(), false)
+            } else {
+                return None;
+            }
+        } else {
+            return None;
+        };
+
+        match (cmp_op, lit_is_one) {
+            (BinaryOp::Eq, true) | (BinaryOp::Ne, false) => Some(bool_expr),
+            (BinaryOp::Eq, false) | (BinaryOp::Ne, true) => {
+                Some(self.negate_condition_expr(bool_expr))
+            }
+            _ => None,
+        }
     }
 
     pub(super) fn rewrite_unsigned_nonzero_test(
@@ -1942,11 +2549,7 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn normalize_sub_cmp_constant(&self, value: CExpr) -> CExpr {
-        match value {
-            CExpr::IntLit(v) if v >= 0x100 => CExpr::Var(format!("0x{:x}", v as u64)),
-            CExpr::UIntLit(v) if v >= 0x100 => CExpr::Var(format!("0x{:x}", v)),
-            other => other,
-        }
+        value
     }
 
     pub(super) fn const_expr_for_comparison(&self, expr: &CExpr) -> Option<CExpr> {
@@ -2144,19 +2747,15 @@ impl<'a> FoldingContext<'a> {
                 if let Some(alias) = self.arg_alias_for_rendered_name(name) {
                     return CExpr::Var(alias);
                 }
-                if let Some(source) = self
+                if let Some(owner) = self.predicate_owned_call_result_expr_for_name(name) {
+                    return owner;
+                }
+                if self
                     .call_result_source_for_ssa_name(name)
                     .or_else(|| self.local_post_call_source_for_ssa_name(name))
+                    .is_some()
                 {
-                    if let Some(inner @ CExpr::Call { .. }) = self
-                        .lookup_definition(name)
-                        .or_else(|| self.formatted_defs_map().get(name).cloned())
-                    {
-                        return inner;
-                    }
-                    if let Some(inner) = self.synthesized_call_expr_for_source_call(source) {
-                        return inner;
-                    }
+                    return CExpr::Var(name.clone());
                 }
                 if let Some(inner) = self.lookup_predicate_expr(name)
                     && inner != CExpr::Var(name.clone())
@@ -3117,22 +3716,15 @@ impl<'a> FoldingContext<'a> {
                 {
                     return CExpr::Var(alias.clone());
                 }
-                if let Some(owner) = self.stable_owned_call_result_expr_for_name(name, true) {
+                if let Some(owner) = self.predicate_owned_call_result_expr_for_name(name) {
                     return owner;
                 }
-                if let Some(source) = self
+                if self
                     .call_result_source_for_ssa_name(name)
                     .or_else(|| self.local_post_call_source_for_ssa_name(name))
+                    .is_some()
                 {
-                    if let Some(inner @ CExpr::Call { .. }) = self
-                        .lookup_definition(name)
-                        .or_else(|| self.formatted_defs_map().get(name).cloned())
-                    {
-                        return inner;
-                    }
-                    if let Some(inner) = self.synthesized_call_expr_for_source_call(source) {
-                        return inner;
-                    }
+                    return CExpr::Var(name.clone());
                 }
                 if let Some(alias) = self.arg_alias_for_rendered_name(name) {
                     return CExpr::Var(alias);
@@ -3229,6 +3821,10 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn is_opaque_temp_name(&self, name: &str) -> bool {
+        let lower = name.to_ascii_lowercase();
+        if lower.starts_with("tmp_") || utils::is_temporary_name(name) {
+            return true;
+        }
         if name.starts_with("var_") {
             return true;
         }
@@ -3240,6 +3836,11 @@ impl<'a> FoldingContext<'a> {
                 .unwrap_or(false);
         }
         false
+    }
+
+    pub(super) fn is_sleigh_memory_temp_name(&self, name: &str) -> bool {
+        let lower = name.to_ascii_lowercase();
+        lower.starts_with("tmp_ld") || lower.starts_with("tmp_st")
     }
 
     pub(super) fn is_semantic_binding_name(name: &str) -> bool {
@@ -3571,6 +4172,25 @@ impl<'a> FoldingContext<'a> {
             )),
             FlagCompareKind::Overflow => None,
         }
+    }
+}
+
+impl<'o> analysis::PredicateAnalysisView for FoldingContext<'o> {
+    fn expand_predicate_vars(
+        &self,
+        expr: &CExpr,
+        depth: u32,
+        visited: &mut HashSet<String>,
+    ) -> CExpr {
+        FoldingContext::expand_predicate_vars(self, expr, depth, visited)
+    }
+
+    fn try_reconstruct_condition(&self, expr: &CExpr) -> Option<CExpr> {
+        FoldingContext::try_reconstruct_condition(self, expr)
+    }
+
+    fn simplify_predicate_expr(&self, expr: CExpr) -> CExpr {
+        FoldingContext::simplify_predicate_expr(self, expr)
     }
 }
 

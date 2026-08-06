@@ -1,0 +1,18 @@
+warning: semantic storage/address classification by string prefix; use a typed classifier owned by the canonical fact producer
+  --> $DIR/main.rs:2:5
+   |
+LL |     name.starts_with("tmp:")
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(string_prefix_semantic_classification)]` on by default
+
+warning: internal analysis must use typed radare2 collector APIs instead of JSON command strings
+  --> $DIR/main.rs:78:13
+   |
+LL |     let _ = "afcfj";
+   |             ^^^^^^^
+   |
+   = note: `#[warn(r2_json_command_internal_seam)]` on by default
+
+warning: 2 warnings emitted
+

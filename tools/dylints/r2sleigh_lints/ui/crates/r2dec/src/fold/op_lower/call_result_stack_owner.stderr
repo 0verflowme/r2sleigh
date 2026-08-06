@@ -1,0 +1,27 @@
+warning: r2dec must not derive call-result owners from stack-local fallback logic
+  --> $DIR/call_result_stack_owner.rs:4:5
+   |
+LL | /     fn fallback_owned_call_result_stack_local_name_for_source(&self) -> Option<String> {
+LL | |         Some("buf".to_string())
+LL | |     }
+   | |_____^
+   |
+   = note: `#[warn(r2dec_call_result_stack_owner_fallback)]` on by default
+
+warning: r2dec must not derive call-result owners from stack-local fallback logic
+  --> $DIR/call_result_stack_owner.rs:8:5
+   |
+LL | /     fn derive_stable_owned_call_result_name_for_alias(&self, alias: &str) -> Option<String> {
+LL | |         let fallback_stack_local = self.semantic_stack_owner_name_for_alias(alias);
+LL | |         fallback_stack_local
+LL | |     }
+   | |_____^
+
+warning: r2dec must consume prepared call-result ownership instead of deriving stack-local owners in op-lowering
+  --> $DIR/call_result_stack_owner.rs:9:36
+   |
+LL |         let fallback_stack_local = self.semantic_stack_owner_name_for_alias(alias);
+   |                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: 3 warnings emitted
+

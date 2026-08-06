@@ -5,10 +5,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use r2ssa::{SSAFunction, SSAOp, SSAVar};
+use r2ssa::{ObjectKind, SSAFunction, SSAOp, SSAVar, SsaArtifact};
 use r2types::{
-    CTypeLike, ExternalStackBase, ExternalStackSlotRole, FunctionTypeFacts, StackSlotKey,
-    VisibleBinding, VisibleBindingKind,
+    CTypeLike, ExternalStackBase, ExternalStackSlotRole, FunctionFacts, FunctionTypeFacts,
+    StackSlotKey, VisibleBinding, VisibleBindingKind,
 };
 
 use crate::analysis::utils;
@@ -28,33 +28,13 @@ pub(crate) fn type_like_to_ctype(ty: &CTypeLike) -> CType {
         CTypeLike::Struct(name) => CType::Struct(name.clone()),
         CTypeLike::Union(name) => CType::Union(name.clone()),
         CTypeLike::Enum(name) => CType::Enum(name.clone()),
+        CTypeLike::Typedef(name) => CType::Typedef(name.clone()),
         CTypeLike::Function | CTypeLike::Unknown => CType::Unknown,
     }
 }
 
 fn parse_const_value(name: &str) -> Option<u64> {
-    let value = name.strip_prefix("const:")?;
-    let value = value.split('_').next().unwrap_or(value);
-    if let Some(hex) = value
-        .strip_prefix("0x")
-        .or_else(|| value.strip_prefix("0X"))
-    {
-        return u64::from_str_radix(hex, 16).ok();
-    }
-    if let Some(dec) = value
-        .strip_prefix("0d")
-        .or_else(|| value.strip_prefix("0D"))
-    {
-        return dec.parse::<u64>().ok();
-    }
-    if value.chars().all(|ch| ch.is_ascii_hexdigit())
-        && value
-            .chars()
-            .any(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_digit())
-    {
-        return u64::from_str_radix(value, 16).ok();
-    }
-    value.parse::<u64>().ok()
+    utils::parse_const_value(name)
 }
 
 /// Variable information.
@@ -116,6 +96,10 @@ pub struct VariableRecovery {
     used_param_names: HashSet<String>,
     /// Used local variable names (to avoid duplicates).
     used_local_names: HashSet<String>,
+    /// Stable C identity for each recovered stack slot.
+    stack_names_by_offset: HashMap<i64, String>,
+    /// Stack storage objects keyed independently from the SSA values stored in them.
+    stack_locals_by_offset: HashMap<i64, VarInfo>,
     /// Used general variable names (to avoid duplicates).
     used_var_names: HashSet<String>,
     /// Stack pointer register name.
@@ -171,6 +155,8 @@ impl VariableRecovery {
             name_counters: HashMap::new(),
             used_param_names: HashSet::new(),
             used_local_names: HashSet::new(),
+            stack_names_by_offset: HashMap::new(),
+            stack_locals_by_offset: HashMap::new(),
             used_var_names: HashSet::new(),
             sp_name: sp_name.to_string(),
             fp_name: fp_name.to_string(),
@@ -183,7 +169,13 @@ impl VariableRecovery {
         }
     }
 
+    /// Set canonical function facts for type/layout-guided variable recovery.
+    pub fn set_function_facts(&mut self, function_facts: &FunctionFacts) {
+        self.type_facts = function_facts.type_facts().clone().canonicalized();
+    }
+
     /// Set externally recovered type/layout facts.
+    #[cfg(test)]
     pub fn set_type_facts(&mut self, type_facts: FunctionTypeFacts) {
         self.type_facts = type_facts.canonicalized();
     }
@@ -209,7 +201,7 @@ impl VariableRecovery {
         let lower = name.to_ascii_lowercase();
         if let Some(rest) = lower.strip_prefix("arg")
             && let Ok(idx) = rest.parse::<usize>()
-            && (1..=self.arg_regs.len()).contains(&idx)
+            && idx < self.arg_regs.len()
         {
             return true;
         }
@@ -221,8 +213,7 @@ impl VariableRecovery {
             .any(|binding| binding.name.eq_ignore_ascii_case(name))
             || self
                 .type_facts
-                .merged_signature
-                .as_ref()
+                .render_authorized_signature()
                 .map(|sig| {
                     sig.params
                         .iter()
@@ -283,16 +274,41 @@ impl VariableRecovery {
     }
 
     fn visible_stack_type_for_offset(&self, offset: i64) -> Option<CType> {
-        self.visible_stack_binding_for_offset(offset)
+        if let Some(ty) = self
+            .visible_stack_binding_for_offset(offset)
             .and_then(|binding| binding.ty.as_ref())
             .map(type_like_to_ctype)
+        {
+            return Some(ty);
+        }
+
+        self.type_facts
+            .stack_slots
+            .iter()
+            .find_map(|(slot_key, slot_spec)| {
+                (Self::stack_slot_matches_offset(slot_key, offset)
+                    && Self::is_visible_external_stack_name_role(slot_spec.role))
+                .then(|| slot_spec.ty.as_ref().map(type_like_to_ctype))
+                .flatten()
+            })
     }
 
     /// Recover variables from an SSA function.
     pub fn recover(&mut self, func: &SSAFunction) {
         // First pass: identify stack variables
-        self.find_stack_variables(func);
+        self.find_stack_variables(func, None);
 
+        self.recover_non_stack_variables(func);
+    }
+
+    /// Recover variables from the canonical prepared SSA artifact.
+    pub fn recover_prepared(&mut self, prepared: &SsaArtifact) {
+        let func = prepared.function();
+        self.find_stack_variables(func, Some(prepared));
+        self.recover_non_stack_variables(func);
+    }
+
+    fn recover_non_stack_variables(&mut self, func: &SSAFunction) {
         // Second pass: identify parameters
         self.find_parameters(func);
 
@@ -426,27 +442,23 @@ impl VariableRecovery {
     }
 
     /// Find stack variables (loads/stores relative to SP/FP).
-    fn find_stack_variables(&mut self, func: &SSAFunction) {
+    fn find_stack_variables(&mut self, func: &SSAFunction, prepared: Option<&SsaArtifact>) {
         let definitions = self.collect_definitions(func);
         for block in func.blocks() {
             for op in &block.ops {
                 match op {
                     SSAOp::Load { dst, addr, .. } => {
-                        if let Some(offset) = self.get_stack_offset(addr, &definitions) {
-                            let name = self.gen_stack_var_name(offset);
-                            let ty = self
-                                .visible_stack_type_for_offset(offset)
-                                .unwrap_or_else(|| self.type_from_size(dst.size));
-                            self.insert_var_info(dst.clone(), name, ty, VarAttrs::local(offset));
+                        if let Some(offset) =
+                            self.get_stack_offset(func, prepared, addr, &definitions)
+                        {
+                            self.ensure_stack_local(offset, dst.size);
                         }
                     }
                     SSAOp::Store { addr, val, .. } => {
-                        if let Some(offset) = self.get_stack_offset(addr, &definitions) {
-                            let name = self.gen_stack_var_name(offset);
-                            let ty = self
-                                .visible_stack_type_for_offset(offset)
-                                .unwrap_or_else(|| self.type_from_size(val.size));
-                            self.insert_var_info(val.clone(), name, ty, VarAttrs::local(offset));
+                        if let Some(offset) =
+                            self.get_stack_offset(func, prepared, addr, &definitions)
+                        {
+                            self.ensure_stack_local(offset, val.size);
                         }
                     }
                     _ => {}
@@ -455,8 +467,46 @@ impl VariableRecovery {
         }
     }
 
+    fn ensure_stack_local(&mut self, offset: i64, size: u32) {
+        if self.stack_locals_by_offset.contains_key(&offset) {
+            return;
+        }
+        let name = self.gen_stack_var_name(offset);
+        let ty = self
+            .visible_stack_type_for_offset(offset)
+            .unwrap_or_else(|| self.type_from_size(size));
+        let synthetic = SSAVar::new(format!("stack:{offset}"), 0, size);
+        let info = self.make_var_info(synthetic, name, ty, VarAttrs::local(offset));
+        self.stack_locals_by_offset.insert(offset, info);
+    }
+
     /// Get stack offset from an address variable.
-    fn get_stack_offset(&self, addr: &SSAVar, definitions: &HashMap<String, CExpr>) -> Option<i64> {
+    fn get_stack_offset(
+        &self,
+        func: &SSAFunction,
+        prepared: Option<&SsaArtifact>,
+        addr: &SSAVar,
+        definitions: &HashMap<String, CExpr>,
+    ) -> Option<i64> {
+        if let Some(offset) = prepared
+            .and_then(|artifact| artifact.object_for_var(addr))
+            .and_then(|object| prepared?.objects().object(object))
+            .and_then(|object| match object.kind {
+                ObjectKind::StackSlot { offset, .. } | ObjectKind::FrameObject { offset, .. } => {
+                    Some(offset)
+                }
+                _ => None,
+            })
+        {
+            return Some(offset);
+        }
+        if let Some(offset) = func
+            .decompile_prep_facts()
+            .and_then(|facts| facts.stack_address_root_of(addr))
+            .map(|root| root.offset)
+        {
+            return Some(offset);
+        }
         utils::extract_stack_offset_from_var(addr, definitions, &self.fp_name, &self.sp_name)
     }
 
@@ -507,6 +557,9 @@ impl VariableRecovery {
 
     /// Generate a name for a stack variable.
     fn gen_stack_var_name(&mut self, offset: i64) -> String {
+        if let Some(name) = self.stack_names_by_offset.get(&offset) {
+            return name.clone();
+        }
         let base_name = self
             .external_stack_name_for_offset(offset)
             .unwrap_or_else(|| {
@@ -520,6 +573,7 @@ impl VariableRecovery {
         // Ensure uniqueness
         if !self.used_local_names.contains(&base_name) {
             self.used_local_names.insert(base_name.clone());
+            self.stack_names_by_offset.insert(offset, base_name.clone());
             return base_name;
         }
 
@@ -529,6 +583,7 @@ impl VariableRecovery {
             let candidate = format!("{}_{}", base_name, counter);
             if !self.used_local_names.contains(&candidate) {
                 self.used_local_names.insert(candidate.clone());
+                self.stack_names_by_offset.insert(offset, candidate.clone());
                 return candidate;
             }
             counter += 1;
@@ -584,7 +639,7 @@ impl VariableRecovery {
         // Emit parameters in CC order, stopping at the first gap
         for (idx, cc_reg) in self.arg_regs.clone().into_iter().enumerate() {
             if let Some(var) = seen_v0.get(&cc_reg) {
-                let mut name = format!("arg{}", idx + 1);
+                let mut name = format!("arg{idx}");
                 let mut ty = self.type_from_size(var.size);
                 self.apply_external_param_override(idx, &mut name, &mut ty);
                 let name = self.make_unique_param_name(name);
@@ -606,18 +661,22 @@ impl VariableRecovery {
             }
         }
 
-        let Some(signature) = self.type_facts.merged_signature.as_ref() else {
-            return;
-        };
-        let Some(ext) = signature.params.get(index) else {
-            return;
-        };
-
-        if !is_generic_arg_name(&ext.name) {
-            *name = ext.name.clone();
-        }
-        if let Some(ext_ty) = &ext.ty {
+        if let Some(ext_ty) = self
+            .type_facts
+            .merged_signature
+            .as_ref()
+            .and_then(|signature| signature.params.get(index))
+            .and_then(|param| param.ty.as_ref())
+        {
             *ty = type_like_to_ctype(ext_ty);
+        }
+        if let Some(ext) = self
+            .type_facts
+            .render_authorized_signature()
+            .and_then(|signature| signature.params.get(index))
+            && !is_generic_arg_name(&ext.name)
+        {
+            *name = ext.name.clone();
         }
     }
 
@@ -627,31 +686,32 @@ impl VariableRecovery {
         // Use register name if it's a common parameter register
         let name = var.name.to_lowercase();
         let base_name = if name.contains("rdi") || name.contains("edi") {
-            "arg1".to_string()
+            "arg0".to_string()
         } else if name.contains("rsi") || name.contains("esi") {
-            "arg2".to_string()
+            "arg1".to_string()
         } else if name.contains("rdx") || name.contains("edx") {
-            "arg3".to_string()
+            "arg2".to_string()
         } else if name.contains("rcx") || name.contains("ecx") {
-            "arg4".to_string()
+            "arg3".to_string()
         } else if name.contains("r8") {
-            "arg5".to_string()
+            "arg4".to_string()
         } else if name.contains("r9") {
-            "arg6".to_string()
+            "arg5".to_string()
         // ARM calling convention
         } else if name.contains("r0") || name.contains("x0") {
-            "arg1".to_string()
+            "arg0".to_string()
         } else if name.contains("r1") || name.contains("x1") {
-            "arg2".to_string()
+            "arg1".to_string()
         } else if name.contains("r2") || name.contains("x2") {
-            "arg3".to_string()
+            "arg2".to_string()
         } else if name.contains("r3") || name.contains("x3") {
-            "arg4".to_string()
+            "arg3".to_string()
         } else {
             // Generic parameter name
             let count = self.name_counters.entry("arg".to_string()).or_insert(0);
+            let name = format!("arg{count}");
             *count += 1;
-            format!("arg{}", count)
+            name
         };
 
         // Ensure uniqueness
@@ -720,9 +780,7 @@ impl VariableRecovery {
 
     /// Generate a variable name.
     fn gen_var_name(&mut self, var: &SSAVar) -> String {
-        let base = if var.name.contains("reg:") {
-            "v"
-        } else if var.name.contains("tmp:") || var.name.contains("unique:") {
+        let base = if var.name_kind().is_temporary() {
             "t"
         } else {
             "v"
@@ -774,7 +832,11 @@ impl VariableRecovery {
 
     /// Get all local variables.
     pub fn locals(&self) -> Vec<&VarInfo> {
-        let mut locals: Vec<_> = self.vars.values().filter(|v| v.is_local).collect();
+        let mut locals: Vec<_> = self
+            .stack_locals_by_offset
+            .values()
+            .chain(self.vars.values().filter(|v| v.is_local))
+            .collect();
         locals.sort_by(|a, b| {
             match (a.stack_offset, b.stack_offset) {
                 (Some(a_off), Some(b_off)) => a_off.cmp(&b_off),
@@ -853,6 +915,18 @@ mod tests {
         }
     }
 
+    fn type_facts_with_external_signature(signature: FunctionSignatureSpec) -> FunctionTypeFacts {
+        let signature_certificate = r2types::SignatureCertificate::from_signature(
+            &signature,
+            [r2types::SignatureCertificateSource::ExternalContext],
+        );
+        FunctionTypeFacts {
+            merged_signature: Some(signature),
+            signature_certificate,
+            ..FunctionTypeFacts::default()
+        }
+    }
+
     fn visible_stack_binding(name: &str, ty: Option<CType>, offset: i64) -> VisibleBinding {
         VisibleBinding {
             name: name.to_string(),
@@ -888,10 +962,10 @@ mod tests {
         let mut vr = VariableRecovery::new("rsp", "rbp", 64);
 
         let var_rdi = SSAVar::new("reg:rdi", 0, 64);
-        assert_eq!(vr.gen_param_name(&var_rdi), "arg1");
+        assert_eq!(vr.gen_param_name(&var_rdi), "arg0");
 
         let var_rsi = SSAVar::new("reg:rsi", 0, 64);
-        assert_eq!(vr.gen_param_name(&var_rsi), "arg2");
+        assert_eq!(vr.gen_param_name(&var_rsi), "arg1");
     }
 
     #[test]
@@ -905,6 +979,12 @@ mod tests {
         let name2 = vr.gen_var_name(&var2);
 
         assert_ne!(name1, name2);
+
+        let temp_name = vr.gen_var_name(&SSAVar::new("tmp:11f80", 1, 64));
+        let unique_name = vr.gen_var_name(&SSAVar::new("unique:11f80", 1, 64));
+
+        assert!(temp_name.starts_with('t'));
+        assert!(unique_name.starts_with('t'));
     }
 
     #[test]
@@ -916,6 +996,14 @@ mod tests {
 
         let name = vr.gen_stack_var_name(-8);
         assert_eq!(name, "arg_8");
+    }
+
+    #[test]
+    fn same_stack_slot_reuses_one_c_identity() {
+        let mut vr = VariableRecovery::new("rsp", "rbp", 64);
+
+        assert_eq!(vr.gen_stack_var_name(-8), "arg_8");
+        assert_eq!(vr.gen_stack_var_name(-8), "arg_8");
     }
 
     #[test]
@@ -988,17 +1076,15 @@ mod tests {
     #[test]
     fn test_external_stack_var_name_matching_param_alias_falls_back_to_generic_local() {
         let mut vr = VariableRecovery::new("rsp", "rbp", 64);
-        vr.set_type_facts(FunctionTypeFacts {
-            merged_signature: Some(signature_spec(vec![
-                ("a", Some(CType::Int(32))),
-                ("b", Some(CType::Int(32))),
-            ])),
-            external_stack_vars: HashMap::from([(
-                -8,
-                stack_var_spec_from_ctype("a", Some(CType::Int(32)), Some("RBP")),
-            )]),
-            ..FunctionTypeFacts::default()
-        });
+        let mut type_facts = type_facts_with_external_signature(signature_spec(vec![
+            ("a", Some(CType::Int(32))),
+            ("b", Some(CType::Int(32))),
+        ]));
+        type_facts.external_stack_vars = HashMap::from([(
+            -8,
+            stack_var_spec_from_ctype("a", Some(CType::Int(32)), Some("RBP")),
+        )]);
+        vr.set_type_facts(type_facts);
 
         let name = vr.gen_stack_var_name(8);
         assert_eq!(name, "local_8");
@@ -1007,19 +1093,17 @@ mod tests {
     #[test]
     fn test_external_signature_overrides_meaningful_param_name_and_type() {
         let mut vr = VariableRecovery::new("rsp", "rbp", 64);
-        vr.set_type_facts(FunctionTypeFacts {
-            visible_bindings: vec![visible_param_binding(
-                "user_input",
-                Some(CType::ptr(CType::Int(8))),
-                0,
-                "rdi",
-            )],
-            merged_signature: Some(signature_spec(vec![(
-                "user_input",
-                Some(CType::ptr(CType::Int(8))),
-            )])),
-            ..FunctionTypeFacts::default()
-        });
+        let mut type_facts = type_facts_with_external_signature(signature_spec(vec![(
+            "user_input",
+            Some(CType::ptr(CType::Int(8))),
+        )]));
+        type_facts.visible_bindings = vec![visible_param_binding(
+            "user_input",
+            Some(CType::ptr(CType::Int(8))),
+            0,
+            "rdi",
+        )];
+        vr.set_type_facts(type_facts);
 
         let mut name = "arg1".to_string();
         let mut ty = CType::Int(64);
@@ -1070,12 +1154,57 @@ mod tests {
     }
 
     #[test]
-    fn test_external_signature_generic_param_name_is_ignored() {
+    fn canonical_stack_slot_type_drives_stack_local_recovery() {
+        let mut block = R2ILBlock::new(0x1000, 1);
+        block.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let mut func = SSAFunction::from_blocks_raw_no_arch(&[block]).expect("ssa function");
+        func.get_block_mut(0x1000).expect("entry").ops = vec![
+            SSAOp::IntAdd {
+                dst: SSAVar::new("tmp:addr", 1, 8),
+                a: SSAVar::new("RBP", 1, 8),
+                b: SSAVar::new("const:ffffffffffffffff", 0, 8),
+            },
+            SSAOp::Load {
+                dst: SSAVar::new("tmp:byte", 1, 1),
+                space: "ram".to_string(),
+                addr: SSAVar::new("tmp:addr", 1, 8),
+            },
+            SSAOp::Return {
+                target: SSAVar::new("tmp:byte", 1, 1),
+            },
+        ];
+
         let mut vr = VariableRecovery::new("rsp", "rbp", 64);
         vr.set_type_facts(FunctionTypeFacts {
-            merged_signature: Some(signature_spec(vec![("arg0", Some(CType::Int(32)))])),
+            stack_slots: std::collections::BTreeMap::from([(
+                StackSlotKey {
+                    base: ExternalStackBase::FramePointer,
+                    offset: -1,
+                },
+                stack_var_spec_from_ctype("c", Some(CType::UInt(8)), Some("RBP")),
+            )]),
             ..FunctionTypeFacts::default()
         });
+
+        vr.recover(&func);
+
+        let local = vr
+            .locals()
+            .into_iter()
+            .find(|info| info.name == "c")
+            .expect("canonical typed stack local");
+        assert_eq!(local.ty, CType::UInt(8));
+    }
+
+    #[test]
+    fn test_external_signature_generic_param_name_is_ignored() {
+        let mut vr = VariableRecovery::new("rsp", "rbp", 64);
+        vr.set_type_facts(type_facts_with_external_signature(signature_spec(vec![(
+            "arg0",
+            Some(CType::Int(32)),
+        )])));
 
         let mut name = "arg1".to_string();
         let mut ty = CType::Int(64);
@@ -1088,10 +1217,9 @@ mod tests {
     #[test]
     fn test_external_signature_type_override_only_when_available() {
         let mut vr = VariableRecovery::new("rsp", "rbp", 64);
-        vr.set_type_facts(FunctionTypeFacts {
-            merged_signature: Some(signature_spec(vec![("count", None)])),
-            ..FunctionTypeFacts::default()
-        });
+        vr.set_type_facts(type_facts_with_external_signature(signature_spec(vec![(
+            "count", None,
+        )])));
 
         let mut name = "arg1".to_string();
         let mut ty = CType::Int(64);
@@ -1144,7 +1272,11 @@ mod tests {
             local_names.iter().any(|name| name == "sum"),
             "expected temp-address store to recover named stack local, got {local_names:?}"
         );
-        assert_eq!(vr.get_name(&SSAVar::new("EAX", 1, 4)), "sum");
+        assert_ne!(
+            vr.get_name(&SSAVar::new("EAX", 1, 4)),
+            "sum",
+            "a stored SSA value must not inherit the identity of its destination object"
+        );
     }
 
     #[test]

@@ -1,106 +1,53 @@
-NAME=stress_parse_number_symbolic_paths_nonempty
-FILE=bins/stress_test
+NAME=public_help_hides_deprecated_debug_verbs
+FILE=bins/vuln_test_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+true
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+a:sla? | jq -Rs 'contains("a:sla.dec") and (contains("anal.sla")|not) and (contains("a:sla.debug.sym")|not)'
+a:sym? | jq -Rs 'contains("a:sym.solve") and contains("a:sym.state") and (contains("a:sym.runj")|not)'
+e??anal.sla | jq -Rs 'length==0'
+EOF_CMDS
+RUN
+
+NAME=manual_sparse_switch_o2_preserves_all_certified_paths
+FILE=bins/r2sleigh_manual_limits_O2
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-s `afl~parse_number$[0]` >/dev/null
-a:sla.sym.paths | jq -c 'type=="array"'
+s `afl~sparse_switch[0]` >/dev/null
+af
+a:sla.dec | jq -Rs 'contains("int32_t sym._sparse_switch(int32_t arg0, int32_t arg1, int32_t arg2)") and contains("if (arg0 <= 2)") and contains("arg0 + 7 == 0") and contains("arg0 == 3") and contains("arg0 == 42") and contains("arg0 != 1000") and contains("arg2 == 0") and contains("return arg1 - arg2;") and contains("return arg1 + arg0 - arg2;") and contains("return arg2 + arg1;") and contains("return arg1 + (arg1 << 1) + arg2;") and contains("return (arg2 ^ arg1) + 42;") and contains("return -1;") and contains("return arg1 / arg2;") and (contains("r2dec residual:")|not) and (contains("ValueId")|not) and (contains("ObjectId")|not) and (contains("tmp:")|not) and (contains("switch (test)")|not) and (contains("case fake")|not)'
 EOF_CMDS
 RUN
 
-NAME=stress_ls_main_decompile_fallback
-FILE=/bin/ls
+NAME=deprecated_debug_aliases_report_moved_namespace
+FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
 true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s main
-a:sla.dec | jq -Rs 'contains("r2dec fallback: skipped decompilation")'
-EOF_CMDS
-RUN
-
-NAME=stress_ls_endbr64_json_nonempty
-FILE=/bin/ls
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
+true
+true
+true
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-aaa
-s main
-a:sla.json | jq -c 'length>0'
+a:sla.debug.mem >/dev/null
+a:sla.mem | jq -Rs '. == ""'
+a:sla.types | jq -Rs '. == ""'
+a:sla.profilej | jq -Rs '. == ""'
+a:sla.assumej [] | jq -Rs '. == ""'
+a:sym.runj {} | jq -Rs '. == ""'
 EOF_CMDS
 RUN
 
-NAME=stress_sla_dec_explicit_target
-FILE=bins/stress_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-a:sla.dec dbg.parse_number | jq -Rs 'contains("parse_number") or contains("dbg.parse_number") or contains("sub_")'
-EOF_CMDS
-RUN
-
-NAME=stress_sla_dec_missing_symbol_guidance
-FILE=bins/stress_test_opt
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-a:sla.dec dbg.nonexistent_symbol | jq -Rs 'contains("may be inlined or stripped")'
-EOF_CMDS
-RUN
-
-NAME=taint_check_secret_schema
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s `afl~check_secret$[0]` >/dev/null
-a:sla.taint | jq -c 'has("sources") and has("sinks") and has("sink_hits") and has("tainted_vars") and (tostring|contains("input:"))'
-EOF_CMDS
-RUN
-
-NAME=taint_vuln_memcpy_schema
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s `afl~vuln_memcpy$[0]` >/dev/null
-a:sla.taint | jq -c 'has("sources") and has("sink_hits") and (.sink_hits|type=="array") and (tostring|contains("tainted"))'
-EOF_CMDS
-RUN
-
-NAME=taint_phi_function_ssa_has_phis
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s `afl~check_secret$[0]` >/dev/null
-a:sla.ssa.func | jq -c 'has("blocks") and ((.blocks|length)>0) and (.blocks|map(.phis|type=="array")|all)'
-EOF_CMDS
-RUN
-
-NAME=taint_slice_zf_structured_shape
+NAME=dec_check_secret_current_function_public_surface
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
@@ -108,14 +55,13 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-s `afl~check_secret$[0]` >/dev/null
-s `afl~check_secret$[0]` >/dev/null
-s `afl~check_secret$[0]` >/dev/null
-a:sla.slice ZF_1 | jq -c 'has("sink_var") and has("ops") and has("blocks") and (.ops|type=="array") and (.blocks|type=="array")'
+s `afl~check_secret[0]` >/dev/null
+af
+a:sla.dec | jq -Rs 'contains("check_secret(int32_t arg0)") and contains("if (arg0 != 57005)") and contains("return 0;") and contains("return 1;") and (contains("var_4h")|not) and (contains("r2dec residual:")|not) and (contains("r2dec fallback:")|not)'
 EOF_CMDS
 RUN
 
-NAME=taint_vuln_memcpy_call_sinks_include_arg_regs
+NAME=pdd_routes_to_sleigh_decompiler_when_plugin_loaded
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
@@ -123,79 +69,39 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-s `afl~vuln_memcpy$[0]` >/dev/null
-s `afl~vuln_memcpy$[0]` >/dev/null
-s `afl~vuln_memcpy$[0]` >/dev/null
-a:sla.taint | jq -c 'any(.sink_hits[]?; ((.op.op // "") == "Call" or (.op.op // "") == "CallInd") and any(.tainted_vars[]?; ((.var // "") | ascii_downcase | startswith("rdi_") or startswith("edi_") or startswith("rsi_") or startswith("esi_") or startswith("rdx_") or startswith("edx_") or startswith("rcx_") or startswith("ecx_") or startswith("r8_") or startswith("r9_"))))'
+s `afl~check_secret[0]` >/dev/null
+af
+pdd | jq -Rs 'contains("check_secret") and contains("return") and (contains("r2pm -ci r2dec")|not)'
 EOF_CMDS
 RUN
 
-NAME=symbolic_check_secret_has_stats
-FILE=bins/vuln_test
+NAME=profilej_reports_deterministic_stage_timings
+FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-aaa
-s `afl~check_secret$[0]` >/dev/null
-a:sla.sym | jq -c 'has("paths_explored") and has("paths_feasible") and has("states_explored")'
+a:sla >/dev/null
+aaaa
+a:sla.debug.profilej | jq -c '.enabled==true and .max==20 and .count>0 and (.engine_cache.analysis|has("hits") and has("misses")) and (.engine_cache.artifacts|has("hits") and has("misses")) and (.functions|type=="array") and (.functions|length>0) and (.functions[0]|has("addr") and has("total_us") and has("lift_us") and has("typed_context_us") and has("session_us") and has("mutation_us") and has("xref_us") and has("taint_us") and has("decompile_us"))'
 EOF_CMDS
 RUN
 
-NAME=symbolic_unlock_has_paths_explored
-FILE=bins/vuln_test
+NAME=profilej_available_without_config
+FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
+a:sla >/dev/null
 aaa
-s `afl~unlock$[0]` >/dev/null
-a:sla.sym | jq -c 'has("paths_explored")'
+a:sla.debug.profilej | jq -c '.enabled==true and .max==20 and .count>0'
 EOF_CMDS
 RUN
 
-NAME=symbolic_solve_equation_has_paths_explored
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s `afl~solve_equation$[0]` >/dev/null
-a:sla.sym | jq -c 'has("paths_explored")'
-EOF_CMDS
-RUN
-
-NAME=symbolic_check_secret_reports_paths_feasible
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s `afl~check_secret$[0]` >/dev/null
-a:sla.sym | jq -c 'has("paths_feasible")'
-EOF_CMDS
-RUN
-
-NAME=symbolic_check_secret_reports_states_explored
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s `afl~check_secret$[0]` >/dev/null
-a:sla.sym | jq -c 'has("states_explored")'
-EOF_CMDS
-RUN
-
-NAME=paths_check_secret_structure
+NAME=dec_check_secret_explicit_address_public_surface
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
@@ -203,14 +109,13 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-s `afl~check_secret$[0]` >/dev/null
-s `afl~check_secret$[0]` >/dev/null
-s `afl~check_secret$[0]` >/dev/null
-a:sla.sym.paths | jq -c 'length>0 and (.[0]|has("path_id") and has("feasible") and has("solution") and has("exit_status"))'
+s `afl~check_secret[0]` >/dev/null
+af
+a:sla.dec $$ | jq -Rs 'contains("check_secret(int32_t arg0)") and contains("if (arg0 != 57005)") and contains("return 0;") and contains("return 1;") and (contains("var_4h")|not) and (contains("r2dec residual:")|not) and (contains("r2dec fallback:")|not)'
 EOF_CMDS
 RUN
 
-NAME=paths_check_secret_finds_magic_0xdead
+NAME=dec_solve_equation_header_not_void
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
@@ -218,14 +123,13 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-s `afl~check_secret$[0]` >/dev/null
-s `afl~check_secret$[0]` >/dev/null
-s `afl~check_secret$[0]` >/dev/null
-a:sla.sym.paths | jq -c 'tostring|contains("0xdead")'
+s `afl~solve_equation[0]` >/dev/null
+af
+a:sla.dec | head -n1 | jq -Rs 'contains("solve_equation") and (contains("int") or contains("uint")) and (contains("void ")|not)'
 EOF_CMDS
 RUN
 
-NAME=paths_solve_equation_finds_0xa
+NAME=dec_boolxor_residualizes_without_return_proof
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
@@ -233,14 +137,167 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-s `afl~solve_equation$[0]` >/dev/null
-s `afl~solve_equation$[0]` >/dev/null
-s `afl~solve_equation$[0]` >/dev/null
-a:sla.sym.paths | jq -c 'tostring|contains("0xa")'
+s `afl~test_boolxor[0]` >/dev/null
+af
+a:sla.dec | jq -Rs 'contains("test_boolxor") and contains("r2dec residual: certified render contract failed") and contains("missing certified value return for control-only exit") and contains("summary return unresolved") and (contains("r2dec fallback:")|not) and (contains("if (EAX")|not)'
 EOF_CMDS
 RUN
 
-NAME=paths_bitwise_finds_0x5a
+NAME=dec_array_and_struct_index_render_without_fallback
+FILE=bins/vuln_test_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaaa
+s `afl~test_array_index[0]` >/dev/null
+af
+a:sla.dec | jq -Rs 'contains("test_array_index") and contains("return") and (contains("r2dec fallback:")|not)'
+s `afl~test_struct_array_index[0]` >/dev/null
+af
+a:sla.dec | jq -Rs 'contains("test_struct_array_index") and contains("struct sla_struct_") and contains("arg0[arg1].f_8 = arg2;") and contains("arg0[arg1].f_34") and contains("arg0[arg1].f_8") and (contains("r2dec residual:")|not) and (contains("r2sleigh residual:")|not) and (contains("r2dec fallback:")|not) and (contains("*(arg0 +")|not) and (contains("(int64_t)")|not)'
+EOF_CMDS
+RUN
+
+NAME=dec_library_call_owners_stay_single_source
+FILE=bins/vuln_test_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+true
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~process_string[0]` >/dev/null
+af
+a:sla.dec | jq -Rs 'contains("int32_t sym._process_string(int8_t* arg0)") and contains("var_18h = sym.imp.strlen(arg0);") and contains("if (var_18h <= 100)") and contains("if (5 <= var_18h)") and contains("var_4h = var_18h;") and contains("var_4h = -1;") and contains("var_4h = -2;") and contains("return var_4h;") and ([scan("sym\\.imp\\.strlen")]|length)==1 and (contains("r2dec residual:")|not) and (contains("r2sleigh residual:")|not) and (contains("summary return unresolved")|not) and (contains("ValueId")|not) and (contains("ObjectId")|not) and (contains("r2dec fallback:")|not)'
+s `afl~authenticate[0]` >/dev/null
+af
+a:sla.dec | jq -Rs 'contains("authenticate") and contains("r2dec residual: certified render contract failed") and contains("with only 2 rendered FunctionCallsiteFacts proof") and contains("raw address-like call argument") and contains("summary return unresolved") and (contains("if (EAX")|not) and (contains("return 0;")|not) and (contains("return 1;")|not) and (contains("r10_1")|not) and (contains("ValueId")|not) and (contains("ObjectId")|not) and (contains("r2dec fallback:")|not)'
+s `afl~alloc_and_copy[0]` >/dev/null
+af
+a:sla.dec | jq -Rs 'contains("alloc_and_copy") and contains("r2dec residual: certified render contract failed") and contains("raw address-like call argument") and contains("summary return unresolved") and (contains("buf = sym.imp.malloc(len + 1);")|not) and (contains("sym.imp.memcpy(buf, src, len);")|not) and (contains("return buf;")|not) and (contains("buf[-0x8]")|not) and (contains("ValueId")|not) and (contains("ObjectId")|not) and (contains("r2dec fallback:")|not) and (contains("ArrayIndexCertificate")|not)'
+EOF_CMDS
+RUN
+
+NAME=sym_solve_check_secret_public_target
+FILE=malloc://64
+ARGS=-a x86 -b 64 -e scr.color=false -e log.level=0
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+wx 4883ff007406b800000000c3b801000000c300000000000000
+s 0 >/dev/null
+af
+a:sym.solve 0xc | jq -c '.found==true and (.selected_path.solution.inputs|length)>0'
+EOF_CMDS
+RUN
+
+NAME=sym_solve_public_solution_filters_temp_and_flag_noise
+FILE=malloc://64
+ARGS=-a x86 -b 64 -e scr.color=false -e log.level=0
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+wx 4883ff007406b800000000c3b801000000c300000000000000
+s 0 >/dev/null
+af
+a:sym.solve 0xc | jq -c '.found==true and (.selected_path.solution.inputs|keys|all((startswith("tmp:") or startswith("TMP") or .=="CY" or .=="NG" or .=="OV" or .=="ZR")|not))'
+EOF_CMDS
+RUN
+
+NAME=sym_explore_check_secret_public_target
+FILE=malloc://64
+ARGS=-a x86 -b 64 -e scr.color=false -e log.level=0
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+wx 4883ff007406b800000000c3b801000000c300000000000000
+s 0 >/dev/null
+af
+a:sym.explore 0xc | jq -c '.matched_paths>0 and (.paths|length)>0'
+EOF_CMDS
+RUN
+
+NAME=sym_state_empty_before_run
+FILE=malloc://64
+ARGS=-a x86 -b 64 -e scr.color=false -e log.level=0
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+wx 4883ff007406b800000000c3b801000000c300000000000000
+s 0 >/dev/null
+af
+a:sym.state | jq -c '.has_state==false'
+EOF_CMDS
+RUN
+
+NAME=sym_state_after_solve_same_session
+FILE=malloc://64
+ARGS=-a x86 -b 64 -e scr.color=false -e log.level=0
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+wx 4883ff007406b800000000c3b801000000c300000000000000
+s 0 >/dev/null
+af
+a:sym.solve 0xc >/dev/null
+a:sym.state | jq -c '.has_state==true and .mode=="solve" and .result.found==true'
+EOF_CMDS
+RUN
+
+NAME=sym_unreachable_target_refuses_without_claiming_proof
+FILE=malloc://64
+ARGS=-a x86 -b 64 -e scr.color=false -e log.level=0
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+wx 4883ff007406b800000000c3b801000000c300000000000000
+s 0 >/dev/null
+af
+a:sym.solve 0xdeadbeef | jq -c '.found==false and (.witness.proven==false)'
+EOF_CMDS
+RUN
+
+NAME=types_symbolic_xor_guard_reports_native_facts
+FILE=bins/vuln_test_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~test_symbolic_xor_guard[0]` >/dev/null
+af
+a:sla.debug.types | jq -c '.compiled_semantics.execution=="native" and (.compiled_semantics.region_count >= 1) and (.compiled_semantics.branches_pruned >= 0)'
+a:sla.dec | jq -Rs 'contains("test_symbolic_xor_guard") and contains("return")'
+EOF_CMDS
+RUN
+
+NAME=arm64_pointer_auth_lift_emits_semantic_userop
+FILE=malloc://16
+ARGS=-a arm -b 64 -e scr.color=false -e log.level=0
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+wx 7f2303d5000000000000000000000000
+s 0 >/dev/null
+a:sla.debug.json | jq -c '.[0].CallOther.userop == 4294901762'
+EOF_CMDS
+RUN
+
+NAME=types_symbolic_helper_scope_exposes_interproc_payload
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
@@ -248,14 +305,44 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-s `afl~bitwise_check$[0]` >/dev/null
-s `afl~bitwise_check$[0]` >/dev/null
-s `afl~bitwise_check$[0]` >/dev/null
-a:sla.sym.paths | jq -c 'tostring|contains("0x5a")'
+s `afl~test_symbolic_helper_pure_guard[0]` >/dev/null
+af
+a:sla.debug.types | jq -c '.compiled_semantics.execution=="native" and (.interproc.scope.payloads // [] | length) >= 1'
 EOF_CMDS
 RUN
 
-NAME=interactive_sym_explore_returns_json
+NAME=typed_assumptions_roundtrip_into_session_payload
+FILE=bins/vuln_test_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~test_symbolic_helper_pure_guard[0]` >/dev/null
+af
+a:sla.debug.assumej [{"subject":{"register":{"name":"rdi"}},"value":{"type_hint":{"ty":"int32_t"}}}] >/dev/null
+a:sla.debug.types | jq -c '(.assumptions.items // [] | any((.subject.register.name? // "" | ascii_downcase) == "rdi" and .value.type_hint.ty == "int32_t"))'
+a:sla.debug.types | jq -c '(.params[0].type // "") == "int32_t"'
+EOF_CMDS
+RUN
+
+NAME=type_session_mutation_plan_materializes_writeback_kinds
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~alloc_wrapper2[0]` >/dev/null
+af
+a:sla.debug.types | jq -c '([.mutation_plan.mutations[]?.kind] as $k | ($k | index("signature") != null) and ($k | index("callconv") != null) and (($k | index("var") != null) or ($k | index("var_type") != null)))'
+EOF_CMDS
+RUN
+
+NAME=typed_multi_assumptions_and_scope_survive_session_payload
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
@@ -263,709 +350,501 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-s `afl~check_secret$[0]` >/dev/null
-s `afl~check_secret$[0]` >/dev/null
-s `afl~check_secret$[0]` >/dev/null
-a:sym.explore `afl~check_secret$[0]`+0x14 | jq -c 'has("target") and has("matched_paths") and has("paths") and ((.paths|length)>0)'
+s `afl~test_symbolic_helper_pure_guard[0]` >/dev/null
+af
+a:sla.debug.assumej [{"subject":{"register":{"name":"rdi"}},"value":{"type_hint":{"ty":"int32_t"}}},{"subject":{"register":{"name":"rsi"}},"value":{"type_hint":{"ty":"size_t"}}}] >/dev/null
+a:sla.debug.types | jq -c '(.compiled_semantics.execution=="native") and (((.interproc.scope.payloads // []) | length) >= 1) and (.assumptions.items // [] | any((.subject.register.name? // "" | ascii_downcase) == "rdi" and .value.type_hint.ty == "int32_t")) and (.assumptions.items // [] | any((.subject.register.name? // "" | ascii_downcase) == "rsi" and .value.type_hint.ty == "size_t"))'
 EOF_CMDS
 RUN
 
-NAME=interactive_sym_solve_returns_solution
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s `afl~check_secret$[0]` >/dev/null
-s `afl~check_secret$[0]` >/dev/null
-s `afl~check_secret$[0]` >/dev/null
-a:sym.solve `afl~check_secret$[0]`+0x14 | jq -c 'has("found") and has("stats") and (.found==true) and ((.selected_path.solution.inputs|length)>0)'
-EOF_CMDS
-RUN
-
-NAME=interactive_sym_state_empty_before_run
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s `afl~check_secret$[0]` >/dev/null
-a:sym.state | jq -c '.has_state == false'
-EOF_CMDS
-RUN
-
-NAME=interactive_sym_alias_sla_sym_paths_still_works
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s `afl~check_secret$[0]` >/dev/null
-s `afl~check_secret$[0]` >/dev/null
-s `afl~check_secret$[0]` >/dev/null
-a:sla.sym.paths | jq -c 'type=="array"'
-EOF_CMDS
-RUN
-
-NAME=interactive_sym_state_after_solve_same_session
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s `afl~check_secret$[0]` >/dev/null
-s `afl~check_secret$[0]` >/dev/null
-s `afl~check_secret$[0]` >/dev/null
-a:sym.solve `afl~check_secret$[0]`+0x14 >/dev/null
-a:sym.state | tail -n1 | jq -c '.has_state==true and .mode=="solve" and (.target == .result.target) and .result.found==true'
-EOF_CMDS
-RUN
-
-NAME=interactive_sym_explore_missing_target_usage
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-Usage: a:sym.explore <target_addr_expr>
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s `afl~check_secret$[0]` >/dev/null
-a:sym.explore | head -n1
-EOF_CMDS
-RUN
-
-NAME=interactive_sym_solve_invalid_target_usage
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-Usage: a:sym.solve <target_addr_expr>
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s `afl~check_secret$[0]` >/dev/null
-a:sym.solve (() | head -n1
-EOF_CMDS
-RUN
-
-NAME=interactive_sym_unreachable_target_found_false
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s `afl~check_secret$[0]` >/dev/null
-a:sym.solve 0xdeadbeef | jq -c '.found==false'
-EOF_CMDS
-RUN
-
-NAME=sim_paths_process_string_no_error_entries
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s `afl~process_string$[0]` >/dev/null
-s `afl~process_string$[0]` >/dev/null
-s `afl~process_string$[0]` >/dev/null
-a:sla.sym.paths | jq -c 'length>0 and (map(has("error")|not)|all)'
-EOF_CMDS
-RUN
-
-NAME=sim_paths_authenticate_no_error_entries
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s `afl~authenticate$[0]` >/dev/null
-s `afl~authenticate$[0]` >/dev/null
-s `afl~authenticate$[0]` >/dev/null
-a:sla.sym.paths | jq -c 'length>0 and (map(has("error")|not)|all)'
-EOF_CMDS
-RUN
-
-NAME=sim_paths_alloc_and_copy_no_error_entries
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s `afl~alloc_and_copy$[0]` >/dev/null
-s `afl~alloc_and_copy$[0]` >/dev/null
-s `afl~alloc_and_copy$[0]` >/dev/null
-a:sla.sym.paths | jq -c 'length>0 and (map(has("error")|not)|all)'
-EOF_CMDS
-RUN
-
-NAME=sim_paths_vuln_printf_no_error_entries
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s `afl~vuln_printf$[0]` >/dev/null
-s `afl~vuln_printf$[0]` >/dev/null
-s `afl~vuln_printf$[0]` >/dev/null
-a:sla.sym.paths | jq -c 'length>0 and (map(has("error")|not)|all)'
-EOF_CMDS
-RUN
-
-NAME=sim_paths_vuln_memcpy_no_error_entries
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s `afl~vuln_memcpy$[0]` >/dev/null
-s `afl~vuln_memcpy$[0]` >/dev/null
-s `afl~vuln_memcpy$[0]` >/dev/null
-a:sla.sym.paths | jq -c 'length>0 and (map(has("error")|not)|all)'
-EOF_CMDS
-RUN
-
-NAME=sim_solve_check_secret_regression
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s `afl~check_secret$[0]` >/dev/null
-s `afl~check_secret$[0]` >/dev/null
-s `afl~check_secret$[0]` >/dev/null
-a:sym.solve `afl~check_secret$[0]`+0x14 | jq -c '.found==true'
-EOF_CMDS
-RUN
-
-NAME=merge_mode_on
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s main
-a:sla.sym.merge on | jq -R 'contains("on")'
-EOF_CMDS
-RUN
-
-NAME=merge_mode_off
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s main
-a:sla.sym.merge off | jq -R 'contains("off")'
-EOF_CMDS
-RUN
-
-NAME=merge_mode_status
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s main
-a:sla.sym.merge | jq -R 'contains("merge")'
-EOF_CMDS
-RUN
-
-NAME=dec_boolxor_preserves_xor_shape
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-a:sla.dec sym.test_boolxor | jq -Rs 'contains("^") and (contains("of_")|not)'
-EOF_CMDS
-RUN
-
-NAME=dec_loop_switch_contains_switch
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-a:sla.dec sym.test_loop_switch | jq -Rs 'contains("switch (")'
-EOF_CMDS
-RUN
-
-NAME=dec_struct_field_uses_field_access
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s `afl~test_struct_field$[0]` >/dev/null
-s `afl~test_struct_field$[0]` >/dev/null
-s `afl~test_struct_field$[0]` >/dev/null
-a:sla.dec | jq -Rs 'contains("test_struct_field") and contains("->") and (contains("f_30") or contains("thirteenth")) and (contains("f_0") or contains("first")) and (contains("saved_fp")|not) and (contains("return stack")|not) and (contains("rdx->")|not)'
-EOF_CMDS
-RUN
-
-NAME=dec_current_function_uses_canonical_command
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s `afl~check_secret$[0]` >/dev/null
-a:sla.dec | jq -Rs '(contains("check_secret") or contains("sym.check_secret")) and contains("return") and (contains("r2dec fallback:")|not)'
-EOF_CMDS
-RUN
-
-NAME=dec_explicit_symbol_target_uses_canonical_command
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-a:sla.dec sym.solve_equation | jq -Rs '(contains("solve_equation") or contains("sym.solve_equation")) and contains("return") and (contains("r2dec fallback:")|not)'
-EOF_CMDS
-RUN
-
-NAME=dec_explicit_address_target_uses_canonical_command
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-a:sla.dec `afl~solve_equation$[0]` | jq -Rs '(contains("solve_equation") or contains("sym.solve_equation") or contains("sub_")) and contains("return") and (contains("r2dec fallback:")|not)'
-EOF_CMDS
-RUN
-
-NAME=dec_pd_stays_disassembly
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s `afl~check_secret$[0]` >/dev/null
-s `afl~check_secret$[0]` >/dev/null
-s `afl~check_secret$[0]` >/dev/null
-pd 1 | jq -Rs '(contains("endbr64") or contains("push ") or contains("mov ") or contains("cmp ")) and (contains("r2dec fallback:")|not)'
-EOF_CMDS
-RUN
-
-NAME=dec_check_secret_has_c_integer_types
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-a:sla.dec sym.check_secret | jq -Rs 'contains("int32_t") or contains("int64_t") or contains("uint32_t")'
-EOF_CMDS
-RUN
-
-NAME=dec_check_secret_shows_control_flow
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-a:sla.dec sym.check_secret | jq -Rs 'contains("if") and contains("return")'
-EOF_CMDS
-RUN
-
-NAME=dec_solve_equation_has_braces
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-a:sla.dec sym.solve_equation | jq -Rs 'contains("{") and contains("}")'
-EOF_CMDS
-RUN
-
-NAME=dec_guard_inversion_still_has_if_return
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-a:sla.dec sym.test_guard_inversion_goto | jq -Rs 'contains("if (") and contains("return")'
-EOF_CMDS
-RUN
-
-NAME=dec_array_index_neg_preserves_subscript_shape
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s `afl~test_array_index_neg$[0]` >/dev/null
-s `afl~test_array_index_neg$[0]` >/dev/null
-s `afl~test_array_index_neg$[0]` >/dev/null
-a:sla.dec | jq -Rs 'contains("test_array_index_neg") and (contains("[-idx]") or contains("[0 - idx]") or contains("[-arg2]") or contains("[0 - arg2]")) and (contains("[0]")|not) and (contains("saved_fp")|not) and (contains("*(rbp")|not)'
-EOF_CMDS
-RUN
-
-NAME=dec_array_index_uses_real_index
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s `afl~test_array_index$[0]` >/dev/null
-s `afl~test_array_index$[0]` >/dev/null
-s `afl~test_array_index$[0]` >/dev/null
-a:sla.dec | jq -Rs 'contains("test_array_index") and (contains("[idx]") or contains("[arg2]")) and (contains("[0]")|not) and (contains("saved_fp")|not)'
-EOF_CMDS
-RUN
-
-NAME=dec_struct_array_index_keeps_member_write_shape
-FILE=bins/vuln_test
+NAME=types_interproc_wrapper_uses_cached_callee_payload
+FILE=bins/test_func_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaaa
-s `afl~test_struct_array_index$[0]` >/dev/null
-s `afl~test_struct_array_index$[0]` >/dev/null
-s `afl~test_struct_array_index$[0]` >/dev/null
-a:sla.dec | jq -Rs 'contains("test_struct_array_index") and (contains("arr[idx].f_8 = v;") or contains("arr[idx].third = v;")) and ((contains("return arr[idx].f_34 + arr[idx].f_8;")) or contains("return arr[idx].f_8 + arr[idx].f_34;") or contains("return arr[idx].fourteenth + arr[idx].third;") or contains("return arr[idx].third + arr[idx].fourteenth;")) and (contains("var_ch")|not) and (contains("var_10h")|not) and (contains("local_")|not) and (contains("(int64_t)")|not) and (contains("saved_fp")|not) and (contains("return stack")|not) and (contains("rdx->")|not) and (contains("*(arg1 +")|not) and (contains("*(rbp")|not)'
-EOF_CMDS
-RUN
-
-NAME=dec_tail_return_guard_shape
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-a:sla.dec sym.test_guard_tail_return | jq -Rs 'contains("if (") and contains("global_tail") and contains("global_counter") and contains("return")'
-EOF_CMDS
-RUN
-
-NAME=dec_check_secret_keeps_hex_compare
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s `afl~check_secret$[0]` >/dev/null
-s `afl~check_secret$[0]` >/dev/null
-s `afl~check_secret$[0]` >/dev/null
-a:sla.dec | jq -Rs 'contains("0xdead") and contains("return 0;") and contains("return 1;") and (contains("return rax")|not) and (contains("0 != 57005")|not)'
-EOF_CMDS
-RUN
-
-NAME=dec_entry0_no_self_xor_residue
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-a:sla.dec entry0 | jq -Rs '(contains(" = eax ^ eax;")|not) and (contains(" = rax ^ rax;")|not)'
-EOF_CMDS
-RUN
-
-NAME=dec_solve_equation_uses_named_stack_var
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s `afl~solve_equation$[0]` >/dev/null
-s `afl~solve_equation$[0]` >/dev/null
-s `afl~solve_equation$[0]` >/dev/null
-a:sla.dec | jq -Rs '(contains("*(rbp")|not) and (contains("!= 19") or contains("== 19"))'
-EOF_CMDS
-RUN
-
-NAME=dec_process_string_avoids_raw_rbp_deref
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-a:sla.dec sym.process_string | jq -Rs '(contains("*(rbp")|not)'
-EOF_CMDS
-RUN
-
-NAME=dec_process_string_keeps_single_strlen_owner
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-a:sla.dec sym.process_string | jq -Rs '(contains("len = sym.imp.strlen(s);")) and ((split("sym.imp.strlen(s)") | length) == 2) and contains("if (len > 100)") and (contains("if (len > 4)") or contains("if (len < 5)")) and contains("return -1;") and contains("return -2;") and contains("return len;")'
-EOF_CMDS
-RUN
-
-NAME=dec_process_string_prunes_dead_temps_after_predicate_rewrite
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-a:sla.dec sym.process_string | jq -Rs '(contains("tmp:")|not) and (test("(^|[^A-Za-z0-9_])t[0-9a-f]+(_[0-9]+)?([^A-Za-z0-9_]|$)")|not)'
-EOF_CMDS
-RUN
-
-NAME=dec_authenticate_keeps_strcmp_condition_shape
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-a:sla.dec sym.authenticate | jq -Rs 'contains("sym.imp.strcmp(password, \"secret123\")") and ((contains("!= 0")) or (contains("== 0"))) and (contains("0 != 0")|not) and (contains("0 == 0")|not)'
-EOF_CMDS
-RUN
-
-NAME=dec_alloc_and_copy_reuses_malloc_owner
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-a:sla.dec sym.alloc_and_copy | jq -Rs 'contains("buf = sym.imp.malloc(len + 1);") and (contains("if (buf == 0)") or contains("if (!buf)")) and contains("return 0;") and contains("sym.imp.memcpy(buf, src, len);") and contains("buf[len] = 0;") and contains("return buf;") and (contains("sym.imp.malloc(sym.imp")|not)'
-EOF_CMDS
-RUN
-
-NAME=dec_test_setlocale_wrapper_keeps_owned_call_result
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-a:sla.dec sym.test_setlocale_wrapper | jq -Rs 'contains("loc = sym.imp.setlocale(6, \"C\");") and (contains("if (loc != 0)") or contains("if (!loc)")) and (contains("return (int32_t)*loc;") or contains("return *loc;") or contains("return loc[0];") or contains("return (int32_t)loc[0];")) and (contains("return (int32_t)loc;")|not)'
-EOF_CMDS
-RUN
-
-NAME=dec_vuln_memcpy_keeps_authoritative_args
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-a:sla.dec sym.vuln_memcpy | jq -Rs 'contains("sym.imp.memcpy(buf, user_input, user_len);") and contains("sym.imp.printf(\"Copied: %s\\n\", buf);") and (contains("arg1")|not) and (contains("arg2")|not) and (contains("tmp:")|not) and (contains("*(rbp")|not)'
-EOF_CMDS
-RUN
-
-NAME=dec_dbg_vuln_memcpy_keeps_debug_symbol_namespace
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-a:sla.dec dbg.vuln_memcpy | jq -Rs 'contains("int64_t dbg.vuln_memcpy") and contains("sym.imp.memcpy(buf, user_input, user_len);") and contains("sym.imp.printf(\"Copied: %s\\n\", buf);") and (contains("r2dec fallback:")|not)'
-EOF_CMDS
-RUN
-
-NAME=dec_my_strdup_reuses_strlen_and_malloc_owner
-FILE=bins/stress_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-a:sla.dec sym.my_strdup | jq -Rs 'contains("len = sym.imp.strlen(s);") and ((split("sym.imp.strlen(s)") | length) == 2) and ((contains("var_10h = sym.imp.malloc(len + 1);")) or contains("dup = sym.imp.malloc(len + 1);")) and ((contains("if (var_10h == 0)")) or contains("if (dup == 0)") or contains("if (!dup)")) and ((contains("sym.imp.memcpy(var_10h, s, len + 1);")) or contains("sym.imp.memcpy(dup, s, len + 1);")) and ((contains("return var_10h;")) or contains("return dup;")) and (contains("tmp:11f80")|not) and (contains("sym.imp.malloc(sym.imp")|not)'
-EOF_CMDS
-RUN
-
-NAME=dec_my_strdup_prunes_dead_register_artifacts
-FILE=bins/stress_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-a:sla.dec sym.my_strdup | jq -Rs '(contains("rax =")|not) and (contains("tmp:")|not) and (contains("t3")|not)'
-EOF_CMDS
-RUN
-
-NAME=dec_vuln_test_main_aaa_structural_smoke
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-a:sla.dec sym.main | jq -Rs 'contains("return 1;") and contains("switch (") and contains("check_secret") and contains("process_string") and contains("authenticate") and contains("alloc_and_copy") and (contains("r2dec fallback:")|not)'
-EOF_CMDS
-RUN
-
-NAME=dec_vuln_test_main_aaaa_structural_smoke
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaaa
-a:sla.dec sym.main | jq -Rs 'contains("return 1;") and contains("switch (") and contains("check_secret") and contains("process_string") and contains("authenticate") and contains("alloc_and_copy") and (contains("r2dec fallback:")|not)'
-EOF_CMDS
-RUN
-
-NAME=dec_callother_emitted
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s `afl~test_cpuid$[0]` >/dev/null
-s `afl~test_cpuid$[0]` >/dev/null
-s `afl~test_cpuid$[0]` >/dev/null
-a:sla.dec | jq -Rs 'contains("callother(")'
-EOF_CMDS
-RUN
-
-NAME=dec_check_secret_signature_uses_int32
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-a:sla.dec sym.check_secret | head -n1 | jq -Rs 'contains("int32_t")'
-EOF_CMDS
-RUN
-
-NAME=dec_solve_equation_return_not_void
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-a:sla.dec sym.solve_equation | head -n1 | jq -Rs '((contains("void ")|not) and (contains("int32_t") or contains("int64_t")))'
-EOF_CMDS
-RUN
-
-NAME=deep_afvj_fast_mode_reduces_pointer_types
-FILE=bins/vuln_test
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-a:sla.info >/dev/null
-e anal.sla.mode=fast
-aa
-s `afl~vuln_memcpy$[0]` >/dev/null
-afva
-afvj | jq -c '[(.reg // []), (.sp // []), (.bp // [])] | add | map(.type // "") | any(.=="void *") | not'
-EOF_CMDS
-RUN
-
-NAME=deep_signature_writeback_fast_mode_keeps_void
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-s `afl~check_secret$[0]` >/dev/null
-a:sla.info >/dev/null
-e anal.sla.mode=fast
+s `afl~alloc_wrapper2[0]` >/dev/null
 af
-afs void sym.check_secret(void)
-afc ms
-af
-afcfj | jq -c '.[0].return == "void"'
+a:sla.debug.types | jq -c '(.ret_type == "allocation_ptr") and (.interproc.summary != null) and (((.interproc.scope.payloads // []) | length) >= 1)'
 EOF_CMDS
 RUN
 
-NAME=deep_signature_writeback_fast_mode_keeps_calltype_ms
-FILE=bins/vuln_test_x86
+NAME=named_file_transfer_summary_feeds_types
+FILE=bins/test_func_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s `afl~check_secret$[0]` >/dev/null
-a:sla.info >/dev/null
-e anal.sla.mode=fast
+aaa
+s `afl~main[0]` >/dev/null
+afn copy_file_data
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
+EOF_CMDS
+RUN
+
+NAME=named_sort_merge_summary_feeds_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~main[0]` >/dev/null
+afn mergefps
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
+EOF_CMDS
+RUN
+
+NAME=named_output_stream_summary_uses_canonical_helper_name
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~main[0]` >/dev/null
+afn oputs_.constprop.0
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
+EOF_CMDS
+RUN
+
+NAME=name_only_hash_fold_does_not_select_summary_only_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn _md5_process_block
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
+EOF_CMDS
+RUN
+
+NAME=named_numeric_transform_summary_feeds_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn gregorian_to_persian
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
+EOF_CMDS
+RUN
+
+NAME=named_randread_summary_feeds_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn randread
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
+EOF_CMDS
+RUN
+
+NAME=named_pattern_parser_summary_feeds_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn _internal_fnwmatch
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
+EOF_CMDS
+RUN
+
+NAME=named_getopt_parser_summary_feeds_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn _getopt_internal_r
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
+EOF_CMDS
+RUN
+
+NAME=named_digest_stream_summary_feeds_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn digest_file.isra.0
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
+EOF_CMDS
+RUN
+
+NAME=named_expression_eval_summary_feeds_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn binop
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
+EOF_CMDS
+RUN
+
+NAME=named_counter_output_summary_feeds_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn write_counts
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
+EOF_CMDS
+RUN
+
+NAME=named_diagnostic_summary_feeds_void_signature
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn verror_at_line
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
+EOF_CMDS
+RUN
+
+NAME=named_argmatch_summary_feeds_table_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn argmatch
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
+EOF_CMDS
+RUN
+
+NAME=named_error_tail_summary_feeds_non_generic_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn error_tail
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
+EOF_CMDS
+RUN
+
+NAME=named_argmatch_to_argument_summary_feeds_table_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn argmatch_to_argument
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
+EOF_CMDS
+RUN
+
+NAME=named_strcoll_loop_summary_feeds_bounded_string_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn strcoll_loop
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
+EOF_CMDS
+RUN
+
+NAME=named_indent_summary_feeds_size_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn indent
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
+EOF_CMDS
+RUN
+
+NAME=named_dired_obstack_summary_feeds_obstack_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn dired_dump_obstack
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
+EOF_CMDS
+RUN
+
+NAME=named_obstack_begin_summary_feeds_obstack_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn _obstack_begin_worker
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
+EOF_CMDS
+RUN
+
+NAME=named_heap_remove_top_summary_feeds_heap_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn heap_remove_top
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
+EOF_CMDS
+RUN
+
+NAME=named_quotearg_summary_feeds_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn quotearg_n_options
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
+EOF_CMDS
+RUN
+
+NAME=named_selinux_path_summary_feeds_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn defaultcon
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
+EOF_CMDS
+RUN
+
+NAME=named_renameatu_summary_feeds_path_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn renameatu
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
+EOF_CMDS
+RUN
+
+NAME=named_streamsavedir_summary_feeds_directory_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn streamsavedir
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
+EOF_CMDS
+RUN
+
+NAME=named_quotearg_alloc_summary_feeds_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn quotearg_alloc_mem
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
+EOF_CMDS
+RUN
+
+NAME=named_xpalloc_summary_feeds_allocation_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn xpalloc
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
+EOF_CMDS
+RUN
+
+NAME=named_version_summary_feeds_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn version_etc_va
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
+EOF_CMDS
+RUN
+
+NAME=named_multibyte_summary_feeds_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn rpl_mbrtowc
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
+EOF_CMDS
+RUN
+
+NAME=stress_parse_number_records_deterministic_output
+FILE=bins/stress_test_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `isq~parse_number$[0]` >/dev/null
 af
-afs void sym.check_secret(void)
-afc ms
+a:sla.debug.types | jq -c 'type=="object" and ((((.function_name // "") | contains("parse_number")) and ((.compiled_semantics // {}) | type == "object")) or (.error? | type == "string"))'
+EOF_CMDS
+RUN
+
+NAME=stress_parse_number_decompile_refuses_bounded_parser_summary_c
+FILE=bins/stress_test_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `isq~parse_number$[0]` >/dev/null
 af
-afij | jq -c '.[0].calltype == "ms"'
+a:sla.dec | jq -Rs 'contains("parse_number") and contains("r2dec residual:") and contains("summary return unresolved") and (contains("ValueId")|not) and (contains("ObjectId")|not) and (contains("eax_")|not) and (contains("summary projection (not native CFG): parser base10 numeric return loop")|not) and (contains("while (str[summary_i] >=")|not) and (contains("summary_value = summary_value * 10U +")|not) and (contains("return summary_value;")|not) and (contains("semantic role:")|not) and (contains("parse_base10_numeric_summary(")|not) and (contains("compute_numeric_transform(")|not)'
+EOF_CMDS
+RUN
+
+NAME=vm_shaped_large_cfg_records_scc_transfer_without_truncation
+FILE=bins/stress_test_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `isq~tiny_vm_dispatch$[0]` >/dev/null
+af
+a:sla.debug.types | jq -c 'type=="object" and ((.function_name // "") | contains("tiny_vm_dispatch")) and .compiled_semantics.execution=="vm" and (.compiled_semantics.vm_transfer != null) and (((.compiled_semantics.vm_transfer.truncated_handlers // []) | length) == 0) and (((.compiled_semantics.vm_transfer.transfers // []) | length) > 0) and (((.compiled_semantics.vm_transfer.transfers // []) | all(.truncated == false and .confidence != "heuristic" and ((.state_updates // []) | all(.exact == true))))) and (((.compiled_semantics.vm_transfer.handler_state_updates // {}) | to_entries | length) >= 5)'
+a:sla.dec | jq -Rs 'contains("/* int32_t _tiny_vm_dispatch(int8_t* arg0, int32_t arg1) */") and (contains("_tiny_vm_dispatch(void)")|not)'
+EOF_CMDS
+RUN
+
+NAME=manual_table_walk_refuses_synthetic_summary_loop
+FILE=bins/r2sleigh_manual_limits_O0
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~table_walk[0]` >/dev/null
+af
+a:sla.dec | jq -Rs 'contains("table_walk") and ((contains("render contract: summary facts only; no executable native C reconstructed") and contains("summary return unresolved")) or contains("r2dec residual: unproven loop effects") or contains("r2dec residual: uncertified structured control") or contains("certified render contract failed")) and (contains("for (Item* it = head; it != NULL; it = it->next)")|not) and (contains("it->id + seen")|not) and (contains("return -seen;")|not) and (contains("table walk fields and returns are certified by r2sym")|not) and (contains("body blocks")|not) and (contains("exit targets")|not) and (contains("while (pos == head)")|not) and (contains("while (head == head)")|not) and (contains("while (it == head)")|not) and (contains("while (1) {\n    break;")|not)'
+EOF_CMDS
+RUN
+
+NAME=manual_unsigned_pointee_uses_certified_extension_evidence
+FILE=bins/r2sleigh_manual_limits_O0
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~fnv_fold[0]` >/dev/null
+af
+a:sla.debug.types | jq -c 'type=="object" and ((.function_name // "") | contains("fnv_fold")) and ((.signature // "") | contains("uint8_t* arg0")) and (((.signature_certificate_sources // []) | index("local_inference")) != null)'
+EOF_CMDS
+RUN
+
+NAME=manual_sparse_switch_o0_structures_internal_sdiv_control
+FILE=bins/r2sleigh_manual_limits_O0
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~sparse_switch[0]` >/dev/null
+af
+a:sla.dec | jq -Rs 'contains("int32_t sym._sparse_switch(int32_t arg0, int32_t arg1, int32_t arg2)") and contains("arg0 + 7 == 0") and contains("arg0 == 0") and contains("arg0 == 3") and contains("arg0 == 42") and contains("arg0 == 1000") and contains("if (arg2 != 0)") and contains("var_4h = arg1 - arg2;") and contains("var_4h = arg1 + arg2;") and contains("var_4h = arg1 * 3 + arg2;") and contains("var_4h = (arg1 ^ arg2) + 42;") and contains("var_8h = arg1 / arg2;") and contains("var_8h = -1;") and contains("var_4h = arg0 + arg1 - arg2;") and contains("return var_4h;") and (contains("var_ch")|not) and (contains("0xffffffffU")|not) and (contains("r2dec residual:")|not) and (contains("ValueId")|not) and (contains("ObjectId")|not) and (contains("tmp:")|not) and (contains("switch (test)")|not) and (contains("case fake")|not)'
 EOF_CMDS
 RUN

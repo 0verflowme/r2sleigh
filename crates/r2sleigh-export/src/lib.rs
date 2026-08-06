@@ -1,13 +1,11 @@
 //! Unified instruction export pipeline for r2sleigh.
 
-use std::collections::HashSet;
-use std::fmt;
-
-use r2dec::{CStmt, CodeGenConfig, CodeGenerator, lower_ssa_ops_to_stmts};
 use r2il::{ArchSpec, R2ILBlock, R2ILOp, SpaceId, Varnode, validate_block_full};
 use r2sleigh_lift::{Disassembler, format_op, op_to_esil_named};
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashSet;
+use std::fmt;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,7 +100,7 @@ pub fn export_instruction(
         InstructionAction::Lift => export_lift(input, format),
         InstructionAction::Ssa => export_ssa(input, format),
         InstructionAction::Defuse => export_defuse(input, format),
-        InstructionAction::Dec => export_dec(input, format),
+        InstructionAction::Dec => export_dec_action(input, format),
     }
 }
 
@@ -137,7 +135,16 @@ fn supported_formats(action: InstructionAction) -> &'static [ExportFormat] {
         InstructionAction::Lift => &[Json, Text, Esil, R2Cmd],
         InstructionAction::Ssa => &[Json, Text],
         InstructionAction::Defuse => &[Json, Text],
-        InstructionAction::Dec => &[CLike, Json, Text],
+        InstructionAction::Dec => {
+            #[cfg(feature = "dec")]
+            {
+                &[CLike, Json, Text]
+            }
+            #[cfg(not(feature = "dec"))]
+            {
+                &[]
+            }
+        }
     }
 }
 
@@ -291,26 +298,52 @@ fn export_defuse(
     }
 }
 
+fn export_dec_action(
+    input: &InstructionExportInput<'_>,
+    format: ExportFormat,
+) -> Result<String, ExportError> {
+    #[cfg(feature = "dec")]
+    {
+        export_dec(input, format)
+    }
+    #[cfg(not(feature = "dec"))]
+    {
+        let _ = input;
+        Err(ExportError::UnsupportedCombination {
+            action: InstructionAction::Dec,
+            format,
+            supported: String::new(),
+        })
+    }
+}
+
+#[cfg(feature = "dec")]
 fn export_dec(
     input: &InstructionExportInput<'_>,
     format: ExportFormat,
 ) -> Result<String, ExportError> {
     let ssa_block = r2ssa::block::to_ssa(input.block, input.disasm);
-    let ptr_size = input.arch.addr_size.saturating_mul(8);
-    let stmts: Vec<CStmt> = lower_ssa_ops_to_stmts(ptr_size, &ssa_block.ops);
+    let residuals = ssa_block
+        .ops
+        .iter()
+        .enumerate()
+        .map(|(op_index, op)| DecResidualJson {
+            kind: "residual",
+            op_index,
+            comment: format!(
+                "r2sleigh-export residual: instruction-level dec requires r2engine FunctionFacts render proof; executable C suppressed: {op:?}"
+            ),
+        })
+        .collect::<Vec<_>>();
 
     match format {
-        ExportFormat::Json => serde_json::to_string_pretty(&stmts)
+        ExportFormat::Json => serde_json::to_string_pretty(&residuals)
             .map_err(|e| ExportError::SerializeError(e.to_string())),
-        ExportFormat::Text | ExportFormat::CLike => {
-            let mut codegen = CodeGenerator::new(CodeGenConfig::default());
-            let mut output = String::new();
-            for stmt in &stmts {
-                output.push_str(&codegen.generate_stmt(stmt));
-                output.push('\n');
-            }
-            Ok(output.trim_end_matches('\n').to_string())
-        }
+        ExportFormat::Text | ExportFormat::CLike => Ok(residuals
+            .iter()
+            .map(|residual| format!("/* {} */", residual.comment))
+            .collect::<Vec<_>>()
+            .join("\n")),
         _ => Err(ExportError::UnsupportedCombination {
             action: InstructionAction::Dec,
             format,
@@ -426,6 +459,14 @@ struct DefUseInfoJson {
     live: Vec<String>,
 }
 
+#[cfg(feature = "dec")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct DecResidualJson {
+    kind: &'static str,
+    op_index: usize,
+    comment: String,
+}
+
 #[cfg(all(test, feature = "x86"))]
 mod tests {
     use super::*;
@@ -434,6 +475,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     const X86_BYTES_MINIMAL: &str = "4889c000000000000000000000000000";
+    #[cfg(feature = "dec")]
     const X86_BYTES_DEC: &str = "48ffc000000000000000000000000000";
 
     fn x86_disasm_and_spec() -> (Disassembler, ArchSpec) {
@@ -506,6 +548,7 @@ mod tests {
         lines.join("\n")
     }
 
+    #[cfg(feature = "dec")]
     fn normalize_c_like_output(output: &str) -> String {
         let text = output.replace("\r\n", "\n");
         let mut lines = Vec::new();
@@ -654,11 +697,22 @@ mod tests {
     }
 
     #[test]
-    fn dec_c_like_nonempty_for_simple_block() {
+    #[cfg(feature = "dec")]
+    fn dec_c_like_residualizes_without_function_facts() {
         let input = lift_input(X86_BYTES_DEC, 0x1000);
         let out = export_instruction(&input, InstructionAction::Dec, ExportFormat::CLike)
-            .expect("dec c-like");
-        assert!(!out.trim().is_empty(), "expected non-empty c-like output");
+            .expect("dec residual");
+        assert!(
+            out.contains("r2sleigh-export residual")
+                && out.contains("FunctionFacts render proof")
+                && out.contains("executable C suppressed"),
+            "expected explicit residual, got: {out}"
+        );
+        assert!(
+            out.lines()
+                .all(|line| line.starts_with("/* ") && line.ends_with(" */")),
+            "instruction-level dec must stay comment-only: {out}"
+        );
     }
 
     #[test]
@@ -670,6 +724,90 @@ mod tests {
             matches!(err, ExportError::UnsupportedCombination { .. }),
             "unexpected error kind: {}",
             err
+        );
+    }
+
+    #[test]
+    fn ensure_supported_enforces_action_format_matrix() {
+        ensure_supported(InstructionAction::Lift, ExportFormat::Json)
+            .expect("lift json should be supported");
+        ensure_supported(InstructionAction::Defuse, ExportFormat::Text)
+            .expect("defuse text should be supported");
+
+        let err = ensure_supported(InstructionAction::Lift, ExportFormat::CLike)
+            .expect_err("lift must not accept c_like format");
+        assert!(
+            matches!(
+                err,
+                ExportError::UnsupportedCombination {
+                    action: InstructionAction::Lift,
+                    format: ExportFormat::CLike,
+                    ..
+                }
+            ),
+            "unexpected support error kind: {}",
+            err
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "dec"))]
+    fn dec_action_is_typed_but_unsupported_without_dec_feature() {
+        let input = lift_input(X86_BYTES_MINIMAL, 0x1000);
+        let err = export_instruction(&input, InstructionAction::Dec, ExportFormat::CLike)
+            .expect_err("dec export must be feature-gated");
+        assert!(
+            matches!(
+                err,
+                ExportError::UnsupportedCombination {
+                    action: InstructionAction::Dec,
+                    format: ExportFormat::CLike,
+                    ..
+                }
+            ),
+            "unexpected error kind: {}",
+            err
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "dec"))]
+    fn dec_feature_gate_rejects_at_support_and_execution_layers() {
+        let input = lift_input(X86_BYTES_MINIMAL, 0x1000);
+
+        assert!(
+            supported_formats(InstructionAction::Dec).is_empty(),
+            "dec must advertise no supported formats without the dec feature"
+        );
+
+        let support_err = ensure_supported(InstructionAction::Dec, ExportFormat::CLike)
+            .expect_err("dec support must be disabled without the dec feature");
+        assert!(
+            matches!(
+                support_err,
+                ExportError::UnsupportedCombination {
+                    action: InstructionAction::Dec,
+                    format: ExportFormat::CLike,
+                    ..
+                }
+            ),
+            "unexpected support error kind: {}",
+            support_err
+        );
+
+        let execution_err = export_dec_action(&input, ExportFormat::CLike)
+            .expect_err("dec execution must be disabled without the dec feature");
+        assert!(
+            matches!(
+                execution_err,
+                ExportError::UnsupportedCombination {
+                    action: InstructionAction::Dec,
+                    format: ExportFormat::CLike,
+                    ..
+                }
+            ),
+            "unexpected execution error kind: {}",
+            execution_err
         );
     }
 
@@ -759,22 +897,25 @@ mod tests {
             );
         }
 
-        for format in [ExportFormat::CLike, ExportFormat::Json, ExportFormat::Text] {
-            let normalized = assert_export_deterministic(
-                X86_BYTES_DEC,
-                InstructionAction::Dec,
-                format,
-                match format {
-                    ExportFormat::CLike => normalize_c_like_output,
-                    ExportFormat::Json => normalize_json_output,
-                    ExportFormat::Text => normalize_text_output,
-                    _ => unreachable!("dec supports c_like/json/text"),
-                },
-            );
-            assert!(
-                !normalized.trim().is_empty(),
-                "dec output should be non-empty"
-            );
+        #[cfg(feature = "dec")]
+        {
+            for format in [ExportFormat::CLike, ExportFormat::Json, ExportFormat::Text] {
+                let normalized = assert_export_deterministic(
+                    X86_BYTES_DEC,
+                    InstructionAction::Dec,
+                    format,
+                    match format {
+                        ExportFormat::CLike => normalize_c_like_output,
+                        ExportFormat::Json => normalize_json_output,
+                        ExportFormat::Text => normalize_text_output,
+                        _ => unreachable!("dec supports c_like/json/text"),
+                    },
+                );
+                assert!(
+                    !normalized.trim().is_empty(),
+                    "dec output should be non-empty"
+                );
+            }
         }
     }
 
@@ -816,7 +957,7 @@ mod tests {
             ExportFormat::Text,
             normalize_text_output,
         );
-        assert_eq!(ssa_text, "0: Copy dst=RAX_1 src=[RAX_1]");
+        assert_eq!(ssa_text, "0: Copy dst=RAX_1 src=[RAX_0]");
 
         let defuse_json = assert_export_deterministic(
             X86_BYTES_MINIMAL,
@@ -826,15 +967,23 @@ mod tests {
         );
         assert_eq!(
             defuse_json,
-            "{\"inputs\":[],\"live\":[\"RAX_1\"],\"outputs\":[]}"
+            "{\"inputs\":[\"RAX_0\"],\"live\":[],\"outputs\":[\"RAX_1\"]}"
         );
 
-        let dec_json = assert_export_deterministic(
-            X86_BYTES_MINIMAL,
-            InstructionAction::Dec,
-            ExportFormat::Json,
-            normalize_json_output,
-        );
-        assert_eq!(dec_json, "[]");
+        #[cfg(feature = "dec")]
+        {
+            let dec_json = assert_export_deterministic(
+                X86_BYTES_MINIMAL,
+                InstructionAction::Dec,
+                ExportFormat::Json,
+                normalize_json_output,
+            );
+            assert!(
+                dec_json.contains("\"kind\":\"residual\"")
+                    && dec_json.contains("FunctionFacts render proof")
+                    && dec_json.contains("executable C suppressed"),
+                "dec json must be explicit residual-only output: {dec_json}"
+            );
+        }
     }
 }

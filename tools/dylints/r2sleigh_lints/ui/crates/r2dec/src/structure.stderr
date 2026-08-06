@@ -1,0 +1,38 @@
+warning: r2dec must not define switch case display-bias helpers; canonical switch facts own case values
+  --> $DIR/structure.rs:4:5
+   |
+LL | /     fn switch_case_display_bias(&self) -> i64 {
+LL | |         1
+LL | |     }
+   | |_____^
+   |
+   = note: `#[warn(r2dec_switch_case_value_ownership)]` on by default
+
+warning: r2dec must not define switch case display-bias helpers; canonical switch facts own case values
+  --> $DIR/structure.rs:8:5
+   |
+LL | /     fn filter_switch_case_outliers(&self, cases: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+LL | |         cases.into_iter().filter(|(value, _)| *value < 16).collect()
+LL | |     }
+   | |_____^
+
+warning: r2dec must not rewrite switch case values from display bias; render canonical case facts
+  --> $DIR/structure.rs:13:28
+   |
+LL |         let display_bias = self.switch_case_display_bias();
+   |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2dec must not rewrite switch case values from display bias; render canonical case facts
+  --> $DIR/structure.rs:14:9
+   |
+LL |         case_value.saturating_add_signed(display_bias) as i64
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2dec must not rewrite switch case values from display bias; render canonical case facts
+  --> $DIR/structure.rs:20:13
+   |
+LL |     let _ = structurer.filter_switch_case_outliers(vec![(0, 0x1000), (408, 0x2000)]);
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: 5 warnings emitted
+

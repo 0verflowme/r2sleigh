@@ -37,14 +37,12 @@ pub(crate) struct CallOwnershipFact {
     pub(crate) owner: Option<CallOwner>,
     pub(crate) aliases: BTreeSet<String>,
     pub(crate) direct_aliases: BTreeSet<String>,
-    pub(crate) call_expr_keys: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct SemanticOwnershipFacts {
     pub(crate) call_ownership: BTreeMap<CallSiteId, CallOwnershipFact>,
     pub(crate) alias_sources: HashMap<String, CallSiteId>,
-    pub(crate) call_expr_sources: HashMap<String, CallSiteId>,
     pub(crate) visible_owner_sources: HashMap<String, CallSiteId>,
     pub(crate) visible_owned_names: BTreeSet<String>,
 }
@@ -59,10 +57,6 @@ impl SemanticOwnershipFacts {
             .get(alias)
             .copied()
             .or_else(|| self.alias_sources.get(&alias.to_ascii_lowercase()).copied())
-    }
-
-    pub(crate) fn source_for_call_expr_key(&self, key: &str) -> Option<CallSiteId> {
-        self.call_expr_sources.get(key).copied()
     }
 
     pub(crate) fn source_for_visible_owner_name(&self, name: &str) -> Option<CallSiteId> {

@@ -1,0 +1,74 @@
+warning: source_var_name is only a hint; call-argument rendering needs source_value_id or prepared semantic authority
+  --> $DIR/call_arg_source_name_authority.rs:19:46
+   |
+LL |         binding.source_value_id.is_some() || binding.source_var_name.is_some()
+   |                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(r2dec_call_arg_source_name_authority)]` on by default
+
+warning: source_var_name is only a hint; call-argument rendering needs source_value_id or prepared semantic authority
+  --> $DIR/call_arg_source_name_authority.rs:24:16
+   |
+LL |             && binding.source_var_name.is_none())
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: source_var_name is only a hint; call-argument rendering needs source_value_id or prepared semantic authority
+  --> $DIR/call_arg_source_name_authority.rs:25:16
+   |
+LL |               || binding
+   |  ________________^
+LL | |                 .source_var_name
+LL | |                 .as_ref()
+LL | |                 .is_some_and(|name| !name.is_empty())
+   | |_____________________________________________________^
+
+warning: source_var_name is only a hint; call-argument rendering needs source_value_id or prepared semantic authority
+  --> $DIR/call_arg_source_name_authority.rs:29:16
+   |
+LL |             || binding.source_var_name.as_ref().is_some()
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: source_var_name is only a hint; call-argument rendering needs source_value_id or prepared semantic authority
+  --> $DIR/call_arg_source_name_authority.rs:30:16
+   |
+LL |             || Some(&binding.source_var_name).is_some()
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: source_var_name is only a hint; call-argument rendering needs source_value_id or prepared semantic authority
+  --> $DIR/call_arg_source_name_authority.rs:31:16
+   |
+LL |             || (&binding.source_var_name).is_some()
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: source_var_name is only a hint; call-argument rendering needs source_value_id or prepared semantic authority
+  --> $DIR/call_arg_source_name_authority.rs:32:16
+   |
+LL |             || wrapper(binding.source_var_name.as_ref()).is_some()
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: source_var_name is only a hint; call-argument rendering needs source_value_id or prepared semantic authority
+  --> $DIR/call_arg_source_name_authority.rs:33:16
+   |
+LL |             || (&wrapper(binding.source_var_name.as_ref())).is_some()
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: source_var_name is only a hint; call-argument rendering needs source_value_id or prepared semantic authority
+  --> $DIR/call_arg_source_name_authority.rs:34:18
+   |
+LL |             || (!binding.source_var_name.is_none())
+   |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: source_var_name is only a hint; call-argument rendering needs source_value_id or prepared semantic authority
+  --> $DIR/call_arg_source_name_authority.rs:35:16
+   |
+LL |             || (binding.source_var_name.as_deref() as Option<&str>).is_some()
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: source_var_name is only a hint; call-argument rendering needs source_value_id or prepared semantic authority
+  --> $DIR/call_arg_source_name_authority.rs:36:16
+   |
+LL |             || { binding.source_var_name.as_ref() }.is_some()
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: 11 warnings emitted
+

@@ -9,17 +9,15 @@ description = "Unified instruction export pipeline for r2sleigh"
 r2il = { path = "../r2il" }
 r2sleigh-lift = { path = "../r2sleigh-lift" }
 r2ssa = { path = "../r2ssa" }
-r2dec = { path = "../r2dec" }
-serde = { workspace = true, features = ["derive"] }
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-hex = "0.4"
+hex.workspace = true
 sleigh-config = { workspace = true, features = ["x86"] }
 
 [features]
 default = []
+dec = []
 x86 = ["sleigh-config/x86"]
-arm = ["sleigh-config/ARM"]
-riscv = ["sleigh-config/RISCV"]

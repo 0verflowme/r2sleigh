@@ -1,0 +1,20 @@
+warning: r2dec DecompilerContext must not store callee resolution outside FunctionFacts
+  --> $DIR/decompiler_context_callee_resolution_side_channel.rs:3:1
+   |
+LL | / struct DecompilerContext {
+LL | |     callee_resolution: Option<CalleeResolutionFacts>,
+LL | | }
+   | |_^
+   |
+   = note: `#[warn(r2dec_decompiler_context_callee_resolution_side_channel)]` on by default
+
+warning: r2dec DecompilerContext must not expose callee-resolution side-channel mutators
+  --> $DIR/decompiler_context_callee_resolution_side_channel.rs:8:5
+   |
+LL | /     fn with_callee_resolution(self, _facts: Option<CalleeResolutionFacts>) -> Self {
+LL | |         self
+LL | |     }
+   | |_____^
+
+warning: 2 warnings emitted
+

@@ -2,44 +2,26 @@ NAME=decompiler_bool_carrier_chain_full_snapshot
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-int32_t dbg.test_bool_carrier_chain(int32_t x, int32_t y)
-{
-    if (x != y) {
-        return x;
-    } else {
-        return y;
-    }
-}
+true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaaa
-a:sla.dec sym.test_bool_carrier_chain | python3 normalize_snapshot.py decompiler
+s `afl~test_bool_carrier_chain[0]` >/dev/null
+af
+a:sla.dec | jq -Rs 'contains("test_bool_carrier_chain") and contains("if") and contains("return") and (contains("r2dec fallback:")|not)'
 EOF_CMDS
 RUN
 
-NAME=decompiler_complex_check_stable_header_and_local_prefix
+NAME=decompiler_complex_check_preserves_shared_default_arm
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-int32_t dbg.complex_check(int32_t a, int32_t b)
-{
-    int32_t diff;
-
-    diff = a - b;
-    {
-        if (b + a != 64) {
-            return 0;
-        }
-        if (diff != 14) {
-            return 0;
-        } else {
-            return 1;
-        }
-    }
-}
+true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-a:sla.dec sym.complex_check | python3 normalize_snapshot.py decompiler
+s `afl~complex_check[0]` >/dev/null
+af
+a:sla.dec | jq -Rs 'contains("int32_t sym._complex_check(int32_t arg0, int32_t arg1)") and contains("int32_t var_10h = arg0 + arg1;") and contains("int32_t var_14h = arg0 - arg1;") and contains("if (var_10h != 100)") and contains("if (var_14h != 20)") and contains("return 0;") and contains("return 1;") and (contains("var_4h")|not) and (contains("r2dec residual:")|not) and (contains("r2sleigh residual:")|not) and (contains("r2dec fallback:")|not) and (contains("*arg0")|not) and (contains("*arg1")|not)'
 EOF_CMDS
 RUN

@@ -1,16 +1,19 @@
 use std::collections::{HashMap, HashSet};
 
+use r2il::userops::is_arm64_pauth_userop;
 use r2ssa::{SSAOp, SSAVar};
 use r2types::TypeOracle;
 
-use super::utils::{format_traced_name, parse_const_value};
+use super::utils::{
+    format_traced_name, is_constant_or_memory_name, is_low_signal_ssa_storage_name,
+    is_temporary_name, is_temporary_or_constant_name, parse_const_value, ssa_render_base_name,
+};
 use super::{
-    BaseRef, NormalizedAddr, ScalarValue, SemanticValue, StackSlotProvenance, UseInfo,
+    BaseRef, NormalizedAddr, PtrArith, ScalarValue, SemanticValue, StackSlotProvenance, UseInfo,
     ValueProvenance, ValueRef,
 };
 use crate::address::parse_address_from_var_name;
 use crate::ast::{BinaryOp, CExpr, CType, UnaryOp};
-use crate::fold::PtrArith;
 
 pub(crate) struct LowerCtx<'a> {
     pub(crate) use_info: Option<&'a UseInfo>,
@@ -25,9 +28,6 @@ pub(crate) struct LowerCtx<'a> {
     pub(crate) ptr_arith: &'a HashMap<String, PtrArith>,
     pub(crate) stack_slots: &'a HashMap<String, StackSlotProvenance>,
     pub(crate) forwarded_values: &'a HashMap<String, ValueProvenance>,
-    pub(crate) function_names: &'a HashMap<u64, String>,
-    pub(crate) strings: &'a HashMap<u64, String>,
-    pub(crate) symbols: &'a HashMap<u64, String>,
     pub(crate) type_oracle: Option<&'a dyn TypeOracle>,
 }
 
@@ -134,15 +134,6 @@ impl<'a> LowerCtx<'a> {
             return format!("{}", val);
         }
 
-        if let Some(addr) = parse_address_from_var_name(&var.name) {
-            if let Some(name) = self.function_names.get(&addr) {
-                return name.clone();
-            }
-            if let Some(name) = self.symbols.get(&addr) {
-                return name.clone();
-            }
-        }
-
         let display = var.display_name();
         if let Some(alias) = self.var_alias_for_name(&display) {
             return alias.clone();
@@ -157,18 +148,7 @@ impl<'a> LowerCtx<'a> {
             return alias;
         }
 
-        let base = if var.name.starts_with("reg:") {
-            let reg = var.name.trim_start_matches("reg:");
-            if is_hex_name(reg) {
-                format!("r{}", reg)
-            } else {
-                reg.to_string()
-            }
-        } else if var.name.starts_with("tmp:") {
-            format!("t{}", var.name.trim_start_matches("tmp:"))
-        } else {
-            var.name.to_lowercase()
-        };
+        let base = ssa_render_base_name(var);
 
         if var.version > 0 {
             format!("{}_{}", base, var.version)
@@ -421,6 +401,16 @@ impl<'a> LowerCtx<'a> {
                 CExpr::cast(CType::Float(dst.size), self.get_expr(src))
             }
             SSAOp::Cast { dst, src } => CExpr::cast(type_from_size(dst.size), self.get_expr(src)),
+            SSAOp::Select {
+                cond,
+                if_true,
+                if_false,
+                ..
+            } => CExpr::Ternary {
+                cond: Box::new(self.get_expr(cond)),
+                then_expr: Box::new(self.get_expr(if_true)),
+                else_expr: Box::new(self.get_expr(if_false)),
+            },
             SSAOp::Call { target } => CExpr::call(self.get_expr(target), vec![]),
             SSAOp::CallInd { target } => {
                 CExpr::call(CExpr::Deref(Box::new(self.get_expr(target))), vec![])
@@ -430,6 +420,11 @@ impl<'a> LowerCtx<'a> {
                 userop,
                 inputs,
             } => {
+                if is_arm64_pauth_userop(*userop)
+                    && let Some(input) = inputs.first()
+                {
+                    return self.get_expr(input);
+                }
                 let mut args = Vec::with_capacity(inputs.len() + 1);
                 args.push(CExpr::StringLit(format!("userop_{}", userop)));
                 for input in inputs {
@@ -625,7 +620,7 @@ impl<'a> LowerCtx<'a> {
             .map(|(name, _)| name.clone())
             .min_by_key(|name| {
                 let generic = name.starts_with("local_") || name.starts_with("stack_");
-                let synthetic = name.starts_with("tmp:") || name.contains(':');
+                let synthetic = is_temporary_name(name) || name.contains(':');
                 (generic, synthetic, name.clone())
             })
     }
@@ -678,7 +673,7 @@ impl<'a> LowerCtx<'a> {
             return false;
         }
 
-        if var_name.starts_with("tmp:") || var_name.starts_with("const:") {
+        if is_temporary_or_constant_name(var_name) {
             return true;
         }
 
@@ -703,20 +698,7 @@ impl<'a> LowerCtx<'a> {
     }
 
     fn resolve_addr_literal(&self, addr: u64) -> Option<CExpr> {
-        if addr <= 0xff {
-            return None;
-        }
-
-        if let Some(name) = self.function_names.get(&addr) {
-            return Some(CExpr::Var(name.clone()));
-        }
-        if let Some(s) = self.strings.get(&addr) {
-            return Some(CExpr::StringLit(s.clone()));
-        }
-        if let Some(name) = self.symbols.get(&addr) {
-            return Some(CExpr::Var(name.clone()));
-        }
-
+        let _ = addr;
         None
     }
 
@@ -1088,9 +1070,7 @@ impl<'a> LowerCtx<'a> {
             }
             CExpr::Var(name) => {
                 let lower = name.to_ascii_lowercase();
-                let semantic_visible_name = !lower.starts_with("tmp:")
-                    && !lower.starts_with("const:")
-                    && !lower.starts_with("ram:")
+                let semantic_visible_name = !is_low_signal_ssa_storage_name(name)
                     && !lower.starts_with("local_")
                     && !lower.starts_with('t')
                     && !lower.starts_with('v');
@@ -1131,8 +1111,7 @@ impl<'a> LowerCtx<'a> {
                     let lower = name.to_ascii_lowercase();
                     let stack_placeholder =
                         lower == "stack" || lower == "saved_fp" || lower.starts_with("stack_");
-                    !name.starts_with("const:")
-                        && !name.starts_with("ram:")
+                    !is_constant_or_memory_name(name)
                         && (!stack_placeholder
                             && (!self.stack_slot_name_map().contains_key(name)
                                 || lower.starts_with("local_")
@@ -1212,9 +1191,7 @@ impl<'a> LowerCtx<'a> {
         match expr {
             CExpr::Var(name) => {
                 let lower = name.to_ascii_lowercase();
-                let semantic_visible_name = !lower.starts_with("tmp:")
-                    && !lower.starts_with("const:")
-                    && !lower.starts_with("ram:")
+                let semantic_visible_name = !is_low_signal_ssa_storage_name(name)
                     && !lower.starts_with("local_")
                     && !lower.starts_with('t')
                     && !lower.starts_with('v');
@@ -1283,7 +1260,7 @@ impl<'a> LowerCtx<'a> {
         match expr {
             CExpr::Var(name) => {
                 let lower = name.to_ascii_lowercase();
-                !lower.starts_with("tmp:")
+                !is_temporary_name(name)
                     && !lower.starts_with('r')
                     && !lower.starts_with('e')
                     && !matches!(lower.as_str(), "stack" | "saved_fp")
@@ -1374,10 +1351,6 @@ fn uint_type_from_size(size: u32) -> CType {
     }
 }
 
-fn is_hex_name(value: &str) -> bool {
-    !value.is_empty() && value.chars().all(|c| c.is_ascii_hexdigit())
-}
-
 fn is_low_signal_lowering_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     let is_temp_family = |prefix: char| {
@@ -1391,10 +1364,8 @@ fn is_low_signal_lowering_name(name: &str) -> bool {
             })
             .is_some_and(|tail| tail.is_empty() || tail.chars().all(|ch| ch.is_ascii_digit()))
     };
-    lower.starts_with("tmp:")
+    is_low_signal_ssa_storage_name(name)
         || lower.starts_with("tmp")
-        || lower.starts_with("const:")
-        || lower.starts_with("ram:")
         || is_temp_family('t')
         || is_temp_family('v')
 }
@@ -1413,9 +1384,9 @@ mod tests {
         ptr_arith: &'a HashMap<String, PtrArith>,
         stack_slots: &'a HashMap<String, StackSlotProvenance>,
         forwarded_values: &'a HashMap<String, ValueProvenance>,
-        function_names: &'a HashMap<u64, String>,
-        strings: &'a HashMap<u64, String>,
-        symbols: &'a HashMap<u64, String>,
+        #[cfg(test)] _function_names: &'a HashMap<u64, String>,
+        #[cfg(test)] _strings: &'a HashMap<u64, String>,
+        #[cfg(test)] _symbols: &'a HashMap<u64, String>,
     ) -> LowerCtx<'a> {
         let type_hints = Box::leak(Box::new(HashMap::new()));
         let semantic_values = Box::leak(Box::new(HashMap::new()));
@@ -1433,15 +1404,12 @@ mod tests {
             ptr_arith,
             stack_slots,
             forwarded_values,
-            function_names,
-            strings,
-            symbols,
             type_oracle: None,
         }
     }
 
     #[test]
-    fn resolve_addr_literal_prefers_function_then_string_then_symbol() {
+    fn resolve_addr_literal_ignores_raw_function_string_symbol_maps() {
         let mut fn_map = HashMap::new();
         let mut str_map = HashMap::new();
         let mut sym_map = HashMap::new();
@@ -1476,26 +1444,13 @@ mod tests {
             &sym_map,
         );
 
-        assert_eq!(
-            ctx.resolve_addr_literal(0x401000),
-            Some(CExpr::Var("sym.main".to_string()))
-        );
-        assert_eq!(
-            ctx.resolve_addr_literal(0x402000),
-            Some(CExpr::StringLit("format: %d\\n".to_string()))
-        );
-        assert_eq!(
-            ctx.resolve_addr_literal(0x403000),
-            Some(CExpr::Var("obj.global".to_string()))
-        );
-        assert_eq!(
-            ctx.resolve_addr_literal(0x404000),
-            Some(CExpr::StringLit("string_wins_over_symbol".to_string()))
-        );
-        assert_eq!(
-            ctx.resolve_addr_literal(0x405000),
-            Some(CExpr::Var("sym.wins".to_string()))
-        );
+        for addr in [0x401000, 0x402000, 0x403000, 0x404000, 0x405000] {
+            assert_eq!(
+                ctx.resolve_addr_literal(addr),
+                None,
+                "raw function/string/symbol maps must not authorize address literal rendering"
+            );
+        }
     }
 
     #[test]
@@ -1530,7 +1485,85 @@ mod tests {
     }
 
     #[test]
-    fn get_expr_resolves_ram_addresses_to_strings() {
+    fn op_to_expr_treats_arm64_pauth_as_value_preserving() {
+        let fn_map = HashMap::new();
+        let str_map = HashMap::new();
+        let sym_map = HashMap::new();
+        let definitions = HashMap::new();
+        let use_counts = HashMap::new();
+        let condition_vars = HashSet::new();
+        let pinned = HashSet::new();
+        let var_aliases = HashMap::new();
+        let ptr_arith = HashMap::new();
+        let stack_slots = HashMap::new();
+        let forwarded_values = HashMap::new();
+        let ctx = make_ctx(
+            &definitions,
+            &use_counts,
+            &condition_vars,
+            &pinned,
+            &var_aliases,
+            &ptr_arith,
+            &stack_slots,
+            &forwarded_values,
+            &fn_map,
+            &str_map,
+            &sym_map,
+        );
+
+        let expr = ctx.op_to_expr(&SSAOp::CallOther {
+            output: Some(SSAVar::new("X30", 1, 8)),
+            userop: r2il::userops::ARM64_PAUTH_AUTH_USEROP,
+            inputs: vec![SSAVar::new("X30", 0, 8), SSAVar::new("SP", 0, 8)],
+        });
+
+        assert_eq!(expr, CExpr::Var("x30".to_string()));
+    }
+
+    #[test]
+    fn op_to_expr_preserves_select_value_semantics() {
+        let function_names = HashMap::new();
+        let strings = HashMap::new();
+        let symbols = HashMap::new();
+        let definitions = HashMap::new();
+        let use_counts = HashMap::new();
+        let condition_vars = HashSet::new();
+        let pinned = HashSet::new();
+        let var_aliases = HashMap::new();
+        let ptr_arith = HashMap::new();
+        let stack_slots = HashMap::new();
+        let forwarded_values = HashMap::new();
+        let ctx = make_ctx(
+            &definitions,
+            &use_counts,
+            &condition_vars,
+            &pinned,
+            &var_aliases,
+            &ptr_arith,
+            &stack_slots,
+            &forwarded_values,
+            &function_names,
+            &strings,
+            &symbols,
+        );
+
+        assert_eq!(
+            ctx.op_to_expr(&SSAOp::Select {
+                dst: SSAVar::new("tmp:result", 1, 4),
+                cond: SSAVar::new("cond", 0, 1),
+                if_true: SSAVar::new("when_true", 0, 4),
+                if_false: SSAVar::new("when_false", 0, 4),
+            }),
+            CExpr::Ternary {
+                cond: Box::new(CExpr::Var("cond".to_string())),
+                then_expr: Box::new(CExpr::Var("when_true".to_string())),
+                else_expr: Box::new(CExpr::Var("when_false".to_string())),
+            }
+        );
+    }
+
+    #[test]
+    fn get_expr_keeps_ram_addresses_numeric_without_typed_string_fact() {
         let fn_map = HashMap::new();
         let mut str_map = HashMap::new();
         let sym_map = HashMap::new();
@@ -1558,10 +1591,7 @@ mod tests {
         );
 
         let var = SSAVar::new("ram:403048", 0, 8);
-        assert_eq!(
-            ctx.get_expr(&var),
-            CExpr::StringLit("Usage: %s <test_num> [args...]\\n".to_string())
-        );
+        assert_eq!(ctx.get_expr(&var), CExpr::Var("ram:403048".to_string()));
     }
 
     #[test]

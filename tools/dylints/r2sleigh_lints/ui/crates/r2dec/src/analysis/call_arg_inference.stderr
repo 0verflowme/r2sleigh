@@ -1,0 +1,16 @@
+warning: r2dec must consume FunctionFacts callsite arguments instead of inferring authoritative call args locally
+  --> $DIR/call_arg_inference.rs:1:1
+   |
+LL | fn infer_call_authoritative_args() {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(r2dec_local_authoritative_call_arg_inference)]` on by default
+
+warning: r2dec must consume FunctionFacts callsite arguments instead of inferring authoritative call args locally
+  --> $DIR/call_arg_inference.rs:3:1
+   |
+LL | fn infer_stack_call_authoritative_args() {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: 2 warnings emitted
+

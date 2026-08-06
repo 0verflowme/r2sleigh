@@ -123,8 +123,7 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
 s dbg.check_secret
-a:sla.info >/dev/null
-e anal.sla.mode=full
+a:sla >/dev/null
 afs void dbg.check_secret(void)
 afc ms
 aaaa

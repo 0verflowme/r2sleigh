@@ -63,7 +63,7 @@ enum Commands {
 
     /// Generate a test architecture specification
     TestArch {
-        /// Architecture name (x86-64, arm, riscv64, riscv32)
+        /// Architecture name (x86-64, arm, mips32be, mips32le, riscv64, riscv32)
         arch: String,
 
         /// Output r2il binary file
@@ -125,6 +125,7 @@ enum RunActionArg {
     Lift,
     Ssa,
     Defuse,
+    #[cfg(feature = "decompile")]
     Dec,
 }
 
@@ -135,6 +136,7 @@ impl From<RunActionArg> for InstructionAction {
             RunActionArg::Lift => InstructionAction::Lift,
             RunActionArg::Ssa => InstructionAction::Ssa,
             RunActionArg::Defuse => InstructionAction::Defuse,
+            #[cfg(feature = "decompile")]
             RunActionArg::Dec => InstructionAction::Dec,
         }
     }
@@ -146,6 +148,7 @@ enum RunFormatArg {
     Json,
     Text,
     Esil,
+    #[cfg(feature = "decompile")]
     #[value(name = "c_like")]
     CLike,
     #[value(name = "r2cmd")]
@@ -159,6 +162,7 @@ impl From<RunFormatArg> for ExportFormat {
             RunFormatArg::Json => ExportFormat::Json,
             RunFormatArg::Text => ExportFormat::Text,
             RunFormatArg::Esil => ExportFormat::Esil,
+            #[cfg(feature = "decompile")]
             RunFormatArg::CLike => ExportFormat::CLike,
             RunFormatArg::R2Cmd => ExportFormat::R2Cmd,
         }
@@ -367,6 +371,26 @@ fn cmd_test_arch(arch: &str, output: Option<&PathBuf>) -> Result<(), String> {
             println!("Generating ARM test specification...");
             create_arm_spec()
         }
+        #[cfg(feature = "mips")]
+        "mips" | "mips32" | "mips32be" | "mipsbe" | "mipseb" => {
+            println!("Generating MIPS32 big-endian test specification...");
+            build_arch_spec(
+                sleigh_config::processor_mips::SLA_MIPS32BE,
+                sleigh_config::processor_mips::PSPEC_MIPS32,
+                "mips32be",
+            )
+            .map_err(|e| e.to_string())?
+        }
+        #[cfg(feature = "mips")]
+        "mipsel" | "mips32le" | "mips32el" => {
+            println!("Generating MIPS32 little-endian test specification...");
+            build_arch_spec(
+                sleigh_config::processor_mips::SLA_MIPS32LE,
+                sleigh_config::processor_mips::PSPEC_MIPS32,
+                "mips32le",
+            )
+            .map_err(|e| e.to_string())?
+        }
         "riscv64" | "rv64" | "rv64gc" => {
             println!("Generating RISC-V RV64 test specification...");
             create_riscv64_spec()
@@ -377,7 +401,7 @@ fn cmd_test_arch(arch: &str, output: Option<&PathBuf>) -> Result<(), String> {
         }
         _ => {
             return Err(format!(
-                "Unknown architecture: {}. Supported: x86-64, arm, riscv64, riscv32",
+                "Unknown architecture: {}. Supported: x86-64, arm, mips32be, mips32le, riscv64, riscv32",
                 arch
             ));
         }
@@ -676,6 +700,97 @@ fn get_disassembler_with_spec(arch: &str) -> Result<(Disassembler, r2il::ArchSpe
             disasm.set_userop_map(userop_map_for_arch("arm"));
             Ok((disasm, spec))
         }
+        #[cfg(feature = "arm")]
+        "arm64" | "arm64e" | "aarch64" => {
+            let mut spec = build_arch_spec(
+                sleigh_config::processor_aarch64::SLA_AARCH64_APPLESILICON,
+                sleigh_config::processor_aarch64::PSPEC_AARCH64,
+                "aarch64",
+            )
+            .map_err(|e| e.to_string())?;
+            let mut disasm = Disassembler::from_sla(
+                sleigh_config::processor_aarch64::SLA_AARCH64_APPLESILICON,
+                sleigh_config::processor_aarch64::PSPEC_AARCH64,
+                "aarch64",
+            )
+            .map_err(|e| e.to_string())?;
+            let userops = userop_map_for_arch("arm64");
+            disasm.set_userop_map(userops.clone());
+            spec.userops = userops
+                .into_iter()
+                .map(|(index, name)| r2il::serialize::UserOpDef { index, name })
+                .collect();
+            spec.userops.sort_by_key(|def| def.index);
+            Ok((disasm, spec))
+        }
+        #[cfg(feature = "mips")]
+        "mips" | "mips32" | "mips32be" | "mipsbe" | "mipseb" => {
+            let spec = build_arch_spec(
+                sleigh_config::processor_mips::SLA_MIPS32BE,
+                sleigh_config::processor_mips::PSPEC_MIPS32,
+                "mips32be",
+            )
+            .map_err(|e| e.to_string())?;
+            let mut disasm = Disassembler::from_sla(
+                sleigh_config::processor_mips::SLA_MIPS32BE,
+                sleigh_config::processor_mips::PSPEC_MIPS32,
+                "mips32be",
+            )
+            .map_err(|e| e.to_string())?;
+            disasm.set_userop_map(userop_map_for_arch("mips32be"));
+            Ok((disasm, spec))
+        }
+        #[cfg(feature = "mips")]
+        "mipsel" | "mips32le" | "mips32el" => {
+            let spec = build_arch_spec(
+                sleigh_config::processor_mips::SLA_MIPS32LE,
+                sleigh_config::processor_mips::PSPEC_MIPS32,
+                "mips32le",
+            )
+            .map_err(|e| e.to_string())?;
+            let mut disasm = Disassembler::from_sla(
+                sleigh_config::processor_mips::SLA_MIPS32LE,
+                sleigh_config::processor_mips::PSPEC_MIPS32,
+                "mips32le",
+            )
+            .map_err(|e| e.to_string())?;
+            disasm.set_userop_map(userop_map_for_arch("mips32le"));
+            Ok((disasm, spec))
+        }
+        #[cfg(feature = "mips")]
+        "mips64" | "mips64be" => {
+            let spec = build_arch_spec(
+                sleigh_config::processor_mips::SLA_MIPS64BE,
+                sleigh_config::processor_mips::PSPEC_MIPS64,
+                "mips64be",
+            )
+            .map_err(|e| e.to_string())?;
+            let mut disasm = Disassembler::from_sla(
+                sleigh_config::processor_mips::SLA_MIPS64BE,
+                sleigh_config::processor_mips::PSPEC_MIPS64,
+                "mips64be",
+            )
+            .map_err(|e| e.to_string())?;
+            disasm.set_userop_map(userop_map_for_arch("mips64be"));
+            Ok((disasm, spec))
+        }
+        #[cfg(feature = "mips")]
+        "mips64el" | "mips64le" => {
+            let spec = build_arch_spec(
+                sleigh_config::processor_mips::SLA_MIPS64LE,
+                sleigh_config::processor_mips::PSPEC_MIPS64,
+                "mips64le",
+            )
+            .map_err(|e| e.to_string())?;
+            let mut disasm = Disassembler::from_sla(
+                sleigh_config::processor_mips::SLA_MIPS64LE,
+                sleigh_config::processor_mips::PSPEC_MIPS64,
+                "mips64le",
+            )
+            .map_err(|e| e.to_string())?;
+            disasm.set_userop_map(userop_map_for_arch("mips64le"));
+            Ok((disasm, spec))
+        }
         #[cfg(feature = "riscv")]
         "riscv64" | "rv64" | "rv64gc" => {
             let spec = build_arch_spec(
@@ -715,13 +830,15 @@ fn get_disassembler_with_spec(arch: &str) -> Result<(Disassembler, r2il::ArchSpe
             #[cfg(feature = "x86")]
             supported.extend(["x86-64", "x86"]);
             #[cfg(feature = "arm")]
-            supported.push("arm");
+            supported.extend(["arm", "arm64", "aarch64"]);
+            #[cfg(feature = "mips")]
+            supported.extend(["mips32be", "mips32le", "mips64be", "mips64le"]);
             #[cfg(feature = "riscv")]
             supported.extend(["riscv64", "riscv32"]);
 
             if supported.is_empty() {
                 Err(
-                    "No architectures enabled. Build with --features x86, arm, or riscv"
+                    "No architectures enabled. Build with --features x86, arm, mips, or riscv"
                         .to_string(),
                 )
             } else {
@@ -744,6 +861,8 @@ mod tests {
     const X86_BYTES_DEC: &str = "48ffc000000000000000000000000000";
     #[cfg(feature = "arm")]
     const ARM_BYTES: &str = "0100a0e3000000000000000000000000";
+    #[cfg(feature = "arm")]
+    const ARM64_PACIBSP_BYTES: &str = "7f2303d5000000000000000000000000";
     #[cfg(feature = "riscv")]
     const RISCV_BYTES: &str = "13051500000000000000000000000000";
 
@@ -781,6 +900,7 @@ mod tests {
         canonicalize_json(&parsed).to_string()
     }
 
+    #[cfg(feature = "decompile")]
     fn normalize_c_like_output(output: &str) -> String {
         let text = output.replace("\r\n", "\n");
         let mut lines = Vec::new();
@@ -897,6 +1017,9 @@ mod tests {
     }
 
     fn run_matrix_for_arch(arch: &str, bytes_hex: &str, dec_bytes_hex: &str) {
+        #[cfg(not(feature = "decompile"))]
+        let _ = dec_bytes_hex;
+
         for format in [
             ExportFormat::Json,
             ExportFormat::Text,
@@ -978,30 +1101,33 @@ mod tests {
             }
         }
 
-        for format in [ExportFormat::CLike, ExportFormat::Json, ExportFormat::Text] {
-            let normalized = assert_deterministic_output(
-                arch,
-                dec_bytes_hex,
-                InstructionAction::Dec,
-                format,
+        #[cfg(feature = "decompile")]
+        {
+            for format in [ExportFormat::CLike, ExportFormat::Json, ExportFormat::Text] {
+                let normalized = assert_deterministic_output(
+                    arch,
+                    dec_bytes_hex,
+                    InstructionAction::Dec,
+                    format,
+                    match format {
+                        ExportFormat::CLike => normalize_c_like_output,
+                        ExportFormat::Json => normalize_json_output,
+                        ExportFormat::Text => normalize_text_output,
+                        _ => unreachable!("dec supports c_like/json/text"),
+                    },
+                );
                 match format {
-                    ExportFormat::CLike => normalize_c_like_output,
-                    ExportFormat::Json => normalize_json_output,
-                    ExportFormat::Text => normalize_text_output,
+                    ExportFormat::Json => {
+                        assert_json_shape_for_action(InstructionAction::Dec, &normalized)
+                    }
+                    ExportFormat::CLike | ExportFormat::Text => {
+                        assert!(
+                            !normalized.trim().is_empty(),
+                            "dec output must be non-empty"
+                        )
+                    }
                     _ => unreachable!("dec supports c_like/json/text"),
-                },
-            );
-            match format {
-                ExportFormat::Json => {
-                    assert_json_shape_for_action(InstructionAction::Dec, &normalized)
                 }
-                ExportFormat::CLike | ExportFormat::Text => {
-                    assert!(
-                        !normalized.trim().is_empty(),
-                        "dec output must be non-empty"
-                    )
-                }
-                _ => unreachable!("dec supports c_like/json/text"),
             }
         }
     }
@@ -1131,6 +1257,24 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "arm")]
+    fn arm64_alias_lifts_pointer_auth_userop() {
+        let out = run_action_output(
+            "arm64",
+            ARM64_PACIBSP_BYTES,
+            "0x1000",
+            InstructionAction::Lift,
+            ExportFormat::Json,
+        )
+        .expect("run output");
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("json");
+        assert_eq!(
+            parsed["ops"][0]["CallOther"]["userop"].as_u64(),
+            Some(0xffff_0002)
+        );
+    }
+
+    #[test]
     #[cfg(feature = "riscv")]
     fn conformance_matrix_riscv64_deterministic() {
         run_matrix_for_arch("riscv64", RISCV_BYTES, RISCV_BYTES);
@@ -1239,6 +1383,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "decompile")]
     fn run_dec_c_like_success() {
         let out = run_action_output(
             "x86-64",
@@ -1373,7 +1518,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "riscv")]
+    #[cfg(all(feature = "riscv", feature = "decompile"))]
     fn run_riscv64_dec_c_like_success() {
         let out = run_action_output(
             "riscv64",

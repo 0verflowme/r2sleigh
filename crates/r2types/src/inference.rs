@@ -1152,7 +1152,7 @@ impl TypeInference {
                 let (elem_ty, struct_name) = self.type_like_to_typeid(inner, arena);
                 (arena.array(elem_ty, *len, None), struct_name)
             }
-            CTypeLike::Struct(name) => (
+            CTypeLike::Struct(name) | CTypeLike::Typedef(name) => (
                 arena.struct_named_or_existing(name.clone()),
                 Some(name.clone()),
             ),
@@ -2185,7 +2185,7 @@ mod tests {
             .graph()
             .values
             .iter()
-            .find(|value| value.var.name.starts_with("tmp:"))
+            .find(|value| value.var.name_kind().is_temporary())
             .map(|value| value.var.clone())
             .expect("stack-root value");
         assert_eq!(

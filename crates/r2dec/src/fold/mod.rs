@@ -6,7 +6,7 @@ pub(crate) mod stack;
 
 use crate::ast::CStmt;
 pub use context::FoldingContext;
-pub(crate) use context::{PtrArith, SSABlock};
+pub(crate) type SSABlock = r2ssa::FunctionSSABlock;
 use r2ssa::SSAOp;
 
 pub(super) const MAX_STACK_OFFSET_DEPTH: u32 = 8;
@@ -22,11 +22,18 @@ pub(super) const MAX_PREDICATE_OPERAND_DEPTH: u32 = 12;
 pub(super) const MAX_SF_SURROGATE_DEPTH: usize = 128;
 pub(super) const MAX_SUB_LIKE_DEPTH: usize = 128;
 
-/// Lower a sequence of SSA operations to C statements using fold lowering.
+/// Residualize raw SSA operations for public block-level exports.
 ///
-/// This helper is intentionally stateless and uses default fold context
-/// configuration, matching block-level lowering behavior used by the plugin.
-pub fn lower_ssa_ops_to_stmts(ptr_size: u32, ops: &[SSAOp]) -> Vec<CStmt> {
-    let ctx = FoldingContext::new(ptr_size);
-    ops.iter().filter_map(|op| ctx.op_to_stmt(op)).collect()
+/// Executable C lowering requires an engine-prepared `DecompilerInput` with
+/// `FunctionFacts` route and render proof. This raw helper is kept only for
+/// diagnostic/export surfaces that do not have that contract.
+pub fn lower_ssa_ops_to_stmts(_ptr_size: u32, ops: &[SSAOp]) -> Vec<CStmt> {
+    ops.iter()
+        .enumerate()
+        .map(|(idx, op)| {
+            CStmt::Comment(format!(
+                "r2dec residual: raw SSA op {idx} requires r2engine FunctionFacts render proof; executable C suppressed: {op:?}"
+            ))
+        })
+        .collect()
 }

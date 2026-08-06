@@ -434,6 +434,18 @@ pub fn format_op(disasm: &Disassembler, op: &R2ILOp) -> String {
                 vn(position)
             )
         }
+        Select {
+            dst,
+            cond,
+            if_true,
+            if_false,
+        } => format!(
+            "Select {{ dst: {}, cond: {}, if_true: {}, if_false: {} }}",
+            vn(dst),
+            vn(cond),
+            vn(if_true),
+            vn(if_false)
+        ),
 
         // Special
         Nop => "Nop".to_string(),
@@ -727,6 +739,19 @@ pub fn op_to_esil(disasm: &Disassembler, op: &R2ILOp) -> String {
                 vn(dst)
             )
         }
+        Select {
+            dst,
+            cond,
+            if_true,
+            if_false,
+        } => format!(
+            "{},?{{,{},{},=,}}{{,{},{},=,}}",
+            vn(cond),
+            vn(if_true),
+            vn(dst),
+            vn(if_false),
+            vn(dst)
+        ),
     }
 }
 

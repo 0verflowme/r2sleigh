@@ -1,6 +1,318 @@
 use super::*;
+use crate::analysis::utils::{is_temporary_or_constant_name, ssa_render_base_name};
+
+struct CertifiedMergedSlotReturnEvidence {
+    expr: CExpr,
+    source: ValueId,
+    return_block: u64,
+    return_op: usize,
+    return_value: ValueId,
+    store_inst: r2ssa::InstId,
+    store_address: ValueId,
+}
 
 impl<'a> FoldingContext<'a> {
+    fn certified_merge_block_is_return_plumbing(
+        &self,
+        evidence: &CertifiedMergedSlotReturnEvidence,
+    ) -> bool {
+        let Some(prepared) = self.inputs.prepared_ssa else {
+            return false;
+        };
+        let Some(block) = prepared.get_block(evidence.return_block) else {
+            return false;
+        };
+        let Some(SSAOp::Return { target }) = block.ops.get(evidence.return_op) else {
+            return false;
+        };
+        let Some(return_target) = prepared.graph().value_id_for_var(target) else {
+            return false;
+        };
+        let stack_objects = prepared
+            .certificates()
+            .stack_slots
+            .values()
+            .map(|slot| slot.object)
+            .collect::<HashSet<_>>();
+
+        for (op_idx, op) in block.ops.iter().enumerate() {
+            if op_idx == evidence.return_op {
+                continue;
+            }
+            if matches!(op, SSAOp::Nop) {
+                continue;
+            }
+            let Some(inst) = prepared
+                .graph()
+                .inst_id_for_op_site(evidence.return_block, op_idx)
+            else {
+                return false;
+            };
+            if let SSAOp::Load { dst, .. } = op {
+                let certified_stack_load =
+                    prepared
+                        .certificates()
+                        .memory_accesses
+                        .values()
+                        .any(|cert| {
+                            cert.access.inst == inst
+                                && !cert.is_write
+                                && stack_objects.contains(&cert.object)
+                        });
+                let return_control_load =
+                    prepared
+                        .graph()
+                        .value_id_for_var(dst)
+                        .is_some_and(|loaded| {
+                            prepared_value_transparently_depends_on(
+                                prepared,
+                                return_target,
+                                loaded,
+                                0,
+                                &mut HashSet::new(),
+                            )
+                        });
+                if certified_stack_load || return_control_load {
+                    continue;
+                }
+                return false;
+            }
+            if op.has_observable_effects(false) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn certified_merged_slot_return_evidence_for_predecessor(
+        &self,
+        merge_block: u64,
+        pred_addr: u64,
+        slot_offset: i64,
+    ) -> Option<CertifiedMergedSlotReturnEvidence> {
+        let prepared = self.inputs.prepared_ssa?;
+        let mut stack_objects = prepared
+            .certificates()
+            .stack_slots
+            .values()
+            .filter_map(|slot| (slot.offset == slot_offset).then_some(slot.object));
+        let stack_object = stack_objects.next()?;
+        if stack_objects.next().is_some() {
+            return None;
+        }
+
+        let render = self.inputs.function_facts.render()?;
+        let mut candidates = Vec::new();
+        for load in prepared
+            .certificates()
+            .memory_accesses
+            .values()
+            .filter(|cert| {
+                !cert.is_write && cert.block_addr == merge_block && cert.object == stack_object
+            })
+        {
+            let Some(load_value) = load.value else {
+                continue;
+            };
+            let Some(use_fact) = prepared
+                .memory()
+                .uses_by_inst
+                .get(&load.access.inst)
+                .and_then(|facts| {
+                    facts.iter().find(|fact| {
+                        fact.location.object == stack_object && fact.location.size == load.width
+                    })
+                })
+            else {
+                continue;
+            };
+            let Some(memory_phi) =
+                prepared
+                    .memory()
+                    .phis_by_block
+                    .get(&merge_block)
+                    .and_then(|phis| {
+                        phis.iter().find(|phi| {
+                            phi.object == stack_object && phi.output_version == use_fact.version
+                        })
+                    })
+            else {
+                continue;
+            };
+            let Some(incoming_version) = memory_phi
+                .inputs
+                .iter()
+                .find_map(|(pred, version)| (*pred == pred_addr).then_some(*version))
+            else {
+                continue;
+            };
+            let Some((store_inst, store_def)) =
+                prepared
+                    .memory()
+                    .defs_by_inst
+                    .iter()
+                    .find_map(|(inst, facts)| {
+                        facts
+                            .iter()
+                            .find(|fact| {
+                                fact.location == use_fact.location
+                                    && fact.next_version == incoming_version
+                            })
+                            .map(|fact| (*inst, fact))
+                    })
+            else {
+                continue;
+            };
+            if store_def.location.size != load.width
+                || prepared.inst_op_site(store_inst)?.0 != pred_addr
+            {
+                continue;
+            }
+            let Some(store) = prepared
+                .certificates()
+                .memory_accesses
+                .values()
+                .find(|cert| {
+                    cert.is_write
+                        && cert.access.inst == store_inst
+                        && cert.object == stack_object
+                        && cert.width == load.width
+                })
+            else {
+                continue;
+            };
+            let Some(source) = store.value else {
+                continue;
+            };
+            let Some(source_var) = prepared.value_var(source) else {
+                continue;
+            };
+            let Some(expr) = self.render_certified_value_expr_for_var(source_var) else {
+                continue;
+            };
+            for return_fact in render.return_effects() {
+                if return_fact.block_addr == merge_block
+                    && prepared
+                        .get_block(return_fact.block_addr)
+                        .and_then(|block| block.ops.get(return_fact.op_index))
+                        .is_some_and(|op| matches!(op, SSAOp::Return { .. }))
+                    && prepared_value_transparently_depends_on(
+                        prepared,
+                        return_fact.value,
+                        load_value,
+                        0,
+                        &mut HashSet::new(),
+                    )
+                {
+                    candidates.push(CertifiedMergedSlotReturnEvidence {
+                        expr: expr.clone(),
+                        source,
+                        return_block: return_fact.block_addr,
+                        return_op: return_fact.op_index,
+                        return_value: return_fact.value,
+                        store_inst,
+                        store_address: store.address,
+                    });
+                }
+            }
+        }
+        match candidates.len() {
+            1 => candidates.pop(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn certified_merged_slot_return_candidate_for_region(
+        &self,
+        merge_block: u64,
+        pred_addr: u64,
+        slot_offset: i64,
+        region_blocks: &[u64],
+    ) -> Option<(CExpr, ValueId, u64, usize, ValueId)> {
+        let prepared = self.inputs.prepared_ssa?;
+        let evidence = self.certified_merged_slot_return_evidence_for_predecessor(
+            merge_block,
+            pred_addr,
+            slot_offset,
+        )?;
+        if !self.certified_merge_block_is_return_plumbing(&evidence) {
+            return None;
+        }
+        let mut dependencies = HashSet::new();
+        collect_prepared_value_dependency_insts(
+            prepared,
+            evidence.source,
+            &mut dependencies,
+            &mut HashSet::new(),
+        );
+        collect_prepared_value_dependency_insts(
+            prepared,
+            prepared_canonical_root_value_id(prepared, evidence.source),
+            &mut dependencies,
+            &mut HashSet::new(),
+        );
+        collect_prepared_value_dependency_insts(
+            prepared,
+            evidence.store_address,
+            &mut dependencies,
+            &mut HashSet::new(),
+        );
+        collect_prepared_value_dependency_insts(
+            prepared,
+            prepared_canonical_root_value_id(prepared, evidence.store_address),
+            &mut dependencies,
+            &mut HashSet::new(),
+        );
+
+        let mut blocks = region_blocks.iter().copied().collect::<HashSet<_>>();
+        blocks.remove(&merge_block);
+        blocks.insert(pred_addr);
+        for block_addr in &blocks {
+            let block = prepared.get_block(*block_addr)?;
+            for (op_idx, op) in block.ops.iter().enumerate() {
+                let inst = prepared.graph().inst_id_for_op_site(*block_addr, op_idx)?;
+                if inst == evidence.store_inst {
+                    if !matches!(op, SSAOp::Store { .. }) {
+                        return None;
+                    }
+                    continue;
+                }
+                if matches!(op, SSAOp::Branch { .. } | SSAOp::Nop)
+                    || prepared_op_is_materialized_phi_edge_copy(prepared, *block_addr, op)
+                {
+                    continue;
+                }
+                if op.is_control_flow() || op.is_memory_read() || op.is_memory_write() {
+                    return None;
+                }
+                let graph_inst = prepared.graph().inst(inst)?;
+                let output = graph_inst.output?;
+                let renderable = prepared
+                    .certificates()
+                    .expressions
+                    .get(&output)
+                    .is_some_and(|cert| cert.renderable);
+                let proof_neutral_register_carrier = prepared
+                    .value_var(output)
+                    .filter(|var| self.inputs.arch.is_register_like_base_name(&var.name))
+                    .and_then(|var| self.render_certified_value_expr_for_var(var))
+                    .is_some_and(|expr| expr == evidence.expr);
+                if !renderable || (!dependencies.contains(&inst) && !proof_neutral_register_carrier)
+                {
+                    return None;
+                }
+            }
+        }
+
+        Some((
+            evidence.expr,
+            evidence.source,
+            evidence.return_block,
+            evidence.return_op,
+            evidence.return_value,
+        ))
+    }
+
     fn typed_integer_literal_expr_in_context(
         &self,
         value: u64,
@@ -11,24 +323,7 @@ impl<'a> FoldingContext<'a> {
             && bits > 0
             && bits <= 64
         {
-            let mask = if bits == 64 {
-                u64::MAX
-            } else {
-                (1u64 << bits) - 1
-            };
-            let truncated = value & mask;
-            if is_signed {
-                let sign_bit = 1u64 << (bits - 1);
-                if truncated & sign_bit != 0 {
-                    return CExpr::IntLit((truncated | (!mask)) as i64);
-                }
-                return CExpr::IntLit(truncated as i64);
-            }
-            return if bits == 64 || truncated > 0x7fff_ffff {
-                CExpr::UIntLit(truncated)
-            } else {
-                CExpr::IntLit(truncated as i64)
-            };
+            return crate::typed_integer_literal_expr(value, is_signed, bits);
         }
 
         if value > 0x7fffffff {
@@ -38,7 +333,11 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
-    fn rewrite_typed_return_literal_expr(&self, expr: CExpr, context: VisibleExprContext) -> CExpr {
+    pub(super) fn rewrite_typed_return_literal_expr(
+        &self,
+        expr: CExpr,
+        context: VisibleExprContext,
+    ) -> CExpr {
         match expr {
             CExpr::UIntLit(value) => self.typed_integer_literal_expr_in_context(value, context),
             CExpr::IntLit(value) if value >= 0 => {
@@ -62,6 +361,47 @@ impl<'a> FoldingContext<'a> {
                 Self::expr_is_structured_memory_candidate(inner)
             }
             _ => false,
+        }
+    }
+
+    pub(super) fn expr_contains_structured_memory_syntax(expr: &CExpr) -> bool {
+        match expr {
+            CExpr::Subscript { .. } | CExpr::Member { .. } | CExpr::PtrMember { .. } => true,
+            CExpr::Unary { operand, .. }
+            | CExpr::Cast { expr: operand, .. }
+            | CExpr::Sizeof(operand)
+            | CExpr::AddrOf(operand)
+            | CExpr::Deref(operand)
+            | CExpr::Paren(operand) => Self::expr_contains_structured_memory_syntax(operand),
+            CExpr::Binary { left, right, .. } => {
+                Self::expr_contains_structured_memory_syntax(left)
+                    || Self::expr_contains_structured_memory_syntax(right)
+            }
+            CExpr::Ternary {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                Self::expr_contains_structured_memory_syntax(cond)
+                    || Self::expr_contains_structured_memory_syntax(then_expr)
+                    || Self::expr_contains_structured_memory_syntax(else_expr)
+            }
+            CExpr::Call { func, args } => {
+                Self::expr_contains_structured_memory_syntax(func)
+                    || args
+                        .iter()
+                        .any(Self::expr_contains_structured_memory_syntax)
+            }
+            CExpr::Comma(items) => items
+                .iter()
+                .any(Self::expr_contains_structured_memory_syntax),
+            CExpr::IntLit(_)
+            | CExpr::UIntLit(_)
+            | CExpr::FloatLit(_)
+            | CExpr::StringLit(_)
+            | CExpr::CharLit(_)
+            | CExpr::Var(_)
+            | CExpr::SizeofType(_) => false,
         }
     }
 
@@ -114,7 +454,7 @@ impl<'a> FoldingContext<'a> {
             .unwrap_or(VisibleExprContext::Generic)
     }
 
-    fn current_return_context(&self) -> VisibleExprContext {
+    pub(super) fn current_return_context(&self) -> VisibleExprContext {
         if self
             .state
             .return_stack_slots
@@ -328,6 +668,12 @@ impl<'a> FoldingContext<'a> {
         }
         let mut has_semantic_root = false;
         if let CExpr::Var(name) = expr {
+            if self
+                .materialized_call_result_source_for_visible_name(name)
+                .is_some()
+            {
+                return expr.clone();
+            }
             if let Some(candidate) = self.semantic_deref_candidate_for_name(name) {
                 let should_promote = if matches!(context, VisibleExprContext::Generic) {
                     Self::expr_is_structured_memory_candidate(&candidate)
@@ -503,6 +849,172 @@ impl<'a> FoldingContext<'a> {
         best
     }
 
+    pub(crate) fn merged_return_register_candidate_for_block_predecessor_with_proof(
+        &self,
+        block_addr: u64,
+        pred_addr: u64,
+    ) -> Option<(CExpr, u64, usize, r2ssa::ValueId)> {
+        let func = self
+            .inputs
+            .prepared_ssa
+            .map(|prepared| prepared.function())?;
+        let prepared = self.inputs.prepared_ssa?;
+        let block = func.get_block(block_addr)?;
+        let mut best = None;
+
+        for phi in &block.phis {
+            if !self
+                .inputs
+                .arch
+                .is_return_register_name(&phi.dst.name.to_ascii_lowercase())
+            {
+                continue;
+            }
+
+            for (source_pred, source) in &phi.sources {
+                if *source_pred != pred_addr {
+                    continue;
+                }
+                let candidate =
+                    self.return_register_candidate_for_phi_source_in_predecessor(pred_addr, source);
+                let Some(expr) = candidate else {
+                    continue;
+                };
+                let Some(value) = self.prepared_value_id_for_var(source) else {
+                    continue;
+                };
+                let Some(cert) = prepared
+                    .certificates()
+                    .returns
+                    .iter()
+                    .find(|cert| cert.block_addr == pred_addr && cert.value == value)
+                else {
+                    continue;
+                };
+                let candidate = Some((expr, cert.block_addr, cert.op_index, cert.value));
+                best = match (best, candidate) {
+                    (None, next) => next,
+                    (Some(current), None) => Some(current),
+                    (
+                        Some((current_expr, current_block, current_op, current_value)),
+                        Some((next_expr, next_block, next_op, next_value)),
+                    ) => {
+                        let preferred = self.preferred_return_candidate(
+                            Some(current_expr.clone()),
+                            Some(next_expr.clone()),
+                        );
+                        if preferred.as_ref() == Some(&next_expr) {
+                            Some((next_expr, next_block, next_op, next_value))
+                        } else {
+                            Some((current_expr, current_block, current_op, current_value))
+                        }
+                    }
+                };
+            }
+        }
+
+        best
+    }
+
+    pub(crate) fn predecessor_return_register_candidate_with_proof(
+        &self,
+        pred_addr: u64,
+    ) -> Option<(CExpr, u64, usize, r2ssa::ValueId)> {
+        let prepared = self.inputs.prepared_ssa?;
+        let cert = prepared
+            .certificates()
+            .returns
+            .iter()
+            .filter(|cert| cert.block_addr == pred_addr)
+            .max_by_key(|cert| cert.op_index)?;
+        let source = prepared.value_var(cert.value)?;
+        let expr = self
+            .return_register_candidate_from_predecessor_definition(pred_addr, source)
+            .or_else(|| self.return_register_candidate_for_phi_source(source))?;
+        Some((expr, cert.block_addr, cert.op_index, cert.value))
+    }
+
+    fn return_register_candidate_for_phi_source_in_predecessor(
+        &self,
+        pred_addr: u64,
+        source: &SSAVar,
+    ) -> Option<CExpr> {
+        self.return_register_candidate_for_phi_source(source)
+            .or_else(|| {
+                self.return_register_candidate_from_predecessor_definition(pred_addr, source)
+            })
+    }
+
+    fn return_register_candidate_from_predecessor_definition(
+        &self,
+        pred_addr: u64,
+        source: &SSAVar,
+    ) -> Option<CExpr> {
+        let func = self.inputs.prepared_ssa?.function();
+        let block = func.get_block(pred_addr)?;
+        let (_, op) = block
+            .ops
+            .iter()
+            .enumerate()
+            .find(|(_, op)| op.dst().is_some_and(|dst| dst == source))?;
+        let candidate = match op {
+            SSAOp::Copy { src, .. } => self.get_return_expr(src),
+            SSAOp::IntZExt { dst, src }
+            | SSAOp::IntSExt { dst, src }
+            | SSAOp::Trunc { dst, src }
+            | SSAOp::Cast { dst, src } => {
+                self.tracked_return_cast_expr(dst, src, self.tracked_return_source_expr(src))
+            }
+            _ => {
+                let mut visited = HashSet::new();
+                let raw = self.op_to_expr(op);
+                let expanded = self.expand_return_expr(&raw, 0, &mut visited);
+                let mut semantic_visited = HashSet::new();
+                let semanticized =
+                    self.semanticize_visible_expr(&expanded, 0, &mut semantic_visited);
+                if self.is_predicate_like_expr(&semanticized) {
+                    self.simplify_condition_expr(semanticized)
+                } else {
+                    semanticized
+                }
+            }
+        };
+        let normalized = self.normalize_final_return_candidate(candidate.clone());
+        let sanitized = self.sanitize_final_return_expr(normalized, candidate);
+        (!self
+            .expr_is_bad_return_candidate_in_context(&sanitized, VisibleExprContext::ScalarReturn))
+        .then_some(sanitized)
+    }
+
+    fn return_register_candidate_for_phi_source(&self, source: &SSAVar) -> Option<CExpr> {
+        let source_name = source.display_name();
+        let mut visited = HashSet::new();
+        let candidate = self
+            .render_semantic_value_by_name(&source_name, 0, &mut visited)
+            .or_else(|| {
+                self.lookup_definition_raw_with_depth(&source_name, 0, &mut visited)
+                    .map(|expr| self.semanticize_visible_expr(&expr, 0, &mut visited))
+            })
+            .or_else(|| {
+                self.render_value_ref(&analysis::ValueRef::from(source.clone()), 0, &mut visited)
+            })
+            .or_else(|| self.lookup_definition_with_depth(&source_name, 0, &mut visited))
+            .or_else(|| self.best_visible_definition_with_depth(&source_name, 0, &mut visited))
+            .or_else(|| Some(self.tracked_return_source_expr(source)));
+
+        candidate
+            .map(|expr| self.resolve_return_candidate(&expr))
+            .filter(|expr| !self.expr_is_transient_return_artifact(expr))
+            .map(|expr| {
+                let normalized = self.normalize_final_return_candidate(expr.clone());
+                self.sanitize_final_return_expr(normalized, expr)
+            })
+            .filter(|expr| {
+                !self
+                    .expr_is_bad_return_candidate_in_context(expr, VisibleExprContext::ScalarReturn)
+            })
+    }
+
     pub(super) fn expr_is_transient_return_artifact(&self, expr: &CExpr) -> bool {
         match expr {
             CExpr::Var(name) => {
@@ -543,15 +1055,12 @@ impl<'a> FoldingContext<'a> {
             .find_ssa_name_for_rendered_alias(var_name)
             .filter(|ssa_name| ssa_name != var_name);
         let semantic_name = ssa_name.as_deref().unwrap_or(var_name);
-        let lower = var_name.to_lowercase();
-        let semantic_lower = semantic_name.to_lowercase();
-        if lower.starts_with("const:")
-            || lower.starts_with("tmp:")
-            || semantic_lower.starts_with("const:")
-            || semantic_lower.starts_with("tmp:")
-        {
+        if is_temporary_or_constant_name(var_name) || is_temporary_or_constant_name(semantic_name) {
             return true;
         }
+
+        let lower = var_name.to_lowercase();
+        let semantic_lower = semantic_name.to_lowercase();
         if self.inputs.arch.is_return_register_name(&lower) {
             return true;
         }
@@ -695,6 +1204,13 @@ impl<'a> FoldingContext<'a> {
                 }
                 if self.lookup_predicate_expr(name).is_some() {
                     return self.simplify_condition_expr(CExpr::Var(name.clone()));
+                }
+                if let Some(source_call) = self
+                    .call_result_source_for_ssa_name(name)
+                    .or_else(|| self.local_post_call_source_for_ssa_name(name))
+                    && let Some(candidate) = self.synthesized_call_expr_for_source_call(source_call)
+                {
+                    return candidate;
                 }
                 if let Some(candidate) = self
                     .scalar_context_root_candidate_for_name(name, VisibleExprContext::ScalarReturn)
@@ -1064,14 +1580,44 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn sanitize_final_return_expr(&self, expr: CExpr, fallback: CExpr) -> CExpr {
+        if self.is_certified_rendered_call_expr(&expr) {
+            return self
+                .stable_owner_for_certified_rendered_call_expr(&expr)
+                .unwrap_or(expr);
+        }
+        if self.is_certified_rendered_call_expr(&fallback) {
+            return self
+                .stable_owner_for_certified_rendered_call_expr(&fallback)
+                .unwrap_or(fallback);
+        }
         let context = self.return_context_for_candidates(Some(&expr), Some(&fallback));
         self.preferred_return_candidate_in_context(
             Some(self.resolve_return_candidate_in_context(&fallback, context)),
             Some(self.resolve_return_candidate_in_context(&expr, context)),
             context,
         )
-        .map(|expr| self.rewrite_typed_return_literal_expr(expr, context))
+        .map(|expr| {
+            let expr = self.rewrite_typed_return_literal_expr(expr, context);
+            self.strip_widening_cast_for_function_return(expr)
+        })
         .unwrap_or_else(|| CExpr::Var("return".to_string()))
+    }
+
+    fn strip_widening_cast_for_function_return(&self, expr: CExpr) -> CExpr {
+        let CExpr::Cast { ty, expr: inner } = expr else {
+            return expr;
+        };
+        let Some(return_bits) = self.function_return_int_bits() else {
+            return CExpr::Cast { ty, expr: inner };
+        };
+        let Some(cast_bits) = ty.bits() else {
+            return CExpr::Cast { ty, expr: inner };
+        };
+        if ty.is_integer() && cast_bits > return_bits {
+            *inner
+        } else {
+            CExpr::Cast { ty, expr: inner }
+        }
     }
 
     /// Convert an SSA variable to a C variable name.
@@ -1083,15 +1629,6 @@ impl<'a> FoldingContext<'a> {
                 return format!("0x{:x}", val);
             } else {
                 return format!("{}", val);
-            }
-        }
-
-        if let Some(addr) = extract_call_address(&var.name) {
-            if let Some(sym) = self.lookup_symbol(addr) {
-                return sym.clone();
-            }
-            if let Some(name) = self.lookup_function(addr) {
-                return name.clone();
             }
         }
 
@@ -1109,18 +1646,7 @@ impl<'a> FoldingContext<'a> {
             return alias;
         }
 
-        let base = if var.name.starts_with("reg:") {
-            let reg = var.name.trim_start_matches("reg:");
-            if is_hex_name(reg) {
-                format!("r{}", reg)
-            } else {
-                reg.to_string()
-            }
-        } else if var.name.starts_with("tmp:") {
-            format!("t{}", var.name.trim_start_matches("tmp:"))
-        } else {
-            var.name.to_lowercase()
-        };
+        let base = ssa_render_base_name(var);
 
         if var.version > 0 {
             format!("{}_{}", base, var.version)
@@ -1132,29 +1658,125 @@ impl<'a> FoldingContext<'a> {
     /// Convert a constant variable to a C expression.
     pub(crate) fn const_to_expr(&self, var: &SSAVar) -> CExpr {
         let val = parse_const_value(&var.name).unwrap_or(0);
-
-        // Only resolve addresses that are plausibly code/data (not small literals)
-        if val > 0xff {
-            // Check if this is a function address (e.g., for lea rdi, [main])
-            if let Some(name) = self.lookup_function(val) {
-                return CExpr::Var(name.clone());
-            }
-
-            // Check if this is a string address
-            if let Some(s) = self.lookup_string(val) {
-                return CExpr::StringLit(s.clone());
-            }
-
-            // Check if this is a symbol address
-            if let Some(s) = self.lookup_symbol(val) {
-                return CExpr::Var(s.clone());
-            }
-        }
-
         if val > 0x7fffffff {
             CExpr::UIntLit(val)
         } else {
             CExpr::IntLit(val as i64)
         }
     }
+}
+
+fn prepared_value_transparently_depends_on(
+    prepared: &SsaArtifact,
+    value: ValueId,
+    target: ValueId,
+    depth: u32,
+    visited: &mut HashSet<ValueId>,
+) -> bool {
+    if value == target {
+        return true;
+    }
+    if depth >= 16 || !visited.insert(value) {
+        return false;
+    }
+    let result = prepared
+        .graph()
+        .def_inst(value)
+        .and_then(|inst| prepared.graph().inst(inst))
+        .and_then(|inst| match &inst.payload {
+            r2ssa::InstPayload::Op(
+                SSAOp::Copy { src, .. }
+                | SSAOp::New { src, .. }
+                | SSAOp::Cast { src, .. }
+                | SSAOp::Subpiece { src, .. }
+                | SSAOp::IntZExt { src, .. }
+                | SSAOp::IntSExt { src, .. }
+                | SSAOp::Trunc { src, .. },
+            ) => prepared.graph().value_id_for_var(src),
+            _ => None,
+        })
+        .is_some_and(|source| {
+            prepared_value_transparently_depends_on(prepared, source, target, depth + 1, visited)
+        });
+    visited.remove(&value);
+    result
+}
+
+fn collect_prepared_value_dependency_insts(
+    prepared: &SsaArtifact,
+    value: ValueId,
+    dependencies: &mut HashSet<r2ssa::InstId>,
+    visited: &mut HashSet<ValueId>,
+) {
+    if !visited.insert(value) {
+        return;
+    }
+    let Some(inst) = prepared.graph().def_inst(value) else {
+        return;
+    };
+    if !dependencies.insert(inst) {
+        return;
+    }
+    if let Some(inst) = prepared.graph().inst(inst) {
+        for input in &inst.inputs {
+            collect_prepared_value_dependency_insts(prepared, *input, dependencies, visited);
+        }
+    }
+}
+
+fn prepared_canonical_root_value_id(prepared: &SsaArtifact, value: ValueId) -> ValueId {
+    let Some(facts) = prepared.function().decompile_prep_facts() else {
+        return value;
+    };
+    let Some(mut current) = prepared.value_var(value).cloned() else {
+        return value;
+    };
+    let mut current_id = value;
+    for _ in 0..32 {
+        let Some(next) = facts.canonical_root_of(&current) else {
+            break;
+        };
+        if next == &current {
+            break;
+        }
+        let Some(next_id) = prepared.graph().value_id_for_var(next) else {
+            break;
+        };
+        current = next.clone();
+        current_id = next_id;
+    }
+    current_id
+}
+
+fn prepared_op_is_materialized_phi_edge_copy(
+    prepared: &SsaArtifact,
+    pred_addr: u64,
+    op: &SSAOp,
+) -> bool {
+    let SSAOp::Copy { dst, src } = op else {
+        return false;
+    };
+    let mut successors = prepared.successors(pred_addr);
+    if successors.is_empty()
+        && let Some(block) = prepared.get_block(pred_addr)
+    {
+        successors.extend(block.ops.iter().filter_map(|op| match op {
+            SSAOp::Branch { target } => crate::address::parse_address_from_var_name(&target.name),
+            _ => None,
+        }));
+        successors.sort_unstable();
+        successors.dedup();
+    }
+    let [successor] = successors.as_slice() else {
+        return false;
+    };
+    prepared.get_block(*successor).is_some_and(|block| {
+        block.phis.iter().any(|phi| {
+            phi.dst == *dst
+                && phi
+                    .sources
+                    .iter()
+                    .any(|(pred, value)| *pred == pred_addr && value == src)
+        })
+    })
 }

@@ -1,0 +1,26 @@
+warning: r2dec tests must prove fold/AST/certificate invariants instead of source-shaped raw decompile text
+  --> $DIR/source_shaped_decompile_oracle.rs:18:5
+   |
+LL | /     fn bad_return_shape_oracle() {
+LL | |         let decompiler = Decompiler;
+LL | |         let func = SsaFunction;
+LL | |         let output = decompiler.decompile(&func);
+LL | |         assert!(output.contains("return 1;"));
+LL | |     }
+   | |_____^
+   |
+   = note: `#[warn(r2dec_source_shaped_decompile_oracle)]` on by default
+
+warning: r2dec tests must prove fold/AST/certificate invariants instead of source-shaped raw decompile text
+  --> $DIR/source_shaped_decompile_oracle.rs:25:5
+   |
+LL | /     fn bad_if_shape_oracle() {
+LL | |         let decompiler = Decompiler;
+LL | |         let func = SsaFunction;
+LL | |         let first = decompiler.decompile(&func);
+LL | |         assert!(first.contains("if (arg1 != 19)"));
+LL | |     }
+   | |_____^
+
+warning: 2 warnings emitted
+
