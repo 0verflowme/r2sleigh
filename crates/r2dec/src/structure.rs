@@ -851,11 +851,20 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         match region {
             Region::Block(addr) => self.structure_block(*addr),
             Region::Sequence(regions) => {
-                let stmts: Vec<CStmt> = regions
-                    .iter()
-                    .map(|r| self.structure_region(r))
-                    .filter(|s| !matches!(s, CStmt::Empty))
-                    .collect();
+                let mut stmts = Vec::with_capacity(regions.len());
+                for (index, region) in regions.iter().enumerate() {
+                    let deferred_merge = Self::sequence_owned_merge(regions, index);
+                    if let Some(merge) = deferred_merge {
+                        self.deferred_merge_blocks.push(merge);
+                    }
+                    let stmt = self.structure_region(region);
+                    if let Some(merge) = deferred_merge {
+                        debug_assert_eq!(self.deferred_merge_blocks.pop(), Some(merge));
+                    }
+                    if !matches!(stmt, CStmt::Empty) {
+                        stmts.push(stmt);
+                    }
+                }
                 if stmts.is_empty() {
                     CStmt::Empty
                 } else if stmts.len() == 1 {
@@ -1829,7 +1838,11 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         // into one continuous list instead of wrapping each in CStmt::Block.
         if let Region::Sequence(regions) = body {
             let mut all_stmts = Vec::new();
-            for region in regions {
+            for (index, region) in regions.iter().enumerate() {
+                let deferred_merge = Self::sequence_owned_merge(regions, index);
+                if let Some(merge) = deferred_merge {
+                    self.deferred_merge_blocks.push(merge);
+                }
                 match region {
                     Region::Block(addr) => {
                         // Inline the block's statements directly
@@ -1843,6 +1856,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                         }
                     }
                 }
+                if let Some(merge) = deferred_merge {
+                    debug_assert_eq!(self.deferred_merge_blocks.pop(), Some(merge));
+                }
             }
             if all_stmts.is_empty() {
                 CStmt::Empty
@@ -1853,6 +1869,22 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             }
         } else {
             self.structure_region(body)
+        }
+    }
+
+    fn sequence_owned_merge(regions: &[Region], index: usize) -> Option<u64> {
+        let region = regions.get(index)?;
+        let next = regions.get(index + 1)?;
+        match region {
+            Region::IfThenElse {
+                merge_block: Some(merge),
+                ..
+            }
+            | Region::Switch {
+                merge_block: Some(merge),
+                ..
+            } if next.entry() == *merge => Some(*merge),
+            _ => None,
         }
     }
 

@@ -62,6 +62,7 @@ pub enum WritebackEvidence {
     SsaVarRecovery,
     CertifiedCallArgument,
     CanonicalStackAccessWidth,
+    CanonicalStackSignedness,
     ExternalSignatureCurrent,
     CanonicalMainSignature,
     SsaFieldOffsetPattern,
@@ -77,6 +78,7 @@ impl WritebackEvidence {
             Self::SsaVarRecovery => "ssa-var-recovery",
             Self::CertifiedCallArgument => "certified-call-argument",
             Self::CanonicalStackAccessWidth => "canonical-stack-access-width",
+            Self::CanonicalStackSignedness => "canonical-stack-signedness",
             Self::ExternalSignatureCurrent => "afcfj-current",
             Self::CanonicalMainSignature => "canonical-main-signature",
             Self::SsaFieldOffsetPattern => "ssa-field-offset-pattern",
@@ -2361,6 +2363,7 @@ struct VarTypeCandidateContext<'a> {
     stack_slots: &'a BTreeMap<StackSlotKey, ExternalStackVarSpec>,
     existing_types: &'a HashMap<String, String>,
     stack_access_widths: &'a BTreeMap<StackSlotKey, BTreeSet<u32>>,
+    stack_access_signedness: &'a BTreeMap<StackSlotKey, BTreeSet<ScalarSignednessEvidence>>,
     ptr_bits: u32,
     is_main_signature: bool,
 }
@@ -3903,6 +3906,13 @@ fn build_type_writeback_analysis_inner(
     let existing_types =
         parse_existing_var_types_from_specs(&input.parsed_context.stack_slots, input.ptr_bits);
     let stack_access_widths = canonical_stack_access_widths(input.ssa_blocks, prep_facts);
+    let arch_name = if input.inferred_signature.arch.is_empty() {
+        input.parsed_context.callconv.as_deref()
+    } else {
+        Some(input.inferred_signature.arch.as_str())
+    };
+    let stack_access_signedness =
+        canonical_stack_access_signedness(input.ssa_blocks, prep_facts, arch_name);
     let is_main_signature = merged_signature
         .as_ref()
         .is_some_and(is_canonical_main_signature_spec);
@@ -3913,6 +3923,7 @@ fn build_type_writeback_analysis_inner(
         stack_slots: &input.parsed_context.stack_slots,
         existing_types: &existing_types,
         stack_access_widths: &stack_access_widths,
+        stack_access_signedness: &stack_access_signedness,
         ptr_bits: input.ptr_bits,
         is_main_signature,
     };
@@ -8041,6 +8052,40 @@ fn canonical_stack_access_widths(
     widths
 }
 
+fn canonical_stack_access_signedness(
+    ssa_blocks: &[SSABlock],
+    prep_facts: Option<&r2ssa::DecompilePrepFacts>,
+    arch_name: Option<&str>,
+) -> BTreeMap<StackSlotKey, BTreeSet<ScalarSignednessEvidence>> {
+    let Some(prep_facts) = prep_facts else {
+        return BTreeMap::new();
+    };
+    let scalar_signedness = infer_scalar_signedness(
+        ssa_blocks.iter().flat_map(|block| block.ops.iter()),
+        std::iter::empty(),
+        arch_name,
+    );
+    let mut signedness = BTreeMap::<StackSlotKey, BTreeSet<ScalarSignednessEvidence>>::new();
+    for op in ssa_blocks.iter().flat_map(|block| &block.ops) {
+        let (addr, value) = match op {
+            SSAOp::Load { dst, addr, .. } => (addr, dst),
+            SSAOp::Store { addr, val, .. } => (addr, val),
+            _ => continue,
+        };
+        let Some(observed) = scalar_signedness.get(value) else {
+            continue;
+        };
+        let Some(root) = prep_facts.stack_address_root_of(addr).copied() else {
+            continue;
+        };
+        signedness
+            .entry(stack_slot_key_from_prepared_root(root))
+            .or_default()
+            .extend(observed.iter().copied());
+    }
+    signedness
+}
+
 fn merge_rebased_stack_slot(
     target: &mut ExternalStackVarSpec,
     source: ExternalStackVarSpec,
@@ -8898,6 +8943,16 @@ fn exact_stack_access_bits(
     bytes.checked_mul(8)
 }
 
+fn exact_stack_access_signedness(
+    var: &RecoveredVariable,
+    signedness: &BTreeMap<StackSlotKey, BTreeSet<ScalarSignednessEvidence>>,
+) -> Option<ScalarSignednessEvidence> {
+    let slot = stack_slot_key_for_recovered_var(var)?;
+    let mut observed = signedness.get(&slot)?.iter().copied();
+    let signedness = observed.next()?;
+    observed.next().is_none().then_some(signedness)
+}
+
 fn apply_canonical_stack_width_types(
     stack_slots: &mut BTreeMap<StackSlotKey, ExternalStackVarSpec>,
     vars: &[RecoveredVariable],
@@ -8940,7 +8995,12 @@ fn apply_canonical_stack_width_types(
         else {
             continue;
         };
-        if existing_bits != candidate_bits {
+        let has_exact_signedness = candidate
+            .evidence
+            .contains(&WritebackEvidence::CanonicalStackSignedness);
+        if existing_bits != candidate_bits
+            || (has_exact_signedness && slot.ty.as_ref() != Some(&candidate_ty))
+        {
             slot.ty = Some(candidate_ty);
         }
     }
@@ -9030,6 +9090,18 @@ fn build_var_type_candidates(
             confidence = confidence.max(96);
             source = WritebackSource::DataflowRanked;
             evidence.push(WritebackEvidence::CanonicalStackAccessWidth);
+        }
+        if let Some(signedness) = exact_stack_access_signedness(var, ctx.stack_access_signedness)
+            && let Some(bits) = exact_access_bits
+            && integer_type_bits(&chosen_type, ctx.ptr_bits) == Some(bits)
+        {
+            chosen_type = match signedness {
+                ScalarSignednessEvidence::Signed => size_to_type(bits / 8),
+                ScalarSignednessEvidence::Unsigned => size_to_unsigned_type(bits / 8),
+            };
+            confidence = confidence.max(97);
+            source = WritebackSource::DataflowRanked;
+            evidence.push(WritebackEvidence::CanonicalStackSignedness);
         }
 
         if let Some(ext) = slot_spec
@@ -11225,6 +11297,110 @@ mod tests {
                         offset: -16,
                     })
         }));
+    }
+
+    #[test]
+    fn canonical_stack_zero_extension_recovers_unsigned_local() {
+        let addr = SSAVar::new("tmp:byte", 1, 8);
+        let loaded = SSAVar::new("tmp:loaded", 1, 1);
+        let blocks = [SSABlock {
+            addr: 0x1000,
+            size: 4,
+            ops: vec![
+                SSAOp::Load {
+                    dst: loaded.clone(),
+                    space: "ram".to_string(),
+                    addr: addr.clone(),
+                },
+                SSAOp::IntZExt {
+                    dst: SSAVar::new("w8", 1, 4),
+                    src: loaded,
+                },
+            ],
+        }];
+        let prep_facts = r2ssa::DecompilePrepFacts {
+            stack_address_roots: [(
+                addr,
+                r2ssa::StackAddressRoot {
+                    base: r2ssa::StackAddressBase::StackPointer,
+                    offset: -15,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..r2ssa::DecompilePrepFacts::default()
+        };
+        let slot_key = StackSlotKey {
+            base: ExternalStackBase::StackPointer,
+            offset: -15,
+        };
+        let mut parsed_context = ParsedExternalContext::default();
+        parsed_context.stack_slots.insert(
+            slot_key.clone(),
+            ExternalStackVarSpec {
+                name: "var_fh".to_string(),
+                ty: Some(CTypeLike::Int {
+                    bits: 8,
+                    signedness: Signedness::Signed,
+                }),
+                base: ExternalStackBase::StackPointer,
+                role: ExternalStackSlotRole::Local,
+                param_index: None,
+                param_name: None,
+                source_reg: None,
+            },
+        );
+        let vars = [RecoveredVariable {
+            name: "var_fh".to_string(),
+            kind: "s".to_string(),
+            delta: -15,
+            var_type: "int8_t".to_string(),
+            isarg: false,
+            reg: None,
+        }];
+
+        let analysis = build_type_writeback_analysis_with_prep_facts(
+            TypeWritebackAnalysisInput {
+                function_name: "sym._fnv_fold",
+                ptr_bits: 64,
+                inferred_signature: InferredSignature {
+                    function_name: "sym._fnv_fold".to_string(),
+                    signature: "void sym._fnv_fold ()".to_string(),
+                    ret_type: "void".to_string(),
+                    params: Vec::new(),
+                    callconv: String::new(),
+                    arch: "aarch64".to_string(),
+                    confidence: 0,
+                    callconv_confidence: 0,
+                },
+                recovered_vars: &vars,
+                ssa_blocks: &blocks,
+                parsed_context,
+                local_structs: LocalStructArtifacts::default(),
+                interproc_summary_set: None,
+                diagnostics: TypeWritebackDiagnostics::default(),
+            },
+            &prep_facts,
+        );
+
+        let candidate = &analysis.plan.var_type_candidates[0];
+        assert_eq!(candidate.var_type, "uint8_t");
+        assert!(
+            candidate
+                .evidence
+                .contains(&WritebackEvidence::CanonicalStackSignedness)
+        );
+        assert_eq!(
+            analysis
+                .type_facts
+                .stack_slots
+                .get(&slot_key)
+                .and_then(|slot| slot.ty.clone()),
+            Some(CTypeLike::Int {
+                bits: 8,
+                signedness: Signedness::Unsigned,
+            })
+        );
     }
 
     #[test]

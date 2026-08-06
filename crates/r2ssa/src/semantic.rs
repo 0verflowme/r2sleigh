@@ -4574,6 +4574,7 @@ fn collect_compare_defs(function: &SSAFunction, graph: &SsaGraph) -> CompareDefi
         for op in &block.ops {
             let Some((dst, kind, lhs, rhs)) = compare_components(op) else {
                 if let Some((dst, kind, lhs, rhs)) = signed_flag_compare_components(
+                    graph,
                     op,
                     &signed_overflow_sources,
                     &signed_sign_sources,
@@ -4608,9 +4609,12 @@ fn collect_compare_defs(function: &SSAFunction, graph: &SsaGraph) -> CompareDefi
                     rhs: normalized_rhs,
                 },
             );
-            if let Some((dst, kind, lhs, rhs)) =
-                signed_flag_compare_components(op, &signed_overflow_sources, &signed_sign_sources)
-            {
+            if let Some((dst, kind, lhs, rhs)) = signed_flag_compare_components(
+                graph,
+                op,
+                &signed_overflow_sources,
+                &signed_sign_sources,
+            ) {
                 let comparison = CompareProvenance { kind, lhs, rhs };
                 normalized.insert(dst.clone(), comparison.clone());
                 evaluated.insert(dst.clone(), comparison);
@@ -4618,8 +4622,8 @@ fn collect_compare_defs(function: &SSAFunction, graph: &SsaGraph) -> CompareDefi
         }
     }
 
-    propagate_compare_definitions(function, &mut normalized);
-    propagate_compare_definitions(function, &mut evaluated);
+    propagate_compare_definitions(function, graph, &mut normalized);
+    propagate_compare_definitions(function, graph, &mut evaluated);
     CompareDefinitions {
         normalized,
         evaluated,
@@ -4628,6 +4632,7 @@ fn collect_compare_defs(function: &SSAFunction, graph: &SsaGraph) -> CompareDefi
 
 fn propagate_compare_definitions(
     function: &SSAFunction,
+    graph: &SsaGraph,
     compare_defs: &mut BTreeMap<SSAVar, CompareProvenance>,
 ) {
     loop {
@@ -4657,12 +4662,12 @@ fn propagate_compare_definitions(
                     SSAOp::BoolAnd { dst, a, b } => compare_defs
                         .get(a)
                         .zip(compare_defs.get(b))
-                        .and_then(|(lhs, rhs)| combine_compare_provenance(lhs, rhs, false))
+                        .and_then(|(lhs, rhs)| combine_compare_provenance(graph, lhs, rhs, false))
                         .map(|comparison| (dst, comparison)),
                     SSAOp::BoolOr { dst, a, b } => compare_defs
                         .get(a)
                         .zip(compare_defs.get(b))
-                        .and_then(|(lhs, rhs)| combine_compare_provenance(lhs, rhs, true))
+                        .and_then(|(lhs, rhs)| combine_compare_provenance(graph, lhs, rhs, true))
                         .map(|comparison| (dst, comparison)),
                     _ => None,
                 };
@@ -4773,17 +4778,29 @@ fn invert_compare_provenance(comparison: &CompareProvenance) -> Option<ComparePr
 }
 
 fn combine_compare_provenance(
+    graph: &SsaGraph,
     lhs: &CompareProvenance,
     rhs: &CompareProvenance,
     is_or: bool,
 ) -> Option<CompareProvenance> {
-    if lhs == rhs {
+    combine_compare_provenance_by(lhs, rhs, is_or, |lhs, rhs| {
+        compare_values_equivalent(graph, lhs, rhs)
+    })
+}
+
+fn combine_compare_provenance_by(
+    lhs: &CompareProvenance,
+    rhs: &CompareProvenance,
+    is_or: bool,
+    equivalent: impl Fn(ValueId, ValueId) -> bool,
+) -> Option<CompareProvenance> {
+    if lhs.kind == rhs.kind && equivalent(lhs.lhs, rhs.lhs) && equivalent(lhs.rhs, rhs.rhs) {
         return Some(lhs.clone());
     }
 
     let equality_operands_match = |ordered: &CompareProvenance, equality: &CompareProvenance| {
-        ordered.lhs == equality.lhs && ordered.rhs == equality.rhs
-            || ordered.lhs == equality.rhs && ordered.rhs == equality.lhs
+        equivalent(ordered.lhs, equality.lhs) && equivalent(ordered.rhs, equality.rhs)
+            || equivalent(ordered.lhs, equality.rhs) && equivalent(ordered.rhs, equality.lhs)
     };
     let (ordered, equality) = if matches!(
         lhs.kind,
@@ -4824,6 +4841,82 @@ fn combine_compare_provenance(
     })
 }
 
+fn compare_values_equivalent(graph: &SsaGraph, lhs: ValueId, rhs: ValueId) -> bool {
+    compare_values_equivalent_inner(graph, lhs, rhs, 0, &mut BTreeSet::new())
+}
+
+fn compare_values_equivalent_inner(
+    graph: &SsaGraph,
+    lhs: ValueId,
+    rhs: ValueId,
+    depth: usize,
+    visiting: &mut BTreeSet<(ValueId, ValueId)>,
+) -> bool {
+    if lhs == rhs {
+        return true;
+    }
+    if depth >= 16 {
+        return false;
+    }
+    let pair = if lhs < rhs { (lhs, rhs) } else { (rhs, lhs) };
+    if !visiting.insert(pair) {
+        return false;
+    }
+    let equivalent = (|| {
+        let lhs_value = graph.value(lhs)?;
+        let rhs_value = graph.value(rhs)?;
+        if lhs_value.var.size != rhs_value.var.size {
+            return Some(false);
+        }
+        if lhs_value.var.is_const() || rhs_value.var.is_const() {
+            return Some(
+                lhs_value.var.is_const()
+                    && rhs_value.var.is_const()
+                    && const_value(&lhs_value.var) == const_value(&rhs_value.var),
+            );
+        }
+        let lhs_inst = graph.inst(graph.def_inst(lhs)?)?;
+        let rhs_inst = graph.inst(graph.def_inst(rhs)?)?;
+        let (InstPayload::Op(lhs_op), InstPayload::Op(rhs_op)) =
+            (&lhs_inst.payload, &rhs_inst.payload)
+        else {
+            return Some(false);
+        };
+        let mut equivalent_sources = |lhs: &SSAVar, rhs: &SSAVar| {
+            graph
+                .value_id_for_var(lhs)
+                .zip(graph.value_id_for_var(rhs))
+                .is_some_and(|(lhs, rhs)| {
+                    compare_values_equivalent_inner(graph, lhs, rhs, depth + 1, visiting)
+                })
+        };
+        Some(match (lhs_op, rhs_op) {
+            (
+                SSAOp::Subpiece {
+                    src: lhs,
+                    offset: lhs_offset,
+                    ..
+                },
+                SSAOp::Subpiece {
+                    src: rhs,
+                    offset: rhs_offset,
+                    ..
+                },
+            ) => lhs_offset == rhs_offset && equivalent_sources(lhs, rhs),
+            (SSAOp::IntZExt { src: lhs, .. }, SSAOp::IntZExt { src: rhs, .. })
+            | (SSAOp::IntSExt { src: lhs, .. }, SSAOp::IntSExt { src: rhs, .. })
+            | (SSAOp::Trunc { src: lhs, .. }, SSAOp::Trunc { src: rhs, .. })
+            | (SSAOp::Cast { src: lhs, .. }, SSAOp::Cast { src: rhs, .. }) => {
+                equivalent_sources(lhs, rhs)
+            }
+            _ => false,
+        })
+    })()
+    .unwrap_or(false);
+    visiting.remove(&pair);
+    equivalent
+}
+
 fn normalize_zero_sub_compare_operands(
     kind: CompareKind,
     lhs: &SSAVar,
@@ -4849,6 +4942,7 @@ fn normalize_zero_sub_compare_operands(
 }
 
 fn signed_flag_compare_components<'a>(
+    graph: &SsaGraph,
     op: &'a SSAOp,
     signed_overflow_sources: &BTreeMap<SSAVar, (ValueId, ValueId)>,
     signed_sign_sources: &BTreeMap<SSAVar, (ValueId, ValueId)>,
@@ -4862,14 +4956,14 @@ fn signed_flag_compare_components<'a>(
     let sign = signed_sign_sources.get(b);
     let (lhs, rhs) = overflow
         .zip(sign)
-        .filter(|(overflow, sign)| overflow == sign)
+        .filter(|(overflow, sign)| compare_operand_pairs_equivalent(graph, overflow, sign))
         .map(|(overflow, _)| *overflow)
         .or_else(|| {
             let overflow = signed_overflow_sources.get(b);
             let sign = signed_sign_sources.get(a);
             overflow
                 .zip(sign)
-                .filter(|(overflow, sign)| overflow == sign)
+                .filter(|(overflow, sign)| compare_operand_pairs_equivalent(graph, overflow, sign))
                 .map(|(overflow, _)| *overflow)
         })?;
     Some(if equal {
@@ -4877,6 +4971,14 @@ fn signed_flag_compare_components<'a>(
     } else {
         (dst, CompareKind::SignedLess, lhs, rhs)
     })
+}
+
+fn compare_operand_pairs_equivalent(
+    graph: &SsaGraph,
+    lhs: &(ValueId, ValueId),
+    rhs: &(ValueId, ValueId),
+) -> bool {
+    compare_values_equivalent(graph, lhs.0, rhs.0) && compare_values_equivalent(graph, lhs.1, rhs.1)
 }
 
 fn compare_components(op: &SSAOp) -> Option<(&SSAVar, CompareKind, &SSAVar, &SSAVar)> {
@@ -5024,7 +5126,7 @@ fn stack_base_root_for_name(name: &str) -> Option<StackAddressRoot> {
 mod tests {
     use super::{
         CallSiteId, CompareKind, CompareProvenance, ControlGuard, LoopId, ObjectId, PredicateId,
-        ProofNodeId, SemanticId, StructuredAccessId, combine_compare_provenance,
+        ProofNodeId, SemanticId, StructuredAccessId, combine_compare_provenance_by,
         invert_compare_provenance,
     };
     use crate::{InstId, SsaArtifact, ValueId};
@@ -5045,7 +5147,7 @@ mod tests {
             rhs: lhs,
         };
         assert_eq!(
-            combine_compare_provenance(&equal, &signed_less, true),
+            combine_compare_provenance_by(&equal, &signed_less, true, |lhs, rhs| lhs == rhs),
             Some(CompareProvenance {
                 kind: CompareKind::SignedLessEqual,
                 lhs,
@@ -5189,7 +5291,9 @@ mod tests {
     #[test]
     fn predicate_comparison_recovers_aarch64_signed_less_equal_flags() {
         let mut entry = R2ILBlock::new(0x1000, 4);
-        let lhs = Varnode::new(SpaceId::Register, 0, 4);
+        let wide_lhs = Varnode::new(SpaceId::Register, 0, 8);
+        let overflow_lhs = Varnode::unique(0x70, 4);
+        let sign_lhs = Varnode::unique(0x78, 4);
         let rhs = Varnode::constant(2, 4);
         let copied_rhs = Varnode::unique(0x08, 4);
         let overflow = Varnode::unique(0x10, 1);
@@ -5201,18 +5305,28 @@ mod tests {
         let copied_negative = Varnode::register(0x100, 1);
         let copied_zero = Varnode::register(0x101, 1);
         let copied_overflow = Varnode::register(0x102, 1);
+        entry.push(R2ILOp::Subpiece {
+            dst: overflow_lhs.clone(),
+            src: wide_lhs.clone(),
+            offset: 0,
+        });
+        entry.push(R2ILOp::Subpiece {
+            dst: sign_lhs.clone(),
+            src: wide_lhs,
+            offset: 0,
+        });
         entry.push(R2ILOp::Copy {
             dst: copied_rhs.clone(),
             src: rhs.clone(),
         });
         entry.push(R2ILOp::IntSBorrow {
             dst: overflow.clone(),
-            a: lhs.clone(),
+            a: overflow_lhs.clone(),
             b: rhs.clone(),
         });
         entry.push(R2ILOp::IntSub {
             dst: difference.clone(),
-            a: lhs,
+            a: sign_lhs,
             b: copied_rhs,
         });
         entry.push(R2ILOp::IntSLess {
@@ -5269,7 +5383,7 @@ mod tests {
                 .graph()
                 .value(comparison.lhs)
                 .map(|value| value.var.name.as_str()),
-            Some("reg:0")
+            Some("tmp:70")
         );
         assert_eq!(
             artifact

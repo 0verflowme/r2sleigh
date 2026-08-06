@@ -1482,7 +1482,7 @@ impl<'a> RegionAnalyzer<'a> {
                     } else {
                         None
                     };
-                    match (then_region, else_region) {
+                    let branch_region = match (then_region, else_region) {
                         (Some(then_r), Some(else_r)) => Region::IfThenElse {
                             cond_block,
                             then_region: then_r,
@@ -1502,6 +1502,16 @@ impl<'a> RegionAnalyzer<'a> {
                             merge_block: merge.and_then(|id| graph.node_entry(id)),
                         },
                         _ => base,
+                    };
+                    if let Some(merge_node) = merge
+                        && graph.node_entry(merge_node).is_some_and(|merge_block| {
+                            self.dominators.dominates(cond_block, merge_block)
+                        })
+                        && let Some(continuation) = region_map.remove(&merge_node)
+                    {
+                        Self::sequence_merge(branch_region, continuation)
+                    } else {
+                        branch_region
                     }
                 }
                 _ => {
@@ -2548,6 +2558,61 @@ mod tests {
     }
 
     #[test]
+    fn iterative_loop_composition_preserves_post_merge_latch() {
+        let blocks = [0x1000, 0x1010, 0x1020, 0x1030, 0x1034, 0x1040, 0x1050]
+            .into_iter()
+            .map(|addr| {
+                let mut block = R2ILBlock::new(addr, 4);
+                block.push(R2ILOp::Nop);
+                block
+            })
+            .collect::<Vec<_>>();
+        let mut func = SSAFunction::from_blocks_raw_no_arch(&blocks).expect("ssa function");
+        func.cfg_mut()
+            .set_terminator(0x1000, BlockTerminator::Branch { target: 0x1010 });
+        func.cfg_mut().set_terminator(
+            0x1010,
+            BlockTerminator::ConditionalBranch {
+                true_target: 0x1020,
+                false_target: 0x1050,
+            },
+        );
+        func.cfg_mut().set_terminator(
+            0x1020,
+            BlockTerminator::ConditionalBranch {
+                true_target: 0x1030,
+                false_target: 0x1040,
+            },
+        );
+        func.cfg_mut()
+            .set_terminator(0x1030, BlockTerminator::Branch { target: 0x1034 });
+        func.cfg_mut()
+            .set_terminator(0x1034, BlockTerminator::Branch { target: 0x1040 });
+        func.cfg_mut()
+            .set_terminator(0x1040, BlockTerminator::Branch { target: 0x1010 });
+        func.cfg_mut()
+            .set_terminator(0x1050, BlockTerminator::Return);
+        func.refresh_after_cfg_mutation();
+
+        let mut analyzer = RegionAnalyzer::new(&func);
+        let region = analyzer.analyze();
+        assert!(
+            region.blocks().contains(&0x1040),
+            "post-merge latch must remain owned by the loop region: {region:?}"
+        );
+        let Region::Sequence(regions) = &region else {
+            panic!("expected preheader and loop sequence, got {region:?}");
+        };
+        let Some(Region::WhileLoop { body, .. }) = regions.get(1) else {
+            panic!("expected pre-tested loop after preheader, got {region:?}");
+        };
+        assert!(
+            body.blocks().contains(&0x1040),
+            "loop body must retain the state-updating latch: {body:?}"
+        );
+    }
+
+    #[test]
     fn test_if_then_else_blocks() {
         let region = Region::IfThenElse {
             cond_block: 0x1000,
@@ -2680,13 +2745,20 @@ mod tests {
 
         let topo = graph.topological_order().expect("graph should be acyclic");
         let region = analyzer.analyze_post_collapse_iterative(entry_node, &graph, &topo);
+        let branch = match &region {
+            Region::IfThenElse { .. } => &region,
+            Region::Sequence(regions) => regions
+                .first()
+                .expect("conditional sequence should retain its branch region"),
+            _ => panic!("expected conditional region with its continuation, got {region:?}"),
+        };
         let Region::IfThenElse {
             then_region,
             else_region,
             ..
-        } = region
+        } = branch
         else {
-            panic!("expected top-level IfThenElse region");
+            panic!("expected leading IfThenElse region, got {region:?}");
         };
 
         assert_eq!(
