@@ -12744,13 +12744,38 @@ mod tests {
         arch.addr_size = 8;
         arch.add_register(r2il::RegisterDef::new("rax", 0, 8));
         arch.add_register(r2il::RegisterDef::new("rdi", 0x10, 8));
+        arch.add_register(r2il::RegisterDef::new("rsi", 0x18, 8));
+        arch.add_register(r2il::RegisterDef::sub("esi", 0x18, 4, "rsi"));
         let mut block = R2ILBlock::new(0x401000, 4);
+        block.push(r2il::R2ILOp::IntZExt {
+            dst: r2il::Varnode::unique(0x100, 8),
+            src: r2il::Varnode::register(0x18, 4),
+        });
+        block.push(r2il::R2ILOp::IntMult {
+            dst: r2il::Varnode::unique(0x108, 8),
+            a: r2il::Varnode::unique(0x100, 8),
+            b: r2il::Varnode::constant(8, 8),
+        });
+        block.push(r2il::R2ILOp::IntAdd {
+            dst: r2il::Varnode::unique(0x110, 8),
+            a: r2il::Varnode::register(0x10, 8),
+            b: r2il::Varnode::unique(0x108, 8),
+        });
         block.push(r2il::R2ILOp::Load {
             dst: r2il::Varnode::register(0, 8),
             space: r2il::SpaceId::Ram,
-            addr: r2il::Varnode::register(0x10, 8),
+            addr: r2il::Varnode::unique(0x110, 8),
         });
         let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&arch)).expect("prepared");
+        let memory = prepared
+            .memory_certificate_for_op_site(0x401000, 3, false)
+            .expect("indexed memory certificate");
+        let index_value = prepared
+            .addresses()
+            .parameter_expression(memory.address)
+            .and_then(|address| address.terms.first())
+            .map(|term| term.value)
+            .expect("semantic array index");
         let type_facts = FunctionTypeFacts {
             array_index_certificates: vec![r2types::ArrayIndexCertificate {
                 slot: 0,
@@ -12761,12 +12786,12 @@ mod tests {
             scalar_array_render_candidates: vec![r2types::ScalarArrayRenderCandidate {
                 slot: 0,
                 block_addr: 0x401000,
-                op_index: 0,
+                op_index: 3,
                 is_write: false,
                 field_offset: 0,
                 element_stride: 8,
                 access_width: 8,
-                index_value: None,
+                index_value: Some(index_value),
             }],
             ..FunctionTypeFacts::default()
         };
@@ -12780,10 +12805,10 @@ mod tests {
         let array = facts
             .render()
             .expect("render facts")
-            .array_access_for_op(0x401000, 0, false, 0, 8, Some(8))
+            .array_access_for_op(0x401000, 3, false, 0, 8, Some(8))
             .expect("matching candidate must be promoted only through prepared memory proof");
         assert_eq!(array.block_addr, 0x401000);
-        assert_eq!(array.op_index, 0);
+        assert_eq!(array.op_index, 3);
         assert!(!array.is_write);
     }
 

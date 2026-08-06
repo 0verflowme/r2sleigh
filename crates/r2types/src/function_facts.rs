@@ -2036,9 +2036,10 @@ impl FunctionFacts {
                 {
                     continue;
                 }
-                let prepared_param_slot =
-                    prepared_memory_access_param_slot(prepared, memory, param_slots);
-                if prepared_param_slot.is_some_and(|slot| slot != candidate.slot) {
+                if self
+                    .certified_scalar_array_identity(prepared, memory, candidate)
+                    .is_none()
+                {
                     continue;
                 }
                 let ptr_bits = prepared_memory_access_ptr_bits(prepared, memory);
@@ -2118,7 +2119,7 @@ impl FunctionFacts {
     pub fn populate_array_access_render_facts_from_scalar_candidates(
         &mut self,
         prepared: &r2ssa::SsaArtifact,
-        param_slots: &ParamSlotResolver,
+        _param_slots: &ParamSlotResolver,
     ) {
         if self.types.scalar_array_render_candidates.is_empty() {
             return;
@@ -2152,30 +2153,11 @@ impl FunctionFacts {
                 {
                     continue;
                 }
-                let prepared_param_slot =
-                    prepared_memory_access_param_slot(prepared, memory, param_slots);
-                if prepared_param_slot.is_some_and(|slot| slot != candidate.slot) {
+                let Some((base, index)) =
+                    self.certified_scalar_array_identity(prepared, memory, candidate)
+                else {
                     continue;
-                }
-                let semantic_identity = candidate.index_value.and_then(|index| {
-                    let base = r2ssa::SemanticId::parameter(candidate.slot)?;
-                    (self
-                        .render
-                        .parameter_values(candidate.slot)
-                        .next()
-                        .is_some()
-                        && self
-                            .render
-                            .certified_expr_for_value(index)
-                            .is_some_and(|expr| expr.fact.renderable))
-                    .then_some((base, r2ssa::SemanticId::expression(index)))
-                });
-                if candidate.index_value.is_some() && semantic_identity.is_none() {
-                    continue;
-                }
-                let (base, index) = semantic_identity
-                    .map(|(base, index)| (Some(base), Some(index)))
-                    .unwrap_or((None, None));
+                };
                 let fact = ArrayAccessRenderFact {
                     access: memory.access,
                     block_addr: memory.block_addr,
@@ -2185,8 +2167,8 @@ impl FunctionFacts {
                     field_offset: candidate.field_offset,
                     element_stride: candidate.element_stride,
                     access_width: memory.width,
-                    base,
-                    index,
+                    base: Some(base),
+                    index: Some(index),
                 };
                 let facts = self.render.array_accesses_by_op.entry(key).or_default();
                 if !facts.contains(&fact) {
@@ -2226,6 +2208,39 @@ impl FunctionFacts {
                     Some(crate::facts::ArrayIndexBase::StackSlot { .. }) | None => true,
                 }
         })
+    }
+
+    fn certified_scalar_array_identity(
+        &self,
+        prepared: &r2ssa::SsaArtifact,
+        memory: &MemoryAccessRenderFact,
+        candidate: crate::facts::ScalarArrayRenderCandidate,
+    ) -> Option<(r2ssa::SemanticId, r2ssa::SemanticId)> {
+        let index = candidate.index_value?;
+        let address = prepared.addresses().parameter_expression(memory.address)?;
+        let [term] = address.terms.as_slice() else {
+            return None;
+        };
+        if address.parameter != candidate.slot
+            || address.offset != i64::try_from(candidate.field_offset).ok()?
+            || term.coefficient != i64::try_from(candidate.element_stride).ok()?
+            || term.value != index
+            || self
+                .render
+                .parameter_values(candidate.slot)
+                .next()
+                .is_none()
+            || !self
+                .render
+                .certified_expr_for_value(index)
+                .is_some_and(|expr| expr.fact.renderable)
+        {
+            return None;
+        }
+        Some((
+            r2ssa::SemanticId::parameter(candidate.slot)?,
+            r2ssa::SemanticId::expression(index),
+        ))
     }
 
     pub fn type_facts(&self) -> &FunctionTypeFacts {
@@ -3697,11 +3712,6 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
         );
     }
     let consumer_roots = prepared_render_consumer_occurrences(prepared, carrier_edge_roots);
-    let stack_reload_accesses = certificates
-        .stack_reloads
-        .values()
-        .map(|reload| reload.load_access)
-        .collect::<BTreeSet<_>>();
     for effect in certified_memory_effects.values_mut() {
         let CertifiedEffect::Memory { fact, .. } = effect else {
             continue;
@@ -3709,7 +3719,7 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
         let Some(value) = fact.value.filter(|_| !fact.is_write) else {
             continue;
         };
-        if stack_reload_accesses.contains(&fact.access) {
+        if certificates.stack_slots.contains_key(&fact.object) {
             continue;
         }
         let dependency_occurrences = consumer_roots.iter().copied().fold(0_u8, |count, root| {
@@ -4964,6 +4974,7 @@ mod tests {
         arch.add_register(RegisterDef::sub("eax", 0x00, 4, "rax"));
         arch.add_register(RegisterDef::new("rdi", 0x10, 8));
         arch.add_register(RegisterDef::new("rsi", 0x18, 8));
+        arch.add_register(RegisterDef::sub("esi", 0x18, 4, "rsi"));
         arch.add_register(RegisterDef::new("rbp", 0x20, 8));
         arch
     }
@@ -5499,17 +5510,42 @@ mod tests {
     #[test]
     fn scalar_array_candidates_populate_indexed_member_render_facts() {
         let mut block = R2ILBlock::new(0x401000, 4);
+        block.push(R2ILOp::IntZExt {
+            dst: Varnode::unique(0x100, 8),
+            src: Varnode::register(0x18, 4),
+        });
+        block.push(R2ILOp::IntMult {
+            dst: Varnode::unique(0x108, 8),
+            a: Varnode::unique(0x100, 8),
+            b: Varnode::constant(16, 8),
+        });
+        block.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(0x110, 8),
+            a: Varnode::register(0x10, 8),
+            b: Varnode::unique(0x108, 8),
+        });
+        block.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(0x118, 8),
+            a: Varnode::unique(0x110, 8),
+            b: Varnode::constant(4, 8),
+        });
         block.push(R2ILOp::Load {
             dst: Varnode::register(0x00, 4),
             space: SpaceId::Ram,
-            addr: Varnode::register(0x10, 8),
+            addr: Varnode::unique(0x118, 8),
         });
         let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
             .expect("prepared");
         let index_value = prepared
-            .memory_certificate_for_op_site(0x401000, 0, false)
+            .memory_certificate_for_op_site(0x401000, 4, false)
             .expect("array load certificate")
             .address;
+        let index_value = prepared
+            .addresses()
+            .parameter_expression(index_value)
+            .and_then(|address| address.terms.first())
+            .map(|term| term.value)
+            .expect("semantic array index");
         let type_facts = FunctionTypeFacts {
             array_index_certificates: vec![crate::facts::ArrayIndexCertificate {
                 slot: 0,
@@ -5526,7 +5562,7 @@ mod tests {
             scalar_array_render_candidates: vec![crate::facts::ScalarArrayRenderCandidate {
                 slot: 0,
                 block_addr: 0x401000,
-                op_index: 0,
+                op_index: 4,
                 is_write: false,
                 field_offset: 4,
                 element_stride: 16,
@@ -5551,18 +5587,18 @@ mod tests {
         let render = facts.render().expect("render facts");
         assert!(
             render
-                .member_access_for_op(0x401000, 0, false, "score", 4, Some(4))
+                .member_access_for_op(0x401000, 4, false, "score", 4, Some(4))
                 .is_some(),
             "scalar array candidate plus field certificate must authorize indexed member rendering"
         );
         assert!(
             render
-                .array_access_for_op(0x401000, 0, false, 4, 16, Some(4))
+                .array_access_for_op(0x401000, 4, false, 4, 16, Some(4))
                 .is_some(),
             "scalar array candidate must still authorize array rendering"
         );
         let array = render
-            .array_access_for_op(0x401000, 0, false, 4, 16, Some(4))
+            .array_access_for_op(0x401000, 4, false, 4, 16, Some(4))
             .expect("stable array render fact");
         assert_eq!(array.base, Some(r2ssa::SemanticId::Parameter(0)));
         assert_eq!(
@@ -5572,7 +5608,7 @@ mod tests {
     }
 
     #[test]
-    fn scalar_array_member_candidate_requires_matching_second_param_slot() {
+    fn scalar_array_member_candidate_requires_semantic_index_identity() {
         let mut block = R2ILBlock::new(0x401000, 4);
         block.push(R2ILOp::Load {
             dst: Varnode::register(0x00, 4),
@@ -5627,10 +5663,10 @@ mod tests {
             &x86_stack_home_param_slots(),
         );
         assert!(
-            matching_slot_facts.render().is_some_and(|render| render
+            matching_slot_facts.render().is_none_or(|render| render
                 .member_access_for_op(0x401000, 0, false, "score", 4, Some(4))
-                .is_some()),
-            "scalar-array member candidate from rsi must render with a slot 1 certificate"
+                .is_none()),
+            "coordinate-only array candidates must not authorize member rendering"
         );
     }
 

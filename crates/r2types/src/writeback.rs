@@ -5357,13 +5357,57 @@ pub fn infer_local_struct_artifacts_from_prepared_ssa(
 ) -> LocalStructArtifacts {
     let blocks = local_struct_inference_from_function_blocks(prepared.function().blocks().cloned());
     let memory_versions = LocalMemoryVersionFacts::from_prepared(prepared);
-    infer_local_struct_artifacts_from_blocks(
+    let mut artifacts = infer_local_struct_artifacts_from_blocks(
         &blocks,
         Some(&memory_versions),
         arch_name,
         ptr_bits,
         diagnostics,
-    )
+    );
+    artifacts.indexed_accesses = prepared_parameter_indexed_accesses(prepared);
+    artifacts
+}
+
+fn prepared_parameter_indexed_accesses(prepared: &SsaArtifact) -> Vec<ScalarArrayRenderCandidate> {
+    let mut candidates = Vec::new();
+    for access in prepared.certificates().memory_accesses.values() {
+        let Some(address) = prepared.addresses().parameter_expression(access.address) else {
+            continue;
+        };
+        let [index] = address.terms.as_slice() else {
+            continue;
+        };
+        let Ok(element_stride) = u64::try_from(index.coefficient) else {
+            continue;
+        };
+        let Ok(field_offset) = u64::try_from(address.offset) else {
+            continue;
+        };
+        if element_stride == 0
+            || field_offset >= element_stride
+            || u64::from(access.width) > element_stride - field_offset
+            || !prepared
+                .certificates()
+                .expressions
+                .get(&index.value)
+                .is_some_and(|certificate| certificate.renderable)
+        {
+            continue;
+        }
+        candidates.push(ScalarArrayRenderCandidate {
+            slot: address.parameter,
+            block_addr: access.block_addr,
+            op_index: access.op_index,
+            is_write: access.is_write,
+            field_offset,
+            element_stride,
+            access_width: access.width,
+            index_value: Some(index.value),
+        });
+    }
+    candidates.sort();
+    candidates.dedup();
+    candidates
 }
 
 /// Infer layout from the normalized pattern artifact while binding render
@@ -20034,6 +20078,57 @@ mod tests {
                 && matches!(certificate.base, Some(ArrayIndexBase::Param { index: 0 }))
         }));
         assert_eq!(certificates.render_candidates, artifacts.indexed_accesses);
+    }
+
+    #[test]
+    fn prepared_parameter_indexed_accesses_keep_semantic_index_identity() {
+        let mut arch = r2il::ArchSpec::new("x86-64");
+        arch.add_register(r2il::RegisterDef::new("RAX", 0x00, 8));
+        arch.add_register(r2il::RegisterDef::sub("EAX", 0x00, 4, "RAX"));
+        arch.add_register(r2il::RegisterDef::new("RDI", 0x10, 8));
+        arch.add_register(r2il::RegisterDef::new("RSI", 0x18, 8));
+        arch.add_register(r2il::RegisterDef::sub("ESI", 0x18, 4, "RSI"));
+        let mut block = r2il::R2ILBlock::new(0x401000, 4);
+        block.push(r2il::R2ILOp::IntZExt {
+            dst: r2il::Varnode::unique(1, 8),
+            src: r2il::Varnode::register(0x18, 4),
+        });
+        block.push(r2il::R2ILOp::IntAdd {
+            dst: r2il::Varnode::unique(2, 8),
+            a: r2il::Varnode::register(0x10, 8),
+            b: r2il::Varnode::unique(1, 8),
+        });
+        block.push(r2il::R2ILOp::Load {
+            dst: r2il::Varnode::register(0x00, 1),
+            space: r2il::SpaceId::Ram,
+            addr: r2il::Varnode::unique(2, 8),
+        });
+        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&arch))
+            .expect("prepared indexed load");
+        let address = prepared
+            .memory_certificate_for_op_site(0x401000, 2, false)
+            .expect("memory certificate");
+        let parameter_address = prepared
+            .addresses()
+            .parameter_expression(address.address)
+            .expect("parameter-relative address");
+        let index_value = parameter_address.terms[0].value;
+
+        let candidates = prepared_parameter_indexed_accesses(&prepared);
+
+        assert_eq!(
+            candidates,
+            vec![ScalarArrayRenderCandidate {
+                slot: 0,
+                block_addr: 0x401000,
+                op_index: 2,
+                is_write: false,
+                field_offset: 0,
+                element_stride: 1,
+                access_width: 1,
+                index_value: Some(index_value),
+            }]
+        );
     }
 
     #[test]
