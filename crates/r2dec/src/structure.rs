@@ -7698,11 +7698,8 @@ mod tests {
                             terms: vec!["x == 0".to_string()],
                             memory_terms: vec![r2sym::BackwardMemoryCondition {
                                 region: r2sym::BackwardMemoryRegion::Argument { index: 0 },
-                                offset_lo: 0,
-                                offset_hi: 0,
+                                address: r2sym::SemanticMemoryAddress::exact(0),
                                 size: 1,
-                                exact_offset: true,
-                                address_terms: Vec::new(),
                                 evidence: r2sym::SemanticEvidence::exact(),
                                 binding: None,
                                 expr: "*arg0".to_string(),
@@ -7734,11 +7731,8 @@ mod tests {
                 r2sym::MemoryFact {
                     term: r2sym::BackwardMemoryCondition {
                         region: r2sym::BackwardMemoryRegion::Argument { index: 0 },
-                        offset_lo: 0,
-                        offset_hi: 0,
+                        address: r2sym::SemanticMemoryAddress::exact(0),
                         size: 1,
-                        exact_offset: true,
-                        address_terms: Vec::new(),
                         evidence: r2sym::SemanticEvidence::exact(),
                         binding: None,
                         expr: "*arg0".to_string(),
@@ -7852,11 +7846,8 @@ mod tests {
                             terms: vec!["!(x == 0)".to_string()],
                             memory_terms: vec![r2sym::BackwardMemoryCondition {
                                 region: r2sym::BackwardMemoryRegion::Argument { index: 0 },
-                                offset_lo: 0,
-                                offset_hi: 0,
+                                address: r2sym::SemanticMemoryAddress::exact(0),
                                 size: 1,
-                                exact_offset: true,
-                                address_terms: Vec::new(),
                                 evidence: likely.clone(),
                                 binding: None,
                                 expr: "*arg0".to_string(),
@@ -7878,11 +7869,8 @@ mod tests {
                 r2sym::MemoryFact {
                     term: r2sym::BackwardMemoryCondition {
                         region: r2sym::BackwardMemoryRegion::Argument { index: 0 },
-                        offset_lo: 0,
-                        offset_hi: 0,
+                        address: r2sym::SemanticMemoryAddress::exact(0),
                         size: 1,
-                        exact_offset: true,
-                        address_terms: Vec::new(),
                         evidence: likely.clone(),
                         binding: None,
                         expr: "*arg0".to_string(),
@@ -7984,11 +7972,8 @@ mod tests {
                             terms: vec!["x == 0".to_string()],
                             memory_terms: vec![r2sym::BackwardMemoryCondition {
                                 region: r2sym::BackwardMemoryRegion::Argument { index: 0 },
-                                offset_lo: 0,
-                                offset_hi: 0,
+                                address: r2sym::SemanticMemoryAddress::exact(0),
                                 size: 1,
-                                exact_offset: true,
-                                address_terms: Vec::new(),
                                 evidence: r2sym::SemanticEvidence::exact(),
                                 binding: None,
                                 expr: "*arg0".to_string(),
@@ -8020,11 +8005,8 @@ mod tests {
                 r2sym::MemoryFact {
                     term: r2sym::BackwardMemoryCondition {
                         region: r2sym::BackwardMemoryRegion::Argument { index: 0 },
-                        offset_lo: 0,
-                        offset_hi: 0,
+                        address: r2sym::SemanticMemoryAddress::exact(0),
                         size: 1,
-                        exact_offset: true,
-                        address_terms: Vec::new(),
                         evidence: r2sym::SemanticEvidence::exact(),
                         binding: None,
                         expr: "*arg0".to_string(),

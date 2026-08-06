@@ -442,7 +442,7 @@ impl<'a> FoldingContext<'a> {
 
     #[cfg(test)]
     fn symbolic_actionable_memory_condition_expr(&self, block_addr: u64) -> Option<CExpr> {
-        fn memory_term_rank(term: &r2sym::BackwardMemoryCondition) -> (u8, bool, bool, i64, i64) {
+        fn memory_term_rank(term: &r2sym::BackwardMemoryCondition) -> (u8, bool, bool, i128, i128) {
             let evidence_rank = match term.evidence().tier {
                 r2sym::SemanticConfidence::Exact => 3,
                 r2sym::SemanticConfidence::Likely => 2,
@@ -453,8 +453,8 @@ impl<'a> FoldingContext<'a> {
                 evidence_rank,
                 term.exact_value,
                 term.has_exact_address(),
-                -(term.offset_hi - term.offset_lo),
-                -term.offset_lo.abs(),
+                -(i128::from(term.address.offset_hi()) - i128::from(term.address.offset_lo())),
+                -i128::from(term.address.offset_lo()).abs(),
             )
         }
 

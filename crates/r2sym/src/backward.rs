@@ -15,6 +15,7 @@ use crate::value::SymValue;
 use crate::{
     MemoryRegionId, MemoryRegionKind, SemanticConfidence, SemanticEvidence,
     SemanticEvidenceCoverage, SemanticEvidenceProvenance, SemanticEvidenceReason,
+    SemanticMemoryAddress,
 };
 
 const DEFAULT_REVERSE_PATH_LIMIT: usize = 16;
@@ -79,17 +80,9 @@ impl BackwardConditionSummary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackwardMemoryCondition {
     pub region: BackwardMemoryRegion,
-    /// Constant component or bounded concrete-offset range.
-    pub offset_lo: i64,
-    pub offset_hi: i64,
+    #[serde(flatten)]
+    pub address: SemanticMemoryAddress,
     pub size: u32,
-    /// True only when the address is one concrete region-relative offset.
-    pub exact_offset: bool,
-    /// Non-empty terms certify an exact affine address whose constant
-    /// displacement is `offset_lo == offset_hi`; it is exact but not directly
-    /// seedable without values for the referenced SSA terms.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub address_terms: Vec<r2ssa::AffineAddressTerm>,
     #[serde(default, skip_serializing_if = "SemanticEvidence::is_default_exact")]
     pub evidence: SemanticEvidence,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -103,22 +96,20 @@ pub struct BackwardMemoryCondition {
 
 impl BackwardMemoryCondition {
     pub fn has_exact_address(&self) -> bool {
-        self.offset_lo == self.offset_hi && (self.exact_offset || !self.address_terms.is_empty())
+        self.address.has_exact_identity()
     }
 
     pub fn concrete_offset_range(&self) -> Option<(i64, i64)> {
-        self.address_terms
-            .is_empty()
-            .then_some((self.offset_lo, self.offset_hi))
+        self.address.concrete_offset_range()
     }
 
     pub fn evidence(&self) -> SemanticEvidence {
         if self.evidence.is_default_exact() && !self.has_exact_address() {
             inferred_memory_term_evidence(
                 &self.region,
-                self.offset_lo,
-                self.offset_hi,
-                self.exact_offset,
+                self.address.offset_lo(),
+                self.address.offset_hi(),
+                self.address.is_exact_offset(),
             )
         } else {
             self.evidence.clone()
@@ -225,17 +216,18 @@ fn format_backward_memory_location(region: &BackwardMemoryRegion, offset: i64) -
 
 fn backward_memory_term_expr(
     region: &BackwardMemoryRegion,
-    offset_lo: i64,
-    offset_hi: i64,
-    address_terms: &[r2ssa::AffineAddressTerm],
+    address: &SemanticMemoryAddress,
     fallback: &str,
 ) -> String {
-    if !address_terms.is_empty() && offset_lo == offset_hi {
+    let offset_lo = address.offset_lo();
+    let offset_hi = address.offset_hi();
+    if !address.terms().is_empty() && offset_lo == offset_hi {
         let base = match region {
             BackwardMemoryRegion::Argument { index } => format!("arg{index}"),
             BackwardMemoryRegion::Region(region) => region.name.clone(),
         };
-        let terms = address_terms
+        let terms = address
+            .terms()
             .iter()
             .map(|term| format!("{}*v{}", term.coefficient, term.value.0))
             .collect::<Vec<_>>();
@@ -984,16 +976,19 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
             let offset_hi = offsets.iter().copied().max().unwrap_or(0);
             let exact_offset = offset_lo == offset_hi;
             let value_expr = value.to_string();
-            let expr = backward_memory_term_expr(&region, offset_lo, offset_hi, &[], &value_expr);
+            let address = if exact_offset {
+                SemanticMemoryAddress::exact(offset_lo)
+            } else {
+                SemanticMemoryAddress::bounded(offset_lo, offset_hi)
+                    .expect("normalized backward memory bounds")
+            };
+            let expr = backward_memory_term_expr(&region, &address, &value_expr);
             let evidence =
                 inferred_memory_term_evidence(&region, offset_lo, offset_hi, exact_offset);
             self.memory_terms.push(BackwardMemoryCondition {
                 region,
-                offset_lo,
-                offset_hi,
+                address,
                 size,
-                exact_offset,
-                address_terms: Vec::new(),
                 evidence,
                 binding: None,
                 expr,
@@ -1017,25 +1012,16 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
         else {
             return false;
         };
-        let (offset, exact_offset, address_terms) = match &location.address {
-            r2ssa::RelativeMemoryAddress::Exact(offset) => (*offset, true, Vec::new()),
-            r2ssa::RelativeMemoryAddress::Affine { terms, offset } if !terms.is_empty() => {
-                (*offset, false, terms.clone())
-            }
-            r2ssa::RelativeMemoryAddress::Affine { .. } | r2ssa::RelativeMemoryAddress::Unknown => {
-                return false;
-            }
+        let Some(address) = SemanticMemoryAddress::from_ssa(&location.address) else {
+            return false;
         };
         let region = BackwardMemoryRegion::Argument { index: *index };
         let value_expr = value.to_string();
-        let expr = backward_memory_term_expr(&region, offset, offset, &address_terms, &value_expr);
+        let expr = backward_memory_term_expr(&region, &address, &value_expr);
         self.memory_terms.push(BackwardMemoryCondition {
             region,
-            offset_lo: offset,
-            offset_hi: offset,
+            address,
             size: location.size,
-            exact_offset,
-            address_terms,
             evidence: SemanticEvidence::exact(),
             binding: None,
             expr,
@@ -1400,11 +1386,8 @@ where
                 let offset = i64::try_from(pointer.offset).unwrap_or(0);
                 BackwardMemoryCondition {
                     region: region.clone(),
-                    offset_lo: offset,
-                    offset_hi: offset,
+                    address: SemanticMemoryAddress::exact(offset),
                     size,
-                    exact_offset: true,
-                    address_terms: Vec::new(),
                     evidence: if matches!(
                         summary.completion,
                         crate::sim::DerivedSummaryCompletion::Exact
@@ -1424,11 +1407,8 @@ where
         })
         .unwrap_or(BackwardMemoryCondition {
             region: BackwardMemoryRegion::Argument { index: arg_index },
-            offset_lo: offset,
-            offset_hi: offset,
+            address: SemanticMemoryAddress::exact(offset),
             size,
-            exact_offset: true,
-            address_terms: Vec::new(),
             evidence: if matches!(
                 summary.completion,
                 crate::sim::DerivedSummaryCompletion::Exact

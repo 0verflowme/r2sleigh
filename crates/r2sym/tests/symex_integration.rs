@@ -63,9 +63,9 @@ fn assert_argument_memory_term(
         &term.region,
         BackwardMemoryRegion::Argument { index: actual } if *actual == index
     ));
-    assert_eq!(term.offset_lo, offset_lo);
-    assert_eq!(term.offset_hi, offset_hi);
-    assert_eq!(term.exact_offset, exact_offset);
+    assert_eq!(term.address.offset_lo(), offset_lo);
+    assert_eq!(term.address.offset_hi(), offset_hi);
+    assert_eq!(term.address.is_exact_offset(), exact_offset);
     assert_eq!(term.size, size);
 }
 
@@ -85,9 +85,9 @@ fn assert_region_memory_term(
         }
         other => panic!("expected concrete region-backed term, got {other:?}"),
     }
-    assert_eq!(term.offset_lo, offset_lo);
-    assert_eq!(term.offset_hi, offset_hi);
-    assert_eq!(term.exact_offset, exact_offset);
+    assert_eq!(term.address.offset_lo(), offset_lo);
+    assert_eq!(term.address.offset_hi(), offset_hi);
+    assert_eq!(term.address.is_exact_offset(), exact_offset);
     assert_eq!(term.size, size);
 }
 
@@ -1102,12 +1102,15 @@ fn test_query_compiles_bounded_indexed_memory_range() {
         &compiled.memory_terms[0].region,
         BackwardMemoryRegion::Argument { .. }
     ) {
-        assert_eq!(compiled.memory_terms[0].offset_lo, 0);
-        assert_eq!(compiled.memory_terms[0].offset_hi, 1);
+        assert_eq!(compiled.memory_terms[0].address.offset_lo(), 0);
+        assert_eq!(compiled.memory_terms[0].address.offset_hi(), 1);
     } else {
-        assert!(compiled.memory_terms[0].offset_hi >= compiled.memory_terms[0].offset_lo);
+        assert!(
+            compiled.memory_terms[0].address.offset_hi()
+                >= compiled.memory_terms[0].address.offset_lo()
+        );
     }
-    assert!(!compiled.memory_terms[0].exact_offset);
+    assert!(!compiled.memory_terms[0].address.is_exact_offset());
     assert_eq!(compiled.memory_terms[0].size, 1);
     assert!(compiled.backward_memory_candidate_enumerations > 0);
     assert_eq!(compiled.backward_memory_residual_fallbacks, 0);

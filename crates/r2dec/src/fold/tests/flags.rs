@@ -537,11 +537,8 @@ fn actionable_memory_island_parses_memory_condition_expr() {
         vec![crate::test_memory_fact(
             r2sym::BackwardMemoryCondition {
                 region: r2sym::BackwardMemoryRegion::Argument { index: 0 },
-                offset_lo: 8,
-                offset_hi: 8,
+                address: r2sym::SemanticMemoryAddress::exact(8),
                 size: 4,
-                exact_offset: true,
-                address_terms: Vec::new(),
                 evidence: r2sym::SemanticEvidence::exact(),
                 binding: None,
                 expr: "*(arg0 + 0x8)".to_string(),

@@ -39,6 +39,7 @@ pub mod executor;
 pub mod kernel;
 pub mod loops;
 pub mod memory;
+mod memory_address;
 pub mod path;
 pub mod query;
 pub mod r2api;
@@ -87,6 +88,7 @@ pub use memory::{
     MemoryRegionId, MemoryRegionKind, RegionPointer, ResolvedPointerSet, SymMemory,
     SymbolicMemoryRegionDef,
 };
+pub use memory_address::SemanticMemoryAddress;
 pub use path::{
     ExploreConfig, PathExplorer, PathResult, PublicSolvedPath, SolvedPath, SolvedPathGeneration,
     SolvedPathGenerationKind,

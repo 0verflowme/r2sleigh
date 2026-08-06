@@ -1184,15 +1184,13 @@ fn constrain_region_backed_memory_term<'ctx>(
             let Some(base_addr) = def.base_addr else {
                 return false;
             };
-            let offset_values = if term.exact_offset || offset_lo == offset_hi {
-                vec![offset_lo]
-            } else {
-                let span = offset_hi - offset_lo;
-                if span > 8 {
-                    return false;
-                }
-                (offset_lo..=offset_hi).collect::<Vec<_>>()
+            let Some(span) = offset_hi.checked_sub(offset_lo) else {
+                return false;
             };
+            if span > 8 {
+                return false;
+            }
+            let offset_values = (offset_lo..=offset_hi).collect::<Vec<_>>();
             (base_addr, offset_values)
         }
         _ => return false,
@@ -2988,11 +2986,8 @@ mod tests {
         let original_constraints = state.num_constraints();
         let target_term = BackwardMemoryCondition {
             region: BackwardMemoryRegion::Argument { index: 0 },
-            offset_lo: 0,
-            offset_hi: 0,
+            address: crate::SemanticMemoryAddress::exact(0),
             size: 1,
-            exact_offset: true,
-            address_terms: Vec::new(),
             evidence: SemanticEvidence::exact(),
             binding: Some("sym_mem".to_string()),
             expr: "0x2a".to_string(),
@@ -3001,11 +2996,8 @@ mod tests {
         };
         let other_branch_term = BackwardMemoryCondition {
             region: BackwardMemoryRegion::Argument { index: 0 },
-            offset_lo: 0,
-            offset_hi: 0,
+            address: crate::SemanticMemoryAddress::exact(0),
             size: 1,
-            exact_offset: true,
-            address_terms: Vec::new(),
             evidence: SemanticEvidence::exact(),
             binding: Some("sym_mem".to_string()),
             expr: "0x2b".to_string(),
@@ -3158,11 +3150,8 @@ mod tests {
                 kind: crate::MemoryRegionKind::Global,
                 name: "ram:0x2000".to_string(),
             }),
-            offset_lo: 0,
-            offset_hi: 0,
+            address: crate::SemanticMemoryAddress::exact(0),
             size: 1,
-            exact_offset: true,
-            address_terms: Vec::new(),
             evidence: SemanticEvidence::exact(),
             binding: None,
             expr: "*(ram:0x2000 + 0)".to_string(),
@@ -3175,11 +3164,8 @@ mod tests {
                 kind: crate::MemoryRegionKind::Global,
                 name: "ram:0x2000".to_string(),
             }),
-            offset_lo: 0,
-            offset_hi: 0,
+            address: crate::SemanticMemoryAddress::exact(0),
             size: 1,
-            exact_offset: true,
-            address_terms: Vec::new(),
             evidence: SemanticEvidence::exact(),
             binding: None,
             expr: "*(ram:0x2000 + 0)".to_string(),
@@ -3327,14 +3313,15 @@ mod tests {
                 kind: crate::MemoryRegionKind::Global,
                 name: "ram:0x2000".to_string(),
             }),
-            offset_lo: 4,
-            offset_hi: 4,
+            address: crate::SemanticMemoryAddress::affine(
+                vec![r2ssa::AffineAddressTerm {
+                    value: ValueId(7),
+                    coefficient: 40,
+                }],
+                4,
+            )
+            .expect("valid affine address"),
             size: 1,
-            exact_offset: false,
-            address_terms: vec![r2ssa::AffineAddressTerm {
-                value: ValueId(7),
-                coefficient: 40,
-            }],
             evidence: SemanticEvidence::exact(),
             binding: None,
             expr: "*(ram:0x2000 + 40*v7 + 4)".to_string(),
@@ -3343,6 +3330,39 @@ mod tests {
         };
 
         assert!(term.has_exact_address());
+        assert!(!super::constrain_region_backed_memory_term(
+            &mut state, &term, 0x2a
+        ));
+        assert_eq!(state.num_constraints(), original_constraints);
+    }
+
+    #[test]
+    fn unrepresentable_bounded_memory_span_refuses_narrowing() {
+        let ctx = Context::thread_local();
+        let mut state = SymState::new(&ctx, 0x1000);
+        let global_region = state.define_memory_region(
+            crate::MemoryRegionKind::Global,
+            "ram:0x2000",
+            Some(0x2000),
+            None,
+        );
+        let original_constraints = state.num_constraints();
+        let term = BackwardMemoryCondition {
+            region: BackwardMemoryRegion::Region(crate::backward::BackwardRegionRef {
+                id: global_region,
+                kind: crate::MemoryRegionKind::Global,
+                name: "ram:0x2000".to_string(),
+            }),
+            address: crate::SemanticMemoryAddress::bounded(i64::MIN, i64::MAX)
+                .expect("ordered bounds"),
+            size: 1,
+            evidence: SemanticEvidence::likely(SemanticEvidenceReason::AliasAmbiguity),
+            binding: None,
+            expr: "*(ram:0x2000 + unknown)".to_string(),
+            value_expr: Some("0x2a".to_string()),
+            exact_value: true,
+        };
+
         assert!(!super::constrain_region_backed_memory_term(
             &mut state, &term, 0x2a
         ));
@@ -3389,11 +3409,8 @@ mod tests {
                     MemoryFact {
                         term: BackwardMemoryCondition {
                             region: BackwardMemoryRegion::Argument { index: 0 },
-                            offset_lo: 0,
-                            offset_hi: 0,
+                            address: crate::SemanticMemoryAddress::exact(0),
                             size: 1,
-                            exact_offset: true,
-                            address_terms: Vec::new(),
                             evidence: SemanticEvidence::exact(),
                             binding: Some("sym_mem".to_string()),
                             expr: "0x2a".to_string(),
@@ -3443,11 +3460,8 @@ mod tests {
         let original_constraints = state.num_constraints();
         let target_term = BackwardMemoryCondition {
             region: BackwardMemoryRegion::Argument { index: 0 },
-            offset_lo: 0,
-            offset_hi: 0,
+            address: crate::SemanticMemoryAddress::exact(0),
             size: 1,
-            exact_offset: true,
-            address_terms: Vec::new(),
             evidence: SemanticEvidence::exact(),
             binding: Some("sym_mem".to_string()),
             expr: "0x2a".to_string(),
@@ -3579,11 +3593,8 @@ mod tests {
                     MemoryFact {
                         term: BackwardMemoryCondition {
                             region: BackwardMemoryRegion::Argument { index: 0 },
-                            offset_lo: 0,
-                            offset_hi: 0,
+                            address: crate::SemanticMemoryAddress::exact(0),
                             size: 1,
-                            exact_offset: true,
-                            address_terms: Vec::new(),
                             evidence: SemanticEvidence::exact(),
                             binding: Some("reg:56_0".to_string()),
                             expr: "0x1".to_string(),
@@ -3706,11 +3717,8 @@ mod tests {
                                 terms: vec!["exact_guard".to_string()],
                                 memory_terms: vec![BackwardMemoryCondition {
                                     region: BackwardMemoryRegion::Argument { index: 0 },
-                                    offset_lo: 0,
-                                    offset_hi: 0,
+                                    address: crate::SemanticMemoryAddress::exact(0),
                                     size: 1,
-                                    exact_offset: true,
-                                    address_terms: Vec::new(),
                                     evidence: exact.clone(),
                                     binding: Some("sym_mem".to_string()),
                                     expr: "0x2a".to_string(),
@@ -3742,11 +3750,8 @@ mod tests {
                                 terms: vec!["weaker_guard".to_string()],
                                 memory_terms: vec![BackwardMemoryCondition {
                                     region: BackwardMemoryRegion::Argument { index: 0 },
-                                    offset_lo: 0,
-                                    offset_hi: 0,
+                                    address: crate::SemanticMemoryAddress::exact(0),
                                     size: 1,
-                                    exact_offset: true,
-                                    address_terms: Vec::new(),
                                     evidence: likely.clone(),
                                     binding: Some("sym_mem".to_string()),
                                     expr: "0x2b".to_string(),
@@ -3847,11 +3852,8 @@ mod tests {
                                 terms: vec!["worker_guard".to_string()],
                                 memory_terms: vec![BackwardMemoryCondition {
                                     region: BackwardMemoryRegion::Argument { index: 0 },
-                                    offset_lo: 0,
-                                    offset_hi: 0,
+                                    address: crate::SemanticMemoryAddress::exact(0),
                                     size: 1,
-                                    exact_offset: true,
-                                    address_terms: Vec::new(),
                                     evidence: likely.clone(),
                                     binding: Some("sym_mem".to_string()),
                                     expr: "0x2a".to_string(),
@@ -4211,10 +4213,8 @@ mod tests {
                         kind: crate::MemoryRegionKind::Global,
                         name: "ram:0x4000".to_string(),
                     },
-                    offset_lo: 0,
-                    offset_hi: 0,
+                    address: crate::SemanticMemoryAddress::exact(0),
                     size: 1,
-                    exact_offset: true,
                     binding: Some(binding.clone()),
                     expr: "*0x4000".to_string(),
                     value_expr: Some("0x1".to_string()),
@@ -4248,10 +4248,8 @@ mod tests {
                         kind: crate::MemoryRegionKind::Global,
                         name: "ram:0x4000".to_string(),
                     },
-                    offset_lo: 0,
-                    offset_hi: 0,
+                    address: crate::SemanticMemoryAddress::exact(0),
                     size: 1,
-                    exact_offset: true,
                     binding: Some(binding.clone()),
                     expr: "*0x4000".to_string(),
                     value_expr: Some("0x0".to_string()),

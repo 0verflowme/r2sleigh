@@ -10,7 +10,6 @@ use r2ssa::{
 use serde::{Deserialize, Serialize};
 use z3::Context;
 
-use crate::SymState;
 use crate::backward::{
     BackwardConditionPrecision, BackwardConditionSummary, BackwardMemoryCondition,
     BackwardMemoryRegion, compile_branch_preconditions_with_summaries,
@@ -26,6 +25,7 @@ use crate::sim::{
     SummaryRegistry,
 };
 use crate::solver::SatResult;
+use crate::{SemanticMemoryAddress, SymState};
 
 use super::region::{
     ControlFact, Judged, MemoryFact, NativeRegionSummary, NativeWorkerSummary, RegionKey,
@@ -244,11 +244,9 @@ fn append_large_cfg_memory_transfer_terms(
             region: BackwardMemoryRegion::Argument {
                 index: transfer.dst_arg,
             },
-            offset_lo: 0,
-            offset_hi: 0,
+            address: SemanticMemoryAddress::bounded(0, 0)
+                .expect("single-point summary memory bound"),
             size: transfer.size,
-            exact_offset: false,
-            address_terms: Vec::new(),
             evidence: SemanticEvidence::likely(SemanticEvidenceReason::SummaryBudget)
                 .with_coverage(SemanticEvidenceCoverage::Bounded)
                 .with_provenance(SemanticEvidenceProvenance::Stable)
@@ -400,13 +398,16 @@ fn join_large_cfg_memory_term(
 fn materialize_joined_large_cfg_memory_term(
     term: JoinedLargeCfgMemoryTerm,
 ) -> BackwardMemoryCondition {
+    let address = if term.exact_offset {
+        SemanticMemoryAddress::exact(term.offset_lo)
+    } else {
+        SemanticMemoryAddress::bounded(term.offset_lo, term.offset_hi)
+            .expect("joined large-CFG memory bounds")
+    };
     BackwardMemoryCondition {
         region: term.key.region.clone(),
-        offset_lo: term.offset_lo,
-        offset_hi: term.offset_hi,
+        address,
         size: term.key.size,
-        exact_offset: term.exact_offset,
-        address_terms: Vec::new(),
         evidence: joined_large_cfg_memory_term_evidence(&term),
         binding: Some(summary_effect_binding(term.key.kind, &term.key.region)),
         expr: summary_effect_range_expr(
@@ -669,11 +670,13 @@ fn derive_summary_memory_terms_by_anchor<'ctx>(
                     region: crate::BackwardMemoryRegion::Argument {
                         index: write.arg_index,
                     },
-                    offset_lo: write.offset,
-                    offset_hi: write.offset,
+                    address: if matches!(summary.completion, DerivedSummaryCompletion::Exact) {
+                        SemanticMemoryAddress::exact(write.offset)
+                    } else {
+                        SemanticMemoryAddress::bounded(write.offset, write.offset)
+                            .expect("single-point derived summary memory bound")
+                    },
                     size: write.size,
-                    exact_offset: matches!(summary.completion, DerivedSummaryCompletion::Exact),
-                    address_terms: Vec::new(),
                     evidence,
                     binding: None,
                     expr: summary_memory_location_expr(write.arg_index, write.offset),
@@ -1398,9 +1401,9 @@ mod tests {
             memory_terms[0].region,
             crate::BackwardMemoryRegion::Argument { index: 0 }
         ));
-        assert_eq!(memory_terms[0].offset_lo, 4);
-        assert_eq!(memory_terms[0].offset_hi, 4);
-        assert!(memory_terms[0].exact_offset);
+        assert_eq!(memory_terms[0].address.offset_lo(), 4);
+        assert_eq!(memory_terms[0].address.offset_hi(), 4);
+        assert!(memory_terms[0].address.is_exact_offset());
     }
 
     #[test]
@@ -1508,11 +1511,11 @@ mod tests {
             term.region,
             crate::BackwardMemoryRegion::Argument { index: 0 }
         ));
-        assert_eq!((term.offset_lo, term.offset_hi), (4, 4));
-        assert!(!term.exact_offset);
+        assert_eq!((term.address.offset_lo(), term.address.offset_hi()), (4, 4));
+        assert!(!term.address.is_exact_offset());
         assert!(term.has_exact_address());
-        assert_eq!(term.address_terms.len(), 1);
-        assert_eq!(term.address_terms[0].coefficient, 40);
+        assert_eq!(term.address.terms().len(), 1);
+        assert_eq!(term.address.terms()[0].coefficient, 40);
     }
 
     #[test]
@@ -1693,9 +1696,9 @@ mod tests {
         assert!(terms.iter().any(|term| {
             term.binding.as_deref() == Some("read_arg0")
                 && matches!(term.region, BackwardMemoryRegion::Argument { index: 0 })
-                && term.offset_lo == 0
-                && term.offset_hi == 383
-                && !term.exact_offset
+                && term.address.offset_lo() == 0
+                && term.address.offset_hi() == 383
+                && !term.address.is_exact_offset()
                 && !term.evidence().budget_limited
         }));
         assert!(terms.iter().any(|term| {

@@ -1734,11 +1734,8 @@ mod tests {
             terms: vec![format!("term_{tag}")],
             memory_terms: vec![BackwardMemoryCondition {
                 region: BackwardMemoryRegion::Argument { index: 0 },
-                offset_lo: tag as i64,
-                offset_hi: tag as i64,
+                address: crate::SemanticMemoryAddress::exact(tag as i64),
                 size: 8,
-                exact_offset: true,
-                address_terms: Vec::new(),
                 evidence: SemanticEvidence::exact(),
                 binding: Some(format!("arg0_{tag}")),
                 expr: format!("*(arg0 + 0x{tag:x})"),

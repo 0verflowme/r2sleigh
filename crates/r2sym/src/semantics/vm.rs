@@ -11,7 +11,7 @@ use super::{
     SemanticConfidence, SemanticEvidence, SemanticEvidenceAmbiguity, SemanticEvidenceCoverage,
     SemanticEvidenceProvenance, SemanticEvidenceReason,
 };
-use crate::MemoryRegionKind;
+use crate::{MemoryRegionKind, SemanticMemoryAddress};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum InterpreterKind {
@@ -258,10 +258,9 @@ pub struct VmMemoryRegionRef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VmMemoryCondition {
     pub region: VmMemoryRegionRef,
-    pub offset_lo: i64,
-    pub offset_hi: i64,
+    #[serde(flatten)]
+    pub address: SemanticMemoryAddress,
     pub size: u32,
-    pub exact_offset: bool,
     pub binding: Option<String>,
     pub expr: String,
     pub value_expr: Option<String>,
@@ -271,17 +270,17 @@ pub struct VmMemoryCondition {
 
 impl VmMemoryCondition {
     pub fn evidence(&self) -> SemanticEvidence {
-        if self.exact_offset && (self.value.is_none() || self.exact_value) {
+        if self.address.has_exact_identity() && (self.value.is_none() || self.exact_value) {
             SemanticEvidence::exact()
-        } else if self.binding.is_some() || self.exact_offset {
-            let reason = if self.exact_offset {
+        } else if self.binding.is_some() || self.address.has_exact_identity() {
+            let reason = if self.address.has_exact_identity() {
                 SemanticEvidenceReason::ValueOpaque
             } else {
                 SemanticEvidenceReason::AliasAmbiguity
             };
             SemanticEvidence::likely(reason)
                 .with_provenance(SemanticEvidenceProvenance::Normalized)
-                .with_ambiguity(if self.exact_offset {
+                .with_ambiguity(if self.address.has_exact_identity() {
                     SemanticEvidenceAmbiguity::Single
                 } else {
                     SemanticEvidenceAmbiguity::Bounded
@@ -956,8 +955,25 @@ fn stack_base_name(base: StackAddressBase) -> &'static str {
     }
 }
 
-fn vm_memory_binding_name(region: &VmMemoryRegionRef, offset: i64, size: u32) -> String {
-    format!("mem:r{}:{offset}:{size}", region.id)
+fn vm_memory_binding_name(
+    region: &VmMemoryRegionRef,
+    address: &SemanticMemoryAddress,
+    size: u32,
+) -> String {
+    if address.terms().is_empty() {
+        return format!("mem:r{}:{}:{size}", region.id, address.offset_lo());
+    }
+    let terms = address
+        .terms()
+        .iter()
+        .map(|term| format!("v{}_c{}", term.value.0, term.coefficient))
+        .collect::<Vec<_>>()
+        .join("_");
+    format!(
+        "mem:r{}:affine_{terms}_offset_{}:{size}",
+        region.id,
+        address.offset_lo()
+    )
 }
 
 fn vm_memory_region_ref_from_object(
@@ -1059,17 +1075,15 @@ fn vm_memory_conditions_for_op(
                 residual = true;
                 continue;
             };
-            let r2ssa::RelativeMemoryAddress::Exact(offset) = &location.address else {
+            let Some(address) = SemanticMemoryAddress::from_ssa(&location.address) else {
                 residual = true;
                 continue;
             };
-            let binding = Some(vm_memory_binding_name(&region, *offset, location.size));
+            let binding = Some(vm_memory_binding_name(&region, &address, location.size));
             reads.push(VmMemoryCondition {
                 region,
-                offset_lo: *offset,
-                offset_hi: *offset,
+                address,
                 size: location.size,
-                exact_offset: true,
                 binding,
                 expr: expr.clone(),
                 value_expr: None,
@@ -1100,17 +1114,15 @@ fn vm_memory_conditions_for_op(
                 residual = true;
                 continue;
             };
-            let r2ssa::RelativeMemoryAddress::Exact(offset) = &location.address else {
+            let Some(address) = SemanticMemoryAddress::from_ssa(&location.address) else {
                 residual = true;
                 continue;
             };
-            let binding = Some(vm_memory_binding_name(&region, *offset, location.size));
+            let binding = Some(vm_memory_binding_name(&region, &address, location.size));
             writes.push(VmMemoryCondition {
                 region,
-                offset_lo: *offset,
-                offset_hi: *offset,
+                address,
                 size: location.size,
-                exact_offset: true,
                 binding,
                 expr: expr.clone(),
                 value_expr: write_value.as_ref().map(VmValueExpr::render),
@@ -1124,7 +1136,7 @@ fn vm_memory_conditions_for_op(
         (
             lhs.region.id,
             &lhs.region.name,
-            lhs.offset_lo,
+            &lhs.address,
             lhs.size,
             lhs.binding.as_deref(),
             &lhs.expr,
@@ -1132,7 +1144,7 @@ fn vm_memory_conditions_for_op(
             .cmp(&(
                 rhs.region.id,
                 &rhs.region.name,
-                rhs.offset_lo,
+                &rhs.address,
                 rhs.size,
                 rhs.binding.as_deref(),
                 &rhs.expr,
@@ -1143,7 +1155,7 @@ fn vm_memory_conditions_for_op(
         (
             lhs.region.id,
             &lhs.region.name,
-            lhs.offset_lo,
+            &lhs.address,
             lhs.size,
             lhs.binding.as_deref(),
             &lhs.expr,
@@ -1153,7 +1165,7 @@ fn vm_memory_conditions_for_op(
             .cmp(&(
                 rhs.region.id,
                 &rhs.region.name,
-                rhs.offset_lo,
+                &rhs.address,
                 rhs.size,
                 rhs.binding.as_deref(),
                 &rhs.expr,
@@ -1372,8 +1384,7 @@ fn sort_vm_memory_conditions(conditions: &mut Vec<VmMemoryCondition>) {
         (
             lhs.region.id,
             &lhs.region.name,
-            lhs.offset_lo,
-            lhs.offset_hi,
+            &lhs.address,
             lhs.size,
             lhs.binding.as_deref(),
             &lhs.expr,
@@ -1383,8 +1394,7 @@ fn sort_vm_memory_conditions(conditions: &mut Vec<VmMemoryCondition>) {
             .cmp(&(
                 rhs.region.id,
                 &rhs.region.name,
-                rhs.offset_lo,
-                rhs.offset_hi,
+                &rhs.address,
                 rhs.size,
                 rhs.binding.as_deref(),
                 &rhs.expr,
@@ -2009,11 +2019,11 @@ pub(crate) fn build_vm_step_summary(
         let exact_memory_effects = summary
             .memory_read_effects
             .iter()
-            .all(|effect| effect.exact_offset)
+            .all(|effect| effect.address.has_exact_identity())
             && summary
                 .memory_write_effects
                 .iter()
-                .all(|effect| effect.exact_offset && effect.exact_value);
+                .all(|effect| effect.address.has_exact_identity() && effect.exact_value);
         let exact = !summary.truncated
             && summary.calls == 0
             && summary.state_updates.iter().all(|update| update.exact)
@@ -2187,6 +2197,120 @@ mod tests {
             target: make_const(loop_header, 8),
         });
         block
+    }
+
+    #[test]
+    fn affine_parameter_memory_is_exact_vm_evidence() {
+        let mut arch = ArchSpec::new("aarch64");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("x0", 0x00, 8));
+        arch.add_register(RegisterDef::new("w1", 0x08, 4));
+        arch.add_register(RegisterDef::new("sp", 0x10, 8));
+
+        let mut block = R2ILBlock::new(0x3000, 4);
+        block.push(R2ILOp::IntSub {
+            dst: Varnode::unique(0x10, 8),
+            a: Varnode::register(0x10, 8),
+            b: Varnode::constant(8, 8),
+        });
+        block.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x10, 8),
+            val: Varnode::register(0x00, 8),
+        });
+        block.push(R2ILOp::Load {
+            dst: Varnode::unique(0x20, 8),
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x10, 8),
+        });
+        block.push(R2ILOp::IntSExt {
+            dst: Varnode::unique(0x30, 8),
+            src: Varnode::register(0x08, 4),
+        });
+        block.push(R2ILOp::IntMult {
+            dst: Varnode::unique(0x40, 8),
+            a: Varnode::unique(0x30, 8),
+            b: Varnode::constant(40, 8),
+        });
+        block.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(0x50, 8),
+            a: Varnode::unique(0x20, 8),
+            b: Varnode::unique(0x40, 8),
+        });
+        block.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(0x60, 8),
+            a: Varnode::unique(0x50, 8),
+            b: Varnode::constant(16, 8),
+        });
+        block.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x60, 8),
+            val: Varnode::constant(0x2a, 4),
+        });
+        block.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(0x70, 8),
+            a: Varnode::unique(0x50, 8),
+            b: Varnode::constant(4, 8),
+        });
+        block.push(R2ILOp::Load {
+            dst: Varnode::unique(0x80, 2),
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x70, 8),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+
+        let func = SsaArtifact::for_symbolic(&[block], Some(&arch)).expect("affine VM SSA fixture");
+        let block = func.get_block(0x3000).expect("entry block");
+        let mut affine_read = None;
+        let mut affine_write = None;
+        for (op_idx, op) in block.ops.iter().enumerate() {
+            let (reads, writes, residual) =
+                vm_memory_conditions_for_op(&func, block.addr, op_idx, op);
+            for condition in reads {
+                if !condition.address.terms().is_empty() {
+                    let value = classify_vm_op_value_at_site(&func, block.addr, op_idx, op, 0);
+                    affine_read = Some((condition, residual, value));
+                }
+            }
+            for condition in writes {
+                if !condition.address.terms().is_empty() {
+                    affine_write = Some((condition, residual));
+                }
+            }
+        }
+
+        let (read, read_residual, read_value) = affine_read.expect("affine parameter read");
+        assert!(!read_residual, "{read:#?}");
+        assert_eq!(read.region.kind, MemoryRegionKind::Input);
+        assert_eq!(read.region.name, "arg0");
+        assert_eq!(read.address.offset_lo(), 4);
+        assert!(!read.address.is_exact_offset());
+        assert!(read.address.has_exact_identity());
+        assert_eq!(read.address.terms().len(), 1);
+        assert_eq!(read.address.terms()[0].coefficient, 40);
+        assert!(read.evidence().is_default_exact());
+        assert_eq!(
+            read_value,
+            read.binding
+                .as_ref()
+                .map(|binding| VmValueExpr::Var(binding.clone()))
+        );
+
+        let (write, write_residual) = affine_write.expect("affine parameter write");
+        assert!(!write_residual, "{write:#?}");
+        assert_eq!(write.region.kind, MemoryRegionKind::Input);
+        assert_eq!(write.region.name, "arg0");
+        assert_eq!(write.address.offset_lo(), 16);
+        assert!(!write.address.is_exact_offset());
+        assert!(write.address.has_exact_identity());
+        assert_eq!(write.address.terms().len(), 1);
+        assert_eq!(write.address.terms()[0].coefficient, 40);
+        assert_eq!(write.value, Some(VmValueExpr::Const(0x2a)));
+        assert!(write.exact_value);
+        assert!(write.evidence().is_default_exact());
+        assert_ne!(read.binding, write.binding);
     }
 
     #[test]

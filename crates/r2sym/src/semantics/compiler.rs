@@ -2392,11 +2392,8 @@ mod tests {
             terms: vec!["flag == 0".to_string()],
             memory_terms: vec![crate::backward::BackwardMemoryCondition {
                 region: crate::backward::BackwardMemoryRegion::Argument { index: 0 },
-                offset_lo: 0,
-                offset_hi: 0,
+                address: crate::SemanticMemoryAddress::exact(0),
                 size: 1,
-                exact_offset: true,
-                address_terms: Vec::new(),
                 evidence: crate::SemanticEvidence::exact(),
                 binding: None,
                 expr: "*arg0".to_string(),

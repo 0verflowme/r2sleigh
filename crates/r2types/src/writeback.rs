@@ -7968,10 +7968,11 @@ fn backward_memory_term_slot_field(
     if !term.has_exact_address() {
         return None;
     }
-    if term.offset_lo < 0 || term.offset_hi < 0 || term.offset_lo != term.offset_hi {
+    let offset = term.address.offset_lo();
+    if offset < 0 || offset != term.address.offset_hi() {
         return None;
     }
-    Some((slot, term.offset_lo as u64, size_to_type(term.size)))
+    Some((slot, offset as u64, size_to_type(term.size)))
 }
 
 fn inferred_signature_abi_register_params(
@@ -13534,11 +13535,8 @@ mod tests {
     fn test_arg_memory_term(offset: i64, size: u32) -> r2sym::BackwardMemoryCondition {
         r2sym::BackwardMemoryCondition {
             region: r2sym::BackwardMemoryRegion::Argument { index: 0 },
-            offset_lo: offset,
-            offset_hi: offset,
+            address: r2sym::SemanticMemoryAddress::exact(offset),
             size,
-            exact_offset: true,
-            address_terms: Vec::new(),
             evidence: r2sym::SemanticEvidence::exact(),
             binding: None,
             expr: format!("*(arg0 + {offset})"),

@@ -346,6 +346,26 @@ fn format_vm_guarded_exits(guards: &[r2sym::VmGuardedExit]) -> String {
     format!("[{rendered}]")
 }
 
+fn format_semantic_memory_address(address: &r2sym::SemanticMemoryAddress) -> String {
+    if address.is_exact_offset() {
+        return format!("{:#x}", address.offset_lo());
+    }
+    if address.terms().is_empty() {
+        return format!(
+            "bounded({:#x}..{:#x})",
+            address.offset_lo(),
+            address.offset_hi()
+        );
+    }
+    let terms = address
+        .terms()
+        .iter()
+        .map(|term| format!("v{}*{}", term.value.0, term.coefficient))
+        .collect::<Vec<_>>()
+        .join(" + ");
+    format!("affine({terms}; offset={})", address.offset_lo())
+}
+
 fn format_vm_memory_conditions(conditions: &[r2sym::VmMemoryCondition]) -> String {
     if conditions.is_empty() {
         return "[]".to_string();
@@ -354,6 +374,7 @@ fn format_vm_memory_conditions(conditions: &[r2sym::VmMemoryCondition]) -> Strin
         .iter()
         .map(|condition| {
             let region = condition.region.name.clone();
+            let address = format_semantic_memory_address(&condition.address);
             let binding = condition
                 .binding
                 .as_deref()
@@ -365,14 +386,8 @@ fn format_vm_memory_conditions(conditions: &[r2sym::VmMemoryCondition]) -> Strin
                 .map(|value| format!(" = {value}"))
                 .unwrap_or_default();
             format!(
-                "{}@[{:#x}..{:#x}]/{}:{}{}{}",
-                region,
-                condition.offset_lo,
-                condition.offset_hi,
-                condition.size,
-                condition.expr,
-                binding,
-                value,
+                "{}@[{}]/{}:{}{}{}",
+                region, address, condition.size, condition.expr, binding, value,
             )
         })
         .collect::<Vec<_>>()
@@ -8307,6 +8322,33 @@ mod tests {
     }
 
     #[test]
+    fn semantic_memory_address_format_preserves_identity_kind() {
+        assert_eq!(
+            format_semantic_memory_address(&r2sym::SemanticMemoryAddress::exact(4)),
+            "0x4"
+        );
+        assert_eq!(
+            format_semantic_memory_address(
+                &r2sym::SemanticMemoryAddress::bounded(4, 8).expect("bounded address")
+            ),
+            "bounded(0x4..0x8)"
+        );
+        assert_eq!(
+            format_semantic_memory_address(
+                &r2sym::SemanticMemoryAddress::affine(
+                    vec![r2ssa::AffineAddressTerm {
+                        value: r2ssa::ValueId(7),
+                        coefficient: 40,
+                    }],
+                    4,
+                )
+                .expect("affine address")
+            ),
+            "affine(v7*40; offset=4)"
+        );
+    }
+
+    #[test]
     fn definite_assignment_rejects_partial_branch_initialization() {
         let mut function = CFunction::new("unlock", CType::i32());
         function.locals.push(crate::ast::CLocal {
@@ -10741,11 +10783,8 @@ mod tests {
     ) -> r2sym::BackwardMemoryCondition {
         r2sym::BackwardMemoryCondition {
             region: r2sym::BackwardMemoryRegion::Argument { index: 0 },
-            offset_lo: offset,
-            offset_hi: offset,
+            address: r2sym::SemanticMemoryAddress::exact(offset),
             size,
-            exact_offset: true,
-            address_terms: Vec::new(),
             evidence,
             binding: None,
             expr: if offset == 0 {
@@ -15592,10 +15631,8 @@ mod tests {
                         kind: r2sym::MemoryRegionKind::Global,
                         name: "ram:0x2000".to_string(),
                     },
-                    offset_lo: 0,
-                    offset_hi: 0,
+                    address: r2sym::SemanticMemoryAddress::exact(0),
                     size: 1,
-                    exact_offset: true,
                     binding: Some("mem:r1:0:1".to_string()),
                     expr: "vm.sel".to_string(),
                     value_expr: None,
@@ -15611,10 +15648,8 @@ mod tests {
                         kind: r2sym::MemoryRegionKind::Heap,
                         name: "heap_alloc@1".to_string(),
                     },
-                    offset_lo: 4,
-                    offset_hi: 4,
+                    address: r2sym::SemanticMemoryAddress::exact(4),
                     size: 1,
-                    exact_offset: true,
                     binding: Some("mem:r2:4:1".to_string()),
                     expr: "state".to_string(),
                     value_expr: Some("state".to_string()),
@@ -15662,10 +15697,8 @@ mod tests {
                         kind: r2sym::MemoryRegionKind::Global,
                         name: "ram:0x2000".to_string(),
                     },
-                    offset_lo: 0,
-                    offset_hi: 0,
+                    address: r2sym::SemanticMemoryAddress::exact(0),
                     size: 1,
-                    exact_offset: true,
                     binding: Some("mem:r1:0:1".to_string()),
                     expr: "vm.sel".to_string(),
                     value_expr: None,
@@ -15678,10 +15711,8 @@ mod tests {
                         kind: r2sym::MemoryRegionKind::Heap,
                         name: "heap_alloc@1".to_string(),
                     },
-                    offset_lo: 4,
-                    offset_hi: 4,
+                    address: r2sym::SemanticMemoryAddress::exact(4),
                     size: 1,
-                    exact_offset: true,
                     binding: Some("mem:r2:4:1".to_string()),
                     expr: "state".to_string(),
                     value_expr: Some("state".to_string()),
