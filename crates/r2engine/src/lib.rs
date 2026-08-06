@@ -5935,14 +5935,6 @@ fn infer_signature_from_engine_analysis(
     analysis: &EngineAnalysis,
 ) -> Option<r2types::InferredSignature> {
     let pattern_ssa_blocks = analysis.pattern_ssa_func.local_ssa_blocks();
-    let recovered_vars = r2types::recover_vars_from_ssa_with_prep_facts(
-        &pattern_ssa_blocks,
-        analysis.pattern_ssa_func.decompile_prep_facts(),
-        arch.map(|spec| spec.name.as_str()),
-        reg_type_hints,
-        semantic_metadata_enabled,
-    );
-    let pointer_arg_slots = r2types::collect_pointer_arg_slots(&recovered_vars);
     let recovered_params = r2types::recover_signature_params_from_ssa(
         &pattern_ssa_blocks,
         arch.map(|spec| spec.name.as_str()),
@@ -5957,7 +5949,6 @@ fn infer_signature_from_engine_analysis(
         &analysis.ssa_func,
         &pattern_ssa_blocks,
         &recovered_params,
-        &pointer_arg_slots,
     ))
 }
 

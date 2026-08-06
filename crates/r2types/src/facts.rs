@@ -163,7 +163,6 @@ impl SignatureCertificate {
                     source,
                     SignatureCertificateSource::LocalInference
                         | SignatureCertificateSource::CalleeSignature
-                        | SignatureCertificateSource::RecoveredVariable
                         | SignatureCertificateSource::SlotTypeOverride
                         | SignatureCertificateSource::SemanticProjection
                         | SignatureCertificateSource::InterprocSummary
@@ -227,7 +226,6 @@ pub enum SignatureCertificateSource {
     LocalInference,
     CalleeSignature,
     TypeAssumption,
-    RecoveredVariable,
     SlotTypeOverride,
     SummaryRole,
     SummaryKind,
@@ -242,7 +240,6 @@ impl SignatureCertificateSource {
             Self::LocalInference => "local_inference",
             Self::CalleeSignature => "callee_signature",
             Self::TypeAssumption => "type_assumption",
-            Self::RecoveredVariable => "recovered_variable",
             Self::SlotTypeOverride => "slot_type_override",
             Self::SummaryRole => "summary_role",
             Self::SummaryKind => "summary_kind",
@@ -256,7 +253,6 @@ impl SignatureCertificateSource {
             self,
             Self::ExternalContext
                 | Self::TypeAssumption
-                | Self::RecoveredVariable
                 | Self::SlotTypeOverride
                 | Self::SemanticProjection
                 | Self::InterprocSummary

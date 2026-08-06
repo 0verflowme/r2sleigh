@@ -3688,19 +3688,6 @@ fn build_type_writeback_analysis_inner(
     );
     hide_unproven_stack_pointer_frame_slots(&mut input.parsed_context.stack_slots);
     apply_main_signature_override(input.function_name, &mut merged_signature);
-    let before_recovered_signature = merged_signature.clone();
-    merged_signature = merge_recovered_arg_types_into_signature(
-        merged_signature,
-        input.recovered_vars,
-        input.ptr_bits,
-        input.function_name,
-    );
-    if merged_signature != before_recovered_signature {
-        push_signature_certificate_source(
-            &mut signature_certificate_sources,
-            SignatureCertificateSource::RecoveredVariable,
-        );
-    }
     let current_param_count = merged_signature
         .as_ref()
         .map(|signature| signature.params.len())
@@ -8555,104 +8542,6 @@ fn is_canonical_main_signature_spec(signature: &FunctionSignatureSpec) -> bool {
     signature == &canonical_main_signature_spec()
 }
 
-fn merge_recovered_arg_types_into_signature(
-    mut signature: Option<FunctionSignatureSpec>,
-    vars: &[RecoveredVariable],
-    ptr_bits: u32,
-    _function_name: &str,
-) -> Option<FunctionSignatureSpec> {
-    if signature
-        .as_ref()
-        .is_some_and(is_canonical_main_signature_spec)
-    {
-        return signature;
-    }
-
-    let local_arg_types = collect_recovered_arg_types(vars, ptr_bits);
-    if local_arg_types.is_empty() {
-        return signature;
-    }
-
-    let max_slot = local_arg_types.keys().copied().max()?;
-    let sig = signature.get_or_insert_with(Default::default);
-    let has_recovered_stack_arg_beyond_signature = vars.iter().any(|var| {
-        var.isarg
-            && var.kind == "s"
-            && var
-                .name
-                .strip_prefix("arg")
-                .and_then(|idx| idx.parse::<usize>().ok())
-                .is_some_and(|slot| slot >= sig.params.len())
-    });
-    let allow_param_count_extension =
-        !signature_param_count_is_authoritative(sig) || has_recovered_stack_arg_beyond_signature;
-    while allow_param_count_extension && sig.params.len() <= max_slot {
-        let idx = sig.params.len();
-        sig.params.push(FunctionParamSpec {
-            name: format!("arg{}", idx + 1),
-            ty: has_recovered_stack_arg_beyond_signature
-                .then(|| abi_placeholder_param_type(ptr_bits)),
-        });
-    }
-
-    for (slot, local_ty) in local_arg_types {
-        if slot >= sig.params.len() {
-            continue;
-        }
-        let param = &mut sig.params[slot];
-        if param.name.is_empty() {
-            param.name = format!("arg{}", slot + 1);
-        }
-        if local_param_should_override_external(Some(&local_ty), param.ty.as_ref(), &param.name)
-            || is_generic_signature_type(param.ty.as_ref())
-        {
-            param.ty = Some(local_ty);
-        }
-    }
-
-    signature
-}
-
-fn abi_placeholder_param_type(ptr_bits: u32) -> CTypeLike {
-    CTypeLike::Int {
-        bits: ptr_bits.max(8),
-        signedness: Signedness::Signed,
-    }
-}
-
-fn collect_recovered_arg_types(
-    vars: &[RecoveredVariable],
-    ptr_bits: u32,
-) -> BTreeMap<usize, CTypeLike> {
-    let mut out = BTreeMap::new();
-    for var in vars {
-        if !var.isarg {
-            continue;
-        }
-        let Some(slot) = var
-            .name
-            .strip_prefix("arg")
-            .and_then(|idx| idx.parse::<usize>().ok())
-        else {
-            continue;
-        };
-        let Some(candidate) = parse_type_like_spec(&var.var_type, ptr_bits) else {
-            continue;
-        };
-        if is_generic_signature_type(Some(&candidate)) {
-            continue;
-        }
-        match out.get(&slot) {
-            Some(current)
-                if !local_signature_should_override_external(Some(&candidate), Some(current)) => {}
-            _ => {
-                out.insert(slot, candidate);
-            }
-        }
-    }
-    out
-}
-
 fn stack_base_for_recovered_var_kind(kind: &str) -> Option<ExternalStackBase> {
     match kind {
         "b" => Some(ExternalStackBase::FramePointer),
@@ -9362,7 +9251,6 @@ fn indexed_local_struct_refinement_slots(
                 source,
                 SignatureCertificateSource::LocalInference
                     | SignatureCertificateSource::TypeAssumption
-                    | SignatureCertificateSource::RecoveredVariable
                     | SignatureCertificateSource::SlotTypeOverride
             )
         })
@@ -14344,74 +14232,7 @@ mod tests {
     }
 
     #[test]
-    fn recovered_arg_types_narrow_external_signature_when_local_signature_is_still_wide() {
-        let mut parsed_context = ParsedExternalContext::default();
-        parsed_context.current_signature = Some(FunctionSignatureSpec {
-            ret_type: Some(CTypeLike::Int {
-                bits: 64,
-                signedness: Signedness::Signed,
-            }),
-            params: vec![FunctionParamSpec {
-                name: "arg1".to_string(),
-                ty: Some(CTypeLike::Int {
-                    bits: 64,
-                    signedness: Signedness::Unsigned,
-                }),
-            }],
-        });
-        parsed_context.merged_signature = parsed_context.current_signature.clone();
-
-        let vars = [RecoveredVariable {
-            name: "arg0".to_string(),
-            kind: "r".to_string(),
-            delta: 0,
-            var_type: "int32_t".to_string(),
-            isarg: true,
-            reg: Some("x0".to_string()),
-        }];
-
-        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
-            function_name: "sym._check_secret",
-            ptr_bits: 64,
-            inferred_signature: InferredSignature {
-                function_name: "sym._check_secret".to_string(),
-                signature: "int64_t sym._check_secret (uint64_t arg1)".to_string(),
-                ret_type: "int64_t".to_string(),
-                params: vec![InferredSignatureParam {
-                    name: "arg1".to_string(),
-                    param_type: "uint64_t".to_string(),
-                }],
-                callconv: String::new(),
-                arch: "aarch64".to_string(),
-                confidence: 90,
-                callconv_confidence: 0,
-            },
-            recovered_vars: &vars,
-            ssa_blocks: &[],
-            parsed_context,
-            local_structs: LocalStructArtifacts::default(),
-            interproc_summary_set: None,
-            diagnostics: TypeWritebackDiagnostics::default(),
-        });
-
-        assert_eq!(analysis.signature.params[0].param_type, "int32_t");
-        assert_eq!(analysis.plan.var_type_candidates[0].var_type, "int32_t");
-        assert_eq!(
-            analysis
-                .type_facts
-                .merged_signature
-                .as_ref()
-                .and_then(|sig| sig.params.first())
-                .and_then(|param| param.ty.clone()),
-            Some(CTypeLike::Int {
-                bits: 32,
-                signedness: Signedness::Signed,
-            })
-        );
-    }
-
-    #[test]
-    fn recovered_stack_arg_extends_external_register_only_signature() {
+    fn recovered_stack_arg_binds_to_canonical_signature_slot() {
         let mut parsed_context = ParsedExternalContext::default();
         parsed_context.current_signature = Some(FunctionSignatureSpec {
             ret_type: Some(CTypeLike::Int {
@@ -14452,12 +14273,14 @@ mod tests {
             ptr_bits: 64,
             inferred_signature: InferredSignature {
                 function_name: "sym.stack_arg".to_string(),
-                signature: "int64_t sym.stack_arg (int64_t arg1)".to_string(),
+                signature: "int64_t sym.stack_arg (int64_t arg0, int64_t arg1, int64_t arg2, int64_t arg3, int64_t arg4, int64_t arg5, int64_t arg6)".to_string(),
                 ret_type: "int64_t".to_string(),
-                params: vec![InferredSignatureParam {
-                    name: "arg1".to_string(),
-                    param_type: "int64_t".to_string(),
-                }],
+                params: (0..7)
+                    .map(|slot| InferredSignatureParam {
+                        name: format!("arg{slot}"),
+                        param_type: "int64_t".to_string(),
+                    })
+                    .collect(),
                 callconv: String::new(),
                 arch: "x86-64".to_string(),
                 confidence: 90,
@@ -16575,14 +16398,6 @@ mod tests {
             &[SignatureCertificateSource::ExternalContext],
             &HashSet::new(),
         );
-        let recovered_slots = indexed_local_struct_refinement_slots(
-            &local_structs,
-            &[
-                SignatureCertificateSource::LocalInference,
-                SignatureCertificateSource::RecoveredVariable,
-            ],
-            &HashSet::new(),
-        );
         let assumption_protected_slots = indexed_local_struct_refinement_slots(
             &local_structs,
             &[
@@ -16618,7 +16433,6 @@ mod tests {
             ))))
         );
         assert_eq!(externally_protected, signature);
-        assert_eq!(recovered_slots, HashSet::from([0]));
         assert!(assumption_protected_slots.is_empty());
     }
 

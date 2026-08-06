@@ -347,17 +347,6 @@ pub fn collect_signature_type_evidence_context_with_arch(
     }
 }
 
-pub fn collect_pointer_arg_slots(vars: &[RecoveredVariable]) -> BTreeSet<usize> {
-    vars.iter()
-        .filter(|var| var.kind == "r" && var.isarg && var.var_type.contains('*'))
-        .filter_map(|var| {
-            var.name
-                .strip_prefix("arg")
-                .and_then(|idx| idx.parse::<usize>().ok())
-        })
-        .collect()
-}
-
 pub fn recover_signature_params_from_ssa(
     ssa_blocks: &[SSABlock],
     arch_name: Option<&str>,
@@ -2384,7 +2373,6 @@ mod tests {
 
         assert!(vars.iter().all(|var| !var.isarg));
         assert!(vars.iter().all(|var| var.delta != 8));
-        assert!(collect_pointer_arg_slots(&vars).is_empty());
     }
 
     #[test]

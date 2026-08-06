@@ -85,12 +85,12 @@ pub use model::{Signedness, StructField, StructShape, Type, TypeArena, TypeId};
 pub use oracle::{LayoutOracle, TypeOracle};
 pub use prepare::{
     ArgAliasMap, BaseRegList, MetadataScalarKind, SignatureTypeEvidenceContext, TypeHint,
-    TypeHintRank, X86_ARG_REGS, X86_FRAME_BASES, collect_pointer_arg_slots,
-    collect_signature_type_evidence_context, collect_signature_type_evidence_context_with_arch,
-    merge_type_hint, recover_signature_params_from_ssa, recover_vars_arch_profile,
-    recover_vars_from_ssa, recover_vars_from_ssa_with_prep_facts, scalar_metadata_type_hint,
-    scalar_register_family_key, size_to_signed_int_type, size_to_type, size_to_unsigned_int_type,
-    ssa_var_block_key, ssa_var_key, type_hint_from_value_metadata,
+    TypeHintRank, X86_ARG_REGS, X86_FRAME_BASES, collect_signature_type_evidence_context,
+    collect_signature_type_evidence_context_with_arch, merge_type_hint,
+    recover_signature_params_from_ssa, recover_vars_arch_profile, recover_vars_from_ssa,
+    recover_vars_from_ssa_with_prep_facts, scalar_metadata_type_hint, scalar_register_family_key,
+    size_to_signed_int_type, size_to_type, size_to_unsigned_int_type, ssa_var_block_key,
+    ssa_var_key, type_hint_from_value_metadata,
 };
 pub use r2ssa::AssumptionUsageReport;
 pub use role_registry::{
@@ -106,8 +106,8 @@ pub use signature_infer::{
     enrich_known_function_signatures_from_names, format_afs_signature,
     infer_signature_from_prepared_ssa, infer_signature_return_type,
     inferred_signature_from_signature_spec, materialize_signature_type_like,
-    merge_initial_signature_type_evidence, merge_pointer_slot_evidence_into_signature_params,
-    render_signature_type, resolve_evidence_driven_signature_type,
+    merge_initial_signature_type_evidence, render_signature_type,
+    resolve_evidence_driven_signature_type,
 };
 pub use solver::{SolvedTypes, SolverConfig, SolverDiagnostics, TypeSolver};
 pub use writeback::{

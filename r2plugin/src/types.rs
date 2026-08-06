@@ -703,14 +703,6 @@ pub(crate) fn merge_register_type_hints(
 }
 
 #[cfg(test)]
-pub(crate) fn merge_pointer_slot_evidence(
-    inferred_params: &mut [r2types::SignatureParamCandidate],
-    pointer_arg_slots: &std::collections::BTreeSet<usize>,
-) {
-    r2types::merge_pointer_slot_evidence_into_signature_params(inferred_params, pointer_arg_slots);
-}
-
-#[cfg(test)]
 pub(crate) fn recover_vars_from_ssa(
     ssa_blocks: &[r2ssa::SSABlock],
     arch: Option<&ArchSpec>,
@@ -1995,28 +1987,6 @@ mod tests {
         assert!(
             vars.iter()
                 .any(|var| var.kind == "b" && var.delta == -8 && var.var_type == "int64_t")
-        );
-    }
-
-    #[test]
-    fn pointer_slot_evidence_marks_param_as_pointer_without_direct_overwrite() {
-        let mut inferred_params = vec![r2types::SignatureParamCandidate {
-            name: "arg1".to_string(),
-            ty: r2types::CTypeLike::Int {
-                bits: 64,
-                signedness: r2types::Signedness::Signed,
-            },
-            arg_index: 1,
-            size_bytes: 8,
-            evidence: TypeEvidence::default(),
-        }];
-        let mut pointer_slots = std::collections::BTreeSet::new();
-        pointer_slots.insert(0);
-
-        merge_pointer_slot_evidence(&mut inferred_params, &pointer_slots);
-        assert_eq!(
-            inferred_params[0].evidence.pointer_proven, 1,
-            "single-parameter fallback should contribute high-confidence pointer evidence"
         );
     }
 

@@ -64,30 +64,6 @@ pub struct RecoveredSignatureParam {
     pub initial_ty: CTypeLike,
 }
 
-pub fn merge_pointer_slot_evidence_into_signature_params(
-    inferred_params: &mut [SignatureParamCandidate],
-    pointer_arg_slots: &BTreeSet<usize>,
-) {
-    if pointer_arg_slots.is_empty() {
-        return;
-    }
-
-    let param_count = inferred_params.len();
-    for (fallback_idx, param) in inferred_params.iter_mut().enumerate() {
-        let explicit_slot = if param.arg_index == usize::MAX {
-            None
-        } else {
-            Some(param.arg_index)
-        };
-        let slot = explicit_slot.unwrap_or(fallback_idx);
-        let fallback_slot_match = pointer_arg_slots.contains(&fallback_idx)
-            && (explicit_slot.is_none() || param_count == 1);
-        if pointer_arg_slots.contains(&slot) || fallback_slot_match {
-            param.evidence.pointer_proven = param.evidence.pointer_proven.max(1);
-        }
-    }
-}
-
 pub fn infer_signature_from_prepared_ssa(
     function_name: &str,
     arch_name: &str,
@@ -95,7 +71,6 @@ pub fn infer_signature_from_prepared_ssa(
     prepared: &SsaArtifact,
     pattern_ssa_blocks: &[SSABlock],
     recovered_params: &[RecoveredSignatureParam],
-    pointer_arg_slots: &BTreeSet<usize>,
 ) -> InferredSignature {
     let evidence_ctx = crate::prepare::collect_signature_type_evidence_context_with_arch(
         pattern_ssa_blocks,
@@ -139,8 +114,6 @@ pub fn infer_signature_from_prepared_ssa(
             }
         })
         .collect::<Vec<_>>();
-
-    merge_pointer_slot_evidence_into_signature_params(&mut canonical_params, pointer_arg_slots);
 
     for param in &mut canonical_params {
         param.ty = resolve_evidence_driven_signature_type(
@@ -1387,25 +1360,39 @@ pub fn build_inferred_signature(
             .cmp(&b.arg_index)
             .then_with(|| a.name.cmp(&b.name))
     });
+    let confidence = compute_signature_confidence(&ordered, ret_type, ret_evidence);
     let mut used_param_names = HashSet::new();
-    let json_params = ordered
-        .iter()
-        .enumerate()
-        .map(|(idx, p)| {
-            let fallback_idx = if p.arg_index == usize::MAX {
-                idx
-            } else {
-                p.arg_index
-            };
-            InferredSignatureParam {
-                name: normalize_inferred_param_name(&p.name, fallback_idx, &mut used_param_names),
-                param_type: render_signature_type(&p.ty, ptr_bits),
-            }
-        })
-        .collect::<Vec<_>>();
+    let mut json_params = Vec::new();
+    for param in &ordered {
+        let slot = if param.arg_index == usize::MAX {
+            json_params.len()
+        } else {
+            param.arg_index
+        };
+        while json_params.len() < slot {
+            let gap_slot = json_params.len();
+            json_params.push(InferredSignatureParam {
+                name: normalize_inferred_param_name(
+                    &format!("arg{gap_slot}"),
+                    gap_slot,
+                    &mut used_param_names,
+                ),
+                param_type: render_signature_type(
+                    &CTypeLike::Int {
+                        bits: ptr_bits.max(8),
+                        signedness: Signedness::Unknown,
+                    },
+                    ptr_bits,
+                ),
+            });
+        }
+        json_params.push(InferredSignatureParam {
+            name: normalize_inferred_param_name(&param.name, slot, &mut used_param_names),
+            param_type: render_signature_type(&param.ty, ptr_bits),
+        });
+    }
     let rendered_ret = render_signature_type(ret_type, ptr_bits);
     let (callconv, callconv_confidence) = compute_callconv_inference(arch_name, input_counts);
-    let confidence = compute_signature_confidence(&ordered, ret_type, ret_evidence);
     InferredSignature {
         function_name: function_name.to_string(),
         signature: format_afs_signature(function_name, &rendered_ret, &json_params),
@@ -1596,7 +1583,6 @@ mod tests {
             &prepared,
             &pattern_blocks,
             &recovered,
-            &BTreeSet::new(),
         );
 
         assert_eq!(inferred.params[0].param_type, "uint8_t*");
@@ -1654,7 +1640,6 @@ mod tests {
             &prepared,
             &pattern_blocks,
             &recovered,
-            &BTreeSet::new(),
         );
 
         assert_eq!(inferred.params[0].param_type, "uint64_t");
@@ -1719,7 +1704,6 @@ mod tests {
             &prepared,
             &pattern_blocks,
             &[],
-            &BTreeSet::new(),
         );
 
         assert_eq!(inferred.ret_type, "uint32_t");
@@ -1742,7 +1726,6 @@ mod tests {
             &prepared,
             &pattern_blocks,
             &[],
-            &BTreeSet::new(),
         );
 
         assert_eq!(inferred.ret_type, "void");
@@ -1857,5 +1840,52 @@ mod tests {
             inferred.confidence,
             crate::SIGNATURE_PROJECTION_STRONG_CONFIDENCE
         );
+    }
+
+    #[test]
+    fn sparse_abi_parameters_materialize_preceding_slots() {
+        let params = vec![
+            SignatureParamCandidate {
+                name: "arg0".to_string(),
+                ty: CTypeLike::Int {
+                    bits: 64,
+                    signedness: Signedness::Unknown,
+                },
+                arg_index: 0,
+                size_bytes: 8,
+                evidence: SignatureTypeEvidence::default(),
+            },
+            SignatureParamCandidate {
+                name: "arg6".to_string(),
+                ty: CTypeLike::Int {
+                    bits: 32,
+                    signedness: Signedness::Signed,
+                },
+                arg_index: 6,
+                size_bytes: 4,
+                evidence: SignatureTypeEvidence {
+                    scalar_proven: 1,
+                    width_bits: 32,
+                    ..SignatureTypeEvidence::default()
+                },
+            },
+        ];
+
+        let inferred = build_inferred_signature(
+            "stack_arg",
+            "x86-64",
+            64,
+            &params,
+            &CTypeLike::Void,
+            &SignatureTypeEvidence::default(),
+            &HashMap::new(),
+        );
+
+        assert_eq!(inferred.params.len(), 7);
+        for (slot, param) in inferred.params.iter().enumerate() {
+            assert_eq!(param.name, format!("arg{slot}"));
+        }
+        assert_eq!(inferred.params[1].param_type, "int64_t");
+        assert_eq!(inferred.params[6].param_type, "int32_t");
     }
 }
