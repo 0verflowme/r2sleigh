@@ -1279,7 +1279,7 @@ pub fn render_vm_semantic_summary(
     }
     consumer_vm::render_vm_semantic_summary(
         func_name,
-        function_facts.type_facts(),
+        function_facts,
         function_facts.semantic_artifact()?,
     )
 }
@@ -5861,7 +5861,7 @@ impl Decompiler {
         }
         crate::consumer_vm::render_vm_semantic_summary(
             func_name,
-            function_facts.type_facts(),
+            function_facts,
             function_facts.semantic_artifact()?,
         )
     }

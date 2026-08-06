@@ -1,7 +1,7 @@
 use std::fmt::Write as _;
 
 use crate::ast::CType;
-use r2types::FunctionTypeFacts;
+use r2types::FunctionFacts;
 
 fn vm_summary_stats_comment(func_name: &str, vm_step: &r2sym::VmStepSummary) -> String {
     let kind = crate::format_vm_summary_kind(vm_step.kind);
@@ -187,7 +187,8 @@ fn c_identifier_from_function_name(func_name: &str) -> String {
     }
 }
 
-fn vm_summary_signature_comment(func_name: &str, type_facts: &FunctionTypeFacts) -> Option<String> {
+fn vm_summary_signature_comment(func_name: &str, function_facts: &FunctionFacts) -> Option<String> {
+    let type_facts = function_facts.type_facts();
     let signature = type_facts.render_authorized_signature()?;
     let ret = signature
         .ret_type
@@ -195,9 +196,14 @@ fn vm_summary_signature_comment(func_name: &str, type_facts: &FunctionTypeFacts)
         .map(crate::type_like_to_ctype)
         .filter(|ty| !matches!(ty, CType::Unknown))?;
     let mut params = Vec::new();
-    for param in &signature.params {
+    for (index, param) in signature.params.iter().enumerate() {
         let name = param.name.trim();
-        if name.is_empty() || crate::is_generic_arg_name(name) {
+        if name.is_empty()
+            || crate::is_generic_arg_name(name)
+                && !function_facts
+                    .render()
+                    .is_some_and(|render| render.has_certified_parameter(index))
+        {
             continue;
         }
         let Some(ty) = param.ty.as_ref().map(crate::type_like_to_ctype) else {
@@ -231,7 +237,7 @@ fn render_vm_case_labels(out: &mut String, vm_step: &r2sym::VmStepSummary, targe
 
 pub(crate) fn render_vm_semantic_summary(
     func_name: &str,
-    type_facts: &FunctionTypeFacts,
+    function_facts: &FunctionFacts,
     semantic_artifact: &r2sym::SemanticArtifact,
 ) -> Option<String> {
     let vm_body = semantic_artifact.vm_body()?;
@@ -243,7 +249,7 @@ pub(crate) fn render_vm_semantic_summary(
     let display_name = c_identifier_from_function_name(func_name);
     let mut out = String::new();
 
-    if let Some(signature) = vm_summary_signature_comment(&display_name, type_facts) {
+    if let Some(signature) = vm_summary_signature_comment(&display_name, function_facts) {
         let _ = writeln!(out, "/* {signature} */");
     }
     let _ = writeln!(
@@ -298,4 +304,73 @@ pub(crate) fn render_vm_semantic_fallback_comment(
         "/* {} */",
         vm_summary_stats_comment(func_name, vm_step)
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+    use r2types::{
+        CTypeLike, CertifiedEntity, FunctionParamSpec, FunctionRenderFacts, FunctionSignatureSpec,
+        FunctionTypeFacts, SignatureCertificate, SignatureCertificateSource, Signedness,
+    };
+
+    fn signed_int(bits: u32) -> CTypeLike {
+        CTypeLike::Int {
+            bits,
+            signedness: Signedness::Signed,
+        }
+    }
+
+    #[test]
+    fn vm_signature_keeps_only_certified_generic_parameters() {
+        let signature = FunctionSignatureSpec {
+            ret_type: Some(signed_int(32)),
+            params: vec![
+                FunctionParamSpec {
+                    name: "arg0".to_string(),
+                    ty: Some(CTypeLike::Pointer(Box::new(signed_int(8)))),
+                },
+                FunctionParamSpec {
+                    name: "arg1".to_string(),
+                    ty: Some(signed_int(32)),
+                },
+                FunctionParamSpec {
+                    name: "arg2".to_string(),
+                    ty: Some(signed_int(64)),
+                },
+            ],
+        };
+        let mut render = FunctionRenderFacts::default();
+        for slot in 0..2 {
+            let id = r2ssa::SemanticId::parameter(slot).expect("parameter id");
+            render.certified_entities.insert(
+                id,
+                CertifiedEntity::Parameter {
+                    id,
+                    slot: slot as u32,
+                    entry_values: BTreeSet::new(),
+                    carrier_width: 64,
+                },
+            );
+        }
+        let facts = FunctionFacts::new(
+            FunctionTypeFacts {
+                signature_certificate: SignatureCertificate::from_signature(
+                    &signature,
+                    [SignatureCertificateSource::LocalInference],
+                ),
+                merged_signature: Some(signature),
+                ..FunctionTypeFacts::default()
+            },
+            None,
+        )
+        .with_render(render);
+
+        assert_eq!(
+            vm_summary_signature_comment("tiny_vm_dispatch", &facts).as_deref(),
+            Some("int32_t tiny_vm_dispatch(int8_t* arg0, int32_t arg1)")
+        );
+    }
 }

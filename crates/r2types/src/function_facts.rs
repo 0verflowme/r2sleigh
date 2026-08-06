@@ -468,6 +468,19 @@ impl FunctionRenderFacts {
             .copied()
     }
 
+    pub fn has_certified_parameter(&self, slot: usize) -> bool {
+        let Some(id) = r2ssa::SemanticId::parameter(slot) else {
+            return false;
+        };
+        matches!(
+            self.certified_entities.get(&id),
+            Some(CertifiedEntity::Parameter {
+                slot: entity_slot,
+                ..
+            }) if usize::try_from(*entity_slot).ok() == Some(slot)
+        )
+    }
+
     /// Resolve a value carrying a direct parameter binding to one ABI slot.
     ///
     /// This deliberately does not walk expression inputs: an expression that
