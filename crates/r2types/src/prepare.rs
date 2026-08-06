@@ -925,6 +925,36 @@ fn collect_register_version_keys(ssa_blocks: &[SSABlock]) -> HashMap<String, Vec
     reg_versions
 }
 
+fn collect_register_live_in_aliases(ssa_blocks: &[SSABlock]) -> Vec<(String, String)> {
+    let mut last_definitions = HashMap::<String, SSAVar>::new();
+    let mut aliases = Vec::new();
+    for block in ssa_blocks {
+        for op in &block.ops {
+            op.for_each_source(|var| {
+                if !ssa_var_is_register_like(var) {
+                    return;
+                }
+                let family = scalar_register_family_key(&var.name);
+                let source = ssa_var_key(var);
+                if let Some(previous) = last_definitions.get(&family)
+                    && var.version <= previous.version
+                    && ssa_var_key(previous) != source
+                {
+                    aliases.push((ssa_var_key(previous), source));
+                }
+            });
+            if let Some(dst) = op.dst()
+                && ssa_var_is_register_like(dst)
+            {
+                last_definitions.insert(scalar_register_family_key(&dst.name), dst.clone());
+            }
+        }
+    }
+    aliases.sort();
+    aliases.dedup();
+    aliases
+}
+
 fn set_width_hint_prefer_narrower(
     width_hints: &mut HashMap<String, u32>,
     key: String,
@@ -1074,8 +1104,14 @@ fn infer_pointer_width_bytes(ssa_blocks: &[SSABlock], stack_bases: BaseRegList) 
 
 fn infer_index_like_var_keys(ssa_blocks: &[SSABlock]) -> HashSet<String> {
     let mut index_like: HashSet<String> = HashSet::new();
+    let mut constant_like: HashSet<String> = HashSet::new();
     for block in ssa_blocks {
         for op in &block.ops {
+            op.for_each_source(|source| {
+                if ssa_var_is_const(source) {
+                    constant_like.insert(ssa_var_key(source));
+                }
+            });
             if let SSAOp::IntSExt { dst, src } | SSAOp::IntZExt { dst, src } = op
                 && src.size < dst.size
             {
@@ -1093,6 +1129,9 @@ fn infer_index_like_var_keys(ssa_blocks: &[SSABlock]) -> HashSet<String> {
                     SSAOp::Copy { dst, src }
                     | SSAOp::Cast { dst, src }
                     | SSAOp::New { dst, src } => {
+                        if constant_like.contains(&ssa_var_key(src)) {
+                            changed |= constant_like.insert(ssa_var_key(dst));
+                        }
                         if index_like.contains(&ssa_var_key(src)) {
                             changed |= index_like.insert(ssa_var_key(dst));
                         }
@@ -1100,13 +1139,16 @@ fn infer_index_like_var_keys(ssa_blocks: &[SSABlock]) -> HashSet<String> {
                     SSAOp::IntMult { dst, a, b } => {
                         let a_key = ssa_var_key(a);
                         let b_key = ssa_var_key(b);
-                        let a_is_scaled_const = ssa_var_is_const(a);
-                        let b_is_scaled_const = ssa_var_is_const(b);
-                        if (index_like.contains(&a_key) && ssa_var_is_const(b))
-                            || (index_like.contains(&b_key) && ssa_var_is_const(a))
-                            || (a_is_scaled_const && !b_is_scaled_const)
-                            || (b_is_scaled_const && !a_is_scaled_const)
-                        {
+                        let a_is_scaled_const = constant_like.contains(&a_key);
+                        let b_is_scaled_const = constant_like.contains(&b_key);
+                        let result_is_index = match (a_is_scaled_const, b_is_scaled_const) {
+                            (true, false) | (false, true) => true,
+                            (true, true) => {
+                                index_like.contains(&a_key) || index_like.contains(&b_key)
+                            }
+                            (false, false) => false,
+                        };
+                        if result_is_index {
                             changed |= index_like.insert(ssa_var_key(dst));
                         }
                     }
@@ -1132,7 +1174,7 @@ fn infer_pointer_var_keys_from_ssa(
     stack_bases: BaseRegList,
 ) -> HashSet<String> {
     let mut pointer_vars: HashSet<String> = HashSet::new();
-    let register_versions = collect_register_version_keys(ssa_blocks);
+    let register_live_in_aliases = collect_register_live_in_aliases(ssa_blocks);
     let index_like_vars = infer_index_like_var_keys(ssa_blocks);
     let pointer_width = infer_pointer_width_bytes(ssa_blocks, stack_bases);
     let mut stack_addr_slots: HashMap<String, String> = HashMap::new();
@@ -1307,12 +1349,12 @@ fn infer_pointer_var_keys_from_ssa(
                 }
             }
         }
-
-        for reg_keys in register_versions.values() {
-            if reg_keys.iter().any(|key| pointer_vars.contains(key)) {
-                for key in reg_keys {
-                    changed |= pointer_vars.insert(key.clone());
-                }
+        for (previous, live_in) in &register_live_in_aliases {
+            if pointer_vars.contains(previous) {
+                changed |= pointer_vars.insert(live_in.clone());
+            }
+            if pointer_vars.contains(live_in) {
+                changed |= pointer_vars.insert(previous.clone());
             }
         }
     }
@@ -2060,6 +2102,80 @@ mod tests {
                 signedness: crate::Signedness::Unknown,
             }))
         );
+    }
+
+    #[test]
+    fn pointer_evidence_does_not_cross_unrelated_register_versions() {
+        let block = SSABlock {
+            addr: 0x1000,
+            size: 16,
+            ops: vec![
+                SSAOp::IntAdd {
+                    dst: SSAVar::new("tmp:slot", 1, 8),
+                    a: SSAVar::new("sp", 1, 8),
+                    b: SSAVar::constant(16, 8),
+                },
+                SSAOp::Store {
+                    addr: SSAVar::new("tmp:slot", 1, 8),
+                    val: SSAVar::new("x1", 0, 8),
+                    space: "ram".to_string(),
+                },
+                SSAOp::Load {
+                    dst: SSAVar::new("x9", 1, 8),
+                    addr: SSAVar::new("tmp:slot", 1, 8),
+                    space: "ram".to_string(),
+                },
+                SSAOp::Load {
+                    dst: SSAVar::new("tmp:value", 1, 1),
+                    addr: SSAVar::new("x9", 2, 8),
+                    space: "ram".to_string(),
+                },
+            ],
+        };
+
+        let evidence = collect_signature_type_evidence_context_with_arch(&[block], Some("aarch64"));
+
+        assert!(evidence.pointer_vars.contains("x9_2"));
+        assert!(!evidence.pointer_vars.contains("x9_1"));
+        assert!(!evidence.pointer_vars.contains("x1_0"));
+    }
+
+    #[test]
+    fn copied_constant_scale_preserves_parameter_pointer_identity() {
+        let block = SSABlock {
+            addr: 0x1000,
+            size: 16,
+            ops: vec![
+                SSAOp::IntSExt {
+                    dst: SSAVar::new("x9", 1, 8),
+                    src: SSAVar::new("w1", 0, 4),
+                },
+                SSAOp::Copy {
+                    dst: SSAVar::new("x10", 1, 8),
+                    src: SSAVar::constant(40, 8),
+                },
+                SSAOp::IntMult {
+                    dst: SSAVar::new("x9", 2, 8),
+                    a: SSAVar::new("x9", 1, 8),
+                    b: SSAVar::new("x10", 1, 8),
+                },
+                SSAOp::IntAdd {
+                    dst: SSAVar::new("tmp:element", 1, 8),
+                    a: SSAVar::new("x0", 0, 8),
+                    b: SSAVar::new("x9", 2, 8),
+                },
+                SSAOp::Load {
+                    dst: SSAVar::new("tmp:value", 1, 4),
+                    addr: SSAVar::new("tmp:element", 1, 8),
+                    space: "ram".to_string(),
+                },
+            ],
+        };
+
+        let evidence = collect_signature_type_evidence_context_with_arch(&[block], Some("aarch64"));
+
+        assert!(evidence.pointer_vars.contains("x0_0"));
+        assert_eq!(evidence.pointer_pointee_width_bytes.get("x0_0"), Some(&4));
     }
 
     #[test]

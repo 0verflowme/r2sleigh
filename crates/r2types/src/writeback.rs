@@ -3564,6 +3564,35 @@ fn apply_type_hint_assumptions_to_context(
     usage
 }
 
+fn applied_type_assumption_parameter_slots(
+    usage: &r2ssa::AssumptionUsageReport,
+    parsed_context: &ParsedExternalContext,
+) -> HashSet<usize> {
+    usage
+        .applied
+        .iter()
+        .filter_map(|assumption| match &assumption.subject {
+            r2ssa::AssumptionSubject::Parameter { index } => Some(*index),
+            r2ssa::AssumptionSubject::Register { name } => {
+                parsed_context.register_params.iter().position(|param| {
+                    param.reg.eq_ignore_ascii_case(name) || param.name.eq_ignore_ascii_case(name)
+                })
+            }
+            r2ssa::AssumptionSubject::StackSlot { base, offset } => assumption_stack_base(base)
+                .and_then(|base| {
+                    parsed_context.stack_slots.get(&StackSlotKey {
+                        base,
+                        offset: *offset,
+                    })
+                })
+                .and_then(|slot| slot.param_index),
+            r2ssa::AssumptionSubject::Predicate { .. }
+            | r2ssa::AssumptionSubject::Target { .. }
+            | r2ssa::AssumptionSubject::MemoryWindow { .. } => None,
+        })
+        .collect()
+}
+
 fn build_type_writeback_analysis_inner(
     mut input: TypeWritebackAnalysisInput<'_>,
     semantic_inputs: Option<TypeWritebackSemanticInputs<'_>>,
@@ -3596,6 +3625,8 @@ fn build_type_writeback_analysis_inner(
         input.ptr_bits,
         Some(&semantic_projection),
     );
+    let type_assumption_parameter_slots =
+        applied_type_assumption_parameter_slots(&type_assumption_usage, &input.parsed_context);
     let mut signature_certificate_sources = Vec::new();
     if authoritative_external_arity {
         push_signature_certificate_source(
@@ -3603,7 +3634,7 @@ fn build_type_writeback_analysis_inner(
             SignatureCertificateSource::ExternalContext,
         );
     }
-    if !type_assumption_usage.applied.is_empty() {
+    if !type_assumption_parameter_slots.is_empty() {
         push_signature_certificate_source(
             &mut signature_certificate_sources,
             SignatureCertificateSource::TypeAssumption,
@@ -3759,8 +3790,11 @@ fn build_type_writeback_analysis_inner(
         input.ptr_bits,
     );
     let array_index_field_profiles = local_structs.slot_field_profiles.clone();
-    let indexed_local_struct_refinement_slots =
-        indexed_local_struct_refinement_slots(&local_structs, &signature_certificate_sources);
+    let indexed_local_struct_refinement_slots = indexed_local_struct_refinement_slots(
+        &local_structs,
+        &signature_certificate_sources,
+        &type_assumption_parameter_slots,
+    );
     prune_conflicting_local_struct_overrides(
         &merged_signature,
         &mut local_structs.struct_decls,
@@ -9284,15 +9318,27 @@ fn signature_param_allows_local_struct_override(
 fn indexed_local_struct_refinement_slots(
     local_structs: &LocalStructArtifacts,
     signature_sources: &[SignatureCertificateSource],
+    type_assumption_parameter_slots: &HashSet<usize>,
 ) -> HashSet<usize> {
     if signature_sources.is_empty()
-        || signature_sources
-            .iter()
-            .any(|source| *source != SignatureCertificateSource::LocalInference)
+        || signature_sources.iter().any(|source| {
+            !matches!(
+                source,
+                SignatureCertificateSource::LocalInference
+                    | SignatureCertificateSource::TypeAssumption
+                    | SignatureCertificateSource::RecoveredVariable
+                    | SignatureCertificateSource::SlotTypeOverride
+            )
+        })
     {
         return HashSet::new();
     }
-    local_structs.slot_element_strides.keys().copied().collect()
+    local_structs
+        .slot_element_strides
+        .keys()
+        .filter(|slot| !type_assumption_parameter_slots.contains(slot))
+        .copied()
+        .collect()
 }
 
 fn merge_slot_type_overrides_into_signature(
@@ -16458,10 +16504,28 @@ mod tests {
         let local_slots = indexed_local_struct_refinement_slots(
             &local_structs,
             &[SignatureCertificateSource::LocalInference],
+            &HashSet::new(),
         );
         let external_slots = indexed_local_struct_refinement_slots(
             &local_structs,
             &[SignatureCertificateSource::ExternalContext],
+            &HashSet::new(),
+        );
+        let recovered_slots = indexed_local_struct_refinement_slots(
+            &local_structs,
+            &[
+                SignatureCertificateSource::LocalInference,
+                SignatureCertificateSource::RecoveredVariable,
+            ],
+            &HashSet::new(),
+        );
+        let assumption_protected_slots = indexed_local_struct_refinement_slots(
+            &local_structs,
+            &[
+                SignatureCertificateSource::LocalInference,
+                SignatureCertificateSource::TypeAssumption,
+            ],
+            &HashSet::from([0]),
         );
 
         let locally_refined = merge_slot_type_overrides_into_signature(
@@ -16490,6 +16554,45 @@ mod tests {
             ))))
         );
         assert_eq!(externally_protected, signature);
+        assert_eq!(recovered_slots, HashSet::from([0]));
+        assert!(assumption_protected_slots.is_empty());
+    }
+
+    #[test]
+    fn stack_local_type_assumption_does_not_claim_signature_authority() {
+        let stack_assumption = r2ssa::AnalysisAssumption {
+            id: None,
+            subject: r2ssa::AssumptionSubject::StackSlot {
+                base: "sp".to_string(),
+                offset: -8,
+            },
+            value: r2ssa::AssumptionValue::TypeHint {
+                ty: "int64_t".to_string(),
+            },
+            scope: r2ssa::AssumptionScope::Function,
+            provenance: r2ssa::AssumptionProvenance::ImportedContext,
+        };
+        let mut usage = r2ssa::AssumptionUsageReport {
+            applied: vec![stack_assumption],
+            ..Default::default()
+        };
+        let context = ParsedExternalContext::default();
+
+        assert!(applied_type_assumption_parameter_slots(&usage, &context).is_empty());
+
+        usage.applied.push(r2ssa::AnalysisAssumption {
+            id: None,
+            subject: r2ssa::AssumptionSubject::Parameter { index: 1 },
+            value: r2ssa::AssumptionValue::TypeHint {
+                ty: "uint64_t".to_string(),
+            },
+            scope: r2ssa::AssumptionScope::Function,
+            provenance: r2ssa::AssumptionProvenance::ImportedContext,
+        });
+        assert_eq!(
+            applied_type_assumption_parameter_slots(&usage, &context),
+            HashSet::from([1])
+        );
     }
 
     #[test]

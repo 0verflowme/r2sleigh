@@ -104,23 +104,28 @@ pub fn infer_signature_from_prepared_ssa(
     let mut type_inference = TypeInference::new(ptr_bits);
     type_inference.set_prepared_ssa(prepared);
     type_inference.infer_function(prepared);
+    let certified_parameter_widths = certified_parameter_memory_widths(prepared);
 
     let mut canonical_params = recovered_params
         .iter()
         .map(|param| {
-            let mut evidence = collect_signature_type_evidence_for_var(
-                &evidence_ctx,
-                &param.ssa_var,
-                &param.initial_ty,
+            let initial_ty = certified_parameter_pointer_type(
+                param.initial_ty.clone(),
+                certified_parameter_widths.get(&param.arg_index),
             );
-            if matches!(param.initial_ty, CTypeLike::Void | CTypeLike::Unknown) {
+            let mut evidence =
+                collect_signature_type_evidence_for_var(&evidence_ctx, &param.ssa_var, &initial_ty);
+            if certified_parameter_widths.contains_key(&param.arg_index) {
+                evidence.pointer_proven = evidence.pointer_proven.max(1);
+            }
+            if matches!(initial_ty, CTypeLike::Void | CTypeLike::Unknown) {
                 merge_initial_signature_type_evidence(
                     &type_inference.type_from_size(param.ssa_var.size),
                     &mut evidence,
                 );
             }
             let ty = resolve_evidence_driven_signature_type(
-                param.initial_ty.clone(),
+                initial_ty,
                 param.ssa_var.size,
                 ptr_bits,
                 &evidence,
@@ -165,6 +170,63 @@ pub fn infer_signature_from_prepared_ssa(
     )
 }
 
+fn certified_parameter_memory_widths(prepared: &SsaArtifact) -> HashMap<usize, BTreeSet<u32>> {
+    let mut widths = HashMap::<usize, BTreeSet<u32>>::new();
+    for access in prepared.certificates().memory_accesses.values() {
+        let Some(index) = certified_memory_parameter(prepared, access) else {
+            continue;
+        };
+        widths.entry(index).or_default().insert(access.width);
+    }
+    widths
+}
+
+fn certified_memory_parameter(
+    prepared: &SsaArtifact,
+    access: &r2ssa::MemoryAccessCertificate,
+) -> Option<usize> {
+    prepared
+        .objects()
+        .object(access.object)
+        .and_then(|object| match object.kind {
+            ObjectKind::Parameter { index } => Some(index),
+            _ => None,
+        })
+        .or_else(|| {
+            prepared
+                .addresses()
+                .parameter_expression(access.address)
+                .map(|expression| expression.parameter)
+        })
+}
+
+fn certified_parameter_pointer_type(
+    initial_ty: CTypeLike,
+    widths: Option<&BTreeSet<u32>>,
+) -> CTypeLike {
+    let Some(widths) = widths else {
+        return initial_ty;
+    };
+    if matches!(
+        initial_ty,
+        CTypeLike::Pointer(ref inner)
+            if !matches!(inner.as_ref(), CTypeLike::Void | CTypeLike::Unknown)
+    ) {
+        return initial_ty;
+    }
+    let Some(width) = widths.first().copied().filter(|_| widths.len() == 1) else {
+        return CTypeLike::Pointer(Box::new(CTypeLike::Void));
+    };
+    let bits = width.saturating_mul(8);
+    if !matches!(bits, 8 | 16 | 32 | 64) {
+        return CTypeLike::Pointer(Box::new(CTypeLike::Void));
+    }
+    CTypeLike::Pointer(Box::new(CTypeLike::Int {
+        bits,
+        signedness: Signedness::Unknown,
+    }))
+}
+
 fn refine_parameter_pointee_signedness(
     arch_name: &str,
     prepared: &SsaArtifact,
@@ -203,10 +265,7 @@ fn refine_parameter_pointee_signedness(
     );
     let mut pointee_evidence = HashMap::<(usize, u32), BTreeSet<ScalarSignednessEvidence>>::new();
     for access in prepared.certificates().memory_accesses.values() {
-        let Some(object) = prepared.objects().object(access.object) else {
-            continue;
-        };
-        let ObjectKind::Parameter { index } = object.kind else {
+        let Some(index) = certified_memory_parameter(prepared, access) else {
             continue;
         };
         let Some(value) = access.value.and_then(|value| prepared.value_var(value)) else {
@@ -1396,10 +1455,10 @@ mod tests {
             name: "code".to_string(),
             arg_index: 0,
             ssa_var: SSAVar::new("x0", 0, 8),
-            initial_ty: CTypeLike::Pointer(Box::new(CTypeLike::Int {
-                bits: 8,
-                signedness: Signedness::Unknown,
-            })),
+            initial_ty: CTypeLike::Int {
+                bits: 64,
+                signedness: Signedness::Signed,
+            },
         }];
 
         let inferred = infer_signature_from_prepared_ssa(
