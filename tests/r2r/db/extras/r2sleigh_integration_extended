@@ -801,7 +801,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `isq~tiny_vm_dispatch$[0]` >/dev/null
 af
-a:sla.debug.types | jq -c 'type=="object" and ((.function_name // "") | contains("tiny_vm_dispatch")) and .compiled_semantics.execution=="vm" and (.compiled_semantics.vm_transfer != null) and (((.compiled_semantics.vm_transfer.truncated_handlers // []) | length) == 0) and (((.compiled_semantics.vm_transfer.transfers // []) | length) > 0) and (((.compiled_semantics.vm_transfer.transfers // []) | all(.truncated == false))) and (((.compiled_semantics.vm_transfer.handler_state_updates // {}) | to_entries | length) >= 5)'
+a:sla.debug.types | jq -c 'type=="object" and ((.function_name // "") | contains("tiny_vm_dispatch")) and .compiled_semantics.execution=="vm" and (.compiled_semantics.vm_transfer != null) and (((.compiled_semantics.vm_transfer.truncated_handlers // []) | length) == 0) and (((.compiled_semantics.vm_transfer.transfers // []) | length) > 0) and (((.compiled_semantics.vm_transfer.transfers // []) | all(.truncated == false and .confidence != "heuristic" and ((.state_updates // []) | all(.exact == true))))) and (((.compiled_semantics.vm_transfer.handler_state_updates // {}) | to_entries | length) >= 5)'
 EOF_CMDS
 RUN
 

@@ -469,8 +469,14 @@ impl VmStepSummary {
             .handler_state_updates
             .values()
             .any(|updates| !updates.is_empty())
+            || self
+                .handler_memory_write_effects
+                .values()
+                .any(|writes| !writes.is_empty())
             || self.transfers.iter().any(|transfer| {
-                !transfer.state_updates.is_empty() || transfer.selector_update.is_some()
+                !transfer.state_updates.is_empty()
+                    || transfer.selector_update.is_some()
+                    || !transfer.memory_writes.is_empty()
             });
         let has_selector_update_evidence = self.selector.as_ref().is_some_and(|selector| {
             self.handler_state_updates
@@ -553,8 +559,6 @@ struct HandlerScc {
 struct HandlerSccSummary {
     blocks: BTreeSet<u64>,
     state_inputs: BTreeSet<String>,
-    state_outputs: BTreeSet<String>,
-    state_updates: BTreeMap<String, VmValueExpr>,
     exit_guards: Vec<VmGuardedExit>,
     memory_read_effects: Vec<VmMemoryCondition>,
     memory_write_effects: Vec<VmMemoryCondition>,
@@ -571,12 +575,7 @@ fn record_block_state(
     state_inputs: &mut BTreeSet<String>,
     state_outputs: &mut BTreeSet<String>,
 ) {
-    block.for_each_source(|src| {
-        if !is_vm_state_input_var(src.var) {
-            return;
-        }
-        state_inputs.insert(src.var.display_name());
-    });
+    record_block_state_inputs(block, state_inputs);
     for phi in &block.phis {
         if is_vm_state_output_var(&phi.dst) {
             state_outputs.insert(phi.dst.display_name());
@@ -591,6 +590,17 @@ fn record_block_state(
         }
         state_outputs.insert(dst.display_name());
     }
+}
+
+fn record_block_state_inputs(
+    block: &r2ssa::function::SSABlock,
+    state_inputs: &mut BTreeSet<String>,
+) {
+    block.for_each_source(|src| {
+        if is_vm_state_input_var(src.var) {
+            state_inputs.insert(src.var.display_name());
+        }
+    });
 }
 
 fn is_vm_state_input_var(var: &SSAVar) -> bool {
@@ -1368,6 +1378,57 @@ fn insert_vm_state_update(
     }
 }
 
+fn value_crosses_handler_boundary(
+    func: &SsaArtifact,
+    blocks: &BTreeSet<u64>,
+    value: &SSAVar,
+) -> bool {
+    let Some(value_id) = func.graph().value_id_for_var(value) else {
+        return false;
+    };
+    func.graph().use_sites(value_id).iter().any(|site| {
+        func.graph()
+            .inst(site.inst)
+            .and_then(|inst| func.graph().block(inst.block))
+            .is_some_and(|block| !blocks.contains(&block.addr))
+    })
+}
+
+fn handler_boundary_state_updates(
+    func: &SsaArtifact,
+    blocks: &BTreeSet<u64>,
+) -> BTreeMap<String, VmValueExpr> {
+    let mut updates = BTreeMap::new();
+    for block_addr in blocks {
+        let Some(block) = func.get_block(*block_addr) else {
+            continue;
+        };
+        for phi in &block.phis {
+            if is_vm_state_output_var(&phi.dst)
+                && value_crosses_handler_boundary(func, blocks, &phi.dst)
+            {
+                insert_vm_state_update(
+                    &mut updates,
+                    phi.dst.display_name(),
+                    classify_vm_var_value(func, &phi.dst, 0),
+                );
+            }
+        }
+        for (op_idx, op) in block.ops.iter().enumerate() {
+            let Some(dst) = op.dst() else {
+                continue;
+            };
+            if !is_vm_state_output_var(dst) || !value_crosses_handler_boundary(func, blocks, dst) {
+                continue;
+            }
+            let value = classify_vm_op_value_at_site(func, *block_addr, op_idx, op, 0)
+                .unwrap_or_else(|| VmValueExpr::Var(dst.display_name()));
+            insert_vm_state_update(&mut updates, dst.display_name(), value);
+        }
+    }
+    updates
+}
+
 fn sort_vm_guarded_exits(guards: &mut Vec<VmGuardedExit>) {
     guards.sort_by(|lhs, rhs| {
         (lhs.target, &lhs.guard.expr, lhs.guard.expect_nonzero).cmp(&(
@@ -1432,7 +1493,7 @@ fn summarize_handler_scc(
             }
         }
 
-        record_block_state(block, &mut summary.state_inputs, &mut summary.state_outputs);
+        record_block_state_inputs(block, &mut summary.state_inputs);
         for (op_idx, op) in block.ops.iter().enumerate() {
             if op.is_memory_read() {
                 summary.memory_reads += 1;
@@ -1451,15 +1512,6 @@ fn summarize_handler_scc(
             ) {
                 summary.calls += 1;
             }
-            if let Some(dst) = op.dst()
-                && !dst.is_const()
-                && !dst.is_temp()
-                && !dst.is_memory()
-            {
-                let value = classify_vm_op_value_at_site(func, *block_addr, op_idx, op, 0)
-                    .unwrap_or_else(|| VmValueExpr::Var(dst.display_name()));
-                insert_vm_state_update(&mut summary.state_updates, dst.display_name(), value);
-            }
         }
     }
 
@@ -1472,10 +1524,6 @@ fn summarize_handler_scc(
 fn join_handler_scc_summary(acc: &mut HandlerSccSummary, summary: HandlerSccSummary) {
     acc.blocks.extend(summary.blocks);
     acc.state_inputs.extend(summary.state_inputs);
-    acc.state_outputs.extend(summary.state_outputs);
-    for (output, value) in summary.state_updates {
-        insert_vm_state_update(&mut acc.state_updates, output, value);
-    }
     acc.exit_guards.extend(summary.exit_guards);
     sort_vm_guarded_exits(&mut acc.exit_guards);
     acc.memory_read_effects.extend(summary.memory_read_effects);
@@ -1506,13 +1554,14 @@ fn summarize_handler_region(
         let summary = summarize_handler_scc(func, scc, &mut seen_exit_guards);
         join_handler_scc_summary(&mut joined, summary);
     }
+    let state_updates = handler_boundary_state_updates(func, &graph.blocks);
+    let state_outputs = state_updates.keys().cloned().collect();
 
     HandlerRegionSummary {
         blocks: joined.blocks.into_iter().collect(),
         state_inputs: joined.state_inputs.into_iter().collect(),
-        state_outputs: joined.state_outputs.into_iter().collect(),
-        state_updates: joined
-            .state_updates
+        state_outputs,
+        state_updates: state_updates
             .into_iter()
             .map(|(output, value)| VmStateUpdate {
                 output,
@@ -2026,6 +2075,7 @@ pub(crate) fn build_vm_step_summary(
                 .all(|effect| effect.address.has_exact_identity() && effect.exact_value);
         let exact = !summary.truncated
             && summary.calls == 0
+            && summary.conditional_branches == 0
             && summary.state_updates.iter().all(|update| update.exact)
             && selector_update.as_ref().is_none_or(|update| update.exact)
             && summary.exit_guards.iter().all(|guard| guard.guard.exact)
@@ -2438,11 +2488,10 @@ mod tests {
         assert!(!summary.truncated);
         assert_eq!(summary.conditional_branches, 1);
         assert!(!summary.exit_guards.is_empty());
-        assert!(!summary.state_updates.is_empty());
     }
 
     #[test]
-    fn handler_scc_summary_widens_conflicting_state_updates() {
+    fn handler_state_updates_keep_only_the_live_final_definition() {
         let dispatch = 0x1000;
         let entry = 0x3000;
         let mut block = R2ILBlock::new(entry, 4);
@@ -2457,7 +2506,16 @@ mod tests {
         block.push(R2ILOp::Branch {
             target: make_const(dispatch, 8),
         });
-        let blocks = vec![block, R2ILBlock::new(dispatch, 4)];
+        let mut dispatch_block = R2ILBlock::new(dispatch, 4);
+        dispatch_block.push(R2ILOp::IntAdd {
+            dst: make_reg(RDI, 8),
+            a: make_reg(RAX, 8),
+            b: make_const(1, 8),
+        });
+        dispatch_block.push(R2ILOp::Return {
+            target: make_reg(RDI, 8),
+        });
+        let blocks = vec![block, dispatch_block];
         let func = SsaArtifact::for_symbolic(&blocks, Some(&test_arch())).expect("ssa");
 
         let summary =
@@ -2468,8 +2526,9 @@ mod tests {
             .iter()
             .find(|update| same_logical_name(&update.output, "RAX"))
             .expect("RAX update");
-        assert!(!update.exact);
-        assert!(matches!(update.value, VmValueExpr::Expr(_)));
+        assert!(update.exact, "{update:#?}");
+        assert_eq!(update.value, VmValueExpr::Const(2));
+        assert_eq!(summary.state_outputs, vec![update.output.clone()]);
         assert!(!summary.truncated);
     }
 }
