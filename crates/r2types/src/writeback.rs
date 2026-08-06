@@ -3286,7 +3286,11 @@ fn type_hint_can_replace_weak_existing(
     }
 
     match assumption.provenance {
-        r2ssa::AssumptionProvenance::User | r2ssa::AssumptionProvenance::ImportedContext => {
+        r2ssa::AssumptionProvenance::User => {
+            binding_name.is_none_or(is_generic_arg_name)
+                && matches!(existing, CTypeLike::Int { .. })
+        }
+        r2ssa::AssumptionProvenance::ImportedContext => {
             let generic_binding = binding_name.is_none_or(is_generic_arg_name);
             generic_binding
                 && matches!(
@@ -3385,6 +3389,13 @@ fn apply_type_hint_assumptions_to_context(
     semantic_projection: Option<&SemanticTypeProjection>,
 ) -> r2ssa::AssumptionUsageReport {
     let mut usage = r2ssa::AssumptionUsageReport::default();
+    let inferred_register_params =
+        inferred_signature_abi_register_params(inferred_signature, ptr_bits);
+    if inferred_register_params.len() > parsed_context.register_params.len() {
+        parsed_context
+            .register_params
+            .extend_from_slice(&inferred_register_params[parsed_context.register_params.len()..]);
+    }
     let assumptions = parsed_context.assumptions.items.clone();
     for assumption in &assumptions {
         let Some(hint) = assumption_type_hint(assumption, ptr_bits) else {
@@ -3418,7 +3429,7 @@ fn apply_type_hint_assumptions_to_context(
                     .iter_mut()
                     .enumerate()
                     .find(|(_, param)| {
-                        param.reg.eq_ignore_ascii_case(name)
+                        register_family_matches(&param.reg, name)
                             || param.name.eq_ignore_ascii_case(name)
                     })
                 else {
@@ -3575,7 +3586,8 @@ fn applied_type_assumption_parameter_slots(
             r2ssa::AssumptionSubject::Parameter { index } => Some(*index),
             r2ssa::AssumptionSubject::Register { name } => {
                 parsed_context.register_params.iter().position(|param| {
-                    param.reg.eq_ignore_ascii_case(name) || param.name.eq_ignore_ascii_case(name)
+                    register_family_matches(&param.reg, name)
+                        || param.name.eq_ignore_ascii_case(name)
                 })
             }
             r2ssa::AssumptionSubject::StackSlot { base, offset } => assumption_stack_base(base)
@@ -8417,7 +8429,9 @@ fn merge_local_signature_into_merged_signature(
             if local_signature_should_override_external(
                 local.ret_type.as_ref(),
                 external.ret_type.as_ref(),
-            ) {
+            ) || (!external_param_count_is_authoritative
+                && scalar_signedness_conflicts(local.ret_type.as_ref(), external.ret_type.as_ref()))
+            {
                 external.ret_type = local.ret_type;
             } else if is_generic_signature_type(external.ret_type.as_ref()) {
                 external.ret_type = local.ret_type.or(external.ret_type);
@@ -8448,7 +8462,10 @@ fn merge_local_signature_into_merged_signature(
                     local_param.ty.as_ref(),
                     target.ty.as_ref(),
                     &target.name,
-                ) {
+                ) || (!external_param_count_is_authoritative
+                    && is_generic_arg_name(&target.name)
+                    && scalar_signedness_conflicts(local_param.ty.as_ref(), target.ty.as_ref()))
+                {
                     target.ty = local_param.ty;
                 } else if is_generic_signature_type(target.ty.as_ref()) {
                     target.ty = local_param.ty.or(target.ty.take());
@@ -8508,11 +8525,30 @@ fn local_scalar_override_should_apply(local: &CTypeLike, external: &CTypeLike) -
         ) => {
             *local_bits < *external_bits
                 || (*local_bits == *external_bits
-                    && matches!(local_signedness, Signedness::Signed)
-                    && !matches!(external_signedness, Signedness::Signed))
+                    && !matches!(local_signedness, Signedness::Unknown)
+                    && matches!(external_signedness, Signedness::Unknown))
         }
         _ => false,
     }
+}
+
+fn scalar_signedness_conflicts(local: Option<&CTypeLike>, external: Option<&CTypeLike>) -> bool {
+    matches!(
+        (local, external),
+        (
+            Some(CTypeLike::Int {
+                bits: local_bits,
+                signedness: local_signedness,
+            }),
+            Some(CTypeLike::Int {
+                bits: external_bits,
+                signedness: external_signedness,
+            })
+        ) if local_bits == external_bits
+            && !matches!(local_signedness, Signedness::Unknown)
+            && !matches!(external_signedness, Signedness::Unknown)
+            && local_signedness != external_signedness
+    )
 }
 
 fn is_canonical_main_signature_spec(signature: &FunctionSignatureSpec) -> bool {
@@ -13880,7 +13916,7 @@ mod tests {
                     bits: 64,
                     signedness: Signedness::Signed,
                 }),
-                reg: "RDI".to_string(),
+                reg: "EDI".to_string(),
             }],
             ..ParsedExternalContext::default()
         };
@@ -14724,6 +14760,34 @@ mod tests {
             .expect("merged signature");
 
         assert_eq!(merged.params[0].ty, Some(pointer));
+    }
+
+    #[test]
+    fn generated_signed_defaults_yield_to_certified_unsigned_signature() {
+        let unsigned = CTypeLike::Int {
+            bits: 64,
+            signedness: Signedness::Unsigned,
+        };
+        let external = FunctionSignatureSpec {
+            ret_type: Some(signed_int_type(64)),
+            params: vec![FunctionParamSpec {
+                name: "arg0".to_string(),
+                ty: Some(signed_int_type(64)),
+            }],
+        };
+        let local = FunctionSignatureSpec {
+            ret_type: Some(unsigned.clone()),
+            params: vec![FunctionParamSpec {
+                name: "arg0".to_string(),
+                ty: Some(unsigned.clone()),
+            }],
+        };
+
+        let merged = merge_local_signature_into_merged_signature(Some(external), Some(local))
+            .expect("merged signature");
+
+        assert_eq!(merged.ret_type, Some(unsigned.clone()));
+        assert_eq!(merged.params[0].ty, Some(unsigned));
     }
 
     #[test]
@@ -16556,6 +16620,67 @@ mod tests {
         assert_eq!(externally_protected, signature);
         assert_eq!(recovered_slots, HashSet::from([0]));
         assert!(assumption_protected_slots.is_empty());
+    }
+
+    #[test]
+    fn scalar_signedness_merge_only_refines_unknown_evidence() {
+        let scalar = |signedness| CTypeLike::Int {
+            bits: 64,
+            signedness,
+        };
+        let signed = scalar(Signedness::Signed);
+        let unsigned = scalar(Signedness::Unsigned);
+        let unknown = scalar(Signedness::Unknown);
+
+        assert!(local_scalar_override_should_apply(&signed, &unknown));
+        assert!(local_scalar_override_should_apply(&unsigned, &unknown));
+        assert!(!local_scalar_override_should_apply(&signed, &unsigned));
+        assert!(!local_scalar_override_should_apply(&unsigned, &signed));
+    }
+
+    #[test]
+    fn user_type_hint_can_replace_narrow_generic_scalar_inference() {
+        let mut context = ParsedExternalContext {
+            assumptions: r2ssa::AssumptionSet::new(vec![r2ssa::AnalysisAssumption {
+                id: None,
+                subject: r2ssa::AssumptionSubject::Register {
+                    name: "rdi".to_string(),
+                },
+                value: r2ssa::AssumptionValue::TypeHint {
+                    ty: "int32_t".to_string(),
+                },
+                scope: r2ssa::AssumptionScope::Function,
+                provenance: r2ssa::AssumptionProvenance::User,
+            }]),
+            ..ParsedExternalContext::default()
+        };
+        let mut signature = InferredSignature {
+            function_name: "sym.demo".to_string(),
+            signature: "uint32_t sym.demo(uint32_t)".to_string(),
+            ret_type: "uint32_t".to_string(),
+            params: vec![InferredSignatureParam {
+                name: "arg0".to_string(),
+                param_type: "uint32_t".to_string(),
+            }],
+            callconv: "amd64".to_string(),
+            arch: "x86-64".to_string(),
+            confidence: 96,
+            callconv_confidence: 92,
+        };
+
+        let usage = apply_type_hint_assumptions_to_context(
+            &mut context,
+            &mut signature,
+            64,
+            Some(&SemanticTypeProjection::default()),
+        );
+
+        assert_eq!(usage.applied.len(), 1);
+        assert_eq!(signature.params[0].param_type, "int32_t");
+        assert!(register_family_matches(
+            &context.register_params[0].reg,
+            "rdi"
+        ));
     }
 
     #[test]

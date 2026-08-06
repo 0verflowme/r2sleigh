@@ -421,7 +421,7 @@ pub fn recover_signature_params_from_ssa(
                             };
                         let initial_ty = hinted_type
                             .and_then(|ty| parse_type_like_spec(ty, ptr_bits))
-                            .unwrap_or_else(|| size_to_type_like(dst.size));
+                            .unwrap_or_else(|| size_to_neutral_int_type_like(dst.size));
                         params.push(RecoveredSignatureParam {
                             name: format!("arg{index}"),
                             arg_index: index,
@@ -446,6 +446,7 @@ pub fn recover_signature_params_from_ssa(
                     seen_arg_regs.insert(canonical.to_string());
                     let hinted_type = recovered_arg_type_hint(
                         &reg_type_hints,
+                        enabled_metadata_hints,
                         canonical,
                         aliases,
                         src,
@@ -454,7 +455,7 @@ pub fn recover_signature_params_from_ssa(
                     );
                     let initial_ty = hinted_type
                         .map(|hint| hint.ty)
-                        .unwrap_or_else(|| size_to_type_like(src.size));
+                        .unwrap_or_else(|| size_to_neutral_int_type_like(src.size));
                     params.push(RecoveredSignatureParam {
                         name: format!("arg{index}"),
                         arg_index: index,
@@ -604,6 +605,7 @@ pub fn recover_vars_from_ssa_with_prep_facts(
                             seen_arg_regs.insert(canonical.to_string());
                             let hinted_type = recovered_arg_type_hint(
                                 &reg_type_hints,
+                                enabled_metadata_hints,
                                 canonical,
                                 aliases,
                                 src,
@@ -641,20 +643,6 @@ fn collect_control_return_targets(ssa_blocks: &[SSABlock]) -> HashSet<String> {
             _ => None,
         })
         .collect()
-}
-
-fn size_to_type_like(size: u32) -> crate::CTypeLike {
-    let bits = match size {
-        1 => 8,
-        2 => 16,
-        4 => 32,
-        8 => 64,
-        _ => return crate::CTypeLike::Unknown,
-    };
-    crate::CTypeLike::Int {
-        bits,
-        signedness: crate::Signedness::Signed,
-    }
 }
 
 fn size_to_neutral_int_type_like(size: u32) -> crate::CTypeLike {
@@ -771,6 +759,7 @@ struct RecoveredArgTypeHint {
 
 fn recovered_arg_type_hint(
     reg_type_hints: &HashMap<String, TypeHint>,
+    metadata_reg_type_hints: &HashMap<String, TypeHint>,
     canonical: &str,
     aliases: &[&str],
     src: &SSAVar,
@@ -808,21 +797,33 @@ fn recovered_arg_type_hint(
             display: hint.ty.clone(),
         });
     }
-    let hint = if let Some(evidence) = signature_evidence
-        && let Some(bits) = recovered_arg_family_width_hint(evidence, src)
-    {
-        Some(size_to_type(bits.div_ceil(8)))
-    } else {
-        best_hint.map(|hint| hint.ty)
-    }?;
-    match parse_type_like_spec(&hint, ptr_bits) {
-        Some(crate::CTypeLike::Int { bits, .. }) if bits > src.size.saturating_mul(8) => {
-            Some(RecoveredArgTypeHint {
-                ty: size_to_type_like(src.size),
-                display: size_to_type(src.size),
-            })
-        }
-        Some(ty) => Some(RecoveredArgTypeHint { ty, display: hint }),
+    if let Some(hint) = strongest_hint_for_aliases(metadata_reg_type_hints, canonical, aliases) {
+        return explicit_arg_type_hint(&hint.ty, src, ptr_bits);
+    }
+    let bits =
+        signature_evidence.and_then(|evidence| recovered_arg_family_width_hint(evidence, src))?;
+    let width = bits.div_ceil(8).min(src.size);
+    Some(RecoveredArgTypeHint {
+        ty: size_to_neutral_int_type_like(width),
+        display: size_to_type(width),
+    })
+}
+
+fn explicit_arg_type_hint(hint: &str, src: &SSAVar, ptr_bits: u32) -> Option<RecoveredArgTypeHint> {
+    match parse_type_like_spec(hint, ptr_bits) {
+        Some(crate::CTypeLike::Int {
+            bits, signedness, ..
+        }) if bits > src.size.saturating_mul(8) => Some(RecoveredArgTypeHint {
+            ty: crate::CTypeLike::Int {
+                bits: src.size.saturating_mul(8),
+                signedness,
+            },
+            display: size_to_type(src.size),
+        }),
+        Some(ty) => Some(RecoveredArgTypeHint {
+            ty,
+            display: hint.to_string(),
+        }),
         None => None,
     }
 }
@@ -1925,7 +1926,34 @@ mod tests {
             params[0].initial_ty,
             crate::CTypeLike::Int {
                 bits: 64,
-                signedness: crate::Signedness::Signed,
+                signedness: crate::Signedness::Unknown,
+            }
+        );
+    }
+
+    #[test]
+    fn recovered_signature_params_preserve_explicit_scalar_signedness() {
+        let block = SSABlock {
+            addr: 0x401000,
+            size: 4,
+            ops: vec![SSAOp::Copy {
+                dst: SSAVar::new("tmp:0", 1, 8),
+                src: SSAVar::new("rdi", 0, 8),
+            }],
+        };
+        let hints = HashMap::from([(
+            "rdi".to_string(),
+            scalar_metadata_type_hint(MetadataScalarKind::UnsignedInt, 8)
+                .expect("unsigned metadata hint"),
+        )]);
+
+        let params = recover_signature_params_from_ssa(&[block], Some("x86-64"), &hints, true, 64);
+
+        assert_eq!(
+            params[0].initial_ty,
+            crate::CTypeLike::Int {
+                bits: 64,
+                signedness: crate::Signedness::Unsigned,
             }
         );
     }
@@ -1967,7 +1995,7 @@ mod tests {
             param.initial_ty,
             crate::CTypeLike::Int {
                 bits: 32,
-                signedness: crate::Signedness::Signed,
+                signedness: crate::Signedness::Unknown,
             }
         );
 
@@ -2016,7 +2044,7 @@ mod tests {
             params[1].initial_ty,
             crate::CTypeLike::Int {
                 bits: 64,
-                signedness: crate::Signedness::Signed,
+                signedness: crate::Signedness::Unknown,
             }
         );
     }

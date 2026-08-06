@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use r2ssa::{SSAOp, SSAVar};
 
@@ -16,6 +16,8 @@ pub(crate) fn infer_scalar_signedness<'a>(
     aliases: impl IntoIterator<Item = (&'a SSAVar, &'a SSAVar)>,
     arch_name: Option<&str>,
 ) -> HashMap<SSAVar, BTreeSet<ScalarSignednessEvidence>> {
+    let operations = operations.into_iter().collect::<Vec<_>>();
+    let condition_values = control_condition_values(&operations);
     let mut reverse_edges = HashMap::<SSAVar, BTreeSet<SSAVar>>::new();
     let mut signedness = HashMap::<SSAVar, BTreeSet<ScalarSignednessEvidence>>::new();
 
@@ -40,17 +42,23 @@ pub(crate) fn infer_scalar_signedness<'a>(
             SSAOp::IntSExt { src, .. } => {
                 seed_signedness(&mut signedness, src, ScalarSignednessEvidence::Signed);
             }
-            SSAOp::IntLess { a, b, .. }
-            | SSAOp::IntLessEqual { a, b, .. }
-            | SSAOp::IntDiv { a, b, .. }
-            | SSAOp::IntRem { a, b, .. } => {
+            SSAOp::IntLess { dst, a, b } | SSAOp::IntLessEqual { dst, a, b }
+                if condition_values.contains(dst) =>
+            {
                 seed_signedness(&mut signedness, a, ScalarSignednessEvidence::Unsigned);
                 seed_signedness(&mut signedness, b, ScalarSignednessEvidence::Unsigned);
             }
-            SSAOp::IntSLess { a, b, .. }
-            | SSAOp::IntSLessEqual { a, b, .. }
-            | SSAOp::IntSDiv { a, b, .. }
-            | SSAOp::IntSRem { a, b, .. } => {
+            SSAOp::IntSLess { dst, a, b } | SSAOp::IntSLessEqual { dst, a, b }
+                if condition_values.contains(dst) =>
+            {
+                seed_signedness(&mut signedness, a, ScalarSignednessEvidence::Signed);
+                seed_signedness(&mut signedness, b, ScalarSignednessEvidence::Signed);
+            }
+            SSAOp::IntDiv { a, b, .. } | SSAOp::IntRem { a, b, .. } => {
+                seed_signedness(&mut signedness, a, ScalarSignednessEvidence::Unsigned);
+                seed_signedness(&mut signedness, b, ScalarSignednessEvidence::Unsigned);
+            }
+            SSAOp::IntSDiv { a, b, .. } | SSAOp::IntSRem { a, b, .. } => {
                 seed_signedness(&mut signedness, a, ScalarSignednessEvidence::Signed);
                 seed_signedness(&mut signedness, b, ScalarSignednessEvidence::Signed);
             }
@@ -82,6 +90,54 @@ pub(crate) fn infer_scalar_signedness<'a>(
         }
     }
     signedness
+}
+
+fn control_condition_values(operations: &[&SSAOp]) -> HashSet<SSAVar> {
+    let mut values = operations
+        .iter()
+        .filter_map(|op| match op {
+            SSAOp::CBranch { cond, .. } => Some(cond.clone()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for op in operations {
+            let Some(dst) = op.dst() else {
+                continue;
+            };
+            if !values.contains(dst) || !condition_carrier_op(op) {
+                continue;
+            }
+            op.for_each_source(|source| {
+                if !source.is_const() {
+                    changed |= values.insert(source.clone());
+                }
+            });
+        }
+    }
+    values
+}
+
+fn condition_carrier_op(op: &SSAOp) -> bool {
+    matches!(
+        op,
+        SSAOp::Copy { .. }
+            | SSAOp::Cast { .. }
+            | SSAOp::New { .. }
+            | SSAOp::Phi { .. }
+            | SSAOp::BoolNot { .. }
+            | SSAOp::BoolAnd { .. }
+            | SSAOp::BoolOr { .. }
+            | SSAOp::BoolXor { .. }
+            | SSAOp::IntEqual { .. }
+            | SSAOp::IntNotEqual { .. }
+    ) || matches!(
+        op,
+        SSAOp::IntAnd { dst, .. } | SSAOp::IntOr { dst, .. } | SSAOp::IntXor { dst, .. }
+            if dst.size == 1
+    )
 }
 
 /// Some ISAs define a narrow register write by zeroing its wider architectural
@@ -199,6 +255,60 @@ mod tests {
         }];
 
         let inferred = infer_scalar_signedness(&operations, std::iter::empty(), Some("x86-64"));
+
+        assert!(!inferred.contains_key(&value));
+    }
+
+    #[test]
+    fn unsigned_compare_reaching_branch_types_its_operands() {
+        let value = SSAVar::new("value", 1, 8);
+        let carry = SSAVar::new("carry", 1, 1);
+        let condition = SSAVar::new("condition", 1, 1);
+        let operations = [
+            SSAOp::IntLessEqual {
+                dst: carry.clone(),
+                a: value.clone(),
+                b: SSAVar::new("bound", 1, 8),
+            },
+            SSAOp::Copy {
+                dst: condition.clone(),
+                src: carry,
+            },
+            SSAOp::CBranch {
+                target: SSAVar::constant(0x2000, 8),
+                cond: condition,
+            },
+        ];
+
+        let inferred = infer_scalar_signedness(&operations, std::iter::empty(), None);
+
+        assert_eq!(
+            inferred.get(&value),
+            Some(&BTreeSet::from([ScalarSignednessEvidence::Unsigned]))
+        );
+    }
+
+    #[test]
+    fn dead_unsigned_flag_does_not_type_signed_branch_operands() {
+        let value = SSAVar::new("value", 1, 8);
+        let operations = [
+            SSAOp::IntLessEqual {
+                dst: SSAVar::new("dead_carry", 1, 1),
+                a: value.clone(),
+                b: SSAVar::new("bound", 1, 8),
+            },
+            SSAOp::IntSLess {
+                dst: SSAVar::new("negative", 1, 1),
+                a: SSAVar::new("difference", 1, 8),
+                b: SSAVar::constant(0, 8),
+            },
+            SSAOp::CBranch {
+                target: SSAVar::constant(0x2000, 8),
+                cond: SSAVar::new("negative", 1, 1),
+            },
+        ];
+
+        let inferred = infer_scalar_signedness(&operations, std::iter::empty(), None);
 
         assert!(!inferred.contains_key(&value));
     }
