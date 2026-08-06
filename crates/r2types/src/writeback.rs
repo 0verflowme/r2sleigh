@@ -32,6 +32,7 @@ use crate::facts::{
 use crate::function_facts::{FunctionFacts, InterprocSummaryView};
 use crate::model::Signedness;
 use crate::prepare::recover_vars_arch_profile;
+use crate::signedness::{ScalarSignednessEvidence, infer_scalar_signedness};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WritebackSource {
@@ -4803,12 +4804,6 @@ enum InferredLocalFieldType {
     SelfPointer,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum InferredScalarSignedness {
-    Signed,
-    Unsigned,
-}
-
 impl InferredLocalFieldType {
     fn shape_key(&self) -> &str {
         match self {
@@ -4969,7 +4964,7 @@ fn local_struct_type_slots(
 fn local_pointer_pointee_types(
     blocks: &[LocalStructInferenceBlock],
     ptr_bits: u32,
-    scalar_signedness: &HashMap<SSAVar, BTreeSet<InferredScalarSignedness>>,
+    scalar_signedness: &HashMap<SSAVar, BTreeSet<ScalarSignednessEvidence>>,
 ) -> HashMap<SSAVar, BTreeSet<String>> {
     let ptr_bytes = (ptr_bits / 8).max(1);
     let mut reverse_edges = HashMap::<SSAVar, BTreeSet<SSAVar>>::new();
@@ -5052,90 +5047,9 @@ fn local_pointer_pointee_types(
     types
 }
 
-/// Recover signedness only from operations whose machine semantics distinguish
-/// signed from unsigned values, then flow that evidence backward through exact
-/// same-width aliases. Width alone remains deliberately neutral.
-fn local_scalar_signedness(
-    blocks: &[LocalStructInferenceBlock],
-) -> HashMap<SSAVar, BTreeSet<InferredScalarSignedness>> {
-    let mut reverse_edges = HashMap::<SSAVar, BTreeSet<SSAVar>>::new();
-    let mut signedness = HashMap::<SSAVar, BTreeSet<InferredScalarSignedness>>::new();
-    let mut link = |source: &SSAVar, derived: &SSAVar| {
-        if source.size == derived.size {
-            reverse_edges
-                .entry(derived.clone())
-                .or_default()
-                .insert(source.clone());
-        }
-    };
-    let mut seed = |var: &SSAVar, value: InferredScalarSignedness| {
-        if !var.is_const() {
-            signedness.entry(var.clone()).or_default().insert(value);
-        }
-    };
-
-    for block in blocks {
-        for phi in &block.phis {
-            for (_, source) in &phi.sources {
-                link(source, &phi.dst);
-            }
-        }
-        for op in &block.ops {
-            match op {
-                SSAOp::Copy { dst, src } | SSAOp::Cast { dst, src } | SSAOp::New { dst, src } => {
-                    link(src, dst);
-                }
-                SSAOp::Phi { dst, sources } => {
-                    for source in sources {
-                        link(source, dst);
-                    }
-                }
-                SSAOp::IntZExt { src, .. } => seed(src, InferredScalarSignedness::Unsigned),
-                SSAOp::IntSExt { src, .. } => seed(src, InferredScalarSignedness::Signed),
-                SSAOp::IntLess { a, b, .. }
-                | SSAOp::IntLessEqual { a, b, .. }
-                | SSAOp::IntDiv { a, b, .. }
-                | SSAOp::IntRem { a, b, .. } => {
-                    seed(a, InferredScalarSignedness::Unsigned);
-                    seed(b, InferredScalarSignedness::Unsigned);
-                }
-                SSAOp::IntSLess { a, b, .. }
-                | SSAOp::IntSLessEqual { a, b, .. }
-                | SSAOp::IntSDiv { a, b, .. }
-                | SSAOp::IntSRem { a, b, .. } => {
-                    seed(a, InferredScalarSignedness::Signed);
-                    seed(b, InferredScalarSignedness::Signed);
-                }
-                SSAOp::IntRight { a, .. } => seed(a, InferredScalarSignedness::Unsigned),
-                SSAOp::IntSRight { a, .. } => seed(a, InferredScalarSignedness::Signed),
-                _ => {}
-            }
-        }
-    }
-
-    let mut ready = signedness.keys().cloned().collect::<VecDeque<_>>();
-    while let Some(derived) = ready.pop_front() {
-        let Some(observed) = signedness.get(&derived).cloned() else {
-            continue;
-        };
-        let Some(sources) = reverse_edges.get(&derived) else {
-            continue;
-        };
-        for source in sources {
-            let entry = signedness.entry(source.clone()).or_default();
-            let before = entry.len();
-            entry.extend(observed.iter().copied());
-            if entry.len() != before {
-                ready.push_back(source.clone());
-            }
-        }
-    }
-    signedness
-}
-
 fn local_scalar_type_names(
     var: &SSAVar,
-    signedness: &HashMap<SSAVar, BTreeSet<InferredScalarSignedness>>,
+    signedness: &HashMap<SSAVar, BTreeSet<ScalarSignednessEvidence>>,
 ) -> BTreeSet<String> {
     let observed = signedness.get(var);
     if observed.is_none_or(BTreeSet::is_empty) {
@@ -5145,8 +5059,8 @@ fn local_scalar_type_names(
         .into_iter()
         .flatten()
         .map(|value| match value {
-            InferredScalarSignedness::Signed => size_to_type(var.size),
-            InferredScalarSignedness::Unsigned => size_to_unsigned_type(var.size),
+            ScalarSignednessEvidence::Signed => size_to_type(var.size),
+            ScalarSignednessEvidence::Unsigned => size_to_unsigned_type(var.size),
         })
         .collect()
 }
@@ -5154,7 +5068,7 @@ fn local_scalar_type_names(
 fn add_local_scalar_type_votes(
     votes: &mut BTreeMap<String, u32>,
     var: &SSAVar,
-    signedness: &HashMap<SSAVar, BTreeSet<InferredScalarSignedness>>,
+    signedness: &HashMap<SSAVar, BTreeSet<ScalarSignednessEvidence>>,
 ) {
     for ty in local_scalar_type_names(var, signedness) {
         *votes.entry(ty).or_insert(0) += 1;
@@ -5453,7 +5367,16 @@ fn infer_local_struct_artifacts_from_blocks(
 ) -> LocalStructArtifacts {
     let pointer_arg_slot_map = collect_pointer_arg_slot_map(arch_name, ptr_bits);
     let type_slots = local_struct_type_slots(ssa_blocks, &pointer_arg_slot_map, ptr_bits);
-    let scalar_signedness = local_scalar_signedness(ssa_blocks);
+    let scalar_signedness = infer_scalar_signedness(
+        ssa_blocks.iter().flat_map(|block| block.ops.iter()),
+        ssa_blocks.iter().flat_map(|block| {
+            block
+                .phis
+                .iter()
+                .flat_map(|phi| phi.sources.iter().map(|(_, source)| (source, &phi.dst)))
+        }),
+        arch_name,
+    );
     let pointer_pointee_types =
         local_pointer_pointee_types(ssa_blocks, ptr_bits, &scalar_signedness);
     let (_, stack_bases, frame_bases) = recover_vars_arch_profile(arch_name);

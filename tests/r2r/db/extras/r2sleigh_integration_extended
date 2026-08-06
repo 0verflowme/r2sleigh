@@ -821,6 +821,20 @@ a:sla.dec | jq -Rs 'contains("table_walk") and ((contains("render contract: summ
 EOF_CMDS
 RUN
 
+NAME=manual_unsigned_pointee_uses_certified_extension_evidence
+FILE=bins/r2sleigh_manual_limits_O0
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~fnv_fold[0]` >/dev/null
+af
+a:sla.debug.types | jq -c 'type=="object" and ((.function_name // "") | contains("fnv_fold")) and ((.signature // "") | contains("uint8_t* arg0")) and (((.signature_certificate_sources // []) | index("local_inference")) != null)'
+EOF_CMDS
+RUN
+
 NAME=manual_sparse_switch_o0_structures_internal_sdiv_control
 FILE=bins/r2sleigh_manual_limits_O0
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true

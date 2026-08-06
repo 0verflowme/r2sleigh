@@ -424,6 +424,7 @@ pub fn recover_signature_params_from_ssa(
                             .unwrap_or_else(|| size_to_type_like(dst.size));
                         params.push(RecoveredSignatureParam {
                             name: format!("arg{index}"),
+                            arg_index: index,
                             ssa_var: dst.clone(),
                             initial_ty,
                         });
@@ -452,11 +453,11 @@ pub fn recover_signature_params_from_ssa(
                         ptr_bits,
                     );
                     let initial_ty = hinted_type
-                        .as_deref()
-                        .and_then(|ty| parse_type_like_spec(ty, ptr_bits))
+                        .map(|hint| hint.ty)
                         .unwrap_or_else(|| size_to_type_like(src.size));
                     params.push(RecoveredSignatureParam {
                         name: format!("arg{index}"),
+                        arg_index: index,
                         ssa_var: src.clone(),
                         initial_ty,
                     });
@@ -613,7 +614,9 @@ pub fn recover_vars_from_ssa_with_prep_facts(
                                 name: format!("arg{i}"),
                                 kind: "r".to_string(),
                                 delta: 0,
-                                var_type: hinted_type.unwrap_or_else(|| size_to_type(src.size)),
+                                var_type: hinted_type
+                                    .map(|hint| hint.display)
+                                    .unwrap_or_else(|| size_to_type(src.size)),
                                 isarg: true,
                                 reg: Some(canonical.to_string()),
                             });
@@ -651,6 +654,20 @@ fn size_to_type_like(size: u32) -> crate::CTypeLike {
     crate::CTypeLike::Int {
         bits,
         signedness: crate::Signedness::Signed,
+    }
+}
+
+fn size_to_neutral_int_type_like(size: u32) -> crate::CTypeLike {
+    let bits = match size {
+        1 => 8,
+        2 => 16,
+        4 => 32,
+        8 => 64,
+        _ => return crate::CTypeLike::Unknown,
+    };
+    crate::CTypeLike::Int {
+        bits,
+        signedness: crate::Signedness::Unknown,
     }
 }
 
@@ -747,6 +764,11 @@ fn recovered_arg_family_width_hint(
         })
 }
 
+struct RecoveredArgTypeHint {
+    ty: crate::CTypeLike,
+    display: String,
+}
+
 fn recovered_arg_type_hint(
     reg_type_hints: &HashMap<String, TypeHint>,
     canonical: &str,
@@ -754,20 +776,37 @@ fn recovered_arg_type_hint(
     src: &SSAVar,
     signature_evidence: Option<&SignatureTypeEvidenceContext>,
     ptr_bits: u32,
-) -> Option<String> {
+) -> Option<RecoveredArgTypeHint> {
     let best_hint = strongest_hint_for_aliases(reg_type_hints, canonical, aliases);
     if let Some(hint) = best_hint.as_ref()
         && hint.rank == TypeHintRank::Pointer
     {
+        let parsed = parse_type_like_spec(&hint.ty, ptr_bits)?;
         if let Some(width) = signature_evidence.and_then(|evidence| {
             evidence
                 .pointer_pointee_width_bytes
                 .get(&ssa_var_key(src))
                 .copied()
         }) {
-            return Some(format!("{} *", size_to_type(width)));
+            if matches!(
+                parsed,
+                crate::CTypeLike::Pointer(ref inner)
+                    if !matches!(inner.as_ref(), crate::CTypeLike::Void | crate::CTypeLike::Unknown)
+            ) {
+                return Some(RecoveredArgTypeHint {
+                    ty: parsed,
+                    display: hint.ty.clone(),
+                });
+            }
+            return Some(RecoveredArgTypeHint {
+                ty: crate::CTypeLike::Pointer(Box::new(size_to_neutral_int_type_like(width))),
+                display: format!("{} *", size_to_type(width)),
+            });
         }
-        return Some(hint.ty.clone());
+        return Some(RecoveredArgTypeHint {
+            ty: parsed,
+            display: hint.ty.clone(),
+        });
     }
     let hint = if let Some(evidence) = signature_evidence
         && let Some(bits) = recovered_arg_family_width_hint(evidence, src)
@@ -778,9 +817,13 @@ fn recovered_arg_type_hint(
     }?;
     match parse_type_like_spec(&hint, ptr_bits) {
         Some(crate::CTypeLike::Int { bits, .. }) if bits > src.size.saturating_mul(8) => {
-            Some(size_to_type(src.size))
+            Some(RecoveredArgTypeHint {
+                ty: size_to_type_like(src.size),
+                display: size_to_type(src.size),
+            })
         }
-        _ => Some(hint),
+        Some(ty) => Some(RecoveredArgTypeHint { ty, display: hint }),
+        None => None,
     }
 }
 
@@ -1922,8 +1965,10 @@ mod tests {
 
         assert_eq!(params.len(), 2);
         assert_eq!(params[0].name, "arg0");
+        assert_eq!(params[0].arg_index, 0);
         assert_eq!(params[0].ssa_var, SSAVar::new("rdi", 0, 8));
         assert_eq!(params[1].name, "arg6");
+        assert_eq!(params[1].arg_index, 6);
         assert_eq!(params[1].ssa_var, SSAVar::new("tmp:stack_arg", 1, 8));
         assert_eq!(
             params[1].initial_ty,
@@ -2009,8 +2054,11 @@ mod tests {
             .expect("rdi argument");
 
         assert_eq!(
-            crate::render_signature_type(&arg0.initial_ty, 64),
-            "int32_t*"
+            arg0.initial_ty,
+            crate::CTypeLike::Pointer(Box::new(crate::CTypeLike::Int {
+                bits: 32,
+                signedness: crate::Signedness::Unknown,
+            }))
         );
     }
 

@@ -13,6 +13,7 @@ pub mod prepare;
 pub mod role_registry;
 pub mod signature;
 pub mod signature_infer;
+mod signedness;
 pub mod solver;
 pub mod writeback;
 

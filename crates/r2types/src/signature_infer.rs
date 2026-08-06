@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use r2ssa::{SSABlock, SSAFunction, SSAOp, SSAVar, SsaArtifact};
+use r2ssa::{ObjectKind, SSABlock, SSAFunction, SSAOp, SSAVar, SsaArtifact};
 
 use crate::convert::CTypeLike;
 use crate::facts::{FunctionSignatureSpec, FunctionType, FunctionTypeFacts, signature_strength};
@@ -10,6 +10,7 @@ use crate::prepare::{
     SignatureTypeEvidenceContext, scalar_register_family_key, ssa_var_is_register_like,
 };
 use crate::signature::SignatureRegistry;
+use crate::signedness::{ScalarSignednessEvidence, infer_scalar_signedness};
 use crate::writeback::{InferredSignature, InferredSignatureParam};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -58,6 +59,7 @@ pub struct SignatureParamCandidate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveredSignatureParam {
     pub name: String,
+    pub arg_index: usize,
     pub ssa_var: SSAVar,
     pub initial_ty: CTypeLike,
 }
@@ -123,15 +125,10 @@ pub fn infer_signature_from_prepared_ssa(
                 ptr_bits,
                 &evidence,
             );
-            let arg_index = param
-                .name
-                .strip_prefix("arg")
-                .and_then(|n| n.parse::<usize>().ok())
-                .unwrap_or(usize::MAX);
             SignatureParamCandidate {
                 name: param.name.clone(),
                 ty,
-                arg_index,
+                arg_index: param.arg_index,
                 size_bytes: param.ssa_var.size,
                 evidence,
             }
@@ -148,6 +145,7 @@ pub fn infer_signature_from_prepared_ssa(
             &param.evidence,
         );
     }
+    refine_parameter_pointee_signedness(arch_name, prepared, &mut canonical_params);
 
     let (ret_type, ret_evidence) = infer_signature_return_type_from_prepared(
         prepared,
@@ -165,6 +163,88 @@ pub fn infer_signature_from_prepared_ssa(
         &ret_evidence,
         &input_counts,
     )
+}
+
+fn refine_parameter_pointee_signedness(
+    arch_name: &str,
+    prepared: &SsaArtifact,
+    params: &mut [SignatureParamCandidate],
+) {
+    let inferred = infer_scalar_signedness(
+        prepared
+            .function()
+            .blocks()
+            .flat_map(|block| block.ops.iter()),
+        prepared
+            .function()
+            .blocks()
+            .flat_map(|block| {
+                block
+                    .phis
+                    .iter()
+                    .flat_map(|phi| phi.sources.iter().map(|(_, source)| (source, &phi.dst)))
+            })
+            .chain(
+                prepared
+                    .certificates()
+                    .stack_reloads
+                    .values()
+                    .filter_map(|reload| {
+                        if reload.value_width != reload.memory_width {
+                            return None;
+                        }
+                        Some((
+                            prepared.value_var(reload.canonical_source)?,
+                            prepared.value_var(reload.value)?,
+                        ))
+                    }),
+            ),
+        Some(arch_name),
+    );
+    let mut pointee_evidence = HashMap::<(usize, u32), BTreeSet<ScalarSignednessEvidence>>::new();
+    for access in prepared.certificates().memory_accesses.values() {
+        let Some(object) = prepared.objects().object(access.object) else {
+            continue;
+        };
+        let ObjectKind::Parameter { index } = object.kind else {
+            continue;
+        };
+        let Some(value) = access.value.and_then(|value| prepared.value_var(value)) else {
+            continue;
+        };
+        if value.size != access.width {
+            continue;
+        }
+        let Some(observed) = inferred.get(value) else {
+            continue;
+        };
+        pointee_evidence
+            .entry((index, access.width.saturating_mul(8)))
+            .or_default()
+            .extend(observed.iter().copied());
+    }
+
+    for param in params {
+        let CTypeLike::Pointer(inner) = &mut param.ty else {
+            continue;
+        };
+        let CTypeLike::Int { bits, signedness } = inner.as_mut() else {
+            continue;
+        };
+        if *signedness != Signedness::Unknown {
+            continue;
+        }
+        let Some(observed) = pointee_evidence.get(&(param.arg_index, *bits)) else {
+            continue;
+        };
+        if observed.len() == 1 {
+            *signedness = match observed.first() {
+                Some(ScalarSignednessEvidence::Signed) => Signedness::Signed,
+                Some(ScalarSignednessEvidence::Unsigned) => Signedness::Unsigned,
+                None => continue,
+            };
+        }
+    }
 }
 
 pub fn merge_initial_signature_type_evidence(
@@ -1271,6 +1351,68 @@ mod tests {
         arch.add_register(r2il::RegisterDef::new("RAX", 0, 8));
         arch.add_register(r2il::RegisterDef::new("RIP", 8, 8));
         arch
+    }
+
+    fn aarch64_parameter_arch() -> r2il::ArchSpec {
+        let mut arch = r2il::ArchSpec::new("aarch64");
+        arch.addr_size = 8;
+        arch.add_register(r2il::RegisterDef::new("x0", 0, 8));
+        arch.add_register(r2il::RegisterDef::new("w0", 0, 4));
+        arch.add_register(r2il::RegisterDef::new("sp", 16, 8));
+        arch
+    }
+
+    #[test]
+    fn prepared_signature_recovers_unsigned_byte_pointee_through_certified_stack_reload() {
+        let arch = aarch64_parameter_arch();
+        let mut block = r2il::R2ILBlock::new(0x1000, 4);
+        block.push(r2il::R2ILOp::IntSub {
+            dst: r2il::Varnode::unique(0x10, 8),
+            a: r2il::Varnode::register(16, 8),
+            b: r2il::Varnode::constant(8, 8),
+        });
+        block.push(r2il::R2ILOp::Load {
+            dst: r2il::Varnode::unique(0x20, 1),
+            space: r2il::SpaceId::Ram,
+            addr: r2il::Varnode::register(0, 8),
+        });
+        block.push(r2il::R2ILOp::Store {
+            space: r2il::SpaceId::Ram,
+            addr: r2il::Varnode::unique(0x10, 8),
+            val: r2il::Varnode::unique(0x20, 1),
+        });
+        block.push(r2il::R2ILOp::Load {
+            dst: r2il::Varnode::unique(0x30, 1),
+            space: r2il::SpaceId::Ram,
+            addr: r2il::Varnode::unique(0x10, 8),
+        });
+        block.push(r2il::R2ILOp::IntZExt {
+            dst: r2il::Varnode::unique(0x40, 4),
+            src: r2il::Varnode::unique(0x30, 1),
+        });
+        let prepared = SsaArtifact::for_decompile(&[block], Some(&arch)).expect("prepared SSA");
+        let pattern_blocks = prepared.local_ssa_blocks();
+        let recovered = [RecoveredSignatureParam {
+            name: "code".to_string(),
+            arg_index: 0,
+            ssa_var: SSAVar::new("x0", 0, 8),
+            initial_ty: CTypeLike::Pointer(Box::new(CTypeLike::Int {
+                bits: 8,
+                signedness: Signedness::Unknown,
+            })),
+        }];
+
+        let inferred = infer_signature_from_prepared_ssa(
+            "decode",
+            "aarch64",
+            64,
+            &prepared,
+            &pattern_blocks,
+            &recovered,
+            &BTreeSet::new(),
+        );
+
+        assert_eq!(inferred.params[0].param_type, "uint8_t*");
     }
 
     #[test]
