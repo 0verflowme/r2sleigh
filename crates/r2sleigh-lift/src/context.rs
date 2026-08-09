@@ -123,6 +123,19 @@ impl LiftContext {
         is_default: bool,
         endianness: Option<Endianness>,
     ) -> SpaceId {
+        self.add_space_with_layout(name, addr_size, 1, is_default, endianness)
+    }
+
+    /// Add an address space while preserving both the encoded address width
+    /// and the number of bytes addressed by one offset unit.
+    pub fn add_space_with_layout(
+        &mut self,
+        name: &str,
+        addr_size: u32,
+        word_size: u32,
+        is_default: bool,
+        endianness: Option<Endianness>,
+    ) -> SpaceId {
         // Check if it's a standard space
         if let Some(&space_id) = self.space_map.get(name) {
             // Update the existing space definition
@@ -130,7 +143,7 @@ impl LiftContext {
                 id: space_id,
                 name: name.into(),
                 addr_size,
-                word_size: 1,
+                word_size,
                 is_default,
                 endianness,
                 memory_class: None,
@@ -151,7 +164,7 @@ impl LiftContext {
             id: space_id,
             name: name.into(),
             addr_size,
-            word_size: 1,
+            word_size,
             is_default,
             endianness,
             memory_class: None,

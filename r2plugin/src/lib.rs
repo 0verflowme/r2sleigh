@@ -370,9 +370,30 @@ pub extern "C" fn r2il_get_reg_profile(ctx: *const R2ILContext) -> *mut c_char {
             .find_map(|name| reg_meta.get(*name).map(|(_, _, original)| original.clone()))
     };
 
-    let pc = first_existing(&["pc", "$pc", "rip", "eip", "ip"]);
-    let sp = first_existing(&["sp", "$sp", "rsp", "esp"]);
-    let bp = first_existing(&["bp", "rbp", "ebp", "fp", "$fp", "s8", "$s8", "x29"]);
+    let first_existing_at_width = |candidates: &[&str], bits: u32| -> Option<String> {
+        candidates.iter().find_map(|name| {
+            reg_meta
+                .get(*name)
+                .filter(|(candidate_bits, _, _)| *candidate_bits == bits)
+                .map(|(_, _, original)| original.clone())
+        })
+    };
+
+    let is_x86 = matches!(arch_name.as_str(), "x86" | "x86-64");
+    let address_bits = arch.addr_size.checked_mul(8);
+    let (pc, sp, bp) = if is_x86 {
+        (
+            address_bits.and_then(|bits| first_existing_at_width(&["rip", "eip", "ip"], bits)),
+            address_bits.and_then(|bits| first_existing_at_width(&["rsp", "esp", "sp"], bits)),
+            address_bits.and_then(|bits| first_existing_at_width(&["rbp", "ebp", "bp"], bits)),
+        )
+    } else {
+        (
+            first_existing(&["pc", "$pc", "rip", "eip", "ip"]),
+            first_existing(&["sp", "$sp", "rsp", "esp"]),
+            first_existing(&["bp", "rbp", "ebp", "fp", "$fp", "s8", "$s8", "x29"]),
+        )
+    };
 
     let mut a_roles: [Option<String>; 8] = std::array::from_fn(|_| None);
     a_roles[0] = first_existing(&["rdi", "a0", "$a0", "x0", "w0", "r0"]);
@@ -9306,7 +9327,20 @@ mod integration_tests {
         assert!(!profile_ptr.is_null());
         let profile = unsafe { CStr::from_ptr(profile_ptr).to_str().unwrap() };
         println!("Profile: {}", profile);
-        assert!(profile.contains("=PC\tRIP"));
+        let arch = ctx.arch.as_ref().expect("x86-64 ArchSpec");
+        assert_eq!(arch.addr_size, 8);
+        for (role, target) in [("PC", "RIP"), ("SP", "RSP"), ("BP", "RBP")] {
+            assert_eq!(role_target(profile, role).as_deref(), Some(target));
+            let expected = arch
+                .get_register(target)
+                .expect("full-width x86 address register");
+            assert_eq!(expected.size, arch.addr_size);
+            assert_eq!(
+                profile_register(profile, target),
+                Some((expected.size * 8, expected.offset)),
+                "={role} must target the exact full-width ArchSpec coordinates"
+            );
+        }
 
         r2il_string_free(profile_ptr);
         r2il_free(ctx_ptr);
@@ -9317,7 +9351,7 @@ mod integration_tests {
     fn create_disassembler_for_arch_arm64() {
         let (spec, disasm) = create_disassembler_for_arch("arm64").expect("arm64 disassembler");
         assert_eq!(spec.name, "aarch64");
-        assert!(spec.addr_size > 0);
+        assert_eq!(spec.addr_size, 8);
         assert_eq!(
             disasm.userop_name(0),
             userop_map_for_arch("arm64").get(&0).map(String::as_str)
@@ -9348,7 +9382,7 @@ mod integration_tests {
         r2il_free(ctx_ptr);
     }
 
-    #[cfg(any(feature = "arm", feature = "mips"))]
+    #[cfg(any(feature = "x86", feature = "arm", feature = "mips"))]
     fn profile_for_arch(arch: &str) -> String {
         let arch_cstr = CString::new(arch).unwrap();
         let ctx_ptr = r2il_arch_init(arch_cstr.as_ptr());
@@ -9369,13 +9403,47 @@ mod integration_tests {
         profile
     }
 
-    #[cfg(any(feature = "arm", feature = "mips"))]
     fn role_target(profile: &str, role: &str) -> Option<String> {
         profile
             .lines()
             .find_map(|line| line.strip_prefix(&format!("={}\t", role)))
             .map(str::trim)
             .map(str::to_string)
+    }
+
+    fn profile_register(profile: &str, name: &str) -> Option<(u32, u64)> {
+        profile.lines().find_map(|line| {
+            let mut fields = line.split('\t');
+            if fields.next()? != "gpr" || fields.next()? != name {
+                return None;
+            }
+            let bits = fields.next()?.strip_prefix('.')?.parse::<u32>().ok()?;
+            let offset = fields.next()?.parse::<u64>().ok()?;
+            if fields.next()? != "0" || fields.next().is_some() {
+                return None;
+            }
+            Some((bits, offset))
+        })
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn x86_32_reg_profile_roles_use_address_width_coordinates() {
+        let (arch, _) = create_disassembler_for_arch("x86").expect("x86 disassembler");
+        assert_eq!(arch.addr_size, 4);
+        let profile = profile_for_arch("x86");
+        for (role, target) in [("PC", "EIP"), ("SP", "ESP"), ("BP", "EBP")] {
+            assert_eq!(role_target(&profile, role).as_deref(), Some(target));
+            let expected = arch
+                .get_register(target)
+                .expect("full-width x86 address register");
+            assert_eq!(expected.size, arch.addr_size);
+            assert_eq!(
+                profile_register(&profile, target),
+                Some((expected.size * 8, expected.offset)),
+                "={role} must target the exact address-width ArchSpec coordinates"
+            );
+        }
     }
 
     #[test]
@@ -9488,7 +9556,7 @@ mod integration_tests {
         let (spec, disasm) =
             create_disassembler_for_arch("mips32be").expect("mips32be disassembler");
         assert_eq!(spec.name, "mips32be");
-        assert!(spec.addr_size > 0);
+        assert_eq!(spec.addr_size, 4);
         assert_eq!(spec.instruction_endianness, r2il::Endianness::Big);
         assert_eq!(spec.memory_endianness, r2il::Endianness::Big);
         assert_eq!(

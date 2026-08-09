@@ -23,7 +23,8 @@ use crate::context::LiftContext;
 ///
 /// # Returns
 ///
-/// An `ArchSpec` containing the extracted metadata.
+/// An `ArchSpec` containing the extracted metadata, or an error when the
+/// Sleigh address-space layout cannot be represented exactly.
 ///
 /// # Example
 ///
@@ -35,31 +36,62 @@ use crate::context::LiftContext;
 ///     .processor_spec(sleigh_config::processor_x86::PSPEC_X86_64)?
 ///     .build(sleigh_config::processor_x86::SLA_X86_64)?;
 ///
-/// let spec = extract_arch_spec(&sleigh, "x86-64");
+/// let spec = extract_arch_spec(&sleigh, "x86-64")?;
 /// println!("Registers: {}", spec.registers.len());
 /// ```
-pub fn extract_arch_spec(sleigh: &GhidraSleigh, arch_name: &str) -> ArchSpec {
+pub fn extract_arch_spec(sleigh: &GhidraSleigh, arch_name: &str) -> Result<ArchSpec, LiftError> {
     let mut ctx = LiftContext::new(arch_name);
 
     // Extract address spaces
     let default_space = sleigh.default_code_space();
+    let mut saw_default_space = false;
     for space in sleigh.address_spaces() {
-        let is_default = space.name == default_space.name;
-        let addr_size = space.word_size as u32;
+        let is_default = space.id == default_space.id;
+        let address_size = u32::try_from(space.address_size).map_err(|_| {
+            LiftError::Parse(format!(
+                "Sleigh address size for space '{}' does not fit u32: {}",
+                space.name, space.address_size
+            ))
+        })?;
+        let word_size = u32::try_from(space.word_size).map_err(|_| {
+            LiftError::Parse(format!(
+                "Sleigh word size for space '{}' does not fit u32: {}",
+                space.name, space.word_size
+            ))
+        })?;
+        if address_size == 0 || word_size == 0 {
+            return Err(LiftError::Parse(format!(
+                "Sleigh space '{}' has invalid layout: address_size={} word_size={}",
+                space.name, address_size, word_size
+            )));
+        }
         let space_endianness = Endianness::from_big_endian(space.big_endian);
 
-        ctx.add_space_with_endianness(&space.name, addr_size, is_default, Some(space_endianness));
+        ctx.add_space_with_layout(
+            &space.name,
+            address_size,
+            word_size,
+            is_default,
+            Some(space_endianness),
+        );
 
         // Set the architecture's address size from the default code space
         if is_default {
-            ctx.set_addr_size(addr_size);
-        }
-
-        // Determine endianness from the default space
-        if is_default {
+            if saw_default_space {
+                return Err(LiftError::Parse(
+                    "Sleigh returned the default code space more than once".to_string(),
+                ));
+            }
+            saw_default_space = true;
+            ctx.set_addr_size(address_size);
             ctx.set_instruction_endianness(space_endianness);
             ctx.set_memory_endianness(space_endianness);
         }
+    }
+    if !saw_default_space {
+        return Err(LiftError::Parse(
+            "Sleigh default code space is absent from its address-space inventory".to_string(),
+        ));
     }
 
     // Add unique space if not already present
@@ -74,7 +106,7 @@ pub fn extract_arch_spec(sleigh: &GhidraSleigh, arch_name: &str) -> ArchSpec {
         ctx.add_register(&name, varnode.address.offset, varnode.size as u32);
     }
 
-    ctx.finish()
+    Ok(ctx.finish())
 }
 
 /// Build an ArchSpec from pre-compiled SLA data.
@@ -114,7 +146,7 @@ pub fn build_arch_spec(
         .build(sla_data)
         .map_err(|e| LiftError::Parse(format!("Failed to load SLA data: {}", e)))?;
 
-    Ok(extract_arch_spec(&sleigh, arch_name))
+    extract_arch_spec(&sleigh, arch_name)
 }
 
 /// Metadata about a parsed Sleigh specification.
@@ -131,16 +163,16 @@ pub struct SleighInfo {
 }
 
 /// Get detailed information about a loaded Sleigh specification.
-pub fn get_sleigh_info(sleigh: &GhidraSleigh, arch_name: &str) -> SleighInfo {
-    let spec = extract_arch_spec(sleigh, arch_name);
+pub fn get_sleigh_info(sleigh: &GhidraSleigh, arch_name: &str) -> Result<SleighInfo, LiftError> {
+    let spec = extract_arch_spec(sleigh, arch_name)?;
     let register_count = spec.registers.len();
     let space_count = spec.spaces.len();
 
-    SleighInfo {
+    Ok(SleighInfo {
         spec,
         space_count,
         register_count,
-    }
+    })
 }
 
 #[cfg(test)]
