@@ -8,7 +8,6 @@
 #include <r_util/r_num.h>
 #include <r_util/r_str.h>
 #include <r_util/r_type.h>
-#include <sdb/ht_up.h>
 #include <ctype.h>
 #include <dlfcn.h>
 #include <errno.h>
@@ -17,10 +16,19 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include "r2sleigh_api_v2.h"
+
+#if R2_ABIVERSION != R2SLEIGH_RADARE_ABI_V2
+#error "r2sleigh schema-6 source transport requires exactly radare2 ABI 136"
+#endif
+#if R_ANAL_FUNCTION_SNAPSHOT_SCHEMA_VERSION != 5
+#error "r2sleigh schema-6 source transport requires function snapshot schema 5"
+#endif
+#if R_ANAL_FUNCTION_SNAPSHOT_LIMITS_VERSION != 1
+#error "r2sleigh schema-6 source transport requires function snapshot limits API 1"
+#endif
 
 /* FFI declarations for r2sleigh Rust library */
-typedef struct R2ILContext R2ILContext;
-typedef struct R2ILBlock R2ILBlock;
 typedef struct {
 	unsigned long long value;
 	unsigned long long target;
@@ -51,6 +59,16 @@ extern unsigned long long r2il_block_addr(const R2ILBlock *block);
 extern unsigned int r2il_block_type(const R2ILBlock *block);
 extern unsigned long long r2il_block_jump(const R2ILBlock *block);
 extern unsigned long long r2il_block_fail(const R2ILBlock *block);
+typedef struct {
+	size_t op_index;
+	uint32_t target_space;
+	uint32_t target_custom_space;
+	uint64_t target_offset;
+	uint32_t target_size;
+} R2ILDirectCallIdentity;
+extern int r2il_block_direct_call_identity(const R2ILBlock *block,
+	uint64_t raw_instruction_addr, uint64_t raw_target_addr,
+	R2ILDirectCallIdentity *output);
 typedef struct R2ILBlockAnalValues R2ILBlockAnalValues;
 typedef struct {
 	int is_write;
@@ -83,14 +101,6 @@ extern char *r2il_block_op_json_named(const R2ILContext *ctx, const R2ILBlock *b
 extern void r2il_string_free(char *s);
 extern char *r2sleigh_engine_cache_stats_json(void);
 extern void r2sleigh_engine_cache_stats_reset(void);
-typedef struct {
-	int include_type_interproc_scope;
-	int include_root_symbolic_scope;
-	size_t interproc_iter;
-	size_t interproc_max_iters;
-	int interproc_converged;
-} R2SleighInterprocSessionPlan;
-
 #define R2SLEIGH_INTERPROC_SESSION_TYPE_ANALYSIS 0u
 #define R2SLEIGH_INTERPROC_SESSION_DECOMPILE 1u
 
@@ -126,8 +136,6 @@ extern char *r2ssa_defuse_function_json(const R2ILContext *ctx, const R2ILBlock 
 extern char *r2ssa_domtree_json(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks);
 extern char *r2ssa_backward_slice_json(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks, const char *var_name);
 extern char *r2taint_function_json(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks);
-extern char *r2taint_function_summary_json(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks);
-extern char *r2taint_sources_sinks_json(const char *json);
 #define R2TAINT_OP_OTHER 0
 #define R2TAINT_OP_CALL 1
 #define R2TAINT_OP_CALL_IND 2
@@ -158,20 +166,12 @@ extern const R2TaintSinkHit *r2taint_function_summary_sink_hits(const R2TaintFun
 extern void r2taint_function_summary_free(R2TaintFunctionSummary *summary);
 
 /* Symbolic execution */
-extern char *r2sym_function(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks, unsigned long long entry_addr);
-extern char *r2sym_paths(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks, unsigned long long entry_addr);
-extern char *r2sym_explore_to(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks,
-	unsigned long long entry_addr, unsigned long long target_addr);
-extern char *r2sym_solve_to(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks,
-	unsigned long long entry_addr, unsigned long long target_addr);
-extern char *r2sym_run_spec_json(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks,
-	unsigned long long entry_addr, const char *spec_json);
-typedef struct {
+struct R2ILFunctionBlocks {
 	unsigned long long entry_addr;
 	const char *name;
 	const R2ILBlock **blocks;
 	size_t num_blocks;
-} R2ILFunctionBlocks;
+};
 typedef struct {
 	const char *name;
 	unsigned long long value;
@@ -225,174 +225,11 @@ typedef struct R2SleighRuntimeSources R2SleighRuntimeSources;
 #define R2SLEIGH_CONTEXT_BASE_ENUM 2
 #define R2SLEIGH_CONTEXT_BASE_TYPEDEF 3
 #define R2SLEIGH_CONTEXT_BASE_ATOMIC 4
-typedef struct {
-	const char *name;
-	const char *type_name;
-	const char *cc_reg;
-} R2SleighContextParam;
-typedef struct {
-	unsigned int kind;
-	const char *name;
-	const char *type_name;
-	const char *reg;
-	const char *base;
-	long long offset;
-	int has_offset;
-	unsigned int role;
-	long long param_index;
-	const char *param_name;
-	const char *source_reg;
-	int is_arg;
-} R2SleighContextVar;
-typedef struct {
-	const char *name;
-	const char *type_name;
-	unsigned long long offset;
-	unsigned long long size_bits;
-	int has_size_bits;
-} R2SleighContextBaseMember;
-typedef struct {
-	const char *name;
-	long long value;
-} R2SleighContextEnumVariant;
-typedef struct {
-	unsigned int kind;
-	const char *name;
-	const char *type_name;
-	unsigned long long size_bits;
-	int has_size_bits;
-	const R2SleighContextBaseMember *members;
-	size_t num_members;
-	const R2SleighContextEnumVariant *variants;
-	size_t num_variants;
-} R2SleighContextBaseType;
-typedef struct {
-	unsigned long long call_addr;
-	unsigned long long addr;
-	const char *name;
-	unsigned int linkage;
-	const char *signature_name;
-	const char *signature_ret_type;
-	const char *signature_callconv;
-	int signature_noreturn;
-	const R2SleighContextParam *signature_params;
-	size_t num_signature_params;
-} R2SleighContextCallee;
-typedef struct {
-	unsigned int schema_version;
-	unsigned long long dirty_epoch;
-	unsigned long long context_hash;
-	unsigned long long type_dirty_epoch;
-	const char *external_context_json;
-	const char *signature_name;
-	const char *signature_ret_type;
-	const char *signature_callconv;
-	int signature_noreturn;
-	const R2SleighContextParam *params;
-	size_t num_params;
-	const R2SleighContextVar *vars;
-	size_t num_vars;
-	const R2SleighContextBaseType *base_types;
-	size_t num_base_types;
-	const R2SleighContextCallee *callees;
-	size_t num_callees;
-	const char *assumptions_json;
-	} R2SleighFunctionContext;
-	typedef enum {
-		R2SLEIGH_INTERPROC_LINKAGE_UNKNOWN = 0,
-		R2SLEIGH_INTERPROC_LINKAGE_INTERNAL = 1,
-		R2SLEIGH_INTERPROC_LINKAGE_IMPORTED = 2,
-	} R2SleighInterprocLinkage;
-	typedef struct {
-		unsigned long long id;
-		const char *name;
-		size_t arg_count_hint;
-		int has_arg_count_hint;
-		unsigned int linkage;
-	} R2SleighInterprocSeed;
-	typedef struct {
-		unsigned int schema_version;
-		const R2ILFunctionBlocks *functions;
-		size_t num_functions;
-		const R2SleighInterprocSeed *seeds;
-		size_t num_seeds;
-	} R2SleighInterprocScope;
 typedef enum {
-	R2SLEIGH_TYPE_WRITEBACK_APPLY = 0,
-	R2SLEIGH_TYPE_WRITEBACK_SKIP_CONCRETE_EXISTING = 1,
-	R2SLEIGH_TYPE_WRITEBACK_SKIP_MISSING_MATERIALIZATION = 2,
-	R2SLEIGH_TYPE_WRITEBACK_SKIP_INVALID = 3,
-} R2SleighTypeWritebackApplyDecision;
-typedef enum {
-	R2SLEIGH_VAR_RENAME_APPLY = 0,
-	R2SLEIGH_VAR_RENAME_SKIP_INVALID = 1,
-	R2SLEIGH_VAR_RENAME_SKIP_CURRENT_NAME_NOT_GENERATED = 2,
-} R2SleighVarRenameApplyDecision;
-typedef struct {
-	size_t expected_blocks;
-	size_t lifted_blocks;
-	size_t read_failures;
-	size_t invalid_blocks;
-	size_t null_lift_failures;
-	size_t truncated_blocks;
-} R2SleighLiftQuality;
-typedef struct {
-	const R2ILContext *ctx;
-	const R2ILBlock **blocks;
-	size_t num_blocks;
-	unsigned long long function_addr;
-		const char *function_name;
-		R2SleighFunctionContext function_context;
-		R2SleighLiftQuality lift_quality;
-		R2SleighInterprocScope interproc_scope;
-		R2SleighInterprocSessionPlan interproc_plan;
-	} R2SleighEngineDecompileInput;
-typedef struct {
-	const R2ILContext *ctx;
-	const R2ILBlock **blocks;
-	size_t num_blocks;
-	unsigned long long function_addr;
-	const char *function_name;
-	R2SleighFunctionContext function_context;
-	R2SleighLiftQuality lift_quality;
-	R2SleighInterprocScope interproc_scope;
-	R2SleighInterprocSessionPlan interproc_plan;
-	unsigned int analysis_depth;
-} R2SleighEngineTypeFunctionInput;
-typedef struct {
-	unsigned int kind;
-	const char *signature;
-	const char *callconv;
-	const char *old_name;
-	const char *name;
-	const char *reg;
-	const char *type_name;
-	const char *type_materialization_key;
-	int type_materialization_required;
-	const char *text;
-	unsigned long long addr;
-	unsigned long long size;
-	long long delta;
-	char var_kind;
-	int is_arg;
-	unsigned char confidence;
-} R2SleighMutation;
-typedef struct {
-	const char *name;
-	const char *type_name;
-} R2SleighSignatureParam;
-typedef struct {
-	const char *signature;
-	const char *ret_type;
-	const char *callconv;
-	const char *arch;
-	const R2SleighSignatureParam *params;
-	size_t num_params;
-	unsigned char confidence;
-	unsigned char callconv_confidence;
-	unsigned int signature_decision;
-	unsigned int callconv_decision;
-} R2SleighSignatureFact;
+	R2SLEIGH_INTERPROC_LINKAGE_UNKNOWN = 0,
+	R2SLEIGH_INTERPROC_LINKAGE_INTERNAL = 1,
+	R2SLEIGH_INTERPROC_LINKAGE_IMPORTED = 2,
+} R2SleighInterprocLinkage;
 typedef struct {
 	const char *name;
 	const char *type_name;
@@ -426,34 +263,6 @@ typedef struct {
 	unsigned int target_cost;
 } R2SleighInterprocTargetInput;
 typedef struct R2SleighInterprocTargetPlan R2SleighInterprocTargetPlan;
-typedef enum {
-	R2SLEIGH_MUTATION_SIGNATURE = 0,
-	R2SLEIGH_MUTATION_CALLCONV = 1,
-	R2SLEIGH_MUTATION_VAR = 2,
-	R2SLEIGH_MUTATION_VAR_RENAME = 3,
-	R2SLEIGH_MUTATION_VAR_TYPE = 4,
-	R2SLEIGH_MUTATION_XREF = 5,
-	R2SLEIGH_MUTATION_COMMENT = 6,
-	R2SLEIGH_MUTATION_FLAG = 7,
-	R2SLEIGH_MUTATION_TYPE_DECL = 8,
-	R2SLEIGH_MUTATION_TYPE_LINK = 9,
-} R2SleighMutationKind;
-
-typedef enum {
-	R2SLEIGH_SIGNATURE_ACTION_APPLY = 0,
-	R2SLEIGH_SIGNATURE_ACTION_SKIP_MISSING_PAYLOAD = 1,
-	R2SLEIGH_SIGNATURE_ACTION_SKIP_UNSUPPORTED_ARCH = 2,
-	R2SLEIGH_SIGNATURE_ACTION_SKIP_TOO_LARGE = 3,
-	R2SLEIGH_SIGNATURE_ACTION_SKIP_LOW_CONFIDENCE = 4,
-} R2SleighSignatureActionDecision;
-
-typedef enum {
-	R2SLEIGH_SIGNATURE_REGISTER_ARG_RENAME_APPLY = 0,
-	R2SLEIGH_SIGNATURE_REGISTER_ARG_RENAME_SKIP_INVALID = 1,
-	R2SLEIGH_SIGNATURE_REGISTER_ARG_RENAME_SKIP_CURRENT_NAME_NOT_GENERATED = 2,
-	R2SLEIGH_SIGNATURE_REGISTER_ARG_RENAME_SKIP_ALREADY_MATCHES = 3,
-} R2SleighSignatureRegisterArgRenameDecision;
-
 extern R2SleighAnnotations *r2sleigh_analyze_fcn_annotations_typed(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks, unsigned long long fcn_addr);
 extern const R2SleighAnnotation *r2sleigh_annotations_items(const R2SleighAnnotations *annotations, size_t *count);
 extern void r2sleigh_annotations_free(R2SleighAnnotations *annotations);
@@ -485,17 +294,12 @@ extern int r2sym_set_symbol_map_json(const char *json);
 extern int r2sym_merge_is_enabled(void);
 extern void r2sym_merge_set_enabled(int enabled);
 
-/* Decompiler */
-extern char *r2sleigh_engine_decompile_function(const R2SleighEngineDecompileInput *input);
-extern char *r2sleigh_engine_type_function_json(const R2SleighEngineTypeFunctionInput *input);
-
 /* CFG */
 extern char *r2cfg_function_ascii(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks);
 extern char *r2cfg_function_json(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks);
 extern char *r2il_get_reg_profile(const R2ILContext *ctx);
 
 /* radare2 Deep Integration */
-extern int r2sleigh_analyze_fcn(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks, unsigned long long fcn_addr);
 extern R2SleighRecoveredVars *r2sleigh_recover_vars_typed(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks, unsigned long long fcn_addr);
 extern const R2SleighRecoveredVar *r2sleigh_recovered_vars_items(const R2SleighRecoveredVars *vars, size_t *count);
 extern void r2sleigh_recovered_vars_free(R2SleighRecoveredVars *vars);
@@ -539,15 +343,18 @@ static int collect_data_refs_from_typed(
 	RVecAnalRef *refs,
 	bool apply_to_anal);
 
-typedef RAnalFcnContext *(*SleighFunctionContextCollectFn)(RAnal *anal, RAnalFunction *fcn);
-typedef void (*SleighFunctionContextFreeFn)(RAnalFcnContext *ctx);
+typedef RAnalFunctionSnapshot *(*SleighFunctionSnapshotCollectWithLimitsFn)(
+	RAnal *anal, RAnalFunction *fcn, const RAnalFunctionSnapshotLimits *limits);
+typedef void (*SleighFunctionSnapshotFreeFn)(RAnalFunctionSnapshot *snapshot);
 
 typedef struct {
 	bool resolved;
 	bool available;
+	bool snapshot_available;
 	bool warned;
-	SleighFunctionContextCollectFn collect;
-	SleighFunctionContextFreeFn free;
+	bool warned_unbounded_snapshot;
+	SleighFunctionSnapshotCollectWithLimitsFn snapshot_collect_with_limits;
+	SleighFunctionSnapshotFreeFn snapshot_free;
 } SleighFunctionContextApi;
 
 static SleighFunctionContextApi sleigh_function_context_api = {0};
@@ -716,6 +523,8 @@ typedef struct {
 	char **owned_names;
 	size_t count;
 	size_t capacity;
+	size_t total_blocks;
+	size_t total_ops;
 } SymFunctionScope;
 
 typedef struct {
@@ -732,13 +541,12 @@ static const char *function_context_stack_base_name(RAnalFcnSlotBase base, const
 static unsigned int function_context_stack_slot_role_id(RAnalFcnSlotRole role);
 static unsigned int function_context_base_type_kind_id(RAnalBaseTypeKind kind);
 static unsigned int function_context_callee_linkage_id(RAnalFcnCalleeLinkage linkage);
-static bool sleigh_import_dwarf_base_types_if_needed(RAnal *anal);
 
 typedef struct {
 	R2SleighFunctionContext context;
 	RAnalFcnContext *typed_ctx;
+	RAnalFunctionSnapshot *snapshot;
 	RList *typed_base_types;
-	bool owns_typed_base_types;
 	R2SleighContextParam *typed_params;
 	R2SleighContextVar *typed_vars;
 	R2SleighContextBaseType *typed_base_type_entries;
@@ -759,84 +567,1182 @@ static void sleigh_typed_function_context_clear(SleighTypedFunctionContext *type
 	free (typed->typed_base_type_entries);
 	free (typed->typed_callee_params);
 	free (typed->typed_callees);
-	if (typed->owns_typed_base_types) {
-		r_anal_types_snapshot_free (typed->typed_base_types);
-	}
 	free (typed->typed_vars);
 	free (typed->typed_params);
-	if (typed->typed_ctx && sleigh_function_context_api.free) {
-		sleigh_function_context_api.free (typed->typed_ctx);
+	if (typed->snapshot && sleigh_function_context_api.snapshot_free) {
+		sleigh_function_context_api.snapshot_free (typed->snapshot);
 	}
 	memset (typed, 0, sizeof (*typed));
 }
 
-static bool sleigh_import_dwarf_base_types_if_needed(RAnal *anal) {
-	static RCore *last_core = NULL;
-	static RBinFile *last_binfile = NULL;
-	static bool last_attempted = false;
+typedef struct {
+	R2SleighSourceFunctionInterfaceV2 interface;
+	R2SleighSourceParameterV2 *parameters;
+	R2SleighSourceParameterTypeV2 *parameter_types;
+	R2SleighSourceTypeV2 *types;
+	R2SleighSourceAggregateLayoutV2 *aggregates;
+	R2SleighSourceAggregateMemberV2 *aggregate_members;
+	// The array is owned here; its names borrow immutable context.fcn_slots.
+	R2SleighSourceStackSlotV2 *stack_slots;
+	R2SleighSourceCallSiteInterfaceV2 *call_sites;
+	R2SleighSourceCallArgumentV2 *call_arguments;
+} SleighSourceInterfaceV2;
 
-	RCore *core;
-	RBinFile *bf;
-	RVecDwarfAbbrevDecl *da;
-	RBinDwarfDebugInfo *info;
-	HtUP *loc_table = NULL;
-	ut64 before_epoch;
-	ut64 after_epoch;
-	bool changed = false;
+static R2SleighStringViewV2 sleigh_string_view_v2(const char *text) {
+	R2SleighStringViewV2 view = {0};
+	if (text) {
+		view.data = (const uint8_t *)text;
+		view.len = strlen (text);
+	}
+	return view;
+}
 
-	if (!anal) {
-		return false;
+static void sleigh_source_interface_v2_clear(SleighSourceInterfaceV2 *source) {
+	if (!source) {
+		return;
 	}
-	core = anal->coreb.core;
-	if (!core || !core->bin) {
-		return false;
-	}
-	bf = r_bin_cur (core->bin);
-	if (!bf) {
-		return false;
-	}
-	if (last_attempted && last_core == core && last_binfile == bf) {
-		return false;
-	}
-	last_core = core;
-	last_binfile = bf;
-	last_attempted = true;
+	free (source->parameters);
+	free (source->parameter_types);
+	free (source->types);
+	free (source->aggregates);
+	free (source->aggregate_members);
+	free (source->stack_slots);
+	free (source->call_sites);
+	free (source->call_arguments);
+	memset (source, 0, sizeof (*source));
+}
 
-	da = r_bin_dwarf_parse_abbrev (bf, R_MODE_SET);
-	if (!da) {
-		R_LOG_DEBUG ("r2sleigh: DWARF base type import skipped; no abbreviations");
+static bool sleigh_source_carrier_v2_copy(
+	R2SleighSourceCarrierProjectionV2 *destination,
+	const RAnalSnapshotCarrierProjection *source
+) {
+	if (!destination || !source || source->offset_bits) {
 		return false;
 	}
-	r_bin_dwarf_parse_comp_dirs (bf, da);
-	info = r_bin_dwarf_parse_info (bf, da, R_MODE_SET);
-	if (info) {
-		RAnalDwarfContext ctx = {0};
-		const int addr_size = anal->config && anal->config->bits > 0
-			? R_MAX (1, anal->config->bits / 8)
-			: 8;
-		before_epoch = r_anal_types_dirty_epoch (anal);
-		loc_table = r_bin_dwarf_parse_loc (bf, addr_size);
-		ctx.info = info;
-		ctx.loc = loc_table;
-		r_anal_dwarf_process_info (anal, &ctx);
-		after_epoch = r_anal_types_dirty_epoch (anal);
-		changed = after_epoch != before_epoch;
-		R_LOG_DEBUG ("r2sleigh: DWARF base type import %s type DB epoch %" PFMT64u " -> %" PFMT64u,
-			changed ? "updated" : "left unchanged", before_epoch, after_epoch);
-		r_bin_dwarf_free_loc (loc_table);
-		r_bin_dwarf_free_debug_info (info);
+	switch (source->kind) {
+	case R_ANAL_SNAPSHOT_CARRIER_FULL:
+		destination->kind = R2SLEIGH_SOURCE_CARRIER_FULL_V2;
+		break;
+	case R_ANAL_SNAPSHOT_CARRIER_LOW_BITS:
+		destination->kind = R2SLEIGH_SOURCE_CARRIER_LOW_BITS_V2;
+		break;
+	default:
+		return false;
+	}
+	destination->size_bits = source->size_bits;
+	return destination->size_bits != 0;
+}
+
+static bool sleigh_source_type_graph_v2_build(
+	const RAnalFunctionSnapshot *snapshot,
+	SleighSourceInterfaceV2 *source
+) {
+	source->interface.return_type_id = R2SLEIGH_SOURCE_TYPE_ID_INVALID_V2;
+	if (!(snapshot->capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_FUNCTION_TYPES)) {
+		return true;
+	}
+	const RAnalFunctionInterfaceSnapshot *interface = &snapshot->function_interface;
+	const RAnalSnapshotTypeGraph *graph = &snapshot->type_graph;
+	if (!graph->complete || !interface->logical_types_complete
+		|| (graph->num_types && !graph->types)
+		|| (graph->num_aggregates && !graph->aggregates)
+		|| graph->num_types > R2SLEIGH_MAX_CONTEXT_ITEMS_V2
+		|| graph->num_aggregates > R2SLEIGH_MAX_CONTEXT_ITEMS_V2
+		|| graph->num_types > UINT32_MAX || graph->num_aggregates > UINT32_MAX
+		|| interface->num_parameters > R2SLEIGH_MAX_CONTEXT_ITEMS_V2) {
+		return false;
+	}
+	size_t total_members = 0;
+	size_t i;
+	for (i = 0; i < graph->num_aggregates; i++) {
+		const RAnalSnapshotAggregateLayout *aggregate = &graph->aggregates[i];
+		if ((aggregate->num_members && !aggregate->members)
+			|| aggregate->num_members > R2SLEIGH_MAX_NESTED_ITEMS_V2 - total_members) {
+			return false;
+		}
+		total_members += aggregate->num_members;
+	}
+	if (interface->num_parameters) {
+		source->parameter_types = calloc (interface->num_parameters,
+			sizeof (*source->parameter_types));
+		if (!source->parameter_types) {
+			return false;
+		}
+	}
+	if (graph->num_types) {
+		source->types = calloc (graph->num_types, sizeof (*source->types));
+		if (!source->types) {
+			return false;
+		}
+	}
+	if (graph->num_aggregates) {
+		source->aggregates = calloc (graph->num_aggregates,
+			sizeof (*source->aggregates));
+		if (!source->aggregates) {
+			return false;
+		}
+	}
+	if (total_members) {
+		source->aggregate_members = calloc (total_members,
+			sizeof (*source->aggregate_members));
+		if (!source->aggregate_members) {
+			return false;
+		}
+	}
+	for (i = 0; i < interface->num_parameters; i++) {
+		const RAnalSnapshotParameter *parameter = &interface->parameters[i];
+		R2SleighSourceParameterTypeV2 *destination = &source->parameter_types[i];
+		if (parameter->index != i
+			|| parameter->logical_type_id == R_ANAL_SNAPSHOT_TYPE_ID_INVALID
+			|| !sleigh_source_carrier_v2_copy (&destination->carrier,
+				&parameter->carrier)) {
+			return false;
+		}
+		destination->index = parameter->index;
+		destination->type_id = parameter->logical_type_id;
+	}
+	for (i = 0; i < graph->num_types; i++) {
+		const RAnalSnapshotType *type = &graph->types[i];
+		R2SleighSourceTypeV2 *destination = &source->types[i];
+		if (type->id != i) {
+			return false;
+		}
+		destination->id = type->id;
+		switch (type->kind) {
+		case R_ANAL_SNAPSHOT_TYPE_SIGNED_INTEGER:
+			destination->kind = R2SLEIGH_SOURCE_TYPE_SIGNED_INTEGER_V2;
+			break;
+		case R_ANAL_SNAPSHOT_TYPE_UNSIGNED_INTEGER:
+			destination->kind = R2SLEIGH_SOURCE_TYPE_UNSIGNED_INTEGER_V2;
+			break;
+		case R_ANAL_SNAPSHOT_TYPE_POINTER:
+			destination->kind = R2SLEIGH_SOURCE_TYPE_POINTER_V2;
+			break;
+		case R_ANAL_SNAPSHOT_TYPE_STRUCT:
+			destination->kind = R2SLEIGH_SOURCE_TYPE_STRUCT_V2;
+			break;
+		default:
+			return false;
+		}
+		destination->size_bits = type->size_bits;
+		destination->align_bits = type->align_bits;
+		destination->target_type_id = type->target_type_id;
+		destination->aggregate_id = type->aggregate_id;
+	}
+	size_t member_index = 0;
+	for (i = 0; i < graph->num_aggregates; i++) {
+		const RAnalSnapshotAggregateLayout *aggregate = &graph->aggregates[i];
+		R2SleighSourceAggregateLayoutV2 *destination = &source->aggregates[i];
+		destination->id = aggregate->id;
+		destination->type_id = aggregate->type_id;
+		destination->size_bits = aggregate->size_bits;
+		destination->align_bits = aggregate->align_bits;
+		destination->name = sleigh_string_view_v2 (aggregate->name);
+		destination->members = aggregate->num_members
+			? &source->aggregate_members[member_index]: NULL;
+		destination->num_members = aggregate->num_members;
+		destination->complete = aggregate->complete? 1: 0;
+		destination->c_layout_compatible = aggregate->c_layout_compatible? 1: 0;
+		size_t j;
+		for (j = 0; j < aggregate->num_members; j++) {
+			const RAnalSnapshotAggregateMember *member = &aggregate->members[j];
+			R2SleighSourceAggregateMemberV2 *member_destination =
+				&source->aggregate_members[member_index++];
+			member_destination->member_id = member->member_id;
+			member_destination->type_id = member->type_id;
+			member_destination->offset_bits = member->offset_bits;
+			member_destination->size_bits = member->size_bits;
+			member_destination->count = member->count;
+			member_destination->name = sleigh_string_view_v2 (member->name);
+		}
+	}
+	if (member_index != total_members) {
+		return false;
+	}
+	if (interface->return_kind == R_ANAL_SNAPSHOT_RETURN_REGISTER) {
+		if (interface->return_type_id == R_ANAL_SNAPSHOT_TYPE_ID_INVALID
+			|| !sleigh_source_carrier_v2_copy (&source->interface.return_carrier,
+				&interface->return_carrier)) {
+			return false;
+		}
+		source->interface.return_type_id = interface->return_type_id;
+	} else if (interface->return_kind != R_ANAL_SNAPSHOT_RETURN_VOID) {
+		return false;
+	}
+	source->interface.parameter_types = source->parameter_types;
+	source->interface.num_parameter_types = interface->num_parameters;
+	source->interface.types = source->types;
+	source->interface.num_types = graph->num_types;
+	source->interface.aggregates = source->aggregates;
+	source->interface.num_aggregates = graph->num_aggregates;
+	source->interface.exact_types_complete = 1;
+	return true;
+}
+
+static bool sleigh_call_site_snapshot_transportable(const RAnalCallSiteInterfaceSnapshot *call) {
+	if (!call || R_STR_ISEMPTY (call->calling_convention)
+		|| (call->num_arguments && !call->arguments)
+		|| (call->result_kind != R_ANAL_SNAPSHOT_RETURN_VOID
+			&& call->result_kind != R_ANAL_SNAPSHOT_RETURN_REGISTER)) {
+		return false;
+	}
+	size_t i;
+	for (i = 0; i < call->num_arguments; i++) {
+		if (call->arguments[i].index != i
+			|| R_STR_ISEMPTY (call->arguments[i].storage.name)
+			|| !call->arguments[i].storage.size) {
+			return false;
+		}
+	}
+	return call->result_kind != R_ANAL_SNAPSHOT_RETURN_REGISTER
+		|| (R_STR_ISNOTEMPTY (call->result_storage.name) && call->result_storage.size);
+}
+
+static int sleigh_call_site_lifted_identity(
+	const BlockArray *blocks,
+	const RAnalCallSiteInterfaceSnapshot *call,
+	ut64 *block_addr,
+	R2ILDirectCallIdentity *identity
+) {
+	if (!blocks || !call || !block_addr || !identity) {
+		return -1;
+	}
+	int matches = 0;
+	size_t i;
+	for (i = 0; i < blocks->count; i++) {
+		R2ILDirectCallIdentity candidate = {0};
+		int state = r2il_block_direct_call_identity (blocks->blocks[i],
+			call->instruction_addr, call->target_addr, &candidate);
+		if (state < 0) {
+			return -1;
+		}
+		if (!state) {
+			continue;
+		}
+		matches++;
+		if (matches != 1) {
+			return -1;
+		}
+		*block_addr = r2il_block_addr (blocks->blocks[i]);
+		*identity = candidate;
+	}
+	return matches == 1? 1: -1;
+}
+
+static bool sleigh_source_call_sites_v2_build(
+	const SleighTypedFunctionContext *typed,
+	const BlockArray *blocks,
+	SleighSourceInterfaceV2 *source
+) {
+	const RAnalFunctionSnapshot *snapshot = typed->snapshot;
+	if (!(snapshot->capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_CALL_SITE_INTERFACES)
+		|| !snapshot->num_call_site_interfaces) {
+		return true;
+	}
+	if (!snapshot->call_site_interfaces
+		|| snapshot->num_call_site_interfaces > R2SLEIGH_MAX_CONTEXT_ITEMS_V2
+		|| snapshot->num_call_site_interfaces > SIZE_MAX / sizeof (*source->call_sites)) {
+		return false;
+	}
+	size_t total_arguments = 0;
+	size_t transportable_count = 0;
+	size_t i, j;
+	for (i = 0; i < snapshot->num_call_site_interfaces; i++) {
+		const RAnalCallSiteInterfaceSnapshot *call = &snapshot->call_site_interfaces[i];
+		for (j = i + 1; j < snapshot->num_call_site_interfaces; j++) {
+			if (call->instruction_addr
+				== snapshot->call_site_interfaces[j].instruction_addr) {
+				return false;
+			}
+		}
+		if (!sleigh_call_site_snapshot_transportable (call)) {
+			// Never transport a partial source callsite set: an unavailable
+			// carrier contract leaves every callsite absent and residual.
+			return true;
+		}
+		if (call->num_arguments > R2SLEIGH_MAX_CONTEXT_ITEMS_V2 - total_arguments) {
+			return false;
+		}
+		total_arguments += call->num_arguments;
+		transportable_count++;
+	}
+	if (!transportable_count) {
+		return true;
+	}
+	source->call_sites = calloc (transportable_count, sizeof (*source->call_sites));
+	if (!source->call_sites) {
+		return false;
+	}
+	if (total_arguments) {
+		if (total_arguments > SIZE_MAX / sizeof (*source->call_arguments)) {
+			return false;
+		}
+		source->call_arguments = calloc (total_arguments, sizeof (*source->call_arguments));
+		if (!source->call_arguments) {
+			return false;
+		}
+	}
+	size_t call_index = 0;
+	size_t argument_index = 0;
+	for (i = 0; i < snapshot->num_call_site_interfaces; i++) {
+		const RAnalCallSiteInterfaceSnapshot *call = &snapshot->call_site_interfaces[i];
+		if (!sleigh_call_site_snapshot_transportable (call)) {
+			continue;
+		}
+		ut64 block_addr = 0;
+		R2ILDirectCallIdentity identity = {0};
+		if (sleigh_call_site_lifted_identity (
+				blocks, call, &block_addr, &identity) < 0) {
+			return false;
+		}
+		R2SleighSourceCallSiteInterfaceV2 *entry = &source->call_sites[call_index];
+		entry->schema_version = R2SLEIGH_SOURCE_CALL_SITE_SCHEMA_V2;
+		entry->struct_size = sizeof (*entry);
+		entry->revision_identity = snapshot->revision_identity;
+		entry->caller_function_addr = snapshot->function_addr;
+		entry->raw_instruction_addr = call->instruction_addr;
+		entry->raw_target_addr = call->target_addr;
+		entry->block_addr = block_addr;
+		entry->op_index = identity.op_index;
+		entry->target.space = identity.target_space;
+		entry->target.custom_space = identity.target_custom_space;
+		entry->target.offset = identity.target_offset;
+		entry->target.size = identity.target_size;
+		entry->calling_convention = sleigh_string_view_v2 (call->calling_convention);
+		entry->arguments = call->num_arguments
+			? &source->call_arguments[argument_index]
+			: NULL;
+		entry->num_arguments = call->num_arguments;
+		for (j = 0; j < call->num_arguments; j++) {
+			R2SleighSourceCallArgumentV2 *argument =
+				&source->call_arguments[argument_index++];
+			argument->index = call->arguments[j].index;
+			argument->storage.name = sleigh_string_view_v2 (call->arguments[j].storage.name);
+			argument->storage.offset = call->arguments[j].storage.offset;
+			argument->storage.size = call->arguments[j].storage.size;
+		}
+		entry->result_kind = call->result_kind == R_ANAL_SNAPSHOT_RETURN_VOID
+			? R2SLEIGH_SOURCE_RETURN_VOID_V2
+			: R2SLEIGH_SOURCE_RETURN_REGISTER_V2;
+		if (call->result_kind == R_ANAL_SNAPSHOT_RETURN_REGISTER) {
+			entry->result_storage.name = sleigh_string_view_v2 (call->result_storage.name);
+			entry->result_storage.offset = call->result_storage.offset;
+			entry->result_storage.size = call->result_storage.size;
+		}
+		entry->variadic = call->variadic? 1: 0;
+		entry->noreturn = call->noreturn? 1: 0;
+		entry->complete = call->complete? 1: 0;
+		call_index++;
+	}
+	if (call_index != transportable_count || argument_index != total_arguments) {
+		return false;
+	}
+	// This seals array transport completeness only: every callsite represented
+	// by this immutable snapshot was carried. `entry->complete` remains the
+	// independent semantic carrier-contract authority for each callsite.
+	source->interface.call_sites = source->call_sites;
+	source->interface.num_call_sites = transportable_count;
+	source->interface.call_sites_complete = 1;
+	return true;
+}
+// Returns 1 for exact authority, 0 when no exact source interface is present,
+// and -1 when an advertised exact interface is invalid or cannot be copied.
+static int sleigh_source_interface_v2_build(
+	const SleighTypedFunctionContext *typed,
+	const BlockArray *blocks,
+	SleighSourceInterfaceV2 *source
+) {
+	if (!typed || !source) {
+		return -1;
+	}
+	memset (source, 0, sizeof (*source));
+	if (!typed->snapshot
+		|| !(typed->snapshot->capabilities
+			& R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_FUNCTION_INTERFACE)
+		|| !(typed->snapshot->capabilities
+			& R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_STACK_SLOT_ROLES)
+		|| !(typed->snapshot->capabilities
+			& R_ANAL_FUNCTION_SNAPSHOT_CAP_RETURN_ADDRESS_STORAGE)) {
+		return 0;
+	}
+	const RAnalFunctionInterfaceSnapshot *interface = &typed->snapshot->function_interface;
+	if (!typed->snapshot->revision_identity
+		|| typed->snapshot->revision_identity != typed->context.context_hash
+		|| !interface->complete || !interface->stack_resources_complete
+		|| !interface->stack_slot_roles_complete
+		|| interface->variadic || interface->noreturn
+		|| !interface->calling_convention
+		|| !typed->snapshot->context.fcn_slots
+		|| !interface->return_address_storage.name
+		|| !interface->return_address_storage.size
+		|| interface->return_address_storage.offset
+			> UINT64_MAX - interface->return_address_storage.size
+		|| (interface->num_parameters && !interface->parameters)
+		|| (interface->return_kind != R_ANAL_SNAPSHOT_RETURN_VOID
+			&& interface->return_kind != R_ANAL_SNAPSHOT_RETURN_REGISTER)) {
+		return -1;
+	}
+	if (interface->num_parameters > SIZE_MAX / sizeof (*source->parameters)) {
+		return -1;
+	}
+	const size_t num_stack_slots = (size_t)r_list_length (typed->snapshot->context.fcn_slots);
+	if (num_stack_slots > SIZE_MAX / sizeof (*source->stack_slots)) {
+		return -1;
+	}
+	if (interface->num_parameters) {
+		source->parameters = calloc (interface->num_parameters, sizeof (*source->parameters));
+		if (!source->parameters) {
+			return -1;
+		}
+	}
+	if (num_stack_slots) {
+		source->stack_slots = calloc (num_stack_slots, sizeof (*source->stack_slots));
+		if (!source->stack_slots) {
+			sleigh_source_interface_v2_clear (source);
+			return -1;
+		}
+	}
+	size_t i;
+	for (i = 0; i < interface->num_parameters; i++) {
+		const RAnalSnapshotParameter *parameter = &interface->parameters[i];
+		if (parameter->index != i || !parameter->storage.name || !parameter->storage.size) {
+			sleigh_source_interface_v2_clear (source);
+			return -1;
+		}
+		source->parameters[i].index = parameter->index;
+		source->parameters[i].storage.name = sleigh_string_view_v2 (parameter->storage.name);
+		source->parameters[i].storage.offset = parameter->storage.offset;
+		source->parameters[i].storage.size = parameter->storage.size;
+	}
+	RListIter *iter;
+	RAnalFcnSlot *slot;
+	i = 0;
+	r_list_foreach (typed->snapshot->context.fcn_slots, iter, slot) {
+		if (i >= num_stack_slots || !slot
+			|| (slot->base != R_ANAL_FCN_BASE_BP && slot->base != R_ANAL_FCN_BASE_SP)
+			|| !slot->base_name || !*slot->base_name || !slot->base_size
+			|| slot->base_offset > UINT64_MAX - slot->base_size
+			|| !slot->offset_valid || !slot->size
+			|| slot->offset > INT64_MAX - (int64_t)slot->size) {
+			sleigh_source_interface_v2_clear (source);
+			return -1;
+		}
+		source->stack_slots[i].base_kind = slot->base == R_ANAL_FCN_BASE_BP
+			? R2SLEIGH_SOURCE_STACK_BASE_BP_V2
+			: R2SLEIGH_SOURCE_STACK_BASE_SP_V2;
+		source->stack_slots[i].base.name = sleigh_string_view_v2 (slot->base_name);
+		source->stack_slots[i].base.offset = slot->base_offset;
+		source->stack_slots[i].base.size = slot->base_size;
+		source->stack_slots[i].offset = slot->offset;
+		source->stack_slots[i].size = slot->size;
+		if (slot->role == R_ANAL_FCN_SLOT_LOCAL) {
+			if (slot->arg_index != -1 || slot->home_reg_offset || slot->home_reg_size) {
+				sleigh_source_interface_v2_clear (source);
+				return -1;
+			}
+			source->stack_slots[i].role = R2SLEIGH_SOURCE_STACK_ROLE_LOCAL_V2;
+			source->stack_slots[i].parameter_index = R2SLEIGH_SOURCE_PARAMETER_INDEX_INVALID_V2;
+		} else if (slot->role == R_ANAL_FCN_SLOT_HOME) {
+			if (slot->arg_index < 0 || (size_t)slot->arg_index >= interface->num_parameters
+				|| !slot->home_reg || !*slot->home_reg
+				|| !slot->home_reg_size
+				|| slot->home_reg_offset > UINT64_MAX - slot->home_reg_size) {
+				sleigh_source_interface_v2_clear (source);
+				return -1;
+			}
+			const RAnalSnapshotParameter *parameter = &interface->parameters[slot->arg_index];
+			if (parameter->index != (uint32_t)slot->arg_index
+				|| parameter->storage.offset != slot->home_reg_offset
+				|| parameter->storage.size != slot->home_reg_size) {
+				sleigh_source_interface_v2_clear (source);
+				return -1;
+			}
+			size_t previous;
+			for (previous = 0; previous < i; previous++) {
+				if (source->stack_slots[previous].role
+						== R2SLEIGH_SOURCE_STACK_ROLE_PARAMETER_HOME_V2
+					&& source->stack_slots[previous].parameter_index
+						== (uint32_t)slot->arg_index) {
+					sleigh_source_interface_v2_clear (source);
+					return -1;
+				}
+			}
+			source->stack_slots[i].role = R2SLEIGH_SOURCE_STACK_ROLE_PARAMETER_HOME_V2;
+			source->stack_slots[i].parameter_index = (uint32_t)slot->arg_index;
+			source->stack_slots[i].home_storage.name = sleigh_string_view_v2 (slot->home_reg);
+			source->stack_slots[i].home_storage.offset = slot->home_reg_offset;
+			source->stack_slots[i].home_storage.size = slot->home_reg_size;
+		} else {
+			sleigh_source_interface_v2_clear (source);
+			return -1;
+		}
+		i++;
+	}
+	if (i != num_stack_slots) {
+		sleigh_source_interface_v2_clear (source);
+		return -1;
+	}
+	source->interface.schema_version = R2SLEIGH_SOURCE_INTERFACE_SCHEMA_V2;
+	source->interface.struct_size = sizeof (source->interface);
+	source->interface.revision_identity = typed->snapshot->revision_identity;
+	source->interface.function_addr = typed->snapshot->function_addr;
+	source->interface.calling_convention = sleigh_string_view_v2 (interface->calling_convention);
+	source->interface.parameters = source->parameters;
+	source->interface.num_parameters = interface->num_parameters;
+	source->interface.stack_slots = source->stack_slots;
+	source->interface.num_stack_slots = num_stack_slots;
+	source->interface.return_kind = interface->return_kind == R_ANAL_SNAPSHOT_RETURN_VOID
+		? R2SLEIGH_SOURCE_RETURN_VOID_V2
+		: R2SLEIGH_SOURCE_RETURN_REGISTER_V2;
+	if (interface->return_kind == R_ANAL_SNAPSHOT_RETURN_REGISTER) {
+		if (!interface->return_storage.name || !interface->return_storage.size) {
+			sleigh_source_interface_v2_clear (source);
+			return -1;
+		}
+		source->interface.return_storage.name =
+			sleigh_string_view_v2 (interface->return_storage.name);
+		source->interface.return_storage.offset = interface->return_storage.offset;
+		source->interface.return_storage.size = interface->return_storage.size;
+	}
+	source->interface.stack_resources_complete = 1;
+	source->interface.stack_slot_roles_complete = 1;
+	source->interface.complete = 1;
+	source->interface.return_address_storage.space = R2SLEIGH_SOURCE_STORAGE_REGISTER_V2;
+	source->interface.return_address_storage.offset = interface->return_address_storage.offset;
+	source->interface.return_address_storage.size = interface->return_address_storage.size;
+	if (!sleigh_source_type_graph_v2_build (typed->snapshot, source)) {
+		sleigh_source_interface_v2_clear (source);
+		return -1;
+	}
+	if (!sleigh_source_call_sites_v2_build (typed, blocks, source)) {
+		sleigh_source_interface_v2_clear (source);
+		return -1;
+	}
+	return 1;
+}
+
+static void sleigh_engine_v2_log_error(
+	const R2SleighApiV2 *api,
+	const R2SleighSessionV2 *session,
+	uint32_t status
+) {
+	R2SleighByteViewV2 error = {0};
+	if (api && session && api->session_error
+		&& api->session_error (session, &error) == R2SLEIGH_STATUS_OK_V2
+		&& error.data && error.len) {
+		int len = error.len > INT_MAX? INT_MAX: (int)error.len;
+		R_LOG_ERROR ("r2sleigh: V2 engine request failed (%u): %.*s",
+			status, len, (const char *)error.data);
+		return;
+	}
+	R_LOG_ERROR ("r2sleigh: V2 engine request failed (%u)", status);
+}
+
+static char *sleigh_byte_view_v2_copy(R2SleighByteViewV2 view) {
+	if ((!view.data && view.len) || view.len == SIZE_MAX) {
+		return NULL;
+	}
+	char *copy = malloc (view.len + 1);
+	if (!copy) {
+		return NULL;
+	}
+	if (view.len) {
+		memcpy (copy, view.data, view.len);
+	}
+	copy[view.len] = '\0';
+	return copy;
+}
+
+static const char *sleigh_engine_v2_phase_name(uint32_t phase) {
+	switch (phase) {
+	case R2SLEIGH_PHASE_SNAPSHOT_CONTEXT_V2:
+		return "snapshot_context";
+	case R2SLEIGH_PHASE_LIFT_NORMALIZE_V2:
+		return "lift_normalize";
+	case R2SLEIGH_PHASE_SSA_V2:
+		return "ssa";
+	case R2SLEIGH_PHASE_OBLIGATIONS_V2:
+		return "obligations";
+	case R2SLEIGH_PHASE_SYMBOLIC_V2:
+		return "symbolic";
+	case R2SLEIGH_PHASE_TYPES_V2:
+		return "types";
+	case R2SLEIGH_PHASE_CERTIFICATION_V2:
+		return "certification";
+	case R2SLEIGH_PHASE_STRUCTURING_V2:
+		return "structuring";
+	case R2SLEIGH_PHASE_NORMALIZATION_V2:
+		return "normalization";
+	case R2SLEIGH_PHASE_RENDERING_V2:
+		return "rendering";
+	case R2SLEIGH_PHASE_FFI_CONVERSION_V2:
+		return "ffi_conversion";
+	default:
+		return "unknown";
+	}
+}
+
+static const char *sleigh_engine_v2_phase_status_name(uint32_t status) {
+	switch (status) {
+	case R2SLEIGH_PHASE_STATUS_NOT_EXECUTED_V2:
+		return "not_executed";
+	case R2SLEIGH_PHASE_STATUS_EXECUTED_V2:
+		return "executed";
+	case R2SLEIGH_PHASE_STATUS_FOLDED_V2:
+		return "folded";
+	case R2SLEIGH_PHASE_STATUS_REUSED_V2:
+		return "reused";
+	case R2SLEIGH_PHASE_STATUS_REFUSED_V2:
+		return "refused";
+	default:
+		return "unknown";
+	}
+}
+
+#define SLEIGH_DECJ_SCHEMA_VERSION 1
+
+static char *sleigh_engine_v2_error_json(const char *state, uint32_t status, const char *message) {
+	PJ *pj = pj_new ();
+	if (!pj) {
+		return NULL;
+	}
+	pj_o (pj);
+	pj_kn (pj, "schema_version", SLEIGH_DECJ_SCHEMA_VERSION);
+	pj_ks (pj, "request_kind", "decompile");
+	pj_kn (pj, "request_kind_code", R2SLEIGH_REQUEST_DECOMPILE_V2);
+	pj_ks (pj, "outcome", "error");
+	pj_knull (pj, "outcome_code");
+	pj_knull (pj, "rendered_output");
+	pj_knull (pj, "diagnostics");
+	pj_ka (pj, "phase_timings");
+	pj_end (pj);
+	pj_kn (pj, "ffi_conversion_elapsed_us", 0);
+	pj_kb (pj, "refused", false);
+	pj_ko (pj, "error");
+	pj_ks (pj, "state", state? state: "unknown");
+	pj_kn (pj, "status", status);
+	pj_ks (pj, "message", message? message: "V2 decompile request failed");
+	pj_end (pj);
+	pj_end (pj);
+	return pj_drain (pj);
+}
+
+static char *sleigh_engine_v2_session_error_copy(const R2SleighApiV2 *api, const R2SleighSessionV2 *session, uint32_t status) {
+	R2SleighByteViewV2 error = {0};
+	if (api && session && api->session_error
+		&& api->session_error (session, &error) == R2SLEIGH_STATUS_OK_V2
+		&& error.data && error.len) {
+		return sleigh_byte_view_v2_copy (error);
+	}
+	return r_str_newf ("V2 engine request failed (%u)", status);
+}
+
+static bool sleigh_json_is_single_object(const char *text, size_t len) {
+	if (!text || !len) {
+		return false;
+	}
+	size_t i = 0;
+	while (i < len && isspace ((unsigned char)text[i])) {
+		i++;
+	}
+	if (i == len || text[i] != '{') {
+		return false;
+	}
+	char closers[R_PRINT_JSON_DEPTH_LIMIT] = {0};
+	size_t depth = 0;
+	bool in_string = false;
+	bool escaped = false;
+	for (; i < len; i++) {
+		unsigned char ch = (unsigned char)text[i];
+		if (in_string) {
+			if (escaped) {
+				escaped = false;
+			} else if (ch == '\\') {
+				escaped = true;
+			} else if (ch == '"') {
+				in_string = false;
+			} else if (ch < 0x20) {
+				return false;
+			}
+			continue;
+		}
+		if (ch == '"') {
+			in_string = true;
+			continue;
+		}
+		if (ch == '{' || ch == '[') {
+			if (depth == R_PRINT_JSON_DEPTH_LIMIT) {
+				return false;
+			}
+			closers[depth++] = ch == '{'? '}': ']';
+			continue;
+		}
+		if (ch == '}' || ch == ']') {
+			if (!depth || closers[depth - 1] != ch) {
+				return false;
+			}
+			depth--;
+			if (!depth) {
+				i++;
+				while (i < len && isspace ((unsigned char)text[i])) {
+					i++;
+				}
+				return i == len;
+			}
+		}
+	}
+	return false;
+}
+
+static char *sleigh_engine_v2_response_json(const R2SleighResponseInfoV2 *info, R2SleighByteViewV2 bytes) {
+	if (!info || !info->diagnostics_json.data || !info->diagnostics_json.len) {
+		return NULL;
+	}
+	if (!sleigh_json_is_single_object (
+		(const char *)info->diagnostics_json.data, info->diagnostics_json.len)) {
+		return NULL;
+	}
+	char *output = sleigh_byte_view_v2_copy (bytes);
+	char *diagnostics_text = sleigh_byte_view_v2_copy (info->diagnostics_json);
+	if (!output || !diagnostics_text) {
+		free (output);
+		free (diagnostics_text);
+		return NULL;
+	}
+	RJson *diagnostics = r_json_parsedup (diagnostics_text);
+	free (diagnostics_text);
+	if (!diagnostics || diagnostics->type != R_JSON_OBJECT) {
+		r_json_free (diagnostics);
+		free (output);
+		return NULL;
+	}
+	PJ *pj = pj_new ();
+	if (!pj) {
+		r_json_free (diagnostics);
+		free (output);
+		return NULL;
+	}
+	pj_o (pj);
+	pj_kn (pj, "schema_version", SLEIGH_DECJ_SCHEMA_VERSION);
+	pj_ks (pj, "request_kind", "decompile");
+	pj_kn (pj, "request_kind_code", info->request_kind);
+	pj_ks (pj, "outcome", info->outcome == R2SLEIGH_OUTCOME_REFUSED_V2
+		? "refused": "completed");
+	pj_kn (pj, "outcome_code", info->outcome);
+	pj_ks (pj, "rendered_output", output);
+	pj_k (pj, "diagnostics");
+	pj_rj (pj, diagnostics);
+	pj_ka (pj, "phase_timings");
+	size_t i = 0;
+	for (; i < info->num_phase_timings; i++) {
+		const R2SleighPhaseTimingV2 *timing = &info->phase_timings[i];
+		pj_o (pj);
+		pj_kn (pj, "phase", timing->phase);
+		pj_ks (pj, "name", sleigh_engine_v2_phase_name (timing->phase));
+		pj_kn (pj, "status", timing->status);
+		pj_ks (pj, "status_name", sleigh_engine_v2_phase_status_name (timing->status));
+		pj_kn (pj, "elapsed_us", timing->elapsed_us);
+		pj_end (pj);
+	}
+	pj_end (pj);
+	pj_kn (pj, "ffi_conversion_elapsed_us", info->ffi_conversion_elapsed_us);
+	pj_kb (pj, "refused", info->outcome == R2SLEIGH_OUTCOME_REFUSED_V2);
+	pj_knull (pj, "error");
+	pj_end (pj);
+	char *json = pj_drain (pj);
+	r_json_free (diagnostics);
+	free (output);
+	return json;
+}
+
+// Returns a malloc-owned NUL-terminated projection. Every borrowed response
+// view is consumed before response_free releases the opaque Rust owner.
+static char *sleigh_engine_execute_v2_project(uint32_t kind, uint64_t required_capability, const R2SleighEngineRequestPayloadV2 *payload, bool json_projection) {
+	required_capability |= R2SLEIGH_CAP_NATIVE_REQUEST_GRAPH_V2
+		| R2SLEIGH_CAP_RESPONSE_INFO_V2
+		| R2SLEIGH_CAP_EXECUTION_CONTROL_V2;
+	const R2SleighApiV2 *api = r2sleigh_api_v2 ();
+	if (!api || api->abi_version != R2SLEIGH_ABI_V2
+		|| api->struct_size < sizeof (*api)
+		|| api->radare_abi_version != R2_ABIVERSION
+		|| api->session_config_size != sizeof (R2SleighSessionConfigV2)
+		|| api->request_size != sizeof (R2SleighRequestV2)
+		|| api->engine_request_payload_size != sizeof (R2SleighEngineRequestPayloadV2)
+		|| api->function_context_size != sizeof (R2SleighFunctionContext)
+		|| api->context_param_size != sizeof (R2SleighContextParam)
+		|| api->context_var_size != sizeof (R2SleighContextVar)
+		|| api->context_base_member_size != sizeof (R2SleighContextBaseMember)
+		|| api->context_enum_variant_size != sizeof (R2SleighContextEnumVariant)
+		|| api->context_base_type_size != sizeof (R2SleighContextBaseType)
+		|| api->context_callee_size != sizeof (R2SleighContextCallee)
+		|| api->lift_quality_size != sizeof (R2SleighLiftQuality)
+		|| api->interproc_seed_size != sizeof (R2SleighInterprocSeed)
+		|| api->interproc_scope_size != sizeof (R2SleighInterprocScope)
+		|| api->interproc_plan_size != sizeof (R2SleighInterprocSessionPlan)
+		|| api->source_function_interface_size != sizeof (R2SleighSourceFunctionInterfaceV2)
+		|| api->source_parameter_size != sizeof (R2SleighSourceParameterV2)
+		|| api->source_parameter_type_size != sizeof (R2SleighSourceParameterTypeV2)
+		|| api->source_carrier_projection_size != sizeof (R2SleighSourceCarrierProjectionV2)
+		|| api->source_type_size != sizeof (R2SleighSourceTypeV2)
+		|| api->source_aggregate_member_size != sizeof (R2SleighSourceAggregateMemberV2)
+		|| api->source_aggregate_layout_size != sizeof (R2SleighSourceAggregateLayoutV2)
+		|| api->source_register_size != sizeof (R2SleighSourceRegisterV2)
+		|| api->source_stack_slot_size != sizeof (R2SleighSourceStackSlotV2)
+		|| api->source_storage_size != sizeof (R2SleighSourceStorageV2)
+		|| api->source_call_argument_size != sizeof (R2SleighSourceCallArgumentV2)
+		|| api->source_call_site_interface_size != sizeof (R2SleighSourceCallSiteInterfaceV2)
+		|| api->byte_view_size != sizeof (R2SleighByteViewV2)
+		|| api->phase_timing_size != sizeof (R2SleighPhaseTimingV2)
+		|| api->response_info_size != sizeof (R2SleighResponseInfoV2)
+		|| (api->capabilities & required_capability) != required_capability
+		|| !api->session_create || !api->session_free
+		|| !api->session_cancel || !api->session_reset_cancellation || !api->execute
+		|| !api->response_bytes || !api->response_info
+		|| !api->response_free || !api->session_error) {
+		R_LOG_ERROR ("r2sleigh: incompatible V2 engine API table");
+		return json_projection
+			? sleigh_engine_v2_error_json ("incompatible_api",
+				R2SLEIGH_STATUS_ABI_MISMATCH_V2,
+				"incompatible V2 engine API table")
+			: NULL;
+	}
+	if (!payload || payload->abi_version != R2SLEIGH_ABI_V2
+		|| payload->struct_size != sizeof (*payload)) {
+		R_LOG_ERROR ("r2sleigh: invalid native V2 request graph");
+		return json_projection
+			? sleigh_engine_v2_error_json ("invalid_request",
+				R2SLEIGH_STATUS_INVALID_ARGUMENT_V2,
+				"invalid native V2 request graph")
+			: NULL;
+	}
+
+	R2SleighSessionConfigV2 config = {
+		.abi_version = R2SLEIGH_ABI_V2,
+		.struct_size = sizeof (config),
+		.required_capabilities = required_capability,
+	};
+	R2SleighSessionV2 *session = NULL;
+	uint32_t status = api->session_create (&config, &session);
+	if (status != R2SLEIGH_STATUS_OK_V2 || !session) {
+		R_LOG_ERROR ("r2sleigh: failed to create V2 engine session (%u)", status);
+		return json_projection
+			? sleigh_engine_v2_error_json ("session_create", status,
+				"failed to create V2 engine session")
+			: NULL;
+	}
+
+	R2SleighRequestV2 request = {
+		.abi_version = R2SLEIGH_ABI_V2,
+		.struct_size = sizeof (request),
+		.kind = kind,
+		.payload = payload,
+		.payload_size = sizeof (*payload),
+	};
+	R2SleighResponseV2 *response = NULL;
+	status = api->execute (session, &request, &response);
+	if (status != R2SLEIGH_STATUS_OK_V2 || !response) {
+		sleigh_engine_v2_log_error (api, session, status);
+		char *message = json_projection
+			? sleigh_engine_v2_session_error_copy (api, session, status)
+			: NULL;
+		api->session_free (session);
+		if (json_projection) {
+			char *json = sleigh_engine_v2_error_json ("execute", status, message);
+			free (message);
+			return json;
+		}
+		return NULL;
+	}
+	R2SleighResponseInfoV2 info = {0};
+	status = api->response_info (response, &info);
+	if (status != R2SLEIGH_STATUS_OK_V2
+		|| info.schema_version != R2SLEIGH_RESPONSE_INFO_SCHEMA_V2
+		|| info.struct_size != sizeof (info)
+		|| info.request_kind != kind
+		|| info.num_phase_timings != R2SLEIGH_PHASE_COUNT_V2
+		|| !info.phase_timings
+		|| (info.outcome != R2SLEIGH_OUTCOME_COMPLETED_V2
+			&& info.outcome != R2SLEIGH_OUTCOME_REFUSED_V2)
+		|| !info.diagnostics_json.data || !info.diagnostics_json.len) {
+		sleigh_engine_v2_log_error (api, session, status);
+		api->response_free (response);
+		api->session_free (session);
+		return json_projection
+			? sleigh_engine_v2_error_json ("response_info",
+				R2SLEIGH_STATUS_ENGINE_ERROR_V2,
+				"invalid or missing V2 response metadata")
+			: NULL;
+	}
+	size_t phase_index;
+	for (phase_index = 0; phase_index < info.num_phase_timings; phase_index++) {
+		if (info.phase_timings[phase_index].phase != phase_index
+			|| info.phase_timings[phase_index].status > R2SLEIGH_PHASE_STATUS_REFUSED_V2) {
+			R_LOG_ERROR ("r2sleigh: invalid V2 engine phase metadata");
+			api->response_free (response);
+			api->session_free (session);
+			return json_projection
+				? sleigh_engine_v2_error_json ("phase_metadata",
+					R2SLEIGH_STATUS_ENGINE_ERROR_V2,
+					"invalid V2 engine phase metadata")
+				: NULL;
+		}
+	}
+	if (info.phase_timings[R2SLEIGH_PHASE_FFI_CONVERSION_V2].status
+			!= R2SLEIGH_PHASE_STATUS_EXECUTED_V2
+		|| info.phase_timings[R2SLEIGH_PHASE_FFI_CONVERSION_V2].elapsed_us
+			!= info.ffi_conversion_elapsed_us) {
+		R_LOG_ERROR ("r2sleigh: invalid V2 FFI conversion metadata");
+		api->response_free (response);
+		api->session_free (session);
+		return json_projection
+			? sleigh_engine_v2_error_json ("ffi_conversion_metadata",
+				R2SLEIGH_STATUS_ENGINE_ERROR_V2,
+				"invalid V2 FFI conversion metadata")
+			: NULL;
+	}
+
+	R2SleighByteViewV2 bytes = {0};
+	status = api->response_bytes (response, &bytes);
+	char *result = NULL;
+	if (status == R2SLEIGH_STATUS_OK_V2 && bytes.len < SIZE_MAX
+		&& (!bytes.len || bytes.data)) {
+		result = json_projection
+			? sleigh_engine_v2_response_json (&info, bytes)
+			: sleigh_byte_view_v2_copy (bytes);
 	} else {
-		R_LOG_DEBUG ("r2sleigh: DWARF base type import skipped; no debug info");
+		sleigh_engine_v2_log_error (api, session, status);
 	}
-	r_bin_dwarf_free_debug_abbrev (da);
-	return changed;
+	if (json_projection && !result) {
+		result = sleigh_engine_v2_error_json ("response_projection",
+			R2SLEIGH_STATUS_ENGINE_ERROR_V2,
+			"invalid output or diagnostics in V2 response");
+	}
+	api->response_free (response);
+	api->session_free (session);
+	return result;
+}
+
+static char *sleigh_engine_execute_v2(uint32_t kind, uint64_t required_capability, const R2SleighEngineRequestPayloadV2 *payload) {
+	return sleigh_engine_execute_v2_project (
+		kind, required_capability, payload, false);
+}
+
+static char *sleigh_engine_execute_v2_json(uint32_t kind, uint64_t required_capability, const R2SleighEngineRequestPayloadV2 *payload) {
+	return sleigh_engine_execute_v2_project (
+		kind, required_capability, payload, true);
+}
+
+typedef struct {
+	size_t context_items;
+	size_t nested_items;
+	size_t string_bytes;
+	size_t json_bytes;
+} SleighContextPreflightBudget;
+
+static bool sleigh_context_preflight_add(
+	size_t *total,
+	size_t amount,
+	size_t cap,
+	const char *label,
+	ut64 function_addr
+) {
+	if (amount > cap - *total) {
+		R_LOG_ERROR ("r2sleigh: typed snapshot preflight refused function 0x%"PFMT64x": aggregate %s exceeds cap %zu",
+			function_addr, label, cap);
+		return false;
+	}
+	*total += amount;
+	return true;
+}
+
+static bool sleigh_context_preflight_string(
+	SleighContextPreflightBudget *budget,
+	const char *text,
+	bool json,
+	const char *label,
+	ut64 function_addr
+) {
+	if (!text) {
+		return true;
+	}
+	const size_t per_value_cap = json
+		? (size_t)R2SLEIGH_MAX_JSON_BYTES_V2
+		: (size_t)R2SLEIGH_MAX_STRING_BYTES_V2;
+	const size_t aggregate_cap = json
+		? (size_t)R2SLEIGH_MAX_AGGREGATE_JSON_BYTES_V2
+		: (size_t)R2SLEIGH_MAX_AGGREGATE_STRING_BYTES_V2;
+	const size_t length = r_str_nlen (text, (int)per_value_cap + 1);
+	if (length > per_value_cap) {
+		R_LOG_ERROR ("r2sleigh: typed snapshot preflight refused function 0x%"PFMT64x": %s exceeds per-value cap %zu",
+			function_addr, label, per_value_cap);
+		return false;
+	}
+	size_t *total = json? &budget->json_bytes: &budget->string_bytes;
+	return sleigh_context_preflight_add (total, length, aggregate_cap,
+		json? "JSON bytes": "string bytes", function_addr);
+}
+
+static bool sleigh_typed_context_preflight(
+	const RAnalFunction *fcn,
+	const RAnalFcnContext *ctx,
+	const RList *base_types
+) {
+	if (!fcn || !ctx || !base_types) {
+		return false;
+	}
+	SleighContextPreflightBudget budget = {0};
+#define PREFLIGHT_STRING(value, label) \
+	do { \
+		if (!sleigh_context_preflight_string (&budget, value, false, label, fcn->addr)) { \
+			return false; \
+		} \
+	} while (0)
+
+	PREFLIGHT_STRING (fcn->name, "function name");
+	if (ctx->signature) {
+		PREFLIGHT_STRING (ctx->signature->signature, "signature name");
+		PREFLIGHT_STRING (ctx->signature->ret_type, "signature return type");
+		PREFLIGHT_STRING (ctx->signature->callconv, "signature calling convention");
+		const size_t parameter_count = ctx->signature->params
+			? (size_t)r_list_length (ctx->signature->params): 0;
+		if (!sleigh_context_preflight_add (&budget.context_items, parameter_count,
+				(size_t)R2SLEIGH_MAX_CONTEXT_ITEMS_V2, "context items", fcn->addr)) {
+			return false;
+		}
+		RListIter *iter;
+		RAnalFunctionParam *parameter;
+		r_list_foreach (ctx->signature->params, iter, parameter) {
+			if (parameter) {
+				PREFLIGHT_STRING (parameter->name, "parameter name");
+				PREFLIGHT_STRING (parameter->type, "parameter type");
+			}
+		}
+	}
+
+	const size_t reg_arg_count = ctx->reg_args? (size_t)r_list_length (ctx->reg_args): 0;
+	const size_t stack_slot_count = ctx->fcn_slots? (size_t)r_list_length (ctx->fcn_slots): 0;
+	if (!sleigh_context_preflight_add (&budget.context_items, reg_arg_count,
+			(size_t)R2SLEIGH_MAX_CONTEXT_ITEMS_V2, "context items", fcn->addr)
+		|| !sleigh_context_preflight_add (&budget.context_items, stack_slot_count,
+			(size_t)R2SLEIGH_MAX_CONTEXT_ITEMS_V2, "context items", fcn->addr)) {
+		return false;
+	}
+	RListIter *iter;
+	RAnalFcnRegArg *reg_arg;
+	r_list_foreach (ctx->reg_args, iter, reg_arg) {
+		if (reg_arg) {
+			PREFLIGHT_STRING (reg_arg->name, "register argument name");
+			PREFLIGHT_STRING (reg_arg->type, "register argument type");
+			PREFLIGHT_STRING (reg_arg->reg, "register argument storage");
+		}
+	}
+	RAnalFcnSlot *slot;
+	r_list_foreach (ctx->fcn_slots, iter, slot) {
+		if (slot) {
+			PREFLIGHT_STRING (slot->name, "stack slot name");
+			PREFLIGHT_STRING (slot->type, "stack slot type");
+			PREFLIGHT_STRING (slot->base_name, "stack slot base");
+			PREFLIGHT_STRING (slot->arg_name, "stack slot argument name");
+			PREFLIGHT_STRING (slot->home_reg, "stack slot home register");
+		}
+	}
+
+	const size_t callee_count = ctx->callees? (size_t)r_list_length (ctx->callees): 0;
+	if (!sleigh_context_preflight_add (&budget.context_items, callee_count,
+			(size_t)R2SLEIGH_MAX_CONTEXT_ITEMS_V2, "context items", fcn->addr)) {
+		return false;
+	}
+	RAnalFcnCallee *callee;
+	r_list_foreach (ctx->callees, iter, callee) {
+		if (!callee) {
+			continue;
+		}
+		PREFLIGHT_STRING (callee->name, "callee name");
+		if (callee->signature) {
+			PREFLIGHT_STRING (callee->signature->signature, "callee signature name");
+			PREFLIGHT_STRING (callee->signature->ret_type, "callee return type");
+			PREFLIGHT_STRING (callee->signature->callconv, "callee calling convention");
+			const size_t callee_parameter_count = callee->signature->params
+				? (size_t)r_list_length (callee->signature->params): 0;
+			if (!sleigh_context_preflight_add (&budget.nested_items, callee_parameter_count,
+					(size_t)R2SLEIGH_MAX_NESTED_ITEMS_V2, "nested items", fcn->addr)) {
+				return false;
+			}
+			RListIter *param_iter;
+			RAnalFunctionParam *parameter;
+			r_list_foreach (callee->signature->params, param_iter, parameter) {
+				if (parameter) {
+					PREFLIGHT_STRING (parameter->name, "callee parameter name");
+					PREFLIGHT_STRING (parameter->type, "callee parameter type");
+				}
+			}
+		}
+	}
+
+	const size_t base_type_count = (size_t)r_list_length (base_types);
+	if (!sleigh_context_preflight_add (&budget.context_items, base_type_count,
+			(size_t)R2SLEIGH_MAX_CONTEXT_ITEMS_V2, "context items", fcn->addr)) {
+		return false;
+	}
+	RAnalBaseType *base_type;
+	r_list_foreach (base_types, iter, base_type) {
+		if (!base_type) {
+			continue;
+		}
+		PREFLIGHT_STRING (base_type->name, "base type name");
+		PREFLIGHT_STRING (base_type->type, "base type declaration");
+		switch (base_type->kind) {
+		case R_ANAL_BASE_TYPE_KIND_STRUCT: {
+			RAnalStructMember *member;
+			R_VEC_FOREACH (&base_type->struct_data.members, member) {
+				if (!sleigh_context_preflight_add (&budget.nested_items, 1,
+						(size_t)R2SLEIGH_MAX_NESTED_ITEMS_V2, "nested items", fcn->addr)) {
+					return false;
+				}
+				PREFLIGHT_STRING (member->name, "struct member name");
+				PREFLIGHT_STRING (member->type, "struct member type");
+			}
+			break;
+		}
+		case R_ANAL_BASE_TYPE_KIND_UNION: {
+			RAnalUnionMember *member;
+			R_VEC_FOREACH (&base_type->union_data.members, member) {
+				if (!sleigh_context_preflight_add (&budget.nested_items, 1,
+						(size_t)R2SLEIGH_MAX_NESTED_ITEMS_V2, "nested items", fcn->addr)) {
+					return false;
+				}
+				PREFLIGHT_STRING (member->name, "union member name");
+				PREFLIGHT_STRING (member->type, "union member type");
+			}
+			break;
+		}
+		case R_ANAL_BASE_TYPE_KIND_ENUM: {
+			RAnalEnumCase *cas;
+			R_VEC_FOREACH (&base_type->enum_data.cases, cas) {
+				if (!sleigh_context_preflight_add (&budget.nested_items, 1,
+						(size_t)R2SLEIGH_MAX_NESTED_ITEMS_V2, "nested items", fcn->addr)) {
+					return false;
+				}
+				PREFLIGHT_STRING (cas->name, "enum variant name");
+			}
+			break;
+		}
+		default:
+			break;
+		}
+	}
+	if (!sleigh_context_preflight_string (&budget, ctx->assumptions_json, true,
+			"assumptions JSON", fcn->addr)) {
+		return false;
+	}
+#undef PREFLIGHT_STRING
+	return true;
 }
 
 static bool sleigh_typed_function_context_build(
 	RAnal *anal,
 	RAnalFunction *fcn,
-	SleighTypedFunctionContext *typed,
-	RList *base_type_snapshot
+	SleighTypedFunctionContext *typed
 ) {
 	RListIter *iter;
 	size_t typed_param_count = 0;
@@ -847,23 +1753,47 @@ static bool sleigh_typed_function_context_build(
 		return false;
 	}
 	memset (typed, 0, sizeof (*typed));
-	typed->context.schema_version = 3;
-	typed->context.dirty_epoch = r_anal_function_dirty_epoch (fcn);
-	typed->context.context_hash = r_anal_function_context_hash (anal, fcn);
-	sleigh_import_dwarf_base_types_if_needed (anal);
-	typed->context.type_dirty_epoch = r_anal_types_dirty_epoch (anal);
+	typed->context.schema_version = R2SLEIGH_FUNCTION_CONTEXT_SCHEMA_V2;
 	typed->context.external_context_json = "{}";
-	if (sleigh_function_context_api.available && sleigh_function_context_api.collect && sleigh_function_context_api.free) {
-		typed->typed_ctx = sleigh_function_context_api.collect (anal, fcn);
+	if (!sleigh_function_context_api.snapshot_available) {
+		if (!sleigh_function_context_api.warned_unbounded_snapshot) {
+			sleigh_function_context_api.warned_unbounded_snapshot = true;
+			R_LOG_ERROR ("r2sleigh: incompatible radare2 runtime: bounded V2 requests require r_anal_function_snapshot_collect_with_limits; the unlimited collector is intentionally not used because it clones global types before caller limits can be enforced");
+		}
+		sleigh_typed_function_context_clear (typed);
+		return false;
 	}
-	if (base_type_snapshot) {
-		typed->typed_base_types = base_type_snapshot;
-		typed->owns_typed_base_types = false;
-	} else {
-		typed->typed_base_types = r_anal_types_snapshot (anal);
-		typed->owns_typed_base_types = true;
+	RAnalFunctionSnapshotLimits snapshot_limits = {
+		.struct_size = sizeof (snapshot_limits),
+		.max_base_types = (size_t)R2SLEIGH_MAX_CONTEXT_ITEMS_V2,
+		.max_base_type_children = (size_t)R2SLEIGH_MAX_NESTED_ITEMS_V2,
+		.max_base_type_string_bytes = (size_t)R2SLEIGH_MAX_AGGREGATE_STRING_BYTES_V2,
+		.max_assumptions_json_bytes = (size_t)R2SLEIGH_MAX_AGGREGATE_JSON_BYTES_V2,
+	};
+	typed->snapshot = sleigh_function_context_api.snapshot_collect_with_limits (
+		anal, fcn, &snapshot_limits);
+	if (!typed->snapshot
+		|| typed->snapshot->schema_version != R_ANAL_FUNCTION_SNAPSHOT_SCHEMA_VERSION
+		|| typed->snapshot->struct_size < sizeof (RAnalFunctionSnapshot)
+		|| !(typed->snapshot->capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_REVISION)
+		|| typed->snapshot->context.context_hash != typed->snapshot->revision_identity) {
+		sleigh_typed_function_context_clear (typed);
+		return false;
+	}
+	typed->typed_ctx = &typed->snapshot->context;
+	typed->typed_base_types = typed->snapshot->base_types;
+	if (!typed->typed_ctx || !typed->typed_base_types) {
+		sleigh_typed_function_context_clear (typed);
+		return false;
+	}
+	if (!sleigh_typed_context_preflight (fcn, typed->typed_ctx, typed->typed_base_types)) {
+		sleigh_typed_function_context_clear (typed);
+		return false;
 	}
 	if (typed->typed_ctx) {
+		typed->context.dirty_epoch = typed->typed_ctx->function_dirty_epoch;
+		typed->context.context_hash = typed->typed_ctx->context_hash;
+		typed->context.type_dirty_epoch = typed->typed_ctx->type_dirty_epoch;
 		typed->context.signature_name = fcn->name;
 		if (typed->typed_ctx->signature) {
 			typed->context.signature_ret_type = typed->typed_ctx->signature->ret_type;
@@ -884,7 +1814,15 @@ static bool sleigh_typed_function_context_build(
 						typed->typed_params[idx].name = param? param->name: NULL;
 						typed->typed_params[idx].type_name = param? param->type: NULL;
 						typed->typed_params[idx].cc_reg = NULL;
-						idx++;
+							if (typed->snapshot
+								&& (typed->snapshot->capabilities
+									& R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_FUNCTION_INTERFACE)
+								&& idx < typed->snapshot->function_interface.num_parameters
+								&& typed->snapshot->function_interface.parameters[idx].index == idx) {
+								typed->typed_params[idx].cc_reg =
+									typed->snapshot->function_interface.parameters[idx].storage.name;
+							}
+							idx++;
 					}
 					typed->context.params = typed->typed_params;
 					typed->context.num_params = idx;
@@ -1220,12 +2158,23 @@ static void sleigh_debug_scope_log(const char *fmt, ...) {
 	fclose (fd);
 }
 
-static void block_array_push(BlockArray *arr, R2ILBlock *block) {
+static bool block_array_push(BlockArray *arr, R2ILBlock *block) {
 	if (arr->count >= arr->capacity) {
-		arr->capacity = arr->capacity ? arr->capacity * 2 : 8;
-		arr->blocks = realloc (arr->blocks, arr->capacity * sizeof (R2ILBlock *));
+		size_t next_capacity = arr->capacity? arr->capacity * 2: 8;
+		size_t allocation_size;
+		if (next_capacity < arr->capacity
+			|| r_mul_overflow (next_capacity, sizeof (R2ILBlock *), &allocation_size)) {
+			return false;
+		}
+		R2ILBlock **next = realloc (arr->blocks, allocation_size);
+		if (!next) {
+			return false;
+		}
+		arr->capacity = next_capacity;
+		arr->blocks = next;
 	}
 	arr->blocks[arr->count++] = block;
+	return true;
 }
 
 static int block_array_compare_addr(const void *a, const void *b) {
@@ -1348,9 +2297,13 @@ static bool sleigh_resolve_function_context_api(void) {
 		return sleigh_function_context_api.available;
 	}
 	sleigh_function_context_api.resolved = true;
-	sleigh_function_context_api.collect = (SleighFunctionContextCollectFn)dlsym (RTLD_DEFAULT, "r_anal_function_context_collect");
-	sleigh_function_context_api.free = (SleighFunctionContextFreeFn)dlsym (RTLD_DEFAULT, "r_anal_function_context_free");
-	sleigh_function_context_api.available = sleigh_function_context_api.collect && sleigh_function_context_api.free;
+	sleigh_function_context_api.snapshot_collect_with_limits = (SleighFunctionSnapshotCollectWithLimitsFn)dlsym (RTLD_DEFAULT, "r_anal_function_snapshot_collect_with_limits");
+	sleigh_function_context_api.snapshot_free = (SleighFunctionSnapshotFreeFn)dlsym (RTLD_DEFAULT, "r_anal_function_snapshot_free");
+	sleigh_function_context_api.snapshot_available = sleigh_function_context_api.snapshot_collect_with_limits
+		&& sleigh_function_context_api.snapshot_free;
+	// Native V2 typed requests intentionally have no unbounded compatibility
+	// fallback: the legacy collectors clone global types before limits can apply.
+	sleigh_function_context_api.available = sleigh_function_context_api.snapshot_available;
 	return sleigh_function_context_api.available;
 }
 
@@ -1360,8 +2313,8 @@ static void sleigh_report_missing_function_context_api(void) {
 	}
 	sleigh_function_context_api.warned = true;
 	const char *msg =
-		"r2sleigh: incompatible radare2 runtime: missing typed function-context API "
-		"(r_anal_function_context_collect / r_anal_function_context_free). "
+		"r2sleigh: incompatible radare2 runtime: missing bounded function-snapshot API "
+		"(r_anal_function_snapshot_collect_with_limits / r_anal_function_snapshot_free). "
 		"Use the matching radare2 build or upgrade the installed radare2.";
 	fprintf (stderr, "%s\n", msg);
 	R_LOG_ERROR ("%s", msg);
@@ -1460,14 +2413,6 @@ static const char *skip_cmd_spaces(const char *s) {
 		s++;
 	}
 	return s;
-}
-
-static void sleigh_print_decompiler_text(RCore *core, RCons *cons, const char *text) {
-	(void)core;
-	if (!cons || !text) {
-		return;
-	}
-	r_cons_printf (cons, "%s\n", text);
 }
 
 static bool read_block_bytes_for_lifting(
@@ -5116,17 +6061,65 @@ static void attach_switch_info_to_block(R2ILBlock *block, const RAnalBlock *bb) 
 	free (cases);
 }
 
+static bool sleigh_engine_function_preflight(const RAnalFunction *fcn, const char *operation) {
+	if (!fcn || !fcn->bbs) {
+		R_LOG_ERROR ("r2sleigh: %s preflight refused a function without a CFG",
+			operation? operation: "engine");
+		return false;
+	}
+	const int listed_blocks = r_list_length (fcn->bbs);
+	if (listed_blocks <= 0) {
+		R_LOG_ERROR ("r2sleigh: %s preflight refused function 0x%"PFMT64x" without CFG blocks",
+			operation? operation: "engine", fcn->addr);
+		return false;
+	}
+	if ((size_t)listed_blocks > (size_t)R2SLEIGH_MAX_FUNCTION_BLOCKS_V2) {
+		R_LOG_ERROR ("r2sleigh: %s preflight refused function 0x%"PFMT64x": %d CFG blocks exceed cap %u",
+			operation? operation: "engine", fcn->addr, listed_blocks,
+			(unsigned int)R2SLEIGH_MAX_FUNCTION_BLOCKS_V2);
+		return false;
+	}
+
+	size_t total_bytes = 0;
+	RListIter *iter;
+	RAnalBlock *bb;
+	r_list_foreach (fcn->bbs, iter, bb) {
+		if (!bb || !bb->size) {
+			R_LOG_ERROR ("r2sleigh: %s preflight refused function 0x%"PFMT64x": CFG contains an empty block",
+				operation? operation: "engine", fcn->addr);
+			return false;
+		}
+		if ((ut64)bb->size > (ut64)SLEIGH_LIFT_BLOCK_MAX_ALLOC) {
+			R_LOG_ERROR ("r2sleigh: %s preflight refused block 0x%"PFMT64x": %"PFMT64u" bytes exceed per-block cap %u",
+				operation? operation: "engine", bb->addr, (ut64)bb->size,
+				(unsigned int)SLEIGH_LIFT_BLOCK_MAX_ALLOC);
+			return false;
+		}
+		if ((ut64)bb->size > (ut64)(R2SLEIGH_MAX_FUNCTION_INPUT_BYTES_V2 - total_bytes)) {
+			R_LOG_ERROR ("r2sleigh: %s preflight refused function 0x%"PFMT64x": aggregate CFG bytes exceed cap %u",
+				operation? operation: "engine", fcn->addr,
+				(unsigned int)R2SLEIGH_MAX_FUNCTION_INPUT_BYTES_V2);
+			return false;
+		}
+		total_bytes += (size_t)bb->size;
+	}
+	return true;
+}
+
 /* Lift all basic blocks of a function */
-static bool lift_function_blocks(
+static bool lift_function_blocks_with_limits(
 	RAnal *anal,
 	RAnalFunction *fcn,
 	R2ILContext *ctx,
-	BlockArray *out
+	BlockArray *out,
+	size_t max_blocks,
+	size_t max_ops
 ) {
 	R_RETURN_VAL_IF_FAIL (anal && fcn && ctx && out, false);
 
 	RListIter *iter;
 	RAnalBlock *bb;
+	size_t total_ops = 0;
 
 	block_array_init (out);
 	out->quality.expected_blocks = fcn->bbs? (size_t)r_list_length (fcn->bbs): 0;
@@ -5161,8 +6154,25 @@ static bool lift_function_blocks(
 				out->quality.invalid_blocks++;
 				continue;
 			}
+			const size_t block_ops = r2il_block_op_count (block);
+			if ((max_blocks && out->count >= max_blocks)
+				|| (max_ops && (block_ops > max_ops || total_ops > max_ops - block_ops))) {
+				R_LOG_ERROR ("r2sleigh: lift budget refused function 0x%"PFMT64x": blocks cap %zu, operations cap %zu",
+					fcn->addr, max_blocks, max_ops);
+				r2il_block_free (block);
+				free (buf);
+				block_array_free (out);
+				return false;
+			}
 			attach_switch_info_to_block (block, bb);
-			block_array_push (out, block);
+			if (!block_array_push (out, block)) {
+				R_LOG_ERROR ("r2sleigh: failed to grow lifted block array for function 0x%"PFMT64x, fcn->addr);
+				r2il_block_free (block);
+				free (buf);
+				block_array_free (out);
+				return false;
+			}
+			total_ops += block_ops;
 		} else {
 			out->quality.null_lift_failures++;
 		}
@@ -5171,6 +6181,27 @@ static bool lift_function_blocks(
 	out->quality.lifted_blocks = out->count;
 
 	return out->count > 0;
+}
+
+static bool lift_function_blocks(
+	RAnal *anal,
+	RAnalFunction *fcn,
+	R2ILContext *ctx,
+	BlockArray *out
+) {
+	return lift_function_blocks_with_limits (anal, fcn, ctx, out, 0, 0);
+}
+
+static bool sleigh_engine_lift_function_blocks(
+	RAnal *anal,
+	RAnalFunction *fcn,
+	R2ILContext *ctx,
+	BlockArray *out
+) {
+	return lift_function_blocks_with_limits (
+		anal, fcn, ctx, out,
+		(size_t)R2SLEIGH_MAX_FUNCTION_BLOCKS_V2,
+		(size_t)R2SLEIGH_MAX_FUNCTION_OPS_V2);
 }
 
 static SleighMode sleigh_mode_from_analysis_depth(RAnal *anal) {
@@ -5566,6 +6597,136 @@ static bool sleigh_direct_sym_debug_only_command(const char *cmd) {
 		|| cmd_matches_exact_or_arg (cmd, "sym.solve.state");
 }
 
+static char *sleigh_decompile_execute(RAnal *anal, RAnalFunction *fcn, bool json_projection);
+
+static RCodeMeta *sleigh_decompile(RAnal *anal, RAnalFunction *fcn) {
+	char *result = sleigh_decompile_execute (anal, fcn, false);
+	RCodeMeta *metadata = result? r_codemeta_new (result): NULL;
+	free (result);
+	return metadata;
+}
+
+static char *sleigh_decompile_execute(RAnal *anal, RAnalFunction *fcn, bool json_projection) {
+	R_RETURN_VAL_IF_FAIL (anal && fcn, NULL);
+	if (!sleigh_engine_function_preflight (fcn, "decompile")) {
+		return json_projection
+			? sleigh_engine_v2_error_json ("preflight",
+				R2SLEIGH_STATUS_LIMIT_EXCEEDED_V2,
+				"function exceeds the V2 decompile input budget")
+			: NULL;
+	}
+	R2ILContext *ctx = get_context (anal);
+	RCore *core = anal->coreb.core;
+	if (!ctx || !core) {
+		R_LOG_ERROR ("r2sleigh: decompiler context is unavailable");
+		return json_projection
+			? sleigh_engine_v2_error_json ("context_unavailable",
+				R2SLEIGH_STATUS_ENGINE_ERROR_V2,
+				"decompiler context is unavailable")
+			: NULL;
+	}
+
+	BlockArray blocks = {0};
+	ut64 profile_start_us = r_time_now_mono ();
+	if (!sleigh_engine_lift_function_blocks (anal, fcn, ctx, &blocks)) {
+		R_LOG_ERROR ("r2sleigh: failed to lift function blocks within the decompile budget");
+		return json_projection
+			? sleigh_engine_v2_error_json ("lift",
+				R2SLEIGH_STATUS_LIMIT_EXCEEDED_V2,
+				"failed to lift function blocks within the decompile budget")
+			: NULL;
+	}
+	sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_LIFT,
+		r_time_now_mono () - profile_start_us);
+
+	SleighTypedFunctionContext typed_context = {0};
+	profile_start_us = r_time_now_mono ();
+	if (!sleigh_typed_function_context_build (anal, fcn, &typed_context)) {
+		R_LOG_ERROR ("r2sleigh: failed to collect typed function snapshot");
+		block_array_free (&blocks);
+		return json_projection
+			? sleigh_engine_v2_error_json ("snapshot_context",
+				R2SLEIGH_STATUS_ENGINE_ERROR_V2,
+				"failed to collect typed function snapshot")
+			: NULL;
+	}
+	sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_TYPED_CONTEXT,
+		r_time_now_mono () - profile_start_us);
+
+	SleighInterprocScope interproc_scope = {0};
+	if (!sleigh_interproc_scope_build (
+			core, anal, fcn, ctx, R2SLEIGH_INTERPROC_SESSION_DECOMPILE,
+			&interproc_scope)) {
+		R_LOG_ERROR ("r2sleigh: failed to build interprocedural scope");
+		sleigh_typed_function_context_clear (&typed_context);
+		block_array_free (&blocks);
+		return json_projection
+			? sleigh_engine_v2_error_json ("interprocedural_scope",
+				R2SLEIGH_STATUS_LIMIT_EXCEEDED_V2,
+				"failed to build interprocedural scope")
+			: NULL;
+	}
+
+	R2SleighEngineRequestPayloadV2 request_payload = {
+		.abi_version = R2SLEIGH_ABI_V2,
+		.struct_size = sizeof (request_payload),
+		.ctx = ctx,
+		.blocks = (const R2ILBlock **)blocks.blocks,
+		.num_blocks = blocks.count,
+		.function_addr = fcn->addr,
+		.function_name = fcn->name,
+		.function_context = typed_context.context,
+		.lift_quality = blocks.quality,
+		.interproc_scope = interproc_scope.scope,
+		.interproc_plan = interproc_scope.plan,
+		.analysis_depth = 0,
+		.timeout_us = 0,
+	};
+	SleighSourceInterfaceV2 source_interface = {0};
+	int source_state = sleigh_source_interface_v2_build (
+		&typed_context, &blocks, &source_interface);
+	if (source_state < 0) {
+		R_LOG_ERROR ("r2sleigh: invalid exact source function interface");
+		sleigh_interproc_scope_clear (&interproc_scope);
+		sleigh_typed_function_context_clear (&typed_context);
+		block_array_free (&blocks);
+		return json_projection
+			? sleigh_engine_v2_error_json ("source_interface",
+				R2SLEIGH_STATUS_INVALID_ARGUMENT_V2,
+				"invalid exact source function interface")
+			: NULL;
+	}
+	profile_start_us = r_time_now_mono ();
+	uint64_t required_capabilities = R2SLEIGH_CAP_DECOMPILE_V2;
+	if (source_state > 0) {
+		required_capabilities |= R2SLEIGH_CAP_EXACT_FUNCTION_INTERFACE_V2
+			| R2SLEIGH_CAP_EXACT_STACK_SLOT_ROLES_V2;
+		if (source_interface.interface.exact_types_complete) {
+			required_capabilities |= R2SLEIGH_CAP_EXACT_TYPE_LAYOUT_V2;
+		}
+		if (source_interface.interface.num_call_sites) {
+			required_capabilities |= R2SLEIGH_CAP_CALL_SITE_INTERFACES_V2;
+		}
+	}
+	request_payload.source_interface = source_state > 0? &source_interface.interface: NULL;
+	char *result = json_projection
+		? sleigh_engine_execute_v2_json (
+			R2SLEIGH_REQUEST_DECOMPILE_V2,
+			required_capabilities,
+			&request_payload)
+		: sleigh_engine_execute_v2 (
+			R2SLEIGH_REQUEST_DECOMPILE_V2,
+			required_capabilities,
+			&request_payload);
+	sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_DECOMPILE,
+		r_time_now_mono () - profile_start_us);
+	sleigh_source_interface_v2_clear (&source_interface);
+	sleigh_interproc_scope_clear (&interproc_scope);
+	sleigh_typed_function_context_clear (&typed_context);
+	block_array_free (&blocks);
+	return result;
+}
+
 static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 	bool is_sla_ns = r_str_startswith (cmd, "sla");
 	bool is_sym_ns = r_str_startswith (cmd, "sym");
@@ -5601,6 +6762,20 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		cmd = debug_cmd;
 		is_sym_debug_ns = true;
 	}
+	if (!strcmp (cmd, "sla.dec?") || !strcmp (cmd, "sla.dec ?")) {
+		if (cons) {
+			r_cons_println (cons, "Usage: a:sla.dec [name|addr]");
+			r_cons_println (cons, "Decompile the selected function and print rendered C.");
+		}
+		return strdup ("");
+	}
+	if (!strcmp (cmd, "sla.decj?") || !strcmp (cmd, "sla.decj ?")) {
+		if (cons) {
+			r_cons_println (cons, "Usage: a:sla.decj [name|addr]");
+			r_cons_println (cons, "Decompile through V2 and print output, diagnostics, outcomes, and timings as JSON.");
+		}
+		return strdup ("");
+	}
 
 	if (!is_sla_debug_ns) {
 		if (sleigh_direct_sla_debug_only_command (cmd)) {
@@ -5617,6 +6792,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		if (cons) {
 			r_cons_println (cons, "| a:sla        - Show r2sleigh status");
 			r_cons_println (cons, "| a:sla.dec [name|addr] - Decompile function (current by default)");
+			r_cons_println (cons, "| a:sla.decj [name|addr] - Decompile with V2 diagnostics as JSON");
 			r_cons_println (cons, "| a:sym.explore <target> - Explore symbolic paths reaching target");
 			r_cons_println (cons, "| a:sym.solve <target> - Solve concrete input for target reachability");
 			r_cons_println (cons, "| a:sym.state  - Show last symbolic explore/solve cached result");
@@ -6405,18 +7581,23 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			R_LOG_ERROR ("r2sleigh: no function at current address");
 			return strdup("");
 		}
+		if (!sleigh_engine_function_preflight (fcn, "type-function")) {
+			return strdup ("");
+		}
 
 		BlockArray blocks;
 		ut64 profile_start_us = r_time_now_mono ();
-		bool lift_ok = lift_function_blocks (anal, fcn, ctx, &blocks);
+		bool lift_ok = sleigh_engine_lift_function_blocks (anal, fcn, ctx, &blocks);
 		if (!lift_ok) {
-			R_LOG_ERROR ("r2sleigh: failed to lift function blocks");
+			R_LOG_ERROR ("r2sleigh: failed to lift function blocks within the type-function budget");
+			block_array_free (&blocks);
+			return strdup ("");
 		}
 		sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_LIFT, r_time_now_mono () - profile_start_us);
 
 			SleighTypedFunctionContext typed_context = {0};
 			profile_start_us = r_time_now_mono ();
-			if (!sleigh_typed_function_context_build (anal, fcn, &typed_context, NULL)) {
+			if (!sleigh_typed_function_context_build (anal, fcn, &typed_context)) {
 				R_LOG_ERROR ("r2sleigh: failed to collect typed function context");
 				block_array_free (&blocks);
 				return strdup("");
@@ -6438,7 +7619,9 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 				return strdup ("");
 			}
 
-			R2SleighEngineTypeFunctionInput type_input = {
+			R2SleighEngineRequestPayloadV2 request_payload = {
+				.abi_version = R2SLEIGH_ABI_V2,
+				.struct_size = sizeof (request_payload),
 				.ctx = ctx,
 				.blocks = lift_ok ? (const R2ILBlock **)blocks.blocks : NULL,
 				.num_blocks = lift_ok ? blocks.count : 0,
@@ -6449,14 +7632,39 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 				.interproc_scope = interproc_scope.scope,
 				.interproc_plan = interproc_scope.plan,
 				.analysis_depth = anal? (unsigned int)anal->plugin_analysis_depth: 0,
+				.timeout_us = 0,
 			};
-			char *result = r2sleigh_engine_type_function_json (&type_input);
+			SleighSourceInterfaceV2 source_interface = {0};
+			int source_state = sleigh_source_interface_v2_build (
+				&typed_context, &blocks, &source_interface);
+			if (source_state < 0) {
+				R_LOG_ERROR ("r2sleigh: invalid exact source function interface");
+				sleigh_interproc_scope_clear (&interproc_scope);
+				sleigh_typed_function_context_clear (&typed_context);
+				block_array_free (&blocks);
+				return strdup ("");
+			}
+			uint64_t required_capabilities = R2SLEIGH_CAP_TYPE_FUNCTION_V2;
+			if (source_state > 0) {
+				required_capabilities |= R2SLEIGH_CAP_EXACT_FUNCTION_INTERFACE_V2
+					| R2SLEIGH_CAP_EXACT_STACK_SLOT_ROLES_V2;
+				if (source_interface.interface.exact_types_complete) {
+					required_capabilities |= R2SLEIGH_CAP_EXACT_TYPE_LAYOUT_V2;
+				}
+				if (source_interface.interface.num_call_sites) {
+					required_capabilities |= R2SLEIGH_CAP_CALL_SITE_INTERFACES_V2;
+				}
+			}
+			request_payload.source_interface = source_state > 0? &source_interface.interface: NULL;
+			char *result = sleigh_engine_execute_v2 (
+				R2SLEIGH_REQUEST_TYPE_FUNCTION_V2,
+				required_capabilities,
+				&request_payload);
 			if (cons && result) {
 				r_cons_printf (cons, "%s\n", result);
 			}
-			if (result) {
-				r2il_string_free (result);
-			}
+			free (result);
+			sleigh_source_interface_v2_clear (&source_interface);
 			sleigh_interproc_scope_clear (&interproc_scope);
 			sleigh_typed_function_context_clear (&typed_context);
 			block_array_free (&blocks);
@@ -6764,13 +7972,33 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		return strdup("");
 	}
 
-	if (!strncmp (cmd, "sla.dec", 7)) {
-		R2ILContext *ctx = get_context (anal);
-		if (!ctx) {
-			R_LOG_ERROR ("r2sleigh: no context");
-			return strdup("");
+	if (cmd_matches_exact_or_arg (cmd, "sla.decj")) {
+		const char *target_arg = skip_cmd_spaces (cmd + strlen ("sla.decj"));
+		RAnalFunction *fcn = NULL;
+		if (target_arg && *target_arg) {
+			fcn = resolve_or_materialize_function_target (core, anal, target_arg);
+		} else {
+			fcn = resolve_or_materialize_current_function (core, anal);
 		}
 
+		char *json = NULL;
+		if (fcn) {
+			json = sleigh_decompile_execute (anal, fcn, true);
+		} else {
+			json = sleigh_engine_v2_error_json ("function_target",
+				R2SLEIGH_STATUS_INVALID_ARGUMENT_V2,
+				target_arg && *target_arg
+					? "function target not found"
+					: "no function at current address");
+		}
+		if (cons && json) {
+			r_cons_printf (cons, "%s\n", json);
+		}
+		free (json);
+		return strdup ("");
+	}
+
+	if (cmd_matches_exact_or_arg (cmd, "sla.dec")) {
 		const char *target_arg = skip_cmd_spaces (cmd + 7);
 		RAnalFunction *fcn = NULL;
 		if (target_arg && *target_arg) {
@@ -6787,71 +8015,17 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			}
 			return strdup("");
 		}
-		/* Lift all blocks */
-		BlockArray blocks;
-		ut64 profile_start_us = r_time_now_mono ();
-		bool lift_ok = lift_function_blocks (anal, fcn, ctx, &blocks);
-		if (!lift_ok) {
-			R_LOG_ERROR ("r2sleigh: failed to lift function blocks");
+		RCodeMeta *metadata = sleigh_decompile (anal, fcn);
+		if (metadata && cons) {
+			char *rendered = r_codemeta_print2 (metadata, NULL, anal);
+			if (rendered) {
+				r_cons_println (cons, rendered);
+			}
+			free (rendered);
 		}
-		sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_LIFT, r_time_now_mono () - profile_start_us);
-
-			char *result = NULL;
-
-			SleighTypedFunctionContext typed_context = {0};
-
-			profile_start_us = r_time_now_mono ();
-			if (!sleigh_typed_function_context_build (anal, fcn, &typed_context, NULL)) {
-				R_LOG_ERROR ("r2sleigh: failed to collect typed function context");
-				block_array_free (&blocks);
-				return strdup("");
-			}
-			sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_TYPED_CONTEXT, r_time_now_mono () - profile_start_us);
-
-			SleighInterprocScope interproc_scope = {0};
-			if (!sleigh_interproc_scope_build (
-				core,
-				anal,
-				fcn,
-				ctx,
-				R2SLEIGH_INTERPROC_SESSION_DECOMPILE,
-				&interproc_scope
-			)) {
-				R_LOG_ERROR ("r2sleigh: failed to build interprocedural scope");
-				sleigh_typed_function_context_clear (&typed_context);
-				block_array_free (&blocks);
-				return strdup("");
-			}
-
-			R2SleighEngineDecompileInput decompile_input = {
-				.ctx = ctx,
-				.blocks = lift_ok ? (const R2ILBlock **)blocks.blocks : NULL,
-				.num_blocks = lift_ok ? blocks.count : 0,
-				.function_addr = fcn->addr,
-				.function_name = fcn->name,
-				.function_context = typed_context.context,
-				.lift_quality = blocks.quality,
-				.interproc_scope = interproc_scope.scope,
-				.interproc_plan = interproc_scope.plan,
-			};
-			profile_start_us = r_time_now_mono ();
-			result = r2sleigh_engine_decompile_function (&decompile_input);
-			sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_DECOMPILE, r_time_now_mono () - profile_start_us);
-
-		if (cons) {
-			if (result) {
-				sleigh_print_decompiler_text (core, cons, result);
-			}
-		}
-
-			if (result) {
-				r2il_string_free (result);
-			}
-			sleigh_interproc_scope_clear (&interproc_scope);
-			sleigh_typed_function_context_clear (&typed_context);
-			block_array_free (&blocks);
-			return strdup("");
-		}
+		r_codemeta_free (metadata);
+		return strdup("");
+	}
 
 	if (!strcmp (cmd, "sla.cfg") || !strcmp (cmd, "sla.cfg.json")) {
 		R2ILContext *ctx = get_context (anal);
@@ -7452,7 +8626,7 @@ static bool sleigh_interproc_scope_build(
 	memset (out, 0, sizeof (*out));
 	sym_function_scope_init (&out->sym_scope);
 	out->plan = sleigh_interproc_session_plan_for_function (anal, fcn, purpose);
-	out->scope.schema_version = 1;
+	out->scope.schema_version = R2SLEIGH_INTERPROC_SCOPE_SCHEMA_V2;
 	if (!out->plan.include_type_interproc_scope && !out->plan.include_root_symbolic_scope) {
 		return true;
 	}
@@ -7720,16 +8894,35 @@ static bool sym_function_scope_ensure_capacity(SymFunctionScope *scope, size_t n
 	if (!scope) {
 		return false;
 	}
+	if (needed > (size_t)R2SLEIGH_MAX_SCOPE_FUNCTIONS_V2) {
+		R_LOG_ERROR ("r2sleigh: interprocedural function count exceeds cap %u",
+			(unsigned int)R2SLEIGH_MAX_SCOPE_FUNCTIONS_V2);
+		return false;
+	}
 	if (needed <= scope->capacity) {
 		return true;
 	}
 	new_cap = scope->capacity? scope->capacity * 2: 4;
-	while (new_cap < needed) {
+	if (new_cap < scope->capacity) {
+		return false;
+	}
+	while (new_cap < needed && new_cap <= (size_t)R2SLEIGH_MAX_SCOPE_FUNCTIONS_V2 / 2) {
 		new_cap *= 2;
 	}
-	functions_next = calloc (new_cap, sizeof (*scope->functions));
-	blocks_next = calloc (new_cap, sizeof (*scope->owned_blocks));
-	names_next = calloc (new_cap, sizeof (*scope->owned_names));
+	if (new_cap < needed) {
+		new_cap = needed;
+	}
+	size_t functions_size;
+	size_t blocks_size;
+	size_t names_size;
+	if (r_mul_overflow (new_cap, sizeof (*scope->functions), &functions_size)
+		|| r_mul_overflow (new_cap, sizeof (*scope->owned_blocks), &blocks_size)
+		|| r_mul_overflow (new_cap, sizeof (*scope->owned_names), &names_size)) {
+		return false;
+	}
+	functions_next = calloc (1, functions_size);
+	blocks_next = calloc (1, blocks_size);
+	names_next = calloc (1, names_size);
 	if (!functions_next || !blocks_next || !names_next) {
 		free (functions_next);
 		free (blocks_next);
@@ -7761,6 +8954,17 @@ static bool sym_function_scope_append(
 	if (!scope || !anal || !fcn || !ctx) {
 		return false;
 	}
+	if (!sleigh_engine_function_preflight (fcn, "interprocedural scope")) {
+		return false;
+	}
+	const size_t scope_block_cap = (size_t)R2SLEIGH_MAX_AGGREGATE_BLOCKS_V2
+		- (size_t)R2SLEIGH_MAX_FUNCTION_BLOCKS_V2;
+	const size_t scope_op_cap = (size_t)R2SLEIGH_MAX_AGGREGATE_OPS_V2
+		- (size_t)R2SLEIGH_MAX_FUNCTION_OPS_V2;
+	if (scope->total_blocks >= scope_block_cap || scope->total_ops >= scope_op_cap) {
+		R_LOG_ERROR ("r2sleigh: interprocedural scope budget exhausted before function 0x%"PFMT64x, fcn->addr);
+		return false;
+	}
 	if (!sym_function_scope_ensure_capacity (scope, scope->count + 1)) {
 		return false;
 	}
@@ -7769,9 +8973,26 @@ static bool sym_function_scope_append(
 		fcn->addr,
 		fcn->name? fcn->name: "(null)"
 	);
-	if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
+	const size_t remaining_blocks = scope_block_cap - scope->total_blocks;
+	const size_t remaining_ops = scope_op_cap - scope->total_ops;
+	const size_t function_block_cap = R_MIN (
+		(size_t)R2SLEIGH_MAX_FUNCTION_BLOCKS_V2, remaining_blocks);
+	const size_t function_op_cap = R_MIN (
+		(size_t)R2SLEIGH_MAX_FUNCTION_OPS_V2, remaining_ops);
+	if (!lift_function_blocks_with_limits (
+			anal, fcn, ctx, &blocks, function_block_cap, function_op_cap)) {
 		sleigh_debug_scope_log ("scope_append_failed addr=0x%"PFMT64x, fcn->addr);
 		return false;
+	}
+	size_t lifted_ops = 0;
+	size_t block_index;
+	for (block_index = 0; block_index < blocks.count; block_index++) {
+		const size_t block_ops = r2il_block_op_count (blocks.blocks[block_index]);
+		if (block_ops > function_op_cap - lifted_ops) {
+			block_array_free (&blocks);
+			return false;
+		}
+		lifted_ops += block_ops;
 	}
 	scope->owned_blocks[scope->count] = blocks;
 	scope->owned_names[scope->count] = fcn->name? strdup (fcn->name): NULL;
@@ -7779,6 +9000,8 @@ static bool sym_function_scope_append(
 	scope->functions[scope->count].name = scope->owned_names[scope->count];
 	scope->functions[scope->count].blocks = (const R2ILBlock **)scope->owned_blocks[scope->count].blocks;
 	scope->functions[scope->count].num_blocks = scope->owned_blocks[scope->count].count;
+	scope->total_blocks += blocks.count;
+	scope->total_ops += lifted_ops;
 	scope->count++;
 	sleigh_debug_scope_log (
 		"scope_appended addr=0x%"PFMT64x" blocks=%zu",
@@ -7815,7 +9038,11 @@ static bool lift_runtime_materialized_source_blocks(
 		block = r2il_lift_block (ctx, buf, sizeof (buf), cur, (unsigned int)logical_size);
 		if (block) {
 			if (r2il_block_validate (ctx, block)) {
-				block_array_push (out, block);
+				if (!block_array_push (out, block)) {
+					r2il_block_free (block);
+					block_array_free (out);
+					return false;
+				}
 			} else {
 				r2il_block_free (block);
 			}
@@ -7853,6 +9080,25 @@ static bool sym_function_scope_append_runtime_source(
 		&blocks)) {
 		return false;
 	}
+	const size_t scope_block_cap = (size_t)R2SLEIGH_MAX_AGGREGATE_BLOCKS_V2
+		- (size_t)R2SLEIGH_MAX_FUNCTION_BLOCKS_V2;
+	const size_t scope_op_cap = (size_t)R2SLEIGH_MAX_AGGREGATE_OPS_V2
+		- (size_t)R2SLEIGH_MAX_FUNCTION_OPS_V2;
+	if (scope->total_blocks > scope_block_cap || scope->total_ops > scope_op_cap
+		|| blocks.count > scope_block_cap - scope->total_blocks) {
+		block_array_free (&blocks);
+		return false;
+	}
+	size_t lifted_ops = 0;
+	size_t block_index;
+	for (block_index = 0; block_index < blocks.count; block_index++) {
+		const size_t block_ops = r2il_block_op_count (blocks.blocks[block_index]);
+		if (block_ops > scope_op_cap - scope->total_ops - lifted_ops) {
+			block_array_free (&blocks);
+			return false;
+		}
+		lifted_ops += block_ops;
+	}
 	if (!sym_function_scope_ensure_capacity (scope, scope->count + 1)) {
 		block_array_free (&blocks);
 		return false;
@@ -7864,6 +9110,8 @@ static bool sym_function_scope_append_runtime_source(
 	scope->functions[scope->count].name = scope->owned_names[scope->count];
 	scope->functions[scope->count].blocks = (const R2ILBlock **)scope->owned_blocks[scope->count].blocks;
 	scope->functions[scope->count].num_blocks = scope->owned_blocks[scope->count].count;
+	scope->total_blocks += blocks.count;
+	scope->total_ops += lifted_ops;
 	scope->count++;
 	sleigh_debug_scope_log (
 		"scope_runtime_source addr=0x%"PFMT64x" size=%"PFMT64u" blocks=%zu",
@@ -8152,7 +9400,6 @@ static bool sleigh_post_analysis(RAnal *anal) {
 		return true;
 	}
 	sleigh_profile_clear ();
-	sleigh_import_dwarf_base_types_if_needed (anal);
 	if (post_mode == SLEIGH_MODE_FAST) {
 		R_LOG_INFO ("r2sleigh: post-analysis running in basic mode");
 	} else if (post_mode == SLEIGH_MODE_BALANCED) {
@@ -8587,6 +9834,7 @@ RAnalPlugin r_anal_plugin_sleigh = {
 	.recover_vars = sleigh_recover_vars,
 	.get_data_refs = sleigh_get_data_refs,
 	.post_analysis = sleigh_post_analysis,
+	.decompile = sleigh_decompile,
 };
 
 #ifndef R2_PLUGIN_INCORE

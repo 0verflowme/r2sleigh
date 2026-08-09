@@ -84,13 +84,13 @@ impl<'a> PcodeSource for DisasmInstructionWrapper<'a> {
         self.instr.inputs.len()
     }
 
-    fn space_from_index(&self, idx: u64) -> SpaceId {
-        let spaces = self.disasm.sleigh.address_spaces();
-        if let Some(space) = spaces.get(idx as usize) {
-            self.disasm.translate_space(space)
-        } else {
-            SpaceId::Custom(idx as u32)
-        }
+    fn space_from_index(&self, idx: u64) -> Option<SpaceId> {
+        self.disasm
+            .sleigh
+            .address_spaces()
+            .into_iter()
+            .find(|space| u64::try_from(space.id.raw_id()) == Ok(idx))
+            .map(|space| self.disasm.translate_space(&space))
     }
 }
 
@@ -1699,6 +1699,13 @@ fn ordering_from_mnemonic_token(token: &str) -> MemoryOrdering {
 mod tests {
     use super::*;
 
+    const REAL_FNV_O2_LOAD_BLOCK_ADDR: u64 = 0x1_0000_05b4;
+    const REAL_FNV_O2_LOAD_BLOCK: &[u8] = &[
+        0x0a, 0x15, 0x40, 0x38, 0x4b, 0x05, 0x01, 0x51, 0x4c, 0x01, 0x1b, 0x32, 0x7f, 0x69, 0x00,
+        0x71, 0x8a, 0x31, 0x8a, 0x1a, 0x0a, 0x00, 0x0a, 0xca, 0x40, 0x7d, 0x09, 0x9b, 0x21, 0x04,
+        0x00, 0xf1, 0x01, 0xff, 0xff, 0x54,
+    ];
+
     fn reg(offset: u64, size: u32) -> Varnode {
         Varnode::register(offset, size)
     }
@@ -1715,6 +1722,65 @@ mod tests {
             "sp" => Some(reg(31 * 8, 8)),
             _ => None,
         }
+    }
+
+    #[test]
+    fn arm64_apple_real_fnv_memory_space_is_ram_and_instance_stable() {
+        let first = Disassembler::from_sla(
+            sleigh_config::processor_aarch64::SLA_AARCH64_APPLESILICON,
+            sleigh_config::processor_aarch64::PSPEC_AARCH64,
+            "aarch64",
+        )
+        .expect("first AARCH64 AppleSilicon disassembler");
+        let second = Disassembler::from_sla(
+            sleigh_config::processor_aarch64::SLA_AARCH64_APPLESILICON,
+            sleigh_config::processor_aarch64::PSPEC_AARCH64,
+            "aarch64",
+        )
+        .expect("second AARCH64 AppleSilicon disassembler");
+
+        let first_block = first
+            .lift_block(
+                REAL_FNV_O2_LOAD_BLOCK,
+                REAL_FNV_O2_LOAD_BLOCK_ADDR,
+                REAL_FNV_O2_LOAD_BLOCK.len(),
+            )
+            .expect("first real ARM64 O2 FNV lift");
+        let second_block = second
+            .lift_block(
+                REAL_FNV_O2_LOAD_BLOCK,
+                REAL_FNV_O2_LOAD_BLOCK_ADDR,
+                REAL_FNV_O2_LOAD_BLOCK.len(),
+            )
+            .expect("second real ARM64 O2 FNV lift");
+
+        for block in [&first_block, &second_block] {
+            let memory_spaces = block
+                .ops
+                .iter()
+                .filter_map(|op| match op {
+                    R2ILOp::Load { space, .. } | R2ILOp::Store { space, .. } => Some(*space),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                !memory_spaces.is_empty(),
+                "real block must contain memory IO"
+            );
+            assert!(
+                memory_spaces.iter().all(|space| *space == SpaceId::Ram),
+                "real ARM64 LOAD/STORE spaces must translate to Ram: {memory_spaces:?}"
+            );
+        }
+
+        assert_eq!(first_block.addr, second_block.addr);
+        assert_eq!(first_block.size as usize, REAL_FNV_O2_LOAD_BLOCK.len());
+        assert_eq!(second_block.size as usize, REAL_FNV_O2_LOAD_BLOCK.len());
+        assert_eq!(first_block.size, second_block.size);
+        assert_eq!(first_block.ops, second_block.ops);
+        assert_eq!(first_block.op_metadata, second_block.op_metadata);
+        assert!(first_block.switch_info.is_none());
+        assert!(second_block.switch_info.is_none());
     }
 
     #[test]

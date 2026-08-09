@@ -29,17 +29,18 @@
         "out_param_parse",
         "table_walk",
         "struct_nested_array",
-        "sparse_switch"
+        "sparse_switch",
+        "state_machine"
       ],
-      "max_functions": 6
+      "max_functions": 7
     },
     {
       "name": "r2sleigh_manual_limits_O0",
       "path": "../r2r/bins/r2sleigh_manual_limits_O0",
       "corpus": "manual",
       "analysis": "aaa",
-      "targets": ["mem_scan2", "fnv_fold", "sparse_switch"],
-      "max_functions": 3
+      "targets": ["mem_scan2", "fnv_fold", "sparse_switch", "out_param_parse", "state_machine", "struct_nested_array"],
+      "max_functions": 6
     }
   ]
 }

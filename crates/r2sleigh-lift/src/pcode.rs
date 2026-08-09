@@ -264,12 +264,11 @@ impl<'a> PcodeSource for RawPcodeSourceWrapper<'a> {
         self.raw.inputs.len()
     }
 
-    fn space_from_index(&self, idx: u64) -> SpaceId {
-        self.translator
-            .space_map
-            .get(idx as usize)
+    fn space_from_index(&self, idx: u64) -> Option<SpaceId> {
+        usize::try_from(idx)
+            .ok()
+            .and_then(|idx| self.translator.space_map.get(idx))
             .copied()
-            .unwrap_or(SpaceId::Custom(idx as u32))
     }
 }
 

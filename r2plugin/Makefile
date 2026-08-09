@@ -80,7 +80,7 @@ LDFLAGS = $(R2_LDFLAGS) -L$(RUST_BUILD_DIR) -lr2sleigh_plugin $(LDFLAGS_OS) -lst
 ANAL_PLUGIN_SO = $(ANAL_PLUGIN_NAME).$(PLUGIN_EXT)
 ARCH_PLUGIN_SO = $(ARCH_PLUGIN_NAME).$(PLUGIN_EXT)
 
-.PHONY: all clean install uninstall rust rust-debug rust-release rust-dist help arch_sleigh.o r_anal_sleigh_arch.o fixup-dylibs FORCE
+.PHONY: all clean install uninstall rust rust-debug rust-release rust-dist ffi-v2-conformance help arch_sleigh.o r_anal_sleigh_arch.o fixup-dylibs FORCE
 
 RUST_MANIFESTS := ../Cargo.toml $(wildcard ../.cargo/config.toml ../crates/*/Cargo.toml ../r2plugin/Cargo.toml)
 RUST_SOURCES := $(shell find ../r2plugin/src ../crates -type f -name '*.rs')
@@ -152,6 +152,14 @@ ifeq ($(UNAME),Darwin)
 		codesign --force --sign - "$@" >/dev/null 2>&1; \
 	fi
 endif
+
+FFI_V2_CONFORMANCE_BIN = $(RUST_BUILD_DIR)/ffi_v2_header_conformance
+
+ffi-v2-conformance: $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT) tests/ffi_v2_header_conformance.c tests/ffi_v2_symbol_absence.sh r2sleigh_api_v2.h
+	$(CC) -Wall -Wextra -I. -o $(FFI_V2_CONFORMANCE_BIN) tests/ffi_v2_header_conformance.c \
+		-L$(RUST_BUILD_DIR) -lr2sleigh_plugin $(LDFLAGS_OS)
+	$(FFI_V2_CONFORMANCE_BIN)
+	sh tests/ffi_v2_symbol_absence.sh $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)
 
 # Install plugins
 install: $(RUST_LIB_LOCAL) $(ANAL_PLUGIN_SO) $(ARCH_PLUGIN_SO)

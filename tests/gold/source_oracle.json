@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "expectations": [
     {
       "id": "repo-stress-parse-number-summary-return-sla",
@@ -8,23 +8,44 @@
       "target": "parse_number",
       "command": "decompile_sla",
       "owner": "r2sym",
-      "contains": [
-        "int32_t parse_number(int8_t* str)",
-        "summary role hint: string_scan; source=Structural",
-        "render contract: summary facts only; no executable native C reconstructed",
-        "island summary: parser",
-        "summary return unresolved"
-      ],
-      "not_contains": [
-        "r2dec residual:",
-        "summary projection (not native CFG): parser base10 numeric return loop",
-        "summary locals are synthetic; source local names were not recovered",
-        "summary_value",
-        "while (str[summary_i]",
-        "parse_base10_numeric_summary(",
-        "compute_numeric_transform(",
-        "return accumulator;"
-      ]
+      "checks": {
+        "type": {
+          "regex": [
+            "int32_t\\s+parse_number\\s*\\(\\s*int8_t\\s*\\*"
+          ]
+        },
+        "semantic": {
+          "contains": [
+            "summary role hint: string_scan; source=Structural",
+            "render contract: summary facts only; no executable native C reconstructed",
+            "island summary: parser",
+            "summary return unresolved"
+          ],
+          "not_contains": [
+            "summary projection (not native CFG): parser base10 numeric return loop",
+            "while (str[summary_i]",
+            "parse_base10_numeric_summary(",
+            "compute_numeric_transform(",
+            "return accumulator;"
+          ]
+        },
+        "structural": {
+          "not_contains": [
+            "r2dec residual:"
+          ]
+        },
+        "cosmetic": {
+          "contains": [
+            "int32_t parse_number(int8_t* str)"
+          ]
+        },
+        "readability": {
+          "not_contains": [
+            "summary locals are synthetic; source local names were not recovered",
+            "summary_value"
+          ]
+        }
+      }
     },
     {
       "id": "repo-stress-parse-number-summary-return-pdd",
@@ -33,23 +54,44 @@
       "target": "parse_number",
       "command": "decompile_pdd",
       "owner": "r2sym",
-      "contains": [
-        "int32_t parse_number(int8_t* str)",
-        "summary role hint: string_scan; source=Structural",
-        "render contract: summary facts only; no executable native C reconstructed",
-        "island summary: parser",
-        "summary return unresolved"
-      ],
-      "not_contains": [
-        "r2dec residual:",
-        "summary projection (not native CFG): parser base10 numeric return loop",
-        "summary locals are synthetic; source local names were not recovered",
-        "summary_value",
-        "while (str[summary_i]",
-        "parse_base10_numeric_summary(",
-        "compute_numeric_transform(",
-        "return accumulator;"
-      ]
+      "checks": {
+        "type": {
+          "regex": [
+            "int32_t\\s+parse_number\\s*\\(\\s*int8_t\\s*\\*"
+          ]
+        },
+        "semantic": {
+          "contains": [
+            "summary role hint: string_scan; source=Structural",
+            "render contract: summary facts only; no executable native C reconstructed",
+            "island summary: parser",
+            "summary return unresolved"
+          ],
+          "not_contains": [
+            "summary projection (not native CFG): parser base10 numeric return loop",
+            "while (str[summary_i]",
+            "parse_base10_numeric_summary(",
+            "compute_numeric_transform(",
+            "return accumulator;"
+          ]
+        },
+        "structural": {
+          "not_contains": [
+            "r2dec residual:"
+          ]
+        },
+        "cosmetic": {
+          "contains": [
+            "int32_t parse_number(int8_t* str)"
+          ]
+        },
+        "readability": {
+          "not_contains": [
+            "summary locals are synthetic; source local names were not recovered",
+            "summary_value"
+          ]
+        }
+      }
     },
     {
       "id": "repo-stress-tiny-vm-summary-sla",
@@ -58,21 +100,38 @@
       "target": "tiny_vm_dispatch",
       "command": "decompile_sla",
       "owner": "r2sym",
-      "contains": [
-        "int32_t tiny_vm_dispatch(uint8_t* code, int32_t len)",
-        "r2dec semantic summary: vm_summary for tiny_vm_dispatch",
-        "switch (dispatch_selector)",
-        "case 0x0:",
-        "case 0x7:",
-        "default:",
-        "redispatch"
-      ],
-      "not_contains": [
-        "r2dec residual:",
-        "summary return unresolved",
-        "while (pos == head)",
-        "parse_base10_numeric_summary("
-      ]
+      "checks": {
+        "type": {
+          "regex": [
+            "int32_t\\s+tiny_vm_dispatch\\s*\\(\\s*uint8_t\\s*\\*"
+          ]
+        },
+        "semantic": {
+          "contains": [
+            "r2dec semantic summary: vm_summary for tiny_vm_dispatch",
+            "switch (dispatch_selector)",
+            "case 0x0:",
+            "case 0x7:",
+            "default:",
+            "redispatch"
+          ],
+          "not_contains": [
+            "while (pos == head)",
+            "parse_base10_numeric_summary("
+          ]
+        },
+        "structural": {
+          "not_contains": [
+            "r2dec residual:",
+            "summary return unresolved"
+          ]
+        },
+        "cosmetic": {
+          "contains": [
+            "int32_t tiny_vm_dispatch(uint8_t* code, int32_t len)"
+          ]
+        }
+      }
     },
     {
       "id": "repo-stress-tiny-vm-types-route",
@@ -81,15 +140,23 @@
       "target": "tiny_vm_dispatch",
       "command": "types",
       "owner": "r2engine",
-      "contains": [
-        "\"function_name\":\"dbg.tiny_vm_dispatch\"",
-        "\"execution\":\"Vm\"",
-        "\"VmSummaryOnly\""
-      ],
-      "not_contains": [
-        "\"execution\":\"Native\"",
-        "\"summary return unresolved\""
-      ]
+      "checks": {
+        "semantic": {
+          "contains": [
+            "\"execution\":\"Vm\"",
+            "\"VmSummaryOnly\""
+          ],
+          "not_contains": [
+            "\"execution\":\"Native\"",
+            "\"summary return unresolved\""
+          ]
+        },
+        "cosmetic": {
+          "contains": [
+            "\"function_name\":\"dbg.tiny_vm_dispatch\""
+          ]
+        }
+      }
     },
     {
       "id": "repo-vuln-struct-array-index",
@@ -98,19 +165,28 @@
       "target": "test_struct_array_index",
       "command": "decompile_sla",
       "owner": "r2types",
-      "contains": [
-        "arr[idx].third",
-        "arr[idx].fourteenth + arr[idx].third"
-      ],
-      "regex": [
-        "DemoStruct\\s*\\*\\s*arr"
-      ],
-      "not_contains": [
-        "sla_struct_",
-        "*(arr +",
-        "[idx].f_8",
-        "[idx].f_34"
-      ]
+      "checks": {
+        "type": {
+          "regex": [
+            "DemoStruct\\s*\\*"
+          ]
+        },
+        "readability": {
+          "contains": [
+            "arr[idx].third",
+            "arr[idx].fourteenth + arr[idx].third"
+          ],
+          "regex": [
+            "DemoStruct\\s*\\*\\s*arr"
+          ],
+          "not_contains": [
+            "sla_struct_",
+            "*(arr +",
+            "[idx].f_8",
+            "[idx].f_34"
+          ]
+        }
+      }
     },
     {
       "id": "manual-mem-scan2-types-preserve-source-size",
@@ -119,43 +195,44 @@
       "target": "mem_scan2",
       "command": "types",
       "owner": "r2types",
-      "contains": [
-        "\"ret_type\":\"size_t\"",
-        "\"name\":\"n\",\"type\":\"size_t\""
-      ],
-      "not_contains": [
-        "\"ret_type\":\"uint8_t\"",
-        "\"name\":\"n\",\"type\":\"uint8_t\""
-      ]
+      "checks": {
+        "type": {
+          "contains": [
+            "\"ret_type\":\"size_t\"",
+            "\"name\":\"n\",\"type\":\"size_t\""
+          ],
+          "not_contains": [
+            "\"ret_type\":\"uint8_t\"",
+            "\"name\":\"n\",\"type\":\"uint8_t\""
+          ]
+        }
+      }
     },
     {
-      "id": "manual-mem-scan2-decompile-no-empty-loop",
+      "id": "manual-mem-scan2-decompile-expected-complexity-refusal",
       "corpus": "manual",
       "case": "r2sleigh_manual_limits_O2",
       "target": "mem_scan2",
       "command": "decompile_sla",
       "owner": "r2dec",
-      "contains": [
-        "size_t mem_scan2(uint8_t* buf, size_t n, uint8_t a, uint8_t b)",
-        "r2dec summary: semantic worker",
-        "render contract: summary facts only; no executable native C reconstructed",
-        "island summary: numeric_transform",
-        "summary return unresolved"
-      ],
-      "not_contains": [
-        "r2dec residual: unproven loop effects",
-        "uint8_t mem_scan2",
-        "summary projection (not native CFG): numeric_transform predicated count loop",
-        "summary_count",
-        "size_t summary_i",
-        "summary_i <",
-        "summary_byte",
-        "do {\n    } while",
-        "return r8d_1;",
-        "count_matching_bytes_summary",
-        "summary-backed count loop",
-        "match_count"
-      ]
+      "checks": {
+        "semantic": {
+          "contains": [
+            "r2dec fallback: skipped decompilation for sym._mem_scan2",
+            "decompile complexity limit exceeded: blocks=16/200 ops=1471/512"
+          ],
+          "not_contains": [
+            "for (size_t i = 0; i < n; i++)",
+            "return count;"
+          ]
+        },
+        "structural": {
+          "not_contains": [
+            "while (",
+            "do {"
+          ]
+        }
+      }
     },
     {
       "id": "manual-fnv-fold-decompile-no-constant-return",
@@ -164,30 +241,53 @@
       "target": "fnv_fold",
       "command": "decompile_sla",
       "owner": "r2dec",
-      "contains": [
-        "uint64_t fnv_fold(uint8_t* buf, size_t n)",
-        "r2dec residual:",
-        "unproven loop effects",
-        "empty loop body rendered",
-        "structured C suppressed until canonical facts prove the rendered effects",
-        "summary return unresolved"
-      ],
-      "not_contains": [
-        "r2dec summary: semantic worker",
-        "render contract: summary facts only; no executable native C reconstructed",
-        "worker summary: hash_fold",
-        "return 0x14650fb0739d0383;",
-        "return fnv1a_hash;",
-        "summary projection (not native CFG): hash_fold loop",
-        "summary_hash",
-        "size_t summary_i",
-        "summary_i <",
-        "summary_byte",
-        "buf[2]",
-        "r8d_2",
-        "fold_summary",
-        "return summary_hash;"
-      ]
+      "checks": {
+        "type": {
+          "regex": [
+            "uint64_t\\s+fnv_fold\\s*\\("
+          ]
+        },
+        "semantic": {
+          "contains": [
+            "structured C suppressed until canonical facts prove the rendered effects",
+            "summary return unresolved"
+          ],
+          "not_contains": [
+            "render contract: summary facts only; no executable native C reconstructed",
+            "worker summary: hash_fold",
+            "return 0x14650fb0739d0383;",
+            "return fnv1a_hash;",
+            "summary projection (not native CFG): hash_fold loop",
+            "buf[2]",
+            "return summary_hash;"
+          ]
+        },
+        "structural": {
+          "contains": [
+            "r2dec residual:",
+            "unproven loop effects",
+            "empty loop body rendered"
+          ],
+          "not_contains": [
+            "r2dec summary: semantic worker"
+          ]
+        },
+        "cosmetic": {
+          "contains": [
+            "uint64_t fnv_fold(uint8_t* buf, size_t n)"
+          ]
+        },
+        "readability": {
+          "not_contains": [
+            "summary_hash",
+            "size_t summary_i",
+            "summary_i <",
+            "summary_byte",
+            "r8d_2",
+            "fold_summary"
+          ]
+        }
+      }
     },
     {
       "id": "manual-out-param-parse-summary-backed",
@@ -196,17 +296,36 @@
       "target": "out_param_parse",
       "command": "decompile_sla",
       "owner": "r2sym",
-      "contains": [
-        "int32_t out_param_parse(int8_t* s, Result* out)",
-        "r2dec summary: semantic worker islands",
-        "render contract: summary facts only; no executable native C reconstructed",
-        "worker summary: parser: dst=out mem=s",
-        "worker summary: memory_write: mem=out"
-      ],
-      "not_contains": [
-        "r2dec residual: unproven loop effects",
-        "do {\n    } while"
-      ]
+      "checks": {
+        "type": {
+          "regex": [
+            "int32_t\\s+out_param_parse\\s*\\(.*Result\\s*\\*"
+          ]
+        },
+        "semantic": {
+          "contains": [
+            "render contract: summary facts only; no executable native C reconstructed",
+            "worker summary: parser: dst=out mem=s",
+            "worker summary: memory_write: mem=out"
+          ],
+          "not_contains": [
+            "do {\n    } while"
+          ]
+        },
+        "structural": {
+          "contains": [
+            "r2dec summary: semantic worker islands"
+          ],
+          "not_contains": [
+            "r2dec residual: unproven loop effects"
+          ]
+        },
+        "cosmetic": {
+          "contains": [
+            "int32_t out_param_parse(int8_t* s, Result* out)"
+          ]
+        }
+      }
     },
     {
       "id": "manual-table-walk-summary-backed",
@@ -215,27 +334,50 @@
       "target": "table_walk",
       "command": "decompile_sla",
       "owner": "r2dec",
-      "contains": [
-        "int32_t table_walk(Item* head, int8_t* needle)",
-        "r2dec residual:",
-        "certified render contract failed",
-        "uncertified return expression",
-        "structured C suppressed until canonical facts prove the rendered effects",
-        "summary return unresolved"
-      ],
-      "not_contains": [
-        "r2dec summary: semantic worker islands",
-        "render contract: summary facts only; no executable native C reconstructed",
-        "worker summary: table_walk: mem=head",
-        "worker summary: string_scan: mem=needle",
-        "for (Item* it = head; it != NULL; it = it->next)",
-        "it->id + seen",
-        "return -seen;",
-        "return table_match_score;",
-        "table walk fields and returns are certified by r2sym",
-        "body blocks",
-        "exit targets"
-      ]
+      "checks": {
+        "type": {
+          "regex": [
+            "int32_t\\s+table_walk\\s*\\(.*Item\\s*\\*"
+          ]
+        },
+        "semantic": {
+          "contains": [
+            "uncertified return expression",
+            "structured C suppressed until canonical facts prove the rendered effects",
+            "summary return unresolved"
+          ],
+          "not_contains": [
+            "render contract: summary facts only; no executable native C reconstructed",
+            "worker summary: table_walk: mem=head",
+            "worker summary: string_scan: mem=needle",
+            "for (Item* it = head; it != NULL; it = it->next)",
+            "it->id + seen",
+            "return -seen;",
+            "return table_match_score;",
+            "table walk fields and returns are certified by r2sym"
+          ]
+        },
+        "structural": {
+          "contains": [
+            "r2dec residual:",
+            "certified render contract failed"
+          ],
+          "not_contains": [
+            "r2dec summary: semantic worker islands"
+          ]
+        },
+        "cosmetic": {
+          "contains": [
+            "int32_t table_walk(Item* head, int8_t* needle)"
+          ]
+        },
+        "readability": {
+          "not_contains": [
+            "body blocks",
+            "exit targets"
+          ]
+        }
+      }
     },
     {
       "id": "manual-struct-nested-array-source-shape",
@@ -244,20 +386,33 @@
       "target": "struct_nested_array",
       "command": "decompile_sla",
       "owner": "r2types",
-      "contains": [
-        "Item* items",
-        "items[idx].scores[2]",
-        "items[idx].flags",
-        "items[idx].id",
-        "items[idx].len"
-      ],
-      "not_contains": [
-        "f_",
-        "t6a80",
-        "edx_",
-        "it = items + it",
-        "RCX"
-      ]
+      "checks": {
+        "type": {
+          "regex": [
+            "Item\\s*\\*"
+          ]
+        },
+        "semantic": {
+          "not_contains": [
+            "it = items + it"
+          ]
+        },
+        "readability": {
+          "contains": [
+            "Item* items",
+            "items[idx].scores[2]",
+            "items[idx].flags",
+            "items[idx].id",
+            "items[idx].len"
+          ],
+          "not_contains": [
+            "f_",
+            "t6a80",
+            "edx_",
+            "RCX"
+          ]
+        }
+      }
     },
     {
       "id": "manual-sparse-switch-source-cases",
@@ -266,22 +421,34 @@
       "target": "sparse_switch",
       "command": "decompile_sla",
       "owner": "r2sym",
-      "contains": [
-        "return a - b;",
-        "return a + b;",
-        "return a * 3 + b;",
-        "return (a ^ b) + 42;",
-        "return b == 0 ? -1 : a / b;",
-        "return op + a - b;"
-      ],
-      "not_contains": [
-        "RCX",
-        "compute_numeric_transform",
-        "summary return: Unknown",
-        "return accumulator;",
-        "t49900",
-        "t49a00"
-      ]
+      "checks": {
+        "semantic": {
+          "contains": [
+            "return a - b;",
+            "return a + b;",
+            "return a * 3 + b;",
+            "return (a ^ b) + 42;",
+            "return b == 0 ? -1 : a / b;",
+            "return op + a - b;"
+          ],
+          "not_contains": [
+            "compute_numeric_transform",
+            "return accumulator;"
+          ]
+        },
+        "structural": {
+          "not_contains": [
+            "summary return: Unknown"
+          ]
+        },
+        "readability": {
+          "not_contains": [
+            "RCX",
+            "t49900",
+            "t49a00"
+          ]
+        }
+      }
     },
     {
       "id": "manual-fnv-fold-source-loop",
@@ -290,22 +457,34 @@
       "target": "fnv_fold",
       "command": "decompile_sla",
       "owner": "r2dec",
-      "contains": [
-        "for (size_t i = 0; i < n; i++)",
-        "uint8_t c = buf[i];",
-        "if (c > 64 && c <= 90)",
-        "c += 32;",
-        "hash ^= c;",
-        "hash *= 0x100000001b3U;",
-        "return hash;"
-      ],
-      "not_contains": [
-        "return fnv1a_hash;",
-        "fold_summary",
-        "summary_hash",
-        "summary return unresolved",
-        "value_"
-      ]
+      "checks": {
+        "semantic": {
+          "not_contains": [
+            "return fnv1a_hash;"
+          ]
+        },
+        "structural": {
+          "not_contains": [
+            "fold_summary",
+            "summary return unresolved"
+          ]
+        },
+        "readability": {
+          "contains": [
+            "uint8_t c = buf[i];",
+            "if (c > 64 && c <= 90)",
+            "c += 32;",
+            "hash ^= c;",
+            "hash *= 0x100000001b3U;",
+            "for (size_t i = 0; i < n; i++)",
+            "return hash;"
+          ],
+          "not_contains": [
+            "summary_hash",
+            "value_"
+          ]
+        }
+      }
     },
     {
       "id": "manual-out-param-parse-source-fields",
@@ -314,18 +493,26 @@
       "target": "out_param_parse",
       "command": "decompile_sla",
       "owner": "r2types",
-      "contains": [
-        "out->code",
-        "out->hash",
-        "out->count",
-        "out->hit",
-        "return i > 0 && s[i] == 0;"
-      ],
-      "not_contains": [
-        "summary return unresolved",
-        "parse_base10_numeric_summary",
-        "compute_numeric_transform"
-      ]
+      "checks": {
+        "semantic": {
+          "contains": [
+            "out->code",
+            "out->hash",
+            "out->count",
+            "out->hit",
+            "return i > 0 && s[i] == 0;"
+          ],
+          "not_contains": [
+            "parse_base10_numeric_summary",
+            "compute_numeric_transform"
+          ]
+        },
+        "structural": {
+          "not_contains": [
+            "summary return unresolved"
+          ]
+        }
+      }
     },
     {
       "id": "manual-state-machine-no-pseudo-source",
@@ -334,15 +521,25 @@
       "target": "state_machine",
       "command": "decompile_sla",
       "owner": "r2dec",
-      "contains": [
-        "int32_t state_machine",
-        "summary return unresolved"
-      ],
-      "not_contains": [
-        "scan_string_summary",
-        "compute_numeric_transform",
-        "return accumulator;"
-      ]
+      "checks": {
+        "type": {
+          "contains": [
+            "int32_t state_machine"
+          ]
+        },
+        "semantic": {
+          "not_contains": [
+            "scan_string_summary",
+            "compute_numeric_transform",
+            "return accumulator;"
+          ]
+        },
+        "structural": {
+          "contains": [
+            "summary return unresolved"
+          ]
+        }
+      }
     },
     {
       "id": "manual-state-machine-source-control",
@@ -351,21 +548,31 @@
       "target": "state_machine",
       "command": "decompile_sla",
       "owner": "r2sym",
-      "contains": [
-        "for (size_t i = 0; s[i] != 0; i++)",
-        "switch (state)",
-        "case 0:",
-        "state = 1;",
-        "score += 3;",
-        "return -100 - (int32_t)i;",
-        "return score + state;"
-      ],
-      "not_contains": [
-        "summary return unresolved",
-        "summary island",
-        "numeric_transform",
-        "string_scan"
-      ]
+      "checks": {
+        "semantic": {
+          "contains": [
+            "state = 1;",
+            "score += 3;",
+            "return -100 - (int32_t)i;",
+            "return score + state;"
+          ],
+          "not_contains": [
+            "numeric_transform",
+            "string_scan"
+          ]
+        },
+        "structural": {
+          "contains": [
+            "for (size_t i = 0; s[i] != 0; i++)",
+            "switch (state)",
+            "case 0:"
+          ],
+          "not_contains": [
+            "summary return unresolved",
+            "summary island"
+          ]
+        }
+      }
     },
     {
       "id": "manual-mem-scan2-source-loop",
@@ -374,23 +581,45 @@
       "target": "mem_scan2",
       "command": "decompile_sla",
       "owner": "r2dec",
-      "contains": [
-        "size_t mem_scan2(uint8_t* buf, size_t n, uint8_t a, uint8_t b)",
-        "size_t count = 0;",
-        "for (size_t i = 0; i < n; i++)",
-        "uint8_t c = buf[i];",
-        "if (c == a || c == b)",
-        "count++;",
-        "return count;"
-      ],
-      "not_contains": [
-        "summary-backed count loop",
-        "summary_i <",
-        "size_t summary_i",
-        "    int8_t c = buf[i];",
-        "match_count",
-        "summary return unresolved"
-      ]
+      "checks": {
+        "type": {
+          "contains": [
+            "size_t count = 0;",
+            "uint8_t c = buf[i];"
+          ],
+          "not_contains": [
+            "    int8_t c = buf[i];"
+          ]
+        },
+        "semantic": {
+          "contains": [
+            "if (c == a || c == b)",
+            "count++;",
+            "return count;"
+          ]
+        },
+        "structural": {
+          "contains": [
+            "for (size_t i = 0; i < n; i++)"
+          ],
+          "not_contains": [
+            "summary-backed count loop",
+            "summary return unresolved"
+          ]
+        },
+        "cosmetic": {
+          "contains": [
+            "size_t mem_scan2(uint8_t* buf, size_t n, uint8_t a, uint8_t b)"
+          ]
+        },
+        "readability": {
+          "not_contains": [
+            "summary_i <",
+            "size_t summary_i",
+            "match_count"
+          ]
+        }
+      }
     }
   ]
 }

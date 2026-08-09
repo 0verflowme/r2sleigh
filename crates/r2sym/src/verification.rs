@@ -536,7 +536,17 @@ pub fn verification_requirement_for_route_and_stats(
 }
 
 pub(crate) fn completion_from_stats(stats: &ExploreStats) -> QueryCompletion {
-    if stats.timed_out || stats.max_states_exhausted {
+    if matches!(
+        stats.execution_stop,
+        Some(crate::SymExecutionStopReason::Cancelled)
+    ) {
+        QueryCompletion::Cancelled
+    } else if matches!(
+        stats.execution_stop,
+        Some(crate::SymExecutionStopReason::DeadlineExceeded)
+    ) {
+        QueryCompletion::DeadlineExceeded
+    } else if stats.timed_out || stats.max_states_exhausted {
         QueryCompletion::BudgetExhausted
     } else {
         QueryCompletion::Complete
@@ -697,6 +707,9 @@ pub(crate) fn classify_solve_status(
             } else {
                 SolveStatus::Solved
             }
+        }
+        (_, _, QueryCompletion::Cancelled | QueryCompletion::DeadlineExceeded, _) => {
+            SolveStatus::Unknown
         }
         (None, _, QueryCompletion::BudgetExhausted, _) => SolveStatus::BudgetExhausted,
         (None, _, QueryCompletion::Complete, _) => SolveStatus::Unsat,

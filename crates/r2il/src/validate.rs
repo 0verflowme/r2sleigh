@@ -711,7 +711,7 @@ pub fn validate_op_semantic(
 
         // Memory rules
         R2ILOp::Load { dst, space, addr } => {
-            let arch_expected = effective_arch_addr_size(arch);
+            let arch_expected = effective_arch_address_size(arch);
             let expected = addr_space_size(*space, arch);
             check_size_addr_width(
                 &mut issues,
@@ -738,7 +738,7 @@ pub fn validate_op_semantic(
         R2ILOp::LoadLinked {
             dst, space, addr, ..
         } => {
-            let arch_expected = effective_arch_addr_size(arch);
+            let arch_expected = effective_arch_address_size(arch);
             let expected = addr_space_size(*space, arch);
             check_size_addr_width(
                 &mut issues,
@@ -765,7 +765,7 @@ pub fn validate_op_semantic(
         R2ILOp::Store {
             space, addr, val, ..
         } => {
-            let arch_expected = effective_arch_addr_size(arch);
+            let arch_expected = effective_arch_address_size(arch);
             let expected = addr_space_size(*space, arch);
             check_size_addr_width(
                 &mut issues,
@@ -796,7 +796,7 @@ pub fn validate_op_semantic(
             val,
             ..
         } => {
-            let arch_expected = effective_arch_addr_size(arch);
+            let arch_expected = effective_arch_address_size(arch);
             let expected = addr_space_size(*space, arch);
             check_size_addr_width(
                 &mut issues,
@@ -855,7 +855,7 @@ pub fn validate_op_semantic(
                 "replacement.size",
                 replacement.size,
             );
-            let arch_expected = effective_arch_addr_size(arch);
+            let arch_expected = effective_arch_address_size(arch);
             let expected_addr = addr_space_size(*space, arch);
             check_size_addr_width(
                 &mut issues,
@@ -894,7 +894,7 @@ pub fn validate_op_semantic(
                 guard.size,
                 1,
             );
-            let arch_expected = effective_arch_addr_size(arch);
+            let arch_expected = effective_arch_address_size(arch);
             let expected = addr_space_size(*space, arch);
             check_size_addr_width(
                 &mut issues,
@@ -933,7 +933,7 @@ pub fn validate_op_semantic(
                 guard.size,
                 1,
             );
-            let arch_expected = effective_arch_addr_size(arch);
+            let arch_expected = effective_arch_address_size(arch);
             let expected = addr_space_size(*space, arch);
             check_size_addr_width(
                 &mut issues,
@@ -1000,7 +1000,7 @@ pub fn validate_op_semantic(
         | R2ILOp::CallInd { target }
         | R2ILOp::Return { target } => {
             if target.space != SpaceId::Const {
-                let arch_expected = effective_arch_addr_size(arch);
+                let arch_expected = effective_arch_address_size(arch);
                 check_size_const(
                     &mut issues,
                     "op.controlflow.target_width_mismatch",
@@ -1013,7 +1013,7 @@ pub fn validate_op_semantic(
         }
         R2ILOp::CBranch { target, cond } => {
             if target.space != SpaceId::Const {
-                let arch_expected = effective_arch_addr_size(arch);
+                let arch_expected = effective_arch_address_size(arch);
                 check_size_const(
                     &mut issues,
                     "op.cbranch.target_width_mismatch",
@@ -1133,7 +1133,7 @@ fn validate_varnode(
 }
 
 fn addr_space_size(space: SpaceId, arch: &ArchSpec) -> u32 {
-    let arch_size = effective_arch_addr_size(arch);
+    let arch_size = effective_arch_address_size(arch);
     let space_size = arch
         .spaces
         .iter()
@@ -1148,7 +1148,8 @@ fn addr_space_size(space: SpaceId, arch: &ArchSpec) -> u32 {
     }
 }
 
-fn effective_arch_addr_size(arch: &ArchSpec) -> u32 {
+/// Effective architecture address size in bytes used by semantic validation.
+pub fn effective_arch_address_size(arch: &ArchSpec) -> u32 {
     if arch.addr_size > 1 {
         return arch.addr_size;
     }

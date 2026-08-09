@@ -87,6 +87,81 @@ jobs:
           R2R_OFFLINE: "1"
         run: make -C tests/r2r run
 
+  # Correctness is intentionally separate from the fixed-machine performance
+  # contract. A semantic/source-gold failure cannot be hidden by faster output.
+  source-gold:
+    name: Source-Gold Correctness Gate
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v6
+      - name: Setup Rust PATH
+        run: |
+          for p in "$HOME/.cargo/bin" "/root/.cargo/bin" "/usr/local/cargo/bin"; do
+            if [ -d "$p" ]; then
+              echo "$p" >> "$GITHUB_PATH"
+              export PATH="$p:$PATH"
+            fi
+          done
+          command -v cargo >/dev/null
+      - name: Ensure radare2 + headers
+        run: bash .github/scripts/ensure-radare2-ci.sh
+      - name: Run source-gold closure gate
+        env:
+          SOURCE_GOLD_JOBS: "1"
+        run: make -C tests/r2r source-gold
+      - name: Archive source-gold report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-gold-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/r2sleigh-source-gold-current.json
+          if-no-files-found: warn
+
+  # Deployment assumption: this label identifies the stable Darwin/arm64
+  # performance host named by tests/gold/mem_scan2_performance.json. Unlike
+  # ordinary developer machines, this required job is not allowed to skip.
+  fixed-performance:
+    name: Fixed-Runner Bounded Performance Gate
+    runs-on: [self-hosted, r2sleigh-perf-v1]
+    env:
+      R2SLEIGH_FIXED_PERF_RUNNER: r2sleigh-darwin-arm64-perf-v1
+    steps:
+      - uses: actions/checkout@v6
+      - name: Setup Rust PATH
+        run: |
+          for p in "$HOME/.cargo/bin" "/root/.cargo/bin" "/usr/local/cargo/bin"; do
+            if [ -d "$p" ]; then
+              echo "$p" >> "$GITHUB_PATH"
+              export PATH="$p:$PATH"
+            fi
+          done
+          command -v cargo >/dev/null
+      - name: Ensure radare2 + headers
+        run: bash .github/scripts/ensure-radare2-ci.sh
+      - name: Build fixed fixture and plugin
+        run: |
+          make -C tests/r2r link-bins
+          make -C r2plugin RUST_FEATURES=all-archs
+      - name: Run required fixed performance gate
+        run: |
+          perf_tmp="$(mktemp -d /tmp/r2sleigh-fixed-perf.XXXXXX)"
+          trap 'rm -rf "$perf_tmp"' EXIT
+          python3 scripts/reversing_benchmark.py \
+            --fixed-performance-gate tests/gold/mem_scan2_performance.json \
+            --require-fixed-performance \
+            --r2 "$R2SLEIGH_E2E_RADARE2" \
+            --plugin-dir r2plugin \
+            --tmpdir "$perf_tmp" \
+            --timeout 120 \
+            --out target/fixed-performance.json
+      - name: Archive fixed performance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fixed-performance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/fixed-performance.json
+          if-no-files-found: error
+
   # ── Rust E2E / integration tests ────────────────────────────────────
   e2e:
     name: Rust E2E Tests
@@ -104,7 +179,7 @@ jobs:
   release:
     name: Release Build
     runs-on: self-hosted
-    needs: [quality, r2r, e2e]
+    needs: [quality, r2r, source-gold, fixed-performance, e2e]
     if: github.ref == 'refs/heads/master'
     steps:
       - uses: actions/checkout@v6

@@ -12,6 +12,7 @@ use z3::Context;
 use z3::ast::BV;
 
 use crate::SymResult;
+use crate::control::SymExecutionControl;
 use crate::state::{ExitStatus, RuntimeValueProvenance, SymState};
 use crate::value::SymValue;
 
@@ -87,6 +88,8 @@ pub struct SymExecutor<'ctx> {
     call_hooks: HashMap<u64, RegisteredCallHook<'ctx>>,
     /// Direct-call targets that should be forked as interprocedural successors.
     direct_call_fork_targets: Option<HashSet<u64>>,
+    /// Cooperative request control polled by executor worklists.
+    execution: SymExecutionControl,
 }
 
 struct ConcreteCopyLoopPlan<'a> {
@@ -99,10 +102,16 @@ struct ConcreteCopyLoopPlan<'a> {
 impl<'ctx> SymExecutor<'ctx> {
     /// Create a new symbolic executor.
     pub fn new(ctx: &'ctx Context) -> Self {
+        Self::with_execution_control(ctx, SymExecutionControl::default())
+    }
+
+    /// Create an executor with cooperative cancellation and deadline control.
+    pub fn with_execution_control(ctx: &'ctx Context, execution: SymExecutionControl) -> Self {
         Self {
             ctx,
             call_hooks: HashMap::new(),
             direct_call_fork_targets: None,
+            execution,
         }
     }
 
@@ -1161,11 +1170,13 @@ impl<'ctx> SymExecutor<'ctx> {
         state: &mut SymState<'ctx>,
         block: &FunctionSSABlock,
     ) -> SymResult<Vec<SymState<'ctx>>> {
+        self.execution.poll()?;
         let mut forked_states = Vec::new();
         let incoming = state.prev_pc();
 
         // Execute phi nodes first
         for phi in &block.phis {
+            self.execution.poll()?;
             // In single-path execution, we need to know which predecessor we came from
             let src = incoming
                 .and_then(|prev| phi.sources.iter().find(|(pred, _)| *pred == prev))
@@ -1185,9 +1196,11 @@ impl<'ctx> SymExecutor<'ctx> {
             // The runahead leaves the state poised for the final non-taken
             // iteration so the normal executor can materialize live-out defs.
         }
+        self.execution.poll()?;
 
         // Execute operations
         for (op_idx, op) in block.ops.iter().enumerate() {
+            self.execution.poll()?;
             if !state.active {
                 break;
             }
@@ -1247,6 +1260,7 @@ impl<'ctx> SymExecutor<'ctx> {
         skipped.pc = target_addr;
         skipped.step();
         for tail_op in tail {
+            self.execution.poll()?;
             if let SSAOp::Copy { dst, .. } = tail_op {
                 let preserved = self.read_var(state, dst);
                 self.write_var(&mut skipped, dst, preserved);
@@ -1256,6 +1270,7 @@ impl<'ctx> SymExecutor<'ctx> {
         state.add_false_constraint(&cond_val);
         state.step();
         for tail_op in tail {
+            self.execution.poll()?;
             let forked = self.step(state, tail_op)?;
             debug_assert!(forked.is_empty());
             state.step();
@@ -1285,6 +1300,9 @@ impl<'ctx> SymExecutor<'ctx> {
         let start_src = plan.src_base.checked_add(counter)?;
         let start_dst = plan.dst_base.checked_add(counter)?;
         for offset in 0..bulk_count {
+            if self.execution.poll().is_err() {
+                return None;
+            }
             let src_addr = start_src.checked_add(offset)?;
             let dst_addr = start_dst.checked_add(offset)?;
             let byte = state.mem_read(&SymValue::concrete(src_addr, 64), 1);
@@ -2238,6 +2256,40 @@ mod tests {
     }
 
     #[test]
+    fn executor_observes_cancellation_triggered_mid_block() {
+        let ctx = Context::thread_local();
+        let cancellation = crate::SymCancellationToken::default();
+        let execution = crate::SymExecutionControl::with_cancellation(cancellation.clone());
+        let mut executor = SymExecutor::with_execution_control(&ctx, execution);
+        executor.register_call_hook(0x401000, move |_| {
+            cancellation.cancel();
+            Ok(CallHookResult::Fallthrough)
+        });
+        let block = FunctionSSABlock {
+            addr: 0x1000,
+            size: 2,
+            phis: Vec::new(),
+            ops: vec![
+                SSAOp::Call {
+                    target: SSAVar::constant(0x401000, 8),
+                },
+                SSAOp::Copy {
+                    dst: SSAVar::new("RAX", 1, 8),
+                    src: SSAVar::constant(0x42, 8),
+                },
+            ],
+        };
+        let mut state = SymState::new(&ctx, 0x1000);
+
+        let error = executor
+            .execute_block(&mut state, &block)
+            .expect_err("the operation after cancellation must not execute");
+
+        assert!(matches!(error, crate::SymError::Cancelled));
+        assert!(state.get_register("RAX_1").as_concrete().is_none());
+    }
+
+    #[test]
     fn test_execute_block_skips_local_cbranch_tail_when_taken() {
         let ctx = Context::thread_local();
         let executor = SymExecutor::new(&ctx);
@@ -2367,6 +2419,7 @@ mod tests {
                     (0x0, SSAVar::constant(0, 8)),
                     (0x1000, SSAVar::new("RCX", 2, 8)),
                 ],
+                canonical_storage: None,
             }],
             ops: vec![
                 SSAOp::IntAdd {

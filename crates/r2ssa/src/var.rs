@@ -2,6 +2,54 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Name-independent storage identity retained from the lifted varnode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum CanonicalStorageSpace {
+    Ram,
+    Register,
+    Unique,
+    Constant,
+    Custom(u32),
+    /// Programmatically synthesized SSA with no lifted storage provenance.
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct CanonicalStorageId {
+    pub space: CanonicalStorageSpace,
+    pub offset: u64,
+    pub size: u32,
+}
+
+impl CanonicalStorageId {
+    pub const fn from_varnode(varnode: &r2il::Varnode) -> Self {
+        let space = match varnode.space {
+            r2il::SpaceId::Ram => CanonicalStorageSpace::Ram,
+            r2il::SpaceId::Register => CanonicalStorageSpace::Register,
+            r2il::SpaceId::Unique => CanonicalStorageSpace::Unique,
+            r2il::SpaceId::Const => CanonicalStorageSpace::Constant,
+            r2il::SpaceId::Custom(id) => CanonicalStorageSpace::Custom(id),
+        };
+        Self {
+            space,
+            offset: varnode.offset,
+            size: varnode.size,
+        }
+    }
+
+    pub const fn unknown(ordinal: u64, size: u32) -> Self {
+        Self {
+            space: CanonicalStorageSpace::Unknown,
+            offset: ordinal,
+            size,
+        }
+    }
+
+    pub const fn is_unknown(self) -> bool {
+        matches!(self.space, CanonicalStorageSpace::Unknown)
+    }
+}
+
 /// Canonical classification for SSA variable names.
 ///
 /// Raw SSA names still carry prefixes because they originate at the IL/lift
@@ -99,6 +147,12 @@ pub struct SSAVar {
     pub version: u32,
     /// Size in bytes.
     pub size: u32,
+    /// Exact source bitvector for constants.
+    ///
+    /// This is semantic data. The `name` field is presentation-only and must
+    /// not be parsed by proof-bearing consumers to recover a constant value.
+    #[serde(default)]
+    constant_bits: Option<u64>,
 }
 
 impl SSAVar {
@@ -108,6 +162,7 @@ impl SSAVar {
             name: name.into(),
             version,
             size,
+            constant_bits: None,
         }
     }
 
@@ -118,7 +173,12 @@ impl SSAVar {
 
     /// Create a constant SSA variable.
     pub fn constant(value: u64, size: u32) -> Self {
-        Self::new(format!("const:{:x}", value), 0, size)
+        Self {
+            name: format!("const:{:x}", value),
+            version: 0,
+            size,
+            constant_bits: Some(value),
+        }
     }
 
     /// Create the next version of this variable.
@@ -130,7 +190,16 @@ impl SSAVar {
             name: self.name.clone(),
             version: self.version.checked_add(1)?,
             size: self.size,
+            constant_bits: self.constant_bits,
         })
+    }
+
+    /// Return the source bitvector carried by a constant SSA value.
+    ///
+    /// Unlike legacy helpers that parse `name`, this accessor is safe to use
+    /// as semantic evidence.
+    pub const fn constant_bits(&self) -> Option<u64> {
+        self.constant_bits
     }
 
     /// Get a display name like "RAX_0" or "RAX_1".
@@ -190,6 +259,15 @@ mod tests {
         assert_eq!(var.version, 0);
         assert_eq!(var.size, 8);
         assert_eq!(var.display_name(), "RAX_0");
+    }
+
+    #[test]
+    fn constants_carry_bits_independently_of_display_names() {
+        let constant = SSAVar::constant(0x100000001b3, 8);
+        assert_eq!(constant.constant_bits(), Some(0x100000001b3));
+
+        let spoofed_name = SSAVar::new("const:100000001b3", 0, 8);
+        assert_eq!(spoofed_name.constant_bits(), None);
     }
 
     #[test]

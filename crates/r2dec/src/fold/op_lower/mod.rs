@@ -2877,6 +2877,19 @@ impl<'a> FoldingContext<'a> {
 
     /// Analyze multiple blocks (for function-level folding).
     pub fn analyze_blocks(&mut self, blocks: &[SSABlock]) {
+        let execution = r2ssa::SsaExecutionControl::default();
+        let control =
+            crate::DecompileWorkControl::new(&execution, crate::DecompileWorkPhase::Structuring);
+        self.analyze_blocks_with_control(blocks, control)
+            .expect("default decompiler work control cannot stop");
+    }
+
+    pub fn analyze_blocks_with_control(
+        &mut self,
+        blocks: &[SSABlock],
+        control: crate::DecompileWorkControl<'_>,
+    ) -> Result<(), crate::DecompileExecutionStop> {
+        control.poll()?;
         if let Some(prepared) = self.inputs.prepared_ssa {
             self.state.analysis_ctx.semantic_mut().type_hints = self.inputs.type_hints.clone();
             let env = self.to_pass_env();
@@ -2892,11 +2905,16 @@ impl<'a> FoldingContext<'a> {
                     certified_rendering_required: self.requires_certified_rendering(),
                 })
             });
-            self.state.analysis_ctx =
-                analysis::build_prepared_runtime_facts(blocks, &env, prepared, &prepared_view);
+            self.state.analysis_ctx = analysis::build_prepared_runtime_facts_with_control(
+                blocks,
+                &env,
+                prepared,
+                &prepared_view,
+                control,
+            )?;
             self.state.analysis_ctx.ownership = self.build_semantic_ownership_facts();
             self.clear_semantic_ownership_caches();
-            return;
+            return Ok(());
         }
 
         // Explicit pass order:
@@ -2905,7 +2923,7 @@ impl<'a> FoldingContext<'a> {
         // 3) Predicate simplification/statement emit consume analysis state
         self.state.analysis_ctx.semantic_mut().type_hints = self.inputs.type_hints.clone();
         let env = self.to_pass_env();
-        let mut use_info = analysis::UseInfo::analyze(blocks, &env);
+        let mut use_info = analysis::UseInfo::analyze_with_control(blocks, &env, control)?;
         let authoritative_use_info = use_info.clone();
         let mut stack_info = analysis::StackInfo::analyze(blocks, &use_info, &env);
         let initial_stack_info = stack_info.clone();
@@ -2942,11 +2960,12 @@ impl<'a> FoldingContext<'a> {
         }
 
         if !stack_info.definition_overrides.is_empty() {
-            use_info = analysis::UseInfo::analyze_with_definition_overrides(
+            use_info = analysis::UseInfo::analyze_with_definition_overrides_with_control(
                 blocks,
                 &env,
                 &stack_info.definition_overrides,
-            );
+                control,
+            )?;
             use_info.preserve_authoritative_facts_from(&authoritative_use_info);
             stack_info = analysis::StackInfo::analyze(blocks, &use_info, &env);
             for (offset, alias) in &initial_stack_info.stack_arg_aliases {
@@ -3001,11 +3020,12 @@ impl<'a> FoldingContext<'a> {
                     }
                 }
             }
-            use_info = analysis::UseInfo::analyze_with_definition_overrides(
+            use_info = analysis::UseInfo::analyze_with_definition_overrides_with_control(
                 blocks,
                 &env,
                 &stack_info.definition_overrides,
-            );
+                control,
+            )?;
             use_info.preserve_authoritative_facts_from(&authoritative_use_info);
         }
         let flag_info = analysis::FlagInfo::analyze(blocks, &use_info, &env);
@@ -3017,6 +3037,8 @@ impl<'a> FoldingContext<'a> {
         };
         self.state.analysis_ctx.ownership = self.build_semantic_ownership_facts();
         self.clear_semantic_ownership_caches();
+        control.poll()?;
+        Ok(())
     }
 
     fn clear_semantic_ownership_caches(&self) {

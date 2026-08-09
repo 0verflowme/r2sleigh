@@ -57,8 +57,40 @@ Function-Level:
 - a:sla.sym.paths -- Path exploration
 - a:sla.slice [var] -- Backward slice
 - a:sla.dec -- Decompile to C
+- a:sla.decj [name|addr] -- Decompile through V2 with structured diagnostics JSON
 
 Both a:sla and a:sleigh prefixes work.
+
+`a:sla.decj` preserves the `a:sla.dec` render path and adds a machine-readable
+projection around its opaque V2 response. The schema-1 object contains
+`rendered_output`, object-valued `diagnostics`, `outcome`, `refused`, all eleven
+`phase_timings`, `ffi_conversion_elapsed_us`, and an `error` object or `null`.
+Refused requests retain the engine's refusal output and diagnostics. Transport,
+malformed-diagnostics, and preflight errors fail closed with a null rendered
+output. Cancellation is an engine refusal with refused phase status and
+non-executable refusal output, never partial C.
+
+For the exact one-block x86-64 O2 integer-guard subset, completed diagnostics
+report `semantic_kernel_render.region_id` as `branchless_guard_function_v1`
+with exact obligation closure. The boundary accepts physical full-width
+RDI/RSI/RAX ABI carriers only after exact register name, offset, and size
+validation, then binds their signed 32-bit values through low-bit projections.
+If the retained guard fact cannot certify or pass its render audit,
+decompilation refuses instead of falling through to generic or legacy C.
+
+The exact x86-64 `DemoStruct` array-update subset similarly reports
+`semantic_kernel_render.region_id` as `struct_array_index_function_v1`. Its
+revision-bound source graph must describe the natural 14-member signed-32
+layout, the full pointer carrier, signed low-32 index/value/return carriers,
+and every ordered member-2/member-13 access. O0 parameter homes and the O2
+register form share the same sealed semantic C renderer; a retained exact fact
+that fails certification or rendering refuses without downgrading to generic
+aggregate or memory output.
+
+Function signatures, layouts, and calling-convention carriers come only from
+the immutable radare2 function snapshot. DWARF ingestion is a binary-load
+operation in radare2; the plugin never reparses or imports DWARF during
+analysis or decompilation.
 
 DATA xrefs are applied automatically during function analysis (`af`) and reference
 analysis (`aar`) via plugin callbacks.

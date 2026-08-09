@@ -30,6 +30,18 @@
 pub(crate) mod address;
 pub(crate) mod analysis;
 pub mod ast;
+pub mod certified_call;
+pub mod certified_conditional_funnel_return;
+pub mod certified_control;
+pub mod certified_counted_loop_return;
+pub mod certified_if_return;
+pub mod certified_loop;
+pub mod certified_loop_return;
+pub mod certified_region;
+pub mod certified_return;
+pub mod certified_structure;
+pub mod certified_switch;
+pub mod certified_switch_return;
 pub(crate) mod codegen;
 pub(crate) mod consumer_fallback;
 #[cfg(test)]
@@ -37,6 +49,7 @@ pub(crate) mod consumer_linear;
 pub(crate) mod consumer_structured;
 pub(crate) mod consumer_summary;
 pub(crate) mod consumer_vm;
+pub mod control;
 pub mod fold;
 pub mod highlight;
 pub(crate) mod normalize;
@@ -44,14 +57,203 @@ pub(crate) mod planner;
 pub(crate) mod post_rename;
 pub mod region;
 pub(crate) mod registers;
+pub mod semantic_aggregate_function;
+pub mod semantic_branchless_guard_function;
+pub mod semantic_c;
+pub mod semantic_call_return;
+pub mod semantic_differential;
+pub mod semantic_fnv_fold_function;
+pub mod semantic_fnv_fold_o0_function;
+pub mod semantic_function;
+pub mod semantic_memory_function;
+pub mod semantic_nested_wrap32_guard_o0_function;
+pub mod semantic_private_frame_function;
+pub mod semantic_stmt;
+pub mod semantic_struct_array_index_function;
+pub mod semantic_sum_array_function;
 pub mod structure;
 pub mod variable;
 
 pub use ast::{BinaryOp, CExpr, CFunction, CStmt, CType, UnaryOp};
+pub use certified_call::{
+    CERTIFIED_DIRECT_CALL_REGION_SCHEMA_VERSION, CertifiedDirectCallBlockRegion,
+    DirectCallRegionAuditReport, DirectCallRegionError, DirectCallRegionScope,
+};
+pub use certified_conditional_funnel_return::{
+    CERTIFIED_CONDITIONAL_FUNNEL_RETURN_FUNCTION_SCHEMA_VERSION,
+    CertifiedConditionalFunnelReturnFunction, ConditionalFunnelCarrierKind,
+    ConditionalFunnelCarrierManifest, ConditionalFunnelPhase, ConditionalFunnelPhaseKind,
+    ConditionalFunnelReturnFunctionAuditReport, ConditionalFunnelReturnFunctionError,
+    ConditionalFunnelReturnFunctionScope,
+};
+pub use certified_control::{
+    CERTIFIED_CONDITIONAL_TRANSFER_REGION_SCHEMA_VERSION,
+    CERTIFIED_DIRECT_TRANSFER_REGION_SCHEMA_VERSION,
+    CERTIFIED_FALLTHROUGH_TRANSFER_REGION_SCHEMA_VERSION, CertifiedConditionalTransferBlockRegion,
+    CertifiedDirectTransferBlockRegion, CertifiedFallthroughTransferBlockRegion,
+    ConditionalTransferRegionAuditReport, ConditionalTransferRegionError,
+    ConditionalTransferRegionScope, DirectTransferRegionAuditReport, DirectTransferRegionError,
+    DirectTransferRegionScope, FallthroughTransferRegionAuditReport,
+    FallthroughTransferRegionError, FallthroughTransferRegionScope,
+};
+pub use certified_counted_loop_return::{
+    CERTIFIED_COUNTED_LOOP_RETURN_FUNCTION_SCHEMA_VERSION, CertifiedCountedLoopReturnFunction,
+    CountedLoopDifferentialCase, CountedLoopDifferentialReport, CountedLoopExecutionOutcome,
+    CountedLoopPhase, CountedLoopPhaseKind, CountedLoopReturnFunctionAuditReport,
+    CountedLoopReturnFunctionError, CountedLoopReturnFunctionScope,
+    check_counted_loop_return_differential,
+};
+pub use certified_if_return::{
+    CERTIFIED_CONDITIONAL_RETURN_FUNCTION_SCHEMA_VERSION, CertifiedConditionalReturnArm,
+    CertifiedConditionalReturnFunction, ConditionalReturnFunctionAuditReport,
+    ConditionalReturnFunctionError, ConditionalReturnFunctionScope,
+};
+pub use certified_loop::{
+    CERTIFIED_HEADER_TESTED_LOOP_SCHEMA_VERSION, CertifiedHeaderTestedLoopFragment,
+    HeaderTestedLoopAuditReport, HeaderTestedLoopError, HeaderTestedLoopScope, LoopContinuationArm,
+};
+pub use certified_loop_return::{
+    CERTIFIED_LOOP_RETURN_FUNCTION_SCHEMA_VERSION, CertifiedLoopReturnExit,
+    CertifiedLoopReturnFunction, LoopExecutionOutcome, LoopReturnDifferentialCase,
+    LoopReturnDifferentialReport, LoopReturnFunctionAuditReport, LoopReturnFunctionError,
+    LoopReturnFunctionScope, LoopReturnValue, check_loop_return_differential,
+};
+pub use certified_region::{
+    CERTIFIED_REGION_SCHEMA_VERSION, CertifiedRegionInstruction, CertifiedSingleBlockAccounting,
+    RegionAuditReport, RegionBuildError, RegionObligationDisposition, RegionObligationMapping,
+    RegionResidualReason, SingleBlockAccountingScope,
+};
+pub use certified_return::{
+    CERTIFIED_TERMINAL_RETURN_REGION_SCHEMA_VERSION, CertifiedTerminalReturnBlockRegion,
+    TerminalReturnRegionAuditReport, TerminalReturnRegionError, TerminalReturnRegionScope,
+};
+pub use certified_structure::{
+    CERTIFIED_IF_ELSE_DIAMOND_SCHEMA_VERSION, CertifiedDiamondArm, CertifiedIfElseDiamondFragment,
+    IfElseDiamondAuditReport, IfElseDiamondError, IfElseDiamondScope,
+};
+pub use certified_switch::{
+    CERTIFIED_SWITCH_TOPOLOGY_FRAGMENT_SCHEMA_VERSION, CertifiedSwitchTopologyFragment,
+    SwitchTopologyAuditReport, SwitchTopologyFragmentError, SwitchTopologyFragmentScope,
+};
+pub use certified_switch_return::{
+    CERTIFIED_SWITCH_RETURN_FUNCTION_SCHEMA_VERSION, CertifiedSwitchReturnArm,
+    CertifiedSwitchReturnCase, CertifiedSwitchReturnFunction, SwitchReturnDifferentialCase,
+    SwitchReturnDifferentialReport, SwitchReturnFunctionAuditReport, SwitchReturnFunctionError,
+    SwitchReturnFunctionScope, SwitchReturnOutcome, check_switch_return_differential,
+};
 pub use codegen::CodeGenConfig;
+pub use control::{DecompileExecutionStop, DecompileWorkControl, DecompileWorkPhase};
 pub use fold::lower_ssa_ops_to_stmts;
 pub use highlight::highlight_c_ansi;
 pub use region::{Region, RegionAnalyzer};
+pub use semantic_aggregate_function::{
+    CERTIFIED_AGGREGATE_MEMBER_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
+    CertifiedAggregateMemberRenderAccess, CertifiedAggregateMemberRenderDirection,
+    CertifiedAggregateMemberSemanticCFunction,
+    CertifiedAggregateMemberSemanticCFunctionAuditReport,
+    CertifiedAggregateMemberSemanticCFunctionError, CertifiedAggregateMemberSemanticCFunctionScope,
+    CertifiedAggregateScalarSignedness, CertifiedAggregateSemanticCParameter,
+    CertifiedAggregateSemanticCParameterKind, CertifiedAggregateSemanticCReturn,
+    CertifiedAggregateStructLayoutManifest, CertifiedAggregateStructMemberManifest,
+};
+pub use semantic_branchless_guard_function::{
+    BranchlessGuardAbiManifest, BranchlessGuardDifferentialCase, BranchlessGuardDifferentialInput,
+    BranchlessGuardDifferentialReport, BranchlessGuardRenderNames, BranchlessGuardRenderProgram,
+    BranchlessGuardSemanticCFunctionAuditReport, BranchlessGuardSemanticCFunctionError,
+    BranchlessGuardSemanticCFunctionScope,
+    CERTIFIED_BRANCHLESS_GUARD_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
+    CertifiedBranchlessGuardSemanticCFunction, check_branchless_guard_differential,
+};
+pub use semantic_c::{
+    SemanticCCallArgument, SemanticCCallArgumentValue, SemanticCDirectCall, SemanticCError,
+    SemanticCExpressionLayer, SemanticCFunctionInterface, SemanticCFunctionReturn,
+    SemanticCIdentityScope, SemanticCInputOrigin, SemanticCParameter, SemanticCReturn,
+    SemanticCReturnValue, SemanticCScope, SemanticCStackSlot,
+};
+pub use semantic_call_return::{
+    CERTIFIED_DIRECT_CALL_RETURN_FUNCTION_SCHEMA_VERSION, CertifiedDirectCallReturnBlock,
+    CertifiedDirectCallReturnFunction, DirectCallArgumentManifest,
+    DirectCallReturnFunctionAuditReport, DirectCallReturnFunctionError,
+    DirectCallReturnFunctionScope,
+};
+pub use semantic_differential::{
+    DifferentialArtifactIdentity, DifferentialBitVector, DifferentialBoundaryOutcome,
+    DifferentialCallArgument, DifferentialCandidateAdmission, DifferentialCandidateIdentity,
+    DifferentialCandidateKind, DifferentialCaseDisposition, DifferentialConclusion,
+    DifferentialLimits, DifferentialMemoryEvent, DifferentialMemoryEventKind,
+    DifferentialMemoryLocation, DifferentialMismatch, DifferentialMismatchKind,
+    DifferentialObservedByte, DifferentialObservedRun, DifferentialObservedTrace,
+    DifferentialObservedValue, DifferentialReport, DifferentialSide, DifferentialState,
+    SEMANTIC_DIFFERENTIAL_EVALUATOR_CONTRACT_VERSION, SEMANTIC_DIFFERENTIAL_SCHEMA_VERSION,
+    check_block_differential, check_conditional_return_differential,
+    check_direct_call_differential, check_memory_terminal_return_differential,
+    check_terminal_return_differential,
+};
+pub use semantic_fnv_fold_function::{
+    CERTIFIED_FNV_FOLD_SEMANTIC_C_FUNCTION_SCHEMA_VERSION, CertifiedFnvFoldSemanticCFunction,
+    FnvFoldAbiManifest, FnvFoldDifferentialCase, FnvFoldDifferentialInput,
+    FnvFoldDifferentialReport, FnvFoldPhase, FnvFoldPhaseKind, FnvFoldRenderNames,
+    FnvFoldRenderProgram, FnvFoldSemanticCFunctionAuditReport, FnvFoldSemanticCFunctionError,
+    FnvFoldSemanticCFunctionScope, check_fnv_fold_differential,
+};
+pub use semantic_fnv_fold_o0_function::{
+    CERTIFIED_FNV_FOLD_O0_SEMANTIC_C_FUNCTION_SCHEMA_VERSION, CertifiedFnvFoldO0SemanticCFunction,
+    FnvFoldO0AbiManifest, FnvFoldO0AliasSeal, FnvFoldO0DifferentialCase,
+    FnvFoldO0DifferentialInput, FnvFoldO0DifferentialReport, FnvFoldO0ObservedRead,
+    FnvFoldO0ProducerDisposition, FnvFoldO0ProducerTarget, FnvFoldO0RenderNames,
+    FnvFoldO0RenderPhase, FnvFoldO0RenderPhaseKind, FnvFoldO0RenderProgram,
+    FnvFoldO0SemanticCFunctionAuditReport, FnvFoldO0SemanticCFunctionError,
+    FnvFoldO0SemanticCFunctionScope, check_fnv_fold_o0_differential,
+};
+pub use semantic_function::{
+    CERTIFIED_SEMANTIC_C_FUNCTION_SCHEMA_VERSION, CertifiedSemanticCFunction,
+    CertifiedSemanticCFunctionError, CertifiedSemanticCFunctionScope,
+};
+pub use semantic_memory_function::{
+    CERTIFIED_MEMORY_SEMANTIC_C_FUNCTION_SCHEMA_VERSION, CertifiedMemorySemanticCFunction,
+    CertifiedMemorySemanticCFunctionAuditReport, CertifiedMemorySemanticCFunctionError,
+    CertifiedMemorySemanticCFunctionScope,
+};
+pub use semantic_nested_wrap32_guard_o0_function::{
+    CERTIFIED_NESTED_WRAP32_GUARD_O0_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
+    CertifiedNestedWrap32GuardO0SemanticCFunction, NestedWrap32GuardO0AbiManifest,
+    NestedWrap32GuardO0DifferentialCase, NestedWrap32GuardO0DifferentialInput,
+    NestedWrap32GuardO0DifferentialReport, NestedWrap32GuardO0RenderNames,
+    NestedWrap32GuardO0SemanticCFunctionAuditReport, NestedWrap32GuardO0SemanticCFunctionError,
+    NestedWrap32GuardO0SemanticCFunctionScope, NestedWrap32GuardO0TypedBinding,
+    NestedWrap32GuardO0TypedExpr, NestedWrap32GuardO0TypedProgram,
+    NestedWrap32GuardO0TypedScalar, NestedWrap32GuardO0TypedStatement,
+    check_nested_wrap32_guard_o0_boundary_and_random_differential,
+    check_nested_wrap32_guard_o0_differential, nested_wrap32_guard_o0_boundary_and_random_cases,
+};
+pub use semantic_private_frame_function::{
+    CERTIFIED_PRIVATE_FRAME_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
+    CertifiedPrivateFrameSemanticCFunction, PrivateFrameAbiManifest, PrivateFrameDifferentialCase,
+    PrivateFrameDifferentialReport, PrivateFramePhase, PrivateFramePhaseKind,
+    PrivateFramePredicate, PrivateFramePredicateOperand, PrivateFrameRenderNames,
+    PrivateFrameSemanticCFunctionAuditReport, PrivateFrameSemanticCFunctionError,
+    PrivateFrameSemanticCFunctionScope, check_private_frame_differential,
+};
+pub use semantic_stmt::{
+    SemanticCBlockStepLayer, SemanticCEntityRef, SemanticCMemoryStatementRef, SemanticCSourceStep,
+    SemanticCStatementError, SemanticCStatementScope, SemanticCStepAuditReport,
+};
+pub use semantic_struct_array_index_function::{
+    CERTIFIED_STRUCT_ARRAY_INDEX_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
+    CertifiedStructArrayIndexSemanticCFunction, StructArrayIndexAbiManifest,
+    StructArrayIndexDifferentialCase, StructArrayIndexDifferentialInput,
+    StructArrayIndexDifferentialReport, StructArrayIndexObservedEvent, StructArrayIndexRenderNames,
+    StructArrayIndexRenderPhase, StructArrayIndexRenderPhaseKind, StructArrayIndexRenderProgram,
+    StructArrayIndexSemanticCFunctionAuditReport, StructArrayIndexSemanticCFunctionError,
+    StructArrayIndexSemanticCFunctionScope, check_struct_array_index_differential,
+};
+pub use semantic_sum_array_function::{
+    CERTIFIED_SUM_ARRAY_SEMANTIC_C_FUNCTION_SCHEMA_VERSION, CertifiedSumArraySemanticCFunction,
+    SumArrayAbiManifest, SumArrayDifferentialCase, SumArrayDifferentialInput,
+    SumArrayDifferentialReport, SumArrayObservedRead, SumArrayRenderNames, SumArrayRenderPhaseKind,
+    SumArrayRenderProgram, SumArraySemanticCFunctionAuditReport, SumArraySemanticCFunctionError,
+    SumArraySemanticCFunctionScope, check_sum_array_differential,
+};
 pub use structure::{
     ControlFlowStructurer, ControlRenderProof, ControlRenderProofKind, ControlTransferRenderProof,
     ControlTransferRenderProofKind,
@@ -60,9 +262,7 @@ pub use variable::VariableRecovery;
 
 use crate::codegen::CodeGenerator;
 use crate::fold::FoldingContext;
-use crate::fold::context::{
-    EffectRenderProof, EffectRenderProofKind, FoldArchConfig, FoldInputs, PhiEdgeRenderKind,
-};
+use crate::fold::context::{EffectRenderProof, EffectRenderProofKind, FoldArchConfig, FoldInputs};
 use r2ssa::SSAFunction;
 use r2ssa::SSAOp;
 use r2ssa::cfg::BlockTerminator;
@@ -73,8 +273,10 @@ use r2types::{
 };
 #[cfg(test)]
 use r2types::{ExternalTypeDb, FunctionType};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 fn is_generic_arg_name(name: &str) -> bool {
     let lower = name.trim().to_ascii_lowercase();
@@ -1353,1353 +1555,6 @@ fn append_semantic_summary_return_comment_to_function_if_needed(
     }
 }
 
-fn looped_standard_output_residual_reason(
-    func: &CFunction,
-    cfg_summary: &r2ssa::CFGRiskSummary,
-) -> Option<String> {
-    if cfg_summary.loop_count == 0 && cfg_summary.back_edge_count == 0 {
-        return None;
-    }
-    if func.body.iter().any(stmt_has_empty_loop_body) {
-        return Some("unproven loop effects: empty loop body rendered".to_string());
-    }
-    if !func.body.iter().any(stmt_contains_loop_construct) {
-        return Some(
-            "unproven loop effects: looped CFG rendered without loop structure".to_string(),
-        );
-    }
-    None
-}
-
-#[cfg(test)]
-fn certifying_render_residual_reason(
-    prepared: Option<&r2ssa::SsaArtifact>,
-    control_facts: Option<&r2types::FunctionControlFacts>,
-    cfg_summary: &r2ssa::CFGRiskSummary,
-    func: &CFunction,
-) -> Option<String> {
-    certifying_render_residual_reason_with_proofs(prepared, control_facts, cfg_summary, func, None)
-}
-
-#[cfg(test)]
-fn certifying_render_residual_reason_with_proofs(
-    prepared: Option<&r2ssa::SsaArtifact>,
-    control_facts: Option<&r2types::FunctionControlFacts>,
-    cfg_summary: &r2ssa::CFGRiskSummary,
-    func: &CFunction,
-    render_proofs: Option<&[ControlRenderProof]>,
-) -> Option<String> {
-    certifying_render_residual_reason_with_transfer_proofs(
-        prepared,
-        control_facts,
-        cfg_summary,
-        func,
-        render_proofs,
-        None,
-    )
-}
-
-fn certifying_render_residual_reason_with_transfer_proofs(
-    prepared: Option<&r2ssa::SsaArtifact>,
-    control_facts: Option<&r2types::FunctionControlFacts>,
-    cfg_summary: &r2ssa::CFGRiskSummary,
-    func: &CFunction,
-    render_proofs: Option<&[ControlRenderProof]>,
-    transfer_proofs: Option<&[ControlTransferRenderProof]>,
-) -> Option<String> {
-    let (rendered, render_proof_failures) =
-        function_control_render_nodes_with_proofs(func, render_proofs);
-    let inventory = prepared
-        .is_some()
-        .then(|| control_certificate_inventory(control_facts));
-
-    let mut reasons = Vec::new();
-    if let Some(reason) = structured_control_residual_reason_for_nodes(
-        inventory.as_ref(),
-        cfg_summary,
-        &rendered,
-        &render_proof_failures,
-    ) {
-        reasons.push(reason);
-    }
-    if render_proofs.is_some()
-        && let Some(reason) = certified_control_transfer_residual_reason(
-            func,
-            prepared,
-            control_facts,
-            transfer_proofs.unwrap_or_default(),
-        )
-    {
-        reasons.push(reason);
-    }
-
-    if reasons.is_empty() {
-        None
-    } else {
-        Some(reasons.join("; "))
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RenderedControlTransferKind {
-    Break,
-    Continue,
-    Goto,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RenderedControlTransfer {
-    id: RenderNodeId,
-    kind: RenderedControlTransferKind,
-    label: Option<String>,
-}
-
-fn certified_control_transfer_residual_reason(
-    func: &CFunction,
-    prepared: Option<&r2ssa::SsaArtifact>,
-    control_facts: Option<&r2types::FunctionControlFacts>,
-    proofs: &[ControlTransferRenderProof],
-) -> Option<String> {
-    let mut rendered = Vec::new();
-    let mut rendered_labels = BTreeMap::new();
-    for (index, stmt) in func.body.iter().enumerate() {
-        collect_rendered_control_transfers(stmt, RenderNodeId::root_child(index), &mut rendered);
-        collect_rendered_labels(stmt, &mut rendered_labels);
-    }
-    for (index, transfer) in rendered.iter().enumerate() {
-        let Some(proof) = proofs.get(index) else {
-            return Some(unproved_control_transfer_reason(transfer));
-        };
-        if let Some(reason) = validate_control_transfer_proof(
-            transfer,
-            proof,
-            prepared,
-            control_facts,
-            &rendered_labels,
-        ) {
-            return Some(reason);
-        }
-    }
-    if let Some(proof) = proofs.get(rendered.len()) {
-        return Some(format!(
-            "control transfer proof {:?} for 0x{:x} -> 0x{:x} was not rendered",
-            proof.kind(),
-            proof.source(),
-            proof.target()
-        ));
-    }
-    for (index, stmt) in func.body.iter().enumerate() {
-        if let Some(reason) =
-            certified_switch_fallthrough_residual_reason(stmt, RenderNodeId::root_child(index))
-        {
-            return Some(reason);
-        }
-    }
-    None
-}
-
-fn collect_rendered_control_transfers(
-    stmt: &CStmt,
-    id: RenderNodeId,
-    out: &mut Vec<RenderedControlTransfer>,
-) {
-    match stmt {
-        CStmt::Break => out.push(RenderedControlTransfer {
-            id,
-            kind: RenderedControlTransferKind::Break,
-            label: None,
-        }),
-        CStmt::Continue => out.push(RenderedControlTransfer {
-            id,
-            kind: RenderedControlTransferKind::Continue,
-            label: None,
-        }),
-        CStmt::Goto(label) => out.push(RenderedControlTransfer {
-            id,
-            kind: RenderedControlTransferKind::Goto,
-            label: Some(label.clone()),
-        }),
-        CStmt::Block(stmts) => collect_rendered_control_transfer_stmts(stmts, id, out),
-        CStmt::If {
-            then_body,
-            else_body,
-            ..
-        } => {
-            collect_rendered_control_transfers(then_body, id.child(0), out);
-            if let Some(else_body) = else_body {
-                collect_rendered_control_transfers(else_body, id.child(1), out);
-            }
-        }
-        CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
-            collect_rendered_control_transfers(body, id.child(0), out);
-        }
-        CStmt::For { init, body, .. } => {
-            if let Some(init) = init {
-                collect_rendered_control_transfers(init, id.child(0), out);
-            }
-            collect_rendered_control_transfers(body, id.child(1), out);
-        }
-        CStmt::Switch { cases, default, .. } => {
-            for (case_index, case) in cases.iter().enumerate() {
-                let case_id = id.child(case_index);
-                collect_rendered_control_transfer_stmts(&case.body, case_id, out);
-            }
-            if let Some(default_body) = default {
-                let default_id = id.child(cases.len());
-                collect_rendered_control_transfer_stmts(default_body, default_id, out);
-            }
-        }
-        CStmt::Expr(_)
-        | CStmt::Decl { .. }
-        | CStmt::Return(_)
-        | CStmt::Empty
-        | CStmt::Label(_)
-        | CStmt::Comment(_) => {}
-    }
-}
-
-fn collect_rendered_control_transfer_stmts(
-    stmts: &[CStmt],
-    id: RenderNodeId,
-    out: &mut Vec<RenderedControlTransfer>,
-) {
-    for (index, stmt) in stmts.iter().enumerate() {
-        collect_rendered_control_transfers(stmt, id.child(index), out);
-    }
-}
-
-fn collect_rendered_labels(stmt: &CStmt, out: &mut BTreeMap<String, usize>) {
-    match stmt {
-        CStmt::Label(label) => {
-            *out.entry(label.clone()).or_default() += 1;
-        }
-        CStmt::Block(stmts) => {
-            for stmt in stmts {
-                collect_rendered_labels(stmt, out);
-            }
-        }
-        CStmt::If {
-            then_body,
-            else_body,
-            ..
-        } => {
-            collect_rendered_labels(then_body, out);
-            if let Some(else_body) = else_body {
-                collect_rendered_labels(else_body, out);
-            }
-        }
-        CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
-            collect_rendered_labels(body, out);
-        }
-        CStmt::For { init, body, .. } => {
-            if let Some(init) = init {
-                collect_rendered_labels(init, out);
-            }
-            collect_rendered_labels(body, out);
-        }
-        CStmt::Switch { cases, default, .. } => {
-            for case in cases {
-                for stmt in &case.body {
-                    collect_rendered_labels(stmt, out);
-                }
-            }
-            if let Some(default) = default {
-                for stmt in default {
-                    collect_rendered_labels(stmt, out);
-                }
-            }
-        }
-        CStmt::Expr(_)
-        | CStmt::Decl { .. }
-        | CStmt::Return(_)
-        | CStmt::Break
-        | CStmt::Continue
-        | CStmt::Goto(_)
-        | CStmt::Empty
-        | CStmt::Comment(_) => {}
-    }
-}
-
-fn unproved_control_transfer_reason(transfer: &RenderedControlTransfer) -> String {
-    match transfer.kind {
-        RenderedControlTransferKind::Break => format!(
-            "unproved control transfer break at {}; exact case/loop exit facts required",
-            transfer.id
-        ),
-        RenderedControlTransferKind::Continue => format!(
-            "unproved control transfer continue at {}; exact loop iteration facts required",
-            transfer.id
-        ),
-        RenderedControlTransferKind::Goto => format!(
-            "unproved control transfer goto {} at {}; exact irreducible-edge facts required",
-            transfer.label.as_deref().unwrap_or("<unknown>"),
-            transfer.id
-        ),
-    }
-}
-
-fn validate_control_transfer_proof(
-    transfer: &RenderedControlTransfer,
-    proof: &ControlTransferRenderProof,
-    prepared: Option<&r2ssa::SsaArtifact>,
-    control_facts: Option<&r2types::FunctionControlFacts>,
-    rendered_labels: &BTreeMap<String, usize>,
-) -> Option<String> {
-    let expected = match transfer.kind {
-        RenderedControlTransferKind::Break => ControlTransferRenderProofKind::Break,
-        RenderedControlTransferKind::Continue => ControlTransferRenderProofKind::Continue,
-        RenderedControlTransferKind::Goto => ControlTransferRenderProofKind::Goto,
-    };
-    if proof.kind() != expected {
-        return Some(format!(
-            "control transfer at {} has {:?} proof for rendered {:?}",
-            transfer.id,
-            proof.kind(),
-            transfer.kind
-        ));
-    }
-    let loop_header = proof.loop_header();
-    let source = proof.source();
-    let target = proof.target();
-    let Some(control_facts) = control_facts else {
-        return Some(format!(
-            "control transfer at {} lacks FunctionControlFacts",
-            transfer.id
-        ));
-    };
-    let Some(loop_fact) = control_facts
-        .loops
-        .values()
-        .find(|fact| fact.header == loop_header)
-    else {
-        return Some(format!(
-            "control transfer at {} has no loop certificate for 0x{:x}",
-            transfer.id, loop_header
-        ));
-    };
-    let Some(branch) = control_facts.branch_for_block(source) else {
-        return Some(format!(
-            "control transfer at {} has no certified branch at 0x{:x}",
-            transfer.id, source
-        ));
-    };
-    if branch.true_target != target && branch.false_target != target {
-        return Some(format!(
-            "control transfer at {} target 0x{:x} is not a certified edge from 0x{:x}",
-            transfer.id, target, source
-        ));
-    }
-    let valid_loop_edge = match proof.kind() {
-        ControlTransferRenderProofKind::Break | ControlTransferRenderProofKind::Goto => {
-            loop_fact.body.contains(&source) && loop_fact.exits.contains(&target)
-        }
-        ControlTransferRenderProofKind::Continue => {
-            target == loop_fact.header && loop_fact.latches.contains(&source)
-        }
-    };
-    (!valid_loop_edge).then(|| {
-        format!(
-            "control transfer at {} edge 0x{:x} -> 0x{:x} disagrees with loop certificate {}",
-            transfer.id, source, target, loop_fact.proof_node
-        )
-    })?;
-    if let ControlTransferRenderProof::Goto {
-        lowered_target,
-        path,
-        label,
-        ..
-    } = proof
-    {
-        if transfer.label.as_deref() != Some(label) {
-            return Some(format!(
-                "control transfer at {} label {:?} disagrees with proof label {label}",
-                transfer.id, transfer.label
-            ));
-        }
-        if rendered_labels.get(label).copied() != Some(1) {
-            return Some(format!(
-                "control transfer at {} targets label {label} rendered {} time(s)",
-                transfer.id,
-                rendered_labels.get(label).copied().unwrap_or(0)
-            ));
-        }
-        let Some(prepared) = prepared else {
-            return Some(format!(
-                "control transfer at {} lacks prepared SSA for goto path proof",
-                transfer.id
-            ));
-        };
-        if !transparent_transfer_path_is_exact(prepared.function(), target, *lowered_target, path) {
-            return Some(format!(
-                "control transfer at {} has invalid transparent path {:?}",
-                transfer.id, path
-            ));
-        }
-    }
-    None
-}
-
-fn transparent_transfer_path_is_exact(
-    function: &r2ssa::SSAFunction,
-    target: u64,
-    lowered_target: u64,
-    path: &[u64],
-) -> bool {
-    if path.first().copied() != Some(target) || path.last().copied() != Some(lowered_target) {
-        return false;
-    }
-    path.windows(2).all(|edge| {
-        let [from, to] = edge else {
-            return false;
-        };
-        function.get_block(*from).is_some_and(|block| {
-            block.phis.is_empty()
-                && block
-                    .ops
-                    .iter()
-                    .all(|op| transparent_forwarder_op_is_exact(function, *from, *to, op))
-                && function.successors(*from).as_slice() == [*to]
-        })
-    })
-}
-
-fn transparent_forwarder_op_is_exact(
-    function: &r2ssa::SSAFunction,
-    predecessor: u64,
-    successor: u64,
-    op: &r2ssa::SSAOp,
-) -> bool {
-    match op {
-        r2ssa::SSAOp::Branch { .. } | r2ssa::SSAOp::Nop => true,
-        r2ssa::SSAOp::Copy { dst, src } => {
-            function.get_block(successor).is_some_and(|block| {
-                block.phis.iter().any(|phi| {
-                    phi.dst == *dst
-                        && phi
-                            .sources
-                            .iter()
-                            .any(|(source, value)| *source == predecessor && value == src)
-                })
-            }) || !function.has_noncarrier_use(dst)
-        }
-        _ => false,
-    }
-}
-
-fn certified_switch_fallthrough_residual_reason(stmt: &CStmt, id: RenderNodeId) -> Option<String> {
-    match stmt {
-        CStmt::Block(stmts) => {
-            for (index, stmt) in stmts.iter().enumerate() {
-                if let Some(reason) =
-                    certified_switch_fallthrough_residual_reason(stmt, id.child(index))
-                {
-                    return Some(reason);
-                }
-            }
-            None
-        }
-        CStmt::If {
-            then_body,
-            else_body,
-            ..
-        } => certified_switch_fallthrough_residual_reason(then_body, id.child(0)).or_else(|| {
-            else_body
-                .as_deref()
-                .and_then(|stmt| certified_switch_fallthrough_residual_reason(stmt, id.child(1)))
-        }),
-        CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
-            certified_switch_fallthrough_residual_reason(body, id.child(0))
-        }
-        CStmt::For { init, body, .. } => init
-            .as_deref()
-            .and_then(|stmt| certified_switch_fallthrough_residual_reason(stmt, id.child(0)))
-            .or_else(|| certified_switch_fallthrough_residual_reason(body, id.child(1))),
-        CStmt::Switch { cases, default, .. } => {
-            for (case_index, case) in cases.iter().enumerate() {
-                let case_id = id.child(case_index);
-                for (stmt_index, stmt) in case.body.iter().enumerate() {
-                    if let Some(reason) = certified_switch_fallthrough_residual_reason(
-                        stmt,
-                        case_id.child(stmt_index),
-                    ) {
-                        return Some(reason);
-                    }
-                }
-                if !certified_stmt_list_is_terminal(&case.body) {
-                    return Some(format!(
-                        "unproved switch case fallthrough at {case_id}; exact case-exit/fallthrough facts required"
-                    ));
-                }
-            }
-            if let Some(default_body) = default {
-                let default_id = id.child(cases.len());
-                for (stmt_index, stmt) in default_body.iter().enumerate() {
-                    if let Some(reason) = certified_switch_fallthrough_residual_reason(
-                        stmt,
-                        default_id.child(stmt_index),
-                    ) {
-                        return Some(reason);
-                    }
-                }
-                if !certified_stmt_list_is_terminal(default_body) {
-                    return Some(format!(
-                        "unproved switch default fallthrough at {default_id}; exact case-exit/fallthrough facts required"
-                    ));
-                }
-            }
-            None
-        }
-        CStmt::Expr(_)
-        | CStmt::Decl { .. }
-        | CStmt::Return(_)
-        | CStmt::Break
-        | CStmt::Continue
-        | CStmt::Goto(_)
-        | CStmt::Empty
-        | CStmt::Label(_)
-        | CStmt::Comment(_) => None,
-    }
-}
-
-fn certified_stmt_list_is_terminal(stmts: &[CStmt]) -> bool {
-    stmts.last().is_some_and(certified_stmt_is_terminal)
-}
-
-fn certified_stmt_is_terminal(stmt: &CStmt) -> bool {
-    match stmt {
-        CStmt::Return(_) => true,
-        CStmt::Block(stmts) => certified_stmt_list_is_terminal(stmts),
-        CStmt::If {
-            then_body,
-            else_body,
-            ..
-        } => {
-            certified_stmt_is_terminal(then_body)
-                && else_body.as_deref().is_some_and(certified_stmt_is_terminal)
-        }
-        _ => false,
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct ControlRenderCounts {
-    branches: usize,
-    loops: usize,
-    switches: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct RenderNodeId(Vec<usize>);
-
-impl RenderNodeId {
-    fn root_child(index: usize) -> Self {
-        Self(vec![index])
-    }
-
-    fn child(&self, index: usize) -> Self {
-        let mut path = self.0.clone();
-        path.push(index);
-        Self(path)
-    }
-}
-
-impl std::fmt::Display for RenderNodeId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("stmt:")?;
-        for (idx, part) in self.0.iter().enumerate() {
-            if idx > 0 {
-                f.write_str(".")?;
-            }
-            write!(f, "{part}")?;
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ControlRenderNodeKind {
-    Branch,
-    Loop,
-    Switch,
-}
-
-impl ControlRenderNodeKind {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Branch => "branch",
-            Self::Loop => "loop",
-            Self::Switch => "switch",
-        }
-    }
-
-    fn matches_proof_kind(self, proof_kind: ControlRenderProofKind) -> bool {
-        matches!(
-            (self, proof_kind),
-            (Self::Branch, ControlRenderProofKind::Branch)
-                | (Self::Loop, ControlRenderProofKind::Loop)
-                | (Self::Switch, ControlRenderProofKind::Switch)
-        )
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ControlRenderNode {
-    id: RenderNodeId,
-    kind: ControlRenderNodeKind,
-    proof_anchor: Option<u64>,
-    proof_branch_condition: Option<r2ssa::PredicateId>,
-    proof_branch_condition_value: Option<r2ssa::ValueId>,
-    proof_loop_condition: Option<r2ssa::PredicateId>,
-    proof_loop_condition_value: Option<r2ssa::ValueId>,
-    proof_loop_body_blocks: Vec<u64>,
-    proof_loop_latches: Vec<u64>,
-    proof_loop_exits: Vec<u64>,
-    proof_switch_selector: Option<r2ssa::ValueId>,
-    proof_switch_cases: Vec<(u64, u64)>,
-    proof_switch_default: Option<u64>,
-    loop_has_condition: bool,
-    switch_cases: usize,
-    switch_case_values: Vec<u64>,
-    switch_has_placeholder_selector: bool,
-    switch_has_nonliteral_case: bool,
-    switch_has_default: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct BranchCertificateSummary {
-    anchor: u64,
-    proof_node: String,
-    condition: r2ssa::PredicateId,
-    condition_value: r2ssa::ValueId,
-    true_target: u64,
-    false_target: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LoopCertificateSummary {
-    anchor: u64,
-    proof_node: String,
-    condition: Option<r2ssa::PredicateId>,
-    condition_value: Option<r2ssa::ValueId>,
-    body: Vec<u64>,
-    latches: Vec<u64>,
-    exits: Vec<u64>,
-    has_condition: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SwitchCertificateSummary {
-    anchor: u64,
-    proof_node: String,
-    selector: Option<r2ssa::ValueId>,
-    case_targets: Vec<(u64, u64)>,
-    default_target: Option<u64>,
-    cases: usize,
-    case_values: Vec<u64>,
-    has_default: bool,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct ControlCertificateInventory {
-    branches: Vec<BranchCertificateSummary>,
-    loops: Vec<LoopCertificateSummary>,
-    switches: Vec<SwitchCertificateSummary>,
-}
-
-impl ControlCertificateInventory {
-    fn counts(&self) -> ControlRenderCounts {
-        ControlRenderCounts {
-            branches: self.branches.len(),
-            loops: self.loops.len(),
-            switches: self.switches.len(),
-        }
-    }
-}
-
-fn control_certificate_inventory(
-    control_facts: Option<&r2types::FunctionControlFacts>,
-) -> ControlCertificateInventory {
-    ControlCertificateInventory {
-        branches: control_facts
-            .into_iter()
-            .flat_map(|facts| facts.branch_predicates.values())
-            .map(|fact| BranchCertificateSummary {
-                anchor: fact.block_addr,
-                proof_node: format!("FunctionFacts.branch_predicate:{:?}", fact.id),
-                condition: fact.id,
-                condition_value: fact.condition,
-                true_target: fact.true_target,
-                false_target: fact.false_target,
-            })
-            .collect(),
-        loops: control_facts
-            .into_iter()
-            .flat_map(|facts| facts.loops.values())
-            .map(|fact| LoopCertificateSummary {
-                anchor: fact.header,
-                proof_node: fact.proof_node.clone(),
-                condition: fact.condition,
-                condition_value: fact.condition_value,
-                body: sorted_u64s(&fact.body),
-                latches: sorted_u64s(&fact.latches),
-                exits: sorted_u64s(&fact.exits),
-                has_condition: fact.condition.is_some(),
-            })
-            .collect(),
-        switches: control_facts
-            .into_iter()
-            .flat_map(|facts| facts.switches.values())
-            .map(|fact| SwitchCertificateSummary {
-                anchor: fact.block_addr,
-                proof_node: fact.proof_node.clone(),
-                selector: fact.selector,
-                case_targets: sorted_switch_cases(&fact.cases),
-                default_target: fact.default,
-                cases: fact.cases.len(),
-                case_values: sorted_switch_case_values(&fact.cases),
-                has_default: fact.default.is_some(),
-            })
-            .collect(),
-    }
-}
-
-fn sorted_u64s(values: &[u64]) -> Vec<u64> {
-    let mut values = values.to_vec();
-    values.sort_unstable();
-    values
-}
-
-fn sorted_switch_cases(cases: &[(u64, u64)]) -> Vec<(u64, u64)> {
-    let mut cases = cases.to_vec();
-    cases.sort_unstable();
-    cases
-}
-
-fn sorted_switch_case_values(cases: &[(u64, u64)]) -> Vec<u64> {
-    let mut values = cases.iter().map(|(value, _)| *value).collect::<Vec<_>>();
-    values.sort_unstable();
-    values
-}
-
-fn structured_control_residual_reason_for_counts(
-    certified: Option<ControlRenderCounts>,
-    cfg_summary: &r2ssa::CFGRiskSummary,
-    rendered: ControlRenderCounts,
-) -> Option<String> {
-    let cfg_has_loop = cfg_summary.loop_count > 0 || cfg_summary.back_edge_count > 0;
-    let cfg_has_switch = cfg_summary.switch_block_count > 0;
-    let rendered_has_control = rendered.branches > 0 || rendered.loops > 0 || rendered.switches > 0;
-
-    if !cfg_has_loop && !cfg_has_switch && !rendered_has_control {
-        return None;
-    }
-
-    let Some(certified) = certified else {
-        return Some("missing prepared SSA certificates for structured control".to_string());
-    };
-
-    let mut reasons = Vec::new();
-    if rendered.loops > 0 && !cfg_has_loop {
-        reasons.push("rendered loop without loop CFG evidence".to_string());
-    }
-    if rendered.switches > 0 && !cfg_has_switch {
-        reasons.push("rendered switch without switch CFG evidence".to_string());
-    }
-    if cfg_has_loop && certified.loops == 0 {
-        reasons.push("loop CFG without LoopCertificate".to_string());
-    }
-    if cfg_has_switch && certified.switches == 0 {
-        reasons.push("switch CFG without SwitchCertificate".to_string());
-    }
-    if rendered.loops > certified.loops {
-        reasons.push(format!(
-            "rendered {} loop construct(s) with only {} LoopCertificate(s)",
-            rendered.loops, certified.loops
-        ));
-    }
-    if rendered.branches > certified.branches {
-        reasons.push(format!(
-            "rendered {} branch construct(s) with only {} FunctionFacts branch predicate(s)",
-            rendered.branches, certified.branches
-        ));
-    }
-    if rendered.loops > 0 && rendered.loops < certified.loops {
-        reasons.push(format!(
-            "rendered only {} of {} LoopCertificate-backed loop construct(s)",
-            rendered.loops, certified.loops
-        ));
-    }
-    if rendered.switches > certified.switches {
-        reasons.push(format!(
-            "rendered {} switch construct(s) with only {} SwitchCertificate(s)",
-            rendered.switches, certified.switches
-        ));
-    }
-    if rendered.switches > 0 && rendered.switches < certified.switches {
-        reasons.push(format!(
-            "rendered only {} of {} SwitchCertificate-backed switch construct(s)",
-            rendered.switches, certified.switches
-        ));
-    }
-    if cfg_has_loop && rendered.loops == 0 {
-        reasons.push("loop CFG rendered without loop structure".to_string());
-    }
-    if cfg_has_switch && rendered.switches == 0 {
-        reasons.push("switch CFG rendered without switch structure".to_string());
-    }
-
-    if reasons.is_empty() {
-        None
-    } else {
-        Some(format!(
-            "uncertified structured control: {}",
-            reasons.join(", ")
-        ))
-    }
-}
-
-fn structured_control_residual_reason_for_nodes(
-    inventory: Option<&ControlCertificateInventory>,
-    cfg_summary: &r2ssa::CFGRiskSummary,
-    rendered: &[ControlRenderNode],
-    render_proof_failures: &[String],
-) -> Option<String> {
-    let rendered_counts = control_render_counts_from_nodes(rendered);
-    let certified_counts = inventory.map(ControlCertificateInventory::counts);
-    let mut reasons = structured_control_residual_reason_for_counts(
-        certified_counts,
-        cfg_summary,
-        rendered_counts,
-    )
-    .map(|reason| vec![reason])
-    .unwrap_or_default();
-    reasons.extend(render_proof_failures.iter().cloned());
-
-    if let Some(inventory) = inventory {
-        reasons.extend(control_node_certificate_shape_failures(inventory, rendered));
-        if !reasons.is_empty() {
-            reasons.extend(control_certificate_identity_notes(
-                inventory,
-                cfg_summary,
-                rendered_counts,
-            ));
-        }
-    }
-
-    if reasons.is_empty() {
-        None
-    } else {
-        Some(reasons.join("; "))
-    }
-}
-
-fn control_render_counts_from_nodes(nodes: &[ControlRenderNode]) -> ControlRenderCounts {
-    let mut counts = ControlRenderCounts::default();
-    for node in nodes {
-        match node.kind {
-            ControlRenderNodeKind::Branch => counts.branches += 1,
-            ControlRenderNodeKind::Loop => counts.loops += 1,
-            ControlRenderNodeKind::Switch => counts.switches += 1,
-        }
-    }
-    counts
-}
-
-fn control_certificate_identity_notes(
-    inventory: &ControlCertificateInventory,
-    cfg_summary: &r2ssa::CFGRiskSummary,
-    rendered: ControlRenderCounts,
-) -> Vec<String> {
-    let mut notes = Vec::new();
-    let cfg_has_loop = cfg_summary.loop_count > 0 || cfg_summary.back_edge_count > 0;
-    let cfg_has_switch = cfg_summary.switch_block_count > 0;
-
-    if cfg_has_loop
-        && (rendered.loops == 0 || rendered.loops > inventory.loops.len())
-        && !inventory.loops.is_empty()
-    {
-        notes.push(format!(
-            "available LoopCertificate proof node(s): {}",
-            inventory
-                .loops
-                .iter()
-                .map(|cert| format!("{} at 0x{:x}", cert.proof_node, cert.anchor))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-    if cfg_has_switch
-        && (rendered.switches == 0 || rendered.switches > inventory.switches.len())
-        && !inventory.switches.is_empty()
-    {
-        notes.push(format!(
-            "available SwitchCertificate proof node(s): {}",
-            inventory
-                .switches
-                .iter()
-                .map(|cert| format!("{} at 0x{:x}", cert.proof_node, cert.anchor))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-
-    notes
-}
-
-fn control_node_certificate_shape_failures(
-    inventory: &ControlCertificateInventory,
-    rendered: &[ControlRenderNode],
-) -> Vec<String> {
-    let mut reasons = Vec::new();
-    let loops_by_anchor = inventory
-        .loops
-        .iter()
-        .map(|cert| (cert.anchor, cert))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let switches_by_anchor = inventory
-        .switches
-        .iter()
-        .map(|cert| (cert.anchor, cert))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let branches_by_anchor = inventory
-        .branches
-        .iter()
-        .map(|cert| (cert.anchor, cert))
-        .collect::<std::collections::BTreeMap<_, _>>();
-
-    for node in rendered {
-        match node.kind {
-            ControlRenderNodeKind::Branch => {
-                let Some(anchor) = node.proof_anchor else {
-                    reasons.push(format!(
-                        "rendered branch node {} lacks FunctionFacts branch predicate proof identity",
-                        node.id
-                    ));
-                    continue;
-                };
-                match branches_by_anchor.get(&anchor).copied() {
-                    Some(cert) => {
-                        if node.proof_branch_condition != Some(cert.condition) {
-                            reasons.push(format!(
-                                "rendered branch node {} predicate proof {:?} disagrees with {} at 0x{:x} predicate {:?}",
-                                node.id,
-                                node.proof_branch_condition,
-                                cert.proof_node,
-                                cert.anchor,
-                                cert.condition
-                            ));
-                        }
-                        if node.proof_branch_condition_value != Some(cert.condition_value) {
-                            reasons.push(format!(
-                                "rendered branch node {} condition value proof {:?} disagrees with {} at 0x{:x} condition value {:?}",
-                                node.id,
-                                node.proof_branch_condition_value,
-                                cert.proof_node,
-                                cert.anchor,
-                                cert.condition_value
-                            ));
-                        }
-                    }
-                    None => reasons.push(format!(
-                        "rendered branch node {} proof anchor 0x{:x} has no matching FunctionFacts branch predicate",
-                        node.id, anchor
-                    )),
-                }
-            }
-            ControlRenderNodeKind::Loop => {
-                let Some(anchor) = node.proof_anchor else {
-                    reasons.push(format!(
-                        "rendered loop node {} lacks LoopCertificate proof identity",
-                        node.id
-                    ));
-                    continue;
-                };
-                if !loops_by_anchor.contains_key(&anchor) {
-                    reasons.push(format!(
-                        "rendered loop node {} proof anchor 0x{:x} has no matching LoopCertificate",
-                        node.id, anchor
-                    ));
-                    continue;
-                }
-                if let Some(cert) = loops_by_anchor.get(&anchor).copied()
-                    && node.loop_has_condition != cert.has_condition
-                {
-                    reasons.push(format!(
-                        "rendered loop node {} condition presence ({}) disagrees with LoopCertificate {} at 0x{:x} ({})",
-                        node.id,
-                        node.loop_has_condition,
-                        cert.proof_node,
-                        cert.anchor,
-                        cert.has_condition
-                    ));
-                }
-                // Condition/condition_value use different ID spaces (r2il vs SSA).
-                // The certified_loop_render_proof gate already validated the loop
-                // against the canonical certificate before recording the proof.
-                if let Some(cert) = loops_by_anchor.get(&anchor).copied() {
-                    if node.proof_loop_body_blocks != cert.body {
-                        reasons.push(format!(
-                            "rendered loop node {} body blocks {:?} disagree with LoopCertificate {} at 0x{:x} body {:?}",
-                            node.id, node.proof_loop_body_blocks, cert.proof_node, cert.anchor, cert.body
-                        ));
-                    }
-                    if node.proof_loop_latches != cert.latches {
-                        reasons.push(format!(
-                            "rendered loop node {} latch blocks {:?} disagree with LoopCertificate {} at 0x{:x} latches {:?}",
-                            node.id, node.proof_loop_latches, cert.proof_node, cert.anchor, cert.latches
-                        ));
-                    }
-                    if node.proof_loop_exits != cert.exits {
-                        reasons.push(format!(
-                            "rendered loop node {} exit targets {:?} disagree with LoopCertificate {} at 0x{:x} exits {:?}",
-                            node.id, node.proof_loop_exits, cert.proof_node, cert.anchor, cert.exits
-                        ));
-                    }
-                }
-            }
-            ControlRenderNodeKind::Switch => {
-                let Some(anchor) = node.proof_anchor else {
-                    reasons.push(format!(
-                        "rendered switch node {} lacks SwitchCertificate proof identity",
-                        node.id
-                    ));
-                    continue;
-                };
-                match switches_by_anchor.get(&anchor).copied() {
-                    Some(cert) => {
-                        if node.switch_cases != cert.cases {
-                            reasons.push(format!(
-                                "rendered switch node {} has {} case(s), but SwitchCertificate {} at 0x{:x} has {}",
-                                node.id, node.switch_cases, cert.proof_node, cert.anchor, cert.cases
-                            ));
-                        }
-                        if cert.selector.is_some() && node.switch_has_placeholder_selector {
-                            reasons.push(format!(
-                                "rendered switch node {} uses placeholder selector, but SwitchCertificate {} at 0x{:x} has canonical selector evidence",
-                                node.id, cert.proof_node, cert.anchor
-                            ));
-                        }
-                        if node.proof_switch_selector != cert.selector {
-                            reasons.push(format!(
-                                "rendered switch node {} selector proof {:?} disagrees with SwitchCertificate {} at 0x{:x} selector {:?}",
-                                node.id, node.proof_switch_selector, cert.proof_node, cert.anchor, cert.selector
-                            ));
-                        }
-                        if node.proof_switch_cases != cert.case_targets {
-                            reasons.push(format!(
-                                "rendered switch node {} case targets {:?} disagree with SwitchCertificate {} at 0x{:x} case targets {:?}",
-                                node.id, node.proof_switch_cases, cert.proof_node, cert.anchor, cert.case_targets
-                            ));
-                        }
-                        if node.proof_switch_default != cert.default_target {
-                            reasons.push(format!(
-                                "rendered switch node {} default target {:?} disagrees with SwitchCertificate {} at 0x{:x} default {:?}",
-                                node.id, node.proof_switch_default, cert.proof_node, cert.anchor, cert.default_target
-                            ));
-                        }
-                        if node.switch_has_nonliteral_case {
-                            reasons.push(format!(
-                                "rendered switch node {} has non-literal case value(s), but SwitchCertificate {} at 0x{:x} requires exact case values",
-                                node.id, cert.proof_node, cert.anchor
-                            ));
-                        } else if node.switch_case_values != cert.case_values {
-                            reasons.push(format!(
-                                "rendered switch node {} case values {:?} disagree with SwitchCertificate {} at 0x{:x} values {:?}",
-                                node.id, node.switch_case_values, cert.proof_node, cert.anchor, cert.case_values
-                            ));
-                        }
-                        if node.switch_has_default != cert.has_default {
-                            reasons.push(format!(
-                                "rendered switch node {} default presence ({}) disagrees with SwitchCertificate {} at 0x{:x} ({})",
-                                node.id, node.switch_has_default, cert.proof_node, cert.anchor, cert.has_default
-                            ));
-                        }
-                    }
-                    None => reasons.push(format!(
-                        "rendered switch node {} proof anchor 0x{:x} has no matching SwitchCertificate",
-                        node.id, anchor
-                    )),
-                }
-            }
-        }
-    }
-
-    reasons
-}
-
-#[cfg(test)]
-fn function_control_render_counts(func: &CFunction) -> ControlRenderCounts {
-    control_render_counts_from_nodes(&function_control_render_nodes(func))
-}
-
-#[cfg(test)]
-fn function_control_render_nodes(func: &CFunction) -> Vec<ControlRenderNode> {
-    function_control_render_nodes_with_proofs(func, None).0
-}
-
-fn function_control_render_nodes_with_proofs(
-    func: &CFunction,
-    render_proofs: Option<&[ControlRenderProof]>,
-) -> (Vec<ControlRenderNode>, Vec<String>) {
-    let mut nodes = Vec::new();
-    for (index, stmt) in func.body.iter().enumerate() {
-        collect_stmt_control_render_nodes(stmt, RenderNodeId::root_child(index), &mut nodes);
-    }
-    let failures = if let Some(render_proofs) = render_proofs {
-        attach_control_render_proofs(&mut nodes, render_proofs)
-    } else {
-        Vec::new()
-    };
-    (nodes, failures)
-}
-
-fn attach_control_render_proofs(
-    nodes: &mut [ControlRenderNode],
-    render_proofs: &[ControlRenderProof],
-) -> Vec<String> {
-    let mut failures = Vec::new();
-    let mut proof_index = 0;
-
-    for node in nodes {
-        let Some(proof) = render_proofs.get(proof_index).cloned() else {
-            failures.push(format!(
-                "rendered {} node {} lacks render proof identity",
-                node.kind.label(),
-                node.id
-            ));
-            continue;
-        };
-        proof_index += 1;
-        if !node.kind.matches_proof_kind(proof.kind) {
-            failures.push(format!(
-                "rendered {} node {} proof kind mismatch: {:?} at 0x{:x}",
-                node.kind.label(),
-                node.id,
-                proof.kind,
-                proof.anchor
-            ));
-            continue;
-        }
-        node.proof_anchor = Some(proof.anchor);
-        node.proof_branch_condition = proof.branch_condition;
-        node.proof_branch_condition_value = proof.branch_condition_value;
-        node.proof_loop_condition = proof.loop_condition;
-        node.proof_loop_condition_value = proof.loop_condition_value;
-        node.proof_loop_body_blocks = proof.loop_body_blocks;
-        node.proof_loop_latches = proof.loop_latches;
-        node.proof_loop_exits = proof.loop_exits;
-        node.proof_switch_selector = proof.switch_selector;
-        node.proof_switch_cases = proof.switch_cases;
-        node.proof_switch_default = proof.switch_default;
-    }
-
-    for proof in &render_proofs[proof_index..] {
-        failures.push(format!(
-            "render proof identity {:?} at 0x{:x} was not rendered",
-            proof.kind, proof.anchor
-        ));
-    }
-
-    failures
-}
-
-fn collect_stmt_control_render_nodes(
-    stmt: &CStmt,
-    id: RenderNodeId,
-    nodes: &mut Vec<ControlRenderNode>,
-) {
-    match stmt {
-        CStmt::While { cond, body } | CStmt::DoWhile { body, cond } => {
-            nodes.push(ControlRenderNode {
-                id: id.clone(),
-                kind: ControlRenderNodeKind::Loop,
-                proof_anchor: None,
-                proof_branch_condition: None,
-                proof_branch_condition_value: None,
-                proof_loop_condition: None,
-                proof_loop_condition_value: None,
-                proof_loop_body_blocks: Vec::new(),
-                proof_loop_latches: Vec::new(),
-                proof_loop_exits: Vec::new(),
-                proof_switch_selector: None,
-                proof_switch_cases: Vec::new(),
-                proof_switch_default: None,
-                loop_has_condition: rendered_loop_has_condition(Some(cond)),
-                switch_cases: 0,
-                switch_case_values: Vec::new(),
-                switch_has_placeholder_selector: false,
-                switch_has_nonliteral_case: false,
-                switch_has_default: false,
-            });
-            collect_stmt_control_render_nodes(body, id.child(0), nodes);
-        }
-        CStmt::For {
-            init, cond, body, ..
-        } => {
-            nodes.push(ControlRenderNode {
-                id: id.clone(),
-                kind: ControlRenderNodeKind::Loop,
-                proof_anchor: None,
-                proof_branch_condition: None,
-                proof_branch_condition_value: None,
-                proof_loop_condition: None,
-                proof_loop_condition_value: None,
-                proof_loop_body_blocks: Vec::new(),
-                proof_loop_latches: Vec::new(),
-                proof_loop_exits: Vec::new(),
-                proof_switch_selector: None,
-                proof_switch_cases: Vec::new(),
-                proof_switch_default: None,
-                loop_has_condition: rendered_loop_has_condition(cond.as_ref()),
-                switch_cases: 0,
-                switch_case_values: Vec::new(),
-                switch_has_placeholder_selector: false,
-                switch_has_nonliteral_case: false,
-                switch_has_default: false,
-            });
-            if let Some(init) = init.as_deref() {
-                collect_stmt_control_render_nodes(init, id.child(0), nodes);
-            }
-            collect_stmt_control_render_nodes(body, id.child(1), nodes);
-        }
-        CStmt::Block(stmts) => {
-            for (index, stmt) in stmts.iter().enumerate() {
-                collect_stmt_control_render_nodes(stmt, id.child(index), nodes);
-            }
-        }
-        CStmt::If {
-            then_body,
-            else_body,
-            ..
-        } => {
-            nodes.push(ControlRenderNode {
-                id: id.clone(),
-                kind: ControlRenderNodeKind::Branch,
-                proof_anchor: None,
-                proof_branch_condition: None,
-                proof_branch_condition_value: None,
-                proof_loop_condition: None,
-                proof_loop_condition_value: None,
-                proof_loop_body_blocks: Vec::new(),
-                proof_loop_latches: Vec::new(),
-                proof_loop_exits: Vec::new(),
-                proof_switch_selector: None,
-                proof_switch_cases: Vec::new(),
-                proof_switch_default: None,
-                loop_has_condition: false,
-                switch_cases: 0,
-                switch_case_values: Vec::new(),
-                switch_has_placeholder_selector: false,
-                switch_has_nonliteral_case: false,
-                switch_has_default: false,
-            });
-            collect_stmt_control_render_nodes(then_body, id.child(0), nodes);
-            if let Some(else_body) = else_body.as_deref() {
-                collect_stmt_control_render_nodes(else_body, id.child(1), nodes);
-            }
-        }
-        CStmt::Switch {
-            expr,
-            cases,
-            default,
-        } => {
-            let mut switch_case_values = cases
-                .iter()
-                .filter_map(|case| switch_case_value_as_u64(&case.value))
-                .collect::<Vec<_>>();
-            switch_case_values.sort_unstable();
-            nodes.push(ControlRenderNode {
-                id: id.clone(),
-                kind: ControlRenderNodeKind::Switch,
-                proof_anchor: None,
-                proof_branch_condition: None,
-                proof_branch_condition_value: None,
-                proof_loop_condition: None,
-                proof_loop_condition_value: None,
-                proof_loop_body_blocks: Vec::new(),
-                proof_loop_latches: Vec::new(),
-                proof_loop_exits: Vec::new(),
-                proof_switch_selector: None,
-                proof_switch_cases: Vec::new(),
-                proof_switch_default: None,
-                loop_has_condition: false,
-                switch_cases: cases.len(),
-                switch_has_placeholder_selector: is_placeholder_switch_selector(expr),
-                switch_has_nonliteral_case: switch_case_values.len() != cases.len(),
-                switch_case_values,
-                switch_has_default: default.is_some(),
-            });
-            for (case_index, case) in cases.iter().enumerate() {
-                for (stmt_index, stmt) in case.body.iter().enumerate() {
-                    collect_stmt_control_render_nodes(
-                        stmt,
-                        id.child(case_index).child(stmt_index),
-                        nodes,
-                    );
-                }
-            }
-            if let Some(default) = default {
-                let default_index = cases.len();
-                for (stmt_index, stmt) in default.iter().enumerate() {
-                    collect_stmt_control_render_nodes(
-                        stmt,
-                        id.child(default_index).child(stmt_index),
-                        nodes,
-                    );
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-fn is_placeholder_switch_selector(expr: &CExpr) -> bool {
-    match expr {
-        CExpr::Var(name) => matches!(name.as_str(), "test" | "switch_expr"),
-        CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
-            is_placeholder_switch_selector(inner)
-        }
-        _ => false,
-    }
-}
-
-fn rendered_loop_has_condition(cond: Option<&CExpr>) -> bool {
-    cond.is_some_and(|cond| !is_loop_unconditional_literal(cond))
-}
-
-fn is_loop_unconditional_literal(cond: &CExpr) -> bool {
-    match cond {
-        CExpr::IntLit(_) | CExpr::UIntLit(_) => true,
-        CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
-            is_loop_unconditional_literal(inner)
-        }
-        _ => false,
-    }
-}
-
-fn switch_case_value_as_u64(value: &CExpr) -> Option<u64> {
-    match value {
-        CExpr::UIntLit(value) => Some(*value),
-        CExpr::IntLit(value) => u64::try_from(*value).ok(),
-        CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => switch_case_value_as_u64(inner),
-        _ => None,
-    }
-}
-
-fn residual_function_for_unproven_loop(mut func: CFunction, reason: String) -> CFunction {
-    func.locals.clear();
-    func.body = vec![CStmt::comment(format!(
-        "r2dec residual: {}; structured C suppressed until canonical facts prove the rendered effects",
-        sanitize_comment_text(&reason)
-    ))];
-    if !matches!(func.ret_type, CType::Void | CType::Unknown) {
-        func.body.push(CStmt::comment(
-            "summary return unresolved; value intentionally not reconstructed".to_string(),
-        ));
-    }
-    func
-}
-
 fn residual_function_for_render_boundary(func_name: &str, reason: &str) -> CFunction {
     let mut func = CFunction::new(func_name.to_string(), CType::Unknown);
     func.body = vec![CStmt::comment(sanitize_comment_text(reason))];
@@ -2804,13 +1659,6 @@ fn render_permission_residual_reason(
     }
 }
 
-fn render_permission_allows_executable_c(permission: Option<&r2sym::RenderPermission>) -> bool {
-    permission.is_some_and(|permission| {
-        permission.kind == r2sym::RenderPermissionKind::CertifiedC
-            && permission.owner == r2sym::ProofOwner::R2engine
-    })
-}
-
 fn summary_only_semantics_standard_render_residual_reason(
     function_facts: &FunctionFacts,
 ) -> Option<String> {
@@ -2834,381 +1682,6 @@ fn missing_decompile_route_residual_comment(func_name: &str) -> String {
     )
 }
 
-#[derive(Debug, Clone, Default)]
-struct CertifiedOutputCounts {
-    calls: usize,
-    expression_roots: usize,
-    returns_with_value: usize,
-    memory_like_accesses: usize,
-    field_accesses: usize,
-    array_accesses: usize,
-    raw_address_call_args: usize,
-    raw_pointer_arithmetic_derefs: usize,
-    residual_comments: usize,
-    field_members: Vec<String>,
-    return_field_members: Vec<String>,
-    call_nodes: Vec<RenderNodeId>,
-    expression_nodes: Vec<RenderNodeId>,
-    return_nodes: Vec<RenderNodeId>,
-    memory_nodes: Vec<RenderNodeId>,
-    field_nodes: Vec<(RenderNodeId, String)>,
-    array_nodes: Vec<RenderNodeId>,
-    raw_address_call_arg_nodes: Vec<RenderNodeId>,
-    raw_pointer_arithmetic_nodes: Vec<RenderNodeId>,
-    residual_comment_nodes: Vec<RenderNodeId>,
-    residual_comment_texts: Vec<String>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct CertifiedEffectProofCounts {
-    calls: usize,
-    expressions: usize,
-    returns: usize,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct CertifiedSemanticLedger {
-    ids: BTreeMap<r2ssa::SemanticId, usize>,
-    unresolved: usize,
-}
-
-impl CertifiedSemanticLedger {
-    fn from_effect_proofs(function_facts: &FunctionFacts, proofs: &[EffectRenderProof]) -> Self {
-        let mut ledger = Self::default();
-        for proof in proofs {
-            let id = match proof.kind {
-                EffectRenderProofKind::Call => function_facts
-                    .callsites()
-                    .and_then(|facts| {
-                        facts.arguments_for_site(r2types::CallsiteKey {
-                            block_addr: proof.block_addr,
-                            op_index: proof.op_idx,
-                        })
-                    })
-                    .map(|fact| r2ssa::SemanticId::call(fact.call_site_id)),
-                EffectRenderProofKind::Expression => proof.value.and_then(|value| {
-                    function_facts
-                        .render_facts()
-                        .certified_expr_for_value(value)
-                        .map(|cert| cert.id)
-                }),
-                EffectRenderProofKind::MemoryRead | EffectRenderProofKind::MemoryWrite => {
-                    proof.address.and_then(|address| {
-                        function_facts.render_facts().memory_effect_id_for_op(
-                            proof.block_addr,
-                            proof.op_idx,
-                            proof.kind == EffectRenderProofKind::MemoryWrite,
-                            address,
-                            proof.value,
-                        )
-                    })
-                }
-                EffectRenderProofKind::Return => function_facts
-                    .render_facts()
-                    .return_effect_id_for_op(proof.block_addr, proof.op_idx),
-            };
-            if let Some(id) = id {
-                *ledger.ids.entry(id).or_default() += 1;
-            } else {
-                ledger.unresolved += 1;
-            }
-        }
-        ledger
-    }
-}
-
-fn certified_effect_proof_counts(
-    effect_render_proofs: &[EffectRenderProof],
-) -> CertifiedEffectProofCounts {
-    let mut calls = 0usize;
-    let mut expressions = 0usize;
-    let mut returns = 0;
-
-    for proof in effect_render_proofs {
-        match proof.kind {
-            EffectRenderProofKind::Call => {
-                calls += 1;
-            }
-            EffectRenderProofKind::Expression => {
-                expressions += 1;
-            }
-            EffectRenderProofKind::MemoryRead | EffectRenderProofKind::MemoryWrite => {}
-            EffectRenderProofKind::Return => {
-                returns += 1;
-            }
-        }
-    }
-
-    CertifiedEffectProofCounts {
-        calls,
-        expressions,
-        returns,
-    }
-}
-
-fn certified_memory_effects_requiring_ast_access(
-    render_facts: &r2types::FunctionRenderFacts,
-    effect_render_proofs: &[EffectRenderProof],
-) -> usize {
-    let mut accesses = BTreeSet::new();
-    for proof in effect_render_proofs.iter().filter(|proof| {
-        matches!(
-            proof.kind,
-            EffectRenderProofKind::MemoryRead | EffectRenderProofKind::MemoryWrite
-        )
-    }) {
-        let is_write = proof.kind == EffectRenderProofKind::MemoryWrite;
-        let Some(memory) =
-            render_facts.memory_access_for_op(proof.block_addr, proof.op_idx, is_write)
-        else {
-            continue;
-        };
-        if proof.address != Some(memory.address) || proof.value != memory.value {
-            continue;
-        }
-        let has_structured_access = render_facts
-            .array_accesses_by_op
-            .get(&(proof.block_addr, proof.op_idx, is_write))
-            .into_iter()
-            .flatten()
-            .any(|fact| fact.access == memory.access)
-            || render_facts
-                .member_accesses_by_op
-                .get(&(proof.block_addr, proof.op_idx, is_write))
-                .into_iter()
-                .flatten()
-                .any(|fact| fact.access == memory.access);
-        if has_structured_access || render_facts.stack_slot(memory.object).is_none() {
-            accesses.insert((proof.block_addr, proof.op_idx, is_write, memory.access));
-        }
-    }
-    accesses.len()
-}
-
-fn call_render_facts_from_effect_proofs(
-    effect_render_proofs: &[EffectRenderProof],
-) -> r2types::FunctionCallRenderFacts {
-    let by_callsite = effect_render_proofs
-        .iter()
-        .filter(|proof| proof.kind == EffectRenderProofKind::Call)
-        .map(|proof| {
-            let callsite = r2types::CallsiteKey {
-                block_addr: proof.block_addr,
-                op_index: proof.op_idx,
-            };
-            (
-                callsite,
-                r2types::CallsiteRenderFact {
-                    callsite,
-                    target: proof.target,
-                    disposition: proof
-                        .call_disposition
-                        .unwrap_or(r2types::CallsiteRenderDisposition::NestedExpression),
-                    proof_values: proof.values.clone(),
-                    residual_reason: None,
-                },
-            )
-        })
-        .collect();
-    r2types::FunctionCallRenderFacts { by_callsite }
-}
-
-fn certified_callsite_expected_argument_values(
-    function_facts: &FunctionFacts,
-    cert: &r2types::CallsiteArgumentFacts,
-) -> Vec<r2ssa::ValueId> {
-    let mut expected = cert
-        .argument_values
-        .iter()
-        .map(|arg| arg.value)
-        .collect::<Vec<_>>();
-    if let Some(max_arity) = function_facts
-        .callee_resolution()
-        .and_then(|resolution| resolution.identity_for_callsite(cert.callsite))
-        .and_then(r2types::CalleeIdentity::non_variadic_known_arity)
-    {
-        expected.truncate(max_arity);
-    }
-    expected
-}
-
-fn return_value_has_certified_call_result_effect(
-    call_result_facts: Option<&r2types::FunctionCallResultFacts>,
-    effect_render_proofs: &[EffectRenderProof],
-    value: r2ssa::ValueId,
-) -> bool {
-    let Some(call_result) = call_result_facts.and_then(|facts| facts.result_for_value(value))
-    else {
-        return false;
-    };
-    effect_render_proofs.iter().any(|proof| {
-        proof.kind == EffectRenderProofKind::Call
-            && proof.block_addr == call_result.callsite.block_addr
-            && proof.op_idx == call_result.callsite.op_index
-    })
-}
-
-fn certified_stack_local_identity_is_exact(
-    function_facts: &FunctionFacts,
-    name: &str,
-    offset: i64,
-) -> bool {
-    function_facts
-        .authorized_stack_slot_owner_render_by_offset(offset, name)
-        .or_else(|| function_facts.authorized_stack_slot_owner_render_by_offset(-offset, name))
-        .is_some()
-        || function_facts.render().is_some_and(|render| {
-            render.stack_slots().any(|(object, _, slot_offset, _)| {
-                (slot_offset == offset || slot_offset == -offset)
-                    && function_facts
-                        .authorized_recovered_stack_slot_owner_render(object, slot_offset, name)
-                        .is_some()
-            })
-        })
-}
-
-fn certified_recovered_stack_local_is_exact(
-    function_facts: &FunctionFacts,
-    emitted_vars: &HashSet<String>,
-    body_visible_names: &HashSet<String>,
-    name: &str,
-    stack_offset: Option<i64>,
-) -> bool {
-    let Some(offset) = stack_offset else {
-        return false;
-    };
-    (emitted_vars.contains(name) || body_visible_names.contains(name))
-        && certified_stack_local_identity_is_exact(function_facts, name, offset)
-}
-
-fn certified_stack_local_type_matches(
-    type_facts: &FunctionTypeFacts,
-    name: &str,
-    offset: i64,
-    rendered_ty: &CType,
-) -> bool {
-    typed_stack_local_type_for_name_offset(type_facts, name, offset)
-        .is_some_and(|certified_ty| certified_ty == *rendered_ty)
-}
-
-fn certified_loop_carrier_local_is_exact(
-    function_facts: &FunctionFacts,
-    local: &ast::CLocal,
-) -> bool {
-    if local.stack_offset.is_some() {
-        return false;
-    }
-    function_facts.render().is_some_and(|render| {
-        render.loop_carriers().any(|entity| {
-            let r2types::CertifiedEntity::LoopCarrier {
-                id, phi, width, ty, ..
-            } = entity
-            else {
-                return false;
-            };
-            let rendered_ty = ty
-                .as_ref()
-                .map(type_like_to_ctype)
-                .or_else(|| (*width > 0).then(|| CType::Int(width.saturating_mul(8))));
-            *id == r2ssa::SemanticId::loop_carrier(*phi)
-                && local.name == certified_loop_carrier_name(*phi)
-                && rendered_ty.is_some_and(|ty| ty == local.ty)
-        })
-    })
-}
-
-fn certified_memory_result_local_is_exact(
-    function_facts: &FunctionFacts,
-    local: &ast::CLocal,
-) -> bool {
-    if local.stack_offset.is_some() {
-        return false;
-    }
-    function_facts.render().is_some_and(|render| {
-        render.certified_effects.values().any(|effect| {
-            let r2types::CertifiedEffect::Memory { id, fact } = effect else {
-                return false;
-            };
-            *id == r2ssa::SemanticId::memory_access(fact.access)
-                && !fact.is_write
-                && fact.value.is_some()
-                && fact.width > 0
-                && fact.materialize_result
-                && local.name == certified_memory_result_name(fact.access)
-                && local.ty
-                    == render
-                        .memory_value_type(fact.access)
-                        .map(type_like_to_ctype)
-                        .unwrap_or_else(|| CType::UInt(fact.width.saturating_mul(8)))
-        })
-    })
-}
-
-fn typed_stack_local_type_for_name_offset(
-    type_facts: &FunctionTypeFacts,
-    name: &str,
-    offset: i64,
-) -> Option<CType> {
-    let normalized = name.trim();
-    if normalized.is_empty() {
-        return None;
-    }
-    let renderable_type = |ty: &CTypeLike| {
-        let ty = type_like_to_ctype(ty);
-        (!matches!(ty, CType::Unknown | CType::Void)).then_some(ty)
-    };
-
-    type_facts
-        .visible_bindings
-        .iter()
-        .find(|binding| {
-            matches!(
-                binding.kind,
-                VisibleBindingKind::Param
-                    | VisibleBindingKind::Local
-                    | VisibleBindingKind::StackObject
-            ) && binding.name.eq_ignore_ascii_case(normalized)
-                && binding
-                    .stack_slot
-                    .as_ref()
-                    .is_some_and(|slot| stack_slot_key_matches_offset(slot, offset))
-        })
-        .and_then(|binding| binding.ty.as_ref())
-        .and_then(renderable_type)
-        .or_else(|| {
-            type_facts
-                .stack_slots
-                .iter()
-                .find(|(slot_key, slot)| {
-                    matches!(
-                        slot.role,
-                        ExternalStackSlotRole::Local | ExternalStackSlotRole::StackArg
-                    ) && slot.name.eq_ignore_ascii_case(normalized)
-                        && stack_slot_key_matches_offset(slot_key, offset)
-                })
-                .and_then(|(_, slot)| slot.ty.as_ref())
-                .and_then(renderable_type)
-        })
-}
-
-fn stack_slot_key_matches_offset(slot: &StackSlotKey, offset: i64) -> bool {
-    slot.offset == offset
-}
-
-#[cfg(test)]
-fn certified_standard_output_residual_reason(
-    prepared: &r2ssa::SsaArtifact,
-    function_facts: &FunctionFacts,
-    func: &CFunction,
-) -> Option<String> {
-    certified_standard_output_residual_reason_with_effect_proofs(
-        prepared,
-        function_facts,
-        func,
-        None,
-    )
-}
-
 #[derive(Debug, Clone, PartialEq)]
 enum AssignmentGuardLiteral {
     Equality {
@@ -3222,20 +1695,46 @@ enum AssignmentGuardLiteral {
     },
 }
 
-#[derive(Debug, Clone)]
-struct DefiniteAssignmentState {
+#[derive(Clone)]
+struct DefiniteAssignmentState<'a> {
     unconditional: BTreeSet<String>,
     guarded: BTreeMap<String, Vec<Vec<AssignmentGuardLiteral>>>,
     assumptions: Vec<AssignmentGuardLiteral>,
+    control: Option<DecompileWorkControl<'a>>,
+    stop_reason: Cell<Option<DecompileExecutionStop>>,
 }
 
-impl DefiniteAssignmentState {
+impl<'a> DefiniteAssignmentState<'a> {
     fn new(unconditional: BTreeSet<String>) -> Self {
         Self {
             unconditional,
             guarded: BTreeMap::new(),
             assumptions: Vec::new(),
+            control: None,
+            stop_reason: Cell::new(None),
         }
+    }
+
+    fn new_with_control(
+        unconditional: BTreeSet<String>,
+        control: DecompileWorkControl<'a>,
+    ) -> Self {
+        let mut state = Self::new(unconditional);
+        state.control = Some(control);
+        state
+    }
+
+    fn poll(&self) -> bool {
+        if self.stop_reason.get().is_some() {
+            return false;
+        }
+        if let Some(control) = self.control
+            && let Err(reason) = control.poll()
+        {
+            self.stop_reason.set(Some(reason));
+            return false;
+        }
+        true
     }
 
     fn local_is_assigned(&self, name: &str) -> bool {
@@ -3292,7 +1791,14 @@ impl DefiniteAssignmentState {
         let Some(mut clauses) = self.guarded.remove(name) else {
             return;
         };
-        simplify_assignment_guard_clauses(&mut clauses);
+        simplify_assignment_guard_clauses_with_control(
+            &mut clauses,
+            self.control,
+            &self.stop_reason,
+        );
+        if self.stop_reason.get().is_some() {
+            return;
+        }
         if clauses.iter().any(Vec::is_empty) {
             self.unconditional.insert(name.to_string());
         } else if !clauses.is_empty() {
@@ -3452,12 +1958,40 @@ fn assignment_guard_consensus(
     )
 }
 
+#[allow(dead_code)]
 fn simplify_assignment_guard_clauses(clauses: &mut Vec<Vec<AssignmentGuardLiteral>>) {
+    let stop_reason = Cell::new(None);
+    simplify_assignment_guard_clauses_with_control(clauses, None, &stop_reason);
+}
+
+fn simplify_assignment_guard_clauses_with_control(
+    clauses: &mut Vec<Vec<AssignmentGuardLiteral>>,
+    control: Option<DecompileWorkControl<'_>>,
+    stop_reason: &Cell<Option<DecompileExecutionStop>>,
+) {
+    let poll = || {
+        if stop_reason.get().is_some() {
+            return false;
+        }
+        if let Some(control) = control
+            && let Err(reason) = control.poll()
+        {
+            stop_reason.set(Some(reason));
+            return false;
+        }
+        true
+    };
     let mut changed = true;
     while changed {
+        if !poll() {
+            return;
+        }
         changed = false;
         let mut unique = Vec::<Vec<AssignmentGuardLiteral>>::new();
         for clause in clauses.drain(..) {
+            if !poll() {
+                return;
+            }
             if !unique.iter().any(|existing| {
                 assignment_guard_clause_implies(&clause, existing)
                     && assignment_guard_clause_implies(existing, &clause)
@@ -3477,7 +2011,13 @@ fn simplify_assignment_guard_clauses(clauses: &mut Vec<Vec<AssignmentGuardLitera
             .map(|(_, clause)| clause.clone())
             .collect();
         'consensus: for left in 0..unique.len() {
+            if !poll() {
+                return;
+            }
             for right in left + 1..unique.len() {
+                if !poll() {
+                    return;
+                }
                 let Some(consensus) = assignment_guard_consensus(&unique[left], &unique[right])
                 else {
                     continue;
@@ -3496,11 +2036,13 @@ fn simplify_assignment_guard_clauses(clauses: &mut Vec<Vec<AssignmentGuardLitera
     }
 }
 
-fn merge_definite_assignment_states(
+fn merge_definite_assignment_states<'a>(
     base_assumptions: &[AssignmentGuardLiteral],
-    states: impl IntoIterator<Item = DefiniteAssignmentState>,
-) -> DefiniteAssignmentState {
+    states: impl IntoIterator<Item = DefiniteAssignmentState<'a>>,
+) -> DefiniteAssignmentState<'a> {
     let states = states.into_iter().collect::<Vec<_>>();
+    let control = states.first().and_then(|state| state.control);
+    let stop_reason = states.iter().find_map(|state| state.stop_reason.get());
     let unconditional = states
         .first()
         .map(|first| {
@@ -3519,6 +2061,8 @@ fn merge_definite_assignment_states(
         unconditional,
         guarded: BTreeMap::new(),
         assumptions: base_assumptions.to_vec(),
+        control,
+        stop_reason: Cell::new(stop_reason),
     };
     for state in states {
         for (name, clauses) in state.guarded {
@@ -3534,13 +2078,26 @@ fn merge_definite_assignment_states(
     merged
 }
 
+#[cfg(test)]
 fn definite_assignment_residual_reason(func: &CFunction) -> Option<String> {
+    let control = r2ssa::SsaExecutionControl::default();
+    let work = DecompileWorkControl::new(&control, DecompileWorkPhase::Rendering);
+    definite_assignment_residual_reason_with_control(func, work)
+        .expect("default decompiler control never stops")
+}
+
+fn definite_assignment_residual_reason_with_control(
+    func: &CFunction,
+    control: DecompileWorkControl<'_>,
+) -> Result<Option<String>, DecompileExecutionStop> {
+    control.poll()?;
     let mut local_names = func
         .locals
         .iter()
         .map(|local| local.name.clone())
         .collect::<BTreeSet<_>>();
     for stmt in &func.body {
+        control.poll()?;
         collect_declared_local_names(stmt, &mut local_names);
     }
     let assigned = func
@@ -3548,15 +2105,20 @@ fn definite_assignment_residual_reason(func: &CFunction) -> Option<String> {
         .iter()
         .map(|param| param.name.clone())
         .collect::<BTreeSet<_>>();
-    let mut state = DefiniteAssignmentState::new(assigned);
+    let mut state = DefiniteAssignmentState::new_with_control(assigned, control);
     for (index, stmt) in func.body.iter().enumerate() {
+        control.poll()?;
         if let Err(reason) = analyze_definite_assignment_stmt(stmt, &local_names, &mut state) {
-            return Some(format!(
+            return Ok(Some(format!(
                 "definite-assignment proof failed at statement {index}: {reason}"
-            ));
+            )));
+        }
+        if let Some(reason) = state.stop_reason.get() {
+            return Err(reason);
         }
     }
-    None
+    control.poll()?;
+    Ok(None)
 }
 
 fn collect_declared_local_names(stmt: &CStmt, names: &mut BTreeSet<String>) {
@@ -3603,8 +2165,11 @@ fn collect_declared_local_names(stmt: &CStmt, names: &mut BTreeSet<String>) {
 fn analyze_definite_assignment_stmt(
     stmt: &CStmt,
     local_names: &BTreeSet<String>,
-    state: &mut DefiniteAssignmentState,
+    state: &mut DefiniteAssignmentState<'_>,
 ) -> Result<(), String> {
+    if !state.poll() {
+        return Ok(());
+    }
     match stmt {
         CStmt::Empty
         | CStmt::Break
@@ -3728,8 +2293,11 @@ fn analyze_definite_assignment_stmt(
 fn analyze_definite_assignment_expr(
     expr: &CExpr,
     local_names: &BTreeSet<String>,
-    state: &mut DefiniteAssignmentState,
+    state: &mut DefiniteAssignmentState<'_>,
 ) -> Result<(), String> {
+    if !state.poll() {
+        return Ok(());
+    }
     match expr {
         CExpr::Var(name) => {
             if local_names.contains(name) && !state.local_is_assigned(name) {
@@ -3850,1171 +2418,6 @@ fn analyze_definite_assignment_expr(
         | CExpr::CharLit(_) => {}
     }
     Ok(())
-}
-
-fn certified_standard_output_residual_reason_with_effect_proofs(
-    prepared: &r2ssa::SsaArtifact,
-    function_facts: &FunctionFacts,
-    func: &CFunction,
-    effect_render_proofs: Option<&[EffectRenderProof]>,
-) -> Option<String> {
-    let empty_callsites = r2types::FunctionCallsiteFacts::default();
-    let callsite_facts = function_facts.callsites().unwrap_or(&empty_callsites);
-    let empty_call_results = r2types::FunctionCallResultFacts::default();
-    let call_result_facts = function_facts.call_results().unwrap_or(&empty_call_results);
-    let empty_render = r2types::FunctionRenderFacts::default();
-    let render_facts = function_facts.render().unwrap_or(&empty_render);
-    let mut reasons = Vec::new();
-    for effect in render_facts.certified_effects.values() {
-        let domain = effect.control_domain();
-        if !domain.complete {
-            reasons.push(format!(
-                "certified effect {} has incomplete control domain {}",
-                effect.id(),
-                domain.id.0
-            ));
-        }
-    }
-
-    if func.body.is_empty() {
-        reasons.push("certified standard route produced no body".to_string());
-    }
-    if let Some(reason) = definite_assignment_residual_reason(func) {
-        reasons.push(reason);
-    }
-    for local in &func.locals {
-        match local.stack_offset {
-            Some(offset)
-                if certified_stack_local_identity_is_exact(function_facts, &local.name, offset)
-                    && certified_stack_local_type_matches(
-                        function_facts.type_facts(),
-                        &local.name,
-                        offset,
-                        &local.ty,
-                    ) => {}
-            None if certified_loop_carrier_local_is_exact(function_facts, local) => {}
-            None if certified_memory_result_local_is_exact(function_facts, local) => {}
-            Some(offset) => reasons.push(format!(
-                "local {} at stack offset {} lacks exact typed StackSlotCertificate",
-                local.name, offset
-            )),
-            None => reasons.push(format!(
-                "local {} lacks stack/object certificate in certified mode",
-                local.name
-            )),
-        }
-    }
-
-    let mut counts = CertifiedOutputCounts::default();
-    let mut raw_names = Vec::new();
-    for (index, stmt) in func.body.iter().enumerate() {
-        collect_certified_stmt_contract(
-            stmt,
-            RenderNodeId::root_child(index),
-            &mut counts,
-            &mut raw_names,
-        );
-    }
-    if let Some(effect_render_proofs) = effect_render_proofs {
-        let semantic_ledger =
-            CertifiedSemanticLedger::from_effect_proofs(function_facts, effect_render_proofs);
-        if !render_facts.certified_effects.is_empty() && semantic_ledger.unresolved > 0 {
-            reasons.push(format!(
-                "{} rendered proof(s) lack stable semantic identity",
-                semantic_ledger.unresolved
-            ));
-        }
-        let phi_edge_liveness = effect_render_proofs
-            .iter()
-            .any(|proof| {
-                matches!(
-                    proof.phi_edge.map(|edge| edge.kind),
-                    Some(PhiEdgeRenderKind::UnconditionalDeadOnOtherEdges)
-                )
-            })
-            .then(|| normalize::PhiEdgeLiveness::compute(prepared.function()));
-        for proof in effect_render_proofs
-            .iter()
-            .filter(|proof| proof.kind == EffectRenderProofKind::Call)
-        {
-            match callsite_facts.arguments_for_site(r2types::CallsiteKey {
-                block_addr: proof.block_addr,
-                op_index: proof.op_idx,
-            }) {
-                Some(cert) => {
-                    if proof.target != Some(cert.target) {
-                        reasons.push(format!(
-                            "rendered call proof at 0x{:x}:{} target proof {:?} disagrees with FunctionCallsiteFacts target {:?}",
-                            proof.block_addr, proof.op_idx, proof.target, cert.target
-                        ));
-                    }
-                    let expected =
-                        certified_callsite_expected_argument_values(function_facts, cert);
-                    if proof.values != expected {
-                        reasons.push(format!(
-                            "rendered call proof at 0x{:x}:{} argument value proof {:?} disagrees with FunctionCallsiteFacts argument values {:?}",
-                            proof.block_addr, proof.op_idx, proof.values, cert.argument_values
-                        ));
-                    }
-                    for value in &proof.values {
-                        if !render_facts.expression_is_renderable(*value) {
-                            reasons.push(format!(
-                                "rendered call proof at 0x{:x}:{} argument value {:?} lacks renderable FunctionRenderFacts expression",
-                                proof.block_addr, proof.op_idx, value
-                            ));
-                        }
-                    }
-                }
-                None => {
-                    reasons.push(format!(
-                        "rendered call proof at 0x{:x}:{} has no matching FunctionCallsiteFacts callsite",
-                        proof.block_addr, proof.op_idx
-                    ));
-                }
-            }
-        }
-        for proof in effect_render_proofs
-            .iter()
-            .filter(|proof| proof.kind == EffectRenderProofKind::Expression)
-        {
-            match proof
-                .value
-                .and_then(|value| render_facts.expression_for_value(value).map(|cert| (value, cert)))
-            {
-                Some((value, cert)) => {
-                    if !cert.renderable {
-                        reasons.push(format!(
-                            "rendered expression proof at 0x{:x}:{} value {:?} lacks renderable FunctionRenderFacts expression",
-                            proof.block_addr, proof.op_idx, value
-                        ));
-                    }
-                    let rendered_inst = prepared
-                        .graph()
-                        .inst_id_for_op_site(proof.block_addr, proof.op_idx);
-                    let defined_at_rendered_site = cert
-                        .defining_inst
-                        .is_some_and(|inst| Some(inst) == rendered_inst);
-                    let consumed_at_rendered_site = rendered_inst
-                        .and_then(|inst| prepared.graph().inst(inst))
-                        .is_some_and(|inst| inst.inputs.contains(&value));
-                    if !defined_at_rendered_site
-                        && !consumed_at_rendered_site
-                        && !expression_proof_is_phi_edge_materialization(
-                            prepared,
-                            render_facts,
-                            phi_edge_liveness.as_ref(),
-                            proof,
-                            value,
-                            cert,
-                        )
-                    {
-                        match cert.defining_inst.and_then(|inst| prepared.inst_op_site(inst)) {
-                            Some((block_addr, op_idx)) => reasons.push(format!(
-                                "rendered expression proof at 0x{:x}:{} value {:?} was neither defined nor consumed at the rendered op site; FunctionRenderFacts value was defined at 0x{:x}:{}",
-                                proof.block_addr, proof.op_idx, value, block_addr, op_idx
-                            )),
-                            None => reasons.push(format!(
-                                "rendered expression proof at 0x{:x}:{} value {:?} was not consumed at the rendered op site and lacks defining op-site FunctionRenderFacts expression",
-                                proof.block_addr, proof.op_idx, value
-                            )),
-                        }
-                    }
-                }
-                None => reasons.push(format!(
-                    "rendered expression proof at 0x{:x}:{} value {:?} has no matching FunctionRenderFacts expression",
-                    proof.block_addr, proof.op_idx, proof.value
-                )),
-            }
-        }
-        for proof in effect_render_proofs.iter().filter(|proof| {
-            matches!(
-                proof.kind,
-                EffectRenderProofKind::MemoryRead | EffectRenderProofKind::MemoryWrite
-            )
-        }) {
-            let is_write = proof.kind == EffectRenderProofKind::MemoryWrite;
-            match render_facts.memory_access_for_op(proof.block_addr, proof.op_idx, is_write) {
-                Some(cert) => {
-                    if proof.address != Some(cert.address) {
-                        reasons.push(format!(
-                            "rendered memory proof at 0x{:x}:{} address proof {:?} disagrees with FunctionRenderFacts memory address {:?}",
-                            proof.block_addr, proof.op_idx, proof.address, cert.address
-                        ));
-                    }
-                    if proof.value != cert.value {
-                        reasons.push(format!(
-                            "rendered memory proof at 0x{:x}:{} value proof {:?} disagrees with FunctionRenderFacts memory value {:?}",
-                            proof.block_addr, proof.op_idx, proof.value, cert.value
-                        ));
-                    }
-                }
-                None => {
-                    reasons.push(format!(
-                        "rendered memory proof at 0x{:x}:{} has no matching FunctionRenderFacts memory access",
-                        proof.block_addr, proof.op_idx
-                    ));
-                }
-            }
-        }
-        for proof in effect_render_proofs
-            .iter()
-            .filter(|proof| proof.kind == EffectRenderProofKind::Return)
-        {
-            match render_facts.return_for_op(proof.block_addr, proof.op_idx) {
-                Some(cert) => {
-                    if proof.value != Some(cert.value) {
-                        reasons.push(format!(
-                            "rendered return proof at 0x{:x}:{} value proof {:?} disagrees with FunctionRenderFacts return value {:?}",
-                            proof.block_addr, proof.op_idx, proof.value, cert.value
-                        ));
-                    }
-                    if proof.value.is_some_and(|value| {
-                        return_value_has_certified_call_result_effect(
-                            Some(call_result_facts),
-                            effect_render_proofs,
-                            value,
-                        )
-                    }) {
-                        continue;
-                    }
-                    match proof.value.and_then(|value| {
-                        render_facts
-                            .expression_for_value(value)
-                            .map(|cert| (value, cert))
-                    }) {
-                        Some((value, expr_cert)) => {
-                            if !expr_cert.renderable {
-                                let value_name = prepared
-                                    .value_var(value)
-                                    .map(|var| var.display_name())
-                                    .unwrap_or_else(|| "<unknown>".to_string());
-                                reasons.push(format!(
-                                    "rendered return proof at 0x{:x}:{} value {:?} ({}) lacks renderable FunctionRenderFacts expression",
-                                    proof.block_addr, proof.op_idx, value, value_name
-                                ));
-                            }
-                            let rendered_inst = prepared
-                                .graph()
-                                .inst_id_for_op_site(proof.block_addr, proof.op_idx);
-                            let defined_at_rendered_site = expr_cert
-                                .defining_inst
-                                .is_some_and(|inst| Some(inst) == rendered_inst);
-                            let consumed_at_rendered_site = rendered_inst
-                                .and_then(|inst| prepared.graph().inst(inst))
-                                .is_some_and(|inst| inst.inputs.contains(&value));
-                            let bound_by_return_certificate = proof.value == Some(cert.value);
-                            if !defined_at_rendered_site
-                                && !consumed_at_rendered_site
-                                && !bound_by_return_certificate
-                            {
-                                match expr_cert
-                                    .defining_inst
-                                    .and_then(|inst| prepared.inst_op_site(inst))
-                                {
-                                    Some((block_addr, op_idx)) => reasons.push(format!(
-                                        "rendered return proof at 0x{:x}:{} value {:?} was neither defined nor consumed at the rendered op site; FunctionRenderFacts value was defined at 0x{:x}:{}",
-                                        proof.block_addr, proof.op_idx, value, block_addr, op_idx
-                                    )),
-                                    None => reasons.push(format!(
-                                        "rendered return proof at 0x{:x}:{} value {:?} was not consumed at the rendered op site and lacks defining op-site FunctionRenderFacts expression",
-                                        proof.block_addr, proof.op_idx, value
-                                    )),
-                                }
-                            }
-                        }
-                        None => reasons.push(format!(
-                            "rendered return proof at 0x{:x}:{} value {:?} has no matching FunctionRenderFacts expression",
-                            proof.block_addr, proof.op_idx, proof.value
-                        )),
-                    }
-                }
-                None => {
-                    reasons.push(format!(
-                        "rendered return proof at 0x{:x}:{} has no matching FunctionRenderFacts return",
-                        proof.block_addr, proof.op_idx
-                    ));
-                }
-            }
-        }
-        let proof_counts = certified_effect_proof_counts(effect_render_proofs);
-        let call_render_facts = call_render_facts_from_effect_proofs(effect_render_proofs);
-        let missing_source_callsite = callsite_facts
-            .by_callsite
-            .keys()
-            .find(|callsite| call_render_facts.fact_for_site(**callsite).is_none());
-        if let Some(callsite) = missing_source_callsite {
-            reasons.push(format!(
-                "rendered {} executable call(s) from {} source FunctionCallsiteFacts callsite(s); first missing callsite 0x{:x}:{}; missing callsite effects must residualize instead of disappearing",
-                counts.calls,
-                callsite_facts.by_callsite.len(),
-                callsite.block_addr,
-                callsite.op_index
-            ));
-        }
-        if counts.calls > proof_counts.calls {
-            let first_missing = counts
-                .call_nodes
-                .get(proof_counts.calls)
-                .map(|id| format!("; first missing node {id}"))
-                .unwrap_or_default();
-            reasons.push(format!(
-                "rendered {} call(s) with only {} rendered FunctionCallsiteFacts proof(s){}",
-                counts.calls, proof_counts.calls, first_missing
-            ));
-        }
-        if proof_counts.calls > counts.calls {
-            reasons.push(format!(
-                "rendered FunctionCallsiteFacts proof recorded {} call effect(s), but final AST contains only {} executable call(s); dropped callsite effects must residualize instead of disappearing",
-                proof_counts.calls, counts.calls
-            ));
-        }
-        if counts.expression_roots > proof_counts.expressions {
-            let first_missing = counts
-                .expression_nodes
-                .get(proof_counts.expressions)
-                .map(|id| format!("; first missing node {id}"))
-                .unwrap_or_default();
-            reasons.push(format!(
-                "rendered {} pure expression assignment(s) with only {} rendered FunctionRenderFacts expression proof(s){}",
-                counts.expression_roots, proof_counts.expressions, first_missing
-            ));
-        }
-        let return_proofs = proof_counts.returns;
-        if counts.returns_with_value > return_proofs {
-            let first_missing = counts
-                .return_nodes
-                .get(return_proofs)
-                .map(|id| format!("; first missing node {id}"))
-                .unwrap_or_default();
-            reasons.push(format!(
-                "rendered {} value return(s) with only {} rendered FunctionRenderFacts return proof(s){}",
-                counts.returns_with_value, return_proofs, first_missing
-            ));
-        }
-        if counts.returns_with_value > 0 && proof_counts.returns == 0 {
-            reasons.push(format!(
-                "rendered {} value return(s) with no EffectRenderProof coverage; returns require at least one certified proof",
-                counts.returns_with_value
-            ));
-        }
-        let memory_proofs =
-            certified_memory_effects_requiring_ast_access(render_facts, effect_render_proofs);
-        if counts.memory_like_accesses > memory_proofs {
-            let first_missing = counts
-                .memory_nodes
-                .get(memory_proofs)
-                .map(|id| format!("; first missing node {id}"))
-                .unwrap_or_default();
-            reasons.push(format!(
-                "rendered {} memory-like access(es) with only {} rendered FunctionRenderFacts memory proof(s){}",
-                counts.memory_like_accesses, memory_proofs, first_missing
-            ));
-        }
-        if memory_proofs > counts.memory_like_accesses {
-            reasons.push(format!(
-				"rendered FunctionRenderFacts proof recorded {} memory effect(s), but final AST contains only {} memory-like access(es); dropped memory effects must residualize instead of disappearing",
-				memory_proofs, counts.memory_like_accesses
-			));
-        }
-    } else if counts.calls > 0
-        || counts.expression_roots > 0
-        || counts.returns_with_value > 0
-        || counts.memory_like_accesses > 0
-    {
-        reasons.push(format!(
-            "missing exact FunctionFacts render proof for certified Standard output: rendered calls={}, expression_roots={}, value_returns={}, memory_like_accesses={}",
-            counts.calls, counts.expression_roots, counts.returns_with_value, counts.memory_like_accesses
-        ));
-    }
-    let proved_member_counts = effect_render_proofs
-        .map(|proofs| proved_member_access_counts(render_facts, proofs))
-        .unwrap_or_default();
-    if counts.field_accesses > 0 && !field_accesses_are_certified(&proved_member_counts, &counts) {
-        let first_node = counts
-            .field_nodes
-            .first()
-            .map(|(id, member)| format!("; first field node {id}.{member}"))
-            .unwrap_or_default();
-        reasons.push(format!(
-            "rendered {} field access(es) without FunctionRenderFacts member-access proof{}",
-            counts.field_accesses, first_node
-        ));
-    }
-    if !counts.return_field_members.is_empty()
-        && !return_field_members_are_authoritatively_certified(&proved_member_counts, &counts)
-    {
-        let first_member = counts
-            .return_field_members
-            .first()
-            .map(|member| format!("; first returned member {member}"))
-            .unwrap_or_default();
-        reasons.push(format!(
-            "rendered returned field access(es) without FunctionRenderFacts member-access proof{}",
-            first_member
-        ));
-    }
-    let array_accesses_certified = effect_render_proofs
-        .is_some_and(|proofs| array_accesses_are_certified(render_facts, proofs, &counts));
-    if counts.array_accesses > 0 && !array_accesses_certified {
-        let first_missing = counts
-            .array_nodes
-            .first()
-            .map(|id| format!("; first array node {id}"))
-            .unwrap_or_default();
-        reasons.push(format!(
-            "rendered {} array access(es) without exact FunctionRenderFacts array-access proof{}",
-            counts.array_accesses, first_missing
-        ));
-    }
-    if counts.raw_pointer_arithmetic_derefs > 0 {
-        let first_node = counts
-            .raw_pointer_arithmetic_nodes
-            .first()
-            .map(|id| format!("; first raw pointer arithmetic node {id}"))
-            .unwrap_or_default();
-        reasons.push(format!(
-            "rendered {} raw pointer-arithmetic dereference(s); typed field/array accesses must render through FunctionFacts certificates{}",
-            counts.raw_pointer_arithmetic_derefs, first_node
-        ));
-    }
-    if counts.raw_address_call_args > 0 {
-        let first_node = counts
-            .raw_address_call_arg_nodes
-            .first()
-            .map(|id| format!("; first raw address call argument node {id}"))
-            .unwrap_or_default();
-        reasons.push(format!(
-            "rendered {} raw address-like call argument(s); pointer/string call arguments must render through FunctionFacts certificates{}",
-            counts.raw_address_call_args, first_node
-        ));
-    }
-    if counts.residual_comments > 0 {
-        let first_node = counts
-            .residual_comment_nodes
-            .first()
-            .map(|id| format!("; first residual node {id}"))
-            .unwrap_or_default();
-        let first_comment = counts
-            .residual_comment_texts
-            .first()
-            .map(|comment| format!("; first residual comment: {comment}"))
-            .unwrap_or_default();
-        reasons.push(format!(
-			"rendered {} residual comment(s) inside certified Standard output; residuals must replace the whole executable body{}{}",
-			counts.residual_comments, first_node, first_comment
-		));
-    }
-    raw_names.sort();
-    raw_names.dedup();
-    raw_names.retain(|name| {
-        !func
-            .params
-            .iter()
-            .any(|param| param.name.eq_ignore_ascii_case(name))
-            && !func.locals.iter().any(|local| {
-                local.name.eq_ignore_ascii_case(name)
-                    && (local.stack_offset.is_some_and(|offset| {
-                        certified_stack_local_identity_is_exact(function_facts, &local.name, offset)
-                            && certified_stack_local_type_matches(
-                                function_facts.type_facts(),
-                                &local.name,
-                                offset,
-                                &local.ty,
-                            )
-                    }) || certified_loop_carrier_local_is_exact(function_facts, local)
-                        || certified_memory_result_local_is_exact(function_facts, local))
-            })
-    });
-    if !raw_names.is_empty() {
-        reasons.push(format!(
-            "rendered uncertified raw artifact name(s): {}",
-            raw_names.join(", ")
-        ));
-    }
-
-    if reasons.is_empty() {
-        None
-    } else {
-        Some(format!(
-            "certified render contract failed: {}",
-            reasons.join("; ")
-        ))
-    }
-}
-
-fn expression_proof_is_phi_edge_materialization(
-    prepared: &r2ssa::SsaArtifact,
-    render_facts: &r2types::FunctionRenderFacts,
-    liveness: Option<&normalize::PhiEdgeLiveness>,
-    proof: &EffectRenderProof,
-    value: r2ssa::ValueId,
-    cert: &r2types::ExpressionRenderFact,
-) -> bool {
-    let Some(phi_edge) = proof.phi_edge else {
-        return false;
-    };
-    if cert.value != value {
-        return false;
-    }
-    let Some(def_inst) = cert.defining_inst else {
-        return false;
-    };
-    let Some(inst) = prepared.graph().inst(def_inst) else {
-        return false;
-    };
-    if inst.output != Some(value) {
-        return false;
-    }
-    let r2ssa::InstPayload::Phi { predecessors } = &inst.payload else {
-        return false;
-    };
-    let phi_edge_matches = predecessors.iter().zip(&inst.inputs).any(|(pred, input)| {
-        *input == phi_edge.source
-            && prepared
-                .graph()
-                .block(*pred)
-                .is_some_and(|block| block.addr == proof.block_addr)
-    });
-    match phi_edge.kind {
-        PhiEdgeRenderKind::Direct if phi_edge_matches => {
-            let Some(phi_block) = prepared.graph().block(inst.block) else {
-                return false;
-            };
-            if prepared.successors(proof.block_addr).as_slice() == [phi_block.addr] {
-                return true;
-            }
-        }
-        PhiEdgeRenderKind::UnconditionalDeadOnOtherEdges if phi_edge_matches => {
-            let Some(phi_block) = prepared.graph().block(inst.block) else {
-                return false;
-            };
-            let Some(dst) = prepared.value_var(value) else {
-                return false;
-            };
-            let Some(liveness) = liveness else {
-                return false;
-            };
-            return liveness.dst_is_dead_on_other_loop_edges(
-                prepared.function(),
-                proof.block_addr,
-                phi_block.addr,
-                dst,
-            );
-        }
-        PhiEdgeRenderKind::Guarded { condition, truth } if phi_edge_matches => {
-            let Some(phi_block) = prepared.graph().block(inst.block) else {
-                return false;
-            };
-            let edge_truth = match prepared
-                .function()
-                .edge_type(proof.block_addr, phi_block.addr)
-            {
-                Some(r2ssa::CFGEdge::True) => true,
-                Some(r2ssa::CFGEdge::False) => false,
-                _ => return false,
-            };
-            return edge_truth == truth
-                && prepared
-                    .function()
-                    .dominates(phi_block.addr, proof.block_addr)
-                && prepared
-                    .get_block(proof.block_addr)
-                    .and_then(|block| block.ops.last())
-                    .is_some_and(|op| {
-                        matches!(op, SSAOp::CBranch { cond, .. }
-                            if prepared.graph().value_id_for_var(cond) == Some(condition))
-                    });
-        }
-        _ => {}
-    }
-    matches!(phi_edge.kind, PhiEdgeRenderKind::Direct)
-        && matches!(
-            render_facts.loop_carrier_for_value(value),
-            Some(r2types::CertifiedEntity::LoopCarrier {
-                phi,
-                dominating_initializers,
-                ..
-            }) if *phi == value
-                && dominating_initializers.iter().any(|initializer| {
-                    initializer.predecessor == proof.block_addr
-                        && initializer.value == phi_edge.source
-                })
-        )
-}
-
-fn array_accesses_are_certified(
-    render_facts: &r2types::FunctionRenderFacts,
-    effect_render_proofs: &[EffectRenderProof],
-    counts: &CertifiedOutputCounts,
-) -> bool {
-    let mut proved = BTreeSet::new();
-    for proof in effect_render_proofs.iter().filter(|proof| {
-        matches!(
-            proof.kind,
-            EffectRenderProofKind::MemoryRead | EffectRenderProofKind::MemoryWrite
-        )
-    }) {
-        let is_write = proof.kind == EffectRenderProofKind::MemoryWrite;
-        let Some(memory) =
-            render_facts.memory_access_for_op(proof.block_addr, proof.op_idx, is_write)
-        else {
-            continue;
-        };
-        if proof.address != Some(memory.address) || proof.value != memory.value {
-            continue;
-        }
-        if render_facts
-            .array_accesses_by_op
-            .get(&(proof.block_addr, proof.op_idx, is_write))
-            .into_iter()
-            .flatten()
-            .any(|array| {
-                array.access == memory.access
-                    && array.block_addr == memory.block_addr
-                    && array.op_index == memory.op_index
-                    && array.object == memory.object
-                    && array.is_write == memory.is_write
-                    && array.access_width == memory.width
-                    && array.element_stride > 0
-            })
-        {
-            proved.insert((proof.block_addr, proof.op_idx, is_write, memory.access));
-        }
-    }
-
-    let mut proved = proved.into_iter();
-    counts.array_nodes.iter().all(|_| proved.next().is_some())
-}
-
-fn proved_member_access_counts(
-    render_facts: &r2types::FunctionRenderFacts,
-    effect_render_proofs: &[EffectRenderProof],
-) -> BTreeMap<String, usize> {
-    let mut proved = BTreeMap::<String, usize>::new();
-    for proof in effect_render_proofs.iter().filter(|proof| {
-        matches!(
-            proof.kind,
-            EffectRenderProofKind::MemoryRead | EffectRenderProofKind::MemoryWrite
-        )
-    }) {
-        let is_write = proof.kind == EffectRenderProofKind::MemoryWrite;
-        let Some(memory) =
-            render_facts.memory_access_for_op(proof.block_addr, proof.op_idx, is_write)
-        else {
-            continue;
-        };
-        if proof.address != Some(memory.address) || proof.value != memory.value {
-            continue;
-        }
-        for member in render_facts
-            .member_accesses_by_op
-            .get(&(proof.block_addr, proof.op_idx, is_write))
-            .into_iter()
-            .flatten()
-            .filter(|member| {
-                member.access == memory.access
-                    && member.object == memory.object
-                    && member.access_width == memory.width
-            })
-        {
-            *proved
-                .entry(member.field_name.to_ascii_lowercase())
-                .or_default() += 1;
-        }
-    }
-    proved
-}
-
-fn field_accesses_are_certified(
-    proved_member_counts: &BTreeMap<String, usize>,
-    counts: &CertifiedOutputCounts,
-) -> bool {
-    let mut rendered = BTreeMap::<String, usize>::new();
-    for (_, member) in &counts.field_nodes {
-        *rendered.entry(member.to_ascii_lowercase()).or_default() += 1;
-    }
-
-    rendered
-        .into_iter()
-        .all(|(field, count)| proved_member_counts.get(&field).copied().unwrap_or(0) >= count)
-}
-
-fn return_field_members_are_authoritatively_certified(
-    proved_member_counts: &BTreeMap<String, usize>,
-    counts: &CertifiedOutputCounts,
-) -> bool {
-    let mut returned = BTreeMap::<String, usize>::new();
-    for member in &counts.return_field_members {
-        *returned.entry(member.to_ascii_lowercase()).or_default() += 1;
-    }
-
-    returned
-        .into_iter()
-        .all(|(field, count)| proved_member_counts.get(&field).copied().unwrap_or(0) >= count)
-}
-
-fn collect_certified_stmt_contract(
-    stmt: &CStmt,
-    id: RenderNodeId,
-    counts: &mut CertifiedOutputCounts,
-    raw_names: &mut Vec<String>,
-) {
-    match stmt {
-        CStmt::Expr(expr) => {
-            if assignment_rhs_requires_expression_certificate(expr) {
-                counts.expression_roots += 1;
-                counts.expression_nodes.push(id.child(0).child(1));
-            }
-            collect_certified_expr_contract(expr, id.child(0), counts, raw_names);
-        }
-        CStmt::Decl { name, init, .. } => {
-            if is_uncertified_render_var_name(name) {
-                raw_names.push(name.clone());
-            }
-            if let Some(expr) = init {
-                collect_certified_expr_contract(expr, id.child(0), counts, raw_names);
-            }
-        }
-        CStmt::Block(stmts) => {
-            for (index, stmt) in stmts.iter().enumerate() {
-                collect_certified_stmt_contract(stmt, id.child(index), counts, raw_names);
-            }
-        }
-        CStmt::If {
-            cond,
-            then_body,
-            else_body,
-        } => {
-            collect_certified_expr_contract(cond, id.child(0), counts, raw_names);
-            collect_certified_stmt_contract(then_body, id.child(1), counts, raw_names);
-            if let Some(else_body) = else_body {
-                collect_certified_stmt_contract(else_body, id.child(2), counts, raw_names);
-            }
-        }
-        CStmt::While { cond, body } => {
-            collect_certified_expr_contract(cond, id.child(0), counts, raw_names);
-            collect_certified_stmt_contract(body, id.child(1), counts, raw_names);
-        }
-        CStmt::DoWhile { body, cond } => {
-            collect_certified_stmt_contract(body, id.child(0), counts, raw_names);
-            collect_certified_expr_contract(cond, id.child(1), counts, raw_names);
-        }
-        CStmt::For {
-            init,
-            cond,
-            update,
-            body,
-        } => {
-            if let Some(init) = init {
-                collect_certified_stmt_contract(init, id.child(0), counts, raw_names);
-            }
-            if let Some(cond) = cond {
-                collect_certified_expr_contract(cond, id.child(1), counts, raw_names);
-            }
-            if let Some(update) = update {
-                collect_certified_expr_contract(update, id.child(2), counts, raw_names);
-            }
-            collect_certified_stmt_contract(body, id.child(3), counts, raw_names);
-        }
-        CStmt::Switch {
-            expr,
-            cases,
-            default,
-        } => {
-            collect_certified_expr_contract(expr, id.child(0), counts, raw_names);
-            for (case_index, case) in cases.iter().enumerate() {
-                collect_certified_expr_contract(
-                    &case.value,
-                    id.child(1).child(case_index),
-                    counts,
-                    raw_names,
-                );
-                for (stmt_index, stmt) in case.body.iter().enumerate() {
-                    collect_certified_stmt_contract(
-                        stmt,
-                        id.child(2).child(case_index).child(stmt_index),
-                        counts,
-                        raw_names,
-                    );
-                }
-            }
-            if let Some(default) = default {
-                for (stmt_index, stmt) in default.iter().enumerate() {
-                    collect_certified_stmt_contract(
-                        stmt,
-                        id.child(3).child(stmt_index),
-                        counts,
-                        raw_names,
-                    );
-                }
-            }
-        }
-        CStmt::Return(Some(expr)) => {
-            counts.returns_with_value += 1;
-            counts.return_nodes.push(id.clone());
-            collect_expr_field_members(expr, &mut counts.return_field_members);
-            collect_certified_expr_contract(expr, id.child(0), counts, raw_names);
-        }
-        CStmt::Return(None)
-        | CStmt::Empty
-        | CStmt::Break
-        | CStmt::Continue
-        | CStmt::Goto(_)
-        | CStmt::Label(_)
-        | CStmt::Comment(_) => {
-            if let CStmt::Comment(text) = stmt
-                && (text.contains("r2sleigh residual:") || text.contains("r2dec residual:"))
-            {
-                counts.residual_comments += 1;
-                counts.residual_comment_nodes.push(id);
-                counts.residual_comment_texts.push(text.clone());
-            }
-        }
-    }
-}
-
-fn collect_expr_field_members(expr: &CExpr, members: &mut Vec<String>) {
-    expr.visit(&mut |node| {
-        if let CExpr::Member { member, .. } | CExpr::PtrMember { member, .. } = node {
-            members.push(member.clone());
-        }
-    });
-}
-
-fn assignment_rhs_requires_expression_certificate(expr: &CExpr) -> bool {
-    let CExpr::Binary {
-        op: BinaryOp::Assign,
-        left,
-        right,
-    } = expr
-    else {
-        return false;
-    };
-    matches!(left.as_ref(), CExpr::Var(_))
-        && !certified_expr_contains_memory_like_access(right)
-        && !certified_expr_contains_call(right)
-}
-
-fn certified_expr_contains_memory_like_access(expr: &CExpr) -> bool {
-    let mut found = false;
-    expr.visit(&mut |node| {
-        if matches!(node, CExpr::Deref(_) | CExpr::Subscript { .. }) {
-            found = true;
-        }
-    });
-    found
-}
-
-fn certified_expr_contains_call(expr: &CExpr) -> bool {
-    let mut found = false;
-    expr.visit(&mut |node| {
-        if matches!(node, CExpr::Call { .. }) {
-            found = true;
-        }
-    });
-    found
-}
-
-fn collect_certified_expr_contract(
-    expr: &CExpr,
-    id: RenderNodeId,
-    counts: &mut CertifiedOutputCounts,
-    raw_names: &mut Vec<String>,
-) {
-    collect_certified_expr_contract_inner(expr, id, counts, raw_names, false);
-}
-
-fn collect_certified_expr_contract_inner(
-    expr: &CExpr,
-    id: RenderNodeId,
-    counts: &mut CertifiedOutputCounts,
-    raw_names: &mut Vec<String>,
-    inside_memory_access: bool,
-) {
-    match expr {
-        CExpr::Var(name) => {
-            if is_uncertified_render_var_name(name) {
-                raw_names.push(name.clone());
-            }
-        }
-        CExpr::Call { func, args } => {
-            counts.calls += 1;
-            counts.call_nodes.push(id.clone());
-            collect_certified_expr_contract_inner(func, id.child(0), counts, raw_names, false);
-            for (index, arg) in args.iter().enumerate() {
-                let arg_id = id.child(index + 1);
-                if certified_expr_is_raw_address_call_arg(arg) {
-                    counts.raw_address_call_args += 1;
-                    counts.raw_address_call_arg_nodes.push(arg_id.clone());
-                }
-                collect_certified_expr_contract_inner(arg, arg_id, counts, raw_names, false);
-            }
-        }
-        CExpr::Subscript { base, index } => {
-            if !inside_memory_access {
-                counts.memory_like_accesses += 1;
-                counts.memory_nodes.push(id.clone());
-            }
-            counts.array_accesses += 1;
-            counts.array_nodes.push(id.clone());
-            collect_certified_expr_contract_inner(base, id.child(0), counts, raw_names, true);
-            collect_certified_expr_contract_inner(index, id.child(1), counts, raw_names, false);
-        }
-        CExpr::Member { base, member } | CExpr::PtrMember { base, member } => {
-            if !inside_memory_access {
-                counts.memory_like_accesses += 1;
-                counts.memory_nodes.push(id.clone());
-            }
-            counts.field_accesses += 1;
-            counts.field_members.push(member.clone());
-            counts.field_nodes.push((id.clone(), member.clone()));
-            collect_certified_expr_contract_inner(base, id.child(0), counts, raw_names, true);
-        }
-        CExpr::Deref(inner) => {
-            if !inside_memory_access {
-                counts.memory_like_accesses += 1;
-                counts.memory_nodes.push(id.clone());
-            }
-            if certified_expr_is_raw_pointer_arithmetic(inner) {
-                counts.raw_pointer_arithmetic_derefs += 1;
-                counts.raw_pointer_arithmetic_nodes.push(id.clone());
-            }
-            collect_certified_expr_contract_inner(inner, id.child(0), counts, raw_names, true);
-        }
-        CExpr::Unary { operand, .. }
-        | CExpr::Cast { expr: operand, .. }
-        | CExpr::Sizeof(operand)
-        | CExpr::AddrOf(operand)
-        | CExpr::Paren(operand) => collect_certified_expr_contract_inner(
-            operand,
-            id.child(0),
-            counts,
-            raw_names,
-            inside_memory_access,
-        ),
-        CExpr::Binary { left, right, .. } => {
-            collect_certified_expr_contract_inner(left, id.child(0), counts, raw_names, false);
-            collect_certified_expr_contract_inner(right, id.child(1), counts, raw_names, false);
-        }
-        CExpr::Ternary {
-            cond,
-            then_expr,
-            else_expr,
-        } => {
-            collect_certified_expr_contract_inner(cond, id.child(0), counts, raw_names, false);
-            collect_certified_expr_contract_inner(then_expr, id.child(1), counts, raw_names, false);
-            collect_certified_expr_contract_inner(else_expr, id.child(2), counts, raw_names, false);
-        }
-        CExpr::Comma(items) => {
-            for (index, item) in items.iter().enumerate() {
-                collect_certified_expr_contract_inner(
-                    item,
-                    id.child(index),
-                    counts,
-                    raw_names,
-                    false,
-                );
-            }
-        }
-        CExpr::IntLit(_)
-        | CExpr::UIntLit(_)
-        | CExpr::FloatLit(_)
-        | CExpr::StringLit(_)
-        | CExpr::CharLit(_)
-        | CExpr::SizeofType(_) => {}
-    }
-}
-
-fn certified_expr_is_raw_address_call_arg(expr: &CExpr) -> bool {
-    const MIN_ADDRESS_LIKE_LITERAL: u64 = 0x1000;
-
-    match expr {
-        CExpr::UIntLit(value) => *value >= MIN_ADDRESS_LIKE_LITERAL,
-        CExpr::IntLit(value) => {
-            u64::try_from(*value).is_ok_and(|value| value >= MIN_ADDRESS_LIKE_LITERAL)
-        }
-        CExpr::Cast { expr, .. } | CExpr::Paren(expr) => {
-            certified_expr_is_raw_address_call_arg(expr)
-        }
-        CExpr::Binary { left, right, .. } => {
-            certified_expr_is_raw_address_call_arg(left)
-                || certified_expr_is_raw_address_call_arg(right)
-        }
-        CExpr::Unary { operand, .. } => certified_expr_is_raw_address_call_arg(operand),
-        _ => false,
-    }
-}
-
-fn certified_expr_is_raw_pointer_arithmetic(expr: &CExpr) -> bool {
-    match expr {
-        CExpr::Binary { op, .. } => matches!(
-            op,
-            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Shl | BinaryOp::Shr
-        ),
-        CExpr::Cast { expr, .. } | CExpr::Paren(expr) => {
-            certified_expr_is_raw_pointer_arithmetic(expr)
-        }
-        _ => false,
-    }
-}
-
-fn is_uncertified_render_var_name(name: &str) -> bool {
-    let stripped = name.trim_start_matches('&');
-    let lower = stripped.to_ascii_lowercase();
-    let is_generated_arg = lower
-        .strip_prefix("arg")
-        .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()));
-    crate::analysis::utils::is_temporary_name(stripped)
-        || stripped == "__r2dec_unresolved_call_arg"
-        || is_generated_arg
-        || lower.starts_with("tmp_")
-        || lower.starts_with("unique_")
-        || lower.starts_with("stack_")
-        || lower.starts_with("local_")
-        || lower.starts_with("var_")
-        || lower.starts_with("value_")
-        || is_unversioned_raw_register_label(stripped)
-        || is_ssa_versioned_register_label(stripped)
-}
-
-fn is_unversioned_raw_register_label(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    matches!(
-        lower.as_str(),
-        "al" | "ah"
-            | "ax"
-            | "eax"
-            | "rax"
-            | "bl"
-            | "bh"
-            | "bx"
-            | "ebx"
-            | "rbx"
-            | "cl"
-            | "ch"
-            | "cx"
-            | "ecx"
-            | "rcx"
-            | "dl"
-            | "dh"
-            | "dx"
-            | "edx"
-            | "rdx"
-            | "si"
-            | "esi"
-            | "rsi"
-            | "di"
-            | "edi"
-            | "rdi"
-            | "sp"
-            | "esp"
-            | "rsp"
-            | "bp"
-            | "ebp"
-            | "rbp"
-            | "x0"
-            | "w0"
-            | "x1"
-            | "w1"
-            | "x2"
-            | "w2"
-            | "x3"
-            | "w3"
-            | "x8"
-            | "w8"
-            | "x9"
-            | "w9"
-            | "x10"
-            | "w10"
-            | "x20"
-            | "w20"
-    )
-}
-
-fn stmt_contains_loop_construct(stmt: &CStmt) -> bool {
-    match stmt {
-        CStmt::While { .. } | CStmt::DoWhile { .. } | CStmt::For { .. } => true,
-        CStmt::Block(stmts) => stmts.iter().any(stmt_contains_loop_construct),
-        CStmt::If {
-            then_body,
-            else_body,
-            ..
-        } => {
-            stmt_contains_loop_construct(then_body)
-                || else_body
-                    .as_deref()
-                    .is_some_and(stmt_contains_loop_construct)
-        }
-        CStmt::Switch { cases, default, .. } => {
-            cases
-                .iter()
-                .any(|case| case.body.iter().any(stmt_contains_loop_construct))
-                || default
-                    .as_ref()
-                    .is_some_and(|body| body.iter().any(stmt_contains_loop_construct))
-        }
-        _ => false,
-    }
-}
-
-fn stmt_has_empty_loop_body(stmt: &CStmt) -> bool {
-    match stmt {
-        CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
-            !stmt_has_loop_body_content(body) || stmt_has_empty_loop_body(body)
-        }
-        CStmt::For { body, .. } => {
-            !stmt_has_loop_body_content(body) || stmt_has_empty_loop_body(body)
-        }
-        CStmt::Block(stmts) => stmts.iter().any(stmt_has_empty_loop_body),
-        CStmt::If {
-            then_body,
-            else_body,
-            ..
-        } => {
-            stmt_has_empty_loop_body(then_body)
-                || else_body.as_deref().is_some_and(stmt_has_empty_loop_body)
-        }
-        CStmt::Switch { cases, default, .. } => {
-            cases
-                .iter()
-                .any(|case| case.body.iter().any(stmt_has_empty_loop_body))
-                || default
-                    .as_ref()
-                    .is_some_and(|body| body.iter().any(stmt_has_empty_loop_body))
-        }
-        _ => false,
-    }
-}
-
-fn stmt_has_loop_body_content(stmt: &CStmt) -> bool {
-    match stmt {
-        CStmt::Empty
-        | CStmt::Break
-        | CStmt::Continue
-        | CStmt::Goto(_)
-        | CStmt::Label(_)
-        | CStmt::Comment(_) => false,
-        CStmt::Decl { init: None, .. } => false,
-        CStmt::Decl { init: Some(_), .. } => true,
-        CStmt::Block(stmts) => stmts.iter().any(stmt_has_loop_body_content),
-        CStmt::If {
-            then_body,
-            else_body,
-            ..
-        } => {
-            stmt_has_loop_body_content(then_body)
-                || else_body.as_deref().is_some_and(stmt_has_loop_body_content)
-        }
-        CStmt::Switch { cases, default, .. } => {
-            cases
-                .iter()
-                .any(|case| case.body.iter().any(stmt_has_loop_body_content))
-                || default
-                    .as_ref()
-                    .is_some_and(|body| body.iter().any(stmt_has_loop_body_content))
-        }
-        _ => true,
-    }
 }
 
 fn summary_non_void_return_type(
@@ -5752,18 +3155,21 @@ impl DecompilerContext {
 
 #[derive(Debug, Clone)]
 pub struct DecompilerInput {
-    pub prepared_ssa: r2ssa::SsaArtifact,
+    pub prepared_ssa: Arc<r2ssa::SsaArtifact>,
     pub interproc_summary_set: Option<r2ssa::InterprocSummarySet>,
     context: DecompilerContext,
 }
 
 impl DecompilerInput {
-    pub fn new(prepared_ssa: r2ssa::SsaArtifact, mut context: DecompilerContext) -> Self {
+    pub fn new(
+        prepared_ssa: impl Into<Arc<r2ssa::SsaArtifact>>,
+        mut context: DecompilerContext,
+    ) -> Self {
         context.function_facts =
             DecompilerContext::canonicalize_function_facts(context.function_facts);
         let interproc_summary_set = context.function_facts.interproc_summary_set().cloned();
         Self {
-            prepared_ssa,
+            prepared_ssa: prepared_ssa.into(),
             interproc_summary_set,
             context,
         }
@@ -5790,6 +3196,10 @@ impl DecompilerInput {
 
     pub fn context(&self) -> &DecompilerContext {
         &self.context
+    }
+
+    pub fn prepared_ssa(&self) -> &r2ssa::SsaArtifact {
+        self.prepared_ssa.as_ref()
     }
 
     pub fn function_facts(&self) -> &FunctionFacts {
@@ -5868,49 +3278,99 @@ impl Decompiler {
 
     /// Decompile a prepared function with an explicit typed context payload.
     pub fn decompile_input(&self, input: &DecompilerInput) -> String {
-        let func = input.prepared_ssa.function();
+        let control = r2ssa::SsaExecutionControl::default();
+        self.decompile_input_with_control(input, &control)
+            .expect("default decompiler control never stops")
+    }
+
+    /// Decompile with cooperative cancellation/deadline polling.
+    pub fn decompile_input_with_control<'a>(
+        &self,
+        input: &'a DecompilerInput,
+        control: &'a dyn r2ssa::SsaWorkControl,
+    ) -> Result<String, DecompileExecutionStop> {
+        let work = DecompileWorkControl::new(control, DecompileWorkPhase::Normalization);
+        work.poll()?;
+        let func = input.prepared_ssa().function();
         let func_name = func
             .name
             .clone()
             .unwrap_or_else(|| format!("sub_{:x}", func.entry));
+        let block_count = func.blocks().count();
+        if block_count > self.config.max_blocks {
+            return Ok(block_guard_fallback_comment(
+                &func_name,
+                block_count,
+                self.config.max_blocks,
+            ));
+        }
         let Some(semantic_route) = input.context.function_facts.decompile_route() else {
-            return missing_decompile_route_residual_comment(&func_name);
+            return Ok(missing_decompile_route_residual_comment(&func_name));
         };
         if let Some(comment) = route_fallback_comment(semantic_route) {
-            return comment.to_string();
+            return Ok(comment.to_string());
         }
         if let Some(comment) = render_permission_refusal_comment(
             &func_name,
             input.context.effective_render_permission(),
         ) {
-            return comment;
+            return Ok(comment);
         }
         if let Some(reason) =
             summary_only_semantics_standard_render_residual_reason(&input.context.function_facts)
         {
-            return artifact_guard_fallback_comment(&func_name, &reason);
+            return Ok(artifact_guard_fallback_comment(&func_name, &reason));
         }
         if let Some(output) = self.vm_summary_output_for_route(
             &func_name,
             &input.context.function_facts,
             semantic_route,
         ) {
-            return output;
+            return Ok(output);
         }
         if let Some(output) = self.semantic_worker_summary_output_for_route(
             &func_name,
             &input.context.function_facts,
             semantic_route,
         ) {
-            return output;
+            return Ok(output);
         }
-        let c_func = self.build_function_from_input(input);
+        let c_func = self.build_function_from_input_with_control(input, control)?;
+        let render_work = work.with_phase(DecompileWorkPhase::Rendering);
+        render_work.poll()?;
         let mut codegen = CodeGenerator::new(self.config.codegen.clone());
-        codegen.generate_function(&c_func)
+        let output = codegen.generate_function(&c_func);
+        render_work.poll()?;
+        Ok(output)
     }
 
     /// Build a C function from a prepared function + typed context payload.
     pub fn build_function_from_input(&self, input: &DecompilerInput) -> CFunction {
+        let control = r2ssa::SsaExecutionControl::default();
+        self.build_function_from_input_with_control(input, &control)
+            .expect("default decompiler control never stops")
+    }
+
+    /// Build a C AST with cooperative cancellation/deadline polling.
+    pub fn build_function_from_input_with_control<'a>(
+        &self,
+        input: &'a DecompilerInput,
+        control: &'a dyn r2ssa::SsaWorkControl,
+    ) -> Result<CFunction, DecompileExecutionStop> {
+        let work = DecompileWorkControl::new(control, DecompileWorkPhase::Normalization);
+        work.poll()?;
+        let func = input.prepared_ssa().function();
+        let func_name = func
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("sub_{:x}", func.entry));
+        let block_count = func.blocks().count();
+        if block_count > self.config.max_blocks {
+            return Ok(residual_function_for_render_boundary(
+                &func_name,
+                &block_guard_fallback_comment(&func_name, block_count, self.config.max_blocks),
+            ));
+        }
         let mut decompiler = Self::new(self.config.clone()).with_context(input.context.clone());
         let param_slots = ParamSlotResolver::from_arg_regs(&decompiler.config.arg_regs);
         decompiler
@@ -5921,50 +3381,53 @@ impl Decompiler {
             .context
             .function_facts
             .populate_member_access_render_facts_from_field_certificates(
-                &input.prepared_ssa,
+                input.prepared_ssa(),
                 &param_slots,
             );
         decompiler
             .context
             .function_facts
             .populate_array_access_render_facts_from_scalar_candidates(
-                &input.prepared_ssa,
+                input.prepared_ssa(),
                 &param_slots,
             );
-        let func = input.prepared_ssa.function();
-        let func_name = func
-            .name
-            .clone()
-            .unwrap_or_else(|| format!("sub_{:x}", func.entry));
         let Some(semantic_route) = decompiler.context.function_facts.decompile_route() else {
-            return residual_function_for_render_boundary(
+            return Ok(residual_function_for_render_boundary(
                 &func_name,
                 &missing_decompile_route_residual_comment(&func_name),
-            );
+            ));
         };
         if let Some(comment) = route_fallback_comment(semantic_route) {
-            return residual_function_for_render_boundary(&func_name, comment);
+            return Ok(residual_function_for_render_boundary(&func_name, comment));
         }
         if let Some(comment) = render_permission_refusal_comment(
             &func_name,
             decompiler.context.effective_render_permission(),
         ) {
-            return residual_function_for_render_boundary(&func_name, &comment);
+            return Ok(residual_function_for_render_boundary(&func_name, &comment));
         }
         if let Some(reason) = summary_only_semantics_standard_render_residual_reason(
             &decompiler.context.function_facts,
         ) {
-            return residual_function_for_render_boundary(&func_name, &reason);
+            return Ok(residual_function_for_render_boundary(&func_name, &reason));
         }
         if route_is_summary_boundary(semantic_route) {
-            return residual_function_for_summary_route_boundary(&func_name, semantic_route);
+            return Ok(residual_function_for_summary_route_boundary(
+                &func_name,
+                semantic_route,
+            ));
         }
         if let Some(reason) =
             render_permission_residual_reason(decompiler.context.effective_render_permission())
         {
-            return residual_function_for_render_boundary(&func_name, &reason);
+            return Ok(residual_function_for_render_boundary(&func_name, &reason));
         }
-        decompiler.build_function_internal(func, &input.prepared_ssa, semantic_route)
+        decompiler.build_function_internal_with_control(
+            func,
+            input.prepared_ssa(),
+            semantic_route,
+            work,
+        )
     }
 
     pub(crate) fn stmt_has_content(stmt: &CStmt) -> bool {
@@ -6315,71 +3778,60 @@ impl Decompiler {
         }
     }
 
+    #[cfg(test)]
     fn build_function_internal(
         &self,
         func: &SSAFunction,
         prepared: &r2ssa::SsaArtifact,
         semantic_route: &DecompileRouteFacts,
     ) -> CFunction {
+        let control = r2ssa::SsaExecutionControl::default();
+        let work = DecompileWorkControl::new(&control, DecompileWorkPhase::Normalization);
+        self.build_function_internal_with_control(func, prepared, semantic_route, work)
+            .expect("default decompiler control never stops")
+    }
+
+    fn build_function_internal_with_control<'a>(
+        &self,
+        func: &'a SSAFunction,
+        prepared: &r2ssa::SsaArtifact,
+        semantic_route: &DecompileRouteFacts,
+        work: DecompileWorkControl<'a>,
+    ) -> Result<CFunction, DecompileExecutionStop> {
+        work.poll()?;
         let mut normalized_func = if let Some(render_facts) = self.context.function_facts.render() {
-            normalize::materialize_certified_loop_carriers(func, prepared, render_facts)
+            normalize::materialize_certified_loop_carriers_with_control(
+                func,
+                prepared,
+                render_facts,
+                work,
+            )?
         } else {
             func.clone()
         };
         if let Some(render_facts) = self.context.function_facts.render() {
-            normalize::materialize_certified_loop_carrier_initializers(
+            normalize::materialize_certified_loop_carrier_initializers_with_control(
                 &mut normalized_func,
                 prepared,
                 render_facts,
-            );
+                work,
+            )?;
         }
+        work.poll()?;
         let func = &normalized_func;
         let func_name = func
             .name
             .clone()
             .unwrap_or_else(|| format!("sub_{:x}", func.entry));
-        let certified_rendering_required =
-            render_permission_allows_executable_c(self.context.effective_render_permission());
-        let certified_standard_mode =
-            certified_rendering_required && route_is_standard(semantic_route);
-        if route_is_standard(semantic_route) && !certified_rendering_required {
-            let reason = render_permission_residual_reason(self.context.effective_render_permission())
-                .unwrap_or_else(|| {
-                    "r2dec residual: Standard executable rendering requires engine-owned CertifiedC permission".to_string()
-                });
-            return residual_function_for_render_boundary(&func_name, &reason);
+        if route_is_standard(semantic_route) {
+            let reason =
+                render_permission_residual_reason(self.context.effective_render_permission())
+                    .unwrap_or_else(|| {
+                        "r2dec residual: legacy CertifiedC claims cannot authorize production output; r2cert typed-region authorization is required".to_string()
+                    });
+            return Ok(residual_function_for_render_boundary(&func_name, &reason));
         }
         let render_signature = self.context.type_facts().render_authorized_signature();
-        if certified_standard_mode {
-            let Some(signature) = render_signature else {
-                return residual_function_for_render_boundary(
-                    &func_name,
-                    "r2dec residual: certified Standard header lacks FunctionTypeFacts render-authorized signature",
-                );
-            };
-            if signature.ret_type.is_none() {
-                return residual_function_for_render_boundary(
-                    &func_name,
-                    "r2dec residual: certified Standard header lacks FunctionTypeFacts render-authorized return type",
-                );
-            }
-            if !signature_has_complete_render_param_types(signature) {
-                return residual_function_for_render_boundary(
-                    &func_name,
-                    "r2dec residual: certified Standard header has incomplete FunctionTypeFacts render-authorized parameter types",
-                );
-            }
-            if let Some(reason) = certified_signature_entity_residual_reason(
-                signature,
-                self.context.function_facts.render_facts(),
-                self.config.ptr_size,
-            ) {
-                return residual_function_for_render_boundary(
-                    &func_name,
-                    &format!("r2dec residual: {reason}"),
-                );
-            }
-        }
         // Recover variables
         let mut var_recovery = VariableRecovery::new_with_abi(
             &self.config.sp_name,
@@ -6466,25 +3918,19 @@ impl Decompiler {
                 )
             })
             .collect();
-        let params = if certified_standard_mode {
-            params_from_authorized_signature(
-                render_signature.expect("certified Standard mode checked render signature"),
-            )
-        } else {
-            merge_params_with_external_signature(
-                recovered_param_infos
-                    .iter()
-                    .map(|(_, param)| param.clone())
-                    .collect(),
-                render_signature,
-            )
-        };
+        let params = merge_params_with_external_signature(
+            recovered_param_infos
+                .iter()
+                .map(|(_, param)| param.clone())
+                .collect(),
+            render_signature,
+        );
         let param_register_aliases = build_param_register_aliases(
             &params,
             &recovered_param_infos,
             &self.context.type_facts().register_params,
             &self.config.arg_regs,
-            !certified_standard_mode,
+            true,
         );
         for (idx, (_ssa_var, _)) in recovered_param_infos.iter().enumerate() {
             let Some(param) = params.get(idx) else {
@@ -6505,24 +3951,16 @@ impl Decompiler {
                 .entry(reg_alias.to_ascii_lowercase())
                 .or_insert_with(|| param.ty.clone());
         }
-        let inferred_ret_type = if certified_standard_mode {
-            CType::Unknown
-        } else {
-            type_inference
-                .as_ref()
-                .map(|type_inference| self.infer_return_type(func, type_inference))
-                .or_else(|| {
-                    render_signature.and_then(|sig| sig.ret_type.as_ref().map(type_like_to_ctype))
-                })
-                .unwrap_or(CType::Unknown)
-        };
+        let inferred_ret_type = type_inference
+            .as_ref()
+            .map(|type_inference| self.infer_return_type(func, type_inference))
+            .or_else(|| {
+                render_signature.and_then(|sig| sig.ret_type.as_ref().map(type_like_to_ctype))
+            })
+            .unwrap_or(CType::Unknown);
         let signature_ret_type =
             render_signature.and_then(|sig| sig.ret_type.as_ref().map(type_like_to_ctype));
-        let fold_function_return_type = if certified_standard_mode {
-            signature_ret_type.as_ref()
-        } else {
-            signature_ret_type.as_ref().or(Some(&inferred_ret_type))
-        };
+        let fold_function_return_type = signature_ret_type.as_ref().or(Some(&inferred_ret_type));
         let fold_arch = FoldArchConfig {
             ptr_size: self.config.ptr_size,
             sp_name: self.config.sp_name.clone(),
@@ -6546,20 +3984,9 @@ impl Decompiler {
                 param_register_aliases: &param_register_aliases,
                 function_facts: &self.context.function_facts,
                 #[cfg(test)]
-                certified_rendering_required,
+                certified_rendering_required: false,
             })
         });
-        let certified_empty_type_hints = HashMap::new();
-        let fold_type_hints = if certified_standard_mode {
-            &certified_empty_type_hints
-        } else {
-            &type_hints
-        };
-        let fold_type_oracle = if certified_standard_mode {
-            None
-        } else {
-            type_oracle
-        };
         let fold_inputs = FoldInputs {
             arch: &fold_arch,
             #[cfg(test)]
@@ -6570,7 +3997,7 @@ impl Decompiler {
             symbols: &self.context.symbols,
             function_facts: &self.context.function_facts,
             #[cfg(test)]
-            certified_rendering_required,
+            certified_rendering_required: false,
             stack_slots: &self.context.type_facts().stack_slots,
             field_access_certificates: &self.context.type_facts().field_access_certificates,
             #[cfg(test)]
@@ -6578,8 +4005,8 @@ impl Decompiler {
             visible_bindings: &self.context.type_facts().visible_bindings,
             external_type_db: &self.context.type_facts().external_type_db,
             param_register_aliases: &param_register_aliases,
-            type_hints: fold_type_hints,
-            type_oracle: fold_type_oracle,
+            type_hints: &type_hints,
+            type_oracle,
             function_return_type: fold_function_return_type,
             prepared_ssa: Some(prepared),
             prepared_semantic_view: prepared_semantic_view.as_ref(),
@@ -6588,85 +4015,29 @@ impl Decompiler {
         };
         let mut fold_ctx = FoldingContext::from_inputs(fold_inputs);
         let fold_blocks: Vec<_> = func.blocks().cloned().collect();
-        fold_ctx.analyze_blocks(&fold_blocks);
+        let structuring_work = work.with_phase(DecompileWorkPhase::Structuring);
+        fold_ctx.analyze_blocks_with_control(&fold_blocks, structuring_work)?;
+        structuring_work.poll()?;
         fold_ctx.analyze_function_structure(func);
-        if certified_standard_mode {
-            fold_ctx.clear_effect_render_proofs();
-        }
-
+        structuring_work.poll()?;
         // Structure control flow (primary path: folded)
-        let mut structurer = ControlFlowStructurer::new(func, &fold_ctx);
+        let mut structurer =
+            ControlFlowStructurer::new_with_control(func, &fold_ctx, structuring_work)?;
 
         // Get set of variables that survive folding before structuring.
         let emitted_vars = structurer.emitted_var_names();
-        let routed_body = if certified_standard_mode && route_is_standard(semantic_route) {
-            consumer_structured::RoutedBody {
-                body_stmt: structurer.structure_preserving_render_proof_identity(),
-                use_conservative_locals: false,
-                is_linear_fallback: false,
-            }
-        } else {
-            consumer_structured::primary_body_for_semantic_route(
-                semantic_route,
-                &mut structurer,
-                || self.linearize_function_body(func, &fold_ctx),
-            )
-        };
-        let mut use_conservative_locals = routed_body.use_conservative_locals;
-        let mut is_linear_fallback = routed_body.is_linear_fallback;
+        let routed_body = consumer_structured::primary_body_for_semantic_route(
+            semantic_route,
+            &mut structurer,
+            || self.linearize_function_body(func, &fold_ctx),
+        );
+        if let Some(stop) = structurer.execution_stop() {
+            return Err(stop);
+        }
+        structuring_work.poll()?;
+        let use_conservative_locals = routed_body.use_conservative_locals;
+        let is_linear_fallback = routed_body.is_linear_fallback;
         let mut body_stmt = routed_body.body_stmt;
-        if certified_standard_mode {
-            body_stmt = fold_ctx.inline_proved_single_use_carriers_in_stmt(body_stmt);
-            body_stmt = fold_ctx.prune_unread_stack_carriers_in_stmt(body_stmt);
-            body_stmt = fold_ctx.prune_unproved_register_carriers_in_stmt(body_stmt);
-            body_stmt = ControlFlowStructurer::cleanup_preserving_render_proof_identity(body_stmt);
-        }
-        let mut control_render_proofs = if certified_standard_mode {
-            structurer.control_render_proofs().to_vec()
-        } else {
-            Vec::new()
-        };
-        let mut control_transfer_render_proofs = if certified_standard_mode {
-            structurer.control_transfer_render_proofs().to_vec()
-        } else {
-            Vec::new()
-        };
-        let mut effect_render_proofs = if certified_standard_mode {
-            fold_ctx.effect_render_proofs()
-        } else {
-            Vec::new()
-        };
-        let structuring_proof_failure = certified_standard_mode
-            .then(|| structurer.safety_reason().map(str::to_string))
-            .flatten();
-        if let Some(reason) = structuring_proof_failure.as_deref() {
-            body_stmt = CStmt::Comment(format!("r2sleigh residual: {reason}"));
-        }
-
-        if !certified_standard_mode
-            && route_is_standard(semantic_route)
-            && !Self::stmt_has_content(&body_stmt)
-        {
-            let folded_reason = structurer
-                .safety_reason()
-                .map(str::to_string)
-                .unwrap_or_else(|| "folded structuring produced empty output".to_string());
-            let empty_fallback = consumer_fallback::recover_empty_structuring(folded_reason);
-            use_conservative_locals = empty_fallback.use_conservative_locals;
-            is_linear_fallback = empty_fallback.is_linear_fallback;
-            body_stmt = empty_fallback.body_stmt;
-            control_render_proofs.clear();
-            control_transfer_render_proofs.clear();
-            effect_render_proofs.clear();
-        }
-
-        if !certified_standard_mode && route_is_standard(semantic_route) {
-            body_stmt = fold_ctx.normalize_final_stmt_calls(body_stmt);
-            body_stmt = fold_ctx.prune_dead_temp_assignments_in_stmt(body_stmt);
-            if !is_linear_fallback {
-                body_stmt = ControlFlowStructurer::cleanup(body_stmt);
-            }
-        }
 
         if let Some(comment) = self.semantic_vm_summary_comment() {
             body_stmt = Self::prepend_comment(body_stmt, comment);
@@ -6713,44 +4084,20 @@ impl Decompiler {
                 .locals()
                 .iter()
                 .filter(|v| {
-                    let not_param_home = !v
+                    !v
                         .stack_offset
-                        .is_some_and(|offset| param_home_offsets.contains(&offset));
-                    if certified_standard_mode {
-                        not_param_home
-                            && certified_recovered_stack_local_is_exact(
-                                &self.context.function_facts,
-                                &emitted_vars,
-                                &body_visible_names,
-                                &v.name,
-                                v.stack_offset,
-                            )
-                    } else {
-                        not_param_home
-                    }
+                        .is_some_and(|offset| param_home_offsets.contains(&offset))
                 })
                 .map(|v| ast::CLocal {
-                    ty: if certified_standard_mode {
-                        v.stack_offset
-                            .and_then(|offset| {
-                                typed_stack_local_type_for_name_offset(
-                                    self.context.type_facts(),
-                                    &v.name,
-                                    offset,
-                                )
+                    ty: choose_more_specific_runtime_type(
+                        type_inference
+                            .as_ref()
+                            .map(|type_inference| {
+                                type_like_to_ctype(&type_inference.get_type(&v.ssa_var))
                             })
-                            .unwrap_or(CType::Unknown)
-                    } else {
-                        choose_more_specific_runtime_type(
-                            type_inference
-                                .as_ref()
-                                .map(|type_inference| {
-                                    type_like_to_ctype(&type_inference.get_type(&v.ssa_var))
-                                })
-                                .unwrap_or_else(|| v.ty.clone()),
-                            runtime_type_hint_for_name(&type_hints, &v.name),
-                        )
-                    },
+                            .unwrap_or_else(|| v.ty.clone()),
+                        runtime_type_hint_for_name(&type_hints, &v.name),
+                    ),
                     name: v.name.clone(),
                     stack_offset: v.stack_offset,
                 })
@@ -6763,46 +4110,22 @@ impl Decompiler {
                     let not_param_home = !v
                         .stack_offset
                         .is_some_and(|offset| param_home_offsets.contains(&offset));
-                    if certified_standard_mode {
-                        not_param_home
-                            && certified_recovered_stack_local_is_exact(
-                                &self.context.function_facts,
-                                &emitted_vars,
-                                &body_visible_names,
-                                &v.name,
-                                v.stack_offset,
-                            )
-                    } else {
-                        not_param_home
-                            && (emitted_vars.contains(&v.name)
-                                || body_visible_names.contains(&v.name)
-                                || v.stack_offset.is_some_and(|offset| {
-                                    body_visible_stack_offsets.contains(&offset)
-                                }))
-                    }
+                    not_param_home
+                        && (emitted_vars.contains(&v.name)
+                            || body_visible_names.contains(&v.name)
+                            || v.stack_offset
+                                .is_some_and(|offset| body_visible_stack_offsets.contains(&offset)))
                 })
                 .map(|v| ast::CLocal {
-                    ty: if certified_standard_mode {
-                        v.stack_offset
-                            .and_then(|offset| {
-                                typed_stack_local_type_for_name_offset(
-                                    self.context.type_facts(),
-                                    &v.name,
-                                    offset,
-                                )
+                    ty: choose_more_specific_runtime_type(
+                        type_inference
+                            .as_ref()
+                            .map(|type_inference| {
+                                type_like_to_ctype(&type_inference.get_type(&v.ssa_var))
                             })
-                            .unwrap_or(CType::Unknown)
-                    } else {
-                        choose_more_specific_runtime_type(
-                            type_inference
-                                .as_ref()
-                                .map(|type_inference| {
-                                    type_like_to_ctype(&type_inference.get_type(&v.ssa_var))
-                                })
-                                .unwrap_or_else(|| v.ty.clone()),
-                            runtime_type_hint_for_name(&type_hints, &v.name),
-                        )
-                    },
+                            .unwrap_or_else(|| v.ty.clone()),
+                        runtime_type_hint_for_name(&type_hints, &v.name),
+                    ),
                     name: v.name.clone(),
                     stack_offset: v.stack_offset,
                 })
@@ -6814,244 +4137,37 @@ impl Decompiler {
             });
             selected
         };
-        if certified_standard_mode && let Some(render_facts) = self.context.function_facts.render()
-        {
-            let mut existing_names = params
-                .iter()
-                .map(|param| param.name.to_ascii_lowercase())
-                .chain(locals.iter().map(|local| local.name.to_ascii_lowercase()))
-                .collect::<BTreeSet<_>>();
-            for entity in render_facts.loop_carriers() {
-                let r2types::CertifiedEntity::LoopCarrier { phi, width, ty, .. } = entity else {
-                    continue;
-                };
-                let name = certified_loop_carrier_name(*phi);
-                if !existing_names.insert(name.to_ascii_lowercase()) {
-                    continue;
-                }
-                locals.push(ast::CLocal {
-                    ty: ty
-                        .as_ref()
-                        .map(type_like_to_ctype)
-                        .unwrap_or_else(|| match width {
-                            0 => CType::Unknown,
-                            width => CType::Int(width.saturating_mul(8)),
-                        }),
-                    name,
-                    stack_offset: None,
-                });
-            }
-            for effect in render_facts.certified_effects.values() {
-                let r2types::CertifiedEffect::Memory { fact, .. } = effect else {
-                    continue;
-                };
-                if fact.is_write
-                    || fact.value.is_none()
-                    || fact.width == 0
-                    || !fact.materialize_result
-                {
-                    continue;
-                }
-                let name = certified_memory_result_name(fact.access);
-                if !existing_names.insert(name.to_ascii_lowercase()) {
-                    continue;
-                }
-                locals.push(ast::CLocal {
-                    ty: render_facts
-                        .memory_value_type(fact.access)
-                        .map(type_like_to_ctype)
-                        .unwrap_or_else(|| CType::UInt(fact.width.saturating_mul(8))),
-                    name,
-                    stack_offset: None,
-                });
-            }
-        }
-
         let mut c_function = CFunction {
             name: func_name,
-            ret_type: if certified_standard_mode {
-                signature_ret_type
-                    .clone()
-                    .expect("certified Standard mode checked render return type")
-            } else {
-                render_signature
-                    .and_then(|sig| sig.ret_type.as_ref().map(type_like_to_ctype))
-                    .unwrap_or_else(|| inferred_ret_type.clone())
-            },
+            ret_type: render_signature
+                .and_then(|sig| sig.ret_type.as_ref().map(type_like_to_ctype))
+                .unwrap_or_else(|| inferred_ret_type.clone()),
             params,
             locals,
             body,
         };
-        if !certified_standard_mode
-            && route_is_standard(semantic_route)
-            && !matches!(c_function.ret_type, CType::Void | CType::Unknown)
-            && !c_function.body.iter().any(summary_stmt_contains_return)
-            && let Some(expr) = fold_ctx.unique_scalar_stack_return_expr()
-        {
-            c_function.body.push(CStmt::Return(Some(expr)));
-        }
-        if certified_standard_mode
-            && route_is_standard(semantic_route)
-            && structuring_proof_failure.is_none()
-            && !matches!(c_function.ret_type, CType::Void | CType::Unknown)
-            && !c_function.body.iter().any(summary_stmt_contains_return)
-        {
-            let unique_return_expr = fold_ctx.unique_scalar_stack_return_expr().or_else(|| {
-                let mut rendered_returns = self
-                    .context
-                    .function_facts
-                    .render()
-                    .into_iter()
-                    .flat_map(r2types::FunctionRenderFacts::return_effects)
-                    .filter_map(|fact| {
-                        fold_ctx
-                            .certified_return_expr_for_op(fact.block_addr, fact.op_index)
-                            .map(|(expr, value)| {
-                                (
-                                    normalize_certified_appended_return_expr(
-                                        expr,
-                                        &c_function.ret_type,
-                                        &c_function.locals,
-                                    ),
-                                    fact.block_addr,
-                                    fact.op_index,
-                                    value,
-                                )
-                            })
-                    })
-                    .collect::<Vec<_>>();
-                rendered_returns
-                    .sort_by_key(|(_, block_addr, op_idx, value)| (*block_addr, *op_idx, *value));
-                let mut groups = Vec::<(CExpr, usize)>::new();
-                for (expr, _, _, _) in &rendered_returns {
-                    if let Some((_, count)) =
-                        groups.iter_mut().find(|(candidate, _)| candidate == expr)
-                    {
-                        *count += 1;
-                    } else {
-                        groups.push((expr.clone(), 1));
-                    }
-                }
-                let max_count = groups.iter().map(|(_, count)| *count).max()?;
-                let mut winners = groups
-                    .into_iter()
-                    .filter(|(_, count)| *count == max_count)
-                    .collect::<Vec<_>>();
-                (winners.len() == 1 && (max_count > 1 || rendered_returns.len() == 1))
-                    .then(|| winners.remove(0).0)
-            });
-            if let Some(expr) = unique_return_expr {
-                let mut rendered_returns = self
-                    .context
-                    .function_facts
-                    .render()
-                    .into_iter()
-                    .flat_map(r2types::FunctionRenderFacts::return_effects)
-                    .filter_map(|fact| {
-                        fold_ctx
-                            .certified_return_expr_for_op(fact.block_addr, fact.op_index)
-                            .map(|(rendered, value)| {
-                                (
-                                    normalize_certified_appended_return_expr(
-                                        rendered,
-                                        &c_function.ret_type,
-                                        &c_function.locals,
-                                    ),
-                                    fact.block_addr,
-                                    fact.op_index,
-                                    value,
-                                )
-                            })
-                    })
-                    .filter(|(rendered, _, _, _)| rendered == &expr)
-                    .collect::<Vec<_>>();
-                rendered_returns
-                    .sort_by_key(|(_, block_addr, op_idx, value)| (*block_addr, *op_idx, *value));
-                if let Some((_, block_addr, op_idx, value)) = rendered_returns.first().cloned() {
-                    c_function.body.push(CStmt::Return(Some(expr)));
-                    effect_render_proofs.push(EffectRenderProof {
-                        kind: EffectRenderProofKind::Return,
-                        block_addr,
-                        op_idx,
-                        call_disposition: None,
-                        target: None,
-                        address: None,
-                        value: Some(value),
-                        values: Vec::new(),
-                        phi_edge: None,
-                    });
-                }
-            }
-        }
-        if !certified_standard_mode && route_is_standard(semantic_route) {
-            fold_ctx.prune_duplicate_call_statements_by_source(&mut c_function.body);
-        }
-        if certified_standard_mode {
-            append_semantic_summary_return_comment_to_function_if_needed(
-                &mut c_function,
-                &self.context.function_facts,
-            );
-        } else {
-            append_semantic_summary_return_to_function_if_needed(
-                &mut c_function,
-                &self.context.function_facts,
-            );
-        }
+        append_semantic_summary_return_to_function_if_needed(
+            &mut c_function,
+            &self.context.function_facts,
+        );
 
         // Apply post-structuring suffix cleanup for folded/unfolded paths.
         // Linear fallback intentionally keeps its raw expression-builder output.
-        if !certified_standard_mode && !is_linear_fallback {
+        if !is_linear_fallback {
             let mut known_function_names = HashSet::new();
             for name in self.context.type_facts().known_function_signatures.keys() {
                 known_function_names.insert(name.to_ascii_lowercase());
             }
             post_rename::rewrite_function_identifiers(&mut c_function, &known_function_names);
         }
-        if !certified_standard_mode {
-            rewrite_stack_synonym_uses_to_declared_locals(&mut c_function, &fold_ctx);
-            prune_dead_temp_assignments_in_function_body(&mut c_function, &fold_ctx);
-        }
+        rewrite_stack_synonym_uses_to_declared_locals(&mut c_function, &fold_ctx);
+        prune_dead_temp_assignments_in_function_body(&mut c_function, &fold_ctx);
         prune_unused_pure_locals(&mut c_function);
         prune_unreferenced_local_declarations(&mut c_function);
         normalize_redundant_return_carrier_casts(&mut c_function);
         normalize_declared_assignment_literals(&mut c_function);
-        if route_is_standard(semantic_route) {
-            let residual_reason =
-                render_permission_residual_reason(self.context.effective_render_permission())
-                    .or_else(|| {
-                        route_is_standard(semantic_route).then(|| {
-                            certified_standard_output_residual_reason_with_effect_proofs(
-                                prepared,
-                                &self.context.function_facts,
-                                &c_function,
-                                certified_standard_mode.then_some(effect_render_proofs.as_slice()),
-                            )
-                        })?
-                    })
-                    .or_else(|| {
-                        certifying_render_residual_reason_with_transfer_proofs(
-                            Some(prepared),
-                            self.context.function_facts.control(),
-                            &func.cfg_risk_summary(),
-                            &c_function,
-                            certified_standard_mode.then_some(control_render_proofs.as_slice()),
-                            certified_standard_mode
-                                .then_some(control_transfer_render_proofs.as_slice()),
-                        )
-                    })
-                    .or_else(|| {
-                        looped_standard_output_residual_reason(
-                            &c_function,
-                            &func.cfg_risk_summary(),
-                        )
-                    });
-
-            if let Some(reason) = residual_reason {
-                c_function = residual_function_for_unproven_loop(c_function, reason);
-            }
-        }
-
-        c_function
+        work.with_phase(DecompileWorkPhase::Rendering).poll()?;
+        Ok(c_function)
     }
 
     /// Convert a CStmt to a Vec<CStmt>.
@@ -8292,13 +5408,40 @@ mod tests {
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
     use r2ssa::SSAFunction;
     use r2types::{
-        ArrayIndexBase, ArrayIndexCertificate, ExternalField, ExternalRegisterParamSpec,
-        ExternalStackBase, ExternalStackSlotRole, ExternalStackSlotSpec, ExternalStruct,
-        ExternalTypeDb, FieldAccessCertificate, FunctionFacts, FunctionParamSpec,
-        FunctionRenderFacts, FunctionSignatureSpec, FunctionTypeFacts, ParamSlotResolver,
-        SignatureCertificate, SignatureCertificateSource, Signedness,
+        ExternalField, ExternalRegisterParamSpec, ExternalStackSlotRole, ExternalStackSlotSpec,
+        ExternalStruct, ExternalTypeDb, FunctionFacts, FunctionParamSpec, FunctionRenderFacts,
+        FunctionSignatureSpec, FunctionTypeFacts, ParamSlotResolver, SignatureCertificate,
+        SignatureCertificateSource, Signedness,
     };
     use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+    struct StopAtPoll {
+        polls: Cell<usize>,
+        stop_at: usize,
+        reason: r2ssa::SsaExecutionStopReason,
+    }
+
+    impl StopAtPoll {
+        fn new(stop_at: usize, reason: r2ssa::SsaExecutionStopReason) -> Self {
+            Self {
+                polls: Cell::new(0),
+                stop_at,
+                reason,
+            }
+        }
+    }
+
+    impl r2ssa::SsaWorkControl for StopAtPoll {
+        fn poll(&self) -> Result<(), r2ssa::SsaExecutionStopReason> {
+            let polls = self.polls.get().saturating_add(1);
+            self.polls.set(polls);
+            if polls >= self.stop_at {
+                Err(self.reason)
+            } else {
+                Ok(())
+            }
+        }
+    }
 
     fn test_stack_render_facts(
         object: r2ssa::ObjectId,
@@ -8504,10 +5647,6 @@ mod tests {
         }];
 
         assert_eq!(definite_assignment_residual_reason(&function), None);
-    }
-
-    fn x86_64_param_slot_resolver() -> ParamSlotResolver {
-        ParamSlotResolver::from_arg_regs(DecompilerConfig::x86_64().arg_regs)
     }
 
     fn empty_fold_context_for_linearization<'a>() -> FoldingContext<'a> {
@@ -8865,234 +6004,33 @@ mod tests {
             .with_name("stable_demo")
     }
 
-    fn prepared_standard_input_with_type_facts(
-        prepared: r2ssa::SsaArtifact,
-        type_facts: FunctionTypeFacts,
-        reason: &str,
-    ) -> DecompilerInput {
-        let mut function_facts =
-            FunctionFacts::new(type_facts, None).with_decompile_route(test_decompile_route(
-                r2types::DecompileRouteKind::Standard,
-                reason,
-                None,
-                r2sym::RenderPermission::certified(r2sym::ProofOwner::R2engine, reason),
-            ));
-        function_facts.attach_prepared_decompile_evidence(&prepared);
-        function_facts.normalize_field_certificates_from_external_layout();
-        function_facts.populate_member_access_render_facts_from_field_certificates(
-            &prepared,
-            &x86_64_param_slot_resolver(),
+    #[test]
+    fn assignment_guard_consensus_polls_inside_pair_search() {
+        let stop = StopAtPoll::new(5, r2ssa::SsaExecutionStopReason::DeadlineExceeded);
+        let work = DecompileWorkControl::new(&stop, DecompileWorkPhase::Rendering);
+        let stop_reason = Cell::new(None);
+        let atom = CExpr::var("guard");
+        let mut clauses = vec![
+            vec![AssignmentGuardLiteral::Expression {
+                expr: atom.clone(),
+                truth: true,
+            }],
+            vec![AssignmentGuardLiteral::Expression {
+                expr: atom,
+                truth: false,
+            }],
+        ];
+
+        simplify_assignment_guard_clauses_with_control(&mut clauses, Some(work), &stop_reason);
+
+        assert_eq!(stop.polls.get(), 5);
+        assert_eq!(
+            stop_reason.get(),
+            Some(DecompileExecutionStop::new(
+                DecompileWorkPhase::Rendering,
+                r2ssa::SsaExecutionStopReason::DeadlineExceeded,
+            ))
         );
-        function_facts.populate_array_access_render_facts_from_scalar_candidates(
-            &prepared,
-            &x86_64_param_slot_resolver(),
-        );
-        function_facts.populate_certified_parameter_exprs(&prepared, &x86_64_param_slot_resolver());
-        DecompilerInput::new(
-            prepared,
-            DecompilerContext::default().with_function_facts(function_facts),
-        )
-    }
-
-    fn expression_value_for_op(
-        prepared: &r2ssa::SsaArtifact,
-        block_addr: u64,
-        op_idx: usize,
-    ) -> r2ssa::ValueId {
-        let inst = prepared
-            .graph()
-            .inst_id_for_op_site(block_addr, op_idx)
-            .expect("prepared op-site should have graph inst");
-        prepared
-            .certificates()
-            .expressions
-            .iter()
-            .find_map(|(value, cert)| (cert.defining_inst == Some(inst)).then_some(*value))
-            .expect("prepared op-site should define expression value")
-    }
-
-    fn test_function_facts_with_prepared_render(prepared: &r2ssa::SsaArtifact) -> FunctionFacts {
-        FunctionFacts::new(FunctionTypeFacts::default(), None)
-            .with_callsites(test_callsite_facts(prepared))
-            .with_call_results(test_call_result_facts(prepared))
-            .with_call_render(test_call_render_facts(prepared))
-            .with_render(test_render_facts(prepared))
-    }
-
-    fn test_callsite_facts(prepared: &r2ssa::SsaArtifact) -> r2types::FunctionCallsiteFacts {
-        let by_callsite = prepared
-            .certificates()
-            .callsites
-            .values()
-            .filter_map(|cert| {
-                let (block_addr, op_index) = prepared.inst_op_site(cert.at)?;
-                let callsite = r2types::CallsiteKey {
-                    block_addr,
-                    op_index,
-                };
-                Some((
-                    callsite,
-                    r2types::CallsiteArgumentFacts {
-                        callsite,
-                        call_site_id: cert.call_site,
-                        at: cert.at,
-                        target: cert.target,
-                        direct_target: cert.direct_target,
-                        argument_values: cert
-                            .argument_values
-                            .iter()
-                            .copied()
-                            .enumerate()
-                            .map(|(index, value)| r2types::CallArgumentValueFact { index, value })
-                            .collect(),
-                        register_argument_locations: Vec::new(),
-                        stack_argument_locations: Vec::new(),
-                    },
-                ))
-            })
-            .collect();
-        r2types::FunctionCallsiteFacts { by_callsite }
-    }
-
-    fn test_call_result_facts(prepared: &r2ssa::SsaArtifact) -> r2types::FunctionCallResultFacts {
-        let mut by_value = BTreeMap::new();
-        let mut by_callsite = BTreeMap::<r2types::CallsiteKey, Vec<r2ssa::ValueId>>::new();
-        for cert in prepared.certificates().call_results.values() {
-            let Some(callsite_cert) = prepared.certificates().callsites.get(&cert.call_site) else {
-                continue;
-            };
-            let callsite = r2types::CallsiteKey {
-                block_addr: callsite_cert.block_addr,
-                op_index: callsite_cert.op_index,
-            };
-            by_callsite.entry(callsite).or_default().push(cert.value);
-            by_value.insert(
-                cert.value,
-                r2types::CallResultFact {
-                    callsite,
-                    call_site_id: cert.call_site,
-                    at: cert.at,
-                    value: cert.value,
-                    width: cert.width,
-                    relation: cert.relation,
-                    carrier: cert.carrier.clone(),
-                    owner: cert.owner.clone(),
-                },
-            );
-        }
-        r2types::FunctionCallResultFacts {
-            by_value,
-            by_callsite,
-        }
-    }
-
-    fn test_call_render_facts(prepared: &r2ssa::SsaArtifact) -> r2types::FunctionCallRenderFacts {
-        let call_results = test_call_result_facts(prepared);
-        let by_callsite = prepared
-            .certificates()
-            .callsites
-            .values()
-            .map(|cert| {
-                let callsite = r2types::CallsiteKey {
-                    block_addr: cert.block_addr,
-                    op_index: cert.op_index,
-                };
-                let disposition = if call_results
-                    .results_for_site(callsite)
-                    .any(|result| matches!(result.owner, Some(r2ssa::ValueOwner::StackSlot { .. })))
-                {
-                    r2types::CallsiteRenderDisposition::AssignedResult
-                } else {
-                    r2types::CallsiteRenderDisposition::SideEffectStatement
-                };
-                (
-                    callsite,
-                    r2types::CallsiteRenderFact {
-                        callsite,
-                        target: Some(cert.target),
-                        disposition,
-                        proof_values: cert.argument_values.clone(),
-                        residual_reason: None,
-                    },
-                )
-            })
-            .collect();
-        r2types::FunctionCallRenderFacts { by_callsite }
-    }
-
-    fn test_render_facts(prepared: &r2ssa::SsaArtifact) -> r2types::FunctionRenderFacts {
-        r2types::FunctionRenderFacts::from_prepared(prepared)
-    }
-
-    struct TestMemberRenderFact<'a> {
-        block_addr: u64,
-        op_index: usize,
-        is_write: bool,
-        field_name: &'a str,
-        field_offset: u64,
-        access_width: u32,
-    }
-
-    struct TestArrayRenderFact {
-        block_addr: u64,
-        op_index: usize,
-        is_write: bool,
-        field_offset: u64,
-        element_stride: u64,
-        access_width: u32,
-    }
-
-    fn add_member_render_fact(
-        function_facts: &mut FunctionFacts,
-        prepared: &r2ssa::SsaArtifact,
-        fact: TestMemberRenderFact<'_>,
-    ) {
-        let cert = prepared
-            .memory_certificate_for_op_site(fact.block_addr, fact.op_index, fact.is_write)
-            .expect("prepared memory certificate for member render fact");
-        function_facts
-            .__test_render_facts_mut()
-            .member_accesses_by_op
-            .entry((fact.block_addr, fact.op_index, fact.is_write))
-            .or_default()
-            .push(r2types::MemberAccessRenderFact {
-                access: cert.access,
-                block_addr: fact.block_addr,
-                op_index: fact.op_index,
-                object: cert.object,
-                is_write: fact.is_write,
-                field_offset: fact.field_offset,
-                field_name: fact.field_name.to_string(),
-                field_type: None,
-                access_width: fact.access_width,
-            });
-    }
-
-    fn add_array_render_fact(
-        function_facts: &mut FunctionFacts,
-        prepared: &r2ssa::SsaArtifact,
-        fact: TestArrayRenderFact,
-    ) {
-        let cert = prepared
-            .memory_certificate_for_op_site(fact.block_addr, fact.op_index, fact.is_write)
-            .expect("prepared memory certificate for array render fact");
-        function_facts
-            .__test_render_facts_mut()
-            .array_accesses_by_op
-            .entry((fact.block_addr, fact.op_index, fact.is_write))
-            .or_default()
-            .push(r2types::ArrayAccessRenderFact {
-                access: cert.access,
-                block_addr: fact.block_addr,
-                op_index: fact.op_index,
-                object: cert.object,
-                is_write: fact.is_write,
-                field_offset: fact.field_offset,
-                element_stride: fact.element_stride,
-                access_width: fact.access_width,
-                base: None,
-                index: None,
-            });
     }
 
     fn test_arch_for_decompile() -> ArchSpec {
@@ -9167,1611 +6105,6 @@ mod tests {
             signature,
             [r2types::SignatureCertificateSource::ExternalContext],
         )
-    }
-
-    fn loop_cfg_summary() -> r2ssa::CFGRiskSummary {
-        r2ssa::CFGRiskSummary {
-            block_count: 4,
-            loop_count: 1,
-            back_edge_count: 1,
-            switch_block_count: 0,
-            max_switch_cases: 0,
-        }
-    }
-
-    fn switch_cfg_summary() -> r2ssa::CFGRiskSummary {
-        r2ssa::CFGRiskSummary {
-            block_count: 4,
-            loop_count: 0,
-            back_edge_count: 0,
-            switch_block_count: 1,
-            max_switch_cases: 2,
-        }
-    }
-
-    fn straightline_cfg_summary() -> r2ssa::CFGRiskSummary {
-        r2ssa::CFGRiskSummary {
-            block_count: 1,
-            loop_count: 0,
-            back_edge_count: 0,
-            switch_block_count: 0,
-            max_switch_cases: 0,
-        }
-    }
-
-    #[test]
-    fn looped_standard_output_refuses_loop_cfg_without_rendered_loop_structure() {
-        let func = CFunction::new("loop_fold", CType::u64()).with_body(vec![CStmt::Return(Some(
-            CExpr::UIntLit(0x14650fb0739d0383),
-        ))]);
-
-        let reason = looped_standard_output_residual_reason(&func, &loop_cfg_summary())
-            .expect("looped CFG without a loop construct must refuse structured output");
-        assert!(reason.contains("without loop structure"), "{reason}");
-
-        let residual = residual_function_for_unproven_loop(func, reason);
-        assert!(residual.locals.is_empty());
-        assert!(residual.body.iter().any(|stmt| matches!(
-            stmt,
-            CStmt::Comment(text) if text.contains("r2dec residual")
-        )));
-        assert!(residual.body.iter().any(|stmt| matches!(
-            stmt,
-            CStmt::Comment(text) if text.contains("summary return unresolved")
-        )));
-    }
-
-    #[test]
-    fn standard_structured_output_requires_prepared_control_certificates() {
-        let func = CFunction::new("loop_fold", CType::u64());
-        let reason = certifying_render_residual_reason(None, None, &loop_cfg_summary(), &func)
-            .expect("missing certificates should refuse loop rendering");
-
-        assert!(
-            reason.contains("missing prepared SSA certificates"),
-            "{reason}"
-        );
-    }
-
-    #[test]
-    fn standard_structured_output_refuses_rendered_loop_without_cfg_evidence() {
-        let func =
-            CFunction::new("spurious_loop", CType::u64()).with_body(vec![CStmt::while_loop(
-                CExpr::var("cond"),
-                CStmt::expr(CExpr::assign(CExpr::var("acc"), CExpr::uint(1))),
-            )]);
-        let cfg = r2ssa::CFGRiskSummary {
-            block_count: 1,
-            loop_count: 0,
-            back_edge_count: 0,
-            switch_block_count: 0,
-            max_switch_cases: 0,
-        };
-
-        let reason = structured_control_residual_reason_for_counts(
-            Some(ControlRenderCounts {
-                branches: 0,
-                loops: 1,
-                switches: 0,
-            }),
-            &cfg,
-            function_control_render_counts(&func),
-        )
-        .expect("rendered loop without CFG loop evidence must be residualized");
-
-        assert!(
-            reason.contains("rendered loop without loop CFG evidence"),
-            "{reason}"
-        );
-    }
-
-    #[test]
-    fn standard_structured_output_refuses_switch_cfg_without_rendered_switch_structure() {
-        let func = CFunction::new("switch_fold", CType::u64())
-            .with_body(vec![CStmt::Return(Some(CExpr::uint(0)))]);
-
-        let reason = structured_control_residual_reason_for_counts(
-            Some(ControlRenderCounts {
-                branches: 0,
-                loops: 0,
-                switches: 1,
-            }),
-            &switch_cfg_summary(),
-            function_control_render_counts(&func),
-        )
-        .expect("switch CFG rendered without switch structure must be residualized");
-
-        assert!(
-            reason.contains("switch CFG rendered without switch structure"),
-            "{reason}"
-        );
-    }
-
-    #[test]
-    fn standard_structured_output_refuses_more_switches_than_certificates() {
-        let func = CFunction::new("extra_switch", CType::u64()).with_body(vec![
-            CStmt::Switch {
-                expr: CExpr::var("sel0"),
-                cases: vec![ast::SwitchCase {
-                    value: CExpr::uint(0),
-                    body: vec![CStmt::Break],
-                }],
-                default: None,
-            },
-            CStmt::Switch {
-                expr: CExpr::var("sel1"),
-                cases: vec![ast::SwitchCase {
-                    value: CExpr::uint(1),
-                    body: vec![CStmt::Break],
-                }],
-                default: None,
-            },
-        ]);
-
-        let reason = structured_control_residual_reason_for_counts(
-            Some(ControlRenderCounts {
-                branches: 0,
-                loops: 0,
-                switches: 1,
-            }),
-            &switch_cfg_summary(),
-            function_control_render_counts(&func),
-        )
-        .expect("rendered switch count must not exceed switch certificates");
-
-        assert!(
-            reason.contains("rendered 2 switch construct(s) with only 1 SwitchCertificate(s)"),
-            "{reason}"
-        );
-    }
-
-    #[test]
-    fn standard_structured_output_refuses_branch_without_function_facts_predicate() {
-        let func = CFunction::new("spurious_if", CType::u64()).with_body(vec![CStmt::if_stmt(
-            CExpr::var("cond"),
-            CStmt::expr(CExpr::assign(CExpr::var("acc"), CExpr::uint(1))),
-            None,
-        )]);
-        let inventory = ControlCertificateInventory {
-            branches: Vec::new(),
-            loops: Vec::new(),
-            switches: Vec::new(),
-        };
-        let cfg = r2ssa::CFGRiskSummary {
-            block_count: 2,
-            loop_count: 0,
-            back_edge_count: 0,
-            switch_block_count: 0,
-            max_switch_cases: 0,
-        };
-        let (nodes, proof_failures) = function_control_render_nodes_with_proofs(&func, Some(&[]));
-
-        let reason = structured_control_residual_reason_for_nodes(
-            Some(&inventory),
-            &cfg,
-            &nodes,
-            &proof_failures,
-        )
-        .expect("rendered if without FunctionFacts branch proof must residualize");
-
-        assert!(reason.contains("branch node stmt:0"), "{reason}");
-        assert!(reason.contains("lacks render proof identity"), "{reason}");
-        assert!(
-            reason.contains("with only 0 FunctionFacts branch predicate"),
-            "{reason}"
-        );
-    }
-
-    #[test]
-    fn standard_structured_output_accepts_exact_function_facts_branch_predicate() {
-        let func = CFunction::new("certified_if", CType::u64()).with_body(vec![CStmt::if_stmt(
-            CExpr::var("cond"),
-            CStmt::expr(CExpr::assign(CExpr::var("acc"), CExpr::uint(1))),
-            None,
-        )]);
-        let inventory = ControlCertificateInventory {
-            branches: vec![BranchCertificateSummary {
-                anchor: 0x401000,
-                proof_node: "FunctionFacts.branch_predicate:PredicateId(7)".to_string(),
-                condition: r2ssa::PredicateId(7),
-                condition_value: r2ssa::ValueId(11),
-                true_target: 0x401010,
-                false_target: 0x401020,
-            }],
-            loops: Vec::new(),
-            switches: Vec::new(),
-        };
-        let cfg = r2ssa::CFGRiskSummary {
-            block_count: 3,
-            loop_count: 0,
-            back_edge_count: 0,
-            switch_block_count: 0,
-            max_switch_cases: 0,
-        };
-        let (nodes, proof_failures) = function_control_render_nodes_with_proofs(
-            &func,
-            Some(&[ControlRenderProof {
-                kind: ControlRenderProofKind::Branch,
-                anchor: 0x401000,
-                branch_condition: Some(r2ssa::PredicateId(7)),
-                branch_condition_value: Some(r2ssa::ValueId(11)),
-                loop_condition: None,
-                loop_condition_value: None,
-                loop_body_blocks: Vec::new(),
-                loop_latches: Vec::new(),
-                loop_exits: Vec::new(),
-                switch_selector: None,
-                switch_cases: Vec::new(),
-                switch_default: None,
-            }]),
-        );
-
-        let reason = structured_control_residual_reason_for_nodes(
-            Some(&inventory),
-            &cfg,
-            &nodes,
-            &proof_failures,
-        );
-
-        assert_eq!(reason, None);
-    }
-
-    #[test]
-    fn standard_structured_output_refuses_branch_predicate_value_mismatch() {
-        let func =
-            CFunction::new("bad_if_predicate", CType::u64()).with_body(vec![CStmt::if_stmt(
-                CExpr::var("cond"),
-                CStmt::expr(CExpr::assign(CExpr::var("acc"), CExpr::uint(1))),
-                None,
-            )]);
-        let inventory = ControlCertificateInventory {
-            branches: vec![BranchCertificateSummary {
-                anchor: 0x401000,
-                proof_node: "FunctionFacts.branch_predicate:PredicateId(7)".to_string(),
-                condition: r2ssa::PredicateId(7),
-                condition_value: r2ssa::ValueId(11),
-                true_target: 0x401010,
-                false_target: 0x401020,
-            }],
-            loops: Vec::new(),
-            switches: Vec::new(),
-        };
-        let cfg = r2ssa::CFGRiskSummary {
-            block_count: 3,
-            loop_count: 0,
-            back_edge_count: 0,
-            switch_block_count: 0,
-            max_switch_cases: 0,
-        };
-        let (nodes, proof_failures) = function_control_render_nodes_with_proofs(
-            &func,
-            Some(&[ControlRenderProof {
-                kind: ControlRenderProofKind::Branch,
-                anchor: 0x401000,
-                branch_condition: Some(r2ssa::PredicateId(8)),
-                branch_condition_value: Some(r2ssa::ValueId(12)),
-                loop_condition: None,
-                loop_condition_value: None,
-                loop_body_blocks: Vec::new(),
-                loop_latches: Vec::new(),
-                loop_exits: Vec::new(),
-                switch_selector: None,
-                switch_cases: Vec::new(),
-                switch_default: None,
-            }]),
-        );
-
-        let reason = structured_control_residual_reason_for_nodes(
-            Some(&inventory),
-            &cfg,
-            &nodes,
-            &proof_failures,
-        )
-        .expect("branch predicate mismatch must residualize");
-
-        assert!(reason.contains("branch node stmt:0"), "{reason}");
-        assert!(
-            reason.contains("predicate proof Some(PredicateId(8))"),
-            "{reason}"
-        );
-        assert!(
-            reason.contains("condition value proof Some(ValueId(12))"),
-            "{reason}"
-        );
-    }
-
-    #[test]
-    fn standard_structured_output_refuses_loop_without_function_facts_loop_structure() {
-        let prepared = prepared_from_ops(Vec::new(), &test_arch_for_decompile());
-        let func =
-            CFunction::new("uncertified_loop", CType::u64()).with_body(vec![CStmt::while_loop(
-                CExpr::var("cond"),
-                CStmt::expr(CExpr::assign(CExpr::var("acc"), CExpr::uint(1))),
-            )]);
-        let (nodes, proof_failures) = function_control_render_nodes_with_proofs(
-            &func,
-            Some(&[ControlRenderProof {
-                kind: ControlRenderProofKind::Loop,
-                anchor: 0x401000,
-                branch_condition: None,
-                branch_condition_value: None,
-                loop_condition: Some(r2ssa::PredicateId(1)),
-                loop_condition_value: Some(r2ssa::ValueId(10)),
-                loop_body_blocks: vec![0x401000, 0x401010],
-                loop_latches: vec![0x401010],
-                loop_exits: vec![0x401020],
-                switch_selector: None,
-                switch_cases: Vec::new(),
-                switch_default: None,
-            }]),
-        );
-        let inventory = control_certificate_inventory(None);
-
-        let direct_reason = structured_control_residual_reason_for_nodes(
-            Some(&inventory),
-            &loop_cfg_summary(),
-            &nodes,
-            &proof_failures,
-        )
-        .expect("rendered loop without FunctionFacts loop proof must residualize");
-        let route_reason = certifying_render_residual_reason_with_proofs(
-            Some(&prepared),
-            None,
-            &loop_cfg_summary(),
-            &func,
-            Some(&[ControlRenderProof {
-                kind: ControlRenderProofKind::Loop,
-                anchor: 0x401000,
-                branch_condition: None,
-                branch_condition_value: None,
-                loop_condition: Some(r2ssa::PredicateId(1)),
-                loop_condition_value: Some(r2ssa::ValueId(10)),
-                loop_body_blocks: vec![0x401000, 0x401010],
-                loop_latches: vec![0x401010],
-                loop_exits: vec![0x401020],
-                switch_selector: None,
-                switch_cases: Vec::new(),
-                switch_default: None,
-            }]),
-        )
-        .expect("certified route must not recover loop proof from prepared SSA side channels");
-
-        assert!(
-            direct_reason.contains("with only 0 LoopCertificate"),
-            "{direct_reason}"
-        );
-        assert!(
-            route_reason.contains("with only 0 LoopCertificate"),
-            "{route_reason}"
-        );
-    }
-
-    #[test]
-    fn standard_structured_output_accepts_exact_function_facts_loop_structure() {
-        let prepared = prepared_from_ops(Vec::new(), &test_arch_for_decompile());
-        let func =
-            CFunction::new("certified_loop", CType::u64()).with_body(vec![CStmt::while_loop(
-                CExpr::var("cond"),
-                CStmt::expr(CExpr::assign(CExpr::var("acc"), CExpr::uint(1))),
-            )]);
-        let control = r2types::FunctionControlFacts {
-            loops: BTreeMap::from([(
-                r2ssa::LoopId(1),
-                r2types::LoopStructureFact {
-                    loop_id: r2ssa::LoopId(1),
-                    proof_node: r2ssa::ProofNodeId::loop_certificate(0x401000, r2ssa::LoopId(1))
-                        .to_string(),
-                    header: 0x401000,
-                    condition: Some(r2ssa::PredicateId(1)),
-                    condition_value: Some(r2ssa::ValueId(10)),
-                    body: vec![0x401000, 0x401010],
-                    latches: vec![0x401010],
-                    exits: vec![0x401020],
-                },
-            )]),
-            ..r2types::FunctionControlFacts::default()
-        };
-
-        let reason = certifying_render_residual_reason_with_proofs(
-            Some(&prepared),
-            Some(&control),
-            &loop_cfg_summary(),
-            &func,
-            Some(&[ControlRenderProof {
-                kind: ControlRenderProofKind::Loop,
-                anchor: 0x401000,
-                branch_condition: None,
-                branch_condition_value: None,
-                loop_condition: Some(r2ssa::PredicateId(1)),
-                loop_condition_value: Some(r2ssa::ValueId(10)),
-                loop_body_blocks: vec![0x401000, 0x401010],
-                loop_latches: vec![0x401010],
-                loop_exits: vec![0x401020],
-                switch_selector: None,
-                switch_cases: Vec::new(),
-                switch_default: None,
-            }]),
-        );
-
-        assert_eq!(reason, None);
-    }
-
-    #[test]
-    fn standard_structured_output_refuses_switch_without_function_facts_selector() {
-        let prepared = prepared_from_ops(Vec::new(), &test_arch_for_decompile());
-        let func =
-            CFunction::new("uncertified_switch", CType::u64()).with_body(vec![CStmt::Switch {
-                expr: CExpr::var("sel"),
-                cases: vec![ast::SwitchCase {
-                    value: CExpr::uint(0),
-                    body: vec![CStmt::Break],
-                }],
-                default: None,
-            }]);
-
-        let reason = certifying_render_residual_reason_with_proofs(
-            Some(&prepared),
-            None,
-            &switch_cfg_summary(),
-            &func,
-            Some(&[ControlRenderProof {
-                kind: ControlRenderProofKind::Switch,
-                anchor: 0x401020,
-                branch_condition: None,
-                branch_condition_value: None,
-                loop_condition: None,
-                loop_condition_value: None,
-                loop_body_blocks: Vec::new(),
-                loop_latches: Vec::new(),
-                loop_exits: Vec::new(),
-                switch_selector: Some(r2ssa::ValueId(7)),
-                switch_cases: vec![(0, 0x401100)],
-                switch_default: None,
-            }]),
-        )
-        .expect("rendered switch without FunctionFacts selector proof must residualize");
-
-        assert!(reason.contains("with only 0 SwitchCertificate"), "{reason}");
-    }
-
-    #[test]
-    fn standard_structured_output_accepts_exact_function_facts_switch_selector() {
-        let prepared = prepared_from_ops(Vec::new(), &test_arch_for_decompile());
-        let func =
-            CFunction::new("certified_switch", CType::u64()).with_body(vec![CStmt::Switch {
-                expr: CExpr::var("sel"),
-                cases: vec![ast::SwitchCase {
-                    value: CExpr::uint(0),
-                    body: vec![CStmt::Return(Some(CExpr::uint(0)))],
-                }],
-                default: None,
-            }]);
-        let control = r2types::FunctionControlFacts {
-            switches: BTreeMap::from([(
-                0x401020,
-                r2types::SwitchSelectorFact {
-                    proof_node: r2ssa::ProofNodeId::switch_certificate(0x401020).to_string(),
-                    block_addr: 0x401020,
-                    selector: Some(r2ssa::ValueId(7)),
-                    cases: vec![(0, 0x401100)],
-                    default: None,
-                },
-            )]),
-            ..r2types::FunctionControlFacts::default()
-        };
-
-        let reason = certifying_render_residual_reason_with_proofs(
-            Some(&prepared),
-            Some(&control),
-            &switch_cfg_summary(),
-            &func,
-            Some(&[ControlRenderProof {
-                kind: ControlRenderProofKind::Switch,
-                anchor: 0x401020,
-                branch_condition: None,
-                branch_condition_value: None,
-                loop_condition: None,
-                loop_condition_value: None,
-                loop_body_blocks: Vec::new(),
-                loop_latches: Vec::new(),
-                loop_exits: Vec::new(),
-                switch_selector: Some(r2ssa::ValueId(7)),
-                switch_cases: vec![(0, 0x401100)],
-                switch_default: None,
-            }]),
-        );
-
-        assert_eq!(reason, None);
-    }
-
-    #[test]
-    fn standard_structured_output_refuses_unproved_switch_case_break() {
-        let prepared = prepared_from_ops(Vec::new(), &test_arch_for_decompile());
-        let control = r2types::FunctionControlFacts {
-            switches: BTreeMap::from([(
-                0x401020,
-                r2types::SwitchSelectorFact {
-                    proof_node: r2ssa::ProofNodeId::switch_certificate(0x401020).to_string(),
-                    block_addr: 0x401020,
-                    selector: Some(r2ssa::ValueId(7)),
-                    cases: vec![(0, 0x401100)],
-                    default: None,
-                },
-            )]),
-            ..r2types::FunctionControlFacts::default()
-        };
-        let func = CFunction::new("case_break", CType::u64()).with_body(vec![CStmt::Switch {
-            expr: CExpr::var("sel"),
-            cases: vec![ast::SwitchCase {
-                value: CExpr::uint(0),
-                body: vec![CStmt::Break],
-            }],
-            default: None,
-        }]);
-
-        let reason = certifying_render_residual_reason_with_proofs(
-            Some(&prepared),
-            Some(&control),
-            &switch_cfg_summary(),
-            &func,
-            Some(&[ControlRenderProof {
-                kind: ControlRenderProofKind::Switch,
-                anchor: 0x401020,
-                branch_condition: None,
-                branch_condition_value: None,
-                loop_condition: None,
-                loop_condition_value: None,
-                loop_body_blocks: Vec::new(),
-                loop_latches: Vec::new(),
-                loop_exits: Vec::new(),
-                switch_selector: Some(r2ssa::ValueId(7)),
-                switch_cases: vec![(0, 0x401100)],
-                switch_default: None,
-            }]),
-        )
-        .expect("case break without case-exit proof must residualize");
-
-        assert!(
-            reason.contains("unproved control transfer break"),
-            "{reason}"
-        );
-    }
-
-    #[test]
-    fn standard_structured_output_refuses_unproved_continue_and_goto() {
-        for (stmt, expected) in [
-            (CStmt::Continue, "unproved control transfer continue"),
-            (
-                CStmt::Goto("block_401000".to_string()),
-                "unproved control transfer goto",
-            ),
-        ] {
-            let func = CFunction::new("unproved_transfer", CType::u64()).with_body(vec![stmt]);
-
-            let reason = certifying_render_residual_reason_with_proofs(
-                None,
-                None,
-                &straightline_cfg_summary(),
-                &func,
-                Some(&[]),
-            )
-            .expect("unproved control transfer must residualize");
-
-            assert!(reason.contains(expected), "{reason}");
-        }
-    }
-
-    #[test]
-    fn standard_structured_output_accepts_exact_loop_transfer_edges() {
-        let prepared = prepared_from_ops(Vec::new(), &test_arch_for_decompile());
-        let loop_header = 0x401000;
-        let break_source = 0x401010;
-        let continue_source = 0x401018;
-        let exit = 0x401020;
-        let func =
-            CFunction::new("certified_transfers", CType::u64()).with_body(vec![CStmt::while_loop(
-                CExpr::var("loop_cond"),
-                CStmt::Block(vec![
-                    CStmt::if_stmt(CExpr::var("exit_cond"), CStmt::Break, None),
-                    CStmt::if_stmt(CExpr::var("next_cond"), CStmt::Continue, None),
-                ]),
-            )]);
-        let branch_fact =
-            |id, block_addr, true_target, false_target| r2types::BranchPredicateFact {
-                id,
-                block_addr,
-                condition: r2ssa::ValueId(id.0 + 20),
-                comparison: None,
-                evaluated_comparison: None,
-                render_comparison: None,
-                true_target,
-                false_target,
-            };
-        let control = r2types::FunctionControlFacts {
-            branch_predicates: BTreeMap::from([
-                (
-                    break_source,
-                    branch_fact(r2ssa::PredicateId(2), break_source, exit, continue_source),
-                ),
-                (
-                    continue_source,
-                    branch_fact(r2ssa::PredicateId(3), continue_source, loop_header, exit),
-                ),
-            ]),
-            loops: BTreeMap::from([(
-                r2ssa::LoopId(1),
-                r2types::LoopStructureFact {
-                    loop_id: r2ssa::LoopId(1),
-                    proof_node: r2ssa::ProofNodeId::loop_certificate(loop_header, r2ssa::LoopId(1))
-                        .to_string(),
-                    header: loop_header,
-                    condition: Some(r2ssa::PredicateId(1)),
-                    condition_value: Some(r2ssa::ValueId(21)),
-                    body: vec![loop_header, break_source, continue_source],
-                    latches: vec![continue_source],
-                    exits: vec![exit],
-                },
-            )]),
-            ..r2types::FunctionControlFacts::default()
-        };
-        let control_proofs = [
-            ControlRenderProof {
-                kind: ControlRenderProofKind::Loop,
-                anchor: loop_header,
-                branch_condition: None,
-                branch_condition_value: None,
-                loop_condition: Some(r2ssa::PredicateId(1)),
-                loop_condition_value: Some(r2ssa::ValueId(21)),
-                loop_body_blocks: vec![loop_header, break_source, continue_source],
-                loop_latches: vec![continue_source],
-                loop_exits: vec![exit],
-                switch_selector: None,
-                switch_cases: Vec::new(),
-                switch_default: None,
-            },
-            ControlRenderProof {
-                kind: ControlRenderProofKind::Branch,
-                anchor: break_source,
-                branch_condition: Some(r2ssa::PredicateId(2)),
-                branch_condition_value: Some(r2ssa::ValueId(22)),
-                loop_condition: None,
-                loop_condition_value: None,
-                loop_body_blocks: Vec::new(),
-                loop_latches: Vec::new(),
-                loop_exits: Vec::new(),
-                switch_selector: None,
-                switch_cases: Vec::new(),
-                switch_default: None,
-            },
-            ControlRenderProof {
-                kind: ControlRenderProofKind::Branch,
-                anchor: continue_source,
-                branch_condition: Some(r2ssa::PredicateId(3)),
-                branch_condition_value: Some(r2ssa::ValueId(23)),
-                loop_condition: None,
-                loop_condition_value: None,
-                loop_body_blocks: Vec::new(),
-                loop_latches: Vec::new(),
-                loop_exits: Vec::new(),
-                switch_selector: None,
-                switch_cases: Vec::new(),
-                switch_default: None,
-            },
-        ];
-        let transfer_proofs = [
-            ControlTransferRenderProof::Break {
-                loop_header,
-                source: break_source,
-                target: exit,
-            },
-            ControlTransferRenderProof::Continue {
-                loop_header,
-                source: continue_source,
-                target: loop_header,
-            },
-        ];
-
-        let reason = certifying_render_residual_reason_with_transfer_proofs(
-            Some(&prepared),
-            Some(&control),
-            &loop_cfg_summary(),
-            &func,
-            Some(&control_proofs),
-            Some(&transfer_proofs),
-        );
-
-        assert_eq!(reason, None);
-    }
-
-    #[test]
-    fn standard_structured_output_accepts_exact_goto_through_transparent_forwarder() {
-        let loop_header = 0x401000;
-        let exit_source = 0x401010;
-        let latch = 0x401014;
-        let exit = 0x401020;
-        let lowered_target = 0x401030;
-        let blocks = [
-            R2ILBlock {
-                addr: loop_header,
-                size: 4,
-                ops: vec![R2ILOp::Branch {
-                    target: Varnode::constant(exit_source, 8),
-                }],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-            R2ILBlock {
-                addr: exit_source,
-                size: 4,
-                ops: vec![R2ILOp::CBranch {
-                    target: Varnode::constant(exit, 8),
-                    cond: Varnode::constant(1, 1),
-                }],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-            R2ILBlock {
-                addr: latch,
-                size: 4,
-                ops: vec![R2ILOp::Branch {
-                    target: Varnode::constant(loop_header, 8),
-                }],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-            R2ILBlock {
-                addr: exit,
-                size: 4,
-                ops: vec![R2ILOp::Branch {
-                    target: Varnode::constant(lowered_target, 8),
-                }],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-            R2ILBlock::new(lowered_target, 4),
-        ];
-        let prepared =
-            r2ssa::SsaArtifact::for_decompile(&blocks, None).expect("prepared SSA should build");
-        let func = CFunction::new("certified_goto", CType::u64()).with_body(vec![
-            CStmt::while_loop(
-                CExpr::var("loop_cond"),
-                CStmt::if_stmt(CExpr::var("exit_cond"), CStmt::Goto("L0".to_string()), None),
-            ),
-            CStmt::Label("L0".to_string()),
-        ]);
-        let control = r2types::FunctionControlFacts {
-            branch_predicates: BTreeMap::from([(
-                exit_source,
-                r2types::BranchPredicateFact {
-                    id: r2ssa::PredicateId(2),
-                    block_addr: exit_source,
-                    condition: r2ssa::ValueId(22),
-                    comparison: None,
-                    evaluated_comparison: None,
-                    render_comparison: None,
-                    true_target: exit,
-                    false_target: latch,
-                },
-            )]),
-            loops: BTreeMap::from([(
-                r2ssa::LoopId(1),
-                r2types::LoopStructureFact {
-                    loop_id: r2ssa::LoopId(1),
-                    proof_node: r2ssa::ProofNodeId::loop_certificate(loop_header, r2ssa::LoopId(1))
-                        .to_string(),
-                    header: loop_header,
-                    condition: Some(r2ssa::PredicateId(1)),
-                    condition_value: Some(r2ssa::ValueId(21)),
-                    body: vec![loop_header, exit_source, latch],
-                    latches: vec![latch],
-                    exits: vec![exit],
-                },
-            )]),
-            ..r2types::FunctionControlFacts::default()
-        };
-        let control_proofs = [
-            ControlRenderProof {
-                kind: ControlRenderProofKind::Loop,
-                anchor: loop_header,
-                branch_condition: None,
-                branch_condition_value: None,
-                loop_condition: Some(r2ssa::PredicateId(1)),
-                loop_condition_value: Some(r2ssa::ValueId(21)),
-                loop_body_blocks: vec![loop_header, exit_source, latch],
-                loop_latches: vec![latch],
-                loop_exits: vec![exit],
-                switch_selector: None,
-                switch_cases: Vec::new(),
-                switch_default: None,
-            },
-            ControlRenderProof {
-                kind: ControlRenderProofKind::Branch,
-                anchor: exit_source,
-                branch_condition: Some(r2ssa::PredicateId(2)),
-                branch_condition_value: Some(r2ssa::ValueId(22)),
-                loop_condition: None,
-                loop_condition_value: None,
-                loop_body_blocks: Vec::new(),
-                loop_latches: Vec::new(),
-                loop_exits: Vec::new(),
-                switch_selector: None,
-                switch_cases: Vec::new(),
-                switch_default: None,
-            },
-        ];
-        let transfer_proofs = [ControlTransferRenderProof::Goto {
-            loop_header,
-            source: exit_source,
-            target: exit,
-            lowered_target,
-            path: vec![exit, lowered_target],
-            label: "L0".to_string(),
-        }];
-
-        let reason = certifying_render_residual_reason_with_transfer_proofs(
-            Some(&prepared),
-            Some(&control),
-            &loop_cfg_summary(),
-            &func,
-            Some(&control_proofs),
-            Some(&transfer_proofs),
-        );
-
-        assert_eq!(reason, None);
-    }
-
-    #[test]
-    fn transparent_goto_path_refuses_effectful_forwarder() {
-        let exit = 0x401020;
-        let lowered_target = 0x401030;
-        let mut forwarder = R2ILBlock::new(exit, 4);
-        forwarder.push(R2ILOp::Copy {
-            dst: Varnode::unique(0x10, 8),
-            src: Varnode::constant(1, 8),
-        });
-        forwarder.push(R2ILOp::Branch {
-            target: Varnode::constant(lowered_target, 8),
-        });
-        let mut consumer = R2ILBlock::new(lowered_target, 4);
-        consumer.push(R2ILOp::Return {
-            target: Varnode::unique(0x10, 8),
-        });
-        let prepared = r2ssa::SsaArtifact::for_decompile(&[forwarder, consumer], None)
-            .expect("prepared SSA should build");
-
-        assert!(!transparent_transfer_path_is_exact(
-            prepared.function(),
-            exit,
-            lowered_target,
-            &[exit, lowered_target],
-        ));
-    }
-
-    #[test]
-    fn transparent_goto_path_accepts_exact_materialized_phi_edge_copy() {
-        let exit = 0x401020;
-        let lowered_target = 0x401030;
-        let prepared = r2ssa::SsaArtifact::for_decompile(
-            &[
-                R2ILBlock {
-                    addr: exit,
-                    size: 4,
-                    ops: vec![R2ILOp::Branch {
-                        target: Varnode::constant(lowered_target, 8),
-                    }],
-                    switch_info: None,
-                    op_metadata: Default::default(),
-                },
-                R2ILBlock::new(lowered_target, 4),
-            ],
-            None,
-        )
-        .expect("prepared SSA should build");
-        let mut function = prepared.into_function();
-        let source = r2ssa::SSAVar::new("x8", 1, 8);
-        let destination = r2ssa::SSAVar::new("x8", 2, 8);
-        let forwarder = function.get_block_mut(exit).expect("forwarder block");
-        let branch_index = forwarder.ops.len().saturating_sub(1);
-        forwarder.ops.insert(
-            branch_index,
-            r2ssa::SSAOp::Copy {
-                dst: destination.clone(),
-                src: source.clone(),
-            },
-        );
-        function
-            .get_block_mut(lowered_target)
-            .expect("phi target")
-            .phis
-            .push(r2ssa::PhiNode {
-                dst: destination,
-                sources: vec![(exit, source)],
-            });
-
-        assert!(transparent_transfer_path_is_exact(
-            &function,
-            exit,
-            lowered_target,
-            &[exit, lowered_target],
-        ));
-    }
-
-    #[test]
-    fn standard_structured_output_refuses_implicit_switch_case_fallthrough() {
-        let prepared = prepared_from_ops(Vec::new(), &test_arch_for_decompile());
-        let control = r2types::FunctionControlFacts {
-            switches: BTreeMap::from([(
-                0x401020,
-                r2types::SwitchSelectorFact {
-                    proof_node: r2ssa::ProofNodeId::switch_certificate(0x401020).to_string(),
-                    block_addr: 0x401020,
-                    selector: Some(r2ssa::ValueId(7)),
-                    cases: vec![(0, 0x401100)],
-                    default: None,
-                },
-            )]),
-            ..r2types::FunctionControlFacts::default()
-        };
-        let func =
-            CFunction::new("case_fallthrough", CType::u64()).with_body(vec![CStmt::Switch {
-                expr: CExpr::var("sel"),
-                cases: vec![ast::SwitchCase {
-                    value: CExpr::uint(0),
-                    body: vec![CStmt::expr(CExpr::assign(CExpr::var("x"), CExpr::uint(1)))],
-                }],
-                default: None,
-            }]);
-
-        let reason = certifying_render_residual_reason_with_proofs(
-            Some(&prepared),
-            Some(&control),
-            &switch_cfg_summary(),
-            &func,
-            Some(&[ControlRenderProof {
-                kind: ControlRenderProofKind::Switch,
-                anchor: 0x401020,
-                branch_condition: None,
-                branch_condition_value: None,
-                loop_condition: None,
-                loop_condition_value: None,
-                loop_body_blocks: Vec::new(),
-                loop_latches: Vec::new(),
-                loop_exits: Vec::new(),
-                switch_selector: Some(r2ssa::ValueId(7)),
-                switch_cases: vec![(0, 0x401100)],
-                switch_default: None,
-            }]),
-        )
-        .expect("implicit switch fallthrough without exact case-exit proof must residualize");
-
-        assert!(
-            reason.contains("unproved switch case fallthrough"),
-            "{reason}"
-        );
-    }
-
-    #[test]
-    fn standard_structured_output_refuses_switch_shape_mismatch_at_render_node() {
-        let func =
-            CFunction::new("bad_switch_shape", CType::u64()).with_body(vec![CStmt::Switch {
-                expr: CExpr::var("sel"),
-                cases: vec![
-                    ast::SwitchCase {
-                        value: CExpr::uint(0),
-                        body: vec![CStmt::Break],
-                    },
-                    ast::SwitchCase {
-                        value: CExpr::uint(1),
-                        body: vec![CStmt::Break],
-                    },
-                ],
-                default: Some(vec![CStmt::Break]),
-            }]);
-        let inventory = ControlCertificateInventory {
-            branches: Vec::new(),
-            loops: Vec::new(),
-            switches: vec![SwitchCertificateSummary {
-                anchor: 0x401020,
-                proof_node: r2ssa::ProofNodeId::switch_certificate(0x401020).to_string(),
-                selector: None,
-                case_targets: Vec::new(),
-                default_target: None,
-                cases: 1,
-                case_values: vec![0],
-                has_default: false,
-            }],
-        };
-        let (nodes, proof_failures) = function_control_render_nodes_with_proofs(
-            &func,
-            Some(&[ControlRenderProof::new(
-                ControlRenderProofKind::Switch,
-                0x401020,
-            )]),
-        );
-
-        let reason = structured_control_residual_reason_for_nodes(
-            Some(&inventory),
-            &switch_cfg_summary(),
-            &nodes,
-            &proof_failures,
-        )
-        .expect("switch shape mismatch must be residualized even with one certificate");
-
-        assert!(reason.contains("switch node stmt:0"), "{reason}");
-        assert!(reason.contains("r2ssa:switch:0x401020:0"), "{reason}");
-        assert!(reason.contains("has 2 case(s)"), "{reason}");
-        assert!(reason.contains("default presence"), "{reason}");
-    }
-
-    #[test]
-    fn standard_structured_output_refuses_switch_case_value_mismatch_at_render_node() {
-        let func =
-            CFunction::new("bad_switch_values", CType::u64()).with_body(vec![CStmt::Switch {
-                expr: CExpr::var("sel"),
-                cases: vec![
-                    ast::SwitchCase {
-                        value: CExpr::uint(0),
-                        body: vec![CStmt::Break],
-                    },
-                    ast::SwitchCase {
-                        value: CExpr::uint(2),
-                        body: vec![CStmt::Break],
-                    },
-                ],
-                default: None,
-            }]);
-        let inventory = ControlCertificateInventory {
-            branches: Vec::new(),
-            loops: Vec::new(),
-            switches: vec![SwitchCertificateSummary {
-                anchor: 0x401020,
-                proof_node: r2ssa::ProofNodeId::switch_certificate(0x401020).to_string(),
-                selector: None,
-                case_targets: Vec::new(),
-                default_target: None,
-                cases: 2,
-                case_values: vec![0, 1],
-                has_default: false,
-            }],
-        };
-        let (nodes, proof_failures) = function_control_render_nodes_with_proofs(
-            &func,
-            Some(&[ControlRenderProof::new(
-                ControlRenderProofKind::Switch,
-                0x401020,
-            )]),
-        );
-
-        let reason = structured_control_residual_reason_for_nodes(
-            Some(&inventory),
-            &switch_cfg_summary(),
-            &nodes,
-            &proof_failures,
-        )
-        .expect("switch value mismatch must be residualized");
-
-        assert!(reason.contains("switch node stmt:0"), "{reason}");
-        assert!(reason.contains("case values [0, 2]"), "{reason}");
-        assert!(reason.contains("values [0, 1]"), "{reason}");
-    }
-
-    #[test]
-    fn standard_structured_output_refuses_switch_case_target_mismatch_at_render_node() {
-        let func =
-            CFunction::new("bad_switch_targets", CType::u64()).with_body(vec![CStmt::Switch {
-                expr: CExpr::var("sel"),
-                cases: vec![
-                    ast::SwitchCase {
-                        value: CExpr::uint(0),
-                        body: vec![CStmt::Break],
-                    },
-                    ast::SwitchCase {
-                        value: CExpr::uint(1),
-                        body: vec![CStmt::Break],
-                    },
-                ],
-                default: None,
-            }]);
-        let inventory = ControlCertificateInventory {
-            branches: Vec::new(),
-            loops: Vec::new(),
-            switches: vec![SwitchCertificateSummary {
-                anchor: 0x401020,
-                proof_node: r2ssa::ProofNodeId::switch_certificate(0x401020).to_string(),
-                selector: None,
-                case_targets: vec![(0, 0x401100), (1, 0x401200)],
-                default_target: None,
-                cases: 2,
-                case_values: vec![0, 1],
-                has_default: false,
-            }],
-        };
-        let (nodes, proof_failures) = function_control_render_nodes_with_proofs(
-            &func,
-            Some(&[ControlRenderProof {
-                kind: ControlRenderProofKind::Switch,
-                anchor: 0x401020,
-                branch_condition: None,
-                branch_condition_value: None,
-                loop_condition: None,
-                loop_condition_value: None,
-                loop_body_blocks: Vec::new(),
-                loop_latches: Vec::new(),
-                loop_exits: Vec::new(),
-                switch_selector: None,
-                switch_cases: vec![(0, 0x401100), (1, 0x401208)],
-                switch_default: None,
-            }]),
-        );
-
-        let reason = structured_control_residual_reason_for_nodes(
-            Some(&inventory),
-            &switch_cfg_summary(),
-            &nodes,
-            &proof_failures,
-        )
-        .expect("switch target mismatch must be residualized");
-
-        assert!(reason.contains("switch node stmt:0"), "{reason}");
-        assert!(reason.contains("case targets"), "{reason}");
-        assert!(reason.contains("4198920"), "{reason}");
-        assert!(reason.contains("4198912"), "{reason}");
-    }
-
-    #[test]
-    fn standard_structured_output_refuses_placeholder_switch_selector_with_selector_certificate() {
-        let func =
-            CFunction::new("bad_switch_selector", CType::u64()).with_body(vec![CStmt::Switch {
-                expr: CExpr::var("test"),
-                cases: vec![
-                    ast::SwitchCase {
-                        value: CExpr::uint(0),
-                        body: vec![CStmt::Break],
-                    },
-                    ast::SwitchCase {
-                        value: CExpr::uint(1),
-                        body: vec![CStmt::Break],
-                    },
-                ],
-                default: None,
-            }]);
-        let inventory = ControlCertificateInventory {
-            branches: Vec::new(),
-            loops: Vec::new(),
-            switches: vec![SwitchCertificateSummary {
-                anchor: 0x401020,
-                proof_node: r2ssa::ProofNodeId::switch_certificate(0x401020).to_string(),
-                selector: Some(r2ssa::ValueId(7)),
-                case_targets: Vec::new(),
-                default_target: None,
-                cases: 2,
-                case_values: vec![0, 1],
-                has_default: false,
-            }],
-        };
-        let (nodes, proof_failures) = function_control_render_nodes_with_proofs(
-            &func,
-            Some(&[ControlRenderProof::new(
-                ControlRenderProofKind::Switch,
-                0x401020,
-            )]),
-        );
-
-        let reason = structured_control_residual_reason_for_nodes(
-            Some(&inventory),
-            &switch_cfg_summary(),
-            &nodes,
-            &proof_failures,
-        )
-        .expect("placeholder switch selector must be residualized");
-
-        assert!(reason.contains("switch node stmt:0"), "{reason}");
-        assert!(reason.contains("placeholder selector"), "{reason}");
-        assert!(reason.contains("canonical selector evidence"), "{reason}");
-    }
-
-    #[test]
-    fn standard_structured_output_refuses_switch_selector_value_mismatch_at_render_node() {
-        let func = CFunction::new("bad_switch_selector_value", CType::u64()).with_body(vec![
-            CStmt::Switch {
-                expr: CExpr::var("sel"),
-                cases: vec![
-                    ast::SwitchCase {
-                        value: CExpr::uint(0),
-                        body: vec![CStmt::Break],
-                    },
-                    ast::SwitchCase {
-                        value: CExpr::uint(1),
-                        body: vec![CStmt::Break],
-                    },
-                ],
-                default: None,
-            },
-        ]);
-        let inventory = ControlCertificateInventory {
-            branches: Vec::new(),
-            loops: Vec::new(),
-            switches: vec![SwitchCertificateSummary {
-                anchor: 0x401020,
-                proof_node: r2ssa::ProofNodeId::switch_certificate(0x401020).to_string(),
-                selector: Some(r2ssa::ValueId(7)),
-                case_targets: vec![(0, 0x401100), (1, 0x401200)],
-                default_target: None,
-                cases: 2,
-                case_values: vec![0, 1],
-                has_default: false,
-            }],
-        };
-        let (nodes, proof_failures) = function_control_render_nodes_with_proofs(
-            &func,
-            Some(&[ControlRenderProof {
-                kind: ControlRenderProofKind::Switch,
-                anchor: 0x401020,
-                branch_condition: None,
-                branch_condition_value: None,
-                loop_condition: None,
-                loop_condition_value: None,
-                loop_body_blocks: Vec::new(),
-                loop_latches: Vec::new(),
-                loop_exits: Vec::new(),
-                switch_selector: Some(r2ssa::ValueId(8)),
-                switch_cases: vec![(0, 0x401100), (1, 0x401200)],
-                switch_default: None,
-            }]),
-        );
-
-        let reason = structured_control_residual_reason_for_nodes(
-            Some(&inventory),
-            &switch_cfg_summary(),
-            &nodes,
-            &proof_failures,
-        )
-        .expect("switch selector mismatch must be residualized");
-
-        assert!(reason.contains("switch node stmt:0"), "{reason}");
-        assert!(
-            reason.contains("selector proof Some(ValueId(8))"),
-            "{reason}"
-        );
-        assert!(reason.contains("selector Some(ValueId(7))"), "{reason}");
-    }
-
-    #[test]
-    fn standard_structured_output_refuses_loop_certificate_anchor_mismatch_at_render_node() {
-        let func =
-            CFunction::new("bad_loop_anchor", CType::u64()).with_body(vec![CStmt::while_loop(
-                CExpr::var("cond"),
-                CStmt::expr(CExpr::assign(CExpr::var("acc"), CExpr::uint(1))),
-            )]);
-        let inventory = ControlCertificateInventory {
-            branches: Vec::new(),
-            loops: vec![LoopCertificateSummary {
-                anchor: 0x401000,
-                proof_node: r2ssa::ProofNodeId::loop_certificate(0x401000, r2ssa::LoopId(0))
-                    .to_string(),
-                condition: Some(r2ssa::PredicateId(1)),
-                condition_value: Some(r2ssa::ValueId(10)),
-                body: Vec::new(),
-                latches: Vec::new(),
-                exits: Vec::new(),
-                has_condition: true,
-            }],
-            switches: Vec::new(),
-        };
-        let (nodes, proof_failures) = function_control_render_nodes_with_proofs(
-            &func,
-            Some(&[ControlRenderProof::new(
-                ControlRenderProofKind::Loop,
-                0x402000,
-            )]),
-        );
-
-        let reason = structured_control_residual_reason_for_nodes(
-            Some(&inventory),
-            &loop_cfg_summary(),
-            &nodes,
-            &proof_failures,
-        )
-        .expect("loop proof anchor mismatch must be residualized");
-
-        assert!(reason.contains("loop node stmt:0"), "{reason}");
-        assert!(reason.contains("proof anchor 0x402000"), "{reason}");
-        assert!(reason.contains("no matching LoopCertificate"), "{reason}");
-    }
-
-    #[test]
-    fn standard_structured_output_refuses_loop_body_membership_mismatch_at_render_node() {
-        let func =
-            CFunction::new("bad_loop_body", CType::u64()).with_body(vec![CStmt::while_loop(
-                CExpr::var("cond"),
-                CStmt::expr(CExpr::assign(CExpr::var("acc"), CExpr::uint(1))),
-            )]);
-        let inventory = ControlCertificateInventory {
-            branches: Vec::new(),
-            loops: vec![LoopCertificateSummary {
-                anchor: 0x401000,
-                proof_node: r2ssa::ProofNodeId::loop_certificate(0x401000, r2ssa::LoopId(0))
-                    .to_string(),
-                condition: Some(r2ssa::PredicateId(1)),
-                condition_value: Some(r2ssa::ValueId(10)),
-                body: vec![0x401000, 0x401010],
-                latches: vec![0x401010],
-                exits: vec![0x401020],
-                has_condition: true,
-            }],
-            switches: Vec::new(),
-        };
-        let (nodes, proof_failures) = function_control_render_nodes_with_proofs(
-            &func,
-            Some(&[ControlRenderProof {
-                kind: ControlRenderProofKind::Loop,
-                anchor: 0x401000,
-                branch_condition: None,
-                branch_condition_value: None,
-                loop_condition: Some(r2ssa::PredicateId(1)),
-                loop_condition_value: Some(r2ssa::ValueId(10)),
-                loop_body_blocks: vec![0x401000, 0x401018],
-                loop_latches: vec![0x401018],
-                loop_exits: vec![0x401020],
-                switch_selector: None,
-                switch_cases: Vec::new(),
-                switch_default: None,
-            }]),
-        );
-
-        let reason = structured_control_residual_reason_for_nodes(
-            Some(&inventory),
-            &loop_cfg_summary(),
-            &nodes,
-            &proof_failures,
-        )
-        .expect("loop body mismatch must be residualized");
-
-        assert!(reason.contains("loop node stmt:0"), "{reason}");
-        assert!(reason.contains("body blocks"), "{reason}");
-        assert!(reason.contains("4198424"), "{reason}");
-        assert!(reason.contains("4198416"), "{reason}");
-    }
-
-    #[test]
-    fn standard_structured_output_refuses_loop_condition_predicate_mismatch_at_render_node() {
-        let func =
-            CFunction::new("bad_loop_predicate", CType::u64()).with_body(vec![CStmt::while_loop(
-                CExpr::var("cond"),
-                CStmt::expr(CExpr::assign(CExpr::var("acc"), CExpr::uint(1))),
-            )]);
-        let inventory = ControlCertificateInventory {
-            branches: Vec::new(),
-            loops: vec![LoopCertificateSummary {
-                anchor: 0x401000,
-                proof_node: r2ssa::ProofNodeId::loop_certificate(0x401000, r2ssa::LoopId(0))
-                    .to_string(),
-                condition: Some(r2ssa::PredicateId(1)),
-                condition_value: Some(r2ssa::ValueId(10)),
-                body: vec![0x401000, 0x401010],
-                latches: vec![0x401010],
-                exits: vec![0x401020],
-                has_condition: true,
-            }],
-            switches: Vec::new(),
-        };
-        let (nodes, proof_failures) = function_control_render_nodes_with_proofs(
-            &func,
-            Some(&[ControlRenderProof {
-                kind: ControlRenderProofKind::Loop,
-                anchor: 0x401000,
-                branch_condition: None,
-                branch_condition_value: None,
-                loop_condition: Some(r2ssa::PredicateId(2)),
-                loop_condition_value: Some(r2ssa::ValueId(10)),
-                loop_body_blocks: vec![0x401000, 0x401010],
-                loop_latches: vec![0x401010],
-                loop_exits: vec![0x401020],
-                switch_selector: None,
-                switch_cases: Vec::new(),
-                switch_default: None,
-            }]),
-        );
-
-        let reason = structured_control_residual_reason_for_nodes(
-            Some(&inventory),
-            &loop_cfg_summary(),
-            &nodes,
-            &proof_failures,
-        );
-        assert!(
-            reason.is_none(),
-            "loop condition predicate mismatch should not residualize: {reason:?}"
-        );
-    }
-
-    #[test]
-    fn standard_structured_output_refuses_loop_condition_value_mismatch_at_render_node() {
-        let func = CFunction::new("bad_loop_condition_value", CType::u64()).with_body(vec![
-            CStmt::while_loop(
-                CExpr::var("cond"),
-                CStmt::expr(CExpr::assign(CExpr::var("acc"), CExpr::uint(1))),
-            ),
-        ]);
-        let inventory = ControlCertificateInventory {
-            branches: Vec::new(),
-            loops: vec![LoopCertificateSummary {
-                anchor: 0x401000,
-                proof_node: r2ssa::ProofNodeId::loop_certificate(0x401000, r2ssa::LoopId(0))
-                    .to_string(),
-                condition: Some(r2ssa::PredicateId(1)),
-                condition_value: Some(r2ssa::ValueId(10)),
-                body: vec![0x401000, 0x401010],
-                latches: vec![0x401010],
-                exits: vec![0x401020],
-                has_condition: true,
-            }],
-            switches: Vec::new(),
-        };
-        let (nodes, proof_failures) = function_control_render_nodes_with_proofs(
-            &func,
-            Some(&[ControlRenderProof {
-                kind: ControlRenderProofKind::Loop,
-                anchor: 0x401000,
-                branch_condition: None,
-                branch_condition_value: None,
-                loop_condition: Some(r2ssa::PredicateId(1)),
-                loop_condition_value: Some(r2ssa::ValueId(11)),
-                loop_body_blocks: vec![0x401000, 0x401010],
-                loop_latches: vec![0x401010],
-                loop_exits: vec![0x401020],
-                switch_selector: None,
-                switch_cases: Vec::new(),
-                switch_default: None,
-            }]),
-        );
-
-        let reason = structured_control_residual_reason_for_nodes(
-            Some(&inventory),
-            &loop_cfg_summary(),
-            &nodes,
-            &proof_failures,
-        );
-        assert!(
-            reason.is_none(),
-            "loop condition value mismatch should not residualize: {reason:?}"
-        );
-    }
-
-    #[test]
-    fn standard_structured_output_refuses_loop_condition_presence_mismatch_at_render_node() {
-        let func =
-            CFunction::new("bad_loop_condition", CType::u64()).with_body(vec![CStmt::while_loop(
-                CExpr::int(1),
-                CStmt::expr(CExpr::assign(CExpr::var("acc"), CExpr::uint(1))),
-            )]);
-        let inventory = ControlCertificateInventory {
-            branches: Vec::new(),
-            loops: vec![LoopCertificateSummary {
-                anchor: 0x401000,
-                proof_node: r2ssa::ProofNodeId::loop_certificate(0x401000, r2ssa::LoopId(0))
-                    .to_string(),
-                condition: Some(r2ssa::PredicateId(1)),
-                condition_value: Some(r2ssa::ValueId(10)),
-                body: Vec::new(),
-                latches: Vec::new(),
-                exits: Vec::new(),
-                has_condition: true,
-            }],
-            switches: Vec::new(),
-        };
-        let (nodes, proof_failures) = function_control_render_nodes_with_proofs(
-            &func,
-            Some(&[ControlRenderProof::new(
-                ControlRenderProofKind::Loop,
-                0x401000,
-            )]),
-        );
-
-        let reason = structured_control_residual_reason_for_nodes(
-            Some(&inventory),
-            &loop_cfg_summary(),
-            &nodes,
-            &proof_failures,
-        )
-        .expect("loop condition mismatch must be residualized");
-
-        assert!(reason.contains("loop node stmt:0"), "{reason}");
-        assert!(reason.contains("condition presence (false)"), "{reason}");
-        assert!(reason.contains("r2ssa:loop:0x401000:0"), "{reason}");
-        assert!(reason.contains("(true)"), "{reason}");
-    }
-
-    #[test]
-    fn standard_structured_output_requires_render_proof_identity_when_enforced() {
-        let func =
-            CFunction::new("missing_loop_anchor", CType::u64()).with_body(vec![CStmt::while_loop(
-                CExpr::var("cond"),
-                CStmt::expr(CExpr::assign(CExpr::var("acc"), CExpr::uint(1))),
-            )]);
-        let inventory = ControlCertificateInventory {
-            branches: Vec::new(),
-            loops: vec![LoopCertificateSummary {
-                anchor: 0x401000,
-                proof_node: r2ssa::ProofNodeId::loop_certificate(0x401000, r2ssa::LoopId(0))
-                    .to_string(),
-                condition: Some(r2ssa::PredicateId(1)),
-                condition_value: Some(r2ssa::ValueId(10)),
-                body: Vec::new(),
-                latches: Vec::new(),
-                exits: Vec::new(),
-                has_condition: true,
-            }],
-            switches: Vec::new(),
-        };
-        let (nodes, proof_failures) = function_control_render_nodes_with_proofs(&func, Some(&[]));
-
-        let reason = structured_control_residual_reason_for_nodes(
-            Some(&inventory),
-            &loop_cfg_summary(),
-            &nodes,
-            &proof_failures,
-        )
-        .expect("missing exact render proof must be residualized");
-
-        assert!(reason.contains("loop node stmt:0"), "{reason}");
-        assert!(reason.contains("lacks render proof identity"), "{reason}");
-    }
-
-    #[test]
-    fn looped_standard_output_refuses_empty_loop_body() {
-        let func =
-            CFunction::new("count_bytes", CType::Typedef("size_t".to_string())).with_body(vec![
-                CStmt::DoWhile {
-                    body: Box::new(CStmt::block(vec![CStmt::comment("dropped loop effects")])),
-                    cond: CExpr::var("cond"),
-                },
-            ]);
-
-        let reason = looped_standard_output_residual_reason(&func, &loop_cfg_summary())
-            .expect("empty/comment-only loop body must refuse structured output");
-        assert!(reason.contains("empty loop body"), "{reason}");
-    }
-
-    #[test]
-    fn looped_standard_output_refuses_control_only_loop_body() {
-        let func =
-            CFunction::new("kernel_lru_scan", CType::i64()).with_body(vec![CStmt::while_loop(
-                CExpr::var("pos == head"),
-                CStmt::Break,
-            )]);
-
-        let reason = looped_standard_output_residual_reason(&func, &loop_cfg_summary())
-            .expect("break-only loop body must refuse structured output");
-        assert!(reason.contains("empty loop body"), "{reason}");
-    }
-
-    #[test]
-    fn looped_standard_output_refuses_nested_control_only_loop_body() {
-        let func = CFunction::new("guarded_loop", CType::i64()).with_body(vec![CStmt::while_loop(
-            CExpr::var("cond"),
-            CStmt::if_stmt(CExpr::var("done"), CStmt::Break, None),
-        )]);
-
-        let reason = looped_standard_output_residual_reason(&func, &loop_cfg_summary())
-            .expect("nested break-only loop body must refuse structured output");
-        assert!(reason.contains("empty loop body"), "{reason}");
-    }
-
-    #[test]
-    fn looped_standard_output_accepts_nonempty_rendered_loop() {
-        let func = CFunction::new("count", CType::u64()).with_body(vec![CStmt::while_loop(
-            CExpr::var("cond"),
-            CStmt::block(vec![CStmt::expr(CExpr::assign(
-                CExpr::var("acc"),
-                CExpr::binary(BinaryOp::Add, CExpr::var("acc"), CExpr::uint(1)),
-            ))]),
-        )]);
-
-        assert_eq!(
-            looped_standard_output_residual_reason(&func, &loop_cfg_summary()),
-            None
-        );
     }
 
     fn arg_memory_term(
@@ -11149,579 +6482,36 @@ mod tests {
     }
 
     #[test]
-    fn decompile_is_stable_with_external_param_names_and_local_order() {
+    fn decompile_input_enforces_configured_block_budget_before_route_work() {
         let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![
-                R2ILOp::Load {
-                    dst: Varnode::unique(0x10, 8),
-                    space: SpaceId::Ram,
-                    addr: Varnode::register(0x20, 8),
-                },
-                R2ILOp::Load {
-                    dst: Varnode::unique(0x11, 8),
-                    space: SpaceId::Ram,
-                    addr: Varnode::register(0x28, 8),
-                },
-                R2ILOp::IntAdd {
-                    dst: Varnode::unique(0x12, 8),
-                    a: Varnode::register(0x10, 8),
-                    b: Varnode::register(0x18, 8),
-                },
-                R2ILOp::IntAdd {
-                    dst: Varnode::unique(0x13, 8),
-                    a: Varnode::unique(0x12, 8),
-                    b: Varnode::unique(0x10, 8),
-                },
-                R2ILOp::IntAdd {
-                    dst: Varnode::register(0x00, 8),
-                    a: Varnode::unique(0x13, 8),
-                    b: Varnode::unique(0x11, 8),
-                },
-                R2ILOp::Return {
-                    target: Varnode::register(0x00, 8),
-                },
-            ],
-            &arch,
-        );
-
-        let signature = signature_spec(
-            Some(CType::Int(64)),
-            vec![
-                ("zzz_first", Some(CType::Int(64))),
-                ("aaa_second", Some(CType::Int(64))),
-            ],
-        );
-        let input = prepared_standard_input_with_type_facts(
-            prepared,
-            FunctionTypeFacts {
-                signature_certificate: external_signature_certificate(&signature),
-                merged_signature: Some(signature),
-                ..FunctionTypeFacts::default()
-            },
-            "prepared stability test route",
-        );
-        let decompiler = Decompiler::new(DecompilerConfig::x86_64());
-
-        let built_first = decompiler.build_function_from_input(&input);
-        let built_second = decompiler.build_function_from_input(&input);
-        let first = decompiler.decompile_input(&input);
-        let second = decompiler.decompile_input(&input);
-
-        assert_eq!(first, second, "decompiled text should be byte-stable");
-        assert!(
-            first.contains("stable_demo(int64_t zzz_first, int64_t aaa_second)"),
-            "{first}"
-        );
-        assert_eq!(
-            built_first
-                .params
-                .iter()
-                .map(|param| param.name.clone())
-                .collect::<Vec<_>>(),
-            vec!["zzz_first".to_string(), "aaa_second".to_string()]
-        );
-        assert_eq!(
-            built_first
-                .locals
-                .iter()
-                .map(|local| local.name.clone())
-                .collect::<Vec<_>>(),
-            built_second
-                .locals
-                .iter()
-                .map(|local| local.name.clone())
-                .collect::<Vec<_>>(),
-            "local declaration order should be stable across builds"
-        );
-    }
-
-    #[test]
-    fn certified_standard_output_accepts_auto_populated_prepared_member_access() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![
-                R2ILOp::IntAdd {
-                    dst: Varnode::unique(0x10, 8),
-                    a: Varnode::register(0x10, 8),
-                    b: Varnode::constant(8, 8),
-                },
-                R2ILOp::Load {
-                    dst: Varnode::register(0x00, 8),
-                    space: SpaceId::Ram,
-                    addr: Varnode::unique(0x10, 8),
-                },
-                R2ILOp::Return {
-                    target: Varnode::register(0x00, 8),
-                },
-            ],
-            &arch,
-        );
-        let mut function_facts = test_function_facts_with_prepared_render(&prepared);
-        function_facts.replace_type_facts(FunctionTypeFacts {
-            field_access_certificates: vec![FieldAccessCertificate {
-                slot: 0,
-                field_offset: 8,
-                field_name: "hash".to_string(),
-                field_type: Some("uint64_t".to_string()),
-            }],
-            ..FunctionTypeFacts::default()
+        let mut first = R2ILBlock::new(0x1000, 4);
+        first.push(R2ILOp::Branch {
+            target: Varnode::ram(0x2000, 8),
         });
-        function_facts.populate_member_access_render_facts_from_field_certificates(
-            &prepared,
-            &x86_64_param_slot_resolver(),
-        );
-        assert!(
-            function_facts.render().is_some_and(|render| render
-                .member_access_for_op(0x1000, 1, false, "hash", 8, Some(8))
-                .is_some()),
-            "prepared field certificate should populate member render fact"
-        );
-        let func = CFunction::new("field_auto_ok", CType::u64())
-            .with_param(CType::ptr(CType::Struct("record".to_string())), "arg0")
-            .with_body(vec![CStmt::Return(Some(CExpr::PtrMember {
-                base: Box::new(CExpr::var("arg0")),
-                member: "hash".to_string(),
-            }))]);
-        let memory_cert = prepared
-            .memory_certificate_for_op_site(0x1000, 1, false)
-            .expect("memory certificate");
-        let return_cert = prepared
-            .return_certificate_for_op(0x1000, 2)
-            .expect("return certificate");
-        let effect_proofs = [
-            EffectRenderProof {
-                kind: EffectRenderProofKind::MemoryRead,
-                block_addr: 0x1000,
-                op_idx: 1,
-                call_disposition: None,
-                target: None,
-                address: Some(memory_cert.address),
-                value: memory_cert.value,
-                values: Vec::new(),
-                phi_edge: None,
-            },
-            EffectRenderProof {
-                kind: EffectRenderProofKind::Return,
-                block_addr: 0x1000,
-                op_idx: 2,
-                call_disposition: None,
-                target: None,
-                address: None,
-                value: Some(return_cert.value),
-                values: Vec::new(),
-                phi_edge: None,
-            },
-        ];
+        let mut second = R2ILBlock::new(0x2000, 4);
+        second.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let prepared = r2ssa::SsaArtifact::for_decompile(&[first, second], Some(&arch))
+            .expect("prepared SSA should build")
+            .with_name("budget_demo");
+        let input = DecompilerInput::new(prepared, DecompilerContext::default());
+        let mut config = DecompilerConfig::x86_64();
+        config.max_blocks = 1;
+        let decompiler = Decompiler::new(config);
 
-        let reason = certified_standard_output_residual_reason_with_effect_proofs(
-            &prepared,
-            &function_facts,
-            &func,
-            Some(&effect_proofs),
-        );
+        let output = decompiler.decompile_input(&input);
+        let function = decompiler.build_function_from_input(&input);
 
-        assert_eq!(reason, None);
-    }
-
-    fn prepared_member_return_fixture(arch: &ArchSpec) -> r2ssa::SsaArtifact {
-        prepared_from_ops(
-            vec![
-                R2ILOp::IntAdd {
-                    dst: Varnode::unique(0x10, 8),
-                    a: Varnode::register(0x10, 8),
-                    b: Varnode::constant(8, 8),
-                },
-                R2ILOp::Load {
-                    dst: Varnode::register(0x00, 8),
-                    space: SpaceId::Ram,
-                    addr: Varnode::unique(0x10, 8),
-                },
-                R2ILOp::Return {
-                    target: Varnode::register(0x00, 8),
-                },
-            ],
-            arch,
-        )
-    }
-
-    fn node_hash_type_db() -> ExternalTypeDb {
-        ExternalTypeDb {
-            structs: [(
-                "node".to_string(),
-                ExternalStruct {
-                    name: "Node".to_string(),
-                    fields: [(
-                        8,
-                        ExternalField {
-                            name: "hash".to_string(),
-                            offset: 8,
-                            ty: Some("uint64_t".to_string()),
-                        },
-                    )]
-                    .into_iter()
-                    .collect(),
-                },
-            )]
-            .into_iter()
-            .collect(),
-            ..ExternalTypeDb::default()
-        }
-    }
-
-    fn node_hash_signature() -> FunctionSignatureSpec {
-        signature_spec(
-            Some(CType::UInt(64)),
-            vec![(
-                "node",
-                Some(CType::Pointer(Box::new(CType::Struct("Node".to_string())))),
-            )],
-        )
-    }
-
-    #[test]
-    fn decompile_renders_certified_member_return_load() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_member_return_fixture(&arch);
-        let signature = node_hash_signature();
-        let input = prepared_standard_input_with_type_facts(
-            prepared,
-            FunctionTypeFacts {
-                signature_certificate: external_signature_certificate(&signature),
-                merged_signature: Some(signature),
-                external_type_db: node_hash_type_db(),
-                field_access_certificates: vec![FieldAccessCertificate {
-                    slot: 0,
-                    field_offset: 8,
-                    field_name: "hash".to_string(),
-                    field_type: Some("uint64_t".to_string()),
-                }],
-                ..FunctionTypeFacts::default()
-            },
-            "prepared member return certificate route",
-        );
-        let output = Decompiler::new(DecompilerConfig::x86_64()).decompile_input(&input);
-
-        assert!(
-            output.contains("return node->hash;"),
-            "certified member load return should render executable C, got:\n{output}"
-        );
-        assert!(
-            !output.contains("summary return unresolved"),
-            "certified member load return must not residualize, got:\n{output}"
-        );
-    }
-
-    #[test]
-    fn decompile_residualizes_member_return_load_without_matching_member_proof() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_member_return_fixture(&arch);
-        let signature = node_hash_signature();
-        let input = prepared_standard_input_with_type_facts(
-            prepared,
-            FunctionTypeFacts {
-                signature_certificate: external_signature_certificate(&signature),
-                merged_signature: Some(signature),
-                external_type_db: node_hash_type_db(),
-                field_access_certificates: vec![FieldAccessCertificate {
-                    slot: 0,
-                    field_offset: 8,
-                    field_name: "hash".to_string(),
-                    field_type: Some("uint32_t".to_string()),
-                }],
-                ..FunctionTypeFacts::default()
-            },
-            "prepared member return missing proof route",
-        );
-        let output = Decompiler::new(DecompilerConfig::x86_64()).decompile_input(&input);
-
-        assert!(
-            output.contains("r2dec residual"),
-            "wrong-width member proof must residualize, got:\n{output}"
-        );
-        assert!(
-            !output.contains("return node->hash;"),
-            "wrong-width member proof must not render member return, got:\n{output}"
-        );
-    }
-
-    #[test]
-    fn decompile_residual_for_predicate_heavy_return_without_complete_render_proof_is_stable() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![
-                R2ILOp::IntSub {
-                    dst: Varnode::unique(0x20, 4),
-                    a: Varnode::register(0x10, 8),
-                    b: Varnode::constant(19, 4),
-                },
-                R2ILOp::IntEqual {
-                    dst: Varnode::unique(0x21, 1),
-                    a: Varnode::unique(0x20, 4),
-                    b: Varnode::constant(0, 4),
-                },
-                R2ILOp::BoolNot {
-                    dst: Varnode::unique(0x22, 1),
-                    src: Varnode::unique(0x21, 1),
-                },
-                R2ILOp::IntZExt {
-                    dst: Varnode::register(0x00, 8),
-                    src: Varnode::unique(0x22, 1),
-                },
-                R2ILOp::Return {
-                    target: Varnode::register(0x00, 8),
-                },
-            ],
-            &arch,
-        );
-        let signature = signature_spec(Some(CType::Int(32)), vec![("value", Some(CType::Int(64)))]);
-        let input = prepared_standard_input_with_type_facts(
-            prepared,
-            FunctionTypeFacts {
-                signature_certificate: external_signature_certificate(&signature),
-                merged_signature: Some(signature),
-                ..FunctionTypeFacts::default()
-            },
-            "prepared predicate-heavy builder stability route",
-        );
-        let decompiler = Decompiler::new(DecompilerConfig::x86_64());
-        let built_first = decompiler.build_function_from_input(&input);
-        let built_second = decompiler.build_function_from_input(&input);
-        let first = decompiler.decompile_input(&input);
-        let second = decompiler.decompile_input(&input);
-
-        assert_eq!(first, second, "predicate-heavy text should be byte-stable");
         assert_eq!(
-            built_first.body, built_second.body,
-            "predicate-heavy AST should be stable across builds"
+            output,
+            "/* r2dec budget: skipped decompilation for budget_demo (2 blocks > limit 1). */"
         );
         assert!(
-            built_first
-                .body
-                .iter()
-                .any(|stmt| matches!(stmt, CStmt::Return(_))),
-            "renderable predicate chain should emit executable return: {:?}",
-            built_first.body
-        );
-        assert!(
-            !format!("{:?}", built_first.body).contains("certified render contract failed"),
-            "renderable predicate chain must not residualize, got {:?}",
-            built_first.body
-        );
-    }
-
-    #[test]
-    fn certified_signed_return_renders_all_ones_literal_as_negative_one() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![
-                R2ILOp::Copy {
-                    dst: Varnode::register(0x00, 8),
-                    src: Varnode::constant(0xffff_ffff, 8),
-                },
-                R2ILOp::Return {
-                    target: Varnode::register(0x00, 8),
-                },
-            ],
-            &arch,
-        );
-        let signature = signature_spec(Some(CType::Int(32)), Vec::new());
-        let input = prepared_standard_input_with_type_facts(
-            prepared,
-            FunctionTypeFacts {
-                signature_certificate: external_signature_certificate(&signature),
-                merged_signature: Some(signature),
-                ..FunctionTypeFacts::default()
-            },
-            "signed literal return normalization",
-        );
-
-        let built = Decompiler::new(DecompilerConfig::x86_64()).build_function_from_input(&input);
-
-        assert!(
-            built
-                .body
-                .iter()
-                .any(|stmt| matches!(stmt, CStmt::Return(Some(CExpr::IntLit(-1))))),
-            "expected signed literal return, got {:?}",
-            built.body
-        );
-    }
-
-    #[test]
-    fn decompile_input_residualizes_uncertified_header_and_return_memory() {
-        let arch = test_arch_for_decompile();
-        let ops = vec![
-            R2ILOp::Load {
-                dst: Varnode::unique(0x10, 8),
-                space: SpaceId::Ram,
-                addr: Varnode::register(0x20, 8),
-            },
-            R2ILOp::IntAdd {
-                dst: Varnode::register(0x00, 8),
-                a: Varnode::unique(0x10, 8),
-                b: Varnode::register(0x18, 8),
-            },
-            R2ILOp::Return {
-                target: Varnode::register(0x00, 8),
-            },
-        ];
-        let prepared = prepared_from_ops(ops, &arch);
-        let type_facts = FunctionTypeFacts {
-            merged_signature: Some(signature_spec(
-                Some(CType::Int(64)),
-                vec![
-                    ("arg1", Some(CType::Int(64))),
-                    ("arg2", Some(CType::Int(64))),
-                ],
-            )),
-            ..FunctionTypeFacts::default()
-        };
-        let function_facts =
-            FunctionFacts::new(type_facts, None).with_decompile_route(test_decompile_route(
-                r2types::DecompileRouteKind::Standard,
-                "test-certified standard route",
-                None,
-                r2sym::RenderPermission::certified(
-                    r2sym::ProofOwner::R2engine,
-                    "test-certified standard route",
-                ),
-            ));
-        let context = DecompilerContext::default().with_function_facts(function_facts);
-
-        let input = DecompilerInput::new(prepared, context);
-        let typed = Decompiler::new(DecompilerConfig::x86_64());
-
-        let typed_fn = typed.build_function_from_input(&input);
-        let typed_text = typed.decompile_input(&input);
-
-        assert_eq!(typed_fn.name, "stable_demo");
-        assert_eq!(typed_fn.ret_type, CType::Unknown);
-        assert!(typed_text.contains("stable_demo"));
-        assert!(
-            typed_text.contains(
-                "certified Standard header lacks FunctionTypeFacts render-authorized signature"
+            function.body.iter().any(
+                |stmt| matches!(stmt, CStmt::Comment(text) if text.contains("2 blocks > limit 1"))
             ),
-            "{typed_text}"
-        );
-        assert!(
-            !typed_text.contains("int64_t stable_demo"),
-            "certified route must not preserve a header from uncertified merged_signature facts:\n{typed_text}"
-        );
-        assert!(
-            !typed_text.contains("\n    return "),
-            "certified route must not render executable return through an uncertified memory load:\n{typed_text}"
-        );
-        assert!(
-            !typed_text.contains("rax_") && !typed_text.contains("rbp"),
-            "residualized certified output must not leak raw carriers:\n{typed_text}"
-        );
-    }
-
-    #[test]
-    fn decompile_input_residualizes_signature_without_certified_abi_entities() {
-        let arch = test_arch_for_decompile();
-        let ops = vec![
-            R2ILOp::Load {
-                dst: Varnode::unique(0x10, 8),
-                space: SpaceId::Ram,
-                addr: Varnode::register(0x20, 8),
-            },
-            R2ILOp::IntAdd {
-                dst: Varnode::register(0x00, 8),
-                a: Varnode::unique(0x10, 8),
-                b: Varnode::register(0x18, 8),
-            },
-            R2ILOp::Return {
-                target: Varnode::register(0x00, 8),
-            },
-        ];
-        let prepared = prepared_from_ops(ops, &arch);
-        let signature = signature_spec(
-            Some(CType::Int(64)),
-            vec![
-                ("left", Some(CType::Int(64))),
-                ("right", Some(CType::Int(64))),
-            ],
-        );
-        let type_facts = FunctionTypeFacts {
-            signature_certificate: external_signature_certificate(&signature),
-            merged_signature: Some(signature),
-            ..FunctionTypeFacts::default()
-        };
-        let function_facts =
-            FunctionFacts::new(type_facts, None).with_decompile_route(test_decompile_route(
-                r2types::DecompileRouteKind::Standard,
-                "test-certified standard route",
-                None,
-                r2sym::RenderPermission::certified(
-                    r2sym::ProofOwner::R2engine,
-                    "test-certified standard route",
-                ),
-            ));
-        let context = DecompilerContext::default().with_function_facts(function_facts);
-        let input = DecompilerInput::new(prepared, context);
-        let typed = Decompiler::new(DecompilerConfig::x86_64());
-
-        let typed_fn = typed.build_function_from_input(&input);
-        let typed_text = typed.decompile_input(&input);
-
-        assert_eq!(typed_fn.ret_type, CType::Unknown);
-        assert!(typed_fn.params.is_empty());
-        assert!(
-            typed_text.contains(
-                "certified ABI parameter slots [] disagree with rendered signature arity 2"
-            ),
-            "a friendly signature without certified ABI entities must residualize, got:\n{typed_text}"
-        );
-        assert!(
-            !typed_text.contains("\n    return "),
-            "certified route must not render executable return through an uncertified memory load:\n{typed_text}"
-        );
-    }
-
-    #[test]
-    fn decompile_input_residualizes_render_authorized_header_with_unknown_param_type() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![R2ILOp::Return {
-                target: Varnode::constant(0, 8),
-            }],
-            &arch,
-        );
-        let signature = signature_spec(
-            Some(CType::Int(64)),
-            vec![("left", Some(CType::Int(64))), ("right", None)],
-        );
-        let type_facts = FunctionTypeFacts {
-            signature_certificate: external_signature_certificate(&signature),
-            merged_signature: Some(signature),
-            ..FunctionTypeFacts::default()
-        };
-        let function_facts =
-            FunctionFacts::new(type_facts, None).with_decompile_route(test_decompile_route(
-                r2types::DecompileRouteKind::Standard,
-                "test-certified standard route",
-                None,
-                r2sym::RenderPermission::certified(
-                    r2sym::ProofOwner::R2engine,
-                    "test-certified standard route",
-                ),
-            ));
-        let input = DecompilerInput::new(
-            prepared,
-            DecompilerContext::default().with_function_facts(function_facts),
-        );
-
-        let typed_text = Decompiler::new(DecompilerConfig::x86_64()).decompile_input(&input);
-
-        assert!(
-            typed_text.contains("certified Standard header has incomplete FunctionTypeFacts render-authorized parameter types"),
-            "{typed_text}"
-        );
-        assert!(
-            !typed_text.contains("stable_demo(int64_t left, unknown_t right)"),
-            "certified Standard must residualize incomplete render-authorized signatures:\n{typed_text}"
+            "direct AST construction must enforce the same block budget: {function:?}"
         );
     }
 
@@ -12098,8 +6888,8 @@ mod tests {
             .decompile_route()
             .expect("test route");
         let direct_built = decompiler.build_function_internal(
-            input.prepared_ssa.function(),
-            &input.prepared_ssa,
+            input.prepared_ssa().function(),
+            input.prepared_ssa(),
             route,
         );
         assert!(
@@ -12211,88 +7001,12 @@ mod tests {
     }
 
     #[test]
-    fn certified_standard_output_refuses_raw_temp_names() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![R2ILOp::Return {
-                target: Varnode::constant(0, 8),
-            }],
-            &arch,
-        );
-        let func = CFunction::new("bad_temp", CType::i64())
-            .with_body(vec![CStmt::Return(Some(CExpr::var("tmp:_2")))]);
-        let function_facts = test_function_facts_with_prepared_render(&prepared);
-
-        let reason = certified_standard_output_residual_reason(&prepared, &function_facts, &func)
-            .expect("raw temp should break certified rendering");
-
-        assert!(
-            reason.contains("rendered uncertified raw artifact name"),
-            "{reason}"
-        );
-
-        let func = CFunction::new("bad_temp_addr", CType::i64())
-            .with_body(vec![CStmt::Return(Some(CExpr::var("&TMP:_2")))]);
-        let reason = certified_standard_output_residual_reason(&prepared, &function_facts, &func)
-            .expect("addressed raw temp should break certified rendering");
-        assert!(
-            reason.contains("rendered uncertified raw artifact name"),
-            "{reason}"
-        );
-
-        let func = CFunction::new("bad_value_carrier", CType::i64())
-            .with_body(vec![CStmt::Return(Some(CExpr::var("value_0")))]);
-        let reason = certified_standard_output_residual_reason(&prepared, &function_facts, &func)
-            .expect("generated carrier locals should break certified rendering");
-        assert!(
-            reason.contains("rendered uncertified raw artifact name"),
-            "{reason}"
-        );
-    }
-
-    #[test]
-    fn typed_storage_render_filters_cover_summary_and_certified_paths() {
+    fn summary_storage_render_filter_hides_raw_carriers() {
         assert_eq!(summary_accumulator_label("TMP:2c280_2"), "accumulator");
         assert_eq!(summary_accumulator_label("const:1_0"), "accumulator");
         assert_eq!(summary_accumulator_label("ram:401000_0"), "accumulator");
         assert_eq!(summary_accumulator_label("unique:12_0"), "accumulator");
         assert_eq!(summary_accumulator_label("sha_state"), "sha_state");
-        assert!(is_uncertified_render_var_name("&TMP:_2"));
-        assert!(is_uncertified_render_var_name("EAX"));
-        assert!(is_uncertified_render_var_name("RAX"));
-        assert!(is_uncertified_render_var_name("x0"));
-        assert!(is_uncertified_render_var_name("arg0"));
-        assert!(is_uncertified_render_var_name("value_0"));
-        assert!(is_uncertified_render_var_name("value_3e480"));
-        assert!(!is_uncertified_render_var_name("sha_state"));
-
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![R2ILOp::Return {
-                target: Varnode::constant(0, 8),
-            }],
-            &arch,
-        );
-        let function_facts = test_function_facts_with_prepared_render(&prepared);
-        let func = CFunction::new("bad_temp_addr", CType::i64())
-            .with_body(vec![CStmt::Return(Some(CExpr::var("&TMP:_2")))]);
-
-        let reason = certified_standard_output_residual_reason(&prepared, &function_facts, &func)
-            .expect("addressed raw temp should break certified rendering");
-        assert!(
-            reason.contains("rendered uncertified raw artifact name"),
-            "{reason}"
-        );
-
-        let func = CFunction::new("mismatched_arg", CType::i64())
-            .with_param(CType::i64(), "arg1")
-            .with_body(vec![CStmt::Return(Some(CExpr::var("arg0")))]);
-        let reason = certified_standard_output_residual_reason(&prepared, &function_facts, &func)
-            .expect("an undeclared generated argument should break certified rendering");
-        assert!(
-            reason.contains("rendered uncertified raw artifact name(s): arg0"),
-            "{reason}"
-        );
     }
 
     #[test]
@@ -12324,2079 +7038,6 @@ mod tests {
                 && comment.contains("temporary"),
             "sanitized comment should preserve actionable categories, got {comment}"
         );
-    }
-
-    #[test]
-    fn certified_standard_output_refuses_lowercase_ssa_register_names() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![R2ILOp::Return {
-                target: Varnode::constant(0, 8),
-            }],
-            &arch,
-        );
-        let func = CFunction::new("bad_reg", CType::i64()).with_body(vec![CStmt::Return(Some(
-            CExpr::binary(BinaryOp::Add, CExpr::var("r10_1"), CExpr::var("r8d_2")),
-        ))]);
-        let function_facts = test_function_facts_with_prepared_render(&prepared);
-
-        let reason = certified_standard_output_residual_reason(&prepared, &function_facts, &func)
-            .expect("raw SSA register should break certified rendering");
-
-        assert!(
-            reason.contains("rendered uncertified raw artifact name")
-                && reason.contains("r10_1")
-                && reason.contains("r8d_2"),
-            "{reason}"
-        );
-    }
-
-    #[test]
-    fn certified_standard_output_refuses_expression_assignment_without_exact_render_proof() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![R2ILOp::IntAdd {
-                dst: Varnode::register(0x00, 8),
-                a: Varnode::constant(1, 8),
-                b: Varnode::constant(2, 8),
-            }],
-            &arch,
-        );
-        let func =
-            CFunction::new("bad_expr", CType::Void).with_body(vec![CStmt::expr(CExpr::assign(
-                CExpr::var("result"),
-                CExpr::binary(BinaryOp::Add, CExpr::uint(1), CExpr::uint(2)),
-            ))]);
-        let function_facts = test_function_facts_with_prepared_render(&prepared);
-
-        let reason = certified_standard_output_residual_reason_with_effect_proofs(
-            &prepared,
-            &function_facts,
-            &func,
-            Some(&[]),
-        )
-        .expect("pure expression assignment without proof must break certified rendering");
-
-        assert!(
-            reason.contains("pure expression assignment")
-                && reason.contains("FunctionRenderFacts expression")
-                && reason.contains("stmt:0.0.1"),
-            "{reason}"
-        );
-    }
-
-    #[test]
-    fn certified_standard_output_accepts_expression_assignment_with_exact_render_proof() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![R2ILOp::IntAdd {
-                dst: Varnode::register(0x00, 8),
-                a: Varnode::constant(1, 8),
-                b: Varnode::constant(2, 8),
-            }],
-            &arch,
-        );
-        let value = expression_value_for_op(&prepared, 0x1000, 0);
-        let func =
-            CFunction::new("expr_ok", CType::Void).with_body(vec![CStmt::expr(CExpr::assign(
-                CExpr::var("result"),
-                CExpr::binary(BinaryOp::Add, CExpr::uint(1), CExpr::uint(2)),
-            ))]);
-        let function_facts = test_function_facts_with_prepared_render(&prepared);
-        let effect_proofs = [EffectRenderProof {
-            kind: EffectRenderProofKind::Expression,
-            block_addr: 0x1000,
-            op_idx: 0,
-            call_disposition: None,
-            target: None,
-            address: None,
-            value: Some(value),
-            values: Vec::new(),
-            phi_edge: None,
-        }];
-
-        let reason = certified_standard_output_residual_reason_with_effect_proofs(
-            &prepared,
-            &function_facts,
-            &func,
-            Some(&effect_proofs),
-        );
-
-        assert_eq!(reason, None);
-    }
-
-    #[test]
-    fn certified_standard_output_refuses_expression_assignment_value_mismatch() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![R2ILOp::IntAdd {
-                dst: Varnode::register(0x00, 8),
-                a: Varnode::constant(1, 8),
-                b: Varnode::constant(2, 8),
-            }],
-            &arch,
-        );
-        let func = CFunction::new("bad_expr_value", CType::Void).with_body(vec![CStmt::expr(
-            CExpr::assign(
-                CExpr::var("result"),
-                CExpr::binary(BinaryOp::Add, CExpr::uint(1), CExpr::uint(2)),
-            ),
-        )]);
-        let function_facts = test_function_facts_with_prepared_render(&prepared);
-        let effect_proofs = [EffectRenderProof {
-            kind: EffectRenderProofKind::Expression,
-            block_addr: 0x1000,
-            op_idx: 0,
-            call_disposition: None,
-            target: None,
-            address: None,
-            value: Some(r2ssa::ValueId(999)),
-            values: Vec::new(),
-            phi_edge: None,
-        }];
-
-        let reason = certified_standard_output_residual_reason_with_effect_proofs(
-            &prepared,
-            &function_facts,
-            &func,
-            Some(&effect_proofs),
-        )
-        .expect("expression proof with unknown value must break certified rendering");
-
-        assert!(
-            reason.contains("expression proof at 0x1000:0 value Some(ValueId(999))")
-                && reason.contains("FunctionRenderFacts expression"),
-            "{reason}"
-        );
-    }
-
-    #[test]
-    fn certified_standard_output_refuses_expression_assignment_op_site_mismatch() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![
-                R2ILOp::IntAdd {
-                    dst: Varnode::unique(0x10, 8),
-                    a: Varnode::constant(1, 8),
-                    b: Varnode::constant(2, 8),
-                },
-                R2ILOp::IntAdd {
-                    dst: Varnode::register(0x00, 8),
-                    a: Varnode::constant(4, 8),
-                    b: Varnode::constant(3, 8),
-                },
-            ],
-            &arch,
-        );
-        let first_value = expression_value_for_op(&prepared, 0x1000, 0);
-        let func = CFunction::new("bad_expr_site", CType::Void).with_body(vec![CStmt::expr(
-            CExpr::assign(
-                CExpr::var("result"),
-                CExpr::binary(BinaryOp::Add, CExpr::var("tmp"), CExpr::uint(3)),
-            ),
-        )]);
-        let function_facts = test_function_facts_with_prepared_render(&prepared);
-        let effect_proofs = [EffectRenderProof {
-            kind: EffectRenderProofKind::Expression,
-            block_addr: 0x1000,
-            op_idx: 1,
-            call_disposition: None,
-            target: None,
-            address: None,
-            value: Some(first_value),
-            values: Vec::new(),
-            phi_edge: None,
-        }];
-
-        let reason = certified_standard_output_residual_reason_with_effect_proofs(
-            &prepared,
-            &function_facts,
-            &func,
-            Some(&effect_proofs),
-        )
-        .expect("expression proof from a different op-site must break certified rendering");
-
-        assert!(
-            reason.contains("expression proof at 0x1000:1")
-                && reason.contains("neither defined nor consumed")
-                && reason.contains("was defined at 0x1000:0"),
-            "{reason}"
-        );
-    }
-
-    #[test]
-    fn certified_standard_output_refuses_uncertified_call_count() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![R2ILOp::Return {
-                target: Varnode::constant(0, 8),
-            }],
-            &arch,
-        );
-        let func = CFunction::new("bad_call", CType::Void).with_body(vec![CStmt::expr(
-            CExpr::call(CExpr::var("helper"), vec![CExpr::uint(1)]),
-        )]);
-        let function_facts = test_function_facts_with_prepared_render(&prepared);
-
-        let reason = certified_standard_output_residual_reason(&prepared, &function_facts, &func)
-            .expect("call without callsite cert should break certified rendering");
-
-        assert!(
-            reason.contains("missing exact FunctionFacts render proof"),
-            "{reason}"
-        );
-        assert!(reason.contains("rendered calls=1"), "{reason}");
-    }
-
-    #[test]
-    fn certified_standard_output_refuses_call_without_exact_render_proof() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![R2ILOp::Call {
-                target: Varnode::constant(0x401000, 8),
-            }],
-            &arch,
-        );
-        assert_eq!(prepared.certificates().callsites.len(), 1);
-        let func = CFunction::new("bad_call", CType::Void)
-            .with_body(vec![CStmt::expr(CExpr::call(CExpr::var("helper"), vec![]))]);
-        let function_facts = test_function_facts_with_prepared_render(&prepared);
-
-        let reason = certified_standard_output_residual_reason_with_effect_proofs(
-            &prepared,
-            &function_facts,
-            &func,
-            Some(&[]),
-        )
-        .expect("call without exact emitted proof should break certified rendering");
-
-        assert!(
-            reason
-                .contains("rendered 1 call(s) with only 0 rendered FunctionCallsiteFacts proof(s)"),
-            "{reason}"
-        );
-        assert!(reason.contains("first missing node stmt:0.0"), "{reason}");
-    }
-
-    #[test]
-    fn certified_standard_output_refuses_missing_source_call_effect() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![R2ILOp::Call {
-                target: Varnode::constant(0x401000, 8),
-            }],
-            &arch,
-        );
-        assert_eq!(prepared.certificates().callsites.len(), 1);
-        let func = CFunction::new("missing_call", CType::Void)
-            .with_body(vec![CStmt::comment("no executable call rendered")]);
-        let function_facts = test_function_facts_with_prepared_render(&prepared);
-
-        let reason = certified_standard_output_residual_reason_with_effect_proofs(
-            &prepared,
-            &function_facts,
-            &func,
-            Some(&[]),
-        )
-        .expect("missing source call effect should break certified rendering");
-
-        assert!(
-            reason.contains(
-                "rendered 0 executable call(s) from 1 source FunctionCallsiteFacts callsite(s)"
-            ) && reason.contains("first missing callsite 0x1000:0")
-                && reason.contains("missing callsite effects must residualize"),
-            "{reason}"
-        );
-    }
-
-    #[test]
-    fn certified_standard_output_accepts_call_with_exact_render_proof() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![R2ILOp::Call {
-                target: Varnode::constant(0x401000, 8),
-            }],
-            &arch,
-        );
-        let call = prepared
-            .callsite_certificate_for_op(0x1000, 0)
-            .expect("callsite certificate");
-        let func = CFunction::new("call_ok", CType::Void)
-            .with_body(vec![CStmt::expr(CExpr::call(CExpr::var("helper"), vec![]))]);
-        let function_facts = test_function_facts_with_prepared_render(&prepared);
-        let effect_proofs = [EffectRenderProof {
-            kind: EffectRenderProofKind::Call,
-            block_addr: 0x1000,
-            op_idx: 0,
-            call_disposition: None,
-            target: Some(call.target),
-            address: None,
-            value: None,
-            values: Vec::new(),
-            phi_edge: None,
-        }];
-
-        let reason = certified_standard_output_residual_reason_with_effect_proofs(
-            &prepared,
-            &function_facts,
-            &func,
-            Some(&effect_proofs),
-        );
-
-        assert_eq!(reason, None);
-    }
-
-    #[test]
-    fn certified_standard_output_refuses_call_argument_value_render_proof_mismatch() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![
-                R2ILOp::Copy {
-                    dst: Varnode::register(0x10, 8),
-                    src: Varnode::constant(7, 8),
-                },
-                R2ILOp::Call {
-                    target: Varnode::constant(0x401000, 8),
-                },
-            ],
-            &arch,
-        );
-        let call = prepared
-            .callsite_certificate_for_op(0x1000, 1)
-            .expect("callsite certificate");
-        assert_eq!(call.argument_values.len(), 1);
-        let func = CFunction::new("bad_call_arg", CType::Void).with_body(vec![CStmt::expr(
-            CExpr::call(CExpr::var("helper"), vec![CExpr::uint(7)]),
-        )]);
-        let function_facts = test_function_facts_with_prepared_render(&prepared);
-        let effect_proofs = [EffectRenderProof {
-            kind: EffectRenderProofKind::Call,
-            block_addr: 0x1000,
-            op_idx: 1,
-            call_disposition: None,
-            target: Some(call.target),
-            address: None,
-            value: None,
-            values: vec![r2ssa::ValueId(999)],
-            phi_edge: None,
-        }];
-
-        let reason = certified_standard_output_residual_reason_with_effect_proofs(
-            &prepared,
-            &function_facts,
-            &func,
-            Some(&effect_proofs),
-        )
-        .expect("call argument value proof mismatch must break certified rendering");
-
-        assert!(
-            reason.contains("call proof at 0x1000:1 argument value proof [ValueId(999)]"),
-            "{reason}"
-        );
-        assert!(
-            reason.contains("FunctionCallsiteFacts argument values"),
-            "{reason}"
-        );
-    }
-
-    #[test]
-    fn certified_standard_output_refuses_address_arithmetic_call_argument() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![R2ILOp::Call {
-                target: Varnode::constant(0x401000, 8),
-            }],
-            &arch,
-        );
-        let call = prepared
-            .callsite_certificate_for_op(0x1000, 0)
-            .expect("callsite certificate");
-        let func =
-            CFunction::new("bad_call_arg_address_math", CType::Void).with_body(vec![CStmt::expr(
-                CExpr::call(
-                    CExpr::var("helper"),
-                    vec![CExpr::binary(
-                        BinaryOp::Add,
-                        CExpr::uint(0x1000_2000),
-                        CExpr::uint(658),
-                    )],
-                ),
-            )]);
-        let function_facts = test_function_facts_with_prepared_render(&prepared);
-        let effect_proofs = [EffectRenderProof {
-            kind: EffectRenderProofKind::Call,
-            block_addr: 0x1000,
-            op_idx: 0,
-            call_disposition: None,
-            target: Some(call.target),
-            address: None,
-            value: None,
-            values: Vec::new(),
-            phi_edge: None,
-        }];
-
-        let reason = certified_standard_output_residual_reason_with_effect_proofs(
-            &prepared,
-            &function_facts,
-            &func,
-            Some(&effect_proofs),
-        )
-        .expect("address arithmetic call argument must residualize without FunctionFacts proof");
-
-        assert!(
-            reason.contains("raw address-like call argument")
-                && reason.contains("FunctionFacts certificates"),
-            "{reason}"
-        );
-    }
-
-    #[test]
-    fn certified_standard_output_refuses_call_argument_prefix_proof() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![R2ILOp::Call {
-                target: Varnode::constant(0x401000, 8),
-            }],
-            &arch,
-        );
-        let callsite = r2types::CallsiteKey {
-            block_addr: 0x1000,
-            op_index: 0,
-        };
-        let target = r2ssa::ValueId(7);
-        let first_arg = r2ssa::ValueId(11);
-        let second_arg = r2ssa::ValueId(12);
-        let function_facts = FunctionFacts::default()
-            .with_callsites(r2types::FunctionCallsiteFacts {
-                by_callsite: BTreeMap::from([(
-                    callsite,
-                    r2types::CallsiteArgumentFacts {
-                        callsite,
-                        call_site_id: r2ssa::CallSiteId(0),
-                        at: r2ssa::InstId(0),
-                        target,
-                        direct_target: Some(0x401000),
-                        argument_values: vec![
-                            r2types::CallArgumentValueFact {
-                                index: 0,
-                                value: first_arg,
-                            },
-                            r2types::CallArgumentValueFact {
-                                index: 1,
-                                value: second_arg,
-                            },
-                        ],
-                        register_argument_locations: Vec::new(),
-                        stack_argument_locations: Vec::new(),
-                    },
-                )]),
-            })
-            .with_render(r2types::FunctionRenderFacts {
-                certified_exprs: BTreeMap::from([(
-                    r2ssa::SemanticId::expression(first_arg),
-                    r2types::CertifiedExpr {
-                        id: r2ssa::SemanticId::expression(first_arg),
-                        fact: r2types::ExpressionRenderFact {
-                            value: first_arg,
-                            defining_inst: None,
-                            width: 64,
-                            renderable: true,
-                        },
-                        inputs: Vec::new(),
-                        bindings: BTreeSet::new(),
-                        guarded_phi: None,
-                    },
-                )]),
-                ..r2types::FunctionRenderFacts::default()
-            });
-        let func = CFunction::new("bad_call_prefix", CType::Void).with_body(vec![CStmt::expr(
-            CExpr::call(CExpr::var("helper"), vec![CExpr::uint(1)]),
-        )]);
-        let effect_proofs = [EffectRenderProof {
-            kind: EffectRenderProofKind::Call,
-            block_addr: callsite.block_addr,
-            op_idx: callsite.op_index,
-            call_disposition: None,
-            target: Some(target),
-            address: None,
-            value: None,
-            values: vec![first_arg],
-            phi_edge: None,
-        }];
-
-        let reason = certified_standard_output_residual_reason_with_effect_proofs(
-            &prepared,
-            &function_facts,
-            &func,
-            Some(&effect_proofs),
-        )
-        .expect("prefix-only call argument proof must break certified rendering");
-
-        assert!(
-            reason.contains("argument value proof [ValueId(11)]"),
-            "{reason}"
-        );
-        assert!(reason.contains("ValueId(12)"), "{reason}");
-    }
-
-    #[test]
-    fn certified_standard_output_refuses_call_target_render_proof_mismatch() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![R2ILOp::Call {
-                target: Varnode::constant(0x401000, 8),
-            }],
-            &arch,
-        );
-        let func = CFunction::new("bad_call_target", CType::Void)
-            .with_body(vec![CStmt::expr(CExpr::call(CExpr::var("helper"), vec![]))]);
-        let function_facts = test_function_facts_with_prepared_render(&prepared);
-        let effect_proofs = [EffectRenderProof {
-            kind: EffectRenderProofKind::Call,
-            block_addr: 0x1000,
-            op_idx: 0,
-            call_disposition: None,
-            target: Some(r2ssa::ValueId(999)),
-            address: None,
-            value: None,
-            values: Vec::new(),
-            phi_edge: None,
-        }];
-
-        let reason = certified_standard_output_residual_reason_with_effect_proofs(
-            &prepared,
-            &function_facts,
-            &func,
-            Some(&effect_proofs),
-        )
-        .expect("call target proof mismatch must break certified rendering");
-
-        assert!(
-            reason.contains("call proof at 0x1000:0 target proof Some(ValueId(999))"),
-            "{reason}"
-        );
-        assert!(reason.contains("FunctionCallsiteFacts target"), "{reason}");
-    }
-
-    #[test]
-    fn certified_standard_output_refuses_return_without_exact_render_proof() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![R2ILOp::Return {
-                target: Varnode::constant(0, 8),
-            }],
-            &arch,
-        );
-        assert_eq!(prepared.certificates().returns.len(), 1);
-        let func = CFunction::new("bad_return", CType::i64())
-            .with_body(vec![CStmt::Return(Some(CExpr::uint(0)))]);
-        let function_facts = test_function_facts_with_prepared_render(&prepared);
-
-        let reason = certified_standard_output_residual_reason_with_effect_proofs(
-            &prepared,
-            &function_facts,
-            &func,
-            Some(&[]),
-        )
-        .expect("return without exact emitted proof should break certified rendering");
-
-        assert!(
-            reason.contains(
-                "rendered 1 value return(s) with only 0 rendered FunctionRenderFacts return proof(s)"
-            ),
-            "{reason}"
-        );
-        assert!(reason.contains("first missing node stmt:0"), "{reason}");
-    }
-
-    #[test]
-    fn certified_standard_output_accepts_return_with_exact_value_render_proof() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![R2ILOp::Return {
-                target: Varnode::constant(0, 8),
-            }],
-            &arch,
-        );
-        let cert = prepared
-            .return_certificate_for_op(0x1000, 0)
-            .expect("return certificate");
-        let func = CFunction::new("return_ok", CType::i64())
-            .with_body(vec![CStmt::Return(Some(CExpr::uint(0)))]);
-        let function_facts = test_function_facts_with_prepared_render(&prepared);
-        let effect_proofs = [EffectRenderProof {
-            kind: EffectRenderProofKind::Return,
-            block_addr: 0x1000,
-            op_idx: 0,
-            call_disposition: None,
-            target: None,
-            address: None,
-            value: Some(cert.value),
-            values: Vec::new(),
-            phi_edge: None,
-        }];
-
-        let reason = certified_standard_output_residual_reason_with_effect_proofs(
-            &prepared,
-            &function_facts,
-            &func,
-            Some(&effect_proofs),
-        );
-
-        assert_eq!(reason, None);
-    }
-
-    #[test]
-    fn certified_standard_output_refuses_return_value_without_renderable_expression_certificate() {
-        let arch = test_arch_for_decompile();
-        let userop_out = Varnode::unique(0x2222, 8);
-        let prepared = prepared_from_ops(
-            vec![
-                R2ILOp::CallOther {
-                    output: Some(userop_out.clone()),
-                    userop: 99,
-                    inputs: vec![Varnode::register(0x10, 8)],
-                },
-                R2ILOp::Return { target: userop_out },
-            ],
-            &arch,
-        );
-        let cert = prepared
-            .return_certificate_for_op(0x1000, 1)
-            .expect("return certificate");
-        assert!(
-            prepared
-                .certificates()
-                .expressions
-                .get(&cert.value)
-                .is_some_and(|cert| !cert.renderable),
-            "opaque userop return should not be renderable"
-        );
-        let func = CFunction::new("return_bad_expr", CType::i64())
-            .with_body(vec![CStmt::Return(Some(CExpr::Var("opaque".to_string())))]);
-        let function_facts = test_function_facts_with_prepared_render(&prepared);
-        let effect_proofs = [EffectRenderProof {
-            kind: EffectRenderProofKind::Return,
-            block_addr: 0x1000,
-            op_idx: 1,
-            call_disposition: None,
-            target: None,
-            address: None,
-            value: Some(cert.value),
-            values: Vec::new(),
-            phi_edge: None,
-        }];
-
-        let reason = certified_standard_output_residual_reason_with_effect_proofs(
-            &prepared,
-            &function_facts,
-            &func,
-            Some(&effect_proofs),
-        )
-        .expect("returning an opaque expression value must break certified rendering");
-
-        assert!(
-            reason.contains("return proof at 0x1000:1 value")
-                && reason.contains("lacks renderable FunctionRenderFacts expression"),
-            "{reason}"
-        );
-    }
-
-    #[test]
-    fn certified_standard_output_refuses_return_value_render_proof_mismatch() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![R2ILOp::Return {
-                target: Varnode::constant(0, 8),
-            }],
-            &arch,
-        );
-        let func = CFunction::new("bad_return_value", CType::i64())
-            .with_body(vec![CStmt::Return(Some(CExpr::uint(0)))]);
-        let function_facts = test_function_facts_with_prepared_render(&prepared);
-        let effect_proofs = [EffectRenderProof {
-            kind: EffectRenderProofKind::Return,
-            block_addr: 0x1000,
-            op_idx: 0,
-            call_disposition: None,
-            target: None,
-            address: None,
-            value: Some(r2ssa::ValueId(999)),
-            values: Vec::new(),
-            phi_edge: None,
-        }];
-
-        let reason = certified_standard_output_residual_reason_with_effect_proofs(
-            &prepared,
-            &function_facts,
-            &func,
-            Some(&effect_proofs),
-        )
-        .expect("return value proof mismatch must break certified rendering");
-
-        assert!(
-            reason.contains("return proof at 0x1000:0 value proof Some(ValueId(999))"),
-            "{reason}"
-        );
-        assert!(
-            reason.contains("FunctionRenderFacts return value"),
-            "{reason}"
-        );
-    }
-
-    #[test]
-    fn certified_standard_output_refuses_second_return_hidden_by_source_return_fact() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![
-                R2ILOp::Return {
-                    target: Varnode::constant(0, 8),
-                },
-                R2ILOp::Return {
-                    target: Varnode::constant(1, 8),
-                },
-            ],
-            &arch,
-        );
-        assert_eq!(prepared.certificates().returns.len(), 2);
-        let first = prepared
-            .return_certificate_for_op(0x1000, 0)
-            .expect("first return certificate");
-        let func = CFunction::new("bad_second_return", CType::i64()).with_body(vec![
-            CStmt::Return(Some(CExpr::uint(0))),
-            CStmt::Return(Some(CExpr::uint(1))),
-        ]);
-        let function_facts = test_function_facts_with_prepared_render(&prepared);
-        assert_eq!(
-            function_facts
-                .render()
-                .map(|render| render.return_effects().count()),
-            Some(2),
-            "fixture must expose two source return facts"
-        );
-        let effect_proofs = [EffectRenderProof {
-            kind: EffectRenderProofKind::Return,
-            block_addr: 0x1000,
-            op_idx: 0,
-            call_disposition: None,
-            target: None,
-            address: None,
-            value: Some(first.value),
-            values: Vec::new(),
-            phi_edge: None,
-        }];
-
-        let reason = certified_standard_output_residual_reason_with_effect_proofs(
-            &prepared,
-            &function_facts,
-            &func,
-            Some(&effect_proofs),
-        )
-        .expect("unproved second return must break certified rendering");
-
-        assert!(
-            reason.contains(
-                "rendered 2 value return(s) with only 1 rendered FunctionRenderFacts return proof(s)"
-            ),
-            "{reason}"
-        );
-        assert!(reason.contains("first missing node stmt:1"), "{reason}");
-    }
-
-    #[test]
-    fn certified_standard_output_refuses_memory_without_exact_render_proof() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![R2ILOp::Load {
-                dst: Varnode::register(0x00, 8),
-                space: SpaceId::Ram,
-                addr: Varnode::register(0x10, 8),
-            }],
-            &arch,
-        );
-        assert_eq!(prepared.certificates().memory_accesses.len(), 1);
-        let func = CFunction::new("bad_memory", CType::Void).with_body(vec![CStmt::expr(
-            CExpr::assign(CExpr::var("x"), CExpr::deref(CExpr::var("p"))),
-        )]);
-        let function_facts = test_function_facts_with_prepared_render(&prepared);
-
-        let reason = certified_standard_output_residual_reason_with_effect_proofs(
-            &prepared,
-            &function_facts,
-            &func,
-            Some(&[]),
-        )
-        .expect("memory expression without exact emitted proof should break certified rendering");
-
-        assert!(
-            reason.contains(
-                "rendered 1 memory-like access(es) with only 0 rendered FunctionRenderFacts memory proof(s)"
-            ),
-            "{reason}"
-        );
-        assert!(reason.contains("first missing node stmt:0.0"), "{reason}");
-    }
-
-    #[test]
-    fn certified_standard_output_refuses_second_memory_access_hidden_by_source_memory_fact() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![
-                R2ILOp::Load {
-                    dst: Varnode::register(0x00, 8),
-                    space: SpaceId::Ram,
-                    addr: Varnode::register(0x10, 8),
-                },
-                R2ILOp::Load {
-                    dst: Varnode::register(0x08, 8),
-                    space: SpaceId::Ram,
-                    addr: Varnode::register(0x18, 8),
-                },
-            ],
-            &arch,
-        );
-        assert_eq!(prepared.certificates().memory_accesses.len(), 2);
-        let first = prepared
-            .memory_certificate_for_op_site(0x1000, 0, false)
-            .expect("first memory certificate");
-        let func = CFunction::new("bad_second_memory", CType::Void).with_body(vec![
-            CStmt::expr(CExpr::assign(
-                CExpr::var("x"),
-                CExpr::deref(CExpr::var("p")),
-            )),
-            CStmt::expr(CExpr::assign(
-                CExpr::var("y"),
-                CExpr::deref(CExpr::var("q")),
-            )),
-        ]);
-        let function_facts = test_function_facts_with_prepared_render(&prepared);
-        assert_eq!(
-            function_facts
-                .render()
-                .map(|render| render.memory_accesses().count()),
-            Some(2),
-            "fixture must expose two source memory facts"
-        );
-        let effect_proofs = [EffectRenderProof {
-            kind: EffectRenderProofKind::MemoryRead,
-            block_addr: 0x1000,
-            op_idx: 0,
-            call_disposition: None,
-            target: None,
-            address: Some(first.address),
-            value: first.value,
-            values: Vec::new(),
-            phi_edge: None,
-        }];
-
-        let reason = certified_standard_output_residual_reason_with_effect_proofs(
-            &prepared,
-            &function_facts,
-            &func,
-            Some(&effect_proofs),
-        )
-        .expect("unproved second memory access must break certified rendering");
-
-        assert!(
-            reason.contains(
-                "rendered 2 memory-like access(es) with only 1 rendered FunctionRenderFacts memory proof(s)"
-            ),
-            "{reason}"
-        );
-        assert!(reason.contains("first missing node stmt:1.0.1"), "{reason}");
-    }
-
-    #[test]
-    fn certified_standard_output_accepts_memory_with_exact_render_proof() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![R2ILOp::Load {
-                dst: Varnode::register(0x00, 8),
-                space: SpaceId::Ram,
-                addr: Varnode::register(0x10, 8),
-            }],
-            &arch,
-        );
-        let function_facts = test_function_facts_with_prepared_render(&prepared);
-        let cert = prepared
-            .memory_certificate_for_op_site(0x1000, 0, false)
-            .expect("memory certificate");
-        let func = CFunction::new("memory_ok", CType::Void).with_body(vec![CStmt::expr(
-            CExpr::assign(CExpr::var("x"), CExpr::deref(CExpr::var("p"))),
-        )]);
-        let effect_proofs = [EffectRenderProof {
-            kind: EffectRenderProofKind::MemoryRead,
-            block_addr: 0x1000,
-            op_idx: 0,
-            call_disposition: None,
-            target: None,
-            address: Some(cert.address),
-            value: cert.value,
-            values: Vec::new(),
-            phi_edge: None,
-        }];
-
-        let reason = certified_standard_output_residual_reason_with_effect_proofs(
-            &prepared,
-            &function_facts,
-            &func,
-            Some(&effect_proofs),
-        );
-
-        assert_eq!(reason, None);
-    }
-
-    #[test]
-    fn certified_standard_output_refuses_dropped_memory_effect() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![R2ILOp::Load {
-                dst: Varnode::register(0x00, 8),
-                space: SpaceId::Ram,
-                addr: Varnode::register(0x10, 8),
-            }],
-            &arch,
-        );
-        let function_facts = test_function_facts_with_prepared_render(&prepared);
-        let cert = prepared
-            .memory_certificate_for_op_site(0x1000, 0, false)
-            .expect("memory certificate");
-        let effect_proofs = [EffectRenderProof {
-            kind: EffectRenderProofKind::MemoryRead,
-            block_addr: 0x1000,
-            op_idx: 0,
-            call_disposition: None,
-            target: None,
-            address: Some(cert.address),
-            value: cert.value,
-            values: Vec::new(),
-            phi_edge: None,
-        }];
-        let func = CFunction::new("dropped_memory", CType::Void)
-            .with_body(vec![CStmt::Comment("no memory effect".to_string())]);
-
-        let reason = certified_standard_output_residual_reason_with_effect_proofs(
-            &prepared,
-            &function_facts,
-            &func,
-            Some(&effect_proofs),
-        )
-        .expect("dropped memory effect must break certified rendering");
-
-        assert!(
-            reason.contains(
-                "recorded 1 memory effect(s), but final AST contains only 0 memory-like access(es)"
-            ),
-            "{reason}"
-        );
-    }
-
-    #[test]
-    fn certified_standard_output_refuses_raw_pointer_arithmetic_deref() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![R2ILOp::Load {
-                dst: Varnode::register(0x00, 8),
-                space: SpaceId::Ram,
-                addr: Varnode::register(0x10, 8),
-            }],
-            &arch,
-        );
-        let func = CFunction::new("raw_pointer_math", CType::Void).with_body(vec![CStmt::expr(
-            CExpr::assign(
-                CExpr::var("x"),
-                CExpr::deref(CExpr::binary(
-                    BinaryOp::Add,
-                    CExpr::var("arr"),
-                    CExpr::binary(BinaryOp::Mul, CExpr::var("idx"), CExpr::int(56)),
-                )),
-            ),
-        )]);
-        let function_facts = test_function_facts_with_prepared_render(&prepared);
-        let cert = prepared
-            .memory_certificate_for_op_site(0x1000, 0, false)
-            .expect("memory certificate");
-        let effect_proofs = [EffectRenderProof {
-            kind: EffectRenderProofKind::MemoryRead,
-            block_addr: 0x1000,
-            op_idx: 0,
-            call_disposition: None,
-            target: None,
-            address: Some(cert.address),
-            value: cert.value,
-            values: Vec::new(),
-            phi_edge: None,
-        }];
-
-        let reason = certified_standard_output_residual_reason_with_effect_proofs(
-            &prepared,
-            &function_facts,
-            &func,
-            Some(&effect_proofs),
-        )
-        .expect("raw pointer arithmetic must not replace typed array/member proof");
-
-        assert!(
-            reason.contains("raw pointer-arithmetic dereference")
-                && reason.contains("FunctionFacts certificates"),
-            "{reason}"
-        );
-    }
-
-    #[test]
-    fn certified_standard_output_refuses_memory_address_value_render_proof_mismatch() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![R2ILOp::Load {
-                dst: Varnode::register(0x00, 8),
-                space: SpaceId::Ram,
-                addr: Varnode::register(0x10, 8),
-            }],
-            &arch,
-        );
-        let cert = prepared
-            .memory_certificate_for_op_site(0x1000, 0, false)
-            .expect("memory certificate");
-        let func = CFunction::new("bad_memory_value", CType::Void).with_body(vec![CStmt::expr(
-            CExpr::assign(CExpr::var("x"), CExpr::deref(CExpr::var("p"))),
-        )]);
-        let function_facts = test_function_facts_with_prepared_render(&prepared);
-        let effect_proofs = [EffectRenderProof {
-            kind: EffectRenderProofKind::MemoryRead,
-            block_addr: 0x1000,
-            op_idx: 0,
-            call_disposition: None,
-            target: None,
-            address: Some(r2ssa::ValueId(998)),
-            value: cert.value.map(|_| r2ssa::ValueId(999)),
-            values: Vec::new(),
-            phi_edge: None,
-        }];
-
-        let reason = certified_standard_output_residual_reason_with_effect_proofs(
-            &prepared,
-            &function_facts,
-            &func,
-            Some(&effect_proofs),
-        )
-        .expect("memory address/value proof mismatch must break certified rendering");
-
-        assert!(
-            reason.contains("memory proof at 0x1000:0 address proof Some(ValueId(998))"),
-            "{reason}"
-        );
-        assert!(
-            reason.contains("memory proof at 0x1000:0 value proof Some(ValueId(999))"),
-            "{reason}"
-        );
-    }
-
-    #[test]
-    fn certified_standard_output_rejects_stack_local_with_offset_only_evidence() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(Vec::new(), &arch);
-        let render = test_stack_render_facts(
-            r2ssa::ObjectId(1),
-            r2ssa::StackAddressBase::FramePointer,
-            -8,
-        );
-        let function_facts =
-            FunctionFacts::new(FunctionTypeFacts::default(), None).with_render(render);
-        let mut func = CFunction::new("local_offset_only", CType::Void)
-            .with_body(vec![CStmt::Comment("body".to_string())]);
-        func.locals.push(ast::CLocal {
-            ty: CType::Int(32),
-            name: "buf".to_string(),
-            stack_offset: Some(-8),
-        });
-
-        let reason = certified_standard_output_residual_reason(&prepared, &function_facts, &func)
-            .expect("offset-only stack evidence must not certify a friendly local");
-
-        assert!(
-            reason.contains("local buf at stack offset -8 lacks exact typed StackSlotCertificate"),
-            "{reason}"
-        );
-    }
-
-    #[test]
-    fn certified_standard_output_accepts_exact_typed_stack_local_identity() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(Vec::new(), &arch);
-        let render = test_stack_render_facts(
-            r2ssa::ObjectId(1),
-            r2ssa::StackAddressBase::FramePointer,
-            -8,
-        );
-        let type_facts = FunctionTypeFacts {
-            stack_slots: BTreeMap::from([(
-                StackSlotKey {
-                    base: ExternalStackBase::FramePointer,
-                    offset: -8,
-                },
-                ExternalStackSlotSpec {
-                    name: "buf".to_string(),
-                    ty: Some(CTypeLike::Int {
-                        bits: 32,
-                        signedness: Signedness::Signed,
-                    }),
-                    base: ExternalStackBase::FramePointer,
-                    role: ExternalStackSlotRole::Local,
-                    ..ExternalStackSlotSpec::default()
-                },
-            )]),
-            ..FunctionTypeFacts::default()
-        };
-        let function_facts = FunctionFacts::new(type_facts, None).with_render(render);
-        let mut func = CFunction::new("local_exact", CType::Void)
-            .with_body(vec![CStmt::Comment("body".to_string())]);
-        func.locals.push(ast::CLocal {
-            ty: CType::Int(32),
-            name: "buf".to_string(),
-            stack_offset: Some(-8),
-        });
-
-        let reason = certified_standard_output_residual_reason(&prepared, &function_facts, &func);
-
-        assert_eq!(reason, None);
-    }
-
-    #[test]
-    fn certified_standard_output_rejects_stack_local_type_mismatch() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(Vec::new(), &arch);
-        let render = test_stack_render_facts(
-            r2ssa::ObjectId(1),
-            r2ssa::StackAddressBase::FramePointer,
-            -8,
-        );
-        let type_facts = FunctionTypeFacts {
-            stack_slots: BTreeMap::from([(
-                StackSlotKey {
-                    base: ExternalStackBase::FramePointer,
-                    offset: -8,
-                },
-                ExternalStackSlotSpec {
-                    name: "buf".to_string(),
-                    ty: Some(CTypeLike::Int {
-                        bits: 32,
-                        signedness: Signedness::Signed,
-                    }),
-                    base: ExternalStackBase::FramePointer,
-                    role: ExternalStackSlotRole::Local,
-                    ..ExternalStackSlotSpec::default()
-                },
-            )]),
-            ..FunctionTypeFacts::default()
-        };
-        let function_facts = FunctionFacts::new(type_facts, None).with_render(render);
-        let mut func = CFunction::new("local_type_mismatch", CType::Void)
-            .with_body(vec![CStmt::Comment("body".to_string())]);
-        func.locals.push(ast::CLocal {
-            ty: CType::UInt(32),
-            name: "buf".to_string(),
-            stack_offset: Some(-8),
-        });
-
-        let reason = certified_standard_output_residual_reason(&prepared, &function_facts, &func)
-            .expect("renderer-local stack local type must not override FunctionTypeFacts");
-
-        assert!(
-            reason.contains("local buf at stack offset -8 lacks exact typed StackSlotCertificate"),
-            "{reason}"
-        );
-    }
-
-    #[test]
-    fn certified_standard_output_accepts_type_layout_certified_member_access() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![
-                R2ILOp::Load {
-                    dst: Varnode::register(0x00, 8),
-                    space: SpaceId::Ram,
-                    addr: Varnode::register(0x10, 8),
-                },
-                R2ILOp::Return {
-                    target: Varnode::register(0x00, 8),
-                },
-            ],
-            &arch,
-        );
-        let mut function_facts = test_function_facts_with_prepared_render(&prepared);
-        function_facts.replace_type_facts(FunctionTypeFacts {
-            field_access_certificates: vec![FieldAccessCertificate {
-                slot: 0,
-                field_offset: 0,
-                field_name: "len".to_string(),
-                field_type: Some("uint64_t".to_string()),
-            }],
-            ..FunctionTypeFacts::default()
-        });
-        add_member_render_fact(
-            &mut function_facts,
-            &prepared,
-            TestMemberRenderFact {
-                block_addr: 0x1000,
-                op_index: 0,
-                is_write: false,
-                field_name: "len",
-                field_offset: 0,
-                access_width: 8,
-            },
-        );
-        let func = CFunction::new("field_ok", CType::i64())
-            .with_param(CType::Struct("record".to_string()), "arg0")
-            .with_body(vec![CStmt::Return(Some(CExpr::Member {
-                base: Box::new(CExpr::var("arg0")),
-                member: "len".to_string(),
-            }))]);
-        let memory_cert = prepared
-            .memory_certificate_for_op_site(0x1000, 0, false)
-            .expect("memory certificate");
-        let return_cert = prepared
-            .return_certificate_for_op(0x1000, 1)
-            .expect("return certificate");
-        let effect_proofs = [
-            EffectRenderProof {
-                kind: EffectRenderProofKind::MemoryRead,
-                block_addr: 0x1000,
-                op_idx: 0,
-                call_disposition: None,
-                target: None,
-                address: Some(memory_cert.address),
-                value: memory_cert.value,
-                values: Vec::new(),
-                phi_edge: None,
-            },
-            EffectRenderProof {
-                kind: EffectRenderProofKind::Return,
-                block_addr: 0x1000,
-                op_idx: 1,
-                call_disposition: None,
-                target: None,
-                address: None,
-                value: Some(return_cert.value),
-                values: Vec::new(),
-                phi_edge: None,
-            },
-        ];
-
-        let reason = certified_standard_output_residual_reason_with_effect_proofs(
-            &prepared,
-            &function_facts,
-            &func,
-            Some(&effect_proofs),
-        );
-
-        assert_eq!(reason, None);
-    }
-
-    #[test]
-    fn certified_standard_output_refuses_member_fact_without_rendered_memory_proof() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![
-                R2ILOp::Load {
-                    dst: Varnode::register(0x00, 8),
-                    space: SpaceId::Ram,
-                    addr: Varnode::register(0x10, 8),
-                },
-                R2ILOp::Return {
-                    target: Varnode::register(0x00, 8),
-                },
-            ],
-            &arch,
-        );
-        let mut function_facts = test_function_facts_with_prepared_render(&prepared);
-        add_member_render_fact(
-            &mut function_facts,
-            &prepared,
-            TestMemberRenderFact {
-                block_addr: 0x1000,
-                op_index: 0,
-                is_write: false,
-                field_name: "len",
-                field_offset: 0,
-                access_width: 8,
-            },
-        );
-        let func =
-            CFunction::new("field_unproved_memory", CType::i64()).with_body(vec![CStmt::Return(
-                Some(CExpr::Member {
-                    base: Box::new(CExpr::var("arg0")),
-                    member: "len".to_string(),
-                }),
-            )]);
-        let return_cert = prepared
-            .return_certificate_for_op(0x1000, 1)
-            .expect("return certificate");
-        let effect_proofs = [EffectRenderProof {
-            kind: EffectRenderProofKind::Return,
-            block_addr: 0x1000,
-            op_idx: 1,
-            call_disposition: None,
-            target: None,
-            address: None,
-            value: Some(return_cert.value),
-            values: Vec::new(),
-            phi_edge: None,
-        }];
-
-        let reason = certified_standard_output_residual_reason_with_effect_proofs(
-            &prepared,
-            &function_facts,
-            &func,
-            Some(&effect_proofs),
-        )
-        .expect("member fact without emitted memory proof must not certify final member syntax");
-
-        assert!(
-            reason.contains(
-                "rendered 1 field access(es) without FunctionRenderFacts member-access proof"
-            ) && reason.contains("len"),
-            "{reason}"
-        );
-    }
-
-    #[test]
-    fn certified_standard_output_refuses_member_fact_from_unrendered_op() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![
-                R2ILOp::Load {
-                    dst: Varnode::register(0x00, 8),
-                    space: SpaceId::Ram,
-                    addr: Varnode::register(0x10, 8),
-                },
-                R2ILOp::Load {
-                    dst: Varnode::register(0x08, 8),
-                    space: SpaceId::Ram,
-                    addr: Varnode::register(0x18, 8),
-                },
-                R2ILOp::Return {
-                    target: Varnode::register(0x00, 8),
-                },
-            ],
-            &arch,
-        );
-        let mut function_facts = test_function_facts_with_prepared_render(&prepared);
-        add_member_render_fact(
-            &mut function_facts,
-            &prepared,
-            TestMemberRenderFact {
-                block_addr: 0x1000,
-                op_index: 1,
-                is_write: false,
-                field_name: "len",
-                field_offset: 0,
-                access_width: 8,
-            },
-        );
-        let func = CFunction::new("field_wrong_op", CType::i64()).with_body(vec![CStmt::Return(
-            Some(CExpr::Member {
-                base: Box::new(CExpr::var("arg0")),
-                member: "len".to_string(),
-            }),
-        )]);
-        let memory_cert = prepared
-            .memory_certificate_for_op_site(0x1000, 0, false)
-            .expect("first memory certificate");
-        let return_cert = prepared
-            .return_certificate_for_op(0x1000, 2)
-            .expect("return certificate");
-        let effect_proofs = [
-            EffectRenderProof {
-                kind: EffectRenderProofKind::MemoryRead,
-                block_addr: 0x1000,
-                op_idx: 0,
-                call_disposition: None,
-                target: None,
-                address: Some(memory_cert.address),
-                value: memory_cert.value,
-                values: Vec::new(),
-                phi_edge: None,
-            },
-            EffectRenderProof {
-                kind: EffectRenderProofKind::Return,
-                block_addr: 0x1000,
-                op_idx: 2,
-                call_disposition: None,
-                target: None,
-                address: None,
-                value: Some(return_cert.value),
-                values: Vec::new(),
-                phi_edge: None,
-            },
-        ];
-
-        let reason = certified_standard_output_residual_reason_with_effect_proofs(
-            &prepared,
-            &function_facts,
-            &func,
-            Some(&effect_proofs),
-        )
-        .expect("member fact from an unrendered op must not certify final member syntax");
-
-        assert!(
-            reason.contains(
-                "rendered 1 field access(es) without FunctionRenderFacts member-access proof"
-            ) && reason.contains("len"),
-            "{reason}"
-        );
-    }
-
-    #[test]
-    fn certified_standard_output_accepts_multiple_returned_members_with_layout_proofs() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![
-                R2ILOp::Load {
-                    dst: Varnode::unique(0x10, 4),
-                    space: SpaceId::Ram,
-                    addr: Varnode::register(0x10, 8),
-                },
-                R2ILOp::Load {
-                    dst: Varnode::unique(0x20, 4),
-                    space: SpaceId::Ram,
-                    addr: Varnode::register(0x18, 8),
-                },
-                R2ILOp::IntAdd {
-                    dst: Varnode::register(0x00, 4),
-                    a: Varnode::unique(0x10, 4),
-                    b: Varnode::unique(0x20, 4),
-                },
-                R2ILOp::Return {
-                    target: Varnode::register(0x00, 4),
-                },
-            ],
-            &arch,
-        );
-        let mut function_facts = test_function_facts_with_prepared_render(&prepared);
-        function_facts.replace_type_facts(FunctionTypeFacts {
-            field_access_certificates: vec![
-                FieldAccessCertificate {
-                    slot: 0,
-                    field_offset: 0,
-                    field_name: "f_0".to_string(),
-                    field_type: Some("int32_t".to_string()),
-                },
-                FieldAccessCertificate {
-                    slot: 0,
-                    field_offset: 0x30,
-                    field_name: "f_30".to_string(),
-                    field_type: Some("int32_t".to_string()),
-                },
-            ],
-            ..FunctionTypeFacts::default()
-        });
-        add_member_render_fact(
-            &mut function_facts,
-            &prepared,
-            TestMemberRenderFact {
-                block_addr: 0x1000,
-                op_index: 0,
-                is_write: false,
-                field_name: "f_0",
-                field_offset: 0,
-                access_width: 4,
-            },
-        );
-        add_member_render_fact(
-            &mut function_facts,
-            &prepared,
-            TestMemberRenderFact {
-                block_addr: 0x1000,
-                op_index: 1,
-                is_write: false,
-                field_name: "f_30",
-                field_offset: 0x30,
-                access_width: 4,
-            },
-        );
-        let func = CFunction::new("field_pair_ok", CType::i32()).with_body(vec![CStmt::Return(
-            Some(CExpr::Binary {
-                op: BinaryOp::Add,
-                left: Box::new(CExpr::PtrMember {
-                    base: Box::new(CExpr::var("obj")),
-                    member: "f_0".to_string(),
-                }),
-                right: Box::new(CExpr::PtrMember {
-                    base: Box::new(CExpr::var("obj")),
-                    member: "f_30".to_string(),
-                }),
-            }),
-        )]);
-        let first_memory_cert = prepared
-            .memory_certificate_for_op_site(0x1000, 0, false)
-            .expect("first memory certificate");
-        let second_memory_cert = prepared
-            .memory_certificate_for_op_site(0x1000, 1, false)
-            .expect("second memory certificate");
-        let return_cert = prepared
-            .return_certificate_for_op(0x1000, 3)
-            .expect("return certificate");
-        let effect_proofs = [
-            EffectRenderProof {
-                kind: EffectRenderProofKind::MemoryRead,
-                block_addr: 0x1000,
-                op_idx: 0,
-                call_disposition: None,
-                target: None,
-                address: Some(first_memory_cert.address),
-                value: first_memory_cert.value,
-                values: Vec::new(),
-                phi_edge: None,
-            },
-            EffectRenderProof {
-                kind: EffectRenderProofKind::MemoryRead,
-                block_addr: 0x1000,
-                op_idx: 1,
-                call_disposition: None,
-                target: None,
-                address: Some(second_memory_cert.address),
-                value: second_memory_cert.value,
-                values: Vec::new(),
-                phi_edge: None,
-            },
-            EffectRenderProof {
-                kind: EffectRenderProofKind::Return,
-                block_addr: 0x1000,
-                op_idx: 3,
-                call_disposition: None,
-                target: None,
-                address: None,
-                value: Some(return_cert.value),
-                values: Vec::new(),
-                phi_edge: None,
-            },
-        ];
-
-        let reason = certified_standard_output_residual_reason_with_effect_proofs(
-            &prepared,
-            &function_facts,
-            &func,
-            Some(&effect_proofs),
-        );
-
-        assert_eq!(reason, None);
-    }
-
-    #[test]
-    fn certified_standard_output_rejects_returned_member_missing_layout_proof() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![
-                R2ILOp::Load {
-                    dst: Varnode::unique(0x10, 4),
-                    space: SpaceId::Ram,
-                    addr: Varnode::register(0x10, 8),
-                },
-                R2ILOp::Return {
-                    target: Varnode::unique(0x10, 4),
-                },
-            ],
-            &arch,
-        );
-        let mut function_facts = test_function_facts_with_prepared_render(&prepared);
-        function_facts.replace_type_facts(FunctionTypeFacts {
-            field_access_certificates: vec![FieldAccessCertificate {
-                slot: 0,
-                field_offset: 0,
-                field_name: "f_0".to_string(),
-                field_type: Some("int32_t".to_string()),
-            }],
-            ..FunctionTypeFacts::default()
-        });
-        let func =
-            CFunction::new("field_pair_missing", CType::i32()).with_body(vec![CStmt::Return(
-                Some(CExpr::Binary {
-                    op: BinaryOp::Add,
-                    left: Box::new(CExpr::PtrMember {
-                        base: Box::new(CExpr::var("obj")),
-                        member: "f_0".to_string(),
-                    }),
-                    right: Box::new(CExpr::PtrMember {
-                        base: Box::new(CExpr::var("obj")),
-                        member: "f_30".to_string(),
-                    }),
-                }),
-            )]);
-
-        add_member_render_fact(
-            &mut function_facts,
-            &prepared,
-            TestMemberRenderFact {
-                block_addr: 0x1000,
-                op_index: 0,
-                is_write: false,
-                field_name: "f_0",
-                field_offset: 0,
-                access_width: 4,
-            },
-        );
-
-        let reason = certified_standard_output_residual_reason(&prepared, &function_facts, &func)
-            .expect("every returned member must have a FunctionRenderFacts member proof");
-
-        assert!(
-            reason.contains("FunctionRenderFacts member-access proof"),
-            "{reason}"
-        );
-    }
-
-    #[test]
-    fn certified_standard_output_rejects_external_layout_member_without_field_certificate() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![R2ILOp::Return {
-                target: Varnode::constant(0, 8),
-            }],
-            &arch,
-        );
-        let mut function_facts = test_function_facts_with_prepared_render(&prepared);
-        function_facts.replace_type_facts(FunctionTypeFacts {
-            external_type_db: ExternalTypeDb {
-                structs: [(
-                    "node".to_string(),
-                    ExternalStruct {
-                        name: "node".to_string(),
-                        fields: [(
-                            0,
-                            ExternalField {
-                                name: "len".to_string(),
-                                offset: 0,
-                                ty: Some("uint64_t".to_string()),
-                            },
-                        )]
-                        .into_iter()
-                        .collect(),
-                    },
-                )]
-                .into_iter()
-                .collect(),
-                ..ExternalTypeDb::default()
-            },
-            ..FunctionTypeFacts::default()
-        });
-        let func =
-            CFunction::new("field_external_only", CType::i64()).with_body(vec![CStmt::Return(
-                Some(CExpr::Member {
-                    base: Box::new(CExpr::var("arg0")),
-                    member: "len".to_string(),
-                }),
-            )]);
-
-        let reason = certified_standard_output_residual_reason(&prepared, &function_facts, &func)
-            .expect("external layout alone must not certify executable member syntax");
-
-        assert!(
-            reason.contains(
-                "rendered 1 field access(es) without FunctionRenderFacts member-access proof"
-            ) && reason.contains("len"),
-            "{reason}"
-        );
-    }
-
-    #[test]
-    fn certified_standard_output_rejects_member_name_not_in_layout_certificate() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![R2ILOp::Return {
-                target: Varnode::constant(0, 8),
-            }],
-            &arch,
-        );
-        let function_facts = FunctionFacts::new(
-            FunctionTypeFacts {
-                field_access_certificates: vec![FieldAccessCertificate {
-                    slot: 0,
-                    field_offset: 0,
-                    field_name: "len".to_string(),
-                    field_type: Some("uint64_t".to_string()),
-                }],
-                ..FunctionTypeFacts::default()
-            },
-            None,
-        );
-        let func = CFunction::new("field_bad", CType::i64()).with_body(vec![CStmt::Return(Some(
-            CExpr::Member {
-                base: Box::new(CExpr::var("arg0")),
-                member: "capacity".to_string(),
-            },
-        ))]);
-
-        let reason = certified_standard_output_residual_reason(&prepared, &function_facts, &func)
-            .expect("mismatched member name must residualize");
-
-        assert!(
-            reason.contains(
-                "rendered 1 field access(es) without FunctionRenderFacts member-access proof"
-            ) && reason.contains("capacity"),
-            "{reason}"
-        );
-    }
-
-    #[test]
-    fn certified_standard_output_rejects_repeated_array_member_access_without_array_render_proof() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![
-                R2ILOp::Load {
-                    dst: Varnode::unique(0x10, 8),
-                    space: SpaceId::Ram,
-                    addr: Varnode::register(0x10, 8),
-                },
-                R2ILOp::Load {
-                    dst: Varnode::unique(0x20, 8),
-                    space: SpaceId::Ram,
-                    addr: Varnode::register(0x10, 8),
-                },
-                R2ILOp::IntAdd {
-                    dst: Varnode::register(0x00, 8),
-                    a: Varnode::unique(0x10, 8),
-                    b: Varnode::unique(0x20, 8),
-                },
-                R2ILOp::Return {
-                    target: Varnode::register(0x00, 8),
-                },
-            ],
-            &arch,
-        );
-        let indexed_len = || CExpr::Member {
-            base: Box::new(CExpr::Subscript {
-                base: Box::new(CExpr::var("arr")),
-                index: Box::new(CExpr::var("idx")),
-            }),
-            member: "len".to_string(),
-        };
-        let func = CFunction::new("array_member_ok", CType::i64()).with_body(vec![CStmt::Return(
-            Some(CExpr::Binary {
-                op: BinaryOp::Add,
-                left: Box::new(indexed_len()),
-                right: Box::new(indexed_len()),
-            }),
-        )]);
-        let mut function_facts = test_function_facts_with_prepared_render(&prepared);
-        function_facts.replace_type_facts(FunctionTypeFacts {
-            array_index_certificates: vec![ArrayIndexCertificate {
-                slot: 0,
-                base: Some(ArrayIndexBase::Param { index: 0 }),
-                field_offset: 0,
-                element_stride: 8,
-            }],
-            field_access_certificates: vec![FieldAccessCertificate {
-                slot: 0,
-                field_offset: 0,
-                field_name: "len".to_string(),
-                field_type: Some("int64_t".to_string()),
-            }],
-            external_type_db: ExternalTypeDb {
-                structs: [(
-                    "node".to_string(),
-                    ExternalStruct {
-                        name: "node".to_string(),
-                        fields: [(
-                            0,
-                            ExternalField {
-                                name: "len".to_string(),
-                                offset: 0,
-                                ty: Some("int64_t".to_string()),
-                            },
-                        )]
-                        .into_iter()
-                        .collect(),
-                    },
-                )]
-                .into_iter()
-                .collect(),
-                ..ExternalTypeDb::default()
-            },
-            ..FunctionTypeFacts::default()
-        });
-        add_member_render_fact(
-            &mut function_facts,
-            &prepared,
-            TestMemberRenderFact {
-                block_addr: 0x1000,
-                op_index: 0,
-                is_write: false,
-                field_name: "len",
-                field_offset: 0,
-                access_width: 8,
-            },
-        );
-        add_member_render_fact(
-            &mut function_facts,
-            &prepared,
-            TestMemberRenderFact {
-                block_addr: 0x1000,
-                op_index: 1,
-                is_write: false,
-                field_name: "len",
-                field_offset: 0,
-                access_width: 8,
-            },
-        );
-
-        let reason = certified_standard_output_residual_reason(&prepared, &function_facts, &func)
-            .expect("array member syntax must residualize without exact array render proof");
-
-        assert!(
-            reason.contains(
-                "rendered 2 array access(es) without exact FunctionRenderFacts array-access proof"
-            ),
-            "{reason}"
-        );
-    }
-
-    #[test]
-    fn certified_standard_output_residualizes_repeated_array_member_access_without_render_node_identity()
-     {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![
-                R2ILOp::Load {
-                    dst: Varnode::unique(0x10, 8),
-                    space: SpaceId::Ram,
-                    addr: Varnode::register(0x10, 8),
-                },
-                R2ILOp::Load {
-                    dst: Varnode::unique(0x20, 8),
-                    space: SpaceId::Ram,
-                    addr: Varnode::register(0x10, 8),
-                },
-                R2ILOp::IntAdd {
-                    dst: Varnode::register(0x00, 8),
-                    a: Varnode::unique(0x10, 8),
-                    b: Varnode::unique(0x20, 8),
-                },
-                R2ILOp::Return {
-                    target: Varnode::register(0x00, 8),
-                },
-            ],
-            &arch,
-        );
-        let indexed_len = || CExpr::Member {
-            base: Box::new(CExpr::Subscript {
-                base: Box::new(CExpr::var("arr")),
-                index: Box::new(CExpr::var("idx")),
-            }),
-            member: "len".to_string(),
-        };
-        let func = CFunction::new("array_member_ok", CType::i64()).with_body(vec![CStmt::Return(
-            Some(CExpr::Binary {
-                op: BinaryOp::Add,
-                left: Box::new(indexed_len()),
-                right: Box::new(indexed_len()),
-            }),
-        )]);
-        let mut function_facts = test_function_facts_with_prepared_render(&prepared);
-        function_facts.replace_type_facts(FunctionTypeFacts {
-            array_index_certificates: vec![ArrayIndexCertificate {
-                slot: 0,
-                base: Some(ArrayIndexBase::Param { index: 0 }),
-                field_offset: 0,
-                element_stride: 8,
-            }],
-            field_access_certificates: vec![FieldAccessCertificate {
-                slot: 0,
-                field_offset: 0,
-                field_name: "len".to_string(),
-                field_type: Some("int64_t".to_string()),
-            }],
-            external_type_db: ExternalTypeDb {
-                structs: [(
-                    "node".to_string(),
-                    ExternalStruct {
-                        name: "node".to_string(),
-                        fields: [(
-                            0,
-                            ExternalField {
-                                name: "len".to_string(),
-                                offset: 0,
-                                ty: Some("int64_t".to_string()),
-                            },
-                        )]
-                        .into_iter()
-                        .collect(),
-                    },
-                )]
-                .into_iter()
-                .collect(),
-                ..ExternalTypeDb::default()
-            },
-            ..FunctionTypeFacts::default()
-        });
-        for op_index in [0, 1] {
-            add_member_render_fact(
-                &mut function_facts,
-                &prepared,
-                TestMemberRenderFact {
-                    block_addr: 0x1000,
-                    op_index,
-                    is_write: false,
-                    field_name: "len",
-                    field_offset: 0,
-                    access_width: 8,
-                },
-            );
-            add_array_render_fact(
-                &mut function_facts,
-                &prepared,
-                TestArrayRenderFact {
-                    block_addr: 0x1000,
-                    op_index,
-                    is_write: false,
-                    field_offset: 0,
-                    element_stride: 8,
-                    access_width: 8,
-                },
-            );
-        }
-
-        let reason = certified_standard_output_residual_reason(&prepared, &function_facts, &func);
-
-        let reason = reason.expect("array syntax without render-node identity must residualize");
-        assert!(reason.contains("rendered 2 array access(es) without exact FunctionRenderFacts"));
-        assert!(reason.contains("first array node"));
-    }
-
-    #[test]
-    fn certified_standard_output_accepts_repeated_array_member_access_with_exact_render_proofs() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![
-                R2ILOp::Load {
-                    dst: Varnode::unique(0x10, 8),
-                    space: SpaceId::Ram,
-                    addr: Varnode::register(0x10, 8),
-                },
-                R2ILOp::Load {
-                    dst: Varnode::unique(0x20, 8),
-                    space: SpaceId::Ram,
-                    addr: Varnode::register(0x10, 8),
-                },
-                R2ILOp::IntAdd {
-                    dst: Varnode::register(0x00, 8),
-                    a: Varnode::unique(0x10, 8),
-                    b: Varnode::unique(0x20, 8),
-                },
-                R2ILOp::Return {
-                    target: Varnode::register(0x00, 8),
-                },
-            ],
-            &arch,
-        );
-        let indexed_len = || CExpr::Member {
-            base: Box::new(CExpr::Subscript {
-                base: Box::new(CExpr::var("arr")),
-                index: Box::new(CExpr::var("idx")),
-            }),
-            member: "len".to_string(),
-        };
-        let func = CFunction::new("array_member_ok", CType::i64()).with_body(vec![CStmt::Return(
-            Some(CExpr::Binary {
-                op: BinaryOp::Add,
-                left: Box::new(indexed_len()),
-                right: Box::new(indexed_len()),
-            }),
-        )]);
-        let mut function_facts = test_function_facts_with_prepared_render(&prepared);
-        function_facts.replace_type_facts(FunctionTypeFacts {
-            array_index_certificates: vec![ArrayIndexCertificate {
-                slot: 0,
-                base: Some(ArrayIndexBase::Param { index: 0 }),
-                field_offset: 0,
-                element_stride: 8,
-            }],
-            field_access_certificates: vec![FieldAccessCertificate {
-                slot: 0,
-                field_offset: 0,
-                field_name: "len".to_string(),
-                field_type: Some("int64_t".to_string()),
-            }],
-            ..FunctionTypeFacts::default()
-        });
-        for op_index in [0, 1] {
-            add_member_render_fact(
-                &mut function_facts,
-                &prepared,
-                TestMemberRenderFact {
-                    block_addr: 0x1000,
-                    op_index,
-                    is_write: false,
-                    field_name: "len",
-                    field_offset: 0,
-                    access_width: 8,
-                },
-            );
-            add_array_render_fact(
-                &mut function_facts,
-                &prepared,
-                TestArrayRenderFact {
-                    block_addr: 0x1000,
-                    op_index,
-                    is_write: false,
-                    field_offset: 0,
-                    element_stride: 8,
-                    access_width: 8,
-                },
-            );
-        }
-        let first_memory_cert = prepared
-            .memory_certificate_for_op_site(0x1000, 0, false)
-            .expect("first memory certificate");
-        let second_memory_cert = prepared
-            .memory_certificate_for_op_site(0x1000, 1, false)
-            .expect("second memory certificate");
-        let return_cert = prepared
-            .return_certificate_for_op(0x1000, 3)
-            .expect("return certificate");
-        let effect_proofs = [
-            EffectRenderProof {
-                kind: EffectRenderProofKind::MemoryRead,
-                block_addr: 0x1000,
-                op_idx: 0,
-                call_disposition: None,
-                target: None,
-                address: Some(first_memory_cert.address),
-                value: first_memory_cert.value,
-                values: Vec::new(),
-                phi_edge: None,
-            },
-            EffectRenderProof {
-                kind: EffectRenderProofKind::MemoryRead,
-                block_addr: 0x1000,
-                op_idx: 1,
-                call_disposition: None,
-                target: None,
-                address: Some(second_memory_cert.address),
-                value: second_memory_cert.value,
-                values: Vec::new(),
-                phi_edge: None,
-            },
-            EffectRenderProof {
-                kind: EffectRenderProofKind::Return,
-                block_addr: 0x1000,
-                op_idx: 3,
-                call_disposition: None,
-                target: None,
-                address: None,
-                value: Some(return_cert.value),
-                values: Vec::new(),
-                phi_edge: None,
-            },
-        ];
-
-        let reason = certified_standard_output_residual_reason_with_effect_proofs(
-            &prepared,
-            &function_facts,
-            &func,
-            Some(&effect_proofs),
-        );
-
-        assert_eq!(reason, None);
     }
 
     #[test]
@@ -15526,9 +8167,7 @@ mod tests {
             strings: &decompiler.context.strings,
             symbols: &decompiler.context.symbols,
             function_facts: &decompiler.context.function_facts,
-            certified_rendering_required: render_permission_allows_executable_c(
-                decompiler.context.effective_render_permission(),
-            ),
+            certified_rendering_required: false,
             stack_slots: &decompiler.context.type_facts().stack_slots,
             field_access_certificates: &decompiler.context.type_facts().field_access_certificates,
             #[cfg(test)]

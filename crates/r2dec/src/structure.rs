@@ -3,6 +3,7 @@
 //! This module converts unstructured control flow (gotos, CFG edges) into
 //! structured high-level constructs (if-then-else, while, for, etc.).
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use r2ssa::cfg::BlockTerminator;
@@ -10,6 +11,7 @@ use r2ssa::{CFGEdge, ControlGuard, LoopId, PredicateId, SSAFunction, SSAOp, Valu
 
 use crate::address::parse_address_from_var_name;
 use crate::ast::{BinaryOp, CExpr, CStmt, UnaryOp};
+use crate::control::{DecompileExecutionStop, DecompileWorkControl};
 use crate::fold::FoldingContext;
 use crate::fold::context::{EffectRenderProof, EffectRenderProofKind};
 use crate::region::{Region, RegionAnalyzer, RegionTransferKind};
@@ -203,6 +205,8 @@ pub struct ControlFlowStructurer<'a, 'o> {
     label_counter: usize,
     /// Region analyzer for detecting breaks/continues.
     region_analyzer: Option<RegionAnalyzer<'a>>,
+    control: Option<DecompileWorkControl<'a>>,
+    stop_reason: Cell<Option<DecompileExecutionStop>>,
     /// Safety budget for recursive region structuring.
     safety_budget_remaining: usize,
     safety_budget_max: usize,
@@ -261,23 +265,56 @@ struct BddNode {
     high: usize,
 }
 
-struct ControlBdd {
+struct ControlBdd<'a, 's> {
     nodes: Vec<Option<BddNode>>,
     unique: HashMap<BddNode, usize>,
     apply_cache: HashMap<(BddOp, usize, usize), usize>,
     not_cache: HashMap<usize, usize>,
     node_limit: usize,
+    control: Option<DecompileWorkControl<'a>>,
+    stop_reason: Cell<Option<DecompileExecutionStop>>,
+    stop_sink: Option<&'s Cell<Option<DecompileExecutionStop>>>,
 }
 
-impl ControlBdd {
+#[cfg(test)]
+impl ControlBdd<'static, 'static> {
     fn new(node_limit: usize) -> Self {
+        Self::new_with_optional_control(node_limit, None, None)
+    }
+}
+
+impl<'a, 's> ControlBdd<'a, 's> {
+    fn new_with_optional_control(
+        node_limit: usize,
+        control: Option<DecompileWorkControl<'a>>,
+        stop_sink: Option<&'s Cell<Option<DecompileExecutionStop>>>,
+    ) -> Self {
         Self {
             nodes: vec![None, None],
             unique: HashMap::new(),
             apply_cache: HashMap::new(),
             not_cache: HashMap::new(),
             node_limit,
+            control,
+            stop_reason: Cell::new(None),
+            stop_sink,
         }
+    }
+
+    fn poll(&self) -> Result<(), String> {
+        if self.stop_reason.get().is_some() {
+            return Err("control coverage stopped".to_string());
+        }
+        if let Some(control) = self.control
+            && let Err(reason) = control.poll()
+        {
+            self.stop_reason.set(Some(reason));
+            if let Some(stop_sink) = self.stop_sink {
+                stop_sink.set(Some(reason));
+            }
+            return Err("control coverage stopped".to_string());
+        }
+        Ok(())
     }
 
     fn created_nodes(&self) -> usize {
@@ -299,6 +336,7 @@ impl ControlBdd {
         low: usize,
         high: usize,
     ) -> Result<usize, String> {
+        self.poll()?;
         if low == high {
             return Ok(low);
         }
@@ -323,6 +361,7 @@ impl ControlBdd {
     }
 
     fn not(&mut self, value: usize) -> Result<usize, String> {
+        self.poll()?;
         if value == BDD_FALSE {
             return Ok(BDD_TRUE);
         }
@@ -359,6 +398,7 @@ impl ControlBdd {
         variables: &BTreeSet<PredicateId>,
         cache: &mut HashMap<usize, usize>,
     ) -> Result<usize, String> {
+        self.poll()?;
         if value == BDD_FALSE || value == BDD_TRUE {
             return Ok(value);
         }
@@ -382,6 +422,7 @@ impl ControlBdd {
     }
 
     fn apply(&mut self, op: BddOp, lhs: usize, rhs: usize) -> Result<usize, String> {
+        self.poll()?;
         let (lhs, rhs) = if lhs <= rhs { (lhs, rhs) } else { (rhs, lhs) };
         let terminal = match op {
             BddOp::And if lhs == BDD_FALSE => Some(BDD_FALSE),
@@ -444,6 +485,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             emitted_labels: BTreeSet::new(),
             label_counter: 0,
             region_analyzer: Some(region_analyzer),
+            control: None,
+            stop_reason: Cell::new(None),
             safety_budget_remaining: safety_budget_max,
             safety_budget_max,
             safety_reason: None,
@@ -457,6 +500,39 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
     }
 
+    /// Create a structurer that cooperatively polls during region and AST work.
+    pub fn new_with_control(
+        func: &'a SSAFunction,
+        fold_ctx: &'o FoldingContext<'o>,
+        control: DecompileWorkControl<'a>,
+    ) -> Result<Self, DecompileExecutionStop> {
+        control.poll()?;
+        let region_analyzer = RegionAnalyzer::new_with_control(func, control.raw())
+            .map_err(|reason| DecompileExecutionStop::new(control.phase(), reason))?;
+        let safety_budget_max = Self::compute_safety_budget(func.num_blocks());
+        Ok(Self {
+            func,
+            fold_ctx,
+            folded_block_cache: HashMap::new(),
+            labels: HashMap::new(),
+            emitted_labels: BTreeSet::new(),
+            label_counter: 0,
+            region_analyzer: Some(region_analyzer),
+            control: Some(control),
+            stop_reason: Cell::new(None),
+            safety_budget_remaining: safety_budget_max,
+            safety_budget_max,
+            safety_reason: None,
+            control_render_proofs: Vec::new(),
+            control_transfer_render_proofs: Vec::new(),
+            deferred_merge_blocks: Vec::new(),
+            active_domains: vec![RenderedBlockDomain::default()],
+            rendered_block_domains: BTreeMap::new(),
+            structured_region_blocks: BTreeSet::new(),
+            transfer_target_domains: BTreeMap::new(),
+        })
+    }
+
     /// Create a structurer without expression folding (for comparison).
     pub fn new_unfolded(func: &'a SSAFunction, fold_ctx: &'o FoldingContext<'o>) -> Self {
         let safety_budget_max = Self::compute_safety_budget(func.num_blocks());
@@ -468,6 +544,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             emitted_labels: BTreeSet::new(),
             label_counter: 0,
             region_analyzer: Some(RegionAnalyzer::new(func)),
+            control: None,
+            stop_reason: Cell::new(None),
             safety_budget_remaining: safety_budget_max,
             safety_budget_max,
             safety_reason: None,
@@ -502,6 +580,24 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         self.safety_reason = None;
     }
 
+    #[inline]
+    fn poll(&self) -> bool {
+        if self.stop_reason.get().is_some() {
+            return false;
+        }
+        if let Some(control) = self.control
+            && let Err(reason) = control.poll()
+        {
+            self.stop_reason.set(Some(reason));
+            return false;
+        }
+        true
+    }
+
+    fn finish_controlled<T>(&self, value: T) -> Result<T, DecompileExecutionStop> {
+        self.stop_reason.get().map_or(Ok(value), Err)
+    }
+
     fn consume_safety_budget(&mut self, units: usize) -> bool {
         if self.safety_budget_remaining >= units {
             self.safety_budget_remaining -= units;
@@ -520,6 +616,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     /// Returns the reason why structuring short-circuited, if any.
     pub fn safety_reason(&self) -> Option<&str> {
         self.safety_reason.as_deref()
+    }
+
+    pub fn execution_stop(&self) -> Option<DecompileExecutionStop> {
+        self.stop_reason.get()
     }
 
     pub fn control_render_proofs(&self) -> &[ControlRenderProof] {
@@ -732,6 +832,20 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         Self::cleanup(stmt)
     }
 
+    /// Structure the function, returning cooperative stop distinctly from safety residuals.
+    pub fn structure_with_control(&mut self) -> Result<CStmt, DecompileExecutionStop> {
+        let stmt = self.structure_preserving_render_proof_identity_with_control()?;
+        self.control
+            .expect("controlled structurer has a work control")
+            .poll()?;
+        let stmt = Self::cleanup_with_control(
+            stmt,
+            self.control
+                .expect("controlled structurer has a work control"),
+        )?;
+        self.finish_controlled(stmt)
+    }
+
     /// Structure control flow without post-proof AST rewrites.
     ///
     /// Certified rendering validates final executable control nodes against the
@@ -739,6 +853,20 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     /// invert, merge, synthesize, or delete control nodes, so certified callers
     /// must validate the unrewritten AST or residualize.
     pub(crate) fn structure_preserving_render_proof_identity(&mut self) -> CStmt {
+        self.structure_preserving_render_proof_identity_impl()
+    }
+
+    pub(crate) fn structure_preserving_render_proof_identity_with_control(
+        &mut self,
+    ) -> Result<CStmt, DecompileExecutionStop> {
+        if !self.poll() {
+            return self.finish_controlled(CStmt::Empty);
+        }
+        let stmt = self.structure_preserving_render_proof_identity_impl();
+        self.finish_controlled(stmt)
+    }
+
+    fn structure_preserving_render_proof_identity_impl(&mut self) -> CStmt {
         self.reset_safety_budget();
         self.control_render_proofs.clear();
         self.control_transfer_render_proofs.clear();
@@ -751,8 +879,24 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             self.region_analyzer = Some(RegionAnalyzer::new(self.func));
         }
         let region = if let Some(analyzer) = self.region_analyzer.as_mut() {
-            let region = analyzer.analyze();
-            if let Some(reason) = analyzer.analysis_reason() {
+            let region = if let Some(control) = self.control {
+                match analyzer.analyze_controlled() {
+                    Ok(region) => region,
+                    Err(reason) => {
+                        self.stop_reason
+                            .set(Some(DecompileExecutionStop::new(control.phase(), reason)));
+                        Region::Irreducible {
+                            entry: self.func.entry,
+                            blocks: Vec::new(),
+                        }
+                    }
+                }
+            } else {
+                analyzer.analyze()
+            };
+            if self.stop_reason.get().is_none()
+                && let Some(reason) = analyzer.analysis_reason()
+            {
                 self.safety_reason = Some(reason.to_string());
             }
             region
@@ -774,7 +918,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     /// Structure a region into C statements.
     fn structure_region(&mut self, region: &Region) -> CStmt {
-        if !self.consume_safety_budget(1) {
+        if !self.poll() || !self.consume_safety_budget(1) {
             return CStmt::Empty;
         }
         let inherited_domains = self.active_domains.clone();
@@ -840,9 +984,11 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 ));
             }
             Err(reason) => {
-                self.safety_reason = Some(format!(
-                    "control-domain coverage proof failed for transfer join at 0x{block_addr:x}: {reason}"
-                ));
+                if self.stop_reason.get().is_none() {
+                    self.safety_reason = Some(format!(
+                        "control-domain coverage proof failed for transfer join at 0x{block_addr:x}: {reason}"
+                    ));
+                }
             }
         }
     }
@@ -1972,6 +2118,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         let mut seen = BTreeSet::new();
         let mut current = start;
         loop {
+            if !self.poll() {
+                return Err("transparent transfer search stopped".to_string());
+            }
             if !seen.insert(current) {
                 return Err(format!(
                     "transparent forwarder path cycles at 0x{current:x}"
@@ -2166,6 +2315,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
         let rendered = self.rendered_block_domains.clone();
         for (block_addr, occurrences) in rendered {
+            if !self.poll() {
+                return;
+            }
             let Some(source) = self
                 .fold_ctx
                 .control_facts()
@@ -2229,9 +2381,11 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     return;
                 }
                 Err(reason) => {
-                    self.safety_reason = Some(format!(
-                        "control-domain coverage proof failed for emitted block 0x{block_addr:x}: {reason}"
-                    ));
+                    if self.stop_reason.get().is_none() {
+                        self.safety_reason = Some(format!(
+                            "control-domain coverage proof failed for emitted block 0x{block_addr:x}: {reason}"
+                        ));
+                    }
                     return;
                 }
             }
@@ -2293,13 +2447,29 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             })
             .map(|predicate| predicate.id)
             .collect::<BTreeSet<_>>();
-        let mut bdd = ControlBdd::new(self.safety_budget_remaining);
+        if !self.poll() {
+            return Err("control coverage stopped".to_string());
+        }
+        let mut bdd = ControlBdd::new_with_optional_control(
+            self.safety_budget_remaining,
+            self.control,
+            Some(&self.stop_reason),
+        );
         let mut rendered_formula = BDD_FALSE;
         for occurrence in occurrences {
+            if !self.poll() {
+                return Err("control coverage stopped".to_string());
+            }
             let mut occurrence_formula = BDD_FALSE;
             for alternative in &occurrence.alternatives {
+                if !self.poll() {
+                    return Err("control coverage stopped".to_string());
+                }
                 let mut alternative_formula = BDD_TRUE;
                 for guard in &alternative.guards {
+                    if !self.poll() {
+                        return Err("control coverage stopped".to_string());
+                    }
                     let ControlGuard::Branch { predicate, truth } = guard else {
                         return Err(
                             "aggregate proof currently requires branch-only guards".to_string()
@@ -2329,9 +2499,15 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         let mut worklist = VecDeque::from([self.func.entry]);
         let mut queued = BTreeSet::from([self.func.entry]);
         while let Some(from) = worklist.pop_front() {
+            if !self.poll() {
+                return Err("control coverage stopped".to_string());
+            }
             queued.remove(&from);
             let from_formula = reach.get(&from).copied().unwrap_or(BDD_FALSE);
             for to in self.func.successors(from) {
+                if !self.poll() {
+                    return Err("control coverage stopped".to_string());
+                }
                 let edge_formula = if self.func.successors(from).len() <= 1 {
                     BDD_TRUE
                 } else {
@@ -2366,6 +2542,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             &mut HashMap::new(),
         )?;
         let created_nodes = bdd.created_nodes();
+        drop(bdd);
         if !self.consume_safety_budget(created_nodes) {
             return Err("control coverage exhausted structuring safety budget".to_string());
         }
@@ -2484,6 +2661,73 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         // Recurse first, then simplify
         let stmt = Self::cleanup_recurse(stmt);
         Self::flatten(stmt)
+    }
+
+    pub(crate) fn cleanup_with_control(
+        stmt: CStmt,
+        control: DecompileWorkControl<'_>,
+    ) -> Result<CStmt, DecompileExecutionStop> {
+        Self::poll_stmt_tree(&stmt, control)?;
+        let stmt = Self::cleanup(stmt);
+        Self::poll_stmt_tree(&stmt, control)?;
+        Ok(stmt)
+    }
+
+    pub(crate) fn cleanup_preserving_render_proof_identity_with_control(
+        stmt: CStmt,
+        control: DecompileWorkControl<'_>,
+    ) -> Result<CStmt, DecompileExecutionStop> {
+        Self::poll_stmt_tree(&stmt, control)?;
+        let stmt = Self::cleanup_preserving_render_proof_identity(stmt);
+        Self::poll_stmt_tree(&stmt, control)?;
+        Ok(stmt)
+    }
+
+    fn poll_stmt_tree(
+        stmt: &CStmt,
+        control: DecompileWorkControl<'_>,
+    ) -> Result<(), DecompileExecutionStop> {
+        control.poll()?;
+        match stmt {
+            CStmt::Block(stmts) => {
+                for stmt in stmts {
+                    Self::poll_stmt_tree(stmt, control)?;
+                }
+            }
+            CStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                Self::poll_stmt_tree(then_body, control)?;
+                if let Some(else_body) = else_body {
+                    Self::poll_stmt_tree(else_body, control)?;
+                }
+            }
+            CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
+                Self::poll_stmt_tree(body, control)?;
+            }
+            CStmt::For { init, body, .. } => {
+                if let Some(init) = init {
+                    Self::poll_stmt_tree(init, control)?;
+                }
+                Self::poll_stmt_tree(body, control)?;
+            }
+            CStmt::Switch { cases, default, .. } => {
+                for case in cases {
+                    for stmt in &case.body {
+                        Self::poll_stmt_tree(stmt, control)?;
+                    }
+                }
+                if let Some(default) = default {
+                    for stmt in default {
+                        Self::poll_stmt_tree(stmt, control)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// Normalize a certified statement tree without changing its control or
@@ -5783,6 +6027,7 @@ mod tests {
             .push(PhiNode {
                 dst: destination,
                 sources: vec![(0x1000, source)],
+                canonical_storage: None,
             });
         func
     }
@@ -6254,6 +6499,7 @@ mod tests {
             .push(PhiNode {
                 dst: destination,
                 sources: vec![(0x1000, source)],
+                canonical_storage: None,
             });
         let ctx = FoldingContext::new(64);
         let mut structurer = ControlFlowStructurer::new(&func, &ctx);

@@ -15,6 +15,8 @@ import hashlib
 import json
 import os
 import re
+import signal
+import shutil
 import stat
 import subprocess
 import sys
@@ -25,7 +27,8 @@ from pathlib import Path
 from typing import Any, Callable, Optional, TypeVar, cast
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 11
+FIXED_PERFORMANCE_GATE_SCHEMA_VERSION = 1
 DEFAULT_TMPDIR = "/tmp/r2sleigh-reversing-benchmark-tmp"
 DEFAULT_OUT = "/tmp/r2sleigh-reversing-benchmark.json"
 DEFAULT_MAX_BINARIES_PER_CORPUS = 8
@@ -39,6 +42,7 @@ BATCH_SECTION_STARTED_TIMEOUT = "started_timeout"
 BATCH_SECTION_STARTED_FAILED = "started_failed"
 BATCH_SECTION_NOT_REACHED = "not_reached"
 BATCH_SECTION_SETUP_FAILED = "setup_failed"
+IN_PROCESS_TIMER_START_NS = -1
 INCOMPLETE_SECTION_STATUSES = {
     BATCH_SECTION_NOT_REACHED,
     BATCH_SECTION_SETUP_FAILED,
@@ -206,7 +210,7 @@ TARGET_COMMAND_DEFS: dict[str, str] = {
 DEFAULT_TARGET_COMMANDS = ("decompile_sla", "decompile_pdd", "types", "profile")
 TIER1_TARGET_COMMANDS = ("decompile_sla", "types", "profile")
 DECOMPILE_COMMAND_PREFIX = "decompile_"
-DECOMPILE_REPEAT_COMMANDS = ("decompile_sla", "decompile_pdg", "types")
+DECOMPILE_REPEAT_COMMANDS = ("decompile_sla", "decompile_pdg", "types", "profile")
 BASELINE_COMMANDS = {"decompile_pdg"}
 QUALITY_RANK = {"empty": 0, "fallback": 1, "residual": 2, "structured": 3}
 QUALITY_GATE_FAILURES = {
@@ -234,6 +238,14 @@ QUALITY_GATE_FAILURES = {
     "unresolved_fcn_or_temp_stack_leak",
 }
 GOLD_ORACLE_FAILURE = "source_oracle_failure"
+GOLD_CHECK_KINDS = ("contains", "regex", "not_contains", "not_regex")
+GOLD_HARD_CATEGORIES = frozenset({"semantic", "type", "structural"})
+GOLD_SOFT_CATEGORIES = frozenset({"cosmetic", "readability"})
+GOLD_LEGACY_CATEGORY = "unclassified"
+GOLD_LEGACY_GATE = "legacy"
+GOLD_CHECK_CATEGORIES = frozenset(
+    {*GOLD_HARD_CATEGORIES, *GOLD_SOFT_CATEGORIES, GOLD_LEGACY_CATEGORY}
+)
 FAILURE_OWNER = {
     "argn_leak": "r2types",
     "comment_only_decompile": "r2dec",
@@ -272,6 +284,61 @@ FAILURE_OWNER = {
     "unresolved_fcn_or_temp_stack_leak": "r2ssa",
     "zero_functions": "radare2",
 }
+FAILURE_PRIMARY_TAXONOMY = {
+    "argn_leak": "readability",
+    "comment_only_decompile": "structural",
+    "command_return": "structural",
+    "decompile_header_return_mismatch": "type",
+    "decompile_header_signature_mismatch": "type",
+    "decompiler_fallback": "structural",
+    "discovery_parse": "structural",
+    "discovery_return": "structural",
+    "empty_decompile": "structural",
+    "empty_loop_body": "structural",
+    "fake_call_arg": "semantic",
+    "fake_stack_slot": "semantic",
+    "fake_signature": "type",
+    "fake_switch_case": "semantic",
+    "fake_while_break_wrapper": "structural",
+    "json_parse": "structural",
+    "missing_return_nonvoid": "semantic",
+    "misleading_summary_role": "semantic",
+    "missing_semantic_claims": "semantic",
+    "missing_summary_role_certificate": "structural",
+    "missing_summary_render_contract": "structural",
+    "claimless_summary_projection": "semantic",
+    "proof_coverage_gap": "structural",
+    "name_hint_structured_route": "semantic",
+    "summary_pseudo_call": "semantic",
+    "summary_synthetic_local": "readability",
+    "unmarked_summary_synthetic_local": "readability",
+    "undefined_identifier_return": "semantic",
+    "missing_debug_target_alias": "structural",
+    "missing_symbol_target_alias": "structural",
+    "missing_symbol_debug_target_alias": "structural",
+    "missing_target": "structural",
+    "nondeterministic_output": "performance",
+    "radare2_candidate": "structural",
+    "timeout": "performance",
+    "unresolved_fcn_or_temp_stack_leak": "readability",
+    "zero_functions": "structural",
+}
+GOLD_CATEGORY_PRIMARY_TAXONOMY = {
+    "semantic": "semantic",
+    "type": "type",
+    "structural": "structural",
+    "cosmetic": "readability",
+    "readability": "readability",
+    GOLD_LEGACY_CATEGORY: "unclassified",
+}
+def primary_failure_taxonomy(kind: str, failure: dict[str, Any]) -> str:
+    if kind == GOLD_ORACLE_FAILURE:
+        return GOLD_CATEGORY_PRIMARY_TAXONOMY.get(
+            str(failure.get("category") or GOLD_LEGACY_CATEGORY), "unclassified"
+        )
+    if kind == "nondeterministic_output":
+        return "performance" if failure.get("command") == "profile" else "semantic"
+    return FAILURE_PRIMARY_TAXONOMY.get(kind, "unclassified")
 OWNER_ACTIONS = {
     "radare2": "extend typed radare2 collectors, discovery aliases, or native analysis metadata",
     "r2ssa": "push missing CFG, def-use, stack, or callsite facts into prepared SSA facts",
@@ -379,6 +446,9 @@ class CmdResult:
     stdout: str
     stderr: str
     elapsed_s: float
+    child_max_rss_bytes: int | None = None
+    stdout_bytes: bytes | None = None
+    stderr_bytes: bytes | None = None
 
 
 @dataclass(frozen=True)
@@ -534,6 +604,31 @@ def parse_args() -> argparse.Namespace:
         help="JSON report output path",
     )
     parser.add_argument(
+        "--fixed-performance-gate",
+        default="",
+        metavar="CONFIG",
+        help=(
+            "run the versioned fixed-runner cold/warm performance gate described by CONFIG "
+            "instead of the general benchmark"
+        ),
+    )
+    parser.add_argument(
+        "--require-fixed-performance",
+        action="store_true",
+        help=(
+            "fail instead of skipping when the configured fixed runner, fixture, radare2, "
+            "or plugin artifacts are unavailable"
+        ),
+    )
+    parser.add_argument(
+        "--raw-output-dir",
+        default="",
+        help=(
+            "opt-in directory for lossless command stdout/stderr archives; raw output may "
+            "contain sensitive data and is never written unless this option is set"
+        ),
+    )
+    parser.add_argument(
         "--analysis",
         choices=("aa", "aaa", "aaaa"),
         default=DEFAULT_ANALYSIS,
@@ -651,7 +746,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "run a repeated decompile/types/profile sequence to measure same-session "
-            "engine analysis and artifact cache reuse"
+            "engine analysis reuse"
         ),
     )
     parser.add_argument(
@@ -746,7 +841,7 @@ def parse_args() -> argparse.Namespace:
         "--max-gold-failures",
         type=nonnegative_int,
         default=None,
-        help="strict quality gate: maximum allowed source-gold oracle failures",
+        help="strict quality gate: maximum allowed hard source-gold oracle failures",
     )
     parser.add_argument(
         "--require-gold",
@@ -1505,12 +1600,13 @@ def source_smell_metrics(text: str) -> dict[str, int]:
 def decompile_quality(text: str) -> dict[str, Any]:
     fallback = decompiler_fallback_marker(text)
     residuals = residual_marker_count(text)
+    summary_projection = bool(SUMMARY_PROJECTION_RE.search(text))
     empty = len(text.strip()) == 0
     if empty:
         classification = "empty"
     elif fallback:
         classification = "fallback"
-    elif residuals:
+    elif residuals or summary_projection:
         classification = "residual"
     else:
         classification = "structured"
@@ -1686,6 +1782,209 @@ def task_env(
     return env
 
 
+def _archive_component(label: str, value: Any) -> str:
+    raw = str(value)
+    digest = hashlib.sha256(raw.encode("utf-8", "surrogatepass")).hexdigest()[:12]
+    return f"{label}-{safe_path_component(raw)}-{digest}"
+
+
+def _atomic_write_bytes(path: Path, payload: bytes) -> None:
+    if path.exists():
+        raise FileExistsError(f"refusing to overwrite raw benchmark archive record: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(
+        f".{path.name}.tmp-{os.getpid()}-{threading.get_ident()}"
+    )
+    try:
+        with tmp_path.open("xb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+class RawOutputArchive:
+    """Opt-in lossless target-command output archive."""
+
+    def __init__(self, root: Path, *, load_existing: bool = False) -> None:
+        self.root = root.expanduser().resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._claimed: set[Path] = set()
+        self._records: list[dict[str, Any]] = []
+        self.session_idx = 0
+        existing = sorted(self.root.rglob("metadata.json"))
+        if any(self.root.iterdir()) and not load_existing:
+            raise FileExistsError(
+                f"raw benchmark archive directory must be empty: {self.root}"
+            )
+        if load_existing:
+            previous_session_indices = [
+                int(match.group(1))
+                for path in self.root.rglob("session-*")
+                if path.is_dir()
+                and (match := re.fullmatch(r"session-([0-9]+)", path.name)) is not None
+            ]
+            for metadata_path in existing:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                if not isinstance(metadata, dict) or metadata.get("schema") != 1:
+                    raise ValueError(f"invalid raw benchmark archive metadata: {metadata_path}")
+                relative_metadata = metadata_path.relative_to(self.root)
+                if metadata.get("metadata_path") != relative_metadata.as_posix():
+                    raise ValueError(f"mismatched raw benchmark archive metadata: {metadata_path}")
+                record = {key: value for key, value in metadata.items() if key != "schema"}
+                self._claimed.add(relative_metadata.parent)
+                self._records.append(record)
+                try:
+                    metadata_session_idx = int(record.get("session_idx", 0))
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        f"invalid raw benchmark archive session: {metadata_path}"
+                    ) from None
+                previous_session_indices.append(metadata_session_idx)
+            if previous_session_indices:
+                self.session_idx = max(previous_session_indices) + 1
+
+    def record(
+        self,
+        *,
+        case: BinaryCase,
+        target: dict[str, Any],
+        command: str,
+        repeat_idx: int,
+        attempt: str,
+        result: CmdResult,
+        returncode: int | None,
+        timeout: bool,
+        temperature: str,
+        section_status: str | None = None,
+        stdout_scope: str = "command_child",
+        stderr_scope: str = "command_child",
+    ) -> dict[str, Any]:
+        case_identity = (
+            f"{case.corpus}\0{case.name}\0{case.path.resolve()}\0{case.analysis}"
+        )
+        target_name = target.get("name") or target.get("requested") or "unknown"
+        target_identity = (
+            f"{target.get('name')}\0{target.get('requested')}\0{target.get('addr')}"
+        )
+        relative_dir = Path(
+            _archive_component("case", case_identity),
+            _archive_component("target", target_identity),
+            f"session-{self.session_idx:04d}",
+            _archive_component("attempt", attempt),
+            _archive_component("command", command),
+            _archive_component("repeat", int(repeat_idx)),
+        )
+        record_dir = self.root / relative_dir
+        with self._lock:
+            if relative_dir in self._claimed:
+                raise FileExistsError(
+                    f"raw benchmark archive identity collision: {relative_dir.as_posix()}"
+                )
+            try:
+                record_dir.mkdir(parents=True, exist_ok=False)
+            except FileExistsError as exc:
+                raise FileExistsError(
+                    f"raw benchmark archive identity collision: {relative_dir.as_posix()}"
+                ) from exc
+            self._claimed.add(relative_dir)
+
+        stdout_bytes = result_stdout_bytes(result)
+        stderr_bytes = result_stderr_bytes(result)
+        stdout_rel = relative_dir / "stdout.bin"
+        stderr_rel = relative_dir / "stderr.bin"
+        metadata_rel = relative_dir / "metadata.json"
+        stream_metadata = {
+            "stdout": {
+                "path": stdout_rel.as_posix(),
+                "length": len(stdout_bytes),
+                "sha256": hashlib.sha256(stdout_bytes).hexdigest(),
+                "scope": stdout_scope,
+            },
+            "stderr": {
+                "path": stderr_rel.as_posix(),
+                "length": len(stderr_bytes),
+                "sha256": hashlib.sha256(stderr_bytes).hexdigest(),
+                "scope": stderr_scope,
+            },
+        }
+        record = {
+            "case": case.name,
+            "corpus": case.corpus,
+            "target": target_name,
+            "addr": target.get("addr"),
+            "command": command,
+            "repeat_idx": repeat_idx,
+            "session_idx": self.session_idx,
+            "attempt": attempt,
+            "temperature": temperature,
+            "returncode": returncode,
+            "timeout": bool(timeout),
+            "section_status": section_status,
+            "metadata_path": metadata_rel.as_posix(),
+            **stream_metadata,
+        }
+        metadata = {"schema": 1, **record}
+        _atomic_write_bytes(self.root / stdout_rel, stdout_bytes)
+        _atomic_write_bytes(self.root / stderr_rel, stderr_bytes)
+        _atomic_write_bytes(
+            self.root / metadata_rel,
+            (json.dumps(metadata, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+        )
+        with self._lock:
+            self._records.append(record)
+        return record
+
+    def summary(self, include_sensitive: bool) -> dict[str, Any]:
+        with self._lock:
+            records = copy.deepcopy(self._records)
+        records.sort(key=lambda record: str(record.get("metadata_path") or ""))
+        return {
+            "enabled": True,
+            "root": display_path(self.root, include_sensitive),
+            "record_count": len(records),
+            "records": records,
+        }
+
+
+def archive_command_result(
+    archive: RawOutputArchive | None,
+    *,
+    case: BinaryCase,
+    target: dict[str, Any],
+    command: str,
+    repeat_idx: int,
+    attempt: str,
+    result: CmdResult,
+    event: dict[str, Any],
+    stdout_scope: str = "command_child",
+    stderr_scope: str = "command_child",
+) -> None:
+    if archive is None:
+        return
+    record = archive.record(
+        case=case,
+        target=target,
+        command=command,
+        repeat_idx=repeat_idx,
+        attempt=attempt,
+        result=result,
+        returncode=event.get("returncode"),
+        timeout=bool(event.get("timeout")),
+        temperature=str(event.get("temperature") or "unknown"),
+        section_status=event.get("section_status"),
+        stdout_scope=stdout_scope,
+        stderr_scope=stderr_scope,
+    )
+    event["raw_output_metadata"] = record["metadata_path"]
+
+
 def parallel_split(total_jobs: int, case_count: int) -> tuple[int, int]:
     jobs = max(1, total_jobs)
     if jobs == 1 or case_count <= 1:
@@ -1725,6 +2024,101 @@ def subprocess_text(value: Any) -> str:
     return ""
 
 
+def subprocess_bytes(value: Any) -> bytes:
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, str):
+        return value.encode("utf-8", "replace")
+    return b""
+
+
+def result_stdout_bytes(result: CmdResult) -> bytes:
+    return result.stdout_bytes if result.stdout_bytes is not None else result.stdout.encode("utf-8")
+
+
+def result_stderr_bytes(result: CmdResult) -> bytes:
+    return result.stderr_bytes if result.stderr_bytes is not None else result.stderr.encode("utf-8")
+
+
+def child_max_rss_bytes(ru_maxrss: Any, platform: str | None = None) -> int | None:
+    """Normalize wait4's platform-specific ru_maxrss unit to bytes."""
+    try:
+        value = int(ru_maxrss)
+    except (TypeError, ValueError):
+        return None
+    if value < 0:
+        return None
+    host = platform or sys.platform
+    if host.startswith("linux"):
+        return value * 1024
+    if host == "darwin":
+        return value
+    return None
+
+
+def _communicate_without_wait4(
+    proc: subprocess.Popen[bytes],
+    timeout_s: int,
+) -> tuple[int, bytes, bytes, None]:
+    """Portable fallback for hosts without os.wait4; RSS is unavailable."""
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout_s)
+        return (
+            int(proc.returncode or 0),
+            subprocess_bytes(stdout),
+            subprocess_bytes(stderr),
+            None,
+        )
+    except subprocess.TimeoutExpired as exc:
+        _kill_child_group(proc)
+        stdout, stderr = proc.communicate()
+        return (
+            124,
+            subprocess_bytes(stdout) or subprocess_bytes(exc.stdout),
+            subprocess_bytes(stderr) or subprocess_bytes(exc.stderr),
+            None,
+        )
+
+
+def _wait4_nointr(pid: int, options: int) -> tuple[int, int, Any]:
+    while True:
+        try:
+            return os.wait4(pid, options)
+        except InterruptedError:
+            continue
+
+
+def _process_groups_supported() -> bool:
+    return os.name == "posix" and hasattr(os, "killpg")
+
+
+def _kill_child_group(proc: subprocess.Popen[Any]) -> None:
+    try:
+        if _process_groups_supported():
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            proc.kill()
+    except ProcessLookupError:
+        pass
+
+
+def _wait4_with_timeout(
+    proc: subprocess.Popen[Any],
+    timeout_s: int,
+) -> tuple[int, Any, bool]:
+    deadline = time.monotonic() + max(0, timeout_s)
+    while True:
+        waited_pid, status, usage = _wait4_nointr(proc.pid, os.WNOHANG)
+        if waited_pid == proc.pid:
+            return status, usage, False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _kill_child_group(proc)
+            _waited_pid, status, usage = _wait4_nointr(proc.pid, 0)
+            return status, usage, True
+        time.sleep(min(0.01, remaining))
+
+
 def run_r2(
     r2: str,
     binary: Path,
@@ -1746,30 +2140,60 @@ def run_r2(
         str(binary),
     ]
     start = time.perf_counter()
-    try:
-        proc = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-            check=False,
-            env=env,
+    proc = subprocess.Popen(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        start_new_session=_process_groups_supported(),
+    )
+    if not hasattr(os, "wait4"):
+        returncode, stdout_bytes, stderr_bytes, max_rss = _communicate_without_wait4(
+            proc,
+            timeout_s,
         )
+        stdout = subprocess_text(stdout_bytes)
+        stderr = subprocess_text(stderr_bytes)
         return CmdResult(
-            returncode=proc.returncode,
-            stdout=proc.stdout,
-            stderr=proc.stderr,
-            elapsed_s=time.perf_counter() - start,
-        )
-    except subprocess.TimeoutExpired as exc:
-        stdout = subprocess_text(exc.stdout)
-        stderr = subprocess_text(exc.stderr)
-        return CmdResult(
-            returncode=124,
+            returncode=returncode,
             stdout=stdout,
-            stderr=stderr or f"timeout after {timeout_s}s",
+            stderr=stderr or (f"timeout after {timeout_s}s" if returncode == 124 else ""),
             elapsed_s=time.perf_counter() - start,
+            child_max_rss_bytes=max_rss,
+            stdout_bytes=stdout_bytes,
+            stderr_bytes=stderr_bytes,
         )
+
+    stdout_chunks: list[bytes] = []
+    stderr_chunks: list[bytes] = []
+
+    def drain(stream: Any, chunks: list[bytes]) -> None:
+        try:
+            chunks.append(subprocess_bytes(stream.read()))
+        finally:
+            stream.close()
+
+    stdout_thread = threading.Thread(target=drain, args=(proc.stdout, stdout_chunks), daemon=True)
+    stderr_thread = threading.Thread(target=drain, args=(proc.stderr, stderr_chunks), daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+    status, usage, timed_out = _wait4_with_timeout(proc, timeout_s)
+    proc.returncode = os.waitstatus_to_exitcode(status)
+    stdout_thread.join()
+    stderr_thread.join()
+    stdout_bytes = b"".join(stdout_chunks)
+    stderr_bytes = b"".join(stderr_chunks)
+    stdout = subprocess_text(stdout_bytes)
+    stderr = subprocess_text(stderr_bytes)
+    return CmdResult(
+        returncode=124 if timed_out else proc.returncode,
+        stdout=stdout,
+        stderr=stderr or (f"timeout after {timeout_s}s" if timed_out else ""),
+        elapsed_s=time.perf_counter() - start,
+        child_max_rss_bytes=child_max_rss_bytes(getattr(usage, "ru_maxrss", None)),
+        stdout_bytes=stdout_bytes,
+        stderr_bytes=stderr_bytes,
+    )
 
 
 def read_manifest(
@@ -2070,6 +2494,7 @@ def probe_native_pdfj(
         "returncode": result.returncode,
         "elapsed_s": round(result.elapsed_s, 6),
         "runtime_bucket": runtime_bucket(result.elapsed_s),
+        "child_max_rss_bytes": result.child_max_rss_bytes,
         "stdout": summarize_text(result.stdout, include_preview=include_sensitive, max_lines=20),
     }
     if result.stderr.strip():
@@ -2170,7 +2595,7 @@ def engine_cache_metrics(payload: Any) -> dict[str, dict[str, int]] | None:
     if not isinstance(payload, dict):
         return None
     out: dict[str, dict[str, int]] = {}
-    for partition in ("analysis", "artifacts", "total"):
+    for partition in ("analysis", "total"):
         counters = cache_counter_metrics(payload.get(partition))
         if counters:
             out[partition] = counters
@@ -2390,6 +2815,23 @@ def command_summary(
     return entry
 
 
+def annotate_payload_admission(
+    event: dict[str, Any],
+    command: str,
+    result: CmdResult,
+) -> None:
+    if command not in TIER1_TARGET_COMMANDS:
+        return
+    summary = command_summary(command, result, False)
+    valid, reason = _fixed_performance_command_output_valid(
+        {"commands": {command: summary}},
+        command,
+    )
+    event["payload_valid"] = valid
+    if reason is not None:
+        event["payload_invalid_reason"] = reason
+
+
 def command_event(
     *,
     case: BinaryCase,
@@ -2400,6 +2842,7 @@ def command_event(
     ended_at: float,
     timeout_s: int,
     returncode: int | None,
+    temperature: str,
 ) -> dict[str, Any]:
     return {
         "case": case.name,
@@ -2408,6 +2851,7 @@ def command_event(
         "addr": target.get("addr"),
         "command": command,
         "repeat_idx": repeat_idx,
+        "temperature": temperature,
         "started_at": round(started_at, 6),
         "ended_at": round(ended_at, 6),
         "elapsed_s": round(max(0.0, ended_at - started_at), 6),
@@ -2448,6 +2892,98 @@ def _symbol_match_keys(value: Any) -> set[str]:
     return keys
 
 
+def gold_gate_for_category(category: str) -> str:
+    if category in GOLD_HARD_CATEGORIES:
+        return "hard"
+    if category in GOLD_SOFT_CATEGORIES:
+        return "soft"
+    if category == GOLD_LEGACY_CATEGORY:
+        return GOLD_LEGACY_GATE
+    raise ValueError(f"unknown gold check category {category!r}")
+
+
+def _gold_patterns(value: Any, context: str) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, list):
+        values = value
+    else:
+        raise ValueError(f"{context} must be a string or array of strings")
+    patterns: list[str] = []
+    for pattern_idx, pattern in enumerate(values):
+        if not isinstance(pattern, str) or not pattern:
+            raise ValueError(f"{context} pattern {pattern_idx} must be a non-empty string")
+        patterns.append(pattern)
+    return patterns
+
+
+def gold_checks_for_expectation(
+    expectation: dict[str, Any],
+    *,
+    context: str = "gold expectation",
+    require_checks: bool = False,
+) -> list[dict[str, str]]:
+    """Normalize categorized checks and legacy arrays to per-pattern records."""
+    cached = expectation.get("_gold_checks")
+    if isinstance(cached, list):
+        return [dict(check) for check in cached if isinstance(check, dict)]
+
+    legacy_fields = [field for field in GOLD_CHECK_KINDS if field in expectation]
+    grouped = expectation.get("checks")
+    if grouped is not None and legacy_fields:
+        raise ValueError(
+            f"{context} cannot mix categorized checks with legacy fields {legacy_fields}"
+        )
+
+    checks: list[dict[str, str]] = []
+    if grouped is not None:
+        if not isinstance(grouped, dict):
+            raise ValueError(f"{context} checks must be an object keyed by category")
+        for category, raw_checks in grouped.items():
+            if category not in GOLD_CHECK_CATEGORIES:
+                raise ValueError(
+                    f"{context} category {category!r} must be one of "
+                    f"{sorted(GOLD_CHECK_CATEGORIES)}"
+                )
+            if not isinstance(raw_checks, dict):
+                raise ValueError(f"{context} category {category!r} must be an object")
+            unknown_kinds = sorted(set(raw_checks) - set(GOLD_CHECK_KINDS))
+            if unknown_kinds:
+                raise ValueError(
+                    f"{context} category {category!r} has unknown checks {unknown_kinds}"
+                )
+            gate = gold_gate_for_category(category)
+            for check in GOLD_CHECK_KINDS:
+                for pattern in _gold_patterns(
+                    raw_checks.get(check), f"{context} {category}.{check}"
+                ):
+                    checks.append(
+                        {
+                            "check": check,
+                            "pattern": pattern,
+                            "category": category,
+                            "gate": gate,
+                        }
+                    )
+    else:
+        for check in GOLD_CHECK_KINDS:
+            for pattern in _gold_patterns(expectation.get(check), f"{context} {check}"):
+                checks.append(
+                    {
+                        "check": check,
+                        "pattern": pattern,
+                        "category": GOLD_LEGACY_CATEGORY,
+                        "gate": GOLD_LEGACY_GATE,
+                    }
+                )
+
+    if require_checks and not checks:
+        raise ValueError(f"{context} needs at least one source-gold check")
+    return checks
+
+
 def load_gold_manifest(path: Path | str | None) -> list[dict[str, Any]]:
     if path is None or not str(path).strip():
         return []
@@ -2481,6 +3017,11 @@ def load_gold_manifest(path: Path | str | None) -> list[dict[str, Any]]:
         expectation["command"] = command.strip()
         expectation["owner"] = owner
         expectation.setdefault("id", f"gold-{idx}")
+        expectation["_gold_checks"] = gold_checks_for_expectation(
+            expectation,
+            context=f"gold expectation {idx}",
+            require_checks=True,
+        )
         expectations.append(expectation)
     expectations.sort(
         key=lambda item: (
@@ -2555,39 +3096,34 @@ def gold_oracle_failures_for_output(
     for expectation in expectations:
         expectation_id = str(expectation.get("id") or "")
         owner = str(expectation.get("owner") or "unknown")
-        for check, patterns in (
-            ("contains", expectation.get("contains", [])),
-            ("regex", expectation.get("regex", [])),
-            ("not_contains", expectation.get("not_contains", [])),
-            ("not_regex", expectation.get("not_regex", [])),
-        ):
-            if isinstance(patterns, str):
-                pattern_list = [patterns]
-            elif isinstance(patterns, list):
-                pattern_list = [str(pattern) for pattern in patterns]
-            else:
-                pattern_list = []
-            for pattern in pattern_list:
-                matched = (
-                    re.search(pattern, stdout, re.MULTILINE) is not None
-                    if check.endswith("regex")
-                    else pattern in stdout
+        for gold_check in gold_checks_for_expectation(expectation):
+            check = gold_check["check"]
+            pattern = gold_check["pattern"]
+            matched = (
+                re.search(pattern, stdout, re.MULTILINE) is not None
+                if check.endswith("regex")
+                else pattern in stdout
+            )
+            failed = matched if check.startswith("not_") else not matched
+            if failed:
+                failures.append(
+                    {
+                        "kind": GOLD_ORACLE_FAILURE,
+                        "case": case.name,
+                        "corpus": case.corpus,
+                        "target": target_name,
+                        "command": command,
+                        "expectation": expectation_id,
+                        "check": check,
+                        "pattern": pattern,
+                        "category": gold_check["category"],
+                        "gate": gold_check["gate"],
+                        "primary_failure_taxonomy": GOLD_CATEGORY_PRIMARY_TAXONOMY[
+                            gold_check["category"]
+                        ],
+                        "owner": owner,
+                    }
                 )
-                failed = matched if check.startswith("not_") else not matched
-                if failed:
-                    failures.append(
-                        {
-                            "kind": GOLD_ORACLE_FAILURE,
-                            "case": case.name,
-                            "corpus": case.corpus,
-                            "target": target_name,
-                            "command": command,
-                            "expectation": expectation_id,
-                            "check": check,
-                            "pattern": pattern,
-                            "owner": owner,
-                        }
-                    )
     failures.sort(
         key=lambda item: (
             str(item.get("expectation") or ""),
@@ -2618,9 +3154,32 @@ def attach_gold_oracle(
         stdout=stdout,
         expectations=expectations,
     )
+    checks = [
+        check
+        for expectation in expectations
+        for check in gold_checks_for_expectation(expectation)
+    ]
+    check_counts = {
+        gate: sum(check["gate"] == gate for check in checks)
+        for gate in ("hard", "soft", GOLD_LEGACY_GATE)
+    }
+    failure_counts = {
+        gate: sum(failure.get("gate") == gate for failure in failures)
+        for gate in ("hard", "soft", GOLD_LEGACY_GATE)
+    }
     entry["gold_oracle"] = {
         "status": "ok" if not failures else "failed",
+        "hard_status": "ok" if not failure_counts["hard"] else "failed",
+        "soft_status": "ok" if not failure_counts["soft"] else "failed",
+        "legacy_status": "ok" if not failure_counts[GOLD_LEGACY_GATE] else "failed",
         "expectation_count": len(expectations),
+        "check_count": len(checks),
+        "hard_check_count": check_counts["hard"],
+        "soft_check_count": check_counts["soft"],
+        "legacy_check_count": check_counts[GOLD_LEGACY_GATE],
+        "hard_failure_count": failure_counts["hard"],
+        "soft_failure_count": failure_counts["soft"],
+        "legacy_failure_count": failure_counts[GOLD_LEGACY_GATE],
         "failures": failures,
     }
 
@@ -2640,6 +3199,38 @@ def batched_section_end(name: str, repeat_idx: int) -> str:
 
 def batched_time_marker(kind: str, name: str, repeat_idx: int) -> str:
     return f"{BATCH_SENTINEL} TIME_{kind} {name} {repeat_idx}"
+
+
+def batched_timed_command(name: str, repeat_idx: int, command: str) -> list[str]:
+    """Wrap one r2 command with its in-process profiler and output sentinels."""
+    return [
+        f"?e {batched_section_start(name, repeat_idx)}",
+        f"?t {command}",
+        f"?e {batched_time_marker('ELAPSED', name, repeat_idx)}",
+        f"?e {batched_section_end(name, repeat_idx)}",
+    ]
+
+
+def _parse_r2_profile_seconds(line: str) -> int | None:
+    try:
+        seconds = float(line.strip())
+    except ValueError:
+        return None
+    if not (0.0 <= seconds < float("inf")):
+        return None
+    return round(seconds * 1_000_000_000)
+
+
+def timing_elapsed_s(start_ns: int | None, end_ns: int | None) -> float | None:
+    if start_ns == IN_PROCESS_TIMER_START_NS and end_ns is not None and end_ns >= 0:
+        return end_ns / 1_000_000_000.0
+    if start_ns is not None and end_ns is not None and end_ns >= start_ns:
+        return (end_ns - start_ns) / 1_000_000_000.0
+    return None
+
+
+def timing_is_in_process(start_ns: int | None, end_ns: int | None) -> bool:
+    return start_ns == IN_PROCESS_TIMER_START_NS and end_ns is not None and end_ns >= 0
 
 
 def parse_batched_output_detailed(
@@ -2688,6 +3279,14 @@ def parse_batched_output_detailed(
                 if key is not None:
                     pending_time = ("START" if parts[1] == "TIME_START" else "END", key)
                     continue
+            if len(parts) == 4 and parts[1] == "TIME_ELAPSED":
+                key = (parts[2], int(parts[3])) if parts[3].isdigit() else None
+                if key is not None and active == key and active_lines:
+                    elapsed_ns = _parse_r2_profile_seconds(active_lines[-1])
+                    if elapsed_ns is not None:
+                        active_lines.pop()
+                        timings[key] = [IN_PROCESS_TIMER_START_NS, elapsed_ns]
+                continue
         if active is not None:
             active_lines.append(line)
     if active is not None:
@@ -2713,6 +3312,48 @@ def parse_batched_sections(stdout: str) -> dict[tuple[str, int], str]:
     return sections
 
 
+def parse_batched_sections_bytes(stdout: bytes) -> dict[tuple[str, int], bytes]:
+    sections: dict[tuple[str, int], list[bytes]] = {}
+    active: tuple[str, int] | None = None
+    active_lines: list[bytes] = []
+    sentinel = BATCH_SENTINEL.encode("ascii") + b" "
+    for line in stdout.splitlines(keepends=True):
+        marker = line.rstrip(b"\r\n")
+        if marker.startswith(sentinel):
+            try:
+                parts = marker.decode("ascii").split()
+            except UnicodeDecodeError:
+                parts = []
+            if len(parts) == 4 and parts[1] in ("START", "END"):
+                key = (parts[2], int(parts[3])) if parts[3].isdigit() else None
+                if parts[1] == "START" and key is not None:
+                    if active is not None:
+                        sections[active] = active_lines
+                    active = key
+                    active_lines = []
+                    continue
+                if parts[1] == "END" and key is not None and active == key:
+                    sections[active] = active_lines
+                    active = None
+                    active_lines = []
+                    continue
+            if len(parts) == 4 and parts[1] == "TIME_ELAPSED":
+                key = (parts[2], int(parts[3])) if parts[3].isdigit() else None
+                if key is not None and active == key and active_lines:
+                    try:
+                        last_line = active_lines[-1].decode("ascii").strip()
+                    except UnicodeDecodeError:
+                        last_line = ""
+                    if _parse_r2_profile_seconds(last_line) is not None:
+                        active_lines.pop()
+                continue
+        if active is not None:
+            active_lines.append(line)
+    if active is not None:
+        sections[active] = active_lines
+    return {key: b"".join(lines) for key, lines in sections.items()}
+
+
 def batched_target_script(
     case: BinaryCase,
     addr: int,
@@ -2720,9 +3361,10 @@ def batched_target_script(
     commands: dict[str, str],
 ) -> list[tuple[str, int, str, str]]:
     sections: list[tuple[str, int, str, str]] = []
-    for name, command in commands.items():
-        per_command_repeats = max(1, repeat) if name in DECOMPILE_REPEAT_COMMANDS else 1
-        for repeat_idx in range(per_command_repeats):
+    for repeat_idx in range(max(1, repeat)):
+        for name, command in commands.items():
+            if repeat_idx > 0 and name not in DECOMPILE_REPEAT_COMMANDS:
+                continue
             sections.append((name, repeat_idx, batched_section_start(name, repeat_idx), command))
     return sections
 
@@ -2963,13 +3605,15 @@ def timed_event_from_ns(
     batch_elapsed: float,
     section_status: str | None = None,
 ) -> dict[str, Any]:
-    elapsed = (
-        max(0.0, (end_ns - start_ns) / 1_000_000_000.0)
-        if start_ns is not None and end_ns is not None and end_ns >= start_ns
-        else fallback_elapsed
+    measured_elapsed = timing_elapsed_s(start_ns, end_ns)
+    elapsed = measured_elapsed if measured_elapsed is not None else fallback_elapsed
+    legacy_wall_clock = (
+        start_ns is not None
+        and start_ns != IN_PROCESS_TIMER_START_NS
+        and end_ns is not None
     )
-    started_at = start_ns / 1_000_000_000.0 if start_ns is not None else fallback_started_at
-    ended_at = end_ns / 1_000_000_000.0 if end_ns is not None else started_at + elapsed
+    started_at = start_ns / 1_000_000_000.0 if legacy_wall_clock else fallback_started_at
+    ended_at = end_ns / 1_000_000_000.0 if legacy_wall_clock else started_at + elapsed
     event = command_event(
         case=case,
         target=target,
@@ -2979,9 +3623,11 @@ def timed_event_from_ns(
         ended_at=ended_at,
         timeout_s=timeout_s,
         returncode=returncode,
+        temperature="cold" if repeat_idx == 0 else "warm",
     )
     event["batch_elapsed_s"] = round(batch_elapsed, 6)
-    event["timed"] = start_ns is not None and end_ns is not None
+    event["timed"] = measured_elapsed is not None
+    event["timer"] = "r2_prof" if timing_is_in_process(start_ns, end_ns) else "legacy_or_fallback"
     if section_status is not None:
         event["section_status"] = section_status
     return event
@@ -2999,28 +3645,17 @@ def collect_target_batched(
     runner: Runner,
     commands: dict[str, str] | None = None,
     gold_manifest: list[dict[str, Any]] | None = None,
+    raw_output_archive: RawOutputArchive | None = None,
 ) -> dict[str, Any]:
     if not target.get("found", True):
         return dict(target)
     commands = commands or target_commands()
     addr = int(target["addr"])
-    prefix = f"{case.analysis}; s 0x{addr:x}; af"
     sections = batched_target_script(case, addr, repeat, commands)
-    command_parts = [
-        f"?e {batched_time_marker('START', 'setup', 0)}",
-        "!date +%s%N",
-        prefix,
-        f"?e {batched_time_marker('END', 'setup', 0)}",
-        "!date +%s%N",
-    ]
-    for name, repeat_idx, start, command in sections:
-        command_parts.append(f"?e {batched_time_marker('START', name, repeat_idx)}")
-        command_parts.append("!date +%s%N")
-        command_parts.append(f"?e {start}")
-        command_parts.append(command)
-        command_parts.append(f"?e {batched_section_end(name, repeat_idx)}")
-        command_parts.append(f"?e {batched_time_marker('END', name, repeat_idx)}")
-        command_parts.append("!date +%s%N")
+    command_parts = [case.analysis, f"s 0x{addr:x}"]
+    command_parts.extend(batched_timed_command("setup", 0, "af"))
+    for name, repeat_idx, _start, command in sections:
+        command_parts.extend(batched_timed_command(name, repeat_idx, command))
     command_env = task_env(env, task_tmpdir, case.corpus, case.name, f"target-0x{addr:x}", "batched")
     started_at = time.time()
     result = runner(r2, case.path, "; ".join(command_parts), timeout_s, command_env)
@@ -3028,6 +3663,7 @@ def collect_target_batched(
     parsed, timings, started_sections, completed_sections = parse_batched_output_detailed(
         result.stdout
     )
+    parsed_bytes = parse_batched_sections_bytes(result_stdout_bytes(result))
     out: dict[str, Any] = dict(target)
     out["execution_mode"] = "batched"
     out["commands"] = {}
@@ -3046,16 +3682,14 @@ def collect_target_batched(
         "timeout_s": timeout_s,
         "timeout": result.returncode == 124,
         "returncode": result.returncode,
+        "child_max_rss_bytes": result.child_max_rss_bytes,
     }
     out["batch_event"] = batch_event
     setup_start_ns, setup_end_ns = timings.get(("setup", 0), (None, None))
-    setup_completed = setup_start_ns is not None and setup_end_ns is not None
+    setup_duration = timing_elapsed_s(setup_start_ns, setup_end_ns)
+    setup_completed = setup_duration is not None
     setup_returncode = batched_section_returncode(result.returncode, setup_completed)
-    setup_elapsed = (
-        max(0.0, (setup_end_ns - setup_start_ns) / 1_000_000_000.0)
-        if setup_completed and setup_end_ns >= setup_start_ns
-        else 0.0
-    )
+    setup_elapsed = setup_duration if setup_duration is not None else 0.0
     setup_event = timed_event_from_ns(
         case=case,
         target=target,
@@ -3080,17 +3714,18 @@ def collect_target_batched(
         section_returncode = batched_section_returncode(result.returncode, section_key in parsed)
         section_stderr = result.stderr if section_returncode != 0 else ""
         start_ns, end_ns = timings.get((name, repeat_idx), (None, None))
-        section_elapsed = (
-            max(0.0, (end_ns - start_ns) / 1_000_000_000.0)
-            if start_ns is not None and end_ns is not None and end_ns >= start_ns
-            else fallback_section_elapsed
-        )
+        measured_elapsed = timing_elapsed_s(start_ns, end_ns)
+        section_elapsed = measured_elapsed if measured_elapsed is not None else fallback_section_elapsed
         section_started_at = (
-            start_ns / 1_000_000_000.0 if start_ns is not None else started_at
+            start_ns / 1_000_000_000.0
+            if start_ns is not None and start_ns != IN_PROCESS_TIMER_START_NS
+            else started_at
         )
         section_ended_at = (
             end_ns / 1_000_000_000.0
-            if end_ns is not None
+            if start_ns is not None
+            and start_ns != IN_PROCESS_TIMER_START_NS
+            and end_ns is not None
             else section_started_at + section_elapsed
         )
         section_result = CmdResult(
@@ -3098,6 +3733,8 @@ def collect_target_batched(
             stdout=section_stdout,
             stderr=section_stderr,
             elapsed_s=section_elapsed,
+            stdout_bytes=parsed_bytes.get(section_key, b""),
+            stderr_bytes=result_stderr_bytes(result),
         )
         event = timed_event_from_ns(
             case=case,
@@ -3111,6 +3748,19 @@ def collect_target_batched(
             timeout_s=timeout_s,
             returncode=section_returncode,
             batch_elapsed=batch_elapsed,
+        )
+        annotate_payload_admission(event, name, section_result)
+        archive_command_result(
+            raw_output_archive,
+            case=case,
+            target=target,
+            command=name,
+            repeat_idx=repeat_idx,
+            attempt="target-batch",
+            result=section_result,
+            event=event,
+            stdout_scope="batch_section",
+            stderr_scope="enclosing_batch_child",
         )
         grouped[name].append((repeat_idx, section_result, event))
         out["command_events"].append(event)
@@ -3171,15 +3821,12 @@ def cached_targets_by_resume_key(cached_case: dict[str, Any] | None) -> dict[str
 
 
 def command_events_from_entry(entry: dict[str, Any]) -> list[dict[str, Any]]:
-    events: list[dict[str, Any]] = []
-    event = entry.get("event")
-    if isinstance(event, dict):
-        events.append(copy.deepcopy(event))
     repeat = entry.get("repeat")
     repeat_events = repeat.get("events") if isinstance(repeat, dict) else None
     if isinstance(repeat_events, list):
-        events.extend(copy.deepcopy(event) for event in repeat_events if isinstance(event, dict))
-    return events
+        return [copy.deepcopy(event) for event in repeat_events if isinstance(event, dict)]
+    event = entry.get("event")
+    return [copy.deepcopy(event)] if isinstance(event, dict) else []
 
 
 def attach_cached_target_commands(
@@ -3196,6 +3843,19 @@ def attach_cached_target_commands(
         cached_target = cached_targets.get(target_resume_key(target))
         resume_commands: dict[str, dict[str, Any]] = {}
         if isinstance(cached_target, dict):
+            cached_resume_batch_events = cached_target.get("resumed_batch_events")
+            resume_batch_events: list[dict[str, Any]] = []
+            if isinstance(cached_resume_batch_events, list):
+                resume_batch_events.extend(
+                    copy.deepcopy(event)
+                    for event in cached_resume_batch_events
+                    if isinstance(event, dict)
+                )
+            cached_batch_event = cached_target.get("batch_event")
+            if isinstance(cached_batch_event, dict):
+                resume_batch_events.append(copy.deepcopy(cached_batch_event))
+            if resume_batch_events:
+                resumed_target["_resume_batch_events"] = resume_batch_events
             cached_commands = cached_target.get("commands")
             if isinstance(cached_commands, dict):
                 for name in commands:
@@ -3236,6 +3896,11 @@ def target_output_with_resumed_commands(
     resume_commands = target.get("_resume_commands")
     out["commands"] = {}
     out["command_events"] = []
+    resume_batch_events = target.get("_resume_batch_events")
+    if isinstance(resume_batch_events, list):
+        out["resumed_batch_events"] = [
+            copy.deepcopy(event) for event in resume_batch_events if isinstance(event, dict)
+        ]
     if isinstance(resume_commands, dict):
         for name in commands:
             entry = resume_commands.get(name)
@@ -3263,6 +3928,7 @@ def collect_targets_batched_case(
     runner: Runner,
     commands: dict[str, str] | None = None,
     gold_manifest: list[dict[str, Any]] | None = None,
+    raw_output_archive: RawOutputArchive | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     commands = commands or target_commands()
     found_targets = [
@@ -3273,41 +3939,22 @@ def collect_targets_batched_case(
     if not found_targets:
         return [target_output_with_resumed_commands(target, commands) for target in targets], []
 
-    command_parts = [
-        f"?e {batched_time_marker('START', 'case_setup', 0)}",
-        "!date +%s%N",
-        case.analysis,
-        f"?e {batched_time_marker('END', 'case_setup', 0)}",
-        "!date +%s%N",
-    ]
+    command_parts = batched_timed_command("case_setup", 0, case.analysis)
     section_specs: list[tuple[int, str, int, str]] = []
     for target_idx, target in found_targets:
         addr = int(target["addr"])
         setup_name = target_setup_name(target_idx)
-        command_parts.extend(
-            [
-                f"?e {batched_time_marker('START', setup_name, 0)}",
-                "!date +%s%N",
-                f"s 0x{addr:x}; af",
-                f"?e {batched_time_marker('END', setup_name, 0)}",
-                "!date +%s%N",
-            ]
-        )
-        for command_name, command in scheduled_commands_for_target(target, commands).items():
-            per_command_repeats = max(1, repeat) if command_name in DECOMPILE_REPEAT_COMMANDS else 1
-            encoded_name = target_section_name(target_idx, command_name)
-            for repeat_idx in range(per_command_repeats):
+        command_parts.append(f"s 0x{addr:x}")
+        command_parts.extend(batched_timed_command(setup_name, 0, "af"))
+        target_commands_to_run = scheduled_commands_for_target(target, commands)
+        for repeat_idx in range(max(1, repeat)):
+            for command_name, command in target_commands_to_run.items():
+                if repeat_idx > 0 and command_name not in DECOMPILE_REPEAT_COMMANDS:
+                    continue
+                encoded_name = target_section_name(target_idx, command_name)
                 section_specs.append((target_idx, command_name, repeat_idx, encoded_name))
                 command_parts.extend(
-                    [
-                        f"?e {batched_time_marker('START', encoded_name, repeat_idx)}",
-                        "!date +%s%N",
-                        f"?e {batched_section_start(encoded_name, repeat_idx)}",
-                        command,
-                        f"?e {batched_section_end(encoded_name, repeat_idx)}",
-                        f"?e {batched_time_marker('END', encoded_name, repeat_idx)}",
-                        "!date +%s%N",
-                    ]
+                    batched_timed_command(encoded_name, repeat_idx, command)
                 )
 
     command_env = task_env(env, task_tmpdir, case.corpus, case.name, "case-batched")
@@ -3321,6 +3968,7 @@ def collect_targets_batched_case(
     parsed, timings, started_sections, completed_sections = parse_batched_output_detailed(
         result.stdout
     )
+    parsed_bytes = parse_batched_sections_bytes(result_stdout_bytes(result))
     batch_elapsed = max(0.0, ended_at - started_at)
     case_start_ns, case_end_ns = timings.get(("case_setup", 0), (None, None))
     case_setup_status = setup_section_status(
@@ -3329,6 +3977,12 @@ def collect_targets_batched_case(
         batch_returncode=result.returncode,
     )
     case_setup_returncode = returncode_for_section_status(result.returncode, case_setup_status)
+    case_setup_elapsed = timing_elapsed_s(case_start_ns, case_end_ns)
+    case_setup_started_at = (
+        case_start_ns / 1_000_000_000.0
+        if case_start_ns is not None and case_start_ns != IN_PROCESS_TIMER_START_NS
+        else started_at
+    )
     case_setup_event = {
         "case": case.name,
         "corpus": case.corpus,
@@ -3336,27 +3990,18 @@ def collect_targets_batched_case(
         "addr": None,
         "command": "case_setup",
         "repeat_idx": 0,
-        "started_at": round(
-            case_start_ns / 1_000_000_000.0 if case_start_ns is not None else started_at,
-            6,
-        ),
-        "ended_at": round(
-            case_end_ns / 1_000_000_000.0
-            if case_end_ns is not None
-            else started_at,
-            6,
-        ),
-        "elapsed_s": round(
-            max(0.0, (case_end_ns - case_start_ns) / 1_000_000_000.0)
-            if case_start_ns is not None and case_end_ns is not None and case_end_ns >= case_start_ns
-            else 0.0,
-            6,
-        ),
+        "started_at": round(case_setup_started_at, 6),
+        "ended_at": round(case_setup_started_at + (case_setup_elapsed or 0.0), 6),
+        "elapsed_s": round(case_setup_elapsed or 0.0, 6),
         "timeout_s": batch_timeout_s,
         "timeout": case_setup_returncode == 124,
         "returncode": case_setup_returncode,
+        "temperature": "cold",
         "batch_elapsed_s": round(batch_elapsed, 6),
-        "timed": case_start_ns is not None and case_end_ns is not None,
+        "timed": case_setup_elapsed is not None,
+        "timer": "r2_prof"
+        if timing_is_in_process(case_start_ns, case_end_ns)
+        else "legacy_or_fallback",
         "section_status": case_setup_status,
     }
 
@@ -3411,9 +4056,10 @@ def collect_targets_batched_case(
             else ""
         )
         section_stderr = result.stderr if section_returncode not in (0, None) else ""
+        measured_elapsed = timing_elapsed_s(start_ns, end_ns)
         section_elapsed = (
-            max(0.0, (end_ns - start_ns) / 1_000_000_000.0)
-            if start_ns is not None and end_ns is not None and end_ns >= start_ns
+            measured_elapsed
+            if measured_elapsed is not None
             else 0.0
             if section_status in INCOMPLETE_SECTION_STATUSES
             else fallback_section_elapsed
@@ -3424,6 +4070,8 @@ def collect_targets_batched_case(
             stdout=section_stdout,
             stderr=section_stderr,
             elapsed_s=section_elapsed,
+            stdout_bytes=parsed_bytes.get(section_key, b""),
+            stderr_bytes=result_stderr_bytes(result),
         )
         event = timed_event_from_ns(
             case=case,
@@ -3438,6 +4086,19 @@ def collect_targets_batched_case(
             returncode=section_returncode,
             batch_elapsed=batch_elapsed,
             section_status=section_status,
+        )
+        annotate_payload_admission(event, command_name, section_result)
+        archive_command_result(
+            raw_output_archive,
+            case=case,
+            target=target,
+            command=command_name,
+            repeat_idx=repeat_idx,
+            attempt="case-batch",
+            result=section_result,
+            event=event,
+            stdout_scope="batch_section",
+            stderr_scope="enclosing_batch_child",
         )
         grouped[target_idx][command_name].append((repeat_idx, section_result, event))
 
@@ -3467,6 +4128,7 @@ def collect_targets_batched_case(
             "timeout_s": batch_timeout_s,
             "timeout": result.returncode == 124,
             "returncode": result.returncode,
+            "child_max_rss_bytes": result.child_max_rss_bytes,
         }
         setup_name = target_setup_name(target_idx)
         setup_start_ns, setup_end_ns = timings.get((setup_name, 0), (None, None))
@@ -3543,6 +4205,7 @@ def collect_target_command_retries(
     *,
     retry_origin: str,
     gold_manifest: list[dict[str, Any]] | None = None,
+    raw_output_archive: RawOutputArchive | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     if not target.get("found", True) or not command_names:
         return base_output, []
@@ -3582,20 +4245,78 @@ def collect_target_command_retries(
             f"run-{repeat_idx}",
         )
         started_at = time.time()
-        result = runner(r2, case.path, f"{prefix}; {command}", timeout_s, command_env)
-        ended_at = time.time()
-        event = command_event(
+        script_parts = [prefix]
+        script_parts.extend(batched_timed_command(name, repeat_idx, command))
+        enclosing_result = runner(
+            r2,
+            case.path,
+            "; ".join(script_parts),
+            timeout_s,
+            command_env,
+        )
+        parsed, timings, _started, completed = parse_batched_output_detailed(
+            enclosing_result.stdout
+        )
+        parsed_bytes = parse_batched_sections_bytes(result_stdout_bytes(enclosing_result))
+        key = (name, repeat_idx)
+        start_ns, end_ns = timings.get(key, (None, None))
+        measured_elapsed = timing_elapsed_s(start_ns, end_ns)
+        section_seen = key in _started or key in completed
+        result = CmdResult(
+            returncode=batched_section_returncode(
+                enclosing_result.returncode,
+                key in completed,
+            ),
+            stdout=parsed.get(key, "") if section_seen else enclosing_result.stdout,
+            stderr=enclosing_result.stderr,
+            elapsed_s=(
+                measured_elapsed
+                if measured_elapsed is not None
+                else enclosing_result.elapsed_s
+            ),
+            child_max_rss_bytes=enclosing_result.child_max_rss_bytes,
+            stdout_bytes=(
+                parsed_bytes.get(key, b"")
+                if section_seen
+                else result_stdout_bytes(enclosing_result)
+            ),
+            stderr_bytes=result_stderr_bytes(enclosing_result),
+        )
+        event = timed_event_from_ns(
             case=case,
             target=target,
             command=name,
             repeat_idx=repeat_idx,
-            started_at=started_at,
-            ended_at=ended_at,
+            start_ns=start_ns,
+            end_ns=end_ns,
+            fallback_started_at=started_at,
+            fallback_elapsed=enclosing_result.elapsed_s,
             timeout_s=timeout_s,
             returncode=result.returncode,
+            batch_elapsed=enclosing_result.elapsed_s,
+            section_status=batched_section_status(
+                key=key,
+                timings=timings,
+                started_sections=_started,
+                completed_sections=completed,
+                batch_returncode=enclosing_result.returncode,
+            ),
         )
+        event["temperature"] = "cold"
+        event["child_max_rss_bytes"] = result.child_max_rss_bytes
         event["attribution_mode"] = "command_retry"
         event["retry_origin"] = retry_origin
+        annotate_payload_admission(event, name, result)
+        archive_command_result(
+            raw_output_archive,
+            case=case,
+            target=target,
+            command=name,
+            repeat_idx=repeat_idx,
+            attempt=f"command-retry-{retry_origin}",
+            result=result,
+            event=event,
+        )
         return name, repeat_idx, result, event
 
     completed = run_ordered_parallel(command_runs, jobs, run_command)
@@ -3663,6 +4384,7 @@ def collect_targets_batched_adaptive(
     *,
     depth: int = 0,
     retry_origin: str | None = None,
+    raw_output_archive: RawOutputArchive | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     commands = commands or target_commands()
     outputs, events = collect_targets_batched_case(
@@ -3677,6 +4399,7 @@ def collect_targets_batched_adaptive(
         runner,
         commands,
         gold_manifest,
+        raw_output_archive,
     )
     mode = "batch" if depth == 0 else "batch_retry"
     for output in outputs:
@@ -3722,6 +4445,7 @@ def collect_targets_batched_adaptive(
             runner,
             retry_origin=retry_origin or origin,
             gold_manifest=gold_manifest,
+            raw_output_archive=raw_output_archive,
         )
         outputs[retry_idx] = retry_output
         events.extend(retry_events)
@@ -3741,6 +4465,7 @@ def collect_target(
     runner: Runner,
     commands: dict[str, str] | None = None,
     gold_manifest: list[dict[str, Any]] | None = None,
+    raw_output_archive: RawOutputArchive | None = None,
 ) -> dict[str, Any]:
     if not target.get("found", True):
         return dict(target)
@@ -3773,22 +4498,81 @@ def collect_target(
             f"run-{repeat_idx}",
         )
         started_at = time.time()
-        result = runner(r2, case.path, f"{prefix}; {command}", timeout_s, command_env)
-        ended_at = time.time()
+        script_parts = [prefix]
+        script_parts.extend(batched_timed_command(name, repeat_idx, command))
+        enclosing_result = runner(
+            r2,
+            case.path,
+            "; ".join(script_parts),
+            timeout_s,
+            command_env,
+        )
+        parsed, timings, started_sections, completed_sections = (
+            parse_batched_output_detailed(enclosing_result.stdout)
+        )
+        parsed_bytes = parse_batched_sections_bytes(result_stdout_bytes(enclosing_result))
+        key = (name, repeat_idx)
+        start_ns, end_ns = timings.get(key, (None, None))
+        measured_elapsed = timing_elapsed_s(start_ns, end_ns)
+        section_seen = key in started_sections or key in completed_sections
+        result = CmdResult(
+            returncode=batched_section_returncode(
+                enclosing_result.returncode,
+                key in completed_sections,
+            ),
+            stdout=parsed.get(key, "") if section_seen else enclosing_result.stdout,
+            stderr=enclosing_result.stderr,
+            elapsed_s=(
+                measured_elapsed
+                if measured_elapsed is not None
+                else enclosing_result.elapsed_s
+            ),
+            child_max_rss_bytes=enclosing_result.child_max_rss_bytes,
+            stdout_bytes=(
+                parsed_bytes.get(key, b"")
+                if section_seen
+                else result_stdout_bytes(enclosing_result)
+            ),
+            stderr_bytes=result_stderr_bytes(enclosing_result),
+        )
+        event = timed_event_from_ns(
+            case=case,
+            target=target,
+            command=name,
+            repeat_idx=repeat_idx,
+            start_ns=start_ns,
+            end_ns=end_ns,
+            fallback_started_at=started_at,
+            fallback_elapsed=enclosing_result.elapsed_s,
+            timeout_s=timeout_s,
+            returncode=result.returncode,
+            batch_elapsed=enclosing_result.elapsed_s,
+            section_status=batched_section_status(
+                key=key,
+                timings=timings,
+                started_sections=started_sections,
+                completed_sections=completed_sections,
+                batch_returncode=enclosing_result.returncode,
+            ),
+        )
+        event["temperature"] = "cold"
+        event["child_max_rss_bytes"] = result.child_max_rss_bytes
+        annotate_payload_admission(event, name, result)
+        archive_command_result(
+            raw_output_archive,
+            case=case,
+            target=target,
+            command=name,
+            repeat_idx=repeat_idx,
+            attempt="isolated",
+            result=result,
+            event=event,
+        )
         return (
             name,
             repeat_idx,
             result,
-            command_event(
-                case=case,
-                target=target,
-                command=name,
-                repeat_idx=repeat_idx,
-                started_at=started_at,
-                ended_at=ended_at,
-                timeout_s=timeout_s,
-                returncode=result.returncode,
-            ),
+            event,
         )
 
     completed = run_ordered_parallel(command_runs, jobs, run_command)
@@ -4007,6 +4791,7 @@ def quality_gate_failures_for_result(
 
 def collect_failures(case_result: dict[str, Any]) -> list[dict[str, Any]]:
     failures: list[dict[str, Any]] = []
+    measurement_observations: list[dict[str, Any]] = []
     native = case_result.get("native_discovery", {})
     if native:
         repro = native.get("repro") or "aa; aflj"
@@ -4099,15 +4884,38 @@ def collect_failures(case_result: dict[str, Any]) -> list[dict[str, Any]]:
             gold_oracle = result.get("gold_oracle")
             if isinstance(gold_oracle, dict):
                 for failure in gold_oracle.get("failures", []):
-                    if isinstance(failure, dict):
+                    if isinstance(failure, dict) and failure.get("gate") == "hard":
                         failures.append(dict(failure))
             repeat = result.get("repeat")
             if isinstance(repeat, dict) and repeat.get("stable") is False:
-                failures.append({"kind": "nondeterministic_output", "target": target_name, "command": command})
+                observation = {
+                    "kind": "unnormalized_profile_repeat_mismatch",
+                    "target": target_name,
+                    "command": command,
+                }
+                if command == "profile":
+                    measurement_observations.append(observation)
+                else:
+                    failures.append(
+                        {
+                            "kind": "nondeterministic_output",
+                            "target": target_name,
+                            "command": command,
+                        }
+                    )
             failures.extend(
                 quality_gate_failures_for_result(target_name, command, result, commands)
             )
+    for failure in failures:
+        kind = str(failure.get("kind") or "unknown")
+        failure.setdefault(
+            "primary_failure_taxonomy", primary_failure_taxonomy(kind, failure)
+        )
     failures.sort(key=lambda item: (item.get("kind", ""), item.get("target", ""), item.get("command", "")))
+    measurement_observations.sort(
+        key=lambda item: (item.get("kind", ""), item.get("target", ""), item.get("command", ""))
+    )
+    case_result["measurement_observations"] = measurement_observations
     return failures
 def add_cache_counter_totals(dest: dict[str, int], source: dict[str, Any]) -> None:
     for field in CACHE_COUNTER_FIELDS:
@@ -4119,7 +4927,7 @@ def add_cache_counter_totals(dest: dict[str, int], source: dict[str, Any]) -> No
 def add_engine_cache_totals(
     dest: dict[str, dict[str, int]], source: dict[str, Any]
 ) -> None:
-    for partition in ("analysis", "artifacts", "total"):
+    for partition in ("analysis", "total"):
         counters = source.get(partition)
         if isinstance(counters, dict):
             add_cache_counter_totals(dest.setdefault(partition, {}), counters)
@@ -4639,6 +5447,7 @@ def run_case(
     command_names: tuple[str, ...] | None = None,
     cached_case: dict[str, Any] | None = None,
     gold_manifest: list[dict[str, Any]] | None = None,
+    raw_output_archive: RawOutputArchive | None = None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     commands = target_commands(command_names)
@@ -4683,6 +5492,7 @@ def run_case(
         "returncode": native_discovery.returncode,
         "elapsed_s": round(native_discovery.elapsed_s, 6),
         "runtime_bucket": runtime_bucket(native_discovery.elapsed_s),
+        "child_max_rss_bytes": native_discovery.child_max_rss_bytes,
         "function_count": len(native_functions),
         "stdout": summarize_text(native_discovery.stdout, include_preview=include_sensitive, max_lines=20),
         "repro": f"{case.analysis}; aflj",
@@ -4707,6 +5517,7 @@ def run_case(
         "returncode": discovery.returncode,
         "elapsed_s": round(discovery.elapsed_s, 6),
         "runtime_bucket": runtime_bucket(discovery.elapsed_s),
+        "child_max_rss_bytes": discovery.child_max_rss_bytes,
         "function_count": len(functions),
         "stdout": summarize_text(discovery.stdout, include_preview=include_sensitive, max_lines=20),
     }
@@ -4748,6 +5559,7 @@ def run_case(
                 runner,
                 commands,
                 gold_manifest,
+                raw_output_archive=raw_output_archive,
             )
             targets.extend(chunk_targets)
             for event in chunk_events:
@@ -4775,6 +5587,7 @@ def run_case(
             runner,
             commands,
             gold_manifest,
+            raw_output_archive,
         )
 
     case_out["targets"] = run_ordered_parallel(selected, target_jobs, collect_selected_target)
@@ -4796,10 +5609,23 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
     quality_gate_failures: dict[str, int] = {}
     gold_oracle_totals = {
         "expectations": 0,
+        "checks": 0,
+        "hard_checks": 0,
+        "soft_checks": 0,
+        "legacy_checks": 0,
         "commands": 0,
         "passed": 0,
         "failed": 0,
         "failures": 0,
+        "hard_passed": 0,
+        "hard_failed": 0,
+        "hard_failures": 0,
+        "soft_passed": 0,
+        "soft_failed": 0,
+        "soft_failures": 0,
+        "legacy_passed": 0,
+        "legacy_failed": 0,
+        "legacy_failures": 0,
     }
     owner_buckets: dict[str, int] = {}
     generic_arg_total = 0
@@ -4829,12 +5655,28 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
     case_setup_elapsed_s = 0.0
     target_setup_elapsed_s = 0.0
     command_elapsed_s = 0.0
+    timing_by_temperature = {
+        "cold": {"count": 0, "elapsed_s": 0.0},
+        "warm": {"count": 0, "elapsed_s": 0.0},
+    }
+    child_max_rss_values: list[int] = []
     engine_cache_totals: dict[str, dict[str, int]] = {}
     cache_totals: dict[str, dict[str, int]] = {}
     fast_path_totals = fast_path_totals_template()
+
+    def record_child_rss(record: Any) -> None:
+        if not isinstance(record, dict):
+            return
+        value = record.get("child_max_rss_bytes")
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            child_max_rss_values.append(value)
+
     for case in cases:
+        for child_record_key in ("native_discovery", "native_pdfj_probe", "discovery"):
+            record_child_rss(case.get(child_record_key))
         for event in case.get("case_events", []):
             if isinstance(event, dict):
+                record_child_rss(event)
                 if event.get("command") == "case_setup":
                     case_setup_elapsed_s += _float_value(event.get("elapsed_s"))
                 slow_commands.append(
@@ -4863,6 +5705,26 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
                 bucket = str(native_result.get("runtime_bucket") or "unknown")
                 runtime_buckets[bucket] = runtime_buckets.get(bucket, 0) + 1
         for target in case.get("targets", []):
+            resumed_batch_events = target.get("resumed_batch_events")
+            if isinstance(resumed_batch_events, list):
+                for event in resumed_batch_events:
+                    record_child_rss(event)
+            record_child_rss(target.get("batch_event"))
+            for event in target.get("command_events", []):
+                if not isinstance(event, dict):
+                    continue
+                record_child_rss(event)
+                temperature = event.get("temperature")
+                if (
+                    temperature not in timing_by_temperature
+                    or section_status_incomplete(event.get("section_status"))
+                    or event.get("command")
+                    in {"setup", "case_setup", "batch", "case_batch"}
+                ):
+                    continue
+                bucket = timing_by_temperature[str(temperature)]
+                bucket["count"] += 1
+                bucket["elapsed_s"] += _float_value(event.get("elapsed_s"))
             if target.get("found", True):
                 total_targets += 1
             target_name = target.get("name") or target.get("requested")
@@ -5007,18 +5869,40 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
                     gold_oracle_totals["expectations"] += int(
                         gold_oracle.get("expectation_count") or 0
                     )
-                    failure_count = len(
-                        [
-                            failure
-                            for failure in gold_oracle.get("failures", [])
-                            if isinstance(failure, dict)
-                        ]
+                    gold_oracle_totals["checks"] += int(gold_oracle.get("check_count") or 0)
+                    gold_oracle_totals["hard_checks"] += int(
+                        gold_oracle.get("hard_check_count") or 0
                     )
+                    gold_oracle_totals["soft_checks"] += int(
+                        gold_oracle.get("soft_check_count") or 0
+                    )
+                    gold_oracle_totals["legacy_checks"] += int(
+                        gold_oracle.get("legacy_check_count") or 0
+                    )
+                    oracle_failures = [
+                        failure
+                        for failure in gold_oracle.get("failures", [])
+                        if isinstance(failure, dict)
+                    ]
+                    failure_count = len(oracle_failures)
                     gold_oracle_totals["failures"] += failure_count
                     if failure_count:
                         gold_oracle_totals["failed"] += 1
                     else:
                         gold_oracle_totals["passed"] += 1
+                    for gate in ("hard", "soft", GOLD_LEGACY_GATE):
+                        gate_failure_count = sum(
+                            failure.get("gate", GOLD_LEGACY_GATE) == gate
+                            for failure in oracle_failures
+                        )
+                        gold_oracle_totals[f"{gate}_failures"] += gate_failure_count
+                        gate_check_count = int(
+                            gold_oracle.get(f"{gate}_check_count") or 0
+                        )
+                        if gate_check_count or gate_failure_count:
+                            gold_oracle_totals[
+                                f"{gate}_{'failed' if gate_failure_count else 'passed'}"
+                            ] += 1
                 slow_commands.append(
                     {
                         "case": case.get("name"),
@@ -5085,6 +5969,13 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
         "setup_to_command_ratio": round(setup_elapsed_s / command_elapsed_s, 6)
         if command_elapsed_s > 0
         else None,
+        "by_temperature": {
+            temperature: {
+                "count": int(values["count"]),
+                "elapsed_s": round(values["elapsed_s"], 6),
+            }
+            for temperature, values in timing_by_temperature.items()
+        },
     }
     sorted_owner_buckets = dict(sorted(owner_buckets.items()))
     pdg_summary = summarize_pdg_comparisons(pdg_comparisons)
@@ -5095,6 +5986,11 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
         "min_score": min(scores) if scores else 0,
         "failures_by_kind": failures_sorted,
         "timing": timing,
+        "memory": {
+            "peak_child_rss_bytes": max(child_max_rss_values)
+            if child_max_rss_values
+            else None,
+        },
         "cache": {
             "engine": {
                 key: dict(sorted(value.items()))
@@ -5138,11 +6034,40 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
 
 def collect_command_events(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
+    batch_event_keys: set[tuple[Any, ...]] = set()
+
+    def append_batch_event(event: Any) -> None:
+        if not isinstance(event, dict):
+            return
+        command = event.get("command")
+        target = event.get("target") if command == "batch" else None
+        key = (
+            event.get("case"),
+            command,
+            target,
+            event.get("started_at"),
+            event.get("ended_at"),
+            event.get("returncode"),
+            event.get("child_max_rss_bytes"),
+        )
+        if key not in batch_event_keys:
+            batch_event_keys.add(key)
+            events.append(event)
+
     for case in cases:
         case_events = case.get("case_events")
         if isinstance(case_events, list):
-            events.extend(event for event in case_events if isinstance(event, dict))
+            for event in case_events:
+                if isinstance(event, dict) and event.get("command") in {"batch", "case_batch"}:
+                    append_batch_event(event)
+                elif isinstance(event, dict):
+                    events.append(event)
         for target in case.get("targets", []):
+            resumed_batch_events = target.get("resumed_batch_events")
+            if isinstance(resumed_batch_events, list):
+                for event in resumed_batch_events:
+                    append_batch_event(event)
+            append_batch_event(target.get("batch_event"))
             target_events = target.get("command_events")
             if isinstance(target_events, list):
                 events.extend(event for event in target_events if isinstance(event, dict))
@@ -5367,7 +6292,7 @@ def strict_quality_gate(args: argparse.Namespace, report: dict[str, Any]) -> dic
             "value": int(
                 _summary_metric(
                     report,
-                    ("summary", "quality", "gold_oracle", "failures"),
+                    ("summary", "quality", "gold_oracle", "hard_failures"),
                     0,
                 )
                 or 0
@@ -5672,6 +6597,7 @@ def benchmark_execution_config(
     command_jobs: int,
 ) -> dict[str, Any]:
     execution_mode = "isolated" if args.isolate_commands else "batched"
+    raw_output_dir = str(getattr(args, "raw_output_dir", "") or "")
     config = {
         "schema": SCHEMA_VERSION,
         "r2": args.r2,
@@ -5687,6 +6613,12 @@ def benchmark_execution_config(
         "case_workers": case_jobs,
         "per_case_workers": command_jobs,
         "include_sensitive": bool(args.include_sensitive),
+        "raw_output_archive": bool(raw_output_dir),
+        "raw_output_archive_root_hash": (
+            stable_json_hash(str(Path(raw_output_dir).expanduser().resolve()))
+            if raw_output_dir
+            else None
+        ),
         "manifest": args.manifest or "",
         "gold_manifest": getattr(args, "gold_manifest", "") or "",
         "gold_manifest_hash": gold_manifest_hash(getattr(args, "gold_manifest", "")),
@@ -5896,6 +6828,7 @@ def build_benchmark_report(
     plugin_info: dict[str, Any],
     benchmark_config: dict[str, Any],
     command_names: tuple[str, ...],
+    raw_output_archive: RawOutputArchive | None = None,
 ) -> dict[str, Any]:
     incomplete_cases = [
         result.get("name")
@@ -5946,6 +6879,11 @@ def build_benchmark_report(
             **benchmark_config,
             "plugin": plugin_info,
         },
+        "raw_output_archive": (
+            raw_output_archive.summary(args.include_sensitive)
+            if raw_output_archive is not None
+            else {"enabled": False, "record_count": 0, "records": []}
+        ),
         "events": collect_command_events(results),
         "summary": aggregate(results),
         "worst_targets": worst_targets(results),
@@ -6013,8 +6951,754 @@ def run_cases_with_checkpoint(
     return completed_results(), resumed
 
 
+def load_fixed_performance_config(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text())
+    if not isinstance(payload, dict):
+        raise ValueError("fixed performance config must be an object")
+    if payload.get("schema") != FIXED_PERFORMANCE_GATE_SCHEMA_VERSION:
+        raise ValueError(
+            "unsupported fixed performance config schema: "
+            f"{payload.get('schema')!r}"
+        )
+    runner = payload.get("runner")
+    contract = payload.get("contract")
+    gates = payload.get("gates")
+    if not isinstance(runner, dict) or not isinstance(contract, dict) or not isinstance(gates, dict):
+        raise ValueError("fixed performance config requires runner, contract, and gates objects")
+    for key in ("id", "environment_variable", "platform", "machine"):
+        if not isinstance(runner.get(key), str) or not runner[key]:
+            raise ValueError(f"fixed performance runner.{key} must be a non-empty string")
+    for key in (
+        "binary",
+        "binary_sha256",
+        "fixture_source",
+        "fixture_source_sha256",
+        "target",
+        "analysis",
+    ):
+        if not isinstance(contract.get(key), str) or not contract[key]:
+            raise ValueError(f"fixed performance contract.{key} must be a non-empty string")
+    commands = contract.get("commands")
+    if (
+        not isinstance(commands, list)
+        or not commands
+        or any(not isinstance(command, str) or command not in TARGET_COMMAND_DEFS for command in commands)
+        or len(set(commands)) != len(commands)
+    ):
+        raise ValueError("fixed performance contract.commands must be unique known commands")
+    for key in ("cold_samples", "warm_sessions", "warm_samples_per_session"):
+        value = contract.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(f"fixed performance contract.{key} must be a positive integer")
+    percentile = contract.get("percentile")
+    if percentile != 95:
+        raise ValueError("fixed performance contract.percentile must be 95")
+    latency_sample_counts = {
+        "cold": int(contract["cold_samples"]),
+        "warm": int(contract["warm_sessions"])
+        * int(contract["warm_samples_per_session"]),
+    }
+    for temperature, sample_count in latency_sample_counts.items():
+        rank = (int(percentile) * sample_count + 99) // 100
+        if sample_count < 20 or rank >= sample_count:
+            raise ValueError(
+                "fixed performance latency sampling must provide at least 20 "
+                f"{temperature} samples with a non-maximum p95 rank"
+            )
+    if contract.get("analysis") not in {"aa", "aaa", "aaaa"}:
+        raise ValueError("fixed performance contract.analysis must be aa, aaa, or aaaa")
+
+    command_gates = gates.get("commands")
+    rss_gates = gates.get("rss")
+    if not isinstance(command_gates, dict) or set(command_gates) != set(commands):
+        raise ValueError("fixed performance command gates must exactly cover contract.commands")
+
+    def validate_limit(limit: Any, context: str, value_suffix: str) -> None:
+        if not isinstance(limit, dict):
+            raise ValueError(f"{context} must be an object")
+        for key in (
+            f"reference_{value_suffix}",
+            f"release_target_{value_suffix}",
+            "max_regression_ratio",
+        ):
+            value = limit.get(key)
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or float(value) <= 0.0
+            ):
+                raise ValueError(f"{context}.{key} must be positive")
+        if float(limit["max_regression_ratio"]) < 1.0:
+            raise ValueError(f"{context}.max_regression_ratio must be at least 1.0")
+        slack_key = f"regression_jitter_slack_{value_suffix.rsplit('_', 1)[-1]}"
+        slack = limit.get(slack_key, 0)
+        if (
+            not isinstance(slack, (int, float))
+            or isinstance(slack, bool)
+            or float(slack) < 0.0
+        ):
+            raise ValueError(f"{context}.{slack_key} must be non-negative")
+
+    for command in commands:
+        command_gate = command_gates.get(command)
+        if not isinstance(command_gate, dict) or set(command_gate) != {"cold", "warm"}:
+            raise ValueError(f"fixed performance gate for {command} must cover cold and warm")
+        for temperature in ("cold", "warm"):
+            validate_limit(
+                command_gate[temperature],
+                f"fixed performance gates.commands.{command}.{temperature}",
+                "p95_s",
+            )
+    if not isinstance(rss_gates, dict) or set(rss_gates) != {"cold", "warm"}:
+        raise ValueError("fixed performance RSS gates must cover cold and warm")
+    for temperature in ("cold", "warm"):
+        validate_limit(
+            rss_gates[temperature],
+            f"fixed performance gates.rss.{temperature}",
+            "p95_bytes",
+        )
+    return payload
+
+
+def fixed_performance_percentile(values: list[float | int], percentile: int = 95) -> float | int | None:
+    if not values:
+        return None
+    if percentile < 1 or percentile > 100:
+        raise ValueError("percentile must be between 1 and 100")
+    ordered = sorted(values)
+    rank = (percentile * len(ordered) + 99) // 100
+    return ordered[rank - 1]
+
+
+def fixed_performance_paths(config: dict[str, Any]) -> tuple[Path, Path]:
+    contract = config["contract"]
+    return (
+        repo_root().joinpath(str(contract["binary"])).resolve(),
+        repo_root().joinpath(str(contract["fixture_source"])).resolve(),
+    )
+
+
+FIXED_PERFORMANCE_PROBE_ERROR_RE = re.compile(
+    r"(?:ABI mismatch|incompatible V2 engine API|V2 engine request failed|"
+    r"failed to create V2 engine session|unknown command)",
+    re.IGNORECASE,
+)
+
+
+def _fixed_performance_command_output_valid(
+    target: dict[str, Any],
+    command: str,
+    *,
+    load_probe: bool = False,
+) -> tuple[bool, str | None]:
+    commands = target.get("commands")
+    entry = commands.get(command) if isinstance(commands, dict) else None
+    if not isinstance(entry, dict):
+        return False, "command result is absent"
+    stdout = entry.get("stdout")
+    stdout_bytes = stdout.get("bytes") if isinstance(stdout, dict) else None
+    if not isinstance(stdout_bytes, int) or isinstance(stdout_bytes, bool) or stdout_bytes <= 0:
+        return False, "command output is empty"
+    if command.startswith(DECOMPILE_COMMAND_PREFIX):
+        quality = entry.get("decompile_quality")
+        if not isinstance(quality, dict):
+            return False, "decompiler output was not classified"
+        rejected_classes = {"empty"} if load_probe else {"empty", "fallback"}
+        if quality.get("classification") in rejected_classes:
+            return False, f"decompiler produced {quality.get('classification')} output"
+    elif command == "types":
+        metrics = entry.get("type_metrics")
+        if entry.get("json_kind") != "dict" or not isinstance(metrics, dict):
+            return False, "types command did not produce its typed JSON object"
+        if not isinstance(metrics.get("ret_type"), str):
+            return False, "types JSON lacks a return type"
+    elif command == "profile":
+        metrics = entry.get("profile_metrics")
+        if entry.get("json_kind") != "dict" or not isinstance(metrics, dict):
+            return False, "profile command did not produce its profile JSON object"
+        count = metrics.get("count")
+        if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+            return False, "profile JSON lacks a positive sample count"
+    return True, None
+
+
+def fixed_performance_plugin_probe(
+    config: dict[str, Any],
+    r2: str,
+    binary: Path,
+    timeout_s: int,
+    env: dict[str, str] | None,
+    runner: Runner = run_r2,
+) -> dict[str, Any]:
+    contract = config["contract"]
+    discovery = runner(
+        r2,
+        binary,
+        f"{contract['analysis']}; aflj",
+        timeout_s,
+        env,
+    )
+    reasons: list[str] = []
+    target: dict[str, Any] | None = None
+    if discovery.returncode != 0:
+        reasons.append(f"probe discovery exited with {discovery.returncode}")
+    else:
+        try:
+            payload = parse_json_payload(discovery.stdout)
+        except ValueError as exc:
+            reasons.append(f"probe discovery is invalid: {exc}")
+        else:
+            functions = []
+            if isinstance(payload, list):
+                for item in payload:
+                    if not isinstance(item, dict):
+                        continue
+                    name = item.get("name")
+                    addr = item.get("addr", item.get("offset"))
+                    if isinstance(name, str) and isinstance(addr, int):
+                        functions.append({"name": name, "addr": addr})
+            selected = choose_targets(functions, (str(contract["target"]),), 1)
+            if selected and selected[0].get("found"):
+                target = selected[0]
+            else:
+                reasons.append("probe target was not discovered")
+
+    probe_result: CmdResult | None = None
+    if target is not None:
+        addr = int(target["addr"])
+        parts = [str(contract["analysis"]), f"s 0x{addr:x}", "af"]
+        parts.extend(
+            [
+                f"?e {batched_section_start('plugin_help', 0)}",
+                "a:sla?",
+                f"?e {batched_section_end('plugin_help', 0)}",
+                f"?e {batched_section_start('plugin_status', 0)}",
+                "a:sla",
+                f"?e {batched_section_end('plugin_status', 0)}",
+            ]
+        )
+        for command in contract["commands"]:
+            parts.extend(
+                [
+                    f"?e {batched_section_start(command, 0)}",
+                    TARGET_COMMAND_DEFS[command],
+                    f"?e {batched_section_end(command, 0)}",
+                ]
+            )
+        probe_result = runner(r2, binary, "; ".join(parts), timeout_s, env)
+        sections = parse_batched_sections(probe_result.stdout)
+        help_text = sections.get(("plugin_help", 0), "")
+        status_text = sections.get(("plugin_status", 0), "")
+        if probe_result.returncode != 0:
+            reasons.append(f"plugin probe exited with {probe_result.returncode}")
+        if FIXED_PERFORMANCE_PROBE_ERROR_RE.search(probe_result.stderr):
+            reasons.append("plugin probe reported an ABI/load error")
+        if "a:sla.dec" not in help_text:
+            reasons.append("plugin help command is absent or a no-op")
+        if "sla: loaded architecture '" not in status_text:
+            reasons.append("plugin status did not load a Sleigh architecture")
+        probe_target = {"commands": {}}
+        command_probes: dict[str, dict[str, Any]] = {}
+        for command in contract["commands"]:
+            command_result = CmdResult(
+                returncode=probe_result.returncode,
+                stdout=sections.get((command, 0), ""),
+                stderr=probe_result.stderr,
+                elapsed_s=0.0,
+            )
+            probe_target["commands"][command] = command_summary(
+                command,
+                command_result,
+                False,
+            )
+            valid, reason = _fixed_performance_command_output_valid(
+                probe_target,
+                command,
+                load_probe=True,
+            )
+            command_probes[command] = {"valid": valid, "reason": reason}
+            if not valid:
+                reasons.append(f"{command} probe rejected: {reason}")
+
+    return {
+        "status": "ok" if not reasons else "failed",
+        "target": target.get("name") if isinstance(target, dict) else None,
+        "discovery_returncode": discovery.returncode,
+        "probe_returncode": probe_result.returncode if probe_result is not None else None,
+        "commands": command_probes if probe_result is not None else {},
+        "stdout": summarize_text(
+            probe_result.stdout if probe_result is not None else "",
+            include_preview=False,
+        ),
+        "stderr": summarize_text(
+            probe_result.stderr if probe_result is not None else discovery.stderr,
+            include_preview=False,
+        ),
+        "reasons": reasons,
+    }
+
+
+def fixed_performance_availability(
+    config: dict[str, Any],
+    args: argparse.Namespace,
+    environ: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    environ = environ if environ is not None else os.environ
+    runner = config["runner"]
+    expected_runner_id = str(runner["id"])
+    runner_variable = str(runner["environment_variable"])
+    actual_runner_id = str(environ.get(runner_variable, ""))
+    binary, fixture_source = fixed_performance_paths(config)
+    reasons: list[str] = []
+    if actual_runner_id != expected_runner_id:
+        reasons.append(
+            f"{runner_variable} must equal {expected_runner_id!r} on the fixed runner"
+        )
+    if sys.platform != runner["platform"]:
+        reasons.append(f"platform {sys.platform!r} does not match {runner['platform']!r}")
+    machine = os.uname().machine if hasattr(os, "uname") else "unknown"
+    if machine != runner["machine"]:
+        reasons.append(f"machine {machine!r} does not match {runner['machine']!r}")
+    if not is_executable(binary):
+        reasons.append(f"fixed benchmark binary is unavailable: {binary}")
+    elif file_sha256(binary) != config["contract"]["binary_sha256"]:
+        reasons.append("fixed benchmark binary hash does not match the reviewed contract")
+    if not fixture_source.is_file():
+        reasons.append(f"fixed benchmark source is unavailable: {fixture_source}")
+    elif file_sha256(fixture_source) != config["contract"]["fixture_source_sha256"]:
+        reasons.append("fixed benchmark source hash does not match the reviewed contract")
+    r2_path = Path(args.r2).expanduser()
+    resolved_r2 = str(r2_path.resolve()) if is_executable(r2_path) else shutil.which(args.r2)
+    if not resolved_r2:
+        reasons.append(f"radare2 executable is unavailable: {args.r2}")
+    plugin_info = plugin_fingerprint(args.plugin_dir)
+    if plugin_info.get("kind") != "artifacts":
+        reasons.append(f"plugin artifacts are unavailable: {args.plugin_dir or '<empty>'}")
+    probe: dict[str, Any] | None = None
+    if resolved_r2 and is_executable(binary) and plugin_info.get("kind") == "artifacts":
+        raw_tmpdir = str(getattr(args, "tmpdir", "") or "")
+        probe_tmpdir = Path(raw_tmpdir).resolve().joinpath("availability-probe") if raw_tmpdir else None
+        probe_env = build_r2_env(args.r2, args.plugin_dir, [], probe_tmpdir)
+        probe = fixed_performance_plugin_probe(
+            config,
+            resolved_r2,
+            binary,
+            min(30, max(1, int(getattr(args, "timeout", 30)))),
+            probe_env,
+        )
+        if probe["status"] != "ok":
+            reasons.extend(f"plugin ABI/load probe: {reason}" for reason in probe["reasons"])
+    return {
+        "status": "available" if not reasons else "unavailable",
+        "expected_runner_id": expected_runner_id,
+        "actual_runner_id": actual_runner_id or None,
+        "platform": sys.platform,
+        "machine": machine,
+        "binary": str(binary),
+        "fixture_source": str(fixture_source),
+        "r2": resolved_r2,
+        "plugin": plugin_info,
+        "plugin_probe": probe,
+        "reasons": reasons,
+    }
+
+
+def _fixed_performance_limit_checks(
+    checks: dict[str, dict[str, Any]],
+    failures: list[dict[str, Any]],
+    metric: str,
+    value: float | int,
+    limit: dict[str, Any],
+    value_suffix: str,
+) -> None:
+    release_target = float(limit[f"release_target_{value_suffix}"])
+    reference = float(limit[f"reference_{value_suffix}"])
+    max_relative = float(limit["max_regression_ratio"])
+    unit = value_suffix.rsplit("_", 1)[-1]
+    jitter_slack = float(limit.get(f"regression_jitter_slack_{unit}", 0.0))
+    relative = float(value) / reference
+    regression_max_value = reference * max_relative + jitter_slack
+    release_metric = f"{metric}.release_target"
+    regression_metric = f"{metric}.regression_vs_reference"
+    checks[release_metric] = {
+        "value": value,
+        "max": release_target,
+        "op": "<=",
+    }
+    checks[regression_metric] = {
+        "relative_value": round(relative, 6),
+        "reference": reference,
+        "max_relative": max_relative,
+        "jitter_slack": jitter_slack,
+        "effective_max_value": round(regression_max_value, 6),
+        "op": "<=",
+    }
+    if float(value) > release_target:
+        failures.append(
+            {
+                "metric": release_metric,
+                "value": value,
+                "limit": release_target,
+                "op": "<=",
+            }
+        )
+    if float(value) > regression_max_value:
+        failures.append(
+            {
+                "metric": regression_metric,
+                "value": round(relative, 6),
+                "limit": max_relative,
+                "op": "<=",
+                "jitter_slack": jitter_slack,
+            }
+        )
+
+
+def evaluate_fixed_performance_gate(
+    config: dict[str, Any],
+    measurements: dict[str, Any],
+    *,
+    availability: dict[str, Any] | None = None,
+    required: bool = False,
+) -> dict[str, Any]:
+    availability = availability or {"status": "available", "reasons": []}
+    config_hash = stable_json_hash(config)
+    if availability.get("status") != "available":
+        failure = {
+            "metric": "fixed_runner_availability",
+            "value": availability.get("status"),
+            "limit": "available",
+            "op": "==",
+            "reasons": list(availability.get("reasons") or []),
+        }
+        return {
+            "schema": FIXED_PERFORMANCE_GATE_SCHEMA_VERSION,
+            "kind": "fixed_runner_performance",
+            "config_id": config.get("id"),
+            "config_sha256": config_hash,
+            "status": "failed" if required else "skipped",
+            "required": required,
+            "availability": availability,
+            "checks": {},
+            "failures": [failure] if required else [],
+        }
+
+    contract = config["contract"]
+    gates = config["gates"]
+    commands = list(contract["commands"])
+    expected_samples = {
+        "cold": int(contract["cold_samples"]),
+        "warm": int(contract["warm_sessions"])
+        * int(contract["warm_samples_per_session"]),
+    }
+    checks: dict[str, dict[str, Any]] = {}
+    failures: list[dict[str, Any]] = []
+    invalid_samples = measurements.get("invalid_samples", [])
+    invalid_samples = invalid_samples if isinstance(invalid_samples, list) else []
+    checks["sample_admission.invalid_samples"] = {
+        "value": len(invalid_samples),
+        "max": 0,
+        "op": "<=",
+    }
+    if invalid_samples:
+        failures.append(
+            {
+                "metric": "sample_admission.invalid_samples",
+                "value": len(invalid_samples),
+                "limit": 0,
+                "op": "<=",
+            }
+        )
+    for command in commands:
+        for temperature in ("cold", "warm"):
+            samples = (
+                measurements.get("commands", {})
+                .get(command, {})
+                .get(temperature, [])
+            )
+            samples = [
+                float(value)
+                for value in samples
+                if isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and float(value) >= 0.0
+            ]
+            sample_metric = f"commands.{command}.{temperature}.samples"
+            checks[sample_metric] = {
+                "value": len(samples),
+                "min": expected_samples[temperature],
+                "op": ">=",
+            }
+            if len(samples) < expected_samples[temperature]:
+                failures.append(
+                    {
+                        "metric": sample_metric,
+                        "value": len(samples),
+                        "limit": expected_samples[temperature],
+                        "op": ">=",
+                    }
+                )
+                continue
+            p95 = fixed_performance_percentile(samples, int(contract["percentile"]))
+            assert p95 is not None
+            _fixed_performance_limit_checks(
+                checks,
+                failures,
+                f"commands.{command}.{temperature}.p95_s",
+                round(float(p95), 6),
+                gates["commands"][command][temperature],
+                "p95_s",
+            )
+
+    rss_expected = {
+        "cold": int(contract["cold_samples"]) * len(commands),
+        "warm": int(contract["warm_sessions"]),
+    }
+    for temperature in ("cold", "warm"):
+        samples = measurements.get("rss", {}).get(temperature, [])
+        samples = [
+            int(value)
+            for value in samples
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        ]
+        sample_metric = f"rss.{temperature}.samples"
+        checks[sample_metric] = {
+            "value": len(samples),
+            "min": rss_expected[temperature],
+            "op": ">=",
+        }
+        if len(samples) < rss_expected[temperature]:
+            failures.append(
+                {
+                    "metric": sample_metric,
+                    "value": len(samples),
+                    "limit": rss_expected[temperature],
+                    "op": ">=",
+                }
+            )
+            continue
+        p95 = fixed_performance_percentile(samples, int(contract["percentile"]))
+        assert p95 is not None
+        _fixed_performance_limit_checks(
+            checks,
+            failures,
+            f"rss.{temperature}.p95_bytes",
+            int(p95),
+            gates["rss"][temperature],
+            "p95_bytes",
+        )
+
+    return {
+        "schema": FIXED_PERFORMANCE_GATE_SCHEMA_VERSION,
+        "kind": "fixed_runner_performance",
+        "config_id": config.get("id"),
+        "config_sha256": config_hash,
+        "status": "ok" if not failures else "failed",
+        "required": required,
+        "availability": availability,
+        "checks": dict(sorted(checks.items())),
+        "failures": failures,
+    }
+
+
+def _fixed_performance_target(case_result: dict[str, Any], target_name: str) -> dict[str, Any] | None:
+    for target in case_result.get("targets", []):
+        if not isinstance(target, dict):
+            continue
+        if normalize_symbol(str(target.get("requested") or target.get("name") or "")) == normalize_symbol(target_name):
+            return target
+    return None
+
+
+def _record_fixed_performance_target(
+    measurements: dict[str, Any],
+    target: dict[str, Any] | None,
+    commands: tuple[str, ...],
+    temperature: str,
+) -> None:
+    if target is None:
+        measurements.setdefault("invalid_samples", []).append(
+            {"temperature": temperature, "reason": "target result is absent"}
+        )
+        return
+    command_validity = {
+        command: _fixed_performance_command_output_valid(target, command)
+        for command in commands
+    }
+    seen_commands: set[str] = set()
+    for event in target.get("command_events", []):
+        if not isinstance(event, dict) or event.get("command") not in commands:
+            continue
+        if event.get("temperature") != temperature:
+            continue
+        command = str(event["command"])
+        seen_commands.add(command)
+        if event.get("timeout") or event.get("returncode") != 0:
+            measurements.setdefault("invalid_samples", []).append(
+                {
+                    "command": command,
+                    "temperature": temperature,
+                    "repeat_idx": event.get("repeat_idx"),
+                    "reason": "command failed or timed out",
+                }
+            )
+            continue
+        valid, invalid_reason = command_validity[command]
+        if event.get("payload_valid") is False:
+            valid = False
+            invalid_reason = str(
+                event.get("payload_invalid_reason") or "command payload was rejected"
+            )
+        if not valid:
+            measurements.setdefault("invalid_samples", []).append(
+                {
+                    "command": command,
+                    "temperature": temperature,
+                    "repeat_idx": event.get("repeat_idx"),
+                    "reason": invalid_reason,
+                }
+            )
+            continue
+        if not event.get("timed") or event.get("timer") != "r2_prof":
+            measurements.setdefault("invalid_samples", []).append(
+                {
+                    "command": command,
+                    "temperature": temperature,
+                    "repeat_idx": event.get("repeat_idx"),
+                    "reason": "in-process command timing is absent",
+                }
+            )
+            continue
+        elapsed_s = event.get("elapsed_s")
+        if isinstance(elapsed_s, (int, float)) and not isinstance(elapsed_s, bool):
+            measurements["commands"][command][temperature].append(
+                round(float(elapsed_s), 6)
+            )
+        if temperature == "cold":
+            rss = event.get("child_max_rss_bytes")
+            if isinstance(rss, int) and not isinstance(rss, bool) and rss >= 0:
+                measurements["rss"]["cold"].append(rss)
+    for command in commands:
+        if command not in seen_commands:
+            measurements.setdefault("invalid_samples", []).append(
+                {
+                    "command": command,
+                    "temperature": temperature,
+                    "reason": "expected command event is absent",
+                }
+            )
+    if temperature == "warm":
+        batch_event = target.get("batch_event")
+        rss = batch_event.get("child_max_rss_bytes") if isinstance(batch_event, dict) else None
+        if isinstance(rss, int) and not isinstance(rss, bool) and rss >= 0:
+            measurements["rss"]["warm"].append(rss)
+
+
+def run_fixed_performance_gate(args: argparse.Namespace) -> int:
+    config_path = Path(args.fixed_performance_gate)
+    try:
+        config = load_fixed_performance_config(config_path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"error: invalid fixed performance config: {exc}", file=sys.stderr)
+        return 2
+    availability = fixed_performance_availability(config, args)
+    measurements = {
+        "commands": {
+            command: {"cold": [], "warm": []}
+            for command in config["contract"]["commands"]
+        },
+        "rss": {"cold": [], "warm": []},
+        "invalid_samples": [],
+    }
+    started = time.perf_counter()
+    if availability["status"] == "available":
+        contract = config["contract"]
+        commands = tuple(contract["commands"])
+        binary, _fixture_source = fixed_performance_paths(config)
+        case = BinaryCase(
+            name=str(config.get("id") or "fixed-performance"),
+            path=binary,
+            corpus="fixed-performance",
+            analysis=str(contract["analysis"]),
+            targets=(str(contract["target"]),),
+            max_functions=1,
+        )
+        tmpdir = Path(args.tmpdir).resolve() if args.tmpdir else None
+        env = build_r2_env(args.r2, args.plugin_dir, [], tmpdir)
+        cold_result = run_case(
+            args.r2,
+            case,
+            args.timeout,
+            int(contract["cold_samples"]),
+            False,
+            env,
+            tmpdir.joinpath("cold") if tmpdir is not None else None,
+            1,
+            run_r2,
+            True,
+            0,
+            commands,
+        )
+        _record_fixed_performance_target(
+            measurements,
+            _fixed_performance_target(cold_result, str(contract["target"])),
+            commands,
+            "cold",
+        )
+        for session_idx in range(int(contract["warm_sessions"])):
+            session_tmpdir = (
+                tmpdir.joinpath(f"warm-{session_idx}") if tmpdir is not None else None
+            )
+            warm_result = run_case(
+                args.r2,
+                case,
+                args.timeout,
+                int(contract["warm_samples_per_session"]) + 1,
+                False,
+                env,
+                session_tmpdir,
+                1,
+                run_r2,
+                False,
+                0,
+                commands,
+            )
+            _record_fixed_performance_target(
+                measurements,
+                _fixed_performance_target(warm_result, str(contract["target"])),
+                commands,
+                "warm",
+            )
+    gate = evaluate_fixed_performance_gate(
+        config,
+        measurements,
+        availability=availability,
+        required=bool(args.require_fixed_performance),
+    )
+    report = {
+        **gate,
+        "elapsed_s": round(time.perf_counter() - started, 6),
+        "config_path": str(config_path),
+        "contract": config["contract"],
+        "baseline": config.get("baseline"),
+        "measurements": measurements,
+        "separation": {
+            "correctness_gate": "not evaluated; run source-gold independently",
+            "performance_gate": "fixed runner latency/RSS only",
+        },
+    }
+    write_report(Path(args.out), report)
+    print(
+        f"fixed performance gate {report['status']}; "
+        f"config={report['config_id']} wrote {args.out}"
+    )
+    return 1 if report["status"] == "failed" else 0
+
+
 def main() -> int:
     args = parse_args()
+    if args.fixed_performance_gate:
+        return run_fixed_performance_gate(args)
     if args.compare:
         before = load_report(Path(args.compare[0]))
         after = load_report(Path(args.compare[1]))
@@ -6049,6 +7733,15 @@ def main() -> int:
     case_keys = [case_cache_key(case, run_config_hash) for case in cases]
     out_path = Path(args.out)
     resume_cases = load_resume_cases(out_path, run_config_hash) if args.resume else {}
+    try:
+        raw_output_archive = (
+            RawOutputArchive(Path(args.raw_output_dir), load_existing=bool(args.resume))
+            if args.raw_output_dir
+            else None
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"error: invalid raw output archive: {exc}", file=sys.stderr)
+        return 2
 
     def run_selected_case(
         case: BinaryCase,
@@ -6069,6 +7762,7 @@ def main() -> int:
             command_names,
             cached_case,
             gold_manifest,
+            raw_output_archive,
         )
 
     def write_checkpoint(partial_results: list[dict[str, Any]], resumed_cases: int) -> None:
@@ -6084,6 +7778,7 @@ def main() -> int:
             plugin_info=plugin_info,
             benchmark_config=benchmark_config,
             command_names=command_names,
+            raw_output_archive=raw_output_archive,
         )
         write_report(out_path, report)
 
@@ -6109,6 +7804,7 @@ def main() -> int:
         plugin_info=plugin_info,
         benchmark_config=benchmark_config,
         command_names=command_names,
+        raw_output_archive=raw_output_archive,
     )
     strict_gate = strict_quality_gate(args, report)
     report["strict_quality_gate"] = strict_gate

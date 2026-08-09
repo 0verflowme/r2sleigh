@@ -5,15 +5,25 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use r2il::SpaceId;
 use serde::{Deserialize, Serialize};
 
 use crate::address::{AddressProvenanceFacts, collect_address_provenance};
 use crate::assumption::{AssumptionSet, AssumptionSubject, AssumptionUsageReport, AssumptionValue};
 use crate::cfg::BlockTerminator;
+use crate::conditional_return::{
+    ConditionalReturnFunnelFact, collect_conditional_return_funnel_facts,
+};
 use crate::function::{DecompilePrepFacts, SSAFunction, StackAddressBase, StackAddressRoot};
 use crate::graph::{InstId, InstPayload, SsaGraph, ValueId};
+use crate::machine_context::{
+    SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION, SOURCE_TYPE_GRAPH_SCHEMA_VERSION, SourceCallResult,
+    SourceCallSiteIdentity, SourceCarrierKind, SourceFunctionReturn, SourceLogicalValue,
+    SourceMachineContext, SourceTypeKind,
+};
+use crate::obligation::SemanticObligationInventory;
 use crate::op::SSAOp;
-use crate::var::SSAVar;
+use crate::var::{CanonicalStorageId, CanonicalStorageSpace, SSAVar};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ObjectId(pub u32);
@@ -293,6 +303,9 @@ pub enum CallMemoryEffect {
 pub struct CallSiteFact {
     pub id: CallSiteId,
     pub at: InstId,
+    /// Exact raw lifted identity when this fact belongs to an artifact-backed
+    /// source machine context. Synthetic/context-free facts leave it absent.
+    pub raw_identity: Option<SourceCallSiteIdentity>,
     pub target: ValueId,
     pub direct_target: Option<u64>,
     pub fallthrough: Option<u64>,
@@ -303,6 +316,114 @@ pub struct CallSiteFact {
 pub struct CallSiteFacts {
     pub by_id: BTreeMap<CallSiteId, CallSiteFact>,
     pub by_inst: BTreeMap<InstId, CallSiteId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum CallBoundarySlot {
+    Register {
+        index: u32,
+        storage: crate::CanonicalStorageId,
+    },
+    Stack(i64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CallBoundaryValueFact {
+    pub slot: CallBoundarySlot,
+    pub value: ValueId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceCallBoundaryFact {
+    pub call_site: CallSiteId,
+    pub at: InstId,
+    pub calling_convention: Option<String>,
+    pub variadic: Option<bool>,
+    pub noreturn: Option<bool>,
+    pub result_kind: Option<SourceCallResult>,
+    pub arguments: Vec<CallBoundaryValueFact>,
+    pub results: Vec<CallBoundaryValueFact>,
+    /// False until an ABI-aware boundary pass proves that every slot is known.
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceReturnBoundaryFact {
+    pub at: InstId,
+    pub values: Vec<CallBoundaryValueFact>,
+    /// Exact register values that require ordered contained-slice writes to
+    /// reconstruct. These are deliberately not also exposed through `values`:
+    /// a single stale full-width definition is not the value at the boundary.
+    pub register_compositions: Vec<SourceReturnRegisterCompositionFact>,
+    /// False when the current source facts cannot distinguish void from an
+    /// unresolved return carrier.
+    pub complete: bool,
+}
+
+/// Schema for exact ABI return-register compositions.
+pub const SOURCE_RETURN_REGISTER_COMPOSITION_SCHEMA_VERSION: u32 = 1;
+
+/// One canonical register definition retained by a return composition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceReturnRegisterDefinitionFact {
+    pub storage: CanonicalStorageId,
+    pub value: ValueId,
+    pub producer: InstId,
+}
+
+/// One ordered contained-slice write over a full-width return-register base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceReturnRegisterOverlayFact {
+    pub definition: SourceReturnRegisterDefinitionFact,
+    /// Physical byte offset from the start of the ABI return storage.
+    pub offset_bytes: u32,
+}
+
+/// Exact boundary value reconstructed from a full-width base and every later
+/// overlapping register write, in source order.
+///
+/// The base supplies every bit not replaced by an overlay. Validation binds
+/// each canonical storage/value/producer identity back to the source graph and
+/// rejects missing, reordered, intervening, or non-contained overlaps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceReturnRegisterCompositionFact {
+    pub schema_version: u32,
+    pub slot: CallBoundarySlot,
+    pub base: SourceReturnRegisterDefinitionFact,
+    pub overlays: Vec<SourceReturnRegisterOverlayFact>,
+}
+
+impl SourceReturnRegisterCompositionFact {
+    /// Canonical definitions in the exact order needed for reconstruction.
+    pub fn ordered_definitions(&self) -> impl Iterator<Item = &SourceReturnRegisterDefinitionFact> {
+        std::iter::once(&self.base).chain(self.overlays.iter().map(|overlay| &overlay.definition))
+    }
+
+    /// Validate this composition against the exact prepared source artifact.
+    pub fn validate(
+        &self,
+        function: &SSAFunction,
+        graph: &SsaGraph,
+        machine_context: &SourceMachineContext,
+        boundary_at: InstId,
+    ) -> bool {
+        validate_return_register_composition(self, function, graph, machine_context, boundary_at)
+    }
+}
+
+/// One exact full-width entry ABI carrier used by the canonical graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceFormalParameterFact {
+    pub index: u32,
+    pub storage: CanonicalStorageId,
+    pub value: ValueId,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SourceBoundaryFacts {
+    pub parameters: BTreeMap<u32, SourceFormalParameterFact>,
+    pub calls: BTreeMap<CallSiteId, SourceCallBoundaryFact>,
+    pub returns: BTreeMap<InstId, SourceReturnBoundaryFact>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -443,6 +564,192 @@ pub struct StructuredLoopFact {
     pub bound: Option<ValueId>,
 }
 
+/// Exact SSA identity map for the first admitted stateful counted loop.
+///
+/// This is deliberately narrower than [`StructuredLoopFact`]. It recognizes
+/// only one closed four-block function whose sole mutable carrier is initialized
+/// to zero, compared unsigned against one bound, incremented by one on the sole
+/// latch, and returned on the unique exit. The fact is evidence about retained
+/// SSA identities; it is not final C-rendering permission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanonicalCountedLoopFact {
+    pub loop_id: LoopId,
+    pub preheader: u64,
+    pub header: u64,
+    pub latch: u64,
+    pub exit: u64,
+    pub predicate: PredicateId,
+    pub carrier_storage: CanonicalStorageId,
+    pub width: u32,
+    pub initializer: ValueId,
+    pub initializer_inst: InstId,
+    pub phi: ValueId,
+    pub phi_inst: InstId,
+    pub bound: ValueId,
+    pub condition: ValueId,
+    pub condition_inst: InstId,
+    pub update: ValueId,
+    pub update_inst: InstId,
+}
+
+pub const CANONICAL_FNV_FOLD_LOOP_FACT_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanonicalFnvFoldTopologyFact {
+    pub entry: u64,
+    pub setup: u64,
+    pub header_latch: u64,
+    pub exit: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalFnvFoldAbiFact {
+    pub revision_identity: Box<[u8]>,
+    pub pointer_parameter: SourceFormalParameterFact,
+    pub remaining_parameter: SourceFormalParameterFact,
+    pub return_storage: CanonicalStorageId,
+    pub pointer_logical: SourceLogicalValue,
+    pub remaining_logical: SourceLogicalValue,
+    pub return_logical: SourceLogicalValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalFnvFoldCarrierFact {
+    pub storage: CanonicalStorageId,
+    pub width: u32,
+    pub phi: ValueId,
+    pub phi_inst: InstId,
+    pub entry: ValueId,
+    pub update: ValueId,
+    pub update_inst: InstId,
+    /// Exact producer support consumed by the carrier transition in addition
+    /// to `update_inst` (identity copies and constructed constant operands).
+    pub update_support_insts: Box<[InstId]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalFnvFoldPointerFact {
+    pub carrier: CanonicalFnvFoldCarrierFact,
+    pub entry_copy_inst: InstId,
+    pub load_address: ValueId,
+    pub load_address_copy_inst: InstId,
+    /// The object model may conservatively call an evolving phi unknown. This
+    /// exact parameter binding is proven from the carrier recurrence instead.
+    pub buffer_parameter_index: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalFnvFoldHashFact {
+    pub carrier: CanonicalFnvFoldCarrierFact,
+    pub offset_basis: u64,
+    pub initializer_inst: InstId,
+    pub initializer_witness_insts: Box<[InstId]>,
+    pub exit_phi: ValueId,
+    pub exit_phi_inst: InstId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanonicalFnvFoldByteLoadFact {
+    pub access: StructuredAccessId,
+    pub memory_space: SpaceId,
+    pub memory_object: ObjectId,
+    pub memory_version: MemoryVersion,
+    pub load_inst: InstId,
+    pub raw_byte: ValueId,
+    pub byte64: ValueId,
+    pub byte64_zext_inst: InstId,
+    pub byte32_for_range: ValueId,
+    pub byte32_for_lower: ValueId,
+    pub byte32_original: ValueId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CanonicalFnvFoldUnsignedLessWitness {
+    Direct {
+        compare_inst: InstId,
+        condition_copies: Box<[InstId]>,
+    },
+    NegatedReverseLessEqual {
+        compare_inst: InstId,
+        comparison_copies: Box<[InstId]>,
+        not_inst: InstId,
+        condition_copies: Box<[InstId]>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalFnvFoldAsciiFact {
+    pub range: ValueId,
+    pub range_inst: InstId,
+    pub lowercase: ValueId,
+    pub lowercase_inst: InstId,
+    pub uppercase: ValueId,
+    pub predicate_witness: CanonicalFnvFoldUnsignedLessWitness,
+    pub selected: ValueId,
+    pub select_inst: InstId,
+    pub true_identity_insts: Box<[InstId]>,
+    pub false_identity_insts: Box<[InstId]>,
+    pub lowercase_on_true: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalFnvFoldRecurrenceFact {
+    pub selected64: ValueId,
+    pub selected64_zext_inst: InstId,
+    pub xor: ValueId,
+    pub xor_inst: InstId,
+    pub prime: ValueId,
+    pub prime_inst: InstId,
+    pub prime_witness_insts: Box<[InstId]>,
+    pub product: ValueId,
+    pub multiply_inst: InstId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanonicalFnvFoldGuardFact {
+    pub predicate: PredicateId,
+    pub condition: ValueId,
+    pub condition_inst: InstId,
+    pub branch_inst: InstId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanonicalFnvFoldReturnFact {
+    pub return_inst: InstId,
+    pub value: ValueId,
+}
+
+/// Exact, name-independent identities for the admitted four-block FNV fold.
+/// This remains source evidence only; downstream certification must still join
+/// every source obligation before it can authorize rendered C.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalFnvFoldLoopFact {
+    pub schema_version: u32,
+    pub loop_id: LoopId,
+    pub topology: CanonicalFnvFoldTopologyFact,
+    pub abi: CanonicalFnvFoldAbiFact,
+    pub pointer: CanonicalFnvFoldPointerFact,
+    pub remaining: CanonicalFnvFoldCarrierFact,
+    pub hash: CanonicalFnvFoldHashFact,
+    pub byte_load: CanonicalFnvFoldByteLoadFact,
+    pub ascii: CanonicalFnvFoldAsciiFact,
+    pub recurrence: CanonicalFnvFoldRecurrenceFact,
+    pub zero_guard: CanonicalFnvFoldGuardFact,
+    pub latch: CanonicalFnvFoldGuardFact,
+    pub returned: CanonicalFnvFoldReturnFact,
+}
+
+impl CanonicalFnvFoldLoopFact {
+    pub fn validate_against(&self, artifact: &crate::function::SsaArtifact) -> bool {
+        self.schema_version == CANONICAL_FNV_FOLD_LOOP_FACT_SCHEMA_VERSION
+            && artifact
+                .structured()
+                .canonical_fnv_fold_loops
+                .get(&self.topology.header_latch)
+                == Some(self)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct StructuredAccessId {
     pub inst: InstId,
@@ -459,6 +766,8 @@ pub struct StructuredMemoryAccessFact {
     pub value: Option<ValueId>,
     pub is_write: bool,
     pub width: u32,
+    /// True only when exactly one memory-SSA fact annotates this raw subeffect.
+    pub provenance_complete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -668,8 +977,30 @@ pub struct PreparedFunctionCertificates {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StructuredDataflowFacts {
     pub loops: BTreeMap<LoopId, StructuredLoopFact>,
+    /// Closed canonical unsigned counted loops keyed by their header address.
+    pub canonical_counted_loops: BTreeMap<u64, CanonicalCountedLoopFact>,
+    /// Closed four-block ASCII-folding FNV loops keyed by their self-loop block.
+    pub canonical_fnv_fold_loops: BTreeMap<u64, CanonicalFnvFoldLoopFact>,
+    /// Exact ARM64 O0 stack-backed FNV functions keyed by their loop header.
+    pub canonical_fnv_fold_o0: BTreeMap<u64, crate::CanonicalFnvFoldO0Fact>,
+    /// Exact one-block x86-64 branchless integer guards keyed by entry address.
+    pub branchless_guards: BTreeMap<u64, crate::BranchlessGuardFact>,
+    /// Exact one-block x86-64 struct-array updates keyed by entry address.
+    pub struct_array_indexes: BTreeMap<u64, crate::StructArrayIndexFact>,
+    /// Exact x86-64 stack-backed scalar array sums keyed by entry address.
+    pub sum_arrays: BTreeMap<u64, crate::SumArrayFact>,
+    /// Exact x86-64 vectorized array sums keyed by entry address.
+    pub sum_array_o2: BTreeMap<u64, crate::SumArrayO2Fact>,
+    /// Exact x86-64 O0 six-block nested wrap32 guards keyed by entry address.
+    pub nested_wrap32_guard_o0: BTreeMap<u64, crate::NestedWrap32GuardO0Fact>,
+    /// Fail-closed explanations for pinned shapes that lack source provenance.
+    pub sum_array_refusals: BTreeMap<u64, crate::SumArrayRefusalFact>,
+    /// Cyclic CFG blocks not represented by a structured loop fact.
+    pub unstructured_cycle_blocks: BTreeSet<u64>,
     pub memory_accesses: BTreeMap<StructuredAccessId, StructuredMemoryAccessFact>,
     pub recursive_calls: BTreeMap<CallSiteId, StructuredRecursiveCallFact>,
+    /// Exact whole-function two-arm funnels keyed by their branch predicate.
+    pub conditional_return_funnels: BTreeMap<PredicateId, ConditionalReturnFunnelFact>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -699,16 +1030,18 @@ pub struct PreparedAssumptionBinding {
     pub binding: PreparedAssumptionBindingKind,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedFunctionFacts {
     pub addresses: AddressProvenanceFacts,
     pub objects: ObjectModel,
     pub memory: MemorySSAFacts,
     pub predicates: PredicateFacts,
     pub call_sites: CallSiteFacts,
+    pub boundaries: SourceBoundaryFacts,
     pub structured: StructuredDataflowFacts,
     pub control_domains: ControlDomainFacts,
     pub certificates: PreparedFunctionCertificates,
+    pub obligations: SemanticObligationInventory,
     pub assumptions: AssumptionSet,
     pub applied_assumption_bindings: Vec<PreparedAssumptionBinding>,
     pub assumption_usage: AssumptionUsageReport,
@@ -716,7 +1049,7 @@ pub struct PreparedFunctionFacts {
 
 impl PreparedFunctionFacts {
     pub fn collect(function: &SSAFunction, graph: &SsaGraph) -> Self {
-        Self::collect_with_assumptions(function, graph, &AssumptionSet::default())
+        Self::collect_inner(function, graph, &AssumptionSet::default(), None)
     }
 
     pub fn collect_with_assumptions(
@@ -724,23 +1057,53 @@ impl PreparedFunctionFacts {
         graph: &SsaGraph,
         assumptions: &AssumptionSet,
     ) -> Self {
-        let addresses = collect_address_provenance(function, graph);
-        let call_sites = collect_call_sites(function, graph, function.decompile_prep_facts());
+        Self::collect_inner(function, graph, assumptions, None)
+    }
+
+    pub(crate) fn collect_with_context(
+        function: &SSAFunction,
+        graph: &SsaGraph,
+        assumptions: &AssumptionSet,
+        machine_context: &SourceMachineContext,
+    ) -> Self {
+        Self::collect_inner(function, graph, assumptions, Some(machine_context))
+    }
+
+    fn collect_inner(
+        function: &SSAFunction,
+        graph: &SsaGraph,
+        assumptions: &AssumptionSet,
+        machine_context: Option<&SourceMachineContext>,
+    ) -> Self {
+        let addresses = collect_address_provenance(function, graph, machine_context);
+        let call_sites = collect_call_sites(
+            function,
+            graph,
+            function.decompile_prep_facts(),
+            machine_context,
+        );
         let (objects, memory) =
             collect_object_and_memory_facts(function, graph, &addresses, &call_sites);
         let predicates = apply_assumptions_to_predicate_facts(
             collect_predicate_facts(function, graph),
             assumptions,
         );
+        let boundaries =
+            collect_source_boundary_facts(function, graph, &call_sites, machine_context);
         let structured = collect_structured_dataflow_facts(
             function,
             graph,
-            &objects,
-            &memory,
-            &predicates,
-            &call_sites,
+            StructuredCollectionInputs {
+                objects: &objects,
+                memory: &memory,
+                predicates: &predicates,
+                call_sites: &call_sites,
+                boundaries: &boundaries,
+                machine_context,
+            },
         );
         let control_domains = collect_control_domain_facts(function, &predicates, &structured);
+        let obligations = SemanticObligationInventory::collect(graph, &structured, &boundaries);
         let certificates = collect_prepared_function_certificates(
             function,
             graph,
@@ -758,9 +1121,11 @@ impl PreparedFunctionFacts {
             memory,
             predicates,
             call_sites,
+            boundaries,
             structured,
             control_domains,
             certificates,
+            obligations,
             assumptions: assumptions.clone(),
             applied_assumption_bindings,
             assumption_usage,
@@ -1438,7 +1803,7 @@ fn build_memory_ssa(
     }
 }
 
-fn memory_locations_may_alias(
+pub(crate) fn memory_locations_may_alias(
     objects: &ObjectModel,
     left: &MemoryLocation,
     right: &MemoryLocation,
@@ -1600,18 +1965,717 @@ fn gcd_u128(mut left: u128, mut right: u128) -> u128 {
     left
 }
 
+struct StructuredCollectionInputs<'a> {
+    objects: &'a ObjectModel,
+    memory: &'a MemorySSAFacts,
+    predicates: &'a PredicateFacts,
+    call_sites: &'a CallSiteFacts,
+    boundaries: &'a SourceBoundaryFacts,
+    machine_context: Option<&'a SourceMachineContext>,
+}
+
 fn collect_structured_dataflow_facts(
     function: &SSAFunction,
     graph: &SsaGraph,
-    objects: &ObjectModel,
-    memory: &MemorySSAFacts,
-    predicates: &PredicateFacts,
-    call_sites: &CallSiteFacts,
+    inputs: StructuredCollectionInputs<'_>,
 ) -> StructuredDataflowFacts {
+    let loops = collect_structured_loop_facts(function, graph, inputs.predicates);
+    let canonical_counted_loops =
+        collect_canonical_counted_loop_facts(function, graph, inputs.predicates, &loops);
+    let memory_accesses =
+        collect_structured_memory_access_facts(function, graph, inputs.objects, inputs.memory);
+    let canonical_fnv_fold_loops = inputs
+        .machine_context
+        .map_or_else(BTreeMap::new, |context| {
+            collect_canonical_fnv_fold_loop_facts(
+                function,
+                graph,
+                inputs.memory,
+                inputs.predicates,
+                inputs.boundaries,
+                &loops,
+                &memory_accesses,
+                context,
+            )
+        });
+    let canonical_fnv_fold_o0 =
+        inputs
+            .machine_context
+            .map_or_else(BTreeMap::new, |machine_context| {
+                crate::canonical_fnv_o0::collect_canonical_fnv_fold_o0_facts(
+                    function,
+                    graph,
+                    inputs.objects,
+                    inputs.memory,
+                    inputs.predicates,
+                    inputs.boundaries,
+                    &loops,
+                    &memory_accesses,
+                    machine_context,
+                )
+            });
+    let branchless_guards = inputs
+        .machine_context
+        .map_or_else(BTreeMap::new, |machine_context| {
+            crate::branchless_guard::collect_branchless_guard_facts(
+                function,
+                graph,
+                inputs.boundaries,
+                machine_context,
+            )
+        });
+    let struct_array_indexes =
+        inputs
+            .machine_context
+            .map_or_else(BTreeMap::new, |machine_context| {
+                crate::struct_array_index::collect_struct_array_index_facts(
+                    function,
+                    graph,
+                    inputs.boundaries,
+                    machine_context,
+                )
+            });
+    let sum_arrays = inputs.machine_context.map_or_else(
+        || crate::sum_array::SumArrayCollection {
+            facts: BTreeMap::new(),
+            o2_facts: BTreeMap::new(),
+            refusals: BTreeMap::new(),
+        },
+        |machine_context| {
+            crate::sum_array::collect_sum_array_facts(
+                function,
+                graph,
+                inputs.boundaries,
+                machine_context,
+            )
+        },
+    );
+    let nested_wrap32_guard_o0 =
+        inputs
+            .machine_context
+            .map_or_else(BTreeMap::new, |machine_context| {
+                crate::nested_wrap32_guard_o0::collect_nested_wrap32_guard_o0_facts(
+                    function,
+                    graph,
+                    inputs.objects,
+                    inputs.memory,
+                    inputs.predicates,
+                    inputs.boundaries,
+                    &memory_accesses,
+                    machine_context,
+                )
+            });
+    let conditional_return_funnels =
+        inputs
+            .machine_context
+            .map_or_else(BTreeMap::new, |machine_context| {
+                collect_conditional_return_funnel_facts(
+                    function,
+                    graph,
+                    inputs.objects,
+                    inputs.memory,
+                    inputs.predicates,
+                    inputs.boundaries,
+                    &memory_accesses,
+                    machine_context,
+                )
+            });
     StructuredDataflowFacts {
-        loops: collect_structured_loop_facts(function, graph, predicates),
-        memory_accesses: collect_structured_memory_access_facts(function, graph, objects, memory),
-        recursive_calls: collect_structured_recursive_call_facts(function, graph, call_sites),
+        unstructured_cycle_blocks: collect_unstructured_cycle_blocks(graph, &loops),
+        loops,
+        canonical_counted_loops,
+        canonical_fnv_fold_loops,
+        canonical_fnv_fold_o0,
+        branchless_guards,
+        struct_array_indexes,
+        sum_arrays: sum_arrays.facts,
+        sum_array_o2: sum_arrays.o2_facts,
+        nested_wrap32_guard_o0,
+        sum_array_refusals: sum_arrays.refusals,
+        memory_accesses,
+        recursive_calls: collect_structured_recursive_call_facts(
+            function,
+            graph,
+            inputs.call_sites,
+        ),
+        conditional_return_funnels,
+    }
+}
+
+fn collect_source_boundary_facts(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    call_sites: &CallSiteFacts,
+    machine_context: Option<&SourceMachineContext>,
+) -> SourceBoundaryFacts {
+    let mut facts = SourceBoundaryFacts::default();
+
+    if let Some(machine_context) = machine_context
+        .filter(|context| context.abi_model().is_available() && context.abi_model().is_coherent())
+    {
+        for slot in machine_context.abi_model().argument_registers() {
+            let candidates = graph
+                .values
+                .iter()
+                .filter(|value| {
+                    graph.def_inst(value.id).is_none()
+                        && value.var.version == 0
+                        && value.var.size == slot.storage().size
+                        && value.canonical_storage == Some(slot.storage())
+                })
+                .map(|value| value.id)
+                .collect::<Vec<_>>();
+            if let [value] = candidates.as_slice() {
+                facts.parameters.insert(
+                    slot.index(),
+                    SourceFormalParameterFact {
+                        index: slot.index(),
+                        storage: slot.storage(),
+                        value: *value,
+                    },
+                );
+            }
+        }
+    }
+
+    for call_site in call_sites.by_id.values() {
+        let mut boundary = SourceCallBoundaryFact {
+            call_site: call_site.id,
+            at: call_site.at,
+            calling_convention: None,
+            variadic: None,
+            noreturn: None,
+            result_kind: None,
+            arguments: Vec::new(),
+            results: Vec::new(),
+            // Calls carry implicit machine state. Only an exact source-owned
+            // callsite interface may change this state to complete.
+            complete: false,
+        };
+        if let Some((machine_context, interface)) = machine_context
+            .and_then(|context| {
+                context
+                    .call_site_interface(call_site.id)
+                    .map(|interface| (context, interface))
+            })
+            .filter(|(_, interface)| call_site.raw_identity == Some(interface.identity()))
+        {
+            boundary.calling_convention = Some(interface.calling_convention().to_string());
+            boundary.variadic = Some(interface.is_variadic());
+            boundary.noreturn = Some(interface.is_noreturn());
+            boundary.result_kind = Some(interface.result());
+            if interface.is_complete()
+                && let Some((block_addr, op_index)) = graph.op_site_for_inst(call_site.at)
+            {
+                let arguments = interface
+                    .arguments()
+                    .iter()
+                    .filter_map(|argument| {
+                        reaching_abi_value_in_block(
+                            function,
+                            graph,
+                            machine_context,
+                            block_addr,
+                            op_index,
+                            argument.storage(),
+                        )
+                        .map(|value| CallBoundaryValueFact {
+                            slot: CallBoundarySlot::Register {
+                                index: argument.index(),
+                                storage: argument.storage(),
+                            },
+                            value,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let results = match interface.result() {
+                    SourceCallResult::Void => Some(Vec::new()),
+                    SourceCallResult::Register { storage } => call_result_value_after_call(
+                        function,
+                        graph,
+                        machine_context,
+                        block_addr,
+                        op_index,
+                        storage,
+                    )
+                    .map(|value| {
+                        vec![CallBoundaryValueFact {
+                            slot: CallBoundarySlot::Register { index: 0, storage },
+                            value,
+                        }]
+                    }),
+                };
+                if arguments.len() == interface.arguments().len()
+                    && let Some(results) = results
+                {
+                    boundary.arguments = arguments;
+                    boundary.results = results;
+                    boundary.complete = true;
+                }
+            }
+        }
+        facts.calls.insert(call_site.id, boundary);
+    }
+
+    for inst in &graph.insts {
+        if matches!(inst.payload, InstPayload::Op(SSAOp::Return { .. })) {
+            let mut values = Vec::new();
+            let mut register_compositions = Vec::new();
+            let mut complete = false;
+            if let Some(machine_context) = machine_context.filter(|context| {
+                context.abi_model().is_available() && context.abi_model().is_coherent()
+            }) {
+                let return_slots = machine_context.abi_model().return_registers();
+                match machine_context
+                    .function_interface()
+                    .map(|interface| interface.return_kind())
+                {
+                    Some(SourceFunctionReturn::Void) => complete = true,
+                    Some(SourceFunctionReturn::Register { .. }) => {
+                        if let Some((block_addr, op_index)) = graph.op_site_for_inst(inst.id) {
+                            for slot in return_slots {
+                                match reaching_abi_return_register_in_block(
+                                    function,
+                                    graph,
+                                    machine_context,
+                                    block_addr,
+                                    op_index,
+                                    slot.index(),
+                                    slot.storage(),
+                                    inst.id,
+                                ) {
+                                    Some(ReachingAbiReturnRegister::Exact(value)) => {
+                                        values.push(CallBoundaryValueFact {
+                                            slot: CallBoundarySlot::Register {
+                                                index: slot.index(),
+                                                storage: slot.storage(),
+                                            },
+                                            value,
+                                        });
+                                    }
+                                    Some(ReachingAbiReturnRegister::Composition(composition)) => {
+                                        register_compositions.push(composition);
+                                    }
+                                    None => {}
+                                }
+                            }
+                            complete = !return_slots.is_empty()
+                                && values.len().saturating_add(register_compositions.len())
+                                    == return_slots.len();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            facts.returns.insert(
+                inst.id,
+                SourceReturnBoundaryFact {
+                    at: inst.id,
+                    values,
+                    register_compositions,
+                    complete,
+                },
+            );
+        }
+    }
+    facts
+}
+
+enum ReachingAbiReturnRegister {
+    Exact(ValueId),
+    Composition(SourceReturnRegisterCompositionFact),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reaching_abi_return_register_in_block(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    machine_context: &SourceMachineContext,
+    block_addr: u64,
+    boundary_op_index: usize,
+    slot_index: u32,
+    storage: CanonicalStorageId,
+    boundary_at: InstId,
+) -> Option<ReachingAbiReturnRegister> {
+    let block = function.get_block(block_addr)?;
+    let mut reverse_overlays = Vec::new();
+
+    for (op_index, op) in block.ops.get(..boundary_op_index)?.iter().enumerate().rev() {
+        if matches!(
+            op,
+            SSAOp::Call { .. } | SSAOp::CallInd { .. } | SSAOp::Return { .. }
+        ) {
+            return None;
+        }
+        if op.dst().is_none() {
+            continue;
+        }
+        let producer = graph.inst_id_for_op_site(block_addr, op_index)?;
+        let Some(dst_storage) = graph.inst(producer).and_then(|inst| inst.canonical_storage) else {
+            continue;
+        };
+        if !register_storages_overlap(dst_storage, storage) {
+            continue;
+        }
+        let value = graph.inst(producer)?.output?;
+        let definition = SourceReturnRegisterDefinitionFact {
+            storage: dst_storage,
+            value,
+            producer,
+        };
+        if dst_storage == storage {
+            if reverse_overlays.is_empty() {
+                return Some(ReachingAbiReturnRegister::Exact(value));
+            }
+            reverse_overlays.reverse();
+            let composition = SourceReturnRegisterCompositionFact {
+                schema_version: SOURCE_RETURN_REGISTER_COMPOSITION_SCHEMA_VERSION,
+                slot: CallBoundarySlot::Register {
+                    index: slot_index,
+                    storage,
+                },
+                base: definition,
+                overlays: reverse_overlays,
+            };
+            if !composition.validate(function, graph, machine_context, boundary_at) {
+                return None;
+            }
+            return Some(ReachingAbiReturnRegister::Composition(composition));
+        }
+        let offset_bytes = contained_register_storage_offset(storage, dst_storage)?;
+        reverse_overlays.push(SourceReturnRegisterOverlayFact {
+            definition,
+            offset_bytes,
+        });
+    }
+
+    if reverse_overlays.is_empty() {
+        reaching_abi_value_in_block(
+            function,
+            graph,
+            machine_context,
+            block_addr,
+            boundary_op_index,
+            storage,
+        )
+        .map(ReachingAbiReturnRegister::Exact)
+    } else {
+        None
+    }
+}
+
+fn reaching_abi_value_in_block(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    machine_context: &SourceMachineContext,
+    block_addr: u64,
+    boundary_op_index: usize,
+    storage: CanonicalStorageId,
+) -> Option<ValueId> {
+    let mut visited = BTreeSet::new();
+    reaching_abi_value_before(
+        function,
+        graph,
+        machine_context,
+        block_addr,
+        boundary_op_index,
+        storage,
+        &mut visited,
+    )
+}
+
+fn reaching_abi_value_before(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    machine_context: &SourceMachineContext,
+    block_addr: u64,
+    boundary_op_index: usize,
+    storage: CanonicalStorageId,
+    visited: &mut BTreeSet<u64>,
+) -> Option<ValueId> {
+    if !visited.insert(block_addr) {
+        return None;
+    }
+    let block = function.get_block(block_addr)?;
+    for (op_index, op) in block.ops.get(..boundary_op_index)?.iter().enumerate().rev() {
+        if matches!(
+            op,
+            SSAOp::Call { .. } | SSAOp::CallInd { .. } | SSAOp::Return { .. }
+        ) {
+            return None;
+        }
+        if op.dst().is_none() {
+            continue;
+        }
+        let Some(producer) = graph.inst_id_for_op_site(block_addr, op_index) else {
+            continue;
+        };
+        let Some(dst_storage) = graph.inst(producer).and_then(|inst| inst.canonical_storage) else {
+            continue;
+        };
+        if !register_storages_overlap(dst_storage, storage) {
+            continue;
+        }
+        if dst_storage != storage {
+            // A later overlapping slice means an older exact-width definition
+            // is not the value at this boundary. Generic boundary recovery has
+            // no implicit register-merge semantics, so it must fail closed.
+            return None;
+        }
+        return graph.inst(producer).and_then(|inst| inst.output);
+    }
+    let phi_values = block
+        .phis
+        .iter()
+        .filter(|phi| phi.canonical_storage == Some(storage))
+        .filter_map(|phi| graph.value_id_for_var(&phi.dst))
+        .collect::<Vec<_>>();
+    if let [value] = phi_values.as_slice() {
+        return Some(*value);
+    }
+    if !phi_values.is_empty() {
+        return None;
+    }
+    let predecessors = function.predecessors(block_addr);
+    let [predecessor] = predecessors.as_slice() else {
+        return None;
+    };
+    let predecessor_block = function.get_block(*predecessor)?;
+    reaching_abi_value_before(
+        function,
+        graph,
+        machine_context,
+        *predecessor,
+        predecessor_block.ops.len(),
+        storage,
+        visited,
+    )
+}
+
+fn register_storages_overlap(left: CanonicalStorageId, right: CanonicalStorageId) -> bool {
+    if left.space != CanonicalStorageSpace::Register
+        || right.space != CanonicalStorageSpace::Register
+    {
+        return false;
+    }
+    let Some(left_end) = left.offset.checked_add(u64::from(left.size)) else {
+        return true;
+    };
+    let Some(right_end) = right.offset.checked_add(u64::from(right.size)) else {
+        return true;
+    };
+    left.offset < right_end && right.offset < left_end
+}
+
+fn contained_register_storage_offset(
+    container: CanonicalStorageId,
+    contained: CanonicalStorageId,
+) -> Option<u32> {
+    if container.space != CanonicalStorageSpace::Register
+        || contained.space != CanonicalStorageSpace::Register
+        || contained.size == 0
+        || contained.size >= container.size
+        || contained.offset < container.offset
+    {
+        return None;
+    }
+    let container_end = container.offset.checked_add(u64::from(container.size))?;
+    let contained_end = contained.offset.checked_add(u64::from(contained.size))?;
+    if contained_end > container_end {
+        return None;
+    }
+    u32::try_from(contained.offset.checked_sub(container.offset)?).ok()
+}
+
+fn canonical_register_definition(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    producer: InstId,
+) -> Option<(SourceReturnRegisterDefinitionFact, u64, usize)> {
+    let (block_addr, op_index) = graph.op_site_for_inst(producer)?;
+    let op = function.get_block(block_addr)?.ops.get(op_index)?;
+    let dst = op.dst()?;
+    let storage = graph.inst(producer)?.canonical_storage?;
+    if storage.space != CanonicalStorageSpace::Register || storage.size != dst.size {
+        return None;
+    }
+    let value = graph.inst(producer)?.output?;
+    if graph
+        .value(value)
+        .is_none_or(|graph_value| graph_value.var != *dst)
+    {
+        return None;
+    }
+    Some((
+        SourceReturnRegisterDefinitionFact {
+            storage,
+            value,
+            producer,
+        },
+        block_addr,
+        op_index,
+    ))
+}
+
+fn validate_return_register_composition(
+    composition: &SourceReturnRegisterCompositionFact,
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    machine_context: &SourceMachineContext,
+    boundary_at: InstId,
+) -> bool {
+    if composition.schema_version != SOURCE_RETURN_REGISTER_COMPOSITION_SCHEMA_VERSION
+        || composition.overlays.is_empty()
+    {
+        return false;
+    }
+    let CallBoundarySlot::Register {
+        index: return_index,
+        storage: return_storage,
+    } = composition.slot
+    else {
+        return false;
+    };
+    if return_storage.space != CanonicalStorageSpace::Register
+        || return_storage.size == 0
+        || !machine_context.abi_model().is_available()
+        || !machine_context.abi_model().is_coherent()
+        || machine_context
+            .function_interface()
+            .is_none_or(|interface| {
+                interface.return_kind()
+                    != (SourceFunctionReturn::Register {
+                        storage: return_storage,
+                    })
+            })
+        || machine_context
+            .abi_model()
+            .return_registers()
+            .iter()
+            .filter(|slot| slot.index() == return_index && slot.storage() == return_storage)
+            .count()
+            != 1
+        || machine_context.abi_model().return_registers().len() != 1
+    {
+        return false;
+    }
+    let Some((base, block_addr, base_op_index)) =
+        canonical_register_definition(function, graph, composition.base.producer)
+    else {
+        return false;
+    };
+    if base != composition.base || base.storage != return_storage {
+        return false;
+    }
+    let Some((boundary_block_addr, boundary_op_index)) = graph.op_site_for_inst(boundary_at) else {
+        return false;
+    };
+    if boundary_block_addr != block_addr
+        || base_op_index >= boundary_op_index
+        || !matches!(
+            function
+                .get_block(boundary_block_addr)
+                .and_then(|block| block.ops.get(boundary_op_index)),
+            Some(SSAOp::Return { .. })
+        )
+    {
+        return false;
+    }
+
+    let mut expected = Vec::with_capacity(composition.overlays.len().saturating_add(1));
+    expected.push(composition.base);
+    let mut previous_op_index = base_op_index;
+    for overlay in &composition.overlays {
+        let Some((definition, overlay_block_addr, op_index)) =
+            canonical_register_definition(function, graph, overlay.definition.producer)
+        else {
+            return false;
+        };
+        if definition != overlay.definition
+            || overlay_block_addr != block_addr
+            || op_index <= previous_op_index
+            || op_index >= boundary_op_index
+            || contained_register_storage_offset(return_storage, definition.storage)
+                != Some(overlay.offset_bytes)
+        {
+            return false;
+        }
+        previous_op_index = op_index;
+        expected.push(definition);
+    }
+
+    let Some(block) = function.get_block(block_addr) else {
+        return false;
+    };
+    let mut actual = Vec::new();
+    for op_index in base_op_index..boundary_op_index {
+        let Some(op) = block.ops.get(op_index) else {
+            return false;
+        };
+        if op_index != base_op_index
+            && matches!(
+                op,
+                SSAOp::Call { .. } | SSAOp::CallInd { .. } | SSAOp::Return { .. }
+            )
+        {
+            return false;
+        }
+        if op.dst().is_none() {
+            continue;
+        }
+        let Some(producer) = graph.inst_id_for_op_site(block_addr, op_index) else {
+            return false;
+        };
+        let Some(storage) = graph.inst(producer).and_then(|inst| inst.canonical_storage) else {
+            continue;
+        };
+        if !register_storages_overlap(storage, return_storage) {
+            continue;
+        }
+        let Some((definition, _, _)) = canonical_register_definition(function, graph, producer)
+        else {
+            return false;
+        };
+        actual.push(definition);
+    }
+    actual == expected
+}
+
+fn call_result_value_after_call(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    _machine_context: &SourceMachineContext,
+    block_addr: u64,
+    call_op_index: usize,
+    storage: CanonicalStorageId,
+) -> Option<ValueId> {
+    let block = function.get_block(block_addr)?;
+    let mut candidates = block
+        .ops
+        .get(call_op_index.checked_add(1)?..)?
+        .iter()
+        .enumerate()
+        .take_while(|(_, op)| matches!(op, SSAOp::CallDefine { .. }))
+        .filter_map(|(relative_index, op)| {
+            let SSAOp::CallDefine { dst } = op else {
+                return None;
+            };
+            let inst = graph.inst_id_for_op_site(
+                block_addr,
+                call_op_index
+                    .saturating_add(1)
+                    .saturating_add(relative_index),
+            )?;
+            let graph_inst = graph.inst(inst)?;
+            if dst.size != storage.size || graph_inst.canonical_storage != Some(storage) {
+                return None;
+            }
+            graph_inst.output
+        })
+        .collect::<Vec<_>>();
+    match candidates.as_mut_slice() {
+        [value] => Some(*value),
+        _ => None,
     }
 }
 
@@ -2471,6 +3535,19 @@ fn process_reaching_return_block(
     mut state: Option<ReachingReturnValue>,
 ) -> (Option<ReachingReturnValue>, BTreeMap<(u64, usize), ValueId>) {
     let mut returns_by_op = BTreeMap::new();
+    let return_phis = block
+        .phis
+        .iter()
+        .filter(|phi| is_return_value_register(&phi.dst))
+        .filter_map(|phi| {
+            reaching_return_value_for_var(graph, call_results, stack_reloads, &phi.dst)
+        })
+        .collect::<Vec<_>>();
+    match return_phis.as_slice() {
+        [return_phi] if state.is_none() => state = Some(*return_phi),
+        [] | [_] => {}
+        _ => state = None,
+    }
     for (op_idx, op) in block.ops.iter().enumerate() {
         if let SSAOp::Return { target } = op
             && is_control_return_target(target)
@@ -3366,6 +4443,1184 @@ fn collect_structured_loop_facts(
     loops
 }
 
+fn collect_canonical_counted_loop_facts(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    predicates: &PredicateFacts,
+    loops: &BTreeMap<LoopId, StructuredLoopFact>,
+) -> BTreeMap<u64, CanonicalCountedLoopFact> {
+    let mut counted = BTreeMap::new();
+    for fact in loops.values() {
+        let (
+            [latch],
+            [exit],
+            [carrier],
+            Some(predicate_id),
+            Some(phi),
+            Some(initializer),
+            Some(update),
+            Some(bound),
+        ) = (
+            fact.latches.as_slice(),
+            fact.exits.as_slice(),
+            fact.carriers.as_slice(),
+            fact.condition,
+            fact.induction_phi,
+            fact.induction_init,
+            fact.induction_update,
+            fact.bound,
+        )
+        else {
+            continue;
+        };
+        let [entry] = carrier.entries.as_slice() else {
+            continue;
+        };
+        let [transition] = carrier.updates.as_slice() else {
+            continue;
+        };
+        let preheader = entry.predecessor;
+        let body = fact.body.iter().copied().collect::<BTreeSet<_>>();
+        if fact.kind != StructuredLoopKind::Natural
+            || function.entry != preheader
+            || function.num_blocks() != 4
+            || BTreeSet::from([preheader, fact.header, *latch, *exit]).len() != 4
+            || function
+                .block_addrs()
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                != BTreeSet::from([preheader, fact.header, *latch, *exit])
+            || body != BTreeSet::from([fact.header, *latch])
+            || carrier.loop_id != fact.id
+            || carrier.header != fact.header
+            || carrier.phi != phi
+            || carrier.width == 0
+            || carrier.identity_values != BTreeSet::from([phi])
+            || entry.value != initializer
+            || transition.predecessor != *latch
+            || transition.value != update
+            || transition.identity_values != BTreeSet::from([update])
+            || !carrier.dominating_initializers.is_empty()
+        {
+            continue;
+        }
+
+        let (Some(preheader_block), Some(header_block), Some(latch_block), Some(exit_block)) = (
+            function.get_block(preheader),
+            function.get_block(fact.header),
+            function.get_block(*latch),
+            function.get_block(*exit),
+        ) else {
+            continue;
+        };
+        if !matches!(
+            preheader_block.ops.as_slice(),
+            [SSAOp::Copy { .. }, SSAOp::Branch { .. }]
+        ) || !preheader_block.phis.is_empty()
+            || !matches!(
+                header_block.ops.as_slice(),
+                [SSAOp::IntLess { .. }, SSAOp::CBranch { .. }]
+            )
+            || header_block.phis.iter().any(|header_phi| {
+                graph
+                    .value_id_for_var(&header_phi.dst)
+                    .is_none_or(|value| value != phi && !graph.use_sites(value).is_empty())
+            })
+            || !matches!(
+                latch_block.ops.as_slice(),
+                [SSAOp::IntAdd { .. }, SSAOp::Branch { .. }]
+            )
+            || !latch_block.phis.is_empty()
+            || !matches!(exit_block.ops.as_slice(), [SSAOp::Return { .. }])
+            || !exit_block.phis.is_empty()
+            || !matches!(
+                function.cfg().get_block(preheader).map(|block| &block.terminator),
+                Some(BlockTerminator::Branch { target }) if *target == fact.header
+            )
+            || !matches!(
+                function.cfg().get_block(fact.header).map(|block| &block.terminator),
+                Some(BlockTerminator::ConditionalBranch { true_target, false_target })
+                    if *true_target == *latch && *false_target == *exit
+            )
+            || !matches!(
+                function.cfg().get_block(*latch).map(|block| &block.terminator),
+                Some(BlockTerminator::Branch { target }) if *target == fact.header
+            )
+            || !matches!(
+                function
+                    .cfg()
+                    .get_block(*exit)
+                    .map(|block| &block.terminator),
+                Some(BlockTerminator::Return)
+            )
+        {
+            continue;
+        }
+
+        let Some(predicate) = predicates.predicates.get(&predicate_id) else {
+            continue;
+        };
+        let expected_comparison = CompareProvenance {
+            kind: CompareKind::Less,
+            lhs: phi,
+            rhs: bound,
+        };
+        if predicate.block_addr != fact.header
+            || predicate.condition == phi
+            || predicate.true_target != *latch
+            || predicate.false_target != *exit
+            || predicate.comparison.as_ref() != Some(&expected_comparison)
+            || predicate.evaluated_comparison.as_ref() != Some(&expected_comparison)
+            || graph.def_inst(bound).is_some()
+        {
+            continue;
+        }
+
+        let (Some(initializer_inst), Some(phi_inst), Some(condition_inst), Some(update_inst)) = (
+            graph.def_inst(initializer),
+            graph.def_inst(phi),
+            graph.def_inst(predicate.condition),
+            graph.def_inst(update),
+        ) else {
+            continue;
+        };
+        let (Some(initializer_def), Some(phi_def), Some(condition_def), Some(update_def)) = (
+            graph.inst(initializer_inst),
+            graph.inst(phi_inst),
+            graph.inst(condition_inst),
+            graph.inst(update_inst),
+        ) else {
+            continue;
+        };
+        let Some(phi_storage) = phi_def.canonical_storage else {
+            continue;
+        };
+        let phi_edges_match = match &phi_def.payload {
+            InstPayload::Phi { predecessors }
+                if predecessors.len() == 2 && phi_def.inputs.len() == 2 =>
+            {
+                predecessors
+                    .iter()
+                    .zip(&phi_def.inputs)
+                    .filter_map(|(predecessor, value)| {
+                        graph.block(*predecessor).map(|block| (block.addr, *value))
+                    })
+                    .collect::<BTreeSet<_>>()
+                    == BTreeSet::from([(preheader, initializer), (*latch, update)])
+            }
+            _ => false,
+        };
+        if !phi_edges_match
+            || phi_def.output != Some(phi)
+            || phi_storage.size != carrier.width
+            || !matches!(
+                &initializer_def.payload,
+                InstPayload::Op(SSAOp::Copy { .. })
+            )
+            || initializer_def.output != Some(initializer)
+            || initializer_def.inputs.len() != 1
+            || graph.value(initializer_def.inputs[0]).is_none_or(|value| {
+                value.var.size != carrier.width || value.var.constant_bits() != Some(0)
+            })
+            || !matches!(
+                &condition_def.payload,
+                InstPayload::Op(SSAOp::IntLess { .. })
+            )
+            || condition_def.output != Some(predicate.condition)
+            || condition_def.inputs != [phi, bound]
+            || graph
+                .value(predicate.condition)
+                .is_none_or(|value| value.var.size != 1)
+            || graph
+                .value(bound)
+                .is_none_or(|value| value.var.size != carrier.width || value.var.is_const())
+            || !matches!(&update_def.payload, InstPayload::Op(SSAOp::IntAdd { .. }))
+            || update_def.output != Some(update)
+            || update_def.inputs.len() != 2
+            || update_def.inputs[0] != phi
+            || graph.value(update_def.inputs[1]).is_none_or(|value| {
+                value.var.size != carrier.width || value.var.constant_bits() != Some(1)
+            })
+        {
+            continue;
+        }
+
+        counted.insert(
+            fact.header,
+            CanonicalCountedLoopFact {
+                loop_id: fact.id,
+                preheader,
+                header: fact.header,
+                latch: *latch,
+                exit: *exit,
+                predicate: predicate_id,
+                carrier_storage: phi_storage,
+                width: carrier.width,
+                initializer,
+                initializer_inst,
+                phi,
+                phi_inst,
+                bound,
+                condition: predicate.condition,
+                condition_inst,
+                update,
+                update_inst,
+            },
+        );
+    }
+    counted
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_canonical_fnv_fold_loop_facts(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    memory: &MemorySSAFacts,
+    predicates: &PredicateFacts,
+    boundaries: &SourceBoundaryFacts,
+    loops: &BTreeMap<LoopId, StructuredLoopFact>,
+    memory_accesses: &BTreeMap<StructuredAccessId, StructuredMemoryAccessFact>,
+    machine_context: &SourceMachineContext,
+) -> BTreeMap<u64, CanonicalFnvFoldLoopFact> {
+    let mut facts = BTreeMap::new();
+    let Some(abi) = canonical_fnv_fold_abi_fact(machine_context, boundaries) else {
+        return facts;
+    };
+    if function.num_blocks() != 4
+        || !machine_context.abi_model().is_available()
+        || !machine_context.abi_model().is_coherent()
+        || !memory.defs_by_inst.is_empty()
+        || !memory.phis_by_block.is_empty()
+        || function.blocks().flat_map(|block| &block.ops).any(|op| {
+            matches!(
+                op,
+                SSAOp::Store { .. }
+                    | SSAOp::StoreGuarded { .. }
+                    | SSAOp::StoreConditional { .. }
+                    | SSAOp::AtomicCAS { .. }
+                    | SSAOp::Call { .. }
+                    | SSAOp::CallInd { .. }
+                    | SSAOp::CallOther { .. }
+            )
+        })
+    {
+        return facts;
+    }
+
+    for loop_fact in loops.values() {
+        if let Some(fact) = collect_one_canonical_fnv_fold_loop(
+            function,
+            graph,
+            memory,
+            predicates,
+            boundaries,
+            memory_accesses,
+            machine_context,
+            loop_fact,
+            abi.clone(),
+        ) {
+            facts.insert(fact.topology.header_latch, fact);
+        }
+    }
+    facts
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_one_canonical_fnv_fold_loop(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    memory: &MemorySSAFacts,
+    predicates: &PredicateFacts,
+    boundaries: &SourceBoundaryFacts,
+    memory_accesses: &BTreeMap<StructuredAccessId, StructuredMemoryAccessFact>,
+    machine_context: &SourceMachineContext,
+    loop_fact: &StructuredLoopFact,
+    abi: CanonicalFnvFoldAbiFact,
+) -> Option<CanonicalFnvFoldLoopFact> {
+    let [latch] = loop_fact.latches.as_slice() else {
+        return None;
+    };
+    let [body] = loop_fact.body.as_slice() else {
+        return None;
+    };
+    let [exit] = loop_fact.exits.as_slice() else {
+        return None;
+    };
+    if loop_fact.kind != StructuredLoopKind::SelfLoop
+        || *latch != loop_fact.header
+        || *body != loop_fact.header
+        || loop_fact.carriers.len() != 3
+    {
+        return None;
+    }
+    let header = loop_fact.header;
+    let external_predecessors = function
+        .predecessors(header)
+        .into_iter()
+        .filter(|predecessor| *predecessor != header)
+        .collect::<Vec<_>>();
+    let [setup] = external_predecessors.as_slice() else {
+        return None;
+    };
+    let entry = function.entry;
+    if BTreeSet::from([entry, *setup, header, *exit]).len() != 4
+        || function
+            .block_addrs()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            != BTreeSet::from([entry, *setup, header, *exit])
+        || function.predecessors(*setup) != [entry]
+        || function
+            .predecessors(*exit)
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            != BTreeSet::from([entry, header])
+        || function
+            .successors(entry)
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            != BTreeSet::from([*setup, *exit])
+        || function.successors(*setup) != [header]
+        || function
+            .successors(header)
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            != BTreeSet::from([header, *exit])
+        || !function.successors(*exit).is_empty()
+        || !matches!(
+            function.cfg().get_block(entry).map(|block| &block.terminator),
+            Some(BlockTerminator::ConditionalBranch { true_target, false_target })
+                if *true_target == *exit && *false_target == *setup
+        )
+        || !matches!(
+            function.cfg().get_block(*setup).map(|block| &block.terminator),
+            Some(BlockTerminator::Fallthrough { next }) if *next == header
+        )
+        || !matches!(
+            function.cfg().get_block(header).map(|block| &block.terminator),
+            Some(BlockTerminator::ConditionalBranch { true_target, false_target })
+                if *true_target == header && *false_target == *exit
+        )
+        || !matches!(
+            function
+                .cfg()
+                .get_block(*exit)
+                .map(|block| &block.terminator),
+            Some(BlockTerminator::Return)
+        )
+    {
+        return None;
+    }
+    let mut carriers = Vec::new();
+    for carrier in &loop_fact.carriers {
+        carriers.push(canonical_fnv_fold_carrier(graph, carrier, *setup, header)?);
+    }
+    let pointer_position = carriers.iter().position(|carrier| {
+        copy_root(graph, carrier.entry)
+            .is_some_and(|(value, _)| value == abi.pointer_parameter.value)
+            && carrier_update_unit_constant_witness(graph, carrier, true).is_some()
+    })?;
+    let mut pointer_carrier = carriers.remove(pointer_position);
+    let pointer_unit_witness = carrier_update_unit_constant_witness(graph, &pointer_carrier, true)?;
+    let mut pointer_support = pointer_carrier.update_support_insts.into_vec();
+    pointer_support.extend(pointer_unit_witness);
+    pointer_support.sort_unstable();
+    pointer_support.dedup();
+    pointer_carrier.update_support_insts = pointer_support.into_boxed_slice();
+    let remaining_position = carriers.iter().position(|carrier| {
+        carrier.entry == abi.remaining_parameter.value
+            && carrier_update_unit_constant_witness(graph, carrier, false).is_some()
+    })?;
+    let mut remaining = carriers.remove(remaining_position);
+    let remaining_unit_witness = carrier_update_unit_constant_witness(graph, &remaining, false)?;
+    let mut remaining_support = remaining.update_support_insts.into_vec();
+    remaining_support.extend(remaining_unit_witness);
+    remaining_support.sort_unstable();
+    remaining_support.dedup();
+    remaining.update_support_insts = remaining_support.into_boxed_slice();
+    let [hash_carrier] = carriers.as_slice() else {
+        return None;
+    };
+    if pointer_carrier.storage == remaining.storage
+        || pointer_carrier.storage == hash_carrier.storage
+        || remaining.storage == hash_carrier.storage
+        || hash_carrier.storage != abi.return_storage
+        || hash_carrier.storage != abi.pointer_parameter.storage
+        || remaining.storage != abi.remaining_parameter.storage
+    {
+        return None;
+    }
+
+    let (pointer_entry_root, pointer_entry_copies) = copy_root(graph, pointer_carrier.entry)?;
+    let [entry_copy_inst] = pointer_entry_copies.as_slice() else {
+        return None;
+    };
+    if pointer_entry_root != abi.pointer_parameter.value {
+        return None;
+    }
+
+    let (initializer_value, initializer_witness) =
+        evaluate_exact_constant(graph, hash_carrier.entry, 64)?;
+    if initializer_value != 0x14650fb0739d0383 {
+        return None;
+    }
+    let initializer_inst = graph.def_inst(hash_carrier.entry)?;
+    let (hash_update_root, _) = copy_root(graph, hash_carrier.update)?;
+    let hash_update_def = graph.inst(graph.def_inst(hash_update_root)?)?;
+    let InstPayload::Op(SSAOp::IntMult { .. }) = &hash_update_def.payload else {
+        return None;
+    };
+    let [multiply_left, multiply_right] = hash_update_def.inputs.as_slice() else {
+        return None;
+    };
+    let (xor, prime) = match (
+        value_is_int_xor(graph, *multiply_left),
+        value_is_int_xor(graph, *multiply_right),
+    ) {
+        (true, false) => (*multiply_left, *multiply_right),
+        (false, true) => (*multiply_right, *multiply_left),
+        _ => return None,
+    };
+    let (prime_value, prime_witness) = evaluate_exact_constant(graph, prime, 64)?;
+    if prime_value != 0x100000001b3 {
+        return None;
+    }
+    let prime_inst = graph.def_inst(prime)?;
+    let xor_def = graph.inst(graph.def_inst(xor)?)?;
+    let InstPayload::Op(SSAOp::IntXor { .. }) = &xor_def.payload else {
+        return None;
+    };
+    let [xor_left, xor_right] = xor_def.inputs.as_slice() else {
+        return None;
+    };
+    let selected64 = if *xor_left == hash_carrier.phi {
+        *xor_right
+    } else if *xor_right == hash_carrier.phi {
+        *xor_left
+    } else {
+        return None;
+    };
+    let selected64_def = graph.inst(graph.def_inst(selected64)?)?;
+    let InstPayload::Op(SSAOp::IntZExt { .. }) = &selected64_def.payload else {
+        return None;
+    };
+    let [selected] = selected64_def.inputs.as_slice() else {
+        return None;
+    };
+    if value_width(graph, selected64) != Some(64) || value_width(graph, *selected) != Some(32) {
+        return None;
+    }
+
+    let select_def = graph.inst(graph.def_inst(*selected)?)?;
+    let InstPayload::Op(SSAOp::Select { .. }) = &select_def.payload else {
+        return None;
+    };
+    let [uppercase, true_arm, false_arm] = select_def.inputs.as_slice() else {
+        return None;
+    };
+    let (true_root, true_copies) = copy_root(graph, *true_arm)?;
+    let (false_root, false_copies) = copy_root(graph, *false_arm)?;
+    let (lowercase, original, lowercase_on_true) = if value_is_or_32(graph, true_root, 0x20) {
+        (true_root, false_root, true)
+    } else if value_is_or_32(graph, false_root, 0x20) {
+        (false_root, true_root, false)
+    } else {
+        return None;
+    };
+    if !lowercase_on_true {
+        return None;
+    }
+    let lowercase_def = graph.inst(graph.def_inst(lowercase)?)?;
+    let [lower_left, lower_right] = lowercase_def.inputs.as_slice() else {
+        return None;
+    };
+    let byte32_for_lower = if constant_is(graph, *lower_left, 32, 0x20) {
+        *lower_right
+    } else if constant_is(graph, *lower_right, 32, 0x20) {
+        *lower_left
+    } else {
+        return None;
+    };
+    let byte64_from_lower = low_subpiece_source(graph, byte32_for_lower)?;
+    let byte64_from_original = low_subpiece_source(graph, original)?;
+    if byte64_from_lower != byte64_from_original {
+        return None;
+    }
+
+    let (range, predicate_witness) = canonical_unsigned_range_predicate(graph, *uppercase, 0x1a)?;
+    let range_def = graph.inst(graph.def_inst(range)?)?;
+    let InstPayload::Op(SSAOp::IntSub { .. }) = &range_def.payload else {
+        return None;
+    };
+    let [range_left, range_right] = range_def.inputs.as_slice() else {
+        return None;
+    };
+    if !constant_is(graph, *range_right, 32, 0x41) {
+        return None;
+    }
+    let byte32_for_range = *range_left;
+    let byte64 = low_subpiece_source(graph, byte32_for_range)?;
+    if byte64 != byte64_from_lower || value_width(graph, byte64) != Some(64) {
+        return None;
+    }
+    let byte64_def = graph.inst(graph.def_inst(byte64)?)?;
+    let InstPayload::Op(SSAOp::IntZExt { .. }) = &byte64_def.payload else {
+        return None;
+    };
+    let [raw_byte] = byte64_def.inputs.as_slice() else {
+        return None;
+    };
+    if value_width(graph, *raw_byte) != Some(8) {
+        return None;
+    }
+    let load_def = graph.inst(graph.def_inst(*raw_byte)?)?;
+    let InstPayload::Op(SSAOp::Load { .. }) = &load_def.payload else {
+        return None;
+    };
+    let [load_address] = load_def.inputs.as_slice() else {
+        return None;
+    };
+    let (load_address_root, load_address_copies) = copy_root(graph, *load_address)?;
+    let [load_address_copy_inst] = load_address_copies.as_slice() else {
+        return None;
+    };
+    if load_address_root != pointer_carrier.phi {
+        return None;
+    }
+    let all_memory_accesses = memory_accesses.values().collect::<Vec<_>>();
+    let [access] = all_memory_accesses.as_slice() else {
+        return None;
+    };
+    let [memory_use] = memory.uses_by_inst.get(&load_def.id)?.as_slice() else {
+        return None;
+    };
+    if access.id.inst != load_def.id
+        || access.id.ordinal != 0
+        || access.block_addr != header
+        || access.address != *load_address
+        || access.value != Some(*raw_byte)
+        || access.is_write
+        || access.width != 1
+        || !access.provenance_complete
+        || memory_use.location.object != access.object
+        || memory_use.location.size != 1
+        || memory_use.version.object != access.object
+    {
+        return None;
+    }
+    let memory_space = machine_context.memory_space_at(access.block_addr, access.op_index)?;
+    let memory_model = machine_context.memory_model();
+    if !memory_model.is_available()
+        || !memory_model.is_coherent()
+        || memory_model
+            .space(memory_space)
+            .is_none_or(|space| space.address_bits() != 64 || space.word_size_bytes() != 1)
+    {
+        return None;
+    }
+
+    let zero_guard = canonical_fnv_guard(
+        graph,
+        predicates,
+        entry,
+        abi.remaining_parameter.value,
+        true,
+        *exit,
+        *setup,
+    )?;
+    let latch = canonical_fnv_guard(
+        graph,
+        predicates,
+        header,
+        remaining.update,
+        false,
+        header,
+        *exit,
+    )?;
+    if loop_fact.condition != Some(latch.predicate) {
+        return None;
+    }
+
+    let (returned, exit_phi_inst) = canonical_fnv_return(
+        function,
+        graph,
+        boundaries,
+        entry,
+        header,
+        *exit,
+        abi.return_storage,
+        hash_carrier.entry,
+        hash_carrier.update,
+    )?;
+    let source_hash_carrier = loop_fact
+        .carriers
+        .iter()
+        .find(|carrier| carrier.phi == hash_carrier.phi)?;
+    if source_hash_carrier.identity_values != BTreeSet::from([hash_carrier.phi, returned.value])
+        || source_hash_carrier.dominating_initializers
+            != [LoopCarrierEdgeValue {
+                predecessor: entry,
+                value: hash_carrier.entry,
+            }]
+    {
+        return None;
+    }
+
+    Some(CanonicalFnvFoldLoopFact {
+        schema_version: CANONICAL_FNV_FOLD_LOOP_FACT_SCHEMA_VERSION,
+        loop_id: loop_fact.id,
+        topology: CanonicalFnvFoldTopologyFact {
+            entry,
+            setup: *setup,
+            header_latch: header,
+            exit: *exit,
+        },
+        abi,
+        pointer: CanonicalFnvFoldPointerFact {
+            carrier: pointer_carrier,
+            entry_copy_inst: *entry_copy_inst,
+            load_address: *load_address,
+            load_address_copy_inst: *load_address_copy_inst,
+            buffer_parameter_index: 0,
+        },
+        remaining,
+        hash: CanonicalFnvFoldHashFact {
+            carrier: hash_carrier.clone(),
+            offset_basis: initializer_value,
+            initializer_inst,
+            initializer_witness_insts: initializer_witness.into_boxed_slice(),
+            exit_phi: returned.value,
+            exit_phi_inst,
+        },
+        byte_load: CanonicalFnvFoldByteLoadFact {
+            access: access.id,
+            memory_space,
+            memory_object: access.object,
+            memory_version: memory_use.version,
+            load_inst: load_def.id,
+            raw_byte: *raw_byte,
+            byte64,
+            byte64_zext_inst: byte64_def.id,
+            byte32_for_range,
+            byte32_for_lower,
+            byte32_original: original,
+        },
+        ascii: CanonicalFnvFoldAsciiFact {
+            range,
+            range_inst: range_def.id,
+            lowercase,
+            lowercase_inst: lowercase_def.id,
+            uppercase: *uppercase,
+            predicate_witness,
+            selected: *selected,
+            select_inst: select_def.id,
+            true_identity_insts: true_copies.into_boxed_slice(),
+            false_identity_insts: false_copies.into_boxed_slice(),
+            lowercase_on_true,
+        },
+        recurrence: CanonicalFnvFoldRecurrenceFact {
+            selected64,
+            selected64_zext_inst: selected64_def.id,
+            xor,
+            xor_inst: xor_def.id,
+            prime,
+            prime_inst,
+            prime_witness_insts: prime_witness.into_boxed_slice(),
+            product: hash_carrier.update,
+            multiply_inst: hash_update_def.id,
+        },
+        zero_guard,
+        latch,
+        returned,
+    })
+}
+
+fn canonical_fnv_fold_abi_fact(
+    machine_context: &SourceMachineContext,
+    boundaries: &SourceBoundaryFacts,
+) -> Option<CanonicalFnvFoldAbiFact> {
+    let interface = machine_context.function_interface()?;
+    let [pointer_spec, remaining_spec] = interface.parameters() else {
+        return None;
+    };
+    let SourceFunctionReturn::Register {
+        storage: return_storage,
+    } = interface.return_kind()
+    else {
+        return None;
+    };
+    let [pointer_logical, remaining_logical] = interface.parameter_logical_values() else {
+        return None;
+    };
+    let return_logical = interface.return_logical_value()?;
+    let graph = interface.type_graph()?;
+    let pointer_type = graph.types().get(pointer_logical.type_id() as usize)?;
+    let SourceTypeKind::Pointer { target_type_id } = pointer_type.kind() else {
+        return None;
+    };
+    let pointee = graph.types().get(target_type_id as usize)?;
+    let remaining_type = graph.types().get(remaining_logical.type_id() as usize)?;
+    let return_type = graph.types().get(return_logical.type_id() as usize)?;
+    let full64 = |logical: SourceLogicalValue| {
+        logical.carrier().kind() == SourceCarrierKind::Full
+            && logical.carrier().offset_bits() == 0
+            && logical.carrier().size_bits() == 64
+    };
+    if interface.schema_version() != SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION
+        || graph.schema_version() != SOURCE_TYPE_GRAPH_SCHEMA_VERSION
+        || !interface
+            .calling_convention()
+            .eq_ignore_ascii_case("aapcs64")
+        || !interface.stack_slot_roles_complete()
+        || !interface.stack_slots().is_empty()
+        || pointer_spec.index() != 0
+        || remaining_spec.index() != 1
+        || pointer_spec.storage().size != 8
+        || remaining_spec.storage().size != 8
+        || return_storage.size != 8
+        || graph.types().len() != 3
+        || !graph.aggregates().is_empty()
+        || pointer_type.size_bits() != 64
+        || pointer_type.align_bits() != 64
+        || pointee.kind() != SourceTypeKind::UnsignedInteger
+        || pointee.size_bits() != 8
+        || pointee.align_bits() != 8
+        || remaining_type.kind() != SourceTypeKind::UnsignedInteger
+        || remaining_type.size_bits() != 64
+        || remaining_type.align_bits() != 64
+        || return_type != remaining_type
+        || !full64(*pointer_logical)
+        || !full64(*remaining_logical)
+        || !full64(return_logical)
+        || boundaries.parameters.len() != 2
+    {
+        return None;
+    }
+    let pointer_parameter = *boundaries.parameters.get(&0)?;
+    let remaining_parameter = *boundaries.parameters.get(&1)?;
+    if pointer_parameter.storage != pointer_spec.storage()
+        || remaining_parameter.storage != remaining_spec.storage()
+    {
+        return None;
+    }
+    Some(CanonicalFnvFoldAbiFact {
+        revision_identity: interface.revision_identity().to_vec().into_boxed_slice(),
+        pointer_parameter,
+        remaining_parameter,
+        return_storage,
+        pointer_logical: *pointer_logical,
+        remaining_logical: *remaining_logical,
+        return_logical,
+    })
+}
+
+fn canonical_fnv_fold_carrier(
+    graph: &SsaGraph,
+    carrier: &LoopCarrierFact,
+    setup: u64,
+    header: u64,
+) -> Option<CanonicalFnvFoldCarrierFact> {
+    let [entry] = carrier.entries.as_slice() else {
+        return None;
+    };
+    let [update] = carrier.updates.as_slice() else {
+        return None;
+    };
+    let phi_inst = graph.def_inst(carrier.phi)?;
+    let storage = graph.inst(phi_inst)?.canonical_storage?;
+    let (update_root, update_copies) = copy_root(graph, update.value)?;
+    let update_inst = graph.def_inst(update_root)?;
+    if carrier.width != 8
+        || storage.size != 8
+        || entry.predecessor != setup
+        || update.predecessor != header
+        || carrier.identity_values.is_empty()
+        || !carrier.identity_values.contains(&carrier.phi)
+        || update.identity_values != exact_copy_identity_values(graph, update.value)
+    {
+        return None;
+    }
+    Some(CanonicalFnvFoldCarrierFact {
+        storage,
+        width: carrier.width,
+        phi: carrier.phi,
+        phi_inst,
+        entry: entry.value,
+        update: update.value,
+        update_inst,
+        update_support_insts: update_copies.into_boxed_slice(),
+    })
+}
+
+fn carrier_update_unit_constant_witness(
+    graph: &SsaGraph,
+    carrier: &CanonicalFnvFoldCarrierFact,
+    increment: bool,
+) -> Option<Vec<InstId>> {
+    let Some((root, _)) = copy_root(graph, carrier.update) else {
+        return None;
+    };
+    let Some(inst) = graph.def_inst(root).and_then(|inst| graph.inst(inst)) else {
+        return None;
+    };
+    let op_matches = matches!(
+        (&inst.payload, increment),
+        (InstPayload::Op(SSAOp::IntAdd { .. }), true)
+            | (InstPayload::Op(SSAOp::IntSub { .. }), false)
+    );
+    if !op_matches || inst.inputs.as_slice().first() != Some(&carrier.phi) {
+        return None;
+    }
+    let (unit, witnesses) = evaluate_exact_constant(graph, *inst.inputs.get(1)?, 64)?;
+    (unit == 1).then_some(witnesses)
+}
+
+fn copy_root(graph: &SsaGraph, value: ValueId) -> Option<(ValueId, Vec<InstId>)> {
+    let mut value = value;
+    let mut copies = Vec::new();
+    let mut visited = BTreeSet::new();
+    while visited.insert(value) {
+        let Some(inst) = graph.def_inst(value).and_then(|inst| graph.inst(inst)) else {
+            return Some((value, copies));
+        };
+        let InstPayload::Op(SSAOp::Copy { .. }) = &inst.payload else {
+            return Some((value, copies));
+        };
+        let [source] = inst.inputs.as_slice() else {
+            return None;
+        };
+        if value_width(graph, value) != value_width(graph, *source) {
+            return None;
+        }
+        copies.push(inst.id);
+        value = *source;
+    }
+    None
+}
+
+fn evaluate_exact_constant(
+    graph: &SsaGraph,
+    value: ValueId,
+    width: u32,
+) -> Option<(u64, Vec<InstId>)> {
+    fn evaluate(
+        graph: &SsaGraph,
+        value: ValueId,
+        width: u32,
+        visiting: &mut BTreeSet<ValueId>,
+    ) -> Option<(u64, BTreeSet<InstId>)> {
+        if value_width(graph, value)? != width {
+            return None;
+        }
+        if let Some(bits) = graph.value(value)?.var.constant_bits() {
+            return Some((mask_to_width(bits, width)?, BTreeSet::new()));
+        }
+        if !visiting.insert(value) {
+            return None;
+        }
+        let inst = graph.inst(graph.def_inst(value)?)?;
+        let evaluated = match &inst.payload {
+            InstPayload::Op(SSAOp::Copy { .. }) => {
+                let [source] = inst.inputs.as_slice() else {
+                    return None;
+                };
+                evaluate(graph, *source, width, visiting)
+            }
+            InstPayload::Op(SSAOp::IntAnd { .. } | SSAOp::IntOr { .. }) => {
+                let [left, right] = inst.inputs.as_slice() else {
+                    return None;
+                };
+                let (left_value, mut left_witness) = evaluate(graph, *left, width, visiting)?;
+                let (right_value, right_witness) = evaluate(graph, *right, width, visiting)?;
+                left_witness.extend(right_witness);
+                let value = if matches!(&inst.payload, InstPayload::Op(SSAOp::IntAnd { .. })) {
+                    left_value & right_value
+                } else {
+                    left_value | right_value
+                };
+                Some((mask_to_width(value, width)?, left_witness))
+            }
+            _ => None,
+        };
+        visiting.remove(&value);
+        let (value, mut witness) = evaluated?;
+        witness.insert(inst.id);
+        Some((value, witness))
+    }
+
+    let (value, witness) = evaluate(graph, value, width, &mut BTreeSet::new())?;
+    Some((value, witness.into_iter().collect()))
+}
+
+fn mask_to_width(value: u64, width: u32) -> Option<u64> {
+    match width {
+        1..=63 => Some(value & ((1u64 << width) - 1)),
+        64 => Some(value),
+        _ => None,
+    }
+}
+
+fn value_width(graph: &SsaGraph, value: ValueId) -> Option<u32> {
+    graph.value(value)?.var.size.checked_mul(8)
+}
+
+fn constant_is(graph: &SsaGraph, value: ValueId, width: u32, expected: u64) -> bool {
+    value_width(graph, value) == Some(width)
+        && graph
+            .value(value)
+            .and_then(|value| value.var.constant_bits())
+            .and_then(|value| mask_to_width(value, width))
+            == Some(expected)
+}
+
+fn value_is_int_xor(graph: &SsaGraph, value: ValueId) -> bool {
+    graph
+        .def_inst(value)
+        .and_then(|inst| graph.inst(inst))
+        .is_some_and(|inst| matches!(&inst.payload, InstPayload::Op(SSAOp::IntXor { .. })))
+}
+
+fn value_is_or_32(graph: &SsaGraph, value: ValueId, constant: u64) -> bool {
+    let Some(inst) = graph.def_inst(value).and_then(|inst| graph.inst(inst)) else {
+        return false;
+    };
+    matches!(&inst.payload, InstPayload::Op(SSAOp::IntOr { .. }))
+        && value_width(graph, value) == Some(32)
+        && inst
+            .inputs
+            .iter()
+            .any(|input| constant_is(graph, *input, 32, constant))
+}
+
+fn low_subpiece_source(graph: &SsaGraph, value: ValueId) -> Option<ValueId> {
+    let inst = graph.inst(graph.def_inst(value)?)?;
+    let InstPayload::Op(SSAOp::Subpiece { offset: 0, .. }) = &inst.payload else {
+        return None;
+    };
+    let [source] = inst.inputs.as_slice() else {
+        return None;
+    };
+    (value_width(graph, value) == Some(32) && value_width(graph, *source) == Some(64))
+        .then_some(*source)
+}
+
+fn canonical_unsigned_range_predicate(
+    graph: &SsaGraph,
+    condition: ValueId,
+    upper_bound: u64,
+) -> Option<(ValueId, CanonicalFnvFoldUnsignedLessWitness)> {
+    let (condition_root, condition_copies) = copy_root(graph, condition)?;
+    let condition_inst = graph.inst(graph.def_inst(condition_root)?)?;
+    if matches!(
+        &condition_inst.payload,
+        InstPayload::Op(SSAOp::IntLess { .. })
+    ) {
+        let [range, bound] = condition_inst.inputs.as_slice() else {
+            return None;
+        };
+        if value_width(graph, *range) == Some(32) && constant_is(graph, *bound, 32, upper_bound) {
+            return Some((
+                *range,
+                CanonicalFnvFoldUnsignedLessWitness::Direct {
+                    compare_inst: condition_inst.id,
+                    condition_copies: condition_copies.into_boxed_slice(),
+                },
+            ));
+        }
+    }
+    let InstPayload::Op(SSAOp::BoolNot { .. }) = &condition_inst.payload else {
+        return None;
+    };
+    let [comparison] = condition_inst.inputs.as_slice() else {
+        return None;
+    };
+    let (comparison_root, comparison_copies) = copy_root(graph, *comparison)?;
+    let comparison_inst = graph.inst(graph.def_inst(comparison_root)?)?;
+    let InstPayload::Op(SSAOp::IntLessEqual { .. }) = &comparison_inst.payload else {
+        return None;
+    };
+    let [bound, range] = comparison_inst.inputs.as_slice() else {
+        return None;
+    };
+    if value_width(graph, *range) != Some(32) || !constant_is(graph, *bound, 32, upper_bound) {
+        return None;
+    }
+    Some((
+        *range,
+        CanonicalFnvFoldUnsignedLessWitness::NegatedReverseLessEqual {
+            compare_inst: comparison_inst.id,
+            comparison_copies: comparison_copies.into_boxed_slice(),
+            not_inst: condition_inst.id,
+            condition_copies: condition_copies.into_boxed_slice(),
+        },
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn canonical_fnv_guard(
+    graph: &SsaGraph,
+    predicates: &PredicateFacts,
+    block_addr: u64,
+    compared_value: ValueId,
+    equal: bool,
+    true_target: u64,
+    false_target: u64,
+) -> Option<CanonicalFnvFoldGuardFact> {
+    let block_predicates = predicates
+        .predicates
+        .values()
+        .filter(|predicate| predicate.block_addr == block_addr)
+        .collect::<Vec<_>>();
+    let [predicate] = block_predicates.as_slice() else {
+        return None;
+    };
+    let comparison = predicate.evaluated_comparison.as_ref()?;
+    let expected_kind = if equal {
+        CompareKind::Equal
+    } else {
+        CompareKind::NotEqual
+    };
+    let compared_root = copy_root(graph, compared_value)?.0;
+    let lhs_root = copy_root(graph, comparison.lhs)?.0;
+    let rhs_root = copy_root(graph, comparison.rhs)?.0;
+    let operands_match = (lhs_root == compared_root && constant_is(graph, comparison.rhs, 64, 0))
+        || (rhs_root == compared_root && constant_is(graph, comparison.lhs, 64, 0));
+    if comparison.kind != expected_kind
+        || !operands_match
+        || predicate.true_target != true_target
+        || predicate.false_target != false_target
+        || value_width(graph, predicate.condition) != Some(8)
+    {
+        return None;
+    }
+    let condition_inst = graph.def_inst(predicate.condition)?;
+    let block = graph.block(graph.block_id_for_addr(block_addr)?)?;
+    let branch_insts = block
+        .insts
+        .iter()
+        .filter_map(|inst| {
+            graph
+                .inst(*inst)
+                .filter(|inst| matches!(&inst.payload, InstPayload::Op(SSAOp::CBranch { .. })))
+                .map(|inst| inst.id)
+        })
+        .collect::<Vec<_>>();
+    let [branch_inst] = branch_insts.as_slice() else {
+        return None;
+    };
+    Some(CanonicalFnvFoldGuardFact {
+        predicate: predicate.id,
+        condition: predicate.condition,
+        condition_inst,
+        branch_inst: *branch_inst,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn canonical_fnv_return(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    boundaries: &SourceBoundaryFacts,
+    entry: u64,
+    header: u64,
+    exit: u64,
+    return_storage: CanonicalStorageId,
+    initializer: ValueId,
+    update: ValueId,
+) -> Option<(CanonicalFnvFoldReturnFact, InstId)> {
+    let returns = function
+        .blocks()
+        .flat_map(|block| {
+            block
+                .ops
+                .iter()
+                .enumerate()
+                .map(move |(index, op)| (block, index, op))
+        })
+        .filter(|(_, _, op)| matches!(op, SSAOp::Return { .. }))
+        .collect::<Vec<_>>();
+    let [(block, op_index, _)] = returns.as_slice() else {
+        return None;
+    };
+    if block.addr != exit {
+        return None;
+    }
+    let return_inst = graph.inst_id_for_op_site(exit, *op_index)?;
+    let boundary = boundaries.returns.get(&return_inst)?;
+    let [returned] = boundary.values.as_slice() else {
+        return None;
+    };
+    if !boundary.complete
+        || returned.slot
+            != (CallBoundarySlot::Register {
+                index: 0,
+                storage: return_storage,
+            })
+    {
+        return None;
+    }
+    let exit_phi_inst = graph.def_inst(returned.value)?;
+    let exit_phi = graph.inst(exit_phi_inst)?;
+    let InstPayload::Phi { predecessors } = &exit_phi.payload else {
+        return None;
+    };
+    if exit_phi.canonical_storage != Some(return_storage)
+        || predecessors.len() != 2
+        || exit_phi.inputs.len() != 2
+        || predecessors
+            .iter()
+            .zip(&exit_phi.inputs)
+            .filter_map(|(predecessor, value)| {
+                graph.block(*predecessor).map(|block| (block.addr, *value))
+            })
+            .collect::<BTreeSet<_>>()
+            != BTreeSet::from([(entry, initializer), (header, update)])
+    {
+        return None;
+    }
+    Some((
+        CanonicalFnvFoldReturnFact {
+            return_inst,
+            value: returned.value,
+        },
+        exit_phi_inst,
+    ))
+}
+
+fn collect_unstructured_cycle_blocks(
+    graph: &SsaGraph,
+    loops: &BTreeMap<LoopId, StructuredLoopFact>,
+) -> BTreeSet<u64> {
+    let covered = loops
+        .values()
+        .flat_map(|loop_fact| loop_fact.body.iter().copied())
+        .collect::<BTreeSet<_>>();
+    graph
+        .blocks
+        .iter()
+        .filter(|block| !covered.contains(&block.addr))
+        .filter(|block| {
+            let mut visited = BTreeSet::new();
+            let mut pending = block.successors.clone();
+            while let Some(candidate) = pending.pop() {
+                if candidate == block.id {
+                    return true;
+                }
+                if !visited.insert(candidate) {
+                    continue;
+                }
+                if let Some(candidate) = graph.block(candidate) {
+                    pending.extend(candidate.successors.iter().copied());
+                }
+            }
+            false
+        })
+        .map(|block| block.addr)
+        .collect()
+}
+
 fn loop_carrier_facts(
     function: &SSAFunction,
     graph: &SsaGraph,
@@ -3381,6 +5636,13 @@ fn loop_carrier_facts(
         .iter()
         .filter_map(|phi| {
             let phi_value = graph.value_id_for_var(&phi.dst)?;
+            // Pruned SSA is not guaranteed at this seam. A loop-local output
+            // can induce a syntactic header phi whose value is never read;
+            // such a dead merge carries no live state and must not acquire a
+            // preservation obligation.
+            if graph.use_sites(phi_value).is_empty() {
+                return None;
+            }
             let mut entries = Vec::new();
             let mut updates = Vec::new();
             for (predecessor, source) in &phi.sources {
@@ -3734,70 +5996,66 @@ fn collect_structured_memory_access_facts(
                 | SSAOp::LoadLinked { dst, addr, .. }
                 | SSAOp::LoadGuarded { dst, addr, .. } => {
                     if let Some(address) = graph.value_id_for_var(addr) {
-                        for use_fact in memory.uses_by_inst.get(&inst).into_iter().flatten() {
-                            insert_structured_memory_access(
-                                &mut access_facts,
-                                inst,
-                                &mut ordinal,
-                                block.addr,
-                                op_index,
-                                use_fact.location.object,
-                                address,
-                                graph.value_id_for_var(dst),
-                                false,
-                                use_fact.location.size,
-                            );
-                        }
+                        insert_raw_memory_subeffect(
+                            &mut access_facts,
+                            memory,
+                            objects,
+                            inst,
+                            &mut ordinal,
+                            block.addr,
+                            op_index,
+                            address,
+                            graph.value_id_for_var(dst),
+                            false,
+                            dst.size,
+                        );
                     }
                 }
                 SSAOp::Store { addr, val, .. } | SSAOp::StoreGuarded { addr, val, .. } => {
                     if let Some(address) = graph.value_id_for_var(addr) {
-                        for def_fact in memory.defs_by_inst.get(&inst).into_iter().flatten() {
-                            insert_structured_memory_access(
-                                &mut access_facts,
-                                inst,
-                                &mut ordinal,
-                                block.addr,
-                                op_index,
-                                def_fact.location.object,
-                                address,
-                                graph.value_id_for_var(val),
-                                true,
-                                def_fact.location.size,
-                            );
-                        }
+                        insert_raw_memory_subeffect(
+                            &mut access_facts,
+                            memory,
+                            objects,
+                            inst,
+                            &mut ordinal,
+                            block.addr,
+                            op_index,
+                            address,
+                            graph.value_id_for_var(val),
+                            true,
+                            val.size,
+                        );
                     }
                 }
                 SSAOp::StoreConditional { addr, val, .. } => {
                     if let Some(address) = graph.value_id_for_var(addr) {
-                        for use_fact in memory.uses_by_inst.get(&inst).into_iter().flatten() {
-                            insert_structured_memory_access(
-                                &mut access_facts,
-                                inst,
-                                &mut ordinal,
-                                block.addr,
-                                op_index,
-                                use_fact.location.object,
-                                address,
-                                None,
-                                false,
-                                use_fact.location.size,
-                            );
-                        }
-                        for def_fact in memory.defs_by_inst.get(&inst).into_iter().flatten() {
-                            insert_structured_memory_access(
-                                &mut access_facts,
-                                inst,
-                                &mut ordinal,
-                                block.addr,
-                                op_index,
-                                def_fact.location.object,
-                                address,
-                                graph.value_id_for_var(val),
-                                true,
-                                def_fact.location.size,
-                            );
-                        }
+                        insert_raw_memory_subeffect(
+                            &mut access_facts,
+                            memory,
+                            objects,
+                            inst,
+                            &mut ordinal,
+                            block.addr,
+                            op_index,
+                            address,
+                            None,
+                            false,
+                            val.size,
+                        );
+                        insert_raw_memory_subeffect(
+                            &mut access_facts,
+                            memory,
+                            objects,
+                            inst,
+                            &mut ordinal,
+                            block.addr,
+                            op_index,
+                            address,
+                            graph.value_id_for_var(val),
+                            true,
+                            val.size,
+                        );
                     }
                 }
                 SSAOp::AtomicCAS {
@@ -3807,76 +6065,95 @@ fn collect_structured_memory_access_facts(
                     ..
                 } => {
                     if let Some(address) = graph.value_id_for_var(addr) {
-                        for use_fact in memory.uses_by_inst.get(&inst).into_iter().flatten() {
-                            insert_structured_memory_access(
-                                &mut access_facts,
-                                inst,
-                                &mut ordinal,
-                                block.addr,
-                                op_index,
-                                use_fact.location.object,
-                                address,
-                                graph.value_id_for_var(dst),
-                                false,
-                                use_fact.location.size,
-                            );
-                        }
-                        for def_fact in memory.defs_by_inst.get(&inst).into_iter().flatten() {
-                            insert_structured_memory_access(
-                                &mut access_facts,
-                                inst,
-                                &mut ordinal,
-                                block.addr,
-                                op_index,
-                                def_fact.location.object,
-                                address,
-                                graph.value_id_for_var(replacement),
-                                true,
-                                def_fact.location.size,
-                            );
-                        }
+                        insert_raw_memory_subeffect(
+                            &mut access_facts,
+                            memory,
+                            objects,
+                            inst,
+                            &mut ordinal,
+                            block.addr,
+                            op_index,
+                            address,
+                            graph.value_id_for_var(dst),
+                            false,
+                            replacement.size,
+                        );
+                        insert_raw_memory_subeffect(
+                            &mut access_facts,
+                            memory,
+                            objects,
+                            inst,
+                            &mut ordinal,
+                            block.addr,
+                            op_index,
+                            address,
+                            graph.value_id_for_var(replacement),
+                            true,
+                            replacement.size,
+                        );
                     }
                 }
                 _ => {}
-            }
-            if ordinal == 0
-                && let Some((address_var, value_var, is_write, width)) =
-                    fallback_memory_access_shape(op)
-                && let Some(address) = graph.value_id_for_var(address_var)
-            {
-                let object = objects.escaped_unknown_object().unwrap_or(ObjectId(0));
-                insert_structured_memory_access(
-                    &mut access_facts,
-                    inst,
-                    &mut ordinal,
-                    block.addr,
-                    op_index,
-                    object,
-                    address,
-                    value_var.and_then(|value| graph.value_id_for_var(value)),
-                    is_write,
-                    width,
-                );
             }
         }
     }
     access_facts
 }
 
-fn fallback_memory_access_shape(op: &SSAOp) -> Option<(&SSAVar, Option<&SSAVar>, bool, u32)> {
-    match op {
-        SSAOp::Load { dst, addr, .. }
-        | SSAOp::LoadLinked { dst, addr, .. }
-        | SSAOp::LoadGuarded { dst, addr, .. } => Some((addr, Some(dst), false, dst.size)),
-        SSAOp::Store { addr, val, .. } | SSAOp::StoreGuarded { addr, val, .. } => {
-            Some((addr, Some(val), true, val.size))
-        }
-        SSAOp::StoreConditional { addr, val, .. } => Some((addr, Some(val), true, val.size)),
-        SSAOp::AtomicCAS {
-            addr, replacement, ..
-        } => Some((addr, Some(replacement), true, replacement.size)),
-        _ => None,
-    }
+#[allow(clippy::too_many_arguments)]
+fn insert_raw_memory_subeffect(
+    access_facts: &mut BTreeMap<StructuredAccessId, StructuredMemoryAccessFact>,
+    memory: &MemorySSAFacts,
+    objects: &ObjectModel,
+    inst: InstId,
+    ordinal: &mut u32,
+    block_addr: u64,
+    op_index: usize,
+    address: ValueId,
+    value: Option<ValueId>,
+    is_write: bool,
+    width: u32,
+) {
+    let annotations = if is_write {
+        memory
+            .defs_by_inst
+            .get(&inst)
+            .into_iter()
+            .flatten()
+            .map(|fact| (fact.location.object, fact.location.size))
+            .collect::<Vec<_>>()
+    } else {
+        memory
+            .uses_by_inst
+            .get(&inst)
+            .into_iter()
+            .flatten()
+            .map(|fact| (fact.location.object, fact.location.size))
+            .collect::<Vec<_>>()
+    };
+    let matching = annotations
+        .iter()
+        .filter(|(_, size)| *size == width)
+        .collect::<Vec<_>>();
+    let provenance_complete = annotations.len() == 1 && matching.len() == 1;
+    let object = matching
+        .first()
+        .map(|(object, _)| *object)
+        .or_else(|| objects.escaped_unknown_object())
+        .unwrap_or(ObjectId(0));
+    insert_structured_memory_access(
+        access_facts,
+        inst,
+        ordinal,
+        block_addr,
+        op_index,
+        object,
+        address,
+        value,
+        is_write,
+        width,
+        provenance_complete,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3891,6 +6168,7 @@ fn insert_structured_memory_access(
     value: Option<ValueId>,
     is_write: bool,
     width: u32,
+    provenance_complete: bool,
 ) {
     let id = StructuredAccessId {
         inst,
@@ -3908,6 +6186,7 @@ fn insert_structured_memory_access(
             value,
             is_write,
             width,
+            provenance_complete,
         },
     );
 }
@@ -4249,6 +6528,7 @@ fn collect_call_sites(
     function: &SSAFunction,
     graph: &SsaGraph,
     prep_facts: Option<&DecompilePrepFacts>,
+    machine_context: Option<&SourceMachineContext>,
 ) -> CallSiteFacts {
     let mut by_id = BTreeMap::new();
     let mut by_inst = BTreeMap::new();
@@ -4282,12 +6562,16 @@ fn collect_call_sites(
             let id = CallSiteId(next_id);
             next_id = next_id.saturating_add(1);
             let direct_target = resolve_const_value(prep_facts, &target);
+            let raw_identity = machine_context
+                .and_then(|context| context.raw_call_site_identity(id))
+                .filter(|identity| identity.block_addr() == block_addr);
             by_inst.insert(inst_id, id);
             by_id.insert(
                 id,
                 CallSiteFact {
                     id,
                     at: inst_id,
+                    raw_identity,
                     target: target_id,
                     direct_target,
                     fallthrough: if op_idx + 1 == block.ops.len() {
@@ -4309,6 +6593,24 @@ fn collect_call_argument_values(
     graph: &SsaGraph,
     call_site: &CallSiteFact,
 ) -> Vec<ValueId> {
+    let mut by_index = collect_call_argument_slots(function, graph, call_site)
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    let mut values = Vec::new();
+    for index in 0..16 {
+        let Some(value) = by_index.remove(&index) else {
+            break;
+        };
+        values.push(value);
+    }
+    values
+}
+
+fn collect_call_argument_slots(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    call_site: &CallSiteFact,
+) -> Vec<(usize, ValueId)> {
     let Some((block_addr, op_idx)) = graph.op_site_for_inst(call_site.at) else {
         return Vec::new();
     };
@@ -4330,14 +6632,7 @@ fn collect_call_argument_values(
         by_index.entry(index).or_insert(value);
     }
 
-    let mut values = Vec::new();
-    for index in 0..16 {
-        let Some(value) = by_index.remove(&index) else {
-            break;
-        };
-        values.push(value);
-    }
-    values
+    by_index.into_iter().collect()
 }
 
 fn collect_register_call_argument_certificates(
@@ -5126,11 +7421,18 @@ fn stack_base_root_for_name(name: &str) -> Option<StackAddressRoot> {
 mod tests {
     use super::{
         CallSiteId, CompareKind, CompareProvenance, ControlGuard, LoopId, ObjectId, PredicateId,
-        ProofNodeId, SemanticId, StructuredAccessId, combine_compare_provenance_by,
-        invert_compare_provenance,
+        ProofNodeId, SemanticId, StructuredAccessId, collect_structured_memory_access_facts,
+        combine_compare_provenance_by, invert_compare_provenance,
     };
-    use crate::{InstId, SsaArtifact, ValueId};
-    use r2il::{R2ILBlock, R2ILOp, SpaceId, Varnode};
+    use crate::{
+        CanonicalStorageId, CanonicalStorageSpace, InstId, SemanticObligationKind,
+        SourceAbiParameterSpec, SourceCarrierKind, SourceCarrierProjection,
+        SourceFunctionInterface, SourceFunctionReturn, SourceLogicalValue, SourceType,
+        SourceTypeGraph, SourceTypeKind, SsaArtifact, ValueId,
+    };
+    use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
+    use r2sleigh_lift::{Disassembler, build_arch_spec};
+    use sha2::{Digest, Sha256};
 
     #[test]
     fn comparison_algebra_recovers_signed_le_and_complement() {
@@ -5221,6 +7523,64 @@ mod tests {
                 SemanticId::ControlDomain(super::ControlDomainId(7)),
                 SemanticId::Effect(InstId(13)),
             ]
+        );
+    }
+
+    #[test]
+    fn raw_atomic_subeffects_do_not_follow_memory_ssa_cardinality() {
+        let mut block = R2ILBlock::new(0x9000, 4);
+        block.push(R2ILOp::AtomicCAS {
+            dst: Varnode::unique(0x10, 8),
+            space: SpaceId::Ram,
+            addr: Varnode::register(0, 8),
+            expected: Varnode::constant(1, 8),
+            replacement: Varnode::constant(2, 8),
+            ordering: r2il::MemoryOrdering::SeqCst,
+        });
+        let artifact = SsaArtifact::raw(&[block], None).expect("atomic artifact");
+
+        let without_annotations = collect_structured_memory_access_facts(
+            artifact.function(),
+            artifact.graph(),
+            artifact.objects(),
+            &super::MemorySSAFacts::default(),
+        );
+        assert_eq!(without_annotations.len(), 2);
+        assert_eq!(
+            without_annotations
+                .keys()
+                .map(|id| id.ordinal)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert!(
+            without_annotations
+                .values()
+                .all(|access| !access.provenance_complete)
+        );
+
+        let mut duplicate_annotations = artifact.memory().clone();
+        for facts in duplicate_annotations.uses_by_inst.values_mut() {
+            if let Some(first) = facts.first().cloned() {
+                facts.push(first);
+            }
+        }
+        for facts in duplicate_annotations.defs_by_inst.values_mut() {
+            if let Some(first) = facts.first().cloned() {
+                facts.push(first);
+            }
+        }
+        let with_duplicates = collect_structured_memory_access_facts(
+            artifact.function(),
+            artifact.graph(),
+            artifact.objects(),
+            &duplicate_annotations,
+        );
+        assert_eq!(with_duplicates.len(), 2);
+        assert!(
+            with_duplicates
+                .values()
+                .all(|access| !access.provenance_complete)
         );
     }
 
@@ -5423,6 +7783,827 @@ mod tests {
             target: test_const(target),
         });
         block
+    }
+
+    fn canonical_counted_loop_blocks() -> Vec<R2ILBlock> {
+        let counter = Varnode::register(0, 8);
+        let bound = Varnode::register(8, 8);
+        let mut preheader = R2ILBlock::new(0x2000, 4);
+        preheader.push(R2ILOp::Copy {
+            dst: counter.clone(),
+            src: Varnode::constant(0, 8),
+        });
+        preheader.push(R2ILOp::Branch {
+            target: Varnode::ram(0x2010, 8),
+        });
+
+        let condition = Varnode::unique(0x40, 1);
+        let mut header = R2ILBlock::new(0x2010, 4);
+        header.push(R2ILOp::IntLess {
+            dst: condition.clone(),
+            a: counter.clone(),
+            b: bound,
+        });
+        header.push(R2ILOp::CBranch {
+            target: Varnode::ram(0x2020, 8),
+            cond: condition,
+        });
+
+        let mut exit = R2ILBlock::new(0x2014, 4);
+        exit.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+
+        let mut latch = R2ILBlock::new(0x2020, 4);
+        latch.push(R2ILOp::IntAdd {
+            dst: counter.clone(),
+            a: counter,
+            b: Varnode::constant(1, 8),
+        });
+        latch.push(R2ILOp::Branch {
+            target: Varnode::ram(0x2010, 8),
+        });
+        vec![preheader, header, exit, latch]
+    }
+
+    fn return_boundary_arch() -> ArchSpec {
+        let mut arch = ArchSpec::new("return-boundary-test");
+        arch.add_register(RegisterDef::new("rax", 0, 8));
+        arch.add_register(RegisterDef::new("rdi", 8, 8));
+        arch.add_register(RegisterDef::new("rip", 16, 8));
+        arch.add_register(RegisterDef::new("cond", 24, 1));
+        arch
+    }
+
+    fn register_storage(offset: u64, size: u32) -> CanonicalStorageId {
+        CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset,
+            size,
+        }
+    }
+
+    fn return_boundary_interface() -> SourceFunctionInterface {
+        SourceFunctionInterface::new(
+            b"return-boundary-revision-1".to_vec(),
+            "test-register-abi",
+            [SourceAbiParameterSpec::new(0, register_storage(8, 8))],
+            SourceFunctionReturn::Register {
+                storage: register_storage(0, 8),
+            },
+            [],
+        )
+        .expect("return boundary interface")
+    }
+
+    fn composed_return_arch(whole_name: &str, slice_name: &str, pc_name: &str) -> ArchSpec {
+        let mut arch = ArchSpec::new("return-composition-test");
+        arch.add_register(RegisterDef::new(whole_name, 0, 4));
+        arch.add_register(RegisterDef::sub(slice_name, 0, 1, whole_name));
+        arch.add_register(RegisterDef::new(pc_name, 16, 8));
+        arch
+    }
+
+    fn composed_return_interface() -> SourceFunctionInterface {
+        SourceFunctionInterface::new(
+            b"return-composition-revision-1".to_vec(),
+            "test-register-abi",
+            [],
+            SourceFunctionReturn::Register {
+                storage: register_storage(0, 4),
+            },
+            [],
+        )
+        .expect("composed return interface")
+    }
+
+    fn composed_return_block(addr: u64) -> R2ILBlock {
+        let mut block = R2ILBlock::new(addr, 4);
+        block.push(R2ILOp::Copy {
+            dst: Varnode::register(0, 4),
+            src: Varnode::constant(0, 4),
+        });
+        block.push(R2ILOp::Copy {
+            dst: Varnode::register(0, 1),
+            src: Varnode::constant(1, 1),
+        });
+        block.push(R2ILOp::Copy {
+            dst: Varnode::register(0, 1),
+            src: Varnode::constant(0, 1),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+        block
+    }
+
+    fn composed_return_artifact(
+        addr: u64,
+        whole_name: &str,
+        slice_name: &str,
+        pc_name: &str,
+    ) -> SsaArtifact {
+        SsaArtifact::for_decompile_with_interface(
+            &[composed_return_block(addr)],
+            Some(&composed_return_arch(whole_name, slice_name, pc_name)),
+            composed_return_interface(),
+        )
+        .expect("composed return artifact")
+    }
+
+    #[test]
+    fn return_boundary_predecessor_phi_recovery_is_exact_and_ambiguity_closed() {
+        let artifact = SsaArtifact::raw_with_interface(
+            &canonical_counted_loop_blocks(),
+            Some(&return_boundary_arch()),
+            return_boundary_interface(),
+        )
+        .expect("counted loop boundary artifact");
+        let recovered = super::reaching_abi_value_in_block(
+            artifact.function(),
+            artifact.graph(),
+            artifact.machine_context(),
+            0x2014,
+            0,
+            register_storage(0, 8),
+        );
+        let counted = artifact
+            .structured()
+            .canonical_counted_loops
+            .get(&0x2010)
+            .expect("canonical counted loop");
+        assert_eq!(recovered, Some(counted.phi));
+        assert_eq!(
+            super::reaching_abi_value_in_block(
+                artifact.function(),
+                artifact.graph(),
+                artifact.machine_context(),
+                0x2014,
+                0,
+                register_storage(0, 4),
+            ),
+            None
+        );
+
+        let mut ambiguous_function = artifact.function().clone();
+        let header = ambiguous_function
+            .get_block_mut(0x2010)
+            .expect("counted header");
+        let counter_phi = header
+            .phis
+            .iter()
+            .find(|phi| phi.canonical_storage == Some(register_storage(0, 8)))
+            .expect("counter phi")
+            .clone();
+        header.phis.push(counter_phi);
+        assert_eq!(
+            super::reaching_abi_value_in_block(
+                &ambiguous_function,
+                artifact.graph(),
+                artifact.machine_context(),
+                0x2014,
+                0,
+                register_storage(0, 8),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn return_boundary_recovery_rejects_fanin_and_phi_free_cycles() {
+        let mut entry = R2ILBlock::new(0x3000, 4);
+        entry.push(R2ILOp::CBranch {
+            target: Varnode::ram(0x3020, 8),
+            cond: Varnode::register(24, 1),
+        });
+        let mut right = R2ILBlock::new(0x3004, 4);
+        right.push(R2ILOp::Branch {
+            target: Varnode::ram(0x3030, 8),
+        });
+        let mut left = R2ILBlock::new(0x3020, 4);
+        left.push(R2ILOp::Branch {
+            target: Varnode::ram(0x3030, 8),
+        });
+        let mut joined = R2ILBlock::new(0x3030, 4);
+        joined.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+        let fanin = SsaArtifact::raw_with_interface(
+            &[entry, right, left, joined],
+            Some(&return_boundary_arch()),
+            return_boundary_interface(),
+        )
+        .expect("fanin boundary artifact");
+        assert_eq!(
+            super::reaching_abi_value_in_block(
+                fanin.function(),
+                fanin.graph(),
+                fanin.machine_context(),
+                0x3030,
+                0,
+                register_storage(0, 8),
+            ),
+            None
+        );
+
+        let mut header = R2ILBlock::new(0x4000, 4);
+        header.push(R2ILOp::CBranch {
+            target: Varnode::ram(0x4000, 8),
+            cond: Varnode::register(24, 1),
+        });
+        let mut exit = R2ILBlock::new(0x4004, 4);
+        exit.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+        let cycle = SsaArtifact::raw_with_interface(
+            &[header, exit],
+            Some(&return_boundary_arch()),
+            return_boundary_interface(),
+        )
+        .expect("cycle boundary artifact");
+        assert_eq!(
+            super::reaching_abi_value_in_block(
+                cycle.function(),
+                cycle.graph(),
+                cycle.machine_context(),
+                0x4000,
+                1,
+                register_storage(0, 8),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn return_boundary_composes_every_ordered_contained_slice_without_stale_generic_value() {
+        let artifact = composed_return_artifact(0x5000, "whole", "slice", "pc");
+        let boundary = artifact
+            .facts()
+            .boundaries
+            .returns
+            .values()
+            .next()
+            .expect("return boundary");
+        assert!(boundary.complete);
+        assert!(
+            boundary.values.is_empty(),
+            "generic return recovery must not select the stale full-width definition"
+        );
+        let [composition] = boundary.register_compositions.as_slice() else {
+            panic!("one exact return composition expected");
+        };
+        assert_eq!(
+            composition.slot,
+            super::CallBoundarySlot::Register {
+                index: 0,
+                storage: register_storage(0, 4),
+            }
+        );
+        assert_eq!(composition.base.storage, register_storage(0, 4));
+        assert_eq!(composition.overlays.len(), 2);
+        assert!(
+            composition
+                .overlays
+                .iter()
+                .all(
+                    |overlay| overlay.definition.storage == register_storage(0, 1)
+                        && overlay.offset_bytes == 0
+                )
+        );
+        assert_eq!(
+            composition
+                .ordered_definitions()
+                .map(|definition| definition.producer)
+                .collect::<Vec<_>>(),
+            vec![InstId(0), InstId(1), InstId(2)]
+        );
+        assert!(composition.validate(
+            artifact.function(),
+            artifact.graph(),
+            artifact.machine_context(),
+            boundary.at,
+        ));
+        let return_value_obligations = artifact
+            .obligations()
+            .obligations_for_inst(boundary.at)
+            .filter(|obligation| obligation.id.kind == SemanticObligationKind::ReturnValue)
+            .collect::<Vec<_>>();
+        let [return_value] = return_value_obligations.as_slice() else {
+            panic!("one composed return-value obligation expected");
+        };
+        assert_eq!(
+            return_value.inputs,
+            composition
+                .ordered_definitions()
+                .map(|definition| definition.value)
+                .collect::<Vec<_>>()
+        );
+        for definition in composition.ordered_definitions() {
+            assert!(
+                artifact
+                    .obligations()
+                    .obligations_for_inst(definition.producer)
+                    .any(|obligation| obligation.id.kind
+                        == SemanticObligationKind::LiveValueProducer)
+            );
+        }
+        assert_eq!(
+            super::reaching_abi_value_in_block(
+                artifact.function(),
+                artifact.graph(),
+                artifact.machine_context(),
+                0x5000,
+                3,
+                register_storage(0, 4),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn return_register_composition_validation_rejects_identity_and_order_mutations() {
+        let artifact = composed_return_artifact(0x5100, "whole", "slice", "pc");
+        let boundary = artifact
+            .facts()
+            .boundaries
+            .returns
+            .values()
+            .next()
+            .expect("return boundary");
+        let fact = boundary
+            .register_compositions
+            .first()
+            .expect("return composition");
+        let validates = |candidate: &super::SourceReturnRegisterCompositionFact| {
+            candidate.validate(
+                artifact.function(),
+                artifact.graph(),
+                artifact.machine_context(),
+                boundary.at,
+            )
+        };
+
+        let mut missing = fact.clone();
+        missing.overlays.remove(0);
+        assert!(!validates(&missing));
+
+        let mut reordered = fact.clone();
+        reordered.overlays.swap(0, 1);
+        assert!(!validates(&reordered));
+
+        let mut wrong_offset = fact.clone();
+        wrong_offset.overlays[0].offset_bytes = 1;
+        assert!(!validates(&wrong_offset));
+
+        let mut wrong_width = fact.clone();
+        wrong_width.overlays[0].definition.storage.size = 2;
+        assert!(!validates(&wrong_width));
+
+        let mut wrong_slot = fact.clone();
+        wrong_slot.slot = super::CallBoundarySlot::Register {
+            index: 1,
+            storage: register_storage(0, 4),
+        };
+        assert!(!validates(&wrong_slot));
+
+        let mut extra = fact.clone();
+        extra.overlays.push(fact.overlays[1]);
+        assert!(!validates(&extra));
+
+        let mut wrong_schema = fact.clone();
+        wrong_schema.schema_version = 0;
+        assert!(!validates(&wrong_schema));
+    }
+
+    #[test]
+    fn return_boundary_refuses_unrepresented_partial_overlap() {
+        let mut arch = composed_return_arch("whole", "slice", "pc");
+        arch.add_register(RegisterDef::new("partial", 3, 2));
+        let mut block = R2ILBlock::new(0x5180, 4);
+        block.push(R2ILOp::Copy {
+            dst: Varnode::register(0, 4),
+            src: Varnode::constant(0, 4),
+        });
+        block.push(R2ILOp::Copy {
+            dst: Varnode::register(3, 2),
+            src: Varnode::constant(1, 2),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+        let artifact = SsaArtifact::for_decompile_with_interface(
+            &[block],
+            Some(&arch),
+            composed_return_interface(),
+        )
+        .expect("partial-overlap artifact");
+        let boundary = artifact
+            .facts()
+            .boundaries
+            .returns
+            .values()
+            .next()
+            .expect("return boundary");
+        assert!(!boundary.complete);
+        assert!(boundary.values.is_empty());
+        assert!(boundary.register_compositions.is_empty());
+    }
+
+    #[test]
+    fn return_register_composition_is_deterministic_name_and_address_independent() {
+        let first = composed_return_artifact(0x5200, "whole_a", "slice_a", "pc_a");
+        let repeated = composed_return_artifact(0x5200, "whole_a", "slice_a", "pc_a");
+        let renamed = composed_return_artifact(0x5200, "whole_b", "slice_b", "pc_b");
+        let relocated = composed_return_artifact(0x9200, "whole_a", "slice_a", "pc_a");
+        let composition = |artifact: &SsaArtifact| {
+            artifact
+                .facts()
+                .boundaries
+                .returns
+                .values()
+                .next()
+                .and_then(|boundary| boundary.register_compositions.first())
+                .cloned()
+                .expect("return composition")
+        };
+        assert_eq!(composition(&first), composition(&repeated));
+        assert_eq!(composition(&first), composition(&renamed));
+        assert_eq!(composition(&first), composition(&relocated));
+    }
+
+    #[test]
+    fn canonical_counted_loop_fact_retains_exact_carrier_transition_identities() {
+        let artifact =
+            SsaArtifact::raw(&canonical_counted_loop_blocks(), None).expect("counted loop SSA");
+        let facts = artifact
+            .structured()
+            .canonical_counted_loops
+            .values()
+            .collect::<Vec<_>>();
+        let [fact] = facts.as_slice() else {
+            panic!("one canonical counted loop fact");
+        };
+        assert_eq!(fact.preheader, 0x2000);
+        assert_eq!(fact.header, 0x2010);
+        assert_eq!(fact.exit, 0x2014);
+        assert_eq!(fact.latch, 0x2020);
+        assert_eq!(fact.width, 8);
+        assert_eq!(artifact.graph().def_inst(fact.phi), Some(fact.phi_inst));
+        assert_eq!(
+            artifact.graph().def_inst(fact.initializer),
+            Some(fact.initializer_inst)
+        );
+        assert_eq!(
+            artifact.graph().def_inst(fact.condition),
+            Some(fact.condition_inst)
+        );
+        assert_eq!(
+            artifact.graph().def_inst(fact.update),
+            Some(fact.update_inst)
+        );
+
+        let phi_obligations = artifact
+            .obligations()
+            .obligations_for_inst(fact.phi_inst)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            phi_obligations
+                .iter()
+                .filter(|obligation| {
+                    obligation.id.kind == SemanticObligationKind::LoopCarriedState
+                })
+                .count(),
+            1
+        );
+        let transitions = phi_obligations
+            .iter()
+            .filter(|obligation| obligation.id.kind == SemanticObligationKind::LiveStateTransition)
+            .collect::<Vec<_>>();
+        let [transition] = transitions.as_slice() else {
+            panic!("one edge-owned transition");
+        };
+        assert_eq!(transition.inputs, [fact.update]);
+    }
+
+    #[test]
+    fn canonical_counted_loop_fact_rejects_non_increment_transition() {
+        let mut blocks = canonical_counted_loop_blocks();
+        blocks[3].ops[0] = R2ILOp::IntSub {
+            dst: Varnode::register(0, 8),
+            a: Varnode::register(0, 8),
+            b: Varnode::constant(1, 8),
+        };
+        let artifact = SsaArtifact::raw(&blocks, None).expect("mutated loop SSA");
+        assert!(artifact.structured().canonical_counted_loops.is_empty());
+    }
+
+    const REAL_FNV_SOURCE_SHA256: &str =
+        "6524278ba4cd32a72dcf9cbcc385275999a50c3449d0e97035736891bcddff09";
+    const REAL_FNV_O2_FUNCTION_SHA256: &str =
+        "127862f7bb0f1efcdd2830dd5bec8eadd8ac9812a847f477909b95fec671b6ac";
+    const REAL_FNV_O2_BINARY_SHA256: &str =
+        "e15adf9d8916bdbc1a45a07741734279cc815b87a5b2762cfb24cd78d33503c1";
+    const REAL_FNV_O2_BINARY_PATH: &str = "tests/r2r/bins/r2sleigh_manual_limits_O2";
+    const REAL_FNV_O2_COMPILER_COMMAND: &str =
+        "cc -O2 -g -o tests/r2r/bins/r2sleigh_manual_limits_O2 tests/gold/manual_limits.c";
+    const REAL_FNV_O2_BASE: u64 = 0x1_0000_0594;
+    const REAL_FNV_O2_SETUP: u64 = 0x1_0000_05ac;
+    const REAL_FNV_O2_LOOP: u64 = 0x1_0000_05b4;
+    const REAL_FNV_O2_EXIT: u64 = 0x1_0000_05d8;
+    const REAL_FNV_O2_BLOCKS: &[&str] = &[
+        "e80300aa607080d2a073aef200f6c1f2a08ce2f2810100b4",
+        "693680d20920c0f2",
+        "0a1540384b0501514c011b327f6900718a318a1a0a000aca407d099b210400f101ffff54",
+        "c0035fd6",
+    ];
+
+    fn decode_hex(encoded: &str) -> Vec<u8> {
+        encoded
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let high = (pair[0] as char).to_digit(16).expect("hex digit") as u8;
+                let low = (pair[1] as char).to_digit(16).expect("hex digit") as u8;
+                (high << 4) | low
+            })
+            .collect()
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    fn real_fnv_fold_storage(arch: &ArchSpec, register: &str) -> CanonicalStorageId {
+        let register = arch
+            .get_register(register)
+            .expect("pinned AARCH64 register");
+        CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: register.offset,
+            size: register.size,
+        }
+    }
+
+    fn real_fnv_fold_interface_with(
+        arch: &ArchSpec,
+        revision: &[u8],
+        pointee_kind: SourceTypeKind,
+        return_storage: CanonicalStorageId,
+    ) -> SourceFunctionInterface {
+        let graph = SourceTypeGraph::new(
+            [
+                SourceType::new(0, pointee_kind, 8, 8),
+                SourceType::new(1, SourceTypeKind::Pointer { target_type_id: 0 }, 64, 64),
+                SourceType::new(2, SourceTypeKind::UnsignedInteger, 64, 64),
+            ],
+            [],
+        )
+        .expect("real FNV source graph");
+        let full64 = SourceCarrierProjection::new(SourceCarrierKind::Full, 0, 64);
+        SourceFunctionInterface::new_exact_with_logical_types(
+            revision.to_vec(),
+            "aapcs64",
+            [
+                SourceAbiParameterSpec::new(0, real_fnv_fold_storage(arch, "x0")),
+                SourceAbiParameterSpec::new(1, real_fnv_fold_storage(arch, "x1")),
+            ],
+            SourceFunctionReturn::Register {
+                storage: return_storage,
+            },
+            [],
+            [
+                SourceLogicalValue::new(1, full64),
+                SourceLogicalValue::new(2, full64),
+            ],
+            Some(SourceLogicalValue::new(2, full64)),
+            Some(graph),
+        )
+        .expect("real FNV source interface")
+    }
+
+    fn real_fnv_fold_fixture() -> (ArchSpec, Vec<R2ILBlock>) {
+        let provenance = format!(
+            "binary={REAL_FNV_O2_BINARY_PATH} binary_sha256={REAL_FNV_O2_BINARY_SHA256} command={REAL_FNV_O2_COMPILER_COMMAND}"
+        );
+        assert_eq!(
+            sha256_hex(include_bytes!("../../../tests/gold/manual_limits.c")),
+            REAL_FNV_SOURCE_SHA256,
+            "source provenance changed: {provenance}"
+        );
+        assert_eq!(
+            sha256_hex(include_bytes!(
+                "../../../tests/r2r/bins/r2sleigh_manual_limits_O2"
+            )),
+            REAL_FNV_O2_BINARY_SHA256,
+            "binary provenance changed: {provenance}"
+        );
+        let function_bytes = REAL_FNV_O2_BLOCKS
+            .iter()
+            .flat_map(|encoded| decode_hex(encoded))
+            .collect::<Vec<_>>();
+        assert_eq!(function_bytes.len(), 72, "{provenance}");
+        assert_eq!(
+            sha256_hex(&function_bytes),
+            REAL_FNV_O2_FUNCTION_SHA256,
+            "function-byte provenance changed: {provenance}"
+        );
+
+        let arch = build_arch_spec(
+            sleigh_config::processor_aarch64::SLA_AARCH64_APPLESILICON,
+            sleigh_config::processor_aarch64::PSPEC_AARCH64,
+            "aarch64",
+        )
+        .expect("AARCH64 architecture");
+        let disassembler = Disassembler::from_sla(
+            sleigh_config::processor_aarch64::SLA_AARCH64_APPLESILICON,
+            sleigh_config::processor_aarch64::PSPEC_AARCH64,
+            "aarch64",
+        )
+        .expect("AARCH64 disassembler");
+        let mut address = REAL_FNV_O2_BASE;
+        let blocks = REAL_FNV_O2_BLOCKS
+            .iter()
+            .map(|encoded| {
+                let bytes = decode_hex(encoded);
+                let block = disassembler
+                    .lift_block(&bytes, address, bytes.len())
+                    .expect("pinned real ARM64 O2 FNV block");
+                assert_eq!(
+                    block.size as usize,
+                    bytes.len(),
+                    "real block must be fully consumed"
+                );
+                address += bytes.len() as u64;
+                block
+            })
+            .collect::<Vec<_>>();
+        let memory_spaces = blocks
+            .iter()
+            .flat_map(|block| &block.ops)
+            .filter_map(|op| match op {
+                R2ILOp::Load { space, .. } | R2ILOp::Store { space, .. } => Some(*space),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !memory_spaces.is_empty(),
+            "real FNV lift must access memory"
+        );
+        assert!(
+            memory_spaces.iter().all(|space| *space == SpaceId::Ram),
+            "real ARM64 FNV accesses must use Ram: {memory_spaces:?}"
+        );
+        (arch, blocks)
+    }
+
+    fn real_fnv_fold_artifact() -> SsaArtifact {
+        let (arch, blocks) = real_fnv_fold_fixture();
+        let interface = real_fnv_fold_interface_with(
+            &arch,
+            b"real-arm64-fnv-fold-o2-v1",
+            SourceTypeKind::UnsignedInteger,
+            real_fnv_fold_storage(&arch, "x0"),
+        );
+        SsaArtifact::for_decompile_with_interface(&blocks, Some(&arch), interface)
+            .expect("prepared real ARM64 O2 FNV artifact")
+    }
+
+    fn real_fnv_fold_artifact_with_contract(
+        revision: &[u8],
+        pointee_kind: SourceTypeKind,
+        return_register: &str,
+    ) -> SsaArtifact {
+        let (arch, blocks) = real_fnv_fold_fixture();
+        let interface = real_fnv_fold_interface_with(
+            &arch,
+            revision,
+            pointee_kind,
+            real_fnv_fold_storage(&arch, return_register),
+        );
+        SsaArtifact::for_decompile_with_interface(&blocks, Some(&arch), interface)
+            .expect("prepared real ARM64 O2 FNV contract variant")
+    }
+
+    #[test]
+    fn real_fnv_fold_fact_retains_exact_recurrence_and_return() {
+        let artifact = real_fnv_fold_artifact();
+        let fact = artifact
+            .structured()
+            .canonical_fnv_fold_loops
+            .get(&REAL_FNV_O2_LOOP)
+            .expect("real ARM64 O2 FNV fact");
+
+        assert_eq!(
+            fact.schema_version,
+            super::CANONICAL_FNV_FOLD_LOOP_FACT_SCHEMA_VERSION
+        );
+        assert_eq!(fact.topology.entry, REAL_FNV_O2_BASE);
+        assert_eq!(fact.topology.setup, REAL_FNV_O2_SETUP);
+        assert_eq!(fact.topology.exit, REAL_FNV_O2_EXIT);
+        assert_eq!(fact.hash.offset_basis, 0x1465_0fb0_739d_0383);
+        assert_eq!(fact.pointer.buffer_parameter_index, 0);
+        assert_eq!(fact.byte_load.access.ordinal, 0);
+        assert_eq!(
+            fact.byte_load.memory_version.object,
+            fact.byte_load.memory_object
+        );
+        assert!(fact.ascii.lowercase_on_true);
+        assert_eq!(fact.recurrence.product, fact.hash.carrier.update);
+        assert_eq!(fact.returned.value, fact.hash.exit_phi);
+        assert!(fact.validate_against(&artifact));
+    }
+
+    #[test]
+    fn real_fnv_fold_fact_rejects_hash_relation_mutation() {
+        let (arch, mut blocks) = real_fnv_fold_fixture();
+        let multiplication = blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.ops)
+            .find(|op| matches!(op, R2ILOp::IntMult { .. }))
+            .expect("real FNV multiplication");
+        let R2ILOp::IntMult { dst, a, b } = multiplication.clone() else {
+            unreachable!("selected multiplication")
+        };
+        *multiplication = R2ILOp::IntAdd { dst, a, b };
+        let interface = real_fnv_fold_interface_with(
+            &arch,
+            b"real-arm64-fnv-fold-o2-v1",
+            SourceTypeKind::UnsignedInteger,
+            real_fnv_fold_storage(&arch, "x0"),
+        );
+        let artifact = SsaArtifact::for_decompile_with_interface(&blocks, Some(&arch), interface)
+            .expect("prepared real ARM64 O2 FNV mutation");
+        assert!(artifact.structured().canonical_fnv_fold_loops.is_empty());
+    }
+
+    #[test]
+    fn real_fnv_fold_fact_rejects_return_and_type_contract_mutations() {
+        let artifact = real_fnv_fold_artifact_with_contract(
+            b"real-arm64-fnv-fold-o2-v1",
+            SourceTypeKind::UnsignedInteger,
+            "x1",
+        );
+        assert!(artifact.structured().canonical_fnv_fold_loops.is_empty());
+
+        let artifact = real_fnv_fold_artifact_with_contract(
+            b"real-arm64-fnv-fold-o2-v1",
+            SourceTypeKind::SignedInteger,
+            "x0",
+        );
+        assert!(artifact.structured().canonical_fnv_fold_loops.is_empty());
+    }
+
+    #[test]
+    fn real_fnv_fold_fact_revision_identity_is_exact() {
+        let original = real_fnv_fold_artifact();
+        let original_fact = original
+            .structured()
+            .canonical_fnv_fold_loops
+            .get(&REAL_FNV_O2_LOOP)
+            .expect("original real FNV revision fact");
+        let revised = real_fnv_fold_artifact_with_contract(
+            b"real-arm64-fnv-fold-o2-v2",
+            SourceTypeKind::UnsignedInteger,
+            "x0",
+        );
+        let revised_fact = revised
+            .structured()
+            .canonical_fnv_fold_loops
+            .get(&REAL_FNV_O2_LOOP)
+            .expect("revised real FNV source fact");
+
+        assert_ne!(
+            original_fact.abi.revision_identity,
+            revised_fact.abi.revision_identity
+        );
+        assert!(!original_fact.validate_against(&revised));
+        assert!(!revised_fact.validate_against(&original));
+    }
+
+    #[test]
+    fn real_fnv_fold_fact_revalidator_rejects_corrupted_identity() {
+        let artifact = real_fnv_fold_artifact();
+        let fact = artifact
+            .structured()
+            .canonical_fnv_fold_loops
+            .get(&REAL_FNV_O2_LOOP)
+            .expect("real ARM64 O2 FNV fact");
+        let mut corrupted = fact.clone();
+        corrupted.schema_version = 0;
+        assert!(!corrupted.validate_against(&artifact));
+        let mut corrupted = fact.clone();
+        corrupted.abi.revision_identity = b"different-revision".to_vec().into_boxed_slice();
+        assert!(!corrupted.validate_against(&artifact));
+        let mut corrupted = fact.clone();
+        corrupted.pointer.load_address = fact.pointer.carrier.update;
+        assert!(!corrupted.validate_against(&artifact));
+        let mut corrupted = fact.clone();
+        corrupted.byte_load.memory_version.version =
+            corrupted.byte_load.memory_version.version.saturating_add(1);
+        assert!(!corrupted.validate_against(&artifact));
+        let mut corrupted = fact.clone();
+        corrupted.returned.value = fact.hash.carrier.phi;
+        assert!(!corrupted.validate_against(&artifact));
     }
 
     #[test]

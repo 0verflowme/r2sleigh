@@ -13455,6 +13455,7 @@ mod tests {
                 phis: vec![PhiNode {
                     dst: rax_2.clone(),
                     sources: vec![(0x1000, rax_1.clone())],
+                    canonical_storage: None,
                 }],
                 ops: vec![SSAOp::Return { target: rax_2 }],
             },
@@ -13502,6 +13503,7 @@ mod tests {
                 phis: vec![PhiNode {
                     dst: rax_2.clone(),
                     sources: vec![(0x1000, rax_1.clone()), (0x1020, rax_3.clone())],
+                    canonical_storage: None,
                 }],
                 ops: vec![SSAOp::CBranch {
                     target: make_var("ram:1020", 0, 8),
@@ -16397,6 +16399,7 @@ mod tests {
                     (0x100c, make_var("X8", 0, 8)),
                     (0x1008, make_var("X8", 0, 8)),
                 ],
+                canonical_storage: None,
             },
             PhiNode {
                 dst: make_var("tmp:300", 2, 4),
@@ -16404,6 +16407,7 @@ mod tests {
                     (0x100c, make_var("tmp:300", 0, 4)),
                     (0x1008, make_var("tmp:300", 0, 4)),
                 ],
+                canonical_storage: None,
             },
             PhiNode {
                 dst: make_var("tmp:6400", 5, 8),
@@ -16411,6 +16415,7 @@ mod tests {
                     (0x100c, make_var("tmp:6400", 0, 8)),
                     (0x1008, make_var("tmp:6400", 0, 8)),
                 ],
+                canonical_storage: None,
             },
         ];
         exit.ops = vec![
@@ -16625,6 +16630,7 @@ mod tests {
                     (0x1028, make_var("tmp:300", 0, 4)),
                     (0x1014, make_var("tmp:300", 0, 4)),
                 ],
+                canonical_storage: None,
             },
             PhiNode {
                 dst: make_var("X8", 4, 8),
@@ -16632,6 +16638,7 @@ mod tests {
                     (0x1028, make_var("X8", 0, 8)),
                     (0x1014, make_var("X8", 0, 8)),
                 ],
+                canonical_storage: None,
             },
             PhiNode {
                 dst: make_var("tmp:6400", 5, 8),
@@ -16639,6 +16646,7 @@ mod tests {
                     (0x1028, make_var("tmp:6400", 0, 8)),
                     (0x1014, make_var("tmp:6400", 0, 8)),
                 ],
+                canonical_storage: None,
             },
         ];
         exit.ops = vec![
@@ -16886,6 +16894,7 @@ mod tests {
                     (0x1028, make_var("tmp:300", 0, 4)),
                     (0x1014, make_var("tmp:300", 0, 4)),
                 ],
+                canonical_storage: None,
             },
             PhiNode {
                 dst: make_var("X8", 4, 8),
@@ -16893,6 +16902,7 @@ mod tests {
                     (0x1028, make_var("X8", 0, 8)),
                     (0x1014, make_var("X8", 0, 8)),
                 ],
+                canonical_storage: None,
             },
             PhiNode {
                 dst: make_var("tmp:6400", 5, 8),
@@ -16900,6 +16910,7 @@ mod tests {
                     (0x1028, make_var("tmp:6400", 0, 8)),
                     (0x1014, make_var("tmp:6400", 0, 8)),
                 ],
+                canonical_storage: None,
             },
         ];
         exit.ops = vec![
@@ -17939,6 +17950,7 @@ mod tests {
                     (0x100000868, make_var("tmp:4700", 0, 8)),
                     (0x100000871, make_var("tmp:4700", 0, 8)),
                 ],
+                canonical_storage: None,
             },
             PhiNode {
                 dst: make_var("tmp:6a80", 5, 4),
@@ -17946,6 +17958,7 @@ mod tests {
                     (0x100000868, make_var("tmp:6a80", 0, 4)),
                     (0x100000871, make_var("tmp:6a80", 0, 4)),
                 ],
+                canonical_storage: None,
             },
         ];
         func.get_block_mut(0x100000878).expect("exit").ops = vec![
@@ -18682,6 +18695,7 @@ mod tests {
                     (0x10000107a, make_var("EAX", 0, 4)),
                     (0x100001082, make_var("EAX", 0, 4)),
                 ],
+                canonical_storage: None,
             },
             PhiNode {
                 dst: make_var("RAX", 6, 8),
@@ -18689,6 +18703,7 @@ mod tests {
                     (0x10000107a, make_var("RAX", 0, 8)),
                     (0x100001082, make_var("RAX", 0, 8)),
                 ],
+                canonical_storage: None,
             },
             PhiNode {
                 dst: make_var("tmp:11f00", 5, 4),
@@ -18696,6 +18711,7 @@ mod tests {
                     (0x10000107a, make_var("tmp:11f00", 0, 4)),
                     (0x100001082, make_var("tmp:11f00", 0, 4)),
                 ],
+                canonical_storage: None,
             },
             PhiNode {
                 dst: make_var("tmp:4700", 13, 8),
@@ -18703,6 +18719,7 @@ mod tests {
                     (0x10000107a, make_var("tmp:4700", 0, 8)),
                     (0x100001082, make_var("tmp:4700", 0, 8)),
                 ],
+                canonical_storage: None,
             },
             PhiNode {
                 dst: make_var("tmp:6a80", 7, 4),
@@ -18710,6 +18727,7 @@ mod tests {
                     (0x10000107a, make_var("tmp:6a80", 0, 4)),
                     (0x100001082, make_var("tmp:6a80", 0, 4)),
                 ],
+                canonical_storage: None,
             },
         ];
         func.get_block_mut(0x100001088).expect("exit").ops = vec![

@@ -8501,7 +8501,7 @@ fn r2plugin_function_decompile_export_is_engine_only() {
     );
 
     assert!(
-        engine_impl.contains("run_engine_decompile_on_large_stack")
+        engine_impl.contains("run_engine_decompile")
             && engine_impl.contains("EngineFunctionDecompileRequestInput::single_function"),
         "engine decompile wrapper must build an engine-owned decompile request and run it through EngineSession"
     );
@@ -8996,6 +8996,27 @@ fn r2dec_certified_c_residualizes_non_engine_owner_and_requires_effect_proofs() 
     assert!(
         !permission_body.contains("r2sym::RenderPermissionKind::CertifiedC => None"),
         "CertifiedC must not bypass residualization without checking proof owner"
+    );
+
+    let production_gate_marker =
+        "#[cfg(not(test))]\nfn render_permission_allows_executable_c";
+    let production_gate_start = source.find(production_gate_marker).unwrap_or_else(|| {
+        panic!("missing production legacy CertifiedC interlock in {}", path.display())
+    });
+    let production_gate_rest = &source[production_gate_start..];
+    let production_gate_end = production_gate_rest
+        .find("#[cfg(test)]\nfn render_permission_allows_executable_c")
+        .unwrap_or_else(|| panic!("missing test-only legacy render-permission fixture branch"));
+    let production_gate = &production_gate_rest[..production_gate_end];
+    for required in ["let _ = permission;", "false"] {
+        assert!(
+            production_gate.contains(required),
+            "production r2dec must keep legacy render permissions inert: {required:?}"
+        );
+    }
+    assert!(
+        !production_gate.contains("RenderPermissionKind::CertifiedC"),
+        "production r2dec must not derive executable authority from the legacy CertifiedC token"
     );
 
     let contract_marker = "fn certified_standard_output_residual_reason_with_effect_proofs";
@@ -9757,17 +9778,18 @@ fn r2plugin_sla_dec_does_not_build_interproc_scope_in_c() {
     let source = std::fs::read_to_string(&path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
     let start = source
-        .find("if (!strncmp (cmd, \"sla.dec\", 7))")
-        .unwrap_or_else(|| panic!("missing sla.dec command block"));
+        .find("static RCodeMeta *sleigh_decompile(")
+        .unwrap_or_else(|| panic!("missing decompiler provider callback"));
     let end = source[start..]
-        .find("if (!strcmp (cmd, \"sla.cfg\")")
+        .find("static char *sleigh_cmd(")
         .map(|offset| start + offset)
-        .unwrap_or_else(|| panic!("missing sla.cfg command block after sla.dec"));
+        .unwrap_or_else(|| panic!("missing command callback after decompiler provider"));
     let decompile_block = &source[start..end];
 
     assert!(
-        decompile_block.contains("r2sleigh_engine_decompile_function (&decompile_input)"),
-        "sla.dec must route decompile through the engine FFI"
+        decompile_block.contains("sleigh_engine_execute_v2 (")
+            && decompile_block.contains("R2SLEIGH_REQUEST_DECOMPILE_V2"),
+        "decompiler provider must route decompile through the V2 engine boundary"
     );
     for forbidden in [
         "build_type_interproc_scope",
@@ -9804,12 +9826,12 @@ fn r2plugin_decompile_path_does_not_repair_cfg_or_invent_switches() {
     let rust_source = std::fs::read_to_string(&rust_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", rust_path.display()));
     let decompile_start = source
-        .find("if (!strncmp (cmd, \"sla.dec\", 7))")
-        .unwrap_or_else(|| panic!("missing sla.dec command block"));
+        .find("static RCodeMeta *sleigh_decompile(")
+        .unwrap_or_else(|| panic!("missing decompiler provider callback"));
     let decompile_end = source[decompile_start..]
-        .find("if (!strcmp (cmd, \"sla.cfg\")")
+        .find("static char *sleigh_cmd(")
         .map(|offset| decompile_start + offset)
-        .unwrap_or_else(|| panic!("missing sla.cfg command block after sla.dec"));
+        .unwrap_or_else(|| panic!("missing command callback after decompiler provider"));
     let decompile_block = &source[decompile_start..decompile_end];
     let lift_start = source
         .find("static bool lift_function_blocks(")
@@ -9821,8 +9843,9 @@ fn r2plugin_decompile_path_does_not_repair_cfg_or_invent_switches() {
     let lift_body = &source[lift_start..lift_end];
 
     assert!(
-        decompile_block.contains("r2sleigh_engine_decompile_function (&decompile_input)"),
-        "sla.dec must route decompile through the engine FFI"
+        decompile_block.contains("sleigh_engine_execute_v2 (")
+            && decompile_block.contains("R2SLEIGH_REQUEST_DECOMPILE_V2"),
+        "decompiler provider must route decompile through the V2 engine boundary"
     );
     assert!(
         decompile_block.contains("lift_function_blocks (anal, fcn, ctx, &blocks)"),
@@ -9891,12 +9914,12 @@ fn r2plugin_sla_dec_preserves_lift_quality_for_engine() {
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", engine_path.display()));
 
     let decompile_start = c_source
-        .find("if (!strncmp (cmd, \"sla.dec\", 7))")
-        .unwrap_or_else(|| panic!("missing sla.dec command block"));
+        .find("static RCodeMeta *sleigh_decompile(")
+        .unwrap_or_else(|| panic!("missing decompiler provider callback"));
     let decompile_end = c_source[decompile_start..]
-        .find("if (!strcmp (cmd, \"sla.cfg\")")
+        .find("static char *sleigh_cmd(")
         .map(|offset| decompile_start + offset)
-        .unwrap_or_else(|| panic!("missing sla.cfg command block after sla.dec"));
+        .unwrap_or_else(|| panic!("missing command callback after decompiler provider"));
     let decompile_block = &c_source[decompile_start..decompile_end];
     let lift_handoff_start = decompile_block
         .find("bool lift_ok = lift_function_blocks")
@@ -9930,8 +9953,9 @@ fn r2plugin_sla_dec_preserves_lift_quality_for_engine() {
         );
     }
     assert!(
-        decompile_block.contains("r2sleigh_engine_decompile_function (&decompile_input)"),
-        "sla.dec must route incomplete lift input to r2engine"
+        decompile_block.contains("sleigh_engine_execute_v2 (")
+            && decompile_block.contains("R2SLEIGH_REQUEST_DECOMPILE_V2"),
+        "decompiler provider must route incomplete lift input to r2engine through V2"
     );
     for forbidden in [
         "R2SleighLiftQuality quality = {0}",
@@ -9960,7 +9984,7 @@ fn r2plugin_sla_dec_preserves_lift_quality_for_engine() {
         "parse_typed_external_context_for_engine(",
         "EngineFunctionDecompileRequestInput::single_function_from_engine_context(",
         ".with_input_quality(input_quality)",
-        "run_engine_decompile_on_large_stack(decompile_input)",
+        "run_engine_decompile(decompile_input)",
         "quality.expected_blocks",
         "quality.lifted_blocks",
         "quality.read_failures",

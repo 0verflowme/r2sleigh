@@ -16,6 +16,9 @@ serde_json.workspace = true
 z3.workspace = true
 
 [dev-dependencies]
+r2sleigh-lift = { path = "../r2sleigh-lift" }
+sleigh-config = { workspace = true, features = ["x86", "AARCH64"] }
+sha2 = "0.10"
 
 [features]
 default = []

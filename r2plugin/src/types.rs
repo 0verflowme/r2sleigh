@@ -24,7 +24,7 @@ pub(crate) type FunctionAnalysisArtifact = r2engine::EngineAnalysisArtifact;
 #[cfg(test)]
 type FunctionAnalysisCacheKey = r2engine::AnalysisCacheKey;
 #[cfg(test)]
-type FunctionArtifactCacheKey = r2engine::ArtifactCacheKey;
+type FunctionRequestKey = r2engine::EngineRequestKey;
 
 #[cfg(test)]
 fn hash_debug_payload<T: std::fmt::Debug>(value: &T) -> u64 {
@@ -53,7 +53,7 @@ fn hash_blocks(blocks: &[R2ILBlock]) -> u64 {
 
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
-fn function_artifact_cache_key_parts_hashed(
+fn function_request_key_parts_hashed(
     function_name: &str,
     function_addr: u64,
     arch: Option<&ArchSpec>,
@@ -64,7 +64,7 @@ fn function_artifact_cache_key_parts_hashed(
     interproc_scope_hash: u64,
     interproc_max_iterations: usize,
     symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
-) -> Option<FunctionArtifactCacheKey> {
+) -> Option<FunctionRequestKey> {
     let analysis = FunctionAnalysisCacheKey::from_hashes(
         function_addr,
         hash_string_payload(function_name),
@@ -73,14 +73,21 @@ fn function_artifact_cache_key_parts_hashed(
         typed_context_hash,
         assumptions_hash,
         r2engine::function_analysis_depth_hash(semantic_metadata_enabled),
+        None,
     );
     let interproc_budget_hash = hash_value(&(
         "interproc-scope-budget-v1",
         interproc_scope_hash,
         interproc_max_iterations,
     ));
-    Some(FunctionArtifactCacheKey::from_hashes(
+    Some(FunctionRequestKey::from_request_hashes(
         analysis,
+        function_addr,
+        typed_context_hash,
+        assumptions_hash,
+        r2engine::function_analysis_depth_hash(semantic_metadata_enabled),
+        arch.map(effective_ptr_bits).unwrap_or(64),
+        0,
         interproc_budget_hash,
         r2sym::stable_scope_hash(symbolic_scope),
     ))
@@ -88,7 +95,7 @@ fn function_artifact_cache_key_parts_hashed(
 
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
-fn function_artifact_cache_key_parts(
+fn function_request_key_parts(
     function_name: &str,
     arch: Option<&ArchSpec>,
     blocks: &[R2ILBlock],
@@ -97,10 +104,10 @@ fn function_artifact_cache_key_parts(
     interproc_scope_hash: u64,
     interproc_max_iterations: usize,
     symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
-) -> Option<FunctionArtifactCacheKey> {
+) -> Option<FunctionRequestKey> {
     let ptr_bits = arch.map(effective_ptr_bits).unwrap_or(64);
     let parsed = r2engine::parse_external_context_json_for_engine(external_context_json, ptr_bits);
-    function_artifact_cache_key_parts_hashed(
+    function_request_key_parts_hashed(
         function_name,
         0,
         arch,
@@ -167,12 +174,10 @@ pub extern "C" fn r2sleigh_engine_cache_stats_json() -> *mut c_char {
     });
     let metrics = profile.metrics;
     let analysis = metrics.analysis;
-    let artifacts = metrics.artifacts;
     let total = profile.total;
     let json = format!(
-        "{{\"analysis\":{},\"artifacts\":{},\"total\":{}}}",
+        "{{\"analysis\":{},\"total\":{}}}",
         cache_counters_json(analysis),
-        cache_counters_json(artifacts),
         cache_counters_json(total)
     );
     CString::new(json).map_or(ptr::null_mut(), |c| c.into_raw())
@@ -514,6 +519,7 @@ pub(crate) fn build_detached_function_analysis_artifact_with_scope_and_optional_
             arch: arch.cloned(),
             ptr_bits: Some(ptr_bits),
             semantic_metadata_enabled,
+            source_snapshot: None,
             reg_type_hints: reg_type_hints.clone(),
             parsed_context: parsed_context.parsed_context,
             external_context_fallback_hash: parsed_context.fallback_hash,
@@ -2139,7 +2145,7 @@ mod tests {
     }
 
     #[test]
-    fn function_artifact_cache_key_distinguishes_symbolic_scope() {
+    fn function_request_key_distinguishes_symbolic_scope() {
         let arch = ArchSpec::new("x86-64");
         let root_blocks = const_return_blocks(0x1000, 0);
         let helper_a_blocks = const_return_blocks(0x2000, 1);
@@ -2186,7 +2192,7 @@ mod tests {
         .expect("scope b");
         let interproc_hash = empty_interproc_hash();
 
-        let key_without_scope = function_artifact_cache_key_parts(
+        let key_without_scope = function_request_key_parts(
             "root",
             Some(&arch),
             &root_blocks,
@@ -2197,7 +2203,7 @@ mod tests {
             None,
         )
         .expect("root-only cache key");
-        let key_a = function_artifact_cache_key_parts(
+        let key_a = function_request_key_parts(
             "root",
             Some(&arch),
             &root_blocks,
@@ -2208,7 +2214,7 @@ mod tests {
             Some(&scope_a),
         )
         .expect("scoped cache key a");
-        let key_a_repeat = function_artifact_cache_key_parts(
+        let key_a_repeat = function_request_key_parts(
             "root",
             Some(&arch),
             &root_blocks,
@@ -2219,7 +2225,7 @@ mod tests {
             Some(&scope_a),
         )
         .expect("scoped cache key a repeat");
-        let key_b = function_artifact_cache_key_parts(
+        let key_b = function_request_key_parts(
             "root",
             Some(&arch),
             &root_blocks,
@@ -2241,16 +2247,16 @@ mod tests {
         );
         assert_ne!(
             key_a, key_b,
-            "different helper closures must not alias the same artifact cache entry"
+            "different helper closures must not alias the same analysis request identity"
         );
     }
 
     #[test]
-    fn function_artifact_cache_key_distinguishes_function_name() {
+    fn function_request_key_distinguishes_function_name() {
         let arch = ArchSpec::new("x86-64");
         let blocks = const_return_blocks(0x1000, 0);
         let interproc_hash = empty_interproc_hash();
-        let first = function_artifact_cache_key_parts(
+        let first = function_request_key_parts(
             "sym.first",
             Some(&arch),
             &blocks,
@@ -2261,7 +2267,7 @@ mod tests {
             None,
         )
         .expect("first cache key");
-        let second = function_artifact_cache_key_parts(
+        let second = function_request_key_parts(
             "sym.second",
             Some(&arch),
             &blocks,
@@ -2280,7 +2286,7 @@ mod tests {
     }
 
     #[test]
-    fn function_artifact_cache_key_distinguishes_interproc_iteration_budget() {
+    fn function_request_key_distinguishes_interproc_iteration_budget() {
         let arch = ArchSpec::new("x86-64");
         let blocks = const_return_blocks(0x1000, 0);
         let scope_hash = interproc_scope_facts_from_seed_entries([(
@@ -2289,7 +2295,7 @@ mod tests {
             Some(1),
         )])
         .identity_hash();
-        let first = function_artifact_cache_key_parts(
+        let first = function_request_key_parts(
             "sym.root",
             Some(&arch),
             &blocks,
@@ -2300,7 +2306,7 @@ mod tests {
             None,
         )
         .expect("low budget cache key");
-        let second = function_artifact_cache_key_parts(
+        let second = function_request_key_parts(
             "sym.root",
             Some(&arch),
             &blocks,
@@ -2319,7 +2325,7 @@ mod tests {
     }
 
     #[test]
-    fn function_artifact_cache_key_uses_typed_context_identity() {
+    fn function_request_key_uses_typed_context_identity() {
         let arch = ArchSpec::new("x86-64");
         let blocks = const_return_blocks(0x1000, 0);
         let first_context = r#"{"context":{"schema_version":1,"dirty_epoch":7,"context_hash":42},"signature":{"name":"sym.root"}}"#;
@@ -2328,7 +2334,7 @@ mod tests {
         let changed_type_epoch_context = r#"{"context":{"schema_version":1,"dirty_epoch":7,"type_dirty_epoch":2,"context_hash":42},"signature":{"name":"sym.root"}}"#;
         let interproc_hash = empty_interproc_hash();
 
-        let first = function_artifact_cache_key_parts(
+        let first = function_request_key_parts(
             "sym.root",
             Some(&arch),
             &blocks,
@@ -2339,7 +2345,7 @@ mod tests {
             None,
         )
         .expect("first cache key");
-        let reordered = function_artifact_cache_key_parts(
+        let reordered = function_request_key_parts(
             "sym.root",
             Some(&arch),
             &blocks,
@@ -2350,7 +2356,7 @@ mod tests {
             None,
         )
         .expect("reordered cache key");
-        let changed_epoch = function_artifact_cache_key_parts(
+        let changed_epoch = function_request_key_parts(
             "sym.root",
             Some(&arch),
             &blocks,
@@ -2361,7 +2367,7 @@ mod tests {
             None,
         )
         .expect("changed epoch cache key");
-        let changed_type_epoch = function_artifact_cache_key_parts(
+        let changed_type_epoch = function_request_key_parts(
             "sym.root",
             Some(&arch),
             &blocks,
@@ -2388,11 +2394,11 @@ mod tests {
     }
 
     #[test]
-    fn function_artifact_cache_key_distinguishes_function_address() {
+    fn function_request_key_distinguishes_function_address() {
         let arch = ArchSpec::new("x86-64");
         let blocks = const_return_blocks(0x1000, 0);
         let interproc_hash = empty_interproc_hash();
-        let first = function_artifact_cache_key_parts_hashed(
+        let first = function_request_key_parts_hashed(
             "sym.root",
             0x1000,
             Some(&arch),
@@ -2405,7 +2411,7 @@ mod tests {
             None,
         )
         .expect("first cache key");
-        let second = function_artifact_cache_key_parts_hashed(
+        let second = function_request_key_parts_hashed(
             "sym.root",
             0x2000,
             Some(&arch),
@@ -2421,7 +2427,7 @@ mod tests {
 
         assert_ne!(
             first, second,
-            "session artifact cache entries must not alias across function addresses"
+            "session analysis request identities must not alias across function addresses"
         );
     }
 }

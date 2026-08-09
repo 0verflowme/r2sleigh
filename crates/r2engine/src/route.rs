@@ -116,6 +116,96 @@ pub enum EnginePlan {
     RefuseWithEvidence,
 }
 
+/// The exact permit-bearing semantic-kernel region selected for production
+/// rendering. This is intentionally separate from the legacy `r2sym` render
+/// permission carried by route facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EngineSemanticKernelRegion {
+    TerminalReturnBlock,
+    AggregateMemberTerminalReturnFunction,
+    PlainRamMemoryTerminalReturnFunction,
+    DirectCallTerminalReturnFunction,
+    ConditionalTerminalReturnFunction,
+    PrivateFrameConditionalReturnFunction,
+    CanonicalFnvFoldLoopFunction,
+    ConditionalFunnelSharedReturnFunction,
+    SwitchTerminalReturnFunction,
+    CarrierFreeLoopTerminalReturnFunction,
+    CountedLoopTerminalReturnFunction,
+    /// Kept at the end to preserve existing serialized enum discriminants.
+    CanonicalFnvFoldO0Function,
+    /// Kept at the end to preserve existing serialized enum discriminants.
+    BranchlessGuardFunction,
+    /// Kept at the end to preserve existing serialized enum discriminants.
+    StructArrayIndexFunction,
+    /// Kept at the end to preserve existing serialized enum discriminants.
+    NestedWrap32GuardO0Function,
+    /// Kept at the end to preserve existing serialized enum discriminants.
+    SumArrayFunction,
+}
+
+impl EngineSemanticKernelRegion {
+    /// Current proof/render contract for this exact semantic-kernel region.
+    /// Transport layers use this table instead of assuming every region is v1.
+    pub const fn current_schema_version(self) -> u32 {
+        match self {
+            Self::TerminalReturnBlock => r2dec::CERTIFIED_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
+            Self::AggregateMemberTerminalReturnFunction => {
+                r2dec::CERTIFIED_AGGREGATE_MEMBER_SEMANTIC_C_FUNCTION_SCHEMA_VERSION
+            }
+            Self::PlainRamMemoryTerminalReturnFunction => {
+                r2dec::CERTIFIED_MEMORY_SEMANTIC_C_FUNCTION_SCHEMA_VERSION
+            }
+            Self::DirectCallTerminalReturnFunction => {
+                r2dec::CERTIFIED_DIRECT_CALL_RETURN_FUNCTION_SCHEMA_VERSION
+            }
+            Self::ConditionalTerminalReturnFunction => {
+                r2dec::CERTIFIED_CONDITIONAL_RETURN_FUNCTION_SCHEMA_VERSION
+            }
+            Self::PrivateFrameConditionalReturnFunction => {
+                r2dec::CERTIFIED_PRIVATE_FRAME_SEMANTIC_C_FUNCTION_SCHEMA_VERSION
+            }
+            Self::CanonicalFnvFoldLoopFunction => {
+                r2dec::CERTIFIED_FNV_FOLD_SEMANTIC_C_FUNCTION_SCHEMA_VERSION
+            }
+            Self::CanonicalFnvFoldO0Function => {
+                r2dec::CERTIFIED_FNV_FOLD_O0_SEMANTIC_C_FUNCTION_SCHEMA_VERSION
+            }
+            Self::BranchlessGuardFunction => {
+                r2dec::CERTIFIED_BRANCHLESS_GUARD_SEMANTIC_C_FUNCTION_SCHEMA_VERSION
+            }
+            Self::StructArrayIndexFunction => {
+                r2dec::CERTIFIED_STRUCT_ARRAY_INDEX_SEMANTIC_C_FUNCTION_SCHEMA_VERSION
+            }
+            Self::NestedWrap32GuardO0Function => {
+                r2dec::CERTIFIED_NESTED_WRAP32_GUARD_O0_SEMANTIC_C_FUNCTION_SCHEMA_VERSION
+            }
+            Self::SumArrayFunction => {
+                r2dec::CERTIFIED_SUM_ARRAY_SEMANTIC_C_FUNCTION_SCHEMA_VERSION
+            }
+            Self::ConditionalFunnelSharedReturnFunction => {
+                r2dec::CERTIFIED_CONDITIONAL_FUNNEL_RETURN_FUNCTION_SCHEMA_VERSION
+            }
+            Self::SwitchTerminalReturnFunction => {
+                r2dec::CERTIFIED_SWITCH_RETURN_FUNCTION_SCHEMA_VERSION
+            }
+            Self::CarrierFreeLoopTerminalReturnFunction => {
+                r2dec::CERTIFIED_LOOP_RETURN_FUNCTION_SCHEMA_VERSION
+            }
+            Self::CountedLoopTerminalReturnFunction => {
+                r2dec::CERTIFIED_COUNTED_LOOP_RETURN_FUNCTION_SCHEMA_VERSION
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineSemanticKernelRender {
+    pub region: EngineSemanticKernelRegion,
+    pub region_schema_version: u32,
+    pub exact_obligation_closure: bool,
+}
+
 fn provisional_decompile_route(
     kind: r2types::DecompileRouteKind,
     reason: Option<String>,
@@ -143,7 +233,10 @@ fn provisional_decompile_route(
 pub struct EngineDiagnostics {
     pub plan: Option<EnginePlan>,
     pub route_reason: Option<String>,
+    pub semantic_kernel_render: Option<EngineSemanticKernelRender>,
+    /// Legacy route coverage retained for diagnostics, never exact render authority.
     pub proof_coverage: Option<r2sym::ProofCoverage>,
+    /// Legacy route claim retained for compatibility, never exact render authority.
     pub render_permission: Option<r2sym::RenderPermission>,
     pub warnings: Vec<String>,
     pub refusal: Option<String>,
@@ -278,6 +371,7 @@ impl EngineTypedRouteDecision {
         EngineDiagnostics {
             plan: Some(self.plan()),
             route_reason: self.reason(),
+            semantic_kernel_render: None,
             proof_coverage: self.proof_coverage(),
             render_permission: self.render_permission(),
             refusal: self.refusal(),
@@ -439,8 +533,9 @@ pub(crate) fn decompile_probe_decision_for_identity(
         && (raw_cfg.loop_count > 0
             || raw_cfg.back_edge_count > 0
             || raw_cfg.switch_block_count > 0);
-    let skipped_large_cfg_guarded =
-        cfg_guard_reason.is_some() || blocks.len() > 200 || op_count > 512;
+    let skipped_large_cfg_guarded = cfg_guard_reason.is_some()
+        || blocks.len() > crate::ENGINE_DECOMPILE_MAX_BLOCKS
+        || op_count > crate::ENGINE_DECOMPILE_MAX_OPS;
     let named_worker_guarded = name_facts.summary_family && skipped_large_cfg_guarded;
     let block_guarded = named_worker_guarded || skipped_large_cfg_guarded;
     let summary_probe_needed =
@@ -709,12 +804,7 @@ pub(crate) fn decompile_route_decision(
         .unwrap_or_default()
         .merge(function_facts.proof_coverage().clone())
         .merge(proof_coverage_from_type_facts(function_facts.type_facts()));
-    let render_permission = render_permission_for_decompile_route(
-        &route,
-        cfg_summary,
-        &proof_coverage,
-        prepared.is_some(),
-    );
+    let render_permission = legacy_render_permission_for_decompile_route(&route);
     let mut route = route;
     route.skip_runtime_type_inference =
         should_skip_runtime_type_inference(prepared, function_facts);
@@ -728,16 +818,17 @@ pub(crate) fn decompile_route_decision(
     }
 }
 
-fn render_permission_for_decompile_route(
+/// Retains the legacy route diagnostic without granting render authority.
+/// Exact executable C is authorized only by the typed-region permits consumed
+/// by the semantic-kernel renderers.
+fn legacy_render_permission_for_decompile_route(
     route: &r2types::DecompileRouteFacts,
-    cfg_summary: &CFGRiskSummary,
-    proof_coverage: &r2sym::ProofCoverage,
-    prepared_available: bool,
 ) -> r2sym::RenderPermission {
     match route.kind {
-        r2types::DecompileRouteKind::Standard => {
-            proof_coverage.standard_control_render_permission(cfg_summary, prepared_available)
-        }
+        r2types::DecompileRouteKind::Standard => r2sym::RenderPermission::residual(
+            r2sym::ProofOwner::R2engine,
+            "legacy Standard proof counters cannot authorize production output; r2cert typed-region authorization is required",
+        ),
         r2types::DecompileRouteKind::FallbackComment => r2sym::RenderPermission::refuse(
             r2sym::ProofOwner::R2engine,
             route

@@ -1,0 +1,334 @@
+{
+  "schema": 3,
+  "title": "Semantic Preservation Kernel Phase-0 Baseline Results",
+  "capture_started_at_utc": "2026-08-06T07:36:43Z",
+  "evidence_collection_finished_at_utc": "2026-08-06T07:38:22Z",
+  "status": "fail",
+  "status_note": "The Phase-0 evidence capture is complete and reproducible. The pinned implementation fails the semantic/type/structural quality gates recorded below.",
+  "identity": {
+    "r2sleigh_commit": "0cbe057efb8427b021e1c8cde4d721573fdb9fdd",
+    "r2sleigh_source_worktree": "/tmp/r2sleigh-phase0-baseline-0cbe057e",
+    "r2sleigh_tracked_worktree_status": "clean",
+    "radare2_commit": "62791dc54f6af6e95d9a61c997e5c1eda098775d",
+    "radare2_source_worktree": "/tmp/radare2-phase0-62791dc5",
+    "radare2_tracked_worktree_status": "clean",
+    "radare2_version": "6.1.8-443-g62791dc54f-131",
+    "radare2_binary_sha256": "60f7c469f0affdc5fb954c25812f8dead5253a9fe4461faab25c513af737854a",
+    "plugin_artifacts_sha256": {
+      "anal_sleigh.dylib": "789e9b7b9302e0f363782b3fa66c8333b87d35712032dd2ba9acc23d39a4b4a2",
+      "arch_sleigh.dylib": "4605c1436fc889d7b5778cf7b91f436c4636ad0d0ff8c23b47424e2be7a5f90c",
+      "libr2sleigh_plugin.dylib": "9c05cae134e19d7fdc70921b92ca18b86feba3074512bd84a6c10d26b994f9ce",
+      "bundle": "f2076a5098d6294839d75ee0591c4b6d2b46bfe0e6d760bb28aee6965da8e454"
+    },
+    "fixture_sha256": {
+      "vuln_test_x86": "21e128b121904b83265f3d8e21201aea9c41f14fb5b35d37269c0fd70fdf7627",
+      "test_func_x86": "783b1ac25b22cb1cc57139cddd52b1571a738b500ae622c29f4d2d8205e3d747",
+      "r2sleigh_manual_limits_O0": "64e6305931f25395612666df180bd2c64e680a7a1f43f538084dd3d0123378b9",
+      "r2sleigh_manual_limits_O2": "4c5284101ce059a987bf3dda899ce667cdcd86e077c9a0f942958b8e5f181845",
+      "source_gold_stress_test_x86": "4eb3363a0f3072ca23f4d5e8efbf3b212bed6d9915192146bbb8b6a509fc2c65",
+      "source_gold_vuln_test_x86": "21e128b121904b83265f3d8e21201aea9c41f14fb5b35d37269c0fd70fdf7627"
+    },
+    "host": "Darwin 25.5.0 arm64",
+    "compiler": "Apple clang 21.0.0 (clang-2100.1.1.101)",
+    "python": "3.9.6",
+    "rustc": "1.93.0",
+    "cargo": "1.93.0",
+    "r2r_version": "6.1.9 +36727 abi:131"
+  },
+  "measurement_harness": {
+    "plugin_under_test_commit": "0cbe057efb8427b021e1c8cde4d721573fdb9fdd",
+    "harness_revision": "uncommitted rewrite-worktree bytes identified only by the hashes below",
+    "used_rewrite_worktree_script": true,
+    "executed_benchmark_sha256": "2f8515268fe7be6329743382fc67403a1390339fbe3d7f09b256f188c95622c4",
+    "executed_source_oracle_sha256": "fb115df78d451bb393960635008dae5c7a3dc10817decd56125f7856693cb78b",
+    "executed_closure_manifest_sha256": "9524750c66dbe15201e66f3eee8ec3643d93c08504503341dc7afb3c7f34c4d9",
+    "executed_capture_script_sha256": "fa03c9f01c6f0edb7982da07576b965aca3c7d244499ab01485929d118ea742c",
+    "raw_output_root_path_identity_note": "Each report value named raw_output_root_path_identity_sha256 is the harness configuration hash of the absolute raw-output root path string, not a content/tree hash. Raw content integrity comes from per-record byte hashes and the archive SHA256SUMS manifest.",
+    "reason": "The pinned plugin source predates lossless source-gold capture, direct-child RSS collection, and explicit semantic/cosmetic oracle categories. Exact executed harness inputs are archived and checksummed; they are measurement-only and are not attributed to the pinned plugin commit."
+  },
+  "local_archive": {
+    "path": "target/phase0-baseline-v2-0cbe057e-62791dc5",
+    "git_ignored": true,
+    "raw_metadata_file_count": 244,
+    "benchmark_raw_records": 180,
+    "source_gold_raw_records": 64,
+    "checksum_entry_count": 771,
+    "checksum_manifest_sha256": "28d1bafd2aff59acc6d150117046c5583cd2e66c1d5c4513932b54dcf0752f3c",
+    "checksum_verification": "pass",
+    "contains_sensitive_paths_and_output": true,
+    "durability": "local_only_git_ignored",
+    "supersedes": "target/phase0-baseline-0cbe057e-62791dc5",
+    "note": "The archive contains lossless stdout/stderr metadata for all benchmark and source-gold executions, exact executed scripts/configurations, every actual pinned fixture byte, pinned plugin/radare2 artifacts, build logs, r2r logs, command statuses, archived UTC/host/compiler provenance, and a verified relative-path SHA-256 manifest. It is locally verifiable but is not a shared durable artifact because it may contain sensitive output and is git-ignored."
+  },
+  "reports": [
+    {
+      "id": "manual_o0_cold",
+      "sha256": "8a0872bd56184adf2e0e6f6becd9cb46ac2b4868da1283c155fe7f05451e8beb",
+      "run_config_sha256": "00a5c2dd0df40cb0e45edc984d4e6b2613eb0edefa536f6cd7b7b4e6bb17662a",
+      "raw_output_root_path_identity_sha256": "eaa11758745f02f9315520633023423426cbf3423afd0b82064dae5601971f48",
+      "targets": 5,
+      "raw_records": 15,
+      "structured": 3,
+      "residual": 2,
+      "peak_child_rss_bytes": 88915968,
+      "wall_seconds": 1.894606,
+      "summed_cold_command_seconds": 11.897499,
+      "summed_warm_command_seconds": 0.0,
+      "average_quality_score": 0.0
+    },
+    {
+      "id": "manual_o0_warm",
+      "sha256": "c74c6d159ff160be52cd2d98b2094f3d49009c1a1cc4337a59be2f5e7e50887d",
+      "run_config_sha256": "4f65070c55195c87626fd33c19c8d0ccb7c4be774e5af8b20f29f131b23e235d",
+      "raw_output_root_path_identity_sha256": "fc3dcae9a9ff0b1ed36ebd9ede6e3539088337c01d3c453dc161149a04b813a8",
+      "targets": 5,
+      "raw_records": 30,
+      "structured": 3,
+      "residual": 2,
+      "peak_child_rss_bytes": 138608640,
+      "wall_seconds": 2.812521,
+      "summed_cold_command_seconds": 0.823166,
+      "summed_warm_command_seconds": 0.65573,
+      "average_quality_score": 0.0
+    },
+    {
+      "id": "manual_o2_cold",
+      "sha256": "13bccd030fde17adfb6208b7bae6ff242946695b55f21d6ab69b1fbabebc160d",
+      "run_config_sha256": "f08245fef9111af2f1ae00297b5e0636f3086270e55422a8d1387731d1842563",
+      "raw_output_root_path_identity_sha256": "f662b9aa9521c23b18c8cd57bafa0ebbd6637cb5a63dd093613dd0da72c9df8e",
+      "targets": 5,
+      "raw_records": 15,
+      "structured": 3,
+      "residual": 2,
+      "peak_child_rss_bytes": 120913920,
+      "wall_seconds": 3.829909,
+      "summed_cold_command_seconds": 13.576225,
+      "summed_warm_command_seconds": 0.0,
+      "average_quality_score": 52.0
+    },
+    {
+      "id": "manual_o2_warm",
+      "sha256": "2b81db0fd5fada943a2e5a60d66a0593364703a054b24689ce28f0105e25e532",
+      "run_config_sha256": "1d78fe07380804184f7099fd3c27c3f8e5b74ac5749168b60c896b155f445cef",
+      "raw_output_root_path_identity_sha256": "53cb56530a197ea8facd59fe46515d9431a8a7899d1a83774b5f8e03c5560573",
+      "targets": 5,
+      "raw_records": 30,
+      "structured": 3,
+      "residual": 2,
+      "peak_child_rss_bytes": 180518912,
+      "wall_seconds": 6.311986,
+      "summed_cold_command_seconds": 2.922304,
+      "summed_warm_command_seconds": 2.078391,
+      "average_quality_score": 52.0
+    },
+    {
+      "id": "test_func_cold",
+      "sha256": "978e20550954554a1729950d4d73a27debffdf2aa375efb15ba39eab190d4211",
+      "run_config_sha256": "d6c35ce65b5901618a50cf91b11e820d57df07b0de4842f9eb39df08bbf2c334",
+      "raw_output_root_path_identity_sha256": "cc6a8fd1998788e7f64ef5c94577380c26738b11f27d173abd2533f2ca7a3ff3",
+      "targets": 4,
+      "raw_records": 12,
+      "structured": 3,
+      "residual": 1,
+      "peak_child_rss_bytes": 84410368,
+      "wall_seconds": 1.576933,
+      "summed_cold_command_seconds": 7.376586,
+      "summed_warm_command_seconds": 0.0,
+      "average_quality_score": 65.0
+    },
+    {
+      "id": "test_func_warm",
+      "sha256": "9b661323566870613166f96caa316fd5b94a83220690022e90ac176d98bcd0e6",
+      "run_config_sha256": "ec404860454f29a42d0d246a6bb3d576c885453590bd1d0fee0d58bdb4f53b73",
+      "raw_output_root_path_identity_sha256": "6b95c3939b8c3237a9b403304d9b6688cb90aadf229cf1b41821379bc6a86456",
+      "targets": 4,
+      "raw_records": 24,
+      "structured": 3,
+      "residual": 1,
+      "peak_child_rss_bytes": 106872832,
+      "wall_seconds": 1.676107,
+      "summed_cold_command_seconds": 0.233332,
+      "summed_warm_command_seconds": 0.134528,
+      "average_quality_score": 65.0
+    },
+    {
+      "id": "vuln_cold",
+      "sha256": "98eb7666aad2bccc6d62e2f3f1a1b738d2119291a8ca3e948d18abc3bb45f016",
+      "run_config_sha256": "0b1a84deb912a22999a0e74fe54a60e7afb9d4ed1f1a4cfb58ee6148def78835",
+      "raw_output_root_path_identity_sha256": "8302f3e75fbb12619a879079fc3cb0bda121b3342cc0e95245413d2d9b39d2be",
+      "targets": 6,
+      "raw_records": 18,
+      "structured": 4,
+      "residual": 2,
+      "peak_child_rss_bytes": 87818240,
+      "wall_seconds": 4.550769,
+      "summed_cold_command_seconds": 33.021487,
+      "summed_warm_command_seconds": 0.0,
+      "average_quality_score": 4.0
+    },
+    {
+      "id": "vuln_warm",
+      "sha256": "ac6b0f3f7936b55df615cf4d382ba25c768dd1edb654103c24f9c06e99a7a084",
+      "run_config_sha256": "a2bca9ae9aecd32f714d3de8121ca44461b1408c7fe30bd23cae71bf6498b4d8",
+      "raw_output_root_path_identity_sha256": "2eb91f2688bad6dce94fb54f809ca5e586a207e9a78f8c4d021296e28d149868",
+      "targets": 6,
+      "raw_records": 36,
+      "structured": 4,
+      "residual": 2,
+      "peak_child_rss_bytes": 115081216,
+      "wall_seconds": 3.376494,
+      "summed_cold_command_seconds": 0.344856,
+      "summed_warm_command_seconds": 0.294049,
+      "average_quality_score": 4.0
+    }
+  ],
+  "execution": {
+    "timeouts": 0,
+    "nonzero_benchmark_command_returns": 0,
+    "r2r_full_extras": {
+      "status": "pass",
+      "summary": "99 OK, 0 BR, 0 XX, 0 SK, 0 FX",
+      "log_sha256": "a1f71b35df342e25d19f8095c6355984bdb3c0e3cd8a090ee7a74321b7695d4e"
+    },
+    "r2r_fast": {
+      "status": "pass",
+      "summary": "30 OK, 0 BR, 0 XX, 0 SK, 0 FX",
+      "log_sha256": "f6c135618b4ae2924814e3ebad3b37ef35f26a750a713ba6e7d71dbbc439a05e"
+    },
+    "r2r_extended": {
+      "status": "pass",
+      "summary": "59 OK, 0 BR, 0 XX, 0 SK, 0 FX",
+      "log_sha256": "885b5a6e42bfbb59873f1ef0a24978819600d5b641c444f030b6c568d9032dfd"
+    },
+    "r2r_decompiler_snapshots": {
+      "status": "pass",
+      "summary": "2 OK, 0 BR, 0 XX, 0 SK, 0 FX",
+      "log_sha256": "b9e1d108cfd8f6ac598b1b6aaf64c42857952b92c9d31af789f90d361172e94c"
+    },
+    "source_gold": {
+      "status": "fail",
+      "archived_report_status": "issues",
+      "strict_quality_gate": "failed",
+      "sha256": "51f956453871363234cdf811635e0c38af26cf4a3b10613189571dc97c372685",
+      "run_config_sha256": "8a363c08b9423ccbc974d82b997c022cb2016b8556a42ec006141b34010687cf",
+      "raw_output_root_path_identity_sha256": "77c97916e31018ba9db27f9a525ffbdb9cea1f3018ba95b71dac69ba9bde4fbd",
+      "cases": 4,
+      "target_applications": 16,
+      "raw_records": 64,
+      "expectation_applications": 20,
+      "checks": 220,
+      "hard_checks": 160,
+      "hard_failed_commands": 17,
+      "hard_passed_commands": 1,
+      "hard_failure_records": 83,
+      "soft_checks": 60,
+      "soft_failed_commands": 12,
+      "soft_passed_commands": 2,
+      "soft_failure_records": 25,
+      "legacy_checks": 0,
+      "legacy_failure_records": 0,
+      "structured": 18,
+      "residual": 14,
+      "note": "Hard semantic/type/structural text checks feed the regression-failure gate, but even a hard textual pass is only an alarm result and never proof of equivalence or certification. Soft readability/cosmetic failures remain recorded without entering the hard regression gate."
+    }
+  },
+  "failure_classification": {
+    "semantic": [
+      {
+        "fixture": "fnv_fold O0 and O2",
+        "status": "fail",
+        "primary_failure_taxonomy": "semantic",
+        "secondary_failure_taxonomy": "type",
+        "failure_mode": "semantic_policy",
+        "evidence": "Both outputs declare the accumulator and return carrier as int64_t even though FNV state is a 64-bit bitvector. The captured initial basis fits int64_t, and the multiply includes an unsigned literal, so that particular expression is converted to unsigned arithmetic and is not itself proven signed-overflow UB. Later wrapped multiplication results can exceed INT64_MAX; assigning those unsigned values back to int64_t is implementation-defined, and the AST carries no explicit Wrap(64) policy. The output is therefore not portable or certifiable as the required uint64_t wrapping semantics."
+      }
+    ],
+    "structural": [
+      {
+        "fixtures": [
+          "state_machine O0/O2",
+          "mem_scan2 O0/O2",
+          "memcpy_wrapper",
+          "authenticate",
+          "alloc_and_copy"
+        ],
+        "status": "fail",
+        "primary_failure_taxonomy": "structural",
+        "failure_mode": "residualized",
+        "evidence": "The baseline refuses executable structured output because control-domain, memory-effect, callsite, address-argument, or stable-proof-identity evidence is incomplete."
+      }
+    ],
+    "type": [
+      {
+        "status": "fail",
+        "primary_failure_taxonomy": "type",
+        "evidence": "The reports contain 40 argN failure records and 16 type-classified failure records. FNV signedness is also wrong. These are classified observations, not a true source-fact type-accuracy score."
+      }
+    ],
+    "readability": [
+      {
+        "status": "fail",
+        "primary_failure_taxonomy": "readability",
+        "evidence": "argN, raw stack/temp, generated structure, and field-offset names are common. These do not independently prove semantic loss and remain soft when the underlying source expectation is cosmetic."
+      }
+    ],
+    "performance": [
+      {
+        "status": "not_run",
+        "failure_mode": "measurement_protocol",
+        "evidence": "Peak direct-child RSS ranges from 84,410,368 to 180,518,912 bytes in the eight benchmark reports. No fixed performance budget was applied, so no performance pass/fail conclusion is drawn. The warm reports retain 20 unnormalized profile repeat mismatches as measurement observations because profile counters and timings are cumulative; they are not failure-ledger entries. Decompile and type repeats are stable. Cold isolated and warm batched RSS are different scopes and are not directly comparable per function."
+      }
+    ]
+  },
+  "failure_ledger": {
+    "status": "pass",
+    "case_failure_records": 193,
+    "nested_oracle_failure_records": 108,
+    "nested_hard_oracle_records_duplicated_in_case_failures": 83,
+    "nested_soft_oracle_records_not_duplicated_in_case_failures": 25,
+    "underlying_logical_failure_records": 218,
+    "serialized_failure_occurrences": 301,
+    "classified_serialized_occurrences": 301,
+    "unclassified_serialized_occurrences": 0,
+    "case_failures_by_primary_taxonomy": {
+      "semantic": 65,
+      "structural": 52,
+      "type": 16,
+      "readability": 60,
+      "performance": 0
+    },
+    "nested_oracle_failures_by_primary_taxonomy": {
+      "semantic": 45,
+      "structural": 22,
+      "type": 16,
+      "readability": 25,
+      "performance": 0
+    },
+    "manual_review_findings": 1,
+    "classified_manual_review_findings": 1,
+    "note": "Every case and nested-oracle failure record has exactly one primary_failure_taxonomy. The 83 hard oracle failures are intentionally present both at their command origin and in case-level strict-gate failures; underlying_logical_failure_records removes that duplication while retaining the 25 soft oracle-only failures. Aggregate strict-threshold breaches and run status fields are conclusions over these records, not additional dispositions."
+  },
+  "measurement_observations": {
+    "unnormalized_profile_repeat_mismatch": 20,
+    "failure_ledger_entries": 0,
+    "note": "Cumulative profile counters and timings make raw repeat bytes unstable. These observations remain available in each warm report and require normalization before any determinism or performance gate."
+  },
+  "known_measurement_gaps": [
+    "Source-obligation proof coverage is unavailable in the pinned baseline.",
+    "True source-fact type accuracy is unavailable.",
+    "RSS covers the direct radare2 child, not descendants or a process tree.",
+    "Profile output needs normalization before it can participate in determinism scoring."
+  ],
+  "gate": {
+    "baseline_capture": "pass",
+    "baseline_quality": "fail",
+    "failures_classified": true,
+    "benchmark_raw_output_archived": true,
+    "source_gold_raw_output_archived": true,
+    "r2r_logs_archived": true,
+    "exact_executed_commands_archived": true,
+    "checksums_verified": true,
+    "proof_coverage_available": false,
+    "type_accuracy_available": false
+  }
+}

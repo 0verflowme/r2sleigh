@@ -350,7 +350,17 @@ impl Default for SymQueryConfig {
 impl SymQueryConfig {
     /// Build a path explorer for this query configuration.
     pub fn make_explorer<'ctx>(&self, ctx: &'ctx Context) -> PathExplorer<'ctx> {
-        let mut explorer = PathExplorer::with_config(ctx, self.explore.clone());
+        self.make_explorer_with_execution_control(ctx, crate::SymExecutionControl::default())
+    }
+
+    /// Build a path explorer with caller-owned cancellation and deadline control.
+    pub fn make_explorer_with_execution_control<'ctx>(
+        &self,
+        ctx: &'ctx Context,
+        execution: crate::SymExecutionControl,
+    ) -> PathExplorer<'ctx> {
+        let mut explorer =
+            PathExplorer::with_config_and_execution_control(ctx, self.explore.clone(), execution);
         explorer.set_target_guided_queries(matches!(self.mode, QueryMode::TargetGuided));
         explorer.set_solve_tactic_config(self.solve_tactics.clone());
         explorer
@@ -623,6 +633,10 @@ pub enum QueryCompletion {
     Complete,
     /// Exploration stopped because a configured budget was exhausted.
     BudgetExhausted,
+    /// Cooperative cancellation stopped exploration.
+    Cancelled,
+    /// A caller-provided deadline stopped exploration.
+    DeadlineExceeded,
 }
 
 /// Reachability result status.
@@ -632,6 +646,8 @@ pub enum ReachabilityStatus {
     Unreachable,
     Unknown,
     BudgetExhausted,
+    Cancelled,
+    DeadlineExceeded,
 }
 
 /// Compact summary of a path condition reaching a given program counter.
@@ -729,7 +745,17 @@ struct TargetQueryPaths<'ctx> {
 }
 
 fn completion_from_stats(stats: &ExploreStats) -> QueryCompletion {
-    if stats.timed_out || stats.max_states_exhausted {
+    if matches!(
+        stats.execution_stop,
+        Some(crate::SymExecutionStopReason::Cancelled)
+    ) {
+        QueryCompletion::Cancelled
+    } else if matches!(
+        stats.execution_stop,
+        Some(crate::SymExecutionStopReason::DeadlineExceeded)
+    ) {
+        QueryCompletion::DeadlineExceeded
+    } else if stats.timed_out || stats.max_states_exhausted {
         QueryCompletion::BudgetExhausted
     } else {
         QueryCompletion::Complete
@@ -1324,7 +1350,7 @@ where
 {
     if let Some(narrowed_state) = narrowed_state {
         let matches = search(explorer, *narrowed_state);
-        if !matches.is_empty() || explorer.budget_exhausted() {
+        if !matches.is_empty() || explorer.search_stopped() {
             return matches;
         }
     }
@@ -1342,7 +1368,7 @@ where
 {
     if let Some(narrowed_state) = narrowed_state {
         let matched = search(explorer, *narrowed_state);
-        if matched.is_some() || explorer.budget_exhausted() {
+        if matched.is_some() || explorer.search_stopped() {
             return matched;
         }
     }
@@ -1709,7 +1735,7 @@ fn continuation_seed_states<'ctx>(
         if let Ok(next_states) = explorer.advance_current_block_in_scope(func, scope, path.state) {
             seeds.extend(next_states.into_iter().filter(state_is_continuation_seed));
         }
-        if explorer.budget_exhausted() {
+        if explorer.search_stopped() {
             break;
         }
     }
@@ -1843,7 +1869,7 @@ fn execute_target_query_paths<'ctx>(
             summary_conditioned |= next.summary_conditioned;
             any_exact_unsat |= next.exact_unsat;
             matched_paths.extend(next.matched_paths);
-            if explorer.budget_exhausted() {
+            if explorer.search_stopped() {
                 break;
             }
         }
@@ -1925,7 +1951,7 @@ fn execute_target_query_first_path<'ctx>(
             "continuation:bridge_done target=0x{bridge_target:x} matched={} exact_unsat={} budget_exhausted={}",
             bridge_paths.matched_paths.len(),
             bridge_paths.exact_unsat,
-            explorer.budget_exhausted(),
+            explorer.search_stopped(),
         ));
         let mut summary_conditioned = bridge_paths.summary_conditioned;
         let Some(bridge_path) = bridge_paths.matched_paths.into_iter().next() else {
@@ -1948,7 +1974,7 @@ fn execute_target_query_first_path<'ctx>(
         debug_query_phase_log(&format!(
             "continuation:seeded count={} budget_exhausted={}",
             seeded_states.len(),
-            explorer.budget_exhausted(),
+            explorer.search_stopped(),
         ));
         let Some(state) = seeded_states.into_iter().next() else {
             return TargetQueryPaths {
@@ -1980,7 +2006,7 @@ fn execute_target_query_first_path<'ctx>(
             "continuation:final_done target=0x{target_addr:x} matched={} exact_unsat={} budget_exhausted={}",
             next.matched_paths.len(),
             next.exact_unsat,
-            explorer.budget_exhausted(),
+            explorer.search_stopped(),
         ));
         summary_conditioned |= next.summary_conditioned;
         return TargetQueryPaths {
@@ -2056,6 +2082,16 @@ impl<'ctx> PathExplorer<'ctx> {
         let summary_conditioned = query.summary_conditioned || stats_show_summary_guidance(&stats);
         let status = if !query.matched_paths.is_empty() {
             ReachabilityStatus::Reachable
+        } else if matches!(
+            stats.execution_stop,
+            Some(crate::SymExecutionStopReason::Cancelled)
+        ) {
+            ReachabilityStatus::Cancelled
+        } else if matches!(
+            stats.execution_stop,
+            Some(crate::SymExecutionStopReason::DeadlineExceeded)
+        ) {
+            ReachabilityStatus::DeadlineExceeded
         } else if self.budget_exhausted() {
             ReachabilityStatus::BudgetExhausted
         } else {

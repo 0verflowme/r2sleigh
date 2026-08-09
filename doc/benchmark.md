@@ -241,6 +241,74 @@ Gold manifest expectations match by corpus/case/target/command. `contains` and
 `not_regex` entries must be absent. Set `owner` when the failure should route
 directly to a canonical component such as `r2types` or `r2dec`.
 
+Fixed-Runner Performance Gate
+-----------------------------
+
+Correctness/source-gold and performance are separate CI jobs. The performance
+gate never treats a fast fallback or semantically wrong output as success; run
+`make -C tests/r2r source-gold` for the correctness side of the contract.
+
+`tests/gold/mem_scan2_performance.json` is the versioned Darwin/arm64 O2 fixed
+performance contract. The historical `mem_scan2` target now exceeds the
+intentional production limit (1471 lifted ops versus the 512-op cap), so the
+latency gate uses the deterministic bounded `fnv_fold` target instead. The
+source-gold oracle records `mem_scan2` as an expected complexity refusal; its
+fast refusal cannot become a decompiler performance sample.
+
+The contract runs 20 isolated cold command processes and four fresh warm
+sessions with five measured repeats each. Command latency comes from radare2's
+in-process `?t` profiler and includes only the command body. It excludes r2
+startup, setup analysis, sentinel output, and the old pair of `date` subprocess
+launches. Nearest-rank p95 is therefore the 19th of 20 latency observations,
+not the maximum. Cold RSS still measures each direct child process and warm RSS
+measures each fresh batch session; RSS remains a separate gate.
+
+Each p95 has two independent limits:
+
+- a release target with explicit headroom over the reviewed command-body result;
+- a regression limit of at most 1.5 times the reviewed in-process reference, plus
+  only the small absolute jitter slack declared in the manifest.
+
+Across two reviewed local captures, the per-metric maximum cold/warm
+command-body p95 references are 20.664/18.624 ms for `decompile_sla`,
+17.016/14.882 ms for
+`types`, and 0.048/0.122 ms for `profile`. Each release target retains explicit
+headroom over its observed reference. In a same-process paired check, the old
+shell-date timer reported a 6.071 ms profile p95 while the in-process clock
+reported 0.061 ms. Release targets, regression ratios, and RSS limits remain
+independent.
+
+Availability is executable, not inferred from artifact filenames. Before any
+sample is accepted, the harness discovers the exact target and runs plugin help,
+architecture status, decompile, type, and profile probes. ABI/load errors,
+missing commands, empty/no-op output, fallback decompilation, invalid JSON, or
+missing in-process timing cause the required gate to fail closed. Optional local
+runs may still report `skipped`; the required CI invocation cannot.
+
+Ordinary machines may run the command and receive an explicit `skipped` report
+when the fixed runner or generated test binary is unavailable:
+
+```bash
+python3 scripts/reversing_benchmark.py \
+  --fixed-performance-gate tests/gold/mem_scan2_performance.json \
+  --out /tmp/r2sleigh-fixed-performance.json
+```
+
+The required CI job cannot skip. Deployment must provide a self-hosted runner
+with the `r2sleigh-perf-v1` label, Darwin/arm64, and the exact runner identity:
+
+```bash
+make -C tests/r2r link-bins
+make -C r2plugin RUST_FEATURES=all-archs
+R2SLEIGH_FIXED_PERF_RUNNER=r2sleigh-darwin-arm64-perf-v1 \
+python3 scripts/reversing_benchmark.py \
+  --fixed-performance-gate tests/gold/mem_scan2_performance.json \
+  --require-fixed-performance \
+  --r2 ../radare2/binr/radare2/radare2 \
+  --plugin-dir r2plugin \
+  --out /tmp/r2sleigh-fixed-performance.json
+```
+
 Interpreting Failures
 ---------------------
 

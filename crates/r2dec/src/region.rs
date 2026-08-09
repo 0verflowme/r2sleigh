@@ -5,9 +5,13 @@
 //! - If-then-else (diamond patterns)
 //! - Loops (natural loops with back edges)
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
-use r2ssa::{BlockTerminator, CFGEdge, SSAFunction, SSAOp, SSAVar, domtree::DomTree};
+use r2ssa::{
+    BlockTerminator, CFGEdge, SSAFunction, SSAOp, SSAVar, SsaExecutionStopReason, SsaWorkControl,
+    domtree::DomTree,
+};
 
 /// A control flow region.
 #[derive(Debug, Clone)]
@@ -165,6 +169,8 @@ pub enum RegionTransferKind {
 /// Region analyzer for identifying structured control flow.
 pub struct RegionAnalyzer<'a> {
     func: &'a SSAFunction,
+    control: Option<&'a dyn SsaWorkControl>,
+    stop_reason: Cell<Option<SsaExecutionStopReason>>,
     /// Dominator tree computed from the current CFG snapshot.
     dominators: DomTree,
     /// Back edges in the CFG (target -> sources).
@@ -221,10 +227,35 @@ impl<'a> RegionAnalyzer<'a> {
 
     /// Create a new region analyzer.
     pub fn new(func: &'a SSAFunction) -> Self {
-        let num_blocks = func.num_blocks();
         let dominators = DomTree::compute(func.cfg());
+        Self::new_with_dominators(func, dominators, None)
+    }
+
+    /// Create a region analyzer whose inner work cooperatively polls `control`.
+    pub fn new_with_control(
+        func: &'a SSAFunction,
+        control: &'a dyn SsaWorkControl,
+    ) -> Result<Self, SsaExecutionStopReason> {
+        control.poll()?;
+        let dominators = DomTree::compute_with_control(func.cfg(), control)?;
+        let analyzer = Self::new_with_dominators(func, dominators, Some(control));
+        if let Some(reason) = analyzer.stop_reason() {
+            Err(reason)
+        } else {
+            Ok(analyzer)
+        }
+    }
+
+    fn new_with_dominators(
+        func: &'a SSAFunction,
+        dominators: DomTree,
+        control: Option<&'a dyn SsaWorkControl>,
+    ) -> Self {
+        let num_blocks = func.num_blocks();
         let mut analyzer = Self {
             func,
+            control,
+            stop_reason: Cell::new(None),
             dominators,
             back_edges: HashMap::new(),
             loops: HashMap::new(),
@@ -241,7 +272,35 @@ impl<'a> RegionAnalyzer<'a> {
         analyzer
     }
 
+    #[inline]
+    fn poll(&self) -> bool {
+        if self.stop_reason.get().is_some() {
+            return false;
+        }
+        let Some(control) = self.control else {
+            return true;
+        };
+        match control.poll() {
+            Ok(()) => true,
+            Err(reason) => {
+                self.stop_reason.set(Some(reason));
+                false
+            }
+        }
+    }
+
+    fn finish_controlled<T>(&self, value: T) -> Result<T, SsaExecutionStopReason> {
+        self.stop_reason.get().map_or(Ok(value), Err)
+    }
+
+    pub fn stop_reason(&self) -> Option<SsaExecutionStopReason> {
+        self.stop_reason.get()
+    }
+
     fn compute_post_dominators(&mut self) {
+        if !self.poll() {
+            return;
+        }
         let block_addrs = self.func.block_addrs();
         let all_blocks: BTreeSet<u64> = block_addrs.iter().copied().collect();
         let exit_blocks: BTreeSet<u64> = block_addrs
@@ -252,6 +311,9 @@ impl<'a> RegionAnalyzer<'a> {
 
         let mut postdoms: HashMap<u64, BTreeSet<u64>> = HashMap::new();
         for &addr in block_addrs {
+            if !self.poll() {
+                return;
+            }
             let initial = if exit_blocks.contains(&addr) {
                 BTreeSet::from([addr])
             } else {
@@ -262,8 +324,14 @@ impl<'a> RegionAnalyzer<'a> {
 
         let mut changed = true;
         while changed {
+            if !self.poll() {
+                return;
+            }
             changed = false;
             for &addr in block_addrs.iter().rev() {
+                if !self.poll() {
+                    return;
+                }
                 if exit_blocks.contains(&addr) {
                     continue;
                 }
@@ -275,6 +343,9 @@ impl<'a> RegionAnalyzer<'a> {
 
                 let mut new_set: Option<BTreeSet<u64>> = None;
                 for succ in succs {
+                    if !self.poll() {
+                        return;
+                    }
                     let succ_set = postdoms
                         .get(&succ)
                         .cloned()
@@ -300,9 +371,18 @@ impl<'a> RegionAnalyzer<'a> {
 
     /// Find back edges by the canonical dominance invariant.
     fn find_back_edges(&mut self) {
+        if !self.poll() {
+            return;
+        }
         self.back_edges.clear();
         for &block in self.func.block_addrs() {
+            if !self.poll() {
+                return;
+            }
             for succ in self.func.successors(block) {
+                if !self.poll() {
+                    return;
+                }
                 if self.dominators.dominates(succ, block) {
                     self.back_edges.entry(succ).or_default().push(block);
                 }
@@ -317,10 +397,16 @@ impl<'a> RegionAnalyzer<'a> {
     /// Find natural loops from back edges.
     fn find_loops(&mut self) {
         for (&header, sources) in &self.back_edges {
+            if !self.poll() {
+                return;
+            }
             let mut body = HashSet::new();
             body.insert(header);
 
             for &source in sources {
+                if !self.poll() {
+                    return;
+                }
                 self.collect_loop_body(source, header, &mut body);
             }
 
@@ -348,6 +434,9 @@ impl<'a> RegionAnalyzer<'a> {
     fn collect_loop_body(&self, source: u64, header: u64, body: &mut HashSet<u64>) {
         let mut worklist = vec![source];
         while let Some(block) = worklist.pop() {
+            if !self.poll() {
+                return;
+            }
             if block != header && !self.dominators.dominates(header, block) {
                 continue;
             }
@@ -355,6 +444,9 @@ impl<'a> RegionAnalyzer<'a> {
                 continue;
             }
             for pred in self.func.predecessors(block) {
+                if !self.poll() {
+                    return;
+                }
                 if pred != header
                     && !body.contains(&pred)
                     && self.dominators.dominates(header, pred)
@@ -371,6 +463,12 @@ impl<'a> RegionAnalyzer<'a> {
     /// Fallback: recursive analysis with depth guard.
     /// `SLEIGH_DEC_LEGACY_ANALYZER=1`: force legacy recursive-only (A/B testing).
     pub fn analyze(&mut self) -> Region {
+        if !self.poll() {
+            return Region::Irreducible {
+                entry: self.func.entry,
+                blocks: Vec::new(),
+            };
+        }
         self.processed.clear();
         self.analysis_reason = None;
         self.recursion_depth = 0;
@@ -435,7 +533,24 @@ impl<'a> RegionAnalyzer<'a> {
         region
     }
 
+    /// Analyze with a distinct cooperative-stop result.
+    pub fn analyze_controlled(&mut self) -> Result<Region, SsaExecutionStopReason> {
+        if !self.poll() {
+            return Err(self
+                .stop_reason()
+                .expect("failed region poll records a stop reason"));
+        }
+        let region = self.analyze();
+        self.finish_controlled(region)
+    }
+
     fn analyze_region_recursive(&mut self, entry: u64) -> Region {
+        if !self.poll() {
+            return Region::Irreducible {
+                entry,
+                blocks: Vec::new(),
+            };
+        }
         if self.recursion_depth >= self.recursion_depth_limit {
             if self.analysis_reason.is_none() {
                 self.analysis_reason = Some(format!(
@@ -632,7 +747,13 @@ impl<'a> RegionAnalyzer<'a> {
         let mut visited = HashSet::from([start]);
 
         while let Some((block, dist)) = queue.pop_front() {
+            if !self.poll() {
+                return None;
+            }
             for succ in self.func.successors(block) {
+                if !self.poll() {
+                    return None;
+                }
                 if !visited.insert(succ) {
                     continue;
                 }
@@ -667,11 +788,14 @@ impl<'a> RegionAnalyzer<'a> {
     }
 
     fn collect_reachable(&self, start: u64, reachable: &mut HashSet<u64>, depth: usize) {
-        if depth == 0 || reachable.contains(&start) {
+        if !self.poll() || depth == 0 || reachable.contains(&start) {
             return;
         }
         reachable.insert(start);
         for succ in self.func.successors(start) {
+            if !self.poll() {
+                return;
+            }
             self.collect_reachable(succ, reachable, depth - 1);
         }
     }
@@ -805,6 +929,9 @@ impl<'a> RegionAnalyzer<'a> {
         // Iterative DFS that produces the same pre-order as the recursive version.
         let mut stack = vec![start];
         while let Some(block) = stack.pop() {
+            if !self.poll() {
+                return;
+            }
             if !body.contains(&block) || !seen.insert(block) {
                 continue;
             }
@@ -817,6 +944,9 @@ impl<'a> RegionAnalyzer<'a> {
                 .filter(|s| body.contains(s))
                 .collect();
             for s in succs.into_iter().rev() {
+                if !self.poll() {
+                    return;
+                }
                 stack.push(s);
             }
         }
@@ -1016,6 +1146,9 @@ impl<'a> RegionAnalyzer<'a> {
         let mut selector_key = None;
 
         for _ in 0..16 {
+            if !self.poll() {
+                return None;
+            }
             let compare = self.extract_switch_chain_case(compare_block)?;
             if let Some(expected) = selector_key.as_ref() {
                 if expected != &compare.selector_key {
@@ -1081,6 +1214,9 @@ impl<'a> RegionAnalyzer<'a> {
     }
 
     fn normalized_switch_info(&self, entry: u64) -> Option<NormalizedSwitchInfo> {
+        if !self.poll() {
+            return None;
+        }
         if let Some((cases, default)) = self.func.switch_info(entry) {
             let (cases, default) = self.filter_local_switch_targets(cases, default)?;
             let cases = self.canonical_switch_cases(&cases);
@@ -1092,10 +1228,16 @@ impl<'a> RegionAnalyzer<'a> {
         let mut visited = HashSet::from([entry]);
         let mut queue = VecDeque::from([(entry, 0usize)]);
         while let Some((block, depth)) = queue.pop_front() {
+            if !self.poll() {
+                return None;
+            }
             if depth >= 6 {
                 continue;
             }
             for succ in self.func.successors(block) {
+                if !self.poll() {
+                    return None;
+                }
                 if !visited.insert(succ) {
                     continue;
                 }
@@ -1121,6 +1263,9 @@ impl<'a> RegionAnalyzer<'a> {
         let mut current = start;
         let mut seen = HashSet::new();
         while seen.insert(current) {
+            if !self.poll() {
+                break;
+            }
             let Some(block) = self.func.get_block(current) else {
                 break;
             };
@@ -1343,6 +1488,9 @@ impl<'a> RegionAnalyzer<'a> {
         // Collect reachable blocks from each target
         let mut reachable_sets: Vec<HashSet<u64>> = Vec::new();
         for &target in targets {
+            if !self.poll() {
+                return None;
+            }
             let mut reachable = HashSet::new();
             self.collect_reachable(target, &mut reachable, 10);
             reachable_sets.push(reachable);
@@ -1365,6 +1513,9 @@ impl<'a> RegionAnalyzer<'a> {
     }
 
     fn analyze_iterative(&mut self) -> Option<Region> {
+        if !self.poll() {
+            return None;
+        }
         let mut graph = WorkingGraph::from_function(self.func);
         let all_loops = self.collect_ordered_loops();
         if all_loops.is_empty() {
@@ -1373,6 +1524,9 @@ impl<'a> RegionAnalyzer<'a> {
 
         let mut iterations = 0usize;
         for loop_info in &all_loops {
+            if !self.poll() {
+                return None;
+            }
             iterations = iterations.saturating_add(1);
             if iterations > self.max_collapse_iterations {
                 self.analysis_reason = Some(format!(
@@ -1414,8 +1568,20 @@ impl<'a> RegionAnalyzer<'a> {
             let mut set = HashSet::new();
             let mut stack = vec![entry];
             while let Some(n) = stack.pop() {
+                if !self.poll() {
+                    return Region::Irreducible {
+                        entry: self.func.entry,
+                        blocks: Vec::new(),
+                    };
+                }
                 if set.insert(n) {
                     for s in graph.sorted_succs(n) {
+                        if !self.poll() {
+                            return Region::Irreducible {
+                                entry: self.func.entry,
+                                blocks: Vec::new(),
+                            };
+                        }
                         stack.push(s);
                     }
                 }
@@ -1435,6 +1601,12 @@ impl<'a> RegionAnalyzer<'a> {
         let mut region_map: HashMap<usize, Region> = HashMap::new();
 
         for node in &rev_topo {
+            if !self.poll() {
+                return Region::Irreducible {
+                    entry: self.func.entry,
+                    blocks: Vec::new(),
+                };
+            }
             let node = *node;
             let base = match graph.node_region(node) {
                 Some(r) => r,
@@ -1532,9 +1704,21 @@ impl<'a> RegionAnalyzer<'a> {
                     {
                         let mut grouped: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
                         for (value, target) in &switch_cases {
+                            if !self.poll() {
+                                return Region::Irreducible {
+                                    entry: self.func.entry,
+                                    blocks: Vec::new(),
+                                };
+                            }
                             grouped.entry(*target).or_default().push(*value);
                         }
                         for (target_block, values) in grouped {
+                            if !self.poll() {
+                                return Region::Irreducible {
+                                    entry: self.func.entry,
+                                    blocks: Vec::new(),
+                                };
+                            }
                             let Some(target_node) = graph.node_for_block(target_block) else {
                                 continue;
                             };
@@ -1650,8 +1834,14 @@ impl<'a> RegionAnalyzer<'a> {
             .collect();
 
         for i in 0..loop_infos.len() {
+            if !self.poll() {
+                return Vec::new();
+            }
             let mut depth = 0usize;
             for j in 0..loop_infos.len() {
+                if !self.poll() {
+                    return Vec::new();
+                }
                 if i == j {
                     continue;
                 }
@@ -1710,6 +1900,9 @@ impl<'a> RegionAnalyzer<'a> {
         }
         let mut reachable_sets: Vec<HashSet<usize>> = Vec::new();
         for target in targets {
+            if !self.poll() {
+                return None;
+            }
             let mut reachable = HashSet::new();
             graph.collect_reachable_limited(*target, &mut reachable, 10);
             reachable_sets.push(reachable);
@@ -1739,7 +1932,13 @@ impl<'a> RegionAnalyzer<'a> {
         let mut visited = HashSet::from([start]);
 
         while let Some((node, dist)) = queue.pop_front() {
+            if !self.poll() {
+                return None;
+            }
             for succ in graph.sorted_succs(node) {
+                if !self.poll() {
+                    return None;
+                }
                 if !visited.insert(succ) {
                     continue;
                 }
@@ -1988,6 +2187,9 @@ impl WorkingGraph {
         analyzer: &mut RegionAnalyzer<'_>,
         loop_info: &LoopInfo,
     ) -> Result<(), ()> {
+        if !analyzer.poll() {
+            return Err(());
+        }
         let header = loop_info.header;
         let body = &loop_info.body;
         let Some(header_node) = self.node_for_block(header) else {
@@ -1997,6 +2199,9 @@ impl WorkingGraph {
         let mut internal_nodes = HashSet::new();
         let mut partial_overlap = false;
         for (node_id, node) in &self.nodes {
+            if !analyzer.poll() {
+                return Err(());
+            }
             let in_count = node.blocks.iter().filter(|b| body.contains(b)).count();
             if in_count == 0 {
                 continue;
@@ -2025,8 +2230,14 @@ impl WorkingGraph {
         let mut all_external_succs = HashSet::new();
 
         for node in &internal_nodes {
+            if !analyzer.poll() {
+                return Err(());
+            }
             if let Some(preds) = self.preds.get(node) {
                 for pred in preds {
+                    if !analyzer.poll() {
+                        return Err(());
+                    }
                     if !internal_nodes.contains(pred) {
                         external_preds.insert(*pred);
                     }
@@ -2034,6 +2245,9 @@ impl WorkingGraph {
             }
             if let Some(succs) = self.succs.get(node) {
                 for succ in succs {
+                    if !analyzer.poll() {
+                        return Err(());
+                    }
                     if !internal_nodes.contains(succ) {
                         all_external_succs.insert(*succ);
                     }
@@ -2043,6 +2257,9 @@ impl WorkingGraph {
 
         let mut incoming_edge_labels = Vec::new();
         for pred in &external_preds {
+            if !analyzer.poll() {
+                return Err(());
+            }
             let labels = internal_nodes
                 .iter()
                 .filter_map(|internal| self.edge_labels.get(&(*pred, *internal)).copied())
@@ -2061,6 +2278,9 @@ impl WorkingGraph {
         let external_succs = canonical_fallthrough.into_iter().collect::<HashSet<_>>();
 
         for succ in &external_succs {
+            if !analyzer.poll() {
+                return Err(());
+            }
             let labels = internal_nodes
                 .iter()
                 .filter_map(|internal| self.edge_labels.get(&(*internal, *succ)).copied())
@@ -2080,6 +2300,9 @@ impl WorkingGraph {
         );
         let mut collapsed_blocks = BTreeSet::new();
         for node_id in &internal_nodes {
+            if !analyzer.poll() {
+                return Err(());
+            }
             if let Some(node) = self.nodes.get(node_id) {
                 collapsed_blocks.extend(node.blocks.iter().copied());
             }
@@ -2106,12 +2329,18 @@ impl WorkingGraph {
         self.succs.insert(new_id, external_succs.clone());
 
         for pred in &external_preds {
+            if !analyzer.poll() {
+                return Err(());
+            }
             if let Some(succs) = self.succs.get_mut(pred) {
                 succs.retain(|id| !internal_nodes.contains(id));
                 succs.insert(new_id);
             }
         }
         for succ in &all_external_succs {
+            if !analyzer.poll() {
+                return Err(());
+            }
             if let Some(preds) = self.preds.get_mut(succ) {
                 preds.retain(|id| !internal_nodes.contains(id));
                 if external_succs.contains(succ) {
@@ -2130,11 +2359,17 @@ impl WorkingGraph {
         }
 
         for node_id in &internal_nodes {
+            if !analyzer.poll() {
+                return Err(());
+            }
             self.nodes.remove(node_id);
             self.preds.remove(node_id);
             self.succs.remove(node_id);
         }
         for block in collapsed_blocks {
+            if !analyzer.poll() {
+                return Err(());
+            }
             self.block_to_node.insert(block, new_id);
         }
 
@@ -2148,7 +2383,13 @@ impl WorkingGraph {
     ) -> HashSet<usize> {
         let mut out = HashSet::new();
         for node in internal_nodes {
+            if !analyzer.poll() {
+                return out;
+            }
             for succ in self.sorted_succs(*node) {
+                if !analyzer.poll() {
+                    return out;
+                }
                 if internal_nodes.contains(&succ) || out.contains(&succ) {
                     continue;
                 }
@@ -2171,6 +2412,9 @@ impl WorkingGraph {
         let mut current = start;
 
         loop {
+            if !analyzer.poll() {
+                return None;
+            }
             if internal_nodes.contains(&current) || !self.nodes.contains_key(&current) {
                 return None;
             }
@@ -2318,6 +2562,9 @@ impl WorkingGraph {
         let mut sub = self.subgraph(&relevant_nodes);
         if let Some(header_node) = sub.node_for_block(loop_header) {
             for source in analyzer.back_edges.get(&loop_header).into_iter().flatten() {
+                if !analyzer.poll() {
+                    return Region::Sequence(Vec::new());
+                }
                 if let Some(source_node) = sub.node_for_block(*source) {
                     sub.remove_edge(source_node, header_node);
                     if Some(*source) != owned_latch_condition
@@ -2342,6 +2589,9 @@ impl WorkingGraph {
             }
         }
         for source_node in &relevant_nodes {
+            if !analyzer.poll() {
+                return Region::Sequence(Vec::new());
+            }
             let Some(Region::Block(source)) = self.node_region(*source_node) else {
                 continue;
             };
@@ -2349,6 +2599,9 @@ impl WorkingGraph {
                 continue;
             }
             for target_node in self.sorted_succs(*source_node) {
+                if !analyzer.poll() {
+                    return Region::Sequence(Vec::new());
+                }
                 if relevant_nodes.contains(&target_node) {
                     continue;
                 }
@@ -2401,6 +2654,9 @@ impl WorkingGraph {
         {
             let mut stack = vec![start_node];
             while let Some(node) = stack.pop() {
+                if !analyzer.poll() {
+                    return Region::Sequence(Vec::new());
+                }
                 if !seen.insert(node) {
                     continue;
                 }
@@ -2422,6 +2678,9 @@ impl WorkingGraph {
 
         let mut regions = Vec::new();
         for node_id in ordered {
+            if !analyzer.poll() {
+                return Region::Sequence(Vec::new());
+            }
             if let Some(node) = self.nodes.get(&node_id) {
                 regions.push(node.region.clone());
             }

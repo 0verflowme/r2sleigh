@@ -1,0 +1,11198 @@
+//! Source-driven certification kernel.
+//!
+//! `r2ssa` owns the exhaustive source obligation inventory. This crate owns the
+//! only operation that can close that inventory: assigning exactly one proven
+//! final disposition to every obligation. Rendered text, names, statement
+//! counts, and AST positions are intentionally absent from this API.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use r2ssa::{
+    AssumptionSet, BlockTerminator, CallBoundarySlot, CallSiteId, CanonicalInstructionId,
+    CanonicalInstructionSite, CanonicalStorageId, FunctionPrepareMode, InstPayload, LoopId,
+    MACHINE_CONTEXT_SCHEMA_VERSION, MachineAddressSpace, MachineBitVector, MachineBuildError,
+    MachineEntity, MachineExprId, MachineExprKind, MachineMemoryEndianness, MachineMemoryModel,
+    MachineProjection, MachineType, MachineValueUse, ObjectId, ObjectKind, PredicateId,
+    RelativeMemoryAddress, SEMANTIC_OBLIGATION_SCHEMA_VERSION,
+    SOURCE_CALL_SITE_INTERFACE_SCHEMA_VERSION, SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION, SSAOp,
+    SSAVar, SemanticInstructionState, SemanticObligationComponent, SemanticObligationId,
+    SemanticObligationInventory, SemanticObligationKind, SourceCallResult, SourceCallSiteIdentity,
+    SourceFunctionReturn, SourceMachineContext, SsaArtifact, StackAddressBase, StackAddressRoot,
+    StructuredAccessId, StructuredLoopKind,
+};
+use serde::{Deserialize, Serialize};
+
+mod aggregate_member;
+mod branchless_guard;
+mod conditional_return;
+mod fnv_fold;
+mod fnv_fold_o0;
+mod nested_wrap32_guard_o0;
+mod private_frame;
+mod struct_array_index;
+mod sum_array;
+
+pub use aggregate_member::{
+    CERTIFIED_AGGREGATE_MEMBER_ACCESS_CONTRACT_VERSION, CertifiedAggregateMemberAccess,
+    CertifiedAggregateMemberAccessSemantics, CertifiedAggregateStructuredAccess,
+    CertifiedNaturalScalarAggregateLayout,
+};
+
+pub use branchless_guard::{
+    CERTIFIED_BRANCHLESS_GUARD_CONTRACT_VERSION, CertifiedBranchlessGuardDispositionClass,
+    CertifiedBranchlessGuardFunction, CertifiedBranchlessGuardKind,
+    CertifiedBranchlessGuardParameter, CertifiedBranchlessGuardReturn,
+    certify_branchless_guard_function,
+};
+
+pub use conditional_return::{
+    CERTIFIED_CONDITIONAL_RETURN_FUNNEL_CONTRACT_VERSION, CertifiedConditionalReturnCandidate,
+    CertifiedConditionalReturnCarrier, CertifiedConditionalReturnFunnelControl,
+    CertifiedConditionalReturnPhiInput, CertifiedConditionalReturnRegisterPhi,
+    CertifiedMemoryVersion, CertifiedPrivateStackScalar, certify_conditional_return_funnel_region,
+};
+
+pub use fnv_fold::{
+    CERTIFIED_FNV_FOLD_LOOP_CONTRACT_VERSION, CERTIFIED_FNV_OFFSET_BASIS, CERTIFIED_FNV_PRIME,
+    CertifiedFnvFoldCarrier, CertifiedFnvFoldLatchControl, CertifiedFnvFoldLoop,
+    CertifiedFnvFoldMemoryVersion, CertifiedFnvFoldPhase, CertifiedFnvFoldPhaseOrder,
+    CertifiedFnvFoldUnsignedLess, certify_fnv_fold_loop_region,
+};
+
+pub use fnv_fold_o0::{
+    CERTIFIED_FNV_FOLD_O0_CONTRACT_VERSION, CERTIFIED_FNV_FOLD_O0_OFFSET_BASIS,
+    CERTIFIED_FNV_FOLD_O0_PRIME, CertifiedFnvFoldO0Access, CertifiedFnvFoldO0AccessId,
+    CertifiedFnvFoldO0Ascii, CertifiedFnvFoldO0CompareKind, CertifiedFnvFoldO0DispositionClass,
+    CertifiedFnvFoldO0ExternalAliasPolicy, CertifiedFnvFoldO0Frame, CertifiedFnvFoldO0Function,
+    CertifiedFnvFoldO0Hash, CertifiedFnvFoldO0Index, CertifiedFnvFoldO0MemoryDef,
+    CertifiedFnvFoldO0MemoryLocation, CertifiedFnvFoldO0MemoryPhi, CertifiedFnvFoldO0MemoryUse,
+    CertifiedFnvFoldO0MemoryVersion, CertifiedFnvFoldO0ParameterHomeRelay, CertifiedFnvFoldO0Phase,
+    CertifiedFnvFoldO0PhiDispositionClass, CertifiedFnvFoldO0Predicate,
+    CertifiedFnvFoldO0RelativeAddress, CertifiedFnvFoldO0Slot, CertifiedFnvFoldO0Topology,
+    certify_fnv_fold_o0_region,
+};
+
+pub use nested_wrap32_guard_o0::{
+    CERTIFIED_NESTED_WRAP32_GUARD_O0_CONTRACT_VERSION, CertifiedNestedWrap32GuardO0Abi,
+    CertifiedNestedWrap32GuardO0AccessId, CertifiedNestedWrap32GuardO0Arithmetic,
+    CertifiedNestedWrap32GuardO0BlockAssumption, CertifiedNestedWrap32GuardO0CompareKind,
+    CertifiedNestedWrap32GuardO0CompareProvenance, CertifiedNestedWrap32GuardO0Comparison,
+    CertifiedNestedWrap32GuardO0Control, CertifiedNestedWrap32GuardO0DispositionClass,
+    CertifiedNestedWrap32GuardO0FlagPacket, CertifiedNestedWrap32GuardO0Frame,
+    CertifiedNestedWrap32GuardO0Function, CertifiedNestedWrap32GuardO0InstructionDisposition,
+    CertifiedNestedWrap32GuardO0MemoryAccess, CertifiedNestedWrap32GuardO0MemoryDef,
+    CertifiedNestedWrap32GuardO0MemoryLocation, CertifiedNestedWrap32GuardO0MemoryPhi,
+    CertifiedNestedWrap32GuardO0MemoryUse, CertifiedNestedWrap32GuardO0MemoryVersion,
+    CertifiedNestedWrap32GuardO0Object, CertifiedNestedWrap32GuardO0ObjectKind,
+    CertifiedNestedWrap32GuardO0Parameter, CertifiedNestedWrap32GuardO0Phi,
+    CertifiedNestedWrap32GuardO0PhiLayer, CertifiedNestedWrap32GuardO0PhysicalRange,
+    CertifiedNestedWrap32GuardO0Predicate, CertifiedNestedWrap32GuardO0RelativeAddress,
+    CertifiedNestedWrap32GuardO0ResultCarrier, CertifiedNestedWrap32GuardO0Return,
+    CertifiedNestedWrap32GuardO0Slot, CertifiedNestedWrap32GuardO0SlotAccess,
+    CertifiedNestedWrap32GuardO0Slots, CertifiedNestedWrap32GuardO0Topology,
+    certify_nested_wrap32_guard_o0_function,
+};
+
+pub use private_frame::{
+    CERTIFIED_PRIVATE_FRAME_CONDITIONAL_RETURN_CONTRACT_VERSION, CertifiedPrivateFrameAccessMemory,
+    CertifiedPrivateFrameConditionalReturn, CertifiedPrivateFrameEnvelopePolicy,
+    CertifiedPrivateFrameHome, CertifiedPrivateFrameHomeReload, CertifiedPrivateFrameLocal,
+    CertifiedPrivateFrameMemoryDef, CertifiedPrivateFrameMemoryLocation,
+    CertifiedPrivateFrameMemoryUse, CertifiedPrivateFrameMemoryVersion,
+    CertifiedPrivateFramePhysicalRange, CertifiedPrivateFrameRawLoad,
+    CertifiedPrivateFrameRegisterCopy, CertifiedPrivateFrameStackUpdate,
+    certify_private_frame_conditional_return_region,
+};
+
+pub use struct_array_index::{
+    CERTIFIED_STRUCT_ARRAY_INDEX_CONTRACT_VERSION, CertifiedStructArrayIndexAccess,
+    CertifiedStructArrayIndexAccessKind, CertifiedStructArrayIndexDispositionClass,
+    CertifiedStructArrayIndexFlagPacket, CertifiedStructArrayIndexFunction,
+    CertifiedStructArrayIndexHome, CertifiedStructArrayIndexHomeReload,
+    CertifiedStructArrayIndexLayout, CertifiedStructArrayIndexLowering,
+    CertifiedStructArrayIndexParameter, CertifiedStructArrayIndexReturn,
+    CertifiedStructArrayIndexScale, certify_struct_array_index_function,
+};
+
+pub use sum_array::{
+    CERTIFIED_SUM_ARRAY_CONTRACT_VERSION, CertifiedSumArrayAbi, CertifiedSumArrayBinding,
+    CertifiedSumArrayDispositionClass, CertifiedSumArrayFrame, CertifiedSumArrayFunction,
+    CertifiedSumArrayHome, CertifiedSumArrayHomeRole, CertifiedSumArrayInstructionDisposition,
+    CertifiedSumArrayLowering, CertifiedSumArrayO0Binding, CertifiedSumArrayO0Loop,
+    CertifiedSumArrayO0Predicate, CertifiedSumArrayO2Binding, CertifiedSumArrayO2Guard,
+    CertifiedSumArrayO2Lane, CertifiedSumArrayO2Reduction, CertifiedSumArrayO2ReturnPath,
+    CertifiedSumArrayO2ScalarTail, CertifiedSumArrayO2Topology, CertifiedSumArrayO2VectorLoop,
+    CertifiedSumArrayO2VectorRead, CertifiedSumArrayParameter, CertifiedSumArrayRead,
+    CertifiedSumArrayReload, CertifiedSumArrayReturn, CertifiedSumArrayType,
+    certify_sum_array_function,
+};
+
+pub const CERTIFICATION_SCHEMA_VERSION: u32 = 17;
+
+/// Stable preparation mode committed by a certification origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CertifiedPreparationMode {
+    Generic,
+    Raw,
+    Decompile,
+    Patterns,
+    DataRefs,
+    Symbolic,
+}
+
+impl From<FunctionPrepareMode> for CertifiedPreparationMode {
+    fn from(mode: FunctionPrepareMode) -> Self {
+        match mode {
+            FunctionPrepareMode::Generic => Self::Generic,
+            FunctionPrepareMode::Raw => Self::Raw,
+            FunctionPrepareMode::Decompile => Self::Decompile,
+            FunctionPrepareMode::Patterns => Self::Patterns,
+            FunctionPrepareMode::DataRefs => Self::DataRefs,
+            FunctionPrepareMode::Symbolic => Self::Symbolic,
+        }
+    }
+}
+
+/// Typed identity snapshot of every decompiler-preparation map retained by an
+/// SSA artifact. `None` in [`CertifiedArtifactOrigin`] means that preparation
+/// facts were not materialized for that artifact mode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CertifiedDecompilerPreparationSnapshot {
+    canonical_value_roots: Box<[(SSAVar, SSAVar)]>,
+    stack_address_roots: Box<[(SSAVar, StackAddressRoot)]>,
+    formal_parameters: Box<[(SSAVar, usize)]>,
+    formal_parameter_bases: Box<[(SSAVar, usize)]>,
+}
+
+impl CertifiedDecompilerPreparationSnapshot {
+    pub const fn canonical_value_roots(&self) -> &[(SSAVar, SSAVar)] {
+        &self.canonical_value_roots
+    }
+
+    pub const fn stack_address_roots(&self) -> &[(SSAVar, StackAddressRoot)] {
+        &self.stack_address_roots
+    }
+
+    pub const fn formal_parameters(&self) -> &[(SSAVar, usize)] {
+        &self.formal_parameters
+    }
+
+    pub const fn formal_parameter_bases(&self) -> &[(SSAVar, usize)] {
+        &self.formal_parameter_bases
+    }
+}
+
+/// Exact immutable source revision shared by certificates derived from one
+/// prepared SSA artifact.
+///
+/// The graph snapshot is a canonical serialization of the ordered graph
+/// payload rather than a probabilistic hash. Consumers compare this sealed
+/// value directly before composing artifact-local handles from child proofs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CertifiedArtifactOrigin {
+    schema_version: u32,
+    graph_snapshot: Box<[u8]>,
+    prepare_mode: CertifiedPreparationMode,
+    decompile_preparation: Option<CertifiedDecompilerPreparationSnapshot>,
+    /// Input order is retained intentionally as part of exact replay context.
+    assumptions: AssumptionSet,
+    machine_context: CertifiedMachineContext,
+    source: SemanticObligationInventory,
+    topology: CertifiedSourceTopology,
+}
+
+impl CertifiedArtifactOrigin {
+    pub const fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    pub const fn machine_context(&self) -> &CertifiedMachineContext {
+        &self.machine_context
+    }
+
+    pub const fn prepare_mode(&self) -> CertifiedPreparationMode {
+        self.prepare_mode
+    }
+
+    pub const fn assumptions(&self) -> &AssumptionSet {
+        &self.assumptions
+    }
+
+    /// Exact preparation maps used as artifact identity, not a semantic proof
+    /// that any individual derived fact is valid.
+    pub const fn decompile_preparation(&self) -> Option<&CertifiedDecompilerPreparationSnapshot> {
+        self.decompile_preparation.as_ref()
+    }
+
+    pub const fn source(&self) -> &SemanticObligationInventory {
+        &self.source
+    }
+
+    pub const fn topology(&self) -> &CertifiedSourceTopology {
+        &self.topology
+    }
+
+    pub fn matches_retained_source(
+        &self,
+        source: &SemanticObligationInventory,
+        topology: &CertifiedSourceTopology,
+    ) -> bool {
+        self.schema_version == CERTIFICATION_SCHEMA_VERSION
+            && !self.graph_snapshot.is_empty()
+            && self.source == *source
+            && self.topology == *topology
+    }
+}
+
+/// Validated, immutable machine context retained by a certification owner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CertifiedMachineContext {
+    schema_version: u32,
+    source: SourceMachineContext,
+}
+
+impl CertifiedMachineContext {
+    fn from_artifact(artifact: &SsaArtifact) -> Result<Self, MachineBuildError> {
+        let source = artifact.machine_context();
+        if source.schema_version() != MACHINE_CONTEXT_SCHEMA_VERSION
+            || source.memory_model().schema_version() != MACHINE_CONTEXT_SCHEMA_VERSION
+            || source.abi_model().schema_version() != MACHINE_CONTEXT_SCHEMA_VERSION
+        {
+            return Err(MachineBuildError::MachineContextMismatch);
+        }
+        match source.function_interface() {
+            Some(interface)
+                if interface.schema_version() == SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION
+                    && !interface.revision_identity().is_empty()
+                    && !interface.calling_convention().trim().is_empty()
+                    && source.abi_model().is_available()
+                    && source.abi_model().is_coherent()
+                    && source.abi_model().argument_registers().len()
+                        == interface.parameters().len()
+                    && source
+                        .abi_model()
+                        .argument_registers()
+                        .iter()
+                        .zip(interface.parameters())
+                        .all(|(actual, expected)| {
+                            actual.index() == expected.index()
+                                && actual.storage() == expected.storage()
+                        })
+                    && match interface.return_kind() {
+                        SourceFunctionReturn::Void => {
+                            source.abi_model().return_registers().is_empty()
+                        }
+                        SourceFunctionReturn::Register { storage } => {
+                            source.abi_model().return_registers().len() == 1
+                                && source.abi_model().return_registers()[0].index() == 0
+                                && source.abi_model().return_registers()[0].storage() == storage
+                        }
+                    } => {}
+            None if !source.abi_model().is_available()
+                && !source.abi_model().is_coherent()
+                && source.abi_model().argument_registers().is_empty()
+                && source.abi_model().return_registers().is_empty() => {}
+            _ => return Err(MachineBuildError::MachineContextMismatch),
+        }
+        if !source.call_site_interfaces_are_coherent() {
+            return Err(MachineBuildError::MachineContextMismatch);
+        }
+        for (call_site, identity) in source.raw_call_sites_by_id() {
+            if artifact
+                .call_sites()
+                .by_id
+                .get(call_site)
+                .is_none_or(|fact| fact.raw_identity != Some(*identity))
+            {
+                return Err(MachineBuildError::MachineContextMismatch);
+            }
+        }
+        for (identity, interface) in source.call_site_interfaces() {
+            if interface.schema_version() != SOURCE_CALL_SITE_INTERFACE_SCHEMA_VERSION
+                || interface.revision_identity().is_empty()
+                || interface.identity() != *identity
+                || interface.calling_convention().trim().is_empty()
+                || !artifact
+                    .call_sites()
+                    .by_id
+                    .values()
+                    .any(|fact| fact.raw_identity == Some(*identity))
+                || source.function_interface().is_some_and(|function| {
+                    function.revision_identity() != interface.revision_identity()
+                })
+            {
+                return Err(MachineBuildError::MachineContextMismatch);
+            }
+        }
+        let graph = artifact.graph();
+        let expected_sites = artifact
+            .facts()
+            .structured
+            .memory_accesses
+            .values()
+            .map(|access| (access.block_addr, access.op_index))
+            .collect::<BTreeSet<_>>();
+        for ((block_addr, op_index), space) in source.memory_spaces_by_op() {
+            let Some(instruction) = graph
+                .inst_id_for_op_site(*block_addr, *op_index)
+                .and_then(|inst| graph.inst(inst))
+            else {
+                return Err(MachineBuildError::MachineContextMismatch);
+            };
+            if !matches!(
+                &instruction.payload,
+                r2ssa::InstPayload::Op(
+                    r2ssa::SSAOp::Load { .. }
+                        | r2ssa::SSAOp::Store { .. }
+                        | r2ssa::SSAOp::LoadLinked { .. }
+                        | r2ssa::SSAOp::StoreConditional { .. }
+                        | r2ssa::SSAOp::AtomicCAS { .. }
+                        | r2ssa::SSAOp::LoadGuarded { .. }
+                        | r2ssa::SSAOp::StoreGuarded { .. }
+                )
+            ) || !expected_sites.contains(&(*block_addr, *op_index))
+                || (source.memory_model().is_available()
+                    && source.memory_model().space(*space).is_none())
+            {
+                return Err(MachineBuildError::MachineContextMismatch);
+            }
+        }
+        if expected_sites
+            .iter()
+            .any(|(block_addr, op_index)| source.memory_space_at(*block_addr, *op_index).is_none())
+        {
+            return Err(MachineBuildError::MachineContextMismatch);
+        }
+        Ok(Self {
+            schema_version: CERTIFICATION_SCHEMA_VERSION,
+            source: source.clone(),
+        })
+    }
+
+    pub const fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    pub const fn source(&self) -> &SourceMachineContext {
+        &self.source
+    }
+
+    pub const fn memory_model(&self) -> &MachineMemoryModel {
+        self.source.memory_model()
+    }
+}
+
+/// Sealed producerless resource for one declared ABI parameter carrier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CertifiedAbiParameter {
+    schema_version: u32,
+    index: u32,
+    storage: CanonicalStorageId,
+    value: Option<MachineValueUse>,
+}
+
+impl CertifiedAbiParameter {
+    pub const fn index(&self) -> u32 {
+        self.index
+    }
+
+    pub const fn storage(&self) -> CanonicalStorageId {
+        self.storage
+    }
+
+    /// Exact entry SSA carrier when the parameter is used by the graph.
+    pub const fn value(&self) -> Option<&MachineValueUse> {
+        self.value.as_ref()
+    }
+
+    fn validate_against_artifact(&self, artifact: &SsaArtifact) -> Result<(), MachineBuildError> {
+        validate_schema(self.schema_version)
+            .map_err(|_| MachineBuildError::MachineContextMismatch)?;
+        let interface = artifact
+            .machine_context()
+            .function_interface()
+            .ok_or(MachineBuildError::MachineContextMismatch)?;
+        let expected = interface
+            .parameters()
+            .get(self.index as usize)
+            .filter(|parameter| {
+                parameter.index() == self.index && parameter.storage() == self.storage
+            })
+            .ok_or(MachineBuildError::MachineContextMismatch)?;
+        let source = artifact.facts().boundaries.parameters.get(&self.index);
+        match (&self.value, source) {
+            (None, None) => {}
+            (Some(value), Some(source))
+                if source.index == self.index
+                    && source.storage == expected.storage()
+                    && value.binding().value() == source.value
+                    && value.binding().width_bits()
+                        == expected.storage().size.checked_mul(8).unwrap_or(0)
+                    && value.producer().is_none()
+                    && value.constant().is_none() => {}
+            _ => return Err(MachineBuildError::MachineContextMismatch),
+        }
+        Ok(())
+    }
+}
+
+fn certified_abi_parameters(
+    artifact: &SsaArtifact,
+) -> Result<BTreeMap<u32, CertifiedAbiParameter>, MachineBuildError> {
+    let Some(interface) = artifact.machine_context().function_interface() else {
+        return Ok(BTreeMap::new());
+    };
+    let mut parameters = BTreeMap::new();
+    for parameter in interface.parameters() {
+        let value = artifact
+            .facts()
+            .boundaries
+            .parameters
+            .get(&parameter.index())
+            .map(|fact| MachineValueUse::from_artifact(artifact, fact.value))
+            .transpose()?;
+        let certified = CertifiedAbiParameter {
+            schema_version: CERTIFICATION_SCHEMA_VERSION,
+            index: parameter.index(),
+            storage: parameter.storage(),
+            value,
+        };
+        certified.validate_against_artifact(artifact)?;
+        if parameters.insert(parameter.index(), certified).is_some() {
+            return Err(MachineBuildError::MachineContextMismatch);
+        }
+    }
+    Ok(parameters)
+}
+
+/// Sealed producerless resource for one exactly sized source-declared stack
+/// slot. `object` is absent when the slot is unused by this graph; callers may
+/// not infer an object or a size from address arithmetic alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CertifiedStackSlot {
+    schema_version: u32,
+    base: StackAddressBase,
+    offset: i64,
+    size_bytes: u32,
+    object: Option<ObjectId>,
+}
+
+impl CertifiedStackSlot {
+    pub const fn base(&self) -> StackAddressBase {
+        self.base
+    }
+
+    pub const fn offset(&self) -> i64 {
+        self.offset
+    }
+
+    pub const fn size_bytes(&self) -> u32 {
+        self.size_bytes
+    }
+
+    /// Exact object-model identity when this slot is referenced by the graph.
+    pub const fn object(&self) -> Option<ObjectId> {
+        self.object
+    }
+
+    fn validate_against_artifact(&self, artifact: &SsaArtifact) -> Result<(), MachineBuildError> {
+        validate_schema(self.schema_version)
+            .map_err(|_| MachineBuildError::MachineContextMismatch)?;
+        let interface = artifact
+            .machine_context()
+            .function_interface()
+            .ok_or(MachineBuildError::MachineContextMismatch)?;
+        if !interface.stack_slots().iter().any(|slot| {
+            slot.base() == self.base
+                && slot.offset() == self.offset
+                && slot.size_bytes() == self.size_bytes
+        }) {
+            return Err(MachineBuildError::MachineContextMismatch);
+        }
+        let matching_objects = artifact
+            .facts()
+            .certificates
+            .stack_slots
+            .values()
+            .filter(|slot| slot.base == self.base && slot.offset == self.offset)
+            .map(|slot| slot.object)
+            .collect::<Vec<_>>();
+        match (self.object, matching_objects.as_slice()) {
+            (None, []) => {}
+            (Some(actual), [expected]) if actual == *expected => {
+                if !matches!(
+                    artifact.objects().object(actual).map(|fact| &fact.kind),
+                    Some(
+                        ObjectKind::StackSlot { base, offset }
+                            | ObjectKind::FrameObject { base, offset }
+                    ) if *base == self.base && *offset == self.offset
+                ) {
+                    return Err(MachineBuildError::MachineContextMismatch);
+                }
+                let locations = artifact
+                    .facts()
+                    .memory
+                    .uses_by_inst
+                    .values()
+                    .flatten()
+                    .map(|fact| &fact.location)
+                    .chain(
+                        artifact
+                            .facts()
+                            .memory
+                            .defs_by_inst
+                            .values()
+                            .flatten()
+                            .map(|fact| &fact.location),
+                    )
+                    .filter(|location| location.object == actual)
+                    .collect::<Vec<_>>();
+                if locations.is_empty()
+                    || locations.iter().any(|location| {
+                        let RelativeMemoryAddress::Exact(relative) = &location.address else {
+                            return true;
+                        };
+                        location.size == 0
+                            || *relative < 0
+                            || u64::try_from(*relative)
+                                .ok()
+                                .and_then(|start| start.checked_add(u64::from(location.size)))
+                                .is_none_or(|end| end > u64::from(self.size_bytes))
+                    })
+                {
+                    return Err(MachineBuildError::MachineContextMismatch);
+                }
+            }
+            _ => return Err(MachineBuildError::MachineContextMismatch),
+        }
+        Ok(())
+    }
+}
+
+fn certified_stack_slots(
+    artifact: &SsaArtifact,
+) -> Result<BTreeMap<StackAddressRoot, CertifiedStackSlot>, MachineBuildError> {
+    let Some(interface) = artifact.machine_context().function_interface() else {
+        return Ok(BTreeMap::new());
+    };
+    let mut slots = BTreeMap::new();
+    for source in interface.stack_slots() {
+        let root = StackAddressRoot {
+            base: source.base(),
+            offset: source.offset(),
+        };
+        let matching_objects = artifact
+            .facts()
+            .certificates
+            .stack_slots
+            .values()
+            .filter(|slot| slot.base == source.base() && slot.offset == source.offset())
+            .map(|slot| slot.object)
+            .collect::<Vec<_>>();
+        let object = match matching_objects.as_slice() {
+            [] => None,
+            [object] => Some(*object),
+            _ => return Err(MachineBuildError::MachineContextMismatch),
+        };
+        let certified = CertifiedStackSlot {
+            schema_version: CERTIFICATION_SCHEMA_VERSION,
+            base: source.base(),
+            offset: source.offset(),
+            size_bytes: source.size_bytes(),
+            object,
+        };
+        certified.validate_against_artifact(artifact)?;
+        if slots.insert(root, certified).is_some() {
+            return Err(MachineBuildError::MachineContextMismatch);
+        }
+    }
+    Ok(slots)
+}
+
+/// Stable description of how one source obligation was preserved or rejected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EffectDisposition {
+    Rendered,
+    AbsorbedIntoExpression {
+        producer: CanonicalInstructionId,
+    },
+    AbsorbedIntoStatement {
+        producer: CanonicalInstructionId,
+    },
+    /// Exact direct-call boundary and its ordered register arguments. This
+    /// remains pending typed-call-region validation and is not final C
+    /// authorization.
+    AbsorbedIntoCall {
+        producer: CanonicalInstructionId,
+    },
+    /// Exact ledger ownership by sealed terminal-control evidence. This remains
+    /// pending typed-region validation and is not final C authorization.
+    AbsorbedIntoControl {
+        producer: CanonicalInstructionId,
+    },
+    /// Exact terminal return and its ordered returned-value obligations.
+    AbsorbedIntoReturn {
+        producer: CanonicalInstructionId,
+    },
+    /// Exact mutable-carrier ownership by a sealed counted-loop witness.
+    /// This remains pending typed counted-loop-region validation.
+    AbsorbedIntoLoopState {
+        producer: CanonicalInstructionId,
+    },
+    /// Exact register-phi or private-stack carrier ownership by a sealed
+    /// conditional-return funnel witness. This is not rendering permission.
+    AbsorbedIntoConditionalReturnState {
+        producer: CanonicalInstructionId,
+    },
+    /// Exact private prologue, epilogue, Home, or Local state owned by a
+    /// sealed private-frame conditional-return witness.
+    AbsorbedIntoPrivateFrameState {
+        producer: CanonicalInstructionId,
+    },
+    /// Exact ownership of the three canonical FNV loop carriers. Visible
+    /// expressions, byte read, controls, and return retain their own evidence.
+    AbsorbedIntoFnvFoldState {
+        producer: CanonicalInstructionId,
+    },
+    /// Exact private O0 frame ownership in the sealed stack-backed FNV fold.
+    AbsorbedIntoFnvFoldO0FrameState {
+        producer: CanonicalInstructionId,
+    },
+    /// Exact effective loop-invariant pointer/length Home MemorySSA relays.
+    AbsorbedIntoFnvFoldO0InvariantHomeRelay {
+        producer: CanonicalInstructionId,
+    },
+    /// The exact escaped-byte read plus its retained conservative frame versions.
+    AbsorbedIntoFnvFoldO0ExternalAlias {
+        producer: CanonicalInstructionId,
+    },
+    /// Exact acyclic forwarding control in the eleven-block O0 FNV topology.
+    AbsorbedIntoFnvFoldO0Forwarder {
+        producer: CanonicalInstructionId,
+    },
+    /// Exact O0 FNV loop guard, predicate routing, and latch/backedge control.
+    AbsorbedIntoFnvFoldO0LoopControl {
+        producer: CanonicalInstructionId,
+    },
+    /// Exact index, ASCII normalization, and FNV recurrence semantics.
+    AbsorbedIntoFnvFoldO0Semantics {
+        producer: CanonicalInstructionId,
+    },
+    /// Exact restored-frame return of the O0 FNV accumulator.
+    AbsorbedIntoFnvFoldO0Return {
+        producer: CanonicalInstructionId,
+    },
+    Rewritten {
+        pass: String,
+    },
+    Superseded {
+        by: SemanticObligationId,
+    },
+    ProvenDead,
+    Residualized {
+        reason: String,
+    },
+    Refused {
+        reason: String,
+    },
+}
+
+impl EffectDisposition {
+    pub const fn permits_certified_c(&self) -> bool {
+        matches!(
+            self,
+            Self::Rendered
+                | Self::AbsorbedIntoExpression { .. }
+                | Self::AbsorbedIntoStatement { .. }
+                | Self::AbsorbedIntoCall { .. }
+                | Self::AbsorbedIntoControl { .. }
+                | Self::AbsorbedIntoReturn { .. }
+                | Self::AbsorbedIntoLoopState { .. }
+                | Self::AbsorbedIntoConditionalReturnState { .. }
+                | Self::AbsorbedIntoPrivateFrameState { .. }
+                | Self::AbsorbedIntoFnvFoldState { .. }
+                | Self::AbsorbedIntoFnvFoldO0FrameState { .. }
+                | Self::AbsorbedIntoFnvFoldO0InvariantHomeRelay { .. }
+                | Self::AbsorbedIntoFnvFoldO0ExternalAlias { .. }
+                | Self::AbsorbedIntoFnvFoldO0Forwarder { .. }
+                | Self::AbsorbedIntoFnvFoldO0LoopControl { .. }
+                | Self::AbsorbedIntoFnvFoldO0Semantics { .. }
+                | Self::AbsorbedIntoFnvFoldO0Return { .. }
+                | Self::Rewritten { .. }
+                | Self::Superseded { .. }
+                | Self::ProvenDead
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CertificationError {
+    SchemaVersion { expected: u32, actual: u32 },
+    IncompleteSourceInventory,
+    EmptySourceSet,
+    UnknownInstruction(CanonicalInstructionId),
+    UnknownObligation(SemanticObligationId),
+    ObligationNotMapped(SemanticObligationId),
+    EmptyReason,
+}
+
+/// A semantic output entity anchored to a canonical producer.
+///
+/// Fields are private so a normal caller must validate it against a source
+/// inventory. Deserialized values are validated again when entered in a
+/// `CertifiedFunction`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CertifiedEntity {
+    schema_version: u32,
+    producer: CanonicalInstructionId,
+    source_obligations: BTreeSet<SemanticObligationId>,
+}
+
+impl CertifiedEntity {
+    // This constructor is test-only until a typed semantic-output validator
+    // owns output provenance. Source IDs alone are not preservation evidence.
+    #[cfg(test)]
+    fn certify(
+        source: &SemanticObligationInventory,
+        producer: CanonicalInstructionId,
+        source_obligations: impl IntoIterator<Item = SemanticObligationId>,
+    ) -> Result<Self, CertificationError> {
+        let entity = Self {
+            schema_version: CERTIFICATION_SCHEMA_VERSION,
+            producer,
+            source_obligations: source_obligations.into_iter().collect(),
+        };
+        entity.validate(source)?;
+        Ok(entity)
+    }
+
+    pub const fn producer(&self) -> CanonicalInstructionId {
+        self.producer
+    }
+
+    pub fn source_obligations(&self) -> &BTreeSet<SemanticObligationId> {
+        &self.source_obligations
+    }
+
+    fn validate(&self, source: &SemanticObligationInventory) -> Result<(), CertificationError> {
+        validate_source(source)?;
+        validate_schema(self.schema_version)?;
+        if !source.instructions().contains_key(&self.producer) {
+            return Err(CertificationError::UnknownInstruction(self.producer));
+        }
+        if self.source_obligations.is_empty() {
+            return Err(CertificationError::EmptySourceSet);
+        }
+        for id in &self.source_obligations {
+            if !source.obligations().contains_key(id) {
+                return Err(CertificationError::UnknownObligation(*id));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A certified expression and its canonical producer dependencies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CertifiedExpr {
+    schema_version: u32,
+    entity: CertifiedEntity,
+    root: MachineExprId,
+    inputs: BTreeSet<CanonicalInstructionId>,
+}
+
+impl CertifiedExpr {
+    pub fn entity(&self) -> &CertifiedEntity {
+        &self.entity
+    }
+
+    /// Exact machine-expression root validated for this certified entity.
+    pub const fn root(&self) -> MachineExprId {
+        self.root
+    }
+
+    pub fn inputs(&self) -> &BTreeSet<CanonicalInstructionId> {
+        &self.inputs
+    }
+
+    fn validate(&self, source: &SemanticObligationInventory) -> Result<(), CertificationError> {
+        validate_source(source)?;
+        validate_schema(self.schema_version)?;
+        self.entity.validate(source)?;
+        for input in &self.inputs {
+            if !source.instructions().contains_key(input) {
+                return Err(CertificationError::UnknownInstruction(*input));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Exact executable shape of one certified plain memory statement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum CertifiedMemoryStatementKind {
+    Read { result: MachineValueUse },
+    Write { value: MachineValueUse },
+}
+
+/// Required execution policy for certified memory statements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum CertifiedMemoryExecutionPolicy {
+    /// Evaluate exactly once in certified source order through an address-space
+    /// helper. An ordinary C pointer dereference is not permitted evidence.
+    ExactlyOnceInSourceOrderViaHelper,
+}
+
+/// Sealed evidence for one plain source Load or Store.
+///
+/// Construction requires one complete structured access, an explicit coherent
+/// machine-memory model, and no guarded, atomic, ordering, or unknown sibling
+/// effect. The statement owns only its observable memory obligation. A load's
+/// live result remains separately owned by its certified expression.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CertifiedMemoryStatement {
+    schema_version: u32,
+    producer: CanonicalInstructionId,
+    access: StructuredAccessId,
+    object: ObjectId,
+    address: MachineValueUse,
+    space: MachineAddressSpace,
+    endianness: MachineMemoryEndianness,
+    word_size_bytes: u32,
+    width_bits: u32,
+    execution: CertifiedMemoryExecutionPolicy,
+    kind: CertifiedMemoryStatementKind,
+    source_obligations: BTreeSet<SemanticObligationId>,
+}
+
+impl CertifiedMemoryStatement {
+    pub const fn producer(&self) -> CanonicalInstructionId {
+        self.producer
+    }
+
+    pub const fn access(&self) -> StructuredAccessId {
+        self.access
+    }
+
+    pub const fn object(&self) -> ObjectId {
+        self.object
+    }
+
+    pub const fn address(&self) -> &MachineValueUse {
+        &self.address
+    }
+
+    pub const fn space(&self) -> MachineAddressSpace {
+        self.space
+    }
+
+    pub const fn endianness(&self) -> MachineMemoryEndianness {
+        self.endianness
+    }
+
+    pub const fn word_size_bytes(&self) -> u32 {
+        self.word_size_bytes
+    }
+
+    pub const fn width_bits(&self) -> u32 {
+        self.width_bits
+    }
+
+    pub const fn kind(&self) -> &CertifiedMemoryStatementKind {
+        &self.kind
+    }
+
+    pub const fn execution(&self) -> CertifiedMemoryExecutionPolicy {
+        self.execution
+    }
+
+    pub fn source_obligations(&self) -> &BTreeSet<SemanticObligationId> {
+        &self.source_obligations
+    }
+
+    fn validate(&self, source: &SemanticObligationInventory) -> Result<(), CertificationError> {
+        validate_source(source)?;
+        validate_schema(self.schema_version)?;
+        let mut obligations = self.source_obligations.iter().copied();
+        let Some(obligation) = obligations.next() else {
+            return Err(CertificationError::EmptySourceSet);
+        };
+        if obligations.next().is_some() {
+            return Err(CertificationError::ObligationNotMapped(obligation));
+        }
+        let expected_kind = match self.kind {
+            CertifiedMemoryStatementKind::Read { .. } => {
+                SemanticObligationKind::ObservableMemoryRead
+            }
+            CertifiedMemoryStatementKind::Write { .. } => {
+                SemanticObligationKind::ObservableMemoryWrite
+            }
+        };
+        if self.width_bits == 0
+            || self.word_size_bytes == 0
+            || !matches!(
+                self.endianness,
+                MachineMemoryEndianness::Little | MachineMemoryEndianness::Big
+            )
+            || self.execution != CertifiedMemoryExecutionPolicy::ExactlyOnceInSourceOrderViaHelper
+            || obligation.instruction != self.producer
+            || obligation.kind != expected_kind
+            || obligation.component
+                != SemanticObligationComponent::MemoryAccess(self.access.ordinal)
+        {
+            return Err(CertificationError::ObligationNotMapped(obligation));
+        }
+        let source_obligation = source
+            .obligations()
+            .get(&obligation)
+            .ok_or(CertificationError::UnknownObligation(obligation))?;
+        let mut expected_inputs = vec![self.address.binding().value()];
+        match &self.kind {
+            CertifiedMemoryStatementKind::Read { result } => {
+                if result.producer() != Some(self.producer)
+                    || result.binding().width_bits() != self.width_bits
+                {
+                    return Err(CertificationError::ObligationNotMapped(obligation));
+                }
+            }
+            CertifiedMemoryStatementKind::Write { value } => {
+                if value.binding().width_bits() != self.width_bits {
+                    return Err(CertificationError::ObligationNotMapped(obligation));
+                }
+                expected_inputs.push(value.binding().value());
+            }
+        }
+        let address_type_matches = matches!(
+            self.address.ty(),
+            MachineType::Address { width_bits, space, .. }
+                if *width_bits == self.address.binding().width_bits() && *space == self.space
+        );
+        if source_obligation.source_inst != self.access.inst
+            || source_obligation.inputs != expected_inputs
+            || self.address.memory_access() != Some(self.access)
+            || !address_type_matches
+        {
+            return Err(CertificationError::ObligationNotMapped(obligation));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn validate_against_artifact(&self, artifact: &SsaArtifact) -> Result<(), MachineBuildError> {
+        let expected = try_certified_memory_statement(artifact, self.access.inst)?
+            .ok_or(MachineBuildError::ObligationMismatch(self.access.inst))?;
+        if expected == *self {
+            Ok(())
+        } else {
+            Err(MachineBuildError::ObligationMismatch(self.access.inst))
+        }
+    }
+}
+
+/// One ordered register argument and the exact source obligation it owns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum CertifiedCallArgumentOrigin {
+    Produced { producer: CanonicalInstructionId },
+    Constant { value: MachineBitVector },
+    AbiParameter { index: u32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CertifiedCallArgument {
+    slot: CallBoundarySlot,
+    value: MachineValueUse,
+    origin: CertifiedCallArgumentOrigin,
+    source_obligation: SemanticObligationId,
+}
+
+impl CertifiedCallArgument {
+    pub const fn slot(&self) -> CallBoundarySlot {
+        self.slot
+    }
+
+    pub const fn value(&self) -> &MachineValueUse {
+        &self.value
+    }
+
+    pub const fn origin(&self) -> &CertifiedCallArgumentOrigin {
+        &self.origin
+    }
+
+    pub const fn source_obligation(&self) -> SemanticObligationId {
+        self.source_obligation
+    }
+}
+
+/// Sealed boundary evidence for the first admitted direct-call subset.
+///
+/// The call must be final in its block, direct, falling through to one existing
+/// successor, nonvariadic, non-noreturn, explicitly void, and register-only.
+/// This witness ends at the call and proves neither callee behavior nor
+/// post-call register or memory state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CertifiedDirectCall {
+    schema_version: u32,
+    producer: CanonicalInstructionId,
+    source_inst: r2ssa::InstId,
+    call_site: CallSiteId,
+    raw_identity: SourceCallSiteIdentity,
+    interface_revision: Box<[u8]>,
+    target: u64,
+    fallthrough: u64,
+    target_value: MachineValueUse,
+    calling_convention: String,
+    arguments: Box<[CertifiedCallArgument]>,
+    call_obligation: SemanticObligationId,
+}
+
+impl CertifiedDirectCall {
+    pub const fn producer(&self) -> CanonicalInstructionId {
+        self.producer
+    }
+
+    pub const fn call_site(&self) -> CallSiteId {
+        self.call_site
+    }
+
+    pub const fn raw_identity(&self) -> SourceCallSiteIdentity {
+        self.raw_identity
+    }
+
+    pub const fn interface_revision(&self) -> &[u8] {
+        &self.interface_revision
+    }
+
+    pub const fn target(&self) -> u64 {
+        self.target
+    }
+
+    pub const fn fallthrough(&self) -> u64 {
+        self.fallthrough
+    }
+
+    pub const fn target_value(&self) -> &MachineValueUse {
+        &self.target_value
+    }
+
+    pub fn calling_convention(&self) -> &str {
+        &self.calling_convention
+    }
+
+    pub const fn arguments(&self) -> &[CertifiedCallArgument] {
+        &self.arguments
+    }
+
+    pub const fn call_obligation(&self) -> SemanticObligationId {
+        self.call_obligation
+    }
+
+    pub fn source_obligations(&self) -> BTreeSet<SemanticObligationId> {
+        std::iter::once(self.call_obligation)
+            .chain(
+                self.arguments
+                    .iter()
+                    .map(CertifiedCallArgument::source_obligation),
+            )
+            .collect()
+    }
+
+    fn validate(&self, source: &SemanticObligationInventory) -> Result<(), CertificationError> {
+        validate_source(source)?;
+        validate_schema(self.schema_version)?;
+        if self.interface_revision.is_empty()
+            || self.calling_convention.trim().is_empty()
+            || self.target == self.fallthrough
+            || self.raw_identity.block_addr() != self.producer.block_addr
+            || self.raw_identity.target().offset != self.target
+            || self.call_obligation.instruction != self.producer
+            || self.call_obligation.kind != SemanticObligationKind::Call
+            || self.call_obligation.component != SemanticObligationComponent::Whole
+            || self.source_obligations().len() != self.arguments.len().saturating_add(1)
+        {
+            return Err(CertificationError::ObligationNotMapped(
+                self.call_obligation,
+            ));
+        }
+        let call = source
+            .obligations()
+            .get(&self.call_obligation)
+            .ok_or(CertificationError::UnknownObligation(self.call_obligation))?;
+        if call.source_inst != self.source_inst
+            || call.inputs != [self.target_value.binding().value()]
+        {
+            return Err(CertificationError::ObligationNotMapped(
+                self.call_obligation,
+            ));
+        }
+        for (position, argument) in self.arguments.iter().enumerate() {
+            let CallBoundarySlot::Register { index, storage } = argument.slot else {
+                return Err(CertificationError::ObligationNotMapped(
+                    argument.source_obligation,
+                ));
+            };
+            if u32::try_from(position) != Ok(index)
+                || argument.source_obligation.instruction != self.producer
+                || argument.source_obligation.kind != SemanticObligationKind::CallArgument
+                || argument.source_obligation.component
+                    != (SemanticObligationComponent::RegisterSlot { index, storage })
+            {
+                return Err(CertificationError::ObligationNotMapped(
+                    argument.source_obligation,
+                ));
+            }
+            let origin_matches = match argument.origin {
+                CertifiedCallArgumentOrigin::Produced { producer } => {
+                    argument.value.producer() == Some(producer)
+                        && argument.value.constant().is_none()
+                }
+                CertifiedCallArgumentOrigin::Constant { value } => {
+                    value.width_bits() == argument.value.binding().width_bits()
+                        && (argument.value.constant() == Some(value)
+                            || (argument.value.constant().is_none()
+                                && argument.value.producer().is_some()))
+                }
+                CertifiedCallArgumentOrigin::AbiParameter { .. } => {
+                    argument.value.constant().is_none()
+                }
+            };
+            if !origin_matches {
+                return Err(CertificationError::ObligationNotMapped(
+                    argument.source_obligation,
+                ));
+            }
+            let obligation = source
+                .obligations()
+                .get(&argument.source_obligation)
+                .ok_or(CertificationError::UnknownObligation(
+                    argument.source_obligation,
+                ))?;
+            if obligation.source_inst != self.source_inst
+                || obligation.inputs != [argument.value.binding().value()]
+            {
+                return Err(CertificationError::ObligationNotMapped(
+                    argument.source_obligation,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn validate_against_artifact(&self, artifact: &SsaArtifact) -> Result<(), MachineBuildError> {
+        let topology = certified_source_topology(artifact)?;
+        let expected = certified_direct_calls(artifact, &topology)?
+            .remove(&self.producer)
+            .ok_or(MachineBuildError::ObligationMismatch(self.source_inst))?;
+        if expected == *self {
+            Ok(())
+        } else {
+            Err(MachineBuildError::ObligationMismatch(self.source_inst))
+        }
+    }
+}
+
+/// Sealed machine/topology evidence for one direct intra-function branch.
+///
+/// This owns one terminal edge and its `ControlTransfer/Whole` obligation. It
+/// is not a structured region, executable statement, or function-exit proof.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CertifiedDirectControl {
+    schema_version: u32,
+    producer: CanonicalInstructionId,
+    source_inst: r2ssa::InstId,
+    target: u64,
+    target_value: MachineValueUse,
+    source_obligation: SemanticObligationId,
+}
+
+impl CertifiedDirectControl {
+    pub const fn producer(&self) -> CanonicalInstructionId {
+        self.producer
+    }
+
+    pub const fn target(&self) -> u64 {
+        self.target
+    }
+
+    pub const fn target_value(&self) -> &MachineValueUse {
+        &self.target_value
+    }
+
+    pub const fn source_obligation(&self) -> SemanticObligationId {
+        self.source_obligation
+    }
+
+    fn validate(&self, source: &SemanticObligationInventory) -> Result<(), CertificationError> {
+        validate_source(source)?;
+        validate_schema(self.schema_version)?;
+        if self.source_obligation.instruction != self.producer
+            || self.source_obligation.kind != SemanticObligationKind::ControlTransfer
+            || self.source_obligation.component != SemanticObligationComponent::Whole
+        {
+            return Err(CertificationError::ObligationNotMapped(
+                self.source_obligation,
+            ));
+        }
+        let obligation = source.obligations().get(&self.source_obligation).ok_or(
+            CertificationError::UnknownObligation(self.source_obligation),
+        )?;
+        if obligation.source_inst != self.source_inst
+            || obligation.inputs != [self.target_value.binding().value()]
+        {
+            return Err(CertificationError::ObligationNotMapped(
+                self.source_obligation,
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn validate_against_artifact(&self, artifact: &SsaArtifact) -> Result<(), MachineBuildError> {
+        let topology = certified_source_topology(artifact)?;
+        let expected = certified_direct_controls(artifact, &topology)?
+            .remove(&self.producer)
+            .ok_or(MachineBuildError::ObligationMismatch(self.source_inst))?;
+        if expected == *self {
+            Ok(())
+        } else {
+            Err(MachineBuildError::ObligationMismatch(self.source_inst))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum CertifiedControlTruthiness {
+    NonZeroIsTrue,
+}
+
+/// Sealed evidence for one direct two-arm conditional transfer.
+///
+/// Admission requires one final raw/SSA `CBranch`, exact distinct internal
+/// true and block-end fallthrough targets, an exact two-successor topology, an
+/// eight-bit condition, and matching `ControlPredicate/Whole` plus
+/// `ControlTransfer/Whole` obligations. `NonZeroIsTrue` is full machine-
+/// bitvector truthiness. This is not an `if`, ternary, join proof, structured
+/// region, or rendering permission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CertifiedConditionalControl {
+    schema_version: u32,
+    producer: CanonicalInstructionId,
+    source_inst: r2ssa::InstId,
+    true_target: u64,
+    false_target: u64,
+    target_value: MachineValueUse,
+    condition: MachineValueUse,
+    truthiness: CertifiedControlTruthiness,
+    predicate_obligation: SemanticObligationId,
+    transfer_obligation: SemanticObligationId,
+}
+
+impl CertifiedConditionalControl {
+    pub const fn producer(&self) -> CanonicalInstructionId {
+        self.producer
+    }
+
+    pub const fn true_target(&self) -> u64 {
+        self.true_target
+    }
+
+    pub const fn false_target(&self) -> u64 {
+        self.false_target
+    }
+
+    pub const fn target_value(&self) -> &MachineValueUse {
+        &self.target_value
+    }
+
+    pub const fn condition(&self) -> &MachineValueUse {
+        &self.condition
+    }
+
+    pub const fn truthiness(&self) -> CertifiedControlTruthiness {
+        self.truthiness
+    }
+
+    pub const fn predicate_obligation(&self) -> SemanticObligationId {
+        self.predicate_obligation
+    }
+
+    pub const fn transfer_obligation(&self) -> SemanticObligationId {
+        self.transfer_obligation
+    }
+
+    pub fn source_obligations(&self) -> BTreeSet<SemanticObligationId> {
+        BTreeSet::from([self.predicate_obligation, self.transfer_obligation])
+    }
+
+    fn validate(&self, source: &SemanticObligationInventory) -> Result<(), CertificationError> {
+        validate_source(source)?;
+        validate_schema(self.schema_version)?;
+        if self.true_target == self.false_target
+            || self.truthiness != CertifiedControlTruthiness::NonZeroIsTrue
+            || self.predicate_obligation.instruction != self.producer
+            || self.predicate_obligation.kind != SemanticObligationKind::ControlPredicate
+            || self.predicate_obligation.component != SemanticObligationComponent::Whole
+            || self.transfer_obligation.instruction != self.producer
+            || self.transfer_obligation.kind != SemanticObligationKind::ControlTransfer
+            || self.transfer_obligation.component != SemanticObligationComponent::Whole
+        {
+            return Err(CertificationError::ObligationNotMapped(
+                self.transfer_obligation,
+            ));
+        }
+        let predicate = source.obligations().get(&self.predicate_obligation).ok_or(
+            CertificationError::UnknownObligation(self.predicate_obligation),
+        )?;
+        let transfer = source.obligations().get(&self.transfer_obligation).ok_or(
+            CertificationError::UnknownObligation(self.transfer_obligation),
+        )?;
+        if predicate.source_inst != self.source_inst
+            || predicate.inputs != [self.condition.binding().value()]
+            || transfer.source_inst != self.source_inst
+            || transfer.inputs
+                != [
+                    self.target_value.binding().value(),
+                    self.condition.binding().value(),
+                ]
+        {
+            return Err(CertificationError::ObligationNotMapped(
+                self.transfer_obligation,
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn validate_against_artifact(&self, artifact: &SsaArtifact) -> Result<(), MachineBuildError> {
+        let topology = certified_source_topology(artifact)?;
+        let expected = certified_conditional_controls(artifact, &topology)?
+            .remove(&self.producer)
+            .ok_or(MachineBuildError::ObligationMismatch(self.source_inst))?;
+        if expected == *self {
+            Ok(())
+        } else {
+            Err(MachineBuildError::ObligationMismatch(self.source_inst))
+        }
+    }
+}
+
+/// One ordered returned ABI value and the exact source obligation it owns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CertifiedReturnValue {
+    slot: CallBoundarySlot,
+    value: MachineValueUse,
+    source_obligation: SemanticObligationId,
+}
+
+impl CertifiedReturnValue {
+    pub const fn slot(&self) -> CallBoundarySlot {
+        self.slot
+    }
+
+    pub const fn value(&self) -> &MachineValueUse {
+        &self.value
+    }
+
+    pub const fn source_obligation(&self) -> SemanticObligationId {
+        self.source_obligation
+    }
+}
+
+/// Sealed terminal-return evidence for one exact source block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CertifiedReturnControl {
+    schema_version: u32,
+    producer: CanonicalInstructionId,
+    source_inst: r2ssa::InstId,
+    control_target: MachineValueUse,
+    values: Box<[CertifiedReturnValue]>,
+    return_obligation: SemanticObligationId,
+}
+
+impl CertifiedReturnControl {
+    pub const fn producer(&self) -> CanonicalInstructionId {
+        self.producer
+    }
+
+    pub const fn control_target(&self) -> &MachineValueUse {
+        &self.control_target
+    }
+
+    pub const fn values(&self) -> &[CertifiedReturnValue] {
+        &self.values
+    }
+
+    pub const fn return_obligation(&self) -> SemanticObligationId {
+        self.return_obligation
+    }
+
+    pub fn source_obligations(&self) -> BTreeSet<SemanticObligationId> {
+        std::iter::once(self.return_obligation)
+            .chain(self.values.iter().map(|value| value.source_obligation))
+            .collect()
+    }
+
+    fn validate(&self, source: &SemanticObligationInventory) -> Result<(), CertificationError> {
+        validate_source(source)?;
+        validate_schema(self.schema_version)?;
+        if self.return_obligation.instruction != self.producer
+            || self.return_obligation.kind != SemanticObligationKind::Return
+            || self.return_obligation.component != SemanticObligationComponent::Whole
+            || self.source_obligations().len() != self.values.len().saturating_add(1)
+        {
+            return Err(CertificationError::ObligationNotMapped(
+                self.return_obligation,
+            ));
+        }
+        let terminal = source.obligations().get(&self.return_obligation).ok_or(
+            CertificationError::UnknownObligation(self.return_obligation),
+        )?;
+        if terminal.source_inst != self.source_inst
+            || terminal.inputs != [self.control_target.binding().value()]
+        {
+            return Err(CertificationError::ObligationNotMapped(
+                self.return_obligation,
+            ));
+        }
+        for returned in &self.values {
+            if returned.source_obligation.instruction != self.producer
+                || returned.source_obligation.kind != SemanticObligationKind::ReturnValue
+                || returned.source_obligation.component != return_component(returned.slot)
+            {
+                return Err(CertificationError::ObligationNotMapped(
+                    returned.source_obligation,
+                ));
+            }
+            let obligation = source
+                .obligations()
+                .get(&returned.source_obligation)
+                .ok_or(CertificationError::UnknownObligation(
+                    returned.source_obligation,
+                ))?;
+            if obligation.source_inst != self.source_inst
+                || obligation.inputs != [returned.value.binding().value()]
+            {
+                return Err(CertificationError::ObligationNotMapped(
+                    returned.source_obligation,
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn return_component(slot: CallBoundarySlot) -> SemanticObligationComponent {
+    match slot {
+        CallBoundarySlot::Register { index, storage } => {
+            SemanticObligationComponent::RegisterSlot { index, storage }
+        }
+        CallBoundarySlot::Stack(offset) => SemanticObligationComponent::StackOffset(offset),
+    }
+}
+
+/// Sealed topology-and-predicate witness for the first admitted natural loop.
+///
+/// This proves only a carrier-free two-block routing shape. The entry and exit
+/// remain open composition ports, and this is not executable-loop or rendering
+/// permission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CertifiedNaturalLoopRouting {
+    schema_version: u32,
+    origin: CertifiedArtifactOrigin,
+    loop_id: LoopId,
+    predicate_id: PredicateId,
+    header_control: CertifiedConditionalControl,
+    body_transfer: CertifiedDirectControl,
+    body_latch: u64,
+    exit: u64,
+    entry_predecessor: u64,
+    continuation_on_true: bool,
+}
+
+impl CertifiedNaturalLoopRouting {
+    pub const fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    pub const fn origin(&self) -> &CertifiedArtifactOrigin {
+        &self.origin
+    }
+
+    pub const fn loop_id(&self) -> LoopId {
+        self.loop_id
+    }
+
+    pub const fn predicate_id(&self) -> PredicateId {
+        self.predicate_id
+    }
+
+    pub const fn header_control(&self) -> &CertifiedConditionalControl {
+        &self.header_control
+    }
+
+    pub const fn body_transfer(&self) -> &CertifiedDirectControl {
+        &self.body_transfer
+    }
+
+    pub const fn header(&self) -> u64 {
+        self.header_control.producer().block_addr
+    }
+
+    pub const fn body_latch(&self) -> u64 {
+        self.body_latch
+    }
+
+    pub const fn exit(&self) -> u64 {
+        self.exit
+    }
+
+    pub const fn entry_predecessor(&self) -> u64 {
+        self.entry_predecessor
+    }
+
+    pub const fn continuation_on_true(&self) -> bool {
+        self.continuation_on_true
+    }
+}
+
+/// Sealed whole-function control evidence for the first executable natural
+/// loop subset.
+///
+/// The function consists of one owned entry preheader, the carrier-free
+/// header/body routing, and one terminal-return exit. The invariant header
+/// condition is exactly one revision-bound ABI parameter carrier. This witness
+/// is still not rendering permission; the complete obligation ledger and exit
+/// return are checked by the typed-region permit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CertifiedClosedNaturalLoopControl {
+    schema_version: u32,
+    origin: CertifiedArtifactOrigin,
+    routing: CertifiedNaturalLoopRouting,
+    preheader_transfer: CertifiedDirectControl,
+    parameter_index: u32,
+    parameter_storage: CanonicalStorageId,
+}
+
+impl CertifiedClosedNaturalLoopControl {
+    pub const fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    pub const fn origin(&self) -> &CertifiedArtifactOrigin {
+        &self.origin
+    }
+
+    pub const fn routing(&self) -> &CertifiedNaturalLoopRouting {
+        &self.routing
+    }
+
+    pub const fn preheader_transfer(&self) -> &CertifiedDirectControl {
+        &self.preheader_transfer
+    }
+
+    pub const fn parameter_index(&self) -> u32 {
+        self.parameter_index
+    }
+
+    pub const fn parameter_storage(&self) -> CanonicalStorageId {
+        self.parameter_storage
+    }
+
+    pub const fn condition(&self) -> &MachineValueUse {
+        self.routing.header_control().condition()
+    }
+}
+
+/// Sealed ownership of one exact mutable counter carried by a header phi.
+///
+/// The three source obligations on `phi` -- its live value, loop-carried
+/// identity, and sole latch-edge transition -- are inseparable here. The
+/// initializer, condition, and update retain their own exact producers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CertifiedCountedLoopState {
+    schema_version: u32,
+    origin: CertifiedArtifactOrigin,
+    loop_id: LoopId,
+    preheader: u64,
+    header: u64,
+    latch: u64,
+    exit: u64,
+    carrier_storage: CanonicalStorageId,
+    initializer: MachineValueUse,
+    phi: MachineValueUse,
+    bound: MachineValueUse,
+    condition: MachineValueUse,
+    update: MachineValueUse,
+    source_obligations: BTreeSet<SemanticObligationId>,
+}
+
+impl CertifiedCountedLoopState {
+    pub const fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    pub const fn origin(&self) -> &CertifiedArtifactOrigin {
+        &self.origin
+    }
+
+    pub const fn loop_id(&self) -> LoopId {
+        self.loop_id
+    }
+
+    pub const fn preheader(&self) -> u64 {
+        self.preheader
+    }
+
+    pub const fn header(&self) -> u64 {
+        self.header
+    }
+
+    pub const fn latch(&self) -> u64 {
+        self.latch
+    }
+
+    pub const fn exit(&self) -> u64 {
+        self.exit
+    }
+
+    pub const fn carrier_storage(&self) -> CanonicalStorageId {
+        self.carrier_storage
+    }
+
+    pub const fn initializer(&self) -> &MachineValueUse {
+        &self.initializer
+    }
+
+    pub const fn phi(&self) -> &MachineValueUse {
+        &self.phi
+    }
+
+    pub const fn bound(&self) -> &MachineValueUse {
+        &self.bound
+    }
+
+    pub const fn condition(&self) -> &MachineValueUse {
+        &self.condition
+    }
+
+    pub const fn update(&self) -> &MachineValueUse {
+        &self.update
+    }
+
+    pub const fn source_obligations(&self) -> &BTreeSet<SemanticObligationId> {
+        &self.source_obligations
+    }
+
+    pub const fn producer(&self) -> CanonicalInstructionId {
+        self.phi
+            .producer()
+            .expect("certified counted-loop phi has one producer")
+    }
+
+    fn validate(&self, source: &SemanticObligationInventory) -> Result<(), CertificationError> {
+        validate_schema(self.schema_version)?;
+        if self.origin.source() != source
+            || self.carrier_storage.size.checked_mul(8) != Some(self.phi.binding().width_bits())
+            || self.initializer.binding().width_bits() != self.phi.binding().width_bits()
+            || self.bound.binding().width_bits() != self.phi.binding().width_bits()
+            || self.update.binding().width_bits() != self.phi.binding().width_bits()
+            || self.condition.binding().width_bits() != 8
+            || self.initializer.producer().is_none()
+            || self.phi.producer().is_none()
+            || self.bound.producer().is_some()
+            || self.condition.producer().is_none()
+            || self.update.producer().is_none()
+        {
+            return Err(CertificationError::ObligationNotMapped(
+                self.source_obligations
+                    .iter()
+                    .copied()
+                    .next()
+                    .unwrap_or(SemanticObligationId {
+                        instruction: self.producer(),
+                        kind: SemanticObligationKind::LoopCarriedState,
+                        component: SemanticObligationComponent::Whole,
+                    }),
+            ));
+        }
+        let producer = self.producer();
+        let expected = BTreeSet::from([
+            SemanticObligationId {
+                instruction: producer,
+                kind: SemanticObligationKind::LiveValueProducer,
+                component: SemanticObligationComponent::Whole,
+            },
+            SemanticObligationId {
+                instruction: producer,
+                kind: SemanticObligationKind::LoopCarriedState,
+                component: SemanticObligationComponent::Whole,
+            },
+            SemanticObligationId {
+                instruction: producer,
+                kind: SemanticObligationKind::LiveStateTransition,
+                component: SemanticObligationComponent::LoopTransition {
+                    carrier: self.carrier_storage,
+                    predecessor: self.latch,
+                },
+            },
+        ]);
+        if self.source_obligations != expected
+            || source
+                .instructions()
+                .get(&producer)
+                .is_none_or(|instruction| instruction.obligations != expected)
+        {
+            return Err(CertificationError::ObligationNotMapped(
+                expected
+                    .iter()
+                    .copied()
+                    .next()
+                    .expect("counted loop obligation set is nonempty"),
+            ));
+        }
+        for obligation in &expected {
+            let Some(source_obligation) = source.obligations().get(obligation) else {
+                return Err(CertificationError::UnknownObligation(*obligation));
+            };
+            let inputs_match = match obligation.kind {
+                SemanticObligationKind::LiveValueProducer
+                | SemanticObligationKind::LoopCarriedState => {
+                    source_obligation.inputs.len() == 2
+                        && source_obligation
+                            .inputs
+                            .iter()
+                            .copied()
+                            .collect::<BTreeSet<_>>()
+                            == BTreeSet::from([
+                                self.initializer.binding().value(),
+                                self.update.binding().value(),
+                            ])
+                }
+                SemanticObligationKind::LiveStateTransition => {
+                    source_obligation.inputs == [self.update.binding().value()]
+                }
+                _ => false,
+            };
+            if !inputs_match {
+                return Err(CertificationError::ObligationNotMapped(*obligation));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Sealed whole-function evidence for the canonical unsigned counted loop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CertifiedClosedCountedLoopControl {
+    schema_version: u32,
+    origin: CertifiedArtifactOrigin,
+    state: CertifiedCountedLoopState,
+    preheader_transfer: CertifiedDirectControl,
+    header_control: CertifiedConditionalControl,
+    backedge_transfer: CertifiedDirectControl,
+    return_control: CertifiedReturnControl,
+    parameter_index: u32,
+    parameter_storage: CanonicalStorageId,
+}
+
+impl CertifiedClosedCountedLoopControl {
+    pub const fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    pub const fn origin(&self) -> &CertifiedArtifactOrigin {
+        &self.origin
+    }
+
+    pub const fn state(&self) -> &CertifiedCountedLoopState {
+        &self.state
+    }
+
+    pub const fn preheader_transfer(&self) -> &CertifiedDirectControl {
+        &self.preheader_transfer
+    }
+
+    pub const fn header_control(&self) -> &CertifiedConditionalControl {
+        &self.header_control
+    }
+
+    pub const fn backedge_transfer(&self) -> &CertifiedDirectControl {
+        &self.backedge_transfer
+    }
+
+    pub const fn return_control(&self) -> &CertifiedReturnControl {
+        &self.return_control
+    }
+
+    pub const fn parameter_index(&self) -> u32 {
+        self.parameter_index
+    }
+
+    pub const fn parameter_storage(&self) -> CanonicalStorageId {
+        self.parameter_storage
+    }
+}
+
+/// Sealed structural witness for one final indirect branch with exact switch
+/// labels and open targets.
+///
+/// This deliberately does not identify a selector or discharge the indirect
+/// `ControlTransfer` obligation. It is topology evidence only and cannot
+/// authorize a C `switch` or any target execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CertifiedSwitchTopology {
+    schema_version: u32,
+    origin: CertifiedArtifactOrigin,
+    producer: CanonicalInstructionId,
+    source_inst: r2ssa::InstId,
+    indirect_target: MachineValueUse,
+    switch_addr: u64,
+    min_value: u64,
+    max_value: u64,
+    cases: Box<[(u64, u64)]>,
+    default_target: u64,
+    source_obligation: SemanticObligationId,
+}
+
+/// Sealed switch-control evidence retained separately from topology.
+///
+/// Construction binds the prepared selector to the terminal `BranchInd`, the
+/// exact case/default topology, and one revision-bound ABI parameter carrier.
+/// A topology witness alone can never acquire this evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CertifiedSwitchControl {
+    schema_version: u32,
+    origin: CertifiedArtifactOrigin,
+    topology: CertifiedSwitchTopology,
+    selector: MachineValueUse,
+    parameter_index: u32,
+    parameter_storage: CanonicalStorageId,
+}
+
+impl CertifiedSwitchControl {
+    pub const fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    pub const fn origin(&self) -> &CertifiedArtifactOrigin {
+        &self.origin
+    }
+
+    pub const fn producer(&self) -> CanonicalInstructionId {
+        self.topology.producer()
+    }
+
+    pub const fn topology(&self) -> &CertifiedSwitchTopology {
+        &self.topology
+    }
+
+    pub const fn selector(&self) -> &MachineValueUse {
+        &self.selector
+    }
+
+    pub const fn indirect_target(&self) -> &MachineValueUse {
+        self.topology.indirect_target()
+    }
+
+    pub const fn source_obligation(&self) -> SemanticObligationId {
+        self.topology.source_obligation()
+    }
+
+    pub const fn parameter_index(&self) -> u32 {
+        self.parameter_index
+    }
+
+    pub const fn parameter_storage(&self) -> CanonicalStorageId {
+        self.parameter_storage
+    }
+
+    fn validate(&self, source: &SemanticObligationInventory) -> Result<(), CertificationError> {
+        validate_schema(self.schema_version)?;
+        validate_schema(self.topology.schema_version())?;
+        let obligation = source.obligations().get(&self.source_obligation()).ok_or(
+            CertificationError::UnknownObligation(self.source_obligation()),
+        )?;
+        if self.origin != *self.topology.origin()
+            || obligation.id.kind != SemanticObligationKind::ControlTransfer
+            || obligation.id.instruction != self.producer()
+            || self.selector.binding().width_bits()
+                != self.parameter_storage.size.checked_mul(8).unwrap_or(0)
+            || self.selector.producer().is_some()
+            || self.selector.constant().is_some()
+            || self.selector.memory_access().is_some()
+        {
+            return Err(CertificationError::ObligationNotMapped(
+                self.source_obligation(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl CertifiedSwitchTopology {
+    pub const fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    pub const fn origin(&self) -> &CertifiedArtifactOrigin {
+        &self.origin
+    }
+
+    pub const fn producer(&self) -> CanonicalInstructionId {
+        self.producer
+    }
+
+    pub const fn indirect_target(&self) -> &MachineValueUse {
+        &self.indirect_target
+    }
+
+    pub const fn switch_addr(&self) -> u64 {
+        self.switch_addr
+    }
+
+    pub const fn min_value(&self) -> u64 {
+        self.min_value
+    }
+
+    pub const fn max_value(&self) -> u64 {
+        self.max_value
+    }
+
+    /// Ordered `(case_value, successor_address)` pairs from the source.
+    pub const fn cases(&self) -> &[(u64, u64)] {
+        &self.cases
+    }
+
+    pub const fn default_target(&self) -> u64 {
+        self.default_target
+    }
+
+    pub const fn source_obligation(&self) -> SemanticObligationId {
+        self.source_obligation
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+struct CertifiedFnvFoldO0EvidenceRef {
+    proof_slot: u32,
+    class: CertifiedFnvFoldO0DispositionClass,
+}
+
+const CERTIFIED_FNV_FOLD_O0_PROOF_SLOT: u32 = 0;
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+enum DispositionEvidence {
+    Output(CertifiedEntity),
+    Expression(CertifiedExpr),
+    Statement(CertifiedMemoryStatement),
+    Call(CertifiedDirectCall),
+    Control(CertifiedDirectControl),
+    ConditionalControl(CertifiedConditionalControl),
+    FnvFoldLatchControl(CertifiedFnvFoldLatchControl),
+    SwitchControl(Box<CertifiedSwitchControl>),
+    ReturnControl(CertifiedReturnControl),
+    LoopState(Box<CertifiedCountedLoopState>),
+    ConditionalReturnState(Box<CertifiedConditionalReturnCarrier>),
+    PrivateFrameState(Box<CertifiedPrivateFrameConditionalReturn>),
+    FnvFoldState(Box<CertifiedFnvFoldLoop>),
+    FnvFoldO0(CertifiedFnvFoldO0EvidenceRef),
+    Rewrite { schema_version: u32, pass: String },
+    Diagnostic,
+}
+
+/// One proof-bearing disposition ready to enter the exact-once ledger.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CertifiedEffect {
+    schema_version: u32,
+    obligation: SemanticObligationId,
+    disposition: EffectDisposition,
+    evidence: DispositionEvidence,
+}
+
+impl CertifiedEffect {
+    pub const fn obligation(&self) -> SemanticObligationId {
+        self.obligation
+    }
+
+    pub const fn disposition(&self) -> &EffectDisposition {
+        &self.disposition
+    }
+
+    pub const fn statement_evidence(&self) -> Option<&CertifiedMemoryStatement> {
+        match &self.evidence {
+            DispositionEvidence::Statement(statement) => Some(statement),
+            _ => None,
+        }
+    }
+
+    pub const fn expression_evidence(&self) -> Option<&CertifiedExpr> {
+        match &self.evidence {
+            DispositionEvidence::Expression(expression) => Some(expression),
+            _ => None,
+        }
+    }
+
+    pub const fn direct_call_evidence(&self) -> Option<&CertifiedDirectCall> {
+        match &self.evidence {
+            DispositionEvidence::Call(call) => Some(call),
+            _ => None,
+        }
+    }
+
+    pub const fn direct_control_evidence(&self) -> Option<&CertifiedDirectControl> {
+        match &self.evidence {
+            DispositionEvidence::Control(control) => Some(control),
+            _ => None,
+        }
+    }
+
+    pub const fn conditional_control_evidence(&self) -> Option<&CertifiedConditionalControl> {
+        match &self.evidence {
+            DispositionEvidence::ConditionalControl(control) => Some(control),
+            _ => None,
+        }
+    }
+
+    pub const fn fnv_fold_latch_control_evidence(&self) -> Option<&CertifiedFnvFoldLatchControl> {
+        match &self.evidence {
+            DispositionEvidence::FnvFoldLatchControl(control) => Some(control),
+            _ => None,
+        }
+    }
+
+    pub fn switch_control_evidence(&self) -> Option<&CertifiedSwitchControl> {
+        match &self.evidence {
+            DispositionEvidence::SwitchControl(control) => Some(control.as_ref()),
+            _ => None,
+        }
+    }
+
+    pub const fn return_control_evidence(&self) -> Option<&CertifiedReturnControl> {
+        match &self.evidence {
+            DispositionEvidence::ReturnControl(control) => Some(control),
+            _ => None,
+        }
+    }
+
+    pub fn counted_loop_state_evidence(&self) -> Option<&CertifiedCountedLoopState> {
+        match &self.evidence {
+            DispositionEvidence::LoopState(state) => Some(state.as_ref()),
+            _ => None,
+        }
+    }
+
+    pub fn conditional_return_state_evidence(&self) -> Option<&CertifiedConditionalReturnCarrier> {
+        match &self.evidence {
+            DispositionEvidence::ConditionalReturnState(state) => Some(state.as_ref()),
+            _ => None,
+        }
+    }
+
+    pub fn private_frame_state_evidence(&self) -> Option<&CertifiedPrivateFrameConditionalReturn> {
+        match &self.evidence {
+            DispositionEvidence::PrivateFrameState(state) => Some(state.as_ref()),
+            _ => None,
+        }
+    }
+
+    pub fn fnv_fold_state_evidence(&self) -> Option<&CertifiedFnvFoldLoop> {
+        match &self.evidence {
+            DispositionEvidence::FnvFoldState(state) => Some(state.as_ref()),
+            _ => None,
+        }
+    }
+
+    fn fnv_fold_o0_evidence_ref(&self) -> Option<CertifiedFnvFoldO0EvidenceRef> {
+        match &self.evidence {
+            DispositionEvidence::FnvFoldO0(reference) => Some(*reference),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn is_exact_fnv_fold_o0(
+        &self,
+        witness: &CertifiedFnvFoldO0Function,
+        obligation: SemanticObligationId,
+    ) -> bool {
+        if self.obligation != obligation {
+            return false;
+        }
+        let Ok(index) = witness
+            .obligation_dispositions()
+            .binary_search_by_key(&obligation, |(candidate, _)| *candidate)
+        else {
+            return false;
+        };
+        let class = witness.obligation_dispositions()[index].1;
+        self.fnv_fold_o0_evidence_ref().is_some_and(|reference| {
+            reference.proof_slot == CERTIFIED_FNV_FOLD_O0_PROOF_SLOT
+                && reference.class == class
+                && fnv_fold_o0_disposition_matches(class, &self.disposition, obligation.instruction)
+        })
+    }
+
+    fn has_fnv_fold_o0_class(&self, class: CertifiedFnvFoldO0DispositionClass) -> bool {
+        self.fnv_fold_o0_evidence_ref().is_some_and(|reference| {
+            reference.proof_slot == CERTIFIED_FNV_FOLD_O0_PROOF_SLOT
+                && reference.class == class
+                && fnv_fold_o0_disposition_matches(
+                    class,
+                    &self.disposition,
+                    self.obligation.instruction,
+                )
+        })
+    }
+
+    fn validate_fnv_fold_o0_ref(
+        &self,
+        reference: CertifiedFnvFoldO0EvidenceRef,
+    ) -> Result<(), CertificationError> {
+        if reference.proof_slot == CERTIFIED_FNV_FOLD_O0_PROOF_SLOT
+            && reference.class != CertifiedFnvFoldO0DispositionClass::ProvenDead
+            && fnv_fold_o0_disposition_matches(
+                reference.class,
+                &self.disposition,
+                self.obligation.instruction,
+            )
+        {
+            Ok(())
+        } else {
+            Err(CertificationError::ObligationNotMapped(self.obligation))
+        }
+    }
+
+    fn validate(&self, source: &SemanticObligationInventory) -> Result<(), CertificationError> {
+        validate_schema(self.schema_version)?;
+        if !source.obligations().contains_key(&self.obligation) {
+            return Err(CertificationError::UnknownObligation(self.obligation));
+        }
+        match (&self.disposition, &self.evidence) {
+            (EffectDisposition::Rendered, DispositionEvidence::Output(entity)) => {
+                entity.validate(source)?;
+                ensure_mapped(entity.source_obligations(), self.obligation)
+            }
+            (
+                EffectDisposition::AbsorbedIntoExpression { producer },
+                DispositionEvidence::Expression(expression),
+            ) => {
+                expression.validate(source)?;
+                if expression.entity().producer() != *producer {
+                    return Err(CertificationError::UnknownInstruction(*producer));
+                }
+                ensure_mapped(expression.entity().source_obligations(), self.obligation)
+            }
+            (
+                EffectDisposition::AbsorbedIntoStatement { producer },
+                DispositionEvidence::Statement(statement),
+            ) => {
+                statement.validate(source)?;
+                if statement.producer() != *producer {
+                    return Err(CertificationError::UnknownInstruction(*producer));
+                }
+                ensure_mapped(statement.source_obligations(), self.obligation)
+            }
+            (EffectDisposition::AbsorbedIntoCall { producer }, DispositionEvidence::Call(call)) => {
+                call.validate(source)?;
+                if call.producer() != *producer
+                    || !call.source_obligations().contains(&self.obligation)
+                {
+                    return Err(CertificationError::ObligationNotMapped(self.obligation));
+                }
+                Ok(())
+            }
+            (
+                EffectDisposition::AbsorbedIntoControl { producer },
+                DispositionEvidence::Control(control),
+            ) => {
+                control.validate(source)?;
+                if control.producer() != *producer || control.source_obligation() != self.obligation
+                {
+                    return Err(CertificationError::ObligationNotMapped(self.obligation));
+                }
+                Ok(())
+            }
+            (
+                EffectDisposition::AbsorbedIntoControl { producer },
+                DispositionEvidence::ConditionalControl(control),
+            ) => {
+                control.validate(source)?;
+                if control.producer() != *producer
+                    || !control.source_obligations().contains(&self.obligation)
+                {
+                    return Err(CertificationError::ObligationNotMapped(self.obligation));
+                }
+                Ok(())
+            }
+            (
+                EffectDisposition::AbsorbedIntoControl { producer },
+                DispositionEvidence::FnvFoldLatchControl(control),
+            ) => {
+                control.validate(source)?;
+                if control.producer() != *producer
+                    || !control.source_obligations().contains(&self.obligation)
+                {
+                    return Err(CertificationError::ObligationNotMapped(self.obligation));
+                }
+                Ok(())
+            }
+            (
+                EffectDisposition::AbsorbedIntoControl { producer },
+                DispositionEvidence::SwitchControl(control),
+            ) => {
+                control.validate(source)?;
+                if control.producer() != *producer || control.source_obligation() != self.obligation
+                {
+                    return Err(CertificationError::ObligationNotMapped(self.obligation));
+                }
+                Ok(())
+            }
+            (
+                EffectDisposition::AbsorbedIntoReturn { producer },
+                DispositionEvidence::ReturnControl(control),
+            ) => {
+                control.validate(source)?;
+                if control.producer() != *producer
+                    || !control.source_obligations().contains(&self.obligation)
+                {
+                    return Err(CertificationError::ObligationNotMapped(self.obligation));
+                }
+                Ok(())
+            }
+            (
+                EffectDisposition::AbsorbedIntoLoopState { producer },
+                DispositionEvidence::LoopState(state),
+            ) => {
+                state.validate(source)?;
+                if state.producer() != *producer
+                    || !state.source_obligations().contains(&self.obligation)
+                {
+                    return Err(CertificationError::ObligationNotMapped(self.obligation));
+                }
+                Ok(())
+            }
+            (
+                EffectDisposition::AbsorbedIntoConditionalReturnState { producer },
+                DispositionEvidence::ConditionalReturnState(state),
+            ) => {
+                state.validate(source)?;
+                if state.producer() != *producer
+                    || !state.source_obligations().contains(&self.obligation)
+                {
+                    return Err(CertificationError::ObligationNotMapped(self.obligation));
+                }
+                Ok(())
+            }
+            (
+                EffectDisposition::AbsorbedIntoPrivateFrameState { producer },
+                DispositionEvidence::PrivateFrameState(state),
+            ) => {
+                if state.owns_obligation(source, self.obligation, *producer) {
+                    Ok(())
+                } else {
+                    Err(CertificationError::ObligationNotMapped(self.obligation))
+                }
+            }
+            (
+                EffectDisposition::AbsorbedIntoFnvFoldState { producer },
+                DispositionEvidence::FnvFoldState(state),
+            ) => {
+                if state.owns_obligation(source, self.obligation, *producer) {
+                    Ok(())
+                } else {
+                    Err(CertificationError::ObligationNotMapped(self.obligation))
+                }
+            }
+            (_, DispositionEvidence::FnvFoldO0(reference)) => {
+                self.validate_fnv_fold_o0_ref(*reference)
+            }
+            (
+                EffectDisposition::Rewritten { pass },
+                DispositionEvidence::Rewrite {
+                    schema_version,
+                    pass: evidence_pass,
+                },
+            ) if !pass.trim().is_empty() && pass == evidence_pass => {
+                validate_schema(*schema_version)
+            }
+            (
+                EffectDisposition::Superseded { .. } | EffectDisposition::ProvenDead,
+                DispositionEvidence::Rewrite {
+                    schema_version,
+                    pass,
+                },
+            ) if !pass.trim().is_empty() => validate_schema(*schema_version),
+            (
+                EffectDisposition::Residualized { reason } | EffectDisposition::Refused { reason },
+                DispositionEvidence::Diagnostic,
+            ) if !reason.trim().is_empty() => Ok(()),
+            _ => Err(CertificationError::ObligationNotMapped(self.obligation)),
+        }
+    }
+}
+
+fn fnv_fold_o0_disposition_matches(
+    class: CertifiedFnvFoldO0DispositionClass,
+    disposition: &EffectDisposition,
+    producer: CanonicalInstructionId,
+) -> bool {
+    match (class, disposition) {
+        (
+            CertifiedFnvFoldO0DispositionClass::FrameState,
+            EffectDisposition::AbsorbedIntoFnvFoldO0FrameState { producer: actual },
+        )
+        | (
+            CertifiedFnvFoldO0DispositionClass::InvariantHomeRelay,
+            EffectDisposition::AbsorbedIntoFnvFoldO0InvariantHomeRelay { producer: actual },
+        )
+        | (
+            CertifiedFnvFoldO0DispositionClass::ExternalAliasSealing,
+            EffectDisposition::AbsorbedIntoFnvFoldO0ExternalAlias { producer: actual },
+        )
+        | (
+            CertifiedFnvFoldO0DispositionClass::ForwarderControl,
+            EffectDisposition::AbsorbedIntoFnvFoldO0Forwarder { producer: actual },
+        )
+        | (
+            CertifiedFnvFoldO0DispositionClass::LoopControl,
+            EffectDisposition::AbsorbedIntoFnvFoldO0LoopControl { producer: actual },
+        )
+        | (
+            CertifiedFnvFoldO0DispositionClass::Semantics,
+            EffectDisposition::AbsorbedIntoFnvFoldO0Semantics { producer: actual },
+        )
+        | (
+            CertifiedFnvFoldO0DispositionClass::Return,
+            EffectDisposition::AbsorbedIntoFnvFoldO0Return { producer: actual },
+        ) => *actual == producer,
+        (CertifiedFnvFoldO0DispositionClass::ProvenDead, _) => false,
+        _ => false,
+    }
+}
+
+fn ensure_mapped(
+    mapped: &BTreeSet<SemanticObligationId>,
+    obligation: SemanticObligationId,
+) -> Result<(), CertificationError> {
+    mapped
+        .contains(&obligation)
+        .then_some(())
+        .ok_or(CertificationError::ObligationNotMapped(obligation))
+}
+
+fn validate_schema(schema_version: u32) -> Result<(), CertificationError> {
+    if schema_version == CERTIFICATION_SCHEMA_VERSION {
+        Ok(())
+    } else {
+        Err(CertificationError::SchemaVersion {
+            expected: CERTIFICATION_SCHEMA_VERSION,
+            actual: schema_version,
+        })
+    }
+}
+
+fn validate_source(source: &SemanticObligationInventory) -> Result<(), CertificationError> {
+    if source.schema_version() == SEMANTIC_OBLIGATION_SCHEMA_VERSION && source.is_complete() {
+        Ok(())
+    } else {
+        Err(CertificationError::IncompleteSourceInventory)
+    }
+}
+
+/// Proof that one transformation accounted for all of its declared inputs.
+///
+/// Obligation IDs remain source identities across rewrites. The certificate
+/// records semantic dispositions, not AST locations or output names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RewriteCertificate {
+    schema_version: u32,
+    pass: String,
+    inputs: BTreeSet<SemanticObligationId>,
+    dispositions: BTreeMap<SemanticObligationId, Vec<EffectDisposition>>,
+}
+
+impl RewriteCertificate {
+    pub fn new(
+        pass: impl Into<String>,
+        inputs: impl IntoIterator<Item = SemanticObligationId>,
+    ) -> Self {
+        Self {
+            schema_version: CERTIFICATION_SCHEMA_VERSION,
+            pass: pass.into(),
+            inputs: inputs.into_iter().collect(),
+            dispositions: BTreeMap::new(),
+        }
+    }
+
+    pub fn residualize(&mut self, id: SemanticObligationId, reason: impl Into<String>) {
+        self.push(
+            id,
+            EffectDisposition::Residualized {
+                reason: reason.into(),
+            },
+        );
+    }
+
+    pub fn refuse(&mut self, id: SemanticObligationId, reason: impl Into<String>) {
+        self.push(
+            id,
+            EffectDisposition::Refused {
+                reason: reason.into(),
+            },
+        );
+    }
+
+    fn push(&mut self, id: SemanticObligationId, disposition: EffectDisposition) {
+        self.dispositions.entry(id).or_default().push(disposition);
+    }
+
+    pub fn audit(&self, source: &SemanticObligationInventory) -> RewriteCertificateReport {
+        let disposition_ids = self.dispositions.keys().copied().collect::<BTreeSet<_>>();
+        let mut report = RewriteCertificateReport {
+            missing: self.inputs.difference(&disposition_ids).copied().collect(),
+            duplicate: self
+                .dispositions
+                .iter()
+                .filter_map(|(id, dispositions)| (dispositions.len() > 1).then_some(*id))
+                .collect(),
+            unexpected: disposition_ids.difference(&self.inputs).copied().collect(),
+            invalid: Vec::new(),
+        };
+        if let Err(error) = validate_schema(self.schema_version) {
+            report.invalid.push(format!("{error:?}"));
+        }
+        if let Err(error) = validate_source(source) {
+            report.invalid.push(format!("{error:?}"));
+        }
+        if self.pass.trim().is_empty() {
+            report
+                .invalid
+                .push("rewrite pass identity is empty".to_string());
+        }
+        for id in &self.inputs {
+            if !source.obligations().contains_key(id) {
+                report
+                    .invalid
+                    .push(format!("rewrite input {id} is not a source obligation"));
+            }
+        }
+        for (id, dispositions) in &self.dispositions {
+            for disposition in dispositions {
+                let valid = match disposition {
+                    EffectDisposition::Rewritten { .. }
+                    | EffectDisposition::Superseded { .. }
+                    | EffectDisposition::ProvenDead => false,
+                    EffectDisposition::Residualized { reason }
+                    | EffectDisposition::Refused { reason } => !reason.trim().is_empty(),
+                    EffectDisposition::Rendered
+                    | EffectDisposition::AbsorbedIntoExpression { .. }
+                    | EffectDisposition::AbsorbedIntoStatement { .. }
+                    | EffectDisposition::AbsorbedIntoCall { .. }
+                    | EffectDisposition::AbsorbedIntoControl { .. }
+                    | EffectDisposition::AbsorbedIntoReturn { .. }
+                    | EffectDisposition::AbsorbedIntoLoopState { .. }
+                    | EffectDisposition::AbsorbedIntoConditionalReturnState { .. }
+                    | EffectDisposition::AbsorbedIntoPrivateFrameState { .. }
+                    | EffectDisposition::AbsorbedIntoFnvFoldState { .. }
+                    | EffectDisposition::AbsorbedIntoFnvFoldO0FrameState { .. }
+                    | EffectDisposition::AbsorbedIntoFnvFoldO0InvariantHomeRelay { .. }
+                    | EffectDisposition::AbsorbedIntoFnvFoldO0ExternalAlias { .. }
+                    | EffectDisposition::AbsorbedIntoFnvFoldO0Forwarder { .. }
+                    | EffectDisposition::AbsorbedIntoFnvFoldO0LoopControl { .. }
+                    | EffectDisposition::AbsorbedIntoFnvFoldO0Semantics { .. }
+                    | EffectDisposition::AbsorbedIntoFnvFoldO0Return { .. } => false,
+                };
+                if !valid {
+                    report.invalid.push(format!(
+                        "rewrite pass {:?} has invalid disposition for {id}",
+                        self.pass
+                    ));
+                }
+            }
+        }
+        report
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RewriteCertificateReport {
+    pub missing: Vec<SemanticObligationId>,
+    pub duplicate: Vec<SemanticObligationId>,
+    pub unexpected: Vec<SemanticObligationId>,
+    pub invalid: Vec<String>,
+}
+
+impl RewriteCertificateReport {
+    pub fn is_closed(&self) -> bool {
+        self.missing.is_empty()
+            && self.duplicate.is_empty()
+            && self.unexpected.is_empty()
+            && self.invalid.is_empty()
+    }
+}
+
+/// Exact-once ledger. Entries are retained as proof-bearing effects so
+/// duplication remains diagnosable rather than being silently overwritten.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ObligationLedger {
+    schema_version: u32,
+    effects: BTreeMap<SemanticObligationId, Vec<CertifiedEffect>>,
+}
+
+impl Default for ObligationLedger {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ObligationLedger {
+    pub fn new() -> Self {
+        Self {
+            schema_version: CERTIFICATION_SCHEMA_VERSION,
+            effects: BTreeMap::new(),
+        }
+    }
+
+    pub fn effects(&self, id: SemanticObligationId) -> &[CertifiedEffect] {
+        self.effects.get(&id).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    fn record(&mut self, effect: CertifiedEffect) {
+        self.effects
+            .entry(effect.obligation())
+            .or_default()
+            .push(effect);
+    }
+
+    fn audit(&self, source: &SemanticObligationInventory) -> CertificationReport {
+        let mut report = CertificationReport {
+            schema_version: CERTIFICATION_SCHEMA_VERSION,
+            source_obligations: source.obligations().len(),
+            missing: Vec::new(),
+            duplicate: Vec::new(),
+            unexpected: Vec::new(),
+            residualized: Vec::new(),
+            refused: Vec::new(),
+            pending_semantic_ast: Vec::new(),
+            typed_region_required: false,
+            invalid: Vec::new(),
+        };
+
+        if let Err(error) = validate_schema(self.schema_version) {
+            report.invalid.push(CertificationFailure {
+                obligation: None,
+                reason: format!("{error:?}"),
+            });
+        }
+        if let Err(error) = validate_source(source) {
+            push_failure(&mut report, None, format!("{error:?}"));
+        }
+        for id in source.obligations().keys() {
+            let effects = self.effects(*id);
+            match effects.len() {
+                0 => report.missing.push(*id),
+                1 => {
+                    let effect = &effects[0];
+                    if let Err(error) = effect.validate(source) {
+                        push_failure(&mut report, Some(*id), format!("{error:?}"));
+                    }
+                    let disposition = effect.disposition();
+                    if matches!(
+                        disposition,
+                        EffectDisposition::AbsorbedIntoExpression { .. }
+                            | EffectDisposition::AbsorbedIntoStatement { .. }
+                            | EffectDisposition::AbsorbedIntoCall { .. }
+                            | EffectDisposition::AbsorbedIntoControl { .. }
+                            | EffectDisposition::AbsorbedIntoReturn { .. }
+                            | EffectDisposition::AbsorbedIntoLoopState { .. }
+                            | EffectDisposition::AbsorbedIntoConditionalReturnState { .. }
+                            | EffectDisposition::AbsorbedIntoPrivateFrameState { .. }
+                            | EffectDisposition::AbsorbedIntoFnvFoldState { .. }
+                            | EffectDisposition::AbsorbedIntoFnvFoldO0FrameState { .. }
+                            | EffectDisposition::AbsorbedIntoFnvFoldO0InvariantHomeRelay { .. }
+                            | EffectDisposition::AbsorbedIntoFnvFoldO0ExternalAlias { .. }
+                            | EffectDisposition::AbsorbedIntoFnvFoldO0Forwarder { .. }
+                            | EffectDisposition::AbsorbedIntoFnvFoldO0LoopControl { .. }
+                            | EffectDisposition::AbsorbedIntoFnvFoldO0Semantics { .. }
+                            | EffectDisposition::AbsorbedIntoFnvFoldO0Return { .. }
+                    ) {
+                        report.pending_semantic_ast.push(*id);
+                    }
+                    if !disposition.permits_certified_c() {
+                        match disposition {
+                            EffectDisposition::Residualized { .. } => report.residualized.push(*id),
+                            EffectDisposition::Refused { .. } => report.refused.push(*id),
+                            _ => {}
+                        }
+                    }
+                    let sealed_unknown = matches!(
+                        (&effect.disposition, &effect.evidence),
+                        (
+                            EffectDisposition::AbsorbedIntoPrivateFrameState { .. },
+                            DispositionEvidence::PrivateFrameState(state),
+                        ) if state.owns_obligation(
+                            source,
+                            effect.obligation,
+                            effect.obligation.instruction,
+                        )
+                    ) || effect.has_fnv_fold_o0_class(
+                        CertifiedFnvFoldO0DispositionClass::ExternalAliasSealing,
+                    );
+                    if source
+                        .instructions()
+                        .get(&id.instruction)
+                        .is_some_and(|instruction| {
+                            instruction.state == SemanticInstructionState::UnsupportedUnknown
+                                && disposition.permits_certified_c()
+                                && !sealed_unknown
+                        })
+                    {
+                        push_failure(
+                            &mut report,
+                            Some(*id),
+                            "unsupported/unknown source semantics cannot authorize CertifiedC",
+                        );
+                    }
+                }
+                _ => report.duplicate.push(*id),
+            }
+        }
+
+        for id in self.effects.keys() {
+            if !source.obligations().contains_key(id) {
+                report.unexpected.push(*id);
+            }
+        }
+        validate_supersession_graph(self, source, &mut report);
+        report
+    }
+}
+
+fn validate_supersession_graph(
+    ledger: &ObligationLedger,
+    source: &SemanticObligationInventory,
+    report: &mut CertificationReport,
+) {
+    let mut edges = BTreeMap::<SemanticObligationId, SemanticObligationId>::new();
+    let mut incoming = BTreeMap::<SemanticObligationId, Vec<SemanticObligationId>>::new();
+    for id in source.obligations().keys() {
+        let [effect] = ledger.effects(*id) else {
+            continue;
+        };
+        if let EffectDisposition::Superseded { by } = effect.disposition() {
+            edges.insert(*id, *by);
+            incoming.entry(*by).or_default().push(*id);
+        }
+    }
+    for (target, predecessors) in incoming {
+        if predecessors.len() > 1 {
+            for predecessor in predecessors {
+                push_failure(
+                    report,
+                    Some(predecessor),
+                    format!("multiple obligations supersede the same target {target}"),
+                );
+            }
+        }
+    }
+    for start in edges.keys() {
+        let mut seen = BTreeSet::new();
+        let mut cursor = *start;
+        loop {
+            if !seen.insert(cursor) {
+                push_failure(report, Some(*start), "supersession chain contains a cycle");
+                break;
+            }
+            let Some(next) = edges.get(&cursor).copied() else {
+                let [terminal] = ledger.effects(cursor) else {
+                    push_failure(
+                        report,
+                        Some(*start),
+                        "supersession chain has no unique terminal disposition",
+                    );
+                    break;
+                };
+                if !terminal.disposition().permits_certified_c() {
+                    push_failure(
+                        report,
+                        Some(*start),
+                        "supersession chain terminates in a non-preserving disposition",
+                    );
+                }
+                break;
+            };
+            cursor = next;
+        }
+    }
+}
+
+fn push_failure(
+    report: &mut CertificationReport,
+    obligation: Option<SemanticObligationId>,
+    reason: impl Into<String>,
+) {
+    let failure = CertificationFailure {
+        obligation,
+        reason: reason.into(),
+    };
+    if !report.invalid.contains(&failure) {
+        report.invalid.push(failure);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CertificationFailure {
+    pub obligation: Option<SemanticObligationId>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CertificationReport {
+    schema_version: u32,
+    source_obligations: usize,
+    missing: Vec<SemanticObligationId>,
+    duplicate: Vec<SemanticObligationId>,
+    unexpected: Vec<SemanticObligationId>,
+    residualized: Vec<SemanticObligationId>,
+    refused: Vec<SemanticObligationId>,
+    pending_semantic_ast: Vec<SemanticObligationId>,
+    typed_region_required: bool,
+    invalid: Vec<CertificationFailure>,
+}
+
+impl CertificationReport {
+    pub const fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    pub const fn source_obligation_count(&self) -> usize {
+        self.source_obligations
+    }
+
+    pub fn missing(&self) -> &[SemanticObligationId] {
+        &self.missing
+    }
+
+    pub fn duplicate(&self) -> &[SemanticObligationId] {
+        &self.duplicate
+    }
+
+    pub fn unexpected(&self) -> &[SemanticObligationId] {
+        &self.unexpected
+    }
+
+    pub fn residualized(&self) -> &[SemanticObligationId] {
+        &self.residualized
+    }
+
+    pub fn refused(&self) -> &[SemanticObligationId] {
+        &self.refused
+    }
+
+    /// Preserved by a sealed semantic node but not yet validated as part of a
+    /// complete typed output AST. `r2cert` alone cannot grant final C output.
+    pub fn pending_semantic_ast(&self) -> &[SemanticObligationId] {
+        &self.pending_semantic_ast
+    }
+
+    pub const fn requires_typed_region_validation(&self) -> bool {
+        self.typed_region_required
+    }
+
+    pub fn invalid(&self) -> &[CertificationFailure] {
+        &self.invalid
+    }
+
+    pub fn has_exactly_one_disposition_per_source(&self) -> bool {
+        self.missing.is_empty() && self.duplicate.is_empty() && self.unexpected.is_empty()
+    }
+
+    pub fn authorizes_certified_c(&self) -> bool {
+        self.schema_version == CERTIFICATION_SCHEMA_VERSION
+            && self.has_exactly_one_disposition_per_source()
+            && self.residualized.is_empty()
+            && self.refused.is_empty()
+            && self.pending_semantic_ast.is_empty()
+            && !self.typed_region_required
+            && self.invalid.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum CertifiedTypedRegionKind {
+    TerminalReturnBlock,
+    PlainRamMemoryTerminalReturnFunction,
+    DirectCallTerminalReturnFunction,
+    ConditionalTerminalReturnFunction,
+    SwitchTerminalReturnFunction,
+    CarrierFreeLoopTerminalReturnFunction,
+    CountedLoopTerminalReturnFunction,
+    ConditionalReturnFunnelFunction,
+    PrivateFrameConditionalReturnFunction,
+    FnvFoldLoopFunction,
+    FnvFoldO0Function,
+}
+
+pub const CERTIFIED_TERMINAL_RETURN_REGION_CONTRACT_VERSION: u32 = 1;
+pub const CERTIFIED_PLAIN_RAM_MEMORY_RETURN_CONTRACT_VERSION: u32 = 1;
+pub const CERTIFIED_DIRECT_CALL_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 1;
+pub const CERTIFIED_CONDITIONAL_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 1;
+pub const CERTIFIED_SWITCH_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 1;
+pub const CERTIFIED_CARRIER_FREE_LOOP_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 1;
+pub const CERTIFIED_COUNTED_LOOP_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TypedRegionMapping {
+    obligation: SemanticObligationId,
+    source_disposition: EffectDisposition,
+}
+
+impl TypedRegionMapping {
+    pub const fn new(
+        obligation: SemanticObligationId,
+        source_disposition: EffectDisposition,
+    ) -> Self {
+        Self {
+            obligation,
+            source_disposition,
+        }
+    }
+
+    pub const fn obligation(&self) -> SemanticObligationId {
+        self.obligation
+    }
+
+    pub const fn source_disposition(&self) -> &EffectDisposition {
+        &self.source_disposition
+    }
+}
+
+/// Opaque final authorization bound to one exact artifact origin and one
+/// source-to-typed-region manifest. It is intentionally not deserializable or
+/// publicly constructible.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CertifiedRenderPermit {
+    schema_version: u32,
+    origin: CertifiedArtifactOrigin,
+    region_kind: CertifiedTypedRegionKind,
+    region_schema_version: u32,
+    mappings: Box<[TypedRegionMapping]>,
+}
+
+impl CertifiedRenderPermit {
+    pub const fn origin(&self) -> &CertifiedArtifactOrigin {
+        &self.origin
+    }
+
+    pub const fn region_kind(&self) -> CertifiedTypedRegionKind {
+        self.region_kind
+    }
+
+    pub const fn region_schema_version(&self) -> u32 {
+        self.region_schema_version
+    }
+
+    pub const fn mappings(&self) -> &[TypedRegionMapping] {
+        &self.mappings
+    }
+
+    pub fn authorizes_certified_c(&self) -> bool {
+        let recognized_contract = match self.region_kind {
+            CertifiedTypedRegionKind::TerminalReturnBlock => {
+                self.region_schema_version == CERTIFIED_TERMINAL_RETURN_REGION_CONTRACT_VERSION
+            }
+            CertifiedTypedRegionKind::PlainRamMemoryTerminalReturnFunction => {
+                self.region_schema_version == CERTIFIED_PLAIN_RAM_MEMORY_RETURN_CONTRACT_VERSION
+            }
+            CertifiedTypedRegionKind::DirectCallTerminalReturnFunction => {
+                self.region_schema_version == CERTIFIED_DIRECT_CALL_TERMINAL_RETURN_CONTRACT_VERSION
+            }
+            CertifiedTypedRegionKind::ConditionalTerminalReturnFunction => {
+                self.region_schema_version == CERTIFIED_CONDITIONAL_TERMINAL_RETURN_CONTRACT_VERSION
+            }
+            CertifiedTypedRegionKind::SwitchTerminalReturnFunction => {
+                self.region_schema_version == CERTIFIED_SWITCH_TERMINAL_RETURN_CONTRACT_VERSION
+            }
+            CertifiedTypedRegionKind::CarrierFreeLoopTerminalReturnFunction => {
+                self.region_schema_version
+                    == CERTIFIED_CARRIER_FREE_LOOP_TERMINAL_RETURN_CONTRACT_VERSION
+            }
+            CertifiedTypedRegionKind::CountedLoopTerminalReturnFunction => {
+                self.region_schema_version
+                    == CERTIFIED_COUNTED_LOOP_TERMINAL_RETURN_CONTRACT_VERSION
+            }
+            CertifiedTypedRegionKind::ConditionalReturnFunnelFunction => {
+                self.region_schema_version == CERTIFIED_CONDITIONAL_RETURN_FUNNEL_CONTRACT_VERSION
+            }
+            CertifiedTypedRegionKind::PrivateFrameConditionalReturnFunction => {
+                self.region_schema_version
+                    == CERTIFIED_PRIVATE_FRAME_CONDITIONAL_RETURN_CONTRACT_VERSION
+            }
+            CertifiedTypedRegionKind::FnvFoldLoopFunction => {
+                self.region_schema_version == CERTIFIED_FNV_FOLD_LOOP_CONTRACT_VERSION
+            }
+            CertifiedTypedRegionKind::FnvFoldO0Function => {
+                self.region_schema_version == CERTIFIED_FNV_FOLD_O0_CONTRACT_VERSION
+            }
+        };
+        self.schema_version == CERTIFICATION_SCHEMA_VERSION
+            && self.origin.schema_version() == CERTIFICATION_SCHEMA_VERSION
+            && recognized_contract
+            && self.mappings.len() == self.origin.source().obligations().len()
+    }
+
+    pub fn matches_region(
+        &self,
+        origin: &CertifiedArtifactOrigin,
+        region_kind: CertifiedTypedRegionKind,
+        region_schema_version: u32,
+        mappings: &[TypedRegionMapping],
+    ) -> bool {
+        self.authorizes_certified_c()
+            && self.origin == *origin
+            && self.region_kind == region_kind
+            && self.region_schema_version == region_schema_version
+            && self.mappings.as_ref() == mappings
+    }
+
+    pub(crate) fn new_fnv_fold_o0(
+        origin: CertifiedArtifactOrigin,
+        mappings: Box<[TypedRegionMapping]>,
+    ) -> Self {
+        Self {
+            schema_version: CERTIFICATION_SCHEMA_VERSION,
+            origin,
+            region_kind: CertifiedTypedRegionKind::FnvFoldO0Function,
+            region_schema_version: CERTIFIED_FNV_FOLD_O0_CONTRACT_VERSION,
+            mappings,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenderAuthorizationError {
+    InvalidOrigin,
+    InvalidRegionSchema,
+    InvalidRegionTopology,
+    InvalidRegionDisposition(SemanticObligationId),
+    IncompleteLedger,
+    ResidualOrRefusedObligation(SemanticObligationId),
+    UnsupportedSourceSemantics(CanonicalInstructionId),
+    MissingMapping(SemanticObligationId),
+    DuplicateMapping(SemanticObligationId),
+    UnexpectedMapping(SemanticObligationId),
+    DispositionMismatch(SemanticObligationId),
+}
+
+impl std::fmt::Display for RenderAuthorizationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "typed-region render authorization failed: {self:?}")
+    }
+}
+
+impl std::error::Error for RenderAuthorizationError {}
+
+pub fn certify_terminal_return_region(
+    origin: &CertifiedArtifactOrigin,
+    ledger: &ObligationLedger,
+    mappings: impl IntoIterator<Item = TypedRegionMapping>,
+) -> Result<CertifiedRenderPermit, RenderAuthorizationError> {
+    if origin.schema_version() != CERTIFICATION_SCHEMA_VERSION
+        || !origin.matches_retained_source(origin.source(), origin.topology())
+        || origin
+            .machine_context()
+            .source()
+            .function_interface()
+            .is_none()
+    {
+        return Err(RenderAuthorizationError::InvalidOrigin);
+    }
+    let [block] = origin.topology().blocks() else {
+        return Err(RenderAuthorizationError::InvalidRegionTopology);
+    };
+    if !matches!(block.terminator(), CertifiedSourceTerminator::Return)
+        || !block.successors().is_empty()
+        || block.instructions().is_empty()
+        || origin.source().obligations().values().any(|obligation| {
+            !matches!(
+                obligation.id.kind,
+                SemanticObligationKind::LiveValueProducer
+                    | SemanticObligationKind::Return
+                    | SemanticObligationKind::ReturnValue
+            )
+        })
+    {
+        return Err(RenderAuthorizationError::InvalidRegionTopology);
+    }
+    let report = ledger.audit(origin.source());
+    if !report.has_exactly_one_disposition_per_source() || !report.invalid().is_empty() {
+        return Err(RenderAuthorizationError::IncompleteLedger);
+    }
+    if let Some(obligation) = report.residualized().iter().chain(report.refused()).next() {
+        return Err(RenderAuthorizationError::ResidualOrRefusedObligation(
+            *obligation,
+        ));
+    }
+    if let Some(instruction) = origin
+        .source()
+        .instructions()
+        .values()
+        .find(|instruction| instruction.state == SemanticInstructionState::UnsupportedUnknown)
+    {
+        return Err(RenderAuthorizationError::UnsupportedSourceSemantics(
+            instruction.id,
+        ));
+    }
+    let return_effects = origin
+        .source()
+        .obligations()
+        .values()
+        .filter(|obligation| obligation.id.kind == SemanticObligationKind::Return)
+        .map(|obligation| ledger.effects(obligation.id))
+        .collect::<Vec<_>>();
+    let [[return_effect]] = return_effects.as_slice() else {
+        return Err(RenderAuthorizationError::InvalidRegionTopology);
+    };
+    let Some(return_control) = return_effect.return_control_evidence() else {
+        return Err(RenderAuthorizationError::InvalidRegionDisposition(
+            return_effect.obligation(),
+        ));
+    };
+    if block.instructions().last() != Some(&return_control.producer())
+        || return_effect.disposition()
+            != &(EffectDisposition::AbsorbedIntoReturn {
+                producer: return_control.producer(),
+            })
+        || match origin
+            .machine_context()
+            .source()
+            .function_interface()
+            .map(|interface| interface.return_kind())
+        {
+            Some(SourceFunctionReturn::Void) => !return_control.values().is_empty(),
+            Some(SourceFunctionReturn::Register { storage }) => !matches!(
+                return_control.values(),
+                [value]
+                    if value.slot()
+                        == CallBoundarySlot::Register { index: 0, storage }
+            ),
+            None => true,
+        }
+    {
+        return Err(RenderAuthorizationError::InvalidRegionTopology);
+    }
+    for obligation in origin.source().obligations().values() {
+        let [effect] = ledger.effects(obligation.id) else {
+            return Err(RenderAuthorizationError::IncompleteLedger);
+        };
+        let valid = match obligation.id.kind {
+            SemanticObligationKind::LiveValueProducer => matches!(
+                effect.disposition(),
+                EffectDisposition::AbsorbedIntoExpression { .. }
+            ),
+            SemanticObligationKind::Return | SemanticObligationKind::ReturnValue => {
+                effect.return_control_evidence() == Some(return_control)
+                    && matches!(
+                        effect.disposition(),
+                        EffectDisposition::AbsorbedIntoReturn { producer }
+                            if *producer == return_control.producer()
+                    )
+            }
+            _ => false,
+        };
+        if !valid {
+            return Err(RenderAuthorizationError::InvalidRegionDisposition(
+                obligation.id,
+            ));
+        }
+    }
+    let mappings = mappings.into_iter().collect::<Vec<_>>();
+    let mut by_obligation = BTreeMap::<SemanticObligationId, &TypedRegionMapping>::new();
+    for mapping in &mappings {
+        if !origin
+            .source()
+            .obligations()
+            .contains_key(&mapping.obligation)
+        {
+            return Err(RenderAuthorizationError::UnexpectedMapping(
+                mapping.obligation,
+            ));
+        }
+        if by_obligation.insert(mapping.obligation, mapping).is_some() {
+            return Err(RenderAuthorizationError::DuplicateMapping(
+                mapping.obligation,
+            ));
+        }
+    }
+    for obligation in origin.source().obligations().keys() {
+        let mapping = by_obligation
+            .get(obligation)
+            .ok_or(RenderAuthorizationError::MissingMapping(*obligation))?;
+        let [effect] = ledger.effects(*obligation) else {
+            return Err(RenderAuthorizationError::IncompleteLedger);
+        };
+        if effect.disposition() != mapping.source_disposition()
+            || matches!(
+                mapping.source_disposition(),
+                EffectDisposition::Residualized { .. } | EffectDisposition::Refused { .. }
+            )
+        {
+            return Err(RenderAuthorizationError::DispositionMismatch(*obligation));
+        }
+    }
+    Ok(CertifiedRenderPermit {
+        schema_version: CERTIFICATION_SCHEMA_VERSION,
+        origin: origin.clone(),
+        region_kind: CertifiedTypedRegionKind::TerminalReturnBlock,
+        region_schema_version: CERTIFIED_TERMINAL_RETURN_REGION_CONTRACT_VERSION,
+        mappings: mappings.into_boxed_slice(),
+    })
+}
+
+/// Authorize one exact closed single-block function containing supported value
+/// expressions, at least one certified plain byte-addressed RAM access, and one
+/// final return under the retained source function interface.
+///
+/// Memory is deliberately narrower than the general statement certificate:
+/// custom spaces, word-addressed RAM, non-8/16/32/64 accesses, and any policy
+/// other than an exactly-once source-ordered helper call remain unauthorized.
+pub fn certify_plain_ram_memory_return_region(
+    origin: &CertifiedArtifactOrigin,
+    ledger: &ObligationLedger,
+    mappings: impl IntoIterator<Item = TypedRegionMapping>,
+) -> Result<CertifiedRenderPermit, RenderAuthorizationError> {
+    if origin.schema_version() != CERTIFICATION_SCHEMA_VERSION
+        || !origin.matches_retained_source(origin.source(), origin.topology())
+        || origin
+            .machine_context()
+            .source()
+            .function_interface()
+            .is_none()
+    {
+        return Err(RenderAuthorizationError::InvalidOrigin);
+    }
+    let [block] = origin.topology().blocks() else {
+        return Err(RenderAuthorizationError::InvalidRegionTopology);
+    };
+    if origin.topology().entry_addr() != block.addr()
+        || !block.predecessors().is_empty()
+        || !matches!(block.terminator(), CertifiedSourceTerminator::Return)
+        || !block.successors().is_empty()
+        || block.instructions().is_empty()
+        || origin.source().instructions().values().any(|instruction| {
+            instruction.state == SemanticInstructionState::UnsupportedUnknown
+                || matches!(instruction.id.site, r2ssa::CanonicalInstructionSite::Phi(_))
+        })
+        || origin.source().obligations().values().any(|obligation| {
+            !matches!(
+                obligation.id.kind,
+                SemanticObligationKind::LiveValueProducer
+                    | SemanticObligationKind::ObservableMemoryRead
+                    | SemanticObligationKind::ObservableMemoryWrite
+                    | SemanticObligationKind::Return
+                    | SemanticObligationKind::ReturnValue
+            )
+        })
+    {
+        return Err(RenderAuthorizationError::InvalidRegionTopology);
+    }
+    let report = ledger.audit(origin.source());
+    if !report.has_exactly_one_disposition_per_source() || !report.invalid().is_empty() {
+        return Err(RenderAuthorizationError::IncompleteLedger);
+    }
+    if let Some(obligation) = report.residualized().iter().chain(report.refused()).next() {
+        return Err(RenderAuthorizationError::ResidualOrRefusedObligation(
+            *obligation,
+        ));
+    }
+
+    let return_effects = origin
+        .source()
+        .obligations()
+        .values()
+        .filter(|obligation| obligation.id.kind == SemanticObligationKind::Return)
+        .map(|obligation| ledger.effects(obligation.id))
+        .collect::<Vec<_>>();
+    let [[return_effect]] = return_effects.as_slice() else {
+        return Err(RenderAuthorizationError::InvalidRegionTopology);
+    };
+    let Some(return_control) = return_effect.return_control_evidence() else {
+        return Err(RenderAuthorizationError::InvalidRegionDisposition(
+            return_effect.obligation(),
+        ));
+    };
+    if block.instructions().last() != Some(&return_control.producer())
+        || return_effect.disposition()
+            != &(EffectDisposition::AbsorbedIntoReturn {
+                producer: return_control.producer(),
+            })
+        || match origin
+            .machine_context()
+            .source()
+            .function_interface()
+            .map(|interface| interface.return_kind())
+        {
+            Some(SourceFunctionReturn::Void) => !return_control.values().is_empty(),
+            Some(SourceFunctionReturn::Register { storage }) => !matches!(
+                return_control.values(),
+                [value]
+                    if value.slot()
+                        == CallBoundarySlot::Register { index: 0, storage }
+            ),
+            None => true,
+        }
+    {
+        return Err(RenderAuthorizationError::InvalidRegionTopology);
+    }
+
+    let mut memory_count = 0_usize;
+    for obligation in origin.source().obligations().values() {
+        let [effect] = ledger.effects(obligation.id) else {
+            return Err(RenderAuthorizationError::IncompleteLedger);
+        };
+        let valid = match obligation.id.kind {
+            SemanticObligationKind::LiveValueProducer => matches!(
+                effect.disposition(),
+                EffectDisposition::AbsorbedIntoExpression { .. }
+            ),
+            SemanticObligationKind::ObservableMemoryRead
+            | SemanticObligationKind::ObservableMemoryWrite => {
+                memory_count += 1;
+                effect.statement_evidence().is_some_and(|statement| {
+                    statement.producer() == obligation.id.instruction
+                        && statement.source_obligations() == &BTreeSet::from([obligation.id])
+                        && statement.space() == MachineAddressSpace::Ram
+                        && statement.word_size_bytes() == 1
+                        && matches!(statement.width_bits(), 8 | 16 | 32 | 64)
+                        && matches!(
+                            statement.endianness(),
+                            MachineMemoryEndianness::Little | MachineMemoryEndianness::Big
+                        )
+                        && statement.execution()
+                            == CertifiedMemoryExecutionPolicy::ExactlyOnceInSourceOrderViaHelper
+                        && effect.disposition()
+                            == &EffectDisposition::AbsorbedIntoStatement {
+                                producer: statement.producer(),
+                            }
+                        && matches!(
+                            (obligation.id.kind, statement.kind()),
+                            (
+                                SemanticObligationKind::ObservableMemoryRead,
+                                CertifiedMemoryStatementKind::Read { .. }
+                            ) | (
+                                SemanticObligationKind::ObservableMemoryWrite,
+                                CertifiedMemoryStatementKind::Write { .. }
+                            )
+                        )
+                })
+            }
+            SemanticObligationKind::Return | SemanticObligationKind::ReturnValue => {
+                effect.return_control_evidence() == Some(return_control)
+                    && matches!(
+                        effect.disposition(),
+                        EffectDisposition::AbsorbedIntoReturn { producer }
+                            if *producer == return_control.producer()
+                    )
+            }
+            _ => false,
+        };
+        if !valid {
+            return Err(RenderAuthorizationError::InvalidRegionDisposition(
+                obligation.id,
+            ));
+        }
+    }
+    if memory_count == 0 {
+        return Err(RenderAuthorizationError::InvalidRegionTopology);
+    }
+
+    let mappings = mappings.into_iter().collect::<Vec<_>>();
+    let mut by_obligation = BTreeMap::<SemanticObligationId, &TypedRegionMapping>::new();
+    for mapping in &mappings {
+        if !origin
+            .source()
+            .obligations()
+            .contains_key(&mapping.obligation)
+        {
+            return Err(RenderAuthorizationError::UnexpectedMapping(
+                mapping.obligation,
+            ));
+        }
+        if by_obligation.insert(mapping.obligation, mapping).is_some() {
+            return Err(RenderAuthorizationError::DuplicateMapping(
+                mapping.obligation,
+            ));
+        }
+    }
+    for obligation in origin.source().obligations().keys() {
+        let mapping = by_obligation
+            .get(obligation)
+            .ok_or(RenderAuthorizationError::MissingMapping(*obligation))?;
+        let [effect] = ledger.effects(*obligation) else {
+            return Err(RenderAuthorizationError::IncompleteLedger);
+        };
+        if effect.disposition() != mapping.source_disposition()
+            || matches!(
+                mapping.source_disposition(),
+                EffectDisposition::Residualized { .. } | EffectDisposition::Refused { .. }
+            )
+        {
+            return Err(RenderAuthorizationError::DispositionMismatch(*obligation));
+        }
+    }
+    Ok(CertifiedRenderPermit {
+        schema_version: CERTIFICATION_SCHEMA_VERSION,
+        origin: origin.clone(),
+        region_kind: CertifiedTypedRegionKind::PlainRamMemoryTerminalReturnFunction,
+        region_schema_version: CERTIFIED_PLAIN_RAM_MEMORY_RETURN_CONTRACT_VERSION,
+        mappings: mappings.into_boxed_slice(),
+    })
+}
+
+/// Authorize one exact closed two-block function whose entry ends in one
+/// certified void direct call and whose sole fallthrough block ends in one
+/// terminal return.
+///
+/// The call target is deliberately outside the function. Its exact source
+/// call-site interface, ordered register arguments, and side-effecting call
+/// event are retained by the direct-call evidence. Callee behavior and
+/// non-void call results are not admitted by this contract.
+pub fn certify_direct_call_terminal_return_region(
+    origin: &CertifiedArtifactOrigin,
+    ledger: &ObligationLedger,
+    mappings: impl IntoIterator<Item = TypedRegionMapping>,
+    entry_addr: u64,
+    return_addr: u64,
+) -> Result<CertifiedRenderPermit, RenderAuthorizationError> {
+    if origin.schema_version() != CERTIFICATION_SCHEMA_VERSION
+        || !origin.matches_retained_source(origin.source(), origin.topology())
+        || origin
+            .machine_context()
+            .source()
+            .function_interface()
+            .is_none_or(|interface| !interface.stack_slots().is_empty())
+    {
+        return Err(RenderAuthorizationError::InvalidOrigin);
+    }
+    let topology = origin.topology();
+    let (Some(entry), Some(returned)) = (topology.block(entry_addr), topology.block(return_addr))
+    else {
+        return Err(RenderAuthorizationError::InvalidRegionTopology);
+    };
+    if topology.entry_addr() != entry_addr
+        || topology.blocks().len() != 2
+        || entry_addr == return_addr
+        || !entry.predecessors().is_empty()
+        || entry.successors() != [return_addr]
+        || returned.predecessors() != [entry_addr]
+        || !returned.successors().is_empty()
+        || entry.instructions().is_empty()
+        || returned.instructions().is_empty()
+        || origin.source().instructions().values().any(|instruction| {
+            instruction.state == SemanticInstructionState::UnsupportedUnknown
+                || matches!(instruction.id.site, r2ssa::CanonicalInstructionSite::Phi(_))
+        })
+        || origin.source().obligations().values().any(|obligation| {
+            !matches!(
+                obligation.id.kind,
+                SemanticObligationKind::LiveValueProducer
+                    | SemanticObligationKind::Call
+                    | SemanticObligationKind::CallArgument
+                    | SemanticObligationKind::Return
+                    | SemanticObligationKind::ReturnValue
+            )
+        })
+    {
+        return Err(RenderAuthorizationError::InvalidRegionTopology);
+    }
+
+    let call_effects = origin
+        .source()
+        .obligations()
+        .values()
+        .filter(|obligation| obligation.id.kind == SemanticObligationKind::Call)
+        .map(|obligation| ledger.effects(obligation.id))
+        .collect::<Vec<_>>();
+    let [[call_effect]] = call_effects.as_slice() else {
+        return Err(RenderAuthorizationError::InvalidRegionTopology);
+    };
+    let Some(call) = call_effect.direct_call_evidence() else {
+        return Err(RenderAuthorizationError::InvalidRegionDisposition(
+            call_effect.obligation(),
+        ));
+    };
+    let call_topology_matches = matches!(
+        entry.terminator(),
+        CertifiedSourceTerminator::Call {
+            target,
+            fallthrough: Some(fallthrough),
+        } if *target == call.target() && *fallthrough == return_addr
+    ) && entry.instructions().last() == Some(&call.producer())
+        && call.fallthrough() == return_addr
+        && call_effect.disposition()
+            == &(EffectDisposition::AbsorbedIntoCall {
+                producer: call.producer(),
+            });
+    let source_call = origin
+        .machine_context()
+        .source()
+        .call_site_interface(call.call_site());
+    let source_call_matches = source_call.is_some_and(|interface| {
+        interface.identity() == call.raw_identity()
+            && interface.revision_identity() == call.interface_revision()
+            && interface.is_complete()
+            && !interface.is_variadic()
+            && !interface.is_noreturn()
+            && interface.result() == SourceCallResult::Void
+            && interface.calling_convention() == call.calling_convention()
+            && interface.arguments().len() == call.arguments().len()
+            && interface
+                .arguments()
+                .iter()
+                .zip(call.arguments())
+                .all(|(source, certified)| {
+                    matches!(
+                        certified.slot(),
+                        CallBoundarySlot::Register { index, storage }
+                            if index == source.index() && storage == source.storage()
+                    )
+                })
+    });
+    if !call_topology_matches || !source_call_matches {
+        return Err(RenderAuthorizationError::InvalidRegionTopology);
+    }
+
+    let return_effects = origin
+        .source()
+        .obligations()
+        .values()
+        .filter(|obligation| obligation.id.kind == SemanticObligationKind::Return)
+        .map(|obligation| ledger.effects(obligation.id))
+        .collect::<Vec<_>>();
+    let [[return_effect]] = return_effects.as_slice() else {
+        return Err(RenderAuthorizationError::InvalidRegionTopology);
+    };
+    let Some(return_control) = return_effect.return_control_evidence() else {
+        return Err(RenderAuthorizationError::InvalidRegionDisposition(
+            return_effect.obligation(),
+        ));
+    };
+    let return_matches = matches!(returned.terminator(), CertifiedSourceTerminator::Return)
+        && returned.instructions().last() == Some(&return_control.producer())
+        && return_effect.disposition()
+            == &(EffectDisposition::AbsorbedIntoReturn {
+                producer: return_control.producer(),
+            })
+        && match origin
+            .machine_context()
+            .source()
+            .function_interface()
+            .map(|interface| interface.return_kind())
+        {
+            Some(SourceFunctionReturn::Void) => return_control.values().is_empty(),
+            Some(SourceFunctionReturn::Register { storage }) => matches!(
+                return_control.values(),
+                [value]
+                    if value.slot()
+                        == CallBoundarySlot::Register { index: 0, storage }
+            ),
+            None => false,
+        };
+    if !return_matches {
+        return Err(RenderAuthorizationError::InvalidRegionTopology);
+    }
+
+    let report = ledger.audit(origin.source());
+    if !report.has_exactly_one_disposition_per_source() || !report.invalid().is_empty() {
+        return Err(RenderAuthorizationError::IncompleteLedger);
+    }
+    if let Some(obligation) = report.residualized().iter().chain(report.refused()).next() {
+        return Err(RenderAuthorizationError::ResidualOrRefusedObligation(
+            *obligation,
+        ));
+    }
+    for obligation in origin.source().obligations().values() {
+        let [effect] = ledger.effects(obligation.id) else {
+            return Err(RenderAuthorizationError::IncompleteLedger);
+        };
+        let valid = match obligation.id.kind {
+            SemanticObligationKind::LiveValueProducer => matches!(
+                effect.disposition(),
+                EffectDisposition::AbsorbedIntoExpression { .. }
+            ),
+            SemanticObligationKind::Call | SemanticObligationKind::CallArgument => {
+                effect.direct_call_evidence() == Some(call)
+                    && matches!(
+                        effect.disposition(),
+                        EffectDisposition::AbsorbedIntoCall { producer }
+                            if *producer == call.producer()
+                    )
+            }
+            SemanticObligationKind::Return | SemanticObligationKind::ReturnValue => {
+                effect.return_control_evidence() == Some(return_control)
+                    && matches!(
+                        effect.disposition(),
+                        EffectDisposition::AbsorbedIntoReturn { producer }
+                            if *producer == return_control.producer()
+                    )
+            }
+            _ => false,
+        };
+        if !valid {
+            return Err(RenderAuthorizationError::InvalidRegionDisposition(
+                obligation.id,
+            ));
+        }
+    }
+
+    let mappings = mappings.into_iter().collect::<Vec<_>>();
+    let mut by_obligation = BTreeMap::<SemanticObligationId, &TypedRegionMapping>::new();
+    for mapping in &mappings {
+        if !origin
+            .source()
+            .obligations()
+            .contains_key(&mapping.obligation)
+        {
+            return Err(RenderAuthorizationError::UnexpectedMapping(
+                mapping.obligation,
+            ));
+        }
+        if by_obligation.insert(mapping.obligation, mapping).is_some() {
+            return Err(RenderAuthorizationError::DuplicateMapping(
+                mapping.obligation,
+            ));
+        }
+    }
+    for obligation in origin.source().obligations().keys() {
+        let mapping = by_obligation
+            .get(obligation)
+            .ok_or(RenderAuthorizationError::MissingMapping(*obligation))?;
+        let [effect] = ledger.effects(*obligation) else {
+            return Err(RenderAuthorizationError::IncompleteLedger);
+        };
+        if effect.disposition() != mapping.source_disposition()
+            || matches!(
+                mapping.source_disposition(),
+                EffectDisposition::Residualized { .. } | EffectDisposition::Refused { .. }
+            )
+        {
+            return Err(RenderAuthorizationError::DispositionMismatch(*obligation));
+        }
+    }
+    Ok(CertifiedRenderPermit {
+        schema_version: CERTIFICATION_SCHEMA_VERSION,
+        origin: origin.clone(),
+        region_kind: CertifiedTypedRegionKind::DirectCallTerminalReturnFunction,
+        region_schema_version: CERTIFIED_DIRECT_CALL_TERMINAL_RETURN_CONTRACT_VERSION,
+        mappings: mappings.into_boxed_slice(),
+    })
+}
+
+/// Authorize one exact closed three-block conditional-return function.
+///
+/// The source topology, conditional polarity, both terminal returns, complete
+/// ledger, and exact mapping manifest are all checked here. Child block
+/// regions cannot independently acquire this whole-function authority.
+pub fn certify_conditional_terminal_return_region(
+    origin: &CertifiedArtifactOrigin,
+    ledger: &ObligationLedger,
+    mappings: impl IntoIterator<Item = TypedRegionMapping>,
+    header_addr: u64,
+    true_addr: u64,
+    false_addr: u64,
+) -> Result<CertifiedRenderPermit, RenderAuthorizationError> {
+    if origin.schema_version() != CERTIFICATION_SCHEMA_VERSION
+        || !origin.matches_retained_source(origin.source(), origin.topology())
+        || origin
+            .machine_context()
+            .source()
+            .function_interface()
+            .is_none()
+    {
+        return Err(RenderAuthorizationError::InvalidOrigin);
+    }
+    let topology = origin.topology();
+    if topology.entry_addr() != header_addr
+        || BTreeSet::from([header_addr, true_addr, false_addr]).len() != 3
+        || topology.blocks().len() != 3
+    {
+        return Err(RenderAuthorizationError::InvalidRegionTopology);
+    }
+    let header = topology
+        .block(header_addr)
+        .ok_or(RenderAuthorizationError::InvalidRegionTopology)?;
+    let true_block = topology
+        .block(true_addr)
+        .ok_or(RenderAuthorizationError::InvalidRegionTopology)?;
+    let false_block = topology
+        .block(false_addr)
+        .ok_or(RenderAuthorizationError::InvalidRegionTopology)?;
+    if !header.predecessors().is_empty()
+        || !matches!(
+            header.terminator(),
+            CertifiedSourceTerminator::ConditionalBranch {
+                true_target,
+                false_target,
+            } if *true_target == true_addr && *false_target == false_addr
+        )
+        || header.successors().len() != 2
+        || header.successors().iter().copied().collect::<BTreeSet<_>>()
+            != BTreeSet::from([true_addr, false_addr])
+        || header.instructions().is_empty()
+        || true_block.predecessors() != [header_addr]
+        || false_block.predecessors() != [header_addr]
+        || !matches!(true_block.terminator(), CertifiedSourceTerminator::Return)
+        || !matches!(false_block.terminator(), CertifiedSourceTerminator::Return)
+        || !true_block.successors().is_empty()
+        || !false_block.successors().is_empty()
+        || true_block.instructions().is_empty()
+        || false_block.instructions().is_empty()
+    {
+        return Err(RenderAuthorizationError::InvalidRegionTopology);
+    }
+    if origin.source().instructions().values().any(|instruction| {
+        instruction.state == SemanticInstructionState::UnsupportedUnknown
+            || matches!(instruction.id.site, r2ssa::CanonicalInstructionSite::Phi(_))
+    }) {
+        return Err(RenderAuthorizationError::UnsupportedSourceSemantics(
+            origin
+                .source()
+                .instructions()
+                .values()
+                .find(|instruction| {
+                    instruction.state == SemanticInstructionState::UnsupportedUnknown
+                        || matches!(instruction.id.site, r2ssa::CanonicalInstructionSite::Phi(_))
+                })
+                .expect("checked unsupported instruction")
+                .id,
+        ));
+    }
+    if origin.source().obligations().values().any(|obligation| {
+        !matches!(
+            obligation.id.kind,
+            SemanticObligationKind::LiveValueProducer
+                | SemanticObligationKind::ControlPredicate
+                | SemanticObligationKind::ControlTransfer
+                | SemanticObligationKind::Return
+                | SemanticObligationKind::ReturnValue
+        )
+    }) {
+        return Err(RenderAuthorizationError::InvalidRegionTopology);
+    }
+    let report = ledger.audit(origin.source());
+    if !report.has_exactly_one_disposition_per_source() || !report.invalid().is_empty() {
+        return Err(RenderAuthorizationError::IncompleteLedger);
+    }
+    if let Some(obligation) = report.residualized().iter().chain(report.refused()).next() {
+        return Err(RenderAuthorizationError::ResidualOrRefusedObligation(
+            *obligation,
+        ));
+    }
+
+    let predicate = origin
+        .source()
+        .obligations()
+        .values()
+        .filter(|obligation| obligation.id.kind == SemanticObligationKind::ControlPredicate)
+        .collect::<Vec<_>>();
+    let transfer = origin
+        .source()
+        .obligations()
+        .values()
+        .filter(|obligation| obligation.id.kind == SemanticObligationKind::ControlTransfer)
+        .collect::<Vec<_>>();
+    let ([predicate], [transfer]) = (predicate.as_slice(), transfer.as_slice()) else {
+        return Err(RenderAuthorizationError::InvalidRegionTopology);
+    };
+    let ([predicate_effect], [transfer_effect]) =
+        (ledger.effects(predicate.id), ledger.effects(transfer.id))
+    else {
+        return Err(RenderAuthorizationError::IncompleteLedger);
+    };
+    let conditional = predicate_effect
+        .conditional_control_evidence()
+        .filter(|control| transfer_effect.conditional_control_evidence() == Some(*control));
+    if conditional.is_none_or(|control| {
+        header.instructions().last() != Some(&control.producer())
+            || control.true_target() != true_addr
+            || control.false_target() != false_addr
+            || control.truthiness() != CertifiedControlTruthiness::NonZeroIsTrue
+            || control.source_obligations() != BTreeSet::from([predicate.id, transfer.id])
+            || predicate_effect.disposition()
+                != &EffectDisposition::AbsorbedIntoControl {
+                    producer: control.producer(),
+                }
+            || transfer_effect.disposition()
+                != &EffectDisposition::AbsorbedIntoControl {
+                    producer: control.producer(),
+                }
+    }) {
+        return Err(RenderAuthorizationError::InvalidRegionDisposition(
+            predicate.id,
+        ));
+    }
+
+    let interface = origin
+        .machine_context()
+        .source()
+        .function_interface()
+        .expect("checked function interface");
+    for block in [true_block, false_block] {
+        let producer = *block
+            .instructions()
+            .last()
+            .expect("checked nonempty return block");
+        let return_obligations = origin
+            .source()
+            .obligations()
+            .values()
+            .filter(|obligation| {
+                obligation.id.instruction == producer
+                    && obligation.id.kind == SemanticObligationKind::Return
+            })
+            .collect::<Vec<_>>();
+        let [return_obligation] = return_obligations.as_slice() else {
+            return Err(RenderAuthorizationError::InvalidRegionTopology);
+        };
+        let [return_effect] = ledger.effects(return_obligation.id) else {
+            return Err(RenderAuthorizationError::IncompleteLedger);
+        };
+        let Some(return_control) = return_effect.return_control_evidence() else {
+            return Err(RenderAuthorizationError::InvalidRegionDisposition(
+                return_obligation.id,
+            ));
+        };
+        let return_matches = return_control.producer() == producer
+            && return_effect.disposition() == &EffectDisposition::AbsorbedIntoReturn { producer }
+            && match interface.return_kind() {
+                SourceFunctionReturn::Void => return_control.values().is_empty(),
+                SourceFunctionReturn::Register { storage } => matches!(
+                    return_control.values(),
+                    [value]
+                        if value.slot()
+                            == CallBoundarySlot::Register { index: 0, storage }
+                ),
+            };
+        if !return_matches {
+            return Err(RenderAuthorizationError::InvalidRegionDisposition(
+                return_obligation.id,
+            ));
+        }
+    }
+
+    for obligation in origin.source().obligations().values() {
+        let [effect] = ledger.effects(obligation.id) else {
+            return Err(RenderAuthorizationError::IncompleteLedger);
+        };
+        let valid = match obligation.id.kind {
+            SemanticObligationKind::LiveValueProducer => matches!(
+                effect.disposition(),
+                EffectDisposition::AbsorbedIntoExpression { .. }
+            ),
+            SemanticObligationKind::ControlPredicate | SemanticObligationKind::ControlTransfer => {
+                matches!(
+                    effect.disposition(),
+                    EffectDisposition::AbsorbedIntoControl { producer }
+                        if producer.block_addr == header_addr
+                )
+            }
+            SemanticObligationKind::Return | SemanticObligationKind::ReturnValue => matches!(
+                effect.disposition(),
+                EffectDisposition::AbsorbedIntoReturn { producer }
+                    if producer.block_addr == true_addr || producer.block_addr == false_addr
+            ),
+            _ => false,
+        };
+        if !valid {
+            return Err(RenderAuthorizationError::InvalidRegionDisposition(
+                obligation.id,
+            ));
+        }
+    }
+
+    let mappings = mappings.into_iter().collect::<Vec<_>>();
+    let mut by_obligation = BTreeMap::<SemanticObligationId, &TypedRegionMapping>::new();
+    for mapping in &mappings {
+        if !origin
+            .source()
+            .obligations()
+            .contains_key(&mapping.obligation)
+        {
+            return Err(RenderAuthorizationError::UnexpectedMapping(
+                mapping.obligation,
+            ));
+        }
+        if by_obligation.insert(mapping.obligation, mapping).is_some() {
+            return Err(RenderAuthorizationError::DuplicateMapping(
+                mapping.obligation,
+            ));
+        }
+    }
+    for obligation in origin.source().obligations().keys() {
+        let mapping = by_obligation
+            .get(obligation)
+            .ok_or(RenderAuthorizationError::MissingMapping(*obligation))?;
+        let [effect] = ledger.effects(*obligation) else {
+            return Err(RenderAuthorizationError::IncompleteLedger);
+        };
+        if effect.disposition() != mapping.source_disposition()
+            || matches!(
+                mapping.source_disposition(),
+                EffectDisposition::Residualized { .. } | EffectDisposition::Refused { .. }
+            )
+        {
+            return Err(RenderAuthorizationError::DispositionMismatch(*obligation));
+        }
+    }
+    Ok(CertifiedRenderPermit {
+        schema_version: CERTIFICATION_SCHEMA_VERSION,
+        origin: origin.clone(),
+        region_kind: CertifiedTypedRegionKind::ConditionalTerminalReturnFunction,
+        region_schema_version: CERTIFIED_CONDITIONAL_TERMINAL_RETURN_CONTRACT_VERSION,
+        mappings: mappings.into_boxed_slice(),
+    })
+}
+
+/// Authorize one exact closed switch whose every labeled target is a terminal
+/// return block. Selector evidence is a separate requirement: topology alone
+/// cannot acquire this permit.
+pub fn certify_switch_terminal_return_region(
+    origin: &CertifiedArtifactOrigin,
+    ledger: &ObligationLedger,
+    mappings: impl IntoIterator<Item = TypedRegionMapping>,
+    topology_witness: &CertifiedSwitchTopology,
+    switch_control: &CertifiedSwitchControl,
+) -> Result<CertifiedRenderPermit, RenderAuthorizationError> {
+    if origin.schema_version() != CERTIFICATION_SCHEMA_VERSION
+        || !origin.matches_retained_source(origin.source(), origin.topology())
+        || origin
+            .machine_context()
+            .source()
+            .function_interface()
+            .is_none()
+    {
+        return Err(RenderAuthorizationError::InvalidOrigin);
+    }
+    if topology_witness.schema_version() != CERTIFICATION_SCHEMA_VERSION
+        || switch_control.schema_version() != CERTIFICATION_SCHEMA_VERSION
+        || topology_witness.origin() != origin
+        || switch_control.origin() != origin
+        || switch_control.topology() != topology_witness
+        || switch_control.producer() != topology_witness.producer()
+        || switch_control.indirect_target() != topology_witness.indirect_target()
+        || switch_control.source_obligation() != topology_witness.source_obligation()
+        || switch_control.selector().binding().width_bits() == 0
+        || switch_control.selector().binding().width_bits() > 64
+        || switch_control.validate(origin.source()).is_err()
+        || origin
+            .machine_context()
+            .source()
+            .function_interface()
+            .and_then(|interface| {
+                interface
+                    .parameters()
+                    .get(switch_control.parameter_index() as usize)
+            })
+            .is_none_or(|parameter| {
+                parameter.index() != switch_control.parameter_index()
+                    || parameter.storage() != switch_control.parameter_storage()
+                    || parameter.storage().size.checked_mul(8)
+                        != Some(switch_control.selector().binding().width_bits())
+            })
+    {
+        return Err(RenderAuthorizationError::InvalidRegionTopology);
+    }
+
+    let topology = origin.topology();
+    let header_addr = topology_witness.producer().block_addr;
+    let arm_addrs = topology_witness
+        .cases()
+        .iter()
+        .map(|(_, target)| *target)
+        .chain([topology_witness.default_target()])
+        .collect::<BTreeSet<_>>();
+    if topology.entry_addr() != header_addr
+        || topology.blocks().len() != arm_addrs.len() + 1
+        || arm_addrs.len() != topology_witness.cases().len() + 1
+        || arm_addrs.contains(&header_addr)
+    {
+        return Err(RenderAuthorizationError::InvalidRegionTopology);
+    }
+    let header = topology
+        .block(header_addr)
+        .ok_or(RenderAuthorizationError::InvalidRegionTopology)?;
+    if !header.predecessors().is_empty()
+        || !matches!(
+            header.terminator(),
+            CertifiedSourceTerminator::Switch {
+                switch_addr,
+                terminal_instruction_addr,
+                min_value,
+                max_value,
+                cases,
+                default,
+            } if *switch_addr == topology_witness.switch_addr()
+                && switch_addr == terminal_instruction_addr
+                && *min_value == topology_witness.min_value()
+                && *max_value == topology_witness.max_value()
+                && cases.as_ref() == topology_witness.cases()
+                && *default == Some(topology_witness.default_target())
+        )
+        || header.instructions().last() != Some(&topology_witness.producer())
+        || header.successors().iter().copied().collect::<BTreeSet<_>>() != arm_addrs
+    {
+        return Err(RenderAuthorizationError::InvalidRegionTopology);
+    }
+    for arm_addr in &arm_addrs {
+        let arm = topology
+            .block(*arm_addr)
+            .ok_or(RenderAuthorizationError::InvalidRegionTopology)?;
+        if arm.predecessors() != [header_addr]
+            || !matches!(arm.terminator(), CertifiedSourceTerminator::Return)
+            || !arm.successors().is_empty()
+            || arm.instructions().is_empty()
+        {
+            return Err(RenderAuthorizationError::InvalidRegionTopology);
+        }
+    }
+    if origin.source().instructions().values().any(|instruction| {
+        instruction.state == SemanticInstructionState::UnsupportedUnknown
+            || matches!(instruction.id.site, r2ssa::CanonicalInstructionSite::Phi(_))
+    }) || origin.source().obligations().values().any(|obligation| {
+        !matches!(
+            obligation.id.kind,
+            SemanticObligationKind::LiveValueProducer
+                | SemanticObligationKind::ControlTransfer
+                | SemanticObligationKind::Return
+                | SemanticObligationKind::ReturnValue
+        )
+    }) {
+        return Err(RenderAuthorizationError::InvalidRegionTopology);
+    }
+
+    let report = ledger.audit(origin.source());
+    if !report.has_exactly_one_disposition_per_source() || !report.invalid().is_empty() {
+        return Err(RenderAuthorizationError::IncompleteLedger);
+    }
+    if let Some(obligation) = report.residualized().iter().chain(report.refused()).next() {
+        return Err(RenderAuthorizationError::ResidualOrRefusedObligation(
+            *obligation,
+        ));
+    }
+    let [switch_effect] = ledger.effects(topology_witness.source_obligation()) else {
+        return Err(RenderAuthorizationError::IncompleteLedger);
+    };
+    if switch_effect.switch_control_evidence() != Some(switch_control)
+        || switch_effect.disposition()
+            != &(EffectDisposition::AbsorbedIntoControl {
+                producer: topology_witness.producer(),
+            })
+    {
+        return Err(RenderAuthorizationError::InvalidRegionDisposition(
+            topology_witness.source_obligation(),
+        ));
+    }
+
+    let interface = origin
+        .machine_context()
+        .source()
+        .function_interface()
+        .expect("checked function interface");
+    for arm_addr in &arm_addrs {
+        let arm = topology
+            .block(*arm_addr)
+            .expect("checked switch return arm");
+        let producer = *arm.instructions().last().expect("checked nonempty arm");
+        let returns = origin
+            .source()
+            .obligations()
+            .values()
+            .filter(|obligation| {
+                obligation.id.instruction == producer
+                    && obligation.id.kind == SemanticObligationKind::Return
+            })
+            .collect::<Vec<_>>();
+        let [return_obligation] = returns.as_slice() else {
+            return Err(RenderAuthorizationError::InvalidRegionTopology);
+        };
+        let [effect] = ledger.effects(return_obligation.id) else {
+            return Err(RenderAuthorizationError::IncompleteLedger);
+        };
+        let Some(control) = effect.return_control_evidence() else {
+            return Err(RenderAuthorizationError::InvalidRegionDisposition(
+                return_obligation.id,
+            ));
+        };
+        let matches_interface = match interface.return_kind() {
+            SourceFunctionReturn::Void => control.values().is_empty(),
+            SourceFunctionReturn::Register { storage } => matches!(
+                control.values(),
+                [value]
+                    if value.slot() == CallBoundarySlot::Register { index: 0, storage }
+            ),
+        };
+        if control.producer() != producer
+            || effect.disposition() != &(EffectDisposition::AbsorbedIntoReturn { producer })
+            || !matches_interface
+        {
+            return Err(RenderAuthorizationError::InvalidRegionDisposition(
+                return_obligation.id,
+            ));
+        }
+    }
+
+    for obligation in origin.source().obligations().values() {
+        let [effect] = ledger.effects(obligation.id) else {
+            return Err(RenderAuthorizationError::IncompleteLedger);
+        };
+        let valid = match obligation.id.kind {
+            SemanticObligationKind::LiveValueProducer => matches!(
+                effect.disposition(),
+                EffectDisposition::AbsorbedIntoExpression { .. }
+            ),
+            SemanticObligationKind::ControlTransfer => {
+                obligation.id == topology_witness.source_obligation()
+                    && effect.switch_control_evidence() == Some(switch_control)
+                    && matches!(
+                        effect.disposition(),
+                        EffectDisposition::AbsorbedIntoControl { producer }
+                            if *producer == topology_witness.producer()
+                    )
+            }
+            SemanticObligationKind::Return | SemanticObligationKind::ReturnValue => matches!(
+                effect.disposition(),
+                EffectDisposition::AbsorbedIntoReturn { producer }
+                    if arm_addrs.contains(&producer.block_addr)
+            ),
+            _ => false,
+        };
+        if !valid {
+            return Err(RenderAuthorizationError::InvalidRegionDisposition(
+                obligation.id,
+            ));
+        }
+    }
+
+    let mappings = mappings.into_iter().collect::<Vec<_>>();
+    let mut by_obligation = BTreeMap::<SemanticObligationId, &TypedRegionMapping>::new();
+    for mapping in &mappings {
+        if !origin
+            .source()
+            .obligations()
+            .contains_key(&mapping.obligation)
+        {
+            return Err(RenderAuthorizationError::UnexpectedMapping(
+                mapping.obligation,
+            ));
+        }
+        if by_obligation.insert(mapping.obligation, mapping).is_some() {
+            return Err(RenderAuthorizationError::DuplicateMapping(
+                mapping.obligation,
+            ));
+        }
+    }
+    for obligation in origin.source().obligations().keys() {
+        let mapping = by_obligation
+            .get(obligation)
+            .ok_or(RenderAuthorizationError::MissingMapping(*obligation))?;
+        let [effect] = ledger.effects(*obligation) else {
+            return Err(RenderAuthorizationError::IncompleteLedger);
+        };
+        if effect.disposition() != mapping.source_disposition()
+            || matches!(
+                mapping.source_disposition(),
+                EffectDisposition::Residualized { .. } | EffectDisposition::Refused { .. }
+            )
+        {
+            return Err(RenderAuthorizationError::DispositionMismatch(*obligation));
+        }
+    }
+    Ok(CertifiedRenderPermit {
+        schema_version: CERTIFICATION_SCHEMA_VERSION,
+        origin: origin.clone(),
+        region_kind: CertifiedTypedRegionKind::SwitchTerminalReturnFunction,
+        region_schema_version: CERTIFIED_SWITCH_TERMINAL_RETURN_CONTRACT_VERSION,
+        mappings: mappings.into_boxed_slice(),
+    })
+}
+
+/// Authorize the exact four-block carrier-free loop function sealed by
+/// [`CertifiedClosedNaturalLoopControl`]. The invariant ABI condition may
+/// either exit immediately or keep traversing the empty backedge forever; no
+/// termination claim is made.
+pub fn certify_carrier_free_loop_terminal_return_region(
+    origin: &CertifiedArtifactOrigin,
+    ledger: &ObligationLedger,
+    mappings: impl IntoIterator<Item = TypedRegionMapping>,
+    loop_control: &CertifiedClosedNaturalLoopControl,
+) -> Result<CertifiedRenderPermit, RenderAuthorizationError> {
+    let Some(interface) = origin.machine_context().source().function_interface() else {
+        return Err(RenderAuthorizationError::InvalidOrigin);
+    };
+    if origin.schema_version() != CERTIFICATION_SCHEMA_VERSION
+        || !origin.matches_retained_source(origin.source(), origin.topology())
+        || loop_control.schema_version() != CERTIFICATION_SCHEMA_VERSION
+        || loop_control.origin() != origin
+        || loop_control.routing().schema_version() != CERTIFICATION_SCHEMA_VERSION
+        || loop_control.routing().origin() != origin
+        || loop_control.condition().binding().width_bits() != 8
+        || loop_control.condition().producer().is_some()
+        || loop_control.condition().constant().is_some()
+        || loop_control.condition().memory_access().is_some()
+        || interface.parameters().len() != 1
+        || interface
+            .parameters()
+            .get(loop_control.parameter_index() as usize)
+            .is_none_or(|parameter| {
+                parameter.index() != loop_control.parameter_index()
+                    || parameter.storage() != loop_control.parameter_storage()
+                    || parameter.storage().size.checked_mul(8)
+                        != Some(loop_control.condition().binding().width_bits())
+            })
+    {
+        return Err(RenderAuthorizationError::InvalidOrigin);
+    }
+
+    let topology = origin.topology();
+    let routing = loop_control.routing();
+    let preheader_addr = routing.entry_predecessor();
+    let header_addr = routing.header();
+    let body_addr = routing.body_latch();
+    let exit_addr = routing.exit();
+    if topology.entry_addr() != preheader_addr
+        || topology.blocks().len() != 4
+        || BTreeSet::from([preheader_addr, header_addr, body_addr, exit_addr]).len() != 4
+    {
+        return Err(RenderAuthorizationError::InvalidRegionTopology);
+    }
+    let preheader = topology
+        .block(preheader_addr)
+        .ok_or(RenderAuthorizationError::InvalidRegionTopology)?;
+    let header = topology
+        .block(header_addr)
+        .ok_or(RenderAuthorizationError::InvalidRegionTopology)?;
+    let body = topology
+        .block(body_addr)
+        .ok_or(RenderAuthorizationError::InvalidRegionTopology)?;
+    let exit = topology
+        .block(exit_addr)
+        .ok_or(RenderAuthorizationError::InvalidRegionTopology)?;
+    let continuation_target = if routing.continuation_on_true() {
+        routing.header_control().true_target()
+    } else {
+        routing.header_control().false_target()
+    };
+    let exit_target = if routing.continuation_on_true() {
+        routing.header_control().false_target()
+    } else {
+        routing.header_control().true_target()
+    };
+    if !preheader.predecessors().is_empty()
+        || preheader.instructions().last() != Some(&loop_control.preheader_transfer().producer())
+        || preheader.successors() != [header_addr]
+        || !matches!(
+            preheader.terminator(),
+            CertifiedSourceTerminator::Branch { target } if *target == header_addr
+        )
+        || loop_control.preheader_transfer().target() != header_addr
+        || header.instructions().last() != Some(&routing.header_control().producer())
+        || header
+            .predecessors()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            != BTreeSet::from([preheader_addr, body_addr])
+        || header.successors().iter().copied().collect::<BTreeSet<_>>()
+            != BTreeSet::from([body_addr, exit_addr])
+        || continuation_target != body_addr
+        || exit_target != exit_addr
+        || body.instructions().last() != Some(&routing.body_transfer().producer())
+        || body.predecessors() != [header_addr]
+        || body.successors() != [header_addr]
+        || !matches!(
+            body.terminator(),
+            CertifiedSourceTerminator::Branch { target } if *target == header_addr
+        )
+        || routing.body_transfer().target() != header_addr
+        || exit.predecessors() != [header_addr]
+        || !exit.successors().is_empty()
+        || !matches!(exit.terminator(), CertifiedSourceTerminator::Return)
+        || exit.instructions().is_empty()
+    {
+        return Err(RenderAuthorizationError::InvalidRegionTopology);
+    }
+    if origin.source().instructions().values().any(|instruction| {
+        instruction.state == SemanticInstructionState::UnsupportedUnknown
+            || matches!(instruction.id.site, CanonicalInstructionSite::Phi(_))
+    }) || origin.source().obligations().values().any(|obligation| {
+        !matches!(
+            obligation.id.kind,
+            SemanticObligationKind::LiveValueProducer
+                | SemanticObligationKind::ControlPredicate
+                | SemanticObligationKind::ControlTransfer
+                | SemanticObligationKind::Return
+                | SemanticObligationKind::ReturnValue
+        ) || (obligation.id.kind == SemanticObligationKind::LiveValueProducer
+            && obligation.id.instruction.block_addr != exit_addr)
+    }) {
+        return Err(RenderAuthorizationError::InvalidRegionTopology);
+    }
+
+    let report = ledger.audit(origin.source());
+    if !report.has_exactly_one_disposition_per_source() || !report.invalid().is_empty() {
+        return Err(RenderAuthorizationError::IncompleteLedger);
+    }
+    if let Some(obligation) = report.residualized().iter().chain(report.refused()).next() {
+        return Err(RenderAuthorizationError::ResidualOrRefusedObligation(
+            *obligation,
+        ));
+    }
+
+    let preheader_obligation = loop_control.preheader_transfer().source_obligation();
+    let predicate_obligation = routing.header_control().predicate_obligation();
+    let header_transfer_obligation = routing.header_control().transfer_obligation();
+    let backedge_obligation = routing.body_transfer().source_obligation();
+    if BTreeSet::from([
+        preheader_obligation,
+        predicate_obligation,
+        header_transfer_obligation,
+        backedge_obligation,
+    ])
+    .len()
+        != 4
+    {
+        return Err(RenderAuthorizationError::InvalidRegionTopology);
+    }
+    let [preheader_effect] = ledger.effects(preheader_obligation) else {
+        return Err(RenderAuthorizationError::IncompleteLedger);
+    };
+    let [predicate_effect] = ledger.effects(predicate_obligation) else {
+        return Err(RenderAuthorizationError::IncompleteLedger);
+    };
+    let [header_transfer_effect] = ledger.effects(header_transfer_obligation) else {
+        return Err(RenderAuthorizationError::IncompleteLedger);
+    };
+    let [backedge_effect] = ledger.effects(backedge_obligation) else {
+        return Err(RenderAuthorizationError::IncompleteLedger);
+    };
+    let preheader_producer = loop_control.preheader_transfer().producer();
+    let header_producer = routing.header_control().producer();
+    let backedge_producer = routing.body_transfer().producer();
+    if preheader_effect.direct_control_evidence() != Some(loop_control.preheader_transfer())
+        || preheader_effect.disposition()
+            != &(EffectDisposition::AbsorbedIntoControl {
+                producer: preheader_producer,
+            })
+        || predicate_effect.conditional_control_evidence() != Some(routing.header_control())
+        || header_transfer_effect.conditional_control_evidence() != Some(routing.header_control())
+        || predicate_effect.disposition()
+            != &(EffectDisposition::AbsorbedIntoControl {
+                producer: header_producer,
+            })
+        || header_transfer_effect.disposition()
+            != &(EffectDisposition::AbsorbedIntoControl {
+                producer: header_producer,
+            })
+        || backedge_effect.direct_control_evidence() != Some(routing.body_transfer())
+        || backedge_effect.disposition()
+            != &(EffectDisposition::AbsorbedIntoControl {
+                producer: backedge_producer,
+            })
+    {
+        return Err(RenderAuthorizationError::InvalidRegionDisposition(
+            preheader_obligation,
+        ));
+    }
+
+    let exit_producer = *exit
+        .instructions()
+        .last()
+        .expect("checked nonempty loop exit");
+    let exit_returns = origin
+        .source()
+        .obligations()
+        .values()
+        .filter(|obligation| {
+            obligation.id.instruction == exit_producer
+                && obligation.id.kind == SemanticObligationKind::Return
+        })
+        .collect::<Vec<_>>();
+    let [exit_return] = exit_returns.as_slice() else {
+        return Err(RenderAuthorizationError::InvalidRegionTopology);
+    };
+    let [exit_return_effect] = ledger.effects(exit_return.id) else {
+        return Err(RenderAuthorizationError::IncompleteLedger);
+    };
+    let Some(return_control) = exit_return_effect.return_control_evidence() else {
+        return Err(RenderAuthorizationError::InvalidRegionDisposition(
+            exit_return.id,
+        ));
+    };
+    let return_matches = match interface.return_kind() {
+        SourceFunctionReturn::Void => return_control.values().is_empty(),
+        SourceFunctionReturn::Register { storage } => matches!(
+            return_control.values(),
+            [value] if value.slot() == CallBoundarySlot::Register { index: 0, storage }
+        ),
+    };
+    if return_control.producer() != exit_producer
+        || exit_return_effect.disposition()
+            != &(EffectDisposition::AbsorbedIntoReturn {
+                producer: exit_producer,
+            })
+        || !return_matches
+    {
+        return Err(RenderAuthorizationError::InvalidRegionDisposition(
+            exit_return.id,
+        ));
+    }
+
+    for obligation in origin.source().obligations().values() {
+        let [effect] = ledger.effects(obligation.id) else {
+            return Err(RenderAuthorizationError::IncompleteLedger);
+        };
+        let valid = match obligation.id.kind {
+            SemanticObligationKind::LiveValueProducer => {
+                obligation.id.instruction.block_addr == exit_addr
+                    && matches!(
+                        effect.disposition(),
+                        EffectDisposition::AbsorbedIntoExpression { .. }
+                    )
+            }
+            SemanticObligationKind::ControlPredicate => {
+                obligation.id == predicate_obligation
+                    && effect.conditional_control_evidence() == Some(routing.header_control())
+            }
+            SemanticObligationKind::ControlTransfer => {
+                (obligation.id == preheader_obligation
+                    && effect.direct_control_evidence() == Some(loop_control.preheader_transfer()))
+                    || (obligation.id == header_transfer_obligation
+                        && effect.conditional_control_evidence() == Some(routing.header_control()))
+                    || (obligation.id == backedge_obligation
+                        && effect.direct_control_evidence() == Some(routing.body_transfer()))
+            }
+            SemanticObligationKind::Return | SemanticObligationKind::ReturnValue => {
+                obligation.id.instruction == exit_producer
+                    && effect.return_control_evidence() == Some(return_control)
+                    && matches!(
+                        effect.disposition(),
+                        EffectDisposition::AbsorbedIntoReturn { producer }
+                            if *producer == exit_producer
+                    )
+            }
+            _ => false,
+        };
+        if !valid {
+            return Err(RenderAuthorizationError::InvalidRegionDisposition(
+                obligation.id,
+            ));
+        }
+    }
+
+    let mappings = mappings.into_iter().collect::<Vec<_>>();
+    let mut by_obligation = BTreeMap::<SemanticObligationId, &TypedRegionMapping>::new();
+    for mapping in &mappings {
+        if !origin
+            .source()
+            .obligations()
+            .contains_key(&mapping.obligation)
+        {
+            return Err(RenderAuthorizationError::UnexpectedMapping(
+                mapping.obligation,
+            ));
+        }
+        if by_obligation.insert(mapping.obligation, mapping).is_some() {
+            return Err(RenderAuthorizationError::DuplicateMapping(
+                mapping.obligation,
+            ));
+        }
+    }
+    for obligation in origin.source().obligations().keys() {
+        let mapping = by_obligation
+            .get(obligation)
+            .ok_or(RenderAuthorizationError::MissingMapping(*obligation))?;
+        let [effect] = ledger.effects(*obligation) else {
+            return Err(RenderAuthorizationError::IncompleteLedger);
+        };
+        if effect.disposition() != mapping.source_disposition()
+            || matches!(
+                mapping.source_disposition(),
+                EffectDisposition::Residualized { .. } | EffectDisposition::Refused { .. }
+            )
+        {
+            return Err(RenderAuthorizationError::DispositionMismatch(*obligation));
+        }
+    }
+    Ok(CertifiedRenderPermit {
+        schema_version: CERTIFICATION_SCHEMA_VERSION,
+        origin: origin.clone(),
+        region_kind: CertifiedTypedRegionKind::CarrierFreeLoopTerminalReturnFunction,
+        region_schema_version: CERTIFIED_CARRIER_FREE_LOOP_TERMINAL_RETURN_CONTRACT_VERSION,
+        mappings: mappings.into_boxed_slice(),
+    })
+}
+
+/// Authorize the exact closed unsigned counted-loop function sealed by
+/// [`CertifiedClosedCountedLoopControl`]. The typed consumer must preserve the
+/// ordered initializer, header test, latch update, and final carrier return.
+pub fn certify_counted_loop_terminal_return_region(
+    origin: &CertifiedArtifactOrigin,
+    ledger: &ObligationLedger,
+    mappings: impl IntoIterator<Item = TypedRegionMapping>,
+    loop_control: &CertifiedClosedCountedLoopControl,
+) -> Result<CertifiedRenderPermit, RenderAuthorizationError> {
+    let state = loop_control.state();
+    if origin.schema_version() != CERTIFICATION_SCHEMA_VERSION
+        || !origin.matches_retained_source(origin.source(), origin.topology())
+        || loop_control.schema_version() != CERTIFICATION_SCHEMA_VERSION
+        || loop_control.origin() != origin
+        || state.schema_version() != CERTIFICATION_SCHEMA_VERSION
+        || state.origin() != origin
+        || state.validate(origin.source()).is_err()
+        || loop_control.header_control().condition() != state.condition()
+        || loop_control.preheader_transfer().target() != state.header()
+        || loop_control.header_control().true_target() != state.latch()
+        || loop_control.header_control().false_target() != state.exit()
+        || loop_control.backedge_transfer().target() != state.header()
+        || origin
+            .machine_context()
+            .source()
+            .function_interface()
+            .is_none_or(|interface| {
+                interface.parameters().len() != 1
+                    || !interface.stack_slots().is_empty()
+                    || interface
+                        .parameters()
+                        .get(loop_control.parameter_index() as usize)
+                        .is_none_or(|parameter| {
+                            parameter.index() != loop_control.parameter_index()
+                                || parameter.storage() != loop_control.parameter_storage()
+                                || parameter.storage().size.checked_mul(8)
+                                    != Some(state.bound().binding().width_bits())
+                        })
+            })
+    {
+        return Err(RenderAuthorizationError::InvalidOrigin);
+    }
+    let topology = origin.topology();
+    let (Some(preheader), Some(header), Some(latch), Some(exit)) = (
+        topology.block(state.preheader()),
+        topology.block(state.header()),
+        topology.block(state.latch()),
+        topology.block(state.exit()),
+    ) else {
+        return Err(RenderAuthorizationError::InvalidRegionTopology);
+    };
+    if topology.entry_addr() != state.preheader()
+        || topology.blocks().len() != 4
+        || preheader.instructions().last() != Some(&loop_control.preheader_transfer().producer())
+        || header.instructions().last() != Some(&loop_control.header_control().producer())
+        || latch.instructions().last() != Some(&loop_control.backedge_transfer().producer())
+        || exit.instructions().last() != Some(&loop_control.return_control().producer())
+        || preheader.successors() != [state.header()]
+        || header.successors().iter().copied().collect::<BTreeSet<_>>()
+            != BTreeSet::from([state.latch(), state.exit()])
+        || latch.successors() != [state.header()]
+        || !exit.successors().is_empty()
+        || origin.source().obligations().values().any(|obligation| {
+            !matches!(
+                obligation.id.kind,
+                SemanticObligationKind::LiveValueProducer
+                    | SemanticObligationKind::LoopCarriedState
+                    | SemanticObligationKind::LiveStateTransition
+                    | SemanticObligationKind::ControlPredicate
+                    | SemanticObligationKind::ControlTransfer
+                    | SemanticObligationKind::Return
+                    | SemanticObligationKind::ReturnValue
+            )
+        })
+    {
+        return Err(RenderAuthorizationError::InvalidRegionTopology);
+    }
+    let report = ledger.audit(origin.source());
+    if !report.has_exactly_one_disposition_per_source() || !report.invalid().is_empty() {
+        return Err(RenderAuthorizationError::IncompleteLedger);
+    }
+    if let Some(obligation) = report.residualized().iter().chain(report.refused()).next() {
+        return Err(RenderAuthorizationError::ResidualOrRefusedObligation(
+            *obligation,
+        ));
+    }
+    for obligation in origin.source().obligations().values() {
+        let [effect] = ledger.effects(obligation.id) else {
+            return Err(RenderAuthorizationError::IncompleteLedger);
+        };
+        let valid = if state.source_obligations().contains(&obligation.id) {
+            effect.disposition()
+                == &(EffectDisposition::AbsorbedIntoLoopState {
+                    producer: state.producer(),
+                })
+                && effect.counted_loop_state_evidence() == Some(state)
+        } else {
+            match obligation.id.kind {
+                SemanticObligationKind::LiveValueProducer => matches!(
+                    effect.disposition(),
+                    EffectDisposition::AbsorbedIntoExpression { producer }
+                        if *producer == obligation.id.instruction
+                ),
+                SemanticObligationKind::ControlPredicate => {
+                    obligation.id.instruction == loop_control.header_control().producer()
+                        && effect.conditional_control_evidence()
+                            == Some(loop_control.header_control())
+                }
+                SemanticObligationKind::ControlTransfer => {
+                    (obligation.id.instruction == loop_control.preheader_transfer().producer()
+                        && effect.direct_control_evidence()
+                            == Some(loop_control.preheader_transfer()))
+                        || (obligation.id.instruction == loop_control.header_control().producer()
+                            && effect.conditional_control_evidence()
+                                == Some(loop_control.header_control()))
+                        || (obligation.id.instruction
+                            == loop_control.backedge_transfer().producer()
+                            && effect.direct_control_evidence()
+                                == Some(loop_control.backedge_transfer()))
+                }
+                SemanticObligationKind::Return | SemanticObligationKind::ReturnValue => {
+                    obligation.id.instruction == loop_control.return_control().producer()
+                        && effect.return_control_evidence() == Some(loop_control.return_control())
+                }
+                _ => false,
+            }
+        };
+        if !valid {
+            return Err(RenderAuthorizationError::InvalidRegionDisposition(
+                obligation.id,
+            ));
+        }
+    }
+
+    let mappings = mappings.into_iter().collect::<Vec<_>>();
+    let mut by_obligation = BTreeMap::<SemanticObligationId, &TypedRegionMapping>::new();
+    for mapping in &mappings {
+        if !origin
+            .source()
+            .obligations()
+            .contains_key(&mapping.obligation)
+        {
+            return Err(RenderAuthorizationError::UnexpectedMapping(
+                mapping.obligation,
+            ));
+        }
+        if by_obligation.insert(mapping.obligation, mapping).is_some() {
+            return Err(RenderAuthorizationError::DuplicateMapping(
+                mapping.obligation,
+            ));
+        }
+    }
+    for obligation in origin.source().obligations().keys() {
+        let mapping = by_obligation
+            .get(obligation)
+            .ok_or(RenderAuthorizationError::MissingMapping(*obligation))?;
+        let [effect] = ledger.effects(*obligation) else {
+            return Err(RenderAuthorizationError::IncompleteLedger);
+        };
+        if effect.disposition() != mapping.source_disposition()
+            || matches!(
+                mapping.source_disposition(),
+                EffectDisposition::Residualized { .. } | EffectDisposition::Refused { .. }
+            )
+        {
+            return Err(RenderAuthorizationError::DispositionMismatch(*obligation));
+        }
+    }
+    Ok(CertifiedRenderPermit {
+        schema_version: CERTIFICATION_SCHEMA_VERSION,
+        origin: origin.clone(),
+        region_kind: CertifiedTypedRegionKind::CountedLoopTerminalReturnFunction,
+        region_schema_version: CERTIFIED_COUNTED_LOOP_TERMINAL_RETURN_CONTRACT_VERSION,
+        mappings: mappings.into_boxed_slice(),
+    })
+}
+
+/// Certification owner for one canonical function.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CertifiedFunction {
+    schema_version: u32,
+    source: SemanticObligationInventory,
+    ledger: ObligationLedger,
+}
+
+impl CertifiedFunction {
+    pub fn new(source: SemanticObligationInventory) -> Result<Self, CertificationError> {
+        validate_source(&source)?;
+        Ok(Self {
+            schema_version: CERTIFICATION_SCHEMA_VERSION,
+            source,
+            ledger: ObligationLedger::new(),
+        })
+    }
+
+    pub fn source(&self) -> &SemanticObligationInventory {
+        &self.source
+    }
+
+    pub fn ledger(&self) -> &ObligationLedger {
+        &self.ledger
+    }
+
+    // Positive dispositions stay sealed until the typed semantic AST validator
+    // can construct proof-bearing output entities.
+    #[cfg(test)]
+    fn record_rendered(
+        &mut self,
+        obligation: SemanticObligationId,
+        output: CertifiedEntity,
+    ) -> Result<(), CertificationError> {
+        let effect = CertifiedEffect {
+            schema_version: CERTIFICATION_SCHEMA_VERSION,
+            obligation,
+            disposition: EffectDisposition::Rendered,
+            evidence: DispositionEvidence::Output(output),
+        };
+        effect.validate(&self.source)?;
+        self.ledger.record(effect);
+        Ok(())
+    }
+
+    fn record_absorbed_expression(
+        &mut self,
+        obligation: SemanticObligationId,
+        expression: CertifiedExpr,
+    ) -> Result<(), CertificationError> {
+        if obligation.kind != SemanticObligationKind::LiveValueProducer {
+            return Err(CertificationError::ObligationNotMapped(obligation));
+        }
+        let producer = expression.entity().producer();
+        let effect = CertifiedEffect {
+            schema_version: CERTIFICATION_SCHEMA_VERSION,
+            obligation,
+            disposition: EffectDisposition::AbsorbedIntoExpression { producer },
+            evidence: DispositionEvidence::Expression(expression),
+        };
+        effect.validate(&self.source)?;
+        self.ledger.record(effect);
+        Ok(())
+    }
+
+    fn record_absorbed_statement(
+        &mut self,
+        obligation: SemanticObligationId,
+        statement: CertifiedMemoryStatement,
+    ) -> Result<(), CertificationError> {
+        if !matches!(
+            obligation.kind,
+            SemanticObligationKind::ObservableMemoryRead
+                | SemanticObligationKind::ObservableMemoryWrite
+        ) {
+            return Err(CertificationError::ObligationNotMapped(obligation));
+        }
+        let producer = statement.producer();
+        let effect = CertifiedEffect {
+            schema_version: CERTIFICATION_SCHEMA_VERSION,
+            obligation,
+            disposition: EffectDisposition::AbsorbedIntoStatement { producer },
+            evidence: DispositionEvidence::Statement(statement),
+        };
+        effect.validate(&self.source)?;
+        self.ledger.record(effect);
+        Ok(())
+    }
+
+    fn record_absorbed_control(
+        &mut self,
+        control: CertifiedDirectControl,
+    ) -> Result<(), CertificationError> {
+        let obligation = control.source_obligation();
+        if obligation.kind != SemanticObligationKind::ControlTransfer {
+            return Err(CertificationError::ObligationNotMapped(obligation));
+        }
+        let producer = control.producer();
+        let effect = CertifiedEffect {
+            schema_version: CERTIFICATION_SCHEMA_VERSION,
+            obligation,
+            disposition: EffectDisposition::AbsorbedIntoControl { producer },
+            evidence: DispositionEvidence::Control(control),
+        };
+        effect.validate(&self.source)?;
+        self.ledger.record(effect);
+        Ok(())
+    }
+
+    fn record_absorbed_call(
+        &mut self,
+        call: CertifiedDirectCall,
+    ) -> Result<(), CertificationError> {
+        let producer = call.producer();
+        for obligation in call.source_obligations() {
+            if !matches!(
+                obligation.kind,
+                SemanticObligationKind::Call | SemanticObligationKind::CallArgument
+            ) {
+                return Err(CertificationError::ObligationNotMapped(obligation));
+            }
+            let effect = CertifiedEffect {
+                schema_version: CERTIFICATION_SCHEMA_VERSION,
+                obligation,
+                disposition: EffectDisposition::AbsorbedIntoCall { producer },
+                evidence: DispositionEvidence::Call(call.clone()),
+            };
+            effect.validate(&self.source)?;
+            self.ledger.record(effect);
+        }
+        Ok(())
+    }
+
+    fn record_absorbed_conditional_control(
+        &mut self,
+        control: CertifiedConditionalControl,
+    ) -> Result<(), CertificationError> {
+        let producer = control.producer();
+        for obligation in control.source_obligations() {
+            if !matches!(
+                obligation.kind,
+                SemanticObligationKind::ControlPredicate | SemanticObligationKind::ControlTransfer
+            ) {
+                return Err(CertificationError::ObligationNotMapped(obligation));
+            }
+            let effect = CertifiedEffect {
+                schema_version: CERTIFICATION_SCHEMA_VERSION,
+                obligation,
+                disposition: EffectDisposition::AbsorbedIntoControl { producer },
+                evidence: DispositionEvidence::ConditionalControl(control.clone()),
+            };
+            effect.validate(&self.source)?;
+            self.ledger.record(effect);
+        }
+        Ok(())
+    }
+
+    fn record_absorbed_switch_control(
+        &mut self,
+        control: CertifiedSwitchControl,
+    ) -> Result<(), CertificationError> {
+        let obligation = control.source_obligation();
+        if obligation.kind != SemanticObligationKind::ControlTransfer {
+            return Err(CertificationError::ObligationNotMapped(obligation));
+        }
+        let producer = control.producer();
+        let effect = CertifiedEffect {
+            schema_version: CERTIFICATION_SCHEMA_VERSION,
+            obligation,
+            disposition: EffectDisposition::AbsorbedIntoControl { producer },
+            evidence: DispositionEvidence::SwitchControl(Box::new(control)),
+        };
+        effect.validate(&self.source)?;
+        self.ledger.record(effect);
+        Ok(())
+    }
+
+    fn record_absorbed_return(
+        &mut self,
+        control: CertifiedReturnControl,
+    ) -> Result<(), CertificationError> {
+        let producer = control.producer();
+        for obligation in control.source_obligations() {
+            if !matches!(
+                obligation.kind,
+                SemanticObligationKind::Return | SemanticObligationKind::ReturnValue
+            ) {
+                return Err(CertificationError::ObligationNotMapped(obligation));
+            }
+            let effect = CertifiedEffect {
+                schema_version: CERTIFICATION_SCHEMA_VERSION,
+                obligation,
+                disposition: EffectDisposition::AbsorbedIntoReturn { producer },
+                evidence: DispositionEvidence::ReturnControl(control.clone()),
+            };
+            effect.validate(&self.source)?;
+            self.ledger.record(effect);
+        }
+        Ok(())
+    }
+
+    fn record_absorbed_counted_loop_state(
+        &mut self,
+        state: CertifiedCountedLoopState,
+    ) -> Result<(), CertificationError> {
+        let producer = state.producer();
+        for obligation in state.source_obligations() {
+            if !matches!(
+                obligation.kind,
+                SemanticObligationKind::LiveValueProducer
+                    | SemanticObligationKind::LoopCarriedState
+                    | SemanticObligationKind::LiveStateTransition
+            ) {
+                return Err(CertificationError::ObligationNotMapped(*obligation));
+            }
+            let effect = CertifiedEffect {
+                schema_version: CERTIFICATION_SCHEMA_VERSION,
+                obligation: *obligation,
+                disposition: EffectDisposition::AbsorbedIntoLoopState { producer },
+                evidence: DispositionEvidence::LoopState(Box::new(state.clone())),
+            };
+            effect.validate(&self.source)?;
+            self.ledger.record(effect);
+        }
+        Ok(())
+    }
+
+    fn record_absorbed_conditional_return_state(
+        &mut self,
+        state: CertifiedConditionalReturnCarrier,
+    ) -> Result<(), CertificationError> {
+        let producer = state.producer();
+        for obligation in state.source_obligations() {
+            if !matches!(
+                obligation.kind,
+                SemanticObligationKind::LiveValueProducer
+                    | SemanticObligationKind::ObservableMemoryRead
+                    | SemanticObligationKind::ObservableMemoryWrite
+            ) {
+                return Err(CertificationError::ObligationNotMapped(*obligation));
+            }
+            let effect = CertifiedEffect {
+                schema_version: CERTIFICATION_SCHEMA_VERSION,
+                obligation: *obligation,
+                disposition: EffectDisposition::AbsorbedIntoConditionalReturnState { producer },
+                evidence: DispositionEvidence::ConditionalReturnState(Box::new(state.clone())),
+            };
+            effect.validate(&self.source)?;
+            self.ledger.record(effect);
+        }
+        Ok(())
+    }
+
+    fn record_absorbed_private_frame_state(
+        &mut self,
+        state: CertifiedPrivateFrameConditionalReturn,
+    ) -> Result<(), CertificationError> {
+        for obligation in state.source_obligations() {
+            if !matches!(
+                obligation.kind,
+                SemanticObligationKind::LiveValueProducer
+                    | SemanticObligationKind::ObservableMemoryRead
+                    | SemanticObligationKind::ObservableMemoryWrite
+                    | SemanticObligationKind::VolatileOrUnknownEffect
+            ) {
+                return Err(CertificationError::ObligationNotMapped(*obligation));
+            }
+            let producer = obligation.instruction;
+            let effect = CertifiedEffect {
+                schema_version: CERTIFICATION_SCHEMA_VERSION,
+                obligation: *obligation,
+                disposition: EffectDisposition::AbsorbedIntoPrivateFrameState { producer },
+                evidence: DispositionEvidence::PrivateFrameState(Box::new(state.clone())),
+            };
+            effect.validate(&self.source)?;
+            self.ledger.record(effect);
+        }
+        Ok(())
+    }
+
+    fn record_absorbed_fnv_fold_state(
+        &mut self,
+        state: CertifiedFnvFoldLoop,
+    ) -> Result<(), CertificationError> {
+        for obligation in state.source_obligations() {
+            if !matches!(
+                obligation.kind,
+                SemanticObligationKind::LiveValueProducer
+                    | SemanticObligationKind::LoopCarriedState
+                    | SemanticObligationKind::LiveStateTransition
+            ) {
+                return Err(CertificationError::ObligationNotMapped(*obligation));
+            }
+            let producer = obligation.instruction;
+            let effect = CertifiedEffect {
+                schema_version: CERTIFICATION_SCHEMA_VERSION,
+                obligation: *obligation,
+                disposition: EffectDisposition::AbsorbedIntoFnvFoldState { producer },
+                evidence: DispositionEvidence::FnvFoldState(Box::new(state.clone())),
+            };
+            effect.validate(&self.source)?;
+            self.ledger.record(effect);
+        }
+        Ok(())
+    }
+
+    fn record_absorbed_fnv_fold_o0(
+        &mut self,
+        state: &CertifiedFnvFoldO0Function,
+    ) -> Result<(), CertificationError> {
+        state
+            .validate(&self.source)
+            .map_err(|_| CertificationError::IncompleteSourceInventory)?;
+        if state
+            .obligation_dispositions()
+            .iter()
+            .any(|(_, class)| *class == CertifiedFnvFoldO0DispositionClass::ProvenDead)
+        {
+            return Err(CertificationError::IncompleteSourceInventory);
+        }
+        for (obligation, class) in state.obligation_dispositions() {
+            let producer = obligation.instruction;
+            let disposition = match class {
+                CertifiedFnvFoldO0DispositionClass::ProvenDead => {
+                    return Err(CertificationError::ObligationNotMapped(*obligation));
+                }
+                CertifiedFnvFoldO0DispositionClass::FrameState => {
+                    EffectDisposition::AbsorbedIntoFnvFoldO0FrameState { producer }
+                }
+                CertifiedFnvFoldO0DispositionClass::InvariantHomeRelay => {
+                    EffectDisposition::AbsorbedIntoFnvFoldO0InvariantHomeRelay { producer }
+                }
+                CertifiedFnvFoldO0DispositionClass::ExternalAliasSealing => {
+                    EffectDisposition::AbsorbedIntoFnvFoldO0ExternalAlias { producer }
+                }
+                CertifiedFnvFoldO0DispositionClass::ForwarderControl => {
+                    EffectDisposition::AbsorbedIntoFnvFoldO0Forwarder { producer }
+                }
+                CertifiedFnvFoldO0DispositionClass::LoopControl => {
+                    EffectDisposition::AbsorbedIntoFnvFoldO0LoopControl { producer }
+                }
+                CertifiedFnvFoldO0DispositionClass::Semantics => {
+                    EffectDisposition::AbsorbedIntoFnvFoldO0Semantics { producer }
+                }
+                CertifiedFnvFoldO0DispositionClass::Return => {
+                    EffectDisposition::AbsorbedIntoFnvFoldO0Return { producer }
+                }
+            };
+            let effect = CertifiedEffect {
+                schema_version: CERTIFICATION_SCHEMA_VERSION,
+                obligation: *obligation,
+                disposition,
+                evidence: DispositionEvidence::FnvFoldO0(CertifiedFnvFoldO0EvidenceRef {
+                    proof_slot: CERTIFIED_FNV_FOLD_O0_PROOF_SLOT,
+                    class: *class,
+                }),
+            };
+            effect.validate(&self.source)?;
+            self.ledger.record(effect);
+        }
+        Ok(())
+    }
+
+    fn record_absorbed_fnv_latch_control(
+        &mut self,
+        control: CertifiedFnvFoldLatchControl,
+    ) -> Result<(), CertificationError> {
+        let producer = control.producer();
+        for obligation in control.source_obligations() {
+            if !matches!(
+                obligation.kind,
+                SemanticObligationKind::ControlPredicate | SemanticObligationKind::ControlTransfer
+            ) {
+                return Err(CertificationError::ObligationNotMapped(obligation));
+            }
+            let effect = CertifiedEffect {
+                schema_version: CERTIFICATION_SCHEMA_VERSION,
+                obligation,
+                disposition: EffectDisposition::AbsorbedIntoControl { producer },
+                evidence: DispositionEvidence::FnvFoldLatchControl(control.clone()),
+            };
+            effect.validate(&self.source)?;
+            self.ledger.record(effect);
+        }
+        Ok(())
+    }
+
+    pub fn residualize(
+        &mut self,
+        obligation: SemanticObligationId,
+        reason: impl Into<String>,
+    ) -> Result<(), CertificationError> {
+        self.record_diagnostic(obligation, reason.into(), false)
+    }
+
+    pub fn refuse(
+        &mut self,
+        obligation: SemanticObligationId,
+        reason: impl Into<String>,
+    ) -> Result<(), CertificationError> {
+        self.record_diagnostic(obligation, reason.into(), true)
+    }
+
+    fn record_diagnostic(
+        &mut self,
+        obligation: SemanticObligationId,
+        reason: String,
+        refused: bool,
+    ) -> Result<(), CertificationError> {
+        if reason.trim().is_empty() {
+            return Err(CertificationError::EmptyReason);
+        }
+        let disposition = if refused {
+            EffectDisposition::Refused { reason }
+        } else {
+            EffectDisposition::Residualized { reason }
+        };
+        let effect = CertifiedEffect {
+            schema_version: CERTIFICATION_SCHEMA_VERSION,
+            obligation,
+            disposition,
+            evidence: DispositionEvidence::Diagnostic,
+        };
+        effect.validate(&self.source)?;
+        self.ledger.record(effect);
+        Ok(())
+    }
+
+    pub fn apply_rewrite(&mut self, certificate: &RewriteCertificate) -> RewriteCertificateReport {
+        let report = certificate.audit(&self.source);
+        if !report.is_closed() {
+            return report;
+        }
+        for (id, dispositions) in &certificate.dispositions {
+            for disposition in dispositions {
+                let evidence = if matches!(
+                    disposition,
+                    EffectDisposition::Residualized { .. } | EffectDisposition::Refused { .. }
+                ) {
+                    DispositionEvidence::Diagnostic
+                } else {
+                    DispositionEvidence::Rewrite {
+                        schema_version: certificate.schema_version,
+                        pass: certificate.pass.clone(),
+                    }
+                };
+                self.ledger.record(CertifiedEffect {
+                    schema_version: CERTIFICATION_SCHEMA_VERSION,
+                    obligation: *id,
+                    disposition: disposition.clone(),
+                    evidence,
+                });
+            }
+        }
+        report
+    }
+
+    pub fn finish(&self) -> CertificationReport {
+        let mut report = self.ledger.audit(&self.source);
+        if let Err(error) = validate_schema(self.schema_version) {
+            push_failure(&mut report, None, format!("{error:?}"));
+        }
+        report
+    }
+}
+
+/// One immutable canonical block in the artifact that owns certification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CertifiedSourceBlock {
+    addr: u64,
+    predecessors: Box<[u64]>,
+    successors: Box<[u64]>,
+    terminator: CertifiedSourceTerminator,
+    instructions: Box<[CanonicalInstructionId]>,
+}
+
+impl CertifiedSourceBlock {
+    pub const fn addr(&self) -> u64 {
+        self.addr
+    }
+
+    pub const fn predecessors(&self) -> &[u64] {
+        &self.predecessors
+    }
+
+    pub const fn successors(&self) -> &[u64] {
+        &self.successors
+    }
+
+    pub const fn terminator(&self) -> &CertifiedSourceTerminator {
+        &self.terminator
+    }
+
+    pub const fn instructions(&self) -> &[CanonicalInstructionId] {
+        &self.instructions
+    }
+}
+
+/// Exact source terminator, retaining branch-arm and switch-case identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum CertifiedSourceTerminator {
+    Fallthrough {
+        next: u64,
+    },
+    Branch {
+        target: u64,
+    },
+    ConditionalBranch {
+        true_target: u64,
+        false_target: u64,
+    },
+    IndirectBranch,
+    Switch {
+        switch_addr: u64,
+        terminal_instruction_addr: u64,
+        min_value: u64,
+        max_value: u64,
+        cases: Box<[(u64, u64)]>,
+        default: Option<u64>,
+    },
+    Call {
+        target: u64,
+        fallthrough: Option<u64>,
+    },
+    IndirectCall {
+        fallthrough: Option<u64>,
+    },
+    Return,
+    None,
+}
+
+impl CertifiedSourceTerminator {
+    fn from_block(block: &r2ssa::BasicBlock) -> Result<Self, MachineBuildError> {
+        Ok(match &block.terminator {
+            BlockTerminator::Fallthrough { next } => Self::Fallthrough { next: *next },
+            BlockTerminator::Branch { target } => Self::Branch { target: *target },
+            BlockTerminator::ConditionalBranch {
+                true_target,
+                false_target,
+            } => Self::ConditionalBranch {
+                true_target: *true_target,
+                false_target: *false_target,
+            },
+            BlockTerminator::IndirectBranch => Self::IndirectBranch,
+            BlockTerminator::Switch { cases, default } => {
+                let switch = block
+                    .switch_info
+                    .as_ref()
+                    .ok_or(MachineBuildError::TopologyMismatch)?;
+                let source_cases = switch
+                    .cases
+                    .iter()
+                    .map(|case| (case.value, case.target))
+                    .collect::<Vec<_>>();
+                if source_cases != *cases || switch.default_target != *default {
+                    return Err(MachineBuildError::TopologyMismatch);
+                }
+                Self::Switch {
+                    switch_addr: switch.switch_addr,
+                    terminal_instruction_addr: block
+                        .terminal_instruction_addr()
+                        .ok_or(MachineBuildError::TopologyMismatch)?,
+                    min_value: switch.min_val,
+                    max_value: switch.max_val,
+                    cases: cases.clone().into_boxed_slice(),
+                    default: *default,
+                }
+            }
+            BlockTerminator::Call {
+                target,
+                fallthrough,
+            } => Self::Call {
+                target: *target,
+                fallthrough: *fallthrough,
+            },
+            BlockTerminator::IndirectCall { fallthrough } => Self::IndirectCall {
+                fallthrough: *fallthrough,
+            },
+            BlockTerminator::Return => Self::Return,
+            BlockTerminator::None => Self::None,
+        })
+    }
+}
+
+/// Artifact-bound source topology, including empty canonical blocks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CertifiedSourceTopology {
+    schema_version: u32,
+    entry_addr: u64,
+    blocks: Box<[CertifiedSourceBlock]>,
+}
+
+impl CertifiedSourceTopology {
+    pub const fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    pub const fn entry_addr(&self) -> u64 {
+        self.entry_addr
+    }
+
+    pub const fn blocks(&self) -> &[CertifiedSourceBlock] {
+        &self.blocks
+    }
+
+    pub fn block(&self, addr: u64) -> Option<&CertifiedSourceBlock> {
+        self.blocks.iter().find(|block| block.addr == addr)
+    }
+}
+
+fn certified_artifact_origin(
+    artifact: &SsaArtifact,
+    machine_context: &CertifiedMachineContext,
+    topology: &CertifiedSourceTopology,
+) -> Result<CertifiedArtifactOrigin, MachineBuildError> {
+    let graph = artifact.graph();
+    let graph_snapshot = serde_json::to_vec(&(
+        graph.entry,
+        &graph.block_order,
+        &graph.blocks,
+        &graph.insts,
+        &graph.values,
+        &graph.def_of,
+        &graph.uses_of,
+    ))
+    .map_err(|_| MachineBuildError::TopologyMismatch)?;
+    if graph_snapshot.is_empty() {
+        return Err(MachineBuildError::TopologyMismatch);
+    }
+    let decompile_preparation = artifact.function().decompile_prep_facts().map(|facts| {
+        CertifiedDecompilerPreparationSnapshot {
+            canonical_value_roots: facts
+                .canonical_value_roots
+                .iter()
+                .map(|(value, root)| (value.clone(), root.clone()))
+                .collect(),
+            stack_address_roots: facts
+                .stack_address_roots
+                .iter()
+                .map(|(value, root)| (value.clone(), *root))
+                .collect(),
+            formal_parameters: facts
+                .formal_parameters
+                .iter()
+                .map(|(value, index)| (value.clone(), *index))
+                .collect(),
+            formal_parameter_bases: facts
+                .formal_parameter_bases
+                .iter()
+                .map(|(value, index)| (value.clone(), *index))
+                .collect(),
+        }
+    });
+    Ok(CertifiedArtifactOrigin {
+        schema_version: CERTIFICATION_SCHEMA_VERSION,
+        graph_snapshot: graph_snapshot.into_boxed_slice(),
+        prepare_mode: artifact.mode().into(),
+        decompile_preparation,
+        assumptions: artifact.facts().assumptions.clone(),
+        machine_context: machine_context.clone(),
+        source: artifact.obligations().clone(),
+        topology: topology.clone(),
+    })
+}
+
+fn certified_direct_calls(
+    artifact: &SsaArtifact,
+    topology: &CertifiedSourceTopology,
+) -> Result<BTreeMap<CanonicalInstructionId, CertifiedDirectCall>, MachineBuildError> {
+    let graph = artifact.graph();
+    let cfg = artifact.function().cfg();
+    let mut calls = BTreeMap::new();
+    for block in topology.blocks() {
+        let CertifiedSourceTerminator::Call {
+            target,
+            fallthrough: Some(fallthrough),
+        } = block.terminator()
+        else {
+            continue;
+        };
+        if *target == block.addr()
+            || *target == *fallthrough
+            || *fallthrough == block.addr()
+            || topology.block(*fallthrough).is_none()
+            || block.successors() != [*fallthrough]
+        {
+            continue;
+        }
+        let Some(producer) = block.instructions().last().copied() else {
+            continue;
+        };
+        if has_earlier_terminal_control(artifact.obligations(), block) {
+            continue;
+        }
+        let Some(disposition) = artifact.obligations().instructions().get(&producer) else {
+            return Err(MachineBuildError::TopologyMismatch);
+        };
+        let Some(inst) = graph.inst(disposition.inst) else {
+            return Err(MachineBuildError::MissingInstruction(disposition.inst));
+        };
+        let Some((block_addr, op_index)) = graph.op_site_for_inst(inst.id) else {
+            return Err(MachineBuildError::TopologyMismatch);
+        };
+        let Some(source_block) = cfg.get_block(block.addr()) else {
+            return Err(MachineBuildError::TopologyMismatch);
+        };
+        let raw_target = source_block.ops.get(op_index).and_then(|op| match op {
+            r2il::R2ILOp::Call { target: raw_target }
+                if matches!(raw_target.space, r2il::SpaceId::Ram | r2il::SpaceId::Const)
+                    && raw_target.offset == *target =>
+            {
+                Some(raw_target)
+            }
+            _ => None,
+        });
+        let Some(call_site_id) = artifact.call_sites().by_inst.get(&inst.id).copied() else {
+            continue;
+        };
+        let Some(call_site) = artifact.call_sites().by_id.get(&call_site_id) else {
+            continue;
+        };
+        let Some(raw_identity) = call_site.raw_identity else {
+            continue;
+        };
+        let Some(interface) = artifact.machine_context().call_site_interface(call_site_id) else {
+            continue;
+        };
+        let Some(boundary) = artifact.facts().boundaries.calls.get(&call_site_id) else {
+            continue;
+        };
+        if disposition.state != SemanticInstructionState::LiveObligation
+            || block_addr != block.addr()
+            || op_index + 1 != source_block.ops.len()
+            || raw_target.is_none()
+            || !matches!(inst.payload, InstPayload::Op(SSAOp::Call { .. }))
+            || inst.inputs.len() != 1
+            || call_site.at != inst.id
+            || call_site.raw_identity != Some(interface.identity())
+            || raw_identity != interface.identity()
+            || call_site.direct_target != Some(*target)
+            || call_site.fallthrough != Some(*fallthrough)
+            || !interface.is_complete()
+            || interface.is_variadic()
+            || interface.is_noreturn()
+            || !matches!(interface.result(), SourceCallResult::Void)
+            || !boundary.complete
+            || boundary.call_site != call_site_id
+            || boundary.at != inst.id
+            || boundary.calling_convention.as_deref() != Some(interface.calling_convention())
+            || boundary.variadic != Some(false)
+            || boundary.noreturn != Some(false)
+            || boundary.result_kind != Some(SourceCallResult::Void)
+            || !boundary.results.is_empty()
+            || boundary.arguments.len() != interface.arguments().len()
+        {
+            continue;
+        }
+        let raw_target = raw_target.expect("checked direct call target");
+        let Some(target_bits) = raw_target.size.checked_mul(8).filter(|bits| *bits != 0) else {
+            continue;
+        };
+        let memory_model = artifact.machine_context().memory_model();
+        if (memory_model.is_available()
+            && (memory_model.default_address_bits() == 0
+                || target_bits != memory_model.default_address_bits()))
+            || (target_bits < 64 && *target >= (1_u64 << target_bits))
+        {
+            continue;
+        }
+        let target_value = MachineValueUse::from_artifact(artifact, inst.inputs[0])?;
+        if target_value.binding().width_bits() != target_bits
+            || match raw_target.space {
+                r2il::SpaceId::Const => target_value.constant().is_none_or(|constant| {
+                    constant.width_bits() != target_bits || constant.bits() != *target
+                }),
+                r2il::SpaceId::Ram => target_value.constant().is_some(),
+                _ => true,
+            }
+        {
+            continue;
+        }
+        let arguments = boundary
+            .arguments
+            .iter()
+            .zip(interface.arguments())
+            .enumerate()
+            .map(|(position, (value, expected))| {
+                let CallBoundarySlot::Register { index, storage } = value.slot else {
+                    return Err(MachineBuildError::ObligationMismatch(inst.id));
+                };
+                if u32::try_from(position) != Ok(index)
+                    || index != expected.index()
+                    || storage != expected.storage()
+                {
+                    return Err(MachineBuildError::ObligationMismatch(inst.id));
+                }
+                let value_use = MachineValueUse::from_artifact(artifact, value.value)?;
+                if value_use.binding().width_bits()
+                    != storage
+                        .size
+                        .checked_mul(8)
+                        .ok_or(MachineBuildError::ObligationMismatch(inst.id))?
+                {
+                    return Err(MachineBuildError::ObligationMismatch(inst.id));
+                }
+                let origin = call_argument_origin_before_boundary(
+                    artifact, block, producer, storage, &value_use,
+                )
+                .ok_or(MachineBuildError::ObligationMismatch(inst.id))?;
+                Ok(CertifiedCallArgument {
+                    slot: value.slot,
+                    value: value_use,
+                    origin,
+                    source_obligation: SemanticObligationId {
+                        instruction: producer,
+                        kind: SemanticObligationKind::CallArgument,
+                        component: SemanticObligationComponent::RegisterSlot { index, storage },
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, MachineBuildError>>()?;
+        let call_obligation = SemanticObligationId {
+            instruction: producer,
+            kind: SemanticObligationKind::Call,
+            component: SemanticObligationComponent::Whole,
+        };
+        let expected_obligations = std::iter::once(call_obligation)
+            .chain(
+                arguments
+                    .iter()
+                    .map(CertifiedCallArgument::source_obligation),
+            )
+            .collect::<BTreeSet<_>>();
+        if disposition.obligations != expected_obligations {
+            continue;
+        }
+        let call = CertifiedDirectCall {
+            schema_version: CERTIFICATION_SCHEMA_VERSION,
+            producer,
+            source_inst: inst.id,
+            call_site: call_site_id,
+            raw_identity,
+            interface_revision: interface.revision_identity().to_vec().into_boxed_slice(),
+            target: *target,
+            fallthrough: *fallthrough,
+            target_value,
+            calling_convention: interface.calling_convention().to_string(),
+            arguments: arguments.into_boxed_slice(),
+            call_obligation,
+        };
+        call.validate(artifact.obligations())
+            .map_err(|_| MachineBuildError::ObligationMismatch(inst.id))?;
+        if calls.insert(producer, call).is_some() {
+            return Err(MachineBuildError::ObligationMismatch(inst.id));
+        }
+    }
+    Ok(calls)
+}
+
+fn call_argument_origin_before_boundary(
+    artifact: &SsaArtifact,
+    block: &CertifiedSourceBlock,
+    call_producer: CanonicalInstructionId,
+    storage: CanonicalStorageId,
+    value: &MachineValueUse,
+) -> Option<CertifiedCallArgumentOrigin> {
+    if let Some(constant) = value.constant() {
+        return Some(CertifiedCallArgumentOrigin::Constant { value: constant });
+    }
+    if let Some(producer) = value.producer() {
+        let call_position = block
+            .instructions()
+            .iter()
+            .position(|candidate| *candidate == call_producer)?;
+        let producer_is_before_call = block
+            .instructions()
+            .iter()
+            .position(|candidate| *candidate == producer)
+            .is_some_and(|position| position < call_position);
+        if !producer_is_before_call {
+            return None;
+        }
+        let source_inst = artifact
+            .obligations()
+            .instructions()
+            .get(&producer)
+            .and_then(|instruction| artifact.graph().inst(instruction.inst));
+        if let Some(source_inst) = source_inst
+            && matches!(source_inst.payload, InstPayload::Op(SSAOp::Copy { .. }))
+            && let [input] = source_inst.inputs.as_slice()
+        {
+            let input = MachineValueUse::from_artifact(artifact, *input).ok()?;
+            if let Some(constant) = input.constant() {
+                return Some(CertifiedCallArgumentOrigin::Constant { value: constant });
+            }
+            if input.producer().is_none() {
+                let matching = artifact
+                    .facts()
+                    .boundaries
+                    .parameters
+                    .iter()
+                    .filter_map(|(index, parameter)| {
+                        (parameter.storage == storage && parameter.value == input.binding().value())
+                            .then_some(*index)
+                    })
+                    .collect::<Vec<_>>();
+                if let [index] = matching.as_slice() {
+                    return Some(CertifiedCallArgumentOrigin::AbiParameter { index: *index });
+                }
+            }
+        }
+        return Some(CertifiedCallArgumentOrigin::Produced { producer });
+    }
+    let matching = artifact
+        .facts()
+        .boundaries
+        .parameters
+        .iter()
+        .filter_map(|(index, parameter)| {
+            (parameter.storage == storage && parameter.value == value.binding().value())
+                .then_some(*index)
+        })
+        .collect::<Vec<_>>();
+    let [index] = matching.as_slice() else {
+        return None;
+    };
+    Some(CertifiedCallArgumentOrigin::AbiParameter { index: *index })
+}
+
+fn certified_direct_controls(
+    artifact: &SsaArtifact,
+    topology: &CertifiedSourceTopology,
+) -> Result<BTreeMap<CanonicalInstructionId, CertifiedDirectControl>, MachineBuildError> {
+    let graph = artifact.graph();
+    let cfg = artifact.function().cfg();
+    let mut controls = BTreeMap::new();
+    for block in topology.blocks() {
+        let CertifiedSourceTerminator::Branch { target } = block.terminator() else {
+            continue;
+        };
+        if *target == block.addr()
+            || topology.block(*target).is_none()
+            || block.successors() != [*target]
+        {
+            continue;
+        }
+        let Some(producer) = block.instructions().last().copied() else {
+            continue;
+        };
+        if has_earlier_terminal_control(artifact.obligations(), block) {
+            continue;
+        }
+        let Some(disposition) = artifact.obligations().instructions().get(&producer) else {
+            return Err(MachineBuildError::TopologyMismatch);
+        };
+        let Some(inst) = graph.inst(disposition.inst) else {
+            return Err(MachineBuildError::MissingInstruction(disposition.inst));
+        };
+        let Some((block_addr, op_index)) = graph.op_site_for_inst(inst.id) else {
+            return Err(MachineBuildError::TopologyMismatch);
+        };
+        let Some(source_block) = cfg.get_block(block.addr()) else {
+            return Err(MachineBuildError::TopologyMismatch);
+        };
+        let raw_target = source_block.ops.get(op_index).and_then(|op| match op {
+            r2il::R2ILOp::Branch { target: raw_target }
+                if matches!(raw_target.space, r2il::SpaceId::Ram | r2il::SpaceId::Const)
+                    && raw_target.offset == *target =>
+            {
+                Some(raw_target)
+            }
+            _ => None,
+        });
+        if disposition.state != SemanticInstructionState::LiveObligation
+            || block_addr != block.addr()
+            || op_index + 1 != source_block.ops.len()
+            || raw_target.is_none()
+            || !matches!(inst.payload, InstPayload::Op(SSAOp::Branch { .. }))
+            || inst.inputs.len() != 1
+        {
+            continue;
+        }
+        let raw_target = raw_target.expect("checked direct target");
+        let Some(target_bits) = raw_target.size.checked_mul(8).filter(|bits| *bits != 0) else {
+            continue;
+        };
+        let memory_model = artifact.machine_context().memory_model();
+        let target_matches_available_arch = raw_target.space == r2il::SpaceId::Const
+            || !memory_model.is_available()
+            || (memory_model.default_address_bits() != 0
+                && target_bits == memory_model.default_address_bits());
+        if !target_matches_available_arch || (target_bits < 64 && *target >= (1_u64 << target_bits))
+        {
+            continue;
+        }
+        let obligation = SemanticObligationId {
+            instruction: producer,
+            kind: SemanticObligationKind::ControlTransfer,
+            component: SemanticObligationComponent::Whole,
+        };
+        if disposition.obligations != BTreeSet::from([obligation])
+            || artifact
+                .obligations()
+                .obligations()
+                .get(&obligation)
+                .is_none_or(|source| {
+                    source.source_inst != inst.id || source.inputs.as_slice() != inst.inputs
+                })
+        {
+            continue;
+        }
+        let target_value = MachineValueUse::from_artifact(artifact, inst.inputs[0])?;
+        if target_value.binding().width_bits() != target_bits
+            || (raw_target.space == r2il::SpaceId::Const
+                && target_value.constant().is_none_or(|constant| {
+                    constant.width_bits() != target_bits || constant.bits() != *target
+                }))
+        {
+            continue;
+        }
+        let control = CertifiedDirectControl {
+            schema_version: CERTIFICATION_SCHEMA_VERSION,
+            producer,
+            source_inst: inst.id,
+            target: *target,
+            target_value,
+            source_obligation: obligation,
+        };
+        control
+            .validate(artifact.obligations())
+            .map_err(|_| MachineBuildError::ObligationMismatch(inst.id))?;
+        if controls.insert(producer, control).is_some() {
+            return Err(MachineBuildError::ObligationMismatch(inst.id));
+        }
+    }
+    Ok(controls)
+}
+
+fn certified_conditional_controls(
+    artifact: &SsaArtifact,
+    topology: &CertifiedSourceTopology,
+) -> Result<BTreeMap<CanonicalInstructionId, CertifiedConditionalControl>, MachineBuildError> {
+    let graph = artifact.graph();
+    let cfg = artifact.function().cfg();
+    let mut controls = BTreeMap::new();
+    for block in topology.blocks() {
+        let CertifiedSourceTerminator::ConditionalBranch {
+            true_target,
+            false_target,
+        } = block.terminator()
+        else {
+            continue;
+        };
+        let expected_successors = BTreeSet::from([*true_target, *false_target]);
+        if true_target == false_target
+            || *true_target == block.addr()
+            || *false_target == block.addr()
+            || topology.block(*true_target).is_none()
+            || topology.block(*false_target).is_none()
+            || block.successors().iter().copied().collect::<BTreeSet<_>>() != expected_successors
+            || block.successors().len() != 2
+        {
+            continue;
+        }
+        let Some(producer) = block.instructions().last().copied() else {
+            continue;
+        };
+        if has_earlier_terminal_control(artifact.obligations(), block) {
+            continue;
+        }
+        let Some(disposition) = artifact.obligations().instructions().get(&producer) else {
+            return Err(MachineBuildError::TopologyMismatch);
+        };
+        let Some(inst) = graph.inst(disposition.inst) else {
+            return Err(MachineBuildError::MissingInstruction(disposition.inst));
+        };
+        let Some((block_addr, op_index)) = graph.op_site_for_inst(inst.id) else {
+            return Err(MachineBuildError::TopologyMismatch);
+        };
+        let Some(source_block) = cfg.get_block(block.addr()) else {
+            return Err(MachineBuildError::TopologyMismatch);
+        };
+        let raw = source_block.ops.get(op_index).and_then(|op| match op {
+            r2il::R2ILOp::CBranch { target, cond }
+                if matches!(target.space, r2il::SpaceId::Ram | r2il::SpaceId::Const)
+                    && target.offset == *true_target =>
+            {
+                Some((target, cond))
+            }
+            _ => None,
+        });
+        let false_target_matches =
+            block.addr().checked_add(u64::from(source_block.size)) == Some(*false_target);
+        if disposition.state != SemanticInstructionState::LiveObligation
+            || block_addr != block.addr()
+            || op_index + 1 != source_block.ops.len()
+            || raw.is_none()
+            || !false_target_matches
+            || !matches!(inst.payload, InstPayload::Op(SSAOp::CBranch { .. }))
+            || inst.inputs.len() != 2
+        {
+            continue;
+        }
+        let (raw_target, raw_condition) = raw.expect("checked conditional source");
+        let Some(target_bits) = raw_target.size.checked_mul(8).filter(|bits| *bits != 0) else {
+            continue;
+        };
+        let Some(condition_bits) = raw_condition.size.checked_mul(8).filter(|bits| *bits == 8)
+        else {
+            continue;
+        };
+        let memory_model = artifact.machine_context().memory_model();
+        let target_matches_available_arch = raw_target.space == r2il::SpaceId::Const
+            || !memory_model.is_available()
+            || (memory_model.default_address_bits() != 0
+                && target_bits == memory_model.default_address_bits());
+        if !target_matches_available_arch
+            || (target_bits < 64
+                && (*true_target >= (1_u64 << target_bits)
+                    || *false_target >= (1_u64 << target_bits)))
+        {
+            continue;
+        }
+        let predicate_obligation = SemanticObligationId {
+            instruction: producer,
+            kind: SemanticObligationKind::ControlPredicate,
+            component: SemanticObligationComponent::Whole,
+        };
+        let transfer_obligation = SemanticObligationId {
+            instruction: producer,
+            kind: SemanticObligationKind::ControlTransfer,
+            component: SemanticObligationComponent::Whole,
+        };
+        if disposition.obligations != BTreeSet::from([predicate_obligation, transfer_obligation]) {
+            continue;
+        }
+        let target_value = MachineValueUse::from_artifact(artifact, inst.inputs[0])?;
+        let condition = MachineValueUse::from_artifact(artifact, inst.inputs[1])?;
+        if target_value.binding().width_bits() != target_bits
+            || condition.binding().width_bits() != condition_bits
+            || (raw_target.space == r2il::SpaceId::Const
+                && target_value.constant().is_none_or(|constant| {
+                    constant.width_bits() != target_bits || constant.bits() != *true_target
+                }))
+        {
+            continue;
+        }
+        let control = CertifiedConditionalControl {
+            schema_version: CERTIFICATION_SCHEMA_VERSION,
+            producer,
+            source_inst: inst.id,
+            true_target: *true_target,
+            false_target: *false_target,
+            target_value,
+            condition,
+            truthiness: CertifiedControlTruthiness::NonZeroIsTrue,
+            predicate_obligation,
+            transfer_obligation,
+        };
+        control
+            .validate(artifact.obligations())
+            .map_err(|_| MachineBuildError::ObligationMismatch(inst.id))?;
+        if controls.insert(producer, control).is_some() {
+            return Err(MachineBuildError::ObligationMismatch(inst.id));
+        }
+    }
+    Ok(controls)
+}
+
+fn certified_return_controls(
+    artifact: &SsaArtifact,
+    topology: &CertifiedSourceTopology,
+) -> Result<BTreeMap<CanonicalInstructionId, CertifiedReturnControl>, MachineBuildError> {
+    let graph = artifact.graph();
+    let cfg = artifact.function().cfg();
+    let mut returns = BTreeMap::new();
+    for block in topology.blocks() {
+        if !matches!(block.terminator(), CertifiedSourceTerminator::Return) {
+            continue;
+        }
+        let Some(producer) = block.instructions().last().copied() else {
+            continue;
+        };
+        if has_earlier_terminal_control(artifact.obligations(), block) {
+            continue;
+        }
+        let disposition = artifact
+            .obligations()
+            .instructions()
+            .get(&producer)
+            .ok_or(MachineBuildError::TopologyMismatch)?;
+        let inst = graph
+            .inst(disposition.inst)
+            .ok_or(MachineBuildError::MissingInstruction(disposition.inst))?;
+        let (block_addr, op_index) = graph
+            .op_site_for_inst(inst.id)
+            .ok_or(MachineBuildError::TopologyMismatch)?;
+        let source_block = cfg
+            .get_block(block.addr())
+            .ok_or(MachineBuildError::TopologyMismatch)?;
+        let raw_target = source_block.ops.get(op_index).and_then(|op| match op {
+            r2il::R2ILOp::Return { target } => Some(target),
+            _ => None,
+        });
+        let boundary = artifact.facts().boundaries.returns.get(&inst.id);
+        if disposition.state != SemanticInstructionState::LiveObligation
+            || block_addr != block.addr()
+            || op_index + 1 != source_block.ops.len()
+            || raw_target.is_none()
+            || !matches!(inst.payload, InstPayload::Op(SSAOp::Return { .. }))
+            || inst.inputs.len() != 1
+            || boundary.is_none_or(|boundary| !boundary.complete)
+        {
+            continue;
+        }
+        let raw_target = raw_target.expect("checked raw return");
+        let target_bits = raw_target
+            .size
+            .checked_mul(8)
+            .filter(|width| *width > 0)
+            .ok_or(MachineBuildError::InvalidValueWidth {
+                value: inst.inputs[0],
+                size_bytes: raw_target.size,
+            })?;
+        let control_target = MachineValueUse::from_artifact(artifact, inst.inputs[0])?;
+        if control_target.binding().width_bits() != target_bits {
+            continue;
+        }
+        let boundary = boundary.expect("checked complete return boundary");
+        let values = boundary
+            .values
+            .iter()
+            .map(|value| {
+                let source_obligation = SemanticObligationId {
+                    instruction: producer,
+                    kind: SemanticObligationKind::ReturnValue,
+                    component: return_component(value.slot),
+                };
+                Ok(CertifiedReturnValue {
+                    slot: value.slot,
+                    value: MachineValueUse::from_artifact(artifact, value.value)?,
+                    source_obligation,
+                })
+            })
+            .collect::<Result<Vec<_>, MachineBuildError>>()?;
+        let return_obligation = SemanticObligationId {
+            instruction: producer,
+            kind: SemanticObligationKind::Return,
+            component: SemanticObligationComponent::Whole,
+        };
+        let expected_obligations = std::iter::once(return_obligation)
+            .chain(values.iter().map(|value| value.source_obligation))
+            .collect::<BTreeSet<_>>();
+        if disposition.obligations != expected_obligations {
+            continue;
+        }
+        let control = CertifiedReturnControl {
+            schema_version: CERTIFICATION_SCHEMA_VERSION,
+            producer,
+            source_inst: inst.id,
+            control_target,
+            values: values.into_boxed_slice(),
+            return_obligation,
+        };
+        control
+            .validate(artifact.obligations())
+            .map_err(|_| MachineBuildError::ObligationMismatch(inst.id))?;
+        if returns.insert(producer, control).is_some() {
+            return Err(MachineBuildError::ObligationMismatch(inst.id));
+        }
+    }
+    Ok(returns)
+}
+
+fn has_earlier_terminal_control(
+    source: &SemanticObligationInventory,
+    block: &CertifiedSourceBlock,
+) -> bool {
+    let earlier_count = block.instructions().len().saturating_sub(1);
+    block
+        .instructions()
+        .iter()
+        .take(earlier_count)
+        .filter_map(|producer| source.instructions().get(producer))
+        .flat_map(|instruction| instruction.obligations.iter())
+        .any(|obligation| {
+            matches!(
+                obligation.kind,
+                SemanticObligationKind::Return
+                    | SemanticObligationKind::ControlTransfer
+                    | SemanticObligationKind::Trap
+            )
+        })
+}
+
+fn certified_switch_topologies(
+    artifact: &SsaArtifact,
+    origin: &CertifiedArtifactOrigin,
+    topology: &CertifiedSourceTopology,
+) -> Result<BTreeMap<u64, CertifiedSwitchTopology>, MachineBuildError> {
+    let graph = artifact.graph();
+    let source = artifact.obligations();
+    let mut switches = BTreeMap::new();
+    for block in topology.blocks() {
+        let CertifiedSourceTerminator::Switch {
+            switch_addr,
+            terminal_instruction_addr,
+            min_value,
+            max_value,
+            cases,
+            default,
+        } = block.terminator()
+        else {
+            continue;
+        };
+        let Some(default_target) = *default else {
+            continue;
+        };
+        let case_values = cases
+            .iter()
+            .map(|(value, _)| *value)
+            .collect::<BTreeSet<_>>();
+        let targets = cases
+            .iter()
+            .map(|(_, target)| *target)
+            .chain([default_target])
+            .collect::<BTreeSet<_>>();
+        if cases.is_empty()
+            || switch_addr != terminal_instruction_addr
+            || min_value > max_value
+            || cases
+                .iter()
+                .any(|(value, _)| value < min_value || value > max_value)
+            || case_values.len() != cases.len()
+            || targets.len() != cases.len() + 1
+            || targets.contains(&block.addr())
+            || targets
+                .iter()
+                .any(|target| topology.block(*target).is_none())
+            || block.successors().len() != targets.len()
+            || block.successors().iter().copied().collect::<BTreeSet<_>>() != targets
+        {
+            continue;
+        }
+        let Some(producer) = block.instructions().last().copied() else {
+            continue;
+        };
+        if has_earlier_terminal_control(source, block) {
+            continue;
+        }
+        let Some(disposition) = source.instructions().get(&producer) else {
+            return Err(MachineBuildError::TopologyMismatch);
+        };
+        let Some(instruction) = graph.inst(disposition.inst) else {
+            return Err(MachineBuildError::MissingInstruction(disposition.inst));
+        };
+        let Some((block_addr, op_index)) = graph.op_site_for_inst(instruction.id) else {
+            return Err(MachineBuildError::TopologyMismatch);
+        };
+        let Some(source_block) = artifact.function().get_block(block.addr()) else {
+            return Err(MachineBuildError::TopologyMismatch);
+        };
+        let obligation = SemanticObligationId {
+            instruction: producer,
+            kind: SemanticObligationKind::ControlTransfer,
+            component: SemanticObligationComponent::Whole,
+        };
+        if block_addr != block.addr()
+            || op_index + 1 != source_block.ops.len()
+            || !matches!(
+                instruction.payload,
+                InstPayload::Op(SSAOp::BranchInd { .. })
+            )
+            || instruction.inputs.len() != 1
+            || disposition.state != SemanticInstructionState::LiveObligation
+            || disposition.obligations != BTreeSet::from([obligation])
+            || source.obligations().get(&obligation).is_none_or(|fact| {
+                fact.source_inst != instruction.id || fact.inputs != instruction.inputs
+            })
+        {
+            continue;
+        }
+        let indirect_target = MachineValueUse::from_artifact(artifact, instruction.inputs[0])?;
+        let memory_model = artifact.machine_context().memory_model();
+        let target_bits = indirect_target.binding().width_bits();
+        if memory_model.is_available()
+            && (memory_model.default_address_bits() == 0
+                || target_bits != memory_model.default_address_bits())
+        {
+            continue;
+        }
+        if target_bits == 0
+            || (target_bits < 64
+                && (switch_addr >= &(1_u64 << target_bits)
+                    || targets
+                        .iter()
+                        .any(|target| *target >= (1_u64 << target_bits))))
+        {
+            continue;
+        }
+        let witness = CertifiedSwitchTopology {
+            schema_version: CERTIFICATION_SCHEMA_VERSION,
+            origin: origin.clone(),
+            producer,
+            source_inst: instruction.id,
+            indirect_target,
+            switch_addr: *switch_addr,
+            min_value: *min_value,
+            max_value: *max_value,
+            cases: cases.clone(),
+            default_target,
+            source_obligation: obligation,
+        };
+        if switches.insert(block.addr(), witness).is_some() {
+            return Err(MachineBuildError::TopologyMismatch);
+        }
+    }
+    Ok(switches)
+}
+
+fn certified_switch_controls(
+    artifact: &SsaArtifact,
+    origin: &CertifiedArtifactOrigin,
+    topologies: &BTreeMap<u64, CertifiedSwitchTopology>,
+    abi_parameters: &BTreeMap<u32, CertifiedAbiParameter>,
+) -> Result<BTreeMap<u64, CertifiedSwitchControl>, MachineBuildError> {
+    let mut controls = BTreeMap::new();
+    for (block_addr, topology) in topologies {
+        let Some(certificate) = artifact.certificates().switches.get(block_addr) else {
+            continue;
+        };
+        let Some(selector_value) = certificate.selector else {
+            continue;
+        };
+        if certificate.block_addr != *block_addr
+            || certificate.cases.as_slice() != topology.cases()
+            || certificate.default != Some(topology.default_target())
+        {
+            continue;
+        }
+        let Some(instruction) = artifact.graph().inst(topology.source_inst) else {
+            return Err(MachineBuildError::MissingInstruction(topology.source_inst));
+        };
+        let InstPayload::Op(SSAOp::BranchInd { target }) = &instruction.payload else {
+            continue;
+        };
+        let Some(target_value) = artifact.graph().value_id_for_var(target) else {
+            return Err(MachineBuildError::MissingGraphValue(selector_value));
+        };
+        if instruction.inputs.as_slice() != [target_value]
+            || artifact
+                .function()
+                .infer_switch_selector_var(*block_addr)
+                .and_then(|selector| artifact.graph().value_id_for_var(&selector))
+                != Some(selector_value)
+        {
+            continue;
+        }
+        let selector = MachineValueUse::from_artifact(artifact, selector_value)?;
+        let selector_bits = selector.binding().width_bits();
+        if selector_bits == 0
+            || selector_bits > 64
+            || (selector_bits < 64
+                && topology
+                    .cases()
+                    .iter()
+                    .any(|(value, _)| *value >= (1_u64 << selector_bits)))
+        {
+            continue;
+        }
+        let matching_parameters = abi_parameters
+            .values()
+            .filter(|parameter| {
+                parameter.value().is_some_and(|value| {
+                    value == &selector
+                        && value.producer().is_none()
+                        && value.constant().is_none()
+                        && value.memory_access().is_none()
+                        && parameter.storage().size.checked_mul(8) == Some(selector_bits)
+                })
+            })
+            .collect::<Vec<_>>();
+        let [parameter] = matching_parameters.as_slice() else {
+            continue;
+        };
+        let witness = CertifiedSwitchControl {
+            schema_version: CERTIFICATION_SCHEMA_VERSION,
+            origin: origin.clone(),
+            topology: topology.clone(),
+            selector,
+            parameter_index: parameter.index(),
+            parameter_storage: parameter.storage(),
+        };
+        witness
+            .validate(artifact.obligations())
+            .map_err(|_| MachineBuildError::ObligationMismatch(topology.source_inst))?;
+        if controls.insert(*block_addr, witness).is_some() {
+            return Err(MachineBuildError::TopologyMismatch);
+        }
+    }
+    Ok(controls)
+}
+
+fn certified_natural_loop_routings(
+    artifact: &SsaArtifact,
+    origin: &CertifiedArtifactOrigin,
+    topology: &CertifiedSourceTopology,
+    direct_controls: &BTreeMap<CanonicalInstructionId, CertifiedDirectControl>,
+    conditional_controls: &BTreeMap<CanonicalInstructionId, CertifiedConditionalControl>,
+) -> Result<BTreeMap<u64, CertifiedNaturalLoopRouting>, MachineBuildError> {
+    let mut routings = BTreeMap::new();
+    for fact in artifact.structured().loops.values() {
+        let [body_latch] = fact.latches.as_slice() else {
+            continue;
+        };
+        let [exit] = fact.exits.as_slice() else {
+            continue;
+        };
+        let body = fact.body.iter().copied().collect::<BTreeSet<_>>();
+        if fact.kind != StructuredLoopKind::Natural
+            || !fact.carriers.is_empty()
+            || body != BTreeSet::from([fact.header, *body_latch])
+            || BTreeSet::from([fact.header, *body_latch, *exit]).len() != 3
+        {
+            continue;
+        }
+        let Some(header_block) = topology.block(fact.header) else {
+            continue;
+        };
+        let Some(body_block) = topology.block(*body_latch) else {
+            continue;
+        };
+        let Some(exit_block) = topology.block(*exit) else {
+            continue;
+        };
+        let Some(header_producer) = header_block.instructions().last() else {
+            continue;
+        };
+        let Some(body_producer) = body_block.instructions().last() else {
+            continue;
+        };
+        let Some(header_control) = conditional_controls.get(header_producer) else {
+            continue;
+        };
+        let Some(body_transfer) = direct_controls.get(body_producer) else {
+            continue;
+        };
+        let (continuation_on_true, topology_exit) = match header_block.terminator() {
+            CertifiedSourceTerminator::ConditionalBranch {
+                true_target,
+                false_target,
+            } if *true_target == *body_latch => (true, *false_target),
+            CertifiedSourceTerminator::ConditionalBranch {
+                true_target,
+                false_target,
+            } if *false_target == *body_latch => (false, *true_target),
+            _ => continue,
+        };
+        let external_predecessors = header_block
+            .predecessors()
+            .iter()
+            .copied()
+            .filter(|predecessor| *predecessor != *body_latch)
+            .collect::<Vec<_>>();
+        let [entry_predecessor] = external_predecessors.as_slice() else {
+            continue;
+        };
+        let Some(predicate_id) = fact.condition else {
+            continue;
+        };
+        let Some(predicate) = artifact.predicates().predicates.get(&predicate_id) else {
+            continue;
+        };
+        let has_loop_state_obligation = artifact.obligations().obligations().keys().any(|id| {
+            matches!(
+                id.kind,
+                SemanticObligationKind::LoopCarriedState
+                    | SemanticObligationKind::LiveStateTransition
+            ) && body.contains(&id.instruction.block_addr)
+        });
+        if topology_exit != *exit
+            || *entry_predecessor == *exit
+            || exit_block.addr() != *exit
+            || header_control.true_target()
+                != match header_block.terminator() {
+                    CertifiedSourceTerminator::ConditionalBranch { true_target, .. } => {
+                        *true_target
+                    }
+                    _ => unreachable!("matched conditional header"),
+                }
+            || header_control.false_target()
+                != match header_block.terminator() {
+                    CertifiedSourceTerminator::ConditionalBranch { false_target, .. } => {
+                        *false_target
+                    }
+                    _ => unreachable!("matched conditional header"),
+                }
+            || body_transfer.target() != fact.header
+            || body_block.successors() != [fact.header]
+            || body_block.predecessors() != [fact.header]
+            || header_block.predecessors() != [*entry_predecessor, *body_latch]
+                && header_block.predecessors() != [*body_latch, *entry_predecessor]
+            || predicate.block_addr != fact.header
+            || predicate.true_target != header_control.true_target()
+            || predicate.false_target != header_control.false_target()
+            || predicate.condition != header_control.condition().binding().value()
+            || has_loop_state_obligation
+        {
+            continue;
+        }
+        let routing = CertifiedNaturalLoopRouting {
+            schema_version: CERTIFICATION_SCHEMA_VERSION,
+            origin: origin.clone(),
+            loop_id: fact.id,
+            predicate_id,
+            header_control: header_control.clone(),
+            body_transfer: body_transfer.clone(),
+            body_latch: *body_latch,
+            exit: *exit,
+            entry_predecessor: *entry_predecessor,
+            continuation_on_true,
+        };
+        if routings.insert(fact.header, routing).is_some() {
+            return Err(MachineBuildError::TopologyMismatch);
+        }
+    }
+    Ok(routings)
+}
+
+fn certified_closed_natural_loop_controls(
+    artifact: &SsaArtifact,
+    origin: &CertifiedArtifactOrigin,
+    topology: &CertifiedSourceTopology,
+    routings: &BTreeMap<u64, CertifiedNaturalLoopRouting>,
+    direct_controls: &BTreeMap<CanonicalInstructionId, CertifiedDirectControl>,
+    abi_parameters: &BTreeMap<u32, CertifiedAbiParameter>,
+) -> Result<BTreeMap<u64, CertifiedClosedNaturalLoopControl>, MachineBuildError> {
+    let mut controls = BTreeMap::new();
+    let Some(interface) = artifact.machine_context().function_interface() else {
+        return Ok(controls);
+    };
+    if interface.parameters().len() != 1 {
+        return Ok(controls);
+    }
+    for (header_addr, routing) in routings {
+        let preheader_addr = routing.entry_predecessor();
+        let body_addr = routing.body_latch();
+        let exit_addr = routing.exit();
+        if routing.origin() != origin
+            || topology.entry_addr() != preheader_addr
+            || topology.blocks().len() != 4
+            || BTreeSet::from([preheader_addr, *header_addr, body_addr, exit_addr]).len() != 4
+        {
+            continue;
+        }
+        let Some(preheader) = topology.block(preheader_addr) else {
+            continue;
+        };
+        let Some(header) = topology.block(*header_addr) else {
+            continue;
+        };
+        let Some(body) = topology.block(body_addr) else {
+            continue;
+        };
+        let Some(exit) = topology.block(exit_addr) else {
+            continue;
+        };
+        let Some(preheader_producer) = preheader.instructions().last() else {
+            continue;
+        };
+        let Some(preheader_transfer) = direct_controls.get(preheader_producer) else {
+            continue;
+        };
+        let continuation_target = if routing.continuation_on_true() {
+            routing.header_control().true_target()
+        } else {
+            routing.header_control().false_target()
+        };
+        let exit_target = if routing.continuation_on_true() {
+            routing.header_control().false_target()
+        } else {
+            routing.header_control().true_target()
+        };
+        if !preheader.predecessors().is_empty()
+            || preheader.successors() != [*header_addr]
+            || !matches!(
+                preheader.terminator(),
+                CertifiedSourceTerminator::Branch { target } if *target == *header_addr
+            )
+            || preheader_transfer.target() != *header_addr
+            || preheader_transfer.producer() != *preheader_producer
+            || header
+                .predecessors()
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                != BTreeSet::from([preheader_addr, body_addr])
+            || header.successors().iter().copied().collect::<BTreeSet<_>>()
+                != BTreeSet::from([body_addr, exit_addr])
+            || continuation_target != body_addr
+            || exit_target != exit_addr
+            || body.predecessors() != [*header_addr]
+            || body.successors() != [*header_addr]
+            || !matches!(
+                body.terminator(),
+                CertifiedSourceTerminator::Branch { target } if *target == *header_addr
+            )
+            || exit.predecessors() != [*header_addr]
+            || !exit.successors().is_empty()
+            || !matches!(exit.terminator(), CertifiedSourceTerminator::Return)
+            || preheader_transfer.validate(artifact.obligations()).is_err()
+            || routing
+                .header_control()
+                .validate(artifact.obligations())
+                .is_err()
+            || routing
+                .body_transfer()
+                .validate(artifact.obligations())
+                .is_err()
+        {
+            continue;
+        }
+        let condition = routing.header_control().condition();
+        if condition.binding().width_bits() != 8
+            || condition.producer().is_some()
+            || condition.constant().is_some()
+            || condition.memory_access().is_some()
+        {
+            continue;
+        }
+        let matching_parameters = abi_parameters
+            .values()
+            .filter(|parameter| {
+                parameter.value() == Some(condition)
+                    && parameter.storage().size.checked_mul(8)
+                        == Some(condition.binding().width_bits())
+                    && interface
+                        .parameters()
+                        .get(parameter.index() as usize)
+                        .is_some_and(|source| {
+                            source.index() == parameter.index()
+                                && source.storage() == parameter.storage()
+                        })
+            })
+            .collect::<Vec<_>>();
+        let [parameter] = matching_parameters.as_slice() else {
+            continue;
+        };
+        parameter.validate_against_artifact(artifact)?;
+        let control = CertifiedClosedNaturalLoopControl {
+            schema_version: CERTIFICATION_SCHEMA_VERSION,
+            origin: origin.clone(),
+            routing: routing.clone(),
+            preheader_transfer: preheader_transfer.clone(),
+            parameter_index: parameter.index(),
+            parameter_storage: parameter.storage(),
+        };
+        if controls.insert(*header_addr, control).is_some() {
+            return Err(MachineBuildError::TopologyMismatch);
+        }
+    }
+    Ok(controls)
+}
+
+fn certified_closed_counted_loop_controls(
+    artifact: &SsaArtifact,
+    origin: &CertifiedArtifactOrigin,
+    topology: &CertifiedSourceTopology,
+    direct_controls: &BTreeMap<CanonicalInstructionId, CertifiedDirectControl>,
+    conditional_controls: &BTreeMap<CanonicalInstructionId, CertifiedConditionalControl>,
+    return_controls: &BTreeMap<CanonicalInstructionId, CertifiedReturnControl>,
+    abi_parameters: &BTreeMap<u32, CertifiedAbiParameter>,
+) -> Result<BTreeMap<u64, CertifiedClosedCountedLoopControl>, MachineBuildError> {
+    let mut controls = BTreeMap::new();
+    let Some(interface) = artifact.machine_context().function_interface() else {
+        return Ok(controls);
+    };
+    if interface.parameters().len() != 1
+        || !interface.stack_slots().is_empty()
+        || !matches!(
+            interface.return_kind(),
+            SourceFunctionReturn::Register { .. }
+        )
+    {
+        return Ok(controls);
+    }
+    let source = artifact.obligations();
+    let canonical = |inst| {
+        source
+            .instruction_for_inst(inst)
+            .map(|instruction| instruction.id)
+    };
+    for fact in artifact.structured().canonical_counted_loops.values() {
+        if fact
+            .width
+            .checked_mul(8)
+            .is_none_or(|width| !matches!(width, 8 | 16 | 32 | 64))
+            || topology.entry_addr() != fact.preheader
+            || topology.blocks().len() != 4
+        {
+            continue;
+        }
+        let (Some(preheader), Some(header), Some(latch), Some(exit)) = (
+            topology.block(fact.preheader),
+            topology.block(fact.header),
+            topology.block(fact.latch),
+            topology.block(fact.exit),
+        ) else {
+            continue;
+        };
+        let (
+            Some(initializer_producer),
+            Some(phi_producer),
+            Some(condition_producer),
+            Some(update_producer),
+        ) = (
+            canonical(fact.initializer_inst),
+            canonical(fact.phi_inst),
+            canonical(fact.condition_inst),
+            canonical(fact.update_inst),
+        )
+        else {
+            continue;
+        };
+        let (
+            Some(preheader_producer),
+            Some(header_producer),
+            Some(backedge_producer),
+            Some(return_producer),
+        ) = (
+            preheader.instructions().last().copied(),
+            header.instructions().last().copied(),
+            latch.instructions().last().copied(),
+            exit.instructions().last().copied(),
+        )
+        else {
+            continue;
+        };
+        let (
+            Some(preheader_transfer),
+            Some(header_control),
+            Some(backedge_transfer),
+            Some(return_control),
+        ) = (
+            direct_controls.get(&preheader_producer),
+            conditional_controls.get(&header_producer),
+            direct_controls.get(&backedge_producer),
+            return_controls.get(&return_producer),
+        )
+        else {
+            continue;
+        };
+        let header_phi_position = header
+            .instructions()
+            .iter()
+            .position(|producer| *producer == phi_producer);
+        let header_condition_position = header
+            .instructions()
+            .iter()
+            .position(|producer| *producer == condition_producer);
+        let header_prefix_is_exact = match (header_phi_position, header_condition_position) {
+            (Some(phi_position), Some(condition_position)) if phi_position < condition_position => {
+                header.instructions()[..condition_position]
+                    .iter()
+                    .enumerate()
+                    .all(|(position, producer)| {
+                        if position == phi_position {
+                            true
+                        } else {
+                            source
+                                .instructions()
+                                .get(producer)
+                                .is_some_and(|instruction| {
+                                    instruction.state == SemanticInstructionState::ProvenDead
+                                        && instruction.obligations.is_empty()
+                                        && matches!(producer.site, CanonicalInstructionSite::Phi(_))
+                                })
+                        }
+                    })
+            }
+            _ => false,
+        };
+        let live_value_only = |producer| {
+            let obligation = SemanticObligationId {
+                instruction: producer,
+                kind: SemanticObligationKind::LiveValueProducer,
+                component: SemanticObligationComponent::Whole,
+            };
+            source
+                .instructions()
+                .get(&producer)
+                .is_some_and(|instruction| {
+                    instruction.state == SemanticInstructionState::LiveObligation
+                        && instruction.obligations == BTreeSet::from([obligation])
+                })
+        };
+        if preheader.instructions() != [initializer_producer, preheader_producer]
+            || header
+                .instructions()
+                .get(header.instructions().len().saturating_sub(2))
+                != Some(&condition_producer)
+            || !header_prefix_is_exact
+            || latch.instructions() != [update_producer, backedge_producer]
+            || exit.instructions() != [return_producer]
+            || !preheader.predecessors().is_empty()
+            || preheader.successors() != [fact.header]
+            || header
+                .predecessors()
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                != BTreeSet::from([fact.preheader, fact.latch])
+            || header.successors().iter().copied().collect::<BTreeSet<_>>()
+                != BTreeSet::from([fact.latch, fact.exit])
+            || latch.predecessors() != [fact.header]
+            || latch.successors() != [fact.header]
+            || exit.predecessors() != [fact.header]
+            || !exit.successors().is_empty()
+            || preheader_transfer.target() != fact.header
+            || header_control.true_target() != fact.latch
+            || header_control.false_target() != fact.exit
+            || backedge_transfer.target() != fact.header
+            || !live_value_only(initializer_producer)
+            || !live_value_only(condition_producer)
+            || !live_value_only(update_producer)
+            || source.instructions().values().any(|instruction| {
+                instruction.state == SemanticInstructionState::UnsupportedUnknown
+            })
+            || source.obligations().values().any(|obligation| {
+                !matches!(
+                    obligation.id.kind,
+                    SemanticObligationKind::LiveValueProducer
+                        | SemanticObligationKind::LoopCarriedState
+                        | SemanticObligationKind::LiveStateTransition
+                        | SemanticObligationKind::ControlPredicate
+                        | SemanticObligationKind::ControlTransfer
+                        | SemanticObligationKind::Return
+                        | SemanticObligationKind::ReturnValue
+                )
+            })
+        {
+            continue;
+        }
+
+        let initializer = MachineValueUse::from_artifact(artifact, fact.initializer)?;
+        let phi = MachineValueUse::from_artifact(artifact, fact.phi)?;
+        let bound = MachineValueUse::from_artifact(artifact, fact.bound)?;
+        let condition = MachineValueUse::from_artifact(artifact, fact.condition)?;
+        let update = MachineValueUse::from_artifact(artifact, fact.update)?;
+        if initializer.producer() != Some(initializer_producer)
+            || phi.producer() != Some(phi_producer)
+            || condition.producer() != Some(condition_producer)
+            || update.producer() != Some(update_producer)
+            || header_control.condition() != &condition
+            || phi.binding().width_bits() != fact.width.saturating_mul(8)
+        {
+            continue;
+        }
+        let matching_parameters = abi_parameters
+            .values()
+            .filter(|parameter| {
+                parameter.value() == Some(&bound)
+                    && parameter.storage().size == fact.width
+                    && parameter.storage() != fact.carrier_storage
+            })
+            .collect::<Vec<_>>();
+        let [parameter] = matching_parameters.as_slice() else {
+            continue;
+        };
+        let SourceFunctionReturn::Register {
+            storage: return_storage,
+        } = interface.return_kind()
+        else {
+            continue;
+        };
+        if return_storage != fact.carrier_storage
+            || !matches!(
+                return_control.values(),
+                [returned]
+                    if returned.slot()
+                        == (CallBoundarySlot::Register {
+                            index: 0,
+                            storage: fact.carrier_storage,
+                        })
+                        && returned.value() == &phi
+            )
+        {
+            continue;
+        }
+        let state_obligations = source
+            .instructions()
+            .get(&phi_producer)
+            .map(|instruction| instruction.obligations.clone())
+            .unwrap_or_default();
+        let state = CertifiedCountedLoopState {
+            schema_version: CERTIFICATION_SCHEMA_VERSION,
+            origin: origin.clone(),
+            loop_id: fact.loop_id,
+            preheader: fact.preheader,
+            header: fact.header,
+            latch: fact.latch,
+            exit: fact.exit,
+            carrier_storage: fact.carrier_storage,
+            initializer,
+            phi,
+            bound,
+            condition,
+            update,
+            source_obligations: state_obligations,
+        };
+        if state.validate(source).is_err() {
+            continue;
+        }
+        let control = CertifiedClosedCountedLoopControl {
+            schema_version: CERTIFICATION_SCHEMA_VERSION,
+            origin: origin.clone(),
+            state,
+            preheader_transfer: preheader_transfer.clone(),
+            header_control: header_control.clone(),
+            backedge_transfer: backedge_transfer.clone(),
+            return_control: return_control.clone(),
+            parameter_index: parameter.index(),
+            parameter_storage: parameter.storage(),
+        };
+        if controls.insert(fact.header, control).is_some() {
+            return Err(MachineBuildError::TopologyMismatch);
+        }
+    }
+    Ok(controls)
+}
+
+fn certified_memory_statements(
+    artifact: &SsaArtifact,
+) -> Result<BTreeMap<CanonicalInstructionId, CertifiedMemoryStatement>, MachineBuildError> {
+    let mut statements = BTreeMap::new();
+    for inst in &artifact.graph().insts {
+        if !matches!(
+            inst.payload,
+            InstPayload::Op(SSAOp::Load { .. } | SSAOp::Store { .. })
+        ) {
+            continue;
+        }
+        let Some(statement) = try_certified_memory_statement(artifact, inst.id)? else {
+            continue;
+        };
+        if statements.insert(statement.producer(), statement).is_some() {
+            return Err(MachineBuildError::ObligationMismatch(inst.id));
+        }
+    }
+    Ok(statements)
+}
+
+fn try_certified_memory_statement(
+    artifact: &SsaArtifact,
+    inst_id: r2ssa::InstId,
+) -> Result<Option<CertifiedMemoryStatement>, MachineBuildError> {
+    let graph = artifact.graph();
+    let Some(inst) = graph.inst(inst_id) else {
+        return Err(MachineBuildError::MissingInstruction(inst_id));
+    };
+    let Some(disposition) = artifact.obligations().instruction_for_inst(inst_id) else {
+        return Err(MachineBuildError::MissingInstructionDisposition(inst_id));
+    };
+    if disposition.state != SemanticInstructionState::LiveObligation {
+        return Ok(None);
+    }
+    let InstPayload::Op(op @ (SSAOp::Load { .. } | SSAOp::Store { .. })) = &inst.payload else {
+        return Ok(None);
+    };
+    let accesses = artifact
+        .facts()
+        .structured
+        .memory_accesses
+        .iter()
+        .filter(|(_, access)| access.id.inst == inst_id)
+        .collect::<Vec<_>>();
+    let [(access_key, access)] = accesses.as_slice() else {
+        return Ok(None);
+    };
+    let Some(width_bits) = access.width.checked_mul(8).filter(|width| *width != 0) else {
+        return Ok(None);
+    };
+    if !access.provenance_complete
+        || **access_key != access.id
+        || access.id.ordinal != 0
+        || graph.op_site_for_inst(inst_id) != Some((access.block_addr, access.op_index))
+        || artifact.objects().object(access.object).is_none()
+        || artifact.objects().object_for_value(access.address) != Some(access.object)
+    {
+        return Ok(None);
+    }
+    let source_context = artifact.machine_context();
+    let model = source_context.memory_model();
+    let Some(source_space) = source_context.memory_space_at(access.block_addr, access.op_index)
+    else {
+        return Ok(None);
+    };
+    let Some(space_model) = model
+        .space(source_space)
+        .filter(|_| model.is_available() && model.is_coherent())
+    else {
+        return Ok(None);
+    };
+    if space_model.address_bits() == 0
+        || space_model.word_size_bytes() == 0
+        || !matches!(
+            space_model.endianness(),
+            MachineMemoryEndianness::Little | MachineMemoryEndianness::Big
+        )
+    {
+        return Ok(None);
+    }
+    let space = MachineAddressSpace::from(source_space);
+    if !matches!(
+        space,
+        MachineAddressSpace::Ram | MachineAddressSpace::Custom(_)
+    ) {
+        return Ok(None);
+    }
+    let Ok(address) = MachineValueUse::memory_address_for_access(artifact, access.id) else {
+        return Ok(None);
+    };
+
+    let (obligation_kind, kind, expected_inputs) = match op {
+        SSAOp::Load { .. } => {
+            let Some(output) = inst.output.filter(|output| access.value == Some(*output)) else {
+                return Ok(None);
+            };
+            if access.is_write || inst.inputs.as_slice() != [access.address] {
+                return Ok(None);
+            }
+            let Ok(result) = MachineValueUse::from_artifact(artifact, output) else {
+                return Ok(None);
+            };
+            if result.binding().width_bits() != width_bits {
+                return Ok(None);
+            }
+            (
+                SemanticObligationKind::ObservableMemoryRead,
+                CertifiedMemoryStatementKind::Read { result },
+                vec![access.address],
+            )
+        }
+        SSAOp::Store { .. } => {
+            let Some(value_id) = access.value else {
+                return Ok(None);
+            };
+            if !access.is_write
+                || inst.output.is_some()
+                || inst.inputs.as_slice() != [access.address, value_id]
+            {
+                return Ok(None);
+            }
+            let Ok(value) = MachineValueUse::from_artifact(artifact, value_id) else {
+                return Ok(None);
+            };
+            if value.binding().width_bits() != width_bits {
+                return Ok(None);
+            }
+            (
+                SemanticObligationKind::ObservableMemoryWrite,
+                CertifiedMemoryStatementKind::Write { value },
+                vec![access.address, value_id],
+            )
+        }
+        _ => unreachable!(),
+    };
+    let obligation = SemanticObligationId {
+        instruction: disposition.id,
+        kind: obligation_kind,
+        component: SemanticObligationComponent::MemoryAccess(access.id.ordinal),
+    };
+    let source_obligation_matches = artifact
+        .obligations()
+        .obligations()
+        .get(&obligation)
+        .is_some_and(|candidate| {
+            candidate.source_inst == inst_id && candidate.inputs == expected_inputs
+        });
+    let sibling_obligations_are_plain = disposition.obligations.iter().all(|candidate| {
+        *candidate == obligation
+            || (matches!(op, SSAOp::Load { .. })
+                && candidate.kind == SemanticObligationKind::LiveValueProducer
+                && candidate.component == SemanticObligationComponent::Whole)
+    });
+    if !source_obligation_matches || !sibling_obligations_are_plain {
+        return Ok(None);
+    }
+    let statement = CertifiedMemoryStatement {
+        schema_version: CERTIFICATION_SCHEMA_VERSION,
+        producer: disposition.id,
+        access: access.id,
+        object: access.object,
+        address,
+        space,
+        endianness: space_model.endianness(),
+        word_size_bytes: space_model.word_size_bytes(),
+        width_bits,
+        execution: CertifiedMemoryExecutionPolicy::ExactlyOnceInSourceOrderViaHelper,
+        kind,
+        source_obligations: BTreeSet::from([obligation]),
+    };
+    if statement.validate(artifact.obligations()).is_err() {
+        return Ok(None);
+    }
+    Ok(Some(statement))
+}
+
+fn memory_statement_input_producers(
+    statement: &CertifiedMemoryStatement,
+) -> BTreeSet<CanonicalInstructionId> {
+    let mut producers = BTreeSet::new();
+    if let Some(producer) = statement.address().producer() {
+        producers.insert(producer);
+    }
+    if let CertifiedMemoryStatementKind::Write { value } = statement.kind()
+        && let Some(producer) = value.producer()
+    {
+        producers.insert(producer);
+    }
+    producers
+}
+
+fn conditional_control_input_producers(
+    control: &CertifiedConditionalControl,
+) -> BTreeSet<CanonicalInstructionId> {
+    [control.target_value(), control.condition()]
+        .into_iter()
+        .filter_map(MachineValueUse::producer)
+        .collect()
+}
+
+fn direct_call_input_producers(call: &CertifiedDirectCall) -> BTreeSet<CanonicalInstructionId> {
+    std::iter::once(call.target_value())
+        .chain(call.arguments().iter().map(CertifiedCallArgument::value))
+        .filter_map(MachineValueUse::producer)
+        .collect()
+}
+
+fn return_control_input_producers(
+    control: &CertifiedReturnControl,
+) -> BTreeSet<CanonicalInstructionId> {
+    std::iter::once(control.control_target())
+        .chain(control.values().iter().map(CertifiedReturnValue::value))
+        .filter_map(MachineValueUse::producer)
+        .collect()
+}
+
+fn certified_read_matches_machine_entity(
+    statement: &CertifiedMemoryStatement,
+    entity: &MachineEntity,
+    kind: &MachineExprKind,
+) -> bool {
+    let CertifiedMemoryStatementKind::Read { result } = statement.kind() else {
+        return false;
+    };
+    let MachineExprKind::MemoryRead {
+        access,
+        object,
+        space,
+        endianness,
+        word_size_bytes,
+        width_bits,
+        ..
+    } = kind
+    else {
+        return false;
+    };
+    entity.producer() == statement.producer()
+        && entity.output() == result.binding()
+        && *access == statement.access()
+        && *object == statement.object()
+        && *space == statement.space()
+        && *endianness == statement.endianness()
+        && *word_size_bytes == statement.word_size_bytes()
+        && *width_bits == statement.width_bits()
+}
+
+/// Machine semantics and their source-bound certification ledger.
+///
+/// Construction is intentionally artifact-only: callers cannot combine a
+/// `MachineProjection` with an inventory from another artifact. It retains sealed
+/// expression, plain-memory, and admitted terminal-control evidence. These
+/// dispositions remain pending typed-region validation and cannot independently
+/// authorize final C.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CertifiedMachineFunction {
+    origin: CertifiedArtifactOrigin,
+    projection: MachineProjection,
+    machine_context: CertifiedMachineContext,
+    abi_parameters: BTreeMap<u32, CertifiedAbiParameter>,
+    stack_slots: BTreeMap<StackAddressRoot, CertifiedStackSlot>,
+    certification: CertifiedFunction,
+    expressions: BTreeMap<CanonicalInstructionId, CertifiedExpr>,
+    memory_statements: BTreeMap<CanonicalInstructionId, CertifiedMemoryStatement>,
+    aggregate_member_accesses: BTreeMap<StructuredAccessId, CertifiedAggregateMemberAccess>,
+    direct_calls: BTreeMap<CanonicalInstructionId, CertifiedDirectCall>,
+    direct_controls: BTreeMap<CanonicalInstructionId, CertifiedDirectControl>,
+    conditional_controls: BTreeMap<CanonicalInstructionId, CertifiedConditionalControl>,
+    return_controls: BTreeMap<CanonicalInstructionId, CertifiedReturnControl>,
+    natural_loop_routings: BTreeMap<u64, CertifiedNaturalLoopRouting>,
+    closed_natural_loop_controls: BTreeMap<u64, CertifiedClosedNaturalLoopControl>,
+    closed_counted_loop_controls: BTreeMap<u64, CertifiedClosedCountedLoopControl>,
+    conditional_return_funnels: BTreeMap<PredicateId, CertifiedConditionalReturnFunnelControl>,
+    private_frame_conditional_return: Option<CertifiedPrivateFrameConditionalReturn>,
+    fnv_fold_loop: Option<CertifiedFnvFoldLoop>,
+    fnv_fold_o0: Option<CertifiedFnvFoldO0Function>,
+    switch_topologies: BTreeMap<u64, CertifiedSwitchTopology>,
+    switch_controls: BTreeMap<u64, CertifiedSwitchControl>,
+    topology: CertifiedSourceTopology,
+}
+
+impl CertifiedMachineFunction {
+    pub fn from_artifact(artifact: &SsaArtifact) -> Result<Self, MachineBuildError> {
+        let projection = MachineProjection::from_artifact(artifact)?;
+        projection.validate_against(artifact)?;
+        let machine_context = CertifiedMachineContext::from_artifact(artifact)?;
+        let topology = certified_source_topology(artifact)?;
+        let origin = certified_artifact_origin(artifact, &machine_context, &topology)?;
+        let abi_parameters = certified_abi_parameters(artifact)?;
+        let stack_slots = certified_stack_slots(artifact)?;
+        let direct_calls = certified_direct_calls(artifact, &topology)?;
+        let direct_controls = certified_direct_controls(artifact, &topology)?;
+        let conditional_controls = certified_conditional_controls(artifact, &topology)?;
+        let return_controls = certified_return_controls(artifact, &topology)?;
+        let memory_statements = certified_memory_statements(artifact)?;
+        let aggregate_member_accesses = aggregate_member::certified_aggregate_member_accesses(
+            artifact,
+            &origin,
+            &abi_parameters,
+            &memory_statements,
+        )?;
+        let switch_topologies = certified_switch_topologies(artifact, &origin, &topology)?;
+        let switch_controls =
+            certified_switch_controls(artifact, &origin, &switch_topologies, &abi_parameters)?;
+        let natural_loop_routings = certified_natural_loop_routings(
+            artifact,
+            &origin,
+            &topology,
+            &direct_controls,
+            &conditional_controls,
+        )?;
+        let closed_natural_loop_controls = certified_closed_natural_loop_controls(
+            artifact,
+            &origin,
+            &topology,
+            &natural_loop_routings,
+            &direct_controls,
+            &abi_parameters,
+        )?;
+        let closed_counted_loop_controls = certified_closed_counted_loop_controls(
+            artifact,
+            &origin,
+            &topology,
+            &direct_controls,
+            &conditional_controls,
+            &return_controls,
+            &abi_parameters,
+        )?;
+        let conditional_return_funnels = conditional_return::certified_conditional_return_funnels(
+            artifact,
+            &origin,
+            &topology,
+            &stack_slots,
+            &memory_statements,
+            &direct_controls,
+            &conditional_controls,
+            &return_controls,
+        )?;
+
+        let mut expressions = BTreeMap::new();
+        for machine_entity in projection.entities() {
+            let source_obligations = machine_entity
+                .source_obligations()
+                .iter()
+                .copied()
+                .filter(|id| id.kind == SemanticObligationKind::LiveValueProducer)
+                .collect::<BTreeSet<_>>();
+            if source_obligations.is_empty() {
+                continue;
+            }
+            let inst_id = artifact
+                .graph()
+                .def_inst(machine_entity.output().value())
+                .ok_or(MachineBuildError::EntityMismatch(r2ssa::InstId(u32::MAX)))?;
+            let expression = certified_expr_from_machine(
+                artifact,
+                &projection,
+                machine_entity,
+                source_obligations,
+            )?;
+            if expressions
+                .insert(machine_entity.producer(), expression)
+                .is_some()
+            {
+                return Err(MachineBuildError::ObligationMismatch(inst_id));
+            }
+        }
+        let private_frame_conditional_return =
+            private_frame::certified_private_frame_conditional_return(
+                artifact,
+                &origin,
+                &topology,
+                &abi_parameters,
+                &stack_slots,
+                &memory_statements,
+                &direct_controls,
+                &conditional_controls,
+                &return_controls,
+                &expressions,
+            )?;
+        let fnv_fold_loop = fnv_fold::certified_fnv_fold_loop(
+            artifact,
+            &origin,
+            &topology,
+            &projection,
+            &abi_parameters,
+            &memory_statements,
+            &conditional_controls,
+            &return_controls,
+            &expressions,
+        )?;
+        let fnv_fold_o0 = fnv_fold_o0::certified_fnv_fold_o0(
+            artifact,
+            &origin,
+            &topology,
+            &projection,
+            &abi_parameters,
+        )?;
+        match (
+            private_frame_conditional_return.as_ref(),
+            fnv_fold_o0.as_ref(),
+        ) {
+            (Some(_), Some(_)) => return Err(MachineBuildError::TopologyMismatch),
+            (Some(private), None) => private_frame::validate_private_frame_projection(
+                artifact,
+                &projection,
+                Some(private),
+            )?,
+            (None, Some(o0)) => {
+                fnv_fold_o0::validate_fnv_fold_o0_projection(artifact, &projection, o0)?
+            }
+            (None, None) => {
+                private_frame::validate_private_frame_projection(artifact, &projection, None)?
+            }
+        }
+        let private_state_producers = private_frame_conditional_return
+            .as_ref()
+            .map(CertifiedPrivateFrameConditionalReturn::state_producers)
+            .cloned()
+            .unwrap_or_default();
+
+        let source = artifact.obligations().clone();
+        let mut certification = CertifiedFunction {
+            schema_version: CERTIFICATION_SCHEMA_VERSION,
+            source,
+            ledger: ObligationLedger::new(),
+        };
+        let mut absorbed = BTreeSet::new();
+
+        if let Some(state) = &fnv_fold_o0 {
+            for (obligation, _) in state.obligation_dispositions() {
+                if !absorbed.insert(*obligation) {
+                    return Err(MachineBuildError::ObligationMismatch(
+                        artifact
+                            .obligations()
+                            .obligations()
+                            .get(obligation)
+                            .map(|source| source.source_inst)
+                            .unwrap_or(r2ssa::InstId(u32::MAX)),
+                    ));
+                }
+            }
+            certification
+                .record_absorbed_fnv_fold_o0(state)
+                .map_err(|_| MachineBuildError::ObligationMismatch(r2ssa::InstId(u32::MAX)))?;
+        }
+
+        if let Some(state) = &fnv_fold_loop {
+            if state
+                .source_obligations()
+                .iter()
+                .all(|obligation| absorbed.contains(obligation))
+            {
+                // The exact O0 whole-function certificate, when present, owns the
+                // complete source ledger before generic loop recognizers run.
+            } else {
+                for obligation in state.source_obligations() {
+                    if !absorbed.insert(*obligation) {
+                        return Err(MachineBuildError::ObligationMismatch(
+                            artifact
+                                .obligations()
+                                .obligations()
+                                .get(obligation)
+                                .map(|source| source.source_inst)
+                                .unwrap_or(r2ssa::InstId(u32::MAX)),
+                        ));
+                    }
+                }
+                certification
+                    .record_absorbed_fnv_fold_state(state.clone())
+                    .map_err(|_| MachineBuildError::ObligationMismatch(r2ssa::InstId(u32::MAX)))?;
+            }
+        }
+
+        if let Some(state) = &private_frame_conditional_return {
+            if state
+                .source_obligations()
+                .iter()
+                .all(|obligation| absorbed.contains(obligation))
+            {
+                // Already sealed by the exact O0 whole-function witness.
+            } else {
+                for obligation in state.source_obligations() {
+                    if !absorbed.insert(*obligation) {
+                        return Err(MachineBuildError::ObligationMismatch(
+                            artifact
+                                .obligations()
+                                .obligations()
+                                .get(obligation)
+                                .map(|source| source.source_inst)
+                                .unwrap_or(r2ssa::InstId(u32::MAX)),
+                        ));
+                    }
+                }
+                certification
+                    .record_absorbed_private_frame_state(state.clone())
+                    .map_err(|_| MachineBuildError::ObligationMismatch(r2ssa::InstId(u32::MAX)))?;
+            }
+        }
+
+        for control in closed_counted_loop_controls.values() {
+            if control
+                .state()
+                .source_obligations()
+                .iter()
+                .all(|obligation| absorbed.contains(obligation))
+            {
+                continue;
+            }
+            for obligation in control.state().source_obligations() {
+                if !absorbed.insert(*obligation) {
+                    return Err(MachineBuildError::ObligationMismatch(
+                        artifact
+                            .obligations()
+                            .obligations()
+                            .get(obligation)
+                            .map(|source| source.source_inst)
+                            .unwrap_or(r2ssa::InstId(u32::MAX)),
+                    ));
+                }
+            }
+            certification
+                .record_absorbed_counted_loop_state(control.state().clone())
+                .map_err(|_| {
+                    MachineBuildError::ObligationMismatch(
+                        artifact
+                            .obligations()
+                            .obligations()
+                            .get(
+                                control
+                                    .state()
+                                    .source_obligations()
+                                    .iter()
+                                    .next()
+                                    .expect("counted loop state obligations are nonempty"),
+                            )
+                            .map(|source| source.source_inst)
+                            .unwrap_or(r2ssa::InstId(u32::MAX)),
+                    )
+                })?;
+        }
+
+        for control in conditional_return_funnels.values() {
+            if control
+                .carrier()
+                .source_obligations()
+                .iter()
+                .all(|obligation| absorbed.contains(obligation))
+            {
+                continue;
+            }
+            for obligation in control.carrier().source_obligations() {
+                if !absorbed.insert(*obligation) {
+                    return Err(MachineBuildError::ObligationMismatch(
+                        artifact
+                            .obligations()
+                            .obligations()
+                            .get(obligation)
+                            .map(|source| source.source_inst)
+                            .unwrap_or(r2ssa::InstId(u32::MAX)),
+                    ));
+                }
+            }
+            certification
+                .record_absorbed_conditional_return_state(control.carrier().clone())
+                .map_err(|_| {
+                    MachineBuildError::ObligationMismatch(
+                        artifact
+                            .obligations()
+                            .obligations()
+                            .get(
+                                control
+                                    .carrier()
+                                    .source_obligations()
+                                    .iter()
+                                    .next()
+                                    .expect("conditional return state obligations are nonempty"),
+                            )
+                            .map(|source| source.source_inst)
+                            .unwrap_or(r2ssa::InstId(u32::MAX)),
+                    )
+                })?;
+        }
+
+        let mut absorbed_calls = BTreeSet::new();
+        for call in direct_calls.values() {
+            if call
+                .source_obligations()
+                .iter()
+                .all(|obligation| absorbed.contains(obligation))
+            {
+                continue;
+            }
+            for obligation in call.source_obligations() {
+                if !absorbed_calls.insert(obligation) {
+                    return Err(MachineBuildError::ObligationMismatch(call.source_inst));
+                }
+            }
+            certification
+                .record_absorbed_call(call.clone())
+                .map_err(|_| MachineBuildError::ObligationMismatch(call.source_inst))?;
+        }
+
+        let mut absorbed_controls = BTreeSet::new();
+        if let Some(fnv) = &fnv_fold_loop {
+            if fnv
+                .latch_control()
+                .source_obligations()
+                .iter()
+                .all(|obligation| absorbed.contains(obligation))
+            {
+                // Already owned by the exact O0 loop-control disposition.
+            } else {
+                for obligation in fnv.latch_control().source_obligations() {
+                    if !absorbed_controls.insert(obligation) {
+                        return Err(MachineBuildError::ObligationMismatch(
+                            fnv.latch_control().source_inst(),
+                        ));
+                    }
+                }
+                certification
+                    .record_absorbed_fnv_latch_control(fnv.latch_control().clone())
+                    .map_err(|_| {
+                        MachineBuildError::ObligationMismatch(fnv.latch_control().source_inst())
+                    })?;
+            }
+        }
+        for control in direct_controls.values() {
+            if absorbed.contains(&control.source_obligation()) {
+                continue;
+            }
+            if !absorbed_controls.insert(control.source_obligation()) {
+                return Err(MachineBuildError::ObligationMismatch(control.source_inst));
+            }
+            certification
+                .record_absorbed_control(control.clone())
+                .map_err(|_| MachineBuildError::ObligationMismatch(control.source_inst))?;
+        }
+        for control in conditional_controls.values() {
+            if control
+                .source_obligations()
+                .iter()
+                .all(|obligation| absorbed.contains(obligation))
+            {
+                continue;
+            }
+            for obligation in control.source_obligations() {
+                if !absorbed_controls.insert(obligation) {
+                    return Err(MachineBuildError::ObligationMismatch(control.source_inst));
+                }
+            }
+            certification
+                .record_absorbed_conditional_control(control.clone())
+                .map_err(|_| MachineBuildError::ObligationMismatch(control.source_inst))?;
+        }
+        for control in switch_controls.values() {
+            let obligation = control.source_obligation();
+            if absorbed.contains(&obligation) {
+                continue;
+            }
+            if !absorbed_controls.insert(obligation) {
+                return Err(MachineBuildError::ObligationMismatch(
+                    artifact
+                        .obligations()
+                        .obligations()
+                        .get(&obligation)
+                        .map(|fact| fact.source_inst)
+                        .unwrap_or(r2ssa::InstId(u32::MAX)),
+                ));
+            }
+            certification
+                .record_absorbed_switch_control(control.clone())
+                .map_err(|_| MachineBuildError::ObligationMismatch(r2ssa::InstId(u32::MAX)))?;
+        }
+        for control in return_controls.values() {
+            if control
+                .source_obligations()
+                .iter()
+                .all(|obligation| absorbed.contains(obligation))
+            {
+                continue;
+            }
+            for obligation in control.source_obligations() {
+                if !absorbed_controls.insert(obligation) {
+                    return Err(MachineBuildError::ObligationMismatch(control.source_inst));
+                }
+            }
+            certification
+                .record_absorbed_return(control.clone())
+                .map_err(|_| MachineBuildError::ObligationMismatch(control.source_inst))?;
+        }
+
+        for statement in memory_statements.values() {
+            for obligation in statement.source_obligations() {
+                if absorbed.contains(obligation) {
+                    continue;
+                }
+                if !absorbed.insert(*obligation) {
+                    return Err(MachineBuildError::ObligationMismatch(
+                        statement.access().inst,
+                    ));
+                }
+                certification
+                    .record_absorbed_statement(*obligation, statement.clone())
+                    .map_err(|_| MachineBuildError::ObligationMismatch(statement.access().inst))?;
+            }
+        }
+
+        for expression in expressions.values() {
+            let inst_id = artifact
+                .obligations()
+                .instructions()
+                .get(&expression.entity().producer())
+                .map(|source| source.inst)
+                .unwrap_or(r2ssa::InstId(u32::MAX));
+            let pending_obligations = expression
+                .entity()
+                .source_obligations()
+                .iter()
+                .copied()
+                .filter(|obligation| !absorbed.contains(obligation))
+                .collect::<Vec<_>>();
+            for obligation in pending_obligations {
+                if !absorbed.insert(obligation) {
+                    return Err(MachineBuildError::ObligationMismatch(inst_id));
+                }
+                certification
+                    .record_absorbed_expression(obligation, expression.clone())
+                    .map_err(|_| MachineBuildError::ObligationMismatch(inst_id))?;
+            }
+        }
+
+        for obligation in artifact
+            .obligations()
+            .obligations()
+            .values()
+            .filter(|obligation| obligation.id.kind == SemanticObligationKind::LiveValueProducer)
+        {
+            if !absorbed.contains(&obligation.id) {
+                return Err(MachineBuildError::ObligationMismatch(
+                    obligation.source_inst,
+                ));
+            }
+        }
+
+        for statement in memory_statements.values() {
+            let missing_inputs = memory_statement_input_producers(statement)
+                .iter()
+                .copied()
+                .filter(|producer| !expressions.contains_key(producer))
+                .collect::<BTreeSet<_>>();
+            let exact_o0_raw_byte_store = fnv_fold_o0.as_ref().is_some_and(|fnv| {
+                let initial_store = fnv.ascii().initial_store();
+                missing_inputs
+                    == BTreeSet::from([fnv.external_alias_policy().external_read().producer()])
+                    && statement.producer() == initial_store.producer()
+                    && statement.access().ordinal == initial_store.ordinal()
+                    && statement.object() == fnv.ascii().object()
+                    && matches!(statement.kind(), CertifiedMemoryStatementKind::Write { value }
+                        if value.binding().value() == fnv.index().raw_byte()
+                            && value.producer()
+                                == Some(fnv.external_alias_policy().external_read().producer()))
+            });
+            if !missing_inputs.is_empty() && !exact_o0_raw_byte_store {
+                return Err(MachineBuildError::ObligationMismatch(
+                    statement.access().inst,
+                ));
+            }
+            if matches!(statement.kind(), CertifiedMemoryStatementKind::Read { .. }) {
+                let entity = projection.entity_for_producer(statement.producer()).ok_or(
+                    MachineBuildError::ObligationMismatch(statement.access().inst),
+                )?;
+                let kind = projection
+                    .expr(entity.root())
+                    .map(|expression| expression.kind())
+                    .ok_or(MachineBuildError::ObligationMismatch(
+                        statement.access().inst,
+                    ))?;
+                if !certified_read_matches_machine_entity(statement, entity, kind) {
+                    return Err(MachineBuildError::ObligationMismatch(
+                        statement.access().inst,
+                    ));
+                }
+            }
+        }
+
+        for control in conditional_controls.values() {
+            if conditional_control_input_producers(control)
+                .iter()
+                .any(|producer| !expressions.contains_key(producer))
+            {
+                return Err(MachineBuildError::ObligationMismatch(control.source_inst));
+            }
+        }
+
+        for call in direct_calls.values() {
+            if direct_call_input_producers(call)
+                .iter()
+                .any(|producer| !expressions.contains_key(producer))
+            {
+                return Err(MachineBuildError::ObligationMismatch(call.source_inst));
+            }
+        }
+
+        for control in return_controls.values() {
+            if return_control_input_producers(control)
+                .iter()
+                .any(|producer| {
+                    !expressions.contains_key(producer)
+                        && !private_state_producers.contains(producer)
+                })
+            {
+                return Err(MachineBuildError::ObligationMismatch(control.source_inst));
+            }
+        }
+
+        Ok(Self {
+            origin,
+            projection,
+            machine_context,
+            abi_parameters,
+            stack_slots,
+            certification,
+            expressions,
+            memory_statements,
+            aggregate_member_accesses,
+            direct_calls,
+            direct_controls,
+            conditional_controls,
+            return_controls,
+            natural_loop_routings,
+            closed_natural_loop_controls,
+            closed_counted_loop_controls,
+            conditional_return_funnels,
+            private_frame_conditional_return,
+            fnv_fold_loop,
+            fnv_fold_o0,
+            switch_topologies,
+            switch_controls,
+            topology,
+        })
+    }
+
+    pub const fn origin(&self) -> &CertifiedArtifactOrigin {
+        &self.origin
+    }
+
+    pub const fn projection(&self) -> &MachineProjection {
+        &self.projection
+    }
+
+    pub const fn machine_context(&self) -> &CertifiedMachineContext {
+        &self.machine_context
+    }
+
+    pub const fn abi_parameters(&self) -> &BTreeMap<u32, CertifiedAbiParameter> {
+        &self.abi_parameters
+    }
+
+    pub const fn stack_slots(&self) -> &BTreeMap<StackAddressRoot, CertifiedStackSlot> {
+        &self.stack_slots
+    }
+
+    pub fn source(&self) -> &SemanticObligationInventory {
+        self.certification.source()
+    }
+
+    pub fn ledger(&self) -> &ObligationLedger {
+        self.certification.ledger()
+    }
+
+    pub const fn topology(&self) -> &CertifiedSourceTopology {
+        &self.topology
+    }
+
+    /// Certified expression bound to one canonical producer.
+    pub fn expression_for_producer(
+        &self,
+        producer: CanonicalInstructionId,
+    ) -> Option<&CertifiedExpr> {
+        self.expressions.get(&producer)
+    }
+
+    pub fn memory_statement_for_producer(
+        &self,
+        producer: CanonicalInstructionId,
+    ) -> Option<&CertifiedMemoryStatement> {
+        self.memory_statements.get(&producer)
+    }
+
+    pub fn aggregate_member_access(
+        &self,
+        access: StructuredAccessId,
+    ) -> Option<&CertifiedAggregateMemberAccess> {
+        self.aggregate_member_accesses.get(&access)
+    }
+
+    pub const fn aggregate_member_accesses(
+        &self,
+    ) -> &BTreeMap<StructuredAccessId, CertifiedAggregateMemberAccess> {
+        &self.aggregate_member_accesses
+    }
+
+    pub fn direct_call_for_producer(
+        &self,
+        producer: CanonicalInstructionId,
+    ) -> Option<&CertifiedDirectCall> {
+        self.direct_calls.get(&producer)
+    }
+
+    pub const fn direct_calls(&self) -> &BTreeMap<CanonicalInstructionId, CertifiedDirectCall> {
+        &self.direct_calls
+    }
+
+    pub fn direct_control_for_producer(
+        &self,
+        producer: CanonicalInstructionId,
+    ) -> Option<&CertifiedDirectControl> {
+        self.direct_controls.get(&producer)
+    }
+
+    pub fn conditional_control_for_producer(
+        &self,
+        producer: CanonicalInstructionId,
+    ) -> Option<&CertifiedConditionalControl> {
+        self.conditional_controls.get(&producer)
+    }
+
+    pub fn return_control_for_producer(
+        &self,
+        producer: CanonicalInstructionId,
+    ) -> Option<&CertifiedReturnControl> {
+        self.return_controls.get(&producer)
+    }
+
+    pub const fn return_controls(
+        &self,
+    ) -> &BTreeMap<CanonicalInstructionId, CertifiedReturnControl> {
+        &self.return_controls
+    }
+
+    pub fn natural_loop_routing_for_header(
+        &self,
+        header: u64,
+    ) -> Option<&CertifiedNaturalLoopRouting> {
+        self.natural_loop_routings.get(&header)
+    }
+
+    pub fn closed_natural_loop_control_for_header(
+        &self,
+        header: u64,
+    ) -> Option<&CertifiedClosedNaturalLoopControl> {
+        self.closed_natural_loop_controls.get(&header)
+    }
+
+    pub fn closed_counted_loop_control_for_header(
+        &self,
+        header: u64,
+    ) -> Option<&CertifiedClosedCountedLoopControl> {
+        self.closed_counted_loop_controls.get(&header)
+    }
+
+    pub fn conditional_return_funnel(
+        &self,
+        predicate: PredicateId,
+    ) -> Option<&CertifiedConditionalReturnFunnelControl> {
+        self.conditional_return_funnels.get(&predicate)
+    }
+
+    pub const fn conditional_return_funnels(
+        &self,
+    ) -> &BTreeMap<PredicateId, CertifiedConditionalReturnFunnelControl> {
+        &self.conditional_return_funnels
+    }
+
+    pub const fn private_frame_conditional_return(
+        &self,
+    ) -> Option<&CertifiedPrivateFrameConditionalReturn> {
+        self.private_frame_conditional_return.as_ref()
+    }
+
+    pub const fn fnv_fold_loop(&self) -> Option<&CertifiedFnvFoldLoop> {
+        self.fnv_fold_loop.as_ref()
+    }
+
+    pub const fn fnv_fold_o0(&self) -> Option<&CertifiedFnvFoldO0Function> {
+        self.fnv_fold_o0.as_ref()
+    }
+
+    pub fn switch_topology_for_block(&self, block_addr: u64) -> Option<&CertifiedSwitchTopology> {
+        self.switch_topologies.get(&block_addr)
+    }
+
+    pub fn switch_control_for_block(&self, block_addr: u64) -> Option<&CertifiedSwitchControl> {
+        self.switch_controls.get(&block_addr)
+    }
+
+    pub fn finish(&self) -> CertificationReport {
+        let mut report = self.certification.finish();
+        report.typed_region_required = true;
+        report
+    }
+}
+
+/// Fail-closed machine projection retaining supported expression, plain-memory,
+/// and admitted terminal-control evidence. Unsupported producers and their
+/// dependents receive exact residual dispositions. Retained evidence remains
+/// pending typed-region validation and cannot independently authorize final C.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CertifiedMachineProjection {
+    origin: CertifiedArtifactOrigin,
+    projection: MachineProjection,
+    machine_context: CertifiedMachineContext,
+    abi_parameters: BTreeMap<u32, CertifiedAbiParameter>,
+    stack_slots: BTreeMap<StackAddressRoot, CertifiedStackSlot>,
+    certification: CertifiedFunction,
+    expressions: BTreeMap<CanonicalInstructionId, CertifiedExpr>,
+    memory_statements: BTreeMap<CanonicalInstructionId, CertifiedMemoryStatement>,
+    aggregate_member_accesses: BTreeMap<StructuredAccessId, CertifiedAggregateMemberAccess>,
+    direct_calls: BTreeMap<CanonicalInstructionId, CertifiedDirectCall>,
+    direct_controls: BTreeMap<CanonicalInstructionId, CertifiedDirectControl>,
+    conditional_controls: BTreeMap<CanonicalInstructionId, CertifiedConditionalControl>,
+    return_controls: BTreeMap<CanonicalInstructionId, CertifiedReturnControl>,
+    natural_loop_routings: BTreeMap<u64, CertifiedNaturalLoopRouting>,
+    closed_natural_loop_controls: BTreeMap<u64, CertifiedClosedNaturalLoopControl>,
+    switch_topologies: BTreeMap<u64, CertifiedSwitchTopology>,
+    switch_controls: BTreeMap<u64, CertifiedSwitchControl>,
+    residual_producers: BTreeSet<CanonicalInstructionId>,
+    topology: CertifiedSourceTopology,
+}
+
+impl CertifiedMachineProjection {
+    pub fn from_artifact(artifact: &SsaArtifact) -> Result<Self, MachineBuildError> {
+        let projection = MachineProjection::from_artifact(artifact)?;
+        projection.validate_against(artifact)?;
+        let machine_context = CertifiedMachineContext::from_artifact(artifact)?;
+        let topology = certified_source_topology(artifact)?;
+        let origin = certified_artifact_origin(artifact, &machine_context, &topology)?;
+        let abi_parameters = certified_abi_parameters(artifact)?;
+        let stack_slots = certified_stack_slots(artifact)?;
+        let candidate_direct_calls = certified_direct_calls(artifact, &topology)?;
+        let direct_controls = certified_direct_controls(artifact, &topology)?;
+        let candidate_conditional_controls = certified_conditional_controls(artifact, &topology)?;
+        let candidate_return_controls = certified_return_controls(artifact, &topology)?;
+        let switch_topologies = certified_switch_topologies(artifact, &origin, &topology)?;
+        let candidate_switch_controls =
+            certified_switch_controls(artifact, &origin, &switch_topologies, &abi_parameters)?;
+        let candidate_natural_loop_routings = certified_natural_loop_routings(
+            artifact,
+            &origin,
+            &topology,
+            &direct_controls,
+            &candidate_conditional_controls,
+        )?;
+        let graph = artifact.graph();
+        let source = artifact.obligations().clone();
+        let mut certification = CertifiedFunction {
+            schema_version: CERTIFICATION_SCHEMA_VERSION,
+            source,
+            ledger: ObligationLedger::new(),
+        };
+        let candidate_memory_statements = certified_memory_statements(artifact)?;
+        let mut absorbed_controls = BTreeSet::new();
+        for control in direct_controls.values() {
+            if !absorbed_controls.insert(control.source_obligation()) {
+                return Err(MachineBuildError::ObligationMismatch(control.source_inst));
+            }
+            certification
+                .record_absorbed_control(control.clone())
+                .map_err(|_| MachineBuildError::ObligationMismatch(control.source_inst))?;
+        }
+        let mut blocked_outputs = projection
+            .failures()
+            .iter()
+            .map(|failure| failure.output())
+            .collect::<BTreeSet<_>>();
+        blocked_outputs.extend(
+            artifact
+                .obligations()
+                .instructions()
+                .values()
+                .filter(|instruction| {
+                    instruction.obligations.iter().any(|obligation| {
+                        matches!(
+                            obligation.kind,
+                            SemanticObligationKind::ObservableMemoryRead
+                                | SemanticObligationKind::ObservableMemoryWrite
+                        )
+                    }) && !candidate_memory_statements.contains_key(&instruction.id)
+                })
+                .filter_map(|instruction| {
+                    graph
+                        .inst(instruction.inst)
+                        .and_then(|instruction| instruction.output)
+                }),
+        );
+        blocked_outputs.extend(
+            artifact
+                .obligations()
+                .instructions()
+                .values()
+                .filter(|instruction| {
+                    instruction.state == SemanticInstructionState::UnsupportedUnknown
+                })
+                .filter_map(|instruction| {
+                    graph
+                        .inst(instruction.inst)
+                        .and_then(|instruction| instruction.output)
+                }),
+        );
+
+        loop {
+            let mut changed = false;
+            for entity in projection.entities() {
+                if blocked_outputs.contains(&entity.output().value()) {
+                    continue;
+                }
+                let inst_id = graph
+                    .def_inst(entity.output().value())
+                    .ok_or(MachineBuildError::EntityMismatch(r2ssa::InstId(u32::MAX)))?;
+                let inst = graph
+                    .inst(inst_id)
+                    .ok_or(MachineBuildError::MissingInstruction(inst_id))?;
+                if inst
+                    .inputs
+                    .iter()
+                    .any(|input| blocked_outputs.contains(input))
+                {
+                    changed |= blocked_outputs.insert(entity.output().value());
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        let mut residual_producers = BTreeSet::new();
+        for instruction in artifact.obligations().instructions().values() {
+            let blocked_output = graph
+                .inst(instruction.inst)
+                .and_then(|inst| inst.output)
+                .is_some_and(|output| blocked_outputs.contains(&output));
+            if instruction.state == SemanticInstructionState::UnsupportedUnknown || blocked_output {
+                residual_producers.insert(instruction.id);
+            }
+        }
+        let direct_calls = candidate_direct_calls
+            .into_iter()
+            .filter(|(_, call)| {
+                direct_call_input_producers(call)
+                    .iter()
+                    .all(|producer| !residual_producers.contains(producer))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let memory_statements = candidate_memory_statements
+            .into_iter()
+            .filter(|(_, statement)| {
+                let address_is_supported = statement
+                    .address()
+                    .producer()
+                    .is_none_or(|producer| !residual_producers.contains(&producer));
+                let value_is_supported = match statement.kind() {
+                    CertifiedMemoryStatementKind::Read { .. } => true,
+                    CertifiedMemoryStatementKind::Write { value } => value
+                        .producer()
+                        .is_none_or(|producer| !residual_producers.contains(&producer)),
+                };
+                address_is_supported && value_is_supported
+            })
+            .collect::<BTreeMap<_, _>>();
+        let aggregate_member_accesses = aggregate_member::certified_aggregate_member_accesses(
+            artifact,
+            &origin,
+            &abi_parameters,
+            &memory_statements,
+        )?;
+        let conditional_controls = candidate_conditional_controls
+            .into_iter()
+            .filter(|(_, control)| {
+                conditional_control_input_producers(control)
+                    .iter()
+                    .all(|producer| !residual_producers.contains(producer))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let return_controls = candidate_return_controls
+            .into_iter()
+            .filter(|(_, control)| {
+                return_control_input_producers(control)
+                    .iter()
+                    .all(|producer| !residual_producers.contains(producer))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let natural_loop_routings = candidate_natural_loop_routings
+            .into_iter()
+            .filter(|(_, routing)| {
+                conditional_controls.contains_key(&routing.header_control().producer())
+                    && direct_controls.contains_key(&routing.body_transfer().producer())
+            })
+            .collect::<BTreeMap<_, _>>();
+        let closed_natural_loop_controls = certified_closed_natural_loop_controls(
+            artifact,
+            &origin,
+            &topology,
+            &natural_loop_routings,
+            &direct_controls,
+            &abi_parameters,
+        )?;
+        let switch_controls = candidate_switch_controls;
+        let mut absorbed_calls = BTreeSet::new();
+        for call in direct_calls.values() {
+            for obligation in call.source_obligations() {
+                if !absorbed_calls.insert(obligation) {
+                    return Err(MachineBuildError::ObligationMismatch(call.source_inst));
+                }
+            }
+            certification
+                .record_absorbed_call(call.clone())
+                .map_err(|_| MachineBuildError::ObligationMismatch(call.source_inst))?;
+        }
+        for control in conditional_controls.values() {
+            for obligation in control.source_obligations() {
+                if !absorbed_controls.insert(obligation) {
+                    return Err(MachineBuildError::ObligationMismatch(control.source_inst));
+                }
+            }
+            certification
+                .record_absorbed_conditional_control(control.clone())
+                .map_err(|_| MachineBuildError::ObligationMismatch(control.source_inst))?;
+        }
+        for control in switch_controls.values() {
+            let obligation = control.source_obligation();
+            if !absorbed_controls.insert(obligation) {
+                return Err(MachineBuildError::ObligationMismatch(
+                    control.topology.source_inst,
+                ));
+            }
+            certification
+                .record_absorbed_switch_control(control.clone())
+                .map_err(|_| MachineBuildError::ObligationMismatch(control.topology.source_inst))?;
+        }
+        for control in return_controls.values() {
+            for obligation in control.source_obligations() {
+                if !absorbed_controls.insert(obligation) {
+                    return Err(MachineBuildError::ObligationMismatch(control.source_inst));
+                }
+            }
+            certification
+                .record_absorbed_return(control.clone())
+                .map_err(|_| MachineBuildError::ObligationMismatch(control.source_inst))?;
+        }
+        let mut absorbed_statements = BTreeSet::new();
+        for statement in memory_statements.values() {
+            for obligation in statement.source_obligations() {
+                if !absorbed_statements.insert(*obligation) {
+                    return Err(MachineBuildError::ObligationMismatch(
+                        statement.access().inst,
+                    ));
+                }
+                certification
+                    .record_absorbed_statement(*obligation, statement.clone())
+                    .map_err(|_| MachineBuildError::ObligationMismatch(statement.access().inst))?;
+            }
+        }
+
+        let mut residualized = BTreeSet::new();
+        for instruction in artifact.obligations().instructions().values() {
+            let blocked_output = graph
+                .inst(instruction.inst)
+                .and_then(|inst| inst.output)
+                .is_some_and(|output| blocked_outputs.contains(&output));
+            let has_memory_obligation = instruction.obligations.iter().any(|obligation| {
+                matches!(
+                    obligation.kind,
+                    SemanticObligationKind::ObservableMemoryRead
+                        | SemanticObligationKind::ObservableMemoryWrite
+                )
+            });
+            let lacks_memory_statement =
+                has_memory_obligation && !memory_statements.contains_key(&instruction.id);
+            let has_call_obligation = instruction.obligations.iter().any(|obligation| {
+                matches!(
+                    obligation.kind,
+                    SemanticObligationKind::Call
+                        | SemanticObligationKind::CallArgument
+                        | SemanticObligationKind::CallResult
+                )
+            });
+            let lacks_call_certificate =
+                has_call_obligation && !direct_calls.contains_key(&instruction.id);
+            let has_control_transfer = instruction
+                .obligations
+                .iter()
+                .any(|obligation| obligation.kind == SemanticObligationKind::ControlTransfer);
+            let lacks_control_certificate = has_control_transfer
+                && !direct_controls.contains_key(&instruction.id)
+                && !conditional_controls.contains_key(&instruction.id)
+                && !switch_controls
+                    .values()
+                    .any(|control| control.producer() == instruction.id);
+            let has_return_obligation = instruction.obligations.iter().any(|obligation| {
+                matches!(
+                    obligation.kind,
+                    SemanticObligationKind::Return | SemanticObligationKind::ReturnValue
+                )
+            });
+            let lacks_return_certificate =
+                has_return_obligation && !return_controls.contains_key(&instruction.id);
+            if instruction.state != SemanticInstructionState::UnsupportedUnknown
+                && !blocked_output
+                && !lacks_memory_statement
+                && !lacks_call_certificate
+                && !lacks_control_certificate
+                && !lacks_return_certificate
+            {
+                continue;
+            }
+            residual_producers.insert(instruction.id);
+            let reason = if instruction.state == SemanticInstructionState::UnsupportedUnknown {
+                "source instruction has unsupported or unknown semantics"
+            } else if lacks_memory_statement {
+                "memory effect lacks an exact plain-statement certificate"
+            } else if lacks_call_certificate {
+                "call boundary lacks an exact direct-call certificate"
+            } else if lacks_control_certificate {
+                "control transfer lacks an exact control certificate"
+            } else if lacks_return_certificate {
+                "return boundary lacks an exact return certificate"
+            } else {
+                "value expression depends on an unsupported producer"
+            };
+            for obligation in &instruction.obligations {
+                if absorbed_statements.contains(obligation)
+                    || absorbed_calls.contains(obligation)
+                    || absorbed_controls.contains(obligation)
+                {
+                    return Err(MachineBuildError::ObligationMismatch(instruction.inst));
+                }
+                if !residualized.insert(*obligation) {
+                    return Err(MachineBuildError::ObligationMismatch(instruction.inst));
+                }
+                certification
+                    .residualize(*obligation, reason)
+                    .map_err(|_| MachineBuildError::ObligationMismatch(instruction.inst))?;
+            }
+        }
+
+        let mut expressions = BTreeMap::new();
+        let mut absorbed = BTreeSet::new();
+        for entity in projection.entities() {
+            if residual_producers.contains(&entity.producer()) {
+                continue;
+            }
+            let source_obligations = entity
+                .source_obligations()
+                .iter()
+                .copied()
+                .filter(|id| id.kind == SemanticObligationKind::LiveValueProducer)
+                .collect::<BTreeSet<_>>();
+            if source_obligations.is_empty() {
+                continue;
+            }
+            let inst_id = graph
+                .def_inst(entity.output().value())
+                .ok_or(MachineBuildError::EntityMismatch(r2ssa::InstId(u32::MAX)))?;
+            let expression = certified_expr_from_projection(
+                artifact,
+                &projection,
+                entity,
+                source_obligations.clone(),
+            )?;
+            if expression
+                .inputs()
+                .iter()
+                .any(|producer| residual_producers.contains(producer))
+            {
+                return Err(MachineBuildError::ObligationMismatch(inst_id));
+            }
+            if expressions
+                .insert(entity.producer(), expression.clone())
+                .is_some()
+            {
+                return Err(MachineBuildError::ObligationMismatch(inst_id));
+            }
+            for obligation in source_obligations {
+                if !absorbed.insert(obligation) || residualized.contains(&obligation) {
+                    return Err(MachineBuildError::ObligationMismatch(inst_id));
+                }
+                certification
+                    .record_absorbed_expression(obligation, expression.clone())
+                    .map_err(|_| MachineBuildError::ObligationMismatch(inst_id))?;
+            }
+        }
+
+        for obligation in artifact
+            .obligations()
+            .obligations()
+            .values()
+            .filter(|obligation| obligation.id.kind == SemanticObligationKind::LiveValueProducer)
+        {
+            if absorbed.contains(&obligation.id) == residualized.contains(&obligation.id) {
+                return Err(MachineBuildError::ObligationMismatch(
+                    obligation.source_inst,
+                ));
+            }
+        }
+
+        for obligation in artifact
+            .obligations()
+            .obligations()
+            .values()
+            .filter(|obligation| {
+                matches!(
+                    obligation.id.kind,
+                    SemanticObligationKind::Call
+                        | SemanticObligationKind::CallArgument
+                        | SemanticObligationKind::CallResult
+                )
+            })
+        {
+            if absorbed_calls.contains(&obligation.id) == residualized.contains(&obligation.id) {
+                return Err(MachineBuildError::ObligationMismatch(
+                    obligation.source_inst,
+                ));
+            }
+        }
+
+        for obligation in artifact
+            .obligations()
+            .obligations()
+            .values()
+            .filter(|obligation| {
+                matches!(
+                    obligation.id.kind,
+                    SemanticObligationKind::ControlPredicate
+                        | SemanticObligationKind::ControlTransfer
+                        | SemanticObligationKind::Return
+                        | SemanticObligationKind::ReturnValue
+                )
+            })
+        {
+            if absorbed_controls.contains(&obligation.id) == residualized.contains(&obligation.id) {
+                return Err(MachineBuildError::ObligationMismatch(
+                    obligation.source_inst,
+                ));
+            }
+        }
+
+        for obligation in artifact
+            .obligations()
+            .obligations()
+            .values()
+            .filter(|obligation| {
+                matches!(
+                    obligation.id.kind,
+                    SemanticObligationKind::ObservableMemoryRead
+                        | SemanticObligationKind::ObservableMemoryWrite
+                )
+            })
+        {
+            if absorbed_statements.contains(&obligation.id) == residualized.contains(&obligation.id)
+            {
+                return Err(MachineBuildError::ObligationMismatch(
+                    obligation.source_inst,
+                ));
+            }
+        }
+
+        for statement in memory_statements.values() {
+            if memory_statement_input_producers(statement)
+                .iter()
+                .any(|producer| !expressions.contains_key(producer))
+            {
+                return Err(MachineBuildError::ObligationMismatch(
+                    statement.access().inst,
+                ));
+            }
+            if matches!(statement.kind(), CertifiedMemoryStatementKind::Read { .. }) {
+                let entity = projection.entity_for_producer(statement.producer()).ok_or(
+                    MachineBuildError::ObligationMismatch(statement.access().inst),
+                )?;
+                let kind = projection
+                    .expr(entity.root())
+                    .map(|expression| expression.kind())
+                    .ok_or(MachineBuildError::ObligationMismatch(
+                        statement.access().inst,
+                    ))?;
+                if !certified_read_matches_machine_entity(statement, entity, kind) {
+                    return Err(MachineBuildError::ObligationMismatch(
+                        statement.access().inst,
+                    ));
+                }
+            }
+        }
+
+        for control in conditional_controls.values() {
+            if conditional_control_input_producers(control)
+                .iter()
+                .any(|producer| !expressions.contains_key(producer))
+            {
+                return Err(MachineBuildError::ObligationMismatch(control.source_inst));
+            }
+        }
+
+        for call in direct_calls.values() {
+            if direct_call_input_producers(call)
+                .iter()
+                .any(|producer| !expressions.contains_key(producer))
+            {
+                return Err(MachineBuildError::ObligationMismatch(call.source_inst));
+            }
+        }
+
+        for control in return_controls.values() {
+            if return_control_input_producers(control)
+                .iter()
+                .any(|producer| !expressions.contains_key(producer))
+            {
+                return Err(MachineBuildError::ObligationMismatch(control.source_inst));
+            }
+        }
+
+        Ok(Self {
+            origin,
+            projection,
+            machine_context,
+            abi_parameters,
+            stack_slots,
+            certification,
+            expressions,
+            memory_statements,
+            aggregate_member_accesses,
+            direct_calls,
+            direct_controls,
+            conditional_controls,
+            return_controls,
+            natural_loop_routings,
+            closed_natural_loop_controls,
+            switch_topologies,
+            switch_controls,
+            residual_producers,
+            topology,
+        })
+    }
+
+    pub const fn origin(&self) -> &CertifiedArtifactOrigin {
+        &self.origin
+    }
+
+    pub const fn projection(&self) -> &MachineProjection {
+        &self.projection
+    }
+
+    pub const fn machine_context(&self) -> &CertifiedMachineContext {
+        &self.machine_context
+    }
+
+    pub const fn abi_parameters(&self) -> &BTreeMap<u32, CertifiedAbiParameter> {
+        &self.abi_parameters
+    }
+
+    pub const fn stack_slots(&self) -> &BTreeMap<StackAddressRoot, CertifiedStackSlot> {
+        &self.stack_slots
+    }
+
+    pub fn source(&self) -> &SemanticObligationInventory {
+        self.certification.source()
+    }
+
+    pub fn ledger(&self) -> &ObligationLedger {
+        self.certification.ledger()
+    }
+
+    pub const fn topology(&self) -> &CertifiedSourceTopology {
+        &self.topology
+    }
+
+    pub const fn residual_producers(&self) -> &BTreeSet<CanonicalInstructionId> {
+        &self.residual_producers
+    }
+
+    pub fn expression_for_producer(
+        &self,
+        producer: CanonicalInstructionId,
+    ) -> Option<&CertifiedExpr> {
+        self.expressions.get(&producer)
+    }
+
+    pub fn memory_statement_for_producer(
+        &self,
+        producer: CanonicalInstructionId,
+    ) -> Option<&CertifiedMemoryStatement> {
+        self.memory_statements.get(&producer)
+    }
+
+    pub fn aggregate_member_access(
+        &self,
+        access: StructuredAccessId,
+    ) -> Option<&CertifiedAggregateMemberAccess> {
+        self.aggregate_member_accesses.get(&access)
+    }
+
+    pub const fn aggregate_member_accesses(
+        &self,
+    ) -> &BTreeMap<StructuredAccessId, CertifiedAggregateMemberAccess> {
+        &self.aggregate_member_accesses
+    }
+
+    pub fn direct_call_for_producer(
+        &self,
+        producer: CanonicalInstructionId,
+    ) -> Option<&CertifiedDirectCall> {
+        self.direct_calls.get(&producer)
+    }
+
+    pub const fn direct_calls(&self) -> &BTreeMap<CanonicalInstructionId, CertifiedDirectCall> {
+        &self.direct_calls
+    }
+
+    pub fn direct_control_for_producer(
+        &self,
+        producer: CanonicalInstructionId,
+    ) -> Option<&CertifiedDirectControl> {
+        self.direct_controls.get(&producer)
+    }
+
+    pub fn conditional_control_for_producer(
+        &self,
+        producer: CanonicalInstructionId,
+    ) -> Option<&CertifiedConditionalControl> {
+        self.conditional_controls.get(&producer)
+    }
+
+    pub fn return_control_for_producer(
+        &self,
+        producer: CanonicalInstructionId,
+    ) -> Option<&CertifiedReturnControl> {
+        self.return_controls.get(&producer)
+    }
+
+    pub const fn return_controls(
+        &self,
+    ) -> &BTreeMap<CanonicalInstructionId, CertifiedReturnControl> {
+        &self.return_controls
+    }
+
+    pub fn natural_loop_routing_for_header(
+        &self,
+        header: u64,
+    ) -> Option<&CertifiedNaturalLoopRouting> {
+        self.natural_loop_routings.get(&header)
+    }
+
+    pub fn closed_natural_loop_control_for_header(
+        &self,
+        header: u64,
+    ) -> Option<&CertifiedClosedNaturalLoopControl> {
+        self.closed_natural_loop_controls.get(&header)
+    }
+
+    pub fn switch_topology_for_block(&self, block_addr: u64) -> Option<&CertifiedSwitchTopology> {
+        self.switch_topologies.get(&block_addr)
+    }
+
+    pub fn switch_control_for_block(&self, block_addr: u64) -> Option<&CertifiedSwitchControl> {
+        self.switch_controls.get(&block_addr)
+    }
+
+    pub fn finish(&self) -> CertificationReport {
+        let mut report = self.certification.finish();
+        report.typed_region_required = true;
+        report
+    }
+}
+
+fn certified_source_topology(
+    artifact: &SsaArtifact,
+) -> Result<CertifiedSourceTopology, MachineBuildError> {
+    let graph = artifact.graph();
+    let source = artifact.obligations();
+    let function = artifact.function();
+    let cfg = function.cfg();
+    let entry = graph
+        .block(graph.entry)
+        .filter(|block| block.id == graph.entry)
+        .ok_or(MachineBuildError::TopologyMismatch)?;
+    if entry.addr != function.entry
+        || entry.addr != cfg.entry
+        || graph.block_order.first() != Some(&graph.entry)
+        || graph.block_order.len() != graph.blocks.len()
+        || cfg.num_blocks() != graph.blocks.len()
+        || function.num_blocks() != graph.blocks.len()
+    {
+        return Err(MachineBuildError::TopologyMismatch);
+    }
+
+    let ordered_blocks = graph.block_order.iter().copied().collect::<BTreeSet<_>>();
+    if ordered_blocks.len() != graph.blocks.len() {
+        return Err(MachineBuildError::TopologyMismatch);
+    }
+    for (index, block) in graph.blocks.iter().enumerate() {
+        if block.id.0 as usize != index
+            || !ordered_blocks.contains(&block.id)
+            || graph.block_by_addr.get(&block.addr) != Some(&block.id)
+            || function
+                .get_block(block.addr)
+                .is_none_or(|source_block| source_block.size != block.size)
+            || cfg
+                .get_block(block.addr)
+                .is_none_or(|source_block| source_block.size != block.size)
+        {
+            return Err(MachineBuildError::TopologyMismatch);
+        }
+    }
+    if graph.block_by_addr.len() != graph.blocks.len() {
+        return Err(MachineBuildError::TopologyMismatch);
+    }
+    for (index, instruction) in graph.insts.iter().enumerate() {
+        if instruction.id.0 as usize != index {
+            return Err(MachineBuildError::TopologyMismatch);
+        }
+    }
+
+    let mut addresses = BTreeSet::new();
+    let mut instruction_ids = BTreeSet::new();
+    let mut graph_instructions = BTreeSet::new();
+    let mut blocks = Vec::with_capacity(graph.block_order.len());
+
+    for block_id in &graph.block_order {
+        let block = graph
+            .block(*block_id)
+            .ok_or(MachineBuildError::MissingGraphBlock(*block_id))?;
+        if !addresses.insert(block.addr) {
+            return Err(MachineBuildError::DuplicateBlockAddress(block.addr));
+        }
+        let predecessor_ids = block.predecessors.iter().copied().collect::<BTreeSet<_>>();
+        let successor_ids = block.successors.iter().copied().collect::<BTreeSet<_>>();
+        if predecessor_ids.len() != block.predecessors.len()
+            || successor_ids.len() != block.successors.len()
+        {
+            return Err(MachineBuildError::TopologyMismatch);
+        }
+        let predecessors = block
+            .predecessors
+            .iter()
+            .map(|predecessor| {
+                graph
+                    .block(*predecessor)
+                    .map(|block| block.addr)
+                    .ok_or(MachineBuildError::MissingGraphBlock(*predecessor))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let successors = block
+            .successors
+            .iter()
+            .map(|successor| {
+                graph
+                    .block(*successor)
+                    .map(|block| block.addr)
+                    .ok_or(MachineBuildError::MissingGraphBlock(*successor))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if predecessors != cfg.predecessors(block.addr) || successors != cfg.successors(block.addr)
+        {
+            return Err(MachineBuildError::TopologyMismatch);
+        }
+        for predecessor in &block.predecessors {
+            let predecessor = graph
+                .block(*predecessor)
+                .ok_or(MachineBuildError::MissingGraphBlock(*predecessor))?;
+            if predecessor
+                .successors
+                .iter()
+                .filter(|successor| **successor == block.id)
+                .count()
+                != 1
+            {
+                return Err(MachineBuildError::TopologyMismatch);
+            }
+        }
+        for successor in &block.successors {
+            let successor = graph
+                .block(*successor)
+                .ok_or(MachineBuildError::MissingGraphBlock(*successor))?;
+            if successor
+                .predecessors
+                .iter()
+                .filter(|predecessor| **predecessor == block.id)
+                .count()
+                != 1
+            {
+                return Err(MachineBuildError::TopologyMismatch);
+            }
+        }
+        let instructions = block
+            .insts
+            .iter()
+            .enumerate()
+            .map(|(ordinal, inst)| {
+                let graph_inst = graph
+                    .inst(*inst)
+                    .filter(|instruction| {
+                        instruction.id == *inst
+                            && instruction.block == block.id
+                            && instruction.ordinal == ordinal
+                    })
+                    .ok_or(MachineBuildError::TopologyMismatch)?;
+                if !graph_instructions.insert(graph_inst.id) {
+                    return Err(MachineBuildError::TopologyMismatch);
+                }
+                let id = source
+                    .instruction_for_inst(*inst)
+                    .map(|instruction| instruction.id)
+                    .ok_or(MachineBuildError::MissingInstructionDisposition(*inst))?;
+                if id.block_addr != block.addr || !instruction_ids.insert(id) {
+                    return Err(MachineBuildError::TopologyMismatch);
+                }
+                Ok(id)
+            })
+            .collect::<Result<Vec<_>, MachineBuildError>>()?;
+        let terminator = cfg
+            .get_block(block.addr)
+            .ok_or(MachineBuildError::TopologyMismatch)
+            .and_then(CertifiedSourceTerminator::from_block)?;
+        blocks.push(CertifiedSourceBlock {
+            addr: block.addr,
+            predecessors: predecessors.into_boxed_slice(),
+            successors: successors.into_boxed_slice(),
+            terminator,
+            instructions: instructions.into_boxed_slice(),
+        });
+    }
+
+    if graph.blocks.len() != blocks.len()
+        || graph_instructions
+            != graph
+                .insts
+                .iter()
+                .map(|instruction| instruction.id)
+                .collect()
+        || instruction_ids != source.instructions().keys().copied().collect()
+    {
+        return Err(MachineBuildError::TopologyMismatch);
+    }
+    Ok(CertifiedSourceTopology {
+        schema_version: CERTIFICATION_SCHEMA_VERSION,
+        entry_addr: entry.addr,
+        blocks: blocks.into_boxed_slice(),
+    })
+}
+
+fn certified_expr_from_machine(
+    artifact: &SsaArtifact,
+    machine: &MachineProjection,
+    machine_entity: &MachineEntity,
+    source_obligations: BTreeSet<SemanticObligationId>,
+) -> Result<CertifiedExpr, MachineBuildError> {
+    let graph = artifact.graph();
+    let inst_id = graph
+        .def_inst(machine_entity.output().value())
+        .ok_or(MachineBuildError::EntityMismatch(r2ssa::InstId(u32::MAX)))?;
+    let inst = graph
+        .inst(inst_id)
+        .ok_or(MachineBuildError::MissingInstruction(inst_id))?;
+    let producer = artifact
+        .obligations()
+        .instruction_for_inst(inst_id)
+        .ok_or(MachineBuildError::MissingInstructionDisposition(inst_id))?
+        .id;
+    if producer != machine_entity.producer()
+        || machine
+            .expr(machine_entity.root())
+            .is_none_or(|root| root.origin() != Some(producer))
+    {
+        return Err(MachineBuildError::EntityMismatch(inst_id));
+    }
+
+    let mut inputs = BTreeSet::new();
+    for input in &inst.inputs {
+        let Some(input_inst) = graph.def_inst(*input) else {
+            continue;
+        };
+        let input_producer = artifact
+            .obligations()
+            .instruction_for_inst(input_inst)
+            .ok_or(MachineBuildError::MissingInstructionDisposition(input_inst))?
+            .id;
+        inputs.insert(input_producer);
+    }
+
+    let expression = CertifiedExpr {
+        schema_version: CERTIFICATION_SCHEMA_VERSION,
+        entity: CertifiedEntity {
+            schema_version: CERTIFICATION_SCHEMA_VERSION,
+            producer,
+            source_obligations,
+        },
+        root: machine_entity.root(),
+        inputs,
+    };
+    expression
+        .validate(artifact.obligations())
+        .map_err(|_| MachineBuildError::ObligationMismatch(inst_id))?;
+    Ok(expression)
+}
+
+fn certified_expr_from_projection(
+    artifact: &SsaArtifact,
+    projection: &MachineProjection,
+    machine_entity: &MachineEntity,
+    source_obligations: BTreeSet<SemanticObligationId>,
+) -> Result<CertifiedExpr, MachineBuildError> {
+    let graph = artifact.graph();
+    let inst_id = graph
+        .def_inst(machine_entity.output().value())
+        .ok_or(MachineBuildError::EntityMismatch(r2ssa::InstId(u32::MAX)))?;
+    let inst = graph
+        .inst(inst_id)
+        .ok_or(MachineBuildError::MissingInstruction(inst_id))?;
+    let producer = artifact
+        .obligations()
+        .instruction_for_inst(inst_id)
+        .ok_or(MachineBuildError::MissingInstructionDisposition(inst_id))?
+        .id;
+    if producer != machine_entity.producer()
+        || projection
+            .expr(machine_entity.root())
+            .is_none_or(|root| root.origin() != Some(producer))
+    {
+        return Err(MachineBuildError::EntityMismatch(inst_id));
+    }
+
+    let mut inputs = BTreeSet::new();
+    for input in &inst.inputs {
+        let Some(input_inst) = graph.def_inst(*input) else {
+            continue;
+        };
+        let input_producer = artifact
+            .obligations()
+            .instruction_for_inst(input_inst)
+            .ok_or(MachineBuildError::MissingInstructionDisposition(input_inst))?
+            .id;
+        inputs.insert(input_producer);
+    }
+
+    let expression = CertifiedExpr {
+        schema_version: CERTIFICATION_SCHEMA_VERSION,
+        entity: CertifiedEntity {
+            schema_version: CERTIFICATION_SCHEMA_VERSION,
+            producer,
+            source_obligations,
+        },
+        root: machine_entity.root(),
+        inputs,
+    };
+    expression
+        .validate(artifact.obligations())
+        .map_err(|_| MachineBuildError::ObligationMismatch(inst_id))?;
+    Ok(expression)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use r2il::{
+        ArchSpec, Endianness, MemoryOrdering, R2ILBlock, R2ILOp, RegisterDef, SpaceId, SwitchCase,
+        SwitchInfo, Varnode,
+    };
+    use r2ssa::{
+        CanonicalStorageId, CanonicalStorageSpace, InstPayload, MachineArithmeticMode,
+        MachineArithmeticOp, MachineExprKind, SSAOp, SourceAbiParameterSpec,
+        SourceCallArgumentSpec, SourceCallResult, SourceCallSiteIdentity, SourceCallSiteInterface,
+        SourceFunctionInterface, SourceFunctionReturn, SourceStackSlotSpec, SsaArtifact,
+    };
+
+    fn inventory() -> SemanticObligationInventory {
+        let mut block = R2ILBlock::new(0x1000, 4);
+        let address = Varnode::register(0, 8);
+        let value = Varnode::unique(0x10, 4);
+        block.push(R2ILOp::Load {
+            dst: value.clone(),
+            space: SpaceId::Ram,
+            addr: address.clone(),
+        });
+        block.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: address,
+            val: value,
+        });
+        SsaArtifact::raw(&[block], None)
+            .expect("source artifact")
+            .obligations()
+            .clone()
+    }
+
+    fn typed_memory_artifact() -> SsaArtifact {
+        let address = Varnode::register(0, 8);
+        let loaded = Varnode::unique(0x10, 4);
+        let mut block = R2ILBlock::new(0x1800, 4);
+        block.push(R2ILOp::Load {
+            dst: loaded.clone(),
+            space: SpaceId::Ram,
+            addr: address.clone(),
+        });
+        block.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: address,
+            val: loaded,
+        });
+        let mut arch = ArchSpec::new("certified-memory-test");
+        arch.addr_size = 8;
+        arch.set_memory_endianness(Endianness::Big);
+        SsaArtifact::raw(&[block], Some(&arch)).expect("typed memory artifact")
+    }
+
+    fn unsupported_inventory() -> SemanticObligationInventory {
+        let mut block = R2ILBlock::new(0x2000, 4);
+        block.push(R2ILOp::Fence {
+            ordering: MemoryOrdering::Unknown,
+        });
+        SsaArtifact::raw(&[block], None)
+            .expect("unsupported artifact")
+            .obligations()
+            .clone()
+    }
+
+    fn explicit_switch_return_artifact() -> SsaArtifact {
+        let storage = |offset| CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let mut header = R2ILBlock::new(0x30e0, 4);
+        header.push(R2ILOp::BranchInd {
+            target: Varnode::register(8, 8),
+        });
+        header.set_switch_info(SwitchInfo {
+            switch_addr: 0x30e0,
+            min_val: 1,
+            max_val: 2,
+            default_target: Some(0x3140),
+            cases: vec![
+                SwitchCase {
+                    value: 1,
+                    target: 0x3100,
+                },
+                SwitchCase {
+                    value: 2,
+                    target: 0x3120,
+                },
+            ],
+        });
+        let arm = |addr, value| {
+            let mut block = R2ILBlock::new(addr, 4);
+            block.push(R2ILOp::Copy {
+                dst: Varnode::register(0, 8),
+                src: Varnode::constant(value, 8),
+            });
+            block.push(R2ILOp::Return {
+                target: Varnode::register(16, 8),
+            });
+            block
+        };
+        let interface = SourceFunctionInterface::new(
+            b"switch-return-certification-revision".to_vec(),
+            "test-register-abi",
+            [SourceAbiParameterSpec::new(0, storage(8))],
+            SourceFunctionReturn::Register {
+                storage: storage(0),
+            },
+            [],
+        )
+        .expect("switch function interface");
+        let mut arch = ArchSpec::new("switch-return-certification-test");
+        arch.add_register(RegisterDef::new("rax", 0, 8));
+        arch.add_register(RegisterDef::new("rdi", 8, 8));
+        arch.add_register(RegisterDef::new("rip", 16, 8));
+        SsaArtifact::raw_with_interface(
+            &[header, arm(0x3100, 11), arm(0x3120, 22), arm(0x3140, 33)],
+            Some(&arch),
+            interface,
+        )
+        .expect("switch-return artifact")
+    }
+
+    fn explicit_carrier_free_loop_return_artifact() -> SsaArtifact {
+        let storage = |offset, size| CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset,
+            size,
+        };
+        let mut preheader = R2ILBlock::new(0x3160, 4);
+        preheader.push(R2ILOp::Branch {
+            target: Varnode::ram(0x3170, 8),
+        });
+        let mut header = R2ILBlock::new(0x3170, 4);
+        header.push(R2ILOp::CBranch {
+            target: Varnode::ram(0x3190, 8),
+            cond: Varnode::register(8, 1),
+        });
+        let mut exit = R2ILBlock::new(0x3174, 4);
+        exit.push(R2ILOp::Copy {
+            dst: Varnode::register(0, 8),
+            src: Varnode::constant(0x2a, 8),
+        });
+        exit.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+        let mut body = R2ILBlock::new(0x3190, 4);
+        body.push(R2ILOp::Branch {
+            target: Varnode::ram(0x3170, 8),
+        });
+        let interface = SourceFunctionInterface::new(
+            b"carrier-free-loop-return-certification-revision".to_vec(),
+            "test-register-abi",
+            [SourceAbiParameterSpec::new(0, storage(8, 1))],
+            SourceFunctionReturn::Register {
+                storage: storage(0, 8),
+            },
+            [],
+        )
+        .expect("loop function interface");
+        let mut arch = ArchSpec::new("carrier-free-loop-return-certification-test");
+        arch.add_register(RegisterDef::new("rax", 0, 8));
+        arch.add_register(RegisterDef::new("dil", 8, 1));
+        arch.add_register(RegisterDef::new("rip", 16, 8));
+        SsaArtifact::raw_with_interface(&[preheader, header, exit, body], Some(&arch), interface)
+            .expect("carrier-free-loop-return artifact")
+    }
+
+    fn fnv_artifact() -> SsaArtifact {
+        let offset = Varnode::unique(0x10, 8);
+        let mixed = Varnode::unique(0x20, 8);
+        let product = Varnode::unique(0x30, 8);
+        let mut entry = R2ILBlock::new(0x3000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: offset.clone(),
+            src: Varnode::constant(1_469_598_103_934_665_603, 8),
+        });
+        entry.push(R2ILOp::IntXor {
+            dst: mixed.clone(),
+            a: offset,
+            b: Varnode::register(0, 8),
+        });
+        entry.push(R2ILOp::IntMult {
+            dst: product.clone(),
+            a: mixed,
+            b: Varnode::constant(1_099_511_628_211, 8),
+        });
+        entry.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::register(8, 8),
+            val: product,
+        });
+        entry.push(R2ILOp::Branch {
+            target: Varnode::ram(0x3010, 8),
+        });
+
+        let mut exit = R2ILBlock::new(0x3010, 4);
+        exit.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        SsaArtifact::raw(&[entry, exit], None).expect("FNV artifact")
+    }
+
+    fn explicit_return_artifact(return_kind: SourceFunctionReturn) -> SsaArtifact {
+        let mut block = R2ILBlock::new(0x3080, 4);
+        block.push(R2ILOp::Copy {
+            dst: Varnode::unique(0x10, 8),
+            src: Varnode::register(8, 8),
+        });
+        if matches!(return_kind, SourceFunctionReturn::Register { .. }) {
+            block.push(R2ILOp::Copy {
+                dst: Varnode::register(0, 8),
+                src: Varnode::unique(0x10, 8),
+            });
+        }
+        block.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+        let mut arch = ArchSpec::new("explicit-interface-test");
+        arch.add_register(RegisterDef::new("rax", 0, 8));
+        arch.add_register(RegisterDef::new("rdi", 8, 8));
+        arch.add_register(RegisterDef::new("rip", 16, 8));
+        let interface = SourceFunctionInterface::new(
+            b"certified-interface-revision-1".to_vec(),
+            "test-register-abi",
+            [SourceAbiParameterSpec::new(
+                0,
+                CanonicalStorageId {
+                    space: CanonicalStorageSpace::Register,
+                    offset: 8,
+                    size: 8,
+                },
+            )],
+            return_kind,
+            [],
+        )
+        .expect("valid interface");
+        SsaArtifact::raw_with_interface(&[block], Some(&arch), interface)
+            .expect("explicit return artifact")
+    }
+
+    fn explicit_direct_call_return_artifact() -> SsaArtifact {
+        let target = Varnode::ram(0x31d0, 8);
+        let mut entry = R2ILBlock::new(0x30d0, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(8, 8),
+            src: Varnode::register(16, 8),
+        });
+        entry.push(R2ILOp::Call {
+            target: target.clone(),
+        });
+        let mut returned = R2ILBlock::new(0x30d4, 4);
+        returned.push(R2ILOp::Return {
+            target: Varnode::register(24, 8),
+        });
+        let mut arch = ArchSpec::new("explicit-direct-call-return-interface-test");
+        arch.add_register(RegisterDef::new("rdi", 8, 8));
+        arch.add_register(RegisterDef::new("rsi", 16, 8));
+        arch.add_register(RegisterDef::new("rip", 24, 8));
+        let revision = b"certified-direct-call-return-revision-1".to_vec();
+        let argument_storage = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 8,
+            size: 8,
+        };
+        let parameter_storage = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 16,
+            size: 8,
+        };
+        let function_interface = SourceFunctionInterface::new(
+            revision.clone(),
+            "caller-test-abi",
+            [SourceAbiParameterSpec::new(0, parameter_storage)],
+            SourceFunctionReturn::Void,
+            [],
+        )
+        .expect("function interface");
+        let identity =
+            SourceCallSiteIdentity::new(0x30d0, 1, CanonicalStorageId::from_varnode(&target));
+        let call_interface = SourceCallSiteInterface::new(
+            revision,
+            identity,
+            true,
+            "callee-test-abi",
+            [SourceCallArgumentSpec::new(0, argument_storage)],
+            false,
+            false,
+            SourceCallResult::Void,
+        )
+        .expect("call interface");
+        SsaArtifact::raw_with_interfaces(
+            &[entry, returned],
+            Some(&arch),
+            Some(function_interface),
+            vec![call_interface],
+        )
+        .expect("explicit direct-call return artifact")
+    }
+
+    fn explicit_memory_return_artifact(word_size: u32) -> SsaArtifact {
+        let mut block = R2ILBlock::new(0x3090, 4);
+        block.push(R2ILOp::Load {
+            dst: Varnode::register(0, 8),
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x40, 8),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+        let mut arch = ArchSpec::new("explicit-memory-return-interface-test");
+        arch.add_register(RegisterDef::new("rax", 0, 8));
+        arch.add_register(RegisterDef::new("rip", 16, 8));
+        let mut ram = r2il::AddressSpace::ram(8);
+        ram.word_size = word_size;
+        arch.add_space(ram);
+        arch.set_memory_endianness(Endianness::Little);
+        let interface = SourceFunctionInterface::new(
+            b"certified-memory-return-revision-1".to_vec(),
+            "test-register-abi",
+            [],
+            SourceFunctionReturn::Register {
+                storage: CanonicalStorageId {
+                    space: CanonicalStorageSpace::Register,
+                    offset: 0,
+                    size: 8,
+                },
+            },
+            [],
+        )
+        .expect("valid memory-return interface");
+        SsaArtifact::raw_with_interface(&[block], Some(&arch), interface)
+            .expect("explicit memory return artifact")
+    }
+
+    fn explicit_conditional_return_artifact() -> SsaArtifact {
+        let mut header = R2ILBlock::new(0x30a0, 4);
+        header.push(R2ILOp::CBranch {
+            target: Varnode::ram(0x30c0, 8),
+            cond: Varnode::constant(1, 1),
+        });
+        let mut false_arm = R2ILBlock::new(0x30a4, 4);
+        false_arm.push(R2ILOp::Copy {
+            dst: Varnode::register(0, 8),
+            src: Varnode::constant(0, 8),
+        });
+        false_arm.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+        let mut true_arm = R2ILBlock::new(0x30c0, 4);
+        true_arm.push(R2ILOp::Copy {
+            dst: Varnode::register(0, 8),
+            src: Varnode::constant(u64::MAX, 8),
+        });
+        true_arm.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+        let mut arch = ArchSpec::new("explicit-conditional-return-interface-test");
+        arch.add_register(RegisterDef::new("rax", 0, 8));
+        arch.add_register(RegisterDef::new("rip", 16, 8));
+        let interface = SourceFunctionInterface::new(
+            b"certified-conditional-return-revision-1".to_vec(),
+            "test-register-abi",
+            [],
+            SourceFunctionReturn::Register {
+                storage: CanonicalStorageId {
+                    space: CanonicalStorageSpace::Register,
+                    offset: 0,
+                    size: 8,
+                },
+            },
+            [],
+        )
+        .expect("valid conditional-return interface");
+        SsaArtifact::raw_with_interface(&[header, false_arm, true_arm], Some(&arch), interface)
+            .expect("explicit conditional-return artifact")
+    }
+
+    fn explicit_stack_slot_artifact(slot_size_bytes: u32) -> SsaArtifact {
+        let mut block = R2ILBlock::new(0x30c0, 4);
+        block.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::register(24, 8),
+            val: Varnode::constant(0x1122_3344_5566_7788, 8),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+        let mut arch = ArchSpec::new("explicit-stack-interface-test");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("rip", 16, 8));
+        arch.add_register(RegisterDef::new("rsp", 24, 8));
+        let interface = SourceFunctionInterface::new(
+            b"certified-stack-interface-revision-1".to_vec(),
+            "test-stack-abi",
+            [],
+            SourceFunctionReturn::Void,
+            [
+                SourceStackSlotSpec::new(
+                    StackAddressBase::StackPointer,
+                    CanonicalStorageId {
+                        space: CanonicalStorageSpace::Register,
+                        offset: 24,
+                        size: 8,
+                    },
+                    0,
+                    slot_size_bytes,
+                ),
+                SourceStackSlotSpec::new(
+                    StackAddressBase::StackPointer,
+                    CanonicalStorageId {
+                        space: CanonicalStorageSpace::Register,
+                        offset: 24,
+                        size: 8,
+                    },
+                    16,
+                    4,
+                ),
+            ],
+        )
+        .expect("valid stack interface");
+        SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface)
+            .expect("explicit stack artifact")
+    }
+
+    fn loop_artifact() -> SsaArtifact {
+        let accumulator = Varnode::register(0, 8);
+        let mut entry = R2ILBlock::new(0x4000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: accumulator.clone(),
+            src: Varnode::constant(0, 8),
+        });
+        entry.push(R2ILOp::Branch {
+            target: Varnode::ram(0x4010, 8),
+        });
+
+        let mut header = R2ILBlock::new(0x4010, 4);
+        header.push(R2ILOp::CBranch {
+            target: Varnode::ram(0x4020, 8),
+            cond: Varnode::constant(1, 1),
+        });
+
+        let mut exit = R2ILBlock::new(0x4014, 4);
+        exit.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+
+        let mut latch = R2ILBlock::new(0x4020, 4);
+        latch.push(R2ILOp::IntAdd {
+            dst: accumulator.clone(),
+            a: accumulator,
+            b: Varnode::constant(1, 8),
+        });
+        latch.push(R2ILOp::Branch {
+            target: Varnode::ram(0x4010, 8),
+        });
+        SsaArtifact::raw(&[entry, header, exit, latch], None).expect("loop artifact")
+    }
+
+    fn obligation_ids(source: &SemanticObligationInventory) -> Vec<SemanticObligationId> {
+        source.obligations().keys().copied().collect()
+    }
+
+    fn output_for(
+        source: &SemanticObligationInventory,
+        id: SemanticObligationId,
+    ) -> CertifiedEntity {
+        CertifiedEntity::certify(source, id.instruction, [id]).expect("certified output")
+    }
+
+    #[test]
+    fn plain_load_and_store_receive_exact_statement_dispositions() {
+        let artifact = typed_memory_artifact();
+        let certified = CertifiedMachineProjection::from_artifact(&artifact)
+            .expect("certified typed-memory projection");
+        assert!(certified.projection().failures().is_empty());
+
+        let load = artifact
+            .graph()
+            .insts
+            .iter()
+            .find(|inst| matches!(inst.payload, InstPayload::Op(SSAOp::Load { .. })))
+            .expect("load instruction");
+        let store = artifact
+            .graph()
+            .insts
+            .iter()
+            .find(|inst| matches!(inst.payload, InstPayload::Op(SSAOp::Store { .. })))
+            .expect("store instruction");
+        let load_producer = artifact
+            .obligations()
+            .instruction_for_inst(load.id)
+            .expect("load source")
+            .id;
+        let store_producer = artifact
+            .obligations()
+            .instruction_for_inst(store.id)
+            .expect("store source")
+            .id;
+        let load_statement = certified
+            .memory_statement_for_producer(load_producer)
+            .expect("certified load statement");
+        let store_statement = certified
+            .memory_statement_for_producer(store_producer)
+            .expect("certified store statement");
+
+        assert!(matches!(
+            load_statement.kind(),
+            CertifiedMemoryStatementKind::Read { result }
+                if result.binding().value() == load.output.expect("load output")
+        ));
+        assert!(matches!(
+            store_statement.kind(),
+            CertifiedMemoryStatementKind::Write { value }
+                if value.binding().value() == store.inputs[1]
+        ));
+        assert_eq!(load_statement.endianness(), MachineMemoryEndianness::Big);
+        assert_eq!(load_statement.width_bits(), 32);
+        assert_eq!(store_statement.width_bits(), 32);
+
+        for statement in [load_statement, store_statement] {
+            let mut obligations = statement.source_obligations().iter().copied();
+            let obligation = obligations.next().expect("one memory obligation");
+            assert!(obligations.next().is_none());
+            let [effect] = certified.ledger().effects(obligation) else {
+                panic!("one statement disposition expected");
+            };
+            assert_eq!(
+                effect.disposition(),
+                &EffectDisposition::AbsorbedIntoStatement {
+                    producer: statement.producer(),
+                }
+            );
+        }
+
+        let live_load = artifact
+            .obligations()
+            .instruction_for_inst(load.id)
+            .expect("load source")
+            .obligations
+            .iter()
+            .copied()
+            .find(|id| id.kind == SemanticObligationKind::LiveValueProducer)
+            .expect("live load result");
+        assert!(matches!(
+            certified.ledger().effects(live_load),
+            [effect]
+                if effect.disposition()
+                    == &EffectDisposition::AbsorbedIntoExpression {
+                        producer: load_producer,
+                    }
+        ));
+        let report = certified.finish();
+        assert!(!report.authorizes_certified_c());
+        assert_eq!(report.pending_semantic_ast().len(), 3);
+    }
+
+    #[test]
+    fn corrupted_memory_statement_witnesses_fail_artifact_revalidation() {
+        let artifact = typed_memory_artifact();
+        let statements = certified_memory_statements(&artifact).expect("memory statements");
+        let load = artifact
+            .graph()
+            .insts
+            .iter()
+            .find(|inst| matches!(inst.payload, InstPayload::Op(SSAOp::Load { .. })))
+            .expect("load instruction");
+        let store = artifact
+            .graph()
+            .insts
+            .iter()
+            .find(|inst| matches!(inst.payload, InstPayload::Op(SSAOp::Store { .. })))
+            .expect("store instruction");
+        let load_producer = artifact
+            .obligations()
+            .instruction_for_inst(load.id)
+            .expect("load source")
+            .id;
+        let store_producer = artifact
+            .obligations()
+            .instruction_for_inst(store.id)
+            .expect("store source")
+            .id;
+        let original = statements
+            .get(&load_producer)
+            .expect("load statement")
+            .clone();
+        original
+            .validate_against_artifact(&artifact)
+            .expect("original statement revalidates");
+        let assert_invalid = |statement: &CertifiedMemoryStatement| {
+            assert!(matches!(
+                statement.validate_against_artifact(&artifact),
+                Err(MachineBuildError::ObligationMismatch(_))
+            ));
+        };
+
+        let mut corrupted = original.clone();
+        corrupted.schema_version += 1;
+        assert_invalid(&corrupted);
+        let mut corrupted = original.clone();
+        corrupted.producer = store_producer;
+        assert_invalid(&corrupted);
+        let mut corrupted = original.clone();
+        corrupted.access.ordinal += 1;
+        assert_invalid(&corrupted);
+        let mut corrupted = original.clone();
+        corrupted.object = ObjectId(corrupted.object.0 + 1);
+        assert_invalid(&corrupted);
+        let mut corrupted = original.clone();
+        corrupted.address =
+            MachineValueUse::from_artifact(&artifact, load.output.expect("load output"))
+                .expect("replacement value use");
+        assert_invalid(&corrupted);
+        let mut corrupted = original.clone();
+        corrupted.space = MachineAddressSpace::Custom(77);
+        assert_invalid(&corrupted);
+        let mut corrupted = original.clone();
+        corrupted.endianness = MachineMemoryEndianness::Little;
+        assert_invalid(&corrupted);
+        let mut corrupted = original.clone();
+        corrupted.word_size_bytes += 1;
+        assert_invalid(&corrupted);
+        let mut corrupted = original.clone();
+        corrupted.width_bits += 8;
+        assert_invalid(&corrupted);
+        let mut corrupted = original.clone();
+        let CertifiedMemoryStatementKind::Read { result } = original.kind() else {
+            panic!("load read expected");
+        };
+        corrupted.kind = CertifiedMemoryStatementKind::Write {
+            value: result.clone(),
+        };
+        assert_invalid(&corrupted);
+        let mut corrupted = original.clone();
+        let obligation = *corrupted
+            .source_obligations
+            .first()
+            .expect("memory obligation");
+        corrupted.source_obligations = BTreeSet::from([SemanticObligationId {
+            kind: SemanticObligationKind::ObservableMemoryWrite,
+            ..obligation
+        }]);
+        assert_invalid(&corrupted);
+    }
+
+    #[test]
+    fn mixed_endian_memory_remains_residual_without_helper_semantics() {
+        let address = Varnode::register(0, 8);
+        let loaded = Varnode::unique(0x10, 4);
+        let mut block = R2ILBlock::new(0x1850, 4);
+        block.push(R2ILOp::Load {
+            dst: loaded.clone(),
+            space: SpaceId::Ram,
+            addr: address.clone(),
+        });
+        block.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: address,
+            val: loaded,
+        });
+        let mut arch = ArchSpec::new("mixed-memory-test");
+        arch.addr_size = 8;
+        arch.set_memory_endianness(Endianness::Mixed);
+        let artifact = SsaArtifact::raw(&[block], Some(&arch)).expect("mixed memory artifact");
+        let certified = CertifiedMachineProjection::from_artifact(&artifact)
+            .expect("fail-closed mixed-memory projection");
+
+        assert!(
+            artifact
+                .obligations()
+                .instructions()
+                .keys()
+                .all(|producer| certified.memory_statement_for_producer(*producer).is_none())
+        );
+        for obligation in artifact
+            .obligations()
+            .obligations()
+            .values()
+            .filter(|obligation| {
+                matches!(
+                    obligation.id.kind,
+                    SemanticObligationKind::ObservableMemoryRead
+                        | SemanticObligationKind::ObservableMemoryWrite
+                )
+            })
+        {
+            assert!(matches!(
+                certified.ledger().effects(obligation.id),
+                [effect]
+                    if matches!(effect.disposition(), EffectDisposition::Residualized { .. })
+            ));
+        }
+        assert!(!certified.finish().authorizes_certified_c());
+    }
+
+    #[test]
+    fn machine_seam_absorbs_fnv_wrapping_multiply_producer() {
+        let artifact = fnv_artifact();
+        let mult_inst = artifact
+            .graph()
+            .insts
+            .iter()
+            .find(|inst| matches!(&inst.payload, InstPayload::Op(SSAOp::IntMult { .. })))
+            .expect("FNV multiply instruction");
+        let producer = artifact
+            .obligations()
+            .instruction_for_inst(mult_inst.id)
+            .expect("multiply disposition")
+            .id;
+        let live_value = artifact
+            .obligations()
+            .instruction_for_inst(mult_inst.id)
+            .expect("multiply disposition")
+            .obligations
+            .iter()
+            .copied()
+            .find(|id| id.kind == SemanticObligationKind::LiveValueProducer)
+            .expect("live multiply obligation");
+
+        let certified = CertifiedMachineFunction::from_artifact(&artifact)
+            .expect("certified machine expressions");
+        let [effect] = certified.ledger().effects(live_value) else {
+            panic!("one exact multiply disposition expected");
+        };
+        assert_eq!(
+            effect.disposition(),
+            &EffectDisposition::AbsorbedIntoExpression { producer }
+        );
+
+        let entity = certified
+            .projection()
+            .entity_for_producer(producer)
+            .expect("multiply machine entity");
+        let expression = certified
+            .expression_for_producer(producer)
+            .expect("certified multiply expression");
+        assert_eq!(expression.root(), entity.root());
+        assert_eq!(expression.entity().producer(), producer);
+        assert!(matches!(
+            certified
+                .projection()
+                .expr(entity.root())
+                .expect("multiply root")
+                .kind(),
+            MachineExprKind::Arithmetic {
+                op: MachineArithmeticOp::Multiply,
+                mode: MachineArithmeticMode::Wrapping,
+                ..
+            }
+        ));
+
+        let xor_inst = artifact
+            .graph()
+            .insts
+            .iter()
+            .find(|inst| matches!(&inst.payload, InstPayload::Op(SSAOp::IntXor { .. })))
+            .expect("FNV xor instruction");
+        let xor_producer = artifact
+            .obligations()
+            .instruction_for_inst(xor_inst.id)
+            .expect("xor disposition")
+            .id;
+        let DispositionEvidence::Expression(expression) = &effect.evidence else {
+            panic!("expression evidence expected");
+        };
+        assert_eq!(expression.inputs(), &BTreeSet::from([xor_producer]));
+    }
+
+    #[test]
+    fn certified_topology_retains_empty_source_blocks() {
+        let mut entry = R2ILBlock::new(0x3800, 4);
+        entry.push(R2ILOp::Branch {
+            target: Varnode::ram(0x3810, 8),
+        });
+        let empty = R2ILBlock::new(0x3810, 4);
+        let artifact = SsaArtifact::raw(&[entry, empty], None).expect("two-block artifact");
+        let certified =
+            CertifiedMachineFunction::from_artifact(&artifact).expect("certified machine");
+
+        assert_eq!(
+            certified.topology().blocks().len(),
+            artifact.graph().blocks.len()
+        );
+        assert_eq!(certified.topology().entry_addr(), 0x3800);
+        assert!(matches!(
+            certified
+                .topology()
+                .block(0x3800)
+                .map(|block| block.terminator()),
+            Some(CertifiedSourceTerminator::Branch { target: 0x3810 })
+        ));
+        assert!(
+            certified
+                .topology()
+                .block(0x3810)
+                .is_some_and(|block| block.instructions().is_empty())
+        );
+    }
+
+    #[test]
+    fn direct_branch_receives_exact_control_disposition_and_mutations_fail() {
+        let mut entry = R2ILBlock::new(0x3820, 4);
+        entry.push(R2ILOp::Branch {
+            target: Varnode::ram(0x3830, 8),
+        });
+        let target = R2ILBlock::new(0x3830, 4);
+        let artifact = SsaArtifact::raw(&[entry, target], None).expect("direct branch artifact");
+        let certified = CertifiedMachineProjection::from_artifact(&artifact)
+            .expect("certified direct branch projection");
+        let branch = artifact
+            .graph()
+            .insts
+            .iter()
+            .find(|inst| matches!(inst.payload, InstPayload::Op(SSAOp::Branch { .. })))
+            .expect("branch instruction");
+        let producer = artifact
+            .obligations()
+            .instruction_for_inst(branch.id)
+            .expect("branch source")
+            .id;
+        let control = certified
+            .direct_control_for_producer(producer)
+            .expect("direct control evidence");
+        assert_eq!(control.target(), 0x3830);
+        assert_eq!(control.target_value().binding().value(), branch.inputs[0]);
+        assert!(matches!(
+            certified.ledger().effects(control.source_obligation()),
+            [effect]
+                if effect.disposition()
+                    == &EffectDisposition::AbsorbedIntoControl { producer }
+        ));
+        control
+            .validate_against_artifact(&artifact)
+            .expect("control revalidates");
+
+        let mut corrupted = control.clone();
+        corrupted.target = 0x3840;
+        assert!(matches!(
+            corrupted.validate_against_artifact(&artifact),
+            Err(MachineBuildError::ObligationMismatch(_))
+        ));
+        let mut corrupted = control.clone();
+        corrupted.source_obligation.kind = SemanticObligationKind::ControlPredicate;
+        assert!(matches!(
+            corrupted.validate_against_artifact(&artifact),
+            Err(MachineBuildError::ObligationMismatch(_))
+        ));
+        let report = certified.finish();
+        assert!(!report.authorizes_certified_c());
+        assert!(
+            report
+                .pending_semantic_ast()
+                .contains(&control.source_obligation())
+        );
+    }
+
+    #[test]
+    fn direct_branch_rejects_available_architecture_target_width_mismatch() {
+        let mut entry = R2ILBlock::new(0x3838, 4);
+        entry.push(R2ILOp::Branch {
+            target: Varnode::ram(0x3848, 8),
+        });
+        let target = R2ILBlock::new(0x3848, 4);
+        let mut arch = ArchSpec::new("32-bit-direct-test");
+        arch.addr_size = 4;
+        let artifact =
+            SsaArtifact::raw(&[entry, target], Some(&arch)).expect("direct branch artifact");
+        let certified = CertifiedMachineProjection::from_artifact(&artifact)
+            .expect("fail-closed direct projection");
+        let branch = artifact
+            .graph()
+            .insts
+            .iter()
+            .find(|inst| matches!(inst.payload, InstPayload::Op(SSAOp::Branch { .. })))
+            .expect("branch instruction");
+        let producer = artifact
+            .obligations()
+            .instruction_for_inst(branch.id)
+            .expect("branch source")
+            .id;
+        let transfer = artifact
+            .obligations()
+            .instructions()
+            .get(&producer)
+            .expect("branch disposition")
+            .obligations
+            .iter()
+            .copied()
+            .find(|obligation| obligation.kind == SemanticObligationKind::ControlTransfer)
+            .expect("control transfer obligation");
+
+        assert!(certified.direct_control_for_producer(producer).is_none());
+        assert!(matches!(
+            certified.ledger().effects(transfer),
+            [effect]
+                if matches!(effect.disposition(), EffectDisposition::Residualized { .. })
+        ));
+    }
+
+    #[test]
+    fn direct_branch_uses_r2il_effective_architecture_width_fallback() {
+        let mut entry = R2ILBlock::new(0x30, 4);
+        entry.push(R2ILOp::Branch {
+            target: Varnode::ram(0x40, 1),
+        });
+        let target = R2ILBlock::new(0x40, 4);
+        let mut arch = ArchSpec::new("fallback-width-direct-test");
+        arch.addr_size = 1;
+        arch.add_register(RegisterDef::new("pc", 0, 8));
+        let artifact =
+            SsaArtifact::raw(&[entry, target], Some(&arch)).expect("direct branch artifact");
+        let certified = CertifiedMachineProjection::from_artifact(&artifact)
+            .expect("fail-closed direct projection");
+        let branch = artifact
+            .graph()
+            .insts
+            .iter()
+            .find(|inst| matches!(inst.payload, InstPayload::Op(SSAOp::Branch { .. })))
+            .expect("branch instruction");
+        let producer = artifact
+            .obligations()
+            .instruction_for_inst(branch.id)
+            .expect("branch source")
+            .id;
+
+        assert_eq!(
+            certified
+                .machine_context()
+                .memory_model()
+                .default_address_bits(),
+            64
+        );
+        assert!(certified.direct_control_for_producer(producer).is_none());
+    }
+
+    #[test]
+    fn conditional_control_receives_exact_predicate_and_transfer_dispositions() {
+        let mut entry = R2ILBlock::new(0x3840, 4);
+        entry.push(R2ILOp::CBranch {
+            target: Varnode::ram(0x3850, 8),
+            cond: Varnode::constant(1, 1),
+        });
+        let fallthrough = R2ILBlock::new(0x3844, 4);
+        let taken = R2ILBlock::new(0x3850, 4);
+        let artifact = SsaArtifact::raw(&[entry, fallthrough, taken], None)
+            .expect("conditional branch artifact");
+        let certified = CertifiedMachineProjection::from_artifact(&artifact)
+            .expect("certified conditional projection");
+        let branch = artifact
+            .graph()
+            .insts
+            .iter()
+            .find(|inst| matches!(inst.payload, InstPayload::Op(SSAOp::CBranch { .. })))
+            .expect("conditional instruction");
+        let producer = artifact
+            .obligations()
+            .instruction_for_inst(branch.id)
+            .expect("conditional source")
+            .id;
+        let control = certified
+            .conditional_control_for_producer(producer)
+            .expect("conditional control evidence");
+        assert_eq!(control.true_target(), 0x3850);
+        assert_eq!(control.false_target(), 0x3844);
+        assert_eq!(control.target_value().binding().value(), branch.inputs[0]);
+        assert_eq!(control.condition().binding().value(), branch.inputs[1]);
+        assert_eq!(
+            control.truthiness(),
+            CertifiedControlTruthiness::NonZeroIsTrue
+        );
+        assert_eq!(
+            control.source_obligations(),
+            BTreeSet::from([
+                control.predicate_obligation(),
+                control.transfer_obligation(),
+            ])
+        );
+        for obligation in control.source_obligations() {
+            assert!(matches!(
+                certified.ledger().effects(obligation),
+                [effect]
+                    if effect.disposition()
+                        == &EffectDisposition::AbsorbedIntoControl { producer }
+            ));
+        }
+        control
+            .validate_against_artifact(&artifact)
+            .expect("conditional control revalidates");
+
+        let mut corrupted = control.clone();
+        corrupted.true_target = 0x3860;
+        assert!(matches!(
+            corrupted.validate_against_artifact(&artifact),
+            Err(MachineBuildError::ObligationMismatch(_))
+        ));
+        let mut corrupted = control.clone();
+        corrupted.false_target = 0x3848;
+        assert!(matches!(
+            corrupted.validate_against_artifact(&artifact),
+            Err(MachineBuildError::ObligationMismatch(_))
+        ));
+        let mut corrupted = control.clone();
+        corrupted.truthiness = CertifiedControlTruthiness::NonZeroIsTrue;
+        corrupted.predicate_obligation.kind = SemanticObligationKind::ControlTransfer;
+        assert!(matches!(
+            corrupted.validate_against_artifact(&artifact),
+            Err(MachineBuildError::ObligationMismatch(_))
+        ));
+        let report = certified.finish();
+        for obligation in control.source_obligations() {
+            assert!(report.pending_semantic_ast().contains(&obligation));
+        }
+        assert!(!report.authorizes_certified_c());
+    }
+
+    #[test]
+    fn conditional_control_with_residual_condition_is_fully_residualized() {
+        let loaded = Varnode::unique(0x10, 1);
+        let mut entry = R2ILBlock::new(0x3860, 4);
+        entry.push(R2ILOp::Load {
+            dst: loaded.clone(),
+            space: SpaceId::Ram,
+            addr: Varnode::register(0, 8),
+        });
+        entry.push(R2ILOp::CBranch {
+            target: Varnode::ram(0x3870, 8),
+            cond: loaded,
+        });
+        let fallthrough = R2ILBlock::new(0x3864, 4);
+        let taken = R2ILBlock::new(0x3870, 4);
+        let artifact = SsaArtifact::raw(&[entry, fallthrough, taken], None)
+            .expect("conditional load artifact");
+        let certified = CertifiedMachineProjection::from_artifact(&artifact)
+            .expect("fail-closed conditional projection");
+        let branch = artifact
+            .graph()
+            .insts
+            .iter()
+            .find(|inst| matches!(inst.payload, InstPayload::Op(SSAOp::CBranch { .. })))
+            .expect("conditional instruction");
+        let producer = artifact
+            .obligations()
+            .instruction_for_inst(branch.id)
+            .expect("conditional source")
+            .id;
+        assert!(
+            certified
+                .conditional_control_for_producer(producer)
+                .is_none()
+        );
+        for obligation in artifact
+            .obligations()
+            .instructions()
+            .get(&producer)
+            .expect("conditional disposition")
+            .obligations
+            .iter()
+            .filter(|obligation| {
+                matches!(
+                    obligation.kind,
+                    SemanticObligationKind::ControlPredicate
+                        | SemanticObligationKind::ControlTransfer
+                )
+            })
+        {
+            assert!(matches!(
+                certified.ledger().effects(*obligation),
+                [effect]
+                    if matches!(effect.disposition(), EffectDisposition::Residualized { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn conditional_control_rejects_non_byte_condition_and_available_arch_width_mismatch() {
+        let build = |condition_size, arch: Option<&ArchSpec>| {
+            let mut entry = R2ILBlock::new(0x3880, 4);
+            entry.push(R2ILOp::CBranch {
+                target: Varnode::ram(0x3890, 8),
+                cond: Varnode::constant(1, condition_size),
+            });
+            let fallthrough = R2ILBlock::new(0x3884, 4);
+            let taken = R2ILBlock::new(0x3890, 4);
+            SsaArtifact::raw(&[entry, fallthrough, taken], arch).expect("conditional artifact")
+        };
+        let wide_condition = build(2, None);
+        let mut arch = ArchSpec::new("32-bit-conditional-test");
+        arch.addr_size = 4;
+        let wrong_target_width = build(1, Some(&arch));
+
+        for artifact in [wide_condition, wrong_target_width] {
+            let certified = CertifiedMachineProjection::from_artifact(&artifact)
+                .expect("fail-closed conditional projection");
+            let branch = artifact
+                .graph()
+                .insts
+                .iter()
+                .find(|inst| matches!(inst.payload, InstPayload::Op(SSAOp::CBranch { .. })))
+                .expect("conditional instruction");
+            let producer = artifact
+                .obligations()
+                .instruction_for_inst(branch.id)
+                .expect("conditional source")
+                .id;
+            assert!(
+                certified
+                    .conditional_control_for_producer(producer)
+                    .is_none()
+            );
+            assert!(artifact
+                .obligations()
+                .instructions()
+                .get(&producer)
+                .expect("conditional disposition")
+                .obligations
+                .iter()
+                .all(|obligation| matches!(
+                    certified.ledger().effects(*obligation),
+                    [effect]
+                        if matches!(effect.disposition(), EffectDisposition::Residualized { .. })
+                )));
+        }
+    }
+
+    #[test]
+    fn conditional_control_rejects_unrepresentable_fallthrough_target() {
+        let mut entry = R2ILBlock::new(0xffff_fffe, 4);
+        entry.push(R2ILOp::CBranch {
+            target: Varnode::ram(0x1000, 4),
+            cond: Varnode::constant(1, 1),
+        });
+        let taken = R2ILBlock::new(0x1000, 4);
+        let fallthrough = R2ILBlock::new(0x1_0000_0002, 4);
+        let mut arch = ArchSpec::new("32-bit-fallthrough-boundary-test");
+        arch.addr_size = 4;
+        let artifact = SsaArtifact::raw(&[entry, taken, fallthrough], Some(&arch))
+            .expect("boundary conditional artifact");
+        let certified = CertifiedMachineProjection::from_artifact(&artifact)
+            .expect("fail-closed conditional projection");
+        let branch = artifact
+            .graph()
+            .insts
+            .iter()
+            .find(|inst| matches!(inst.payload, InstPayload::Op(SSAOp::CBranch { .. })))
+            .expect("conditional instruction");
+        let producer = artifact
+            .obligations()
+            .instruction_for_inst(branch.id)
+            .expect("conditional source")
+            .id;
+
+        assert!(
+            certified
+                .conditional_control_for_producer(producer)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn certified_owner_retains_typed_memory_context_without_guessing_missing_architecture() {
+        let mut block = R2ILBlock::new(0x3850, 4);
+        block.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::register(0, 8),
+            val: Varnode::constant(1, 1),
+        });
+        let unavailable_artifact =
+            SsaArtifact::raw(&[block.clone()], None).expect("untyped architecture artifact");
+        let unavailable = CertifiedMachineFunction::from_artifact(&unavailable_artifact)
+            .expect("certified machine");
+        assert!(!unavailable.machine_context().memory_model().is_available());
+        assert_eq!(
+            unavailable
+                .machine_context()
+                .source()
+                .memory_space_at(0x3850, 0),
+            Some(SpaceId::Ram)
+        );
+
+        let mut arch = ArchSpec::new("big-endian-test");
+        arch.set_memory_endianness(Endianness::Big);
+        let artifact =
+            SsaArtifact::raw(&[block], Some(&arch)).expect("typed architecture artifact");
+        let certified =
+            CertifiedMachineFunction::from_artifact(&artifact).expect("certified machine");
+        assert!(certified.machine_context().memory_model().is_available());
+        assert!(certified.machine_context().memory_model().is_coherent());
+        assert_eq!(
+            certified
+                .machine_context()
+                .memory_model()
+                .space(SpaceId::Ram)
+                .map(r2ssa::MachineMemorySpace::endianness),
+            Some(r2ssa::MachineMemoryEndianness::Big)
+        );
+    }
+
+    #[test]
+    fn certified_topology_retains_conditional_branch_arm_identity() {
+        let mut entry = R2ILBlock::new(0x3900, 4);
+        entry.push(R2ILOp::CBranch {
+            target: Varnode::ram(0x3910, 8),
+            cond: Varnode::register(0, 1),
+        });
+        let mut false_block = R2ILBlock::new(0x3904, 4);
+        false_block.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let mut true_block = R2ILBlock::new(0x3910, 4);
+        true_block.push(R2ILOp::Return {
+            target: Varnode::constant(1, 8),
+        });
+        let artifact = SsaArtifact::raw(&[entry, false_block, true_block], None)
+            .expect("conditional artifact");
+        let certified =
+            CertifiedMachineFunction::from_artifact(&artifact).expect("certified machine");
+
+        assert!(matches!(
+            certified
+                .topology()
+                .block(0x3900)
+                .map(|block| block.terminator()),
+            Some(CertifiedSourceTerminator::ConditionalBranch {
+                true_target: 0x3910,
+                false_target: 0x3904,
+            })
+        ));
+    }
+
+    #[test]
+    fn machine_seam_leaves_non_value_obligations_unclosed() {
+        let artifact = fnv_artifact();
+        let certified = CertifiedMachineFunction::from_artifact(&artifact)
+            .expect("certified machine expressions");
+        let report = certified.finish();
+
+        for id in artifact
+            .obligations()
+            .obligations()
+            .keys()
+            .filter(|id| id.kind != SemanticObligationKind::LiveValueProducer)
+        {
+            if id.kind == SemanticObligationKind::ControlTransfer
+                && certified
+                    .direct_control_for_producer(id.instruction)
+                    .is_some()
+            {
+                assert!(matches!(
+                    certified.ledger().effects(*id),
+                    [effect]
+                        if matches!(
+                            effect.disposition(),
+                            EffectDisposition::AbsorbedIntoControl { .. }
+                        )
+                ));
+                assert!(report.pending_semantic_ast().contains(id));
+            } else {
+                assert!(certified.ledger().effects(*id).is_empty());
+                assert!(report.missing().contains(id));
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_direct_void_call_certifies_target_and_ordered_register_arguments() {
+        let target = Varnode::ram(0x7600, 8);
+        let mut entry = R2ILBlock::new(0x7500, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(8, 8),
+            src: Varnode::constant(0x2a, 8),
+        });
+        entry.push(R2ILOp::Call {
+            target: target.clone(),
+        });
+        let fallthrough = R2ILBlock::new(0x7504, 4);
+        let mut arch = ArchSpec::new("certified-call-test");
+        arch.add_register(RegisterDef::new("rdi", 8, 8));
+        arch.add_register(RegisterDef::new("rip", 16, 8));
+        let argument_storage = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 8,
+            size: 8,
+        };
+        let identity =
+            SourceCallSiteIdentity::new(0x7500, 1, CanonicalStorageId::from_varnode(&target));
+        let interface = SourceCallSiteInterface::new(
+            b"certified-call-revision-1".to_vec(),
+            identity,
+            true,
+            "test-call-abi",
+            [SourceCallArgumentSpec::new(0, argument_storage)],
+            false,
+            false,
+            SourceCallResult::Void,
+        )
+        .expect("callsite interface");
+        let artifact = SsaArtifact::raw_with_interfaces(
+            &[entry, fallthrough],
+            Some(&arch),
+            None,
+            vec![interface],
+        )
+        .expect("direct call artifact");
+        let certified =
+            CertifiedMachineProjection::from_artifact(&artifact).expect("direct call projection");
+        let instruction = artifact
+            .graph()
+            .insts
+            .iter()
+            .find(|instruction| matches!(instruction.payload, InstPayload::Op(SSAOp::Call { .. })))
+            .expect("call instruction");
+        let producer = artifact
+            .obligations()
+            .instruction_for_inst(instruction.id)
+            .expect("call disposition")
+            .id;
+        let call = certified
+            .direct_call_for_producer(producer)
+            .expect("certified direct call");
+        assert_eq!(call.call_site(), CallSiteId(0));
+        assert_eq!(call.raw_identity(), identity);
+        assert_eq!(call.target(), 0x7600);
+        assert_eq!(call.fallthrough(), 0x7504);
+        assert_eq!(call.calling_convention(), "test-call-abi");
+        assert_eq!(call.arguments().len(), 1);
+        assert_eq!(
+            call.arguments()[0].slot(),
+            CallBoundarySlot::Register {
+                index: 0,
+                storage: argument_storage,
+            }
+        );
+        assert_eq!(
+            call.arguments()[0]
+                .value()
+                .producer()
+                .map(|id| id.block_addr),
+            Some(0x7500)
+        );
+        assert!(matches!(
+            call.arguments()[0].origin(),
+            CertifiedCallArgumentOrigin::Constant { value }
+                if value.width_bits() == 64 && value.bits() == 0x2a
+        ));
+        for obligation in call.source_obligations() {
+            assert!(matches!(
+                certified.ledger().effects(obligation),
+                [effect]
+                    if effect.disposition() == &EffectDisposition::AbsorbedIntoCall { producer }
+                        && effect.direct_call_evidence() == Some(call)
+            ));
+        }
+        call.validate_against_artifact(&artifact)
+            .expect("call revalidates");
+
+        let mut corrupted = call.clone();
+        corrupted.fallthrough = 0x7508;
+        assert!(matches!(
+            corrupted.validate_against_artifact(&artifact),
+            Err(MachineBuildError::ObligationMismatch(_))
+        ));
+        let mut corrupted = call.clone();
+        corrupted.arguments[0].source_obligation.component =
+            SemanticObligationComponent::RegisterSlot {
+                index: 1,
+                storage: argument_storage,
+            };
+        assert!(matches!(
+            corrupted.validate_against_artifact(&artifact),
+            Err(MachineBuildError::ObligationMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn explicit_direct_void_call_classifies_caller_abi_parameter_argument() {
+        let target = Varnode::ram(0x7620, 8);
+        let argument = Varnode::register(8, 8);
+        let mut entry = R2ILBlock::new(0x7520, 4);
+        entry.push(R2ILOp::Copy {
+            dst: argument.clone(),
+            src: argument,
+        });
+        entry.push(R2ILOp::Call {
+            target: target.clone(),
+        });
+        let fallthrough = R2ILBlock::new(0x7524, 4);
+        let mut arch = ArchSpec::new("certified-call-parameter-test");
+        arch.add_register(RegisterDef::new("rdi", 8, 8));
+        let argument_storage = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 8,
+            size: 8,
+        };
+        let revision = b"certified-call-parameter-revision-1";
+        let function_interface = SourceFunctionInterface::new(
+            revision.to_vec(),
+            "test-call-abi",
+            [SourceAbiParameterSpec::new(0, argument_storage)],
+            SourceFunctionReturn::Void,
+            [],
+        )
+        .expect("function interface");
+        let identity =
+            SourceCallSiteIdentity::new(0x7520, 1, CanonicalStorageId::from_varnode(&target));
+        let call_interface = SourceCallSiteInterface::new(
+            revision.to_vec(),
+            identity,
+            true,
+            "test-call-abi",
+            [SourceCallArgumentSpec::new(0, argument_storage)],
+            false,
+            false,
+            SourceCallResult::Void,
+        )
+        .expect("callsite interface");
+        let artifact = SsaArtifact::raw_with_interfaces(
+            &[entry, fallthrough],
+            Some(&arch),
+            Some(function_interface),
+            vec![call_interface],
+        )
+        .expect("parameter call artifact");
+        let certified = CertifiedMachineProjection::from_artifact(&artifact)
+            .expect("parameter call projection");
+        let instruction = artifact
+            .graph()
+            .insts
+            .iter()
+            .find(|instruction| matches!(instruction.payload, InstPayload::Op(SSAOp::Call { .. })))
+            .expect("call instruction");
+        let producer = artifact
+            .obligations()
+            .instruction_for_inst(instruction.id)
+            .expect("call disposition")
+            .id;
+        let call = certified
+            .direct_call_for_producer(producer)
+            .expect("certified direct call");
+        let [argument] = call.arguments() else {
+            panic!("one exact call argument expected");
+        };
+
+        assert_eq!(
+            argument.origin(),
+            &CertifiedCallArgumentOrigin::AbiParameter { index: 0 }
+        );
+        assert_eq!(
+            argument.slot(),
+            CallBoundarySlot::Register {
+                index: 0,
+                storage: argument_storage,
+            }
+        );
+        assert_eq!(argument.value().ty().width_bits(), 64);
+        assert!(argument.value().constant().is_none());
+        assert!(argument.value().producer().is_some());
+        assert_eq!(
+            call.source_obligations(),
+            BTreeSet::from([call.call_obligation(), argument.source_obligation()])
+        );
+        for obligation in call.source_obligations() {
+            assert!(matches!(
+                certified.ledger().effects(obligation),
+                [effect]
+                    if effect.disposition() == &EffectDisposition::AbsorbedIntoCall { producer }
+                        && effect.direct_call_evidence() == Some(call)
+            ));
+        }
+        call.validate_against_artifact(&artifact)
+            .expect("parameter call revalidates");
+    }
+
+    #[test]
+    fn explicit_interface_certifies_parameter_and_register_return_exactly_once() {
+        let return_storage = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 0,
+            size: 8,
+        };
+        let artifact = explicit_return_artifact(SourceFunctionReturn::Register {
+            storage: return_storage,
+        });
+        let certified =
+            CertifiedMachineProjection::from_artifact(&artifact).expect("certified return");
+        let parameter = certified.abi_parameters().get(&0).expect("parameter");
+        assert_eq!(parameter.index(), 0);
+        assert_eq!(parameter.storage().offset, 8);
+        assert!(parameter.value().is_some());
+
+        let producer = CanonicalInstructionId {
+            block_addr: 0x3080,
+            site: r2ssa::CanonicalInstructionSite::Op(2),
+        };
+        let returned = certified
+            .return_control_for_producer(producer)
+            .expect("return control");
+        assert_eq!(returned.values().len(), 1);
+        assert_eq!(
+            returned.values()[0].slot(),
+            CallBoundarySlot::Register {
+                index: 0,
+                storage: return_storage,
+            }
+        );
+        for obligation in returned.source_obligations() {
+            assert!(matches!(
+                certified.ledger().effects(obligation),
+                [effect]
+                    if effect.disposition()
+                        == &EffectDisposition::AbsorbedIntoReturn { producer }
+            ));
+            assert!(
+                certified
+                    .finish()
+                    .pending_semantic_ast()
+                    .contains(&obligation)
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_void_return_is_distinct_from_unknown_return_state() {
+        let artifact = explicit_return_artifact(SourceFunctionReturn::Void);
+        let certified =
+            CertifiedMachineProjection::from_artifact(&artifact).expect("certified void return");
+        let producer = CanonicalInstructionId {
+            block_addr: 0x3080,
+            site: r2ssa::CanonicalInstructionSite::Op(1),
+        };
+        let returned = certified
+            .return_control_for_producer(producer)
+            .expect("void return control");
+        assert!(returned.values().is_empty());
+        assert!(matches!(
+            certified.ledger().effects(returned.return_obligation()),
+            [effect]
+                if effect.disposition()
+                    == &EffectDisposition::AbsorbedIntoReturn { producer }
+        ));
+        assert!(certified.finish().missing().iter().all(|obligation| {
+            !matches!(
+                obligation.kind,
+                SemanticObligationKind::Return | SemanticObligationKind::ReturnValue
+            )
+        }));
+    }
+
+    #[test]
+    fn final_render_permit_is_origin_ledger_and_manifest_bound() {
+        let artifact = explicit_return_artifact(SourceFunctionReturn::Register {
+            storage: CanonicalStorageId {
+                space: CanonicalStorageSpace::Register,
+                offset: 0,
+                size: 8,
+            },
+        });
+        let certified =
+            CertifiedMachineProjection::from_artifact(&artifact).expect("certified projection");
+        let mappings = artifact
+            .obligations()
+            .obligations()
+            .keys()
+            .map(|obligation| {
+                let [effect] = certified.ledger().effects(*obligation) else {
+                    panic!("one effect per obligation");
+                };
+                TypedRegionMapping::new(*obligation, effect.disposition().clone())
+            })
+            .collect::<Vec<_>>();
+        let permit = certify_terminal_return_region(
+            certified.origin(),
+            certified.ledger(),
+            mappings.clone(),
+        )
+        .expect("final render permit");
+        assert!(permit.authorizes_certified_c());
+        assert!(permit.matches_region(
+            certified.origin(),
+            CertifiedTypedRegionKind::TerminalReturnBlock,
+            CERTIFIED_TERMINAL_RETURN_REGION_CONTRACT_VERSION,
+            &mappings,
+        ));
+        let mut wrong_schema = permit.clone();
+        wrong_schema.region_schema_version = CERTIFIED_TERMINAL_RETURN_REGION_CONTRACT_VERSION + 1;
+        assert!(!wrong_schema.authorizes_certified_c());
+
+        let mut nonterminal_origin = certified.origin().clone();
+        nonterminal_origin.topology.blocks[0].terminator = CertifiedSourceTerminator::None;
+        assert!(matches!(
+            certify_terminal_return_region(
+                &nonterminal_origin,
+                certified.ledger(),
+                mappings.clone(),
+            ),
+            Err(RenderAuthorizationError::InvalidRegionTopology)
+        ));
+        assert!(matches!(
+            certify_terminal_return_region(
+                certified.origin(),
+                &ObligationLedger::new(),
+                mappings.clone(),
+            ),
+            Err(RenderAuthorizationError::IncompleteLedger)
+        ));
+
+        let mut duplicated = mappings.clone();
+        duplicated.push(mappings[0].clone());
+        assert!(matches!(
+            certify_terminal_return_region(certified.origin(), certified.ledger(), duplicated,),
+            Err(RenderAuthorizationError::DuplicateMapping(_))
+        ));
+
+        let mut mismatched = mappings;
+        mismatched[0].source_disposition = EffectDisposition::ProvenDead;
+        assert!(matches!(
+            certify_terminal_return_region(certified.origin(), certified.ledger(), mismatched,),
+            Err(RenderAuthorizationError::DispositionMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn plain_ram_memory_return_permit_is_narrow_and_manifest_bound() {
+        let artifact = explicit_memory_return_artifact(1);
+        let certified =
+            CertifiedMachineProjection::from_artifact(&artifact).expect("certified projection");
+        let mappings = artifact
+            .obligations()
+            .obligations()
+            .keys()
+            .map(|obligation| {
+                let [effect] = certified.ledger().effects(*obligation) else {
+                    panic!("one effect per obligation");
+                };
+                TypedRegionMapping::new(*obligation, effect.disposition().clone())
+            })
+            .collect::<Vec<_>>();
+        let permit = certify_plain_ram_memory_return_region(
+            certified.origin(),
+            certified.ledger(),
+            mappings.clone(),
+        )
+        .expect("plain RAM memory return permit");
+        assert!(permit.authorizes_certified_c());
+        assert!(permit.matches_region(
+            certified.origin(),
+            CertifiedTypedRegionKind::PlainRamMemoryTerminalReturnFunction,
+            CERTIFIED_PLAIN_RAM_MEMORY_RETURN_CONTRACT_VERSION,
+            &mappings,
+        ));
+        assert!(matches!(
+            certify_terminal_return_region(
+                certified.origin(),
+                certified.ledger(),
+                mappings.clone(),
+            ),
+            Err(RenderAuthorizationError::InvalidRegionTopology)
+        ));
+
+        let mut duplicated = mappings.clone();
+        duplicated.push(mappings[0].clone());
+        assert!(matches!(
+            certify_plain_ram_memory_return_region(
+                certified.origin(),
+                certified.ledger(),
+                duplicated,
+            ),
+            Err(RenderAuthorizationError::DuplicateMapping(_))
+        ));
+
+        let word_artifact = explicit_memory_return_artifact(2);
+        let word_certified = CertifiedMachineProjection::from_artifact(&word_artifact)
+            .expect("word-addressed projection");
+        let word_mappings = word_artifact
+            .obligations()
+            .obligations()
+            .keys()
+            .map(|obligation| {
+                let [effect] = word_certified.ledger().effects(*obligation) else {
+                    panic!("one word-addressed effect per obligation");
+                };
+                TypedRegionMapping::new(*obligation, effect.disposition().clone())
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            certify_plain_ram_memory_return_region(
+                word_certified.origin(),
+                word_certified.ledger(),
+                word_mappings,
+            ),
+            Err(RenderAuthorizationError::InvalidRegionDisposition(_))
+        ));
+    }
+
+    #[test]
+    fn direct_call_return_permit_is_closed_interface_and_manifest_bound() {
+        let artifact = explicit_direct_call_return_artifact();
+        let certified = CertifiedMachineProjection::from_artifact(&artifact)
+            .expect("certified direct-call return projection");
+        let mappings = artifact
+            .obligations()
+            .obligations()
+            .keys()
+            .map(|obligation| {
+                let [effect] = certified.ledger().effects(*obligation) else {
+                    panic!("one effect per obligation");
+                };
+                TypedRegionMapping::new(*obligation, effect.disposition().clone())
+            })
+            .collect::<Vec<_>>();
+        let permit = certify_direct_call_terminal_return_region(
+            certified.origin(),
+            certified.ledger(),
+            mappings.clone(),
+            0x30d0,
+            0x30d4,
+        )
+        .expect("direct-call return render permit");
+        assert!(permit.authorizes_certified_c());
+        assert!(permit.matches_region(
+            certified.origin(),
+            CertifiedTypedRegionKind::DirectCallTerminalReturnFunction,
+            CERTIFIED_DIRECT_CALL_TERMINAL_RETURN_CONTRACT_VERSION,
+            &mappings,
+        ));
+        assert!(matches!(
+            certify_direct_call_terminal_return_region(
+                certified.origin(),
+                certified.ledger(),
+                mappings.clone(),
+                0x30d4,
+                0x30d0,
+            ),
+            Err(RenderAuthorizationError::InvalidRegionTopology)
+        ));
+        let mut duplicated = mappings;
+        duplicated.push(duplicated[0].clone());
+        assert!(matches!(
+            certify_direct_call_terminal_return_region(
+                certified.origin(),
+                certified.ledger(),
+                duplicated,
+                0x30d0,
+                0x30d4,
+            ),
+            Err(RenderAuthorizationError::DuplicateMapping(_))
+        ));
+    }
+
+    #[test]
+    fn conditional_return_permit_is_closed_polarity_and_manifest_bound() {
+        let artifact = explicit_conditional_return_artifact();
+        let certified = CertifiedMachineProjection::from_artifact(&artifact)
+            .expect("certified conditional-return projection");
+        let mappings = artifact
+            .obligations()
+            .obligations()
+            .keys()
+            .map(|obligation| {
+                let [effect] = certified.ledger().effects(*obligation) else {
+                    panic!("one effect per obligation");
+                };
+                TypedRegionMapping::new(*obligation, effect.disposition().clone())
+            })
+            .collect::<Vec<_>>();
+        let permit = certify_conditional_terminal_return_region(
+            certified.origin(),
+            certified.ledger(),
+            mappings.clone(),
+            0x30a0,
+            0x30c0,
+            0x30a4,
+        )
+        .expect("conditional-return render permit");
+        assert!(permit.authorizes_certified_c());
+        assert!(permit.matches_region(
+            certified.origin(),
+            CertifiedTypedRegionKind::ConditionalTerminalReturnFunction,
+            CERTIFIED_CONDITIONAL_TERMINAL_RETURN_CONTRACT_VERSION,
+            &mappings,
+        ));
+        assert!(matches!(
+            certify_conditional_terminal_return_region(
+                certified.origin(),
+                certified.ledger(),
+                mappings.clone(),
+                0x30a0,
+                0x30a4,
+                0x30c0,
+            ),
+            Err(RenderAuthorizationError::InvalidRegionTopology)
+        ));
+        let mut duplicated = mappings.clone();
+        duplicated.push(mappings[0].clone());
+        assert!(matches!(
+            certify_conditional_terminal_return_region(
+                certified.origin(),
+                certified.ledger(),
+                duplicated,
+                0x30a0,
+                0x30c0,
+                0x30a4,
+            ),
+            Err(RenderAuthorizationError::DuplicateMapping(_))
+        ));
+        assert!(matches!(
+            certify_conditional_terminal_return_region(
+                certified.origin(),
+                certified.ledger(),
+                mappings[1..].to_vec(),
+                0x30a0,
+                0x30c0,
+                0x30a4,
+            ),
+            Err(RenderAuthorizationError::MissingMapping(_))
+        ));
+    }
+
+    #[test]
+    fn switch_return_permit_requires_closed_switch_control_and_manifest() {
+        let artifact = explicit_switch_return_artifact();
+        let certified = CertifiedMachineProjection::from_artifact(&artifact)
+            .expect("certified switch-return projection");
+        let topology = certified
+            .switch_topology_for_block(0x30e0)
+            .expect("switch topology");
+        let control = certified
+            .switch_control_for_block(0x30e0)
+            .expect("sealed switch control");
+        let effect = certified.ledger().effects(control.source_obligation());
+        assert!(matches!(
+            effect,
+            [effect]
+                if effect.disposition()
+                    == &(EffectDisposition::AbsorbedIntoControl {
+                        producer: control.producer(),
+                    })
+                    && effect.switch_control_evidence() == Some(control)
+        ));
+        assert!(certified.finish().residualized().is_empty());
+
+        let mappings = artifact
+            .obligations()
+            .obligations()
+            .keys()
+            .map(|obligation| {
+                let [effect] = certified.ledger().effects(*obligation) else {
+                    panic!("one effect per obligation");
+                };
+                TypedRegionMapping::new(*obligation, effect.disposition().clone())
+            })
+            .collect::<Vec<_>>();
+        let permit = certify_switch_terminal_return_region(
+            certified.origin(),
+            certified.ledger(),
+            mappings.clone(),
+            topology,
+            control,
+        )
+        .expect("switch-return permit");
+        assert!(permit.authorizes_certified_c());
+        assert!(permit.matches_region(
+            certified.origin(),
+            CertifiedTypedRegionKind::SwitchTerminalReturnFunction,
+            CERTIFIED_SWITCH_TERMINAL_RETURN_CONTRACT_VERSION,
+            &mappings,
+        ));
+
+        let mut wrong_parameter = control.clone();
+        wrong_parameter.parameter_storage.offset = 24;
+        assert!(matches!(
+            certify_switch_terminal_return_region(
+                certified.origin(),
+                certified.ledger(),
+                mappings.clone(),
+                topology,
+                &wrong_parameter,
+            ),
+            Err(RenderAuthorizationError::InvalidRegionTopology)
+        ));
+        let mut duplicated = mappings;
+        duplicated.push(duplicated[0].clone());
+        assert!(matches!(
+            certify_switch_terminal_return_region(
+                certified.origin(),
+                certified.ledger(),
+                duplicated,
+                topology,
+                control,
+            ),
+            Err(RenderAuthorizationError::DuplicateMapping(_))
+        ));
+    }
+
+    #[test]
+    fn carrier_free_loop_return_permit_requires_closed_control_and_manifest() {
+        let artifact = explicit_carrier_free_loop_return_artifact();
+        let certified = CertifiedMachineProjection::from_artifact(&artifact)
+            .expect("certified loop-return projection");
+        let control = certified
+            .closed_natural_loop_control_for_header(0x3170)
+            .expect("sealed closed loop control");
+        assert_eq!(control.parameter_storage().offset, 8);
+        assert_eq!(control.parameter_storage().size, 1);
+        let routing = control.routing();
+        for (obligation, producer, direct) in [
+            (
+                control.preheader_transfer().source_obligation(),
+                control.preheader_transfer().producer(),
+                true,
+            ),
+            (
+                routing.header_control().predicate_obligation(),
+                routing.header_control().producer(),
+                false,
+            ),
+            (
+                routing.header_control().transfer_obligation(),
+                routing.header_control().producer(),
+                false,
+            ),
+            (
+                routing.body_transfer().source_obligation(),
+                routing.body_transfer().producer(),
+                true,
+            ),
+        ] {
+            let [effect] = certified.ledger().effects(obligation) else {
+                panic!("one sealed loop control effect");
+            };
+            assert_eq!(
+                effect.disposition(),
+                &EffectDisposition::AbsorbedIntoControl { producer }
+            );
+            if direct {
+                assert!(effect.direct_control_evidence().is_some());
+            } else {
+                assert_eq!(
+                    effect.conditional_control_evidence(),
+                    Some(routing.header_control())
+                );
+            }
+        }
+        assert!(certified.finish().residualized().is_empty());
+
+        let mappings = artifact
+            .obligations()
+            .obligations()
+            .keys()
+            .map(|obligation| {
+                let [effect] = certified.ledger().effects(*obligation) else {
+                    panic!("one effect per obligation");
+                };
+                TypedRegionMapping::new(*obligation, effect.disposition().clone())
+            })
+            .collect::<Vec<_>>();
+        let permit = certify_carrier_free_loop_terminal_return_region(
+            certified.origin(),
+            certified.ledger(),
+            mappings.clone(),
+            control,
+        )
+        .expect("carrier-free loop return permit");
+        assert!(permit.authorizes_certified_c());
+        assert!(permit.matches_region(
+            certified.origin(),
+            CertifiedTypedRegionKind::CarrierFreeLoopTerminalReturnFunction,
+            CERTIFIED_CARRIER_FREE_LOOP_TERMINAL_RETURN_CONTRACT_VERSION,
+            &mappings,
+        ));
+
+        let mut wrong_parameter = control.clone();
+        wrong_parameter.parameter_storage.offset = 24;
+        assert!(matches!(
+            certify_carrier_free_loop_terminal_return_region(
+                certified.origin(),
+                certified.ledger(),
+                mappings.clone(),
+                &wrong_parameter,
+            ),
+            Err(RenderAuthorizationError::InvalidOrigin)
+        ));
+        let mut duplicated = mappings;
+        duplicated.push(duplicated[0].clone());
+        assert!(matches!(
+            certify_carrier_free_loop_terminal_return_region(
+                certified.origin(),
+                certified.ledger(),
+                duplicated,
+                control,
+            ),
+            Err(RenderAuthorizationError::DuplicateMapping(_))
+        ));
+    }
+
+    #[test]
+    fn explicit_stack_slots_bind_exact_objects_and_retain_unused_resources() {
+        let artifact = explicit_stack_slot_artifact(8);
+        let certified =
+            CertifiedMachineProjection::from_artifact(&artifact).expect("certified stack slots");
+        let used_root = StackAddressRoot {
+            base: StackAddressBase::StackPointer,
+            offset: 0,
+        };
+        let used = certified.stack_slots().get(&used_root).expect("used slot");
+        assert_eq!(used.size_bytes(), 8);
+        assert!(used.object().is_some());
+
+        let unused_root = StackAddressRoot {
+            base: StackAddressBase::StackPointer,
+            offset: 16,
+        };
+        let unused = certified
+            .stack_slots()
+            .get(&unused_root)
+            .expect("unused declared slot");
+        assert_eq!(unused.size_bytes(), 4);
+        assert_eq!(unused.object(), None);
+    }
+
+    #[test]
+    fn explicit_stack_slot_rejects_access_wider_than_declared_resource() {
+        let artifact = explicit_stack_slot_artifact(4);
+        assert!(matches!(
+            CertifiedMachineProjection::from_artifact(&artifact),
+            Err(MachineBuildError::MachineContextMismatch)
+        ));
+    }
+
+    #[test]
+    fn phi_does_not_close_loop_state_or_transition_obligations() {
+        let artifact = loop_artifact();
+        let certified =
+            CertifiedMachineFunction::from_artifact(&artifact).expect("loop machine expressions");
+        assert!(certified.natural_loop_routing_for_header(0x4010).is_none());
+        let loop_state = artifact
+            .obligations()
+            .obligations()
+            .keys()
+            .copied()
+            .filter(|id| {
+                matches!(
+                    id.kind,
+                    SemanticObligationKind::LoopCarriedState
+                        | SemanticObligationKind::LiveStateTransition
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(!loop_state.is_empty());
+        for id in loop_state {
+            assert!(certified.ledger().effects(id).is_empty());
+            assert!(certified.finish().missing().contains(&id));
+        }
+    }
+
+    #[test]
+    fn unsupported_value_operation_fails_machine_certification_closed() {
+        let mut block = R2ILBlock::new(0x5000, 4);
+        block.push(R2ILOp::Load {
+            dst: Varnode::unique(0x10, 8),
+            space: SpaceId::Ram,
+            addr: Varnode::register(0, 8),
+        });
+        let artifact = SsaArtifact::raw(&[block], None).expect("load artifact");
+        assert!(matches!(
+            CertifiedMachineFunction::from_artifact(&artifact),
+            Err(MachineBuildError::UnsupportedOperation { op, .. })
+                if matches!(*op, SSAOp::Load { .. })
+        ));
+    }
+
+    #[test]
+    fn partial_certification_residualizes_unsupported_values_and_dependents() {
+        let loaded = Varnode::unique(0x10, 8);
+        let sum = Varnode::unique(0x18, 8);
+        let mut block = R2ILBlock::new(0x5100, 4);
+        block.push(R2ILOp::Load {
+            dst: loaded.clone(),
+            space: SpaceId::Ram,
+            addr: Varnode::register(0, 8),
+        });
+        block.push(R2ILOp::IntAdd {
+            dst: sum,
+            a: loaded,
+            b: Varnode::constant(1, 8),
+        });
+        let artifact = SsaArtifact::raw(&[block], None).expect("load dependency artifact");
+        let certified = CertifiedMachineProjection::from_artifact(&artifact)
+            .expect("certified partial projection");
+
+        let residual_producers = certified.residual_producers();
+        assert_eq!(residual_producers.len(), 2);
+        assert!(certified.projection().failures().iter().all(|failure| {
+            residual_producers.contains(&failure.producer())
+                && matches!(
+                    failure.error(),
+                    MachineBuildError::UnsupportedOperation { op, .. }
+                        if matches!(op.as_ref(), SSAOp::Load { .. })
+                )
+        }));
+        for instruction in artifact.obligations().instructions().values() {
+            assert!(residual_producers.contains(&instruction.id));
+            for obligation in &instruction.obligations {
+                let [effect] = certified.ledger().effects(*obligation) else {
+                    panic!("one residual effect expected for {obligation}");
+                };
+                assert!(matches!(
+                    effect.disposition(),
+                    EffectDisposition::Residualized { .. }
+                ));
+            }
+            assert!(certified.expression_for_producer(instruction.id).is_none());
+        }
+        let report = certified.finish();
+        assert!(report.has_exactly_one_disposition_per_source());
+        assert!(!report.authorizes_certified_c());
+    }
+
+    #[test]
+    fn unsupported_source_state_blocks_supported_downstream_machine_ops() {
+        let before_call = Varnode::unique(0x10, 8);
+        let after_call = Varnode::unique(0x18, 8);
+        let mut block = R2ILBlock::new(0x5200, 4);
+        block.push(R2ILOp::Copy {
+            dst: before_call.clone(),
+            src: Varnode::constant(7, 8),
+        });
+        block.push(R2ILOp::Call {
+            target: Varnode::ram(0x8000, 8),
+        });
+        block.push(R2ILOp::IntAdd {
+            dst: after_call.clone(),
+            a: before_call,
+            b: Varnode::constant(1, 8),
+        });
+        block.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::register(0, 8),
+            val: after_call,
+        });
+        let artifact = SsaArtifact::raw(&[block], None).expect("incomplete call artifact");
+        let certified = CertifiedMachineProjection::from_artifact(&artifact)
+            .expect("certified partial projection");
+
+        let value_producers = artifact
+            .graph()
+            .insts
+            .iter()
+            .filter(|instruction| {
+                matches!(
+                    &instruction.payload,
+                    InstPayload::Op(SSAOp::Copy { .. } | SSAOp::IntAdd { .. })
+                )
+            })
+            .map(|instruction| {
+                artifact
+                    .obligations()
+                    .instruction_for_inst(instruction.id)
+                    .expect("value producer disposition")
+                    .id
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(value_producers.len(), 2);
+        assert!(value_producers.is_subset(certified.residual_producers()));
+        assert!(
+            value_producers
+                .iter()
+                .all(|producer| certified.expression_for_producer(*producer).is_none())
+        );
+        for producer in value_producers {
+            let live = artifact
+                .obligations()
+                .instructions()
+                .get(&producer)
+                .expect("source producer")
+                .obligations
+                .iter()
+                .find(|obligation| obligation.kind == SemanticObligationKind::LiveValueProducer)
+                .expect("live value obligation");
+            assert!(matches!(
+                certified.ledger().effects(*live),
+                [effect]
+                    if matches!(effect.disposition(), EffectDisposition::Residualized { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn value_expressions_cannot_authorize_without_effect_control_and_return_closure() {
+        let artifact = fnv_artifact();
+        let certified = CertifiedMachineFunction::from_artifact(&artifact)
+            .expect("certified machine expressions");
+        let report = certified.finish();
+        for kind in [
+            SemanticObligationKind::ObservableMemoryWrite,
+            SemanticObligationKind::Return,
+        ] {
+            assert!(report.missing().iter().any(|id| id.kind == kind));
+        }
+        assert!(
+            report
+                .pending_semantic_ast()
+                .iter()
+                .any(|id| id.kind == SemanticObligationKind::ControlTransfer)
+        );
+        assert!(report.requires_typed_region_validation());
+        assert!(!report.authorizes_certified_c());
+    }
+
+    #[test]
+    fn exact_once_ledger_authorizes_fully_proven_source() {
+        let mut function = CertifiedFunction::new(inventory()).expect("complete source");
+        for id in obligation_ids(function.source()) {
+            let output = output_for(function.source(), id);
+            function.record_rendered(id, output).expect("output proof");
+        }
+        assert!(function.finish().authorizes_certified_c());
+    }
+
+    #[test]
+    fn exact_once_ledger_rejects_missing_and_duplicate_effects() {
+        let mut function = CertifiedFunction::new(inventory()).expect("complete source");
+        let ids = obligation_ids(function.source());
+        let missing = ids[0];
+        let duplicate = ids[1];
+        for id in ids.iter().copied().filter(|id| *id != missing) {
+            let output = output_for(function.source(), id);
+            function.record_rendered(id, output).expect("output proof");
+        }
+        let output = output_for(function.source(), duplicate);
+        function
+            .record_rendered(duplicate, output)
+            .expect("duplicate proof");
+        let report = function.finish();
+        assert_eq!(report.missing(), &[missing]);
+        assert_eq!(report.duplicate(), &[duplicate]);
+        assert!(!report.authorizes_certified_c());
+    }
+
+    #[test]
+    fn unsupported_semantics_must_residualize_or_refuse() {
+        let source = unsupported_inventory();
+        let ids = obligation_ids(&source);
+        assert!(source.instructions().values().any(|instruction| {
+            instruction.state == SemanticInstructionState::UnsupportedUnknown
+        }));
+
+        let mut rendered = CertifiedFunction::new(source.clone()).expect("complete source");
+        for id in &ids {
+            let output = output_for(rendered.source(), *id);
+            rendered
+                .record_rendered(*id, output)
+                .expect("test-only structural proof");
+        }
+        assert_eq!(rendered.finish().invalid().len(), ids.len());
+
+        let mut residual = CertifiedFunction::new(source).expect("complete source");
+        for id in &ids {
+            residual
+                .residualize(*id, "unknown semantics")
+                .expect("residual diagnostic");
+        }
+        let report = residual.finish();
+        assert!(report.has_exactly_one_disposition_per_source());
+        assert_eq!(report.residualized().len(), ids.len());
+        assert!(!report.authorizes_certified_c());
+    }
+
+    #[test]
+    fn incomplete_rewrite_certificate_is_not_applied() {
+        let mut function = CertifiedFunction::new(inventory()).expect("complete source");
+        let ids = obligation_ids(function.source());
+        let missing = ids[0];
+        let condition = ids[1];
+        let mut certificate = RewriteCertificate::new("while-to-for", [missing, condition]);
+        certificate.push(
+            condition,
+            EffectDisposition::Rewritten {
+                pass: "while-to-for".to_string(),
+            },
+        );
+        let report = function.apply_rewrite(&certificate);
+        assert_eq!(report.missing, vec![missing]);
+        assert!(!report.invalid.is_empty());
+        assert!(function.ledger().effects(condition).is_empty());
+    }
+
+    #[test]
+    fn duplicate_rewrite_disposition_is_not_overwritten_or_applied() {
+        let mut function = CertifiedFunction::new(inventory()).expect("complete source");
+        let condition = obligation_ids(function.source())[0];
+        let mut certificate = RewriteCertificate::new("if-normalize", [condition]);
+        certificate.push(
+            condition,
+            EffectDisposition::Rewritten {
+                pass: "if-normalize".to_string(),
+            },
+        );
+        certificate.push(
+            condition,
+            EffectDisposition::Rewritten {
+                pass: "if-normalize".to_string(),
+            },
+        );
+        let report = function.apply_rewrite(&certificate);
+        assert_eq!(report.duplicate, vec![condition]);
+        assert!(function.ledger().effects(condition).is_empty());
+    }
+
+    #[test]
+    fn self_attested_deadness_cannot_close_a_rewrite_certificate() {
+        let mut function = CertifiedFunction::new(inventory()).expect("complete source");
+        let write = obligation_ids(function.source())[0];
+        let mut certificate = RewriteCertificate::new("unreachable-block", [write]);
+        certificate.push(write, EffectDisposition::ProvenDead);
+        assert!(!function.apply_rewrite(&certificate).is_closed());
+        assert!(function.finish().missing().contains(&write));
+        assert!(!function.finish().authorizes_certified_c());
+    }
+
+    #[test]
+    fn supersession_cycle_cannot_authorize_certified_c() {
+        let mut function = CertifiedFunction::new(inventory()).expect("complete source");
+        let ids = obligation_ids(function.source());
+        let first = ids[0];
+        let second = ids[1];
+        let mut certificate = RewriteCertificate::new("cycle", [first, second]);
+        certificate.push(first, EffectDisposition::Superseded { by: second });
+        certificate.push(second, EffectDisposition::Superseded { by: first });
+        assert!(!function.apply_rewrite(&certificate).is_closed());
+        let report = function.finish();
+        assert!(report.missing().contains(&first));
+        assert!(report.missing().contains(&second));
+        assert!(!report.authorizes_certified_c());
+    }
+
+    #[test]
+    fn output_entity_must_map_the_recorded_obligation() {
+        let mut function = CertifiedFunction::new(inventory()).expect("complete source");
+        let ids = obligation_ids(function.source());
+        let read = ids[0];
+        let write = ids[1];
+        let wrong_output = output_for(function.source(), read);
+        assert_eq!(
+            function.record_rendered(write, wrong_output),
+            Err(CertificationError::ObligationNotMapped(write))
+        );
+        assert_eq!(function.finish().missing().len(), ids.len());
+    }
+
+    #[test]
+    fn incompatible_schema_and_rewrite_pass_are_rejected() {
+        let source = inventory();
+        let condition = obligation_ids(&source)[0];
+        let mut certificate = RewriteCertificate::new("if-normalize", [condition]);
+        certificate.push(
+            condition,
+            EffectDisposition::Rewritten {
+                pass: "if-normalize".to_string(),
+            },
+        );
+        certificate.schema_version = CERTIFICATION_SCHEMA_VERSION + 1;
+        if let Some(dispositions) = certificate.dispositions.get_mut(&condition) {
+            dispositions[0] = EffectDisposition::Rewritten {
+                pass: "different-pass".to_string(),
+            };
+        }
+        let report = certificate.audit(&source);
+        assert_eq!(report.invalid.len(), 2);
+        assert!(!report.is_closed());
+    }
+
+    #[test]
+    fn source_and_reports_are_issued_with_current_schemas() {
+        let function = CertifiedFunction::new(inventory()).expect("source-issued inventory");
+        let report = function.finish();
+        assert_eq!(
+            function.source().schema_version(),
+            SEMANTIC_OBLIGATION_SCHEMA_VERSION
+        );
+        assert_eq!(report.schema_version(), CERTIFICATION_SCHEMA_VERSION);
+        assert_eq!(report.source_obligation_count(), report.missing().len());
+        assert!(!report.authorizes_certified_c());
+    }
+
+    #[test]
+    fn counted_loop_state_owns_phi_value_carrier_and_transition_exactly() {
+        let counter = Varnode::register(0, 8);
+        let bound = Varnode::register(8, 8);
+        let mut preheader = R2ILBlock::new(0x6200, 4);
+        preheader.push(R2ILOp::Copy {
+            dst: counter.clone(),
+            src: Varnode::constant(0, 8),
+        });
+        preheader.push(R2ILOp::Branch {
+            target: Varnode::ram(0x6210, 8),
+        });
+        let condition = Varnode::unique(0x40, 1);
+        let mut header = R2ILBlock::new(0x6210, 4);
+        header.push(R2ILOp::IntLess {
+            dst: condition.clone(),
+            a: counter.clone(),
+            b: bound,
+        });
+        header.push(R2ILOp::CBranch {
+            target: Varnode::ram(0x6220, 8),
+            cond: condition,
+        });
+        let mut exit = R2ILBlock::new(0x6214, 4);
+        exit.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+        let mut latch = R2ILBlock::new(0x6220, 4);
+        latch.push(R2ILOp::IntAdd {
+            dst: counter.clone(),
+            a: counter,
+            b: Varnode::constant(1, 8),
+        });
+        latch.push(R2ILOp::Branch {
+            target: Varnode::ram(0x6210, 8),
+        });
+
+        let mut arch = ArchSpec::new("counted-loop-cert-test");
+        arch.add_register(RegisterDef::new("rax", 0, 8));
+        arch.add_register(RegisterDef::new("rdi", 8, 8));
+        arch.add_register(RegisterDef::new("rip", 16, 8));
+        let counter_storage = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 0,
+            size: 8,
+        };
+        let bound_storage = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 8,
+            size: 8,
+        };
+        let interface = SourceFunctionInterface::new(
+            b"counted-loop-cert-revision-1".to_vec(),
+            "test-register-abi",
+            [SourceAbiParameterSpec::new(0, bound_storage)],
+            SourceFunctionReturn::Register {
+                storage: counter_storage,
+            },
+            [],
+        )
+        .expect("counted loop interface");
+        let artifact = SsaArtifact::raw_with_interface(
+            &[preheader, header, exit, latch],
+            Some(&arch),
+            interface,
+        )
+        .expect("counted loop artifact");
+        let certified =
+            CertifiedMachineFunction::from_artifact(&artifact).expect("counted loop certificate");
+        let control = certified
+            .closed_counted_loop_control_for_header(0x6210)
+            .expect("closed counted loop control");
+        assert_eq!(control.parameter_storage(), bound_storage);
+        assert_eq!(control.state().carrier_storage(), counter_storage);
+        assert_eq!(control.state().source_obligations().len(), 3);
+        for obligation in control.state().source_obligations() {
+            assert!(matches!(
+                certified.ledger().effects(*obligation),
+                [effect]
+                    if effect.disposition()
+                        == &EffectDisposition::AbsorbedIntoLoopState {
+                            producer: control.state().producer(),
+                        }
+                        && effect.counted_loop_state_evidence() == Some(control.state())
+            ));
+        }
+        let report = certified.finish();
+        assert!(report.has_exactly_one_disposition_per_source());
+        assert!(report.residualized().is_empty());
+        assert!(report.refused().is_empty());
+    }
+
+    #[test]
+    fn artifact_origin_commits_preparation_mode_assumptions_and_current_schema() {
+        let mut block = R2ILBlock::new(0x6100, 4);
+        block.push(R2ILOp::Copy {
+            dst: Varnode::unique(0x10, 4),
+            src: Varnode::constant(7, 4),
+        });
+        let raw = SsaArtifact::raw(&[block.clone()], None).expect("raw origin artifact");
+        let raw_certified =
+            CertifiedMachineProjection::from_artifact(&raw).expect("raw origin certification");
+        let rebuilt =
+            CertifiedMachineProjection::from_artifact(&raw).expect("rebuilt certification");
+        assert_eq!(raw_certified.origin(), rebuilt.origin());
+
+        let mut arch = ArchSpec::new("origin-context");
+        arch.addr_size = 8;
+        arch.set_memory_endianness(Endianness::Little);
+        let contextual =
+            SsaArtifact::raw(&[block.clone()], Some(&arch)).expect("contextual origin artifact");
+        let contextual_certified = CertifiedMachineProjection::from_artifact(&contextual)
+            .expect("contextual origin certification");
+        assert_ne!(raw_certified.origin(), contextual_certified.origin());
+
+        let symbolic = SsaArtifact::for_symbolic(&[block], None).expect("symbolic origin artifact");
+        let symbolic_certified = CertifiedMachineProjection::from_artifact(&symbolic)
+            .expect("symbolic origin certification");
+        assert_ne!(raw_certified.origin(), symbolic_certified.origin());
+        assert!(raw_certified.origin().decompile_preparation().is_none());
+        let symbolic_preparation = symbolic_certified
+            .origin()
+            .decompile_preparation()
+            .expect("symbolic preparation snapshot");
+        assert!(!symbolic_preparation.canonical_value_roots().is_empty());
+        let serialized_preparation =
+            serde_json::to_value(symbolic_preparation).expect("serialized preparation snapshot");
+        assert!(
+            serialized_preparation
+                .get("canonical_value_roots")
+                .is_some()
+        );
+        assert!(serialized_preparation.get("stack_address_roots").is_some());
+        assert!(serialized_preparation.get("formal_parameters").is_some());
+        assert!(
+            serialized_preparation
+                .get("formal_parameter_bases")
+                .is_some()
+        );
+
+        let assumptions = r2ssa::AssumptionSet::new(vec![r2ssa::AnalysisAssumption {
+            id: Some("origin-proof-context".to_string()),
+            subject: r2ssa::AssumptionSubject::Target { addr: 0x6100 },
+            value: r2ssa::AssumptionValue::Constant { value: 1 },
+            scope: r2ssa::AssumptionScope::Function,
+            provenance: r2ssa::AssumptionProvenance::User,
+        }]);
+        let assumed = raw.with_assumptions(&assumptions);
+        let assumed_certified = CertifiedMachineProjection::from_artifact(&assumed)
+            .expect("assumed origin certification");
+        assert_ne!(raw_certified.origin(), assumed_certified.origin());
+        let ordered = r2ssa::AssumptionSet::new(vec![
+            r2ssa::AnalysisAssumption {
+                id: Some("first".to_string()),
+                subject: r2ssa::AssumptionSubject::Target { addr: 0x6100 },
+                value: r2ssa::AssumptionValue::Constant { value: 1 },
+                scope: r2ssa::AssumptionScope::Function,
+                provenance: r2ssa::AssumptionProvenance::User,
+            },
+            r2ssa::AnalysisAssumption {
+                id: Some("second".to_string()),
+                subject: r2ssa::AssumptionSubject::Target { addr: 0x6200 },
+                value: r2ssa::AssumptionValue::Constant { value: 2 },
+                scope: r2ssa::AssumptionScope::Function,
+                provenance: r2ssa::AssumptionProvenance::User,
+            },
+        ]);
+        let reversed = r2ssa::AssumptionSet::new(ordered.items.iter().cloned().rev().collect());
+        let ordered = CertifiedMachineProjection::from_artifact(&raw.with_assumptions(&ordered))
+            .expect("ordered assumption certification");
+        let reversed = CertifiedMachineProjection::from_artifact(&raw.with_assumptions(&reversed))
+            .expect("reversed assumption certification");
+        assert_ne!(ordered.origin(), reversed.origin());
+
+        assert_eq!(CERTIFICATION_SCHEMA_VERSION, 17);
+        assert_eq!(
+            raw_certified.origin().schema_version(),
+            CERTIFICATION_SCHEMA_VERSION
+        );
+        assert_eq!(
+            raw_certified.origin().prepare_mode(),
+            CertifiedPreparationMode::Raw
+        );
+        let modes = [
+            CertifiedPreparationMode::Generic,
+            CertifiedPreparationMode::Raw,
+            CertifiedPreparationMode::Decompile,
+            CertifiedPreparationMode::Patterns,
+            CertifiedPreparationMode::DataRefs,
+            CertifiedPreparationMode::Symbolic,
+        ];
+        let serialized = modes
+            .iter()
+            .map(|mode| serde_json::to_value(mode).expect("serialized preparation mode"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            serialized,
+            vec![
+                serde_json::json!("generic"),
+                serde_json::json!("raw"),
+                serde_json::json!("decompile"),
+                serde_json::json!("patterns"),
+                serde_json::json!("data_refs"),
+                serde_json::json!("symbolic"),
+            ]
+        );
+    }
+}

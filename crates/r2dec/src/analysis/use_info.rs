@@ -1,7 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
 
-use r2ssa::{ObjectKind, SSAFunction, SSAOp, SSAVar, SSAVarNameKind, SsaArtifact, ValueId};
+use r2ssa::{
+    ObjectKind, SSAFunction, SSAOp, SSAVar, SSAVarNameKind, SsaArtifact, SsaExecutionControl,
+    ValueId,
+};
 use r2types::{
     CalleeCallArgPolicy, CalleeResolutionFacts, CalleeTargetIdentityRequest,
     CalleeTargetPolicyDecision, CalleeTargetResolutionRequest, CallsiteKey,
@@ -14,6 +17,7 @@ use super::{
     ValueRef, lower::LowerCtx, utils,
 };
 use crate::ast::{BinaryOp, CExpr, CType};
+use crate::control::{DecompileExecutionStop, DecompileWorkControl, DecompileWorkPhase};
 use crate::registers::register_family_name;
 
 #[derive(Debug, Default)]
@@ -51,29 +55,72 @@ pub(crate) struct LocalStructFieldAccessProfile {
     pub(crate) is_write: bool,
 }
 
+#[allow(dead_code)]
 pub(crate) fn analyze(blocks: &[SSABlock], env: &PassEnv<'_>) -> UseInfo {
-    analyze_with_definition_overrides_mode(blocks, env, &HashMap::new(), UseInfoAnalysisMode::Full)
+    let execution = SsaExecutionControl::default();
+    let control = DecompileWorkControl::new(&execution, DecompileWorkPhase::Structuring);
+    analyze_with_control(blocks, env, control).expect("default decompiler work control cannot stop")
+}
+
+pub(crate) fn analyze_with_control(
+    blocks: &[SSABlock],
+    env: &PassEnv<'_>,
+    control: DecompileWorkControl<'_>,
+) -> Result<UseInfo, DecompileExecutionStop> {
+    analyze_with_definition_overrides_mode(
+        blocks,
+        env,
+        &HashMap::new(),
+        UseInfoAnalysisMode::Full,
+        control,
+    )
 }
 
 pub(crate) fn analyze_for_local_struct_accesses(blocks: &[SSABlock], env: &PassEnv<'_>) -> UseInfo {
+    let execution = SsaExecutionControl::default();
+    let control = DecompileWorkControl::new(&execution, DecompileWorkPhase::Structuring);
+    analyze_for_local_struct_accesses_with_control(blocks, env, control)
+        .expect("default decompiler work control cannot stop")
+}
+
+pub(crate) fn analyze_for_local_struct_accesses_with_control(
+    blocks: &[SSABlock],
+    env: &PassEnv<'_>,
+    control: DecompileWorkControl<'_>,
+) -> Result<UseInfo, DecompileExecutionStop> {
     analyze_with_definition_overrides_mode(
         blocks,
         env,
         &HashMap::new(),
         UseInfoAnalysisMode::LocalStructAccesses,
+        control,
     )
 }
 
+#[allow(dead_code)]
 pub(crate) fn analyze_with_definition_overrides(
     blocks: &[SSABlock],
     env: &PassEnv<'_>,
     definition_overrides: &HashMap<String, CExpr>,
 ) -> UseInfo {
+    let execution = SsaExecutionControl::default();
+    let control = DecompileWorkControl::new(&execution, DecompileWorkPhase::Structuring);
+    analyze_with_definition_overrides_with_control(blocks, env, definition_overrides, control)
+        .expect("default decompiler work control cannot stop")
+}
+
+pub(crate) fn analyze_with_definition_overrides_with_control(
+    blocks: &[SSABlock],
+    env: &PassEnv<'_>,
+    definition_overrides: &HashMap<String, CExpr>,
+    control: DecompileWorkControl<'_>,
+) -> Result<UseInfo, DecompileExecutionStop> {
     analyze_with_definition_overrides_mode(
         blocks,
         env,
         definition_overrides,
         UseInfoAnalysisMode::Full,
+        control,
     )
 }
 
@@ -82,17 +129,21 @@ fn analyze_with_definition_overrides_mode(
     env: &PassEnv<'_>,
     definition_overrides: &HashMap<String, CExpr>,
     mode: UseInfoAnalysisMode,
-) -> UseInfo {
+    control: DecompileWorkControl<'_>,
+) -> Result<UseInfo, DecompileExecutionStop> {
+    control.poll()?;
     let mut scratch = UseScratch::default();
     scratch.info.type_hints = env.type_hints.clone();
     seed_local_value_ids(&mut scratch, blocks);
     seed_entry_param_aliases(&mut scratch, blocks, env);
 
     for block in blocks {
+        control.poll()?;
         count_uses_and_conditions(&mut scratch, block);
     }
     pin_loop_carried_phi_values(&mut scratch, blocks);
     for block in blocks {
+        control.poll()?;
         collect_definitions(&mut scratch, block, env, definition_overrides);
     }
     refresh_semantic_values(&mut scratch, blocks, env);
@@ -104,17 +155,18 @@ fn analyze_with_definition_overrides_mode(
 
     analyze_call_args(&mut scratch, blocks, env);
     bind_single_use_call_result_definitions(&mut scratch, blocks, env);
-    propagate_call_result_aliases(&mut scratch.info);
-    rerun_semantic_call_analysis_after_result_binding(&mut scratch, blocks, env);
+    propagate_call_result_aliases(&mut scratch.info, control)?;
+    rerun_semantic_call_analysis_after_result_binding(&mut scratch, blocks, env, control)?;
     if matches!(mode, UseInfoAnalysisMode::Full) {
-        coalesce_variables(&mut scratch, blocks, env);
+        coalesce_variables(&mut scratch, blocks, env, control)?;
         pin_aliases_for_pinned_values(&mut scratch.info);
         build_formatted_defs(&mut scratch, env);
     }
     rebuild_id_mirrors_from_name_maps(&mut scratch.info);
     scratch.info.producers = scratch.producers.clone();
 
-    scratch.info
+    control.poll()?;
+    Ok(scratch.info)
 }
 
 fn seed_local_value_ids(scratch: &mut UseScratch, blocks: &[SSABlock]) {
@@ -227,7 +279,9 @@ fn rerun_semantic_call_analysis_after_result_binding(
     scratch: &mut UseScratch,
     blocks: &[SSABlock],
     env: &PassEnv<'_>,
-) {
+    control: DecompileWorkControl<'_>,
+) -> Result<(), DecompileExecutionStop> {
+    control.poll()?;
     scratch.info.call_args.clear();
     scratch.info.consumed_by_call.clear();
     scratch.info.inlined_call_results.clear();
@@ -237,7 +291,8 @@ fn rerun_semantic_call_analysis_after_result_binding(
     refresh_semantic_values(scratch, blocks, env);
     analyze_call_args(scratch, blocks, env);
     bind_single_use_call_result_definitions(scratch, blocks, env);
-    propagate_call_result_aliases(&mut scratch.info);
+    propagate_call_result_aliases(&mut scratch.info, control)?;
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -4738,13 +4793,20 @@ fn pair_interferes(
     false
 }
 
-fn coalesce_variables(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEnv<'_>) {
+fn coalesce_variables(
+    scratch: &mut UseScratch,
+    blocks: &[SSABlock],
+    env: &PassEnv<'_>,
+    control: DecompileWorkControl<'_>,
+) -> Result<(), DecompileExecutionStop> {
+    control.poll()?;
     const MAX_INTERFERENCE_PAIRS: usize = 16_384;
     const MAX_INTERFERENCE_WORK: usize = 512_000;
 
     let mut reg_versions: HashMap<String, Vec<(String, u32)>> = HashMap::new();
 
     for block in blocks {
+        control.poll()?;
         block.for_each_def(|def| {
             if !is_register_candidate_var(def.var, env) {
                 return;
@@ -4773,6 +4835,7 @@ fn coalesce_variables(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassE
 
     let mut uf_parent: HashMap<String, String> = HashMap::new();
     for base in &bases {
+        control.poll()?;
         let Some(versions) = reg_versions.get(base) else {
             continue;
         };
@@ -4788,6 +4851,7 @@ fn coalesce_variables(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassE
     // and leave original SSA naming intact.
     let mut estimated_pairs = 0usize;
     for base in &bases {
+        control.poll()?;
         let Some(versions) = reg_versions.get(base) else {
             continue;
         };
@@ -4802,11 +4866,12 @@ fn coalesce_variables(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassE
     }
     let estimated_work = estimated_pairs.saturating_mul(blocks.len());
     if estimated_pairs > MAX_INTERFERENCE_PAIRS || estimated_work > MAX_INTERFERENCE_WORK {
-        return;
+        return Ok(());
     }
 
     let mut key_to_base: HashMap<String, String> = HashMap::new();
     for base in &bases {
+        control.poll()?;
         let Some(versions) = reg_versions.get(base) else {
             continue;
         };
@@ -4816,6 +4881,7 @@ fn coalesce_variables(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassE
     }
 
     for block in blocks {
+        control.poll()?;
         for phi in &block.phis {
             if !is_register_candidate_var(&phi.dst, env) {
                 continue;
@@ -4904,8 +4970,10 @@ fn coalesce_variables(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassE
 
     let mut changed = true;
     while changed {
+        control.poll()?;
         changed = false;
         for block in blocks.iter().rev() {
+            control.poll()?;
             let mut new_live_out = HashSet::new();
             for succ in successors.get(&block.addr).into_iter().flatten() {
                 let mut succ_live_in = live_in.get(succ).cloned().unwrap_or_default();
@@ -4943,6 +5011,7 @@ fn coalesce_variables(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassE
     let mut interference_cache: HashMap<(String, String), bool> = HashMap::new();
 
     for base in &bases {
+        control.poll()?;
         let Some(versions) = reg_versions.get(base) else {
             continue;
         };
@@ -4971,6 +5040,7 @@ fn coalesce_variables(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassE
         let mut roots: Vec<_> = groups.keys().cloned().collect();
         roots.sort();
         for root in roots {
+            control.poll()?;
             let Some(members) = groups.get(&root) else {
                 continue;
             };
@@ -4979,6 +5049,7 @@ fn coalesce_variables(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassE
 
             let mut classes: Vec<Vec<String>> = Vec::new();
             for member in sorted_members {
+                control.poll()?;
                 let mut placed = false;
                 for class in &mut classes {
                     let mut interferes = false;
@@ -5023,6 +5094,7 @@ fn coalesce_variables(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassE
 
         let mut merged = true;
         while merged {
+            control.poll()?;
             merged = false;
             'outer: for i in 0..alias_classes.len() {
                 for j in (i + 1)..alias_classes.len() {
@@ -5087,6 +5159,8 @@ fn coalesce_variables(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassE
             }
         }
     }
+    control.poll()?;
+    Ok(())
 }
 
 fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEnv<'_>) {
@@ -5606,12 +5680,17 @@ fn call_result_source_for_alias(info: &UseInfo, alias: &str) -> Option<(u64, usi
     })
 }
 
-fn propagate_call_result_aliases(info: &mut UseInfo) {
+fn propagate_call_result_aliases(
+    info: &mut UseInfo,
+    control: DecompileWorkControl<'_>,
+) -> Result<(), DecompileExecutionStop> {
     let mut changed = true;
     while changed {
+        control.poll()?;
         changed = false;
 
         for (dst, src) in info.copy_sources.clone() {
+            control.poll()?;
             let Some(source_call) = call_result_source_for_alias(info, &src) else {
                 continue;
             };
@@ -5622,6 +5701,7 @@ fn propagate_call_result_aliases(info: &mut UseInfo) {
         }
 
         for (dst, prov) in info.forwarded_values.clone() {
+            control.poll()?;
             let source_call = call_result_source_for_alias(info, &prov.source).or_else(|| {
                 prov.source_var.as_ref().and_then(|source_var| {
                     call_result_source_for_alias(info, &source_var.display_name())
@@ -5637,6 +5717,7 @@ fn propagate_call_result_aliases(info: &mut UseInfo) {
         }
 
         for (name, value) in info.semantic_values.clone() {
+            control.poll()?;
             let source_alias = match value {
                 SemanticValue::Scalar(ScalarValue::Root(root)) => Some(root.display_name()),
                 SemanticValue::Scalar(ScalarValue::Expr(expr)) => {
@@ -5662,6 +5743,7 @@ fn propagate_call_result_aliases(info: &mut UseInfo) {
             }
         }
     }
+    Ok(())
 }
 
 fn call_result_expr_for_call_at(
@@ -10197,6 +10279,7 @@ mod tests {
             phis: vec![PhiNode {
                 dst: eax_3.clone(),
                 sources: vec![(0x1000, eax_1), (0x1100, eax_2)],
+                canonical_storage: None,
             }],
             ops: vec![
                 SSAOp::Copy {

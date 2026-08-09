@@ -291,6 +291,28 @@ pub fn ssa_var_block_key(block_addr: u64, var: &SSAVar) -> String {
 
 pub fn scalar_register_family_key(name: &str) -> String {
     let lower = name.to_ascii_lowercase();
+    let x86_family = match lower.as_str() {
+        "rax" | "eax" | "ax" | "al" | "ah" => Some("ax"),
+        "rbx" | "ebx" | "bx" | "bl" | "bh" => Some("bx"),
+        "rcx" | "ecx" | "cx" | "cl" | "ch" => Some("cx"),
+        "rdx" | "edx" | "dx" | "dl" | "dh" => Some("dx"),
+        "rsi" | "esi" | "si" | "sil" => Some("si"),
+        "rdi" | "edi" | "di" | "dil" => Some("di"),
+        "rbp" | "ebp" | "bp" | "bpl" => Some("bp"),
+        "rsp" | "esp" | "spl" => Some("sp"),
+        "r8" | "r8d" | "r8w" | "r8b" => Some("8"),
+        "r9" | "r9d" | "r9w" | "r9b" => Some("9"),
+        "r10" | "r10d" | "r10w" | "r10b" => Some("10"),
+        "r11" | "r11d" | "r11w" | "r11b" => Some("11"),
+        "r12" | "r12d" | "r12w" | "r12b" => Some("12"),
+        "r13" | "r13d" | "r13w" | "r13b" => Some("13"),
+        "r14" | "r14d" | "r14w" | "r14b" => Some("14"),
+        "r15" | "r15d" | "r15w" | "r15b" => Some("15"),
+        _ => None,
+    };
+    if let Some(family) = x86_family {
+        return format!("x86:gpr:{family}");
+    }
 
     if let Some(idx) = lower.strip_prefix('x').or_else(|| lower.strip_prefix('w'))
         && !idx.is_empty()
@@ -1994,6 +2016,116 @@ mod tests {
             .find(|var| var.name == "arg2")
             .expect("third recovered variable");
         assert_eq!(var.var_type, "int32_t");
+    }
+
+    #[test]
+    fn x86_scalar_register_families_cover_legacy_and_extended_gprs() {
+        let families: &[&[&str]] = &[
+            &["RAX", "eax", "ax", "al", "ah"],
+            &["RBX", "ebx", "bx", "bl", "bh"],
+            &["RCX", "ecx", "cx", "cl", "ch"],
+            &["RDX", "edx", "dx", "dl", "dh"],
+            &["RSI", "esi", "si", "sil"],
+            &["RDI", "edi", "di", "dil"],
+            &["RBP", "ebp", "bp", "bpl"],
+            &["RSP", "esp", "spl"],
+            &["R8", "r8d", "r8w", "r8b"],
+            &["R9", "r9d", "r9w", "r9b"],
+            &["R10", "r10d", "r10w", "r10b"],
+            &["R11", "r11d", "r11w", "r11b"],
+            &["R12", "r12d", "r12w", "r12b"],
+            &["R13", "r13d", "r13w", "r13b"],
+            &["R14", "r14d", "r14w", "r14b"],
+            &["R15", "r15d", "r15w", "r15b"],
+        ];
+        for aliases in families {
+            let family = scalar_register_family_key(aliases[0]);
+            for &alias in *aliases {
+                assert_eq!(scalar_register_family_key(alias), family, "{alias}");
+            }
+        }
+        assert_eq!(scalar_register_family_key("sp"), "aarch64:sp");
+    }
+
+    #[test]
+    fn recovered_x86_second_arg_uses_low_32_carrier_width_in_either_op_order() {
+        for narrow_first in [false, true] {
+            let wide_use = SSAOp::IntAdd {
+                dst: SSAVar::new("tmp:wide_sum", 1, 8),
+                a: SSAVar::new("RSI", 0, 8),
+                b: SSAVar::constant(7, 8),
+            };
+            let narrow_use = SSAOp::IntSub {
+                dst: SSAVar::new("ESI", 1, 4),
+                a: SSAVar::new("ESI", 0, 4),
+                b: SSAVar::constant(3, 4),
+            };
+            let ops = if narrow_first {
+                vec![narrow_use, wide_use]
+            } else {
+                vec![wide_use, narrow_use]
+            };
+            let block = SSABlock {
+                addr: 0x401000,
+                size: 8,
+                ops,
+            };
+
+            let params = recover_signature_params_from_ssa(
+                &[block],
+                Some("x86-64"),
+                &HashMap::new(),
+                false,
+                64,
+            );
+            let second = params
+                .iter()
+                .find(|param| param.arg_index == 1)
+                .expect("second ABI parameter");
+            assert_eq!(second.name, "arg1");
+            assert_eq!(
+                second.initial_ty,
+                crate::CTypeLike::Int {
+                    bits: 32,
+                    signedness: crate::Signedness::Unknown,
+                },
+                "narrow_first={narrow_first}"
+            );
+        }
+    }
+
+    #[test]
+    fn recovered_x86_pointer_carrier_stays_pointer_despite_low_alias_use() {
+        let block = SSABlock {
+            addr: 0x401000,
+            size: 12,
+            ops: vec![
+                SSAOp::IntAdd {
+                    dst: SSAVar::new("tmp:address", 1, 8),
+                    a: SSAVar::new("RDI", 0, 8),
+                    b: SSAVar::constant(4, 8),
+                },
+                SSAOp::Load {
+                    dst: SSAVar::new("tmp:value", 1, 4),
+                    addr: SSAVar::new("tmp:address", 1, 8),
+                    space: "ram".to_string(),
+                },
+                SSAOp::IntSub {
+                    dst: SSAVar::new("EDI", 1, 4),
+                    a: SSAVar::new("EDI", 0, 4),
+                    b: SSAVar::constant(1, 4),
+                },
+            ],
+        };
+
+        let params =
+            recover_signature_params_from_ssa(&[block], Some("x86-64"), &HashMap::new(), false, 64);
+        let first = params
+            .iter()
+            .find(|param| param.arg_index == 0)
+            .expect("first ABI parameter");
+        assert_eq!(first.ssa_var, SSAVar::new("RDI", 0, 8));
+        assert!(matches!(first.initial_ty, crate::CTypeLike::Pointer(_)));
     }
 
     #[test]

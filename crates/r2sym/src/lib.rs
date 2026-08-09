@@ -35,6 +35,7 @@
 
 pub mod backward;
 pub mod constraints;
+pub mod control;
 pub mod executor;
 pub mod kernel;
 pub mod loops;
@@ -68,6 +69,7 @@ pub use constraints::{
     build_final_constraint_graph_for_path, build_model_conditioned_recurrence_constraint_graph,
     exact_fold_model_bytes,
 };
+pub use control::{SymCancellationToken, SymExecutionControl, SymExecutionStopReason};
 pub use executor::{CallHookResult, SymExecutor};
 pub use kernel::{
     CallEdgePolicy, ConcreteExecutionBackend, ConcreteMemorySeed, ConcreteRunRequest,
@@ -211,6 +213,23 @@ pub enum SymError {
     /// Timeout during exploration.
     #[error("Exploration timeout")]
     Timeout,
+
+    /// Cooperative cancellation was requested.
+    #[error("Symbolic execution cancelled")]
+    Cancelled,
+
+    /// The caller-provided deadline expired.
+    #[error("Symbolic execution deadline exceeded")]
+    DeadlineExceeded,
+}
+
+impl From<SymExecutionStopReason> for SymError {
+    fn from(reason: SymExecutionStopReason) -> Self {
+        match reason {
+            SymExecutionStopReason::Cancelled => Self::Cancelled,
+            SymExecutionStopReason::DeadlineExceeded => Self::DeadlineExceeded,
+        }
+    }
 }
 
 pub type SymResult<T> = Result<T, SymError>;

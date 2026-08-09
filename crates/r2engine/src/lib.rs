@@ -3,13 +3,15 @@
 //! Fact ownership stays in the lower crates: SSA in `r2ssa`, semantic artifacts
 //! in `r2sym`, type facts in `r2types`, and rendering in `r2dec`. This crate is
 //! the session-level scheduler/cache boundary that decides which artifacts are
-//! needed for a request and how they are reused.
+//! needed for a request. Only immutable SSA analysis is reused across requests;
+//! request-specific semantic, type, and render artifacts are never cached.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::OpenOptions;
 use std::hash::Hash;
 use std::io::Write;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use r2il::R2ILBlock;
 use r2ssa::{CFGRiskSummary, SsaArtifact};
@@ -29,7 +31,8 @@ pub use cache::{CacheCounters, EngineSessionCacheMetrics};
 pub use route::{
     DecompileProbeDecision, EngineDiagnostics, EngineFunctionIdentity, EnginePlan,
     EngineProfileRouteDecision, EngineProfileRouteKind, EngineRequestKind, EngineRequestPlan,
-    EngineRouteContext, EngineRouteDecision, EngineTypeRouteDecision, EngineTypeRouteKind,
+    EngineRouteContext, EngineRouteDecision, EngineSemanticKernelRegion,
+    EngineSemanticKernelRender, EngineTypeRouteDecision, EngineTypeRouteKind,
     EngineTypedRouteDecision, cfg_guard_reason, cfg_guard_reason_from_summary,
     plan_profile_request, plan_type_request, prefer_symbolic_large_worker_decompile,
     profile_route_decision, select_engine_plan, semantic_artifact_needs_fallback_type_payload,
@@ -47,10 +50,12 @@ use route::{
     proof_coverage_from_type_facts, raw_cfg_risk_summary_for_preprobe,
 };
 pub use stable_hash::{
-    stable_blocks_hash, stable_fnv1a_bytes, stable_fnv1a_debug_hash, stable_fnv1a_hash,
+    stable_arch_hash, stable_blocks_hash, stable_fnv1a_bytes, stable_fnv1a_debug_hash,
+    stable_fnv1a_hash,
 };
 
-pub const ENGINE_SCHEMA_VERSION: u32 = 3;
+pub const ENGINE_SCHEMA_VERSION: u32 = 7;
+pub const ENGINE_SOURCE_SNAPSHOT_SCHEMA_VERSION: u32 = 3;
 pub const DEFAULT_ENGINE_CACHE_LIMIT: usize = 256;
 pub const SYMBOLIC_PATHS_LIMIT: usize = 32;
 pub const SYMBOLIC_PATHS_CALL_FREE_MAX_STATES: usize = 16;
@@ -67,12 +72,108 @@ pub const POST_ANALYSIS_AGGRESSIVE_BUDGET_USEC: u64 = 30 * 1_000_000;
 pub const TAINT_GLOBAL_MAX_FUNCTIONS: usize = 128;
 pub const SIGNATURE_WRITEBACK_GLOBAL_MAX_FUNCTIONS: usize = 128;
 pub const TYPE_WRITEBACK_GLOBAL_MAX_FUNCTIONS: usize = 128;
+pub const ENGINE_DECOMPILE_MAX_BLOCKS: usize = 200;
+pub const ENGINE_DECOMPILE_MAX_OPS: usize = 512;
 pub const AUTO_CALLBACK_MAX_BLOCKS: u32 = 96;
 pub const AUTO_CALLBACK_MAX_COST: u32 = 512;
 pub const AUTO_CALLBACK_MAX_LINEAR_SIZE: u64 = 256 * 1024;
 pub const SYMBOLIC_SCOPE_MAX_FUNCTIONS: usize = 32;
 pub const RUNTIME_MATERIALIZED_MAX_BYTES: u64 = 0x4000;
 pub const RUNTIME_MATERIALIZED_SLOT_BYTES: u64 = 16;
+
+/// Immutable, source-owned interface facts for one exact lifted revision.
+///
+/// The engine only transports these facts into SSA. It does not infer a
+/// revision identity or upgrade absent interface data into authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineSourceSnapshot {
+    schema_version: u32,
+    revision_identity: Box<[u8]>,
+    function_interface: Option<r2ssa::SourceFunctionInterface>,
+    call_site_interfaces: Box<[r2ssa::SourceCallSiteInterface]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineSourceSnapshotError {
+    EmptyRevisionIdentity,
+    FunctionRevisionMismatch,
+    CallSiteRevisionMismatch,
+    DuplicateCallSiteIdentity,
+    DuplicateCallSiteLocation,
+}
+
+impl std::fmt::Display for EngineSourceSnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid engine source snapshot: {self:?}")
+    }
+}
+
+impl std::error::Error for EngineSourceSnapshotError {}
+
+impl EngineSourceSnapshot {
+    pub fn new(
+        revision_identity: impl Into<Vec<u8>>,
+        function_interface: Option<r2ssa::SourceFunctionInterface>,
+        call_site_interfaces: impl IntoIterator<Item = r2ssa::SourceCallSiteInterface>,
+    ) -> Result<Self, EngineSourceSnapshotError> {
+        let revision_identity = revision_identity.into();
+        if revision_identity.is_empty() {
+            return Err(EngineSourceSnapshotError::EmptyRevisionIdentity);
+        }
+        if function_interface
+            .as_ref()
+            .is_some_and(|interface| interface.revision_identity() != revision_identity)
+        {
+            return Err(EngineSourceSnapshotError::FunctionRevisionMismatch);
+        }
+        let call_site_interfaces = call_site_interfaces.into_iter().collect::<Vec<_>>();
+        if call_site_interfaces
+            .iter()
+            .any(|interface| interface.revision_identity() != revision_identity)
+        {
+            return Err(EngineSourceSnapshotError::CallSiteRevisionMismatch);
+        }
+        let mut identities = BTreeSet::new();
+        let mut locations = BTreeSet::new();
+        for interface in &call_site_interfaces {
+            let identity = interface.identity();
+            if !identities.insert(identity) {
+                return Err(EngineSourceSnapshotError::DuplicateCallSiteIdentity);
+            }
+            if !locations.insert((identity.block_addr(), identity.op_index())) {
+                return Err(EngineSourceSnapshotError::DuplicateCallSiteLocation);
+            }
+        }
+        Ok(Self {
+            schema_version: ENGINE_SOURCE_SNAPSHOT_SCHEMA_VERSION,
+            revision_identity: revision_identity.into_boxed_slice(),
+            function_interface,
+            call_site_interfaces: call_site_interfaces.into_boxed_slice(),
+        })
+    }
+
+    pub const fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    pub const fn revision_identity(&self) -> &[u8] {
+        &self.revision_identity
+    }
+
+    pub const fn function_interface(&self) -> Option<&r2ssa::SourceFunctionInterface> {
+        self.function_interface.as_ref()
+    }
+
+    pub const fn call_site_interfaces(&self) -> &[r2ssa::SourceCallSiteInterface] {
+        &self.call_site_interfaces
+    }
+
+    /// Deterministic identity of every exact source byte retained by this
+    /// snapshot, including logical carriers, reachable layouts, and callsites.
+    pub fn payload_identity(&self) -> u64 {
+        stable_fnv1a_debug_hash(self)
+    }
+}
 
 pub fn recover_vars_from_ssa(
     ssa_blocks: &[r2ssa::SSABlock],
@@ -856,10 +957,103 @@ pub struct EngineInterprocSummaryJsonInput<'a> {
     pub symbolic_scope: Option<&'a r2sym::PreparedFunctionScope>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnginePhase {
+    SnapshotContext,
+    LiftNormalize,
+    Ssa,
+    Obligations,
+    Symbolic,
+    Types,
+    Certification,
+    Structuring,
+    Normalization,
+    Rendering,
+    FfiConversion,
+}
+
+impl EnginePhase {
+    pub const ALL: [Self; 11] = [
+        Self::SnapshotContext,
+        Self::LiftNormalize,
+        Self::Ssa,
+        Self::Obligations,
+        Self::Symbolic,
+        Self::Types,
+        Self::Certification,
+        Self::Structuring,
+        Self::Normalization,
+        Self::Rendering,
+        Self::FfiConversion,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SnapshotContext => "snapshot_context",
+            Self::LiftNormalize => "lift_normalize",
+            Self::Ssa => "ssa",
+            Self::Obligations => "obligations",
+            Self::Symbolic => "symbolic",
+            Self::Types => "types",
+            Self::Certification => "certification",
+            Self::Structuring => "structuring",
+            Self::Normalization => "normalization",
+            Self::Rendering => "rendering",
+            Self::FfiConversion => "ffi_conversion",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnginePhaseStatus {
+    NotExecuted,
+    Executed,
+    /// The phase executed inside the elapsed span attributed to another
+    /// boundary. Its zero duration means "not separately measured", not free.
+    Folded,
+    Reused,
+    Refused,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnginePhaseTimingJson {
-    pub phase: String,
+    pub phase: EnginePhase,
+    pub status: EnginePhaseStatus,
     pub elapsed_us: u64,
+}
+
+impl EnginePhaseTimingJson {
+    fn not_executed(phase: EnginePhase) -> Self {
+        Self {
+            phase,
+            status: EnginePhaseStatus::NotExecuted,
+            elapsed_us: 0,
+        }
+    }
+}
+
+fn empty_engine_phase_timings() -> Vec<EnginePhaseTimingJson> {
+    EnginePhase::ALL
+        .into_iter()
+        .map(EnginePhaseTimingJson::not_executed)
+        .collect()
+}
+
+fn normalize_engine_phase_timings(
+    timings: Vec<EnginePhaseTimingJson>,
+) -> Vec<EnginePhaseTimingJson> {
+    let mut normalized = empty_engine_phase_timings();
+    for timing in timings {
+        if let Some(slot) = normalized
+            .iter_mut()
+            .find(|slot| slot.phase == timing.phase)
+        {
+            *slot = timing;
+        }
+    }
+    normalized
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -874,6 +1068,14 @@ pub struct EngineInferredTypeWritebackJson {
     pub core: EngineTypeWritebackJsonCore,
     pub interproc: EngineInterprocSummaryJson,
     pub semantic_status: EngineSemanticStatusJson,
+    /// Legacy route claim derived from rendered-proof facts. This is not an
+    /// `r2cert` source-obligation authorization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legacy_render_permission: Option<r2sym::RenderPermission>,
+    /// Legacy rendered-proof counters. These do not establish exact source-
+    /// obligation closure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legacy_rendered_proof_coverage: Option<r2sym::ProofCoverage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub semantics: Option<r2sym::SemanticArtifact>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1209,9 +1411,11 @@ pub fn type_writeback_report_json(
         core: type_writeback_json_core(payload),
         interproc,
         semantic_status,
+        legacy_render_permission: None,
+        legacy_rendered_proof_coverage: None,
         semantics,
         compiled_semantics,
-        phase_timings: Vec::new(),
+        phase_timings: empty_engine_phase_timings(),
     }
 }
 
@@ -1277,6 +1481,10 @@ pub fn type_writeback_report_json_from_function_analysis(
                     .map(|diagnostics| format!("summary diagnostics: {diagnostics:?}"))
             }),
     );
+    if let Some(route) = request.report.semantic_route.as_ref() {
+        report.legacy_render_permission = Some(route.render_permission.clone());
+        report.legacy_rendered_proof_coverage = Some(route.proof_coverage.clone());
+    }
     report
 }
 
@@ -1433,9 +1641,10 @@ pub fn function_analysis_report_json_core(
 
 pub fn function_analysis_session_report_json(
     payload: &EngineFunctionAnalysisReportPayload,
-    type_writeback: EngineInferredTypeWritebackJson,
+    mut type_writeback: EngineInferredTypeWritebackJson,
     phase_timings: Vec<EnginePhaseTimingJson>,
 ) -> EngineFunctionAnalysisSessionReportJson {
+    type_writeback.phase_timings = normalize_engine_phase_timings(type_writeback.phase_timings);
     EngineFunctionAnalysisSessionReportJson {
         core: function_analysis_report_json_core(payload),
         semantic: payload
@@ -1443,7 +1652,7 @@ pub fn function_analysis_session_report_json(
             .as_ref()
             .map(compiled_semantic_info),
         type_writeback,
-        phase_timings,
+        phase_timings: normalize_engine_phase_timings(phase_timings),
     }
 }
 
@@ -2031,65 +2240,102 @@ impl EngineRenderTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AnalysisCacheKey {
+    #[serde(deserialize_with = "deserialize_engine_schema_version")]
     pub schema_version: u32,
-    pub function_addr: u64,
+    pub source_snapshot_schema_version: Option<u32>,
+    pub source_revision_identity: Option<Box<[u8]>>,
+    pub source_payload_identity: Option<u64>,
     pub function_name_hash: u64,
     pub arch_hash: u64,
     pub blocks_hash: u64,
-    pub typed_context_hash: u64,
-    pub assumptions_hash: u64,
-    pub analysis_depth_hash: u64,
+}
+
+fn deserialize_engine_schema_version<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let schema_version = u32::deserialize(deserializer)?;
+    if schema_version == ENGINE_SCHEMA_VERSION {
+        Ok(schema_version)
+    } else {
+        Err(serde::de::Error::custom(format_args!(
+            "unsupported r2engine cache-key schema version {schema_version}; expected {ENGINE_SCHEMA_VERSION}"
+        )))
+    }
 }
 
 impl AnalysisCacheKey {
-    pub fn from_parts(
-        function_addr: u64,
+    pub fn from_immutable_parts(
         function_name: &str,
         arch: Option<&r2il::ArchSpec>,
         blocks: &[R2ILBlock],
-        typed_context_hash: u64,
-        assumptions_hash: u64,
-        analysis_depth: &str,
+        source_snapshot: Option<&EngineSourceSnapshot>,
     ) -> Self {
-        Self {
-            schema_version: ENGINE_SCHEMA_VERSION,
-            function_addr,
-            function_name_hash: stable_fnv1a_hash(&function_name),
-            arch_hash: stable_fnv1a_debug_hash(&arch),
-            blocks_hash: stable_blocks_hash(blocks),
-            typed_context_hash,
-            assumptions_hash,
-            analysis_depth_hash: stable_fnv1a_hash(&analysis_depth),
-        }
+        Self::from_immutable_hashes(
+            stable_fnv1a_hash(&function_name),
+            stable_arch_hash(arch),
+            stable_blocks_hash(blocks),
+            source_snapshot,
+        )
     }
 
-    pub fn from_hashes(
-        function_addr: u64,
+    pub fn from_immutable_hashes(
         function_name_hash: u64,
         arch_hash: u64,
         blocks_hash: u64,
-        typed_context_hash: u64,
-        assumptions_hash: u64,
-        analysis_depth_hash: u64,
+        source_snapshot: Option<&EngineSourceSnapshot>,
     ) -> Self {
         Self {
             schema_version: ENGINE_SCHEMA_VERSION,
-            function_addr,
+            source_snapshot_schema_version: source_snapshot
+                .map(EngineSourceSnapshot::schema_version),
+            source_revision_identity: source_snapshot
+                .map(|snapshot| snapshot.revision_identity().to_vec().into_boxed_slice()),
+            source_payload_identity: source_snapshot.map(EngineSourceSnapshot::payload_identity),
             function_name_hash,
             arch_hash,
             blocks_hash,
-            typed_context_hash,
-            assumptions_hash,
-            analysis_depth_hash,
         }
+    }
+
+    /// Compatibility constructor. Request-specific arguments do not
+    /// participate in immutable analysis identity.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        _function_addr: u64,
+        function_name: &str,
+        arch: Option<&r2il::ArchSpec>,
+        blocks: &[R2ILBlock],
+        _typed_context_hash: u64,
+        _assumptions_hash: u64,
+        _analysis_depth: &str,
+        source_snapshot: Option<&EngineSourceSnapshot>,
+    ) -> Self {
+        Self::from_immutable_parts(function_name, arch, blocks, source_snapshot)
+    }
+
+    /// Compatibility constructor. Request-specific hashes do not participate
+    /// in immutable analysis identity.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_hashes(
+        _function_addr: u64,
+        function_name_hash: u64,
+        arch_hash: u64,
+        blocks_hash: u64,
+        _typed_context_hash: u64,
+        _assumptions_hash: u64,
+        _analysis_depth_hash: u64,
+        source_snapshot: Option<&EngineSourceSnapshot>,
+    ) -> Self {
+        Self::from_immutable_hashes(function_name_hash, arch_hash, blocks_hash, source_snapshot)
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EngineCacheLayer {
     Analysis,
-    Artifact,
     MetricsSnapshot,
 }
 
@@ -2130,10 +2376,8 @@ impl EngineCachePlan {
         match request {
             EngineRequestKind::Decompile
             | EngineRequestKind::Types
-            | EngineRequestKind::SymbolicQuery => {
-                Self::lookup_store(request, EngineCacheLayer::Artifact)
-            }
-            EngineRequestKind::DebugFacts => {
+            | EngineRequestKind::SymbolicQuery
+            | EngineRequestKind::DebugFacts => {
                 Self::lookup_store(request, EngineCacheLayer::Analysis)
             }
             EngineRequestKind::Profile => {
@@ -2179,60 +2423,44 @@ pub struct EngineCacheLookup<T> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ArtifactCacheKey {
+#[serde(deny_unknown_fields)]
+pub struct EngineRequestKey {
     pub analysis: AnalysisCacheKey,
+    pub function_addr: u64,
+    pub typed_context_hash: u64,
+    pub assumptions_hash: u64,
+    pub analysis_depth_hash: u64,
+    pub ptr_bits: u32,
+    pub reg_type_hints_hash: u64,
     pub interproc_budget_hash: u64,
     pub symbolic_scope_hash: u64,
     pub semantic_schema_version: u32,
     pub semantic_claim_schema_version: u32,
 }
 
-pub type EngineFunctionKey = ArtifactCacheKey;
-
-impl ArtifactCacheKey {
+impl EngineRequestKey {
+    /// Builds a complete request identity from the immutable analysis key and
+    /// every request-specific input hash.
     #[allow(clippy::too_many_arguments)]
-    pub fn from_parts(
+    pub fn from_request_hashes(
+        analysis: AnalysisCacheKey,
         function_addr: u64,
-        function_name: &str,
-        arch: Option<&r2il::ArchSpec>,
-        blocks: &[R2ILBlock],
         typed_context_hash: u64,
         assumptions_hash: u64,
-        interproc_budget_hash: u64,
-        symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
-        analysis_depth: &str,
-    ) -> Self {
-        let analysis = AnalysisCacheKey::from_parts(
-            function_addr,
-            function_name,
-            arch,
-            blocks,
-            typed_context_hash,
-            assumptions_hash,
-            analysis_depth,
-        );
-        Self::from_analysis(analysis, interproc_budget_hash, symbolic_scope)
-    }
-
-    pub fn from_analysis(
-        analysis: AnalysisCacheKey,
-        interproc_budget_hash: u64,
-        symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
-    ) -> Self {
-        Self::from_hashes(
-            analysis,
-            interproc_budget_hash,
-            r2sym::stable_scope_hash(symbolic_scope),
-        )
-    }
-
-    pub fn from_hashes(
-        analysis: AnalysisCacheKey,
+        analysis_depth_hash: u64,
+        ptr_bits: u32,
+        reg_type_hints_hash: u64,
         interproc_budget_hash: u64,
         symbolic_scope_hash: u64,
     ) -> Self {
         Self {
             analysis,
+            function_addr,
+            typed_context_hash,
+            assumptions_hash,
+            analysis_depth_hash,
+            ptr_bits,
+            reg_type_hints_hash,
             interproc_budget_hash,
             symbolic_scope_hash,
             semantic_schema_version: r2sym::SEMANTIC_ARTIFACT_SCHEMA_VERSION,
@@ -2287,7 +2515,7 @@ pub fn function_facts_for_decompile(
 
 #[cfg(test)]
 pub fn decompiler_input_from_prepared_facts(
-    ssa_func: SsaArtifact,
+    ssa_func: impl Into<Arc<SsaArtifact>>,
     function_facts: FunctionFacts,
     param_slots: &ParamSlotResolver,
     _function_names: HashMap<u64, String>,
@@ -2295,40 +2523,89 @@ pub fn decompiler_input_from_prepared_facts(
     _symbols: HashMap<u64, String>,
     ptr_bits: u32,
 ) -> r2dec::DecompilerInput {
+    let ssa_func = ssa_func.into();
     let func_name = ssa_func
         .function()
         .name
         .clone()
         .unwrap_or_else(|| format!("sub_{:x}", ssa_func.entry));
     let function_facts =
-        function_facts_for_decompile(&func_name, &ssa_func, function_facts, param_slots);
+        function_facts_for_decompile(&func_name, ssa_func.as_ref(), function_facts, param_slots);
     let _ = ptr_bits;
     let context = r2dec::DecompilerContext::from_function_facts(function_facts);
     r2dec::DecompilerInput::new(ssa_func, context)
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct EngineMetrics {
+    /// True when this request reused the immutable session analysis.
     pub cache_hit: bool,
     pub planning_time: Duration,
     pub ssa_time: Duration,
     pub semantic_time: Duration,
     pub type_time: Duration,
     pub render_time: Duration,
+    /// Stable, complete phase inventory. A phase which this engine boundary
+    /// did not execute is retained with `NotExecuted` status and zero time.
+    pub phase_timings: Vec<EnginePhaseTimingJson>,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct EngineArtifacts {
-    pub prepared_ssa: Option<SsaArtifact>,
-    pub pattern_ssa: Option<SsaArtifact>,
-    pub function_facts: Option<FunctionFacts>,
-    pub writeback_plan: Option<TypeWritebackPlan>,
+impl Default for EngineMetrics {
+    fn default() -> Self {
+        Self {
+            cache_hit: false,
+            planning_time: Duration::default(),
+            ssa_time: Duration::default(),
+            semantic_time: Duration::default(),
+            type_time: Duration::default(),
+            render_time: Duration::default(),
+            phase_timings: empty_engine_phase_timings(),
+        }
+    }
+}
+
+impl EngineMetrics {
+    fn record_phase(&mut self, phase: EnginePhase, status: EnginePhaseStatus, elapsed: Duration) {
+        let elapsed_us = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
+        let timing = self
+            .phase_timings
+            .iter_mut()
+            .find(|timing| timing.phase == phase)
+            .expect("engine metrics must contain every stable phase");
+        timing.status = status;
+        timing.elapsed_us = elapsed_us;
+    }
+
+    fn refuse_from(&mut self, phase: EnginePhase) {
+        let Some(start) = self
+            .phase_timings
+            .iter()
+            .position(|timing| timing.phase == phase)
+        else {
+            return;
+        };
+        for timing in &mut self.phase_timings[start..] {
+            if timing.status == EnginePhaseStatus::NotExecuted {
+                timing.status = EnginePhaseStatus::Refused;
+            }
+        }
+    }
+
+    fn record_folded_if_not_executed(&mut self, phase: EnginePhase) {
+        if self
+            .phase_timings
+            .iter()
+            .any(|timing| timing.phase == phase && timing.status == EnginePhaseStatus::NotExecuted)
+        {
+            self.record_phase(phase, EnginePhaseStatus::Folded, Duration::default());
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct EngineAnalysis {
-    pub ssa_func: SsaArtifact,
-    pub pattern_ssa_func: SsaArtifact,
+    pub ssa_func: Arc<SsaArtifact>,
+    pub pattern_ssa_func: Arc<SsaArtifact>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2987,12 +3264,8 @@ mod kani_proofs {
         match request {
             EngineRequestKind::Decompile
             | EngineRequestKind::Types
-            | EngineRequestKind::SymbolicQuery => {
-                assert_eq!(plan.layer, EngineCacheLayer::Artifact);
-                assert!(plan.lookup);
-                assert!(plan.store_on_miss);
-            }
-            EngineRequestKind::DebugFacts => {
+            | EngineRequestKind::SymbolicQuery
+            | EngineRequestKind::DebugFacts => {
                 assert_eq!(plan.layer, EngineCacheLayer::Analysis);
                 assert!(plan.lookup);
                 assert!(plan.store_on_miss);
@@ -3010,7 +3283,7 @@ mod kani_proofs {
     }
 
     #[kani::proof]
-    fn analysis_cache_key_changes_when_semantic_inputs_change() {
+    fn analysis_cache_key_changes_only_when_immutable_inputs_change() {
         let function_addr = kani::any::<u64>();
         let function_name_hash = kani::any::<u64>();
         let arch_hash = kani::any::<u64>();
@@ -3027,10 +3300,12 @@ mod kani_proofs {
             typed_context_hash,
             assumptions_hash,
             analysis_depth_hash,
+            None,
         );
 
-        assert!(
-            base != AnalysisCacheKey::from_hashes(
+        assert_eq!(
+            base,
+            AnalysisCacheKey::from_hashes(
                 function_addr.wrapping_add(1),
                 function_name_hash,
                 arch_hash,
@@ -3038,6 +3313,7 @@ mod kani_proofs {
                 typed_context_hash,
                 assumptions_hash,
                 analysis_depth_hash,
+                None,
             )
         );
         assert!(
@@ -3049,6 +3325,7 @@ mod kani_proofs {
                 typed_context_hash,
                 assumptions_hash,
                 analysis_depth_hash,
+                None,
             )
         );
         assert!(
@@ -3060,6 +3337,7 @@ mod kani_proofs {
                 typed_context_hash,
                 assumptions_hash,
                 analysis_depth_hash,
+                None,
             )
         );
         assert!(
@@ -3071,10 +3349,12 @@ mod kani_proofs {
                 typed_context_hash,
                 assumptions_hash,
                 analysis_depth_hash,
+                None,
             )
         );
-        assert!(
-            base != AnalysisCacheKey::from_hashes(
+        assert_eq!(
+            base,
+            AnalysisCacheKey::from_hashes(
                 function_addr,
                 function_name_hash,
                 arch_hash,
@@ -3082,10 +3362,12 @@ mod kani_proofs {
                 typed_context_hash.wrapping_add(1),
                 assumptions_hash,
                 analysis_depth_hash,
+                None,
             )
         );
-        assert!(
-            base != AnalysisCacheKey::from_hashes(
+        assert_eq!(
+            base,
+            AnalysisCacheKey::from_hashes(
                 function_addr,
                 function_name_hash,
                 arch_hash,
@@ -3093,10 +3375,12 @@ mod kani_proofs {
                 typed_context_hash,
                 assumptions_hash.wrapping_add(1),
                 analysis_depth_hash,
+                None,
             )
         );
-        assert!(
-            base != AnalysisCacheKey::from_hashes(
+        assert_eq!(
+            base,
+            AnalysisCacheKey::from_hashes(
                 function_addr,
                 function_name_hash,
                 arch_hash,
@@ -3104,12 +3388,13 @@ mod kani_proofs {
                 typed_context_hash,
                 assumptions_hash,
                 analysis_depth_hash.wrapping_add(1),
+                None,
             )
         );
     }
 
     #[kani::proof]
-    fn artifact_cache_keys_include_analysis_and_orchestration_inputs() {
+    fn request_keys_include_analysis_and_orchestration_inputs() {
         let analysis = AnalysisCacheKey::from_hashes(
             kani::any(),
             kani::any(),
@@ -3118,43 +3403,75 @@ mod kani_proofs {
             kani::any(),
             kani::any(),
             kani::any(),
+            None,
         );
         let interproc_budget_hash = kani::any::<u64>();
         let symbolic_scope_hash = kani::any::<u64>();
 
-        let artifact = ArtifactCacheKey::from_hashes(
+        let function_addr = kani::any::<u64>();
+        let typed_context_hash = kani::any::<u64>();
+        let assumptions_hash = kani::any::<u64>();
+        let analysis_depth_hash = kani::any::<u64>();
+        let ptr_bits = kani::any::<u32>();
+        let reg_type_hints_hash = kani::any::<u64>();
+        let request_key = EngineRequestKey::from_request_hashes(
             analysis.clone(),
+            function_addr,
+            typed_context_hash,
+            assumptions_hash,
+            analysis_depth_hash,
+            ptr_bits,
+            reg_type_hints_hash,
             interproc_budget_hash,
             symbolic_scope_hash,
         );
         assert!(
-            artifact
-                != ArtifactCacheKey::from_hashes(
+            request_key
+                != EngineRequestKey::from_request_hashes(
                     AnalysisCacheKey::from_hashes(
-                        analysis.function_addr.wrapping_add(1),
+                        0,
                         analysis.function_name_hash,
                         analysis.arch_hash,
                         analysis.blocks_hash,
-                        analysis.typed_context_hash,
-                        analysis.assumptions_hash,
-                        analysis.analysis_depth_hash,
+                        0,
+                        0,
+                        0,
+                        None,
                     ),
+                    function_addr.wrapping_add(1),
+                    typed_context_hash,
+                    assumptions_hash,
+                    analysis_depth_hash,
+                    ptr_bits,
+                    reg_type_hints_hash,
                     interproc_budget_hash,
                     symbolic_scope_hash,
                 )
         );
         assert!(
-            artifact
-                != ArtifactCacheKey::from_hashes(
+            request_key
+                != EngineRequestKey::from_request_hashes(
                     analysis.clone(),
+                    function_addr,
+                    typed_context_hash,
+                    assumptions_hash,
+                    analysis_depth_hash,
+                    ptr_bits,
+                    reg_type_hints_hash,
                     interproc_budget_hash.wrapping_add(1),
                     symbolic_scope_hash,
                 )
         );
         assert!(
-            artifact
-                != ArtifactCacheKey::from_hashes(
+            request_key
+                != EngineRequestKey::from_request_hashes(
                     analysis,
+                    function_addr,
+                    typed_context_hash,
+                    assumptions_hash,
+                    analysis_depth_hash,
+                    ptr_bits,
+                    reg_type_hints_hash,
                     interproc_budget_hash,
                     symbolic_scope_hash.wrapping_add(1),
                 )
@@ -3298,8 +3615,8 @@ pub fn interproc_runtime_materialized_sources(
 
 #[derive(Debug, Clone)]
 pub struct EngineAnalysisArtifact {
-    pub ssa_func: SsaArtifact,
-    pub pattern_ssa_func: SsaArtifact,
+    pub ssa_func: Arc<SsaArtifact>,
+    pub pattern_ssa_func: Arc<SsaArtifact>,
     pub function_facts: FunctionFacts,
     pub writeback_plan: TypeWritebackPlan,
 }
@@ -3404,12 +3721,192 @@ pub enum EngineSemanticMode {
     Optional,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct EngineCancellationToken {
+    symbolic: r2sym::SymCancellationToken,
+    ssa: r2ssa::SsaCancellationToken,
+}
+
+impl EngineCancellationToken {
+    pub fn cancel(&self) {
+        self.symbolic.cancel();
+        self.ssa.cancel();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.symbolic.is_cancelled() || self.ssa.is_cancelled()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct EngineExecutionControl {
+    cancellation: EngineCancellationToken,
+    deadline: Option<Instant>,
+}
+
+impl EngineExecutionControl {
+    /// Build a control in which cancellation and a deadline coexist.
+    pub fn new(cancellation: EngineCancellationToken, deadline: Option<Instant>) -> Self {
+        Self {
+            cancellation,
+            deadline,
+        }
+    }
+
+    pub fn with_cancellation_and_deadline(
+        cancellation: EngineCancellationToken,
+        deadline: Instant,
+    ) -> Self {
+        Self::new(cancellation, Some(deadline))
+    }
+
+    pub fn with_cancellation(cancellation: EngineCancellationToken) -> Self {
+        Self::new(cancellation, None)
+    }
+
+    pub fn with_deadline(deadline: Instant) -> Self {
+        Self::new(EngineCancellationToken::default(), Some(deadline))
+    }
+
+    pub fn with_timeout(timeout: Duration) -> Self {
+        Self::with_deadline(
+            Instant::now()
+                .checked_add(timeout)
+                .unwrap_or_else(Instant::now),
+        )
+    }
+
+    pub fn cancellation(&self) -> EngineCancellationToken {
+        self.cancellation.clone()
+    }
+
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    pub fn symbolic_execution_control(&self) -> r2sym::SymExecutionControl {
+        r2sym::SymExecutionControl::new(self.cancellation.symbolic.clone(), self.deadline)
+    }
+
+    pub fn ssa_execution_control(&self) -> r2ssa::SsaExecutionControl {
+        r2ssa::SsaExecutionControl::new(self.cancellation.ssa.clone(), self.deadline)
+    }
+
+    fn replace_cancellation(&mut self, cancellation: EngineCancellationToken) {
+        self.cancellation = cancellation;
+    }
+
+    fn replace_deadline(&mut self, deadline: Instant) {
+        self.deadline = Some(deadline);
+    }
+
+    fn refusal_reason(&self, phase: EnginePhase) -> Option<String> {
+        if self.cancellation.is_cancelled() {
+            return Some(format!(
+                "engine request cancelled before {} phase",
+                phase.as_str()
+            ));
+        }
+        self.deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+            .then(|| {
+                format!(
+                    "engine request deadline exceeded before {} phase",
+                    phase.as_str()
+                )
+            })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct EngineExecutionRefusal {
+    pub reason: String,
+    pub phase: EnginePhase,
+    pub metrics: Box<EngineMetrics>,
+    pub diagnostics: Box<EngineDiagnostics>,
+}
+
+impl std::fmt::Display for EngineExecutionRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for EngineExecutionRefusal {}
+
+fn engine_execution_refusal(
+    reason: String,
+    phase: EnginePhase,
+    mut metrics: EngineMetrics,
+) -> EngineExecutionRefusal {
+    metrics.refuse_from(phase);
+    EngineExecutionRefusal {
+        diagnostics: Box::new(EngineDiagnostics {
+            plan: Some(EnginePlan::RefuseWithEvidence),
+            route_reason: Some(reason.clone()),
+            refusal: Some(reason.clone()),
+            ..EngineDiagnostics::default()
+        }),
+        reason,
+        phase,
+        metrics: Box::new(metrics),
+    }
+}
+
+fn engine_render_execution_refusal(
+    reason: String,
+    phase: EnginePhase,
+    metrics: EngineMetrics,
+) -> EngineExecutionRefusal {
+    EngineExecutionRefusal {
+        diagnostics: Box::new(EngineDiagnostics {
+            plan: Some(EnginePlan::RefuseWithEvidence),
+            route_reason: Some(reason.clone()),
+            refusal: Some(reason.clone()),
+            ..EngineDiagnostics::default()
+        }),
+        reason,
+        phase,
+        metrics: Box::new(metrics),
+    }
+}
+
+fn ssa_prepare_execution_refusal(
+    error: r2ssa::SsaPrepareError,
+    metrics: EngineMetrics,
+) -> EngineExecutionRefusal {
+    let reason = match error {
+        r2ssa::SsaPrepareError::Cancelled => {
+            "engine request cancelled during ssa phase".to_string()
+        }
+        r2ssa::SsaPrepareError::DeadlineExceeded => {
+            "engine request deadline exceeded during ssa phase".to_string()
+        }
+        r2ssa::SsaPrepareError::MalformedInput => {
+            "malformed SSA source input during ssa phase".to_string()
+        }
+    };
+    engine_execution_refusal(reason, EnginePhase::Ssa, metrics)
+}
+
+fn poll_engine_execution(
+    execution: &EngineExecutionControl,
+    phase: EnginePhase,
+    metrics: &EngineMetrics,
+) -> Result<(), EngineExecutionRefusal> {
+    if let Some(reason) = execution.refusal_reason(phase) {
+        return Err(engine_execution_refusal(reason, phase, metrics.clone()));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct EngineAnalyzeRequest {
     pub function_name: String,
     pub function_addr: u64,
     pub blocks: Vec<R2ILBlock>,
     pub arch: Option<r2il::ArchSpec>,
+    pub source_snapshot: Option<Arc<EngineSourceSnapshot>>,
     pub ptr_bits: u32,
     pub semantic_metadata_enabled: bool,
     pub reg_type_hints: HashMap<String, r2types::TypeHint>,
@@ -3421,6 +3918,7 @@ pub struct EngineAnalyzeRequest {
     pub precomputed_semantic_artifact: Option<r2sym::SemanticArtifact>,
     pub semantic_mode: EngineSemanticMode,
     pub include_interproc_summary_set: bool,
+    pub execution: EngineExecutionControl,
 }
 
 #[derive(Debug, Clone)]
@@ -3429,6 +3927,7 @@ pub struct EngineAnalyzeRequestParts {
     pub function_addr: u64,
     pub blocks: Vec<R2ILBlock>,
     pub arch: Option<r2il::ArchSpec>,
+    pub source_snapshot: Option<Arc<EngineSourceSnapshot>>,
     pub ptr_bits: u32,
     pub semantic_metadata_enabled: bool,
     pub reg_type_hints: HashMap<String, r2types::TypeHint>,
@@ -3447,6 +3946,7 @@ pub struct EngineFunctionInput {
     pub function_addr: u64,
     pub blocks: Vec<R2ILBlock>,
     pub arch: Option<r2il::ArchSpec>,
+    pub source_snapshot: Option<Arc<EngineSourceSnapshot>>,
     pub semantic_metadata_enabled: bool,
 }
 
@@ -3550,6 +4050,7 @@ pub struct EngineAnalyzeRequestInput {
     pub function_addr: u64,
     pub blocks: Vec<R2ILBlock>,
     pub arch: Option<r2il::ArchSpec>,
+    pub source_snapshot: Option<Arc<EngineSourceSnapshot>>,
     pub ptr_bits: Option<u32>,
     pub semantic_metadata_enabled: bool,
     pub reg_type_hints: HashMap<String, r2types::TypeHint>,
@@ -3634,6 +4135,7 @@ impl EngineAnalyzeRequest {
             function_addr: parts.function_addr,
             blocks: parts.blocks,
             arch: parts.arch,
+            source_snapshot: parts.source_snapshot,
             ptr_bits: parts.ptr_bits,
             semantic_metadata_enabled: parts.semantic_metadata_enabled,
             reg_type_hints: parts.reg_type_hints,
@@ -3645,7 +4147,32 @@ impl EngineAnalyzeRequest {
             precomputed_semantic_artifact: parts.precomputed_semantic_artifact,
             semantic_mode,
             include_interproc_summary_set: parts.include_interproc_summary_set,
+            execution: EngineExecutionControl::default(),
         }
+    }
+
+    pub fn with_execution_control(mut self, execution: EngineExecutionControl) -> Self {
+        self.execution = execution;
+        self
+    }
+
+    pub fn with_cancellation(mut self, cancellation: EngineCancellationToken) -> Self {
+        self.execution.replace_cancellation(cancellation);
+        self
+    }
+
+    pub fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.execution.replace_deadline(deadline);
+        self
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.execution.replace_deadline(
+            Instant::now()
+                .checked_add(timeout)
+                .unwrap_or_else(Instant::now),
+        );
+        self
     }
 }
 
@@ -3657,6 +4184,7 @@ fn engine_analyze_request_input_from_function(
         function_addr: input.function.function_addr,
         blocks: input.function.blocks,
         arch: input.function.arch,
+        source_snapshot: input.function.source_snapshot,
         ptr_bits: input.ptr_bits,
         semantic_metadata_enabled: input.function.semantic_metadata_enabled,
         reg_type_hints: input.reg_type_hints,
@@ -3681,6 +4209,7 @@ fn engine_analyze_request_parts_from_input(
         function_addr: input.function_addr,
         blocks: input.blocks,
         arch: input.arch,
+        source_snapshot: input.source_snapshot,
         ptr_bits,
         semantic_metadata_enabled: input.semantic_metadata_enabled,
         reg_type_hints: input.reg_type_hints,
@@ -3698,8 +4227,7 @@ fn engine_analyze_request_parts_from_input(
 pub struct EngineAnalyzeResponse {
     pub artifact: EngineAnalysisArtifact,
     pub analysis_cache_hit: bool,
-    pub artifact_cache_hit: bool,
-    pub artifact_key: ArtifactCacheKey,
+    pub request_key: EngineRequestKey,
     pub metrics: EngineMetrics,
     pub diagnostics: EngineDiagnostics,
 }
@@ -3707,9 +4235,11 @@ pub struct EngineAnalyzeResponse {
 #[derive(Debug, Clone)]
 struct EngineDecompileRequest {
     pub function_name: String,
-    pub prepared_ssa: SsaArtifact,
+    pub prepared_ssa: Arc<SsaArtifact>,
     pub function_facts: FunctionFacts,
     pub render_target: EngineRenderTarget,
+    pub execution: EngineExecutionControl,
+    pub metrics: EngineMetrics,
 }
 
 #[derive(Debug, Clone)]
@@ -3728,6 +4258,7 @@ pub struct EngineFunctionDecompileRequestInput {
     interproc_max_iterations: usize,
     symbolic_scope: Option<r2sym::PreparedFunctionScope>,
     input_quality: EngineFunctionInputQuality,
+    execution: EngineExecutionControl,
 }
 
 impl EngineFunctionDecompileRequestInput {
@@ -3747,6 +4278,7 @@ impl EngineFunctionDecompileRequestInput {
             interproc_max_iterations: 1,
             symbolic_scope: None,
             input_quality: EngineFunctionInputQuality::complete(function_block_count),
+            execution: EngineExecutionControl::default(),
         }
     }
 
@@ -3765,6 +4297,30 @@ impl EngineFunctionDecompileRequestInput {
 
     pub fn with_input_quality(mut self, input_quality: EngineFunctionInputQuality) -> Self {
         self.input_quality = input_quality;
+        self
+    }
+
+    pub fn with_execution_control(mut self, execution: EngineExecutionControl) -> Self {
+        self.execution = execution;
+        self
+    }
+
+    pub fn with_cancellation(mut self, cancellation: EngineCancellationToken) -> Self {
+        self.execution.replace_cancellation(cancellation);
+        self
+    }
+
+    pub fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.execution.replace_deadline(deadline);
+        self
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.execution.replace_deadline(
+            Instant::now()
+                .checked_add(timeout)
+                .unwrap_or_else(Instant::now),
+        );
         self
     }
 
@@ -3798,7 +4354,8 @@ impl EngineFunctionDecompileRequest {
                     precomputed_semantic_artifact: None,
                     include_interproc_summary_set: true,
                 },
-            ),
+            )
+            .with_execution_control(input.execution),
         }
     }
 }
@@ -3949,6 +4506,23 @@ pub struct EngineRunSpecResponse<'ctx> {
     pub assumption_conditioned: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineSymbolicRunError {
+    InvalidSpec(String),
+    ExecutionStopped(r2sym::SymExecutionStopReason),
+}
+
+impl std::fmt::Display for EngineSymbolicRunError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidSpec(reason) => formatter.write_str(reason),
+            Self::ExecutionStopped(reason) => reason.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for EngineSymbolicRunError {}
+
 #[derive(Debug, Clone)]
 pub struct EngineConditionedSymbolicScope {
     pub scope: r2sym::PreparedFunctionScope,
@@ -4009,8 +4583,8 @@ pub struct EngineInterprocSummaryReportRequest {
 #[derive(Debug, Clone)]
 pub struct EngineInterprocSummaryReportResponse {
     pub report: EngineInterprocSummaryJson,
-    pub artifact_cache_hit: bool,
-    pub artifact_key: ArtifactCacheKey,
+    pub analysis_cache_hit: bool,
+    pub request_key: EngineRequestKey,
     pub metrics: EngineMetrics,
     pub diagnostics: EngineDiagnostics,
 }
@@ -4217,8 +4791,8 @@ pub struct EngineTypeAnalysisResponse {
     pub route_decision: EngineTypeRouteDecision,
     pub callsite_count: usize,
     pub current_summary: Option<r2ssa::FunctionSemanticSummary>,
-    pub artifact_cache_hit: bool,
-    pub artifact_key: Option<ArtifactCacheKey>,
+    pub analysis_cache_hit: bool,
+    pub request_key: Option<EngineRequestKey>,
     pub metrics: EngineMetrics,
     pub diagnostics: EngineDiagnostics,
 }
@@ -4245,8 +4819,7 @@ pub struct EngineDecompileResponse {
 }
 
 pub struct EngineSession {
-    analysis_cache: SessionCache<AnalysisCacheKey, EngineArtifacts>,
-    artifact_cache: SessionCache<ArtifactCacheKey, EngineArtifacts>,
+    analysis_cache: SessionCache<AnalysisCacheKey, EngineAnalysis>,
 }
 
 impl Default for EngineSession {
@@ -4259,11 +4832,10 @@ impl EngineSession {
     pub fn new(cache_limit: usize) -> Self {
         Self {
             analysis_cache: SessionCache::new(cache_limit),
-            artifact_cache: SessionCache::new(cache_limit),
         }
     }
 
-    pub fn cached_analysis(&self, key: &AnalysisCacheKey) -> Option<EngineArtifacts> {
+    pub fn cached_analysis(&self, key: &AnalysisCacheKey) -> Option<Arc<EngineAnalysis>> {
         self.cached_analysis_with_decision(EngineRequestKind::DebugFacts, key)
             .value
     }
@@ -4272,8 +4844,8 @@ impl EngineSession {
         &self,
         request: EngineRequestKind,
         key: &AnalysisCacheKey,
-    ) -> EngineCacheLookup<EngineArtifacts> {
-        let value = self.analysis_cache.get_cloned(key);
+    ) -> EngineCacheLookup<Arc<EngineAnalysis>> {
+        let value = self.analysis_cache.get_arc(key);
         let decision = EngineCacheReuseDecision::from_lookup(
             request,
             EngineCacheLayer::Analysis,
@@ -4285,63 +4857,36 @@ impl EngineSession {
     pub(crate) fn insert_analysis(
         &self,
         key: AnalysisCacheKey,
-        artifacts: EngineArtifacts,
-    ) -> EngineArtifacts {
-        self.analysis_cache.insert_cloned(key, artifacts)
-    }
-
-    pub(crate) fn cached_artifacts(&self, key: &EngineFunctionKey) -> Option<EngineArtifacts> {
-        self.cached_artifacts_with_decision(EngineRequestKind::Types, key)
-            .value
-    }
-
-    pub(crate) fn cached_artifacts_with_decision(
-        &self,
-        request: EngineRequestKind,
-        key: &EngineFunctionKey,
-    ) -> EngineCacheLookup<EngineArtifacts> {
-        let value = self.artifact_cache.get_cloned(key);
-        let decision = EngineCacheReuseDecision::from_lookup(
-            request,
-            EngineCacheLayer::Artifact,
-            value.is_some(),
-        );
-        EngineCacheLookup { value, decision }
-    }
-
-    pub(crate) fn insert_artifacts(
-        &self,
-        key: EngineFunctionKey,
-        artifacts: EngineArtifacts,
-    ) -> EngineArtifacts {
-        self.artifact_cache.insert_cloned(key, artifacts)
+        analysis: EngineAnalysis,
+    ) -> Arc<EngineAnalysis> {
+        self.analysis_cache.insert(key, analysis)
     }
 
     pub fn cache_metrics(&self) -> EngineSessionCacheMetrics {
         EngineSessionCacheMetrics {
             analysis: self.analysis_cache.counters(),
-            artifacts: self.artifact_cache.counters(),
         }
     }
 
     pub fn reset_cache_metrics(&self) {
         self.analysis_cache.reset_counters();
-        self.artifact_cache.reset_counters();
     }
 
     pub fn profile(&self, request: EngineProfileRequest) -> EngineProfileResponse {
         let route_decision = profile_route_decision();
-        let metrics = self.cache_metrics();
-        let response = EngineProfileResponse {
+        let metrics = if request.reset_after_read {
+            EngineSessionCacheMetrics {
+                analysis: self.analysis_cache.take_counters(),
+            }
+        } else {
+            self.cache_metrics()
+        };
+        EngineProfileResponse {
             route_decision: route_decision.clone(),
             total: metrics.total(),
             metrics,
             diagnostics: EngineRequestPlan::profile(route_decision).diagnostics(),
-        };
-        if request.reset_after_read {
-            self.reset_cache_metrics();
         }
-        response
     }
 
     pub fn prepare_analysis(
@@ -4350,26 +4895,43 @@ impl EngineSession {
         blocks: &[R2ILBlock],
         arch: Option<&r2il::ArchSpec>,
     ) -> Option<EngineAnalysis> {
-        let key = function_analysis_cache_key(function_name, arch, blocks);
-        if let Some(cached) = self
-            .cached_analysis(&key)
-            .and_then(engine_artifacts_to_analysis)
-        {
-            return Some(rename_engine_analysis(cached, function_name));
+        self.prepare_analysis_shared(function_name, blocks, arch)
+            .map(|analysis| analysis.as_ref().clone())
+    }
+
+    pub fn prepare_analysis_shared(
+        &self,
+        function_name: &str,
+        blocks: &[R2ILBlock],
+        arch: Option<&r2il::ArchSpec>,
+    ) -> Option<Arc<EngineAnalysis>> {
+        let key = function_analysis_cache_key(function_name, arch, blocks, None);
+        if let Some(cached) = self.cached_analysis(&key) {
+            return Some(cached);
         }
-        let analysis = build_engine_analysis_from_parts(function_name, blocks, arch)?;
-        self.insert_analysis(key, engine_analysis_to_artifacts(analysis.clone()));
-        Some(rename_engine_analysis(analysis, function_name))
+        let analysis = build_engine_analysis_from_parts(function_name, blocks, arch, None)?;
+        Some(self.insert_analysis(key, analysis))
     }
 
     pub fn analyze(&self, request: EngineAnalyzeRequest) -> Option<EngineAnalyzeResponse> {
-        let started = std::time::Instant::now();
-        let artifact_key = function_artifact_cache_key(&request);
-        if let Some(response) = self.cached_analyze_with_key(&artifact_key, started.elapsed()) {
-            return Some(response);
-        }
+        self.analyze_checked(request).ok()
+    }
 
-        self.analyze_uncached_with_key(request, artifact_key, started)
+    pub fn analyze_checked(
+        &self,
+        request: EngineAnalyzeRequest,
+    ) -> Result<EngineAnalyzeResponse, EngineExecutionRefusal> {
+        let started = Instant::now();
+        let mut metrics = EngineMetrics::default();
+        poll_engine_execution(&request.execution, EnginePhase::SnapshotContext, &metrics)?;
+        let phase_started = Instant::now();
+        let request_key = function_request_key(&request);
+        metrics.record_phase(
+            EnginePhase::SnapshotContext,
+            EnginePhaseStatus::Executed,
+            phase_started.elapsed(),
+        );
+        self.analyze_with_key(request, request_key, started, metrics)
     }
 
     pub fn interproc_summary_report(
@@ -4401,56 +4963,113 @@ impl EngineSession {
         });
         Some(EngineInterprocSummaryReportResponse {
             report,
-            artifact_cache_hit: response.artifact_cache_hit,
-            artifact_key: response.artifact_key,
+            analysis_cache_hit: response.analysis_cache_hit,
+            request_key: response.request_key,
             metrics: response.metrics,
             diagnostics: response.diagnostics,
         })
     }
 
-    fn analyze_uncached_with_key(
+    fn analyze_with_key(
         &self,
         request: EngineAnalyzeRequest,
-        artifact_key: ArtifactCacheKey,
-        started: std::time::Instant,
-    ) -> Option<EngineAnalyzeResponse> {
-        let function_name = request.function_name.clone();
+        request_key: EngineRequestKey,
+        started: Instant,
+        metrics: EngineMetrics,
+    ) -> Result<EngineAnalyzeResponse, EngineExecutionRefusal> {
+        let ssa_control = request.execution.ssa_execution_control();
+        self.analyze_with_key_and_ssa_control(request, request_key, started, metrics, &ssa_control)
+    }
 
+    fn analyze_with_key_and_ssa_control<C: r2ssa::SsaWorkControl + ?Sized>(
+        &self,
+        request: EngineAnalyzeRequest,
+        request_key: EngineRequestKey,
+        started: Instant,
+        mut metrics: EngineMetrics,
+        ssa_control: &C,
+    ) -> Result<EngineAnalyzeResponse, EngineExecutionRefusal> {
+        poll_engine_execution(&request.execution, EnginePhase::Ssa, &metrics)?;
+        let ssa_started = Instant::now();
         let analysis_key = function_analysis_cache_key(
             &request.function_name,
             request.arch.as_ref(),
             &request.blocks,
+            request.source_snapshot.as_deref(),
         );
-        let (analysis, analysis_cache_hit) = if let Some(cached) = self
-            .cached_analysis(&analysis_key)
-            .and_then(engine_artifacts_to_analysis)
-        {
-            (rename_engine_analysis(cached, &function_name), true)
+        let (analysis, analysis_cache_hit) =
+            if let Some(cached) = self.cached_analysis(&analysis_key) {
+                (cached, true)
+            } else {
+                let analysis = match build_engine_analysis_from_parts_with_control(
+                    &request.function_name,
+                    &request.blocks,
+                    request.arch.as_ref(),
+                    request.source_snapshot.as_deref(),
+                    ssa_control,
+                ) {
+                    Ok(analysis) => analysis,
+                    Err(error) => {
+                        metrics.record_phase(
+                            EnginePhase::Ssa,
+                            EnginePhaseStatus::Refused,
+                            ssa_started.elapsed(),
+                        );
+                        return Err(ssa_prepare_execution_refusal(error, metrics));
+                    }
+                };
+                (self.insert_analysis(analysis_key, analysis), false)
+            };
+        let ssa_status = if analysis_cache_hit {
+            EnginePhaseStatus::Reused
         } else {
-            let analysis = build_engine_analysis_from_parts(
-                &function_name,
-                &request.blocks,
-                request.arch.as_ref(),
-            )?;
-            self.insert_analysis(analysis_key, engine_analysis_to_artifacts(analysis.clone()));
-            (analysis, false)
+            EnginePhaseStatus::Executed
         };
-
-        let artifact = build_engine_analysis_artifact(&request, analysis)?;
-        self.insert_artifacts(
-            artifact_key.clone(),
-            engine_analysis_artifact_to_artifacts(artifact.clone()),
+        metrics.record_phase(EnginePhase::Ssa, ssa_status, ssa_started.elapsed());
+        let obligation_status = if analysis_cache_hit {
+            EnginePhaseStatus::Reused
+        } else {
+            EnginePhaseStatus::Folded
+        };
+        metrics.record_phase(
+            EnginePhase::Obligations,
+            obligation_status,
+            Duration::default(),
         );
-        Some(EngineAnalyzeResponse {
+        metrics.cache_hit = analysis_cache_hit;
+        metrics.ssa_time = ssa_started.elapsed();
+
+        poll_engine_execution(&request.execution, EnginePhase::Symbolic, &metrics)?;
+        let artifact_started = Instant::now();
+        let Some(artifact) = build_engine_analysis_artifact(&request, analysis.as_ref()) else {
+            poll_engine_execution(&request.execution, EnginePhase::Types, &metrics)?;
+            return Err(engine_execution_refusal(
+                "failed to construct semantic/type analysis artifact".to_string(),
+                EnginePhase::Types,
+                metrics,
+            ));
+        };
+        let artifact_elapsed = artifact_started.elapsed();
+        if artifact.function_facts.semantic_artifact().is_some() {
+            metrics.record_phase(
+                EnginePhase::Symbolic,
+                EnginePhaseStatus::Folded,
+                Duration::default(),
+            );
+        }
+        metrics.record_phase(
+            EnginePhase::Types,
+            EnginePhaseStatus::Executed,
+            artifact_elapsed,
+        );
+        metrics.type_time = artifact_elapsed;
+        poll_engine_execution(&request.execution, EnginePhase::Certification, &metrics)?;
+        metrics.planning_time = started.elapsed();
+        Ok(EngineAnalyzeResponse {
             artifact,
             analysis_cache_hit,
-            artifact_cache_hit: false,
-            artifact_key,
-            metrics: EngineMetrics {
-                cache_hit: false,
-                planning_time: started.elapsed(),
-                ..EngineMetrics::default()
-            },
+            request_key,
+            metrics,
             diagnostics: EngineDiagnostics::default(),
         })
     }
@@ -4459,8 +5078,25 @@ impl EngineSession {
         &self,
         request: EngineTypeAnalysisRequest,
     ) -> Option<EngineTypeAnalysisResponse> {
-        let started = std::time::Instant::now();
+        self.type_function_checked(request).ok()
+    }
+
+    pub fn type_function_checked(
+        &self,
+        request: EngineTypeAnalysisRequest,
+    ) -> Result<EngineTypeAnalysisResponse, EngineExecutionRefusal> {
+        let started = Instant::now();
         let analysis_request = request.analysis;
+        let execution = analysis_request.execution.clone();
+        let mut preprobe_metrics = EngineMetrics::default();
+        poll_engine_execution(&execution, EnginePhase::SnapshotContext, &preprobe_metrics)?;
+        preprobe_metrics.record_phase(
+            EnginePhase::SnapshotContext,
+            EnginePhaseStatus::Executed,
+            Duration::default(),
+        );
+        poll_engine_execution(&execution, EnginePhase::Types, &preprobe_metrics)?;
+        let type_started = Instant::now();
         let (arch_name, _, _) = EngineRenderTarget::for_arch(analysis_request.arch.as_ref());
         let type_seed = r2types::function_type_facts_from_parsed_context(
             &analysis_request.function_name,
@@ -4488,7 +5124,7 @@ impl EngineSession {
         });
         if let Some(preprobe) = preprobe {
             let mut function_facts = preprobe.function_facts;
-            let writeback_plan = type_writeback_plan_for_route(TypeWritebackPlanRouteInput {
+            let Some(writeback_plan) = type_writeback_plan_for_route(TypeWritebackPlanRouteInput {
                 function_name: &analysis_request.function_name,
                 arch_name: &arch_name,
                 ptr_bits: analysis_request.ptr_bits,
@@ -4496,7 +5132,13 @@ impl EngineSession {
                 cfg_summary: &preprobe.cfg_summary,
                 route: &preprobe.route_decision,
                 full_writeback_plan: None,
-            })?;
+            }) else {
+                return Err(engine_execution_refusal(
+                    "failed to construct bounded type writeback plan".to_string(),
+                    EnginePhase::Types,
+                    preprobe_metrics,
+                ));
+            };
             let decompile_decision = decompile_route_decision(
                 &analysis_request.function_name,
                 &function_facts,
@@ -4504,25 +5146,29 @@ impl EngineSession {
                 &preprobe.cfg_summary,
             );
             function_facts.set_decompile_route(Some(decompile_decision.route));
-            return Some(EngineTypeAnalysisResponse {
+            preprobe_metrics.record_phase(
+                EnginePhase::Types,
+                EnginePhaseStatus::Executed,
+                type_started.elapsed(),
+            );
+            preprobe_metrics.type_time = type_started.elapsed();
+            preprobe_metrics.planning_time = started.elapsed();
+            poll_engine_execution(&execution, EnginePhase::Certification, &preprobe_metrics)?;
+            return Ok(EngineTypeAnalysisResponse {
                 cfg_summary: preprobe.cfg_summary,
                 function_facts,
                 writeback_plan,
                 route_decision: preprobe.route_decision,
                 callsite_count: 0,
                 current_summary: None,
-                artifact_cache_hit: false,
-                artifact_key: None,
-                metrics: EngineMetrics {
-                    cache_hit: false,
-                    planning_time: started.elapsed(),
-                    ..EngineMetrics::default()
-                },
+                analysis_cache_hit: false,
+                request_key: None,
+                metrics: preprobe_metrics,
                 diagnostics: EngineDiagnostics::default(),
             });
         }
 
-        let analyze_response = self.analyze(analysis_request.clone())?;
+        let analyze_response = self.analyze_checked(analysis_request.clone())?;
         let mut artifact = analyze_response.artifact;
         let cfg_summary = artifact.ssa_func.function().cfg_risk_summary();
         let route_decision = type_route_decision(
@@ -4530,7 +5176,7 @@ impl EngineSession {
             &cfg_summary,
             request.caller_prefers_bounded_type_plan,
         );
-        let writeback_plan = type_writeback_plan_for_route(TypeWritebackPlanRouteInput {
+        let Some(writeback_plan) = type_writeback_plan_for_route(TypeWritebackPlanRouteInput {
             function_name: &analysis_request.function_name,
             arch_name: &arch_name,
             ptr_bits: analysis_request.ptr_bits,
@@ -4538,7 +5184,13 @@ impl EngineSession {
             cfg_summary: &cfg_summary,
             route: &route_decision,
             full_writeback_plan: Some(artifact.writeback_plan),
-        })?;
+        }) else {
+            return Err(engine_execution_refusal(
+                "failed to construct full type writeback plan".to_string(),
+                EnginePhase::Types,
+                analyze_response.metrics,
+            ));
+        };
         let decompile_decision = decompile_route_decision(
             &analysis_request.function_name,
             &artifact.function_facts,
@@ -4552,15 +5204,15 @@ impl EngineSession {
             count_prepared_callsites(&artifact.pattern_ssa_func.local_ssa_blocks());
         let current_summary = current_interproc_summary(&artifact.function_facts);
 
-        Some(EngineTypeAnalysisResponse {
+        Ok(EngineTypeAnalysisResponse {
             cfg_summary,
             function_facts: artifact.function_facts,
             writeback_plan,
             route_decision,
             callsite_count,
             current_summary,
-            artifact_cache_hit: analyze_response.artifact_cache_hit,
-            artifact_key: Some(analyze_response.artifact_key),
+            analysis_cache_hit: analyze_response.analysis_cache_hit,
+            request_key: Some(analyze_response.request_key),
             metrics: EngineMetrics {
                 cache_hit: analyze_response.metrics.cache_hit,
                 planning_time: started.elapsed(),
@@ -4590,44 +5242,31 @@ impl EngineSession {
         ))
     }
 
-    pub fn cached_analyze(&self, request: &EngineAnalyzeRequest) -> Option<EngineAnalyzeResponse> {
-        let artifact_key = function_artifact_cache_key(request);
-        self.cached_analyze_with_key(&artifact_key, Duration::default())
-    }
-
-    fn cached_analyze_with_key(
-        &self,
-        artifact_key: &ArtifactCacheKey,
-        planning_time: Duration,
-    ) -> Option<EngineAnalyzeResponse> {
-        let artifact = self
-            .cached_artifacts(artifact_key)
-            .and_then(engine_artifacts_to_analysis_artifact)?;
-        Some(EngineAnalyzeResponse {
-            artifact,
-            analysis_cache_hit: false,
-            artifact_cache_hit: true,
-            artifact_key: artifact_key.clone(),
-            metrics: EngineMetrics {
-                cache_hit: true,
-                planning_time,
-                ..EngineMetrics::default()
-            },
-            diagnostics: EngineDiagnostics::default(),
-        })
-    }
-
     pub(crate) fn decompile_function(
         &self,
         request: EngineFunctionDecompileRequest,
     ) -> EngineDecompileResponse {
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let EngineFunctionDecompileRequest {
             analysis: analysis_request,
             input_quality,
         } = request;
+        let execution = analysis_request.execution.clone();
         let canonical_name = analysis_request.function_name.clone();
         let display_name = canonical_name.clone();
+        if let Err(refusal) = poll_engine_execution(
+            &execution,
+            EnginePhase::SnapshotContext,
+            &EngineMetrics::default(),
+        ) {
+            return refused_decompile_response_with_metrics(
+                &display_name,
+                &refusal.reason,
+                None,
+                *refusal.metrics,
+                *refusal.diagnostics,
+            );
+        }
         let actual_lifted_blocks = analysis_request.blocks.len();
         let input_quality_facts = if let Some(quality) = input_quality {
             let reason = quality.refusal_reason_for_actual_lifted_blocks(actual_lifted_blocks);
@@ -4655,53 +5294,69 @@ impl EngineSession {
             &display_name,
         );
         let probe = decompile_probe_decision_for_identity(&analysis_request.blocks, &identity);
-        let artifact_key = function_artifact_cache_key(&analysis_request);
-        let cached = self.cached_analyze_with_key(&artifact_key, Duration::default());
-
-        let analyze_response = if let Some(response) = cached {
-            response
-        } else if let Some(response) =
-            self.analyze_uncached_with_key(analysis_request.clone(), artifact_key, started)
+        if actual_lifted_blocks > ENGINE_DECOMPILE_MAX_BLOCKS
+            || probe.op_count > ENGINE_DECOMPILE_MAX_OPS
         {
-            response
-        } else {
-            let reason = if probe.block_guarded {
-                if probe.summary_probe_skipped_large_cfg {
-                    probe
-                        .cfg_guard_reason
-                        .as_deref()
-                        .unwrap_or("large native worker without canonical summary")
-                } else {
-                    "bounded native-worker preprobe without canonical summary"
-                }
-            } else {
-                "failed to build detached analysis artifact"
-            };
+            let reason = format!(
+                "decompile complexity limit exceeded: blocks={actual_lifted_blocks}/{} ops={}/{}",
+                ENGINE_DECOMPILE_MAX_BLOCKS, probe.op_count, ENGINE_DECOMPILE_MAX_OPS
+            );
             return refused_decompile_response(
                 &display_name,
-                reason,
+                &reason,
                 started.elapsed(),
                 input_quality_facts,
             );
+        }
+        let analyze_response = match self.analyze_checked(analysis_request) {
+            Ok(response) => response,
+            Err(refusal) => {
+                return refused_decompile_response_with_metrics(
+                    &display_name,
+                    &refusal.reason,
+                    input_quality_facts,
+                    *refusal.metrics,
+                    *refusal.diagnostics,
+                );
+            }
         };
 
-        let mut artifact =
-            rename_engine_analysis_artifact(analyze_response.artifact, &display_name);
+        let mut metrics = analyze_response.metrics;
+        let mut artifact = analyze_response.artifact;
         artifact
             .function_facts
-            .set_input_quality(input_quality_facts);
+            .set_input_quality(input_quality_facts.clone());
 
+        if let Err(refusal) =
+            poll_engine_execution(&execution, EnginePhase::Normalization, &metrics)
+        {
+            return refused_decompile_response_with_metrics(
+                &display_name,
+                &refusal.reason,
+                input_quality_facts,
+                *refusal.metrics,
+                *refusal.diagnostics,
+            );
+        }
+        let normalization_started = Instant::now();
         artifact.function_facts = function_facts_for_decompile(
             &display_name,
             &artifact.ssa_func,
             artifact.function_facts,
             &param_slots,
         );
+        metrics.record_phase(
+            EnginePhase::Normalization,
+            EnginePhaseStatus::Executed,
+            normalization_started.elapsed(),
+        );
         self.decompile(EngineDecompileRequest {
             function_name: display_name,
             prepared_ssa: artifact.ssa_func,
             function_facts: artifact.function_facts,
             render_target,
+            execution,
+            metrics,
         })
     }
 
@@ -4732,23 +5387,177 @@ impl EngineSession {
     }
 
     fn decompile(&self, request: EngineDecompileRequest) -> EngineDecompileResponse {
-        let started = std::time::Instant::now();
-        let diagnostics = decompile_diagnostics_from_function_facts(&request.function_facts);
+        let render_control = request.execution.ssa_execution_control();
+        self.decompile_with_r2dec_control(request, &render_control)
+    }
+
+    fn decompile_with_r2dec_control<C: r2ssa::SsaWorkControl>(
+        &self,
+        request: EngineDecompileRequest,
+        render_control: &C,
+    ) -> EngineDecompileResponse {
+        self.decompile_with_r2dec_control_and_kernel_policy(request, render_control, true)
+    }
+
+    fn decompile_with_r2dec_control_and_kernel_policy<C: r2ssa::SsaWorkControl>(
+        &self,
+        request: EngineDecompileRequest,
+        render_control: &C,
+        try_semantic_kernel: bool,
+    ) -> EngineDecompileResponse {
+        let started = Instant::now();
+        let mut diagnostics = decompile_diagnostics_from_function_facts(&request.function_facts);
         let planning_time = started.elapsed();
 
-        let render_started = std::time::Instant::now();
-        let output = render_engine_decompile_request(&request);
+        if let Err(refusal) = poll_engine_execution(
+            &request.execution,
+            EnginePhase::Certification,
+            &request.metrics,
+        ) {
+            return refused_decompile_response_with_metrics(
+                &request.function_name,
+                &refusal.reason,
+                request.function_facts.input_quality().cloned(),
+                *refusal.metrics,
+                *refusal.diagnostics,
+            );
+        }
+
+        let render_started = Instant::now();
+        let rendered =
+            match render_engine_decompile_request(&request, render_control, try_semantic_kernel) {
+                Ok(rendered) => rendered,
+                Err(stop) => {
+                    let render_time = render_started.elapsed();
+                    let metrics = engine_metrics_for_render_stop(
+                        request.metrics,
+                        &stop,
+                        planning_time,
+                        render_time,
+                    );
+                    let refusal = engine_render_execution_refusal(stop.reason, stop.phase, metrics);
+                    return refused_decompile_response_with_metrics(
+                        &request.function_name,
+                        &refusal.reason,
+                        request.function_facts.input_quality().cloned(),
+                        *refusal.metrics,
+                        *refusal.diagnostics,
+                    );
+                }
+            };
         let render_time = render_started.elapsed();
+        let mut metrics = request.metrics;
+        if rendered.semantic_kernel_render.is_some() {
+            metrics.record_phase(
+                EnginePhase::Certification,
+                EnginePhaseStatus::Folded,
+                Duration::default(),
+            );
+        }
+        if rendered.structuring_executed {
+            metrics.record_phase(
+                EnginePhase::Structuring,
+                EnginePhaseStatus::Folded,
+                Duration::default(),
+            );
+        }
+        metrics.record_phase(
+            EnginePhase::Rendering,
+            EnginePhaseStatus::Executed,
+            render_time,
+        );
+        metrics.planning_time += planning_time;
+        metrics.render_time = render_time;
+        if let Err(refusal) =
+            poll_engine_execution(&request.execution, EnginePhase::FfiConversion, &metrics)
+        {
+            return refused_decompile_response_with_metrics(
+                &request.function_name,
+                &refusal.reason,
+                request.function_facts.input_quality().cloned(),
+                *refusal.metrics,
+                *refusal.diagnostics,
+            );
+        }
+        if let Some(status) = rendered.semantic_kernel_render {
+            let (plan, reason) = match status.region {
+                EngineSemanticKernelRegion::TerminalReturnBlock => (
+                    EnginePlan::FastLocal,
+                    "r2cert authorized exact terminal-return obligation closure",
+                ),
+                EngineSemanticKernelRegion::AggregateMemberTerminalReturnFunction => (
+                    EnginePlan::FastLocal,
+                    "r2cert authorized exact aggregate-member terminal-return obligation closure",
+                ),
+                EngineSemanticKernelRegion::PlainRamMemoryTerminalReturnFunction => (
+                    EnginePlan::FastLocal,
+                    "r2cert authorized exact plain-RAM-memory terminal-return obligation closure",
+                ),
+                EngineSemanticKernelRegion::DirectCallTerminalReturnFunction => (
+                    EnginePlan::SemanticStructured,
+                    "r2cert authorized exact direct-call terminal-return obligation closure",
+                ),
+                EngineSemanticKernelRegion::ConditionalTerminalReturnFunction => (
+                    EnginePlan::SemanticStructured,
+                    "r2cert authorized exact conditional-return obligation closure",
+                ),
+                EngineSemanticKernelRegion::PrivateFrameConditionalReturnFunction => (
+                    EnginePlan::SemanticStructured,
+                    "r2cert authorized exact private-frame conditional-return obligation closure",
+                ),
+                EngineSemanticKernelRegion::CanonicalFnvFoldLoopFunction => (
+                    EnginePlan::SemanticStructured,
+                    "r2cert authorized exact canonical FNV-fold loop obligation closure",
+                ),
+                EngineSemanticKernelRegion::CanonicalFnvFoldO0Function => (
+                    EnginePlan::SemanticStructured,
+                    "r2cert authorized exact stack-backed O0 FNV-fold obligation closure",
+                ),
+                EngineSemanticKernelRegion::BranchlessGuardFunction => (
+                    EnginePlan::FastLocal,
+                    "r2cert authorized exact branchless-guard obligation closure",
+                ),
+                EngineSemanticKernelRegion::StructArrayIndexFunction => (
+                    EnginePlan::SemanticStructured,
+                    "r2cert authorized exact struct-array-index obligation closure",
+                ),
+                EngineSemanticKernelRegion::NestedWrap32GuardO0Function => (
+                    EnginePlan::SemanticStructured,
+                    "r2cert authorized exact nested wrap32 O0 obligation closure",
+                ),
+                EngineSemanticKernelRegion::SumArrayFunction => (
+                    EnginePlan::SemanticStructured,
+                    "r2cert authorized exact sum-array obligation closure",
+                ),
+                EngineSemanticKernelRegion::ConditionalFunnelSharedReturnFunction => (
+                    EnginePlan::SemanticStructured,
+                    "r2cert authorized exact conditional-funnel shared-return obligation closure",
+                ),
+                EngineSemanticKernelRegion::SwitchTerminalReturnFunction => (
+                    EnginePlan::SemanticStructured,
+                    "r2cert authorized exact switch terminal-return obligation closure",
+                ),
+                EngineSemanticKernelRegion::CarrierFreeLoopTerminalReturnFunction => (
+                    EnginePlan::SemanticStructured,
+                    "r2cert authorized exact carrier-free loop terminal-return obligation closure",
+                ),
+                EngineSemanticKernelRegion::CountedLoopTerminalReturnFunction => (
+                    EnginePlan::SemanticStructured,
+                    "r2cert authorized exact counted-loop carrier terminal-return obligation closure",
+                ),
+            };
+            diagnostics.plan = Some(plan);
+            diagnostics.route_reason = Some(reason.to_string());
+            diagnostics.semantic_kernel_render = Some(status);
+            diagnostics.proof_coverage = None;
+            diagnostics.render_permission = None;
+            diagnostics.refusal = None;
+        }
 
         EngineDecompileResponse {
-            output,
+            output: rendered.output,
             function_facts: request.function_facts,
-            metrics: EngineMetrics {
-                cache_hit: false,
-                planning_time,
-                render_time,
-                ..EngineMetrics::default()
-            },
+            metrics,
             diagnostics,
         }
     }
@@ -4757,6 +5566,17 @@ impl EngineSession {
         &self,
         request: EngineSymbolicSummaryRequest<'ctx, '_>,
     ) -> EngineSymbolicSummaryResponse<'ctx> {
+        self.symbolic_summary_with_execution_control(request, EngineExecutionControl::default())
+            .expect("default symbolic execution control cannot stop")
+    }
+
+    pub fn symbolic_summary_with_execution_control<'ctx>(
+        &self,
+        request: EngineSymbolicSummaryRequest<'ctx, '_>,
+        execution: EngineExecutionControl,
+    ) -> Result<EngineSymbolicSummaryResponse<'ctx>, r2sym::SymExecutionStopReason> {
+        let symbolic_execution = execution.symbolic_execution_control();
+        symbolic_execution.poll()?;
         let context = request.context;
         let (assumption_usage, assumption_conditioned) =
             prepared_assumption_conditioning(context.prepared);
@@ -4771,6 +5591,7 @@ impl EngineSession {
                 query_config.summary_profile,
             )
         });
+        symbolic_execution.poll()?;
         if compiled.as_ref().is_some_and(|compiled| {
             should_skip_expensive_symbolic_summary(compiled, context.prepared)
         }) {
@@ -4781,13 +5602,13 @@ impl EngineSession {
                 &initial_state,
                 None,
             );
-            return EngineSymbolicSummaryResponse {
+            return Ok(EngineSymbolicSummaryResponse {
                 summary: empty_symbolic_summary(),
                 compiled,
                 query_policy,
                 assumption_usage,
                 assumption_conditioned,
-            };
+            });
         }
 
         let initial_state = symbolic_initial_state(&context);
@@ -4797,22 +5618,37 @@ impl EngineSession {
             &initial_state,
             None,
         );
-        let mut explorer = query_config.make_explorer(context.z3_ctx);
+        let mut explorer =
+            query_config.make_explorer_with_execution_control(context.z3_ctx, symbolic_execution);
         install_symbolic_hooks_for_context(&mut explorer, &context, &query_policy);
         let summary = explorer.summarize_function(context.prepared, initial_state);
-        EngineSymbolicSummaryResponse {
-            summary,
-            compiled,
-            query_policy,
-            assumption_usage,
-            assumption_conditioned,
-        }
+        explorer.execution_stop_reason().map_or(
+            Ok(EngineSymbolicSummaryResponse {
+                summary,
+                compiled,
+                query_policy,
+                assumption_usage,
+                assumption_conditioned,
+            }),
+            Err,
+        )
     }
 
     pub fn symbolic_paths<'ctx>(
         &self,
         request: EngineSymbolicPathsRequest<'ctx, '_>,
     ) -> EngineSymbolicPathsResponse<'ctx> {
+        self.symbolic_paths_with_execution_control(request, EngineExecutionControl::default())
+            .expect("default symbolic execution control cannot stop")
+    }
+
+    pub fn symbolic_paths_with_execution_control<'ctx>(
+        &self,
+        request: EngineSymbolicPathsRequest<'ctx, '_>,
+        execution: EngineExecutionControl,
+    ) -> Result<EngineSymbolicPathsResponse<'ctx>, r2sym::SymExecutionStopReason> {
+        let symbolic_execution = execution.symbolic_execution_control();
+        symbolic_execution.poll()?;
         let context = request.context;
         let (assumption_usage, assumption_conditioned) =
             prepared_assumption_conditioning(context.prepared);
@@ -4824,24 +5660,42 @@ impl EngineSession {
             &initial_state,
             None,
         );
-        let mut explorer = query_config.make_explorer(context.z3_ctx);
+        let mut explorer =
+            query_config.make_explorer_with_execution_control(context.z3_ctx, symbolic_execution);
         install_symbolic_hooks_for_context(&mut explorer, &context, &query_policy);
         let summary = explorer.summarize_function(context.prepared, initial_state);
         let solution_limit = path_listing_solution_limit(summary.paths.len(), context.prepared);
-        EngineSymbolicPathsResponse {
-            summary,
-            explorer,
-            solution_limit,
-            query_policy,
-            assumption_usage,
-            assumption_conditioned,
-        }
+        explorer.execution_stop_reason().map_or(
+            Ok(EngineSymbolicPathsResponse {
+                summary,
+                explorer,
+                solution_limit,
+                query_policy,
+                assumption_usage,
+                assumption_conditioned,
+            }),
+            Err,
+        )
     }
 
     pub fn symbolic_target_explore<'ctx>(
         &self,
         request: EngineTargetExploreRequest<'ctx, '_>,
     ) -> EngineTargetExploreResponse<'ctx> {
+        self.symbolic_target_explore_with_execution_control(
+            request,
+            EngineExecutionControl::default(),
+        )
+        .expect("default symbolic execution control cannot stop")
+    }
+
+    pub fn symbolic_target_explore_with_execution_control<'ctx>(
+        &self,
+        request: EngineTargetExploreRequest<'ctx, '_>,
+        execution: EngineExecutionControl,
+    ) -> Result<EngineTargetExploreResponse<'ctx>, r2sym::SymExecutionStopReason> {
+        let symbolic_execution = execution.symbolic_execution_control();
+        symbolic_execution.poll()?;
         let context = request.context;
         let mut query_config = symbolic_query_config_for_context(&context);
         let compiled = r2sym::compile_query_semantic_artifact_with_scope(
@@ -4853,6 +5707,7 @@ impl EngineSession {
             context.symbol_map,
             query_config.summary_profile,
         );
+        symbolic_execution.poll()?;
         let initial_state = symbolic_initial_state(&context);
         let selected_route = target_query_route_decision(EngineTargetQueryRouteRequest {
             z3_ctx: context.z3_ctx,
@@ -4872,7 +5727,8 @@ impl EngineSession {
             &initial_state,
             Some(&selected_route),
         );
-        let mut explorer = query_config.make_explorer(context.z3_ctx);
+        let mut explorer =
+            query_config.make_explorer_with_execution_control(context.z3_ctx, symbolic_execution);
         install_symbolic_hooks_for_context(&mut explorer, &context, &query_policy);
         let reach = explorer.can_reach_with_artifact_in_scope(
             context.prepared,
@@ -4882,19 +5738,36 @@ impl EngineSession {
             request.target_addr,
         );
         let selected_route = reach.selected_route.clone();
-        EngineTargetExploreResponse {
-            reach,
-            explorer,
-            compiled,
-            selected_route,
-            query_policy,
-        }
+        explorer.execution_stop_reason().map_or(
+            Ok(EngineTargetExploreResponse {
+                reach,
+                explorer,
+                compiled,
+                selected_route,
+                query_policy,
+            }),
+            Err,
+        )
     }
 
     pub fn symbolic_target_solve<'ctx>(
         &self,
         request: EngineTargetSolveRequest<'ctx, '_>,
     ) -> EngineTargetSolveResponse<'ctx> {
+        self.symbolic_target_solve_with_execution_control(
+            request,
+            EngineExecutionControl::default(),
+        )
+        .expect("default symbolic execution control cannot stop")
+    }
+
+    pub fn symbolic_target_solve_with_execution_control<'ctx>(
+        &self,
+        request: EngineTargetSolveRequest<'ctx, '_>,
+        execution: EngineExecutionControl,
+    ) -> Result<EngineTargetSolveResponse<'ctx>, r2sym::SymExecutionStopReason> {
+        let symbolic_execution = execution.symbolic_execution_control();
+        symbolic_execution.poll()?;
         let context = request.context;
         let mut query_config = symbolic_query_config_for_context(&context);
         let compiled = match context.seed {
@@ -4922,6 +5795,7 @@ impl EngineSession {
                 )
             }
         };
+        symbolic_execution.poll()?;
         let initial_state = symbolic_initial_state(&context);
         let selected_route = target_query_route_decision(EngineTargetQueryRouteRequest {
             z3_ctx: context.z3_ctx,
@@ -4941,7 +5815,8 @@ impl EngineSession {
             &initial_state,
             Some(&selected_route),
         );
-        let mut explorer = query_config.make_explorer(context.z3_ctx);
+        let mut explorer =
+            query_config.make_explorer_with_execution_control(context.z3_ctx, symbolic_execution);
         install_symbolic_hooks_for_context(&mut explorer, &context, &query_policy);
         let solve = explorer.solve_for_target_with_artifact_in_scope(
             context.prepared,
@@ -4951,24 +5826,43 @@ impl EngineSession {
             request.target_addr,
         );
         let selected_route = solve.selected_route.clone();
-        EngineTargetSolveResponse {
-            solve,
-            explorer,
-            compiled,
-            selected_route,
-            query_policy,
-        }
+        explorer.execution_stop_reason().map_or(
+            Ok(EngineTargetSolveResponse {
+                solve,
+                explorer,
+                compiled,
+                selected_route,
+                query_policy,
+            }),
+            Err,
+        )
     }
 
     pub fn symbolic_run_spec<'ctx>(
         &self,
         request: EngineRunSpecRequest<'ctx, '_>,
     ) -> Result<EngineRunSpecResponse<'ctx>, String> {
+        self.symbolic_run_spec_with_execution_control(request, EngineExecutionControl::default())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn symbolic_run_spec_with_execution_control<'ctx>(
+        &self,
+        request: EngineRunSpecRequest<'ctx, '_>,
+        execution: EngineExecutionControl,
+    ) -> Result<EngineRunSpecResponse<'ctx>, EngineSymbolicRunError> {
+        let symbolic_execution = execution.symbolic_execution_control();
+        symbolic_execution
+            .poll()
+            .map_err(EngineSymbolicRunError::ExecutionStopped)?;
         let context = request.context;
         let (assumption_usage, assumption_conditioned) =
             prepared_assumption_conditioning(context.prepared);
         let mut query_config = symbolic_query_config_for_context(&context);
-        let start_pc = request.spec.start_pc(context.seed.entry_addr())?;
+        let start_pc = request
+            .spec
+            .start_pc(context.seed.entry_addr())
+            .map_err(EngineSymbolicRunError::InvalidSpec)?;
         let mut initial_state = symbolic_initial_state_at(&context, start_pc);
         request.spec.apply_to_state(&mut initial_state);
         let query_policy = symbolic_query_policy_for_state(
@@ -4977,14 +5871,20 @@ impl EngineSession {
             &initial_state,
             None,
         );
-        let mut explorer = r2sym::PathExplorer::with_config(
+        let mut explorer = r2sym::PathExplorer::with_config_and_execution_control(
             context.z3_ctx,
             request.spec.to_explore_config(&query_config.explore),
+            symbolic_execution,
         );
         install_symbolic_hooks_for_context(&mut explorer, &context, &query_policy);
-        let result = explorer.run_spec(context.prepared, initial_state, request.spec)?;
+        let result = explorer
+            .run_spec(context.prepared, initial_state, request.spec)
+            .map_err(EngineSymbolicRunError::InvalidSpec)?;
         let stats = explorer.stats().clone();
         let solver_stats = explorer.solver().stats();
+        if let Some(reason) = explorer.execution_stop_reason() {
+            return Err(EngineSymbolicRunError::ExecutionStopped(reason));
+        }
         Ok(EngineRunSpecResponse {
             result,
             explorer,
@@ -5190,6 +6090,7 @@ fn decompile_diagnostics_from_function_facts(function_facts: &FunctionFacts) -> 
         return EngineDiagnostics {
             plan: None,
             route_reason: Some("missing FunctionFacts decompile route".to_string()),
+            semantic_kernel_render: None,
             proof_coverage: None,
             render_permission: None,
             warnings: vec![
@@ -5201,6 +6102,7 @@ fn decompile_diagnostics_from_function_facts(function_facts: &FunctionFacts) -> 
     EngineDiagnostics {
         plan: Some(engine_plan_from_decompile_route_kind(route.kind)),
         route_reason: route.reason.clone(),
+        semantic_kernel_render: None,
         proof_coverage: Some(route.proof_coverage.clone()),
         render_permission: Some(route.render_permission.clone()),
         warnings: Vec::new(),
@@ -5219,25 +6121,1107 @@ fn engine_plan_from_decompile_route_kind(kind: r2types::DecompileRouteKind) -> E
     }
 }
 
-fn render_engine_decompile_request(request: &EngineDecompileRequest) -> String {
+#[derive(Debug)]
+struct EngineRenderedDecompile {
+    output: String,
+    semantic_kernel_render: Option<EngineSemanticKernelRender>,
+    structuring_executed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EngineRenderExecutionStop {
+    reason: String,
+    phase: EnginePhase,
+    certification_completed: bool,
+    normalization_completed: bool,
+    structuring_completed: bool,
+}
+
+fn engine_metrics_for_render_stop(
+    mut metrics: EngineMetrics,
+    stop: &EngineRenderExecutionStop,
+    planning_time: Duration,
+    render_time: Duration,
+) -> EngineMetrics {
+    if stop.certification_completed {
+        metrics.record_folded_if_not_executed(EnginePhase::Certification);
+    }
+    if stop.normalization_completed {
+        metrics.record_folded_if_not_executed(EnginePhase::Normalization);
+    }
+    if stop.structuring_completed {
+        metrics.record_folded_if_not_executed(EnginePhase::Structuring);
+    }
+    metrics.record_phase(stop.phase, EnginePhaseStatus::Refused, render_time);
+    metrics.planning_time += planning_time;
+    metrics.render_time = render_time;
+    metrics
+}
+
+fn engine_render_stop_reason(
+    reason: r2ssa::SsaExecutionStopReason,
+    phase: EnginePhase,
+) -> EngineRenderExecutionStop {
+    let reason = match reason {
+        r2ssa::SsaExecutionStopReason::Cancelled => {
+            format!("engine request cancelled during {} phase", phase.as_str())
+        }
+        r2ssa::SsaExecutionStopReason::DeadlineExceeded => format!(
+            "engine request deadline exceeded during {} phase",
+            phase.as_str()
+        ),
+    };
+    EngineRenderExecutionStop {
+        reason,
+        phase,
+        certification_completed: false,
+        normalization_completed: false,
+        structuring_completed: false,
+    }
+}
+
+fn poll_engine_render_control<C: r2ssa::SsaWorkControl + ?Sized>(
+    control: &C,
+    phase: EnginePhase,
+) -> Result<(), EngineRenderExecutionStop> {
+    poll_engine_render_control_with_completion(control, phase, false, false)
+}
+
+fn poll_engine_render_control_with_completion<C: r2ssa::SsaWorkControl + ?Sized>(
+    control: &C,
+    phase: EnginePhase,
+    certification_completed: bool,
+    structuring_completed: bool,
+) -> Result<(), EngineRenderExecutionStop> {
+    control.poll().map_err(|reason| {
+        let mut stop = engine_render_stop_reason(reason, phase);
+        stop.certification_completed = certification_completed;
+        stop.structuring_completed = structuring_completed;
+        stop
+    })
+}
+
+fn engine_render_stop_from_decompiler(
+    stop: r2dec::DecompileExecutionStop,
+) -> EngineRenderExecutionStop {
+    let phase = match stop.phase() {
+        r2dec::DecompileWorkPhase::Normalization => EnginePhase::Normalization,
+        r2dec::DecompileWorkPhase::Structuring => EnginePhase::Structuring,
+        r2dec::DecompileWorkPhase::Rendering => EnginePhase::Rendering,
+    };
+    let mut mapped = engine_render_stop_reason(stop.reason(), phase);
+    match stop.phase() {
+        r2dec::DecompileWorkPhase::Normalization => {}
+        r2dec::DecompileWorkPhase::Structuring => {
+            mapped.normalization_completed = true;
+        }
+        r2dec::DecompileWorkPhase::Rendering => {
+            mapped.normalization_completed = true;
+            mapped.structuring_completed = true;
+        }
+    }
+    mapped
+}
+
+fn prepared_artifact_has_source_aggregate_pointer(artifact: &SsaArtifact) -> bool {
+    let Some(interface) = artifact.machine_context().function_interface() else {
+        return false;
+    };
+    let Some(graph) = interface.type_graph() else {
+        return false;
+    };
+    interface.parameter_logical_values().iter().any(|logical| {
+        let Some(source_type) = usize::try_from(logical.type_id())
+            .ok()
+            .and_then(|type_id| graph.types().get(type_id))
+        else {
+            return false;
+        };
+        let r2ssa::SourceTypeKind::Pointer { target_type_id } = source_type.kind() else {
+            return false;
+        };
+        usize::try_from(target_type_id)
+            .ok()
+            .and_then(|type_id| graph.types().get(type_id))
+            .is_some_and(|target| matches!(target.kind(), r2ssa::SourceTypeKind::Struct { .. }))
+    })
+}
+
+fn prepared_artifact_exact_branchless_guard_applicability(
+    artifact: &SsaArtifact,
+) -> Result<bool, String> {
+    let facts = &artifact.structured().branchless_guards;
+    if facts.is_empty() {
+        return Ok(false);
+    }
+    if facts.len() != 1 {
+        return Err(format!(
+            "branchless-guard applicability retained {} exact facts instead of one",
+            facts.len()
+        ));
+    }
+    let Some(fact) = facts.values().next() else {
+        return Err("branchless-guard applicability lost its exact fact".to_string());
+    };
+    if !fact.validate_against(artifact) {
+        return Err("branchless-guard exact fact failed artifact validation".to_string());
+    }
+    Ok(true)
+}
+
+fn prepared_artifact_exact_nested_wrap32_guard_o0_applicability(
+    artifact: &SsaArtifact,
+) -> Result<bool, String> {
+    let facts = &artifact.structured().nested_wrap32_guard_o0;
+    if facts.is_empty() {
+        return Ok(false);
+    }
+    if facts.len() != 1 {
+        return Err(format!(
+            "nested wrap32 O0 applicability retained {} exact facts instead of one",
+            facts.len()
+        ));
+    }
+    let Some(fact) = facts.values().next() else {
+        return Err("nested wrap32 O0 applicability lost its exact fact".to_string());
+    };
+    if !fact.validate_against_parts(
+        artifact.function(),
+        artifact.graph(),
+        artifact.objects(),
+        artifact.memory(),
+        artifact.predicates(),
+        &artifact.facts().boundaries,
+        &artifact.structured().memory_accesses,
+        artifact.machine_context(),
+    ) {
+        return Err("nested wrap32 O0 exact fact failed artifact validation".to_string());
+    }
+    Ok(true)
+}
+
+fn prepared_artifact_exact_struct_array_index_applicability(
+    artifact: &SsaArtifact,
+) -> Result<bool, String> {
+    let facts = &artifact.structured().struct_array_indexes;
+    if facts.is_empty() {
+        return Ok(false);
+    }
+    if facts.len() != 1 {
+        return Err(format!(
+            "struct-array-index applicability retained {} exact facts instead of one",
+            facts.len()
+        ));
+    }
+    let Some(fact) = facts.values().next() else {
+        return Err("struct-array-index applicability lost its exact fact".to_string());
+    };
+    if !fact.validate_against(artifact) {
+        return Err("struct-array-index exact fact failed artifact validation".to_string());
+    }
+    Ok(true)
+}
+
+fn prepared_artifact_exact_sum_array_applicability(artifact: &SsaArtifact) -> Result<bool, String> {
+    let o0 = &artifact.structured().sum_arrays;
+    let o2 = &artifact.structured().sum_array_o2;
+    if o0.is_empty() && o2.is_empty() {
+        return Ok(false);
+    }
+    if o0.len() + o2.len() != 1 {
+        return Err(format!(
+            "sum-array applicability retained {} exact facts instead of one",
+            o0.len() + o2.len()
+        ));
+    }
+    let valid = o0
+        .values()
+        .next()
+        .is_some_and(|fact| fact.validate_against(artifact))
+        || o2
+            .values()
+            .next()
+            .is_some_and(|fact| fact.validate_against(artifact));
+    if !valid {
+        return Err("sum-array exact fact failed artifact validation".to_string());
+    }
+    Ok(true)
+}
+
+fn prepared_artifact_exact_fnv_fold_applicability(artifact: &SsaArtifact) -> Result<bool, String> {
+    let facts = &artifact.structured().canonical_fnv_fold_loops;
+    if facts.is_empty() {
+        return Ok(false);
+    }
+    if facts.len() != 1 {
+        return Err(format!(
+            "canonical FNV-fold applicability retained {} exact facts instead of one",
+            facts.len()
+        ));
+    }
+    let Some(fact) = facts.values().next() else {
+        return Err("canonical FNV-fold applicability lost its exact fact".to_string());
+    };
+    if !fact.validate_against(artifact) {
+        return Err("canonical FNV-fold exact fact failed artifact validation".to_string());
+    }
+    let Some(interface) = artifact.machine_context().function_interface() else {
+        return Err("canonical FNV-fold exact fact has no source interface".to_string());
+    };
+    let Some(graph) = interface.type_graph() else {
+        return Err("canonical FNV-fold exact fact has no source type graph".to_string());
+    };
+    let [byte, pointer, integer] = graph.types() else {
+        return Err("canonical FNV-fold exact fact has a non-exact source type graph".to_string());
+    };
+    let [pointer_logical, length_logical] = interface.parameter_logical_values() else {
+        return Err("canonical FNV-fold exact fact has non-exact logical parameters".to_string());
+    };
+    let Some(return_logical) = interface.return_logical_value() else {
+        return Err("canonical FNV-fold exact fact has no logical return".to_string());
+    };
+    let [pointer_parameter, length_parameter] = interface.parameters() else {
+        return Err("canonical FNV-fold exact fact has non-exact ABI parameters".to_string());
+    };
+    let r2ssa::SourceFunctionReturn::Register {
+        storage: return_storage,
+    } = interface.return_kind()
+    else {
+        return Err("canonical FNV-fold exact fact has no register return".to_string());
+    };
+    let full64 = |logical: r2ssa::SourceLogicalValue| {
+        logical.carrier().kind() == r2ssa::SourceCarrierKind::Full
+            && logical.carrier().offset_bits() == 0
+            && logical.carrier().size_bits() == 64
+    };
+    let exact_interface = interface.schema_version()
+        == r2ssa::SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION
+        && graph.schema_version() == r2ssa::SOURCE_TYPE_GRAPH_SCHEMA_VERSION
+        && interface
+            .calling_convention()
+            .eq_ignore_ascii_case("aapcs64")
+        && interface.stack_slot_roles_complete()
+        && interface.stack_slots().is_empty()
+        && interface.revision_identity() == fact.abi.revision_identity.as_ref()
+        && pointer_parameter.index() == fact.abi.pointer_parameter.index
+        && pointer_parameter.storage() == fact.abi.pointer_parameter.storage
+        && length_parameter.index() == fact.abi.remaining_parameter.index
+        && length_parameter.storage() == fact.abi.remaining_parameter.storage
+        && return_storage == fact.abi.return_storage
+        && graph.aggregates().is_empty()
+        && byte.kind() == r2ssa::SourceTypeKind::UnsignedInteger
+        && byte.size_bits() == 8
+        && byte.align_bits() == 8
+        && matches!(
+            pointer.kind(),
+            r2ssa::SourceTypeKind::Pointer { target_type_id: 0 }
+        )
+        && pointer.size_bits() == 64
+        && pointer.align_bits() == 64
+        && integer.kind() == r2ssa::SourceTypeKind::UnsignedInteger
+        && integer.size_bits() == 64
+        && integer.align_bits() == 64
+        && *pointer_logical == fact.abi.pointer_logical
+        && *length_logical == fact.abi.remaining_logical
+        && return_logical == fact.abi.return_logical
+        && full64(*pointer_logical)
+        && full64(*length_logical)
+        && full64(return_logical);
+    if !exact_interface {
+        return Err(
+            "canonical FNV-fold exact fact does not match its exact source interface".to_string(),
+        );
+    }
+    Ok(true)
+}
+
+fn prepared_artifact_exact_fnv_fold_o0_applicability(
+    artifact: &SsaArtifact,
+) -> Result<bool, String> {
+    let facts = &artifact.structured().canonical_fnv_fold_o0;
+    if facts.is_empty() {
+        return Ok(false);
+    }
+    if facts.len() != 1 {
+        return Err(format!(
+            "stack-backed O0 FNV-fold applicability retained {} exact facts instead of one",
+            facts.len()
+        ));
+    }
+    let Some(fact) = facts.values().next() else {
+        return Err("stack-backed O0 FNV-fold applicability lost its exact fact".to_string());
+    };
+    if !fact.validate_against(artifact) {
+        return Err("stack-backed O0 FNV-fold exact fact failed artifact validation".to_string());
+    }
+    Ok(true)
+}
+
+#[derive(Debug)]
+enum EngineSemanticKernelAttempt {
+    NotApplicable,
+    Rendered(EngineRenderedDecompile),
+    Rejected {
+        reason: String,
+        phase: EnginePhase,
+        certification_completed: bool,
+        structuring_completed: bool,
+    },
+}
+
+fn complete_engine_semantic_kernel_attempt<C: r2ssa::SsaWorkControl + ?Sized>(
+    control: &C,
+    attempt: EngineSemanticKernelAttempt,
+) -> Result<EngineSemanticKernelAttempt, EngineRenderExecutionStop> {
+    match &attempt {
+        EngineSemanticKernelAttempt::Rejected { .. } => {}
+        EngineSemanticKernelAttempt::Rendered(rendered) => {
+            poll_engine_render_control_with_completion(
+                control,
+                EnginePhase::Rendering,
+                true,
+                rendered.structuring_executed,
+            )?;
+        }
+        EngineSemanticKernelAttempt::NotApplicable => {
+            poll_engine_render_control(control, EnginePhase::Rendering)?;
+        }
+    }
+    Ok(attempt)
+}
+
+fn poll_engine_semantic_kernel_after_certification<C: r2ssa::SsaWorkControl + ?Sized>(
+    control: &C,
+) -> Result<(), EngineRenderExecutionStop> {
+    poll_engine_render_control_with_completion(control, EnginePhase::Rendering, true, false)
+}
+
+fn resolve_engine_semantic_kernel_attempt(
+    attempt: EngineSemanticKernelAttempt,
+) -> Result<Option<EngineRenderedDecompile>, EngineRenderExecutionStop> {
+    match attempt {
+        EngineSemanticKernelAttempt::NotApplicable => Ok(None),
+        EngineSemanticKernelAttempt::Rendered(rendered) => Ok(Some(rendered)),
+        EngineSemanticKernelAttempt::Rejected {
+            reason,
+            phase,
+            certification_completed,
+            structuring_completed,
+        } => Err(EngineRenderExecutionStop {
+            reason,
+            phase,
+            certification_completed,
+            normalization_completed: false,
+            structuring_completed,
+        }),
+    }
+}
+
+fn render_semantic_kernel_function<C: r2ssa::SsaWorkControl + ?Sized>(
+    request: &EngineDecompileRequest,
+    control: &C,
+) -> Result<EngineSemanticKernelAttempt, EngineRenderExecutionStop> {
+    poll_engine_render_control(control, EnginePhase::Rendering)?;
+    let branchless_guard_applicable =
+        match prepared_artifact_exact_branchless_guard_applicability(request.prepared_ssa.as_ref())
+        {
+            Ok(applicable) => applicable,
+            Err(reason) => {
+                return complete_engine_semantic_kernel_attempt(
+                    control,
+                    EngineSemanticKernelAttempt::Rejected {
+                        reason,
+                        phase: EnginePhase::Certification,
+                        certification_completed: false,
+                        structuring_completed: false,
+                    },
+                );
+            }
+        };
+    if branchless_guard_applicable {
+        let function = match r2dec::CertifiedBranchlessGuardSemanticCFunction::from_artifact(
+            request.prepared_ssa.as_ref(),
+        ) {
+            Ok(function) => function,
+            Err(error) => {
+                return complete_engine_semantic_kernel_attempt(
+                    control,
+                    EngineSemanticKernelAttempt::Rejected {
+                        reason: format!(
+                            "exact branchless-guard fact failed certification: {error:?}"
+                        ),
+                        phase: EnginePhase::Certification,
+                        certification_completed: false,
+                        structuring_completed: false,
+                    },
+                );
+            }
+        };
+        poll_engine_semantic_kernel_after_certification(control)?;
+        let output = match function
+            .with_cosmetic_names(&request.function_name, "first", "second")
+            .render_certified_c()
+        {
+            Ok(output) => output,
+            Err(error) => {
+                return complete_engine_semantic_kernel_attempt(
+                    control,
+                    EngineSemanticKernelAttempt::Rejected {
+                        reason: format!(
+                            "exact branchless-guard fact failed certified rendering: {error:?}"
+                        ),
+                        phase: EnginePhase::Rendering,
+                        certification_completed: true,
+                        structuring_completed: true,
+                    },
+                );
+            }
+        };
+        return complete_engine_semantic_kernel_attempt(
+            control,
+            EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
+                output,
+                structuring_executed: true,
+                semantic_kernel_render: Some(EngineSemanticKernelRender {
+                    region: EngineSemanticKernelRegion::BranchlessGuardFunction,
+                    region_schema_version:
+                        r2dec::CERTIFIED_BRANCHLESS_GUARD_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
+                    exact_obligation_closure: true,
+                }),
+            }),
+        );
+    }
+    poll_engine_render_control(control, EnginePhase::Rendering)?;
+    let nested_wrap32_guard_o0_applicable =
+        match prepared_artifact_exact_nested_wrap32_guard_o0_applicability(
+            request.prepared_ssa.as_ref(),
+        ) {
+            Ok(applicable) => applicable,
+            Err(reason) => {
+                return complete_engine_semantic_kernel_attempt(
+                    control,
+                    EngineSemanticKernelAttempt::Rejected {
+                        reason,
+                        phase: EnginePhase::Certification,
+                        certification_completed: false,
+                        structuring_completed: false,
+                    },
+                );
+            }
+        };
+    if nested_wrap32_guard_o0_applicable {
+        let function = match r2dec::CertifiedNestedWrap32GuardO0SemanticCFunction::from_artifact(
+            request.prepared_ssa.as_ref(),
+        ) {
+            Ok(function) => function,
+            Err(error) => {
+                return complete_engine_semantic_kernel_attempt(
+                    control,
+                    EngineSemanticKernelAttempt::Rejected {
+                        reason: format!(
+                            "exact nested wrap32 O0 fact failed certification: {error:?}"
+                        ),
+                        phase: EnginePhase::Certification,
+                        certification_completed: false,
+                        structuring_completed: false,
+                    },
+                );
+            }
+        };
+        poll_engine_semantic_kernel_after_certification(control)?;
+        let output = match function
+            .with_cosmetic_names(&request.function_name, "first", "second")
+            .render_certified_c()
+        {
+            Ok(output) => output,
+            Err(error) => {
+                return complete_engine_semantic_kernel_attempt(
+                    control,
+                    EngineSemanticKernelAttempt::Rejected {
+                        reason: format!(
+                            "exact nested wrap32 O0 fact failed certified rendering: {error:?}"
+                        ),
+                        phase: EnginePhase::Rendering,
+                        certification_completed: true,
+                        structuring_completed: true,
+                    },
+                );
+            }
+        };
+        return complete_engine_semantic_kernel_attempt(
+            control,
+            EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
+                output,
+                structuring_executed: true,
+                semantic_kernel_render: Some(EngineSemanticKernelRender {
+                    region: EngineSemanticKernelRegion::NestedWrap32GuardO0Function,
+                    region_schema_version:
+                        r2dec::CERTIFIED_NESTED_WRAP32_GUARD_O0_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
+                    exact_obligation_closure: true,
+                }),
+            }),
+        );
+    }
+    poll_engine_render_control(control, EnginePhase::Rendering)?;
+    let struct_array_index_applicable =
+        match prepared_artifact_exact_struct_array_index_applicability(
+            request.prepared_ssa.as_ref(),
+        ) {
+            Ok(applicable) => applicable,
+            Err(reason) => {
+                return complete_engine_semantic_kernel_attempt(
+                    control,
+                    EngineSemanticKernelAttempt::Rejected {
+                        reason,
+                        phase: EnginePhase::Certification,
+                        certification_completed: false,
+                        structuring_completed: false,
+                    },
+                );
+            }
+        };
+    if struct_array_index_applicable {
+        let function = match r2dec::CertifiedStructArrayIndexSemanticCFunction::from_artifact(
+            request.prepared_ssa.as_ref(),
+        ) {
+            Ok(function) => function,
+            Err(error) => {
+                return complete_engine_semantic_kernel_attempt(
+                    control,
+                    EngineSemanticKernelAttempt::Rejected {
+                        reason: format!(
+                            "exact struct-array-index fact failed certification: {error:?}"
+                        ),
+                        phase: EnginePhase::Certification,
+                        certification_completed: false,
+                        structuring_completed: false,
+                    },
+                );
+            }
+        };
+        poll_engine_semantic_kernel_after_certification(control)?;
+        let output = match function
+            .with_cosmetic_names(
+                &request.function_name,
+                "DemoStruct",
+                "array",
+                "index",
+                "value",
+            )
+            .render_certified_c()
+        {
+            Ok(output) => output,
+            Err(error) => {
+                return complete_engine_semantic_kernel_attempt(
+                    control,
+                    EngineSemanticKernelAttempt::Rejected {
+                        reason: format!(
+                            "exact struct-array-index fact failed certified rendering: {error:?}"
+                        ),
+                        phase: EnginePhase::Rendering,
+                        certification_completed: true,
+                        structuring_completed: true,
+                    },
+                );
+            }
+        };
+        return complete_engine_semantic_kernel_attempt(
+            control,
+            EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
+                output,
+                structuring_executed: true,
+                semantic_kernel_render: Some(EngineSemanticKernelRender {
+                    region: EngineSemanticKernelRegion::StructArrayIndexFunction,
+                    region_schema_version:
+                        r2dec::CERTIFIED_STRUCT_ARRAY_INDEX_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
+                    exact_obligation_closure: true,
+                }),
+            }),
+        );
+    }
+    poll_engine_render_control(control, EnginePhase::Rendering)?;
+    if request.prepared_ssa.private_frame().is_some() {
+        let function = match r2dec::CertifiedPrivateFrameSemanticCFunction::from_artifact(
+            request.prepared_ssa.as_ref(),
+        ) {
+            Ok(function) => function,
+            Err(error) => {
+                return complete_engine_semantic_kernel_attempt(
+                    control,
+                    EngineSemanticKernelAttempt::Rejected {
+                        reason: format!("exact private-frame fact failed certification: {error:?}"),
+                        phase: EnginePhase::Certification,
+                        certification_completed: false,
+                        structuring_completed: false,
+                    },
+                );
+            }
+        };
+        poll_engine_semantic_kernel_after_certification(control)?;
+        let output = match function
+            .with_cosmetic_names(&request.function_name, "argument", "result")
+            .render_certified_c()
+        {
+            Ok(output) => output,
+            Err(error) => {
+                return complete_engine_semantic_kernel_attempt(
+                    control,
+                    EngineSemanticKernelAttempt::Rejected {
+                        reason: format!(
+                            "exact private-frame fact failed certified rendering: {error:?}"
+                        ),
+                        phase: EnginePhase::Rendering,
+                        certification_completed: true,
+                        structuring_completed: true,
+                    },
+                );
+            }
+        };
+        return complete_engine_semantic_kernel_attempt(
+            control,
+            EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
+                output,
+                structuring_executed: true,
+                semantic_kernel_render: Some(EngineSemanticKernelRender {
+                    region: EngineSemanticKernelRegion::PrivateFrameConditionalReturnFunction,
+                    region_schema_version:
+                        r2dec::CERTIFIED_PRIVATE_FRAME_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
+                    exact_obligation_closure: true,
+                }),
+            }),
+        );
+    }
+    poll_engine_render_control(control, EnginePhase::Rendering)?;
+    let sum_array_applicable =
+        match prepared_artifact_exact_sum_array_applicability(request.prepared_ssa.as_ref()) {
+            Ok(applicable) => applicable,
+            Err(reason) => {
+                return complete_engine_semantic_kernel_attempt(
+                    control,
+                    EngineSemanticKernelAttempt::Rejected {
+                        reason,
+                        phase: EnginePhase::Certification,
+                        certification_completed: false,
+                        structuring_completed: false,
+                    },
+                );
+            }
+        };
+    if sum_array_applicable {
+        let function = match r2dec::CertifiedSumArraySemanticCFunction::from_artifact(
+            request.prepared_ssa.as_ref(),
+        ) {
+            Ok(function) => function,
+            Err(error) => {
+                return complete_engine_semantic_kernel_attempt(
+                    control,
+                    EngineSemanticKernelAttempt::Rejected {
+                        reason: format!("exact sum-array fact failed certification: {error:?}"),
+                        phase: EnginePhase::Certification,
+                        certification_completed: false,
+                        structuring_completed: false,
+                    },
+                );
+            }
+        };
+        poll_engine_semantic_kernel_after_certification(control)?;
+        let output = match function
+            .with_cosmetic_names(
+                &request.function_name,
+                "array",
+                "length",
+                "index",
+                "sum_bits",
+            )
+            .render_certified_c()
+        {
+            Ok(output) => output,
+            Err(error) => {
+                return complete_engine_semantic_kernel_attempt(
+                    control,
+                    EngineSemanticKernelAttempt::Rejected {
+                        reason: format!(
+                            "exact sum-array fact failed certified rendering: {error:?}"
+                        ),
+                        phase: EnginePhase::Rendering,
+                        certification_completed: true,
+                        structuring_completed: true,
+                    },
+                );
+            }
+        };
+        return complete_engine_semantic_kernel_attempt(
+            control,
+            EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
+                output,
+                structuring_executed: true,
+                semantic_kernel_render: Some(EngineSemanticKernelRender {
+                    region: EngineSemanticKernelRegion::SumArrayFunction,
+                    region_schema_version:
+                        r2dec::CERTIFIED_SUM_ARRAY_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
+                    exact_obligation_closure: true,
+                }),
+            }),
+        );
+    }
+    poll_engine_render_control(control, EnginePhase::Rendering)?;
+    let fnv_fold_applicable =
+        match prepared_artifact_exact_fnv_fold_applicability(request.prepared_ssa.as_ref()) {
+            Ok(applicable) => applicable,
+            Err(reason) => {
+                return complete_engine_semantic_kernel_attempt(
+                    control,
+                    EngineSemanticKernelAttempt::Rejected {
+                        reason,
+                        phase: EnginePhase::Certification,
+                        certification_completed: false,
+                        structuring_completed: false,
+                    },
+                );
+            }
+        };
+    if fnv_fold_applicable {
+        let function = match r2dec::CertifiedFnvFoldSemanticCFunction::from_artifact(
+            request.prepared_ssa.as_ref(),
+        ) {
+            Ok(function) => function,
+            Err(error) => {
+                return complete_engine_semantic_kernel_attempt(
+                    control,
+                    EngineSemanticKernelAttempt::Rejected {
+                        reason: format!(
+                            "exact canonical FNV-fold fact failed certification: {error:?}"
+                        ),
+                        phase: EnginePhase::Certification,
+                        certification_completed: false,
+                        structuring_completed: false,
+                    },
+                );
+            }
+        };
+        poll_engine_semantic_kernel_after_certification(control)?;
+        let output = match function
+            .with_cosmetic_names(&request.function_name, "bytes", "length")
+            .render_certified_c()
+        {
+            Ok(output) => output,
+            Err(error) => {
+                return complete_engine_semantic_kernel_attempt(
+                    control,
+                    EngineSemanticKernelAttempt::Rejected {
+                        reason: format!(
+                            "exact canonical FNV-fold fact failed certified rendering: {error:?}"
+                        ),
+                        phase: EnginePhase::Rendering,
+                        certification_completed: true,
+                        structuring_completed: true,
+                    },
+                );
+            }
+        };
+        return complete_engine_semantic_kernel_attempt(
+            control,
+            EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
+                output,
+                structuring_executed: true,
+                semantic_kernel_render: Some(EngineSemanticKernelRender {
+                    region: EngineSemanticKernelRegion::CanonicalFnvFoldLoopFunction,
+                    region_schema_version:
+                        r2dec::CERTIFIED_FNV_FOLD_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
+                    exact_obligation_closure: true,
+                }),
+            }),
+        );
+    }
+    poll_engine_render_control(control, EnginePhase::Rendering)?;
+    let fnv_fold_o0_applicable =
+        match prepared_artifact_exact_fnv_fold_o0_applicability(request.prepared_ssa.as_ref()) {
+            Ok(applicable) => applicable,
+            Err(reason) => {
+                return complete_engine_semantic_kernel_attempt(
+                    control,
+                    EngineSemanticKernelAttempt::Rejected {
+                        reason,
+                        phase: EnginePhase::Certification,
+                        certification_completed: false,
+                        structuring_completed: false,
+                    },
+                );
+            }
+        };
+    if fnv_fold_o0_applicable {
+        let function = match r2dec::CertifiedFnvFoldO0SemanticCFunction::from_artifact(
+            request.prepared_ssa.as_ref(),
+        ) {
+            Ok(function) => function,
+            Err(error) => {
+                return complete_engine_semantic_kernel_attempt(
+                    control,
+                    EngineSemanticKernelAttempt::Rejected {
+                        reason: format!(
+                            "exact stack-backed O0 FNV-fold fact failed certification: {error:?}"
+                        ),
+                        phase: EnginePhase::Certification,
+                        certification_completed: false,
+                        structuring_completed: false,
+                    },
+                );
+            }
+        };
+        poll_engine_semantic_kernel_after_certification(control)?;
+        let output = match function
+            .with_cosmetic_names(&request.function_name, "bytes", "length")
+            .render_certified_c()
+        {
+            Ok(output) => output,
+            Err(error) => {
+                return complete_engine_semantic_kernel_attempt(
+                    control,
+                    EngineSemanticKernelAttempt::Rejected {
+                        reason: format!(
+                            "exact stack-backed O0 FNV-fold fact failed certified rendering: {error:?}"
+                        ),
+                        phase: EnginePhase::Rendering,
+                        certification_completed: true,
+                        structuring_completed: true,
+                    },
+                );
+            }
+        };
+        return complete_engine_semantic_kernel_attempt(
+            control,
+            EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
+                output,
+                structuring_executed: true,
+                semantic_kernel_render: Some(EngineSemanticKernelRender {
+                    region: EngineSemanticKernelRegion::CanonicalFnvFoldO0Function,
+                    region_schema_version:
+                        r2dec::CERTIFIED_FNV_FOLD_O0_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
+                    exact_obligation_closure: true,
+                }),
+            }),
+        );
+    }
+    poll_engine_render_control(control, EnginePhase::Rendering)?;
+    if let Ok(function) = r2dec::CertifiedAggregateMemberSemanticCFunction::from_artifact(
+        request.prepared_ssa.as_ref(),
+    ) && let Ok(output) = function.render_certified_c()
+    {
+        return complete_engine_semantic_kernel_attempt(
+            control,
+            EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
+                output,
+                structuring_executed: true,
+                semantic_kernel_render: Some(EngineSemanticKernelRender {
+                    region: EngineSemanticKernelRegion::AggregateMemberTerminalReturnFunction,
+                    region_schema_version: function.schema_version(),
+                    exact_obligation_closure: true,
+                }),
+            }),
+        );
+    }
+    poll_engine_render_control(control, EnginePhase::Rendering)?;
+    if !prepared_artifact_has_source_aggregate_pointer(request.prepared_ssa.as_ref())
+        && let Ok(function) =
+            r2dec::CertifiedMemorySemanticCFunction::from_artifact(request.prepared_ssa.as_ref())
+        && let Ok(output) = function.render_certified_c()
+    {
+        return complete_engine_semantic_kernel_attempt(
+            control,
+            EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
+                output,
+                structuring_executed: true,
+                semantic_kernel_render: Some(EngineSemanticKernelRender {
+                    region: EngineSemanticKernelRegion::PlainRamMemoryTerminalReturnFunction,
+                    region_schema_version: function.schema_version(),
+                    exact_obligation_closure: true,
+                }),
+            }),
+        );
+    }
+    poll_engine_render_control(control, EnginePhase::Rendering)?;
+    if let Ok(function) =
+        r2dec::CertifiedDirectCallReturnFunction::from_artifact(request.prepared_ssa.as_ref())
+        && let Ok(output) = function.render_certified_c()
+    {
+        return complete_engine_semantic_kernel_attempt(
+            control,
+            EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
+                output,
+                structuring_executed: true,
+                semantic_kernel_render: Some(EngineSemanticKernelRender {
+                    region: EngineSemanticKernelRegion::DirectCallTerminalReturnFunction,
+                    region_schema_version: function.schema_version(),
+                    exact_obligation_closure: true,
+                }),
+            }),
+        );
+    }
+    poll_engine_render_control(control, EnginePhase::Rendering)?;
+    if let Ok(function) =
+        r2dec::CertifiedConditionalReturnFunction::from_artifact(request.prepared_ssa.as_ref())
+        && let Ok(output) = function.render_certified_c()
+    {
+        return complete_engine_semantic_kernel_attempt(
+            control,
+            EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
+                output,
+                structuring_executed: true,
+                semantic_kernel_render: Some(EngineSemanticKernelRender {
+                    region: EngineSemanticKernelRegion::ConditionalTerminalReturnFunction,
+                    region_schema_version: function.schema_version(),
+                    exact_obligation_closure: true,
+                }),
+            }),
+        );
+    }
+    poll_engine_render_control(control, EnginePhase::Rendering)?;
+    if let Ok(function) = r2dec::CertifiedConditionalFunnelReturnFunction::from_artifact(
+        request.prepared_ssa.as_ref(),
+    ) && let Ok(output) = function.render_certified_c()
+    {
+        return complete_engine_semantic_kernel_attempt(
+            control,
+            EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
+                output,
+                structuring_executed: true,
+                semantic_kernel_render: Some(EngineSemanticKernelRender {
+                    region: EngineSemanticKernelRegion::ConditionalFunnelSharedReturnFunction,
+                    region_schema_version: function.schema_version(),
+                    exact_obligation_closure: true,
+                }),
+            }),
+        );
+    }
+    poll_engine_render_control(control, EnginePhase::Rendering)?;
+    if let Ok(function) =
+        r2dec::CertifiedSwitchReturnFunction::from_artifact(request.prepared_ssa.as_ref())
+        && let Ok(output) = function.render_certified_c()
+    {
+        return complete_engine_semantic_kernel_attempt(
+            control,
+            EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
+                output,
+                structuring_executed: true,
+                semantic_kernel_render: Some(EngineSemanticKernelRender {
+                    region: EngineSemanticKernelRegion::SwitchTerminalReturnFunction,
+                    region_schema_version: function.schema_version(),
+                    exact_obligation_closure: true,
+                }),
+            }),
+        );
+    }
+    poll_engine_render_control(control, EnginePhase::Rendering)?;
+    if let Ok(function) =
+        r2dec::CertifiedCountedLoopReturnFunction::from_artifact(request.prepared_ssa.as_ref())
+        && let Ok(output) = function.render_certified_c()
+    {
+        return complete_engine_semantic_kernel_attempt(
+            control,
+            EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
+                output,
+                structuring_executed: true,
+                semantic_kernel_render: Some(EngineSemanticKernelRender {
+                    region: EngineSemanticKernelRegion::CountedLoopTerminalReturnFunction,
+                    region_schema_version: function.schema_version(),
+                    exact_obligation_closure: true,
+                }),
+            }),
+        );
+    }
+    poll_engine_render_control(control, EnginePhase::Rendering)?;
+    if let Ok(function) =
+        r2dec::CertifiedLoopReturnFunction::from_artifact(request.prepared_ssa.as_ref())
+        && let Ok(output) = function.render_certified_c()
+    {
+        return complete_engine_semantic_kernel_attempt(
+            control,
+            EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
+                output,
+                structuring_executed: true,
+                semantic_kernel_render: Some(EngineSemanticKernelRender {
+                    region: EngineSemanticKernelRegion::CarrierFreeLoopTerminalReturnFunction,
+                    region_schema_version: function.schema_version(),
+                    exact_obligation_closure: true,
+                }),
+            }),
+        );
+    }
+    poll_engine_render_control(control, EnginePhase::Rendering)?;
+    if let Ok(function) =
+        r2dec::CertifiedSemanticCFunction::from_artifact(request.prepared_ssa.as_ref())
+        && let Ok(output) = function.render_certified_c()
+    {
+        return complete_engine_semantic_kernel_attempt(
+            control,
+            EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
+                output,
+                structuring_executed: true,
+                semantic_kernel_render: Some(EngineSemanticKernelRender {
+                    region: EngineSemanticKernelRegion::TerminalReturnBlock,
+                    region_schema_version: function.schema_version(),
+                    exact_obligation_closure: true,
+                }),
+            }),
+        );
+    }
+    complete_engine_semantic_kernel_attempt(control, EngineSemanticKernelAttempt::NotApplicable)
+}
+
+fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
+    request: &EngineDecompileRequest,
+    control: &C,
+    try_semantic_kernel: bool,
+) -> Result<EngineRenderedDecompile, EngineRenderExecutionStop> {
+    if try_semantic_kernel {
+        if let Some(rendered) = resolve_engine_semantic_kernel_attempt(
+            render_semantic_kernel_function(request, control)?,
+        )? {
+            return Ok(rendered);
+        }
+    } else {
+        poll_engine_render_control(control, EnginePhase::Rendering)?;
+    }
+    poll_engine_render_control(control, EnginePhase::Rendering)?;
     if let Some(output) = render_semantic_route(
         &request.function_name,
         &request.function_facts,
         &request.render_target,
     ) {
-        return output;
+        poll_engine_render_control(control, EnginePhase::Rendering)?;
+        return Ok(EngineRenderedDecompile {
+            output,
+            semantic_kernel_render: None,
+            structuring_executed: false,
+        });
     }
 
-    let context = r2dec::DecompilerContext::from_function_facts(request.function_facts.clone());
-    let input = r2dec::DecompilerInput::new(request.prepared_ssa.clone(), context);
+    let input = decompiler_input_for_engine_request(request);
     let output = r2dec::Decompiler::new(request.render_target.to_decompiler_config())
-        .decompile_input(&input);
+        .decompile_input_with_control(&input, control)
+        .map_err(engine_render_stop_from_decompiler)?;
     if !output.trim().is_empty() {
-        return output;
+        return Ok(EngineRenderedDecompile {
+            output,
+            semantic_kernel_render: None,
+            structuring_executed: true,
+        });
     }
 
-    decompile_route_output_from_function_facts(&request.function_name, &request.function_facts)
-        .unwrap_or_default()
+    Ok(EngineRenderedDecompile {
+        output: decompile_route_output_from_function_facts(
+            &request.function_name,
+            &request.function_facts,
+        )
+        .unwrap_or_default(),
+        semantic_kernel_render: None,
+        structuring_executed: false,
+    })
+}
+
+fn decompiler_input_for_engine_request(request: &EngineDecompileRequest) -> r2dec::DecompilerInput {
+    let context = r2dec::DecompilerContext::from_function_facts(request.function_facts.clone());
+    r2dec::DecompilerInput::new(Arc::clone(&request.prepared_ssa), context)
 }
 
 fn refused_decompile_response(
@@ -5246,18 +7230,40 @@ fn refused_decompile_response(
     planning_time: Duration,
     input_quality: Option<r2types::FunctionInputQualityFacts>,
 ) -> EngineDecompileResponse {
+    let mut metrics = EngineMetrics {
+        planning_time,
+        ..EngineMetrics::default()
+    };
+    metrics.refuse_from(EnginePhase::SnapshotContext);
+    refused_decompile_response_with_metrics(
+        function_name,
+        reason,
+        input_quality,
+        metrics,
+        EngineDiagnostics::default(),
+    )
+}
+
+fn refused_decompile_response_with_metrics(
+    function_name: &str,
+    reason: &str,
+    input_quality: Option<r2types::FunctionInputQualityFacts>,
+    metrics: EngineMetrics,
+    mut diagnostics: EngineDiagnostics,
+) -> EngineDecompileResponse {
     let function_facts = refused_decompile_function_facts(function_name, reason, input_quality);
     let output = decompile_route_output_from_function_facts(function_name, &function_facts)
         .expect("refused decompile response must stamp a fallback route");
-    let diagnostics = decompile_diagnostics_from_function_facts(&function_facts);
+    let route_diagnostics = decompile_diagnostics_from_function_facts(&function_facts);
+    diagnostics.plan = route_diagnostics.plan;
+    diagnostics.route_reason = route_diagnostics.route_reason;
+    diagnostics.proof_coverage = route_diagnostics.proof_coverage;
+    diagnostics.render_permission = route_diagnostics.render_permission;
+    diagnostics.refusal = route_diagnostics.refusal;
     EngineDecompileResponse {
         output,
         function_facts,
-        metrics: EngineMetrics {
-            cache_hit: false,
-            planning_time,
-            ..EngineMetrics::default()
-        },
+        metrics,
         diagnostics,
     }
 }
@@ -5310,40 +7316,32 @@ fn decompile_route_output_from_function_facts(
 }
 
 pub fn function_analysis_cache_key(
-    _function_name: &str,
+    function_name: &str,
     arch: Option<&r2il::ArchSpec>,
     blocks: &[R2ILBlock],
+    source_snapshot: Option<&EngineSourceSnapshot>,
 ) -> AnalysisCacheKey {
-    AnalysisCacheKey::from_hashes(
-        0,
-        0,
-        arch.map(stable_fnv1a_debug_hash).unwrap_or(0),
-        stable_blocks_hash(blocks),
-        0,
-        0,
-        0,
-    )
+    AnalysisCacheKey::from_immutable_parts(function_name, arch, blocks, source_snapshot)
 }
 
-pub fn function_artifact_cache_key(request: &EngineAnalyzeRequest) -> ArtifactCacheKey {
-    let analysis = AnalysisCacheKey::from_hashes(
+pub fn function_request_key(request: &EngineAnalyzeRequest) -> EngineRequestKey {
+    let analysis = function_analysis_cache_key(
+        &request.function_name,
+        request.arch.as_ref(),
+        &request.blocks,
+        request.source_snapshot.as_deref(),
+    );
+    EngineRequestKey::from_request_hashes(
+        analysis,
         request.function_addr,
-        stable_fnv1a_hash(request.function_name.as_str()),
-        request
-            .arch
-            .as_ref()
-            .map(stable_fnv1a_debug_hash)
-            .unwrap_or(0),
-        stable_blocks_hash(&request.blocks),
         session_context_identity_hash_from_parsed(
             &request.parsed_context,
             request.external_context_fallback_hash,
         ),
         assumptions_identity_hash(&request.parsed_context.assumptions),
         function_analysis_depth_hash(request.semantic_metadata_enabled),
-    );
-    ArtifactCacheKey::from_hashes(
-        analysis,
+        request.ptr_bits,
+        register_type_hints_identity_hash(&request.reg_type_hints),
         stable_fnv1a_hash(&(
             "interproc-scope-budget-v1",
             request.scope_facts.identity_hash(),
@@ -5355,8 +7353,57 @@ pub fn function_artifact_cache_key(request: &EngineAnalyzeRequest) -> ArtifactCa
                 .as_ref()
                 .map(stable_fnv1a_debug_hash),
         )),
-        r2sym::stable_scope_hash(request.symbolic_scope.as_ref()),
+        request_scope_identity_hash(request.symbolic_scope.as_ref()),
     )
+}
+
+/// Exact engine identity for a prepared symbolic scope.
+///
+/// `r2sym::stable_scope_hash` intentionally ignores presentation names. Those
+/// names affect engine-built semantic artifacts, so the request boundary adds
+/// both scoped and prepared function names in deterministic function order.
+pub fn request_scope_identity_hash(scope: Option<&r2sym::PreparedFunctionScope>) -> u64 {
+    let Some(scope) = scope else {
+        return 0;
+    };
+    let functions = scope
+        .functions()
+        .values()
+        .enumerate()
+        .map(|(order, function)| {
+            (
+                order,
+                function.id.0,
+                function.name.as_deref(),
+                function.prepared.function().name.as_deref(),
+            )
+        })
+        .collect::<Vec<_>>();
+    stable_fnv1a_hash(&(
+        "r2engine-request-scope-v1",
+        r2sym::stable_scope_hash(Some(scope)),
+        scope.root_id().0,
+        functions,
+    ))
+}
+
+pub fn register_type_hints_identity_hash(hints: &HashMap<String, r2types::TypeHint>) -> u64 {
+    if hints.is_empty() {
+        return 0;
+    }
+    let mut entries = hints
+        .iter()
+        .map(|(register, hint)| {
+            let rank = match hint.rank {
+                r2types::TypeHintRank::Integer => 1_u8,
+                r2types::TypeHintRank::Float => 2_u8,
+                r2types::TypeHintRank::Pointer => 3_u8,
+            };
+            (register.as_str(), rank, hint.ty.as_str())
+        })
+        .collect::<Vec<_>>();
+    entries.sort_unstable();
+    stable_fnv1a_hash(&("r2engine-register-type-hints-v1", entries))
 }
 
 pub fn assumptions_identity_hash(assumptions: &r2ssa::AssumptionSet) -> u64 {
@@ -5395,55 +7442,19 @@ pub fn session_context_identity_hash_from_parsed(
     }
 }
 
-fn engine_analysis_to_artifacts(analysis: EngineAnalysis) -> EngineArtifacts {
-    EngineArtifacts {
-        prepared_ssa: Some(analysis.ssa_func),
-        pattern_ssa: Some(analysis.pattern_ssa_func),
-        ..EngineArtifacts::default()
-    }
-}
-
-fn engine_artifacts_to_analysis(artifacts: EngineArtifacts) -> Option<EngineAnalysis> {
-    Some(EngineAnalysis {
-        ssa_func: artifacts.prepared_ssa?,
-        pattern_ssa_func: artifacts.pattern_ssa?,
-    })
-}
-
-fn engine_analysis_artifact_to_artifacts(artifact: EngineAnalysisArtifact) -> EngineArtifacts {
-    EngineArtifacts {
-        prepared_ssa: Some(artifact.ssa_func),
-        pattern_ssa: Some(artifact.pattern_ssa_func),
-        function_facts: Some(artifact.function_facts),
-        writeback_plan: Some(artifact.writeback_plan),
-    }
-}
-
-fn engine_artifacts_to_analysis_artifact(
-    artifacts: EngineArtifacts,
-) -> Option<EngineAnalysisArtifact> {
-    Some(EngineAnalysisArtifact {
-        ssa_func: artifacts.prepared_ssa?,
-        pattern_ssa_func: artifacts.pattern_ssa?,
-        function_facts: artifacts.function_facts?,
-        writeback_plan: artifacts.writeback_plan?,
-    })
-}
-
-fn rename_engine_analysis(analysis: EngineAnalysis, function_name: &str) -> EngineAnalysis {
-    EngineAnalysis {
-        ssa_func: analysis.ssa_func.with_name(function_name),
-        pattern_ssa_func: analysis.pattern_ssa_func.with_name(function_name),
-    }
-}
-
 pub fn rename_engine_analysis_artifact(
     artifact: EngineAnalysisArtifact,
     function_name: &str,
 ) -> EngineAnalysisArtifact {
     EngineAnalysisArtifact {
-        ssa_func: artifact.ssa_func.with_name(function_name),
-        pattern_ssa_func: artifact.pattern_ssa_func.with_name(function_name),
+        ssa_func: Arc::new(artifact.ssa_func.as_ref().clone().with_name(function_name)),
+        pattern_ssa_func: Arc::new(
+            artifact
+                .pattern_ssa_func
+                .as_ref()
+                .clone()
+                .with_name(function_name),
+        ),
         function_facts: artifact.function_facts,
         writeback_plan: artifact.writeback_plan,
     }
@@ -5453,14 +7464,52 @@ fn build_engine_analysis_from_parts(
     function_name: &str,
     blocks: &[R2ILBlock],
     arch: Option<&r2il::ArchSpec>,
+    source_snapshot: Option<&EngineSourceSnapshot>,
 ) -> Option<EngineAnalysis> {
-    let ssa_func = r2ssa::SsaArtifact::for_decompile(blocks, arch)?.with_name(function_name);
-    let pattern_ssa_func = if should_reuse_decompile_ssa_for_pattern_analysis(&ssa_func) {
-        ssa_func.clone()
+    build_engine_analysis_from_parts_with_control(
+        function_name,
+        blocks,
+        arch,
+        source_snapshot,
+        &r2ssa::SsaExecutionControl::default(),
+    )
+    .ok()
+}
+
+fn build_engine_analysis_from_parts_with_control<C: r2ssa::SsaWorkControl + ?Sized>(
+    function_name: &str,
+    blocks: &[R2ILBlock],
+    arch: Option<&r2il::ArchSpec>,
+    source_snapshot: Option<&EngineSourceSnapshot>,
+    control: &C,
+) -> Result<EngineAnalysis, r2ssa::SsaPrepareError> {
+    let ssa_func = Arc::new(
+        if let Some(snapshot) = source_snapshot {
+            r2ssa::SsaArtifact::for_decompile_with_interfaces_and_control(
+                blocks,
+                arch,
+                snapshot.function_interface().cloned(),
+                snapshot.call_site_interfaces().to_vec(),
+                control,
+            )?
+        } else {
+            r2ssa::SsaArtifact::for_decompile_with_control(blocks, arch, control)?
+        }
+        .with_name(function_name),
+    );
+    control.poll()?;
+    let pattern_ssa_func = if source_snapshot.is_none()
+        && should_reuse_decompile_ssa_for_pattern_analysis(&ssa_func)
+    {
+        Arc::clone(&ssa_func)
     } else {
-        r2ssa::SsaArtifact::for_patterns(blocks, arch)?.with_name(function_name)
+        Arc::new(
+            r2ssa::SsaArtifact::for_patterns_with_control(blocks, arch, control)?
+                .with_name(function_name),
+        )
     };
-    Some(EngineAnalysis {
+    control.poll()?;
+    Ok(EngineAnalysis {
         ssa_func,
         pattern_ssa_func,
     })
@@ -5567,14 +7616,14 @@ pub fn build_interproc_summary_set_with_scope_facts(
 
 fn build_engine_analysis_artifact(
     request: &EngineAnalyzeRequest,
-    analysis: EngineAnalysis,
+    analysis: &EngineAnalysis,
 ) -> Option<EngineAnalysisArtifact> {
     let interproc_summary_set = request.include_interproc_summary_set.then(|| {
         build_interproc_summary_set_with_scope_facts(InterprocSummaryBuildInput {
             function_name: &request.function_name,
             function_addr: request.function_addr,
             arch: request.arch.as_ref(),
-            analysis: &analysis,
+            analysis,
             parsed_context: &request.parsed_context,
             scope_facts: &request.scope_facts,
             max_iterations: request.interproc_max_iterations,
@@ -5582,15 +7631,26 @@ fn build_engine_analysis_artifact(
         })
     });
     let semantic_analysis = if request.parsed_context.assumptions.is_empty() {
-        analysis.clone()
+        EngineAnalysis {
+            ssa_func: Arc::clone(&analysis.ssa_func),
+            pattern_ssa_func: Arc::clone(&analysis.pattern_ssa_func),
+        }
     } else {
         EngineAnalysis {
-            ssa_func: analysis
-                .ssa_func
-                .with_assumptions(&request.parsed_context.assumptions),
-            pattern_ssa_func: analysis
-                .pattern_ssa_func
-                .with_assumptions(&request.parsed_context.assumptions),
+            ssa_func: Arc::new(
+                analysis
+                    .ssa_func
+                    .as_ref()
+                    .clone()
+                    .with_assumptions(&request.parsed_context.assumptions),
+            ),
+            pattern_ssa_func: Arc::new(
+                analysis
+                    .pattern_ssa_func
+                    .as_ref()
+                    .clone()
+                    .with_assumptions(&request.parsed_context.assumptions),
+            ),
         }
     };
     let pattern_ssa_blocks = semantic_analysis.pattern_ssa_func.local_ssa_blocks();
@@ -5602,7 +7662,7 @@ fn build_engine_analysis_artifact(
         request.arch.as_ref(),
         request.semantic_metadata_enabled,
         &request.reg_type_hints,
-        &analysis,
+        analysis,
     )?;
     let mut diagnostics = r2types::TypeWritebackDiagnostics::default();
     let local_structs = r2types::infer_local_struct_artifacts_from_prepared_views(
@@ -5657,6 +7717,13 @@ fn build_engine_analysis_artifact(
             )
         })
     });
+    if request
+        .execution
+        .refusal_reason(EnginePhase::Types)
+        .is_some()
+    {
+        return None;
+    }
     let recovered_vars = r2types::recover_vars_from_ssa_with_prep_facts(
         &pattern_ssa_blocks,
         semantic_analysis.pattern_ssa_func.decompile_prep_facts(),
@@ -5701,6 +7768,13 @@ fn build_engine_analysis_artifact(
     } else {
         r2types::build_type_writeback_analysis(writeback_input)
     };
+    if request
+        .execution
+        .refusal_reason(EnginePhase::Certification)
+        .is_some()
+    {
+        return None;
+    }
     let mut function_facts = writeback.function_facts;
     let mut writeback_plan = writeback.plan;
     let mut usage = semantic_analysis.ssa_func.facts().assumption_usage.clone();
@@ -7128,7 +9202,15 @@ fn count_prepared_callsites(ssa_blocks: &[r2ssa::SSABlock]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::collections::{BTreeMap, BTreeSet, HashMap};
+    use std::fmt::Write;
+    use std::fs;
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use r2sleigh_lift::{Disassembler, build_arch_spec};
+    use sha2::{Digest, Sha256};
 
     fn test_decompile_route(
         kind: r2types::DecompileRouteKind,
@@ -7350,6 +9432,3145 @@ mod tests {
             target: r2il::Varnode::constant(0, 8),
         });
         vec![block]
+    }
+
+    fn source_snapshot_call_interface(
+        revision_identity: &[u8],
+        block_addr: u64,
+        op_index: usize,
+        target: u64,
+    ) -> r2ssa::SourceCallSiteInterface {
+        r2ssa::SourceCallSiteInterface::new(
+            revision_identity.to_vec(),
+            r2ssa::SourceCallSiteIdentity::new(
+                block_addr,
+                op_index,
+                r2ssa::CanonicalStorageId {
+                    space: r2ssa::CanonicalStorageSpace::Constant,
+                    offset: target,
+                    size: 8,
+                },
+            ),
+            true,
+            "sysv",
+            Vec::<r2ssa::SourceCallArgumentSpec>::new(),
+            false,
+            false,
+            r2ssa::SourceCallResult::Void,
+        )
+        .expect("source callsite interface")
+    }
+
+    fn source_snapshot_function_interface(
+        revision_identity: &[u8],
+    ) -> r2ssa::SourceFunctionInterface {
+        r2ssa::SourceFunctionInterface::new(
+            revision_identity.to_vec(),
+            "sysv",
+            Vec::<r2ssa::SourceAbiParameterSpec>::new(),
+            r2ssa::SourceFunctionReturn::Register {
+                storage: r2ssa::CanonicalStorageId {
+                    space: r2ssa::CanonicalStorageSpace::Register,
+                    offset: 0,
+                    size: 8,
+                },
+            },
+            Vec::<r2ssa::SourceStackSlotSpec>::new(),
+        )
+        .expect("source function interface")
+    }
+
+    fn exact_source_snapshot_function_interface(
+        revision_identity: &[u8],
+        member_count: u32,
+        scalar_bits: u64,
+    ) -> r2ssa::SourceFunctionInterface {
+        let scalar_bytes = u32::try_from(scalar_bits / 8).expect("test scalar width");
+        let aggregate_bits = u64::from(member_count) * scalar_bits;
+        let members = (0..member_count).map(|index| {
+            r2ssa::SourceAggregateMember::new(
+                index,
+                1,
+                u64::from(index) * scalar_bits,
+                scalar_bits,
+                format!("field_{index}"),
+            )
+        });
+        let graph = r2ssa::SourceTypeGraph::new(
+            [
+                r2ssa::SourceType::new(
+                    0,
+                    r2ssa::SourceTypeKind::Struct { aggregate_id: 0 },
+                    aggregate_bits,
+                    scalar_bits,
+                ),
+                r2ssa::SourceType::new(
+                    1,
+                    r2ssa::SourceTypeKind::SignedInteger,
+                    scalar_bits,
+                    scalar_bits,
+                ),
+                r2ssa::SourceType::new(
+                    2,
+                    r2ssa::SourceTypeKind::Pointer { target_type_id: 0 },
+                    64,
+                    64,
+                ),
+            ],
+            [r2ssa::SourceAggregateLayout::new(
+                0,
+                0,
+                aggregate_bits,
+                scalar_bits,
+                "DemoStruct",
+                members,
+            )],
+        )
+        .expect("valid exact source graph");
+        let register = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let scalar_carrier = if scalar_bytes == 8 {
+            r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::Full, 0, scalar_bits)
+        } else {
+            r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::LowBits, 0, scalar_bits)
+        };
+        r2ssa::SourceFunctionInterface::new_with_logical_types(
+            revision_identity.to_vec(),
+            "sysv",
+            [
+                r2ssa::SourceAbiParameterSpec::new(0, register(0)),
+                r2ssa::SourceAbiParameterSpec::new(1, register(8)),
+            ],
+            r2ssa::SourceFunctionReturn::Register {
+                storage: register(16),
+            },
+            Vec::<r2ssa::SourceStackSlotSpec>::new(),
+            [
+                r2ssa::SourceLogicalValue::new(
+                    2,
+                    r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::Full, 0, 64),
+                ),
+                r2ssa::SourceLogicalValue::new(1, scalar_carrier),
+            ],
+            Some(r2ssa::SourceLogicalValue::new(1, scalar_carrier)),
+            Some(graph),
+        )
+        .expect("valid exact source function interface")
+    }
+
+    fn source_snapshot_terminal_function()
+    -> (Vec<R2ILBlock>, r2il::ArchSpec, Arc<EngineSourceSnapshot>) {
+        let revision = b"production-terminal-revision";
+        let mut arch = r2il::ArchSpec::new("production-terminal-test");
+        arch.addr_size = 8;
+        arch.set_memory_endianness(r2il::Endianness::Little);
+        arch.add_register(r2il::RegisterDef::new("rax", 0, 8));
+        arch.add_register(r2il::RegisterDef::new("rdi", 8, 8));
+        arch.add_register(r2il::RegisterDef::new("rip", 16, 8));
+        arch.add_register(r2il::RegisterDef::new("rsi", 24, 8));
+        let register = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let interface = r2ssa::SourceFunctionInterface::new(
+            revision.to_vec(),
+            "test-register-abi",
+            [r2ssa::SourceAbiParameterSpec::new(0, register(8))],
+            r2ssa::SourceFunctionReturn::Register {
+                storage: register(0),
+            },
+            Vec::<r2ssa::SourceStackSlotSpec>::new(),
+        )
+        .expect("source function interface");
+        let snapshot = EngineSourceSnapshot::new(revision.to_vec(), Some(interface), Vec::new())
+            .expect("source snapshot");
+        let mut block = R2ILBlock::new(0x7200, 4);
+        block.push(r2il::R2ILOp::IntAdd {
+            dst: r2il::Varnode::unique(0x10, 8),
+            a: r2il::Varnode::register(8, 8),
+            b: r2il::Varnode::constant(1, 8),
+        });
+        block.push(r2il::R2ILOp::Copy {
+            dst: r2il::Varnode::register(0, 8),
+            src: r2il::Varnode::unique(0x10, 8),
+        });
+        block.push(r2il::R2ILOp::Return {
+            target: r2il::Varnode::register(16, 8),
+        });
+        (vec![block], arch, Arc::new(snapshot))
+    }
+
+    fn source_snapshot_memory_terminal_function()
+    -> (Vec<R2ILBlock>, r2il::ArchSpec, Arc<EngineSourceSnapshot>) {
+        let revision = b"production-memory-terminal-revision";
+        let mut arch = r2il::ArchSpec::new("production-memory-terminal-test");
+        arch.addr_size = 8;
+        arch.set_memory_endianness(r2il::Endianness::Little);
+        arch.add_space(r2il::AddressSpace::ram(8));
+        arch.add_register(r2il::RegisterDef::new("eax", 0, 4));
+        arch.add_register(r2il::RegisterDef::new("rip", 16, 8));
+        let interface = r2ssa::SourceFunctionInterface::new(
+            revision.to_vec(),
+            "test-register-abi",
+            Vec::<r2ssa::SourceAbiParameterSpec>::new(),
+            r2ssa::SourceFunctionReturn::Register {
+                storage: r2ssa::CanonicalStorageId {
+                    space: r2ssa::CanonicalStorageSpace::Register,
+                    offset: 0,
+                    size: 4,
+                },
+            },
+            Vec::<r2ssa::SourceStackSlotSpec>::new(),
+        )
+        .expect("source function interface");
+        let snapshot = EngineSourceSnapshot::new(revision.to_vec(), Some(interface), Vec::new())
+            .expect("source snapshot");
+        let mut block = R2ILBlock::new(0x7280, 4);
+        block.push(r2il::R2ILOp::Load {
+            dst: r2il::Varnode::register(0, 4),
+            space: r2il::SpaceId::Ram,
+            addr: r2il::Varnode::constant(0x40, 8),
+        });
+        block.push(r2il::R2ILOp::Return {
+            target: r2il::Varnode::register(16, 8),
+        });
+        (vec![block], arch, Arc::new(snapshot))
+    }
+
+    fn aggregate_member_test_arch() -> r2il::ArchSpec {
+        let mut arch = r2il::ArchSpec::new("aarch64");
+        arch.addr_size = 8;
+        arch.alignment = 4;
+        arch.add_register(r2il::RegisterDef::new("x0", 0, 8));
+        arch.add_register(r2il::RegisterDef::new("w0", 0, 4));
+        arch.add_register(r2il::RegisterDef::new("x1", 8, 8));
+        arch.add_register(r2il::RegisterDef::new("w1", 8, 4));
+        arch.add_register(r2il::RegisterDef::new("x4", 32, 8));
+        arch.add_register(r2il::RegisterDef::new("w4", 32, 4));
+        arch.add_register(r2il::RegisterDef::new("x30", 48, 8));
+        arch.add_space(r2il::AddressSpace::ram(8));
+        arch.set_memory_endianness(r2il::Endianness::Little);
+        arch
+    }
+
+    fn aggregate_member_test_graph() -> r2ssa::SourceTypeGraph {
+        r2ssa::SourceTypeGraph::new(
+            [
+                r2ssa::SourceType::new(
+                    0,
+                    r2ssa::SourceTypeKind::Struct { aggregate_id: 0 },
+                    56 * 8,
+                    32,
+                ),
+                r2ssa::SourceType::new(1, r2ssa::SourceTypeKind::SignedInteger, 32, 32),
+                r2ssa::SourceType::new(
+                    2,
+                    r2ssa::SourceTypeKind::Pointer { target_type_id: 0 },
+                    64,
+                    64,
+                ),
+            ],
+            [r2ssa::SourceAggregateLayout::new(
+                0,
+                0,
+                56 * 8,
+                32,
+                "CosmeticAggregateName",
+                (0..14).map(|index| {
+                    r2ssa::SourceAggregateMember::new(
+                        index,
+                        1,
+                        u64::from(index) * 32,
+                        32,
+                        format!("cosmetic_member_{index}"),
+                    )
+                }),
+            )],
+        )
+        .expect("valid aggregate-member source graph")
+    }
+
+    fn source_snapshot_aggregate_member_load_return_function()
+    -> (Vec<R2ILBlock>, r2il::ArchSpec, Arc<EngineSourceSnapshot>) {
+        let revision = b"production-aggregate-member-load-revision";
+        let register = |offset, size| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size,
+        };
+        let interface = r2ssa::SourceFunctionInterface::new_exact_with_logical_types(
+            revision.to_vec(),
+            "aapcs64",
+            [r2ssa::SourceAbiParameterSpec::new(0, register(0, 8))],
+            r2ssa::SourceFunctionReturn::Register {
+                storage: register(32, 4),
+            },
+            [],
+            [r2ssa::SourceLogicalValue::new(
+                2,
+                r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::Full, 0, 64),
+            )],
+            Some(r2ssa::SourceLogicalValue::new(
+                1,
+                r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::Full, 0, 32),
+            )),
+            Some(aggregate_member_test_graph()),
+        )
+        .expect("exact aggregate-member load interface");
+        let snapshot = EngineSourceSnapshot::new(revision.to_vec(), Some(interface), Vec::new())
+            .expect("aggregate-member load source snapshot");
+        let mut block = R2ILBlock::new(0x7700, 4);
+        block.push(r2il::R2ILOp::IntAdd {
+            dst: r2il::Varnode::unique(0x10, 8),
+            a: r2il::Varnode::register(0, 8),
+            b: r2il::Varnode::constant(8, 8),
+        });
+        block.push(r2il::R2ILOp::Load {
+            dst: r2il::Varnode::register(32, 4),
+            space: r2il::SpaceId::Ram,
+            addr: r2il::Varnode::unique(0x10, 8),
+        });
+        block.push(r2il::R2ILOp::Return {
+            target: r2il::Varnode::register(48, 8),
+        });
+        (
+            vec![block],
+            aggregate_member_test_arch(),
+            Arc::new(snapshot),
+        )
+    }
+
+    fn source_snapshot_aggregate_member_store_function()
+    -> (Vec<R2ILBlock>, r2il::ArchSpec, Arc<EngineSourceSnapshot>) {
+        let revision = b"production-aggregate-member-store-revision";
+        let register = |offset, size| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size,
+        };
+        let interface = r2ssa::SourceFunctionInterface::new_exact_with_logical_types(
+            revision.to_vec(),
+            "aapcs64",
+            [
+                r2ssa::SourceAbiParameterSpec::new(0, register(0, 8)),
+                r2ssa::SourceAbiParameterSpec::new(1, register(8, 8)),
+            ],
+            r2ssa::SourceFunctionReturn::Void,
+            [],
+            [
+                r2ssa::SourceLogicalValue::new(
+                    2,
+                    r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::Full, 0, 64),
+                ),
+                r2ssa::SourceLogicalValue::new(
+                    1,
+                    r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::LowBits, 0, 32),
+                ),
+            ],
+            None,
+            Some(aggregate_member_test_graph()),
+        )
+        .expect("exact aggregate-member store interface");
+        let snapshot = EngineSourceSnapshot::new(revision.to_vec(), Some(interface), Vec::new())
+            .expect("aggregate-member store source snapshot");
+        let mut block = R2ILBlock::new(0x7710, 4);
+        block.push(r2il::R2ILOp::Subpiece {
+            dst: r2il::Varnode::unique(0x18, 4),
+            src: r2il::Varnode::register(8, 8),
+            offset: 0,
+        });
+        block.push(r2il::R2ILOp::IntAdd {
+            dst: r2il::Varnode::unique(0x20, 8),
+            a: r2il::Varnode::register(0, 8),
+            b: r2il::Varnode::constant(52, 8),
+        });
+        block.push(r2il::R2ILOp::Store {
+            space: r2il::SpaceId::Ram,
+            addr: r2il::Varnode::unique(0x20, 8),
+            val: r2il::Varnode::unique(0x18, 4),
+        });
+        block.push(r2il::R2ILOp::Return {
+            target: r2il::Varnode::register(48, 8),
+        });
+        (
+            vec![block],
+            aggregate_member_test_arch(),
+            Arc::new(snapshot),
+        )
+    }
+
+    fn source_snapshot_direct_call_return_function()
+    -> (Vec<R2ILBlock>, r2il::ArchSpec, Arc<EngineSourceSnapshot>) {
+        let revision = b"production-direct-call-return-revision";
+        let mut arch = r2il::ArchSpec::new("production-direct-call-return-test");
+        arch.addr_size = 8;
+        arch.set_memory_endianness(r2il::Endianness::Little);
+        arch.add_register(r2il::RegisterDef::new("rax", 0, 8));
+        arch.add_register(r2il::RegisterDef::new("rdi", 8, 8));
+        arch.add_register(r2il::RegisterDef::new("rip", 16, 8));
+        let register = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let function_interface = r2ssa::SourceFunctionInterface::new(
+            revision.to_vec(),
+            "caller-test-abi",
+            [r2ssa::SourceAbiParameterSpec::new(0, register(8))],
+            r2ssa::SourceFunctionReturn::Register {
+                storage: register(0),
+            },
+            Vec::<r2ssa::SourceStackSlotSpec>::new(),
+        )
+        .expect("source function interface");
+        let target = r2il::Varnode::constant(0x8600, 8);
+        let call_interface = r2ssa::SourceCallSiteInterface::new(
+            revision.to_vec(),
+            r2ssa::SourceCallSiteIdentity::new(
+                0x7500,
+                1,
+                r2ssa::CanonicalStorageId::from_varnode(&target),
+            ),
+            true,
+            "callee-test-abi",
+            [r2ssa::SourceCallArgumentSpec::new(0, register(8))],
+            false,
+            false,
+            r2ssa::SourceCallResult::Void,
+        )
+        .expect("source callsite interface");
+        let snapshot = EngineSourceSnapshot::new(
+            revision.to_vec(),
+            Some(function_interface),
+            [call_interface],
+        )
+        .expect("source snapshot");
+        let mut call = R2ILBlock::new(0x7500, 4);
+        call.push(r2il::R2ILOp::Copy {
+            dst: r2il::Varnode::register(8, 8),
+            src: r2il::Varnode::constant(0x11, 8),
+        });
+        call.push(r2il::R2ILOp::Call { target });
+        let mut returned = R2ILBlock::new(0x7504, 4);
+        returned.push(r2il::R2ILOp::Copy {
+            dst: r2il::Varnode::register(0, 8),
+            src: r2il::Varnode::constant(7, 8),
+        });
+        returned.push(r2il::R2ILOp::Return {
+            target: r2il::Varnode::register(16, 8),
+        });
+        (vec![call, returned], arch, Arc::new(snapshot))
+    }
+
+    fn source_snapshot_conditional_return_function()
+    -> (Vec<R2ILBlock>, r2il::ArchSpec, Arc<EngineSourceSnapshot>) {
+        let revision = b"production-conditional-return-revision";
+        let mut arch = r2il::ArchSpec::new("production-conditional-return-test");
+        arch.addr_size = 8;
+        arch.set_memory_endianness(r2il::Endianness::Little);
+        arch.add_register(r2il::RegisterDef::new("rax", 0, 8));
+        arch.add_register(r2il::RegisterDef::new("rdi", 8, 8));
+        arch.add_register(r2il::RegisterDef::new("rip", 16, 8));
+        let register = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let interface = r2ssa::SourceFunctionInterface::new(
+            revision.to_vec(),
+            "test-register-abi",
+            [r2ssa::SourceAbiParameterSpec::new(0, register(8))],
+            r2ssa::SourceFunctionReturn::Register {
+                storage: register(0),
+            },
+            Vec::<r2ssa::SourceStackSlotSpec>::new(),
+        )
+        .expect("source function interface");
+        let snapshot = EngineSourceSnapshot::new(revision.to_vec(), Some(interface), Vec::new())
+            .expect("source snapshot");
+
+        let mut header = R2ILBlock::new(0x7300, 4);
+        header.push(r2il::R2ILOp::IntNotEqual {
+            dst: r2il::Varnode::unique(0x10, 1),
+            a: r2il::Varnode::register(8, 8),
+            b: r2il::Varnode::constant(0, 8),
+        });
+        header.push(r2il::R2ILOp::CBranch {
+            target: r2il::Varnode::ram(0x7320, 8),
+            cond: r2il::Varnode::unique(0x10, 1),
+        });
+        let mut false_arm = R2ILBlock::new(0x7304, 4);
+        false_arm.push(r2il::R2ILOp::Copy {
+            dst: r2il::Varnode::register(0, 8),
+            src: r2il::Varnode::constant(0, 8),
+        });
+        false_arm.push(r2il::R2ILOp::Return {
+            target: r2il::Varnode::register(16, 8),
+        });
+        let mut true_arm = R2ILBlock::new(0x7320, 4);
+        true_arm.push(r2il::R2ILOp::Copy {
+            dst: r2il::Varnode::register(0, 8),
+            src: r2il::Varnode::constant(u64::MAX, 8),
+        });
+        true_arm.push(r2il::R2ILOp::Return {
+            target: r2il::Varnode::register(16, 8),
+        });
+        (vec![header, false_arm, true_arm], arch, Arc::new(snapshot))
+    }
+
+    fn source_snapshot_conditional_funnel_return_function(
+        private_stack: bool,
+    ) -> (Vec<R2ILBlock>, r2il::ArchSpec, Arc<EngineSourceSnapshot>) {
+        let revision: &[u8] = if private_stack {
+            b"production-conditional-funnel-stack-revision"
+        } else {
+            b"production-conditional-funnel-register-revision"
+        };
+        let mut arch = r2il::ArchSpec::new("production-conditional-funnel-return-test");
+        arch.addr_size = 8;
+        arch.set_memory_endianness(r2il::Endianness::Little);
+        arch.add_register(r2il::RegisterDef::new("sp", 0, 8));
+        arch.add_register(r2il::RegisterDef::new("x0", 8, 8));
+        arch.add_register(r2il::RegisterDef::new("arg0", 16, 8));
+        arch.add_register(r2il::RegisterDef::new("pc", 24, 8));
+        let register = |offset, size| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size,
+        };
+        let stack_slots = private_stack
+            .then(|| {
+                r2ssa::SourceStackSlotSpec::new_local(
+                    r2ssa::StackAddressBase::StackPointer,
+                    register(0, 8),
+                    -4,
+                    4,
+                )
+            })
+            .into_iter();
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            revision.to_vec(),
+            "test-register-abi",
+            [r2ssa::SourceAbiParameterSpec::new(0, register(16, 8))],
+            r2ssa::SourceFunctionReturn::Register {
+                storage: register(8, 8),
+            },
+            stack_slots,
+        )
+        .expect("conditional funnel function interface");
+        let snapshot = EngineSourceSnapshot::new(revision.to_vec(), Some(interface), Vec::new())
+            .expect("conditional funnel source snapshot");
+
+        let condition = r2il::Varnode::unique(0x10, 1);
+        let mut entry = R2ILBlock::new(0x7600, 4);
+        entry.push(r2il::R2ILOp::IntEqual {
+            dst: condition.clone(),
+            a: r2il::Varnode::register(16, 8),
+            b: r2il::Varnode::constant(7, 8),
+        });
+        entry.push(r2il::R2ILOp::CBranch {
+            target: r2il::Varnode::ram(0x7620, 8),
+            cond: condition,
+        });
+
+        let blocks = if private_stack {
+            let mut forwarder = R2ILBlock::new(0x7604, 4);
+            forwarder.push(r2il::R2ILOp::Branch {
+                target: r2il::Varnode::ram(0x7608, 8),
+            });
+            let stack_address = |unique| {
+                let address = r2il::Varnode::unique(unique, 8);
+                (
+                    r2il::R2ILOp::IntAdd {
+                        dst: address.clone(),
+                        a: r2il::Varnode::register(0, 8),
+                        b: r2il::Varnode::constant((-4_i64) as u64, 8),
+                    },
+                    address,
+                )
+            };
+            let (false_address_op, false_address) = stack_address(0x30);
+            let mut false_arm = R2ILBlock::new(0x7608, 4);
+            false_arm.push(false_address_op);
+            false_arm.push(r2il::R2ILOp::Store {
+                space: r2il::SpaceId::Ram,
+                addr: false_address,
+                val: r2il::Varnode::constant(0, 4),
+            });
+            false_arm.push(r2il::R2ILOp::Branch {
+                target: r2il::Varnode::ram(0x7630, 8),
+            });
+            let (true_address_op, true_address) = stack_address(0x40);
+            let mut true_arm = R2ILBlock::new(0x7620, 4);
+            true_arm.push(true_address_op);
+            true_arm.push(r2il::R2ILOp::Store {
+                space: r2il::SpaceId::Ram,
+                addr: true_address,
+                val: r2il::Varnode::constant(1, 4),
+            });
+            true_arm.push(r2il::R2ILOp::Branch {
+                target: r2il::Varnode::ram(0x7630, 8),
+            });
+            let (join_address_op, join_address) = stack_address(0x50);
+            let loaded = r2il::Varnode::unique(0x60, 4);
+            let mut join = R2ILBlock::new(0x7630, 4);
+            join.push(join_address_op);
+            join.push(r2il::R2ILOp::Load {
+                dst: loaded.clone(),
+                space: r2il::SpaceId::Ram,
+                addr: join_address,
+            });
+            join.push(r2il::R2ILOp::IntZExt {
+                dst: r2il::Varnode::register(8, 8),
+                src: loaded,
+            });
+            join.push(r2il::R2ILOp::Return {
+                target: r2il::Varnode::register(24, 8),
+            });
+            vec![entry, forwarder, false_arm, true_arm, join]
+        } else {
+            let mut false_arm = R2ILBlock::new(0x7604, 4);
+            false_arm.push(r2il::R2ILOp::Copy {
+                dst: r2il::Varnode::register(8, 8),
+                src: r2il::Varnode::constant(0, 8),
+            });
+            false_arm.push(r2il::R2ILOp::Branch {
+                target: r2il::Varnode::ram(0x7630, 8),
+            });
+            let mut true_arm = R2ILBlock::new(0x7620, 4);
+            true_arm.push(r2il::R2ILOp::Copy {
+                dst: r2il::Varnode::register(8, 8),
+                src: r2il::Varnode::constant(1, 8),
+            });
+            true_arm.push(r2il::R2ILOp::Branch {
+                target: r2il::Varnode::ram(0x7630, 8),
+            });
+            let mut join = R2ILBlock::new(0x7630, 4);
+            join.push(r2il::R2ILOp::Return {
+                target: r2il::Varnode::register(24, 8),
+            });
+            vec![entry, false_arm, true_arm, join]
+        };
+        (blocks, arch, Arc::new(snapshot))
+    }
+
+    fn source_snapshot_private_frame_function(
+        revision: &[u8],
+    ) -> (Vec<R2ILBlock>, r2il::ArchSpec, Arc<EngineSourceSnapshot>) {
+        let mut arch = r2il::ArchSpec::new("production-private-frame-test");
+        arch.addr_size = 8;
+        arch.set_memory_endianness(r2il::Endianness::Little);
+        arch.add_register(r2il::RegisterDef::new("rax", 0, 8));
+        arch.add_register(r2il::RegisterDef::new("eax", 0, 4));
+        arch.add_register(r2il::RegisterDef::new("rdi", 8, 8));
+        arch.add_register(r2il::RegisterDef::new("edi", 8, 4));
+        arch.add_register(r2il::RegisterDef::new("rsp", 16, 8));
+        arch.add_register(r2il::RegisterDef::new("rbp", 24, 8));
+        arch.add_register(r2il::RegisterDef::new("rip", 32, 8));
+        let register = |offset, size| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size,
+        };
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            revision.to_vec(),
+            "sysv",
+            [r2ssa::SourceAbiParameterSpec::new(0, register(8, 4))],
+            r2ssa::SourceFunctionReturn::Register {
+                storage: register(0, 4),
+            },
+            [
+                r2ssa::SourceStackSlotSpec::new_parameter_home(
+                    r2ssa::StackAddressBase::FramePointer,
+                    register(24, 8),
+                    -8,
+                    4,
+                    0,
+                    register(8, 4),
+                ),
+                r2ssa::SourceStackSlotSpec::new_local(
+                    r2ssa::StackAddressBase::FramePointer,
+                    register(24, 8),
+                    -4,
+                    4,
+                ),
+            ],
+        )
+        .expect("private-frame source interface");
+        let snapshot = EngineSourceSnapshot::new(revision.to_vec(), Some(interface), Vec::new())
+            .expect("private-frame source snapshot");
+        let frame_address = |unique, offset: i64| {
+            let address = r2il::Varnode::unique(unique, 8);
+            (
+                r2il::R2ILOp::IntAdd {
+                    dst: address.clone(),
+                    a: r2il::Varnode::register(24, 8),
+                    b: r2il::Varnode::constant(offset as u64, 8),
+                },
+                address,
+            )
+        };
+
+        let mut entry = R2ILBlock::new(0x7800, 0x10);
+        let saved_fp = r2il::Varnode::unique(0x10, 8);
+        entry.push(r2il::R2ILOp::Copy {
+            dst: saved_fp.clone(),
+            src: r2il::Varnode::register(24, 8),
+        });
+        entry.push(r2il::R2ILOp::IntSub {
+            dst: r2il::Varnode::register(16, 8),
+            a: r2il::Varnode::register(16, 8),
+            b: r2il::Varnode::constant(8, 8),
+        });
+        entry.push(r2il::R2ILOp::Store {
+            space: r2il::SpaceId::Ram,
+            addr: r2il::Varnode::register(16, 8),
+            val: saved_fp,
+        });
+        entry.push(r2il::R2ILOp::Copy {
+            dst: r2il::Varnode::register(24, 8),
+            src: r2il::Varnode::register(16, 8),
+        });
+        let (home_address_op, home_address) = frame_address(0x20, -8);
+        entry.push(home_address_op);
+        entry.push(r2il::R2ILOp::Store {
+            space: r2il::SpaceId::Ram,
+            addr: home_address.clone(),
+            val: r2il::Varnode::register(8, 4),
+        });
+        let home_value = r2il::Varnode::unique(0x28, 4);
+        entry.push(r2il::R2ILOp::Load {
+            dst: home_value.clone(),
+            space: r2il::SpaceId::Ram,
+            addr: home_address,
+        });
+        let condition = r2il::Varnode::unique(0x30, 1);
+        entry.push(r2il::R2ILOp::IntEqual {
+            dst: condition.clone(),
+            a: home_value,
+            b: r2il::Varnode::constant(0x5ec2e7, 4),
+        });
+        entry.push(r2il::R2ILOp::CBranch {
+            target: r2il::Varnode::ram(0x7820, 8),
+            cond: condition,
+        });
+
+        let mut false_arm = R2ILBlock::new(0x7810, 0x10);
+        let (false_address_op, false_address) = frame_address(0x40, -4);
+        false_arm.push(false_address_op);
+        false_arm.push(r2il::R2ILOp::Store {
+            space: r2il::SpaceId::Ram,
+            addr: false_address,
+            val: r2il::Varnode::constant(0, 4),
+        });
+        false_arm.push(r2il::R2ILOp::Branch {
+            target: r2il::Varnode::ram(0x7830, 8),
+        });
+
+        let mut true_arm = R2ILBlock::new(0x7820, 0x10);
+        let (true_address_op, true_address) = frame_address(0x50, -4);
+        true_arm.push(true_address_op);
+        true_arm.push(r2il::R2ILOp::Store {
+            space: r2il::SpaceId::Ram,
+            addr: true_address,
+            val: r2il::Varnode::constant(1, 4),
+        });
+        true_arm.push(r2il::R2ILOp::Branch {
+            target: r2il::Varnode::ram(0x7830, 8),
+        });
+
+        let mut join = R2ILBlock::new(0x7830, 0x10);
+        let (local_address_op, local_address) = frame_address(0x60, -4);
+        join.push(local_address_op);
+        join.push(r2il::R2ILOp::Load {
+            dst: r2il::Varnode::register(0, 4),
+            space: r2il::SpaceId::Ram,
+            addr: local_address,
+        });
+        let restored_fp = r2il::Varnode::unique(0x70, 8);
+        join.push(r2il::R2ILOp::Load {
+            dst: restored_fp.clone(),
+            space: r2il::SpaceId::Ram,
+            addr: r2il::Varnode::register(16, 8),
+        });
+        join.push(r2il::R2ILOp::IntAdd {
+            dst: r2il::Varnode::register(16, 8),
+            a: r2il::Varnode::register(16, 8),
+            b: r2il::Varnode::constant(8, 8),
+        });
+        join.push(r2il::R2ILOp::Copy {
+            dst: r2il::Varnode::register(24, 8),
+            src: restored_fp,
+        });
+        join.push(r2il::R2ILOp::Load {
+            dst: r2il::Varnode::register(32, 8),
+            space: r2il::SpaceId::Ram,
+            addr: r2il::Varnode::register(16, 8),
+        });
+        join.push(r2il::R2ILOp::IntAdd {
+            dst: r2il::Varnode::register(16, 8),
+            a: r2il::Varnode::register(16, 8),
+            b: r2il::Varnode::constant(8, 8),
+        });
+        join.push(r2il::R2ILOp::Return {
+            target: r2il::Varnode::register(32, 8),
+        });
+
+        (
+            vec![entry, false_arm, true_arm, join],
+            arch,
+            Arc::new(snapshot),
+        )
+    }
+
+    // The only positive O2 FNV authority in these engine tests is this pinned real lift.
+    const REAL_FNV_SOURCE_SHA256: &str =
+        "6524278ba4cd32a72dcf9cbcc385275999a50c3449d0e97035736891bcddff09";
+    const REAL_FNV_O2_FUNCTION_SHA256: &str =
+        "127862f7bb0f1efcdd2830dd5bec8eadd8ac9812a847f477909b95fec671b6ac";
+    const REAL_FNV_O2_BINARY_SHA256: &str =
+        "e15adf9d8916bdbc1a45a07741734279cc815b87a5b2762cfb24cd78d33503c1";
+    const REAL_FNV_O2_BINARY_PATH: &str = "tests/r2r/bins/r2sleigh_manual_limits_O2";
+    const REAL_FNV_O2_COMPILER_COMMAND: &str =
+        "cc -O2 -g -o tests/r2r/bins/r2sleigh_manual_limits_O2 tests/gold/manual_limits.c";
+    const REAL_FNV_O2_BASE: u64 = 0x1_0000_0594;
+    const REAL_FNV_O2_SETUP: u64 = 0x1_0000_05ac;
+    const REAL_FNV_O2_LOOP: u64 = 0x1_0000_05b4;
+    const REAL_FNV_O2_EXIT: u64 = 0x1_0000_05d8;
+    const REAL_FNV_O2_BLOCKS: &[&str] = &[
+        "e80300aa607080d2a073aef200f6c1f2a08ce2f2810100b4",
+        "693680d20920c0f2",
+        "0a1540384b0501514c011b327f6900718a318a1a0a000aca407d099b210400f101ffff54",
+        "c0035fd6",
+    ];
+
+    const EXPECTED_FNV_SEMANTIC_C: &str = concat!(
+        "#include <stdint.h>\n",
+        "\n",
+        "uint64_t r2s_fn_sym_production_fnv_fold(const uint8_t *r2s_arg_bytes, uint64_t r2s_arg_length) {\n",
+        "\tconst uint8_t *r2s_local_pointer = r2s_arg_bytes;\n",
+        "\tuint64_t r2s_local_hash = UINT64_C(0x14650fb0739d0383);\n",
+        "\tuint64_t r2s_local_remaining = r2s_arg_length;\n",
+        "\twhile (r2s_local_remaining != UINT64_C(0x0)) {\n",
+        "\t\tuint8_t r2s_local_byte = *r2s_local_pointer;\n",
+        "\t\tuint32_t r2s_local_original = (uint32_t)r2s_local_byte;\n",
+        "\t\tuint32_t r2s_local_range = (uint32_t)(r2s_local_original - UINT32_C(0x41));\n",
+        "\t\tuint32_t r2s_local_lowercase = (uint32_t)(r2s_local_original | UINT32_C(0x20));\n",
+        "\t\tuint32_t r2s_local_folded = (r2s_local_range < UINT32_C(0x1a)) ? r2s_local_lowercase : r2s_local_original;\n",
+        "\t\tr2s_local_hash = (uint64_t)((r2s_local_hash ^ (uint64_t)r2s_local_folded) * UINT64_C(0x100000001b3));\n",
+        "\t\tr2s_local_pointer = r2s_local_pointer + UINT64_C(0x1);\n",
+        "\t\tr2s_local_remaining = (uint64_t)(r2s_local_remaining - UINT64_C(0x1));\n",
+        "\t}\n",
+        "\treturn r2s_local_hash;\n",
+        "}\n",
+    );
+
+    fn decode_real_fnv_hex(encoded: &str) -> Vec<u8> {
+        encoded
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let high = (pair[0] as char).to_digit(16).expect("hex digit") as u8;
+                let low = (pair[1] as char).to_digit(16).expect("hex digit") as u8;
+                (high << 4) | low
+            })
+            .collect()
+    }
+
+    fn real_fnv_sha256(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    fn real_fnv_arch() -> r2il::ArchSpec {
+        build_arch_spec(
+            sleigh_config::processor_aarch64::SLA_AARCH64_APPLESILICON,
+            sleigh_config::processor_aarch64::PSPEC_AARCH64,
+            "aarch64",
+        )
+        .expect("AARCH64 architecture")
+    }
+
+    fn real_fnv_storage(arch: &r2il::ArchSpec, register: &str) -> r2ssa::CanonicalStorageId {
+        let register = arch
+            .get_register(register)
+            .expect("pinned AARCH64 register");
+        r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset: register.offset,
+            size: register.size,
+        }
+    }
+
+    fn real_fnv_source_snapshot(
+        arch: &r2il::ArchSpec,
+        revision: &[u8],
+    ) -> Arc<EngineSourceSnapshot> {
+        let types = r2ssa::SourceTypeGraph::new(
+            [
+                r2ssa::SourceType::new(0, r2ssa::SourceTypeKind::UnsignedInteger, 8, 8),
+                r2ssa::SourceType::new(
+                    1,
+                    r2ssa::SourceTypeKind::Pointer { target_type_id: 0 },
+                    64,
+                    64,
+                ),
+                r2ssa::SourceType::new(2, r2ssa::SourceTypeKind::UnsignedInteger, 64, 64),
+            ],
+            [],
+        )
+        .expect("real FNV source type graph");
+        let full64 = r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::Full, 0, 64);
+        let interface = r2ssa::SourceFunctionInterface::new_exact_with_logical_types(
+            revision.to_vec(),
+            "aapcs64",
+            [
+                r2ssa::SourceAbiParameterSpec::new(0, real_fnv_storage(arch, "x0")),
+                r2ssa::SourceAbiParameterSpec::new(1, real_fnv_storage(arch, "x1")),
+            ],
+            r2ssa::SourceFunctionReturn::Register {
+                storage: real_fnv_storage(arch, "x0"),
+            },
+            [],
+            [
+                r2ssa::SourceLogicalValue::new(1, full64),
+                r2ssa::SourceLogicalValue::new(2, full64),
+            ],
+            Some(r2ssa::SourceLogicalValue::new(2, full64)),
+            Some(types),
+        )
+        .and_then(|interface| interface.with_return_address_storage(real_fnv_storage(arch, "x30")))
+        .expect("real FNV source interface");
+        Arc::new(
+            EngineSourceSnapshot::new(revision.to_vec(), Some(interface), Vec::new())
+                .expect("real FNV source snapshot"),
+        )
+    }
+
+    fn real_fnv_fold_function(
+        revision: &[u8],
+    ) -> (Vec<R2ILBlock>, r2il::ArchSpec, Arc<EngineSourceSnapshot>) {
+        let provenance = format!(
+            "binary={REAL_FNV_O2_BINARY_PATH} binary_sha256={REAL_FNV_O2_BINARY_SHA256} command={REAL_FNV_O2_COMPILER_COMMAND}"
+        );
+        assert_eq!(
+            real_fnv_sha256(include_bytes!("../../../tests/gold/manual_limits.c")),
+            REAL_FNV_SOURCE_SHA256,
+            "source provenance changed: {provenance}"
+        );
+        assert_eq!(
+            real_fnv_sha256(include_bytes!(
+                "../../../tests/r2r/bins/r2sleigh_manual_limits_O2"
+            )),
+            REAL_FNV_O2_BINARY_SHA256,
+            "full-binary provenance changed: {provenance}"
+        );
+        let function_bytes = REAL_FNV_O2_BLOCKS
+            .iter()
+            .flat_map(|encoded| decode_real_fnv_hex(encoded))
+            .collect::<Vec<_>>();
+        assert_eq!(function_bytes.len(), 72, "{provenance}");
+        assert_eq!(
+            real_fnv_sha256(&function_bytes),
+            REAL_FNV_O2_FUNCTION_SHA256,
+            "function-byte provenance changed: {provenance}"
+        );
+
+        let arch = real_fnv_arch();
+        let disassembler = Disassembler::from_sla(
+            sleigh_config::processor_aarch64::SLA_AARCH64_APPLESILICON,
+            sleigh_config::processor_aarch64::PSPEC_AARCH64,
+            "aarch64",
+        )
+        .expect("AARCH64 disassembler");
+        let mut address = REAL_FNV_O2_BASE;
+        let blocks = REAL_FNV_O2_BLOCKS
+            .iter()
+            .map(|encoded| {
+                let bytes = decode_real_fnv_hex(encoded);
+                let block = disassembler
+                    .lift_block(&bytes, address, bytes.len())
+                    .expect("pinned real ARM64 O2 FNV block");
+                assert_eq!(
+                    block.size as usize,
+                    bytes.len(),
+                    "real block must be fully consumed"
+                );
+                address += bytes.len() as u64;
+                block
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(blocks.len(), 4, "{provenance}");
+        let memory_spaces = blocks
+            .iter()
+            .flat_map(|block| &block.ops)
+            .filter_map(|op| match op {
+                r2il::R2ILOp::Load { space, .. } | r2il::R2ILOp::Store { space, .. } => {
+                    Some(*space)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !memory_spaces.is_empty(),
+            "real FNV lift must access memory"
+        );
+        assert!(
+            memory_spaces
+                .iter()
+                .all(|space| *space == r2il::SpaceId::Ram),
+            "real ARM64 FNV accesses must use Ram: {memory_spaces:?}"
+        );
+        let snapshot = real_fnv_source_snapshot(&arch, revision);
+        (blocks, arch, snapshot)
+    }
+
+    fn reference_fnv_fold(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0x1465_0fb0_739d_0383_u64, |hash, byte| {
+            let folded = if byte.is_ascii_uppercase() {
+                byte.to_ascii_lowercase()
+            } else {
+                *byte
+            };
+            (hash ^ u64::from(folded)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    }
+
+    fn compiled_fnv_results(source: &str, probes: &[Vec<u8>]) -> Vec<u64> {
+        let mut source = source.to_string();
+        source.push_str("\n#include <inttypes.h>\n#include <stdio.h>\n\nint main(void) {\n");
+        for (index, bytes) in probes.iter().enumerate() {
+            write!(&mut source, "\tstatic const uint8_t case_{index}[] = {{")
+                .expect("String writes cannot fail");
+            if bytes.is_empty() {
+                source.push_str("UINT8_C(0x0)");
+            } else {
+                for (byte_index, byte) in bytes.iter().enumerate() {
+                    if byte_index != 0 {
+                        source.push_str(", ");
+                    }
+                    write!(&mut source, "UINT8_C(0x{byte:02x})")
+                        .expect("String writes cannot fail");
+                }
+            }
+            source.push_str("};\n");
+            writeln!(
+                &mut source,
+                "\tprintf(\"%\" PRIu64 \"\\n\", r2s_fn_sym_production_fnv_fold(case_{index}, UINT64_C(0x{:x})));",
+                bytes.len()
+            )
+            .expect("String writes cannot fail");
+        }
+        source.push_str("\treturn 0;\n}\n");
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("r2engine-fnv-o2-{}-{nonce}", std::process::id()));
+        fs::create_dir(&directory).expect("temporary directory");
+        let source_path = directory.join("probe.c");
+        let executable = directory.join("probe");
+        fs::write(&source_path, source).expect("C source");
+        let compiler = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+        let status = Command::new(compiler)
+            .args(["-std=c11", "-Wall", "-Wextra", "-Wpedantic", "-Werror"])
+            .arg(&source_path)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .expect("C compiler");
+        assert!(status.success());
+        let output = Command::new(&executable)
+            .output()
+            .expect("compiled C probe");
+        assert!(output.status.success());
+        let results = String::from_utf8(output.stdout)
+            .expect("UTF-8 output")
+            .lines()
+            .map(|line| line.parse::<u64>().expect("integer output"))
+            .collect();
+        let _ = fs::remove_file(&source_path);
+        let _ = fs::remove_file(&executable);
+        let _ = fs::remove_dir(&directory);
+        results
+    }
+
+    fn source_snapshot_switch_return_function()
+    -> (Vec<R2ILBlock>, r2il::ArchSpec, Arc<EngineSourceSnapshot>) {
+        let revision = b"production-switch-return-revision";
+        let mut arch = r2il::ArchSpec::new("production-switch-return-test");
+        arch.addr_size = 8;
+        arch.set_memory_endianness(r2il::Endianness::Little);
+        arch.add_register(r2il::RegisterDef::new("rax", 0, 8));
+        arch.add_register(r2il::RegisterDef::new("rdi", 8, 8));
+        arch.add_register(r2il::RegisterDef::new("rip", 16, 8));
+        arch.add_register(r2il::RegisterDef::new("rsi", 24, 8));
+        let register = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let interface = r2ssa::SourceFunctionInterface::new(
+            revision.to_vec(),
+            "test-register-abi",
+            [r2ssa::SourceAbiParameterSpec::new(0, register(8))],
+            r2ssa::SourceFunctionReturn::Register {
+                storage: register(0),
+            },
+            Vec::<r2ssa::SourceStackSlotSpec>::new(),
+        )
+        .expect("source function interface");
+        let snapshot = EngineSourceSnapshot::new(revision.to_vec(), Some(interface), Vec::new())
+            .expect("source snapshot");
+
+        let mut header = R2ILBlock::new(0x7380, 4);
+        header.push(r2il::R2ILOp::BranchInd {
+            target: r2il::Varnode::register(8, 8),
+        });
+        header.set_switch_info(r2il::SwitchInfo {
+            switch_addr: 0x7380,
+            min_val: 1,
+            max_val: 7,
+            default_target: Some(0x73e0),
+            cases: vec![
+                r2il::SwitchCase {
+                    value: 1,
+                    target: 0x73a0,
+                },
+                r2il::SwitchCase {
+                    value: 7,
+                    target: 0x73c0,
+                },
+            ],
+        });
+        let arm = |addr, value| {
+            let mut block = R2ILBlock::new(addr, 4);
+            block.push(r2il::R2ILOp::Copy {
+                dst: r2il::Varnode::register(0, 8),
+                src: r2il::Varnode::constant(value, 8),
+            });
+            block.push(r2il::R2ILOp::Return {
+                target: r2il::Varnode::register(16, 8),
+            });
+            block
+        };
+        (
+            vec![header, arm(0x73a0, 11), arm(0x73c0, 22), arm(0x73e0, 33)],
+            arch,
+            Arc::new(snapshot),
+        )
+    }
+
+    fn source_snapshot_carrier_free_loop_return_function()
+    -> (Vec<R2ILBlock>, r2il::ArchSpec, Arc<EngineSourceSnapshot>) {
+        let revision = b"production-carrier-free-loop-return-revision";
+        let mut arch = r2il::ArchSpec::new("production-carrier-free-loop-return-test");
+        arch.addr_size = 8;
+        arch.set_memory_endianness(r2il::Endianness::Little);
+        arch.add_register(r2il::RegisterDef::new("rax", 0, 8));
+        arch.add_register(r2il::RegisterDef::new("dil", 8, 1));
+        arch.add_register(r2il::RegisterDef::new("rip", 16, 8));
+        arch.add_register(r2il::RegisterDef::new("sil", 24, 1));
+        let register = |offset, size| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size,
+        };
+        let interface = r2ssa::SourceFunctionInterface::new(
+            revision.to_vec(),
+            "test-register-abi",
+            [r2ssa::SourceAbiParameterSpec::new(0, register(8, 1))],
+            r2ssa::SourceFunctionReturn::Register {
+                storage: register(0, 8),
+            },
+            Vec::<r2ssa::SourceStackSlotSpec>::new(),
+        )
+        .expect("source function interface");
+        let snapshot = EngineSourceSnapshot::new(revision.to_vec(), Some(interface), Vec::new())
+            .expect("source snapshot");
+
+        let mut preheader = R2ILBlock::new(0x7400, 4);
+        preheader.push(r2il::R2ILOp::Branch {
+            target: r2il::Varnode::ram(0x7410, 8),
+        });
+        let mut header = R2ILBlock::new(0x7410, 4);
+        header.push(r2il::R2ILOp::CBranch {
+            target: r2il::Varnode::ram(0x7430, 8),
+            cond: r2il::Varnode::register(8, 1),
+        });
+        let mut exit = R2ILBlock::new(0x7414, 4);
+        exit.push(r2il::R2ILOp::Copy {
+            dst: r2il::Varnode::register(0, 8),
+            src: r2il::Varnode::constant(0x2a, 8),
+        });
+        exit.push(r2il::R2ILOp::Return {
+            target: r2il::Varnode::register(16, 8),
+        });
+        let mut body = R2ILBlock::new(0x7430, 4);
+        body.push(r2il::R2ILOp::Branch {
+            target: r2il::Varnode::ram(0x7410, 8),
+        });
+        (
+            vec![preheader, header, exit, body],
+            arch,
+            Arc::new(snapshot),
+        )
+    }
+
+    fn source_snapshot_counted_loop_return_function()
+    -> (Vec<R2ILBlock>, r2il::ArchSpec, Arc<EngineSourceSnapshot>) {
+        let revision = b"production-counted-loop-return-revision";
+        let mut arch = r2il::ArchSpec::new("production-counted-loop-return-test");
+        arch.addr_size = 8;
+        arch.set_memory_endianness(r2il::Endianness::Little);
+        arch.add_register(r2il::RegisterDef::new("rax", 0, 8));
+        arch.add_register(r2il::RegisterDef::new("rdi", 8, 8));
+        arch.add_register(r2il::RegisterDef::new("rip", 16, 8));
+        arch.add_register(r2il::RegisterDef::new("rsi", 24, 8));
+        let register = |offset, size| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size,
+        };
+        let interface = r2ssa::SourceFunctionInterface::new(
+            revision.to_vec(),
+            "test-register-abi",
+            [r2ssa::SourceAbiParameterSpec::new(0, register(8, 8))],
+            r2ssa::SourceFunctionReturn::Register {
+                storage: register(0, 8),
+            },
+            Vec::<r2ssa::SourceStackSlotSpec>::new(),
+        )
+        .expect("source function interface");
+        let snapshot = EngineSourceSnapshot::new(revision.to_vec(), Some(interface), Vec::new())
+            .expect("source snapshot");
+
+        let counter = r2il::Varnode::register(0, 8);
+        let mut preheader = R2ILBlock::new(0x7500, 4);
+        preheader.push(r2il::R2ILOp::Copy {
+            dst: counter.clone(),
+            src: r2il::Varnode::constant(0, 8),
+        });
+        preheader.push(r2il::R2ILOp::Branch {
+            target: r2il::Varnode::ram(0x7510, 8),
+        });
+        let condition = r2il::Varnode::unique(0x40, 1);
+        let mut header = R2ILBlock::new(0x7510, 4);
+        header.push(r2il::R2ILOp::IntLess {
+            dst: condition.clone(),
+            a: counter.clone(),
+            b: r2il::Varnode::register(8, 8),
+        });
+        header.push(r2il::R2ILOp::CBranch {
+            target: r2il::Varnode::ram(0x7530, 8),
+            cond: condition,
+        });
+        let mut exit = R2ILBlock::new(0x7514, 4);
+        exit.push(r2il::R2ILOp::Return {
+            target: r2il::Varnode::register(16, 8),
+        });
+        let mut latch = R2ILBlock::new(0x7530, 4);
+        latch.push(r2il::R2ILOp::IntAdd {
+            dst: counter.clone(),
+            a: counter,
+            b: r2il::Varnode::constant(1, 8),
+        });
+        latch.push(r2il::R2ILOp::Branch {
+            target: r2il::Varnode::ram(0x7510, 8),
+        });
+        (
+            vec![preheader, header, exit, latch],
+            arch,
+            Arc::new(snapshot),
+        )
+    }
+
+    #[test]
+    fn production_engine_renders_only_exact_certified_terminal_subset() {
+        let (blocks, arch, source_snapshot) = source_snapshot_terminal_function();
+        let response = EngineSession::new(4).decompile_function_from_input(
+            EngineFunctionDecompileRequestInput::single_function(
+                EngineFunctionInput {
+                    function_name: "sym.production_terminal".to_string(),
+                    function_addr: 0x7200,
+                    blocks: blocks.clone(),
+                    arch: Some(arch.clone()),
+                    source_snapshot: Some(source_snapshot),
+                    semantic_metadata_enabled: true,
+                },
+                Some(64),
+                r2types::ParsedExternalContext::default(),
+                0,
+            ),
+        );
+        assert!(
+            response
+                .output
+                .contains("uint64_t certified_sub_7200(uint64_t v_")
+                && response.output.contains("return v_"),
+            "exact terminal source snapshot must reach certified semantic C:\n{}",
+            response.output
+        );
+        assert_eq!(
+            response.diagnostics.semantic_kernel_render,
+            Some(EngineSemanticKernelRender {
+                region: EngineSemanticKernelRegion::TerminalReturnBlock,
+                region_schema_version: r2dec::CERTIFIED_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
+                exact_obligation_closure: true,
+            })
+        );
+        assert!(response.diagnostics.render_permission.is_none());
+        assert!(response.diagnostics.proof_coverage.is_none());
+        assert!(response.diagnostics.refusal.is_none());
+
+        let absent = EngineSession::new(4).decompile_function_from_input(
+            EngineFunctionDecompileRequestInput::single_function(
+                EngineFunctionInput {
+                    function_name: "sym.production_terminal".to_string(),
+                    function_addr: 0x7200,
+                    blocks,
+                    arch: Some(arch),
+                    source_snapshot: None,
+                    semantic_metadata_enabled: true,
+                },
+                Some(64),
+                r2types::ParsedExternalContext::default(),
+                0,
+            ),
+        );
+        assert!(
+            absent.output.contains("r2dec residual:")
+                && !absent.output.contains("certified_sub_7200"),
+            "missing source snapshot must fail closed:\n{}",
+            absent.output
+        );
+        assert!(absent.diagnostics.semantic_kernel_render.is_none());
+    }
+
+    #[test]
+    fn production_engine_renders_only_exact_certified_memory_terminal_subset() {
+        let (blocks, arch, source_snapshot) = source_snapshot_memory_terminal_function();
+        let response = EngineSession::new(4).decompile_function_from_input(
+            EngineFunctionDecompileRequestInput::single_function(
+                EngineFunctionInput {
+                    function_name: "sym.production_memory_terminal".to_string(),
+                    function_addr: 0x7280,
+                    blocks: blocks.clone(),
+                    arch: Some(arch.clone()),
+                    source_snapshot: Some(source_snapshot),
+                    semantic_metadata_enabled: true,
+                },
+                Some(64),
+                r2types::ParsedExternalContext::default(),
+                0,
+            ),
+        );
+        assert!(
+            response
+                .output
+                .contains("uint32_t certified_mem_sub_7280(void)")
+                && response.output.contains("r2s_ram_read_le_u32")
+                && response.output.contains("return v_"),
+            "exact memory source snapshot must reach certified semantic C:\n{}",
+            response.output
+        );
+        assert_eq!(
+            response.diagnostics.semantic_kernel_render,
+            Some(EngineSemanticKernelRender {
+                region: EngineSemanticKernelRegion::PlainRamMemoryTerminalReturnFunction,
+                region_schema_version: r2dec::CERTIFIED_MEMORY_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
+                exact_obligation_closure: true,
+            })
+        );
+        assert_eq!(response.diagnostics.plan, Some(EnginePlan::FastLocal));
+        assert!(response.diagnostics.render_permission.is_none());
+        assert!(response.diagnostics.proof_coverage.is_none());
+        assert!(response.diagnostics.refusal.is_none());
+
+        for source_snapshot in [
+            None,
+            Some(Arc::new(
+                EngineSourceSnapshot::new(
+                    b"production-memory-terminal-revision".to_vec(),
+                    None,
+                    Vec::new(),
+                )
+                .expect("source snapshot without interface"),
+            )),
+        ] {
+            let refused = EngineSession::new(4).decompile_function_from_input(
+                EngineFunctionDecompileRequestInput::single_function(
+                    EngineFunctionInput {
+                        function_name: "sym.production_memory_terminal".to_string(),
+                        function_addr: 0x7280,
+                        blocks: blocks.clone(),
+                        arch: Some(arch.clone()),
+                        source_snapshot,
+                        semantic_metadata_enabled: true,
+                    },
+                    Some(64),
+                    r2types::ParsedExternalContext::default(),
+                    0,
+                ),
+            );
+            assert!(
+                refused.output.contains("r2dec residual:")
+                    && !refused.output.contains("certified_mem_sub_7280"),
+                "absent or incomplete source authority must fail closed:\n{}",
+                refused.output
+            );
+            assert!(refused.diagnostics.semantic_kernel_render.is_none());
+        }
+    }
+
+    #[test]
+    fn production_engine_prefers_exact_aggregate_member_terminal_subset() {
+        let (load_blocks, load_arch, load_snapshot) =
+            source_snapshot_aggregate_member_load_return_function();
+        assert!(
+            load_snapshot
+                .function_interface()
+                .is_some_and(r2ssa::SourceFunctionInterface::stack_slot_roles_complete)
+        );
+        let prepared_load = r2ssa::SsaArtifact::for_decompile_with_interface(
+            &load_blocks,
+            Some(&load_arch),
+            load_snapshot
+                .function_interface()
+                .cloned()
+                .expect("aggregate load interface"),
+        )
+        .expect("prepared aggregate load");
+        assert!(
+            r2dec::CertifiedAggregateMemberSemanticCFunction::from_artifact(&prepared_load).is_ok()
+        );
+        assert!(r2dec::CertifiedMemorySemanticCFunction::from_artifact(&prepared_load).is_ok());
+
+        let load = EngineSession::new(4).decompile_function_from_input(
+            EngineFunctionDecompileRequestInput::single_function(
+                EngineFunctionInput {
+                    function_name: "sym.production_aggregate_member_load".to_string(),
+                    function_addr: 0x7700,
+                    blocks: load_blocks.clone(),
+                    arch: Some(load_arch.clone()),
+                    source_snapshot: Some(Arc::clone(&load_snapshot)),
+                    semantic_metadata_enabled: true,
+                },
+                Some(64),
+                r2types::ParsedExternalContext::default(),
+                0,
+            ),
+        );
+        assert!(
+            load.output
+                .contains("int32_t certified_aggregate_sub_7700(r2s_struct_0 *arg_0)")
+                && load.output.contains(
+                    "r2s_ram_read_le_u32(((uint64_t)(uintptr_t)((const uint8_t *)&arg_0->field_2)))"
+                ),
+            "exact aggregate load must use the typed member renderer:\n{}",
+            load.output
+        );
+        assert_eq!(
+            load.diagnostics.semantic_kernel_render,
+            Some(EngineSemanticKernelRender {
+                region: EngineSemanticKernelRegion::AggregateMemberTerminalReturnFunction,
+                region_schema_version:
+                    r2dec::CERTIFIED_AGGREGATE_MEMBER_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
+                exact_obligation_closure: true,
+            })
+        );
+        assert_eq!(load.diagnostics.plan, Some(EnginePlan::FastLocal));
+        assert!(load.diagnostics.render_permission.is_none());
+        assert!(load.diagnostics.proof_coverage.is_none());
+        assert!(load.diagnostics.refusal.is_none());
+
+        let (store_blocks, store_arch, store_snapshot) =
+            source_snapshot_aggregate_member_store_function();
+        let store = EngineSession::new(4).decompile_function_from_input(
+            EngineFunctionDecompileRequestInput::single_function(
+                EngineFunctionInput {
+                    function_name: "sym.production_aggregate_member_store".to_string(),
+                    function_addr: 0x7710,
+                    blocks: store_blocks,
+                    arch: Some(store_arch),
+                    source_snapshot: Some(store_snapshot),
+                    semantic_metadata_enabled: true,
+                },
+                Some(64),
+                r2types::ParsedExternalContext::default(),
+                0,
+            ),
+        );
+        assert!(
+            store
+                .output
+                .contains("void certified_aggregate_sub_7710(r2s_struct_0 *arg_0, int32_t arg_1)")
+                && store.output.contains(
+                    "r2s_ram_write_le_u32(((uint64_t)(uintptr_t)((uint8_t *)&arg_0->field_13))"
+                ),
+            "exact aggregate store must retain signed ABI and member address:\n{}",
+            store.output
+        );
+        assert_eq!(
+            store.diagnostics.semantic_kernel_render,
+            Some(EngineSemanticKernelRender {
+                region: EngineSemanticKernelRegion::AggregateMemberTerminalReturnFunction,
+                region_schema_version:
+                    r2dec::CERTIFIED_AGGREGATE_MEMBER_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
+                exact_obligation_closure: true,
+            })
+        );
+
+        let mut indirect_address = load_blocks;
+        indirect_address[0].ops.insert(
+            1,
+            r2il::R2ILOp::Copy {
+                dst: r2il::Varnode::unique(0x11, 8),
+                src: r2il::Varnode::unique(0x10, 8),
+            },
+        );
+        let r2il::R2ILOp::Load { addr, .. } = &mut indirect_address[0].ops[2] else {
+            panic!("aggregate near-miss load");
+        };
+        *addr = r2il::Varnode::unique(0x11, 8);
+        let prepared_near_miss = r2ssa::SsaArtifact::for_decompile_with_interface(
+            &indirect_address,
+            Some(&load_arch),
+            load_snapshot
+                .function_interface()
+                .cloned()
+                .expect("aggregate near-miss interface"),
+        )
+        .expect("prepared aggregate near miss");
+        assert!(
+            r2dec::CertifiedAggregateMemberSemanticCFunction::from_artifact(&prepared_near_miss)
+                .is_err()
+        );
+        assert!(
+            r2dec::CertifiedMemorySemanticCFunction::from_artifact(&prepared_near_miss).is_ok()
+        );
+        let refused = EngineSession::new(4).decompile_function_from_input(
+            EngineFunctionDecompileRequestInput::single_function(
+                EngineFunctionInput {
+                    function_name: "sym.production_aggregate_member_near_miss".to_string(),
+                    function_addr: 0x7700,
+                    blocks: indirect_address,
+                    arch: Some(load_arch),
+                    source_snapshot: Some(load_snapshot),
+                    semantic_metadata_enabled: true,
+                },
+                Some(64),
+                r2types::ParsedExternalContext::default(),
+                0,
+            ),
+        );
+        assert!(
+            refused.output.contains("r2dec residual:")
+                && !refused.output.contains("certified_aggregate_sub_7700")
+                && !refused.output.contains("certified_mem_sub_7700"),
+            "non-direct aggregate address must not downgrade to generic memory C:\n{}",
+            refused.output
+        );
+        assert!(refused.diagnostics.semantic_kernel_render.is_none());
+    }
+
+    #[test]
+    fn production_engine_renders_only_exact_certified_direct_call_return_subset() {
+        let (blocks, arch, source_snapshot) = source_snapshot_direct_call_return_function();
+        let prepared = EngineSession::new(4)
+            .analyze(EngineAnalyzeRequest::full_semantics_for_function(
+                EngineAnalyzeFunctionRequestInput {
+                    function: EngineFunctionInput {
+                        function_name: "sym.production_direct_call_return".to_string(),
+                        function_addr: 0x7500,
+                        blocks: blocks.clone(),
+                        arch: Some(arch.clone()),
+                        source_snapshot: Some(Arc::clone(&source_snapshot)),
+                        semantic_metadata_enabled: true,
+                    },
+                    ptr_bits: Some(64),
+                    reg_type_hints: HashMap::new(),
+                    parsed_context: r2types::ParsedExternalContext::default(),
+                    external_context_fallback_hash: 0,
+                    scope_facts: InterprocScopeFacts::empty(),
+                    interproc_max_iterations: 1,
+                    symbolic_scope: None,
+                    precomputed_semantic_artifact: None,
+                    include_interproc_summary_set: false,
+                },
+            ))
+            .expect("prepared call/return analysis");
+        r2dec::CertifiedDirectCallReturnFunction::from_artifact(
+            prepared.artifact.ssa_func.as_ref(),
+        )
+        .unwrap_or_else(|error| panic!("engine-prepared call/return artifact: {error:?}"));
+        let response = EngineSession::new(4).decompile_function_from_input(
+            EngineFunctionDecompileRequestInput::single_function(
+                EngineFunctionInput {
+                    function_name: "sym.production_direct_call_return".to_string(),
+                    function_addr: 0x7500,
+                    blocks: blocks.clone(),
+                    arch: Some(arch.clone()),
+                    source_snapshot: Some(Arc::clone(&source_snapshot)),
+                    semantic_metadata_enabled: true,
+                },
+                Some(64),
+                r2types::ParsedExternalContext::default(),
+                0,
+            ),
+        );
+        assert!(
+            response
+                .output
+                .contains("uint64_t certified_call_sub_7500(uint64_t arg_0)")
+                && response.output.contains("extern void r2s_call_")
+                && response.output.contains("_at_0000000000007500_1")
+                && response.output.contains("return v_"),
+            "exact callsite source snapshot must reach certified semantic C:\n{}",
+            response.output
+        );
+        assert_eq!(
+            response.diagnostics.semantic_kernel_render,
+            Some(EngineSemanticKernelRender {
+                region: EngineSemanticKernelRegion::DirectCallTerminalReturnFunction,
+                region_schema_version: r2dec::CERTIFIED_DIRECT_CALL_RETURN_FUNCTION_SCHEMA_VERSION,
+                exact_obligation_closure: true,
+            })
+        );
+        assert_eq!(
+            response.diagnostics.plan,
+            Some(EnginePlan::SemanticStructured)
+        );
+        assert!(response.diagnostics.render_permission.is_none());
+        assert!(response.diagnostics.proof_coverage.is_none());
+        assert!(response.diagnostics.refusal.is_none());
+
+        let missing_callsite = Arc::new(
+            EngineSourceSnapshot::new(
+                source_snapshot.revision_identity().to_vec(),
+                source_snapshot.function_interface().cloned(),
+                Vec::new(),
+            )
+            .expect("snapshot without exact callsite interface"),
+        );
+        let refused = EngineSession::new(4).decompile_function_from_input(
+            EngineFunctionDecompileRequestInput::single_function(
+                EngineFunctionInput {
+                    function_name: "sym.production_direct_call_return".to_string(),
+                    function_addr: 0x7500,
+                    blocks,
+                    arch: Some(arch),
+                    source_snapshot: Some(missing_callsite),
+                    semantic_metadata_enabled: true,
+                },
+                Some(64),
+                r2types::ParsedExternalContext::default(),
+                0,
+            ),
+        );
+        assert!(
+            refused.output.contains("r2dec residual:")
+                && !refused.output.contains("certified_call_sub_7500"),
+            "missing callsite authority must fail closed:\n{}",
+            refused.output
+        );
+        assert!(refused.diagnostics.semantic_kernel_render.is_none());
+    }
+
+    #[test]
+    fn production_engine_renders_exact_certified_conditional_return_subset() {
+        let (blocks, arch, source_snapshot) = source_snapshot_conditional_return_function();
+        let response = EngineSession::new(4).decompile_function_from_input(
+            EngineFunctionDecompileRequestInput::single_function(
+                EngineFunctionInput {
+                    function_name: "sym.production_conditional_return".to_string(),
+                    function_addr: 0x7300,
+                    blocks,
+                    arch: Some(arch),
+                    source_snapshot: Some(source_snapshot),
+                    semantic_metadata_enabled: true,
+                },
+                Some(64),
+                r2types::ParsedExternalContext::default(),
+                0,
+            ),
+        );
+        assert!(
+            response
+                .output
+                .contains("uint64_t certified_sub_7300(uint64_t v_")
+                && response.output.contains("if ((uint8_t)(v_")
+                && response.output.contains("} else {")
+                && response.output.matches("return v_").count() == 2,
+            "exact conditional source snapshot must reach certified semantic C:\n{}",
+            response.output
+        );
+        assert_eq!(
+            response.diagnostics.semantic_kernel_render,
+            Some(EngineSemanticKernelRender {
+                region: EngineSemanticKernelRegion::ConditionalTerminalReturnFunction,
+                region_schema_version: r2dec::CERTIFIED_CONDITIONAL_RETURN_FUNCTION_SCHEMA_VERSION,
+                exact_obligation_closure: true,
+            })
+        );
+        assert_eq!(
+            response.diagnostics.plan,
+            Some(EnginePlan::SemanticStructured)
+        );
+        assert!(response.diagnostics.render_permission.is_none());
+        assert!(response.diagnostics.proof_coverage.is_none());
+        assert!(response.diagnostics.refusal.is_none());
+    }
+
+    #[test]
+    fn production_engine_renders_exact_register_phi_conditional_funnel_subset() {
+        let (blocks, arch, source_snapshot) =
+            source_snapshot_conditional_funnel_return_function(false);
+        assert!(
+            source_snapshot
+                .function_interface()
+                .is_some_and(r2ssa::SourceFunctionInterface::stack_slot_roles_complete)
+        );
+        let session = EngineSession::new(4);
+        let response = session.decompile_function_from_input(
+            EngineFunctionDecompileRequestInput::single_function(
+                EngineFunctionInput {
+                    function_name: "sym.production_conditional_funnel_register".to_string(),
+                    function_addr: 0x7600,
+                    blocks: blocks.clone(),
+                    arch: Some(arch.clone()),
+                    source_snapshot: Some(Arc::clone(&source_snapshot)),
+                    semantic_metadata_enabled: true,
+                },
+                Some(64),
+                r2types::ParsedExternalContext::default(),
+                0,
+            ),
+        );
+        assert!(
+            response
+                .output
+                .contains("uint64_t certified_sub_7600(uint64_t v_")
+                && response.output.contains("\tuint64_t v_")
+                && response.output.contains("\tif ((uint8_t)(")
+                && response.output.contains("\t} else {")
+                && response
+                    .output
+                    .lines()
+                    .filter(|line| line.starts_with("\treturn (uint64_t)("))
+                    .count()
+                    == 1,
+            "exact register-phi funnel must reach certified semantic C:\n{}",
+            response.output
+        );
+        assert_eq!(
+            response.diagnostics.semantic_kernel_render,
+            Some(EngineSemanticKernelRender {
+                region: EngineSemanticKernelRegion::ConditionalFunnelSharedReturnFunction,
+                region_schema_version:
+                    r2dec::CERTIFIED_CONDITIONAL_FUNNEL_RETURN_FUNCTION_SCHEMA_VERSION,
+                exact_obligation_closure: true,
+            })
+        );
+        assert_eq!(
+            response.diagnostics.plan,
+            Some(EnginePlan::SemanticStructured)
+        );
+        assert_eq!(
+            response.diagnostics.route_reason.as_deref(),
+            Some("r2cert authorized exact conditional-funnel shared-return obligation closure")
+        );
+        assert!(response.diagnostics.render_permission.is_none());
+        assert!(response.diagnostics.proof_coverage.is_none());
+        assert!(response.diagnostics.refusal.is_none());
+
+        let cache_after_uncached = session.cache_metrics();
+        let cached = session.decompile_function_from_input(
+            EngineFunctionDecompileRequestInput::single_function(
+                EngineFunctionInput {
+                    function_name: "sym.production_conditional_funnel_register".to_string(),
+                    function_addr: 0x7600,
+                    blocks: blocks.clone(),
+                    arch: Some(arch.clone()),
+                    source_snapshot: Some(Arc::clone(&source_snapshot)),
+                    semantic_metadata_enabled: true,
+                },
+                Some(64),
+                r2types::ParsedExternalContext::default(),
+                0,
+            ),
+        );
+        assert_eq!(cached.output, response.output);
+        assert_eq!(
+            cached.diagnostics.semantic_kernel_render,
+            response.diagnostics.semantic_kernel_render
+        );
+        let cache_after_reuse = session.cache_metrics();
+        assert!(cache_after_reuse.analysis.hits > cache_after_uncached.analysis.hits);
+        assert_eq!(
+            cache_after_reuse.analysis.insertions,
+            cache_after_uncached.analysis.insertions
+        );
+
+        let mut wrong_width = blocks;
+        wrong_width[1].ops[0] = r2il::R2ILOp::Copy {
+            dst: r2il::Varnode::register(8, 4),
+            src: r2il::Varnode::constant(0, 4),
+        };
+        let refused = session.decompile_function_from_input(
+            EngineFunctionDecompileRequestInput::single_function(
+                EngineFunctionInput {
+                    function_name: "sym.production_conditional_funnel_register".to_string(),
+                    function_addr: 0x7600,
+                    blocks: wrong_width,
+                    arch: Some(arch),
+                    source_snapshot: Some(source_snapshot),
+                    semantic_metadata_enabled: true,
+                },
+                Some(64),
+                r2types::ParsedExternalContext::default(),
+                0,
+            ),
+        );
+        assert!(
+            refused.output.contains("r2dec residual:")
+                && !refused.output.contains("certified_sub_7600"),
+            "carrier-width mutation must fail closed:\n{}",
+            refused.output
+        );
+        assert!(refused.diagnostics.semantic_kernel_render.is_none());
+    }
+
+    #[test]
+    fn production_engine_renders_exact_private_stack_conditional_funnel_subset() {
+        let (blocks, arch, source_snapshot) =
+            source_snapshot_conditional_funnel_return_function(true);
+        assert!(
+            source_snapshot
+                .function_interface()
+                .is_some_and(r2ssa::SourceFunctionInterface::stack_slot_roles_complete)
+        );
+        let response = EngineSession::new(4).decompile_function_from_input(
+            EngineFunctionDecompileRequestInput::single_function(
+                EngineFunctionInput {
+                    function_name: "sym.production_conditional_funnel_stack".to_string(),
+                    function_addr: 0x7600,
+                    blocks: blocks.clone(),
+                    arch: Some(arch.clone()),
+                    source_snapshot: Some(source_snapshot),
+                    semantic_metadata_enabled: true,
+                },
+                Some(64),
+                r2types::ParsedExternalContext::default(),
+                0,
+            ),
+        );
+        assert!(
+            response
+                .output
+                .contains("uint64_t certified_sub_7600(uint64_t v_")
+                && response.output.contains("\tuint32_t v_")
+                && response.output.contains("\tif ((uint8_t)(")
+                && response.output.contains("\t} else {")
+                && response
+                    .output
+                    .lines()
+                    .filter(|line| line.starts_with("\treturn (uint64_t)("))
+                    .count()
+                    == 1,
+            "exact private-stack funnel must reach certified semantic C:\n{}",
+            response.output
+        );
+        for forbidden in ["r2s_load", "r2s_store", "*(", "sp_", "fp_"] {
+            assert!(
+                !response.output.contains(forbidden),
+                "private stack carrier leaked through {forbidden}:\n{}",
+                response.output
+            );
+        }
+        assert_eq!(
+            response.diagnostics.semantic_kernel_render,
+            Some(EngineSemanticKernelRender {
+                region: EngineSemanticKernelRegion::ConditionalFunnelSharedReturnFunction,
+                region_schema_version:
+                    r2dec::CERTIFIED_CONDITIONAL_FUNNEL_RETURN_FUNCTION_SCHEMA_VERSION,
+                exact_obligation_closure: true,
+            })
+        );
+        assert_eq!(
+            response.diagnostics.plan,
+            Some(EnginePlan::SemanticStructured)
+        );
+        assert!(response.diagnostics.render_permission.is_none());
+        assert!(response.diagnostics.proof_coverage.is_none());
+        assert!(response.diagnostics.refusal.is_none());
+
+        let refused = EngineSession::new(4).decompile_function_from_input(
+            EngineFunctionDecompileRequestInput::single_function(
+                EngineFunctionInput {
+                    function_name: "sym.production_conditional_funnel_stack".to_string(),
+                    function_addr: 0x7600,
+                    blocks,
+                    arch: Some(arch),
+                    source_snapshot: None,
+                    semantic_metadata_enabled: true,
+                },
+                Some(64),
+                r2types::ParsedExternalContext::default(),
+                0,
+            ),
+        );
+        assert!(
+            refused.output.contains("r2dec residual:")
+                && !refused.output.contains("certified_sub_7600"),
+            "missing private-stack authority must fail closed:\n{}",
+            refused.output
+        );
+        assert!(refused.diagnostics.semantic_kernel_render.is_none());
+    }
+
+    #[test]
+    fn production_engine_prefers_exact_private_frame_and_invalidates_by_revision() {
+        let revision = b"production-private-frame-revision";
+        let (blocks, arch, source_snapshot) = source_snapshot_private_frame_function(revision);
+        let session = EngineSession::new(4);
+        let request = || {
+            EngineFunctionDecompileRequestInput::single_function(
+                EngineFunctionInput {
+                    function_name: "sym.production_private_frame".to_string(),
+                    function_addr: 0x7800,
+                    blocks: blocks.clone(),
+                    arch: Some(arch.clone()),
+                    source_snapshot: Some(Arc::clone(&source_snapshot)),
+                    semantic_metadata_enabled: true,
+                },
+                Some(64),
+                r2types::ParsedExternalContext::default(),
+                0,
+            )
+        };
+        let response = session.decompile_function_from_input(request());
+        assert!(
+            response.output.contains(
+                "uint32_t r2s_fn_sym_production_private_frame(uint32_t r2s_arg_argument)"
+            ) && response
+                .output
+                .contains("r2s_arg_argument == ((uint32_t)UINT64_C(0x5ec2e7))")
+                && response
+                    .output
+                    .contains("r2s_local_result = (uint32_t)UINT64_C(0x1)")
+                && response.output.contains("return r2s_local_result;"),
+            "exact private frame must use its whole-function renderer:\n{}",
+            response.output
+        );
+        for forbidden in [
+            "saved_fp",
+            "return_address",
+            "home_reload",
+            "frame_address",
+            "r2s_read",
+            "r2s_write",
+            "rsp",
+            "rbp",
+            "rip",
+        ] {
+            assert!(
+                !response.output.contains(forbidden),
+                "private-frame state leaked through {forbidden}:\n{}",
+                response.output
+            );
+        }
+        assert_eq!(
+            response.diagnostics.semantic_kernel_render,
+            Some(EngineSemanticKernelRender {
+                region: EngineSemanticKernelRegion::PrivateFrameConditionalReturnFunction,
+                region_schema_version:
+                    r2dec::CERTIFIED_PRIVATE_FRAME_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
+                exact_obligation_closure: true,
+            })
+        );
+        assert_eq!(
+            response.diagnostics.plan,
+            Some(EnginePlan::SemanticStructured)
+        );
+        assert_eq!(
+            response.diagnostics.route_reason.as_deref(),
+            Some("r2cert authorized exact private-frame conditional-return obligation closure")
+        );
+        assert!(!response.metrics.cache_hit);
+        assert!(response.diagnostics.render_permission.is_none());
+        assert!(response.diagnostics.proof_coverage.is_none());
+        assert!(response.diagnostics.refusal.is_none());
+
+        let cached = session.decompile_function_from_input(request());
+        assert!(cached.metrics.cache_hit);
+        assert_eq!(cached.output, response.output);
+        assert_eq!(
+            cached.diagnostics.semantic_kernel_render,
+            response.diagnostics.semantic_kernel_render
+        );
+
+        let changed_revision = b"production-private-frame-revision-2";
+        let (_, _, changed_snapshot) = source_snapshot_private_frame_function(changed_revision);
+        let changed = session.decompile_function_from_input(
+            EngineFunctionDecompileRequestInput::single_function(
+                EngineFunctionInput {
+                    function_name: "sym.production_private_frame".to_string(),
+                    function_addr: 0x7800,
+                    blocks: blocks.clone(),
+                    arch: Some(arch.clone()),
+                    source_snapshot: Some(changed_snapshot),
+                    semantic_metadata_enabled: true,
+                },
+                Some(64),
+                r2types::ParsedExternalContext::default(),
+                0,
+            ),
+        );
+        assert!(!changed.metrics.cache_hit);
+        assert_eq!(changed.output, response.output);
+        assert_eq!(
+            changed.diagnostics.semantic_kernel_render,
+            response.diagnostics.semantic_kernel_render
+        );
+
+        let mut near_miss = blocks;
+        near_miss[2].ops[1] = r2il::R2ILOp::Store {
+            space: r2il::SpaceId::Ram,
+            addr: r2il::Varnode::unique(0x50, 8),
+            val: r2il::Varnode::constant(2, 4),
+        };
+        let refused = session.decompile_function_from_input(
+            EngineFunctionDecompileRequestInput::single_function(
+                EngineFunctionInput {
+                    function_name: "sym.production_private_frame".to_string(),
+                    function_addr: 0x7800,
+                    blocks: near_miss,
+                    arch: Some(arch),
+                    source_snapshot: Some(source_snapshot),
+                    semantic_metadata_enabled: true,
+                },
+                Some(64),
+                r2types::ParsedExternalContext::default(),
+                0,
+            ),
+        );
+        assert!(
+            refused.output.contains("r2dec residual:")
+                && !refused
+                    .output
+                    .contains("r2s_fn_sym_production_private_frame")
+                && !refused.output.contains("certified_sub_7800"),
+            "private-frame near miss must not downgrade to generic C:\n{}",
+            refused.output
+        );
+        assert!(refused.diagnostics.semantic_kernel_render.is_none());
+    }
+
+    #[test]
+    fn production_engine_prefers_exact_fnv_fold_and_residualizes_transition_near_miss() {
+        let revision = b"production-real-fnv-fold-o2-revision";
+        let (blocks, arch, source_snapshot) = real_fnv_fold_function(revision);
+        let analysis = build_engine_analysis_from_parts(
+            "sym.production_fnv_fold",
+            &blocks,
+            Some(&arch),
+            Some(source_snapshot.as_ref()),
+        )
+        .expect("prepared exact FNV analysis");
+        let prepared = analysis.ssa_func.as_ref();
+        assert_eq!(
+            prepared_artifact_exact_fnv_fold_applicability(prepared),
+            Ok(true)
+        );
+        let facts = prepared
+            .structured()
+            .canonical_fnv_fold_loops
+            .values()
+            .collect::<Vec<_>>();
+        let [fact] = facts.as_slice() else {
+            panic!("one exact FNV fact")
+        };
+        assert_eq!(fact.topology.entry, REAL_FNV_O2_BASE);
+        assert_eq!(fact.topology.setup, REAL_FNV_O2_SETUP);
+        assert_eq!(fact.topology.header_latch, REAL_FNV_O2_LOOP);
+        assert_eq!(fact.topology.exit, REAL_FNV_O2_EXIT);
+        assert!(fact.validate_against(prepared));
+        assert!(prepared.memory().defs_by_inst.is_empty());
+        assert!(prepared.memory().phis_by_block.is_empty());
+        assert_eq!(
+            prepared
+                .memory()
+                .uses_by_inst
+                .values()
+                .map(Vec::len)
+                .sum::<usize>(),
+            1
+        );
+        let access = prepared
+            .structured()
+            .memory_accesses
+            .values()
+            .next()
+            .expect("one exact FNV byte access");
+        assert_eq!(prepared.structured().memory_accesses.len(), 1);
+        assert!(!access.is_write);
+        assert_eq!(access.width, 1);
+        assert!(access.provenance_complete);
+        let session = EngineSession::new(4);
+        let request = |blocks, source_snapshot| {
+            EngineFunctionDecompileRequestInput::single_function(
+                EngineFunctionInput {
+                    function_name: "sym.production_fnv_fold".to_string(),
+                    function_addr: REAL_FNV_O2_BASE,
+                    blocks,
+                    arch: Some(arch.clone()),
+                    source_snapshot: Some(source_snapshot),
+                    semantic_metadata_enabled: true,
+                },
+                Some(64),
+                r2types::ParsedExternalContext::default(),
+                0,
+            )
+        };
+        let response = session
+            .decompile_function_from_input(request(blocks.clone(), Arc::clone(&source_snapshot)));
+        assert_eq!(response.output, EXPECTED_FNV_SEMANTIC_C);
+        assert!(
+            response.output.contains(
+                "uint64_t r2s_fn_sym_production_fnv_fold(const uint8_t *r2s_arg_bytes, uint64_t r2s_arg_length)"
+            ) && response.output.contains("UINT64_C(0x14650fb0739d0383)")
+                && response.output.contains("UINT64_C(0x100000001b3)")
+                && response
+                    .output
+                    .contains("while (r2s_local_remaining != UINT64_C(0x0))")
+                && response.output.contains("= *r2s_local_pointer;")
+                && response.output.contains("r2s_local_pointer = r2s_local_pointer +")
+                && response.output.contains("r2s_local_remaining = (uint64_t)(r2s_local_remaining -"),
+            "exact FNV fold must use the certified canonical loop:\n{}",
+            response.output
+        );
+        assert_eq!(
+            response.diagnostics.semantic_kernel_render,
+            Some(EngineSemanticKernelRender {
+                region: EngineSemanticKernelRegion::CanonicalFnvFoldLoopFunction,
+                region_schema_version: r2dec::CERTIFIED_FNV_FOLD_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
+                exact_obligation_closure: true,
+            })
+        );
+        assert_eq!(
+            response.diagnostics.plan,
+            Some(EnginePlan::SemanticStructured)
+        );
+        assert_eq!(
+            response.diagnostics.route_reason.as_deref(),
+            Some("r2cert authorized exact canonical FNV-fold loop obligation closure")
+        );
+        assert!(!response.metrics.cache_hit);
+        assert!(response.diagnostics.render_permission.is_none());
+        assert!(response.diagnostics.proof_coverage.is_none());
+        assert!(response.diagnostics.refusal.is_none());
+        assert!(response.diagnostics.warnings.is_empty());
+
+        let probes = vec![
+            Vec::new(),
+            b"A".to_vec(),
+            b"Z".to_vec(),
+            b"AbC".to_vec(),
+            b"abc".to_vec(),
+            vec![0x00, 0x40, 0x41, 0x5a, 0x5b, 0x7f, 0x80, 0xff],
+            (0_u8..=u8::MAX).collect(),
+        ];
+        let expected_results = probes
+            .iter()
+            .map(|bytes| reference_fnv_fold(bytes))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            compiled_fnv_results(&response.output, &probes),
+            expected_results
+        );
+
+        let cached = session
+            .decompile_function_from_input(request(blocks.clone(), Arc::clone(&source_snapshot)));
+        assert!(cached.metrics.cache_hit);
+        assert_eq!(cached.output, response.output);
+        assert_eq!(
+            cached.diagnostics.semantic_kernel_render,
+            response.diagnostics.semantic_kernel_render
+        );
+
+        let changed_snapshot =
+            real_fnv_source_snapshot(&arch, b"production-real-fnv-fold-o2-revision-2");
+        let changed =
+            session.decompile_function_from_input(request(blocks.clone(), changed_snapshot));
+        assert!(!changed.metrics.cache_hit);
+        assert_eq!(changed.output, response.output);
+        assert_eq!(
+            changed.diagnostics.semantic_kernel_render,
+            response.diagnostics.semantic_kernel_render
+        );
+
+        let mut near_miss = blocks;
+        let mut changed_prime_chunks = 0;
+        for op in near_miss.iter_mut().flat_map(|block| &mut block.ops) {
+            if let r2il::R2ILOp::Copy { src, .. } = op
+                && src.space == r2il::SpaceId::Const
+                && src.offset == 0x01b3
+                && src.size == 8
+            {
+                *src = r2il::Varnode::constant(0x01b5, 8);
+                changed_prime_chunks += 1;
+            }
+        }
+        assert_eq!(
+            changed_prime_chunks, 1,
+            "one real-lift FNV prime low initializer"
+        );
+        let near_miss_analysis = build_engine_analysis_from_parts(
+            "sym.production_fnv_fold",
+            &near_miss,
+            Some(&arch),
+            Some(source_snapshot.as_ref()),
+        )
+        .expect("prepared FNV transition near miss");
+        assert!(
+            near_miss_analysis
+                .ssa_func
+                .structured()
+                .canonical_fnv_fold_loops
+                .is_empty(),
+            "a changed prime must remove exact FNV applicability"
+        );
+        let residual = session.decompile_function_from_input(request(near_miss, source_snapshot));
+        assert!(
+            residual.output.contains("r2dec residual:")
+                && !residual.output.contains("r2s_fn_sym_production_fnv_fold")
+                && !residual.output.contains("certified_sub_100000594"),
+            "FNV transition near miss must remain residual without an exact fact:\n{}",
+            residual.output
+        );
+        assert!(residual.diagnostics.semantic_kernel_render.is_none());
+    }
+
+    #[test]
+    fn specialized_source_shapes_without_exact_facts_do_not_hijack_terminal_route() {
+        let private_revision = b"production-private-frame-shape-only-revision";
+        let (_, private_arch, private_snapshot) =
+            source_snapshot_private_frame_function(private_revision);
+        let mut private_terminal = R2ILBlock::new(0x7800, 4);
+        let private_result = r2il::Varnode::unique(0x200, 4);
+        private_terminal.push(r2il::R2ILOp::IntAdd {
+            dst: private_result.clone(),
+            a: r2il::Varnode::register(8, 4),
+            b: r2il::Varnode::constant(1, 4),
+        });
+        private_terminal.push(r2il::R2ILOp::Copy {
+            dst: r2il::Varnode::register(0, 4),
+            src: private_result,
+        });
+        private_terminal.push(r2il::R2ILOp::Return {
+            target: r2il::Varnode::register(32, 8),
+        });
+        let private_blocks = vec![private_terminal];
+        let private_analysis = build_engine_analysis_from_parts(
+            "sym.private_shape_terminal",
+            &private_blocks,
+            Some(&private_arch),
+            Some(private_snapshot.as_ref()),
+        )
+        .expect("prepared private-frame-shape terminal");
+        assert!(private_analysis.ssa_func.private_frame().is_none());
+        let private_response = EngineSession::new(4).decompile_function_from_input(
+            EngineFunctionDecompileRequestInput::single_function(
+                EngineFunctionInput {
+                    function_name: "sym.private_shape_terminal".to_string(),
+                    function_addr: 0x7800,
+                    blocks: private_blocks,
+                    arch: Some(private_arch),
+                    source_snapshot: Some(private_snapshot),
+                    semantic_metadata_enabled: true,
+                },
+                Some(64),
+                r2types::ParsedExternalContext::default(),
+                0,
+            ),
+        );
+        assert_eq!(
+            private_response
+                .diagnostics
+                .semantic_kernel_render
+                .map(|render| render.region),
+            Some(EngineSemanticKernelRegion::TerminalReturnBlock),
+            "a stack-slot source shape without a private-frame fact must reach the later terminal route:\n{}",
+            private_response.output
+        );
+
+        let fnv_revision = b"refusal-only-fnv-shape-revision";
+        let fnv_arch = real_fnv_arch();
+        let fnv_snapshot = real_fnv_source_snapshot(&fnv_arch, fnv_revision);
+        let mut refusal_only_fnv_terminal = R2ILBlock::new(REAL_FNV_O2_BASE, 4);
+        refusal_only_fnv_terminal.push(r2il::R2ILOp::Copy {
+            dst: r2il::Varnode::register(0, 8),
+            src: r2il::Varnode::register(8, 8),
+        });
+        refusal_only_fnv_terminal.push(r2il::R2ILOp::Return {
+            target: r2il::Varnode::register(
+                fnv_arch.get_register("x30").expect("AARCH64 x30").offset,
+                8,
+            ),
+        });
+        let refusal_only_fnv_blocks = vec![refusal_only_fnv_terminal];
+        let fnv_analysis = build_engine_analysis_from_parts(
+            "sym.fnv_shape_terminal",
+            &refusal_only_fnv_blocks,
+            Some(&fnv_arch),
+            Some(fnv_snapshot.as_ref()),
+        )
+        .expect("prepared FNV-shape terminal");
+        assert!(
+            fnv_analysis
+                .ssa_func
+                .structured()
+                .canonical_fnv_fold_loops
+                .is_empty()
+        );
+        assert_eq!(
+            prepared_artifact_exact_fnv_fold_applicability(fnv_analysis.ssa_func.as_ref()),
+            Ok(false)
+        );
+        let fnv_response = EngineSession::new(4).decompile_function_from_input(
+            EngineFunctionDecompileRequestInput::single_function(
+                EngineFunctionInput {
+                    function_name: "sym.fnv_shape_terminal".to_string(),
+                    function_addr: REAL_FNV_O2_BASE,
+                    blocks: refusal_only_fnv_blocks,
+                    arch: Some(fnv_arch),
+                    source_snapshot: Some(fnv_snapshot),
+                    semantic_metadata_enabled: true,
+                },
+                Some(64),
+                r2types::ParsedExternalContext::default(),
+                0,
+            ),
+        );
+        assert_eq!(
+            fnv_response
+                .diagnostics
+                .semantic_kernel_render
+                .map(|render| render.region),
+            Some(EngineSemanticKernelRegion::TerminalReturnBlock),
+            "an FNV ABI/type shape without an exact FNV fact must reach the later terminal route:\n{}",
+            fnv_response.output
+        );
+    }
+
+    #[test]
+    fn production_engine_renders_only_exact_certified_switch_return_subset() {
+        let (blocks, arch, source_snapshot) = source_snapshot_switch_return_function();
+        let prepared = EngineSession::new(4)
+            .analyze(EngineAnalyzeRequest::full_semantics_for_function(
+                EngineAnalyzeFunctionRequestInput {
+                    function: EngineFunctionInput {
+                        function_name: "sym.production_switch_return".to_string(),
+                        function_addr: 0x7380,
+                        blocks: blocks.clone(),
+                        arch: Some(arch.clone()),
+                        source_snapshot: Some(Arc::clone(&source_snapshot)),
+                        semantic_metadata_enabled: true,
+                    },
+                    ptr_bits: Some(64),
+                    reg_type_hints: HashMap::new(),
+                    parsed_context: r2types::ParsedExternalContext::default(),
+                    external_context_fallback_hash: 0,
+                    scope_facts: InterprocScopeFacts::empty(),
+                    interproc_max_iterations: 1,
+                    symbolic_scope: None,
+                    precomputed_semantic_artifact: None,
+                    include_interproc_summary_set: false,
+                },
+            ))
+            .expect("prepared switch-return analysis");
+        r2dec::CertifiedSwitchReturnFunction::from_artifact(prepared.artifact.ssa_func.as_ref())
+            .expect("engine-prepared switch-return artifact");
+
+        let response = EngineSession::new(4).decompile_function_from_input(
+            EngineFunctionDecompileRequestInput::single_function(
+                EngineFunctionInput {
+                    function_name: "sym.production_switch_return".to_string(),
+                    function_addr: 0x7380,
+                    blocks: blocks.clone(),
+                    arch: Some(arch.clone()),
+                    source_snapshot: Some(Arc::clone(&source_snapshot)),
+                    semantic_metadata_enabled: true,
+                },
+                Some(64),
+                r2types::ParsedExternalContext::default(),
+                0,
+            ),
+        );
+        assert!(
+            response
+                .output
+                .contains("uint64_t certified_sub_7380(uint64_t v_")
+                && response.output.contains("switch ((uint64_t)v_")
+                && response.output.contains("case UINT64_C(0x1):")
+                && response.output.contains("case UINT64_C(0x7):")
+                && response.output.contains("default:")
+                && response
+                    .output
+                    .matches("return ((uint64_t)UINT64_C(")
+                    .count()
+                    == 3,
+            "exact switch source snapshot must reach certified semantic C:\n{}",
+            response.output
+        );
+        assert_eq!(
+            response.diagnostics.semantic_kernel_render,
+            Some(EngineSemanticKernelRender {
+                region: EngineSemanticKernelRegion::SwitchTerminalReturnFunction,
+                region_schema_version: r2dec::CERTIFIED_SWITCH_RETURN_FUNCTION_SCHEMA_VERSION,
+                exact_obligation_closure: true,
+            })
+        );
+        assert_eq!(
+            response.diagnostics.plan,
+            Some(EnginePlan::SemanticStructured)
+        );
+        assert!(response.diagnostics.render_permission.is_none());
+        assert!(response.diagnostics.proof_coverage.is_none());
+        assert!(response.diagnostics.refusal.is_none());
+
+        let register = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let wrong_interface = r2ssa::SourceFunctionInterface::new(
+            source_snapshot.revision_identity().to_vec(),
+            "test-register-abi",
+            [r2ssa::SourceAbiParameterSpec::new(0, register(24))],
+            r2ssa::SourceFunctionReturn::Register {
+                storage: register(0),
+            },
+            Vec::<r2ssa::SourceStackSlotSpec>::new(),
+        )
+        .expect("wrong selector interface");
+        let wrong_storage = Arc::new(
+            EngineSourceSnapshot::new(
+                source_snapshot.revision_identity().to_vec(),
+                Some(wrong_interface),
+                Vec::new(),
+            )
+            .expect("wrong selector snapshot"),
+        );
+        let missing_interface = Arc::new(
+            EngineSourceSnapshot::new(
+                source_snapshot.revision_identity().to_vec(),
+                None,
+                Vec::new(),
+            )
+            .expect("snapshot without function interface"),
+        );
+        for source_snapshot in [missing_interface, wrong_storage] {
+            let refused = EngineSession::new(4).decompile_function_from_input(
+                EngineFunctionDecompileRequestInput::single_function(
+                    EngineFunctionInput {
+                        function_name: "sym.production_switch_return".to_string(),
+                        function_addr: 0x7380,
+                        blocks: blocks.clone(),
+                        arch: Some(arch.clone()),
+                        source_snapshot: Some(source_snapshot),
+                        semantic_metadata_enabled: true,
+                    },
+                    Some(64),
+                    r2types::ParsedExternalContext::default(),
+                    0,
+                ),
+            );
+            assert!(
+                refused.output.contains("r2dec residual:")
+                    && !refused.output.contains("certified_sub_7380"),
+                "missing or wrong selector authority must fail closed:\n{}",
+                refused.output
+            );
+            assert!(refused.diagnostics.semantic_kernel_render.is_none());
+        }
+    }
+
+    #[test]
+    fn production_engine_renders_only_exact_carrier_free_loop_return_subset() {
+        let (blocks, arch, source_snapshot) = source_snapshot_carrier_free_loop_return_function();
+        let prepared = EngineSession::new(4)
+            .analyze(EngineAnalyzeRequest::full_semantics_for_function(
+                EngineAnalyzeFunctionRequestInput {
+                    function: EngineFunctionInput {
+                        function_name: "sym.production_carrier_free_loop_return".to_string(),
+                        function_addr: 0x7400,
+                        blocks: blocks.clone(),
+                        arch: Some(arch.clone()),
+                        source_snapshot: Some(Arc::clone(&source_snapshot)),
+                        semantic_metadata_enabled: true,
+                    },
+                    ptr_bits: Some(64),
+                    reg_type_hints: HashMap::new(),
+                    parsed_context: r2types::ParsedExternalContext::default(),
+                    external_context_fallback_hash: 0,
+                    scope_facts: InterprocScopeFacts::empty(),
+                    interproc_max_iterations: 1,
+                    symbolic_scope: None,
+                    precomputed_semantic_artifact: None,
+                    include_interproc_summary_set: false,
+                },
+            ))
+            .expect("prepared carrier-free loop-return analysis");
+        r2dec::CertifiedLoopReturnFunction::from_artifact(prepared.artifact.ssa_func.as_ref())
+            .expect("engine-prepared carrier-free loop-return artifact");
+
+        let response = EngineSession::new(4).decompile_function_from_input(
+            EngineFunctionDecompileRequestInput::single_function(
+                EngineFunctionInput {
+                    function_name: "sym.production_carrier_free_loop_return".to_string(),
+                    function_addr: 0x7400,
+                    blocks: blocks.clone(),
+                    arch: Some(arch.clone()),
+                    source_snapshot: Some(Arc::clone(&source_snapshot)),
+                    semantic_metadata_enabled: true,
+                },
+                Some(64),
+                r2types::ParsedExternalContext::default(),
+                0,
+            ),
+        );
+        assert!(
+            response
+                .output
+                .contains("uint64_t certified_sub_7400(uint8_t v_")
+                && response.output.contains("while ((uint8_t)v_")
+                && response.output.contains(" != UINT8_C(0x0)")
+                && response
+                    .output
+                    .contains("return ((uint64_t)UINT64_C(0x2a));"),
+            "exact carrier-free loop snapshot must reach certified semantic C:\n{}",
+            response.output
+        );
+        assert_eq!(
+            response.diagnostics.semantic_kernel_render,
+            Some(EngineSemanticKernelRender {
+                region: EngineSemanticKernelRegion::CarrierFreeLoopTerminalReturnFunction,
+                region_schema_version: r2dec::CERTIFIED_LOOP_RETURN_FUNCTION_SCHEMA_VERSION,
+                exact_obligation_closure: true,
+            })
+        );
+        assert_eq!(
+            response.diagnostics.plan,
+            Some(EnginePlan::SemanticStructured)
+        );
+        assert!(response.diagnostics.render_permission.is_none());
+        assert!(response.diagnostics.proof_coverage.is_none());
+        assert!(response.diagnostics.refusal.is_none());
+
+        let register = |offset, size| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size,
+        };
+        let wrong_interface = r2ssa::SourceFunctionInterface::new(
+            source_snapshot.revision_identity().to_vec(),
+            "test-register-abi",
+            [r2ssa::SourceAbiParameterSpec::new(0, register(24, 1))],
+            r2ssa::SourceFunctionReturn::Register {
+                storage: register(0, 8),
+            },
+            Vec::<r2ssa::SourceStackSlotSpec>::new(),
+        )
+        .expect("wrong loop condition interface");
+        let wrong_storage = Arc::new(
+            EngineSourceSnapshot::new(
+                source_snapshot.revision_identity().to_vec(),
+                Some(wrong_interface),
+                Vec::new(),
+            )
+            .expect("wrong loop condition snapshot"),
+        );
+        let missing_interface = Arc::new(
+            EngineSourceSnapshot::new(
+                source_snapshot.revision_identity().to_vec(),
+                None,
+                Vec::new(),
+            )
+            .expect("snapshot without loop function interface"),
+        );
+        for source_snapshot in [missing_interface, wrong_storage] {
+            let refused = EngineSession::new(4).decompile_function_from_input(
+                EngineFunctionDecompileRequestInput::single_function(
+                    EngineFunctionInput {
+                        function_name: "sym.production_carrier_free_loop_return".to_string(),
+                        function_addr: 0x7400,
+                        blocks: blocks.clone(),
+                        arch: Some(arch.clone()),
+                        source_snapshot: Some(source_snapshot),
+                        semantic_metadata_enabled: true,
+                    },
+                    Some(64),
+                    r2types::ParsedExternalContext::default(),
+                    0,
+                ),
+            );
+            assert!(
+                refused.output.contains("r2dec residual:")
+                    && !refused.output.contains("certified_sub_7400"),
+                "missing or wrong loop condition authority must fail closed:\n{}",
+                refused.output
+            );
+            assert!(refused.diagnostics.semantic_kernel_render.is_none());
+        }
+    }
+
+    #[test]
+    fn production_engine_renders_only_exact_counted_loop_return_subset() {
+        let (blocks, arch, source_snapshot) = source_snapshot_counted_loop_return_function();
+        let prepared = EngineSession::new(4)
+            .analyze(EngineAnalyzeRequest::full_semantics_for_function(
+                EngineAnalyzeFunctionRequestInput {
+                    function: EngineFunctionInput {
+                        function_name: "sym.production_counted_loop_return".to_string(),
+                        function_addr: 0x7500,
+                        blocks: blocks.clone(),
+                        arch: Some(arch.clone()),
+                        source_snapshot: Some(Arc::clone(&source_snapshot)),
+                        semantic_metadata_enabled: true,
+                    },
+                    ptr_bits: Some(64),
+                    reg_type_hints: HashMap::new(),
+                    parsed_context: r2types::ParsedExternalContext::default(),
+                    external_context_fallback_hash: 0,
+                    scope_facts: InterprocScopeFacts::empty(),
+                    interproc_max_iterations: 1,
+                    symbolic_scope: None,
+                    precomputed_semantic_artifact: None,
+                    include_interproc_summary_set: false,
+                },
+            ))
+            .expect("prepared counted-loop return analysis");
+        let function = r2dec::CertifiedCountedLoopReturnFunction::from_artifact(
+            prepared.artifact.ssa_func.as_ref(),
+        )
+        .expect("engine-prepared counted-loop return artifact");
+        assert!(function.render_permit().authorizes_certified_c());
+        assert!(
+            r2dec::check_counted_loop_return_differential(prepared.artifact.ssa_func.as_ref(), 3,)
+                .expect("counted-loop differential")
+                .all_match()
+        );
+
+        let response = EngineSession::new(4).decompile_function_from_input(
+            EngineFunctionDecompileRequestInput::single_function(
+                EngineFunctionInput {
+                    function_name: "sym.production_counted_loop_return".to_string(),
+                    function_addr: 0x7500,
+                    blocks: blocks.clone(),
+                    arch: Some(arch.clone()),
+                    source_snapshot: Some(Arc::clone(&source_snapshot)),
+                    semantic_metadata_enabled: true,
+                },
+                Some(64),
+                r2types::ParsedExternalContext::default(),
+                0,
+            ),
+        );
+        assert!(
+            response
+                .output
+                .contains("uint64_t certified_sub_7500(uint64_t v_")
+                && response.output.contains(" = UINT64_C(0x0);")
+                && response.output.contains("while (v_")
+                && response.output.contains(" < v_")
+                && response.output.contains(" + UINT64_C(0x1)")
+                && response.output.contains("return v_"),
+            "exact counted-loop snapshot must reach certified semantic C:\n{}",
+            response.output
+        );
+        assert_eq!(
+            response.diagnostics.semantic_kernel_render,
+            Some(EngineSemanticKernelRender {
+                region: EngineSemanticKernelRegion::CountedLoopTerminalReturnFunction,
+                region_schema_version: r2dec::CERTIFIED_COUNTED_LOOP_RETURN_FUNCTION_SCHEMA_VERSION,
+                exact_obligation_closure: true,
+            })
+        );
+        assert_eq!(
+            response.diagnostics.plan,
+            Some(EnginePlan::SemanticStructured)
+        );
+        assert!(response.diagnostics.render_permission.is_none());
+        assert!(response.diagnostics.proof_coverage.is_none());
+        assert!(response.diagnostics.refusal.is_none());
+
+        let register = |offset, size| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size,
+        };
+        let wrong_interface = r2ssa::SourceFunctionInterface::new(
+            source_snapshot.revision_identity().to_vec(),
+            "test-register-abi",
+            [r2ssa::SourceAbiParameterSpec::new(0, register(24, 8))],
+            r2ssa::SourceFunctionReturn::Register {
+                storage: register(0, 8),
+            },
+            Vec::<r2ssa::SourceStackSlotSpec>::new(),
+        )
+        .expect("wrong counted-loop bound interface");
+        let wrong_storage = Arc::new(
+            EngineSourceSnapshot::new(
+                source_snapshot.revision_identity().to_vec(),
+                Some(wrong_interface),
+                Vec::new(),
+            )
+            .expect("wrong counted-loop bound snapshot"),
+        );
+        let missing_interface = Arc::new(
+            EngineSourceSnapshot::new(
+                source_snapshot.revision_identity().to_vec(),
+                None,
+                Vec::new(),
+            )
+            .expect("snapshot without counted-loop function interface"),
+        );
+        for source_snapshot in [missing_interface, wrong_storage] {
+            let refused = EngineSession::new(4).decompile_function_from_input(
+                EngineFunctionDecompileRequestInput::single_function(
+                    EngineFunctionInput {
+                        function_name: "sym.production_counted_loop_return".to_string(),
+                        function_addr: 0x7500,
+                        blocks: blocks.clone(),
+                        arch: Some(arch.clone()),
+                        source_snapshot: Some(source_snapshot),
+                        semantic_metadata_enabled: true,
+                    },
+                    Some(64),
+                    r2types::ParsedExternalContext::default(),
+                    0,
+                ),
+            );
+            assert!(
+                refused.output.contains("r2dec residual:")
+                    && !refused.output.contains("certified_sub_7500"),
+                "missing or wrong counted-loop bound authority must fail closed:\n{}",
+                refused.output
+            );
+            assert!(refused.diagnostics.semantic_kernel_render.is_none());
+        }
+
+        let mut wrong_update = blocks;
+        wrong_update[3].ops[0] = r2il::R2ILOp::IntSub {
+            dst: r2il::Varnode::register(0, 8),
+            a: r2il::Varnode::register(0, 8),
+            b: r2il::Varnode::constant(1, 8),
+        };
+        let refused = EngineSession::new(4).decompile_function_from_input(
+            EngineFunctionDecompileRequestInput::single_function(
+                EngineFunctionInput {
+                    function_name: "sym.production_counted_loop_return".to_string(),
+                    function_addr: 0x7500,
+                    blocks: wrong_update,
+                    arch: Some(arch),
+                    source_snapshot: Some(source_snapshot),
+                    semantic_metadata_enabled: true,
+                },
+                Some(64),
+                r2types::ParsedExternalContext::default(),
+                0,
+            ),
+        );
+        assert!(!refused.output.contains("certified_sub_7500"));
+        assert!(refused.diagnostics.semantic_kernel_render.is_none());
+    }
+
+    #[test]
+    fn engine_source_snapshot_preserves_exact_ordered_interfaces() {
+        let revision = b"source-revision-1";
+        let function_interface = source_snapshot_function_interface(revision);
+        let first = source_snapshot_call_interface(revision, 0x401000, 1, 0x5000);
+        let second = source_snapshot_call_interface(revision, 0x401000, 3, 0x6000);
+
+        let snapshot = EngineSourceSnapshot::new(
+            revision.to_vec(),
+            Some(function_interface.clone()),
+            vec![second.clone(), first.clone()],
+        )
+        .expect("coherent source snapshot");
+
+        assert_eq!(
+            snapshot.schema_version(),
+            ENGINE_SOURCE_SNAPSHOT_SCHEMA_VERSION
+        );
+        assert_eq!(snapshot.revision_identity(), revision);
+        assert_eq!(snapshot.function_interface(), Some(&function_interface));
+        assert_eq!(snapshot.call_site_interfaces(), &[second, first]);
+    }
+
+    #[test]
+    fn engine_source_snapshot_rejects_empty_mismatched_and_duplicate_authority() {
+        assert_eq!(
+            EngineSourceSnapshot::new(Vec::new(), None, Vec::new()),
+            Err(EngineSourceSnapshotError::EmptyRevisionIdentity)
+        );
+        assert_eq!(
+            EngineSourceSnapshot::new(
+                b"source-revision-1".to_vec(),
+                Some(source_snapshot_function_interface(b"source-revision-2")),
+                Vec::new(),
+            ),
+            Err(EngineSourceSnapshotError::FunctionRevisionMismatch)
+        );
+
+        let first = source_snapshot_call_interface(b"source-revision-1", 0x401000, 1, 0x5000);
+        assert_eq!(
+            EngineSourceSnapshot::new(b"source-revision-2".to_vec(), None, vec![first.clone()],),
+            Err(EngineSourceSnapshotError::CallSiteRevisionMismatch)
+        );
+        assert_eq!(
+            EngineSourceSnapshot::new(
+                b"source-revision-1".to_vec(),
+                None,
+                vec![first.clone(), first],
+            ),
+            Err(EngineSourceSnapshotError::DuplicateCallSiteIdentity)
+        );
+
+        let same_location_other_target =
+            source_snapshot_call_interface(b"source-revision-1", 0x401000, 1, 0x6000);
+        let first = source_snapshot_call_interface(b"source-revision-1", 0x401000, 1, 0x5000);
+        assert_eq!(
+            EngineSourceSnapshot::new(
+                b"source-revision-1".to_vec(),
+                None,
+                vec![first, same_location_other_target],
+            ),
+            Err(EngineSourceSnapshotError::DuplicateCallSiteLocation)
+        );
+    }
+
+    #[test]
+    fn analysis_cache_key_partitions_exact_source_snapshot_revisions() {
+        let blocks = const_return_blocks(0x401000, 0);
+        let first = EngineSourceSnapshot::new(b"revision-a".to_vec(), None, Vec::new())
+            .expect("first source snapshot");
+        let same = EngineSourceSnapshot::new(b"revision-a".to_vec(), None, Vec::new())
+            .expect("same source snapshot identity");
+        let changed = EngineSourceSnapshot::new(b"revision-b".to_vec(), None, Vec::new())
+            .expect("changed source snapshot");
+        let key = AnalysisCacheKey::from_parts(
+            0x401000,
+            "sym.snapshot",
+            None,
+            &blocks,
+            0,
+            0,
+            "aa",
+            Some(&first),
+        );
+
+        assert_eq!(
+            key,
+            AnalysisCacheKey::from_parts(
+                0x401000,
+                "sym.snapshot",
+                None,
+                &blocks,
+                0,
+                0,
+                "aa",
+                Some(&same),
+            )
+        );
+        assert_ne!(
+            key,
+            AnalysisCacheKey::from_parts(
+                0x401000,
+                "sym.snapshot",
+                None,
+                &blocks,
+                0,
+                0,
+                "aa",
+                Some(&changed),
+            )
+        );
+        assert_ne!(
+            key,
+            AnalysisCacheKey::from_parts(0x401000, "sym.snapshot", None, &blocks, 0, 0, "aa", None,)
+        );
+        assert_eq!(
+            key.source_snapshot_schema_version,
+            Some(ENGINE_SOURCE_SNAPSHOT_SCHEMA_VERSION)
+        );
+        assert_eq!(
+            key.source_revision_identity.as_deref(),
+            Some(b"revision-a".as_slice())
+        );
+
+        let session = EngineSession::new(4);
+        let mut request = EngineAnalyzeRequest {
+            function_name: "sym.snapshot".to_string(),
+            function_addr: 0x401000,
+            blocks,
+            arch: None,
+            source_snapshot: Some(Arc::new(first)),
+            ptr_bits: 64,
+            semantic_metadata_enabled: false,
+            reg_type_hints: HashMap::new(),
+            parsed_context: r2types::ParsedExternalContext::default(),
+            external_context_fallback_hash: 0,
+            scope_facts: InterprocScopeFacts::empty(),
+            interproc_max_iterations: 1,
+            symbolic_scope: None,
+            precomputed_semantic_artifact: None,
+            semantic_mode: EngineSemanticMode::Optional,
+            include_interproc_summary_set: false,
+            execution: EngineExecutionControl::default(),
+        };
+        let first_response = session
+            .analyze(request.clone())
+            .expect("first revision analysis");
+        assert!(!first_response.analysis_cache_hit);
+
+        request.source_snapshot = Some(Arc::new(changed));
+        let changed_response = session
+            .analyze(request.clone())
+            .expect("changed revision analysis");
+        assert!(!changed_response.analysis_cache_hit);
+        let repeated_response = session
+            .analyze(request)
+            .expect("repeated revision analysis");
+        assert!(repeated_response.analysis_cache_hit);
+    }
+
+    #[test]
+    fn analysis_cache_key_partitions_exact_layout_and_carrier_payloads() {
+        let revision = b"same-claimed-source-revision";
+        let snapshot = |member_count, scalar_bits| {
+            EngineSourceSnapshot::new(
+                revision.to_vec(),
+                Some(exact_source_snapshot_function_interface(
+                    revision,
+                    member_count,
+                    scalar_bits,
+                )),
+                Vec::new(),
+            )
+            .expect("valid exact source snapshot")
+        };
+        let baseline = snapshot(14, 32);
+        let changed_layout = snapshot(15, 32);
+        let changed_carrier = snapshot(14, 64);
+
+        let baseline_key = AnalysisCacheKey::from_immutable_hashes(1, 2, 3, Some(&baseline));
+        let layout_key = AnalysisCacheKey::from_immutable_hashes(1, 2, 3, Some(&changed_layout));
+        let carrier_key = AnalysisCacheKey::from_immutable_hashes(1, 2, 3, Some(&changed_carrier));
+
+        assert_eq!(
+            baseline_key.source_revision_identity,
+            layout_key.source_revision_identity
+        );
+        assert_eq!(
+            baseline_key.source_revision_identity,
+            carrier_key.source_revision_identity
+        );
+        assert_ne!(
+            baseline_key.source_payload_identity,
+            layout_key.source_payload_identity
+        );
+        assert_ne!(
+            baseline_key.source_payload_identity,
+            carrier_key.source_payload_identity
+        );
+        assert_ne!(baseline_key, layout_key);
+        assert_ne!(baseline_key, carrier_key);
+        assert_eq!(
+            baseline
+                .function_interface()
+                .and_then(r2ssa::SourceFunctionInterface::type_graph)
+                .expect("retained graph")
+                .aggregates()[0]
+                .members()[13]
+                .offset_bits(),
+            52 * 8
+        );
+    }
+
+    #[test]
+    fn analysis_cache_key_partitions_exact_stack_slot_role_and_home_payloads() {
+        let revision = b"same-stack-slot-role-revision";
+        let register = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let stack_base = register(64);
+        let snapshot = |slot| {
+            let interface = r2ssa::SourceFunctionInterface::new_exact(
+                revision.to_vec(),
+                "sysv",
+                [
+                    r2ssa::SourceAbiParameterSpec::new(0, register(0)),
+                    r2ssa::SourceAbiParameterSpec::new(1, register(8)),
+                ],
+                r2ssa::SourceFunctionReturn::Void,
+                [slot],
+            )
+            .expect("exact classified stack slot");
+            EngineSourceSnapshot::new(revision.to_vec(), Some(interface), Vec::new())
+                .expect("exact source snapshot")
+        };
+        let local = snapshot(r2ssa::SourceStackSlotSpec::new_local(
+            r2ssa::StackAddressBase::FramePointer,
+            stack_base,
+            -8,
+            8,
+        ));
+        let first_home = snapshot(r2ssa::SourceStackSlotSpec::new_parameter_home(
+            r2ssa::StackAddressBase::FramePointer,
+            stack_base,
+            -8,
+            8,
+            0,
+            register(0),
+        ));
+        let second_home = snapshot(r2ssa::SourceStackSlotSpec::new_parameter_home(
+            r2ssa::StackAddressBase::FramePointer,
+            stack_base,
+            -8,
+            8,
+            1,
+            register(8),
+        ));
+
+        let local_key = AnalysisCacheKey::from_immutable_hashes(1, 2, 3, Some(&local));
+        let first_home_key = AnalysisCacheKey::from_immutable_hashes(1, 2, 3, Some(&first_home));
+        let second_home_key = AnalysisCacheKey::from_immutable_hashes(1, 2, 3, Some(&second_home));
+
+        assert_eq!(local.revision_identity(), first_home.revision_identity());
+        assert_eq!(local.revision_identity(), second_home.revision_identity());
+        assert_ne!(local, first_home);
+        assert_ne!(first_home, second_home);
+        assert_ne!(
+            local_key.source_payload_identity,
+            first_home_key.source_payload_identity
+        );
+        assert_ne!(
+            first_home_key.source_payload_identity,
+            second_home_key.source_payload_identity
+        );
+    }
+
+    #[test]
+    fn authoritative_source_interface_reaches_prepared_ssa_through_request() {
+        let revision = b"source-revision-1";
+        let snapshot = Arc::new(
+            EngineSourceSnapshot::new(
+                revision.to_vec(),
+                Some(source_snapshot_function_interface(revision)),
+                vec![source_snapshot_call_interface(
+                    revision, 0x401000, 0, 0x5000,
+                )],
+            )
+            .expect("source snapshot"),
+        );
+        let request =
+            EngineAnalyzeRequest::full_semantics_for_function(EngineAnalyzeFunctionRequestInput {
+                function: EngineFunctionInput {
+                    function_name: "sym.snapshot".to_string(),
+                    function_addr: 0x401000,
+                    blocks: direct_call_return_blocks(0x401000, 0x5000),
+                    arch: Some(x86_64_result_arch()),
+                    source_snapshot: Some(snapshot.clone()),
+                    semantic_metadata_enabled: false,
+                },
+                ptr_bits: Some(64),
+                reg_type_hints: HashMap::new(),
+                parsed_context: r2types::ParsedExternalContext::default(),
+                external_context_fallback_hash: 0,
+                scope_facts: InterprocScopeFacts::empty(),
+                interproc_max_iterations: 1,
+                symbolic_scope: None,
+                precomputed_semantic_artifact: None,
+                include_interproc_summary_set: false,
+            });
+        assert!(Arc::ptr_eq(
+            request.source_snapshot.as_ref().expect("request snapshot"),
+            &snapshot
+        ));
+
+        let response = EngineSession::new(4)
+            .analyze(request)
+            .expect("snapshot-backed analysis");
+        let context = response.artifact.ssa_func.machine_context();
+        assert_eq!(
+            context
+                .function_interface()
+                .expect("authoritative function interface")
+                .revision_identity(),
+            revision
+        );
+        assert!(context.abi_model().is_coherent());
+        assert!(context.call_site_interfaces_are_coherent());
+        assert_eq!(context.call_site_interfaces().len(), 1);
+        assert!(
+            response
+                .artifact
+                .ssa_func
+                .facts()
+                .boundaries
+                .calls
+                .values()
+                .next()
+                .expect("authoritative call boundary")
+                .complete
+        );
+        assert!(
+            response
+                .artifact
+                .pattern_ssa_func
+                .machine_context()
+                .function_interface()
+                .is_none(),
+            "pattern SSA must remain on the legacy constructor"
+        );
+    }
+
+    #[test]
+    fn absent_source_snapshot_preserves_legacy_prepared_ssa_path() {
+        let blocks = const_return_blocks(0x401000, 0);
+        let arch = x86_64_result_arch();
+        let analysis = build_engine_analysis_from_parts("sym.legacy", &blocks, Some(&arch), None)
+            .expect("legacy engine analysis");
+        let legacy = r2ssa::SsaArtifact::for_decompile(&blocks, Some(&arch))
+            .expect("legacy prepared SSA")
+            .with_name("sym.legacy");
+
+        assert_eq!(analysis.ssa_func.mode(), legacy.mode());
+        assert_eq!(
+            format!("{:?}", analysis.ssa_func.local_ssa_blocks()),
+            format!("{:?}", legacy.local_ssa_blocks())
+        );
+        assert_eq!(
+            analysis.ssa_func.machine_context(),
+            legacy.machine_context()
+        );
+        assert!(
+            analysis
+                .ssa_func
+                .machine_context()
+                .function_interface()
+                .is_none()
+        );
     }
 
     fn x86_64_arg_arch() -> r2il::ArchSpec {
@@ -7975,7 +13196,8 @@ mod tests {
             &payload,
             type_writeback,
             vec![EnginePhaseTimingJson {
-                phase: "writeback".to_string(),
+                phase: EnginePhase::FfiConversion,
+                status: EnginePhaseStatus::Executed,
                 elapsed_us: 7,
             }],
         ))
@@ -7984,9 +13206,36 @@ mod tests {
         assert_eq!(value["function_name"], "target");
         assert_eq!(value["type_writeback"]["interproc"]["callsite_count"], 2);
         assert_eq!(value["type_writeback"]["interproc"]["max_iterations"], 3);
+        assert!(
+            value["type_writeback"]
+                .get("legacy_render_permission")
+                .is_none()
+        );
+        assert!(
+            value["type_writeback"]
+                .get("legacy_rendered_proof_coverage")
+                .is_none()
+        );
+        assert!(value["type_writeback"].get("render_permission").is_none());
+        assert!(value["type_writeback"].get("proof_coverage").is_none());
         assert!(value["type_writeback"]["compiled_semantics"].is_null());
-        assert_eq!(value["phase_timings"][0]["phase"], "writeback");
-        assert_eq!(value["phase_timings"][0]["elapsed_us"], 7);
+        assert_eq!(
+            value["type_writeback"]["phase_timings"]
+                .as_array()
+                .map(Vec::len),
+            Some(11)
+        );
+        assert!(
+            value["type_writeback"]["phase_timings"]
+                .as_array()
+                .is_some_and(|timings| timings
+                    .iter()
+                    .all(|timing| timing["status"] == "not_executed"))
+        );
+        assert_eq!(value["phase_timings"].as_array().map(Vec::len), Some(11));
+        assert_eq!(value["phase_timings"][10]["phase"], "ffi_conversion");
+        assert_eq!(value["phase_timings"][10]["status"], "executed");
+        assert_eq!(value["phase_timings"][10]["elapsed_us"], 7);
     }
 
     #[test]
@@ -8041,7 +13290,7 @@ mod tests {
     }
 
     #[test]
-    fn engine_type_writeback_report_json_from_function_analysis_owns_summary_projection() {
+    fn engine_type_writeback_report_json_from_function_analysis_labels_legacy_render_claims() {
         let summary = r2ssa::FunctionSemanticSummary::unknown(
             r2ssa::InterprocFunctionId(0x401000),
             Some("target".to_string()),
@@ -8084,13 +13333,35 @@ mod tests {
             assumption_usage: r2types::AssumptionUsageReport::default(),
             semantic_artifact: None,
             semantic_build_plan: None,
-            semantic_route: None,
+            semantic_route: Some(r2types::DecompileRouteFacts {
+                kind: r2types::DecompileRouteKind::Standard,
+                reason: Some("legacy rendered proofs complete".to_string()),
+                fallback_comment: None,
+                skip_runtime_type_inference: false,
+                use_prepared_semantic_view: true,
+                proof_coverage: r2sym::ProofCoverage {
+                    certified_loops: 1,
+                    certified_expressions: 4,
+                    certified_memory_accesses: 2,
+                    certified_returns: 1,
+                    ..r2sym::ProofCoverage::default()
+                },
+                render_permission: r2sym::RenderPermission::certified(
+                    r2sym::ProofOwner::R2engine,
+                    "legacy rendered proofs complete",
+                ),
+            }),
             summary_diagnostics: None,
             type_writeback,
             prefer_bounded_type_plan: false,
             callsite_count: 3,
             current_summary: Some(summary),
         };
+        let route = payload.semantic_route.as_ref().expect("semantic route");
+        let expected_render_permission =
+            serde_json::to_value(&route.render_permission).expect("serialize render permission");
+        let expected_proof_coverage =
+            serde_json::to_value(&route.proof_coverage).expect("serialize proof coverage");
         let report = type_writeback_report_json_from_function_analysis(
             EngineFunctionAnalysisTypeWritebackJsonRequest {
                 report: &payload,
@@ -8107,6 +13378,38 @@ mod tests {
         assert_eq!(value["interproc"]["iterations"], 1);
         assert_eq!(value["interproc"]["max_iterations"], 1);
         assert_eq!(value["interproc"]["summary"]["name"], "target");
+        assert!(value.get("render_permission").is_none());
+        assert!(value.get("proof_coverage").is_none());
+        assert_eq!(
+            value["legacy_render_permission"],
+            expected_render_permission
+        );
+        assert_eq!(
+            value["legacy_rendered_proof_coverage"],
+            expected_proof_coverage
+        );
+        assert_eq!(value["legacy_render_permission"]["kind"], "CertifiedC");
+        assert_eq!(value["legacy_render_permission"]["owner"], "R2engine");
+        assert_eq!(
+            value["legacy_render_permission"]["reason"],
+            "legacy rendered proofs complete"
+        );
+        assert_eq!(
+            value["legacy_rendered_proof_coverage"]["certified_loops"],
+            1
+        );
+        assert_eq!(
+            value["legacy_rendered_proof_coverage"]["certified_expressions"],
+            4
+        );
+        assert_eq!(
+            value["legacy_rendered_proof_coverage"]["certified_memory_accesses"],
+            2
+        );
+        assert_eq!(
+            value["legacy_rendered_proof_coverage"]["certified_returns"],
+            1
+        );
         assert!(
             value["interproc"]["summary_json"]
                 .as_str()
@@ -8244,8 +13547,8 @@ mod tests {
             },
             callsite_count: 0,
             current_summary: None,
-            artifact_cache_hit: false,
-            artifact_key: None,
+            analysis_cache_hit: false,
+            request_key: None,
             metrics: EngineMetrics::default(),
             diagnostics: EngineDiagnostics::default(),
         };
@@ -8314,8 +13617,8 @@ mod tests {
             },
             callsite_count: 3,
             current_summary: None,
-            artifact_cache_hit: false,
-            artifact_key: None,
+            analysis_cache_hit: false,
+            request_key: None,
             metrics: EngineMetrics::default(),
             diagnostics: EngineDiagnostics::default(),
         };
@@ -8519,6 +13822,7 @@ mod tests {
             function_addr: 0x401000,
             blocks: const_return_blocks(0x401000, 0),
             arch: None,
+            source_snapshot: None,
             ptr_bits: 64,
             semantic_metadata_enabled: false,
             reg_type_hints: HashMap::new(),
@@ -8557,6 +13861,7 @@ mod tests {
             function_addr: 0x402000,
             blocks: const_return_blocks(0x402000, 0),
             arch: Some(arch),
+            source_snapshot: None,
             ptr_bits: None,
             semantic_metadata_enabled: true,
             reg_type_hints: HashMap::new(),
@@ -8594,6 +13899,7 @@ mod tests {
                     function_addr: 0x403000,
                     blocks: const_return_blocks(0x403000, 0),
                     arch: explicit.arch.clone(),
+                    source_snapshot: None,
                     semantic_metadata_enabled: false,
                 },
                 ptr_bits: Some(32),
@@ -8616,8 +13922,8 @@ mod tests {
         let mut arch = r2il::ArchSpec::new("amd64");
         arch.addr_size = 8;
         let blocks = const_return_blocks(0x401000, 0);
-        let analysis =
-            build_engine_analysis_from_parts("sym.owner", &blocks, Some(&arch)).expect("analysis");
+        let analysis = build_engine_analysis_from_parts("sym.owner", &blocks, Some(&arch), None)
+            .expect("analysis");
 
         let signature = infer_signature_from_analysis(EngineSignatureInferenceRequest {
             function_name: "sym.owner",
@@ -8691,6 +13997,7 @@ mod tests {
                 function_addr: 0x401000,
                 blocks: vec![block],
                 arch: None,
+                source_snapshot: None,
                 semantic_metadata_enabled: true,
             },
             ptr_bits: Some(64),
@@ -8744,8 +14051,9 @@ mod tests {
             src: ptr_reg,
         });
         let blocks = vec![block];
-        let analysis = build_engine_analysis_from_parts("sym.sig_hints", &blocks, Some(&arch))
-            .expect("analysis");
+        let analysis =
+            build_engine_analysis_from_parts("sym.sig_hints", &blocks, Some(&arch), None)
+                .expect("analysis");
 
         let signature = infer_signature_from_analysis_with_register_names(
             EngineSignatureInferenceWithRegisterNamesRequest {
@@ -9489,49 +14797,163 @@ mod tests {
     }
 
     #[test]
-    fn engine_cache_key_tracks_typed_context_and_assumptions() {
+    fn engine_request_key_tracks_typed_context_and_assumptions() {
         let arch = r2il::ArchSpec::new("x86-64");
         let blocks = const_return_blocks(0x401000, 0);
-        let first = EngineFunctionKey::from_parts(
+        let analysis =
+            AnalysisCacheKey::from_immutable_parts("sym.main", Some(&arch), &blocks, None);
+        let first = EngineRequestKey::from_request_hashes(
+            analysis.clone(),
             0x401000,
-            "sym.main",
-            Some(&arch),
-            &blocks,
             1,
             2,
+            stable_fnv1a_hash("aaa"),
+            64,
+            0,
             3,
-            None,
-            "aaa",
+            0,
         );
-        let changed_assumption = EngineFunctionKey::from_parts(
+        let changed_assumption = EngineRequestKey::from_request_hashes(
+            analysis.clone(),
             0x401000,
-            "sym.main",
-            Some(&arch),
-            &blocks,
             1,
             9,
+            stable_fnv1a_hash("aaa"),
+            64,
+            0,
             3,
-            None,
-            "aaa",
+            0,
         );
-        let changed_context = EngineFunctionKey::from_parts(
+        let changed_context = EngineRequestKey::from_request_hashes(
+            analysis,
             0x401000,
-            "sym.main",
-            Some(&arch),
-            &blocks,
             8,
             2,
+            stable_fnv1a_hash("aaa"),
+            64,
+            0,
             3,
-            None,
-            "aaa",
+            0,
         );
 
         assert_ne!(first, changed_assumption);
         assert_ne!(first, changed_context);
+        assert_eq!(first.analysis, changed_assumption.analysis);
+        assert_eq!(first.analysis, changed_context.analysis);
     }
 
     #[test]
-    fn function_artifact_cache_key_hashes_parsed_assumptions_separately() {
+    fn engine_request_key_rejects_v3_and_missing_v4_request_fields() {
+        let legacy_v3 = serde_json::json!({
+            "analysis": {
+                "schema_version": 3,
+                "function_addr": 0x401000u64,
+                "function_name_hash": 1,
+                "arch_hash": 2,
+                "blocks_hash": 3,
+                "typed_context_hash": 4,
+                "assumptions_hash": 5,
+                "analysis_depth_hash": 6
+            },
+            "interproc_budget_hash": 7,
+            "symbolic_scope_hash": 8,
+            "semantic_schema_version": r2sym::SEMANTIC_ARTIFACT_SCHEMA_VERSION,
+            "semantic_claim_schema_version": r2sym::SEMANTIC_CLAIM_SCHEMA_VERSION
+        });
+        assert!(serde_json::from_value::<EngineRequestKey>(legacy_v3).is_err());
+
+        let key = EngineRequestKey::from_request_hashes(
+            AnalysisCacheKey::from_immutable_hashes(1, 2, 3, None),
+            0x401000,
+            4,
+            5,
+            6,
+            64,
+            7,
+            8,
+            9,
+        );
+        let encoded = serde_json::to_value(&key).expect("serialize v4 engine request key");
+        assert_eq!(encoded["analysis"]["schema_version"], ENGINE_SCHEMA_VERSION);
+        assert_eq!(
+            serde_json::from_value::<EngineRequestKey>(encoded.clone())
+                .expect("round-trip v4 engine request key"),
+            key
+        );
+
+        for field in [
+            "function_addr",
+            "typed_context_hash",
+            "assumptions_hash",
+            "analysis_depth_hash",
+            "ptr_bits",
+            "reg_type_hints_hash",
+        ] {
+            let mut missing = encoded.clone();
+            missing
+                .as_object_mut()
+                .expect("request key JSON object")
+                .remove(field);
+            assert!(
+                serde_json::from_value::<EngineRequestKey>(missing).is_err(),
+                "missing {field} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn request_scope_identity_separates_name_order_collisions() {
+        let root = r2ssa::SsaArtifact::for_symbolic(&const_return_blocks(0x401000, 0), None)
+            .expect("root prepared");
+        let helper = r2ssa::SsaArtifact::for_symbolic(&const_return_blocks(0x402000, 1), None)
+            .expect("helper prepared");
+        let left = r2sym::PreparedFunctionScope::new(
+            0x401000,
+            vec![
+                r2sym::ScopedPreparedFunction {
+                    id: r2ssa::InterprocFunctionId(0x401000),
+                    name: Some("sym.root".to_string()),
+                    prepared: root.clone().with_name("sym.root"),
+                },
+                r2sym::ScopedPreparedFunction {
+                    id: r2ssa::InterprocFunctionId(0x402000),
+                    name: Some("sym.helper".to_string()),
+                    prepared: helper.clone().with_name("sym.helper"),
+                },
+            ],
+        )
+        .expect("left scope");
+        let reordered_names = r2sym::PreparedFunctionScope::new(
+            0x401000,
+            vec![
+                r2sym::ScopedPreparedFunction {
+                    id: r2ssa::InterprocFunctionId(0x401000),
+                    name: Some("sym.helper".to_string()),
+                    prepared: root.with_name("sym.helper"),
+                },
+                r2sym::ScopedPreparedFunction {
+                    id: r2ssa::InterprocFunctionId(0x402000),
+                    name: Some("sym.root".to_string()),
+                    prepared: helper.with_name("sym.root"),
+                },
+            ],
+        )
+        .expect("scope with reordered names");
+
+        assert_eq!(
+            r2sym::stable_scope_hash(Some(&left)),
+            r2sym::stable_scope_hash(Some(&reordered_names)),
+            "upstream semantic scope identity intentionally ignores names"
+        );
+        assert_ne!(
+            request_scope_identity_hash(Some(&left)),
+            request_scope_identity_hash(Some(&reordered_names)),
+            "engine request identity must include name placement in scope order"
+        );
+    }
+
+    #[test]
+    fn function_request_key_hashes_parsed_assumptions_separately() {
         let blocks = const_return_blocks(0x401000, 0);
         let parsed_context = r2types::ParsedExternalContext {
             context_schema_version: Some(1),
@@ -9545,6 +14967,7 @@ mod tests {
             function_addr: 0x401000,
             blocks,
             arch: None,
+            source_snapshot: None,
             ptr_bits: 64,
             semantic_metadata_enabled: false,
             reg_type_hints: HashMap::new(),
@@ -9556,22 +14979,21 @@ mod tests {
             precomputed_semantic_artifact: None,
             semantic_mode: EngineSemanticMode::Full,
             include_interproc_summary_set: true,
+            execution: EngineExecutionControl::default(),
         };
-        let base = function_artifact_cache_key(&base_request);
+        let base = function_request_key(&base_request);
 
         let mut changed_assumption_request = base_request.clone();
         changed_assumption_request.parsed_context.assumptions =
             r2ssa::AssumptionSet::new(vec![cache_register_assumption("rdi-one", "rdi", 1)]);
-        let changed_assumption = function_artifact_cache_key(&changed_assumption_request);
+        let changed_assumption = function_request_key(&changed_assumption_request);
 
         assert_eq!(
-            base.analysis.typed_context_hash,
-            changed_assumption.analysis.typed_context_hash
+            base.typed_context_hash,
+            changed_assumption.typed_context_hash
         );
-        assert_ne!(
-            base.analysis.assumptions_hash,
-            changed_assumption.analysis.assumptions_hash
-        );
+        assert_ne!(base.assumptions_hash, changed_assumption.assumptions_hash);
+        assert_eq!(base.analysis, changed_assumption.analysis);
         assert_ne!(base, changed_assumption);
 
         let mut reordered_first = base_request.clone();
@@ -9585,35 +15007,1305 @@ mod tests {
             cache_register_assumption("rdi-one", "rdi", 1),
         ]);
         assert_eq!(
-            function_artifact_cache_key(&reordered_first),
-            function_artifact_cache_key(&reordered_second),
+            function_request_key(&reordered_first),
+            function_request_key(&reordered_second),
             "assumption identity should be deterministic and order-insensitive"
         );
 
+        let mut changed_ptr_bits_request = base_request.clone();
+        changed_ptr_bits_request.ptr_bits = 32;
+        let changed_ptr_bits = function_request_key(&changed_ptr_bits_request);
+        assert_eq!(base.analysis, changed_ptr_bits.analysis);
+        assert_ne!(base, changed_ptr_bits);
+
+        let integer_hint = r2types::TypeHint {
+            rank: r2types::TypeHintRank::Integer,
+            ty: "uint64_t".to_string(),
+        };
+        let pointer_hint = r2types::TypeHint::pointer();
+        let mut first_hint_order = base_request.clone();
+        first_hint_order
+            .reg_type_hints
+            .insert("rsi".to_string(), pointer_hint.clone());
+        first_hint_order
+            .reg_type_hints
+            .insert("rdi".to_string(), integer_hint.clone());
+        let mut second_hint_order = base_request.clone();
+        second_hint_order
+            .reg_type_hints
+            .insert("rdi".to_string(), integer_hint);
+        second_hint_order
+            .reg_type_hints
+            .insert("rsi".to_string(), pointer_hint);
+        let first_hint_key = function_request_key(&first_hint_order);
+        let second_hint_key = function_request_key(&second_hint_order);
+        assert_eq!(first_hint_key, second_hint_key);
+        assert_eq!(base.analysis, first_hint_key.analysis);
+        assert_ne!(base, first_hint_key);
+
         let mut changed_config_request = base_request;
         changed_config_request.semantic_metadata_enabled = true;
-        let changed_config = function_artifact_cache_key(&changed_config_request);
-        assert_eq!(
-            base.analysis.assumptions_hash,
-            changed_config.analysis.assumptions_hash
-        );
-        assert_ne!(
-            base.analysis.analysis_depth_hash,
-            changed_config.analysis.analysis_depth_hash
-        );
+        let changed_config = function_request_key(&changed_config_request);
+        assert_eq!(base.assumptions_hash, changed_config.assumptions_hash);
+        assert_ne!(base.analysis_depth_hash, changed_config.analysis_depth_hash);
+        assert_eq!(base.analysis, changed_config.analysis);
     }
 
     #[test]
     fn analyze_uncached_reports_planning_time() {
         let session = EngineSession::new(4);
+        let request = EngineAnalyzeRequest {
+            function_name: "sym.zero".to_string(),
+            function_addr: 0x401000,
+            blocks: const_return_blocks(0x401000, 0),
+            arch: None,
+            source_snapshot: None,
+            ptr_bits: 64,
+            semantic_metadata_enabled: false,
+            reg_type_hints: HashMap::new(),
+            parsed_context: r2types::ParsedExternalContext::default(),
+            external_context_fallback_hash: 0,
+            scope_facts: InterprocScopeFacts::empty(),
+            interproc_max_iterations: 1,
+            symbolic_scope: None,
+            precomputed_semantic_artifact: None,
+            semantic_mode: EngineSemanticMode::Full,
+            include_interproc_summary_set: true,
+            execution: EngineExecutionControl::default(),
+        };
         let response = session
-            .analyze(EngineAnalyzeRequest {
-                function_name: "sym.zero".to_string(),
-                function_addr: 0x401000,
-                blocks: const_return_blocks(0x401000, 0),
+            .analyze(request.clone())
+            .expect("analysis should succeed");
+
+        assert!(response.metrics.planning_time > Duration::default());
+        assert_eq!(response.metrics.phase_timings.len(), EnginePhase::ALL.len());
+        assert_eq!(
+            response
+                .metrics
+                .phase_timings
+                .iter()
+                .map(|timing| timing.phase)
+                .collect::<Vec<_>>(),
+            EnginePhase::ALL
+        );
+        assert_eq!(
+            response.metrics.phase_timings[2].status,
+            EnginePhaseStatus::Executed
+        );
+
+        let reused = session
+            .analyze(request)
+            .expect("cached analysis should succeed");
+        assert_eq!(reused.metrics.phase_timings.len(), EnginePhase::ALL.len());
+        assert_eq!(
+            reused.metrics.phase_timings[2].status,
+            EnginePhaseStatus::Reused
+        );
+        assert_eq!(
+            reused.metrics.phase_timings[3].status,
+            EnginePhaseStatus::Reused
+        );
+
+        let decompiled = session.decompile_function_from_input(
+            EngineFunctionDecompileRequestInput::single_function(
+                EngineFunctionInput {
+                    function_name: "sym.zero".to_string(),
+                    function_addr: 0x401000,
+                    blocks: const_return_blocks(0x401000, 0),
+                    arch: None,
+                    source_snapshot: None,
+                    semantic_metadata_enabled: false,
+                },
+                Some(64),
+                r2types::ParsedExternalContext::default(),
+                0,
+            ),
+        );
+        assert_eq!(
+            decompiled.metrics.phase_timings.len(),
+            EnginePhase::ALL.len()
+        );
+        assert_eq!(
+            decompiled.metrics.phase_timings[10].status,
+            EnginePhaseStatus::NotExecuted,
+            "FFI conversion is outside the engine measurement boundary"
+        );
+    }
+
+    fn controlled_ssa_test_request(
+        function_name: &str,
+        blocks: Vec<R2ILBlock>,
+    ) -> EngineAnalyzeRequest {
+        EngineAnalyzeRequest::full_semantics_for_function(EngineAnalyzeFunctionRequestInput {
+            function: EngineFunctionInput {
+                function_name: function_name.to_string(),
+                function_addr: blocks.first().map(|block| block.addr).unwrap_or(0),
+                blocks,
                 arch: None,
-                ptr_bits: 64,
+                source_snapshot: None,
                 semantic_metadata_enabled: false,
+            },
+            ptr_bits: Some(64),
+            reg_type_hints: HashMap::new(),
+            parsed_context: r2types::ParsedExternalContext::default(),
+            external_context_fallback_hash: 0,
+            scope_facts: InterprocScopeFacts::empty(),
+            interproc_max_iterations: 1,
+            symbolic_scope: None,
+            precomputed_semantic_artifact: None,
+            include_interproc_summary_set: false,
+        })
+    }
+
+    fn controlled_r2dec_render_request() -> EngineDecompileRequest {
+        let blocks = const_return_blocks(0x614000, 7);
+        let prepared = r2ssa::SsaArtifact::for_decompile(&blocks, None)
+            .expect("prepared render SSA")
+            .with_name("sym.r2dec_controlled");
+        let signature = r2types::FunctionSignatureSpec {
+            ret_type: Some(r2types::CTypeLike::Int {
+                bits: 64,
+                signedness: r2types::Signedness::Unsigned,
+            }),
+            params: Vec::new(),
+        };
+        let route = r2types::DecompileRouteFacts {
+            kind: r2types::DecompileRouteKind::Standard,
+            reason: Some("controlled r2dec render test".to_string()),
+            fallback_comment: None,
+            skip_runtime_type_inference: true,
+            use_prepared_semantic_view: true,
+            proof_coverage: r2sym::ProofCoverage::default(),
+            render_permission: r2sym::RenderPermission::certified(
+                r2sym::ProofOwner::R2engine,
+                "controlled r2dec render test",
+            ),
+        };
+        let function_facts = FunctionFacts::new(
+            FunctionTypeFacts {
+                merged_signature: Some(signature.clone()),
+                signature_certificate: r2types::SignatureCertificate::from_signature(
+                    &signature,
+                    [r2types::SignatureCertificateSource::ExternalContext],
+                ),
+                ..FunctionTypeFacts::default()
+            },
+            None,
+        )
+        .with_decompile_route(route);
+        let param_slots = ParamSlotResolver::from_arch_name(Some("x86-64"));
+        let function_facts = function_facts_for_decompile(
+            "sym.r2dec_controlled",
+            &prepared,
+            function_facts,
+            &param_slots,
+        );
+        EngineDecompileRequest {
+            function_name: "sym.r2dec_controlled".to_string(),
+            prepared_ssa: Arc::new(prepared),
+            function_facts,
+            render_target: EngineRenderTarget::default(),
+            execution: EngineExecutionControl::default(),
+            metrics: EngineMetrics::default(),
+        }
+    }
+
+    fn controlled_semantic_kernel_render_request(
+        session: &EngineSession,
+    ) -> EngineDecompileRequest {
+        let (blocks, arch, source_snapshot) = source_snapshot_terminal_function();
+        let analyzed = session
+            .analyze(EngineAnalyzeRequest::full_semantics_for_function(
+                EngineAnalyzeFunctionRequestInput {
+                    function: EngineFunctionInput {
+                        function_name: "sym.controlled_semantic_kernel".to_string(),
+                        function_addr: 0x7200,
+                        blocks,
+                        arch: Some(arch.clone()),
+                        source_snapshot: Some(source_snapshot),
+                        semantic_metadata_enabled: true,
+                    },
+                    ptr_bits: Some(64),
+                    reg_type_hints: HashMap::new(),
+                    parsed_context: r2types::ParsedExternalContext::default(),
+                    external_context_fallback_hash: 0,
+                    scope_facts: InterprocScopeFacts::empty(),
+                    interproc_max_iterations: 1,
+                    symbolic_scope: None,
+                    precomputed_semantic_artifact: None,
+                    include_interproc_summary_set: false,
+                },
+            ))
+            .expect("controlled semantic-kernel analysis");
+        let (arch_name, render_target) =
+            EngineRenderTarget::for_arch_with_ptr_bits(Some(&arch), 64);
+        let param_slots = ParamSlotResolver::from_arch_name(Some(&arch_name));
+        let function_facts = function_facts_for_decompile(
+            "sym.controlled_semantic_kernel",
+            &analyzed.artifact.ssa_func,
+            analyzed.artifact.function_facts,
+            &param_slots,
+        );
+        EngineDecompileRequest {
+            function_name: "sym.controlled_semantic_kernel".to_string(),
+            prepared_ssa: analyzed.artifact.ssa_func,
+            function_facts,
+            render_target,
+            execution: EngineExecutionControl::default(),
+            metrics: EngineMetrics::default(),
+        }
+    }
+
+    fn controlled_aggregate_member_render_request(
+        session: &EngineSession,
+    ) -> EngineDecompileRequest {
+        let (blocks, arch, source_snapshot) =
+            source_snapshot_aggregate_member_load_return_function();
+        let analyzed = session
+            .analyze(EngineAnalyzeRequest::full_semantics_for_function(
+                EngineAnalyzeFunctionRequestInput {
+                    function: EngineFunctionInput {
+                        function_name: "sym.controlled_aggregate_member".to_string(),
+                        function_addr: 0x7700,
+                        blocks,
+                        arch: Some(arch.clone()),
+                        source_snapshot: Some(source_snapshot),
+                        semantic_metadata_enabled: true,
+                    },
+                    ptr_bits: Some(64),
+                    reg_type_hints: HashMap::new(),
+                    parsed_context: r2types::ParsedExternalContext::default(),
+                    external_context_fallback_hash: 0,
+                    scope_facts: InterprocScopeFacts::empty(),
+                    interproc_max_iterations: 1,
+                    symbolic_scope: None,
+                    precomputed_semantic_artifact: None,
+                    include_interproc_summary_set: false,
+                },
+            ))
+            .expect("controlled aggregate-member analysis");
+        let (arch_name, render_target) =
+            EngineRenderTarget::for_arch_with_ptr_bits(Some(&arch), 64);
+        let param_slots = ParamSlotResolver::from_arch_name(Some(&arch_name));
+        let function_facts = function_facts_for_decompile(
+            "sym.controlled_aggregate_member",
+            &analyzed.artifact.ssa_func,
+            analyzed.artifact.function_facts,
+            &param_slots,
+        );
+        EngineDecompileRequest {
+            function_name: "sym.controlled_aggregate_member".to_string(),
+            prepared_ssa: analyzed.artifact.ssa_func,
+            function_facts,
+            render_target,
+            execution: EngineExecutionControl::default(),
+            metrics: EngineMetrics::default(),
+        }
+    }
+
+    fn controlled_conditional_funnel_render_request(
+        session: &EngineSession,
+    ) -> EngineDecompileRequest {
+        let (blocks, arch, source_snapshot) =
+            source_snapshot_conditional_funnel_return_function(true);
+        let analyzed = session
+            .analyze(EngineAnalyzeRequest::full_semantics_for_function(
+                EngineAnalyzeFunctionRequestInput {
+                    function: EngineFunctionInput {
+                        function_name: "sym.controlled_conditional_funnel".to_string(),
+                        function_addr: 0x7600,
+                        blocks,
+                        arch: Some(arch.clone()),
+                        source_snapshot: Some(source_snapshot),
+                        semantic_metadata_enabled: true,
+                    },
+                    ptr_bits: Some(64),
+                    reg_type_hints: HashMap::new(),
+                    parsed_context: r2types::ParsedExternalContext::default(),
+                    external_context_fallback_hash: 0,
+                    scope_facts: InterprocScopeFacts::empty(),
+                    interproc_max_iterations: 1,
+                    symbolic_scope: None,
+                    precomputed_semantic_artifact: None,
+                    include_interproc_summary_set: false,
+                },
+            ))
+            .expect("controlled conditional-funnel analysis");
+        let (arch_name, render_target) =
+            EngineRenderTarget::for_arch_with_ptr_bits(Some(&arch), 64);
+        let param_slots = ParamSlotResolver::from_arch_name(Some(&arch_name));
+        let function_facts = function_facts_for_decompile(
+            "sym.controlled_conditional_funnel",
+            &analyzed.artifact.ssa_func,
+            analyzed.artifact.function_facts,
+            &param_slots,
+        );
+        EngineDecompileRequest {
+            function_name: "sym.controlled_conditional_funnel".to_string(),
+            prepared_ssa: analyzed.artifact.ssa_func,
+            function_facts,
+            render_target,
+            execution: EngineExecutionControl::default(),
+            metrics: EngineMetrics::default(),
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingRenderControl {
+        polls: Cell<usize>,
+    }
+
+    impl r2ssa::SsaWorkControl for CountingRenderControl {
+        fn poll(&self) -> Result<(), r2ssa::SsaExecutionStopReason> {
+            self.polls.set(self.polls.get().saturating_add(1));
+            Ok(())
+        }
+    }
+
+    struct StopRenderAtPoll {
+        polls: Cell<usize>,
+        stop_at: usize,
+        reason: r2ssa::SsaExecutionStopReason,
+    }
+
+    impl StopRenderAtPoll {
+        fn new(stop_at: usize, reason: r2ssa::SsaExecutionStopReason) -> Self {
+            Self {
+                polls: Cell::new(0),
+                stop_at,
+                reason,
+            }
+        }
+    }
+
+    impl r2ssa::SsaWorkControl for StopRenderAtPoll {
+        fn poll(&self) -> Result<(), r2ssa::SsaExecutionStopReason> {
+            let polls = self.polls.get().saturating_add(1);
+            self.polls.set(polls);
+            if polls >= self.stop_at {
+                Err(self.reason)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn exact_semantic_kernel_permits_override_legacy_route_metadata() {
+        let session = EngineSession::new(4);
+        let mut terminal = controlled_semantic_kernel_render_request(&session);
+        let terminal_baseline = session
+            .decompile_with_r2dec_control(terminal.clone(), &r2ssa::SsaExecutionControl::default());
+        terminal
+            .function_facts
+            .set_decompile_route(Some(test_decompile_route(
+                r2types::DecompileRouteKind::FallbackComment,
+                Some("forced legacy terminal refusal"),
+                Some("/* forced legacy terminal fallback */"),
+            )));
+        let terminal =
+            session.decompile_with_r2dec_control(terminal, &r2ssa::SsaExecutionControl::default());
+        assert_eq!(terminal.output, terminal_baseline.output);
+        assert!(terminal.output.contains("certified_sub_7200"));
+        assert_eq!(
+            terminal.diagnostics.semantic_kernel_render,
+            terminal_baseline.diagnostics.semantic_kernel_render
+        );
+        assert!(terminal.diagnostics.render_permission.is_none());
+        assert!(terminal.diagnostics.refusal.is_none());
+
+        let mut funnel = controlled_conditional_funnel_render_request(&session);
+        let funnel_baseline = session
+            .decompile_with_r2dec_control(funnel.clone(), &r2ssa::SsaExecutionControl::default());
+        funnel
+            .function_facts
+            .set_decompile_route(Some(test_decompile_route(
+                r2types::DecompileRouteKind::StructuredWorker,
+                Some("forced legacy structured-worker summary"),
+                Some("/* forced legacy structured-worker fallback */"),
+            )));
+        let funnel =
+            session.decompile_with_r2dec_control(funnel, &r2ssa::SsaExecutionControl::default());
+        assert_eq!(funnel.output, funnel_baseline.output);
+        assert!(funnel.output.contains("certified_sub_7600"));
+        assert_eq!(
+            funnel.diagnostics.semantic_kernel_render,
+            funnel_baseline.diagnostics.semantic_kernel_render
+        );
+        assert!(funnel.diagnostics.render_permission.is_none());
+        assert!(funnel.diagnostics.refusal.is_none());
+    }
+
+    #[test]
+    fn legacy_certified_c_claim_cannot_authorize_a_semantic_kernel_near_miss() {
+        let session = EngineSession::new(4);
+        let request = controlled_r2dec_render_request();
+        assert_eq!(
+            request
+                .function_facts
+                .decompile_route()
+                .map(|route| route.render_permission.kind),
+            Some(r2sym::RenderPermissionKind::CertifiedC),
+            "fixture must carry the obsolete authority claim"
+        );
+
+        let response =
+            session.decompile_with_r2dec_control(request, &r2ssa::SsaExecutionControl::default());
+
+        assert!(response.diagnostics.semantic_kernel_render.is_none());
+        assert_eq!(
+            response
+                .diagnostics
+                .render_permission
+                .as_ref()
+                .map(|permission| permission.kind),
+            Some(r2sym::RenderPermissionKind::CertifiedC),
+            "the compatibility diagnostic may report the stale claim without authorizing it"
+        );
+        assert!(response.output.contains("r2dec residual:"));
+        assert!(!response.output.contains("() {"));
+    }
+
+    #[test]
+    fn semantic_kernel_near_miss_preserves_legacy_fallback_without_c() {
+        let session = EngineSession::new(4);
+        let mut request = controlled_r2dec_render_request();
+        let fallback = "/* forced near-miss legacy fallback */";
+        request
+            .function_facts
+            .set_decompile_route(Some(test_decompile_route(
+                r2types::DecompileRouteKind::FallbackComment,
+                Some("forced near-miss refusal"),
+                Some(fallback),
+            )));
+
+        let response =
+            session.decompile_with_r2dec_control(request, &r2ssa::SsaExecutionControl::default());
+
+        assert_eq!(response.output, fallback);
+        assert!(response.diagnostics.semantic_kernel_render.is_none());
+        assert_eq!(
+            response
+                .function_facts
+                .decompile_route()
+                .map(|route| route.kind),
+            Some(r2types::DecompileRouteKind::FallbackComment)
+        );
+        assert_eq!(
+            response.diagnostics.route_reason.as_deref(),
+            Some("forced near-miss refusal")
+        );
+        assert!(response.diagnostics.refusal.is_some());
+        assert!(!response.output.contains("() {"));
+    }
+
+    #[test]
+    fn r2dec_inner_stops_map_to_engine_refusals_without_output_or_cache_mutation() {
+        let session = EngineSession::new(4);
+        let request = controlled_r2dec_render_request();
+        let decompiler_input = decompiler_input_for_engine_request(&request);
+        let legacy_output = r2dec::Decompiler::new(request.render_target.to_decompiler_config())
+            .decompile_input(&decompiler_input);
+        let counting = CountingRenderControl::default();
+        let controlled = session.decompile_with_r2dec_control_and_kernel_policy(
+            request.clone(),
+            &counting,
+            false,
+        );
+        assert_eq!(controlled.output, legacy_output);
+        let total_polls = counting.polls.get();
+        assert!(total_polls > 3, "r2dec pipeline must expose inner polls");
+
+        let cache_before = session.cache_metrics();
+        let mut observed = HashMap::new();
+        for stop_at in 1..=total_polls {
+            let stop = StopRenderAtPoll::new(stop_at, r2ssa::SsaExecutionStopReason::Cancelled);
+            let response = session.decompile_with_r2dec_control_and_kernel_policy(
+                request.clone(),
+                &stop,
+                false,
+            );
+            let phase = [EnginePhase::Normalization, EnginePhase::Rendering]
+                .into_iter()
+                .find(|phase| {
+                    response.metrics.phase_timings.iter().any(|timing| {
+                        timing.phase == *phase && timing.status == EnginePhaseStatus::Refused
+                    })
+                })
+                .expect("stopped render must mark one render phase refused");
+            observed.entry(phase).or_insert(stop_at);
+            if observed.len() == 2 {
+                break;
+            }
+        }
+        observed.insert(EnginePhase::Rendering, total_polls);
+
+        for phase in [EnginePhase::Normalization, EnginePhase::Rendering] {
+            let stop_at = *observed
+                .get(&phase)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing deterministic {phase:?} stop (polls={total_polls}, output={legacy_output})"
+                    )
+                });
+            let reason = if phase == EnginePhase::Rendering {
+                r2ssa::SsaExecutionStopReason::DeadlineExceeded
+            } else {
+                r2ssa::SsaExecutionStopReason::Cancelled
+            };
+            let stop = StopRenderAtPoll::new(stop_at, reason);
+            let response = session.decompile_with_r2dec_control_and_kernel_policy(
+                request.clone(),
+                &stop,
+                false,
+            );
+            let expected_reason = match reason {
+                r2ssa::SsaExecutionStopReason::Cancelled => {
+                    format!("engine request cancelled during {} phase", phase.as_str())
+                }
+                r2ssa::SsaExecutionStopReason::DeadlineExceeded => format!(
+                    "engine request deadline exceeded during {} phase",
+                    phase.as_str()
+                ),
+            };
+            assert_eq!(response.metrics.phase_timings.len(), EnginePhase::ALL.len());
+            assert!(response.metrics.phase_timings.iter().any(|timing| {
+                timing.phase == phase && timing.status == EnginePhaseStatus::Refused
+            }));
+            assert_eq!(
+                response
+                    .metrics
+                    .phase_timings
+                    .iter()
+                    .filter(|timing| timing.status == EnginePhaseStatus::Refused)
+                    .count(),
+                1,
+                "only the interrupted phase is refused"
+            );
+            let normalization_status = if phase == EnginePhase::Rendering {
+                EnginePhaseStatus::Folded
+            } else {
+                EnginePhaseStatus::Refused
+            };
+            let structuring_status = if phase == EnginePhase::Rendering {
+                EnginePhaseStatus::Folded
+            } else {
+                EnginePhaseStatus::NotExecuted
+            };
+            assert_eq!(
+                response.metrics.phase_timings[EnginePhase::Normalization as usize].status,
+                normalization_status
+            );
+            assert_eq!(
+                response.metrics.phase_timings[EnginePhase::Structuring as usize].status,
+                structuring_status
+            );
+            assert_eq!(
+                response.metrics.phase_timings[EnginePhase::FfiConversion as usize].status,
+                EnginePhaseStatus::NotExecuted
+            );
+            assert_eq!(
+                response.diagnostics.route_reason.as_deref(),
+                Some(expected_reason.as_str())
+            );
+            assert!(
+                response
+                    .diagnostics
+                    .refusal
+                    .as_deref()
+                    .is_some_and(|refusal| refusal.contains(&expected_reason))
+            );
+            assert_eq!(
+                response
+                    .function_facts
+                    .decompile_route()
+                    .map(|route| route.kind),
+                Some(r2types::DecompileRouteKind::FallbackComment)
+            );
+            assert!(response.output.starts_with("/* r2dec fallback:"));
+            assert!(!response.output.contains("() {"));
+        }
+        assert_eq!(session.cache_metrics(), cache_before);
+    }
+
+    #[test]
+    fn r2dec_stop_mapping_preserves_all_decompiler_phases_and_reasons() {
+        // Production r2dec deliberately refuses executable Standard rendering before its
+        // structurer, while every non-Standard route exits at a summary boundary. The r2dec
+        // assignment-consensus test therefore exercises the actual inner Structuring stop;
+        // this engine test covers its exact cross-crate phase/reason mapping without weakening
+        // that fail-closed authorization boundary.
+        for (decompile_phase, engine_phase) in [
+            (
+                r2dec::DecompileWorkPhase::Normalization,
+                EnginePhase::Normalization,
+            ),
+            (
+                r2dec::DecompileWorkPhase::Structuring,
+                EnginePhase::Structuring,
+            ),
+            (r2dec::DecompileWorkPhase::Rendering, EnginePhase::Rendering),
+        ] {
+            for reason in [
+                r2ssa::SsaExecutionStopReason::Cancelled,
+                r2ssa::SsaExecutionStopReason::DeadlineExceeded,
+            ] {
+                let mapped = engine_render_stop_from_decompiler(
+                    r2dec::DecompileExecutionStop::new(decompile_phase, reason),
+                );
+                assert_eq!(mapped.phase, engine_phase);
+                assert_eq!(
+                    mapped.normalization_completed,
+                    !matches!(decompile_phase, r2dec::DecompileWorkPhase::Normalization)
+                );
+                assert_eq!(
+                    mapped.structuring_completed,
+                    matches!(decompile_phase, r2dec::DecompileWorkPhase::Rendering)
+                );
+                match reason {
+                    r2ssa::SsaExecutionStopReason::Cancelled => {
+                        assert_eq!(
+                            mapped.reason,
+                            format!(
+                                "engine request cancelled during {} phase",
+                                engine_phase.as_str()
+                            )
+                        );
+                    }
+                    r2ssa::SsaExecutionStopReason::DeadlineExceeded => {
+                        assert_eq!(
+                            mapped.reason,
+                            format!(
+                                "engine request deadline exceeded during {} phase",
+                                engine_phase.as_str()
+                            )
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn semantic_kernel_rejection_preserves_certification_and_rendering_phases() {
+        let cancellation = StopRenderAtPoll::new(1, r2ssa::SsaExecutionStopReason::Cancelled);
+        let injected_rejection = complete_engine_semantic_kernel_attempt(
+            &cancellation,
+            EngineSemanticKernelAttempt::Rejected {
+                reason: "forced certificate rejection".to_string(),
+                phase: EnginePhase::Certification,
+                certification_completed: false,
+                structuring_completed: false,
+            },
+        )
+        .expect("a known exact rejection must not run a masking cancellation poll");
+        assert_eq!(cancellation.polls.get(), 0);
+        let certification = resolve_engine_semantic_kernel_attempt(injected_rejection)
+            .expect_err("forced certificate rejection must not yield partial C");
+        let certification_metrics = engine_metrics_for_render_stop(
+            EngineMetrics::default(),
+            &certification,
+            Duration::from_micros(3),
+            Duration::from_micros(5),
+        );
+        assert_eq!(certification.reason, "forced certificate rejection");
+        assert_eq!(certification.phase, EnginePhase::Certification);
+        assert_eq!(
+            certification_metrics.phase_timings[EnginePhase::Certification as usize].status,
+            EnginePhaseStatus::Refused
+        );
+        assert_eq!(
+            certification_metrics.phase_timings[EnginePhase::Structuring as usize].status,
+            EnginePhaseStatus::NotExecuted
+        );
+        assert_eq!(
+            certification_metrics.phase_timings[EnginePhase::Rendering as usize].status,
+            EnginePhaseStatus::NotExecuted
+        );
+        assert_eq!(
+            certification_metrics.phase_timings[EnginePhase::FfiConversion as usize].status,
+            EnginePhaseStatus::NotExecuted
+        );
+
+        let rendering =
+            resolve_engine_semantic_kernel_attempt(EngineSemanticKernelAttempt::Rejected {
+                reason: "forced certified-render rejection".to_string(),
+                phase: EnginePhase::Rendering,
+                certification_completed: true,
+                structuring_completed: true,
+            })
+            .expect_err("forced rendering rejection must not yield partial C");
+        let rendering_metrics = engine_metrics_for_render_stop(
+            EngineMetrics::default(),
+            &rendering,
+            Duration::from_micros(7),
+            Duration::from_micros(11),
+        );
+        assert_eq!(rendering.reason, "forced certified-render rejection");
+        assert_eq!(rendering.phase, EnginePhase::Rendering);
+        assert_eq!(
+            rendering_metrics.phase_timings[EnginePhase::Certification as usize].status,
+            EnginePhaseStatus::Folded
+        );
+        assert_eq!(
+            rendering_metrics.phase_timings[EnginePhase::Structuring as usize].status,
+            EnginePhaseStatus::Folded
+        );
+        assert_eq!(
+            rendering_metrics.phase_timings[EnginePhase::Rendering as usize].status,
+            EnginePhaseStatus::Refused
+        );
+        assert_eq!(
+            rendering_metrics.phase_timings[EnginePhase::FfiConversion as usize].status,
+            EnginePhaseStatus::NotExecuted
+        );
+    }
+
+    #[test]
+    fn semantic_kernel_region_schema_table_tracks_exact_r2dec_contracts() {
+        for (region, contract, expected_wire) in [
+            (
+                EngineSemanticKernelRegion::TerminalReturnBlock,
+                r2dec::CERTIFIED_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
+                1,
+            ),
+            (
+                EngineSemanticKernelRegion::AggregateMemberTerminalReturnFunction,
+                r2dec::CERTIFIED_AGGREGATE_MEMBER_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
+                1,
+            ),
+            (
+                EngineSemanticKernelRegion::PlainRamMemoryTerminalReturnFunction,
+                r2dec::CERTIFIED_MEMORY_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
+                1,
+            ),
+            (
+                EngineSemanticKernelRegion::DirectCallTerminalReturnFunction,
+                r2dec::CERTIFIED_DIRECT_CALL_RETURN_FUNCTION_SCHEMA_VERSION,
+                1,
+            ),
+            (
+                EngineSemanticKernelRegion::ConditionalTerminalReturnFunction,
+                r2dec::CERTIFIED_CONDITIONAL_RETURN_FUNCTION_SCHEMA_VERSION,
+                1,
+            ),
+            (
+                EngineSemanticKernelRegion::PrivateFrameConditionalReturnFunction,
+                r2dec::CERTIFIED_PRIVATE_FRAME_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
+                1,
+            ),
+            (
+                EngineSemanticKernelRegion::CanonicalFnvFoldLoopFunction,
+                r2dec::CERTIFIED_FNV_FOLD_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
+                1,
+            ),
+            (
+                EngineSemanticKernelRegion::ConditionalFunnelSharedReturnFunction,
+                r2dec::CERTIFIED_CONDITIONAL_FUNNEL_RETURN_FUNCTION_SCHEMA_VERSION,
+                1,
+            ),
+            (
+                EngineSemanticKernelRegion::SwitchTerminalReturnFunction,
+                r2dec::CERTIFIED_SWITCH_RETURN_FUNCTION_SCHEMA_VERSION,
+                1,
+            ),
+            (
+                EngineSemanticKernelRegion::CarrierFreeLoopTerminalReturnFunction,
+                r2dec::CERTIFIED_LOOP_RETURN_FUNCTION_SCHEMA_VERSION,
+                1,
+            ),
+            (
+                EngineSemanticKernelRegion::CountedLoopTerminalReturnFunction,
+                r2dec::CERTIFIED_COUNTED_LOOP_RETURN_FUNCTION_SCHEMA_VERSION,
+                1,
+            ),
+            (
+                EngineSemanticKernelRegion::CanonicalFnvFoldO0Function,
+                r2dec::CERTIFIED_FNV_FOLD_O0_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
+                1,
+            ),
+            (
+                EngineSemanticKernelRegion::BranchlessGuardFunction,
+                r2dec::CERTIFIED_BRANCHLESS_GUARD_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
+                1,
+            ),
+            (
+                EngineSemanticKernelRegion::StructArrayIndexFunction,
+                r2dec::CERTIFIED_STRUCT_ARRAY_INDEX_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
+                1,
+            ),
+            (
+                EngineSemanticKernelRegion::NestedWrap32GuardO0Function,
+                r2dec::CERTIFIED_NESTED_WRAP32_GUARD_O0_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
+                1,
+            ),
+            (
+                EngineSemanticKernelRegion::SumArrayFunction,
+                r2dec::CERTIFIED_SUM_ARRAY_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
+                1,
+            ),
+        ] {
+            assert_eq!(contract, expected_wire);
+            assert_eq!(region.current_schema_version(), expected_wire);
+        }
+    }
+
+    #[test]
+    fn engine_execution_cancellation_reaches_r2dec_inner_normalization() {
+        let session = EngineSession::new(4);
+        let cancellation = EngineCancellationToken::default();
+        let mut request = controlled_r2dec_render_request();
+        request.execution = EngineExecutionControl::with_cancellation(cancellation.clone());
+        let control = DeterministicSsaControl {
+            polls: Cell::new(0),
+            stop_at: 5,
+            trigger: SsaPollTrigger::Cancel(cancellation),
+            downstream: Some(request.execution.ssa_execution_control()),
+        };
+
+        let response =
+            session.decompile_with_r2dec_control_and_kernel_policy(request, &control, false);
+
+        assert_eq!(control.polls.get(), 5);
+        assert_eq!(
+            response.diagnostics.route_reason.as_deref(),
+            Some("engine request cancelled during normalization phase")
+        );
+        assert!(response.metrics.phase_timings.iter().any(|timing| {
+            timing.phase == EnginePhase::Normalization
+                && timing.status == EnginePhaseStatus::Refused
+        }));
+        assert_eq!(
+            response
+                .metrics
+                .phase_timings
+                .iter()
+                .filter(|timing| timing.status == EnginePhaseStatus::Refused)
+                .count(),
+            1
+        );
+        assert_eq!(
+            response.metrics.phase_timings[EnginePhase::Structuring as usize].status,
+            EnginePhaseStatus::NotExecuted
+        );
+        assert_eq!(
+            response.metrics.phase_timings[EnginePhase::Rendering as usize].status,
+            EnginePhaseStatus::NotExecuted
+        );
+        assert!(response.output.starts_with("/* r2dec fallback:"));
+        assert!(!response.output.contains("() {"));
+    }
+
+    #[test]
+    fn semantic_kernel_renderers_poll_without_reclassifying_certification() {
+        let session = EngineSession::new(4);
+        let request = controlled_semantic_kernel_render_request(&session);
+        let baseline = session
+            .decompile_with_r2dec_control(request.clone(), &r2ssa::SsaExecutionControl::default());
+        assert!(
+            baseline.diagnostics.semantic_kernel_render.is_some(),
+            "exact terminal-return fixture should retain its semantic-kernel authorization"
+        );
+        assert!(baseline.diagnostics.refusal.is_none());
+
+        let cache_before = session.cache_metrics();
+        let stop = StopRenderAtPoll::new(1, r2ssa::SsaExecutionStopReason::Cancelled);
+        let refused = session.decompile_with_r2dec_control(request, &stop);
+        assert_eq!(stop.polls.get(), 1);
+        assert_eq!(
+            refused.diagnostics.route_reason.as_deref(),
+            Some("engine request cancelled during rendering phase")
+        );
+        assert!(refused.diagnostics.semantic_kernel_render.is_none());
+        assert!(refused.metrics.phase_timings.iter().any(|timing| {
+            timing.phase == EnginePhase::Normalization
+                && timing.status == EnginePhaseStatus::NotExecuted
+        }));
+        assert!(refused.metrics.phase_timings.iter().any(|timing| {
+            timing.phase == EnginePhase::Structuring
+                && timing.status == EnginePhaseStatus::NotExecuted
+        }));
+        assert!(refused.metrics.phase_timings.iter().any(|timing| {
+            timing.phase == EnginePhase::Rendering && timing.status == EnginePhaseStatus::Refused
+        }));
+        assert_eq!(
+            refused
+                .metrics
+                .phase_timings
+                .iter()
+                .filter(|timing| timing.status == EnginePhaseStatus::Refused)
+                .count(),
+            1
+        );
+        assert!(refused.output.starts_with("/* r2dec fallback:"));
+        assert!(!refused.output.contains("() {"));
+        assert_eq!(session.cache_metrics(), cache_before);
+    }
+
+    #[test]
+    fn aggregate_member_renderer_cancellation_is_atomic_and_cache_invariant() {
+        let session = EngineSession::new(4);
+        let request = controlled_aggregate_member_render_request(&session);
+        let counting = CountingRenderControl::default();
+        let baseline = session.decompile_with_r2dec_control(request.clone(), &counting);
+        assert_eq!(
+            baseline.diagnostics.semantic_kernel_render,
+            Some(EngineSemanticKernelRender {
+                region: EngineSemanticKernelRegion::AggregateMemberTerminalReturnFunction,
+                region_schema_version:
+                    r2dec::CERTIFIED_AGGREGATE_MEMBER_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
+                exact_obligation_closure: true,
+            })
+        );
+        assert!(baseline.output.contains("certified_aggregate_sub_7700"));
+        let aggregate_completion_poll = counting.polls.get();
+        assert!(
+            aggregate_completion_poll >= 2,
+            "aggregate route must poll before construction and before publishing C"
+        );
+
+        let cache_before = session.cache_metrics();
+        let stop = StopRenderAtPoll::new(
+            aggregate_completion_poll,
+            r2ssa::SsaExecutionStopReason::DeadlineExceeded,
+        );
+        let refused = session.decompile_with_r2dec_control(request.clone(), &stop);
+        assert_eq!(stop.polls.get(), aggregate_completion_poll);
+        assert_eq!(
+            refused.diagnostics.route_reason.as_deref(),
+            Some("engine request deadline exceeded during rendering phase")
+        );
+        assert!(refused.diagnostics.semantic_kernel_render.is_none());
+        assert!(refused.output.starts_with("/* r2dec fallback:"));
+        assert!(!refused.output.contains("certified_aggregate_sub_7700"));
+        assert!(!refused.output.contains("() {"));
+        assert_eq!(
+            refused
+                .metrics
+                .phase_timings
+                .iter()
+                .filter(|timing| timing.status == EnginePhaseStatus::Refused)
+                .count(),
+            1
+        );
+        assert_eq!(
+            refused.metrics.phase_timings[EnginePhase::Rendering as usize].status,
+            EnginePhaseStatus::Refused
+        );
+        assert_eq!(
+            refused.metrics.phase_timings[EnginePhase::Certification as usize].status,
+            EnginePhaseStatus::Folded
+        );
+        assert_eq!(
+            refused.metrics.phase_timings[EnginePhase::Structuring as usize].status,
+            EnginePhaseStatus::Folded
+        );
+        assert_eq!(
+            refused.metrics.phase_timings[EnginePhase::FfiConversion as usize].status,
+            EnginePhaseStatus::NotExecuted
+        );
+        assert_eq!(session.cache_metrics(), cache_before);
+
+        let resumed =
+            session.decompile_with_r2dec_control(request, &r2ssa::SsaExecutionControl::default());
+        assert_eq!(resumed.output, baseline.output);
+        assert_eq!(
+            resumed.diagnostics.semantic_kernel_render,
+            baseline.diagnostics.semantic_kernel_render
+        );
+        assert_eq!(session.cache_metrics(), cache_before);
+    }
+
+    #[test]
+    fn conditional_funnel_renderer_cancellation_is_atomic_and_cache_invariant() {
+        let session = EngineSession::new(4);
+        let request = controlled_conditional_funnel_render_request(&session);
+        let counting = CountingRenderControl::default();
+        let baseline = session.decompile_with_r2dec_control(request.clone(), &counting);
+        assert_eq!(
+            baseline.diagnostics.semantic_kernel_render,
+            Some(EngineSemanticKernelRender {
+                region: EngineSemanticKernelRegion::ConditionalFunnelSharedReturnFunction,
+                region_schema_version:
+                    r2dec::CERTIFIED_CONDITIONAL_FUNNEL_RETURN_FUNCTION_SCHEMA_VERSION,
+                exact_obligation_closure: true,
+            })
+        );
+        assert!(baseline.output.contains("certified_sub_7600"));
+        let funnel_completion_poll = counting.polls.get();
+        assert!(
+            funnel_completion_poll > 4,
+            "funnel route must remain interruptible after earlier exact route attempts"
+        );
+
+        let cache_before = session.cache_metrics();
+        let stop = StopRenderAtPoll::new(
+            funnel_completion_poll,
+            r2ssa::SsaExecutionStopReason::Cancelled,
+        );
+        let refused = session.decompile_with_r2dec_control(request.clone(), &stop);
+        assert_eq!(stop.polls.get(), funnel_completion_poll);
+        assert_eq!(
+            refused.diagnostics.route_reason.as_deref(),
+            Some("engine request cancelled during rendering phase")
+        );
+        assert!(refused.diagnostics.semantic_kernel_render.is_none());
+        assert!(refused.output.starts_with("/* r2dec fallback:"));
+        assert!(!refused.output.contains("certified_sub_7600"));
+        assert!(!refused.output.contains("() {"));
+        assert_eq!(
+            refused
+                .metrics
+                .phase_timings
+                .iter()
+                .filter(|timing| timing.status == EnginePhaseStatus::Refused)
+                .count(),
+            1
+        );
+        assert_eq!(
+            refused.metrics.phase_timings[EnginePhase::Rendering as usize].status,
+            EnginePhaseStatus::Refused
+        );
+        assert_eq!(
+            refused.metrics.phase_timings[EnginePhase::Certification as usize].status,
+            EnginePhaseStatus::Folded
+        );
+        assert_eq!(
+            refused.metrics.phase_timings[EnginePhase::Structuring as usize].status,
+            EnginePhaseStatus::Folded
+        );
+        assert_eq!(
+            refused.metrics.phase_timings[EnginePhase::FfiConversion as usize].status,
+            EnginePhaseStatus::NotExecuted
+        );
+        assert_eq!(session.cache_metrics(), cache_before);
+
+        let resumed =
+            session.decompile_with_r2dec_control(request, &r2ssa::SsaExecutionControl::default());
+        assert_eq!(resumed.output, baseline.output);
+        assert_eq!(
+            resumed.diagnostics.semantic_kernel_render,
+            baseline.diagnostics.semantic_kernel_render
+        );
+        assert_eq!(session.cache_metrics(), cache_before);
+    }
+
+    fn analyze_with_injected_ssa_control<C: r2ssa::SsaWorkControl + ?Sized>(
+        session: &EngineSession,
+        request: EngineAnalyzeRequest,
+        control: &C,
+    ) -> Result<EngineAnalyzeResponse, EngineExecutionRefusal> {
+        let started = Instant::now();
+        let mut metrics = EngineMetrics::default();
+        poll_engine_execution(&request.execution, EnginePhase::SnapshotContext, &metrics)?;
+        let phase_started = Instant::now();
+        let request_key = function_request_key(&request);
+        metrics.record_phase(
+            EnginePhase::SnapshotContext,
+            EnginePhaseStatus::Executed,
+            phase_started.elapsed(),
+        );
+        session.analyze_with_key_and_ssa_control(request, request_key, started, metrics, control)
+    }
+
+    enum SsaPollTrigger {
+        Cancel(EngineCancellationToken),
+        Stop(r2ssa::SsaExecutionStopReason),
+    }
+
+    struct DeterministicSsaControl {
+        polls: Cell<usize>,
+        stop_at: usize,
+        trigger: SsaPollTrigger,
+        downstream: Option<r2ssa::SsaExecutionControl>,
+    }
+
+    impl r2ssa::SsaWorkControl for DeterministicSsaControl {
+        fn poll(&self) -> Result<(), r2ssa::SsaExecutionStopReason> {
+            let polls = self.polls.get() + 1;
+            self.polls.set(polls);
+            if polls == self.stop_at {
+                match &self.trigger {
+                    SsaPollTrigger::Cancel(cancellation) => cancellation.cancel(),
+                    SsaPollTrigger::Stop(reason) => return Err(*reason),
+                }
+            }
+            self.downstream
+                .as_ref()
+                .map_or(Ok(()), r2ssa::SsaWorkControl::poll)
+        }
+    }
+
+    #[test]
+    fn analyze_checked_maps_mid_ssa_cancellation_without_caching_partial_artifact() {
+        let session = EngineSession::new(4);
+        let cancellation = EngineCancellationToken::default();
+        let request =
+            controlled_ssa_test_request("sym.ssa_cancelled", const_return_blocks(0x611000, 7))
+                .with_cancellation(cancellation.clone());
+        let analysis_key = function_analysis_cache_key(
+            &request.function_name,
+            request.arch.as_ref(),
+            &request.blocks,
+            request.source_snapshot.as_deref(),
+        );
+        let control = DeterministicSsaControl {
+            polls: Cell::new(0),
+            stop_at: 10,
+            trigger: SsaPollTrigger::Cancel(cancellation),
+            downstream: Some(request.execution.ssa_execution_control()),
+        };
+
+        let refusal = analyze_with_injected_ssa_control(&session, request, &control)
+            .expect_err("mid-SSA cancellation must fail closed");
+
+        assert_eq!(control.polls.get(), 10);
+        assert_eq!(refusal.phase, EnginePhase::Ssa);
+        assert_eq!(refusal.reason, "engine request cancelled during ssa phase");
+        assert_eq!(
+            refusal.metrics.phase_timings[EnginePhase::Ssa as usize].status,
+            EnginePhaseStatus::Refused
+        );
+        assert!(session.cached_analysis(&analysis_key).is_none());
+    }
+
+    #[test]
+    fn analyze_checked_maps_mid_ssa_deadline_without_caching_partial_artifact() {
+        let session = EngineSession::new(4);
+        let request =
+            controlled_ssa_test_request("sym.ssa_deadline", const_return_blocks(0x612000, 9));
+        let analysis_key = function_analysis_cache_key(
+            &request.function_name,
+            request.arch.as_ref(),
+            &request.blocks,
+            request.source_snapshot.as_deref(),
+        );
+        let control = DeterministicSsaControl {
+            polls: Cell::new(0),
+            stop_at: 10,
+            trigger: SsaPollTrigger::Stop(r2ssa::SsaExecutionStopReason::DeadlineExceeded),
+            downstream: None,
+        };
+
+        let refusal = analyze_with_injected_ssa_control(&session, request, &control)
+            .expect_err("mid-SSA deadline must fail closed");
+
+        assert_eq!(control.polls.get(), 10);
+        assert_eq!(refusal.phase, EnginePhase::Ssa);
+        assert_eq!(
+            refusal.reason,
+            "engine request deadline exceeded during ssa phase"
+        );
+        assert_eq!(
+            refusal.metrics.phase_timings[EnginePhase::Ssa as usize].status,
+            EnginePhaseStatus::Refused
+        );
+        assert!(session.cached_analysis(&analysis_key).is_none());
+    }
+
+    #[test]
+    fn analyze_checked_keeps_malformed_ssa_distinct_from_execution_stops() {
+        let session = EngineSession::new(4);
+        let request = controlled_ssa_test_request("sym.ssa_malformed", Vec::new());
+        let analysis_key = function_analysis_cache_key(
+            &request.function_name,
+            request.arch.as_ref(),
+            &request.blocks,
+            request.source_snapshot.as_deref(),
+        );
+
+        let refusal = session
+            .analyze_checked(request)
+            .expect_err("malformed SSA input must fail closed");
+
+        assert_eq!(refusal.phase, EnginePhase::Ssa);
+        assert_eq!(
+            refusal.reason,
+            "malformed SSA source input during ssa phase"
+        );
+        assert!(!refusal.reason.contains("cancelled"));
+        assert!(!refusal.reason.contains("deadline"));
+        assert_eq!(
+            refusal.metrics.phase_timings[EnginePhase::Ssa as usize].status,
+            EnginePhaseStatus::Refused
+        );
+        assert!(session.cached_analysis(&analysis_key).is_none());
+    }
+
+    #[test]
+    fn controlled_ssa_build_is_unchanged_and_cache_hits_skip_worklist_polling() {
+        let blocks = const_return_blocks(0x613000, 11);
+        let legacy = build_engine_analysis_from_parts("sym.ssa_same", &blocks, None, None)
+            .expect("legacy analysis");
+        let controlled = build_engine_analysis_from_parts_with_control(
+            "sym.ssa_same",
+            &blocks,
+            None,
+            None,
+            &r2ssa::SsaExecutionControl::default(),
+        )
+        .expect("controlled analysis");
+        assert_eq!(legacy.ssa_func.graph(), controlled.ssa_func.graph());
+        assert_eq!(legacy.ssa_func.facts(), controlled.ssa_func.facts());
+        assert_eq!(
+            legacy.pattern_ssa_func.graph(),
+            controlled.pattern_ssa_func.graph()
+        );
+        assert_eq!(
+            legacy.pattern_ssa_func.facts(),
+            controlled.pattern_ssa_func.facts()
+        );
+
+        let session = EngineSession::new(4);
+        let request = controlled_ssa_test_request("sym.ssa_cached", blocks);
+        session
+            .analyze_checked(request.clone())
+            .expect("cache priming analysis");
+        let stopped = DeterministicSsaControl {
+            polls: Cell::new(0),
+            stop_at: 1,
+            trigger: SsaPollTrigger::Stop(r2ssa::SsaExecutionStopReason::Cancelled),
+            downstream: None,
+        };
+        let response = analyze_with_injected_ssa_control(&session, request, &stopped)
+            .expect("cache hit must not enter SSA worklists");
+        assert!(response.analysis_cache_hit);
+        assert_eq!(stopped.polls.get(), 0);
+    }
+
+    #[test]
+    fn engine_execution_control_translates_combined_ssa_control() {
+        let cancellation = EngineCancellationToken::default();
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(30))
+            .expect("future deadline");
+        let execution =
+            EngineExecutionControl::with_cancellation_and_deadline(cancellation.clone(), deadline);
+        let ssa = execution.ssa_execution_control();
+        assert_eq!(ssa.deadline(), Some(deadline));
+
+        cancellation.cancel();
+        assert_eq!(
+            r2ssa::SsaWorkControl::poll(&ssa),
+            Err(r2ssa::SsaExecutionStopReason::Cancelled)
+        );
+    }
+
+    #[test]
+    fn analyze_checked_refuses_pre_cancelled_request_with_full_phase_report() {
+        let cancellation = EngineCancellationToken::default();
+        cancellation.cancel();
+        let request =
+            EngineAnalyzeRequest::full_semantics_for_function(EngineAnalyzeFunctionRequestInput {
+                function: EngineFunctionInput {
+                    function_name: "sym.cancelled".to_string(),
+                    function_addr: 0x401000,
+                    blocks: const_return_blocks(0x401000, 0),
+                    arch: None,
+                    source_snapshot: None,
+                    semantic_metadata_enabled: false,
+                },
+                ptr_bits: Some(64),
                 reg_type_hints: HashMap::new(),
                 parsed_context: r2types::ParsedExternalContext::default(),
                 external_context_fallback_hash: 0,
@@ -9621,16 +16313,109 @@ mod tests {
                 interproc_max_iterations: 1,
                 symbolic_scope: None,
                 precomputed_semantic_artifact: None,
-                semantic_mode: EngineSemanticMode::Full,
-                include_interproc_summary_set: true,
+                include_interproc_summary_set: false,
             })
-            .expect("analysis should succeed");
+            .with_cancellation(cancellation);
 
-        assert!(response.metrics.planning_time > Duration::default());
+        let refusal = EngineSession::new(4)
+            .analyze_checked(request)
+            .expect_err("pre-cancelled analysis must fail closed");
+        assert_eq!(refusal.phase, EnginePhase::SnapshotContext);
+        assert!(refusal.reason.contains("cancelled before snapshot_context"));
+        assert_eq!(refusal.metrics.phase_timings.len(), EnginePhase::ALL.len());
+        assert!(
+            refusal
+                .metrics
+                .phase_timings
+                .iter()
+                .all(|timing| timing.status == EnginePhaseStatus::Refused)
+        );
+        assert_eq!(
+            refusal.diagnostics.refusal.as_deref(),
+            Some(refusal.reason.as_str())
+        );
     }
 
     #[test]
-    fn cache_keys_partition_analysis_and_artifact_inputs() {
+    fn decompile_expired_deadline_returns_actionable_refusal_without_c() {
+        let deadline = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("deadline before now");
+        let input = EngineFunctionDecompileRequestInput::single_function(
+            EngineFunctionInput {
+                function_name: "sym.expired".to_string(),
+                function_addr: 0x401000,
+                blocks: const_return_blocks(0x401000, 0),
+                arch: None,
+                source_snapshot: None,
+                semantic_metadata_enabled: false,
+            },
+            Some(64),
+            r2types::ParsedExternalContext::default(),
+            0,
+        )
+        .with_deadline(deadline);
+
+        let response = EngineSession::new(4).decompile_function_from_input(input);
+        assert!(
+            response
+                .output
+                .contains("deadline exceeded before snapshot_context")
+        );
+        assert!(!response.output.contains("uint64_t sym_expired"));
+        assert!(
+            response
+                .diagnostics
+                .refusal
+                .as_deref()
+                .is_some_and(|reason| reason.contains("deadline exceeded"))
+        );
+        assert_eq!(response.metrics.phase_timings.len(), EnginePhase::ALL.len());
+        assert!(
+            response
+                .metrics
+                .phase_timings
+                .iter()
+                .all(|timing| timing.status == EnginePhaseStatus::Refused)
+        );
+    }
+
+    #[test]
+    fn cancellation_and_deadline_coexist_and_refuse_without_partial_c() {
+        let cancellation = EngineCancellationToken::default();
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(30))
+            .expect("future deadline");
+        let input = EngineFunctionDecompileRequestInput::single_function(
+            EngineFunctionInput {
+                function_name: "sym.combined".to_string(),
+                function_addr: 0x401000,
+                blocks: const_return_blocks(0x401000, 7),
+                arch: None,
+                source_snapshot: None,
+                semantic_metadata_enabled: false,
+            },
+            Some(64),
+            r2types::ParsedExternalContext::default(),
+            0,
+        )
+        .with_deadline(deadline)
+        .with_cancellation(cancellation.clone());
+        assert_eq!(input.execution.deadline(), Some(deadline));
+        cancellation.cancel();
+
+        let response = EngineSession::new(4).decompile_function_from_input(input);
+
+        assert!(
+            response
+                .output
+                .contains("cancelled before snapshot_context")
+        );
+        assert!(!response.output.contains("uint64_t sym_combined"));
+    }
+
+    #[test]
+    fn cache_and_request_keys_partition_their_inputs() {
         let arch = r2il::ArchSpec::new("x86-64");
         let blocks = const_return_blocks(0x401000, 0);
         let analysis = AnalysisCacheKey::from_parts(
@@ -9641,6 +16426,7 @@ mod tests {
             0x10,
             0x20,
             "aaa",
+            None,
         );
         let changed_typed_context = AnalysisCacheKey::from_parts(
             0x401000,
@@ -9650,6 +16436,7 @@ mod tests {
             0x11,
             0x20,
             "aaa",
+            None,
         );
         let changed_assumptions = AnalysisCacheKey::from_parts(
             0x401000,
@@ -9659,37 +16446,63 @@ mod tests {
             0x10,
             0x21,
             "aaa",
+            None,
         );
 
-        assert_ne!(analysis, changed_typed_context);
-        assert_ne!(analysis, changed_assumptions);
+        assert_eq!(analysis, changed_typed_context);
+        assert_eq!(analysis, changed_assumptions);
 
-        let artifact = ArtifactCacheKey::from_hashes(analysis.clone(), 0x30, 0x40);
-        let changed_interproc_budget = ArtifactCacheKey::from_hashes(analysis.clone(), 0x31, 0x40);
-        let changed_symbolic_scope = ArtifactCacheKey::from_hashes(analysis.clone(), 0x30, 0x41);
+        let request_key = EngineRequestKey::from_request_hashes(
+            analysis.clone(),
+            0x401000,
+            0x10,
+            0x20,
+            0x25,
+            64,
+            0x28,
+            0x30,
+            0x40,
+        );
+        let changed_interproc_budget = EngineRequestKey::from_request_hashes(
+            analysis.clone(),
+            0x401000,
+            0x10,
+            0x20,
+            0x25,
+            64,
+            0x28,
+            0x31,
+            0x40,
+        );
+        let changed_symbolic_scope = EngineRequestKey::from_request_hashes(
+            analysis, 0x401000, 0x10, 0x20, 0x25, 64, 0x28, 0x30, 0x41,
+        );
 
-        assert_ne!(artifact, changed_interproc_budget);
-        assert_ne!(artifact, changed_symbolic_scope);
+        assert_ne!(request_key, changed_interproc_budget);
+        assert_ne!(request_key, changed_symbolic_scope);
     }
 
     #[test]
     fn session_cache_metrics_track_hits_misses_and_evictions() {
         let session = EngineSession::new(2);
         let blocks = const_return_blocks(0x1000, 0);
-        let key1 = EngineFunctionKey::from_parts(0x1000, "a", None, &blocks, 0, 0, 0, None, "aa");
-        let key2 = EngineFunctionKey::from_parts(0x1001, "b", None, &blocks, 0, 0, 0, None, "aa");
-        let key3 = EngineFunctionKey::from_parts(0x1002, "c", None, &blocks, 0, 0, 0, None, "aa");
+        let key1 = function_analysis_cache_key("a", None, &blocks, None);
+        let key2 = function_analysis_cache_key("b", None, &blocks, None);
+        let key3 = function_analysis_cache_key("c", None, &blocks, None);
+        let analysis1 = build_engine_analysis_from_parts("a", &blocks, None, None).expect("a");
+        let analysis2 = build_engine_analysis_from_parts("b", &blocks, None, None).expect("b");
+        let analysis3 = build_engine_analysis_from_parts("c", &blocks, None, None).expect("c");
 
-        assert!(session.cached_artifacts(&key1).is_none());
-        session.insert_artifacts(key1.clone(), EngineArtifacts::default());
-        session.insert_artifacts(key2.clone(), EngineArtifacts::default());
-        assert!(session.cached_artifacts(&key1).is_some());
-        session.insert_artifacts(key3, EngineArtifacts::default());
-        assert!(session.cached_artifacts(&key2).is_none());
+        assert!(session.cached_analysis(&key1).is_none());
+        session.insert_analysis(key1.clone(), analysis1);
+        session.insert_analysis(key2.clone(), analysis2);
+        assert!(session.cached_analysis(&key1).is_some());
+        session.insert_analysis(key3, analysis3);
+        assert!(session.cached_analysis(&key2).is_none());
 
         let metrics = session.cache_metrics();
         assert_eq!(
-            metrics.artifacts,
+            metrics.analysis,
             CacheCounters {
                 hits: 1,
                 misses: 2,
@@ -9701,24 +16514,147 @@ mod tests {
     }
 
     #[test]
-    fn session_cache_metrics_are_partitioned_by_reusable_artifact_kind() {
+    fn session_cache_metrics_track_only_reusable_analysis() {
         let session = EngineSession::new(4);
         let blocks = const_return_blocks(0x2000, 0);
-        let analysis = AnalysisCacheKey::from_parts(0x2000, "a", None, &blocks, 1, 2, "types-only");
-        let artifact = ArtifactCacheKey::from_hashes(analysis.clone(), 3, 4);
+        let analysis =
+            AnalysisCacheKey::from_parts(0x2000, "a", None, &blocks, 1, 2, "types-only", None);
+        let reusable =
+            build_engine_analysis_from_parts("a", &blocks, None, None).expect("analysis");
 
         assert!(session.cached_analysis(&analysis).is_none());
-        session.insert_analysis(analysis.clone(), EngineArtifacts::default());
+        session.insert_analysis(analysis.clone(), reusable);
         assert!(session.cached_analysis(&analysis).is_some());
-
-        assert!(session.cached_artifacts(&artifact).is_none());
-        session.insert_artifacts(artifact, EngineArtifacts::default());
 
         let metrics = session.cache_metrics();
         assert_eq!(metrics.analysis.hits, 1);
         assert_eq!(metrics.analysis.misses, 1);
-        assert_eq!(metrics.artifacts.hits, 0);
-        assert_eq!(metrics.artifacts.misses, 1);
+    }
+
+    #[test]
+    fn realistic_session_trace_reuses_shared_analysis_without_artifact_cache() {
+        let session = EngineSession::new(8);
+        let blocks = const_return_blocks(0x401000, 7);
+        let first = session
+            .prepare_analysis_shared("sym.session_trace", &blocks, None)
+            .expect("initial SSA analysis");
+        let repeated = session
+            .prepare_analysis_shared("sym.session_trace", &blocks, None)
+            .expect("repeated SSA analysis");
+        assert!(Arc::ptr_eq(&first, &repeated));
+        assert!(Arc::ptr_eq(&first.ssa_func, &repeated.ssa_func));
+
+        let render_request = EngineDecompileRequest {
+            function_name: "sym.session_trace".to_string(),
+            prepared_ssa: Arc::clone(&repeated.ssa_func),
+            function_facts: FunctionFacts::default(),
+            render_target: EngineRenderTarget::default(),
+            execution: EngineExecutionControl::default(),
+            metrics: EngineMetrics::default(),
+        };
+        let decompiler_input = decompiler_input_for_engine_request(&render_request);
+        assert!(Arc::ptr_eq(
+            &repeated.ssa_func,
+            &decompiler_input.prepared_ssa
+        ));
+
+        let analysis_request = EngineAnalyzeRequest {
+            function_name: "sym.session_trace".to_string(),
+            function_addr: 0x401000,
+            blocks: blocks.clone(),
+            arch: None,
+            source_snapshot: None,
+            ptr_bits: 64,
+            semantic_metadata_enabled: false,
+            reg_type_hints: HashMap::new(),
+            parsed_context: r2types::ParsedExternalContext::default(),
+            external_context_fallback_hash: 0,
+            scope_facts: InterprocScopeFacts::empty(),
+            interproc_max_iterations: 1,
+            symbolic_scope: None,
+            precomputed_semantic_artifact: None,
+            semantic_mode: EngineSemanticMode::Optional,
+            include_interproc_summary_set: false,
+            execution: EngineExecutionControl::default(),
+        };
+        let typed = session
+            .type_function(EngineTypeAnalysisRequest {
+                analysis: analysis_request,
+                caller_prefers_bounded_type_plan: false,
+            })
+            .expect("type analysis");
+        assert!(typed.analysis_cache_hit);
+        assert!(typed.metrics.cache_hit);
+
+        let decompiled = session.decompile_function_from_input(
+            EngineFunctionDecompileRequestInput::single_function(
+                EngineFunctionInput {
+                    function_name: "sym.session_trace".to_string(),
+                    function_addr: 0x401000,
+                    blocks,
+                    arch: None,
+                    source_snapshot: None,
+                    semantic_metadata_enabled: false,
+                },
+                Some(64),
+                r2types::ParsedExternalContext::default(),
+                0,
+            ),
+        );
+        assert!(decompiled.metrics.cache_hit);
+
+        let metrics = session.cache_metrics();
+        assert_eq!(
+            metrics.analysis,
+            CacheCounters {
+                hits: 3,
+                misses: 1,
+                insertions: 1,
+                evictions: 0,
+            }
+        );
+        assert_eq!(metrics.total(), metrics.analysis);
+    }
+
+    #[test]
+    fn concurrent_analysis_preparation_keeps_one_resident_arc() {
+        const WORKER_COUNT: usize = 8;
+
+        let session = Arc::new(EngineSession::new(4));
+        let blocks = Arc::new(const_return_blocks(0x402000, 7));
+        let barrier = Arc::new(std::sync::Barrier::new(WORKER_COUNT));
+        let workers = (0..WORKER_COUNT)
+            .map(|_| {
+                let session = Arc::clone(&session);
+                let blocks = Arc::clone(&blocks);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    session
+                        .prepare_analysis_shared("sym.concurrent", &blocks, None)
+                        .expect("concurrent analysis")
+                })
+            })
+            .collect::<Vec<_>>();
+        let prepared = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("analysis preparation worker"))
+            .collect::<Vec<_>>();
+
+        let resident = session
+            .prepare_analysis_shared("sym.concurrent", &blocks, None)
+            .expect("resident analysis");
+        assert!(
+            prepared
+                .iter()
+                .all(|analysis| Arc::ptr_eq(analysis, &resident))
+        );
+        assert!(
+            prepared
+                .iter()
+                .all(|analysis| Arc::ptr_eq(&analysis.ssa_func, &resident.ssa_func))
+        );
+        assert_eq!(session.cache_metrics().analysis.insertions, 1);
     }
 
     #[test]
@@ -9751,7 +16687,7 @@ mod tests {
     }
 
     #[test]
-    fn decompile_route_decision_reports_prepared_proof_coverage() {
+    fn decompile_route_decision_keeps_proof_coverage_diagnostic_only() {
         let mut entry = R2ILBlock::new(0x401000, 4);
         entry.push(r2il::R2ILOp::CBranch {
             target: r2il::Varnode::constant(0x401000, 8),
@@ -9777,8 +16713,8 @@ mod tests {
                 .route
                 .render_permission
                 .reason
-                .contains("requires a certified signature"),
-            "prepared loop certificates alone must not certify executable C: {:?}",
+                .contains("proof counters cannot authorize production output"),
+            "prepared proof counters must remain diagnostic-only: {:?}",
             decision.route.render_permission
         );
         assert_eq!(
@@ -9824,6 +16760,18 @@ mod tests {
             decompile_route_decision("sym.typed", &function_facts, Some(&prepared), &cfg_summary);
 
         assert_eq!(decision.route.proof_coverage.certified_signatures, 1);
+        assert_eq!(
+            decision.route.render_permission.kind,
+            r2sym::RenderPermissionKind::Residual
+        );
+        assert!(
+            decision
+                .route
+                .render_permission
+                .reason
+                .contains("proof counters cannot authorize production output"),
+            "even complete legacy signature coverage must not mint executable-C authority"
+        );
     }
 
     #[test]
@@ -9934,7 +16882,7 @@ mod tests {
     }
 
     #[test]
-    fn decompile_route_decision_residualizes_loop_cfg_without_prepared_proof() {
+    fn decompile_route_decision_residualizes_standard_route_without_prepared_proof() {
         let cfg_summary = r2ssa::CFGRiskSummary {
             block_count: 2,
             loop_count: 1,
@@ -9955,7 +16903,7 @@ mod tests {
                 .route
                 .render_permission
                 .reason
-                .contains("missing prepared SSA certificates")
+                .contains("proof counters cannot authorize production output")
         );
     }
 
@@ -9984,21 +16932,30 @@ mod tests {
     }
 
     #[test]
-    fn session_cache_refreshes_recency_and_evicts_oldest() {
+    fn analysis_cache_refreshes_recency_and_evicts_oldest() {
         let session = EngineSession::new(2);
         let blocks = const_return_blocks(0x1000, 0);
-        let key1 = EngineFunctionKey::from_parts(0x1000, "a", None, &blocks, 0, 0, 0, None, "aa");
-        let key2 = EngineFunctionKey::from_parts(0x1001, "b", None, &blocks, 0, 0, 0, None, "aa");
-        let key3 = EngineFunctionKey::from_parts(0x1002, "c", None, &blocks, 0, 0, 0, None, "aa");
+        let key1 = function_analysis_cache_key("a", None, &blocks, None);
+        let key2 = function_analysis_cache_key("b", None, &blocks, None);
+        let key3 = function_analysis_cache_key("c", None, &blocks, None);
 
-        session.insert_artifacts(key1.clone(), EngineArtifacts::default());
-        session.insert_artifacts(key2.clone(), EngineArtifacts::default());
-        assert!(session.cached_artifacts(&key1).is_some());
-        session.insert_artifacts(key3.clone(), EngineArtifacts::default());
+        session.insert_analysis(
+            key1.clone(),
+            build_engine_analysis_from_parts("a", &blocks, None, None).expect("a"),
+        );
+        session.insert_analysis(
+            key2.clone(),
+            build_engine_analysis_from_parts("b", &blocks, None, None).expect("b"),
+        );
+        assert!(session.cached_analysis(&key1).is_some());
+        session.insert_analysis(
+            key3.clone(),
+            build_engine_analysis_from_parts("c", &blocks, None, None).expect("c"),
+        );
 
-        assert!(session.cached_artifacts(&key1).is_some());
-        assert!(session.cached_artifacts(&key2).is_none());
-        assert!(session.cached_artifacts(&key3).is_some());
+        assert!(session.cached_analysis(&key1).is_some());
+        assert!(session.cached_analysis(&key2).is_none());
+        assert!(session.cached_analysis(&key3).is_some());
     }
 
     #[test]
@@ -10104,6 +17061,67 @@ mod tests {
         assert!(!at_limit.block_guarded);
         assert!(over_limit.summary_probe_skipped_large_cfg);
         assert!(over_limit.block_guarded);
+    }
+
+    #[test]
+    fn decompile_complexity_caps_refuse_before_analysis_construction() {
+        let over_blocks = (0..=ENGINE_DECOMPILE_MAX_BLOCKS)
+            .map(|index| {
+                R2ILBlock::new(0xb000 + u64::try_from(index).expect("small block index"), 1)
+            })
+            .collect::<Vec<_>>();
+        let mut over_ops = R2ILBlock::new(0xc000, 1);
+        for index in 0..=ENGINE_DECOMPILE_MAX_OPS {
+            over_ops.push(r2il::R2ILOp::Copy {
+                dst: r2il::Varnode::unique(
+                    0x100 + u64::try_from(index).expect("small operation index"),
+                    8,
+                ),
+                src: r2il::Varnode::constant(
+                    u64::try_from(index).expect("small operation index"),
+                    8,
+                ),
+            });
+        }
+
+        for (name, addr, blocks) in [
+            ("sym.over_blocks", 0xb000, over_blocks),
+            ("sym.over_ops", 0xc000, vec![over_ops]),
+        ] {
+            let session = EngineSession::new(4);
+            let response = session.decompile_function_from_input(
+                EngineFunctionDecompileRequestInput::single_function(
+                    EngineFunctionInput {
+                        function_name: name.to_string(),
+                        function_addr: addr,
+                        blocks,
+                        arch: None,
+                        source_snapshot: None,
+                        semantic_metadata_enabled: false,
+                    },
+                    Some(64),
+                    r2types::ParsedExternalContext::default(),
+                    0,
+                ),
+            );
+            assert!(
+                response
+                    .output
+                    .contains("decompile complexity limit exceeded"),
+                "{}",
+                response.output
+            );
+            assert_eq!(
+                response
+                    .function_facts
+                    .decompile_route()
+                    .map(|route| route.kind),
+                Some(r2types::DecompileRouteKind::FallbackComment)
+            );
+            let metrics = session.cache_metrics();
+            assert_eq!(metrics.analysis.misses, 0);
+            assert_eq!(metrics.analysis.insertions, 0);
+        }
     }
 
     #[test]
@@ -10520,6 +17538,7 @@ mod tests {
             "sym.wrapper",
             &direct_call_return_blocks(0x401000, 0x2000),
             Some(&arch),
+            None,
         )
         .expect("analysis");
 
@@ -10969,8 +17988,9 @@ mod tests {
         block.push(r2il::R2ILOp::Return {
             target: r2il::Varnode::constant(0, 8),
         });
-        let analysis = build_engine_analysis_from_parts("sym.runtime_seed", &[block], Some(&arch))
-            .expect("analysis");
+        let analysis =
+            build_engine_analysis_from_parts("sym.runtime_seed", &[block], Some(&arch), None)
+                .expect("analysis");
 
         assert_eq!(
             interproc_runtime_registration_targets(&analysis, Some(&arch), &[0x1800_1000]),
@@ -11005,8 +18025,9 @@ mod tests {
         block.push(r2il::R2ILOp::Call {
             target: r2il::Varnode::constant(0x1800_1000, 8),
         });
-        let analysis = build_engine_analysis_from_parts("sym.runtime_seed", &[block], Some(&arch))
-            .expect("analysis");
+        let analysis =
+            build_engine_analysis_from_parts("sym.runtime_seed", &[block], Some(&arch), None)
+                .expect("analysis");
 
         assert!(
             interproc_runtime_registration_targets(&analysis, None, &[0x1800_1000]).is_empty(),
@@ -11053,8 +18074,9 @@ mod tests {
         block.push(r2il::R2ILOp::Return {
             target: r2il::Varnode::constant(0, 8),
         });
-        let analysis = build_engine_analysis_from_parts("sym.runtime_copy", &[block], Some(&arch))
-            .expect("analysis");
+        let analysis =
+            build_engine_analysis_from_parts("sym.runtime_copy", &[block], Some(&arch), None)
+                .expect("analysis");
 
         assert_eq!(
             interproc_runtime_materialized_sources(&analysis, Some(&arch), &[0x1800_2000]),
@@ -11098,8 +18120,9 @@ mod tests {
         block.push(r2il::R2ILOp::Call {
             target: r2il::Varnode::constant(0x1800_2000, 8),
         });
-        let analysis = build_engine_analysis_from_parts("sym.runtime_copy", &[block], Some(&arch))
-            .expect("analysis");
+        let analysis =
+            build_engine_analysis_from_parts("sym.runtime_copy", &[block], Some(&arch), None)
+                .expect("analysis");
 
         assert!(
             interproc_runtime_materialized_sources(&analysis, Some(&arch), &[0x1800_2000])
@@ -11322,7 +18345,7 @@ mod tests {
     }
 
     #[test]
-    fn type_function_uses_engine_summary_preprobe_without_artifact_cache_key() {
+    fn type_function_uses_engine_summary_preprobe_without_analysis_cache_lookup() {
         let mut blocks = const_return_blocks(0x55a0, 0);
         for idx in 0..210 {
             blocks.push(R2ILBlock::new(0x5600 + idx, 1));
@@ -11337,6 +18360,7 @@ mod tests {
                     function_addr: 0x55a0,
                     blocks,
                     arch: None,
+                    source_snapshot: None,
                     ptr_bits: 64,
                     semantic_metadata_enabled: false,
                     reg_type_hints: HashMap::new(),
@@ -11348,6 +18372,7 @@ mod tests {
                     precomputed_semantic_artifact: None,
                     semantic_mode: EngineSemanticMode::Full,
                     include_interproc_summary_set: true,
+                    execution: EngineExecutionControl::default(),
                 },
                 caller_prefers_bounded_type_plan: false,
             })
@@ -11384,6 +18409,7 @@ mod tests {
                     function_addr: 0x55a0,
                     blocks,
                     arch: None,
+                    source_snapshot: None,
                     ptr_bits: 64,
                     semantic_metadata_enabled: false,
                     reg_type_hints: HashMap::new(),
@@ -11395,6 +18421,7 @@ mod tests {
                     precomputed_semantic_artifact: None,
                     semantic_mode: EngineSemanticMode::Full,
                     include_interproc_summary_set: true,
+                    execution: EngineExecutionControl::default(),
                 },
                 interproc_max_iters: 1,
                 interproc_converged: false,
@@ -11428,6 +18455,7 @@ mod tests {
                     function_addr: 0x55a0,
                     blocks: Vec::new(),
                     arch: None,
+                    source_snapshot: None,
                     semantic_metadata_enabled: false,
                 },
                 ptr_bits: Some(64),
@@ -11467,6 +18495,7 @@ mod tests {
                     function_addr: 0x6600,
                     blocks: Vec::new(),
                     arch: None,
+                    source_snapshot: None,
                     semantic_metadata_enabled: false,
                 },
                 ptr_bits: Some(64),
@@ -11487,7 +18516,7 @@ mod tests {
         assert_eq!(request.analysis.external_context_fallback_hash, 0xabc);
         assert!(
             request.analysis.reg_type_hints.is_empty(),
-            "artifact cache request builder owns default register-hint policy"
+            "request identity builder owns default register-hint policy"
         );
     }
 
@@ -11504,6 +18533,7 @@ mod tests {
                 function_addr: 0x401000,
                 blocks,
                 arch: None,
+                source_snapshot: None,
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
@@ -11515,6 +18545,7 @@ mod tests {
                 precomputed_semantic_artifact: None,
                 semantic_mode: EngineSemanticMode::Full,
                 include_interproc_summary_set: true,
+                execution: EngineExecutionControl::default(),
             },
         });
 
@@ -11538,6 +18569,7 @@ mod tests {
                 function_addr: 0x401000,
                 blocks,
                 arch: None,
+                source_snapshot: None,
                 semantic_metadata_enabled: false,
             },
             ptr_bits: Some(64),
@@ -11554,6 +18586,7 @@ mod tests {
                 null_lift_failures: 0,
                 truncated_blocks: 0,
             },
+            execution: EngineExecutionControl::default(),
         });
 
         assert!(
@@ -11606,6 +18639,7 @@ mod tests {
                 function_addr: 0x401000,
                 blocks,
                 arch: None,
+                source_snapshot: None,
                 semantic_metadata_enabled: false,
             },
             ptr_bits: Some(64),
@@ -11615,6 +18649,7 @@ mod tests {
             interproc_max_iterations: 1,
             symbolic_scope: None,
             input_quality: EngineFunctionInputQuality::complete(2),
+            execution: EngineExecutionControl::default(),
         });
 
         assert!(
@@ -11658,6 +18693,7 @@ mod tests {
                 function_addr: 0x401000,
                 blocks: Vec::new(),
                 arch: None,
+                source_snapshot: None,
                 semantic_metadata_enabled: false,
             },
             ptr_bits: Some(64),
@@ -11674,6 +18710,7 @@ mod tests {
                 null_lift_failures: 1,
                 truncated_blocks: 0,
             },
+            execution: EngineExecutionControl::default(),
         });
 
         assert!(
@@ -11716,6 +18753,7 @@ mod tests {
                 function_addr: 0x401000,
                 blocks: Vec::new(),
                 arch: None,
+                source_snapshot: None,
                 semantic_metadata_enabled: false,
             },
             ptr_bits: Some(64),
@@ -11725,6 +18763,7 @@ mod tests {
             interproc_max_iterations: 1,
             symbolic_scope: None,
             input_quality: EngineFunctionInputQuality::complete(0),
+            execution: EngineExecutionControl::default(),
         });
 
         assert!(
@@ -11767,6 +18806,7 @@ mod tests {
                 function_addr: 0x401000,
                 blocks,
                 arch: None,
+                source_snapshot: None,
                 semantic_metadata_enabled: false,
             },
             ptr_bits: Some(64),
@@ -11776,6 +18816,7 @@ mod tests {
             interproc_max_iterations: 1,
             symbolic_scope: None,
             input_quality: EngineFunctionInputQuality::complete(1),
+            execution: EngineExecutionControl::default(),
         });
 
         let quality = response
@@ -11809,6 +18850,7 @@ mod tests {
                 function_addr: 0x401000,
                 blocks,
                 arch: None,
+                source_snapshot: None,
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
@@ -11820,6 +18862,7 @@ mod tests {
                 precomputed_semantic_artifact: None,
                 semantic_mode: EngineSemanticMode::Full,
                 include_interproc_summary_set: true,
+                execution: EngineExecutionControl::default(),
             },
         });
 
@@ -11857,6 +18900,7 @@ mod tests {
                 function_addr: 0x401000,
                 blocks,
                 arch: None,
+                source_snapshot: None,
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
@@ -11868,6 +18912,7 @@ mod tests {
                 precomputed_semantic_artifact: None,
                 semantic_mode: EngineSemanticMode::Full,
                 include_interproc_summary_set: true,
+                execution: EngineExecutionControl::default(),
             },
         });
 
@@ -11901,6 +18946,7 @@ mod tests {
                 function_addr: 0x401000,
                 blocks,
                 arch: None,
+                source_snapshot: None,
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
@@ -11912,6 +18958,7 @@ mod tests {
                 precomputed_semantic_artifact: None,
                 semantic_mode: EngineSemanticMode::Full,
                 include_interproc_summary_set: true,
+                execution: EngineExecutionControl::default(),
             },
         });
 
@@ -11943,6 +18990,7 @@ mod tests {
                 function_addr: 0x401000,
                 blocks,
                 arch: None,
+                source_snapshot: None,
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
@@ -11954,6 +19002,7 @@ mod tests {
                 precomputed_semantic_artifact: None,
                 semantic_mode: EngineSemanticMode::Full,
                 include_interproc_summary_set: true,
+                execution: EngineExecutionControl::default(),
             },
         });
 
@@ -11973,6 +19022,7 @@ mod tests {
                     function_addr: 0x401000,
                     blocks: Vec::new(),
                     arch: None,
+                    source_snapshot: None,
                     semantic_metadata_enabled: false,
                 },
                 ptr_bits: Some(64),
@@ -11982,6 +19032,7 @@ mod tests {
                 interproc_max_iterations: 3,
                 symbolic_scope: None,
                 input_quality: EngineFunctionInputQuality::complete(0),
+                execution: EngineExecutionControl::default(),
             },
         );
 
@@ -12074,7 +19125,7 @@ mod tests {
             plan_decompile_request("sym.simple", &function_facts, Some(&prepared), &cfg_summary);
         assert_eq!(decompile.request(), EngineRequestKind::Decompile);
         assert_eq!(decompile.engine_plan(), EnginePlan::FastLocal);
-        assert_eq!(decompile.cache.layer, EngineCacheLayer::Artifact);
+        assert_eq!(decompile.cache.layer, EngineCacheLayer::Analysis);
         assert!(decompile.cache.lookup);
         assert!(decompile.cache.store_on_miss);
         assert_eq!(decompile.diagnostics().plan, Some(EnginePlan::FastLocal));
@@ -12082,7 +19133,7 @@ mod tests {
         let types = plan_type_request(&function_facts, &cfg_summary, false);
         assert_eq!(types.request(), EngineRequestKind::Types);
         assert_eq!(types.engine_plan(), EnginePlan::PreparedOnly);
-        assert_eq!(types.cache.layer, EngineCacheLayer::Artifact);
+        assert_eq!(types.cache.layer, EngineCacheLayer::Analysis);
         assert!(types.cache.lookup);
 
         let profile = plan_profile_request();
@@ -12134,6 +19185,39 @@ mod tests {
             response.solution_limit,
             path_listing_solution_limit(response.summary.paths.len(), &prepared)
         );
+    }
+
+    #[test]
+    fn engine_translates_pre_cancelled_control_into_symbolic_request() {
+        let blocks = const_return_blocks(0x401000, 0);
+        let prepared = r2ssa::SsaArtifact::for_symbolic(&blocks, None).expect("prepared");
+        let z3_ctx = z3::Context::thread_local();
+        let symbols = HashMap::new();
+        let cancellation = EngineCancellationToken::default();
+        cancellation.cancel();
+
+        let result = EngineSession::new(4).symbolic_paths_with_execution_control(
+            EngineSymbolicPathsRequest {
+                context: EngineSymbolicContextRequest {
+                    z3_ctx: &z3_ctx,
+                    prepared: &prepared,
+                    scope: None,
+                    arch: None,
+                    symbol_map: &symbols,
+                    merge_states: false,
+                    config_profile: EngineSymbolicConfigProfile::PathListing,
+                    seed: EngineSymbolicStateSeed::Default {
+                        entry_addr: 0x401000,
+                    },
+                },
+            },
+            EngineExecutionControl::with_cancellation(cancellation),
+        );
+
+        assert!(matches!(
+            result,
+            Err(r2sym::SymExecutionStopReason::Cancelled)
+        ));
     }
 
     #[test]
@@ -12267,9 +19351,8 @@ mod tests {
         let session = EngineSession::new(4);
         let blocks = const_return_blocks(0x403000, 0);
         let analysis =
-            AnalysisCacheKey::from_parts(0x403000, "sym.profile", None, &blocks, 1, 2, "aa");
-        let artifact = ArtifactCacheKey::from_hashes(analysis, 3, 4);
-        let _ = session.cached_artifacts_with_decision(EngineRequestKind::Decompile, &artifact);
+            AnalysisCacheKey::from_parts(0x403000, "sym.profile", None, &blocks, 1, 2, "aa", None);
+        let _ = session.cached_analysis_with_decision(EngineRequestKind::Decompile, &analysis);
         let profile = session.profile(EngineProfileRequest {
             reset_after_read: true,
         });
@@ -12278,7 +19361,7 @@ mod tests {
             profile.route_decision.kind,
             EngineProfileRouteKind::MetricsSnapshot
         );
-        assert_eq!(profile.metrics.artifacts.misses, 1);
+        assert_eq!(profile.metrics.analysis.misses, 1);
         assert_eq!(profile.total.misses, 1);
         assert_eq!(
             session
@@ -12287,6 +19370,55 @@ mod tests {
                 .misses,
             0
         );
+    }
+
+    #[test]
+    fn profile_reset_conserves_concurrent_cache_counter_updates() {
+        const WORKER_COUNT: usize = 4;
+        const LOOKUPS_PER_WORKER: usize = 4_000;
+        const SNAPSHOT_COUNT: usize = 256;
+
+        let session = Arc::new(EngineSession::new(4));
+        let blocks = const_return_blocks(0x404000, 0);
+        let key = function_analysis_cache_key("sym.profile.concurrent", None, &blocks, None);
+        let barrier = Arc::new(std::sync::Barrier::new(WORKER_COUNT + 1));
+        let workers = (0..WORKER_COUNT)
+            .map(|_| {
+                let session = Arc::clone(&session);
+                let key = key.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..LOOKUPS_PER_WORKER {
+                        assert!(session.cached_analysis(&key).is_none());
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        barrier.wait();
+        let mut observed_misses = 0_u64;
+        for _ in 0..SNAPSHOT_COUNT {
+            observed_misses += session
+                .profile(EngineProfileRequest {
+                    reset_after_read: true,
+                })
+                .total
+                .misses;
+            std::thread::yield_now();
+        }
+        for worker in workers {
+            worker.join().expect("cache lookup worker");
+        }
+        observed_misses += session
+            .profile(EngineProfileRequest {
+                reset_after_read: true,
+            })
+            .total
+            .misses;
+
+        assert_eq!(observed_misses, (WORKER_COUNT * LOOKUPS_PER_WORKER) as u64);
+        assert_eq!(session.cache_metrics().analysis.misses, 0);
     }
 
     #[test]
@@ -12307,7 +19439,7 @@ mod tests {
         let diagnostics = request_plan.diagnostics();
 
         assert_eq!(request_plan.engine_plan(), EnginePlan::RefuseWithEvidence);
-        assert_eq!(request_plan.cache.layer, EngineCacheLayer::Artifact);
+        assert_eq!(request_plan.cache.layer, EngineCacheLayer::Analysis);
         assert_eq!(diagnostics.refusal, Some(comment.clone()));
         assert_eq!(diagnostics.route_reason, Some(comment.clone()));
         assert_eq!(
@@ -12467,25 +19599,27 @@ mod tests {
     }
 
     #[test]
-    fn cache_lookup_decisions_report_repeated_request_reuse() {
+    fn cache_lookup_decisions_report_repeated_analysis_reuse() {
         let session = EngineSession::new(4);
         let blocks = const_return_blocks(0x403000, 0);
         let analysis =
-            AnalysisCacheKey::from_parts(0x403000, "sym.cache", None, &blocks, 1, 2, "aa");
-        let artifact = ArtifactCacheKey::from_hashes(analysis, 3, 4);
+            AnalysisCacheKey::from_parts(0x403000, "sym.cache", None, &blocks, 1, 2, "aa", None);
 
-        let miss = session.cached_artifacts_with_decision(EngineRequestKind::Decompile, &artifact);
+        let miss = session.cached_analysis_with_decision(EngineRequestKind::Decompile, &analysis);
         assert!(miss.value.is_none());
         assert_eq!(miss.decision.reuse, EngineCacheReuse::Miss);
 
-        session.insert_artifacts(artifact.clone(), EngineArtifacts::default());
-        let hit = session.cached_artifacts_with_decision(EngineRequestKind::Decompile, &artifact);
+        session.insert_analysis(
+            analysis.clone(),
+            build_engine_analysis_from_parts("sym.cache", &blocks, None, None).expect("analysis"),
+        );
+        let hit = session.cached_analysis_with_decision(EngineRequestKind::Decompile, &analysis);
         assert!(hit.value.is_some());
         assert!(hit.decision.is_hit());
 
         let metrics = session.cache_metrics();
         assert_eq!(
-            metrics.counters_for_layer(EngineCacheLayer::Artifact),
+            metrics.counters_for_layer(EngineCacheLayer::Analysis),
             CacheCounters {
                 hits: 1,
                 misses: 1,

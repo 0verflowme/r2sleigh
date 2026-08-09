@@ -1,0 +1,42 @@
+use r2engine::{EngineFunctionDecompileRequestInput, EngineFunctionInput, EngineSession};
+use r2il::{R2ILBlock, R2ILOp, Varnode};
+
+#[test]
+fn production_engine_standard_route_never_issues_legacy_certified_c() {
+    let mut block = R2ILBlock::new(0x401000, 4);
+    block.push(R2ILOp::Return {
+        target: Varnode::constant(0, 8),
+    });
+    let response = EngineSession::new(4).decompile_function_from_input(
+        EngineFunctionDecompileRequestInput::single_function(
+            EngineFunctionInput {
+                function_name: "legacy_route_interlock".to_string(),
+                function_addr: 0x401000,
+                blocks: vec![block],
+                arch: None,
+                semantic_metadata_enabled: false,
+                source_snapshot: None,
+            },
+            Some(64),
+            r2types::ParsedExternalContext::default(),
+            0,
+        ),
+    );
+    let route = response
+        .function_facts
+        .decompile_route()
+        .expect("engine response route");
+    assert_eq!(route.kind, r2types::DecompileRouteKind::Standard);
+    assert_eq!(
+        route.render_permission.kind,
+        r2sym::RenderPermissionKind::Residual
+    );
+    assert_eq!(route.render_permission.owner, r2sym::ProofOwner::R2engine);
+    assert!(
+        route
+            .render_permission
+            .reason
+            .contains("r2cert typed-region authorization is required")
+    );
+    assert!(response.output.contains("r2dec residual:"));
+}

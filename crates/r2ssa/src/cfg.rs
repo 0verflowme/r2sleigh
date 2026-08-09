@@ -8,7 +8,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use petgraph::Direction;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
-use r2il::{R2ILBlock, R2ILOp};
+use r2il::{R2ILBlock, R2ILOp, SwitchInfo};
 use serde::{Deserialize, Serialize};
 
 /// A basic block in the control flow graph.
@@ -22,6 +22,12 @@ pub struct BasicBlock {
     pub ops: Vec<R2ILOp>,
     /// The type of terminator for this block.
     pub terminator: BlockTerminator,
+    /// Original switch metadata, retained so certification can validate every
+    /// source field instead of relying on the lossy CFG terminator projection.
+    pub switch_info: Option<SwitchInfo>,
+    /// Address attributed to the final operation by the source lifter. When
+    /// metadata is absent this falls back to the block address.
+    terminal_instruction_addr: Option<u64>,
 }
 
 /// How a basic block terminates.
@@ -63,6 +69,8 @@ impl BasicBlock {
             size: 0,
             ops: Vec::new(),
             terminator: BlockTerminator::None,
+            switch_info: None,
+            terminal_instruction_addr: None,
         }
     }
 
@@ -89,7 +97,21 @@ impl BasicBlock {
             size: block.size,
             ops: block.ops.clone(),
             terminator,
+            switch_info: block.switch_info.clone(),
+            terminal_instruction_addr: (!block.ops.is_empty()).then(|| {
+                block
+                    .op_metadata
+                    .get(&(block.ops.len() - 1))
+                    .and_then(|metadata| metadata.instruction_addr)
+                    .unwrap_or(block.addr)
+            }),
         }
+    }
+
+    /// Source address of the final operation, with the block address used when
+    /// the lifter did not attach per-operation instruction metadata.
+    pub const fn terminal_instruction_addr(&self) -> Option<u64> {
+        self.terminal_instruction_addr
     }
 
     /// Analyze the operations to determine the block terminator.
@@ -588,17 +610,23 @@ impl CFG {
         visited: &mut HashSet<NodeIndex>,
         postorder: &mut Vec<u64>,
     ) {
-        if !visited.insert(node) {
-            return;
-        }
+        let mut stack = vec![(node, false)];
+        while let Some((node, expanded)) = stack.pop() {
+            if expanded {
+                postorder.push(self.graph[node].addr);
+                continue;
+            }
+            if !visited.insert(node) {
+                continue;
+            }
 
-        for succ_addr in self.successors(self.graph[node].addr) {
-            if let Some(succ) = self.get_node(succ_addr) {
-                self.dfs_postorder(succ, visited, postorder);
+            stack.push((node, true));
+            for succ_addr in self.successors(self.graph[node].addr).into_iter().rev() {
+                if let Some(succ) = self.get_node(succ_addr) {
+                    stack.push((succ, false));
+                }
             }
         }
-
-        postorder.push(self.graph[node].addr);
     }
 
     /// Get the underlying petgraph for advanced algorithms.
@@ -850,6 +878,13 @@ mod tests {
         // Exit has two predecessors
         let exit_preds = cfg.predecessors(0x100c);
         assert_eq!(exit_preds.len(), 2);
+
+        // Preserve DFS successor visitation (true before false) and the
+        // resulting deterministic reverse postorder.
+        assert_eq!(
+            cfg.reverse_postorder(),
+            vec![0x1000, 0x1004, 0x1008, 0x100c]
+        );
     }
 
     #[test]
@@ -876,6 +911,33 @@ mod tests {
         let cfg = CFG::from_blocks(&blocks).unwrap();
         let rpo = cfg.reverse_postorder();
         assert_eq!(rpo, vec![0x1000, 0x1004]);
+    }
+
+    #[test]
+    fn reverse_postorder_handles_a_deep_linear_cfg() {
+        const BLOCK_COUNT: usize = 8_192;
+        const BASE: u64 = 0x1000;
+
+        let blocks = (0..BLOCK_COUNT)
+            .map(|index| R2ILBlock {
+                addr: BASE + index as u64 * 4,
+                size: 4,
+                ops: if index + 1 == BLOCK_COUNT {
+                    vec![R2ILOp::Return {
+                        target: make_ram(0, 8),
+                    }]
+                } else {
+                    vec![R2ILOp::Nop]
+                },
+                switch_info: None,
+                op_metadata: Default::default(),
+            })
+            .collect::<Vec<_>>();
+        let expected = blocks.iter().map(|block| block.addr).collect::<Vec<_>>();
+
+        let cfg = CFG::from_blocks(&blocks).expect("deep linear CFG");
+
+        assert_eq!(cfg.reverse_postorder(), expected);
     }
 
     #[test]

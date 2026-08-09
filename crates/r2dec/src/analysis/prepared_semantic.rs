@@ -316,12 +316,28 @@ fn prepared_call_site_tuple(
     prepared.inst_op_site(inst_id)
 }
 
+#[allow(dead_code)]
 pub(crate) fn build_prepared_runtime_facts(
     blocks: &[SSABlock],
     env: &PassEnv<'_>,
     prepared: &SsaArtifact,
     view: &PreparedSemanticView,
 ) -> DecompilerFacts {
+    let execution = r2ssa::SsaExecutionControl::default();
+    let control =
+        crate::DecompileWorkControl::new(&execution, crate::DecompileWorkPhase::Structuring);
+    build_prepared_runtime_facts_with_control(blocks, env, prepared, view, control)
+        .expect("default decompiler work control cannot stop")
+}
+
+pub(crate) fn build_prepared_runtime_facts_with_control(
+    blocks: &[SSABlock],
+    env: &PassEnv<'_>,
+    prepared: &SsaArtifact,
+    view: &PreparedSemanticView,
+    control: crate::DecompileWorkControl<'_>,
+) -> Result<DecompilerFacts, crate::DecompileExecutionStop> {
+    control.poll()?;
     let mut use_info = UseInfo {
         type_hints: env.type_hints.clone(),
         ..UseInfo::default()
@@ -335,17 +351,18 @@ pub(crate) fn build_prepared_runtime_facts(
     pin_prepared_loop_carried_phi_values(&mut use_info, prepared, view);
     pin_aliases_for_prepared_pinned_values(&mut use_info);
     populate_prepared_call_runtime_facts(&mut use_info, blocks, env, prepared, view);
-    overlay_local_struct_semantics(&mut use_info, blocks, env);
+    overlay_local_struct_semantics(&mut use_info, blocks, env, control)?;
     overlay_prepared_switch_roots(&mut use_info, prepared, view);
     populate_prepared_render_definitions(&mut use_info, blocks, env);
     finalize_prepared_call_inlining(&mut use_info);
 
-    DecompilerFacts {
+    control.poll()?;
+    Ok(DecompilerFacts {
         use_info,
         ownership: SemanticOwnershipFacts::default(),
         flag_info,
         stack_info,
-    }
+    })
 }
 
 fn pin_prepared_loop_carried_phi_values(
@@ -565,9 +582,15 @@ fn is_self_render_definition(dst: &SSAVar, expr: &CExpr) -> bool {
     matches!(expr, CExpr::Var(name) if name == &dst_display || name.eq_ignore_ascii_case(&dst_rendered))
 }
 
-fn overlay_local_struct_semantics(use_info: &mut UseInfo, blocks: &[SSABlock], env: &PassEnv<'_>) {
-    let semantic = UseInfo::analyze_for_local_struct_accesses(blocks, env);
+fn overlay_local_struct_semantics(
+    use_info: &mut UseInfo,
+    blocks: &[SSABlock],
+    env: &PassEnv<'_>,
+    control: crate::DecompileWorkControl<'_>,
+) -> Result<(), crate::DecompileExecutionStop> {
+    let semantic = UseInfo::analyze_for_local_struct_accesses_with_control(blocks, env, control)?;
     for (name, value) in semantic.semantic_values {
+        control.poll()?;
         // Prepared ValueId-bound facts are canonical; local struct inference is heuristic.
         if use_info.value_ids_by_name.contains_key(&name) {
             continue;
@@ -585,8 +608,10 @@ fn overlay_local_struct_semantics(use_info: &mut UseInfo, blocks: &[SSABlock], e
         }
     }
     for (name, fact) in semantic.ptr_members {
+        control.poll()?;
         use_info.ptr_members.entry(name).or_insert(fact);
     }
+    Ok(())
 }
 
 fn populate_stack_aliases(

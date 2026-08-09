@@ -12,17 +12,27 @@ use r2il::{ArchSpec, R2ILBlock};
 use serde::{Deserialize, Serialize};
 
 use crate::AssumptionSet;
+use crate::CanonicalStorageId;
+use crate::aggregate_access::{
+    AggregateAccessProjectionFacts, collect_aggregate_access_projections,
+};
 use crate::block::SSABlock as LocalSSABlock;
 use crate::cfg::{CFG, CFGEdge};
+use crate::control::{
+    SsaExecutionStopReason, SsaPrepareError, SsaWorkControl, UncheckedSsaWorkControl,
+};
 use crate::defuse::{BackwardSlice, SliceOpRef, backward_slice_from_op, backward_slice_from_var};
 use crate::domtree::DomTree;
 use crate::graph::SsaGraph;
-use crate::naming::{ArchCacheTag, cached_register_name_map};
+use crate::machine_context::{
+    SourceCallSiteInterface, SourceFunctionInterface, SourceMachineContext,
+};
+use crate::naming::{ARCH_DERIVED_CACHE_MAX_ENTRIES, ArchCacheTag, cached_register_name_map};
 use crate::op::SSAOp;
-use crate::phi::{PhiPlacement, collect_defs_from_cfg_with_names};
+use crate::phi::{PhiPlacement, collect_defs_from_cfg_with_names_storage_and_control};
+use crate::private_frame::{PrivateFrameFact, collect_private_frame_fact};
 use crate::rename::{
-    CallBoundaryConfig, CallBoundaryDef, rename_function_with_names,
-    rename_function_with_names_and_call_boundaries,
+    CallBoundaryConfig, CallBoundaryDef, rename_function_with_names_and_call_boundaries_and_control,
 };
 use crate::semantic::{
     CallResultCertificate, CallSiteFacts, CallSiteId, CallsiteCertificate, MemoryAccessCertificate,
@@ -46,14 +56,14 @@ pub struct CFGRiskSummary {
 }
 
 /// Canonical base used to form a proven stack address.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum StackAddressBase {
     FramePointer,
     StackPointer,
 }
 
 /// Proven stack-address root: `base +/- offset`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct StackAddressRoot {
     pub base: StackAddressBase,
     pub offset: i64,
@@ -88,59 +98,245 @@ pub struct SsaArtifact {
     graph: SsaGraph,
     mode: FunctionPrepareMode,
     facts: PreparedFunctionFacts,
+    machine_context: SourceMachineContext,
+    aggregate_accesses: AggregateAccessProjectionFacts,
+    private_frame: Option<PrivateFrameFact>,
 }
 
 impl SsaArtifact {
+    #[cfg(test)]
     fn new(function: SSAFunction, mode: FunctionPrepareMode) -> Self {
-        let graph = SsaGraph::from_function(&function);
-        let facts = PreparedFunctionFacts::collect(&function, &graph);
-        Self {
+        Self::new_with_context(function, mode, SourceMachineContext::from_blocks(&[], None))
+    }
+
+    fn new_with_context(
+        function: SSAFunction,
+        mode: FunctionPrepareMode,
+        machine_context: SourceMachineContext,
+    ) -> Self {
+        Self::new_with_context_and_control(
+            function,
+            mode,
+            machine_context,
+            &UncheckedSsaWorkControl,
+        )
+        .expect("unchecked SSA artifact construction cannot stop")
+    }
+
+    fn new_with_context_and_control<C: SsaWorkControl + ?Sized>(
+        function: SSAFunction,
+        mode: FunctionPrepareMode,
+        mut machine_context: SourceMachineContext,
+        control: &C,
+    ) -> Result<Self, SsaExecutionStopReason> {
+        control.poll()?;
+        machine_context.remap_memory_sites_to_prepared(&function);
+        let graph = SsaGraph::from_function_with_storage(&function);
+        control.poll()?;
+        let facts = PreparedFunctionFacts::collect_with_context(
+            &function,
+            &graph,
+            &AssumptionSet::default(),
+            &machine_context,
+        );
+        let aggregate_accesses = collect_aggregate_access_projections(
+            &graph,
+            &facts.addresses,
+            &facts.structured.memory_accesses,
+            &machine_context,
+        );
+        let private_frame = machine_context.function_interface().and_then(|interface| {
+            collect_private_frame_fact(
+                mode,
+                &function,
+                &graph,
+                &facts,
+                &machine_context,
+                interface.revision_identity(),
+            )
+        });
+        control.poll()?;
+        Ok(Self {
             function,
             graph,
             mode,
             facts,
-        }
+            machine_context,
+            aggregate_accesses,
+            private_frame,
+        })
     }
 
     pub fn from_blocks(blocks: &[R2ILBlock], arch: Option<&ArchSpec>) -> Option<Self> {
-        Some(Self::new(
+        Some(Self::new_with_context(
             SSAFunction::from_blocks_with_arch(blocks, arch)?,
             FunctionPrepareMode::Generic,
+            SourceMachineContext::from_blocks(blocks, arch),
         ))
     }
 
     pub fn raw(blocks: &[R2ILBlock], arch: Option<&ArchSpec>) -> Option<Self> {
-        Some(Self::new(
+        Some(Self::new_with_context(
             SSAFunction::from_blocks_raw(blocks, arch)?,
             FunctionPrepareMode::Raw,
+            SourceMachineContext::from_blocks(blocks, arch),
+        ))
+    }
+
+    /// Build raw SSA with an explicit, revision-bound function interface.
+    pub fn raw_with_interface(
+        blocks: &[R2ILBlock],
+        arch: Option<&ArchSpec>,
+        function_interface: SourceFunctionInterface,
+    ) -> Option<Self> {
+        Self::raw_with_interfaces(blocks, arch, Some(function_interface), Vec::new())
+    }
+
+    /// Build raw SSA with explicit, revision-bound function and callsite
+    /// interfaces. A missing function interface does not weaken the per-callsite
+    /// revision and carrier checks.
+    pub fn raw_with_interfaces(
+        blocks: &[R2ILBlock],
+        arch: Option<&ArchSpec>,
+        function_interface: Option<SourceFunctionInterface>,
+        call_site_interfaces: Vec<SourceCallSiteInterface>,
+    ) -> Option<Self> {
+        Some(Self::new_with_context(
+            SSAFunction::from_blocks_raw(blocks, arch)?,
+            FunctionPrepareMode::Raw,
+            SourceMachineContext::from_blocks_with_interfaces(
+                blocks,
+                arch,
+                function_interface,
+                call_site_interfaces,
+            ),
         ))
     }
 
     pub fn for_decompile(blocks: &[R2ILBlock], arch: Option<&ArchSpec>) -> Option<Self> {
-        Some(Self::new(
+        Some(Self::new_with_context(
             SSAFunction::from_blocks_for_decompile(blocks, arch)?,
             FunctionPrepareMode::Decompile,
+            SourceMachineContext::from_blocks(blocks, arch),
         ))
+    }
+
+    /// Build a complete decompiler SSA artifact under cooperative control.
+    ///
+    /// Work is assembled in local values. A stop returns an explicit error and
+    /// drops all intermediate state rather than exposing a partial artifact.
+    pub fn for_decompile_with_control<C: SsaWorkControl + ?Sized>(
+        blocks: &[R2ILBlock],
+        arch: Option<&ArchSpec>,
+        control: &C,
+    ) -> Result<Self, SsaPrepareError> {
+        let function = SSAFunction::from_blocks_for_decompile_with_control(blocks, arch, control)?;
+        control.poll()?;
+        let machine_context = SourceMachineContext::from_blocks(blocks, arch);
+        Self::new_with_context_and_control(
+            function,
+            FunctionPrepareMode::Decompile,
+            machine_context,
+            control,
+        )
+        .map_err(Into::into)
+    }
+
+    /// Build decompiler-prepared SSA with an explicit function interface.
+    pub fn for_decompile_with_interface(
+        blocks: &[R2ILBlock],
+        arch: Option<&ArchSpec>,
+        function_interface: SourceFunctionInterface,
+    ) -> Option<Self> {
+        Self::for_decompile_with_interfaces(blocks, arch, Some(function_interface), Vec::new())
+    }
+
+    /// Build decompiler-prepared SSA with explicit, revision-bound function and
+    /// callsite interfaces.
+    pub fn for_decompile_with_interfaces(
+        blocks: &[R2ILBlock],
+        arch: Option<&ArchSpec>,
+        function_interface: Option<SourceFunctionInterface>,
+        call_site_interfaces: Vec<SourceCallSiteInterface>,
+    ) -> Option<Self> {
+        Some(Self::new_with_context(
+            SSAFunction::from_blocks_for_decompile(blocks, arch)?,
+            FunctionPrepareMode::Decompile,
+            SourceMachineContext::from_blocks_with_interfaces(
+                blocks,
+                arch,
+                function_interface,
+                call_site_interfaces,
+            ),
+        ))
+    }
+
+    /// Build controlled decompiler SSA with explicit source interfaces.
+    pub fn for_decompile_with_interfaces_and_control<C: SsaWorkControl + ?Sized>(
+        blocks: &[R2ILBlock],
+        arch: Option<&ArchSpec>,
+        function_interface: Option<SourceFunctionInterface>,
+        call_site_interfaces: Vec<SourceCallSiteInterface>,
+        control: &C,
+    ) -> Result<Self, SsaPrepareError> {
+        let function = SSAFunction::from_blocks_for_decompile_with_control(blocks, arch, control)?;
+        control.poll()?;
+        let machine_context = SourceMachineContext::from_blocks_with_interfaces(
+            blocks,
+            arch,
+            function_interface,
+            call_site_interfaces,
+        );
+        Self::new_with_context_and_control(
+            function,
+            FunctionPrepareMode::Decompile,
+            machine_context,
+            control,
+        )
+        .map_err(Into::into)
     }
 
     pub fn for_patterns(blocks: &[R2ILBlock], arch: Option<&ArchSpec>) -> Option<Self> {
-        Some(Self::new(
+        Some(Self::new_with_context(
             SSAFunction::from_blocks_for_patterns(blocks, arch)?,
             FunctionPrepareMode::Patterns,
+            SourceMachineContext::from_blocks(blocks, arch),
         ))
     }
 
+    /// Build a complete pattern/type-inference SSA artifact under cooperative control.
+    pub fn for_patterns_with_control<C: SsaWorkControl + ?Sized>(
+        blocks: &[R2ILBlock],
+        arch: Option<&ArchSpec>,
+        control: &C,
+    ) -> Result<Self, SsaPrepareError> {
+        let function = SSAFunction::from_blocks_for_patterns_with_control(blocks, arch, control)?;
+        control.poll()?;
+        Self::new_with_context_and_control(
+            function,
+            FunctionPrepareMode::Patterns,
+            SourceMachineContext::from_blocks(blocks, arch),
+            control,
+        )
+        .map_err(Into::into)
+    }
+
     pub fn for_data_refs(blocks: &[R2ILBlock], arch: Option<&ArchSpec>) -> Option<Self> {
-        Some(Self::new(
+        Some(Self::new_with_context(
             SSAFunction::from_blocks_for_data_refs(blocks, arch)?,
             FunctionPrepareMode::DataRefs,
+            SourceMachineContext::from_blocks(blocks, arch),
         ))
     }
 
     pub fn for_symbolic(blocks: &[R2ILBlock], arch: Option<&ArchSpec>) -> Option<Self> {
         let mut function = SSAFunction::from_blocks_raw(blocks, arch)?;
         function.refresh_decompile_prep_facts(arch);
-        Some(Self::new(function, FunctionPrepareMode::Symbolic))
+        Some(Self::new_with_context(
+            function,
+            FunctionPrepareMode::Symbolic,
+            SourceMachineContext::from_blocks(blocks, arch),
+        ))
     }
 
     pub fn mode(&self) -> FunctionPrepareMode {
@@ -163,17 +359,52 @@ impl SsaArtifact {
         &self.facts
     }
 
+    pub const fn machine_context(&self) -> &SourceMachineContext {
+        &self.machine_context
+    }
+
+    pub const fn aggregate_accesses(&self) -> &AggregateAccessProjectionFacts {
+        &self.aggregate_accesses
+    }
+
+    pub const fn private_frame(&self) -> Option<&PrivateFrameFact> {
+        self.private_frame.as_ref()
+    }
+
     pub fn with_assumptions(&self, assumptions: &AssumptionSet) -> Self {
-        let facts = PreparedFunctionFacts::collect_with_assumptions(
+        let facts = PreparedFunctionFacts::collect_with_context(
             &self.function,
             &self.graph,
             assumptions,
+            &self.machine_context,
         );
+        let aggregate_accesses = collect_aggregate_access_projections(
+            &self.graph,
+            &facts.addresses,
+            &facts.structured.memory_accesses,
+            &self.machine_context,
+        );
+        let private_frame = self
+            .machine_context
+            .function_interface()
+            .and_then(|interface| {
+                collect_private_frame_fact(
+                    self.mode,
+                    &self.function,
+                    &self.graph,
+                    &facts,
+                    &self.machine_context,
+                    interface.revision_identity(),
+                )
+            });
         Self {
             function: self.function.clone(),
             graph: self.graph.clone(),
             mode: self.mode,
             facts,
+            machine_context: self.machine_context.clone(),
+            aggregate_accesses,
+            private_frame,
         }
     }
 
@@ -207,6 +438,10 @@ impl SsaArtifact {
 
     pub fn certificates(&self) -> &crate::semantic::PreparedFunctionCertificates {
         &self.facts.certificates
+    }
+
+    pub fn obligations(&self) -> &crate::obligation::SemanticObligationInventory {
+        &self.facts.obligations
     }
 
     pub fn callsite_certificate_for_op(
@@ -467,6 +702,11 @@ pub struct SSAFunction {
     blocks: HashMap<u64, SSABlock>,
     /// Block addresses in reverse postorder.
     block_order: Vec<u64>,
+    /// Canonical lifted storage retained during SSA renaming.
+    ///
+    /// Values are attached from raw varnodes at the lift/SSA seam. Consumers
+    /// must not reconstruct this information from `SSAVar::name`.
+    canonical_storage_by_var: BTreeMap<SSAVar, CanonicalStorageId>,
     /// Optional decompiler-prep fact snapshot for the current SSA state.
     decompile_prep_facts: Option<DecompilePrepFacts>,
     /// Structural def/use index for repeated SSA queries.
@@ -488,6 +728,7 @@ impl Clone for SSAFunction {
             domtree: self.domtree.clone(),
             blocks: self.blocks.clone(),
             block_order: self.block_order.clone(),
+            canonical_storage_by_var: self.canonical_storage_by_var.clone(),
             decompile_prep_facts: self.decompile_prep_facts.clone(),
             query_index: RwLock::new(None),
         }
@@ -514,6 +755,9 @@ pub struct PhiNode {
     pub dst: SSAVar,
     /// The source variables, one per predecessor.
     pub sources: Vec<(u64, SSAVar)>, // (predecessor addr, variable)
+    /// Name-independent lifted storage identity.
+    #[serde(default)]
+    pub canonical_storage: Option<CanonicalStorageId>,
 }
 
 /// Location metadata for a source variable use.
@@ -967,10 +1211,27 @@ impl SSAFunction {
         blocks: &[R2ILBlock],
         arch: Option<&ArchSpec>,
     ) -> Option<Self> {
-        let mut func = Self::from_blocks_raw_for_decompile(blocks, arch)?;
-        func.prepare_for_decompile(&crate::optimize::DecompilePrepConfig::default());
-        func.refresh_decompile_prep_facts(arch);
-        Some(func)
+        Self::from_blocks_for_decompile_with_control(blocks, arch, &UncheckedSsaWorkControl).ok()
+    }
+
+    /// Build decompiler-prepared SSA while polling expensive worklists.
+    ///
+    /// The function is constructed locally and returned only after every
+    /// preparation and canonicalization phase completes.
+    pub fn from_blocks_for_decompile_with_control<C: SsaWorkControl + ?Sized>(
+        blocks: &[R2ILBlock],
+        arch: Option<&ArchSpec>,
+        control: &C,
+    ) -> Result<Self, SsaPrepareError> {
+        control.poll()?;
+        let mut func = Self::from_blocks_raw_for_decompile_with_control(blocks, arch, control)?;
+        func.prepare_for_decompile_with_control(
+            &crate::optimize::DecompilePrepConfig::default(),
+            control,
+        )?;
+        func.refresh_decompile_prep_facts_with_control(arch, control)?;
+        control.poll()?;
+        Ok(func)
     }
 
     /// Build SSA prepared for pattern/type inference.
@@ -979,7 +1240,17 @@ impl SSAFunction {
     /// applying limited whole-function SCCP so layout-sensitive patterns
     /// collapse to a canonical indexed+offset form for downstream consumers.
     pub fn from_blocks_for_patterns(blocks: &[R2ILBlock], arch: Option<&ArchSpec>) -> Option<Self> {
-        let mut func = Self::from_blocks_raw(blocks, arch)?;
+        Self::from_blocks_for_patterns_with_control(blocks, arch, &UncheckedSsaWorkControl).ok()
+    }
+
+    /// Build pattern/type-inference SSA while polling expensive worklists.
+    pub fn from_blocks_for_patterns_with_control<C: SsaWorkControl + ?Sized>(
+        blocks: &[R2ILBlock],
+        arch: Option<&ArchSpec>,
+        control: &C,
+    ) -> Result<Self, SsaPrepareError> {
+        control.poll()?;
+        let mut func = Self::from_blocks_raw_with_policy_and_control(blocks, arch, None, control)?;
         let cfg = crate::optimize::OptimizationConfig {
             max_iterations: 1,
             enable_sccp: true,
@@ -990,9 +1261,12 @@ impl SSAFunction {
             enable_dce: false,
             preserve_memory_reads: true,
         };
-        func.optimize(&cfg);
-        func.refresh_decompile_prep_facts(arch);
-        Some(func)
+        func.decompile_prep_facts = None;
+        func.invalidate_query_index();
+        crate::optimize::optimize_function_with_control(&mut func, &cfg, control)?;
+        func.refresh_decompile_prep_facts_with_control(arch, control)?;
+        control.poll()?;
+        Ok(func)
     }
 
     /// Build SSA for data-reference recovery.
@@ -1035,8 +1309,18 @@ impl SSAFunction {
         blocks: &[R2ILBlock],
         arch: Option<&ArchSpec>,
     ) -> Option<Self> {
+        Self::from_blocks_raw_for_decompile_with_control(blocks, arch, &UncheckedSsaWorkControl)
+            .ok()
+    }
+
+    /// Build raw decompiler SSA while polling construction worklists.
+    pub fn from_blocks_raw_for_decompile_with_control<C: SsaWorkControl + ?Sized>(
+        blocks: &[R2ILBlock],
+        arch: Option<&ArchSpec>,
+        control: &C,
+    ) -> Result<Self, SsaPrepareError> {
         let policy = decompile_call_boundary_config(arch);
-        Self::from_blocks_raw_with_policy(blocks, arch, policy.as_ref())
+        Self::from_blocks_raw_with_policy_and_control(blocks, arch, policy.as_ref(), control)
     }
 
     fn from_blocks_raw_with_policy(
@@ -1044,44 +1328,67 @@ impl SSAFunction {
         arch: Option<&ArchSpec>,
         call_boundaries: Option<&CallBoundaryConfig>,
     ) -> Option<Self> {
+        Self::from_blocks_raw_with_policy_and_control(
+            blocks,
+            arch,
+            call_boundaries,
+            &UncheckedSsaWorkControl,
+        )
+        .ok()
+    }
+
+    fn from_blocks_raw_with_policy_and_control<C: SsaWorkControl + ?Sized>(
+        blocks: &[R2ILBlock],
+        arch: Option<&ArchSpec>,
+        call_boundaries: Option<&CallBoundaryConfig>,
+        control: &C,
+    ) -> Result<Self, SsaPrepareError> {
+        control.poll()?;
         if blocks.is_empty() {
-            return None;
+            return Err(SsaPrepareError::MalformedInput);
         }
 
         // Build CFG
-        let cfg = CFG::from_blocks(blocks)?;
+        let cfg = CFG::from_blocks(blocks).ok_or(SsaPrepareError::MalformedInput)?;
+        control.poll()?;
         let entry = cfg.entry;
 
         // Compute dominator tree
-        let domtree = DomTree::compute(&cfg);
+        let domtree = DomTree::compute_with_control(&cfg, control)?;
 
         let reg_names = arch.map(cached_register_name_map);
         let reg_names_ref = reg_names.as_deref();
 
         // Collect variable definitions and sizes
-        let (defs, var_sizes) = collect_defs_from_cfg_with_names(&cfg, reg_names_ref);
+        let (defs, var_sizes, storage_by_name) =
+            collect_defs_from_cfg_with_names_storage_and_control(&cfg, reg_names_ref, control)?;
 
         // Place phi nodes
-        let phi_placement = PhiPlacement::compute(&cfg, &domtree, &defs, &var_sizes);
+        let phi_placement = PhiPlacement::compute_with_storage_and_control(
+            &cfg,
+            &domtree,
+            &defs,
+            &var_sizes,
+            &storage_by_name,
+            control,
+        )?;
 
         // Rename variables
-        let renamed = if let Some(boundary) = call_boundaries {
-            rename_function_with_names_and_call_boundaries(
-                &cfg,
-                &domtree,
-                &phi_placement,
-                &var_sizes,
-                reg_names_ref,
-                Some(boundary),
-            )
-        } else {
-            rename_function_with_names(&cfg, &domtree, &phi_placement, &var_sizes, reg_names_ref)
-        };
+        let renamed = rename_function_with_names_and_call_boundaries_and_control(
+            &cfg,
+            &domtree,
+            &phi_placement,
+            &var_sizes,
+            reg_names_ref,
+            call_boundaries,
+            control,
+        )?;
 
         // Build SSA blocks
         let mut ssa_blocks = HashMap::new();
         for &addr in &renamed.block_order {
-            let cfg_block = cfg.get_block(addr)?;
+            control.poll()?;
+            let cfg_block = cfg.get_block(addr).ok_or(SsaPrepareError::MalformedInput)?;
             let ops = renamed.blocks.get(&addr).cloned().unwrap_or_default();
 
             // Separate phi nodes from other ops
@@ -1093,16 +1400,22 @@ impl SSAFunction {
             let preds = cfg.predecessors(addr);
             let phis: Vec<PhiNode> = phi_ops
                 .into_iter()
-                .filter_map(|op| {
+                .enumerate()
+                .filter_map(|(phi_idx, op)| {
                     if let SSAOp::Phi { dst, sources } = op {
                         let phi_sources: Vec<(u64, SSAVar)> = sources
                             .into_iter()
                             .zip(preds.iter())
                             .map(|(var, &pred)| (pred, var))
                             .collect();
+                        let canonical_storage = phi_placement
+                            .get_phis(addr)
+                            .get(phi_idx)
+                            .and_then(|phi| phi.storage);
                         Some(PhiNode {
                             dst,
                             sources: phi_sources,
+                            canonical_storage,
                         })
                     } else {
                         None
@@ -1126,13 +1439,15 @@ impl SSAFunction {
             domtree,
             blocks: ssa_blocks,
             block_order: renamed.block_order,
+            canonical_storage_by_var: renamed.canonical_storage_by_var,
             decompile_prep_facts: None,
             query_index: RwLock::new(None),
         };
         if let Some(arch) = arch {
-            function.normalize_register_alias_sources(arch);
+            function.normalize_register_alias_sources_with_control(arch, control)?;
         }
-        Some(function)
+        control.poll()?;
+        Ok(function)
     }
 
     /// Build raw SSA without architecture metadata.
@@ -1173,6 +1488,15 @@ impl SSAFunction {
     /// Get block addresses in reverse postorder.
     pub fn block_addrs(&self) -> &[u64] {
         &self.block_order
+    }
+
+    /// Return name-independent storage provenance retained from the lifted
+    /// varnode that produced or supplied this SSA value.
+    pub(crate) fn canonical_storage_for_var(
+        &self,
+        var: &SSAVar,
+    ) -> Option<CanonicalStorageId> {
+        self.canonical_storage_by_var.get(var).copied()
     }
 
     /// Get the number of blocks.
@@ -1454,34 +1778,61 @@ impl SSAFunction {
         &mut self,
         config: &crate::optimize::DecompilePrepConfig,
     ) -> crate::optimize::OptimizationStats {
-        self.decompile_prep_facts = None;
-        let cfg: crate::optimize::OptimizationConfig = config.into();
-        self.optimize(&cfg)
+        self.prepare_for_decompile_with_control(config, &UncheckedSsaWorkControl)
+            .expect("unchecked decompiler preparation cannot stop")
     }
 
+    fn prepare_for_decompile_with_control<C: SsaWorkControl + ?Sized>(
+        &mut self,
+        config: &crate::optimize::DecompilePrepConfig,
+        control: &C,
+    ) -> Result<crate::optimize::OptimizationStats, SsaExecutionStopReason> {
+        control.poll()?;
+        self.decompile_prep_facts = None;
+        self.invalidate_query_index();
+        let cfg: crate::optimize::OptimizationConfig = config.into();
+        crate::optimize::optimize_function_with_control(self, &cfg, control)
+    }
+
+    #[cfg(test)]
     fn normalize_register_alias_sources(&mut self, arch: &ArchSpec) {
+        self.normalize_register_alias_sources_with_control(arch, &UncheckedSsaWorkControl)
+            .expect("unchecked register alias normalization cannot stop");
+    }
+
+    fn normalize_register_alias_sources_with_control<C: SsaWorkControl + ?Sized>(
+        &mut self,
+        arch: &ArchSpec,
+        control: &C,
+    ) -> Result<(), SsaExecutionStopReason> {
+        control.poll()?;
         self.decompile_prep_facts = None;
         self.invalidate_query_index();
         let family_info = cached_register_family_info(arch);
         if family_info.name_to_member.is_empty() {
-            return;
+            return Ok(());
         }
 
-        let block_in_states = self.compute_decompile_family_in_states(&family_info);
+        let block_in_states = self
+            .compute_decompile_family_states_with_control(&family_info, control)?
+            .incoming;
 
         for &addr in &self.block_order {
+            control.poll()?;
             let mut state = block_in_states.get(&addr).cloned().unwrap_or_default();
             let Some(block) = self.blocks.get_mut(&addr) else {
                 continue;
             };
 
             for phi in &block.phis {
+                control.poll()?;
                 apply_phi_family_effect(phi, &mut state, &family_info);
             }
 
             let original_ops = std::mem::take(&mut block.ops);
             let mut normalized_ops = Vec::with_capacity(original_ops.len());
             for (op_index, op) in original_ops.into_iter().enumerate() {
+                control.poll()?;
                 let (materialized, rewritten) =
                     materialize_register_alias_sources(&op, &state, &family_info, addr, op_index);
                 normalized_ops.extend(materialized);
@@ -1490,6 +1841,139 @@ impl SSAFunction {
             }
             block.ops = normalized_ops;
         }
+
+        // Renaming treats overlapping register names as independent variables,
+        // so a phi for a contained lane can still carry its version-zero name
+        // on an edge where the predecessor actually wrote the wide register.
+        // Recompute after ordinary source normalization: this makes edge state
+        // refer to the materialized lane producers created above rather than to
+        // stale alias names from the lifted input.
+        let family_states =
+            self.compute_decompile_family_states_with_control(&family_info, control)?;
+        self.materialize_register_alias_phi_sources(
+            &family_states.outgoing,
+            &family_info,
+            control,
+        )?;
+        control.poll()?;
+        Ok(())
+    }
+
+    fn materialize_register_alias_phi_sources<C: SsaWorkControl + ?Sized>(
+        &mut self,
+        block_out_states: &HashMap<u64, FamilyRootState>,
+        family_info: &RegisterFamilyInfo,
+        control: &C,
+    ) -> Result<(), SsaExecutionStopReason> {
+        struct PhiSourceRewrite {
+            block_addr: u64,
+            phi_index: usize,
+            source_index: usize,
+            replacement: SSAVar,
+            projection: Option<(u64, SSAOp)>,
+        }
+
+        let mut rewrites = Vec::new();
+        for &block_addr in &self.block_order {
+            control.poll()?;
+            let Some(block) = self.blocks.get(&block_addr) else {
+                continue;
+            };
+            for (phi_index, phi) in block.phis.iter().enumerate() {
+                control.poll()?;
+                for (source_index, (pred_addr, source)) in phi.sources.iter().enumerate() {
+                    let Some(member) = family_info.member_for(source) else {
+                        continue;
+                    };
+                    let requested = RegisterFamilySlot {
+                        family_id: member.family_id,
+                        offset: member.offset,
+                        width: source.size,
+                    };
+                    let Some(root) = block_out_states
+                        .get(pred_addr)
+                        .and_then(|state| family_root_slice_for_range(state, requested))
+                    else {
+                        // An unavailable range stays unresolved. Adjacent or
+                        // partial fragments must never be assembled implicitly.
+                        continue;
+                    };
+                    if let Some(direct) = direct_family_root_value(&root, source.size) {
+                        if direct != *source {
+                            rewrites.push(PhiSourceRewrite {
+                                block_addr,
+                                phi_index,
+                                source_index,
+                                replacement: direct,
+                                projection: None,
+                            });
+                        }
+                        continue;
+                    }
+                    if root.value == *source && root.offset == 0 {
+                        continue;
+                    }
+                    let projected = SSAVar::new(
+                        format!("tmp:regalias:phi:{block_addr:x}:{phi_index:x}:{source_index:x}"),
+                        1,
+                        source.size,
+                    );
+                    rewrites.push(PhiSourceRewrite {
+                        block_addr,
+                        phi_index,
+                        source_index,
+                        replacement: projected.clone(),
+                        projection: Some((
+                            *pred_addr,
+                            SSAOp::Subpiece {
+                                dst: projected,
+                                src: root.value,
+                                offset: root.offset,
+                            },
+                        )),
+                    });
+                }
+            }
+        }
+
+        for rewrite in rewrites {
+            control.poll()?;
+            let projection_inserted = match rewrite.projection {
+                Some((pred_addr, projection)) => {
+                    let Some(pred) = self.blocks.get_mut(&pred_addr) else {
+                        continue;
+                    };
+                    let insert_at = pred
+                        .ops
+                        .last()
+                        .filter(|op| {
+                            matches!(
+                                op,
+                                SSAOp::Branch { .. }
+                                    | SSAOp::CBranch { .. }
+                                    | SSAOp::BranchInd { .. }
+                                    | SSAOp::Return { .. }
+                            )
+                        })
+                        .map_or(pred.ops.len(), |_| pred.ops.len().saturating_sub(1));
+                    pred.ops.insert(insert_at, projection);
+                    true
+                }
+                None => true,
+            };
+            if !projection_inserted {
+                continue;
+            }
+            if let Some(phi) = self
+                .blocks
+                .get_mut(&rewrite.block_addr)
+                .and_then(|block| block.phis.get_mut(rewrite.phi_index))
+                && let Some((_, source)) = phi.sources.get_mut(rewrite.source_index)
+            {
+                *source = rewrite.replacement;
+            }
+        }
+        Ok(())
     }
 
     /// Snapshot the current decompiler-prep fact view, if available.
@@ -1499,10 +1983,27 @@ impl SSAFunction {
 
     /// Refresh the cached decompiler-prep facts for the current SSA state.
     pub fn refresh_decompile_prep_facts(&mut self, arch: Option<&ArchSpec>) {
-        self.decompile_prep_facts = Some(self.collect_decompile_prep_facts(arch));
+        self.refresh_decompile_prep_facts_with_control(arch, &UncheckedSsaWorkControl)
+            .expect("unchecked decompiler fact collection cannot stop");
     }
 
-    fn collect_decompile_prep_facts(&self, arch: Option<&ArchSpec>) -> DecompilePrepFacts {
+    fn refresh_decompile_prep_facts_with_control<C: SsaWorkControl + ?Sized>(
+        &mut self,
+        arch: Option<&ArchSpec>,
+        control: &C,
+    ) -> Result<(), SsaExecutionStopReason> {
+        let facts = self.collect_decompile_prep_facts_with_control(arch, control)?;
+        control.poll()?;
+        self.decompile_prep_facts = Some(facts);
+        Ok(())
+    }
+
+    fn collect_decompile_prep_facts_with_control<C: SsaWorkControl + ?Sized>(
+        &self,
+        arch: Option<&ArchSpec>,
+        control: &C,
+    ) -> Result<DecompilePrepFacts, SsaExecutionStopReason> {
+        control.poll()?;
         let abi = crate::AbiProfile::from_arch(arch);
         let cached_family_info = arch.map(cached_register_family_info);
         let empty_family_info = RegisterFamilyInfo::default();
@@ -1510,11 +2011,13 @@ impl SSAFunction {
         let family_in_states = if family_info.name_to_member.is_empty() {
             HashMap::new()
         } else {
-            self.compute_decompile_family_in_states(family_info)
+            self.compute_decompile_family_in_states_with_control(family_info, control)?
         };
         let mut facts = DecompilePrepFacts::default();
         for block in self.blocks() {
+            control.poll()?;
             for phi in &block.phis {
+                control.poll()?;
                 for var in
                     std::iter::once(&phi.dst).chain(phi.sources.iter().map(|(_, source)| source))
                 {
@@ -1527,6 +2030,7 @@ impl SSAFunction {
                 }
             }
             for op in &block.ops {
+                control.poll()?;
                 if let Some(dst) = op.dst()
                     && let Some(index) = abi.formal_argument_index(dst)
                 {
@@ -1550,14 +2054,17 @@ impl SSAFunction {
 
         let mut changed = true;
         while changed {
+            control.poll()?;
             changed = false;
             for &addr in &self.block_order {
+                control.poll()?;
                 let mut family_state = family_in_states.get(&addr).cloned().unwrap_or_default();
                 let Some(block) = self.get_block(addr) else {
                     continue;
                 };
 
                 for phi in &block.phis {
+                    control.poll()?;
                     let source_roots = phi
                         .sources
                         .iter()
@@ -1596,6 +2103,7 @@ impl SSAFunction {
                 }
 
                 for op in &block.ops {
+                    control.poll()?;
                     match op {
                         SSAOp::Copy { dst, src }
                         | SSAOp::Cast { dst, src }
@@ -1687,20 +2195,35 @@ impl SSAFunction {
             }
         }
 
-        facts
+        control.poll()?;
+        Ok(facts)
     }
 
-    fn compute_decompile_family_in_states(
+    fn compute_decompile_family_in_states_with_control<C: SsaWorkControl + ?Sized>(
         &self,
         family_info: &RegisterFamilyInfo,
-    ) -> HashMap<u64, FamilyRootState> {
+        control: &C,
+    ) -> Result<HashMap<u64, FamilyRootState>, SsaExecutionStopReason> {
+        Ok(self
+            .compute_decompile_family_states_with_control(family_info, control)?
+            .incoming)
+    }
+
+    fn compute_decompile_family_states_with_control<C: SsaWorkControl + ?Sized>(
+        &self,
+        family_info: &RegisterFamilyInfo,
+        control: &C,
+    ) -> Result<DecompileFamilyStates, SsaExecutionStopReason> {
+        control.poll()?;
         let mut in_states: HashMap<u64, FamilyRootState> = HashMap::new();
         let mut out_states: HashMap<u64, FamilyRootState> = HashMap::new();
 
         loop {
+            control.poll()?;
             let mut changed = false;
 
             for &addr in &self.block_order {
+                control.poll()?;
                 let preds = self.predecessors(addr);
                 let next_in = meet_family_states(&preds, &out_states);
                 let next_out = self.transfer_family_state_for_block(addr, &next_in, family_info);
@@ -1720,7 +2243,11 @@ impl SSAFunction {
             }
         }
 
-        in_states
+        control.poll()?;
+        Ok(DecompileFamilyStates {
+            incoming: in_states,
+            outgoing: out_states,
+        })
     }
 
     fn transfer_family_state_for_block(
@@ -1786,7 +2313,10 @@ impl SSAFunction {
             return None;
         }
 
-        let (block_addr, DefLocation::Op(op_idx)) = self.find_def(var)? else {
+        let Some((block_addr, location)) = self.find_def(var) else {
+            return (!Self::is_constish_switch_value(var)).then(|| var.clone());
+        };
+        let DefLocation::Op(op_idx) = location else {
             return None;
         };
         let block = self.get_block(block_addr)?;
@@ -1995,21 +2525,40 @@ impl SSAFunction {
         in_stack: &mut HashSet<u64>,
         back_edges: &mut HashMap<u64, Vec<u64>>,
     ) {
-        if visited.contains(&block) {
-            return;
+        enum DfsStep {
+            Enter(u64),
+            ExamineEdge { from: u64, to: u64 },
+            Exit(u64),
         }
-        visited.insert(block);
-        in_stack.insert(block);
 
-        for succ in self.successors(block) {
-            if in_stack.contains(&succ) {
-                back_edges.entry(succ).or_default().push(block);
-            } else {
-                self.dfs_back_edges(succ, visited, in_stack, back_edges);
+        let mut stack = vec![DfsStep::Enter(block)];
+        while let Some(step) = stack.pop() {
+            match step {
+                DfsStep::Enter(block) => {
+                    if !visited.insert(block) {
+                        continue;
+                    }
+                    in_stack.insert(block);
+                    stack.push(DfsStep::Exit(block));
+                    for succ in self.successors(block).into_iter().rev() {
+                        stack.push(DfsStep::ExamineEdge {
+                            from: block,
+                            to: succ,
+                        });
+                    }
+                }
+                DfsStep::ExamineEdge { from, to } => {
+                    if in_stack.contains(&to) {
+                        back_edges.entry(to).or_default().push(from);
+                    } else {
+                        stack.push(DfsStep::Enter(to));
+                    }
+                }
+                DfsStep::Exit(block) => {
+                    in_stack.remove(&block);
+                }
             }
         }
-
-        in_stack.remove(&block);
     }
 }
 
@@ -2031,9 +2580,30 @@ struct RegisterFamilyMember {
 struct RegisterFamilyInfo {
     name_to_member: HashMap<String, RegisterFamilyMember>,
     family_widths_by_offset: HashMap<(usize, u64), Vec<u32>>,
+    family_slots: HashMap<usize, Vec<RegisterFamilySlot>>,
 }
 
-type FamilyRootState = HashMap<RegisterFamilySlot, SSAVar>;
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegisterFamilyRoot {
+    /// One real SSA definition that contains this storage range.
+    value: SSAVar,
+    /// Byte offset of the range inside `value`.
+    offset: u32,
+}
+
+impl RegisterFamilyRoot {
+    fn exact(value: SSAVar) -> Self {
+        Self { value, offset: 0 }
+    }
+}
+
+type FamilyRootState = HashMap<RegisterFamilySlot, RegisterFamilyRoot>;
+
+#[derive(Debug, Clone, Default)]
+struct DecompileFamilyStates {
+    incoming: HashMap<u64, FamilyRootState>,
+    outgoing: HashMap<u64, FamilyRootState>,
+}
 
 fn register_family_info_cache() -> &'static RwLock<HashMap<ArchCacheTag, Arc<RegisterFamilyInfo>>> {
     static CACHE: OnceLock<RwLock<HashMap<ArchCacheTag, Arc<RegisterFamilyInfo>>>> =
@@ -2054,10 +2624,16 @@ fn cached_register_family_info(arch: &ArchSpec) -> Arc<RegisterFamilyInfo> {
     }
 
     let info = Arc::new(RegisterFamilyInfo::from_arch(arch));
-    register_family_info_cache()
+    let mut cache = register_family_info_cache()
         .write()
-        .expect("register family cache write lock poisoned")
-        .insert(cache_tag, info.clone());
+        .expect("register family cache write lock poisoned");
+    if let Some(cached) = cache.get(&cache_tag) {
+        return Arc::clone(cached);
+    }
+    if cache.len() >= ARCH_DERIVED_CACHE_MAX_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(cache_tag, info.clone());
     info
 }
 
@@ -2151,7 +2727,7 @@ impl RegisterFamilyInfo {
             seed_x86_low_register_aliases(&mut name_to_member, &mut family_width_sets);
         }
 
-        let family_widths_by_offset = family_width_sets
+        let family_widths_by_offset: HashMap<(usize, u64), Vec<u32>> = family_width_sets
             .into_iter()
             .map(|(family_and_offset, mut widths)| {
                 let mut widths: Vec<u32> = widths.drain().collect();
@@ -2159,10 +2735,26 @@ impl RegisterFamilyInfo {
                 (family_and_offset, widths)
             })
             .collect();
+        let mut family_slots: HashMap<usize, Vec<RegisterFamilySlot>> = HashMap::new();
+        for (&(family_id, offset), widths) in &family_widths_by_offset {
+            family_slots
+                .entry(family_id)
+                .or_default()
+                .extend(widths.iter().copied().map(|width| RegisterFamilySlot {
+                    family_id,
+                    offset,
+                    width,
+                }));
+        }
+        for slots in family_slots.values_mut() {
+            slots.sort_unstable_by_key(|slot| (slot.offset, slot.width));
+            slots.dedup();
+        }
 
         Self {
             name_to_member,
             family_widths_by_offset,
+            family_slots,
         }
     }
 
@@ -2249,23 +2841,13 @@ fn apply_phi_family_effect(
     let Some(member) = family_info.member_for(&phi.dst) else {
         return;
     };
-    kill_family_roots(state, member.family_id);
-    state.insert(
-        RegisterFamilySlot {
-            family_id: member.family_id,
-            offset: member.offset,
-            width: member.width,
-        },
-        phi.dst.clone(),
-    );
-    seed_narrow_family_roots(
-        state,
-        family_info,
-        member.family_id,
-        member.offset,
-        member.width,
-        &phi.dst,
-    );
+    let written = RegisterFamilySlot {
+        family_id: member.family_id,
+        offset: member.offset,
+        width: phi.dst.size,
+    };
+    kill_overlapping_family_roots(state, written);
+    seed_family_roots(state, family_info, written, &phi.dst, &phi.dst);
 }
 
 fn apply_op_family_effect(
@@ -2279,98 +2861,61 @@ fn apply_op_family_effect(
     let Some(member) = family_info.member_for(dst) else {
         return;
     };
+    let written = RegisterFamilySlot {
+        family_id: member.family_id,
+        offset: member.offset,
+        width: dst.size,
+    };
 
     let preserved_narrow_roots =
         preserved_narrow_family_roots_for_widening(op, state, family_info, member);
-    kill_family_roots(state, member.family_id);
-
-    let exact_slot = RegisterFamilySlot {
-        family_id: member.family_id,
-        offset: member.offset,
-        width: member.width,
-    };
+    kill_overlapping_family_roots(state, written);
 
     match op {
         SSAOp::Copy { src, .. } | SSAOp::Cast { src, .. } | SSAOp::New { src, .. } => {
-            if let Some(root) = adapt_family_root(src, member.width) {
-                state.insert(exact_slot, root.clone());
-                seed_narrow_family_roots(
-                    state,
-                    family_info,
-                    member.family_id,
-                    member.offset,
-                    member.width,
-                    &root,
-                );
+            let root = adapt_family_root(src, written.width).unwrap_or_else(|| dst.clone());
+            let exact_root = if family_slot_is_maximal(family_info, written) {
+                dst
             } else {
-                state.insert(exact_slot, dst.clone());
-                seed_narrow_family_roots(
-                    state,
-                    family_info,
-                    member.family_id,
-                    member.offset,
-                    member.width,
-                    dst,
-                );
-            }
+                &root
+            };
+            seed_family_roots(state, family_info, written, exact_root, &root);
         }
         SSAOp::IntZExt { src, .. } | SSAOp::IntSExt { src, .. } => {
-            state.insert(exact_slot, dst.clone());
-            seed_narrow_family_roots(
-                state,
-                family_info,
-                member.family_id,
-                member.offset,
-                member.width,
-                dst,
-            );
+            seed_family_roots(state, family_info, written, dst, dst);
             for (slot, root) in preserved_narrow_roots {
                 state.insert(slot, root);
             }
-            if let Some(root) = adapt_family_root(src, src.size) {
+            if src.size <= written.width {
                 state.insert(
                     RegisterFamilySlot {
                         family_id: member.family_id,
                         offset: member.offset,
                         width: src.size,
                     },
-                    root,
+                    RegisterFamilyRoot::exact(src.clone()),
                 );
             }
         }
-        SSAOp::Trunc { src, .. } | SSAOp::Subpiece { src, .. } => {
-            if let Some(root) = adapt_family_root(src, member.width) {
-                state.insert(exact_slot, root.clone());
-                seed_narrow_family_roots(
-                    state,
-                    family_info,
-                    member.family_id,
-                    member.offset,
-                    member.width,
-                    &root,
-                );
+        SSAOp::Trunc { src, .. } => {
+            let root = if src.is_const() {
+                extract_constant_family_slice(src, 0, written.width).unwrap_or_else(|| dst.clone())
             } else {
-                state.insert(exact_slot, dst.clone());
-                seed_narrow_family_roots(
-                    state,
-                    family_info,
-                    member.family_id,
-                    member.offset,
-                    member.width,
-                    dst,
-                );
-            }
+                dst.clone()
+            };
+            seed_family_roots(state, family_info, written, &root, &root);
+        }
+        SSAOp::Subpiece { src, offset, .. } => {
+            let root = if src.is_const() {
+                extract_constant_family_slice(src, *offset, written.width)
+                    .unwrap_or_else(|| dst.clone())
+            } else {
+                dst.clone()
+            };
+            seed_family_roots(state, family_info, written, &root, &root);
         }
         _ => {
-            state.insert(exact_slot, dst.clone());
-            seed_narrow_family_roots(
-                state,
-                family_info,
-                member.family_id,
-                member.offset,
-                member.width,
-                dst,
-            );
+            seed_family_roots(state, family_info, written, dst, dst);
         }
     }
 }
@@ -2380,7 +2925,7 @@ fn preserved_narrow_family_roots_for_widening(
     state: &FamilyRootState,
     family_info: &RegisterFamilyInfo,
     dst_member: RegisterFamilyMember,
-) -> Vec<(RegisterFamilySlot, SSAVar)> {
+) -> Vec<(RegisterFamilySlot, RegisterFamilyRoot)> {
     let src = match op {
         SSAOp::IntZExt { src, .. } | SSAOp::IntSExt { src, .. } => src,
         _ => return Vec::new(),
@@ -2388,7 +2933,10 @@ fn preserved_narrow_family_roots_for_widening(
     let Some(src_member) = family_info.member_for(src) else {
         return Vec::new();
     };
-    if src_member.family_id != dst_member.family_id || src.size >= dst_member.width {
+    if src_member.family_id != dst_member.family_id
+        || src_member.offset != dst_member.offset
+        || src.size >= dst_member.width
+    {
         return Vec::new();
     }
     let Some(widths) = family_info
@@ -2408,8 +2956,7 @@ fn preserved_narrow_family_roots_for_widening(
                 offset: dst_member.offset,
                 width,
             };
-            let root = state.get(&slot)?;
-            adapt_family_root(root, width).map(|root| (slot, root))
+            state.get(&slot).cloned().map(|root| (slot, root))
         })
         .collect()
 }
@@ -2423,6 +2970,8 @@ fn materialize_register_alias_sources(
 ) -> (Vec<SSAOp>, SSAOp) {
     let mut materialized = Vec::new();
     let mut replacements = HashMap::<SSAVar, SSAVar>::new();
+    let op =
+        rewrite_decompile_family_subpiece(op, state, family_info).unwrap_or_else(|| op.clone());
 
     for (source_index, source) in op.sources().into_iter().enumerate() {
         if replacements.contains_key(source) {
@@ -2433,19 +2982,24 @@ fn materialize_register_alias_sources(
             replacements.insert(source.clone(), rewritten);
             continue;
         }
-        if exact_register_family_root(source, state, family_info).as_ref() == Some(source) {
-            continue;
-        }
-        let Some(wide_root) = wider_register_family_root(source, state, family_info) else {
+        let Some(member) = family_info.member_for(source) else {
             continue;
         };
-        if wide_root.is_const() {
-            if let Some(narrowed) = adapt_family_root(&wide_root, source.size) {
-                replacements.insert(source.clone(), narrowed);
+        let requested = RegisterFamilySlot {
+            family_id: member.family_id,
+            offset: member.offset,
+            width: source.size,
+        };
+        let Some(root) = family_root_slice_for_range(state, requested) else {
+            continue;
+        };
+        if let Some(direct) = direct_family_root_value(&root, source.size) {
+            if direct != *source {
+                replacements.insert(source.clone(), direct);
             }
             continue;
         }
-        if wide_root.size <= source.size {
+        if root.value == *source && root.offset == 0 {
             continue;
         }
         let extracted = SSAVar::new(
@@ -2455,13 +3009,13 @@ fn materialize_register_alias_sources(
         );
         materialized.push(SSAOp::Subpiece {
             dst: extracted.clone(),
-            src: wide_root,
-            offset: 0,
+            src: root.value,
+            offset: root.offset,
         });
         replacements.insert(source.clone(), extracted);
     }
 
-    let rewritten = crate::optimize::map_sources_in_op(op, &|source| {
+    let rewritten = crate::optimize::map_sources_in_op(&op, &|source| {
         replacements
             .get(source)
             .cloned()
@@ -2470,42 +3024,65 @@ fn materialize_register_alias_sources(
     (materialized, rewritten)
 }
 
-fn exact_register_family_root(
-    source: &SSAVar,
+fn rewrite_decompile_family_subpiece(
+    op: &SSAOp,
     state: &FamilyRootState,
     family_info: &RegisterFamilyInfo,
-) -> Option<SSAVar> {
-    let member = family_info.member_for(source)?;
-    state
-        .get(&RegisterFamilySlot {
-            family_id: member.family_id,
-            offset: member.offset,
-            width: source.size,
-        })
-        .and_then(|root| adapt_family_root(root, source.size))
+) -> Option<SSAOp> {
+    let SSAOp::Subpiece { dst, src, offset } = op else {
+        return None;
+    };
+    let member = family_info.member_for(src)?;
+    let requested_end = offset.checked_add(dst.size)?;
+    if requested_end > src.size {
+        return None;
+    }
+    let requested = RegisterFamilySlot {
+        family_id: member.family_id,
+        offset: member.offset.checked_add(u64::from(*offset))?,
+        width: dst.size,
+    };
+    let root = family_root_slice_for_range(state, requested)?;
+    if let Some(direct) = direct_family_root_value(&root, dst.size) {
+        return Some(SSAOp::Copy {
+            dst: dst.clone(),
+            src: direct,
+        });
+    }
+    Some(SSAOp::Subpiece {
+        dst: dst.clone(),
+        src: root.value,
+        offset: root.offset,
+    })
 }
 
-fn wider_register_family_root(
-    source: &SSAVar,
+fn family_root_slice_for_range(
     state: &FamilyRootState,
-    family_info: &RegisterFamilyInfo,
-) -> Option<SSAVar> {
-    let member = family_info.member_for(source)?;
-    family_info
-        .family_widths_by_offset
-        .get(&(member.family_id, member.offset))?
+    requested: RegisterFamilySlot,
+) -> Option<RegisterFamilyRoot> {
+    // A request must have one containing definition. Combining adjacent
+    // fragments here would invent a wide value without an explicit Piece.
+    state
         .iter()
-        .copied()
-        .filter(|width| *width > source.size)
-        .filter_map(|width| {
-            state.get(&RegisterFamilySlot {
-                family_id: member.family_id,
-                offset: member.offset,
-                width,
-            })
+        .filter(|(slot, _)| family_slot_contains(**slot, requested))
+        .filter_map(|(slot, root)| {
+            let relative = requested.offset.checked_sub(slot.offset)?;
+            let relative = u32::try_from(relative).ok()?;
+            let offset = root.offset.checked_add(relative)?;
+            offset
+                .checked_add(requested.width)
+                .filter(|end| *end <= root.value.size)?;
+            Some((
+                slot.width,
+                slot.offset,
+                RegisterFamilyRoot {
+                    value: root.value.clone(),
+                    offset,
+                },
+            ))
         })
-        .min_by_key(|root| root.size)
-        .cloned()
+        .min_by_key(|(width, offset, _)| (*width, *offset))
+        .map(|(_, _, root)| root)
 }
 
 fn rewrite_decompile_family_source(
@@ -2516,25 +3093,18 @@ fn rewrite_decompile_family_source(
     let Some(member) = family_info.member_for(src) else {
         return src.clone();
     };
-    if src.version != 0
-        && member.width == src.size
-        && family_info
-            .family_widths_by_offset
-            .get(&(member.family_id, member.offset))
-            .and_then(|widths| widths.iter().copied().max())
-            .is_none_or(|max_width| member.width >= max_width)
-    {
-        return src.clone();
-    }
     let slot = RegisterFamilySlot {
         family_id: member.family_id,
         offset: member.offset,
         width: src.size,
     };
+    if src.version != 0 && member.width == src.size && family_slot_is_maximal(family_info, slot) {
+        return src.clone();
+    }
     let Some(root) = state.get(&slot) else {
         return src.clone();
     };
-    let Some(adapted) = adapt_family_root(root, src.size) else {
+    let Some(adapted) = direct_family_root_value(root, src.size) else {
         return src.clone();
     };
     if adapted == *src {
@@ -2557,6 +3127,25 @@ fn adapt_family_root(root: &SSAVar, width: u32) -> Option<SSAVar> {
     const_value(root).map(|value| SSAVar::constant(mask_const_to_width(value, width), width))
 }
 
+fn direct_family_root_value(root: &RegisterFamilyRoot, width: u32) -> Option<SSAVar> {
+    if root.offset == 0 && root.value.size == width {
+        return Some(root.value.clone());
+    }
+    extract_constant_family_slice(&root.value, root.offset, width)
+}
+
+fn extract_constant_family_slice(root: &SSAVar, offset: u32, width: u32) -> Option<SSAVar> {
+    let value = const_value(root)?;
+    offset.checked_add(width).filter(|end| *end <= root.size)?;
+    let shift = offset.checked_mul(8)?;
+    let shifted = if shift >= u64::BITS {
+        0
+    } else {
+        value >> shift
+    };
+    Some(SSAVar::constant(mask_const_to_width(shifted, width), width))
+}
+
 fn can_width_adapt_register_family_root(root: &SSAVar) -> bool {
     !root.is_const()
         && !root.is_temp()
@@ -2566,47 +3155,81 @@ fn can_width_adapt_register_family_root(root: &SSAVar) -> bool {
         )
 }
 
-fn seed_narrow_family_roots(
+fn seed_family_roots(
     state: &mut FamilyRootState,
     family_info: &RegisterFamilyInfo,
-    family_id: usize,
-    offset: u64,
-    written_width: u32,
-    root: &SSAVar,
+    written: RegisterFamilySlot,
+    exact_root: &SSAVar,
+    contained_root: &SSAVar,
 ) {
-    // A non-constant wide write does not define standalone narrow SSA values.
-    // Consumers must materialize an explicit Subpiece so the graph retains a
-    // real definition instead of a size-changed register/temp lookalike.
-    if !root.is_const() {
+    if exact_root.size != written.width || contained_root.size != written.width {
         return;
     }
-    let Some(widths) = family_info
-        .family_widths_by_offset
-        .get(&(family_id, offset))
-    else {
+    // Views are internal bookkeeping only. A later narrow use emits a real
+    // Subpiece before substituting the view into an SSA operation.
+    state.insert(written, RegisterFamilyRoot::exact(exact_root.clone()));
+    let Some(slots) = family_info.family_slots.get(&written.family_id) else {
         return;
     };
-
-    for &width in widths {
-        if width > written_width {
+    for &slot in slots {
+        if slot == written || !family_slot_contains(written, slot) {
             continue;
         }
-        let Some(adapted) = adapt_family_root(root, width) else {
+        let Some(relative) = slot.offset.checked_sub(written.offset) else {
+            continue;
+        };
+        let Ok(relative) = u32::try_from(relative) else {
             continue;
         };
         state.insert(
-            RegisterFamilySlot {
-                family_id,
-                offset,
-                width,
+            slot,
+            RegisterFamilyRoot {
+                value: contained_root.clone(),
+                offset: relative,
             },
-            adapted,
         );
     }
 }
 
-fn kill_family_roots(state: &mut FamilyRootState, family_id: usize) {
-    state.retain(|slot, _| slot.family_id != family_id);
+fn family_slot_is_maximal(family_info: &RegisterFamilyInfo, slot: RegisterFamilySlot) -> bool {
+    family_info
+        .family_slots
+        .get(&slot.family_id)
+        .is_none_or(|slots| {
+            !slots
+                .iter()
+                .any(|candidate| *candidate != slot && family_slot_contains(*candidate, slot))
+        })
+}
+
+fn kill_overlapping_family_roots(state: &mut FamilyRootState, written: RegisterFamilySlot) {
+    state.retain(|slot, _| !family_slots_overlap(*slot, written));
+}
+
+fn family_slot_contains(container: RegisterFamilySlot, contained: RegisterFamilySlot) -> bool {
+    if container.family_id != contained.family_id || contained.offset < container.offset {
+        return false;
+    }
+    let Some(container_end) = container.offset.checked_add(u64::from(container.width)) else {
+        return false;
+    };
+    let Some(contained_end) = contained.offset.checked_add(u64::from(contained.width)) else {
+        return false;
+    };
+    contained_end <= container_end
+}
+
+fn family_slots_overlap(a: RegisterFamilySlot, b: RegisterFamilySlot) -> bool {
+    if a.family_id != b.family_id {
+        return false;
+    }
+    let Some(a_end) = a.offset.checked_add(u64::from(a.width)) else {
+        return true;
+    };
+    let Some(b_end) = b.offset.checked_add(u64::from(b.width)) else {
+        return true;
+    };
+    a.offset < b_end && b.offset < a_end
 }
 
 fn const_value(var: &SSAVar) -> Option<u64> {
@@ -2706,7 +3329,7 @@ fn resolve_value_root(
     let Some(root) = family_state.get(&slot) else {
         return var.clone();
     };
-    adapt_family_root(root, var.size)
+    direct_family_root_value(root, var.size)
         .map(|root| canonicalize_value_root(&root, roots))
         .unwrap_or_else(|| var.clone())
 }
@@ -2778,20 +3401,20 @@ fn stack_address_root_from_add(
 ) -> Option<StackAddressRoot> {
     if let (Some(base), Some(delta)) = (
         stack_root_from_operand(a, roots, stack_roots, family_state, family_info),
-        const_value(b).map(|value| value as i64),
+        signed_stack_delta(b),
     ) {
         return Some(StackAddressRoot {
             base: base.base,
-            offset: base.offset.saturating_add(delta),
+            offset: base.offset.checked_add(delta)?,
         });
     }
     if let (Some(base), Some(delta)) = (
         stack_root_from_operand(b, roots, stack_roots, family_state, family_info),
-        const_value(a).map(|value| value as i64),
+        signed_stack_delta(a),
     ) {
         return Some(StackAddressRoot {
             base: base.base,
-            offset: base.offset.saturating_add(delta),
+            offset: base.offset.checked_add(delta)?,
         });
     }
     None
@@ -2806,11 +3429,31 @@ fn stack_address_root_from_sub(
     family_info: &RegisterFamilyInfo,
 ) -> Option<StackAddressRoot> {
     let base = stack_root_from_operand(a, roots, stack_roots, family_state, family_info)?;
-    let delta = const_value(b).map(|value| value as i64)?;
+    let delta = signed_stack_delta(b)?;
     Some(StackAddressRoot {
         base: base.base,
-        offset: base.offset.saturating_sub(delta),
+        offset: base.offset.checked_sub(delta)?,
     })
+}
+
+fn signed_stack_delta(var: &SSAVar) -> Option<i64> {
+    let value = var.constant_bits()?;
+    let bits = var.size.checked_mul(8)?;
+    match bits {
+        0 => None,
+        64 => Some(value as i64),
+        1..=63 => {
+            let sign = 1u64.checked_shl(bits - 1)?;
+            let mask = 1u64.checked_shl(bits)?.wrapping_sub(1);
+            let value = value & mask;
+            Some(if value & sign == 0 {
+                value as i64
+            } else {
+                (value | !mask) as i64
+            })
+        }
+        _ => None,
+    }
 }
 
 fn insert_stack_root(
@@ -2964,6 +3607,9 @@ mod tests {
         CallArgumentLocation, CallResultValueRelation, ReturnCarrier, SemanticId, ValueOwner,
     };
     use r2il::{R2ILOp, RegisterDef, SpaceId, SwitchCase, SwitchInfo as R2ILSwitchInfo, Varnode};
+    use std::cell::Cell;
+    use std::collections::BTreeSet;
+    use std::time::{Duration, Instant};
 
     fn make_const(val: u64, size: u32) -> Varnode {
         Varnode {
@@ -3020,6 +3666,567 @@ mod tests {
         arch.add_register(RegisterDef::new("rsp", 16, 8));
         arch.add_register(RegisterDef::new("rbp", 24, 8));
         arch
+    }
+
+    fn make_x86_vector_alias_arch() -> ArchSpec {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.add_register(RegisterDef::new("XMM0", 0x100, 16));
+        arch.add_register(RegisterDef::sub("XMM0_L0", 0x100, 4, "XMM0"));
+        arch.add_register(RegisterDef::sub("XMM0_L1", 0x104, 4, "XMM0"));
+        arch.add_register(RegisterDef::sub("XMM0_L2", 0x108, 4, "XMM0"));
+        arch.add_register(RegisterDef::sub("XMM0_L3", 0x10c, 4, "XMM0"));
+        arch.add_register(RegisterDef::sub("XMM0_LO", 0x100, 8, "XMM0"));
+        arch.add_register(RegisterDef::sub("XMM0_MID", 0x104, 8, "XMM0"));
+        arch.add_register(RegisterDef::sub("XMM0_HI", 0x108, 8, "XMM0"));
+        arch
+    }
+
+    fn normalize_manual_vector_alias_ops(ops: Vec<SSAOp>) -> Vec<SSAOp> {
+        let blocks = vec![R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            ops: vec![R2ILOp::Return {
+                target: make_ram(0, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+        let mut function =
+            SSAFunction::from_blocks_raw_no_arch(&blocks).expect("raw SSA should build");
+        function.get_block_mut(0x1000).expect("entry block").ops = ops;
+        function.normalize_register_alias_sources(&make_x86_vector_alias_arch());
+        function.get_block(0x1000).expect("entry block").ops.clone()
+    }
+
+    fn vector_loop_alias_arch(prefix: &str) -> ArchSpec {
+        let mut arch = ArchSpec::new("range-alias-test");
+        let acc = format!("{prefix}_acc");
+        let loaded = format!("{prefix}_loaded");
+        arch.add_register(RegisterDef::new(&acc, 0x100, 16));
+        arch.add_register(RegisterDef::new(format!("{prefix}_acc_a"), 0x100, 4));
+        arch.add_register(RegisterDef::new(format!("{prefix}_acc_b"), 0x104, 4));
+        arch.add_register(RegisterDef::new(format!("{prefix}_acc_c"), 0x108, 4));
+        arch.add_register(RegisterDef::new(format!("{prefix}_acc_d"), 0x10c, 4));
+        arch.add_register(RegisterDef::new(&loaded, 0x200, 16));
+        arch.add_register(RegisterDef::new(format!("{prefix}_load_a"), 0x200, 4));
+        arch.add_register(RegisterDef::new(format!("{prefix}_load_b"), 0x204, 4));
+        arch.add_register(RegisterDef::new(format!("{prefix}_load_c"), 0x208, 4));
+        arch.add_register(RegisterDef::new(format!("{prefix}_load_d"), 0x20c, 4));
+        arch.add_register(RegisterDef::new(format!("{prefix}_return64"), 0x300, 8));
+        arch.add_register(RegisterDef::new(format!("{prefix}_return32"), 0x300, 4));
+        arch
+    }
+
+    fn vector_loop_alias_blocks(base: u64) -> Vec<R2ILBlock> {
+        let header = base + 4;
+        let exit = base + 8;
+        let body = base + 12;
+        let mut body_ops = vec![R2ILOp::Load {
+            dst: make_reg(0x200, 16),
+            space: SpaceId::Ram,
+            addr: make_const(0x8000, 8),
+        }];
+        for lane in 0u64..4 {
+            let offset = lane * 4;
+            body_ops.push(R2ILOp::IntAdd {
+                dst: make_reg(0x100 + offset, 4),
+                a: make_reg(0x100 + offset, 4),
+                b: make_reg(0x200 + offset, 4),
+            });
+        }
+        body_ops.push(R2ILOp::Branch {
+            target: make_const(header, 8),
+        });
+
+        vec![
+            R2ILBlock {
+                addr: base,
+                size: 4,
+                ops: vec![
+                    R2ILOp::IntXor {
+                        dst: make_reg(0x100, 16),
+                        a: make_reg(0x100, 16),
+                        b: make_reg(0x100, 16),
+                    },
+                    R2ILOp::Branch {
+                        target: make_const(header, 8),
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: header,
+                size: 4,
+                ops: vec![R2ILOp::CBranch {
+                    target: make_const(body, 8),
+                    cond: make_const(1, 1),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: exit,
+                size: 4,
+                ops: vec![
+                    R2ILOp::Subpiece {
+                        dst: make_reg(0x300, 4),
+                        src: make_reg(0x100, 16),
+                        offset: 0,
+                    },
+                    R2ILOp::IntZExt {
+                        dst: make_reg(0x300, 8),
+                        src: make_reg(0x300, 4),
+                    },
+                    R2ILOp::Return {
+                        target: make_reg(0x300, 8),
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: body,
+                size: 4,
+                ops: body_ops,
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ]
+    }
+
+    #[test]
+    fn graph_value_storage_is_retained_from_varnodes_across_cosmetic_names() {
+        fn arch(prefix: &str) -> ArchSpec {
+            let mut arch = ArchSpec::new("storage-provenance-test");
+            arch.add_register(RegisterDef::new(format!("{prefix}_out"), 0x10, 8));
+            arch.add_register(RegisterDef::new(format!("{prefix}_input"), 0x20, 8));
+            arch.add_register(RegisterDef::new(format!("{prefix}_return"), 0x30, 8));
+            arch
+        }
+
+        let blocks = [R2ILBlock {
+            addr: 0x2200,
+            size: 4,
+            ops: vec![
+                R2ILOp::IntAdd {
+                    dst: make_reg(0x10, 8),
+                    a: make_reg(0x20, 8),
+                    b: make_const(7, 8),
+                },
+                R2ILOp::Return {
+                    target: make_reg(0x30, 8),
+                },
+            ],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+        let left = SSAFunction::from_blocks_raw(&blocks, Some(&arch("left")))
+            .expect("left SSA must build");
+        let right = SSAFunction::from_blocks_raw(&blocks, Some(&arch("right")))
+            .expect("right SSA must build");
+        let left_graph = SsaGraph::from_function(&left);
+        let right_graph = SsaGraph::from_function(&right);
+
+        let projection = |graph: &SsaGraph| {
+            graph
+                .values
+                .iter()
+                .map(|value| {
+                    (
+                        value.id,
+                        value.var.version,
+                        value.var.size,
+                        value.canonical_storage,
+                        graph.def_inst(value.id),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(projection(&left_graph), projection(&right_graph));
+        assert_ne!(
+            left_graph
+                .values
+                .iter()
+                .map(|value| value.var.name.as_str())
+                .collect::<Vec<_>>(),
+            right_graph
+                .values
+                .iter()
+                .map(|value| value.var.name.as_str())
+                .collect::<Vec<_>>()
+        );
+        let storages = left_graph
+            .values
+            .iter()
+            .map(|value| value.canonical_storage.expect("raw value provenance"))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            storages,
+            BTreeSet::from([
+                CanonicalStorageId {
+                    space: crate::CanonicalStorageSpace::Register,
+                    offset: 0x10,
+                    size: 8,
+                },
+                CanonicalStorageId {
+                    space: crate::CanonicalStorageSpace::Register,
+                    offset: 0x20,
+                    size: 8,
+                },
+                CanonicalStorageId {
+                    space: crate::CanonicalStorageSpace::Register,
+                    offset: 0x30,
+                    size: 8,
+                },
+                CanonicalStorageId {
+                    space: crate::CanonicalStorageSpace::Constant,
+                    offset: 7,
+                    size: 8,
+                },
+            ])
+        );
+    }
+
+    fn assert_vector_loop_alias_provenance(base: u64, prefix: &str) {
+        let function = SSAFunction::from_blocks_raw(
+            &vector_loop_alias_blocks(base),
+            Some(&vector_loop_alias_arch(prefix)),
+        )
+        .expect("vector loop SSA should build");
+        let header = function.get_block(base + 4).expect("loop header");
+        let accumulator_phis = header
+            .phis
+            .iter()
+            .filter(|phi| {
+                phi.canonical_storage.is_some_and(|storage| {
+                    storage.offset >= 0x100 && storage.offset < 0x110 && storage.size == 4
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(accumulator_phis.len(), 4, "one accumulator phi per lane");
+
+        let graph = SsaGraph::from_function(&function);
+        for phi in &accumulator_phis {
+            assert_eq!(phi.sources.len(), 2);
+            for (_, source) in &phi.sources {
+                let value = graph.value_id_for_var(source).expect("phi input value");
+                assert!(
+                    graph.def_inst(value).is_some(),
+                    "every lane phi input must have an SSA producer: {source}"
+                );
+            }
+        }
+
+        let entry = function.get_block(base).expect("preheader");
+        let zero = entry
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                SSAOp::IntXor { dst, .. } if dst.size == 16 => Some(dst.clone()),
+                _ => None,
+            })
+            .expect("wide zero definition");
+        let zero_lane_offsets = entry
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                SSAOp::Subpiece { src, offset, dst } if *src == zero && dst.size == 4 => {
+                    Some(*offset)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(zero_lane_offsets, vec![0, 4, 8, 12]);
+
+        let body = function.get_block(base + 12).expect("vector body");
+        let loaded = body
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                SSAOp::Load { dst, .. } if dst.size == 16 => Some(dst.clone()),
+                _ => None,
+            })
+            .expect("wide vector load");
+        let loaded_lane_offsets = body
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                SSAOp::Subpiece { src, offset, dst } if *src == loaded && dst.size == 4 => {
+                    Some(*offset)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(loaded_lane_offsets, vec![0, 4, 8, 12]);
+
+        let low_phi = accumulator_phis
+            .iter()
+            .find(|phi| {
+                phi.canonical_storage
+                    .is_some_and(|storage| storage.offset == 0x100)
+            })
+            .expect("low-lane phi");
+        let exit = function.get_block(base + 8).expect("loop exit");
+        assert!(exit.ops.iter().any(|op| matches!(
+            op,
+            SSAOp::Copy { dst, src }
+                if dst.size == 4 && *src == low_phi.dst
+        )));
+        assert!(
+            !function
+                .blocks()
+                .flat_map(|block| &block.ops)
+                .any(|op| matches!(op, SSAOp::Piece { .. }))
+        );
+    }
+
+    #[test]
+    fn decompile_artifact_two_address_stack_updates_read_incoming_versions() {
+        let mut arch = make_x86_64_prep_arch();
+        arch.add_register(RegisterDef::new("rip", 32, 8));
+        let rsp = make_reg(16, 8);
+        let rbp = make_reg(24, 8);
+        let rip = make_reg(32, 8);
+        let saved_fp = make_unique(0x10, 8);
+        let restored_fp = make_unique(0x18, 8);
+        let return_target = make_unique(0x20, 8);
+        let blocks = [R2ILBlock {
+            addr: 0x1000,
+            size: 9,
+            ops: vec![
+                R2ILOp::Copy {
+                    dst: saved_fp.clone(),
+                    src: rbp.clone(),
+                },
+                R2ILOp::IntSub {
+                    dst: rsp.clone(),
+                    a: rsp.clone(),
+                    b: make_const(8, 8),
+                },
+                R2ILOp::Store {
+                    space: SpaceId::Ram,
+                    addr: rsp.clone(),
+                    val: saved_fp,
+                },
+                R2ILOp::Load {
+                    dst: restored_fp.clone(),
+                    space: SpaceId::Ram,
+                    addr: rsp.clone(),
+                },
+                R2ILOp::IntAdd {
+                    dst: rsp.clone(),
+                    a: rsp.clone(),
+                    b: make_const(8, 8),
+                },
+                R2ILOp::Copy {
+                    dst: rbp,
+                    src: restored_fp,
+                },
+                R2ILOp::Load {
+                    dst: return_target.clone(),
+                    space: SpaceId::Ram,
+                    addr: rsp.clone(),
+                },
+                R2ILOp::IntAdd {
+                    dst: rsp.clone(),
+                    a: rsp,
+                    b: make_const(8, 8),
+                },
+                R2ILOp::Copy {
+                    dst: rip,
+                    src: return_target,
+                },
+                R2ILOp::Return {
+                    target: make_reg(32, 8),
+                },
+            ],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+        let interface = SourceFunctionInterface::new_exact(
+            b"two-address-stack-updates".to_vec(),
+            "sysv",
+            [],
+            crate::SourceFunctionReturn::Void,
+            [],
+        )
+        .expect("exact source interface");
+        let artifact = SsaArtifact::for_decompile_with_interface(&blocks, Some(&arch), interface)
+            .expect("decompile SSA artifact");
+        let updates = artifact
+            .function()
+            .get_block(0x1000)
+            .expect("entry block")
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                SSAOp::IntSub { dst, a, .. } | SSAOp::IntAdd { dst, a, .. }
+                    if dst.name == "rsp" =>
+                {
+                    Some((dst.version, a.name.as_str(), a.version))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            updates,
+            vec![(1, "rsp", 0), (2, "rsp", 1), (3, "rsp", 2)],
+            "PUSH-, POP-, and RET-like SP updates must read the incoming SSA version"
+        );
+    }
+
+    fn controlled_prep_blocks() -> Vec<R2ILBlock> {
+        vec![
+            R2ILBlock {
+                addr: 0x1000,
+                size: 4,
+                ops: vec![
+                    R2ILOp::Copy {
+                        dst: make_reg(0, 8),
+                        src: make_const(1, 8),
+                    },
+                    R2ILOp::Branch {
+                        target: make_const(0x1004, 8),
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1004,
+                size: 4,
+                ops: vec![
+                    R2ILOp::Copy {
+                        dst: make_reg(8, 8),
+                        src: make_reg(0, 8),
+                    },
+                    R2ILOp::Return {
+                        target: make_ram(0, 8),
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ]
+    }
+
+    struct StopAtPoll {
+        polls: Cell<usize>,
+        stop_at: usize,
+        cancellation: crate::SsaCancellationToken,
+        execution: crate::SsaExecutionControl,
+    }
+
+    impl StopAtPoll {
+        fn new(stop_at: usize) -> Self {
+            let cancellation = crate::SsaCancellationToken::default();
+            let execution = crate::SsaExecutionControl::with_cancellation(cancellation.clone());
+            Self {
+                polls: Cell::new(0),
+                stop_at,
+                cancellation,
+                execution,
+            }
+        }
+    }
+
+    impl SsaWorkControl for StopAtPoll {
+        fn poll(&self) -> Result<(), SsaExecutionStopReason> {
+            let polls = self.polls.get() + 1;
+            self.polls.set(polls);
+            if polls == self.stop_at {
+                self.cancellation.cancel();
+            }
+            self.execution.poll()
+        }
+    }
+
+    #[test]
+    fn checked_decompile_builder_reports_pre_cancelled() {
+        let cancellation = crate::SsaCancellationToken::default();
+        cancellation.cancel();
+        let control = crate::SsaExecutionControl::with_cancellation(cancellation);
+
+        let result =
+            SsaArtifact::for_decompile_with_control(&controlled_prep_blocks(), None, &control);
+
+        assert!(matches!(result, Err(SsaPrepareError::Cancelled)));
+    }
+
+    #[test]
+    fn checked_decompile_builder_reports_expired_deadline() {
+        let deadline = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("one millisecond is representable");
+        let control = crate::SsaExecutionControl::with_deadline(deadline);
+
+        let result =
+            SsaArtifact::for_decompile_with_control(&controlled_prep_blocks(), None, &control);
+
+        assert!(matches!(result, Err(SsaPrepareError::DeadlineExceeded)));
+        assert!(matches!(
+            SsaArtifact::for_decompile_with_control(
+                &[],
+                None,
+                &crate::SsaExecutionControl::default()
+            ),
+            Err(SsaPrepareError::MalformedInput)
+        ));
+    }
+
+    #[test]
+    fn checked_decompile_builder_observes_mid_dominator_worklist_cancellation() {
+        // Polls 1-3 cover builder/CFG boundaries; poll 6 occurs while the
+        // two-entry RPO index is being assembled by the dominator builder.
+        let control = StopAtPoll::new(6);
+
+        let result =
+            SsaArtifact::for_decompile_with_control(&controlled_prep_blocks(), None, &control);
+
+        assert!(matches!(result, Err(SsaPrepareError::Cancelled)));
+        assert_eq!(control.polls.get(), 6);
+    }
+
+    #[test]
+    fn unchecked_and_controlled_decompile_builders_produce_identical_artifacts() {
+        let blocks = controlled_prep_blocks();
+        let unchecked = SsaArtifact::for_decompile(&blocks, None).expect("unchecked artifact");
+        let controlled = SsaArtifact::for_decompile_with_control(
+            &blocks,
+            None,
+            &crate::SsaExecutionControl::default(),
+        )
+        .expect("controlled artifact");
+
+        assert_eq!(unchecked.mode(), controlled.mode());
+        assert_eq!(
+            unchecked.function().block_addrs(),
+            controlled.function().block_addrs()
+        );
+        for (lhs, rhs) in unchecked
+            .function()
+            .blocks()
+            .zip(controlled.function().blocks())
+        {
+            assert_eq!(lhs.addr, rhs.addr);
+            assert_eq!(lhs.size, rhs.size);
+            assert_eq!(lhs.ops, rhs.ops);
+            assert_eq!(lhs.phis.len(), rhs.phis.len());
+            for (lhs_phi, rhs_phi) in lhs.phis.iter().zip(&rhs.phis) {
+                assert_eq!(lhs_phi.dst, rhs_phi.dst);
+                assert_eq!(lhs_phi.sources, rhs_phi.sources);
+                assert_eq!(lhs_phi.canonical_storage, rhs_phi.canonical_storage);
+            }
+        }
+        assert_eq!(
+            unchecked.function().decompile_prep_facts(),
+            controlled.function().decompile_prep_facts()
+        );
+        assert_eq!(unchecked.graph(), controlled.graph());
+        assert_eq!(unchecked.facts(), controlled.facts());
+        assert_eq!(unchecked.machine_context(), controlled.machine_context());
     }
 
     #[test]
@@ -3454,6 +4661,7 @@ mod tests {
                 (0x1104, SSAVar::constant(7, 8)),
                 (0x1110, SSAVar::constant(7, 8)),
             ],
+            canonical_storage: None,
         }];
         function.get_block_mut(0x1114).expect("return block").ops = vec![SSAOp::Return {
             target: SSAVar::new("RIP", 1, 8),
@@ -3502,6 +4710,7 @@ mod tests {
         function.get_block_mut(0x1214).expect("return block").phis = vec![PhiNode {
             dst: phi_dst,
             sources: vec![(0x1204, load.clone()), (0x1210, load.clone())],
+            canonical_storage: None,
         }];
         function.get_block_mut(0x1214).expect("return block").ops = vec![
             SSAOp::Load {
@@ -4940,6 +6149,7 @@ mod tests {
             block.phis = vec![PhiNode {
                 dst: phi_dst.clone(),
                 sources: phi_sources,
+                canonical_storage: None,
             }];
             block.ops = vec![SSAOp::Return { target: phi_dst }];
             SsaArtifact::new(function, FunctionPrepareMode::Raw)
@@ -5024,6 +6234,7 @@ mod tests {
         function.get_block_mut(0x1810).expect("loop header").phis = vec![PhiNode {
             dst: phi.clone(),
             sources: vec![(0x1800, init), (0x1820, update.clone())],
+            canonical_storage: None,
         }];
         function.get_block_mut(0x1820).expect("loop latch").ops = vec![
             SSAOp::IntAdd {
@@ -5305,6 +6516,7 @@ mod tests {
         function.get_block_mut(0x1a20).expect("loop header").phis = vec![PhiNode {
             dst: phi.clone(),
             sources: vec![(0x1a10, init.clone()), (0x1a20, update.clone())],
+            canonical_storage: None,
         }];
         function.get_block_mut(0x1a20).expect("loop header").ops = vec![
             SSAOp::IntAdd {
@@ -5324,6 +6536,7 @@ mod tests {
         function.get_block_mut(0x1a30).expect("loop exit").phis = vec![PhiNode {
             dst: result.clone(),
             sources: vec![(0x1a00, init.clone()), (0x1a20, update)],
+            canonical_storage: None,
         }];
         function.get_block_mut(0x1a30).expect("loop exit").ops = vec![SSAOp::Return {
             target: result.clone(),
@@ -5598,6 +6811,99 @@ mod tests {
     }
 
     #[test]
+    fn producerless_switch_selector_is_retained_as_a_leaf() {
+        let mut selector = R2ILBlock::new(0x1080, 4);
+        selector.push(R2ILOp::BranchInd {
+            target: make_reg(8, 8),
+        });
+        selector.set_switch_info(R2ILSwitchInfo {
+            switch_addr: 0x1080,
+            min_val: 1,
+            max_val: 2,
+            default_target: Some(0x10b0),
+            cases: vec![
+                SwitchCase {
+                    value: 1,
+                    target: 0x1090,
+                },
+                SwitchCase {
+                    value: 2,
+                    target: 0x10a0,
+                },
+            ],
+        });
+        let arms = [0x1090, 0x10a0, 0x10b0].map(|addr| {
+            let mut block = R2ILBlock::new(addr, 4);
+            block.push(R2ILOp::Return {
+                target: make_reg(16, 8),
+            });
+            block
+        });
+        let artifact = SsaArtifact::raw(
+            &[selector, arms[0].clone(), arms[1].clone(), arms[2].clone()],
+            None,
+        )
+        .expect("switch artifact");
+        let certificate = artifact
+            .certificates()
+            .switches
+            .get(&0x1080)
+            .expect("switch certificate");
+        let selector = certificate.selector.expect("producerless selector leaf");
+        let value = artifact
+            .graph()
+            .value(selector)
+            .expect("selector graph value");
+        assert_eq!(value.var.size, 8);
+        let branch = artifact
+            .graph()
+            .insts
+            .iter()
+            .find(|instruction| {
+                matches!(
+                    instruction.payload,
+                    crate::graph::InstPayload::Op(SSAOp::BranchInd { .. })
+                )
+            })
+            .expect("branch instruction");
+        assert_eq!(branch.inputs, vec![selector]);
+    }
+
+    #[test]
+    fn public_ssa_path_handles_a_deep_cycle_and_reports_its_back_edge() {
+        const BLOCK_COUNT: usize = 8_192;
+        const BASE: u64 = 0x10_0000;
+
+        let blocks = (0..BLOCK_COUNT)
+            .map(|index| R2ILBlock {
+                addr: BASE + index as u64 * 4,
+                size: 4,
+                ops: if index + 1 == BLOCK_COUNT {
+                    vec![R2ILOp::Branch {
+                        target: make_const(BASE, 8),
+                    }]
+                } else {
+                    vec![R2ILOp::Nop]
+                },
+                switch_info: None,
+                op_metadata: Default::default(),
+            })
+            .collect::<Vec<_>>();
+        let expected_order = blocks.iter().map(|block| block.addr).collect::<Vec<_>>();
+        let latch = BASE + (BLOCK_COUNT as u64 - 1) * 4;
+
+        let function =
+            SSAFunction::from_blocks_raw_no_arch(&blocks).expect("SSA for deep cyclic CFG");
+        let risk = function.cfg_risk_summary();
+
+        assert_eq!(function.block_addrs(), expected_order);
+        assert_eq!(risk.block_count, BLOCK_COUNT);
+        assert_eq!(risk.loop_count, 1);
+        assert_eq!(risk.back_edge_count, 1);
+        assert_eq!(function.collect_back_edges().get(&BASE), Some(&vec![latch]));
+    }
+
+    #[test]
     fn test_raw_ssa_construction_is_deterministic_across_runs() {
         let blocks = vec![
             R2ILBlock {
@@ -5736,6 +7042,7 @@ mod tests {
         merge.phis = vec![PhiNode {
             dst: merged.clone(),
             sources: vec![(0x1000, copied)],
+            canonical_storage: None,
         }];
         merge.ops = vec![SSAOp::Copy {
             dst: forwarded.clone(),
@@ -5984,6 +7291,7 @@ mod tests {
             phis: vec![PhiNode {
                 dst: SSAVar::new("reg:0", 2, 8),
                 sources: vec![(0x1000, SSAVar::new("reg:0", 0, 8))],
+                canonical_storage: None,
             }],
             ops: vec![
                 SSAOp::Copy {
@@ -6008,6 +7316,249 @@ mod tests {
             seen,
             vec!["phi:0:reg:0_2".to_string(), "op:0:reg:8_1".to_string()]
         );
+    }
+
+    #[test]
+    fn vector_alias_wide_definition_materializes_nonzero_lane_offsets() {
+        let ops = normalize_manual_vector_alias_ops(vec![
+            SSAOp::IntXor {
+                dst: SSAVar::new("XMM0", 1, 16),
+                a: SSAVar::new("XMM0", 0, 16),
+                b: SSAVar::new("XMM0", 0, 16),
+            },
+            SSAOp::Copy {
+                dst: SSAVar::new("tmp:low", 1, 4),
+                src: SSAVar::new("XMM0_L0", 0, 4),
+            },
+            SSAOp::Copy {
+                dst: SSAVar::new("tmp:high", 1, 4),
+                src: SSAVar::new("XMM0_L2", 7, 4),
+            },
+        ]);
+
+        assert_eq!(ops.len(), 5);
+        match &ops[1] {
+            SSAOp::Subpiece { src, offset, .. } => {
+                assert_eq!(src, &SSAVar::new("XMM0", 1, 16));
+                assert_eq!(*offset, 0);
+            }
+            other => panic!("expected low-lane extraction, got {other:?}"),
+        }
+        match &ops[3] {
+            SSAOp::Subpiece { src, offset, .. } => {
+                assert_eq!(src, &SSAVar::new("XMM0", 1, 16));
+                assert_eq!(*offset, 8);
+            }
+            other => panic!("expected nonzero lane extraction, got {other:?}"),
+        }
+        assert!(ops.iter().skip(1).all(|op| {
+            op.sources()
+                .into_iter()
+                .all(|src| src.name != "XMM0_L0" && src.name != "XMM0_L2")
+        }));
+    }
+
+    #[test]
+    fn vector_alias_loop_edges_keep_exact_lane_producers_across_names_and_relocation() {
+        assert_vector_loop_alias_provenance(0x1000, "first_names");
+        assert_vector_loop_alias_provenance(0x7fff_4000, "renamed_registers");
+    }
+
+    #[test]
+    fn register_alias_maximal_copy_retains_the_written_ssa_definition() {
+        let blocks = vec![R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            ops: vec![R2ILOp::Return {
+                target: make_ram(0, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+        let mut arch = ArchSpec::new("x86-64");
+        arch.add_register(RegisterDef::new("RAX", 0, 8));
+        arch.add_register(RegisterDef::sub("EAX", 0, 4, "RAX"));
+
+        let mut function =
+            SSAFunction::from_blocks_raw_no_arch(&blocks).expect("raw SSA should build");
+        function.get_block_mut(0x1000).expect("entry block").ops = vec![
+            SSAOp::Copy {
+                dst: SSAVar::new("RAX", 2, 8),
+                src: SSAVar::constant(0x33, 8),
+            },
+            SSAOp::Copy {
+                dst: SSAVar::new("tmp:returned", 1, 8),
+                src: SSAVar::new("RAX", 0, 8),
+            },
+        ];
+
+        function.normalize_register_alias_sources(&arch);
+
+        let ops = &function.get_block(0x1000).expect("entry block").ops;
+        assert_eq!(ops.len(), 2);
+        match &ops[1] {
+            SSAOp::Copy { src, .. } => assert_eq!(src, &SSAVar::new("RAX", 2, 8)),
+            other => panic!("expected maximal-register copy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vector_alias_narrow_write_preserves_disjoint_lane_roots() {
+        let ops = normalize_manual_vector_alias_ops(vec![
+            SSAOp::Copy {
+                dst: SSAVar::new("XMM0", 1, 16),
+                src: SSAVar::new("tmp:wide", 1, 16),
+            },
+            SSAOp::Copy {
+                dst: SSAVar::new("XMM0_L2", 1, 4),
+                src: SSAVar::new("tmp:new_l2", 1, 4),
+            },
+            SSAOp::Copy {
+                dst: SSAVar::new("tmp:read_l0", 1, 4),
+                src: SSAVar::new("XMM0_L0", 0, 4),
+            },
+            SSAOp::Copy {
+                dst: SSAVar::new("tmp:read_l2", 1, 4),
+                src: SSAVar::new("XMM0_L2", 0, 4),
+            },
+            SSAOp::Copy {
+                dst: SSAVar::new("tmp:read_l3", 1, 4),
+                src: SSAVar::new("XMM0_L3", 0, 4),
+            },
+        ]);
+
+        let lane_slices = ops
+            .iter()
+            .filter_map(|op| match op {
+                SSAOp::Subpiece { src, offset, .. } if src.name == "tmp:wide" => Some(*offset),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lane_slices, vec![0, 12]);
+        let updated_lane_read = ops.iter().find_map(|op| match op {
+            SSAOp::Copy { dst, src } if dst.name == "tmp:read_l2" => Some(src),
+            _ => None,
+        });
+        assert_eq!(updated_lane_read, Some(&SSAVar::new("tmp:new_l2", 1, 4)));
+    }
+
+    #[test]
+    fn vector_alias_subpiece_uses_exact_updated_lane_without_stale_wide_live_in() {
+        let ops = normalize_manual_vector_alias_ops(vec![
+            SSAOp::Copy {
+                dst: SSAVar::new("XMM0", 1, 16),
+                src: SSAVar::new("tmp:wide", 1, 16),
+            },
+            SSAOp::Copy {
+                dst: SSAVar::new("XMM0_L2", 1, 4),
+                src: SSAVar::new("tmp:new_l2", 1, 4),
+            },
+            SSAOp::Subpiece {
+                dst: SSAVar::new("tmp:extracted_l2", 1, 4),
+                src: SSAVar::new("XMM0", 0, 16),
+                offset: 8,
+            },
+        ]);
+
+        assert_eq!(ops.len(), 3);
+        match &ops[2] {
+            SSAOp::Copy { dst, src } => {
+                assert_eq!(dst, &SSAVar::new("tmp:extracted_l2", 1, 4));
+                assert_eq!(src, &SSAVar::new("tmp:new_l2", 1, 4));
+            }
+            other => panic!("expected exact updated-lane copy, got {other:?}"),
+        }
+        assert!(ops[2].sources().into_iter().all(|src| src.name != "XMM0"));
+    }
+
+    #[test]
+    fn vector_alias_overlapping_write_invalidates_only_affected_ranges() {
+        let ops = normalize_manual_vector_alias_ops(vec![
+            SSAOp::Copy {
+                dst: SSAVar::new("XMM0", 1, 16),
+                src: SSAVar::new("tmp:wide", 1, 16),
+            },
+            SSAOp::Copy {
+                dst: SSAVar::new("XMM0_MID", 1, 8),
+                src: SSAVar::new("tmp:new_mid", 1, 8),
+            },
+            SSAOp::Copy {
+                dst: SSAVar::new("tmp:unaffected_low", 1, 4),
+                src: SSAVar::new("XMM0_L0", 0, 4),
+            },
+            SSAOp::Copy {
+                dst: SSAVar::new("tmp:affected_low_half", 1, 8),
+                src: SSAVar::new("XMM0_LO", 0, 8),
+            },
+            SSAOp::Copy {
+                dst: SSAVar::new("tmp:unaffected_high", 1, 4),
+                src: SSAVar::new("XMM0_L3", 0, 4),
+            },
+            SSAOp::Copy {
+                dst: SSAVar::new("tmp:unresolved_whole", 1, 16),
+                src: SSAVar::new("XMM0", 0, 16),
+            },
+        ]);
+
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            SSAOp::Subpiece { src, offset: 0, .. } if src.name == "tmp:wide"
+        )));
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            SSAOp::Subpiece { src, offset: 12, .. } if src.name == "tmp:wide"
+        )));
+        let unresolved_overlap = ops.iter().find_map(|op| match op {
+            SSAOp::Copy { dst, src } if dst.name == "tmp:affected_low_half" => Some(src),
+            _ => None,
+        });
+        assert_eq!(unresolved_overlap, Some(&SSAVar::new("XMM0_LO", 0, 8)));
+        let unresolved_whole = ops.iter().find_map(|op| match op {
+            SSAOp::Copy { dst, src } if dst.name == "tmp:unresolved_whole" => Some(src),
+            _ => None,
+        });
+        assert_eq!(unresolved_whole, Some(&SSAVar::new("XMM0", 0, 16)));
+        assert!(!ops.iter().any(|op| matches!(op, SSAOp::Piece { .. })));
+    }
+
+    #[test]
+    fn vector_alias_final_low_lane_survives_disjoint_lane_updates() {
+        let ops = normalize_manual_vector_alias_ops(vec![
+            SSAOp::IntXor {
+                dst: SSAVar::new("XMM0", 1, 16),
+                a: SSAVar::new("XMM0", 0, 16),
+                b: SSAVar::new("XMM0", 0, 16),
+            },
+            SSAOp::Copy {
+                dst: SSAVar::new("XMM0_L1", 1, 4),
+                src: SSAVar::new("tmp:new_l1", 1, 4),
+            },
+            SSAOp::Copy {
+                dst: SSAVar::new("XMM0_L2", 1, 4),
+                src: SSAVar::new("tmp:new_l2", 1, 4),
+            },
+            SSAOp::Copy {
+                dst: SSAVar::new("XMM0_L3", 1, 4),
+                src: SSAVar::new("tmp:new_l3", 1, 4),
+            },
+            SSAOp::Copy {
+                dst: SSAVar::new("tmp:final_low", 1, 4),
+                src: SSAVar::new("XMM0_L0", 0, 4),
+            },
+        ]);
+
+        let final_low = ops
+            .windows(2)
+            .find_map(|window| match (&window[0], &window[1]) {
+                (SSAOp::Subpiece { src, offset, .. }, SSAOp::Copy { dst, .. })
+                    if dst.name == "tmp:final_low" =>
+                {
+                    Some((src, *offset))
+                }
+                _ => None,
+            })
+            .expect("final low-lane extraction");
+        assert_eq!(final_low, (&SSAVar::new("XMM0", 1, 16), 0));
     }
 
     #[test]
@@ -6634,6 +8185,21 @@ mod tests {
                 dst: SSAVar::new("tmp:4", 1, 8),
                 src: SSAVar::new("tmp:3", 1, 8),
             },
+            SSAOp::IntAdd {
+                dst: SSAVar::new("tmp:5", 1, 8),
+                a: SSAVar::new("rsp", 0, 8),
+                b: SSAVar::constant(0xffff_fff0, 4),
+            },
+            SSAOp::IntAdd {
+                dst: SSAVar::new("tmp:max", 1, 8),
+                a: SSAVar::new("rsp", 0, 8),
+                b: SSAVar::constant(i64::MAX as u64, 8),
+            },
+            SSAOp::IntAdd {
+                dst: SSAVar::new("tmp:overflow", 1, 8),
+                a: SSAVar::new("tmp:max", 1, 8),
+                b: SSAVar::constant(1, 8),
+            },
         ];
         func.refresh_decompile_prep_facts(None);
 
@@ -6662,6 +8228,16 @@ mod tests {
         assert_eq!(
             facts.stack_address_root_of(&SSAVar::new("tmp:4", 1, 8)),
             Some(&rbp_root)
+        );
+        assert_eq!(
+            facts.stack_address_root_of(&SSAVar::new("tmp:5", 1, 8)),
+            Some(&rsp_root),
+            "32-bit negative stack deltas must be sign-extended"
+        );
+        assert_eq!(
+            facts.stack_address_root_of(&SSAVar::new("tmp:overflow", 1, 8)),
+            None,
+            "overflowing stack offsets must not saturate into false provenance"
         );
         assert_eq!(
             facts.canonical_root_of(&SSAVar::new("tmp:2", 1, 8)),

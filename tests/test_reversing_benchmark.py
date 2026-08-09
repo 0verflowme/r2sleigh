@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import sys
@@ -20,12 +21,22 @@ sys.modules["reversing_benchmark"] = benchmark
 SPEC.loader.exec_module(benchmark)
 
 
-def cmd_result(stdout: str, returncode: int = 0, stderr: str = ""):
+def cmd_result(
+    stdout: str,
+    returncode: int = 0,
+    stderr: str = "",
+    child_max_rss_bytes: int | None = None,
+    stdout_bytes: bytes | None = None,
+    stderr_bytes: bytes | None = None,
+):
     return benchmark.CmdResult(
         returncode=returncode,
         stdout=stdout,
         stderr=stderr,
         elapsed_s=0.001,
+        child_max_rss_bytes=child_max_rss_bytes,
+        stdout_bytes=stdout_bytes,
+        stderr_bytes=stderr_bytes,
     )
 
 
@@ -62,29 +73,321 @@ class ReversingBenchmarkTests(unittest.TestCase):
         )
         offenders = []
         for expectation in oracle.get("expectations", []):
-            for needle in expectation.get("contains", []):
+            for check in benchmark.gold_checks_for_expectation(expectation):
+                if check["check"] != "contains":
+                    continue
+                needle = check["pattern"]
                 if any(marker in needle for marker in synthetic_markers):
                     offenders.append((expectation.get("id"), needle))
 
         self.assertEqual([], offenders)
+
+    def test_checked_in_source_oracle_classifies_every_pattern(self):
+        oracle_path = ROOT / "tests" / "gold" / "source_oracle.json"
+        oracle = json.loads(oracle_path.read_text())
+        self.assertEqual(oracle["schema"], 2)
+
+        raw_check_count = 0
+        for expectation in oracle["expectations"]:
+            self.assertIn("checks", expectation)
+            self.assertTrue(
+                set(benchmark.GOLD_CHECK_KINDS).isdisjoint(expectation),
+                expectation["id"],
+            )
+            checks = benchmark.gold_checks_for_expectation(
+                expectation,
+                context=expectation["id"],
+                require_checks=True,
+            )
+            raw_check_count += len(checks)
+            self.assertTrue(
+                all(check["category"] != benchmark.GOLD_LEGACY_CATEGORY for check in checks),
+                expectation["id"],
+            )
+            self.assertTrue(
+                all(check["gate"] in {"hard", "soft"} for check in checks),
+                expectation["id"],
+            )
+
+        loaded = benchmark.load_gold_manifest(oracle_path)
+        loaded_checks = [check for expectation in loaded for check in expectation["_gold_checks"]]
+        self.assertEqual(len(loaded_checks), raw_check_count)
+        self.assertEqual(
+            {check["category"] for check in loaded_checks},
+            {"semantic", "type", "structural", "cosmetic", "readability"},
+        )
 
     def test_parse_json_payload_skips_non_json_prefix(self):
         output = "INFO: ignored {not json}\n[{\"ok\": true}]\nWARN: trailing text\n"
         self.assertEqual(benchmark.parse_json_payload(output), [{"ok": True}])
 
     def test_run_r2_preserves_timeout_partial_byte_output(self):
-        exc = benchmark.subprocess.TimeoutExpired(
-            ["r2"],
-            timeout=1,
-            output=b"partial stdout\n",
-            stderr=b"partial stderr\n",
-        )
-        with mock.patch.object(benchmark.subprocess, "run", side_effect=exc):
-            result = benchmark.run_r2("r2", Path("/tmp/sample"), "aaa", 1, {})
+        stdout = mock.Mock()
+        stdout.read.return_value = b"partial stdout \xff\n"
+        stderr = mock.Mock()
+        stderr.read.return_value = b"partial stderr \xfe\n"
+        proc = mock.Mock(pid=123, stdout=stdout, stderr=stderr, returncode=None)
+        usage = type("Usage", (), {"ru_maxrss": 7})()
+        with (
+            mock.patch.object(benchmark.subprocess, "Popen", return_value=proc) as popen,
+            mock.patch.object(benchmark.os, "wait4", create=True),
+            mock.patch.object(
+                benchmark,
+                "_wait4_with_timeout",
+                return_value=(benchmark.signal.SIGKILL, usage, True),
+            ),
+        ):
+            result = benchmark.run_r2(
+                "r2",
+                Path("/tmp/sample"),
+                "aaa",
+                1,
+                {},
+            )
 
         self.assertEqual(result.returncode, 124)
-        self.assertEqual(result.stdout, "partial stdout\n")
-        self.assertEqual(result.stderr, "partial stderr\n")
+        self.assertEqual(result.stdout, "partial stdout �\n")
+        self.assertEqual(result.stderr, "partial stderr �\n")
+        self.assertEqual(result.stdout_bytes, b"partial stdout \xff\n")
+        self.assertEqual(result.stderr_bytes, b"partial stderr \xfe\n")
+        self.assertEqual(
+            result.child_max_rss_bytes,
+            benchmark.child_max_rss_bytes(usage.ru_maxrss),
+        )
+        self.assertEqual(
+            popen.call_args.kwargs["start_new_session"],
+            benchmark._process_groups_supported(),
+        )
+
+    def test_wait4_timeout_kills_child_group_and_reaps_direct_child(self):
+        proc = mock.Mock(pid=321)
+        usage = type("Usage", (), {"ru_maxrss": 9})()
+        with (
+            mock.patch.object(
+                benchmark,
+                "_wait4_nointr",
+                side_effect=[(0, 0, None), (proc.pid, benchmark.signal.SIGKILL, usage)],
+            ) as wait4,
+            mock.patch.object(benchmark, "_process_groups_supported", return_value=True),
+            mock.patch.object(benchmark.os, "killpg", create=True) as killpg,
+        ):
+            status, actual_usage, timed_out = benchmark._wait4_with_timeout(proc, 0)
+
+        self.assertTrue(timed_out)
+        self.assertEqual(status, benchmark.signal.SIGKILL)
+        self.assertIs(actual_usage, usage)
+        killpg.assert_called_once_with(proc.pid, benchmark.signal.SIGKILL)
+        self.assertEqual(
+            wait4.call_args_list,
+            [mock.call(proc.pid, benchmark.os.WNOHANG), mock.call(proc.pid, 0)],
+        )
+
+    def test_child_max_rss_normalizes_linux_and_macos_units(self):
+        self.assertEqual(benchmark.child_max_rss_bytes(7, "linux"), 7 * 1024)
+        self.assertEqual(benchmark.child_max_rss_bytes(7, "darwin"), 7)
+        self.assertIsNone(benchmark.child_max_rss_bytes(7, "win32"))
+        self.assertIsNone(benchmark.child_max_rss_bytes(-1, "linux"))
+
+    def test_phase0_manifest_matches_direct_child_rss_and_fresh_temp_contract(self):
+        manifest = json.loads((ROOT / "doc" / "phase0-baseline-manifest.json").read_text())
+        complete_output = next(
+            metric for metric in manifest["required_metrics"] if metric["id"] == "complete_output"
+        )
+        peak_rss = next(
+            metric for metric in manifest["required_metrics"] if metric["id"] == "peak_rss"
+        )
+        self.assertEqual(
+            complete_output["current_support"],
+            "available",
+        )
+        self.assertTrue(manifest["phase0_gate"]["baseline_reproducible"])
+        self.assertTrue(manifest["phase0_gate"]["source_gold_raw_capture_verified"])
+        self.assertTrue(manifest["phase0_gate"]["r2r_logs_verified"])
+        self.assertTrue(manifest["phase0_gate"]["exact_command_provenance_verified"])
+        self.assertIn("--raw-output-dir", complete_output["collector"])
+        self.assertEqual(peak_rss["current_support"], "available")
+        self.assertIn("direct radare2 child", peak_rss["scope"])
+        self.assertIn("does not claim descendant", peak_rss["note"])
+        for capture in manifest["commands"]:
+            if capture["id"].endswith(("_cold", "_warm")):
+                self.assertTrue(capture["command"].startswith('phase0_tmpdir="$(mktemp -d '))
+                self.assertIn('--tmpdir "$phase0_tmpdir"', capture["command"])
+                self.assertIn(
+                    '--raw-output-dir "$phase0_tmpdir/raw-output"',
+                    capture["command"],
+                )
+
+    def test_raw_output_archive_preserves_bytes_and_separates_adversarial_identities(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive = benchmark.RawOutputArchive(root / "raw")
+            fixture_a = root / "fixtures" / "sample-a"
+            fixture_b = root / "fixtures" / "sample-b"
+            case_a = benchmark.BinaryCase(
+                name="../../same case",
+                path=fixture_a,
+                corpus="unit/a",
+                analysis="aaa",
+                targets=(),
+                max_functions=1,
+            )
+            case_b = benchmark.BinaryCase(
+                name="../../same case",
+                path=fixture_b,
+                corpus="unit/b",
+                analysis="aaa",
+                targets=(),
+                max_functions=1,
+            )
+            target_a = {"name": "../../sym?f", "addr": 0x1000}
+            target_b = {"name": "..\\..//sym?f", "addr": 0x1000}
+            raw_stdout = b"\x00\xffstdout\r\n\x80"
+            raw_stderr = b"\xfeerror\x00\n"
+            result = cmd_result(
+                "\x00�stdout\r\n�",
+                returncode=124,
+                stderr="�error\x00\n",
+                stdout_bytes=raw_stdout,
+                stderr_bytes=raw_stderr,
+            )
+
+            identities = [
+                (case_a, target_a, "isolated"),
+                (case_a, target_b, "isolated"),
+                (case_a, target_a, "command-retry/batch_timeout"),
+                (case_b, target_a, "isolated"),
+            ]
+            records = [
+                archive.record(
+                    case=case,
+                    target=target,
+                    command="decompile/../../sla",
+                    repeat_idx=0,
+                    attempt=attempt,
+                    result=result,
+                    returncode=124,
+                    timeout=True,
+                    temperature="cold",
+                )
+                for case, target, attempt in identities
+            ]
+
+            metadata_paths = [record["metadata_path"] for record in records]
+            self.assertEqual(len(set(metadata_paths)), len(records))
+            for record in records:
+                metadata_rel = Path(record["metadata_path"])
+                self.assertFalse(metadata_rel.is_absolute())
+                self.assertNotIn("..", metadata_rel.parts)
+                metadata = json.loads((archive.root / metadata_rel).read_text())
+                self.assertEqual(metadata["returncode"], 124)
+                self.assertTrue(metadata["timeout"])
+                for stream_name, expected in (
+                    ("stdout", raw_stdout),
+                    ("stderr", raw_stderr),
+                ):
+                    stream = metadata[stream_name]
+                    self.assertEqual((archive.root / stream["path"]).read_bytes(), expected)
+                    self.assertEqual(stream["length"], len(expected))
+                    self.assertEqual(stream["sha256"], hashlib.sha256(expected).hexdigest())
+
+            with self.assertRaises(FileExistsError):
+                archive.record(
+                    case=case_a,
+                    target=target_a,
+                    command="decompile/../../sla",
+                    repeat_idx=0,
+                    attempt="isolated",
+                    result=result,
+                    returncode=124,
+                    timeout=True,
+                    temperature="cold",
+                )
+            self.assertEqual(list(archive.root.rglob("*.tmp-*")), [])
+            clone = benchmark.RawOutputArchive(root / "raw-clone")
+            clone_record = clone.record(
+                case=case_a,
+                target=target_a,
+                command="decompile/../../sla",
+                repeat_idx=0,
+                attempt="isolated",
+                result=result,
+                returncode=124,
+                timeout=True,
+                temperature="cold",
+            )
+            self.assertEqual(clone_record["metadata_path"], records[0]["metadata_path"])
+
+            resumed = benchmark.RawOutputArchive(archive.root, load_existing=True)
+            self.assertEqual(resumed.summary(False)["record_count"], len(records))
+            self.assertEqual(resumed.summary(False)["root"], "<redacted:raw>")
+            resumed_record = resumed.record(
+                case=case_a,
+                target=target_a,
+                command="decompile/../../sla",
+                repeat_idx=0,
+                attempt="isolated",
+                result=result,
+                returncode=124,
+                timeout=True,
+                temperature="cold",
+            )
+            self.assertEqual(resumed_record["session_idx"], 1)
+            self.assertNotEqual(resumed_record["metadata_path"], records[0]["metadata_path"])
+            args = type(
+                "Args",
+                (),
+                {
+                    "r2": "r2",
+                    "analysis": "aaa",
+                    "repeat": 1,
+                    "isolate_commands": True,
+                    "batch_target_size": 0,
+                    "manifest": "",
+                    "gold_manifest": "",
+                    "manifest_only": True,
+                    "no_repo_fixtures": True,
+                    "coreutils_dir": "",
+                    "cgc_dir": "",
+                    "juliet_dir": "",
+                    "kernel": "",
+                    "preset": "",
+                    "resume": False,
+                    "include_sensitive": False,
+                },
+            )()
+            report = benchmark.build_benchmark_report(
+                args,
+                [],
+                elapsed_s=0.0,
+                total_jobs=1,
+                case_jobs=1,
+                command_jobs=1,
+                total_cases=0,
+                resumed_cases=0,
+                plugin_info={"hash": "none", "files": []},
+                benchmark_config={"run_config_hash": "test"},
+                command_names=("decompile_sla",),
+                raw_output_archive=resumed,
+            )
+            disabled_report = benchmark.build_benchmark_report(
+                args,
+                [],
+                elapsed_s=0.0,
+                total_jobs=1,
+                case_jobs=1,
+                command_jobs=1,
+                total_cases=0,
+                resumed_cases=0,
+                plugin_info={"hash": "none", "files": []},
+                benchmark_config={"run_config_hash": "test"},
+                command_names=("decompile_sla",),
+            )
+            json.dumps(report)
+            self.assertEqual(report["raw_output_archive"]["record_count"], len(records) + 1)
+            self.assertEqual(
+                disabled_report["raw_output_archive"],
+                {"enabled": False, "record_count": 0, "records": []},
+            )
 
     def test_choose_targets_prefers_requested_function(self):
         functions = [
@@ -143,6 +446,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
                     "matched": "sym.xstrtoumax",
                     "requested_prefix": "dbg",
                     "matched_prefix": "sym",
+                    "primary_failure_taxonomy": "structural",
                 }
             ],
         )
@@ -375,7 +679,14 @@ class ReversingBenchmarkTests(unittest.TestCase):
 
         self.assertEqual(
             failures,
-            [{"kind": "timeout", "target": "sym.hot", "command": "decompile_sla"}],
+            [
+                {
+                    "kind": "timeout",
+                    "target": "sym.hot",
+                    "command": "decompile_sla",
+                    "primary_failure_taxonomy": "performance",
+                }
+            ],
         )
 
     def test_collect_failures_gates_manual_decompiler_failures(self):
@@ -433,7 +744,80 @@ class ReversingBenchmarkTests(unittest.TestCase):
                 "unresolved_fcn_or_temp_stack_leak",
             }.issubset(kinds)
         )
+        self.assertTrue(
+            all(
+                failure["primary_failure_taxonomy"]
+                in {"semantic", "structural", "type", "readability", "performance"}
+                for failure in failures
+            )
+        )
         self.assertLessEqual(benchmark.score_case(case_result), 34)
+
+    def test_phase0_primary_failure_taxonomy_is_total_for_known_kinds(self):
+        known = (
+            set(benchmark.FAILURE_OWNER) - {benchmark.GOLD_ORACLE_FAILURE}
+            | set(benchmark.QUALITY_GATE_FAILURES)
+            | {
+                "decompiler_fallback",
+                "discovery_parse",
+                "discovery_return",
+                "empty_decompile",
+                "json_parse",
+                "missing_symbol_debug_target_alias",
+                "summary_synthetic_local",
+            }
+        )
+        self.assertEqual(
+            [],
+            sorted(known - set(benchmark.FAILURE_PRIMARY_TAXONOMY)),
+        )
+        self.assertEqual(
+            {"semantic", "structural", "type", "readability", "performance"},
+            set(benchmark.FAILURE_PRIMARY_TAXONOMY.values()),
+        )
+        self.assertEqual(
+            "performance",
+            benchmark.primary_failure_taxonomy(
+                "nondeterministic_output", {"command": "profile"}
+            ),
+        )
+        self.assertEqual(
+            "semantic",
+            benchmark.primary_failure_taxonomy(
+                "nondeterministic_output", {"command": "decompile_sla"}
+            ),
+        )
+
+    def test_profile_repeat_mismatch_is_measurement_observation_not_failure(self):
+        case_result = {
+            "discovery": {"returncode": 0, "function_count": 1},
+            "targets": [
+                {
+                    "name": "sym.sample",
+                    "commands": {
+                        "profile": {"returncode": 0, "repeat": {"stable": False}},
+                        "decompile_sla": {"returncode": 0, "repeat": {"stable": False}},
+                    },
+                }
+            ],
+        }
+
+        failures = benchmark.collect_failures(case_result)
+
+        self.assertEqual(
+            ["nondeterministic_output"],
+            [failure["kind"] for failure in failures],
+        )
+        self.assertEqual(
+            [
+                {
+                    "kind": "unnormalized_profile_repeat_mismatch",
+                    "target": "sym.sample",
+                    "command": "profile",
+                }
+            ],
+            case_result["measurement_observations"],
+        )
 
     def test_gold_oracle_gates_source_expectations(self):
         case = benchmark.BinaryCase(
@@ -456,8 +840,13 @@ class ReversingBenchmarkTests(unittest.TestCase):
                 "target": "test_struct_array_index",
                 "command": "decompile_sla",
                 "owner": "r2types",
-                "contains": ["DemoStruct*", "arr[idx].third"],
-                "not_contains": ["sla_struct_", "*(arr +"],
+                "checks": {
+                    "type": {"contains": ["DemoStruct*"]},
+                    "readability": {
+                        "contains": ["arr[idx].third"],
+                        "not_contains": ["sla_struct_", "*(arr +"],
+                    },
+                },
             }
         ]
         entry = benchmark.command_summary(
@@ -482,8 +871,24 @@ class ReversingBenchmarkTests(unittest.TestCase):
         kinds = [failure["kind"] for failure in failures]
 
         self.assertEqual(entry["gold_oracle"]["status"], "failed")
+        self.assertEqual(entry["gold_oracle"]["hard_status"], "failed")
+        self.assertEqual(entry["gold_oracle"]["soft_status"], "failed")
         self.assertIn("source_oracle_failure", kinds)
         self.assertTrue(any(failure.get("owner") == "r2types" for failure in failures))
+        self.assertTrue(
+            all(
+                failure.get("category") == "type" and failure.get("gate") == "hard"
+                for failure in failures
+                if failure["kind"] == benchmark.GOLD_ORACLE_FAILURE
+            )
+        )
+        self.assertTrue(
+            all(
+                failure.get("primary_failure_taxonomy") == "type"
+                for failure in failures
+                if failure["kind"] == benchmark.GOLD_ORACLE_FAILURE
+            )
+        )
         case_result["failures"] = failures
         self.assertLess(benchmark.score_case(case_result), 100)
 
@@ -502,8 +907,13 @@ class ReversingBenchmarkTests(unittest.TestCase):
                 "target": "dbg.test_struct_array_index",
                 "command": "decompile_sla",
                 "owner": "r2types",
-                "contains": ["DemoStruct*", "arr[idx].fourteenth + arr[idx].third"],
-                "not_contains": ["sla_struct_", "*(arr +"],
+                "checks": {
+                    "type": {"contains": ["DemoStruct*"]},
+                    "readability": {
+                        "contains": ["arr[idx].fourteenth + arr[idx].third"],
+                        "not_contains": ["sla_struct_", "*(arr +"],
+                    },
+                },
             }
         ]
         entry = benchmark.command_summary(
@@ -523,7 +933,84 @@ class ReversingBenchmarkTests(unittest.TestCase):
 
         self.assertEqual(entry["gold_oracle"]["status"], "ok")
         self.assertEqual(entry["gold_oracle"]["expectation_count"], 1)
+        self.assertEqual(entry["gold_oracle"]["hard_check_count"], 1)
+        self.assertEqual(entry["gold_oracle"]["soft_check_count"], 3)
+        self.assertEqual(entry["gold_oracle"]["legacy_check_count"], 0)
         self.assertEqual(entry["gold_oracle"]["failures"], [])
+
+    def test_soft_gold_failure_does_not_fail_semantic_hard_gate(self):
+        case = benchmark.BinaryCase(
+            name="sample",
+            path=Path("/tmp/sample"),
+            corpus="unit",
+            analysis="aaa",
+            targets=("worker",),
+            max_functions=1,
+        )
+        target = {"name": "sym.worker", "requested": "worker"}
+        gold = [
+            {
+                "target": "worker",
+                "command": "decompile_sla",
+                "owner": "r2dec",
+                "checks": {
+                    "semantic": {"contains": ["return 1;"]},
+                    "readability": {"contains": ["friendly_result_name"]},
+                },
+            }
+        ]
+        entry = benchmark.command_summary(
+            "decompile_sla",
+            cmd_result("int worker(void) { return 1; }\n"),
+            False,
+            case=case,
+            target=target,
+            gold_manifest=gold,
+        )
+        case_result = {
+            "name": "sample",
+            "corpus": "unit",
+            "score": 100,
+            "discovery": {"returncode": 0, "function_count": 1},
+            "targets": [{"name": target["name"], "commands": {"decompile_sla": entry}}],
+        }
+        failures = benchmark.collect_failures(case_result)
+        case_result["failures"] = failures
+        summary = benchmark.aggregate([case_result])
+
+        self.assertEqual(entry["gold_oracle"]["status"], "failed")
+        self.assertEqual(entry["gold_oracle"]["hard_status"], "ok")
+        self.assertEqual(entry["gold_oracle"]["soft_status"], "failed")
+        self.assertEqual(
+            [(failure["category"], failure["gate"]) for failure in entry["gold_oracle"]["failures"]],
+            [("readability", "soft")],
+        )
+        self.assertFalse(any(failure["kind"] == benchmark.GOLD_ORACLE_FAILURE for failure in failures))
+        self.assertEqual(summary["quality"]["gold_oracle"]["hard_failures"], 0)
+        self.assertEqual(summary["quality"]["gold_oracle"]["soft_failures"], 1)
+
+        args = type(
+            "Args",
+            (),
+            {
+                "closure_gate": False,
+                "max_hard_failures": None,
+                "max_residual_decompile": None,
+                "max_generic_args": None,
+                "max_generic_types": None,
+                "min_average_score": None,
+                "max_setup_command_ratio": None,
+                "require_pdg_comparison": False,
+                "max_pdg_quality_wins": None,
+                "max_pdg_perf_wins": None,
+                "max_pdg_quality_then_perf_wins": None,
+                "max_gold_failures": 0,
+                "require_gold": False,
+            },
+        )()
+        gate = benchmark.strict_quality_gate(args, {"summary": summary})
+        self.assertEqual(gate["checks"]["gold_failures"]["value"], 0)
+        self.assertNotIn("gold_failures", {failure["metric"] for failure in gate["failures"]})
 
     def test_load_gold_manifest_requires_canonical_owner(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -563,6 +1050,96 @@ class ReversingBenchmarkTests(unittest.TestCase):
             expectations = benchmark.load_gold_manifest(path)
 
         self.assertEqual(expectations[0]["owner"], "r2dec")
+        self.assertEqual(
+            expectations[0]["_gold_checks"],
+            [
+                {
+                    "check": "contains",
+                    "pattern": "return 1;",
+                    "category": "unclassified",
+                    "gate": "legacy",
+                }
+            ],
+        )
+
+    def test_load_gold_manifest_rejects_unknown_or_mixed_check_taxonomy(self):
+        base = {
+            "target": "dbg.worker",
+            "command": "decompile_sla",
+            "owner": "r2dec",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "gold.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "expectations": [
+                            {**base, "checks": {"style": {"contains": ["worker"]}}}
+                        ]
+                    }
+                )
+            )
+            with self.assertRaisesRegex(ValueError, "category 'style'"):
+                benchmark.load_gold_manifest(path)
+
+            path.write_text(
+                json.dumps(
+                    {
+                        "expectations": [
+                            {
+                                **base,
+                                "checks": {"semantic": {"contains": ["return 1;"]}},
+                                "contains": ["worker"],
+                            }
+                        ]
+                    }
+                )
+            )
+            with self.assertRaisesRegex(ValueError, "cannot mix categorized checks"):
+                benchmark.load_gold_manifest(path)
+
+    def test_legacy_gold_failure_is_explicit_and_not_hard(self):
+        case = benchmark.BinaryCase(
+            name="sample",
+            path=Path("/tmp/sample"),
+            corpus="unit",
+            analysis="aaa",
+            targets=("worker",),
+            max_functions=1,
+        )
+        target = {"name": "sym.worker", "requested": "worker"}
+        entry = benchmark.command_summary(
+            "decompile_sla",
+            cmd_result("int worker(void) { return 0; }\n"),
+            False,
+            case=case,
+            target=target,
+            gold_manifest=[
+                {
+                    "target": "worker",
+                    "command": "decompile_sla",
+                    "owner": "r2dec",
+                    "contains": ["return 1;"],
+                }
+            ],
+        )
+        case_result = {
+            "discovery": {"returncode": 0, "function_count": 1},
+            "targets": [{"name": target["name"], "commands": {"decompile_sla": entry}}],
+        }
+
+        self.assertEqual(entry["gold_oracle"]["hard_status"], "ok")
+        self.assertEqual(entry["gold_oracle"]["legacy_status"], "failed")
+        self.assertEqual(
+            (entry["gold_oracle"]["failures"][0]["category"], entry["gold_oracle"]["failures"][0]["gate"]),
+            ("unclassified", "legacy"),
+        )
+        self.assertFalse(
+            any(
+                failure["kind"] == benchmark.GOLD_ORACLE_FAILURE
+                for failure in benchmark.collect_failures(case_result)
+            )
+        )
 
     def test_run_case_classifies_native_discovery_as_radare2_candidate(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -798,7 +1375,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertEqual(quality["missing_summary_render_contract_count"], 0)
         self.assertEqual(quality["claimless_summary_projection_count"], 0)
         self.assertEqual(quality["missing_summary_role_certificate_count"], 0)
-        self.assertEqual(quality["classification"], "structured")
+        self.assertEqual(quality["classification"], "residual")
         self.assertGreaterEqual(quality["readability_smell_count"], 3)
         self.assertEqual(quality["residual_markers"], 0)
 
@@ -951,6 +1528,79 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertEqual(timings[("types", 0)], (1000000000, 1500000000))
         self.assertIn("return 1", sections[("decompile_sla", 0)])
 
+    def test_in_process_timer_is_removed_from_payload_and_charges_only_command(self):
+        stdout = "\n".join(
+            [
+                benchmark.batched_section_start("profile", 0),
+                '{"count":1}',
+                "0.000123",
+                benchmark.batched_time_marker("ELAPSED", "profile", 0),
+                benchmark.batched_section_end("profile", 0),
+            ]
+        )
+
+        sections, timings = benchmark.parse_batched_output(stdout)
+        byte_sections = benchmark.parse_batched_sections_bytes(stdout.encode())
+
+        self.assertEqual(sections[("profile", 0)], '{"count":1}\n')
+        self.assertEqual(byte_sections[("profile", 0)], b'{"count":1}\n')
+        self.assertEqual(
+            timings[("profile", 0)],
+            (benchmark.IN_PROCESS_TIMER_START_NS, 123_000),
+        )
+        self.assertEqual(
+            benchmark.timing_elapsed_s(*timings[("profile", 0)]),
+            0.000123,
+        )
+        script = "; ".join(benchmark.batched_timed_command("profile", 0, "a:sla.debug.profilej"))
+        self.assertIn("?t a:sla.debug.profilej", script)
+        self.assertNotIn("!date", script)
+
+    def test_isolated_command_event_excludes_process_and_setup_overhead(self):
+        case = benchmark.BinaryCase(
+            "sample",
+            Path("/tmp/sample"),
+            "unit",
+            "aaa",
+            (),
+            1,
+        )
+        stdout = "\n".join(
+            [
+                benchmark.batched_section_start("profile", 0),
+                '{"count":1}',
+                "0.000123",
+                benchmark.batched_time_marker("ELAPSED", "profile", 0),
+                benchmark.batched_section_end("profile", 0),
+            ]
+        )
+        seen_scripts = []
+
+        def runner(r2, path, cmd, timeout, env):
+            seen_scripts.append(cmd)
+            return benchmark.CmdResult(0, stdout, "", 9.0, 123)
+
+        target = benchmark.collect_target(
+            "r2",
+            case,
+            {"name": "sym.f", "addr": 0x1000, "found": True},
+            30,
+            1,
+            False,
+            {},
+            None,
+            1,
+            runner,
+            {"profile": "a:sla.debug.profilej"},
+        )
+
+        event = target["command_events"][0]
+        self.assertEqual(event["elapsed_s"], 0.000123)
+        self.assertEqual(event["timer"], "r2_prof")
+        self.assertEqual(target["commands"]["profile"]["elapsed_s"], 0.000123)
+        self.assertEqual(target["commands"]["profile"]["stdout"]["bytes"], 12)
+        self.assertNotIn("!date", seen_scripts[0])
+
     def test_parse_batched_output_tracks_started_and_completed_sections(self):
         stdout = "\n".join(
             [
@@ -971,7 +1621,143 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertIn(("done", 0), completed)
         self.assertNotIn(("partial", 0), completed)
 
-    def test_run_case_batched_scores_clean_outputs_and_reports_artifact_cache_hits(self):
+    def test_parse_batched_sections_bytes_preserves_non_utf8_payload(self):
+        payload = b"\x00\xffpayload\r\n\x80without-final-newline"
+        stdout = (
+            benchmark.batched_section_start("decompile_sla", 0).encode("ascii")
+            + b"\n"
+            + payload
+            + b"\n"
+            + benchmark.batched_section_end("decompile_sla", 0).encode("ascii")
+            + b"\n"
+        )
+
+        sections = benchmark.parse_batched_sections_bytes(stdout)
+
+        self.assertEqual(sections[("decompile_sla", 0)], payload + b"\n")
+
+    def test_batched_temperatures_are_explicit_without_section_rss_attribution(self):
+        case = benchmark.BinaryCase(
+            name="sample",
+            path=Path("/tmp/sample"),
+            corpus="unit",
+            analysis="aaa",
+            targets=(),
+            max_functions=1,
+        )
+        stdout = batched_stdout(
+            [
+                ("decompile_sla", 0, "int f(void) { return 1; }"),
+                ("decompile_sla", 1, "int f(void) { return 1; }"),
+            ]
+        )
+
+        def runner(r2, path, cmd, timeout, env):
+            return cmd_result(stdout, child_max_rss_bytes=64 * 1024 * 1024)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = benchmark.RawOutputArchive(Path(tmp) / "raw")
+            target = benchmark.collect_target_batched(
+                "r2",
+                case,
+                {"name": "sym.f", "addr": 0x1000, "found": True},
+                30,
+                2,
+                False,
+                {},
+                None,
+                runner,
+                {"decompile_sla": "a:sla.dec"},
+                raw_output_archive=archive,
+            )
+            archive_summary = archive.summary(True)
+
+        command_events = [
+            event
+            for event in target["command_events"]
+            if event["command"] == "decompile_sla"
+        ]
+        self.assertEqual(
+            [event["temperature"] for event in command_events],
+            ["cold", "warm"],
+        )
+        self.assertEqual(target["batch_event"]["child_max_rss_bytes"], 64 * 1024 * 1024)
+        self.assertTrue(
+            all("child_max_rss_bytes" not in event for event in target["command_events"])
+        )
+        self.assertEqual(archive_summary["record_count"], 2)
+        self.assertTrue(
+            all(event.get("raw_output_metadata") for event in command_events)
+        )
+        self.assertTrue(
+            all(record["stdout"]["scope"] == "batch_section" for record in archive_summary["records"])
+        )
+
+    def test_batched_warm_pass_repeats_full_tier1_sequence(self):
+        case = benchmark.BinaryCase("sample", Path("/tmp/sample"), "unit", "aaa", (), 1)
+        sections = benchmark.batched_target_script(
+            case,
+            0x1000,
+            2,
+            benchmark.target_commands(("decompile_sla", "types", "profile")),
+        )
+
+        self.assertEqual(
+            [(name, repeat_idx) for name, repeat_idx, _marker, _command in sections],
+            [
+                ("decompile_sla", 0),
+                ("types", 0),
+                ("profile", 0),
+                ("decompile_sla", 1),
+                ("types", 1),
+                ("profile", 1),
+            ],
+        )
+
+    def test_isolated_repeats_are_cold_children_with_individual_rss(self):
+        case = benchmark.BinaryCase(
+            name="sample",
+            path=Path("/tmp/sample"),
+            corpus="unit",
+            analysis="aaa",
+            targets=(),
+            max_functions=1,
+        )
+        responses = iter(
+            [
+                cmd_result("int f(void) { return 1; }", child_max_rss_bytes=10),
+                cmd_result("int f(void) { return 1; }", child_max_rss_bytes=20),
+            ]
+        )
+
+        def runner(r2, path, cmd, timeout, env):
+            return next(responses)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = benchmark.RawOutputArchive(Path(tmp) / "raw")
+            target = benchmark.collect_target(
+                "r2",
+                case,
+                {"name": "sym.f", "addr": 0x1000, "found": True},
+                30,
+                2,
+                False,
+                {},
+                None,
+                1,
+                runner,
+                {"decompile_sla": "a:sla.dec"},
+                raw_output_archive=archive,
+            )
+            archive_summary = archive.summary(True)
+
+        events = target["command_events"]
+        self.assertEqual([event["temperature"] for event in events], ["cold", "cold"])
+        self.assertEqual([event["child_max_rss_bytes"] for event in events], [10, 20])
+        self.assertEqual(archive_summary["record_count"], 2)
+        self.assertTrue(all(event.get("raw_output_metadata") for event in events))
+
+    def test_run_case_batched_scores_clean_outputs_and_reports_analysis_cache_hits(self):
         with tempfile.TemporaryDirectory() as tmp:
             binary = Path(tmp) / "sample"
             binary.write_bytes(b"\x00")
@@ -990,8 +1776,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
                     (
                         '{"count":1,'
                         '"engine_cache":{"analysis":{"hits":1,"misses":2,"lookups":3,"insertions":2,"evictions":0},'
-                        '"artifacts":{"hits":1,"misses":1,"lookups":2,"insertions":1,"evictions":0},'
-                        '"total":{"hits":2,"misses":3,"lookups":5,"insertions":3,"evictions":0}}}'
+                        '"total":{"hits":1,"misses":2,"lookups":3,"insertions":2,"evictions":0}}}'
                     ),
                     benchmark.batched_section_end("t0_profile", 0),
                 ]
@@ -1034,11 +1819,11 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertEqual(result["score"], 100)
         self.assertEqual(
             target["commands"]["profile"]["profile_metrics"]["engine_cache"]["total"]["hits"],
-            2,
-        )
-        self.assertEqual(
-            target["commands"]["profile"]["profile_metrics"]["engine_cache"]["artifacts"]["hits"],
             1,
+        )
+        self.assertNotIn(
+            "artifacts",
+            target["commands"]["profile"]["profile_metrics"]["engine_cache"],
         )
         self.assertEqual(
             target["commands"]["decompile_pdd"]["decompile_quality"]["classification"],
@@ -1223,7 +2008,14 @@ class ReversingBenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(
             benchmark.collect_failures({"discovery": {"returncode": 0}, "targets": outputs}),
-            [{"kind": "timeout", "target": "sym.hot", "command": "decompile_sla"}],
+            [
+                {
+                    "kind": "timeout",
+                    "target": "sym.hot",
+                    "command": "decompile_sla",
+                    "primary_failure_taxonomy": "performance",
+                }
+            ],
         )
 
     def test_aggregate_is_sorted_and_scores_cases(self):
@@ -1279,8 +2071,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
                                 "profile_metrics": {
                                     "engine_cache": {
                                         "analysis": {"hits": 1, "misses": 2},
-                                        "artifacts": {"hits": 3, "misses": 4},
-                                        "total": {"hits": 4, "misses": 6},
+                                        "total": {"hits": 1, "misses": 2},
                                     }
                                 },
                             },
@@ -1297,8 +2088,8 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertEqual(summary["timing"]["case_setup_s"], 3.0)
         self.assertEqual(summary["timing"]["target_setup_s"], 0.5)
         self.assertEqual(summary["timing"]["command_s"], 4.75)
-        self.assertEqual(summary["cache"]["engine"]["total"]["hits"], 4)
-        self.assertEqual(summary["cache"]["engine"]["artifacts"]["misses"], 4)
+        self.assertEqual(summary["cache"]["engine"]["total"]["hits"], 1)
+        self.assertNotIn("artifacts", summary["cache"]["engine"])
         self.assertEqual(
             summary["quality"]["decompile_by_family"],
             {"unknown": {"fallback": 1, "structured": 1}},
@@ -1334,6 +2125,66 @@ class ReversingBenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(summary["worst_targets"][0]["target"], None)
         self.assertEqual(summary["worst_targets"][0]["elapsed_s"], 4.75)
+
+    def test_aggregate_separates_temperature_and_reports_peak_child_rss(self):
+        summary = benchmark.aggregate(
+            [
+                {
+                    "name": "sample",
+                    "corpus": "unit",
+                    "score": 100,
+                    "failures": [],
+                    "discovery": {"child_max_rss_bytes": 80},
+                    "targets": [
+                        {
+                            "name": "sym.f",
+                            "batch_event": {"child_max_rss_bytes": 300},
+                            "command_events": [
+                                {
+                                    "command": "decompile_sla",
+                                    "temperature": "cold",
+                                    "elapsed_s": 1.0,
+                                    "child_max_rss_bytes": 100,
+                                },
+                                {
+                                    "command": "decompile_sla",
+                                    "temperature": "warm",
+                                    "elapsed_s": 0.25,
+                                },
+                                {
+                                    "command": "types",
+                                    "temperature": "cold",
+                                    "elapsed_s": 0.5,
+                                    "child_max_rss_bytes": 200,
+                                },
+                                {
+                                    "command": "setup",
+                                    "temperature": "cold",
+                                    "elapsed_s": 10.0,
+                                },
+                                {
+                                    "command": "profile",
+                                    "temperature": "cold",
+                                    "elapsed_s": 9.0,
+                                    "section_status": benchmark.BATCH_SECTION_NOT_REACHED,
+                                },
+                            ],
+                            "commands": {},
+                        }
+                    ],
+                }
+            ]
+        )
+
+        self.assertEqual(
+            summary["timing"]["by_temperature"],
+            {
+                "cold": {"count": 2, "elapsed_s": 1.5},
+                "warm": {"count": 1, "elapsed_s": 0.25},
+            },
+        )
+        self.assertEqual(summary["memory"], {"peak_child_rss_bytes": 300})
+        self.assertEqual(benchmark.SCHEMA_VERSION, 11)
 
     def test_aggregate_summarizes_cache_and_summary_fast_paths(self):
         summary = benchmark.aggregate(
@@ -1798,6 +2649,14 @@ class ReversingBenchmarkTests(unittest.TestCase):
                         "name": "sym.hot",
                         "addr": 0x1000,
                         "found": True,
+                        "batch_event": {
+                            "case": "sample",
+                            "command": "case_batch",
+                            "started_at": 1.0,
+                            "ended_at": 2.0,
+                            "returncode": 0,
+                            "child_max_rss_bytes": 900,
+                        },
                         "commands": {
                             "decompile_sla": {
                                 "returncode": 0,
@@ -1806,6 +2665,15 @@ class ReversingBenchmarkTests(unittest.TestCase):
                                 "runtime_bucket": "fast",
                                 "stdout": benchmark.summarize_text("", include_preview=False),
                                 "decompile_quality": {"classification": "structured"},
+                                "event": {
+                                    "case": "sample",
+                                    "command": "decompile_sla",
+                                    "repeat_idx": 0,
+                                    "temperature": "cold",
+                                    "started_at": 1.1,
+                                    "ended_at": 1.2,
+                                    "elapsed_s": 0.1,
+                                },
                             }
                         },
                     }
@@ -1829,7 +2697,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
 
             def runner(r2, path, cmd, timeout, env):
                 seen_commands.append(cmd)
-                return cmd_result(batch_stdout)
+                return cmd_result(batch_stdout, child_max_rss_bytes=100)
 
             case = benchmark.BinaryCase(
                 name="sample",
@@ -1856,6 +2724,30 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertNotIn("a:sla.dec", seen_commands[0])
         self.assertTrue(outputs[0]["commands"]["decompile_sla"]["resumed_from_checkpoint"])
         self.assertEqual(outputs[0]["commands"]["types"]["returncode"], 0)
+        self.assertEqual(outputs[0]["resumed_batch_events"][0]["child_max_rss_bytes"], 900)
+        self.assertEqual(
+            benchmark.aggregate(
+                [
+                    {
+                        "name": "sample",
+                        "corpus": "unit",
+                        "score": 100,
+                        "failures": [],
+                        "targets": outputs,
+                    }
+                ]
+            )["memory"]["peak_child_rss_bytes"],
+            900,
+        )
+        flattened = benchmark.collect_command_events([{"targets": outputs}])
+        self.assertEqual(
+            len([event for event in flattened if event.get("command") == "decompile_sla"]),
+            1,
+        )
+        self.assertEqual(
+            len([event for event in flattened if event.get("command") == "case_batch"]),
+            2,
+        )
         self.assertFalse(
             benchmark.case_result_has_incomplete_work(
                 {"targets": outputs},
@@ -1963,6 +2855,43 @@ class ReversingBenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(delta["next_work"]["after"]["status"], "clean")
         self.assertEqual(delta["slowest_command_delta"][0]["delta_s"], -7.0)
+
+    def test_collect_command_events_includes_one_shared_case_batch(self):
+        shared_batch = {
+            "case": "sample",
+            "corpus": "unit",
+            "target": "sym.a",
+            "command": "case_batch",
+            "started_at": 1.0,
+            "ended_at": 2.0,
+            "returncode": 0,
+            "child_max_rss_bytes": 4096,
+        }
+        cases = [
+            {
+                "targets": [
+                    {
+                        "batch_event": shared_batch,
+                        "command_events": [
+                            {"case": "sample", "command": "types", "started_at": 1.1}
+                        ],
+                    },
+                    {
+                        "batch_event": {**shared_batch, "target": "sym.b"},
+                        "command_events": [
+                            {"case": "sample", "command": "profile", "started_at": 1.2}
+                        ],
+                    },
+                ]
+            }
+        ]
+
+        events = benchmark.collect_command_events(cases)
+
+        self.assertEqual(
+            [event["command"] for event in events],
+            ["case_batch", "types", "profile"],
+        )
 
     def test_strict_quality_gate_checks_broad_quality_thresholds(self):
         args = type(
@@ -2208,6 +3137,8 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertEqual(args.commands, "decompile_sla,types,profile")
         self.assertTrue(config["cache_probe"])
         self.assertEqual(config["repeat"], 2)
+        self.assertFalse(config["raw_output_archive"])
+        self.assertIsNone(config["raw_output_archive_root_hash"])
 
     def test_manifest_max_functions_can_be_overridden_for_broad_runs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2350,6 +3281,510 @@ class ReversingBenchmarkTests(unittest.TestCase):
 
         self.assertEqual([result.stdout for result in outputs], items)
         self.assertLessEqual(max_active, 2)
+
+    def test_fixed_performance_contract_is_versioned_and_phase0_derived(self):
+        config = benchmark.load_fixed_performance_config(
+            ROOT / "tests" / "gold" / "mem_scan2_performance.json"
+        )
+
+        self.assertEqual(config["schema"], benchmark.FIXED_PERFORMANCE_GATE_SCHEMA_VERSION)
+        self.assertEqual(config["contract"]["target"], "fnv_fold")
+        self.assertEqual(config["expected_refusal"]["target"], "mem_scan2")
+        self.assertEqual(config["contract"]["cold_samples"], 20)
+        self.assertEqual(config["contract"]["warm_sessions"], 4)
+        self.assertEqual(config["contract"]["warm_samples_per_session"], 5)
+        self.assertEqual(config["contract"]["percentile"], 95)
+        self.assertIn("in-process", config["baseline"]["note"])
+        self.assertEqual(len(config["contract"]["binary_sha256"]), 64)
+        self.assertEqual(
+            config["validation_observation"]["runner_fingerprint"]["radare2_abi"],
+            132,
+        )
+        for command_gate in config["gates"]["commands"].values():
+            for limit in command_gate.values():
+                self.assertGreater(limit["release_target_p95_s"], 0.0)
+                self.assertGreater(
+                    limit["release_target_p95_s"],
+                    limit["reference_p95_s"],
+                )
+                self.assertEqual(limit["max_regression_ratio"], 1.5)
+        for limit in config["gates"]["rss"].values():
+            self.assertGreater(
+                limit["release_target_p95_bytes"],
+                limit["reference_p95_bytes"],
+            )
+        self.assertEqual(
+            config["gates"]["commands"]["decompile_sla"]["cold"][
+                "reference_p95_s"
+            ],
+            config["validation_observation"]["p95"]["decompile_sla"]["cold_s"],
+        )
+
+    def test_fixed_performance_gate_passes_complete_measurements(self):
+        config = benchmark.load_fixed_performance_config(
+            ROOT / "tests" / "gold" / "mem_scan2_performance.json"
+        )
+        measurements = {
+            "commands": {
+                command: {
+                    "cold": [
+                        min(
+                            limit["cold"]["release_target_p95_s"],
+                            limit["cold"]["reference_p95_s"],
+                        )
+                    ]
+                    * config["contract"]["cold_samples"],
+                    "warm": [
+                        min(
+                            limit["warm"]["release_target_p95_s"],
+                            limit["warm"]["reference_p95_s"],
+                        )
+                    ]
+                    * (
+                        config["contract"]["warm_sessions"]
+                        * config["contract"]["warm_samples_per_session"]
+                    ),
+                }
+                for command, limit in config["gates"]["commands"].items()
+            },
+            "rss": {
+                "cold": [config["gates"]["rss"]["cold"]["reference_p95_bytes"]]
+                * (config["contract"]["cold_samples"] * len(config["contract"]["commands"])),
+                "warm": [config["gates"]["rss"]["warm"]["reference_p95_bytes"]]
+                * config["contract"]["warm_sessions"],
+            },
+        }
+
+        gate = benchmark.evaluate_fixed_performance_gate(config, measurements, required=True)
+
+        self.assertEqual(gate["status"], "ok")
+        self.assertEqual(gate["failures"], [])
+        self.assertLessEqual(
+            gate["checks"][
+                "commands.decompile_sla.cold.p95_s.regression_vs_reference"
+            ]["relative_value"],
+            1.0,
+        )
+        self.assertEqual(
+            gate["checks"]["rss.warm.p95_bytes.release_target"]["op"],
+            "<=",
+        )
+
+    def test_fixed_performance_release_exceedance_does_not_imply_regression(self):
+        config = benchmark.load_fixed_performance_config(
+            ROOT / "tests" / "gold" / "mem_scan2_performance.json"
+        )
+        measurements = {
+            "commands": {
+                command: {
+                    "cold": [limit["cold"]["release_target_p95_s"] * 1.05]
+                    * config["contract"]["cold_samples"],
+                    "warm": [limit["warm"]["release_target_p95_s"] * 1.05]
+                    * (
+                        config["contract"]["warm_sessions"]
+                        * config["contract"]["warm_samples_per_session"]
+                    ),
+                }
+                for command, limit in config["gates"]["commands"].items()
+            },
+            "rss": {
+                "cold": [config["gates"]["rss"]["cold"]["reference_p95_bytes"]]
+                * (config["contract"]["cold_samples"] * len(config["contract"]["commands"])),
+                "warm": [config["gates"]["rss"]["warm"]["reference_p95_bytes"]]
+                * config["contract"]["warm_sessions"],
+            },
+        }
+
+        gate = benchmark.evaluate_fixed_performance_gate(config, measurements, required=True)
+
+        metrics = {failure["metric"] for failure in gate["failures"]}
+        self.assertEqual(gate["status"], "failed")
+        self.assertIn("commands.decompile_sla.cold.p95_s.release_target", metrics)
+        self.assertFalse(any("regression_vs_reference" in metric for metric in metrics))
+
+    def test_fixed_performance_gate_reports_absolute_relative_and_rss_failures(self):
+        config = benchmark.load_fixed_performance_config(
+            ROOT / "tests" / "gold" / "mem_scan2_performance.json"
+        )
+        measurements = {
+            "commands": {
+                command: {
+                    "cold": [limit["cold"]["reference_p95_s"]]
+                    * config["contract"]["cold_samples"],
+                    "warm": [limit["warm"]["reference_p95_s"]]
+                    * (
+                        config["contract"]["warm_sessions"]
+                        * config["contract"]["warm_samples_per_session"]
+                    ),
+                }
+                for command, limit in config["gates"]["commands"].items()
+            },
+            "rss": {
+                "cold": [config["gates"]["rss"]["cold"]["reference_p95_bytes"]]
+                * (config["contract"]["cold_samples"] * len(config["contract"]["commands"])),
+                "warm": [config["gates"]["rss"]["warm"]["reference_p95_bytes"]]
+                * config["contract"]["warm_sessions"],
+            },
+        }
+        measurements["commands"]["decompile_sla"]["cold"] = [10.0] * config["contract"]["cold_samples"]
+        measurements["rss"]["warm"] = [600_000_000] * config["contract"]["warm_sessions"]
+
+        gate = benchmark.evaluate_fixed_performance_gate(config, measurements, required=True)
+
+        self.assertEqual(gate["status"], "failed")
+        metrics = {failure["metric"] for failure in gate["failures"]}
+        self.assertIn("commands.decompile_sla.cold.p95_s.release_target", metrics)
+        self.assertIn(
+            "commands.decompile_sla.cold.p95_s.regression_vs_reference",
+            metrics,
+        )
+        self.assertIn("rss.warm.p95_bytes.release_target", metrics)
+        self.assertIn("rss.warm.p95_bytes.regression_vs_reference", metrics)
+
+    def test_fixed_performance_gate_fails_closed_on_missing_samples(self):
+        config = benchmark.load_fixed_performance_config(
+            ROOT / "tests" / "gold" / "mem_scan2_performance.json"
+        )
+
+        gate = benchmark.evaluate_fixed_performance_gate(
+            config,
+            {"commands": {}, "rss": {}},
+            required=True,
+        )
+
+        self.assertEqual(gate["status"], "failed")
+        metrics = {failure["metric"] for failure in gate["failures"]}
+        self.assertIn("commands.decompile_sla.cold.samples", metrics)
+        self.assertIn("commands.decompile_sla.warm.samples", metrics)
+        self.assertIn("rss.cold.samples", metrics)
+        self.assertIn("rss.warm.samples", metrics)
+
+    def test_fixed_performance_unavailable_skip_policy_is_explicit(self):
+        config = benchmark.load_fixed_performance_config(
+            ROOT / "tests" / "gold" / "mem_scan2_performance.json"
+        )
+        unavailable = {"status": "unavailable", "reasons": ["fixed runner absent"]}
+
+        optional = benchmark.evaluate_fixed_performance_gate(
+            config,
+            {},
+            availability=unavailable,
+            required=False,
+        )
+        required = benchmark.evaluate_fixed_performance_gate(
+            config,
+            {},
+            availability=unavailable,
+            required=True,
+        )
+
+        self.assertEqual(optional["status"], "skipped")
+        self.assertEqual(optional["failures"], [])
+        self.assertEqual(required["status"], "failed")
+        self.assertEqual(required["failures"][0]["metric"], "fixed_runner_availability")
+
+    def test_fixed_performance_percentile_uses_nearest_rank(self):
+        self.assertEqual(benchmark.fixed_performance_percentile([]), None)
+        self.assertEqual(benchmark.fixed_performance_percentile([5, 1, 4, 2, 3]), 5)
+        self.assertEqual(
+            benchmark.fixed_performance_percentile(list(range(1, 101))),
+            95,
+        )
+
+    def test_fixed_performance_config_rejects_p95_that_is_the_sample_maximum(self):
+        payload = json.loads(
+            (ROOT / "tests" / "gold" / "mem_scan2_performance.json").read_text()
+        )
+        payload["contract"]["cold_samples"] = 15
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "invalid.json"
+            path.write_text(json.dumps(payload))
+            with self.assertRaisesRegex(ValueError, "non-maximum p95 rank"):
+                benchmark.load_fixed_performance_config(path)
+
+    def test_fixed_performance_probe_rejects_stale_abi_and_noop_plugin(self):
+        config = benchmark.load_fixed_performance_config(
+            ROOT / "tests" / "gold" / "mem_scan2_performance.json"
+        )
+        discovery = cmd_result(
+            json.dumps([{"name": "sym._fnv_fold", "addr": 0x1000}])
+        )
+        stale = cmd_result(
+            "",
+            stderr="WARN: ABI mismatch: Expect 132 vs 131 from anal_sleigh.dylib",
+        )
+        noop = cmd_result(
+            batched_stdout(
+                [
+                    ("plugin_help", 0, "| a:sla.dec [name|addr]"),
+                    ("plugin_status", 0, "sla: loaded architecture 'x86'"),
+                    ("decompile_sla", 0, ""),
+                    ("types", 0, ""),
+                    ("profile", 0, ""),
+                ]
+            )
+        )
+        healthy = cmd_result(
+            batched_stdout(
+                [
+                    ("plugin_help", 0, "| a:sla.dec [name|addr]"),
+                    ("plugin_status", 0, "sla: loaded architecture 'x86'"),
+                    ("decompile_sla", 0, "int f(void) { return 1; }"),
+                    ("types", 0, '{"ret_type":"int","params":[]}'),
+                    ("profile", 0, '{"count":1}'),
+                ]
+            )
+        )
+
+        stale_probe = benchmark.fixed_performance_plugin_probe(
+            config,
+            "r2",
+            Path("/tmp/sample"),
+            30,
+            {},
+            mock.Mock(side_effect=[discovery, stale]),
+        )
+        noop_probe = benchmark.fixed_performance_plugin_probe(
+            config,
+            "r2",
+            Path("/tmp/sample"),
+            30,
+            {},
+            mock.Mock(side_effect=[discovery, noop]),
+        )
+        healthy_probe = benchmark.fixed_performance_plugin_probe(
+            config,
+            "r2",
+            Path("/tmp/sample"),
+            30,
+            {},
+            mock.Mock(side_effect=[discovery, healthy]),
+        )
+
+        self.assertEqual(stale_probe["status"], "failed")
+        self.assertTrue(any("ABI/load" in reason for reason in stale_probe["reasons"]))
+        self.assertEqual(noop_probe["status"], "failed")
+        self.assertTrue(any("no-op" in reason or "empty" in reason for reason in noop_probe["reasons"]))
+        self.assertEqual(healthy_probe["status"], "ok")
+        self.assertTrue(
+            all(item["valid"] for item in healthy_probe["commands"].values())
+        )
+
+    def test_fixed_performance_availability_executes_and_requires_abi_probe(self):
+        config = benchmark.load_fixed_performance_config(
+            ROOT / "tests" / "gold" / "mem_scan2_performance.json"
+        )
+        args = type(
+            "Args",
+            (),
+            {
+                "r2": str(ROOT.parent / "radare2" / "binr" / "radare2" / "radare2"),
+                "plugin_dir": str(ROOT / "r2plugin"),
+                "tmpdir": "",
+                "timeout": 30,
+            },
+        )()
+        failed_probe = {"status": "failed", "reasons": ["stale ABI"]}
+        uname = type("Uname", (), {"machine": "arm64"})()
+        with (
+            mock.patch.object(benchmark.sys, "platform", "darwin"),
+            mock.patch.object(benchmark.os, "uname", return_value=uname),
+            mock.patch.object(
+                benchmark,
+                "fixed_performance_plugin_probe",
+                return_value=failed_probe,
+            ) as probe,
+        ):
+            availability = benchmark.fixed_performance_availability(
+                config,
+                args,
+                {"R2SLEIGH_FIXED_PERF_RUNNER": "r2sleigh-darwin-arm64-perf-v1"},
+            )
+
+        probe.assert_called_once()
+        self.assertEqual(availability["status"], "unavailable")
+        self.assertIn("plugin ABI/load probe: stale ABI", availability["reasons"])
+
+    def test_fixed_performance_measurements_refuse_noop_or_external_timing(self):
+        commands = ("decompile_sla", "types", "profile")
+        measurements = {
+            "commands": {
+                command: {"cold": [], "warm": []} for command in commands
+            },
+            "rss": {"cold": [], "warm": []},
+            "invalid_samples": [],
+        }
+        target = {
+            "commands": {
+                "decompile_sla": {
+                    "stdout": {"bytes": 0},
+                    "decompile_quality": {"classification": "empty"},
+                },
+                "types": {
+                    "stdout": {"bytes": 2},
+                    "json_kind": "dict",
+                },
+                "profile": {
+                    "stdout": {"bytes": 11},
+                    "json_kind": "dict",
+                    "profile_metrics": {"count": 1},
+                },
+            },
+            "command_events": [
+                {
+                    "command": command,
+                    "temperature": "cold",
+                    "repeat_idx": 0,
+                    "returncode": 0,
+                    "timeout": False,
+                    "elapsed_s": 0.000001,
+                    "timed": command != "profile",
+                    "timer": "r2_prof" if command != "profile" else "legacy_or_fallback",
+                    "child_max_rss_bytes": 123,
+                }
+                for command in commands
+            ],
+        }
+
+        benchmark._record_fixed_performance_target(
+            measurements,
+            target,
+            commands,
+            "cold",
+        )
+
+        self.assertTrue(
+            all(not values["cold"] for values in measurements["commands"].values())
+        )
+        self.assertEqual(measurements["rss"]["cold"], [])
+        self.assertEqual(len(measurements["invalid_samples"]), 3)
+
+    def test_fixed_performance_runner_schedules_cold_and_fresh_warm_sessions(self):
+        config_path = ROOT / "tests" / "gold" / "mem_scan2_performance.json"
+        config = benchmark.load_fixed_performance_config(config_path)
+        commands = tuple(config["contract"]["commands"])
+
+        def target_result(temperature, count, rss):
+            events = []
+            command_entries = {}
+            for command in commands:
+                limit = config["gates"]["commands"][command][temperature]
+                elapsed = min(
+                    limit["reference_p95_s"],
+                    limit["release_target_p95_s"],
+                )
+                for repeat_idx in range(count):
+                    event = {
+                        "command": command,
+                        "temperature": temperature,
+                        "repeat_idx": repeat_idx,
+                        "returncode": 0,
+                        "timeout": False,
+                        "elapsed_s": elapsed,
+                        "timed": True,
+                        "timer": "r2_prof",
+                    }
+                    if temperature == "cold":
+                        event["child_max_rss_bytes"] = rss
+                    events.append(event)
+                if command == "decompile_sla":
+                    command_entries[command] = {
+                        "stdout": {"bytes": 24},
+                        "decompile_quality": {"classification": "structured"},
+                    }
+                elif command == "types":
+                    command_entries[command] = {
+                        "stdout": {"bytes": 24},
+                        "json_kind": "dict",
+                        "type_metrics": {"ret_type": "int"},
+                    }
+                elif command == "profile":
+                    command_entries[command] = {
+                        "stdout": {"bytes": 24},
+                        "json_kind": "dict",
+                        "profile_metrics": {"count": 1},
+                    }
+            target = {
+                "requested": config["contract"]["target"],
+                "command_events": events,
+                "commands": command_entries,
+            }
+            if temperature == "warm":
+                target["batch_event"] = {"child_max_rss_bytes": rss}
+            return {"targets": [target]}
+
+        cold_result = target_result(
+            "cold",
+            config["contract"]["cold_samples"],
+            config["gates"]["rss"]["cold"]["reference_p95_bytes"],
+        )
+        warm_results = [
+            target_result(
+                "warm",
+                config["contract"]["warm_samples_per_session"],
+                config["gates"]["rss"]["warm"]["reference_p95_bytes"],
+            )
+            for _ in range(config["contract"]["warm_sessions"])
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            args = type(
+                "Args",
+                (),
+                {
+                    "fixed_performance_gate": str(config_path),
+                    "require_fixed_performance": True,
+                    "r2": "r2",
+                    "plugin_dir": "r2plugin",
+                    "tmpdir": str(Path(tmp) / "runner"),
+                    "timeout": 120,
+                    "out": str(Path(tmp) / "report.json"),
+                },
+            )()
+            available = {"status": "available", "reasons": []}
+            with (
+                mock.patch.object(
+                    benchmark,
+                    "fixed_performance_availability",
+                    return_value=available,
+                ),
+                mock.patch.object(benchmark, "build_r2_env", return_value={}),
+                mock.patch.object(
+                    benchmark,
+                    "run_case",
+                    side_effect=[cold_result, *warm_results],
+                ) as run_case,
+            ):
+                exit_code = benchmark.run_fixed_performance_gate(args)
+
+            report = json.loads(Path(args.out).read_text())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(run_case.call_count, 1 + config["contract"]["warm_sessions"])
+        self.assertEqual(
+            run_case.call_args_list[0].args[3],
+            config["contract"]["cold_samples"],
+        )
+        self.assertTrue(run_case.call_args_list[0].args[9])
+        for call in run_case.call_args_list[1:]:
+            self.assertEqual(
+                call.args[3],
+                config["contract"]["warm_samples_per_session"] + 1,
+            )
+            self.assertFalse(call.args[9])
+        self.assertEqual(
+            len(report["measurements"]["commands"]["decompile_sla"]["cold"]),
+            config["contract"]["cold_samples"],
+        )
+        self.assertEqual(
+            len(report["measurements"]["commands"]["decompile_sla"]["warm"]),
+            config["contract"]["warm_sessions"]
+            * config["contract"]["warm_samples_per_session"],
+        )
+        self.assertEqual(
+            len(report["measurements"]["rss"]["warm"]),
+            config["contract"]["warm_sessions"],
+        )
 
 
 if __name__ == "__main__":

@@ -1,0 +1,133 @@
+{
+  "schema_version": 1,
+  "fixture_set": "r2sleigh-plain-o2-x86_64-macho-v1",
+  "immutability_policy": "The v1 paths and SHA-256 values identify immutable checked-in inputs. A compiler, flag, source, SDK, deployment-target, or byte change requires new versioned artifact names and a new manifest.",
+  "purpose": "Provide genuine compiler-generated plain -O2 inputs for exact semantic-preservation work without suppressing LLVM loop or SLP vectorization.",
+  "build_environment": {
+    "host_arch": "arm64",
+    "host_os": "macOS 26.5.1 (25F80)",
+    "compiler_driver": "/usr/bin/clang",
+    "compiler_installed_dir": "/Library/Developer/CommandLineTools/usr/bin",
+    "compiler_version": "Apple clang version 21.0.0 (clang-2100.1.1.101)",
+    "compiler_default_target": "arm64-apple-darwin25.5.0",
+    "sdk_path": "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+    "sdk_version": "26.5",
+    "linker_version": "1267.0",
+    "deployment_target": "26.0",
+    "working_directory": "repository root"
+  },
+  "profile": {
+    "baseline_rule": "tests/r2r/Makefile Darwin x86 fixture rules",
+    "optimization": "-O2",
+    "debug_information": "-g",
+    "target_flags": [
+      "-arch",
+      "x86_64"
+    ],
+    "link_flags": [
+      "-Wl,-no_pie"
+    ],
+    "vectorization": "Compiler defaults are intentionally retained; neither -fno-vectorize nor -fno-slp-vectorize was used.",
+    "linker_warning": "ld: warning: -no_pie is deprecated when targeting new OS versions"
+  },
+  "capture": {
+    "core_capture": "tests/r2r/fixtures/plain_o2_v1/core-functions.json",
+    "core_capture_tool": "radare2 6.1.9 +36695 abi:135, commit fdf95064eeec2cff3c8610f0228362eeed39e4cd",
+    "core_capture_policy": "Core x86 decoding ran with external plugins disabled. Each record pins the complete analyzed function bytes and ordered instruction boundaries/opcodes.",
+    "live_sleigh_lift_status": "unavailable_in_capture_environment",
+    "live_sleigh_lift_limitation": "The available arch_sleigh.dylib has ABI 132 while the available radare2 has ABI 135. Loading it is refused, so this manifest does not claim a Sleigh lift capture. scripts/capture_plain_o2_fixtures_v1.sh can capture it once a matching already-built plugin is supplied through R2SLEIGH_PLUGIN_DIR.",
+    "r2r_contract": "tests/r2r/db/extras/r2sleigh_plain_o2_fixtures"
+  },
+  "artifacts": [
+    {
+      "id": "test_func-x86_64-macho-O2-v1",
+      "path": "tests/r2r/bins/r2sleigh_test_func_x86_64_macho_O2_v1",
+      "source": "tests/e2e/test_func.c",
+      "source_sha256": "3f84014e6328ac0514f0777ad3322d0ce5acf4b8b9c5ef26483f945cb76b4dcd",
+      "compiler_command": "clang -arch x86_64 -Wl,-no_pie -O2 -g -o tests/r2r/bins/r2sleigh_test_func_x86_64_macho_O2_v1 tests/e2e/test_func.c",
+      "sha256": "be967f00b147ce995818d1aabb4648e5aa0423214e4e623f5f44d5fcf0ad5428",
+      "size_bytes": 9568,
+      "file_identification": "Mach-O 64-bit executable x86_64",
+      "macho": {
+        "magic": "MH_MAGIC_64",
+        "cpu_type": "X86_64",
+        "cpu_subtype": "ALL",
+        "file_type": "EXECUTE",
+        "flags": [
+          "NOUNDEFS",
+          "DYLDLINK",
+          "TWOLEVEL"
+        ],
+        "uuid": "CCC919AE-F8B0-3C97-842F-54DD7AF308E3"
+      },
+      "required_symbols": [
+        {
+          "name": "_sum_array",
+          "start_vaddr": "0x100000620",
+          "symbol_interval_end_vaddr_exclusive": "0x1000006b0",
+          "symbol_interval_size": 144,
+          "next_text_symbol": "_alloc_wrapper",
+          "analyzed_code_end_vaddr_exclusive": "0x1000006ad",
+          "analyzed_code_size": 141,
+          "instruction_count": 45,
+          "required_native_property": "The loop includes compiler-generated XMM vector loads and paddd reductions plus a scalar remainder loop."
+        }
+      ]
+    },
+    {
+      "id": "vuln_test-x86_64-macho-O2-v1",
+      "path": "tests/r2r/bins/r2sleigh_vuln_test_x86_64_macho_O2_v1",
+      "source": "tests/e2e/vuln_test.c",
+      "source_sha256": "187557b24b8d0c8e13faf57e735c2894ea6dcdb7f99f7689e4ed2fcadd6364c5",
+      "compiler_command": "clang -arch x86_64 -Wl,-no_pie -O2 -g -fno-stack-protector -o tests/r2r/bins/r2sleigh_vuln_test_x86_64_macho_O2_v1 tests/e2e/vuln_test.c",
+      "compiler_warning": "tests/e2e/vuln_test.c:63:12: warning: format string is not a string literal (potentially insecure) [-Wformat-security]",
+      "sha256": "f223535d0a5974e5af3b997b7f5e3ac6adc9e00895d281e3e304e3adce42fe29",
+      "size_bytes": 24480,
+      "file_identification": "Mach-O 64-bit executable x86_64",
+      "macho": {
+        "magic": "MH_MAGIC_64",
+        "cpu_type": "X86_64",
+        "cpu_subtype": "ALL",
+        "file_type": "EXECUTE",
+        "flags": [
+          "NOUNDEFS",
+          "DYLDLINK",
+          "TWOLEVEL"
+        ],
+        "uuid": "71863F33-EBB2-3817-B727-130970AC1F96"
+      },
+      "required_symbols": [
+        {
+          "name": "_check_secret",
+          "start_vaddr": "0x100000650",
+          "symbol_interval_end_vaddr_exclusive": "0x100000670",
+          "symbol_interval_size": 32,
+          "next_text_symbol": "_unlock",
+          "analyzed_code_end_vaddr_exclusive": "0x100000661",
+          "analyzed_code_size": 17,
+          "instruction_count": 7
+        },
+        {
+          "name": "_complex_check",
+          "start_vaddr": "0x100000790",
+          "symbol_interval_end_vaddr_exclusive": "0x1000007b0",
+          "symbol_interval_size": 32,
+          "next_text_symbol": "_bitwise_check",
+          "analyzed_code_end_vaddr_exclusive": "0x1000007a8",
+          "analyzed_code_size": 24,
+          "instruction_count": 11
+        },
+        {
+          "name": "_test_struct_array_index",
+          "start_vaddr": "0x100000ab0",
+          "symbol_interval_end_vaddr_exclusive": "0x100000ad0",
+          "symbol_interval_size": 32,
+          "next_text_symbol": "_test_struct_offset_0x100",
+          "analyzed_code_end_vaddr_exclusive": "0x100000ac7",
+          "analyzed_code_size": 23,
+          "instruction_count": 9
+        }
+      ]
+    }
+  ]
+}

@@ -6,6 +6,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use crate::control::{SsaExecutionStopReason, SsaWorkControl, UncheckedSsaWorkControl};
 use crate::{BlockTerminator, PhiNode, SSAFunction, SSAOp, SSAVar, SourceSite};
 
 /// Configuration for SSA optimization passes.
@@ -91,19 +92,32 @@ pub struct OptimizationStats {
 
 /// Run the SSA optimization pipeline on a function.
 pub fn optimize_function(func: &mut SSAFunction, config: &OptimizationConfig) -> OptimizationStats {
+    optimize_function_with_control(func, config, &UncheckedSsaWorkControl)
+        .expect("unchecked SSA optimization cannot stop")
+}
+
+pub(crate) fn optimize_function_with_control<C: SsaWorkControl + ?Sized>(
+    func: &mut SSAFunction,
+    config: &OptimizationConfig,
+    control: &C,
+) -> Result<OptimizationStats, SsaExecutionStopReason> {
+    control.poll()?;
     let mut stats = OptimizationStats::default();
     let max_iters = config.max_iterations.max(1);
 
     if config.enable_sccp {
-        let (consts, executable_edges) = sccp(func);
+        let (consts, executable_edges) = sccp_with_control(func, control)?;
+        control.poll()?;
         apply_sccp_results(func, &consts, &executable_edges, &mut stats);
     }
 
     for _ in 0..max_iters {
+        control.poll()?;
         let mut changed = false;
 
         if config.enable_const_prop && !config.enable_sccp {
-            let consts = compute_constants(func, max_iters);
+            let consts = compute_constants_with_control(func, max_iters, control)?;
+            control.poll()?;
             if replace_sources_with_constants(func, &consts, &mut stats) {
                 changed = true;
             }
@@ -113,14 +127,17 @@ pub fn optimize_function(func: &mut SSAFunction, config: &OptimizationConfig) ->
             changed = true;
         }
 
+        control.poll()?;
         if config.enable_cse && common_subexpr_elim(func, &mut stats) {
             changed = true;
         }
 
+        control.poll()?;
         if config.enable_copy_prop && copy_propagation(func, &mut stats) {
             changed = true;
         }
 
+        control.poll()?;
         if config.enable_dce && dead_code_elim(func, config, &mut stats) {
             changed = true;
         }
@@ -131,7 +148,8 @@ pub fn optimize_function(func: &mut SSAFunction, config: &OptimizationConfig) ->
         }
     }
 
-    stats
+    control.poll()?;
+    Ok(stats)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -140,6 +158,8 @@ struct VarKey {
     version: u32,
     size: u32,
 }
+
+type SccpResult = (HashMap<VarKey, u64>, HashSet<(u64, u64)>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LatticeValue {
@@ -351,7 +371,16 @@ fn evaluate_terminator_sccp(
     }
 }
 
+#[cfg(test)]
 fn sccp(func: &SSAFunction) -> (HashMap<VarKey, u64>, HashSet<(u64, u64)>) {
+    sccp_with_control(func, &UncheckedSsaWorkControl).expect("unchecked SCCP cannot stop")
+}
+
+fn sccp_with_control<C: SsaWorkControl + ?Sized>(
+    func: &SSAFunction,
+    control: &C,
+) -> Result<SccpResult, SsaExecutionStopReason> {
+    control.poll()?;
     let mut lattice = HashMap::new();
     let mut executable = HashSet::new();
     let mut block_visited = HashSet::new();
@@ -360,6 +389,7 @@ fn sccp(func: &SSAFunction) -> (HashMap<VarKey, u64>, HashSet<(u64, u64)>) {
     let use_map = build_use_map(func);
 
     for block in func.blocks() {
+        control.poll()?;
         block.for_each_def(|def| init_if_input(def.var, &mut lattice));
         block.for_each_source(|src| init_if_input(src.var, &mut lattice));
     }
@@ -367,7 +397,9 @@ fn sccp(func: &SSAFunction) -> (HashMap<VarKey, u64>, HashSet<(u64, u64)>) {
     cfg_worklist.push_back((u64::MAX, func.entry));
 
     while !cfg_worklist.is_empty() || !ssa_worklist.is_empty() {
+        control.poll()?;
         while let Some((from, to)) = cfg_worklist.pop_front() {
+            control.poll()?;
             if !executable.insert((from, to)) {
                 continue;
             }
@@ -377,6 +409,7 @@ fn sccp(func: &SSAFunction) -> (HashMap<VarKey, u64>, HashSet<(u64, u64)>) {
             };
 
             for phi in &block.phis {
+                control.poll()?;
                 let new_val = evaluate_phi_sccp(phi, &executable, &lattice, to);
                 if update_lattice(&mut lattice, &phi.dst, new_val) {
                     ssa_worklist.push_back(VarKey::from_var(&phi.dst));
@@ -385,6 +418,7 @@ fn sccp(func: &SSAFunction) -> (HashMap<VarKey, u64>, HashSet<(u64, u64)>) {
 
             if block_visited.insert(to) {
                 for op in &block.ops {
+                    control.poll()?;
                     if let Some(dst) = op.dst() {
                         let new_val = evaluate_op_sccp(op, &lattice);
                         if update_lattice(&mut lattice, dst, new_val) {
@@ -397,10 +431,12 @@ fn sccp(func: &SSAFunction) -> (HashMap<VarKey, u64>, HashSet<(u64, u64)>) {
         }
 
         while let Some(var_key) = ssa_worklist.pop_front() {
+            control.poll()?;
             let Some(use_locs) = use_map.get(&var_key) else {
                 continue;
             };
             for use_loc in use_locs {
+                control.poll()?;
                 match use_loc {
                     UseLocation::Phi {
                         block_addr,
@@ -459,7 +495,8 @@ fn sccp(func: &SSAFunction) -> (HashMap<VarKey, u64>, HashSet<(u64, u64)>) {
             LatticeValue::Top | LatticeValue::Bottom => None,
         })
         .collect();
-    (consts, executable)
+    control.poll()?;
+    Ok((consts, executable))
 }
 
 fn const_value(var: &SSAVar) -> Option<u64> {
@@ -507,13 +544,19 @@ fn const_for_var(var: &SSAVar, consts: &HashMap<VarKey, u64>) -> Option<u64> {
     consts.get(&VarKey::from_var(var)).copied()
 }
 
-fn compute_constants(func: &SSAFunction, max_iters: usize) -> HashMap<VarKey, u64> {
+fn compute_constants_with_control<C: SsaWorkControl + ?Sized>(
+    func: &SSAFunction,
+    max_iters: usize,
+    control: &C,
+) -> Result<HashMap<VarKey, u64>, SsaExecutionStopReason> {
     let mut consts = HashMap::new();
 
     for _ in 0..max_iters {
+        control.poll()?;
         let mut changed = false;
 
         for phi in func.all_phis() {
+            control.poll()?;
             let dst_key = VarKey::from_var(&phi.dst);
             if consts.contains_key(&dst_key) {
                 continue;
@@ -532,6 +575,7 @@ fn compute_constants(func: &SSAFunction, max_iters: usize) -> HashMap<VarKey, u6
         }
 
         for op in func.all_ops() {
+            control.poll()?;
             let Some(dst) = op.dst() else { continue };
             let dst_key = VarKey::from_var(dst);
             if consts.contains_key(&dst_key) {
@@ -548,7 +592,8 @@ fn compute_constants(func: &SSAFunction, max_iters: usize) -> HashMap<VarKey, u6
         }
     }
 
-    consts
+    control.poll()?;
+    Ok(consts)
 }
 
 fn eval_const_op(op: &SSAOp, consts: &HashMap<VarKey, u64>) -> Option<u64> {
@@ -2102,6 +2147,7 @@ where
 #[cfg(test)]
 mod sccp_tests {
     use super::*;
+    use crate::{CanonicalStorageId, CanonicalStorageSpace, InstPayload, SsaGraph};
     use r2il::{R2ILBlock, R2ILOp, SpaceId, Varnode};
 
     fn make_const(val: u64, size: u32) -> Varnode {
@@ -2482,6 +2528,7 @@ mod sccp_tests {
                 (0x1004, SSAVar::new("rax", 1, 8)),
                 (0x1008, SSAVar::new("rax", 2, 8)),
             ],
+            canonical_storage: None,
         }];
 
         let stats = optimize_function(&mut func, &OptimizationConfig::default());
@@ -2503,6 +2550,108 @@ mod sccp_tests {
             stats.dce_removed_phis == 0,
             "DCE must not classify the exit return phi as dead"
         );
+    }
+
+    #[test]
+    fn phi_storage_identity_survives_removing_preceding_phi() {
+        let mut func = raw_func(vec![
+            R2ILBlock {
+                addr: 0x1000,
+                size: 4,
+                ops: vec![R2ILOp::CBranch {
+                    target: make_const(0x1008, 8),
+                    cond: make_reg(32, 1),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1004,
+                size: 4,
+                ops: vec![R2ILOp::Branch {
+                    target: make_const(0x100c, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1008,
+                size: 4,
+                ops: vec![R2ILOp::Branch {
+                    target: make_const(0x100c, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x100c,
+                size: 4,
+                ops: vec![R2ILOp::Return {
+                    target: make_ram(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ]);
+        let removed_storage = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 0,
+            size: 8,
+        };
+        let retained_storage = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 8,
+            size: 8,
+        };
+        let retained_dst = SSAVar::new("reg:8", 3, 8);
+        let merge = func.get_block_mut(0x100c).expect("merge block");
+        merge.phis = vec![
+            PhiNode {
+                dst: SSAVar::new("reg:0", 3, 8),
+                sources: vec![
+                    (0x1004, SSAVar::new("reg:0", 1, 8)),
+                    (0x1008, SSAVar::new("reg:0", 1, 8)),
+                ],
+                canonical_storage: Some(removed_storage),
+            },
+            PhiNode {
+                dst: retained_dst.clone(),
+                sources: vec![
+                    (0x1004, SSAVar::new("reg:8", 1, 8)),
+                    (0x1008, SSAVar::new("reg:8", 2, 8)),
+                ],
+                canonical_storage: Some(retained_storage),
+            },
+        ];
+        merge.ops = vec![SSAOp::Return {
+            target: retained_dst.clone(),
+        }];
+
+        let config = OptimizationConfig {
+            max_iterations: 1,
+            enable_sccp: false,
+            enable_const_prop: false,
+            enable_inst_combine: false,
+            enable_copy_prop: true,
+            enable_cse: false,
+            enable_dce: false,
+            preserve_memory_reads: false,
+        };
+        let stats = optimize_function(&mut func, &config);
+
+        assert_eq!(stats.phis_simplified, 1);
+        let merge = func.get_block(0x100c).expect("merge block");
+        assert_eq!(merge.phis.len(), 1);
+        assert_eq!(merge.phis[0].dst, retained_dst);
+        assert_eq!(merge.phis[0].canonical_storage, Some(retained_storage));
+
+        let graph = SsaGraph::from_function(&func);
+        let graph_phi = graph
+            .insts
+            .iter()
+            .find(|inst| matches!(inst.payload, InstPayload::Phi { .. }))
+            .expect("retained graph phi");
+        assert_eq!(graph_phi.canonical_storage, Some(retained_storage));
     }
 
     #[test]

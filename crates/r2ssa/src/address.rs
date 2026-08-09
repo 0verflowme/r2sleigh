@@ -9,7 +9,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use serde::{Deserialize, Serialize};
 
 use crate::data_ref::parse_const_value;
-use crate::{SSAFunction, SSAOp, SSAVar, SsaGraph, StackAddressRoot, ValueId};
+use crate::{
+    CanonicalStorageId, SSAFunction, SSAOp, SSAVar, SourceMachineContext, SsaGraph,
+    StackAddressRoot, ValueId,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct AffineAddressTerm {
@@ -20,6 +23,9 @@ pub struct AffineAddressTerm {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ParameterAddressExpression {
     pub parameter: usize,
+    /// Canonical full-width register storage that seeded this parameter base.
+    /// Absent only when SSA was prepared without a machine context.
+    pub parameter_storage: Option<CanonicalStorageId>,
     pub terms: Vec<AffineAddressTerm>,
     pub offset: i64,
 }
@@ -91,7 +97,11 @@ struct AddressCollector<'a> {
 }
 
 impl<'a> AddressCollector<'a> {
-    fn new(function: &'a SSAFunction, graph: &'a SsaGraph) -> Self {
+    fn new(
+        function: &'a SSAFunction,
+        graph: &'a SsaGraph,
+        _machine_context: Option<&SourceMachineContext>,
+    ) -> Self {
         let definitions = function
             .blocks()
             .flat_map(|block| block.ops.iter())
@@ -105,6 +115,9 @@ impl<'a> AddressCollector<'a> {
                         value,
                         ParameterAddressExpression {
                             parameter: *parameter,
+                            parameter_storage: graph
+                                .value(value)
+                                .and_then(|value| value.canonical_storage),
                             terms: Vec::new(),
                             offset: 0,
                         },
@@ -447,8 +460,9 @@ fn signed_constant(var: &SSAVar) -> Option<i64> {
 pub(crate) fn collect_address_provenance(
     function: &SSAFunction,
     graph: &SsaGraph,
+    machine_context: Option<&SourceMachineContext>,
 ) -> AddressProvenanceFacts {
-    AddressCollector::new(function, graph).collect()
+    AddressCollector::new(function, graph, machine_context).collect()
 }
 
 #[cfg(test)]

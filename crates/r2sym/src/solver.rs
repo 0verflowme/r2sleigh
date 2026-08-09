@@ -11,6 +11,7 @@ use std::time::Duration;
 use z3::ast::{Ast, BV, Bool, Dynamic};
 use z3::{AstKind, Context, DeclKind, Model, Params, Solver};
 
+use crate::control::{SymExecutionControl, SymExecutionStopReason};
 use crate::state::{ConstraintCursorKey, SymState};
 use crate::value::SymValue;
 
@@ -48,6 +49,8 @@ pub struct SolverStats {
     pub solve_calls: usize,
     /// Number of solve calls that returned early from a cached UNSAT result.
     pub solve_unsat_shortcuts: usize,
+    /// Cooperative stop observed by the solver, separate from solver timeout/unknown.
+    pub execution_stop: Option<SymExecutionStopReason>,
 }
 
 /// A wrapper around Z3's solver with convenience methods.
@@ -74,6 +77,8 @@ pub struct SymSolver<'ctx> {
     selection_session: RefCell<SelectionSolverSession>,
     /// Internal counters used for perf/debug summaries.
     stats: RefCell<SolverStats>,
+    /// Cooperative request control polled around solver worklists and checks.
+    execution: SymExecutionControl,
 }
 
 #[derive(Debug, Clone)]
@@ -308,25 +313,27 @@ impl<'ctx> SymSolver<'ctx> {
 
     /// Create a new solver.
     pub fn new(ctx: &'ctx Context) -> Self {
-        Self {
-            ctx,
-            solver: Self::configured_solver(0),
-            state_solver: Self::configured_solver(0),
-            selection_solver: Self::configured_solver(0),
-            scratch_solver: Self::configured_solver(0),
-            timeout_ms: 0,
-            sat_cache: RefCell::new(HashMap::new()),
-            analysis_cache: RefCell::new(ConstraintAnalysisCache::default()),
-            state_session: RefCell::new(SolverCursorSession::default()),
-            selection_session: RefCell::new(SelectionSolverSession::default()),
-            stats: RefCell::new(SolverStats::default()),
-        }
+        Self::with_timeout_and_execution_control(ctx, None, SymExecutionControl::default())
     }
 
-    /// Create a solver with a timeout.
-    pub fn with_timeout(ctx: &'ctx Context, timeout: Duration) -> Self {
-        let timeout_ms = timeout.as_millis() as u32;
+    /// Create a solver with cooperative cancellation and deadline control.
+    pub fn with_execution_control(ctx: &'ctx Context, execution: SymExecutionControl) -> Self {
+        Self::with_timeout_and_execution_control(ctx, None, execution)
+    }
 
+    fn with_timeout_and_execution_control(
+        ctx: &'ctx Context,
+        timeout: Option<Duration>,
+        execution: SymExecutionControl,
+    ) -> Self {
+        let configured_timeout_ms = timeout
+            .map(|timeout| timeout.as_millis().min(u32::MAX as u128) as u32)
+            .unwrap_or(0);
+        let timeout_ms = match (configured_timeout_ms, execution.remaining_timeout_ms()) {
+            (0, Some(deadline_ms)) => deadline_ms,
+            (configured, Some(deadline_ms)) => configured.min(deadline_ms),
+            (configured, None) => configured,
+        };
         Self {
             ctx,
             solver: Self::configured_solver(timeout_ms),
@@ -339,7 +346,22 @@ impl<'ctx> SymSolver<'ctx> {
             state_session: RefCell::new(SolverCursorSession::default()),
             selection_session: RefCell::new(SelectionSolverSession::default()),
             stats: RefCell::new(SolverStats::default()),
+            execution,
         }
+    }
+
+    /// Create a solver with a timeout.
+    pub fn with_timeout(ctx: &'ctx Context, timeout: Duration) -> Self {
+        Self::with_timeout_and_execution_control(ctx, Some(timeout), SymExecutionControl::default())
+    }
+
+    /// Create a timed solver with additional cooperative request control.
+    pub fn with_timeout_and_control(
+        ctx: &'ctx Context,
+        timeout: Duration,
+        execution: SymExecutionControl,
+    ) -> Self {
+        Self::with_timeout_and_execution_control(ctx, Some(timeout), execution)
     }
 
     /// Get the Z3 context.
@@ -369,6 +391,42 @@ impl<'ctx> SymSolver<'ctx> {
     /// Reset solver/cache counters without touching constraints.
     pub fn clear_stats(&self) {
         *self.stats.borrow_mut() = SolverStats::default();
+    }
+
+    /// Cooperative stop observed by the most recent solver work.
+    pub fn execution_stop_reason(&self) -> Option<SymExecutionStopReason> {
+        self.stats.borrow().execution_stop
+    }
+
+    fn poll_execution(&self) -> Result<(), SymExecutionStopReason> {
+        match self.execution.poll() {
+            Ok(()) => Ok(()),
+            Err(reason) => {
+                self.stats.borrow_mut().execution_stop = Some(reason);
+                Err(reason)
+            }
+        }
+    }
+
+    fn refresh_solver_timeout(&self, solver: &Solver) {
+        // Recompute this at every check: a construction-time minimum would let
+        // later checks run past the absolute request deadline.
+        let timeout_ms = self
+            .execution
+            .remaining_timeout_ms()
+            .map(|deadline_ms| {
+                if self.timeout_ms == 0 {
+                    deadline_ms
+                } else {
+                    self.timeout_ms.min(deadline_ms)
+                }
+            })
+            .unwrap_or(self.timeout_ms);
+        if timeout_ms != 0 {
+            let mut params = Params::new();
+            params.set_u32("timeout", timeout_ms);
+            solver.set_params(&params);
+        }
     }
 
     /// Drop memoized satisfiability results.
@@ -417,16 +475,35 @@ impl<'ctx> SymSolver<'ctx> {
 
     /// Check if the current constraints are satisfiable.
     pub fn check(&self) -> SatResult {
-        self.solver.check().into()
+        if self.poll_execution().is_err() {
+            return SatResult::Unknown;
+        }
+        self.refresh_solver_timeout(&self.solver);
+        let result = self.solver.check().into();
+        if self.poll_execution().is_err() {
+            SatResult::Unknown
+        } else {
+            result
+        }
     }
 
     /// Check with additional assumptions (without modifying the solver state).
     pub fn check_assumptions(&self, assumptions: &[Bool]) -> SatResult {
-        self.solver.check_assumptions(assumptions).into()
+        if self.poll_execution().is_err() {
+            return SatResult::Unknown;
+        }
+        self.refresh_solver_timeout(&self.solver);
+        let result = self.solver.check_assumptions(assumptions).into();
+        if self.poll_execution().is_err() {
+            SatResult::Unknown
+        } else {
+            result
+        }
     }
 
     /// Get the model if the constraints are satisfiable.
     pub fn get_model(&self) -> Option<Model> {
+        self.poll_execution().ok()?;
         self.solver.get_model()
     }
 
@@ -453,6 +530,9 @@ impl<'ctx> SymSolver<'ctx> {
     }
 
     fn ensure_state_solver_cursor(&self, state: &SymState<'ctx>) {
+        if self.poll_execution().is_err() {
+            return;
+        }
         let target_suffix = match state.constraint_suffix_from_cursor(ConstraintCursorKey::ROOT) {
             Some(suffix) => suffix,
             None => {
@@ -489,6 +569,9 @@ impl<'ctx> SymSolver<'ctx> {
             .iter()
             .skip(session.asserted_stack.len().saturating_sub(1))
         {
+            if self.poll_execution().is_err() {
+                return;
+            }
             self.state_solver.push();
             self.state_solver.assert(constraint);
             session.asserted_stack.push(*key);
@@ -762,6 +845,9 @@ impl<'ctx> SymSolver<'ctx> {
         let mut out = Vec::with_capacity(pairs.len());
         let mut parent = ConstraintCursorKey::ROOT;
         for (key, constraint) in pairs {
+            if self.poll_execution().is_err() {
+                break;
+            }
             let facts = self.constraint_facts_for_key(key, parent, &constraint);
             parent = key;
             out.push((key, facts.parent, facts));
@@ -791,6 +877,9 @@ impl<'ctx> SymSolver<'ctx> {
         let mut first_match = None;
         let mut rebuilt = Vec::with_capacity(next.partitions.len() + 1);
         for partition in next.partitions {
+            if self.poll_execution().is_err() {
+                break;
+            }
             if partition.atoms.is_disjoint(&facts.deps) {
                 rebuilt.push(partition);
                 continue;
@@ -836,6 +925,9 @@ impl<'ctx> SymSolver<'ctx> {
     fn distinct_dependency_atom_count(&self, state: &SymState<'ctx>) -> usize {
         let mut atoms = HashSet::new();
         for (_, _, facts) in self.ensure_cursor_facts(state) {
+            if self.poll_execution().is_err() {
+                break;
+            }
             atoms.extend(facts.deps);
         }
         atoms.len()
@@ -869,6 +961,9 @@ impl<'ctx> SymSolver<'ctx> {
 
         let mut current = cached_prefix;
         for (key, _, constraint, facts) in pairs.iter().skip(start_index) {
+            if self.poll_execution().is_err() {
+                break;
+            }
             current = self.extend_state_constraint_analysis(&current, constraint, facts);
             let cached = Rc::new(current.clone());
             self.analysis_cache
@@ -951,6 +1046,9 @@ impl<'ctx> SymSolver<'ctx> {
         }
 
         for partition in &analysis.partitions {
+            if self.poll_execution().is_err() {
+                break;
+            }
             if !partition.atoms.is_disjoint(seed_deps) {
                 selected.extend(partition.constraints.iter().cloned());
                 abstract_facts.merge(&partition.abstract_facts);
@@ -977,6 +1075,9 @@ impl<'ctx> SymSolver<'ctx> {
     ) -> ConstraintSelection {
         let mut abstract_facts = analysis.ground_abstract_facts.clone();
         for partition in &analysis.partitions {
+            if self.poll_execution().is_err() {
+                break;
+            }
             abstract_facts.merge(&partition.abstract_facts);
         }
         ConstraintSelection {
@@ -1047,11 +1148,17 @@ impl<'ctx> SymSolver<'ctx> {
     }
 
     fn ensure_selection_solver(&self, selection: &ConstraintSelection) {
+        if self.poll_execution().is_err() {
+            return;
+        }
         if self.selection_session.borrow().asserted_key.as_ref() == Some(&selection.key) {
             return;
         }
         self.reset_selection_solver();
         for constraint in &selection.constraints {
+            if self.poll_execution().is_err() {
+                return;
+            }
             self.selection_solver.assert(constraint);
         }
         self.selection_session.borrow_mut().asserted_key = Some(selection.key.clone());
@@ -1062,12 +1169,23 @@ impl<'ctx> SymSolver<'ctx> {
         selection: &ConstraintSelection,
         constraint: &Bool,
     ) -> SatResult {
+        if self.poll_execution().is_err() {
+            return SatResult::Unknown;
+        }
         self.ensure_selection_solver(selection);
+        if self.poll_execution().is_err() {
+            return SatResult::Unknown;
+        }
         self.selection_solver.push();
         self.selection_solver.assert(constraint);
+        self.refresh_solver_timeout(&self.selection_solver);
         let result = self.selection_solver.check().into();
         self.selection_solver.pop(1);
-        result
+        if self.poll_execution().is_err() {
+            SatResult::Unknown
+        } else {
+            result
+        }
     }
 
     fn selection_find_value(
@@ -1076,9 +1194,12 @@ impl<'ctx> SymSolver<'ctx> {
         target: &SymValue<'ctx>,
         constraint: &Bool,
     ) -> Option<u64> {
+        self.poll_execution().ok()?;
         self.ensure_selection_solver(selection);
+        self.poll_execution().ok()?;
         self.selection_solver.push();
         self.selection_solver.assert(constraint);
+        self.refresh_solver_timeout(&self.selection_solver);
         let sat = self.selection_solver.check();
         let out = if sat == z3::SatResult::Sat {
             let model = self.selection_solver.get_model()?;
@@ -1087,6 +1208,7 @@ impl<'ctx> SymSolver<'ctx> {
             None
         };
         self.selection_solver.pop(1);
+        self.poll_execution().ok()?;
         out
     }
 
@@ -1133,7 +1255,11 @@ impl<'ctx> SymSolver<'ctx> {
                 }
             } else {
                 self.scratch_assert_constraints(&analysis.ground_constraints);
+                self.refresh_solver_timeout(&self.scratch_solver);
                 let result: SatResult = self.scratch_solver.check().into();
+                if self.poll_execution().is_err() {
+                    return Some(SatResult::Unknown);
+                }
                 if matches!(result, SatResult::Sat | SatResult::Unsat) {
                     self.analysis_cache
                         .borrow_mut()
@@ -1149,6 +1275,9 @@ impl<'ctx> SymSolver<'ctx> {
 
         self.scratch_assert_constraints(&analysis.ground_constraints);
         for partition in &analysis.partitions {
+            if self.poll_execution().is_err() {
+                return Some(SatResult::Unknown);
+            }
             if partition.abstract_facts.unsat {
                 return Some(SatResult::Unsat);
             }
@@ -1171,10 +1300,18 @@ impl<'ctx> SymSolver<'ctx> {
 
             self.scratch_solver.push();
             for constraint in &partition.constraints {
+                if self.poll_execution().is_err() {
+                    self.scratch_solver.pop(1);
+                    return Some(SatResult::Unknown);
+                }
                 self.scratch_solver.assert(constraint);
             }
+            self.refresh_solver_timeout(&self.scratch_solver);
             let result: SatResult = self.scratch_solver.check().into();
             self.scratch_solver.pop(1);
+            if self.poll_execution().is_err() {
+                return Some(SatResult::Unknown);
+            }
             if matches!(result, SatResult::Sat | SatResult::Unsat) {
                 self.analysis_cache
                     .borrow_mut()
@@ -1192,6 +1329,9 @@ impl<'ctx> SymSolver<'ctx> {
     fn scratch_assert_constraints(&self, constraints: &[Bool]) {
         self.reset_scratch_solver();
         for constraint in constraints {
+            if self.poll_execution().is_err() {
+                return;
+            }
             self.scratch_solver.assert(constraint);
         }
     }
@@ -1219,6 +1359,9 @@ impl<'ctx> SymSolver<'ctx> {
         mode: SolverMode,
         kind: DeepQueryKind,
     ) -> SatResult {
+        if self.poll_execution().is_err() {
+            return SatResult::Unknown;
+        }
         let partitioned = match mode {
             SolverMode::ExploreFast => {
                 self.partitioned_state_result(state, mode, DeepQueryKind::Predicate)
@@ -1231,12 +1374,30 @@ impl<'ctx> SymSolver<'ctx> {
         match partitioned {
             Some(SatResult::Unknown) => {
                 self.ensure_state_solver_cursor(state);
-                self.state_solver.check().into()
+                if self.poll_execution().is_err() {
+                    return SatResult::Unknown;
+                }
+                self.refresh_solver_timeout(&self.state_solver);
+                let result = self.state_solver.check().into();
+                if self.poll_execution().is_err() {
+                    SatResult::Unknown
+                } else {
+                    result
+                }
             }
             Some(other) => other,
             None => {
                 self.ensure_state_solver_cursor(state);
-                self.state_solver.check().into()
+                if self.poll_execution().is_err() {
+                    return SatResult::Unknown;
+                }
+                self.refresh_solver_timeout(&self.state_solver);
+                let result = self.state_solver.check().into();
+                if self.poll_execution().is_err() {
+                    SatResult::Unknown
+                } else {
+                    result
+                }
             }
         }
     }
@@ -1247,6 +1408,9 @@ impl<'ctx> SymSolver<'ctx> {
         mode: SolverMode,
         kind: DeepQueryKind,
     ) -> SatResult {
+        if self.poll_execution().is_err() {
+            return SatResult::Unknown;
+        }
         let cache_key = self.state_sat_cache_key(state);
         if let Some(result) = self.cached_state_sat_result(cache_key, mode) {
             return result;
@@ -1260,6 +1424,9 @@ impl<'ctx> SymSolver<'ctx> {
     /// Check if a state's path constraints are satisfiable.
     pub fn is_sat(&self, state: &SymState<'ctx>) -> bool {
         self.stats.borrow_mut().sat_queries += 1;
+        if self.poll_execution().is_err() {
+            return true;
+        }
 
         let cache_key = self.state_sat_cache_key(state);
         if let Some(result) = self.cached_state_sat_result(cache_key, SolverMode::ExploreFast) {
@@ -1280,6 +1447,9 @@ impl<'ctx> SymSolver<'ctx> {
 
     /// Check whether a state's constraints remain satisfiable with one extra constraint.
     pub fn sat_with_constraint(&self, state: &SymState<'ctx>, constraint: &Bool) -> SatResult {
+        if self.poll_execution().is_err() {
+            return SatResult::Unknown;
+        }
         if self.state_sat_result(state, SolverMode::QueryDeep, DeepQueryKind::Predicate)
             != SatResult::Sat
         {
@@ -1307,6 +1477,7 @@ impl<'ctx> SymSolver<'ctx> {
     /// Get a concrete model for a state's constraints.
     pub fn solve(&self, state: &SymState<'ctx>) -> Option<SymModel<'_>> {
         self.stats.borrow_mut().solve_calls += 1;
+        self.poll_execution().ok()?;
 
         let cache_key = self.state_sat_cache_key(state);
         if matches!(
@@ -1327,7 +1498,10 @@ impl<'ctx> SymSolver<'ctx> {
         }
 
         self.ensure_state_solver_cursor(state);
+        self.poll_execution().ok()?;
+        self.refresh_solver_timeout(&self.state_solver);
         let sat_result: SatResult = self.state_solver.check().into();
+        self.poll_execution().ok()?;
         let result = if sat_result == SatResult::Sat {
             self.state_solver
                 .get_model()
@@ -1346,6 +1520,7 @@ impl<'ctx> SymSolver<'ctx> {
         antecedent: &SymState<'ctx>,
         consequent: &SymState<'ctx>,
     ) -> Option<bool> {
+        self.poll_execution().ok()?;
         if antecedent.constraints_imply_by_prefix(consequent) {
             return Some(true);
         }
@@ -1393,6 +1568,7 @@ impl<'ctx> SymSolver<'ctx> {
         target: &SymValue<'ctx>,
         constraint: &Bool,
     ) -> Option<u64> {
+        self.poll_execution().ok()?;
         if self.state_sat_result(state, SolverMode::QueryDeep, DeepQueryKind::Model)
             != SatResult::Sat
         {
@@ -1422,6 +1598,9 @@ impl<'ctx> SymSolver<'ctx> {
         a: &SymValue<'ctx>,
         b: &SymValue<'ctx>,
     ) -> bool {
+        if self.poll_execution().is_err() {
+            return false;
+        }
         // Normalize bit widths before comparison
         let (a_bv, b_bv) = if a.bits() == b.bits() {
             (a.to_bv(self.ctx), b.to_bv(self.ctx))
@@ -1459,6 +1638,9 @@ impl<'ctx> SymSolver<'ctx> {
 
     /// Check if a value can be zero.
     pub fn can_be_zero(&self, state: &SymState<'ctx>, value: &SymValue<'ctx>) -> bool {
+        if self.poll_execution().is_err() {
+            return false;
+        }
         let seed_deps = self.expr_dependencies_bv(&value.to_bv(self.ctx));
         let selection =
             self.preferred_selection_for_query(state, &seed_deps, DeepQueryKind::Predicate);
@@ -1483,6 +1665,9 @@ impl<'ctx> SymSolver<'ctx> {
 
     /// Check if a value must be zero (cannot be non-zero).
     pub fn must_be_zero(&self, state: &SymState<'ctx>, value: &SymValue<'ctx>) -> bool {
+        if self.poll_execution().is_err() {
+            return false;
+        }
         let seed_deps = self.expr_dependencies_bv(&value.to_bv(self.ctx));
         let selection =
             self.preferred_selection_for_query(state, &seed_deps, DeepQueryKind::Predicate);
@@ -1507,6 +1692,7 @@ impl<'ctx> SymSolver<'ctx> {
 
     /// Get the minimum value for a symbolic expression.
     pub fn minimize(&self, state: &SymState<'ctx>, value: &SymValue<'ctx>) -> Option<u64> {
+        self.poll_execution().ok()?;
         if self.state_sat_result(state, SolverMode::QueryDeep, DeepQueryKind::Model)
             != SatResult::Sat
         {
@@ -1543,6 +1729,7 @@ impl<'ctx> SymSolver<'ctx> {
         let mut result = None;
 
         while lo <= hi {
+            self.poll_execution().ok()?;
             let mid = lo + (hi - lo) / 2;
             let mid_bv = BV::from_u64(mid, bits);
             let constraint = bv.bvule(&mid_bv);
@@ -1570,6 +1757,7 @@ impl<'ctx> SymSolver<'ctx> {
 
     /// Get the maximum value for a symbolic expression.
     pub fn maximize(&self, state: &SymState<'ctx>, value: &SymValue<'ctx>) -> Option<u64> {
+        self.poll_execution().ok()?;
         if self.state_sat_result(state, SolverMode::QueryDeep, DeepQueryKind::Model)
             != SatResult::Sat
         {
@@ -1606,6 +1794,7 @@ impl<'ctx> SymSolver<'ctx> {
         let mut result = None;
 
         while lo <= hi {
+            self.poll_execution().ok()?;
             let mid = lo + (hi - lo) / 2;
             let mid_bv = BV::from_u64(mid, bits);
             let constraint = bv.bvuge(&mid_bv);
@@ -2225,5 +2414,26 @@ mod tests {
         assert!(!solver.must_be_zero(&state, &x));
         assert_eq!(solver.minimize(&state, &x), Some(3));
         assert_eq!(solver.maximize(&state, &x), Some(9));
+    }
+
+    #[test]
+    fn solver_reports_pre_cancelled_queries_separately_from_unknown() {
+        let ctx = Context::thread_local();
+        let cancellation = crate::SymCancellationToken::default();
+        cancellation.cancel();
+        let solver = SymSolver::with_execution_control(
+            &ctx,
+            crate::SymExecutionControl::with_cancellation(cancellation),
+        );
+
+        assert_eq!(solver.check(), SatResult::Unknown);
+        assert_eq!(
+            solver.execution_stop_reason(),
+            Some(crate::SymExecutionStopReason::Cancelled)
+        );
+        assert_eq!(
+            solver.stats().execution_stop,
+            Some(crate::SymExecutionStopReason::Cancelled)
+        );
     }
 }

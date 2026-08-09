@@ -9,3 +9,6 @@ description = "Sleigh to r2il translator"
 r2il = { path = "../r2il" }
 libsla.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+sleigh-config = { workspace = true, features = ["AARCH64"] }

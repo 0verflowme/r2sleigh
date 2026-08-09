@@ -8,6 +8,7 @@ members = [
     "crates/r2ssa",
     "crates/r2sym",
     "crates/r2types",
+    "crates/r2cert",
     "crates/r2engine",
     "crates/r2dec",
     "r2plugin",
@@ -36,7 +37,7 @@ z3 = "0.20.0"
 # Use `--profile dist` when a maximum-optimized distributable artifact is needed.
 lto = false
 codegen-units = 16
-panic = "abort"
+panic = "unwind"
 strip = true
 
 [profile.dist]

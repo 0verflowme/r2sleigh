@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::{CanonicalStorageId, CanonicalStorageSpace};
 use crate::function::SSAFunction;
 use crate::op::SSAOp;
 use crate::var::SSAVar;
@@ -25,6 +26,9 @@ pub struct UseSite {
 pub struct GraphValue {
     pub id: ValueId,
     pub var: SSAVar,
+    /// Name-independent storage retained from the lifted varnode.
+    #[serde(default)]
+    pub canonical_storage: Option<CanonicalStorageId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -40,6 +44,9 @@ pub struct GraphInst {
     pub ordinal: usize,
     pub inputs: Vec<ValueId>,
     pub output: Option<ValueId>,
+    /// Name-independent lifted storage identity for phi nodes and for ordinary
+    /// definitions when the graph is built with a source machine context.
+    pub canonical_storage: Option<CanonicalStorageId>,
     pub payload: InstPayload,
 }
 
@@ -70,6 +77,10 @@ pub struct SsaGraph {
 
 impl SsaGraph {
     pub fn from_function(function: &SSAFunction) -> Self {
+        Self::from_function_with_storage(function)
+    }
+
+    pub(crate) fn from_function_with_storage(function: &SSAFunction) -> Self {
         let mut block_by_addr = BTreeMap::new();
         let mut block_order = Vec::new();
         let mut blocks = Vec::new();
@@ -122,9 +133,17 @@ impl SsaGraph {
                 return id;
             }
             let id = ValueId(values.len() as u32);
+            let canonical_storage = function.canonical_storage_for_var(var).or_else(|| {
+                var.constant_bits().map(|bits| CanonicalStorageId {
+                    space: CanonicalStorageSpace::Constant,
+                    offset: bits,
+                    size: var.size,
+                })
+            });
             values.push(GraphValue {
                 id,
                 var: var.clone(),
+                canonical_storage,
             });
             value_by_var.insert(var.clone(), id);
             def_of.push(None);
@@ -175,6 +194,7 @@ impl SsaGraph {
                     ordinal: phi_idx,
                     inputs,
                     output: Some(output),
+                    canonical_storage: phi.canonical_storage,
                     payload: InstPayload::Phi { predecessors },
                 });
                 blocks[block_id.0 as usize].insts.push(inst_id);
@@ -219,6 +239,9 @@ impl SsaGraph {
                     ordinal: block.phis.len() + op_idx,
                     inputs,
                     output,
+                    canonical_storage: output
+                        .and_then(|value| values.get(value.0 as usize))
+                        .and_then(|value| value.canonical_storage),
                     payload: InstPayload::Op(op.clone()),
                 });
                 blocks[block_id.0 as usize].insts.push(inst_id);
@@ -249,6 +272,14 @@ impl SsaGraph {
 
     pub fn block_id_for_addr(&self, addr: u64) -> Option<BlockId> {
         self.block_by_addr.get(&addr).copied()
+    }
+
+    /// Return storage provenance already retained at the lift/SSA boundary.
+    /// This lookup never parses or resolves the variable's display name.
+    pub fn canonical_storage_for_var(&self, var: &SSAVar) -> Option<CanonicalStorageId> {
+        self.value_id_for_var(var)
+            .and_then(|value| self.value(value))
+            .and_then(|value| value.canonical_storage)
     }
 
     pub fn value_id_for_var(&self, var: &SSAVar) -> Option<ValueId> {

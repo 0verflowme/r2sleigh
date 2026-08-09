@@ -84,7 +84,7 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 a:sla >/dev/null
 aaaa
-a:sla.debug.profilej | jq -c '.enabled==true and .max==20 and .count>0 and (.engine_cache.analysis|has("hits") and has("misses")) and (.engine_cache.artifacts|has("hits") and has("misses")) and (.functions|type=="array") and (.functions|length>0) and (.functions[0]|has("addr") and has("total_us") and has("lift_us") and has("typed_context_us") and has("session_us") and has("mutation_us") and has("xref_us") and has("taint_us") and has("decompile_us"))'
+a:sla.debug.profilej | jq -c '.enabled==true and .max==20 and .count>0 and (.engine_cache.analysis|has("hits") and has("misses")) and (.engine_cache|has("artifacts")|not) and (.functions|type=="array") and (.functions|length>0) and (.functions[0]|has("addr") and has("total_us") and has("lift_us") and has("typed_context_us") and has("session_us") and has("mutation_us") and has("xref_us") and has("taint_us") and has("decompile_us"))'
 EOF_CMDS
 RUN
 

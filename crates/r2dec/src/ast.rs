@@ -185,7 +185,7 @@ pub enum CExpr {
     Cast { ty: CType, expr: Box<CExpr> },
     /// Function call.
     Call { func: Box<CExpr>, args: Vec<CExpr> },
-    /// Array/pointer subscript: arr[index].
+    /// Array/pointer subscript: `arr[index]`.
     Subscript { base: Box<CExpr>, index: Box<CExpr> },
     /// Member access: obj.member.
     Member { base: Box<CExpr>, member: String },

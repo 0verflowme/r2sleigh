@@ -1,18 +1,17 @@
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use r2il::{ArchSpec, SpaceId, Varnode, select_register_name};
 
 pub type RegisterNameMap = HashMap<(u64, u32), String>;
+pub(crate) const ARCH_DERIVED_CACHE_MAX_ENTRIES: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ArchLayoutHashKey {
-    ptr_id: usize,
+struct RegisterLayoutCacheKey {
     name: String,
-    variant: String,
-    addr_size: u32,
-    register_count: usize,
+    offset: u64,
+    size: u32,
+    parent: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -20,55 +19,27 @@ pub(crate) struct ArchCacheTag {
     name: String,
     variant: String,
     addr_size: u32,
-    register_layout_hash: u64,
+    registers: Box<[RegisterLayoutCacheKey]>,
 }
 
 impl ArchCacheTag {
     pub(crate) fn from_arch(arch: &ArchSpec) -> Self {
-        let cache_key = ArchLayoutHashKey {
-            ptr_id: arch as *const ArchSpec as usize,
+        Self {
             name: arch.name.clone(),
             variant: arch.variant.clone(),
             addr_size: arch.addr_size,
-            register_count: arch.registers.len(),
-        };
-        if let Some(register_layout_hash) = arch_layout_hash_cache()
-            .read()
-            .expect("arch layout hash cache read lock poisoned")
-            .get(&cache_key)
-            .copied()
-        {
-            return Self {
-                name: cache_key.name,
-                variant: cache_key.variant,
-                addr_size: cache_key.addr_size,
-                register_layout_hash,
-            };
-        }
-
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        for reg in &arch.registers {
-            reg.name.hash(&mut hasher);
-            reg.offset.hash(&mut hasher);
-            reg.size.hash(&mut hasher);
-        }
-        let register_layout_hash = hasher.finish();
-        arch_layout_hash_cache()
-            .write()
-            .expect("arch layout hash cache write lock poisoned")
-            .insert(cache_key.clone(), register_layout_hash);
-        Self {
-            name: cache_key.name,
-            variant: cache_key.variant,
-            addr_size: cache_key.addr_size,
-            register_layout_hash,
+            registers: arch
+                .registers
+                .iter()
+                .map(|register| RegisterLayoutCacheKey {
+                    name: register.name.clone(),
+                    offset: register.offset,
+                    size: register.size,
+                    parent: register.parent.clone(),
+                })
+                .collect(),
         }
     }
-}
-
-fn arch_layout_hash_cache() -> &'static RwLock<HashMap<ArchLayoutHashKey, u64>> {
-    static CACHE: OnceLock<RwLock<HashMap<ArchLayoutHashKey, u64>>> = OnceLock::new();
-    CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 fn register_name_map_cache() -> &'static RwLock<HashMap<ArchCacheTag, Arc<RegisterNameMap>>> {
@@ -105,10 +76,16 @@ pub(crate) fn cached_register_name_map(arch: &ArchSpec) -> Arc<RegisterNameMap> 
     }
 
     let map = Arc::new(build_register_name_map_uncached(arch));
-    register_name_map_cache()
+    let mut cache = register_name_map_cache()
         .write()
-        .expect("register name cache write lock poisoned")
-        .insert(cache_tag, map.clone());
+        .expect("register name cache write lock poisoned");
+    if let Some(cached) = cache.get(&cache_tag) {
+        return Arc::clone(cached);
+    }
+    if cache.len() >= ARCH_DERIVED_CACHE_MAX_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(cache_tag, map.clone());
     map
 }
 
@@ -178,6 +155,42 @@ mod tests {
             meta: None,
         };
         assert_eq!(varnode_to_name(&vn, Some(&map)), "reg:10");
+    }
+
+    #[test]
+    fn architecture_cache_identity_tracks_exact_register_layout() {
+        let mut arch = ArchSpec::new("cache-identity-test");
+        arch.add_register(r2il::RegisterDef::new("ret", 0, 1));
+        let first_tag = ArchCacheTag::from_arch(&arch);
+        let first_names = cached_register_name_map(&arch);
+        assert_eq!(first_names.get(&(0, 1)).map(String::as_str), Some("ret"));
+
+        arch.registers[0].size = 2;
+        let second_tag = ArchCacheTag::from_arch(&arch);
+        let second_names = cached_register_name_map(&arch);
+        assert_ne!(first_tag, second_tag);
+        assert!(!second_names.contains_key(&(0, 1)));
+        assert_eq!(second_names.get(&(0, 2)).map(String::as_str), Some("ret"));
+
+        arch.registers[0].parent = Some("wide".to_string());
+        assert_ne!(second_tag, ArchCacheTag::from_arch(&arch));
+    }
+
+    #[test]
+    fn register_name_cache_has_a_fixed_resident_bound() {
+        for index in 0..=ARCH_DERIVED_CACHE_MAX_ENTRIES {
+            let mut arch = ArchSpec::new(format!("bounded-cache-{index}"));
+            let offset = u64::try_from(index).expect("small cache index");
+            arch.add_register(r2il::RegisterDef::new("ret", offset, 8));
+            let _ = cached_register_name_map(&arch);
+        }
+        assert!(
+            register_name_map_cache()
+                .read()
+                .expect("register name cache read lock poisoned")
+                .len()
+                <= ARCH_DERIVED_CACHE_MAX_ENTRIES
+        );
     }
 
     #[test]

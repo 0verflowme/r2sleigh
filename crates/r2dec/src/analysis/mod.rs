@@ -27,7 +27,7 @@ pub(crate) use ownership::{
 pub(crate) use predicate::{PredicateAnalysisView, PredicateSimplifier};
 pub(crate) use prepared_semantic::{
     PreparedCallView, PreparedSemanticView, PreparedSemanticViewInputs,
-    build_prepared_runtime_facts,
+    build_prepared_runtime_facts_with_control,
 };
 
 static EMPTY_CALLEE_FACTS: OnceLock<BTreeMap<u64, CalleeFact>> = OnceLock::new();
@@ -468,8 +468,17 @@ fn lookup_name_key<'a, T>(map: &'a HashMap<String, T>, name: &str) -> Option<&'a
 }
 
 impl UseInfo {
+    #[allow(dead_code)]
     pub(crate) fn analyze(blocks: &[SSABlock], env: &PassEnv<'_>) -> Self {
         use_info::analyze(blocks, env)
+    }
+
+    pub(crate) fn analyze_with_control(
+        blocks: &[SSABlock],
+        env: &PassEnv<'_>,
+        control: crate::DecompileWorkControl<'_>,
+    ) -> Result<Self, crate::DecompileExecutionStop> {
+        use_info::analyze_with_control(blocks, env, control)
     }
 
     pub(crate) fn analyze_for_local_struct_accesses(
@@ -479,12 +488,35 @@ impl UseInfo {
         use_info::analyze_for_local_struct_accesses(blocks, env)
     }
 
+    pub(crate) fn analyze_for_local_struct_accesses_with_control(
+        blocks: &[SSABlock],
+        env: &PassEnv<'_>,
+        control: crate::DecompileWorkControl<'_>,
+    ) -> Result<Self, crate::DecompileExecutionStop> {
+        use_info::analyze_for_local_struct_accesses_with_control(blocks, env, control)
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn analyze_with_definition_overrides(
         blocks: &[SSABlock],
         env: &PassEnv<'_>,
         definition_overrides: &HashMap<String, CExpr>,
     ) -> Self {
         use_info::analyze_with_definition_overrides(blocks, env, definition_overrides)
+    }
+
+    pub(crate) fn analyze_with_definition_overrides_with_control(
+        blocks: &[SSABlock],
+        env: &PassEnv<'_>,
+        definition_overrides: &HashMap<String, CExpr>,
+        control: crate::DecompileWorkControl<'_>,
+    ) -> Result<Self, crate::DecompileExecutionStop> {
+        use_info::analyze_with_definition_overrides_with_control(
+            blocks,
+            env,
+            definition_overrides,
+            control,
+        )
     }
 
     pub(crate) fn preserve_authoritative_facts_from(&mut self, baseline: &UseInfo) {

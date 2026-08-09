@@ -1,0 +1,508 @@
+{
+  "schema": 1,
+  "title": "Semantic Preservation Kernel Phase-0 Baseline",
+  "purpose": "Pin the recoverable commit pair and specify fixture, expectation, measurement, and command coverage while distinguishing verified evidence from known capture gaps.",
+  "measurement_status": "pass",
+  "results": "doc/phase0-baseline-results.json",
+  "baseline": {
+    "r2sleigh": {
+      "repository": ".",
+      "commit": "0cbe057efb8427b021e1c8cde4d721573fdb9fdd",
+      "baseline_branch": "codex/gold-standard-r2sleigh"
+    },
+    "radare2": {
+      "repository": "../radare2",
+      "commit": "62791dc54f6af6e95d9a61c997e5c1eda098775d",
+      "baseline_branch": "codex/r2sleigh-clean-pr"
+    },
+    "rewrite_branch": "codex/semantic-preservation-kernel",
+    "rewrite_derives_from_r2sleigh_commit": "0cbe057efb8427b021e1c8cde4d721573fdb9fdd",
+    "working_tree_rule": "Run a baseline only at the pinned commits. If either tree is dirty, archive both diffs with the result and do not call it the pinned baseline."
+  },
+  "expectation_policy": {
+    "semantic": {
+      "gate": "hard",
+      "definition": "Machine effects, control decisions, calls and arguments/results, returns, memory behavior, widths, signedness, wrapping, shifts, casts, layouts, and unsupported-semantics refusal.",
+      "regression_failure_use": true,
+      "positive_proof_use": false
+    },
+    "cosmetic": {
+      "gate": "soft",
+      "definition": "Exact recovered names, whitespace, literal spelling, for-versus-while source likeness, declaration placement, and other readability-only presentation.",
+      "regression_failure_use": false,
+      "positive_proof_use": false
+    },
+    "rule": "A cosmetic mismatch cannot fail semantic equivalence or prevent certification. Source-gold substring and regex checks are regression alarms: a hard mismatch may fail the Phase-0 quality baseline, but a textual match never proves semantic equivalence or certification. A semantic obligation cannot be satisfied by text, a variable name, or an AST position."
+  },
+  "failure_taxonomy": [
+    {
+      "id": "semantic",
+      "definition": "An observable effect, value, call, return, predicate, transition, or machine-arithmetic rule is missing, duplicated, reordered unsafely, or changed."
+    },
+    {
+      "id": "structural",
+      "definition": "Control is unstructured, incorrectly structured, or remains residual because the required structuring evidence or implementation coverage is unavailable. A safe residual is a structural-coverage gap, not an assertion that executable semantics changed."
+    },
+    {
+      "id": "type",
+      "definition": "A width, signedness, pointer, array, field layout, calling convention, cast, or address-space fact is wrong or unjustifiably generic."
+    },
+    {
+      "id": "readability",
+      "definition": "Semantics are preserved but names, formatting, source likeness, or presentation are poor."
+    },
+    {
+      "id": "performance",
+      "definition": "Latency, RSS, setup cost, nondeterminism, timeout, or cache behavior violates the recorded budget without changing the semantic result."
+    }
+  ],
+  "result_schema": {
+    "required_identity": [
+      "r2sleigh_commit",
+      "radare2_commit",
+      "both_worktree_diffs_or_clean",
+      "host_os_and_arch",
+      "compiler_identity",
+      "radare2_binary_hash",
+      "plugin_binary_hash",
+      "fixture_binary_hash",
+      "exact_command",
+      "timestamp_utc"
+    ],
+    "required_status": [
+      "pass",
+      "fail",
+      "not_run"
+    ],
+    "failure_rule": "Every emitted case, nested-oracle, and manual-review failure record has one primary failure_taxonomy value and may have additional secondary values. Aggregate threshold breaches and run status fields are conclusions, not additional failure records or dispositions.",
+    "not_run_rule": "A required field that the current harness cannot collect is recorded as not_run or unavailable, never inferred from a proxy."
+  },
+  "required_metrics": [
+    {
+      "id": "complete_output",
+      "unit": "raw_bytes",
+      "scope": "lossless stdout and stderr bytes for every target/command/repeat, plus exit status and timeout",
+      "collector": "reversing_benchmark.py --raw-output-dir; report raw_output_archive records and per-record metadata.json",
+      "current_support": "available",
+      "note": "Raw capture is explicitly opt-in because output may be sensitive. The eight cold/warm benchmark reports and source-gold report contain lossless stdout/stderr records. R2r output is retained as complete command logs."
+    },
+    {
+      "id": "cold_command_latency",
+      "unit": "milliseconds",
+      "scope": "first target command in a fresh radare2 process and fresh benchmark temporary home",
+      "collector": "reversing_benchmark.py with --isolate-commands --repeat 1 and a unique --tmpdir",
+      "current_support": "available_with_protocol"
+    },
+    {
+      "id": "warm_command_latency",
+      "unit": "milliseconds",
+      "scope": "same-session repeated decompile/types/profile sequence",
+      "collector": "reversing_benchmark.py with --repeat 2 --cache-probe",
+      "current_support": "available"
+    },
+    {
+      "id": "peak_rss",
+      "unit": "bytes",
+      "scope": "direct radare2 child process per isolated command or enclosing batch invocation",
+      "collector": "reversing_benchmark.py child_max_rss_bytes records and summary.memory.peak_child_rss_bytes",
+      "current_support": "available",
+      "note": "The collector normalizes Linux KiB and macOS byte ru_maxrss values to bytes. It deliberately does not claim descendant or process-tree RSS."
+    },
+    {
+      "id": "output_classification",
+      "unit": "enum",
+      "scope": "each decompile result",
+      "values": [
+        "structured",
+        "residual",
+        "fallback",
+        "empty"
+      ],
+      "collector": "reversing_benchmark.py decompile_quality",
+      "current_support": "available"
+    },
+    {
+      "id": "proof_coverage",
+      "unit": "percent_and_counts",
+      "scope": "source obligations total, exactly-once closed, missing, duplicated, residualized, and refused",
+      "collector": null,
+      "current_support": "gap",
+      "note": "Existing rendered-proof/fact counters are not source-obligation coverage and must not be substituted."
+    },
+    {
+      "id": "type_accuracy",
+      "unit": "percent_and_counts",
+      "scope": "correct hard source type facts divided by applicable hard source type facts",
+      "collector": null,
+      "current_support": "gap",
+      "note": "Generic argument/type counts and individual source-oracle strings are useful proxies, not a true type-accuracy measurement."
+    }
+  ],
+  "fixtures": [
+    {
+      "id": "check_secret",
+      "source": "tests/e2e/vuln_test.c:33",
+      "binary": "tests/e2e/vuln_test_x86",
+      "optimization": "O0",
+      "targets": [
+        "check_secret"
+      ],
+      "semantic_expectations": [
+        "compare the 32-bit input with 0xdead",
+        "return 1 on equality and 0 otherwise",
+        "preserve both control outcomes"
+      ],
+      "cosmetic_expectations": [
+        "source-like function and argument names",
+        "decimal 57005 versus hexadecimal 0xdead spelling",
+        "if statement versus an equivalent conditional expression"
+      ],
+      "existing_checks": [
+        "tests/r2r/db/extras/r2sleigh_integration_extended:dec_check_secret_current_function_public_surface",
+        "tests/e2e/integration_tests.rs:fresh_clang_host_matrix_keeps_helper_semantics_consistent"
+      ]
+    },
+    {
+      "id": "sum_array",
+      "source": "tests/e2e/test_func.c:17",
+      "binary": "tests/e2e/test_func_x86",
+      "optimization": "O0",
+      "targets": [
+        "sum_array"
+      ],
+      "semantic_expectations": [
+        "initialize the accumulator and loop index",
+        "use the signed 32-bit index-versus-length loop predicate",
+        "load arr[i], add it exactly once per iteration, preserve the latch increment, and return the accumulator",
+        "preserve a 32-bit signed element type and pointer parameter"
+      ],
+      "cosmetic_expectations": [
+        "sum and i variable names",
+        "for-loop spelling rather than an equivalent certified while loop",
+        "source operand ordering"
+      ],
+      "existing_checks": [
+        "tests/r2r/db/extras/r2sleigh_integration_fast:dec_sum_array_uses_typed_session_header_and_signed_loop_condition"
+      ]
+    },
+    {
+      "id": "complex_check",
+      "source": "tests/e2e/vuln_test.c:115",
+      "binary": "tests/e2e/vuln_test_x86",
+      "optimization": "O0",
+      "targets": [
+        "complex_check"
+      ],
+      "semantic_expectations": [
+        "compute 32-bit a+b and a-b values",
+        "require sum equal to 100 and difference equal to 20 for the success path",
+        "return 1 only on the joint success path and 0 otherwise"
+      ],
+      "cosmetic_expectations": [
+        "sum and diff source names",
+        "nested-if versus equivalent conjunction structure",
+        "temporary declaration placement"
+      ],
+      "existing_checks": [
+        "tests/r2r/db/extras/r2sleigh_decompiler_snapshots:decompiler_complex_check_preserves_shared_default_arm",
+        "tests/e2e/integration_tests.rs:fresh_clang_host_matrix_keeps_helper_semantics_consistent"
+      ]
+    },
+    {
+      "id": "struct_arrays",
+      "sources": [
+        "tests/e2e/vuln_test.c:378",
+        "tests/gold/manual_limits.c:37"
+      ],
+      "binaries": [
+        "tests/e2e/vuln_test_x86",
+        "tests/r2r/bins/r2sleigh_manual_limits_O0",
+        "tests/r2r/bins/r2sleigh_manual_limits_O2"
+      ],
+      "optimizations": [
+        "O0",
+        "O2"
+      ],
+      "targets": [
+        "test_struct_array_index",
+        "struct_nested_array"
+      ],
+      "semantic_expectations": [
+        "preserve scaled array indexing using the certified structure size",
+        "preserve the write and subsequent reads of the selected fields in test_struct_array_index",
+        "preserve the scores[2] update, flags predicate, and both return expressions in struct_nested_array",
+        "preserve field offsets, element widths, signedness, and pointer provenance"
+      ],
+      "cosmetic_expectations": [
+        "DemoStruct and Item type names",
+        "third, fourteenth, scores, flags, id, and len field names",
+        "array-member syntax rather than equivalent certified pointer arithmetic"
+      ],
+      "existing_checks": [
+        "tests/r2r/db/extras/r2sleigh_integration_extended:dec_array_and_struct_index_render_without_fallback",
+        "tests/r2r/db/extras/r2sleigh_signature_snapshots:signature_struct_array_index_full_snapshot",
+        "tests/gold/source_oracle.json:repo-vuln-struct-array-index",
+        "tests/gold/source_oracle.json:manual-struct-nested-array-source-shape"
+      ]
+    },
+    {
+      "id": "fnv",
+      "source": "tests/gold/manual_limits.c:67",
+      "binaries": [
+        "tests/r2r/bins/r2sleigh_manual_limits_O0",
+        "tests/r2r/bins/r2sleigh_manual_limits_O2"
+      ],
+      "optimizations": [
+        "O0",
+        "O2"
+      ],
+      "targets": [
+        "fnv_fold"
+      ],
+      "semantic_expectations": [
+        "initialize the 64-bit unsigned accumulator to 1469598103934665603",
+        "read every live input byte selected by the loop",
+        "lower ASCII uppercase bytes by adding 32 only for the certified range",
+        "xor the byte into the accumulator, perform wrapping 64-bit unsigned multiplication by 1099511628211, preserve the latch update, and return the accumulator",
+        "never replace an unproven loop with a constant or guessed executable summary"
+      ],
+      "cosmetic_expectations": [
+        "hash, c, and i names",
+        "hexadecimal versus decimal constants",
+        "for-loop source likeness"
+      ],
+      "existing_checks": [
+        "tests/gold/source_oracle.json:manual-fnv-fold-source-loop",
+        "tests/gold/source_oracle.json:manual-fnv-fold-decompile-no-constant-return",
+        "tests/r2r/db/extras/r2sleigh_integration_extended:manual_unsigned_pointee_uses_certified_extension_evidence"
+      ]
+    },
+    {
+      "id": "mem_scan2",
+      "source": "tests/gold/manual_limits.c:163",
+      "binaries": [
+        "tests/r2r/bins/r2sleigh_manual_limits_O0",
+        "tests/r2r/bins/r2sleigh_manual_limits_O2"
+      ],
+      "optimizations": [
+        "O0",
+        "O2"
+      ],
+      "targets": [
+        "mem_scan2"
+      ],
+      "semantic_expectations": [
+        "initialize a size_t count and index",
+        "read each byte for indexes below n",
+        "increment count exactly when the byte equals a or b",
+        "preserve the loop latch and return the final size_t count",
+        "residualize rather than emit an empty or guessed loop when effects are unproven"
+      ],
+      "cosmetic_expectations": [
+        "buf, n, a, b, count, c, and i names",
+        "for-loop spelling",
+        "source ordering of the equality alternatives"
+      ],
+      "existing_checks": [
+        "tests/gold/source_oracle.json:manual-mem-scan2-source-loop",
+        "tests/gold/source_oracle.json:manual-mem-scan2-decompile-no-empty-loop",
+        "tests/gold/source_oracle.json:manual-mem-scan2-types-preserve-source-size"
+      ]
+    },
+    {
+      "id": "switches",
+      "sources": [
+        "tests/gold/manual_limits.c:80",
+        "tests/gold/manual_limits.c:115"
+      ],
+      "binaries": [
+        "tests/r2r/bins/r2sleigh_manual_limits_O0",
+        "tests/r2r/bins/r2sleigh_manual_limits_O2"
+      ],
+      "optimizations": [
+        "O0",
+        "O2"
+      ],
+      "targets": [
+        "sparse_switch",
+        "state_machine"
+      ],
+      "semantic_expectations": [
+        "preserve cases -7, 0, 3, 42, and 1000 plus the default",
+        "preserve each case return expression and the divide-by-zero conditional",
+        "preserve signed division semantics and all control transfers exactly once",
+        "preserve state_machine loop-carried state and score, every character-class predicate, switch transition, early return, latch update, and final return"
+      ],
+      "cosmetic_expectations": [
+        "switch statement versus an equivalent certified decision tree",
+        "op, a, and b names",
+        "case ordering"
+      ],
+      "existing_checks": [
+        "tests/r2r/db/extras/r2sleigh_integration_extended:manual_sparse_switch_o0_structures_internal_sdiv_control",
+        "tests/r2r/db/extras/r2sleigh_integration_extended:manual_sparse_switch_o2_preserves_all_certified_paths",
+        "tests/gold/source_oracle.json:manual-sparse-switch-source-cases",
+        "tests/gold/source_oracle.json:manual-state-machine-no-pseudo-source",
+        "tests/gold/source_oracle.json:manual-state-machine-source-control"
+      ]
+    },
+    {
+      "id": "calls",
+      "sources": [
+        "tests/e2e/test_func.c:25",
+        "tests/e2e/test_func.c:29",
+        "tests/e2e/test_func.c:33",
+        "tests/e2e/vuln_test.c:67",
+        "tests/e2e/vuln_test.c:79",
+        "tests/e2e/vuln_test.c:87"
+      ],
+      "binaries": [
+        "tests/e2e/test_func_x86",
+        "tests/e2e/vuln_test_x86"
+      ],
+      "optimization": "O0",
+      "targets": [
+        "alloc_wrapper",
+        "alloc_wrapper2",
+        "memcpy_wrapper",
+        "process_string",
+        "authenticate",
+        "alloc_and_copy"
+      ],
+      "semantic_expectations": [
+        "preserve every live call exactly once and in program order",
+        "preserve callee identity, ABI arguments, return/result flow, and memory effects",
+        "preserve the single strlen call in process_string",
+        "residualize raw or uncertified call arguments rather than inventing executable C"
+      ],
+      "cosmetic_expectations": [
+        "wrapper, parameter, and local names",
+        "sym.imp prefix spelling",
+        "declaration placement around call results"
+      ],
+      "existing_checks": [
+        "tests/r2r/db/extras/r2sleigh_integration_fast:types_interproc_wrapper_uses_cached_callee_payload",
+        "tests/r2r/db/extras/r2sleigh_integration_extended:dec_library_call_owners_stay_single_source"
+      ]
+    }
+  ],
+  "command_provenance": {
+    "status": "pass",
+    "authoritative_archive": "target/phase0-baseline-v2-0cbe057e-62791dc5",
+    "capture_script_sha256": "fa03c9f01c6f0edb7982da07576b965aca3c7d244499ab01485929d118ea742c",
+    "checksum_manifest_sha256": "28d1bafd2aff59acc6d150117046c5583cd2e66c1d5c4513932b54dcf0752f3c",
+    "description": "The archive contains the exact executed capture script, shell xtrace log, command status file, canonical report configurations, actual pinned fixture bytes, archived UTC/host/compiler identity, and a verified 771-entry relative-path checksum manifest. The entries below remain human-readable protocol examples; the archived script and trace are authoritative for byte-exact command provenance."
+  },
+  "commands": [
+    {
+      "id": "verify_pinned_pair",
+      "cwd": ".",
+      "command": "test \"$(git rev-parse HEAD)\" = 0cbe057efb8427b021e1c8cde4d721573fdb9fdd && test \"$(git -C ../radare2 rev-parse HEAD)\" = 62791dc54f6af6e95d9a61c997e5c1eda098775d",
+      "purpose": "Fail before capture when either repository is not at the pinned baseline commit."
+    },
+    {
+      "id": "build_and_link_fixtures",
+      "cwd": ".",
+      "command": "make -C tests/r2r link-bins",
+      "purpose": "Build the source-pinned O0/O2 and x86 fixture binaries through the existing harness."
+    },
+    {
+      "id": "full_r2r_extras",
+      "cwd": ".",
+      "command": "r2r -t 120 -j 1 -L tests/r2r/db/extras",
+      "purpose": "Run the complete r2sleigh extras slice (99 tests), not the entire repository-wide r2r suite."
+    },
+    {
+      "id": "focused_r2r_fast",
+      "cwd": ".",
+      "command": "make -C tests/r2r run R2R_ARGS=db/extras/r2sleigh_integration_fast",
+      "purpose": "Run the sum_array and call-wrapper checks with their surrounding fast integration slice."
+    },
+    {
+      "id": "focused_r2r_extended",
+      "cwd": ".",
+      "command": "make -C tests/r2r run R2R_ARGS=db/extras/r2sleigh_integration_extended",
+      "purpose": "Run check_secret, struct-array, calls, FNV type, and switch checks."
+    },
+    {
+      "id": "focused_r2r_decompiler_snapshots",
+      "cwd": ".",
+      "command": "make -C tests/r2r run R2R_ARGS=db/extras/r2sleigh_decompiler_snapshots",
+      "purpose": "Run complex_check and deterministic decompiler guardrail snapshots."
+    },
+    {
+      "id": "source_gold",
+      "cwd": ".",
+      "command": "make -C tests/r2r source-gold SOURCE_GOLD_OUT=/tmp/phase0-source-gold.json",
+      "purpose": "Run the existing O0/O2 closure manifest and source oracle."
+    },
+    {
+      "id": "vuln_cold",
+      "cwd": ".",
+      "command": "phase0_tmpdir=\"$(mktemp -d /tmp/phase0-vuln-cold.XXXXXX)\" && python3 scripts/reversing_benchmark.py --r2 ../radare2/binr/radare2/radare2 --plugin-dir r2plugin --manifest-only --binary tests/e2e/vuln_test_x86 --target check_secret --target complex_check --target test_struct_array_index --target process_string --target authenticate --target alloc_and_copy --analysis aaa --commands decompile_sla,types,profile --isolate-commands --repeat 1 --include-sensitive --tmpdir \"$phase0_tmpdir\" --raw-output-dir \"$phase0_tmpdir/raw-output\" --out /tmp/phase0-vuln-cold.json",
+      "purpose": "Collect isolated-process latency and classifications for the vuln fixture group."
+    },
+    {
+      "id": "vuln_warm",
+      "cwd": ".",
+      "command": "phase0_tmpdir=\"$(mktemp -d /tmp/phase0-vuln-warm.XXXXXX)\" && python3 scripts/reversing_benchmark.py --r2 ../radare2/binr/radare2/radare2 --plugin-dir r2plugin --manifest-only --binary tests/e2e/vuln_test_x86 --target check_secret --target complex_check --target test_struct_array_index --target process_string --target authenticate --target alloc_and_copy --analysis aaa --commands decompile_sla,types,profile --repeat 2 --cache-probe --include-sensitive --tmpdir \"$phase0_tmpdir\" --raw-output-dir \"$phase0_tmpdir/raw-output\" --out /tmp/phase0-vuln-warm.json",
+      "purpose": "Collect same-session warm latency and cache-probe data for the vuln fixture group."
+    },
+    {
+      "id": "test_func_cold",
+      "cwd": ".",
+      "command": "phase0_tmpdir=\"$(mktemp -d /tmp/phase0-test-func-cold.XXXXXX)\" && python3 scripts/reversing_benchmark.py --r2 ../radare2/binr/radare2/radare2 --plugin-dir r2plugin --manifest-only --binary tests/e2e/test_func_x86 --target sum_array --target alloc_wrapper --target alloc_wrapper2 --target memcpy_wrapper --analysis aaa --commands decompile_sla,types,profile --isolate-commands --repeat 1 --include-sensitive --tmpdir \"$phase0_tmpdir\" --raw-output-dir \"$phase0_tmpdir/raw-output\" --out /tmp/phase0-test-func-cold.json",
+      "purpose": "Collect isolated-process latency and classifications for sum_array and call wrappers."
+    },
+    {
+      "id": "test_func_warm",
+      "cwd": ".",
+      "command": "phase0_tmpdir=\"$(mktemp -d /tmp/phase0-test-func-warm.XXXXXX)\" && python3 scripts/reversing_benchmark.py --r2 ../radare2/binr/radare2/radare2 --plugin-dir r2plugin --manifest-only --binary tests/e2e/test_func_x86 --target sum_array --target alloc_wrapper --target alloc_wrapper2 --target memcpy_wrapper --analysis aaa --commands decompile_sla,types,profile --repeat 2 --cache-probe --include-sensitive --tmpdir \"$phase0_tmpdir\" --raw-output-dir \"$phase0_tmpdir/raw-output\" --out /tmp/phase0-test-func-warm.json",
+      "purpose": "Collect same-session warm latency and cache-probe data for sum_array and call wrappers."
+    },
+    {
+      "id": "manual_o0_cold",
+      "cwd": ".",
+      "command": "phase0_tmpdir=\"$(mktemp -d /tmp/phase0-manual-o0-cold.XXXXXX)\" && python3 scripts/reversing_benchmark.py --r2 ../radare2/binr/radare2/radare2 --plugin-dir r2plugin --manifest-only --binary tests/r2r/bins/r2sleigh_manual_limits_O0 --target struct_nested_array --target fnv_fold --target sparse_switch --target state_machine --target mem_scan2 --analysis aaa --commands decompile_sla,types,profile --isolate-commands --repeat 1 --include-sensitive --tmpdir \"$phase0_tmpdir\" --raw-output-dir \"$phase0_tmpdir/raw-output\" --out /tmp/phase0-manual-o0-cold.json",
+      "purpose": "Collect isolated-process O0 latency and classifications for manual semantic fixtures."
+    },
+    {
+      "id": "manual_o0_warm",
+      "cwd": ".",
+      "command": "phase0_tmpdir=\"$(mktemp -d /tmp/phase0-manual-o0-warm.XXXXXX)\" && python3 scripts/reversing_benchmark.py --r2 ../radare2/binr/radare2/radare2 --plugin-dir r2plugin --manifest-only --binary tests/r2r/bins/r2sleigh_manual_limits_O0 --target struct_nested_array --target fnv_fold --target sparse_switch --target state_machine --target mem_scan2 --analysis aaa --commands decompile_sla,types,profile --repeat 2 --cache-probe --include-sensitive --tmpdir \"$phase0_tmpdir\" --raw-output-dir \"$phase0_tmpdir/raw-output\" --out /tmp/phase0-manual-o0-warm.json",
+      "purpose": "Collect same-session warm O0 latency and cache-probe data for manual semantic fixtures."
+    },
+    {
+      "id": "manual_o2_cold",
+      "cwd": ".",
+      "command": "phase0_tmpdir=\"$(mktemp -d /tmp/phase0-manual-o2-cold.XXXXXX)\" && python3 scripts/reversing_benchmark.py --r2 ../radare2/binr/radare2/radare2 --plugin-dir r2plugin --manifest-only --binary tests/r2r/bins/r2sleigh_manual_limits_O2 --target struct_nested_array --target fnv_fold --target sparse_switch --target state_machine --target mem_scan2 --analysis aaa --commands decompile_sla,types,profile --isolate-commands --repeat 1 --include-sensitive --tmpdir \"$phase0_tmpdir\" --raw-output-dir \"$phase0_tmpdir/raw-output\" --out /tmp/phase0-manual-o2-cold.json",
+      "purpose": "Collect isolated-process O2 latency and classifications for manual semantic fixtures."
+    },
+    {
+      "id": "manual_o2_warm",
+      "cwd": ".",
+      "command": "phase0_tmpdir=\"$(mktemp -d /tmp/phase0-manual-o2-warm.XXXXXX)\" && python3 scripts/reversing_benchmark.py --r2 ../radare2/binr/radare2/radare2 --plugin-dir r2plugin --manifest-only --binary tests/r2r/bins/r2sleigh_manual_limits_O2 --target struct_nested_array --target fnv_fold --target sparse_switch --target state_machine --target mem_scan2 --analysis aaa --commands decompile_sla,types,profile --repeat 2 --cache-probe --include-sensitive --tmpdir \"$phase0_tmpdir\" --raw-output-dir \"$phase0_tmpdir/raw-output\" --out /tmp/phase0-manual-o2-warm.json",
+      "purpose": "Collect same-session warm O2 latency and cache-probe data for manual semantic fixtures."
+    }
+  ],
+  "current_capture_gaps": [
+    "Direct-child peak RSS is available; descendant and process-tree RSS remain outside the collector contract.",
+    "The current implementation cannot report source-obligation proof coverage.",
+    "The current implementation does not compute true source-fact type accuracy.",
+    "Profile output needs normalization before it can participate in determinism scoring."
+  ],
+  "phase0_gate": {
+    "baseline_reproducible": true,
+    "baseline_quality": "fail",
+    "failures_classified": true,
+    "benchmark_raw_capture_verified": true,
+    "source_gold_raw_capture_verified": true,
+    "r2r_logs_verified": true,
+    "exact_command_provenance_verified": true,
+    "archive_checksums_verified": true,
+    "archive_durability": "local_only_git_ignored",
+    "shared_archive_durable": false,
+    "exact_original_names_required_for_correctness": false,
+    "note": "Phase-0 capture is closed locally: pinned identities and actual fixture bytes, exact commands, build evidence, 244 raw command records, the 99-test r2sleigh extras slice plus focused r2r logs, source-gold regression evidence, checksums, and one-primary-taxonomy dispositions are verified. The evidence archive is intentionally local and git-ignored because it can contain sensitive output; reproducibility comes from the pinned commits and checked-in capture driver, not from a shared artifact. The pinned implementation's quality gate remains failed, which is the baseline the rewrite must improve. Proof coverage and true type accuracy remain unavailable in the pinned implementation and are recorded as measurement gaps rather than inferred."
+  }
+}

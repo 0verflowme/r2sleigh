@@ -1,0 +1,233 @@
+{
+  "schema_version": 1,
+  "fixture_set": "r2sleigh-plain-o2-x86_64-macho-sleigh-lift-v1",
+  "origin_manifest": "tests/r2r/fixtures/plain_o2_v1/manifest.json",
+  "origin_core_capture": "tests/r2r/fixtures/plain_o2_v1/core-functions.json",
+  "arch": "x86-64",
+  "custom_space_normalization": "Process-local libsla custom-space handles are normalized to architecture_custom before semantic hashing.",
+  "artifacts": [
+    {
+      "id": "test_func-x86_64-macho-O2-v1",
+      "path": "tests/r2r/bins/r2sleigh_test_func_x86_64_macho_O2_v1",
+      "sha256": "be967f00b147ce995818d1aabb4648e5aa0423214e4e623f5f44d5fcf0ad5428",
+      "size_bytes": 9568,
+      "fnv1a64": "0624d6bb82af1e97"
+    },
+    {
+      "id": "vuln_test-x86_64-macho-O2-v1",
+      "path": "tests/r2r/bins/r2sleigh_vuln_test_x86_64_macho_O2_v1",
+      "sha256": "f223535d0a5974e5af3b997b7f5e3ac6adc9e00895d281e3e304e3adce42fe29",
+      "size_bytes": 24480,
+      "fnv1a64": "80f916aeb4e6142e"
+    }
+  ],
+  "functions": [
+    {
+      "name": "sum_array",
+      "symbol": "sym._sum_array",
+      "artifact": "test_func-x86_64-macho-O2-v1",
+      "source": "tests/e2e/test_func.c",
+      "address": 4294968864,
+      "file_offset": 1568,
+      "bytes": "554889e585f67e0d89f183fe08730a31d231c0eb6b31c05dc389ca81e2f8ffff7f89c8c1e80325ffffff0f48c1e005660fefc031f6660fefc90f1f8000000000f30f6f1437660ffec2f30f6f543710660ffeca4883c6204839f075e4660ffec8660f70c1ee660ffec1660f70c855660ffec8660f7ec839ca7411660f1f44000003049748ffc24839d175f55dc3",
+      "bytes_fnv1a64": "d093eafd65854e85",
+      "r2il_fnv1a64": "8af6ec5c96150544",
+      "ssa_fnv1a64": "8e378d39fbfd1bc9",
+      "required_native_opcodes": ["movdqu", "paddd", "pshufd"],
+      "source_abi": {
+        "calling_convention": "sysv_amd64",
+        "return_type": "int32_t",
+        "parameters": [
+          { "name": "arr", "register": "RDI", "type": "int32_t*" },
+          { "name": "len", "register": "ESI", "type": "int32_t" }
+        ]
+      },
+      "blocks": [
+        {
+          "address": 4294968864,
+          "bytes": "554889e585f67e0d",
+          "op_count": 16,
+          "ops_fnv1a64": "30ebd61a8e9c8c93",
+          "op_kinds": "Copy,IntSub,Store,Copy,Copy,Copy,IntAnd,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,IntNotEqual,BoolOr,CBranch"
+        },
+        {
+          "address": 4294968872,
+          "bytes": "89f183fe08730a",
+          "op_count": 14,
+          "ops_fnv1a64": "7da2d4c76d736194",
+          "op_kinds": "Copy,IntZExt,Copy,IntLess,IntSBorrow,IntSub,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,BoolNot,CBranch"
+        },
+        {
+          "address": 4294968879,
+          "bytes": "31d231c0eb6b",
+          "op_count": 21,
+          "ops_fnv1a64": "27b956be438e3786",
+          "op_kinds": "Copy,Copy,IntXor,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,Copy,IntXor,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Branch"
+        },
+        {
+          "address": 4294968885,
+          "bytes": "31c05dc3",
+          "op_count": 17,
+          "ops_fnv1a64": "120e5d8aad423737",
+          "op_kinds": "Copy,Copy,IntXor,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,Load,IntAdd,Copy,Load,IntAdd,Return"
+        },
+        {
+          "address": 4294968889,
+          "bytes": "89ca81e2f8ffff7f89c8c1e80325ffffff0f48c1e005660fefc031f6660fefc90f1f8000000000",
+          "op_count": 111,
+          "ops_fnv1a64": "209443e3c4cc5003",
+          "op_kinds": "Copy,IntZExt,Copy,Copy,IntAnd,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,IntZExt,IntAnd,Copy,IntRight,IntZExt,IntNotEqual,IntSub,IntRight,IntAnd,IntNotEqual,BoolNot,IntAnd,IntAnd,IntOr,IntEqual,IntSLess,BoolNot,IntAnd,IntAnd,IntOr,IntNotEqual,IntSLess,BoolNot,IntAnd,IntAnd,IntOr,IntEqual,BoolNot,IntAnd,IntAnd,IntOr,IntAnd,PopCount,IntAnd,IntEqual,BoolNot,IntAnd,IntAnd,IntOr,Copy,Copy,IntAnd,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,IntAnd,Copy,IntLeft,IntNotEqual,IntSub,IntLeft,IntSLess,BoolNot,IntAnd,IntAnd,IntOr,IntEqual,IntSLess,IntXor,BoolNot,IntAnd,IntAnd,IntOr,IntNotEqual,IntSLess,BoolNot,IntAnd,IntAnd,IntOr,IntEqual,BoolNot,IntAnd,IntAnd,IntOr,IntAnd,PopCount,IntAnd,IntEqual,BoolNot,IntAnd,IntAnd,IntOr,IntXor,Copy,Copy,IntXor,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,IntXor"
+        },
+        {
+          "address": 4294968928,
+          "bytes": "f30f6f1437660ffec2f30f6f543710660ffeca4883c6204839f075e4",
+          "op_count": 38,
+          "ops_fnv1a64": "1c71135b3a20e015",
+          "op_kinds": "IntMult,IntAdd,Load,Copy,IntAdd,IntAdd,IntAdd,IntAdd,IntAdd,IntMult,IntAdd,Load,Copy,IntAdd,IntAdd,IntAdd,IntAdd,IntCarry,IntSCarry,IntAdd,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,IntLess,IntSBorrow,IntSub,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,BoolNot,CBranch"
+        },
+        {
+          "address": 4294968956,
+          "bytes": "660ffec8660f70c1ee660ffec1660f70c855660ffec8660f7ec839ca7411",
+          "op_count": 153,
+          "ops_fnv1a64": "2a8ae4b41af960c6",
+          "op_kinds": "IntAdd,IntAdd,IntAdd,IntAdd,Copy,Copy,Copy,Copy,IntEqual,IntZExt,IntMult,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntAdd,IntAdd,IntAdd,IntAdd,IntAdd,Copy,Copy,Copy,Copy,IntEqual,IntZExt,IntMult,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntAdd,IntAdd,IntAdd,IntAdd,IntAdd,Subpiece,IntZExt,Copy,IntLess,IntSBorrow,IntSub,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,CBranch"
+        },
+        {
+          "address": 4294968986,
+          "bytes": "660f1f440000",
+          "op_count": 2,
+          "ops_fnv1a64": "2219b3125706bb77",
+          "op_kinds": "IntMult,IntAdd"
+        },
+        {
+          "address": 4294968992,
+          "bytes": "03049748ffc24839d175f5",
+          "op_count": 35,
+          "ops_fnv1a64": "b1cc25da5c378845",
+          "op_kinds": "IntMult,IntAdd,Load,IntCarry,Load,IntSCarry,Load,IntAdd,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,IntSCarry,IntAdd,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,IntLess,IntSBorrow,IntSub,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,BoolNot,CBranch"
+        },
+        {
+          "address": 4294969003,
+          "bytes": "5dc3",
+          "op_count": 7,
+          "ops_fnv1a64": "1d77f72b63af5f00",
+          "op_kinds": "Copy,Load,IntAdd,Copy,Load,IntAdd,Return"
+        }
+      ],
+      "ssa_blocks": [
+        { "address": 4294968864, "size": 8, "phi_count": 0, "op_count": 16, "fnv1a64": "979eaa837ec6f118" },
+        { "address": 4294968872, "size": 7, "phi_count": 0, "op_count": 14, "fnv1a64": "386adb16301cecab" },
+        { "address": 4294968879, "size": 6, "phi_count": 0, "op_count": 21, "fnv1a64": "d16447e5a2736470" },
+        { "address": 4294968889, "size": 39, "phi_count": 0, "op_count": 111, "fnv1a64": "7b064122ca6b4369" },
+        { "address": 4294968928, "size": 28, "phi_count": 27, "op_count": 40, "fnv1a64": "bf5f0520d8dc5020" },
+        { "address": 4294968956, "size": 30, "phi_count": 0, "op_count": 153, "fnv1a64": "a4fa7a390060a502" },
+        { "address": 4294968986, "size": 6, "phi_count": 0, "op_count": 2, "fnv1a64": "2c3147b0ccc4d96b" },
+        { "address": 4294968992, "size": 11, "phi_count": 103, "op_count": 38, "fnv1a64": "5d7e51c4ce1ce243" },
+        { "address": 4294969003, "size": 2, "phi_count": 103, "op_count": 7, "fnv1a64": "5fa3011acce7e3b6" },
+        { "address": 4294968885, "size": 4, "phi_count": 0, "op_count": 17, "fnv1a64": "de106f50738cec4d" }
+      ]
+    },
+    {
+      "name": "check_secret",
+      "symbol": "sym._check_secret",
+      "artifact": "vuln_test-x86_64-macho-O2-v1",
+      "source": "tests/e2e/vuln_test.c",
+      "address": 4294968912,
+      "file_offset": 1616,
+      "bytes": "554889e531c081ffadde00000f94c05dc3",
+      "bytes_fnv1a64": "696bc30ad7592da1",
+      "r2il_fnv1a64": "8ce1280929a80437",
+      "ssa_fnv1a64": "11fb796dcfd9dbf0",
+      "source_abi": {
+        "calling_convention": "sysv_amd64",
+        "return_type": "int32_t",
+        "parameters": [
+          { "name": "x", "register": "EDI", "type": "int32_t" }
+        ]
+      },
+      "blocks": [
+        {
+          "address": 4294968912,
+          "bytes": "554889e531c081ffadde00000f94c05dc3",
+          "op_count": 32,
+          "ops_fnv1a64": "df6c5bb6968c932b",
+          "op_kinds": "Copy,IntSub,Store,Copy,Copy,Copy,IntXor,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,IntLess,IntSBorrow,IntSub,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,Copy,Load,IntAdd,Copy,Load,IntAdd,Return"
+        }
+      ],
+      "ssa_blocks": [
+        { "address": 4294968912, "size": 17, "phi_count": 0, "op_count": 32, "fnv1a64": "588be3ffb4b42daa" }
+      ]
+    },
+    {
+      "name": "complex_check",
+      "symbol": "sym._complex_check",
+      "artifact": "vuln_test-x86_64-macho-O2-v1",
+      "source": "tests/e2e/vuln_test.c",
+      "address": 4294969232,
+      "file_offset": 1936,
+      "bytes": "554889e58d0c3e29f783f16483f71431c009cf0f94c05dc3",
+      "bytes_fnv1a64": "bcde133ae05d0b35",
+      "r2il_fnv1a64": "d9045166796dee5f",
+      "ssa_fnv1a64": "3348654a5dde0372",
+      "source_abi": {
+        "calling_convention": "sysv_amd64",
+        "return_type": "int32_t",
+        "parameters": [
+          { "name": "a", "register": "EDI", "type": "int32_t" },
+          { "name": "b", "register": "ESI", "type": "int32_t" }
+        ]
+      },
+      "blocks": [
+        {
+          "address": 4294969232,
+          "bytes": "554889e58d0c3e29f783f16483f71431c009cf0f94c05dc3",
+          "op_count": 66,
+          "ops_fnv1a64": "45183b0d43e80b5d",
+          "op_kinds": "Copy,IntSub,Store,Copy,IntMult,IntAdd,Subpiece,IntZExt,IntLess,IntSBorrow,IntSub,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,Copy,IntXor,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,Copy,IntXor,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,Copy,IntXor,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,Copy,IntOr,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,Copy,Load,IntAdd,Copy,Load,IntAdd,Return"
+        }
+      ],
+      "ssa_blocks": [
+        { "address": 4294969232, "size": 24, "phi_count": 0, "op_count": 66, "fnv1a64": "c4e280e56eca2240" }
+      ]
+    },
+    {
+      "name": "test_struct_array_index",
+      "symbol": "sym._test_struct_array_index",
+      "artifact": "vuln_test-x86_64-macho-O2-v1",
+      "source": "tests/e2e/vuln_test.c",
+      "address": 4294970032,
+      "file_offset": 2736,
+      "bytes": "554889e589d04863ce486bc93889540f0803440f345dc3",
+      "bytes_fnv1a64": "274373379d942066",
+      "r2il_fnv1a64": "3a9fb313e4eab034",
+      "ssa_fnv1a64": "3d17008bc9796e82",
+      "source_abi": {
+        "calling_convention": "sysv_amd64",
+        "return_type": "int32_t",
+        "parameters": [
+          { "name": "arr", "register": "RDI", "type": "DemoStruct*" },
+          { "name": "idx", "register": "ESI", "type": "int32_t" },
+          { "name": "v", "register": "EDX", "type": "int32_t" }
+        ],
+        "aggregate": {
+          "name": "DemoStruct",
+          "size_bytes": 56,
+          "align_bytes": 4,
+          "member_offsets": [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52]
+        }
+      },
+      "blocks": [
+        {
+          "address": 4294970032,
+          "bytes": "554889e589d04863ce486bc93889540f0803440f345dc3",
+          "op_count": 43,
+          "ops_fnv1a64": "47cf39ae2eda485b",
+          "op_kinds": "Copy,IntSub,Store,Copy,Copy,IntZExt,IntSExt,IntSExt,IntSExt,IntMult,IntMult,Subpiece,IntSExt,IntNotEqual,Copy,IntAdd,IntMult,IntAdd,Copy,Store,IntAdd,IntMult,IntAdd,Load,IntCarry,Load,IntSCarry,Load,IntAdd,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,Load,IntAdd,Copy,Load,IntAdd,Return"
+        }
+      ],
+      "ssa_blocks": [
+        { "address": 4294970032, "size": 23, "phi_count": 0, "op_count": 43, "fnv1a64": "5614b2be3ac43140" }
+      ]
+    }
+  ]
+}

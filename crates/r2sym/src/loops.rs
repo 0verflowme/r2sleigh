@@ -2036,6 +2036,7 @@ mod tests {
             phis: vec![PhiNode {
                 dst: counter.clone(),
                 sources: vec![(0x900, var("RCX", 0, 8)), (0x1008, var("RCX", 1, 8))],
+                canonical_storage: None,
             }],
             ops: Vec::new(),
         };
@@ -2060,10 +2061,12 @@ mod tests {
                 PhiNode {
                     dst: var("RCX", 2, 8),
                     sources: vec![(0x900, var("RCX", 0, 8)), (0x1008, var("RCX", 1, 8))],
+                    canonical_storage: None,
                 },
                 PhiNode {
                     dst: acc_phi.clone(),
                     sources: vec![(0x900, var("RBX", 0, 8)), (0x1008, var("RBX", 1, 8))],
+                    canonical_storage: None,
                 },
             ],
             ops: vec![SSAOp::IntXor {
@@ -2091,10 +2094,12 @@ mod tests {
                 PhiNode {
                     dst: counter_phi.clone(),
                     sources: vec![(0x900, var("RCX", 0, 8)), (0x1008, var("RCX", 1, 8))],
+                    canonical_storage: None,
                 },
                 PhiNode {
                     dst: acc_phi.clone(),
                     sources: vec![(0x900, var("RBX", 0, 8)), (0x1008, var("RBX", 1, 8))],
+                    canonical_storage: None,
                 },
             ],
             ops: vec![
@@ -2157,10 +2162,12 @@ mod tests {
                 PhiNode {
                     dst: counter_phi.clone(),
                     sources: vec![(0x900, var("RCX", 0, 8)), (0x1008, var("RCX", 1, 8))],
+                    canonical_storage: None,
                 },
                 PhiNode {
                     dst: acc_phi.clone(),
                     sources: vec![(0x900, var("RBX", 0, 8)), (0x1008, var("RBX", 1, 8))],
+                    canonical_storage: None,
                 },
             ],
             ops: vec![
@@ -2233,6 +2240,7 @@ mod tests {
             phis: vec![PhiNode {
                 dst: counter_phi.clone(),
                 sources: vec![(0x900, var("RCX", 0, 8)), (0x1008, var("RCX", 1, 8))],
+                canonical_storage: None,
             }],
             ops: vec![
                 SSAOp::IntAdd {
@@ -2278,14 +2286,17 @@ mod tests {
                 PhiNode {
                     dst: counter_phi.clone(),
                     sources: vec![(0x900, var("RCX", 0, 8)), (0x1008, var("RCX", 1, 8))],
+                    canonical_storage: None,
                 },
                 PhiNode {
                     dst: ptr_phi.clone(),
                     sources: vec![(0x900, var("RDI", 0, 8)), (0x1008, var("RDI", 1, 8))],
+                    canonical_storage: None,
                 },
                 PhiNode {
                     dst: acc_phi.clone(),
                     sources: vec![(0x900, var("RBX", 0, 8)), (0x1008, var("RBX", 1, 8))],
+                    canonical_storage: None,
                 },
             ],
             ops: vec![
@@ -2377,14 +2388,17 @@ mod tests {
                 PhiNode {
                     dst: counter_phi.clone(),
                     sources: vec![(0x900, var("RCX", 0, 8)), (0x1008, var("RCX", 1, 8))],
+                    canonical_storage: None,
                 },
                 PhiNode {
                     dst: ptr_phi.clone(),
                     sources: vec![(0x900, var("RDI", 0, 8)), (0x1008, var("RDI", 1, 8))],
+                    canonical_storage: None,
                 },
                 PhiNode {
                     dst: acc_phi.clone(),
                     sources: vec![(0x900, var("RBX", 0, 8)), (0x1008, var("RBX", 1, 8))],
+                    canonical_storage: None,
                 },
             ],
             ops: vec![
@@ -2462,14 +2476,17 @@ mod tests {
                 PhiNode {
                     dst: counter_phi.clone(),
                     sources: vec![(0x900, var("RCX", 0, 8)), (0x1008, var("RCX", 1, 8))],
+                    canonical_storage: None,
                 },
                 PhiNode {
                     dst: ptr_phi.clone(),
                     sources: vec![(0x900, var("RDI", 0, 8)), (0x1008, var("RDI", 1, 8))],
+                    canonical_storage: None,
                 },
                 PhiNode {
                     dst: acc_phi.clone(),
                     sources: vec![(0x900, var("RBX", 0, 8)), (0x1008, var("RBX", 1, 8))],
+                    canonical_storage: None,
                 },
             ],
             ops: vec![
@@ -2541,14 +2558,17 @@ mod tests {
                 PhiNode {
                     dst: counter_phi.clone(),
                     sources: vec![(0x900, var("RCX", 0, 8)), (0x1008, var("RCX", 1, 8))],
+                    canonical_storage: None,
                 },
                 PhiNode {
                     dst: ptr_phi.clone(),
                     sources: vec![(0x900, var("RDI", 0, 8)), (0x1008, var("RDI", 1, 8))],
+                    canonical_storage: None,
                 },
                 PhiNode {
                     dst: acc_phi.clone(),
                     sources: vec![(0x900, var("RBX", 0, 1)), (0x1008, var("RBX", 1, 1))],
+                    canonical_storage: None,
                 },
             ],
             ops: vec![
@@ -2664,14 +2684,17 @@ mod tests {
                 PhiNode {
                     dst: counter_phi.clone(),
                     sources: vec![(0x900, var("RCX", 0, 8)), (0x1008, var("RCX", 1, 8))],
+                    canonical_storage: None,
                 },
                 PhiNode {
                     dst: ptr_phi.clone(),
                     sources: vec![(0x900, var("RDI", 0, 8)), (0x1008, var("RDI", 1, 8))],
+                    canonical_storage: None,
                 },
                 PhiNode {
                     dst: acc_phi.clone(),
                     sources: vec![(0x900, var("RBX", 0, 8)), (0x1008, var("RBX", 1, 8))],
+                    canonical_storage: None,
                 },
             ],
             ops: vec![

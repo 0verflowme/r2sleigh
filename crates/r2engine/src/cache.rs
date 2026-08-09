@@ -23,23 +23,16 @@ impl CacheCounters {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EngineSessionCacheMetrics {
     pub analysis: CacheCounters,
-    pub artifacts: CacheCounters,
 }
 
 impl EngineSessionCacheMetrics {
     pub fn total(self) -> CacheCounters {
-        CacheCounters {
-            hits: self.analysis.hits + self.artifacts.hits,
-            misses: self.analysis.misses + self.artifacts.misses,
-            insertions: self.analysis.insertions + self.artifacts.insertions,
-            evictions: self.analysis.evictions + self.artifacts.evictions,
-        }
+        self.analysis
     }
 
     pub fn counters_for_layer(self, layer: EngineCacheLayer) -> CacheCounters {
         match layer {
             EngineCacheLayer::Analysis => self.analysis,
-            EngineCacheLayer::Artifact => self.artifacts,
             EngineCacheLayer::MetricsSnapshot => self.total(),
         }
     }
@@ -84,13 +77,15 @@ where
             .inner
             .write()
             .expect("engine cache write lock poisoned")
-            .insert(key, value);
+            .insert_if_absent(key, value);
         let mut counters = self
             .counters
             .write()
             .expect("engine cache counters write lock poisoned");
-        counters.insertions += 1;
-        counters.evictions += result.evicted_count;
+        if result.inserted {
+            counters.insertions += 1;
+            counters.evictions += result.evicted_count;
+        }
         result.value
     }
 
@@ -106,24 +101,16 @@ where
     }
 
     pub fn reset_counters(&self) {
-        *self
-            .counters
-            .write()
-            .expect("engine cache counters write lock poisoned") = CacheCounters::default();
-    }
-}
-
-impl<K, V> SessionCache<K, V>
-where
-    K: Clone + Eq + Hash,
-    V: Clone,
-{
-    pub fn get_cloned(&self, key: &K) -> Option<V> {
-        self.get_arc(key).map(|value| (*value).clone())
+        let _ = self.take_counters();
     }
 
-    pub fn insert_cloned(&self, key: K, value: V) -> V {
-        self.insert(key, value).as_ref().clone()
+    pub fn take_counters(&self) -> CacheCounters {
+        std::mem::take(
+            &mut *self
+                .counters
+                .write()
+                .expect("engine cache counters write lock poisoned"),
+        )
     }
 }
 
@@ -136,6 +123,7 @@ struct BoundedArcCache<K, V> {
 
 struct CacheInsertResult<V> {
     value: Arc<V>,
+    inserted: bool,
     evicted_count: u64,
 }
 
@@ -169,17 +157,24 @@ where
         Some(value)
     }
 
-    fn insert(&mut self, key: K, value: Arc<V>) -> CacheInsertResult<V> {
+    fn insert_if_absent(&mut self, key: K, value: Arc<V>) -> CacheInsertResult<V> {
         if self.limit == 0 {
             return CacheInsertResult {
                 value,
+                inserted: false,
+                evicted_count: 0,
+            };
+        }
+        if let Some(value) = self.get(&key) {
+            return CacheInsertResult {
+                value,
+                inserted: false,
                 evicted_count: 0,
             };
         }
         let ticket = self.allocate_ticket();
-        if let Some((_, old_ticket)) = self.entries.insert(key.clone(), (value.clone(), ticket)) {
-            self.order.remove(&old_ticket);
-        }
+        self.entries
+            .insert(key.clone(), (Arc::clone(&value), ticket));
         self.order.insert(ticket, key);
         let mut evicted_count = 0;
         while self.entries.len() > self.limit {
@@ -192,7 +187,42 @@ where
         }
         CacheInsertResult {
             value,
+            inserted: true,
             evicted_count,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Barrier;
+    use std::thread;
+
+    #[test]
+    fn concurrent_insert_if_absent_preserves_resident_arc_identity() {
+        const THREAD_COUNT: usize = 8;
+
+        let cache = Arc::new(SessionCache::new(4));
+        let barrier = Arc::new(Barrier::new(THREAD_COUNT));
+        let workers = (0..THREAD_COUNT)
+            .map(|value| {
+                let cache = Arc::clone(&cache);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let candidate = Arc::new(value);
+                    barrier.wait();
+                    cache.insert_arc(7, candidate)
+                })
+            })
+            .collect::<Vec<_>>();
+        let values = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("cache insert worker"))
+            .collect::<Vec<_>>();
+
+        let resident = cache.get_arc(&7).expect("resident cache value");
+        assert!(values.iter().all(|value| Arc::ptr_eq(value, &resident)));
+        assert_eq!(cache.counters().insertions, 1);
     }
 }

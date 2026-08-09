@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "C-ABI plugin for radare2 integration"
+build = "build.rs"
 
 [lib]
 crate-type = ["cdylib"]
@@ -21,7 +22,11 @@ serde_json.workspace = true
 z3.workspace = true
 
 [dev-dependencies]
+r2dec = { path = "../crates/r2dec" }
 r2engine = { path = "../crates/r2engine" }
+
+[build-dependencies]
+cbindgen = "0.29"
 
 [dependencies.sleigh-config]
 workspace = true

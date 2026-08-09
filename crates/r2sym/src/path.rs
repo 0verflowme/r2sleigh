@@ -15,6 +15,7 @@ use z3::Context;
 
 use crate::backward::DerivedCallSummaryView;
 use crate::constraints::FinalConstraintGraph;
+use crate::control::{SymExecutionControl, SymExecutionStopReason};
 use crate::executor::SymExecutor;
 use crate::loops::{self, ExactLoopFoldEvidence, ExactLoopRecurrenceEvidence, LoopSummaryKind};
 use crate::sim::{
@@ -409,6 +410,8 @@ pub struct PathExplorer<'ctx> {
     target_distance_cache: TargetDistanceCache,
     /// Candidate-generation tactics used during model extraction.
     solve_tactic_config: SolveTacticConfig,
+    /// Cooperative control shared with executor and solver worklists.
+    execution: SymExecutionControl,
 }
 
 /// Statistics from path exploration.
@@ -430,6 +433,8 @@ pub struct ExploreStats {
     pub timed_out: bool,
     /// Whether exploration stopped because the max_states budget was exhausted.
     pub max_states_exhausted: bool,
+    /// Cooperative stop, distinct from exploration fuel and timeout budgets.
+    pub execution_stop: Option<SymExecutionStopReason>,
     /// Number of queued states discarded because another state subsumed them.
     pub states_subsumed: usize,
     /// Number of implication checks attempted for same-PC subsumption.
@@ -750,6 +755,12 @@ impl<'ctx> DriverMode<'ctx> {
                 .push("exploration stopped at max_states budget".to_string());
         }
         true
+    }
+
+    fn on_execution_stop(&mut self, reason: SymExecutionStopReason) {
+        if let DriverMode::Spec { result, .. } = self {
+            result.diagnostics.push(reason.to_string());
+        }
     }
 
     fn on_unsat_pruned(&mut self) {
@@ -1579,6 +1590,9 @@ impl<'ctx> PathExplorer<'ctx> {
         let mut runahead = state.fork();
         let mut guard_visits = 0u64;
         for block_step in 0..EXACT_RUNTIME_LOOP_MAX_BLOCK_STEPS {
+            if self.execution.poll().is_err() {
+                return None;
+            }
             if let Some(dispatched) = self.dispatch_runtime_breakpoint(&mut runahead) {
                 runahead = dispatched;
             }
@@ -1683,32 +1697,33 @@ impl<'ctx> PathExplorer<'ctx> {
 
     /// Create a new path explorer.
     pub fn new(ctx: &'ctx Context) -> Self {
-        Self {
-            _ctx: ctx,
-            executor: SymExecutor::new(ctx),
-            solver: SymSolver::new(ctx),
-            config: ExploreConfig::default(),
-            stats: ExploreStats::default(),
-            target_guided_queries: false,
-            exception_bridge_guidance_enabled: true,
-            residual_runtime_loop_summaries_enabled: true,
-            derived_call_summaries: HashMap::new(),
-            target_distance_cache: TargetDistanceCache::new(),
-            solve_tactic_config: SolveTacticConfig::default(),
-        }
+        Self::with_config_and_execution_control(
+            ctx,
+            ExploreConfig::default(),
+            SymExecutionControl::default(),
+        )
     }
 
-    /// Create a path explorer with configuration.
-    pub fn with_config(ctx: &'ctx Context, config: ExploreConfig) -> Self {
+    /// Create a path explorer with cooperative cancellation and deadline control.
+    pub fn with_execution_control(ctx: &'ctx Context, execution: SymExecutionControl) -> Self {
+        Self::with_config_and_execution_control(ctx, ExploreConfig::default(), execution)
+    }
+
+    /// Create a configured path explorer with cooperative request control.
+    pub fn with_config_and_execution_control(
+        ctx: &'ctx Context,
+        config: ExploreConfig,
+        execution: SymExecutionControl,
+    ) -> Self {
         let solver = if let Some(timeout) = config.timeout {
-            SymSolver::with_timeout(ctx, timeout)
+            SymSolver::with_timeout_and_control(ctx, timeout, execution.clone())
         } else {
-            SymSolver::new(ctx)
+            SymSolver::with_execution_control(ctx, execution.clone())
         };
 
         Self {
             _ctx: ctx,
-            executor: SymExecutor::new(ctx),
+            executor: SymExecutor::with_execution_control(ctx, execution.clone()),
             solver,
             config,
             stats: ExploreStats::default(),
@@ -1718,7 +1733,13 @@ impl<'ctx> PathExplorer<'ctx> {
             derived_call_summaries: HashMap::new(),
             target_distance_cache: TargetDistanceCache::new(),
             solve_tactic_config: SolveTacticConfig::default(),
+            execution,
         }
+    }
+
+    /// Create a path explorer with configuration.
+    pub fn with_config(ctx: &'ctx Context, config: ExploreConfig) -> Self {
+        Self::with_config_and_execution_control(ctx, config, SymExecutionControl::default())
     }
 
     /// Get the exploration statistics.
@@ -2000,6 +2021,32 @@ impl<'ctx> PathExplorer<'ctx> {
         self.stats.timed_out || self.stats.max_states_exhausted
     }
 
+    /// Whether cooperative cancellation or a caller deadline stopped exploration.
+    pub fn execution_stop_reason(&self) -> Option<SymExecutionStopReason> {
+        self.stats
+            .execution_stop
+            .or_else(|| self.solver.execution_stop_reason())
+            .or_else(|| self.execution.stop_reason())
+    }
+
+    /// Whether any budget or cooperative request control stopped this search.
+    pub fn search_stopped(&self) -> bool {
+        self.budget_exhausted() || self.execution_stop_reason().is_some()
+    }
+
+    fn poll_execution(&mut self, mode: &mut DriverMode<'ctx>) -> bool {
+        let Some(reason) = self
+            .execution
+            .stop_reason()
+            .or_else(|| self.solver.execution_stop_reason())
+        else {
+            return true;
+        };
+        self.stats.execution_stop = Some(reason);
+        mode.on_execution_stop(reason);
+        false
+    }
+
     fn record_depth(&mut self, depth: usize) {
         if depth > self.stats.max_depth_reached {
             self.stats.max_depth_reached = depth;
@@ -2085,6 +2132,9 @@ impl<'ctx> PathExplorer<'ctx> {
         worklist.push(initial_state);
 
         'worklist: while let Some(mut state) = worklist.pop_next() {
+            if !self.poll_execution(mode) {
+                break;
+            }
             if self.config.merge_states
                 && let Some(other) = worklist.take_same_pc(state.pc)
             {
@@ -2129,6 +2179,9 @@ impl<'ctx> PathExplorer<'ctx> {
             let inline_start_depth = state.depth;
             let mut revisit_current_state = false;
             loop {
+                if !self.poll_execution(mode) {
+                    break 'worklist;
+                }
                 if let Some(timeout) = self.config.timeout
                     && start_time.elapsed() > timeout
                     && mode.on_timeout()
@@ -2432,6 +2485,9 @@ impl<'ctx> PathExplorer<'ctx> {
         'worklist: while let Some((mut state, reordered)) =
             self.pop_target_guided_state(&mut worklist, &mut target_heap)
         {
+            if !self.poll_execution(mode) {
+                break;
+            }
             if reordered {
                 self.stats.target_guided_reorders += 1;
             }
@@ -2492,6 +2548,9 @@ impl<'ctx> PathExplorer<'ctx> {
             let inline_start_depth = state.depth;
             let mut revisit_current_state = false;
             loop {
+                if !self.poll_execution(mode) {
+                    break 'worklist;
+                }
                 let mut had_runtime_dispatch = false;
                 if let Some(timeout) = self.config.timeout
                     && start_time.elapsed() > timeout
@@ -3034,6 +3093,79 @@ mod tests {
 
     const RAX: u64 = 0;
     const RDI: u64 = 56;
+
+    fn terminal_test_function() -> SsaArtifact {
+        SsaArtifact::for_symbolic(
+            &[R2ILBlock {
+                addr: 0x1000,
+                size: 1,
+                ops: vec![R2ILOp::Return {
+                    target: make_const(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            }],
+            None,
+        )
+        .expect("terminal symbolic function")
+    }
+
+    #[test]
+    fn pre_cancelled_exploration_is_not_reported_as_budget_exhaustion() {
+        let ctx = Context::thread_local();
+        let cancellation = crate::SymCancellationToken::default();
+        cancellation.cancel();
+        let mut explorer = PathExplorer::with_execution_control(
+            &ctx,
+            crate::SymExecutionControl::with_cancellation(cancellation),
+        );
+        let function = terminal_test_function();
+        let summary = explorer.summarize_function(&function, SymState::new(&ctx, function.entry));
+
+        assert_eq!(summary.completion, crate::QueryCompletion::Cancelled);
+        assert_eq!(
+            summary.stats.execution_stop,
+            Some(crate::SymExecutionStopReason::Cancelled)
+        );
+        assert!(!summary.stats.timed_out);
+        assert!(!summary.stats.max_states_exhausted);
+    }
+
+    #[test]
+    fn expired_deadline_is_not_reported_as_exploration_timeout() {
+        let ctx = Context::thread_local();
+        let deadline = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("past deadline");
+        let mut explorer = PathExplorer::with_execution_control(
+            &ctx,
+            crate::SymExecutionControl::with_deadline(deadline),
+        );
+        let function = terminal_test_function();
+        let summary = explorer.summarize_function(&function, SymState::new(&ctx, function.entry));
+
+        assert_eq!(summary.completion, crate::QueryCompletion::DeadlineExceeded);
+        assert_eq!(
+            summary.stats.execution_stop,
+            Some(crate::SymExecutionStopReason::DeadlineExceeded)
+        );
+        assert!(!summary.stats.timed_out);
+        assert!(!summary.stats.max_states_exhausted);
+    }
+
+    #[test]
+    fn max_state_budget_remains_distinct_from_execution_control() {
+        let ctx = Context::thread_local();
+        let mut config = ExploreConfig::default();
+        config.max_states = 0;
+        let mut explorer = PathExplorer::with_config(&ctx, config);
+        let function = terminal_test_function();
+        let summary = explorer.summarize_function(&function, SymState::new(&ctx, function.entry));
+
+        assert_eq!(summary.completion, crate::QueryCompletion::BudgetExhausted);
+        assert!(summary.stats.max_states_exhausted);
+        assert_eq!(summary.stats.execution_stop, None);
+    }
     const TMP0: u64 = 0x80;
     const TMP1: u64 = 0x88;
     const TMP2: u64 = 0x90;
@@ -3618,6 +3750,7 @@ mod tests {
                     (0x1000, r2ssa::SSAVar::new("RCX", 4, 8)),
                     (0x1200, r2ssa::SSAVar::new("RCX", 6, 8)),
                 ],
+                canonical_storage: None,
             }],
             ops: Vec::new(),
         };

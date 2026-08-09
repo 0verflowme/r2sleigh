@@ -16,21 +16,21 @@ use r2il::MemoryOrdering;
 pub enum SSAOp {
     // ========== SSA-specific Operations ==========
     /// Phi function: merges values from different control flow paths.
-    /// dst = phi(sources[0], sources[1], ...)
+    /// `dst = phi(sources[0], sources[1], ...)`
     Phi { dst: SSAVar, sources: Vec<SSAVar> },
 
     // ========== Data Movement ==========
     /// Copy src to dst: dst = src
     Copy { dst: SSAVar, src: SSAVar },
 
-    /// Load from memory: dst = *[space]addr
+    /// Load from memory: `dst = *[space]addr`
     Load {
         dst: SSAVar,
         space: String,
         addr: SSAVar,
     },
 
-    /// Store to memory: *[space]addr = val
+    /// Store to memory: `*[space]addr = val`
     Store {
         space: String,
         addr: SSAVar,
@@ -185,7 +185,7 @@ pub enum SSAOp {
     /// Concatenate two values: dst = (hi << lo.size*8) | lo
     Piece { dst: SSAVar, hi: SSAVar, lo: SSAVar },
 
-    /// Extract a portion of a value: dst = src[offset:size]
+    /// Extract a portion of a value: `dst = src[offset:size]`
     Subpiece {
         dst: SSAVar,
         src: SSAVar,

@@ -14,8 +14,18 @@ mod analysis;
 mod blocks;
 mod context;
 mod decompiler;
+mod ffi_v2;
 mod helpers;
+#[cfg(test)]
+mod plain_o2_lift_fixtures;
 mod types;
+
+use ffi_v2::{
+    R2SleighContextCallee, R2SleighEngineRequestPayloadV2, R2SleighFunctionContext,
+    R2SleighInterprocScope, R2SleighInterprocSessionPlan, R2SleighLiftQuality,
+};
+#[cfg(test)]
+use ffi_v2::{R2SleighContextParam, R2SleighInterprocSeed};
 
 #[cfg(test)]
 use analysis::ssa::{r2il_block_defuse_json, r2il_block_to_ssa_json};
@@ -654,6 +664,74 @@ pub extern "C" fn r2il_block_op_count(block: *const R2ILBlock) -> usize {
         return 0;
     }
     unsafe { (*block).ops.len() }
+}
+
+/// Exact identity of one direct lifted call selected by source instruction
+/// address. Used only to bind immutable radare2 callsite facts to lifted IL.
+#[repr(C)]
+pub struct R2ILDirectCallIdentity {
+    pub op_index: usize,
+    pub target_space: u32,
+    pub target_custom_space: u32,
+    pub target_offset: u64,
+    pub target_size: u32,
+}
+
+/// Resolve one raw call instruction to exactly one lifted direct call.
+/// Returns 1 on an exact match, 0 when absent, and -1 when ambiguous or when
+/// the raw target disagrees with the lifted constant target.
+#[unsafe(no_mangle)]
+pub extern "C" fn r2il_block_direct_call_identity(
+    block: *const R2ILBlock,
+    raw_instruction_addr: u64,
+    raw_target_addr: u64,
+    output: *mut R2ILDirectCallIdentity,
+) -> i32 {
+    if block.is_null() || output.is_null() {
+        return -1;
+    }
+    let block = unsafe { &*block };
+    let mut selected = None;
+    for (op_index, op) in block.ops.iter().enumerate() {
+        let R2ILOp::Call { target } = op else {
+            continue;
+        };
+        if block
+            .op_metadata(op_index)
+            .and_then(|metadata| metadata.instruction_addr)
+            != Some(raw_instruction_addr)
+        {
+            continue;
+        }
+        if selected.is_some()
+            || !matches!(target.space, r2il::SpaceId::Const)
+            || target.offset != raw_target_addr
+            || target.size == 0
+        {
+            return -1;
+        }
+        selected = Some((op_index, target));
+    }
+    let Some((op_index, target)) = selected else {
+        return 0;
+    };
+    let (target_space, target_custom_space) = match target.space {
+        r2il::SpaceId::Ram => (ffi_v2::R2SLEIGH_SOURCE_STORAGE_RAM_V2, 0),
+        r2il::SpaceId::Register => (ffi_v2::R2SLEIGH_SOURCE_STORAGE_REGISTER_V2, 0),
+        r2il::SpaceId::Unique => (ffi_v2::R2SLEIGH_SOURCE_STORAGE_UNIQUE_V2, 0),
+        r2il::SpaceId::Const => (ffi_v2::R2SLEIGH_SOURCE_STORAGE_CONSTANT_V2, 0),
+        r2il::SpaceId::Custom(id) => (ffi_v2::R2SLEIGH_SOURCE_STORAGE_CUSTOM_V2, id),
+    };
+    unsafe {
+        *output = R2ILDirectCallIdentity {
+            op_index,
+            target_space,
+            target_custom_space,
+            target_offset: target.offset,
+            target_size: target.size,
+        };
+    }
+    1
 }
 
 /// Get the ESIL string for a block (one line per op, joined with ';').
@@ -2852,39 +2930,18 @@ fn parse_external_stack_vars(
     vars
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_engine_decompile_function(
-    input: *const R2SleighEngineDecompileInput,
-) -> *mut c_char {
-    if input.is_null() {
-        return ptr::null_mut();
-    }
-    let input = unsafe { &*input };
-    let Some(output) = r2sleigh_engine_decompile_function_output(input) else {
-        return ptr::null_mut();
-    };
-
-    CString::new(output).map_or(ptr::null_mut(), |c| c.into_raw())
+#[derive(Debug)]
+pub(crate) struct EngineV2Output {
+    pub(crate) output: String,
+    pub(crate) metrics: r2engine::EngineMetrics,
+    pub(crate) diagnostics: r2engine::EngineDiagnostics,
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_engine_type_function_json(
-    input: *const R2SleighEngineTypeFunctionInput,
-) -> *mut c_char {
-    if input.is_null() {
-        return ptr::null_mut();
-    }
-    let input = unsafe { &*input };
-    let Some(output) = r2sleigh_engine_type_function_json_output(input) else {
-        return ptr::null_mut();
-    };
-
-    CString::new(output).map_or(ptr::null_mut(), |c| c.into_raw())
-}
-
-fn r2sleigh_engine_type_function_json_output(
-    input: &R2SleighEngineTypeFunctionInput,
-) -> Option<String> {
+fn r2sleigh_engine_type_function_json_output_with_source(
+    input: &R2SleighEngineRequestPayloadV2,
+    source_snapshot: Option<std::sync::Arc<r2engine::EngineSourceSnapshot>>,
+    execution: r2engine::EngineExecutionControl,
+) -> Option<EngineV2Output> {
     let ctx_view = context::require_ctx_view(input.ctx)?;
     let input_quality = engine_function_input_quality_from_ffi(input.lift_quality);
     let block_slice = unsafe { blocks::BlockSlice::from_ffi(input.blocks, input.num_blocks) };
@@ -2926,6 +2983,7 @@ fn r2sleigh_engine_type_function_json_output(
         blocks: blocks.clone(),
         arch: ctx_view.arch.cloned(),
         semantic_metadata_enabled: ctx_view.semantic_metadata_enabled,
+        source_snapshot,
     };
     let report_input = r2engine::EngineFunctionAnalysisReportRequestInput {
         function: function_input,
@@ -2939,11 +2997,44 @@ fn r2sleigh_engine_type_function_json_output(
         writeback_budget,
         writeback_apply_policy,
     };
-    let request = r2engine::EngineFunctionAnalysisReportRequest::full_semantics_for_function_with_register_names(
+    let mut request = r2engine::EngineFunctionAnalysisReportRequest::full_semantics_for_function_with_register_names(
 		report_input,
 		|vn| ctx_view.disasm.register_name(vn),
 	);
-    let report = types::engine_session().type_function_report_payload(request)?;
+    request.analysis = request.analysis.with_execution_control(execution);
+    let function_name = request.analysis.function_name.clone();
+    let function_addr = request.analysis.function_addr;
+    let writeback_budget = request.writeback_budget;
+    let writeback_apply_policy = request.writeback_apply_policy;
+    let response = match types::engine_session().type_function_checked(
+        r2engine::EngineTypeAnalysisRequest::from_interproc_budget(
+            request.analysis,
+            request.interproc_max_iters,
+            request.interproc_converged,
+        ),
+    ) {
+        Ok(response) => response,
+        Err(refusal) => {
+            return Some(EngineV2Output {
+                output: serde_json::json!({
+                    "refused": true,
+                    "reason": refusal.reason,
+                })
+                .to_string(),
+                metrics: *refusal.metrics,
+                diagnostics: *refusal.diagnostics,
+            });
+        }
+    };
+    let metrics = response.metrics.clone();
+    let diagnostics = response.diagnostics.clone();
+    let report = r2engine::function_analysis_report_payload_from_type_response(
+        function_name,
+        function_addr,
+        response,
+        writeback_budget,
+        writeback_apply_policy,
+    );
     let type_writeback = r2engine::type_writeback_report_json_from_function_analysis(
         r2engine::EngineFunctionAnalysisTypeWritebackJsonRequest {
             report: &report,
@@ -2954,12 +3045,18 @@ fn r2sleigh_engine_type_function_json_output(
             symbolic_scope: symbolic_scope_report.as_ref(),
         },
     );
-    serde_json::to_string(&type_writeback).ok()
+    Some(EngineV2Output {
+        output: serde_json::to_string(&type_writeback).ok()?,
+        metrics,
+        diagnostics,
+    })
 }
 
-fn r2sleigh_engine_decompile_function_output(
-    input: &R2SleighEngineDecompileInput,
-) -> Option<String> {
+fn r2sleigh_engine_decompile_function_output_with_source(
+    input: &R2SleighEngineRequestPayloadV2,
+    source_snapshot: Option<std::sync::Arc<r2engine::EngineSourceSnapshot>>,
+    execution: r2engine::EngineExecutionControl,
+) -> Option<EngineV2Output> {
     let ctx_view = context::require_ctx_view(input.ctx)?;
     let input_quality = engine_function_input_quality_from_ffi(input.lift_quality);
     let block_slice = unsafe { blocks::BlockSlice::from_ffi(input.blocks, input.num_blocks) };
@@ -2978,6 +3075,7 @@ fn r2sleigh_engine_decompile_function_output(
             .unwrap_or_default(),
         arch: ctx_view.arch.cloned(),
         semantic_metadata_enabled: ctx_view.semantic_metadata_enabled,
+        source_snapshot,
     };
     let parsed_context = r2engine::parse_typed_external_context_for_engine(
         unsafe { typed_function_context_to_engine_input(&input.function_context) },
@@ -3003,8 +3101,14 @@ fn r2sleigh_engine_decompile_function_output(
             input.interproc_plan.interproc_max_iters.max(1),
             symbolic_scope,
         )
-        .with_input_quality(input_quality);
-    decompiler::run_engine_decompile_on_large_stack(decompile_input)
+        .with_input_quality(input_quality)
+        .with_execution_control(execution);
+    let response = decompiler::run_engine_decompile(decompile_input);
+    Some(EngineV2Output {
+        output: response.output,
+        metrics: response.metrics,
+        diagnostics: response.diagnostics,
+    })
 }
 
 fn engine_function_input_quality_from_ffi(
@@ -3109,114 +3213,9 @@ type InterprocSummaryJson = r2engine::EngineInterprocSummaryJson;
 #[cfg(test)]
 type InferredTypeWritebackJson = r2engine::EngineInferredTypeWritebackJson;
 
-#[repr(C)]
-pub struct R2SleighContextParam {
-    name: *const c_char,
-    type_name: *const c_char,
-    cc_reg: *const c_char,
-}
-
-#[repr(C)]
-pub struct R2SleighContextVar {
-    kind: u32,
-    name: *const c_char,
-    type_name: *const c_char,
-    reg: *const c_char,
-    base: *const c_char,
-    offset: i64,
-    has_offset: i32,
-    role: u32,
-    param_index: i64,
-    param_name: *const c_char,
-    source_reg: *const c_char,
-    is_arg: i32,
-}
-
-#[repr(C)]
-pub struct R2SleighContextBaseMember {
-    name: *const c_char,
-    type_name: *const c_char,
-    offset: u64,
-    size_bits: u64,
-    has_size_bits: i32,
-}
-
-#[repr(C)]
-pub struct R2SleighContextEnumVariant {
-    name: *const c_char,
-    value: i64,
-}
-
-#[repr(C)]
-pub struct R2SleighContextBaseType {
-    kind: u32,
-    name: *const c_char,
-    type_name: *const c_char,
-    size_bits: u64,
-    has_size_bits: i32,
-    members: *const R2SleighContextBaseMember,
-    num_members: usize,
-    variants: *const R2SleighContextEnumVariant,
-    num_variants: usize,
-}
-
-#[repr(C)]
-pub struct R2SleighContextCallee {
-    call_addr: u64,
-    addr: u64,
-    name: *const c_char,
-    linkage: u32,
-    signature_name: *const c_char,
-    signature_ret_type: *const c_char,
-    signature_callconv: *const c_char,
-    signature_noreturn: i32,
-    signature_params: *const R2SleighContextParam,
-    num_signature_params: usize,
-}
-
-#[repr(C)]
-pub struct R2SleighFunctionContext {
-    schema_version: u32,
-    dirty_epoch: u64,
-    context_hash: u64,
-    type_dirty_epoch: u64,
-    external_context_json: *const c_char,
-    signature_name: *const c_char,
-    signature_ret_type: *const c_char,
-    signature_callconv: *const c_char,
-    signature_noreturn: i32,
-    params: *const R2SleighContextParam,
-    num_params: usize,
-    vars: *const R2SleighContextVar,
-    num_vars: usize,
-    base_types: *const R2SleighContextBaseType,
-    num_base_types: usize,
-    callees: *const R2SleighContextCallee,
-    num_callees: usize,
-    assumptions_json: *const c_char,
-}
-
-#[repr(C)]
-pub struct R2SleighInterprocSeed {
-    id: u64,
-    name: *const c_char,
-    arg_count_hint: usize,
-    has_arg_count_hint: i32,
-    linkage: u32,
-}
-
 const R2SLEIGH_INTERPROC_LINKAGE_UNKNOWN: u32 = 0;
 const R2SLEIGH_INTERPROC_LINKAGE_INTERNAL: u32 = 1;
 const R2SLEIGH_INTERPROC_LINKAGE_IMPORTED: u32 = 2;
-
-#[repr(C)]
-pub struct R2SleighInterprocScope {
-    schema_version: u32,
-    functions: *const analysis::sym::R2ILFunctionBlocks,
-    num_functions: usize,
-    seeds: *const R2SleighInterprocSeed,
-    num_seeds: usize,
-}
 
 #[repr(C)]
 #[cfg(test)]
@@ -3267,16 +3266,6 @@ pub struct R2SleighAutoCallbackPlan {
     allowed: i32,
     kind: u32,
     reason: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct R2SleighInterprocSessionPlan {
-    include_type_interproc_scope: i32,
-    include_root_symbolic_scope: i32,
-    interproc_iter: usize,
-    interproc_max_iters: usize,
-    interproc_converged: i32,
 }
 
 #[repr(C)]
@@ -3567,64 +3556,6 @@ pub extern "C" fn r2sleigh_auto_callback_plan_for_depth(
     ))
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_ffi_sizeof_function_context() -> usize {
-    std::mem::size_of::<R2SleighFunctionContext>()
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_ffi_alignof_function_context() -> usize {
-    std::mem::align_of::<R2SleighFunctionContext>()
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_ffi_sizeof_engine_decompile_input() -> usize {
-    std::mem::size_of::<R2SleighEngineDecompileInput>()
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_ffi_alignof_engine_decompile_input() -> usize {
-    std::mem::align_of::<R2SleighEngineDecompileInput>()
-}
-
-#[repr(C)]
-pub struct R2SleighEngineDecompileInput {
-    ctx: *const R2ILContext,
-    blocks: *const *const R2ILBlock,
-    num_blocks: usize,
-    function_addr: u64,
-    function_name: *const c_char,
-    function_context: R2SleighFunctionContext,
-    lift_quality: R2SleighLiftQuality,
-    interproc_scope: R2SleighInterprocScope,
-    interproc_plan: R2SleighInterprocSessionPlan,
-}
-
-#[repr(C)]
-pub struct R2SleighEngineTypeFunctionInput {
-    ctx: *const R2ILContext,
-    blocks: *const *const R2ILBlock,
-    num_blocks: usize,
-    function_addr: u64,
-    function_name: *const c_char,
-    function_context: R2SleighFunctionContext,
-    lift_quality: R2SleighLiftQuality,
-    interproc_scope: R2SleighInterprocScope,
-    interproc_plan: R2SleighInterprocSessionPlan,
-    analysis_depth: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct R2SleighLiftQuality {
-    expected_blocks: usize,
-    lifted_blocks: usize,
-    read_failures: usize,
-    invalid_blocks: usize,
-    null_lift_failures: usize,
-    truncated_blocks: usize,
-}
-
 #[cfg(test)]
 fn type_writeback_apply_policy_from_ffi(
     policy: &R2SleighTypeWritebackApplyPolicy,
@@ -3815,49 +3746,6 @@ fn ffi_interproc_seed_linkage(raw: u32) -> r2ssa::FunctionSemanticLinkage {
         R2SLEIGH_INTERPROC_LINKAGE_IMPORTED => r2ssa::FunctionSemanticLinkage::Imported,
         _ => r2ssa::FunctionSemanticLinkage::Unknown,
     }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct R2SleighMutation {
-    kind: u32,
-    signature: *const c_char,
-    callconv: *const c_char,
-    old_name: *const c_char,
-    name: *const c_char,
-    reg: *const c_char,
-    type_name: *const c_char,
-    type_materialization_key: *const c_char,
-    type_materialization_required: i32,
-    text: *const c_char,
-    addr: u64,
-    size: u64,
-    delta: i64,
-    var_kind: c_char,
-    is_arg: i32,
-    confidence: u8,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct R2SleighSignatureParam {
-    name: *const c_char,
-    type_name: *const c_char,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct R2SleighSignatureFact {
-    signature: *const c_char,
-    ret_type: *const c_char,
-    callconv: *const c_char,
-    arch: *const c_char,
-    params: *const R2SleighSignatureParam,
-    num_params: usize,
-    confidence: u8,
-    callconv_confidence: u8,
-    signature_decision: u32,
-    callconv_decision: u32,
 }
 
 #[repr(C)]
@@ -6500,15 +6388,124 @@ mod tests {
     }
 
     #[test]
+    fn c_plugin_decj_projects_owned_v2_response_as_structured_json() {
+        let c_source = include_str!("../r_anal_sleigh.c");
+        let project_start = c_source
+            .find("static char *sleigh_engine_execute_v2_project(")
+            .expect("V2 response projector");
+        let project_end = c_source[project_start..]
+            .find("static char *sleigh_engine_execute_v2(")
+            .map(|offset| project_start + offset)
+            .expect("legacy V2 output wrapper");
+        let project = &c_source[project_start..project_end];
+        let bytes = project
+            .find("api->response_bytes (response, &bytes)")
+            .expect("opaque response bytes inspection");
+        let json = project[bytes..]
+            .find("sleigh_engine_v2_response_json (&info, bytes)")
+            .map(|offset| bytes + offset)
+            .expect("structured JSON projection");
+        let free = project[json..]
+            .find("api->response_free (response)")
+            .map(|offset| json + offset)
+            .expect("opaque response owner release");
+        assert!(
+            bytes < json && json < free,
+            "all borrowed output, diagnostics, and timing views must be projected before response_free"
+        );
+        assert!(
+            project.contains("api->response_info (response, &info)"),
+            "decj metadata must come from the V2 response inspection API"
+        );
+
+        let response_json_start = c_source
+            .find("static char *sleigh_engine_v2_response_json(")
+            .expect("decj response JSON builder");
+        let response_json_end = c_source[response_json_start..]
+            .find("static char *sleigh_engine_execute_v2_project(")
+            .map(|offset| response_json_start + offset)
+            .expect("V2 executor after JSON builder");
+        let response_json = &c_source[response_json_start..response_json_end];
+        for field in [
+            "schema_version",
+            "rendered_output",
+            "diagnostics",
+            "outcome",
+            "phase_timings",
+            "ffi_conversion_elapsed_us",
+            "refused",
+            "error",
+        ] {
+            assert!(
+                response_json.contains(field),
+                "decj schema must expose {field}"
+            );
+        }
+        assert!(
+            c_source.contains("sleigh_json_is_single_object (")
+                && response_json.contains("r_json_parsedup (diagnostics_text)")
+                && response_json.contains("diagnostics->type != R_JSON_OBJECT")
+                && response_json.contains("pj_rj (pj, diagnostics)"),
+            "diagnostics must be one complete object and emitted structurally, never as a double-encoded string"
+        );
+        assert!(
+            !response_json.contains("pj_raw")
+                && !response_json.contains("pj_ks (pj, \"diagnostics\""),
+            "unparsed diagnostics must never be injected into decj JSON"
+        );
+        assert!(
+            project.contains("!info.diagnostics_json.data || !info.diagnostics_json.len")
+                && project.contains("invalid output or diagnostics in V2 response"),
+            "missing or malformed diagnostics must fail closed"
+        );
+
+        let decj_route = c_source
+            .find("cmd_matches_exact_or_arg (cmd, \"sla.decj\")")
+            .expect("public decj command route");
+        let dec_route = c_source
+            .find("cmd_matches_exact_or_arg (cmd, \"sla.dec\")")
+            .expect("legacy dec command route");
+        assert!(
+            decj_route < dec_route,
+            "the exact decj command must route before the backward-compatible dec command"
+        );
+        assert!(
+            c_source.contains("Usage: a:sla.decj [name|addr]")
+                && c_source.contains("sleigh_decompile_execute (anal, fcn, true)"),
+            "decj must expose help and reuse the same typed V2 decompile input path"
+        );
+        assert!(
+            c_source.contains("pj_knull (pj, \"rendered_output\")")
+                && c_source.contains("pj_ks (pj, \"outcome\", \"error\")"),
+            "transport and cancellation failures must not expose partial rendered output"
+        );
+    }
+
+    #[test]
+    fn c_plugin_never_imports_dwarf_during_analysis_or_decompilation() {
+        let c_source = include_str!("../r_anal_sleigh.c");
+        for forbidden in [
+            "sleigh_import_dwarf_base_types_if_needed",
+            "r_bin_dwarf_parse_",
+            "r_anal_dwarf_process_info",
+        ] {
+            assert!(
+                !c_source.contains(forbidden),
+                "immutable snapshots require DWARF ingestion before plugin analysis: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
     fn c_plugin_keeps_decompile_session_policy_out_of_c_glue() {
         let c_source = include_str!("../r_anal_sleigh.c");
         let start = c_source
-            .find("if (!strncmp (cmd, \"sla.dec\", 7))")
-            .expect("a:sla.dec command block");
+            .find("static RCodeMeta *sleigh_decompile(")
+            .expect("decompiler provider callback");
         let end = c_source[start..]
-            .find("if (!strcmp (cmd, \"sla.cfg\")")
+            .find("static char *sleigh_cmd(")
             .map(|offset| start + offset)
-            .expect("next command after a:sla.dec");
+            .expect("command callback after decompiler provider");
         let decompile_block = &c_source[start..end];
 
         assert!(
@@ -6586,8 +6583,9 @@ mod tests {
             );
         }
         assert!(
-            decompile_block.contains("r2sleigh_engine_decompile_function (&decompile_input)"),
-            "a:sla.dec must call the engine decompile FFI with decompile-only typed input"
+            decompile_block.contains("sleigh_engine_execute_v2 (")
+                && decompile_block.contains("R2SLEIGH_REQUEST_DECOMPILE_V2"),
+            "a:sla.dec must call the versioned engine boundary with decompile-only typed input"
         );
         for forbidden in [
             "/* r2dec: function target",
@@ -6599,6 +6597,106 @@ mod tests {
                 "a:sla.dec must not synthesize plugin-owned decompile refusal text {forbidden:?}"
             );
         }
+    }
+
+    #[test]
+    fn c_plugin_preflights_before_lift_and_snapshot_collection() {
+        let c_source = include_str!("../r_anal_sleigh.c");
+        let typed_start = c_source
+            .find("static bool sleigh_typed_function_context_build(")
+            .expect("typed context builder");
+        let typed_end = c_source[typed_start..]
+            .find("static bool sleigh_interproc_scope_build(")
+            .map(|offset| typed_start + offset)
+            .expect("function after typed context builder");
+        let typed_builder = &c_source[typed_start..typed_end];
+        let limited_snapshot = typed_builder
+            .find("typed->snapshot = sleigh_function_context_api.snapshot_collect_with_limits")
+            .expect("bounded snapshot collection");
+        let copied_context_preflight = typed_builder
+            .find("sleigh_typed_context_preflight")
+            .expect("post-collection typed context validation");
+        assert!(
+            limited_snapshot < copied_context_preflight,
+            "global type limits must be applied by radare2 before plugin-side copied-context validation"
+        );
+        for cap in [
+            "R2SLEIGH_MAX_CONTEXT_ITEMS_V2",
+            "R2SLEIGH_MAX_NESTED_ITEMS_V2",
+            "R2SLEIGH_MAX_AGGREGATE_STRING_BYTES_V2",
+            "R2SLEIGH_MAX_AGGREGATE_JSON_BYTES_V2",
+        ] {
+            assert!(
+                typed_builder[..limited_snapshot].contains(cap),
+                "bounded snapshot must receive {cap} before collection"
+            );
+        }
+        assert!(
+            !typed_builder.contains("snapshot_collect_unlimited (")
+                && !typed_builder.contains("r_anal_types_snapshot ("),
+            "bounded V2 context collection must not call legacy unbounded collectors"
+        );
+        assert!(
+            c_source
+                .contains("dlsym (RTLD_DEFAULT, \"r_anal_function_snapshot_collect_with_limits\")")
+                && c_source
+                    .contains("legacy context and type collectors are intentionally fail-closed"),
+            "limited snapshot resolution and no-header compatibility policy must be explicit"
+        );
+
+        let start = c_source
+            .find("static RCodeMeta *sleigh_decompile(")
+            .expect("decompiler provider callback");
+        let end = c_source[start..]
+            .find("static char *sleigh_cmd(")
+            .map(|offset| start + offset)
+            .expect("command callback after decompiler provider");
+        let decompile = &c_source[start..end];
+        let preflight = decompile
+            .find("sleigh_engine_function_preflight")
+            .expect("decompile CFG preflight");
+        let context = decompile
+            .find("get_context (anal)")
+            .expect("architecture context lookup");
+        let lift = decompile
+            .find("sleigh_engine_lift_function_blocks")
+            .expect("bounded function lift");
+        let snapshot = decompile
+            .find("sleigh_typed_function_context_build")
+            .expect("typed snapshot collection");
+        assert!(
+            preflight < context,
+            "CFG cap must precede provider context work"
+        );
+        assert!(preflight < lift, "CFG and byte caps must precede lifting");
+        assert!(
+            lift < snapshot,
+            "operation cap must precede snapshot collection"
+        );
+        assert!(
+            decompile.contains("R2SLEIGH_MAX_FUNCTION_BLOCKS_V2")
+                || c_source.contains("R2SLEIGH_MAX_FUNCTION_BLOCKS_V2"),
+            "C preflight must consume generated V2 cap constants"
+        );
+
+        let type_start = c_source
+            .find("if (!strncmp (cmd, \"sla.types\"")
+            .expect("type-function command");
+        let type_end = c_source[type_start..]
+            .find("/* ========== Function-level SSA commands ========== */")
+            .map(|offset| type_start + offset)
+            .expect("command after type-function");
+        let type_command = &c_source[type_start..type_end];
+        let type_preflight = type_command
+            .find("sleigh_engine_function_preflight")
+            .expect("type-function CFG preflight");
+        let type_lift = type_command
+            .find("sleigh_engine_lift_function_blocks")
+            .expect("bounded type-function lift");
+        let type_snapshot = type_command
+            .find("sleigh_typed_function_context_build")
+            .expect("typed snapshot collection");
+        assert!(type_preflight < type_lift && type_lift < type_snapshot);
     }
 
     #[test]
@@ -6736,7 +6834,7 @@ mod tests {
             "EngineFunctionInput",
             "blocks: block_slice",
             ".with_input_quality(input_quality)",
-            "run_engine_decompile_on_large_stack(decompile_input)",
+            "run_engine_decompile(decompile_input)",
         ] {
             assert!(
                 engine_impl.contains(required),
@@ -6797,6 +6895,7 @@ mod tests {
     #[test]
     fn plugin_decompile_boundary_has_no_legacy_direct_decompile_exports() {
         let rust_source = include_str!("lib.rs");
+        let ffi_source = include_str!("ffi_v2.rs");
         let c_source = include_str!("../r_anal_sleigh.c");
         let forbidden_rust = [
             concat!("pub extern \"C\" fn r2dec_", "function_with_context"),
@@ -6811,11 +6910,23 @@ mod tests {
                 "semantic_worker_linearization_scope_ffi"
             ),
             concat!("pub extern \"C\" fn r2dec_", "block_guard_comment_ffi"),
+            concat!("pub struct R2SleighEngine", "DecompileInput"),
+            concat!("pub struct R2SleighEngine", "TypeFunctionInput"),
+            concat!("pub extern \"C\" fn r2sleigh_engine_", "decompile_function"),
+            concat!("pub extern \"C\" fn r2sleigh_engine_", "type_function_json"),
+            concat!("execute_", "migration_shim"),
+            concat!("legacy_", "input"),
+            concat!("r2sleigh_ffi_sizeof_", "function_context"),
+            concat!("r2sleigh_ffi_alignof_", "function_context"),
         ];
         for forbidden in forbidden_rust {
             assert!(
                 !rust_source.contains(forbidden),
                 "r2plugin Rust must not expose legacy direct decompile ABI {forbidden:?}"
+            );
+            assert!(
+                !ffi_source.contains(forbidden),
+                "V2 Rust must not retain legacy request transport {forbidden:?}"
             );
         }
 
@@ -6827,6 +6938,8 @@ mod tests {
             concat!("r2dec_", "named_native_worker_summary("),
             concat!("r2dec_", "semantic_worker_linearization_scope_ffi("),
             concat!("r2dec_", "block_guard_comment_ffi("),
+            concat!("R2SleighEngine", "DecompileInput"),
+            concat!("R2SleighEngine", "TypeFunctionInput"),
         ];
         for forbidden in forbidden_c {
             assert!(
@@ -6835,8 +6948,14 @@ mod tests {
             );
         }
         assert!(
-            c_source.contains("r2sleigh_engine_decompile_function"),
-            "C plugin glue must route decompile through the engine boundary"
+            c_source.contains("sleigh_engine_execute_v2 (")
+                && c_source.contains("R2SLEIGH_REQUEST_DECOMPILE_V2")
+                && c_source.contains("R2SleighEngineRequestPayloadV2 request_payload")
+                && !c_source.contains(concat!(
+                    "r2sleigh_engine_",
+                    "decompile_function (&decompile_input)"
+                )),
+            "C plugin glue must route decompile exclusively through the V2 engine boundary"
         );
     }
 
@@ -8803,18 +8922,6 @@ mod integration_tests {
         }
     }
 
-    #[test]
-    fn engine_decompile_input_layout_exports_match_rust_layout() {
-        assert_eq!(
-            r2sleigh_ffi_sizeof_engine_decompile_input(),
-            std::mem::size_of::<R2SleighEngineDecompileInput>()
-        );
-        assert_eq!(
-            r2sleigh_ffi_alignof_engine_decompile_input(),
-            std::mem::align_of::<R2SleighEngineDecompileInput>()
-        );
-    }
-
     #[cfg(feature = "x86")]
     #[test]
     fn engine_decompile_ffi_refuses_incomplete_zero_block_lift() {
@@ -8824,7 +8931,9 @@ mod integration_tests {
 
         let external_context = CString::new("{}").expect("external context");
         let function_name = CString::new("sym.all_failed").expect("function name");
-        let input = R2SleighEngineDecompileInput {
+        let input = R2SleighEngineRequestPayloadV2 {
+            abi_version: ffi_v2::R2SLEIGH_ABI_V2,
+            struct_size: std::mem::size_of::<R2SleighEngineRequestPayloadV2>() as u32,
             ctx,
             blocks: ptr::null(),
             num_blocks: 0,
@@ -8841,19 +8950,34 @@ mod integration_tests {
             },
             interproc_scope: empty_interproc_scope(),
             interproc_plan: empty_interproc_plan(),
+            analysis_depth: 0,
+            timeout_us: 0,
+            source_interface: ptr::null(),
         };
 
-        let output = r2sleigh_engine_decompile_function_output(&input)
-            .expect("incomplete lift must still reach engine refusal");
-        assert!(output.contains("empty lifted function input"), "{output}");
-        assert!(output.contains("read_failures=1"), "{output}");
+        let output = r2sleigh_engine_decompile_function_output_with_source(
+            &input,
+            None,
+            r2engine::EngineExecutionControl::default(),
+        )
+        .expect("incomplete lift must still reach engine refusal");
+        assert!(
+            output.output.contains("empty lifted function input"),
+            "{}",
+            output.output
+        );
+        assert!(
+            output.output.contains("read_failures=1"),
+            "{}",
+            output.output
+        );
 
         r2il_free(ctx);
     }
 
     #[cfg(feature = "x86")]
     #[test]
-    fn engine_decompile_ffi_uses_imported_allocator_scope_for_signature() {
+    fn legacy_imported_allocator_scope_does_not_authorize_executable_c() {
         fn decode_hex(bytes: &str) -> Vec<u8> {
             let bytes = bytes.as_bytes();
             assert_eq!(bytes.len() % 2, 0, "hex input must have even length");
@@ -8915,7 +9039,9 @@ mod integration_tests {
             interproc_max_iters: 4,
             interproc_converged: 1,
         };
-        let input = R2SleighEngineDecompileInput {
+        let input = R2SleighEngineRequestPayloadV2 {
+            abi_version: ffi_v2::R2SLEIGH_ABI_V2,
+            struct_size: std::mem::size_of::<R2SleighEngineRequestPayloadV2>() as u32,
             ctx,
             blocks: blocks.as_ptr(),
             num_blocks: blocks.len(),
@@ -8932,13 +9058,24 @@ mod integration_tests {
             },
             interproc_scope,
             interproc_plan,
+            analysis_depth: 0,
+            timeout_us: 0,
+            source_interface: ptr::null(),
         };
 
-        let output = r2sleigh_engine_decompile_function_output(&input)
-            .expect("decompile output should be produced");
+        let output = r2sleigh_engine_decompile_function_output_with_source(
+            &input,
+            None,
+            r2engine::EngineExecutionControl::default(),
+        )
+        .expect("decompile output should be produced");
         assert!(
-            output.starts_with("allocation_ptr dbg.alloc_wrapper("),
-            "{output}"
+            output.output.contains("r2dec residual:")
+                && !output
+                    .output
+                    .starts_with("allocation_ptr dbg.alloc_wrapper("),
+            "{}",
+            output.output
         );
 
         r2il_free(ctx);
@@ -10729,6 +10866,7 @@ mod integration_tests {
             "int32_t"
         );
 
+        let prepared = std::sync::Arc::new(prepared);
         let analysis = r2engine::EngineAnalysis {
             ssa_func: prepared.clone(),
             pattern_ssa_func: prepared,
@@ -10781,6 +10919,7 @@ mod integration_tests {
                     blocks,
                     arch: Some(arch.clone()),
                     semantic_metadata_enabled: false,
+                    source_snapshot: None,
                 },
                 Some(64),
                 parsed_context,
@@ -10807,14 +10946,10 @@ mod integration_tests {
             });
         assert_eq!(len_home.name, "arg1");
         assert!(
-            !response.output.contains("r2dec residual:")
-                && response.output.contains("int32_t var_10h = 0;")
-                && response.output.contains("for (int32_t var_14h = 0;")
-                && response.output.contains("var_14h < arg1")
-                && !response.output.contains("memory_value_")
-                && response.output.contains("arg0[var_14h]")
-                && response.output.contains("return var_10h;"),
-            "typed spilled array access should render from real lifted bytes; output={} render_facts={:?}",
+            response.output.contains("r2dec residual:")
+                && !response.output.contains("for (int32_t var_14h = 0;")
+                && !response.output.contains("return var_10h;"),
+            "legacy facts must remain inspectable without authorizing production executable C; output={} render_facts={:?}",
             response.output,
             response.function_facts.render_facts()
         );
@@ -11141,6 +11276,7 @@ mod integration_tests {
             blocks: vec![block],
             arch: Some(arch),
             semantic_metadata_enabled: true,
+            source_snapshot: None,
         };
         let response = r2engine::EngineSession::new(4).decompile_function_from_input(
             r2engine::EngineFunctionDecompileRequestInput::single_function(
@@ -11151,14 +11287,10 @@ mod integration_tests {
             ),
         );
         assert!(
-            (response.output.contains("return dbg.alloc_wrapper(n);")
-                || response.output.contains("return sub_1239(n);")),
-            "certified decompile should render the wrapper call as an executable return, got:\n{}",
-            response.output
-        );
-        assert!(
-            !response.output.contains("rendered 0 executable call(s)"),
-            "certified decompile must not drop the source callsite effect, got:\n{}",
+            response.output.contains("r2dec residual:")
+                && !response.output.contains("return dbg.alloc_wrapper(n);")
+                && !response.output.contains("return sub_1239(n);"),
+            "legacy callsite facts must not authorize production executable C, got:\n{}",
             response.output
         );
     }

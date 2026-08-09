@@ -753,15 +753,22 @@ fn dfs_summary_postorder(
     visited: &mut BTreeSet<InterprocFunctionId>,
     order: &mut Vec<InterprocFunctionId>,
 ) {
-    if !visited.insert(node) {
-        return;
-    }
-    if let Some(children) = succs.get(&node) {
-        for succ in children {
-            dfs_summary_postorder(*succ, succs, visited, order);
+    let mut stack = vec![(node, false)];
+    while let Some((node, expanded)) = stack.pop() {
+        if expanded {
+            order.push(node);
+            continue;
+        }
+        if !visited.insert(node) {
+            continue;
+        }
+        stack.push((node, true));
+        if let Some(children) = succs.get(&node) {
+            for &succ in children.iter().rev() {
+                stack.push((succ, false));
+            }
         }
     }
-    order.push(node);
 }
 
 fn dfs_summary_component(
@@ -770,13 +777,16 @@ fn dfs_summary_component(
     visited: &mut BTreeSet<InterprocFunctionId>,
     component: &mut Vec<InterprocFunctionId>,
 ) {
-    if !visited.insert(node) {
-        return;
-    }
-    component.push(node);
-    if let Some(preds) = rev.get(&node) {
-        for pred in preds {
-            dfs_summary_component(*pred, rev, visited, component);
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if !visited.insert(node) {
+            continue;
+        }
+        component.push(node);
+        if let Some(preds) = rev.get(&node) {
+            for &pred in preds.iter().rev() {
+                stack.push(pred);
+            }
         }
     }
 }
@@ -2063,6 +2073,66 @@ mod tests {
         arch.add_register(RegisterDef::new("r8", 40, 8));
         arch.add_register(RegisterDef::new("r9", 48, 8));
         arch
+    }
+
+    fn empty_local_summary(direct_callees: BTreeSet<u64>) -> LocalSummaryFacts {
+        LocalSummaryFacts {
+            arg_count_hint: None,
+            direct_callees,
+            callsite_count: 0,
+            has_unknown_calls: false,
+            arg_effects: BTreeMap::new(),
+            memory_effects: BTreeSet::new(),
+            transfer_effects: BTreeSet::new(),
+            allocation_effects: BTreeSet::new(),
+            lifetime_effects: BTreeSet::new(),
+            sync_effects: BTreeSet::new(),
+            atomic_effects: BTreeSet::new(),
+            return_observations: Vec::new(),
+            call_observations: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn summary_sccs_handle_deep_chains_and_cycles_deterministically() {
+        const FUNCTION_COUNT: u64 = 8_192;
+
+        let mut locals = BTreeMap::new();
+        for node in 0..FUNCTION_COUNT {
+            let direct_callees = (node + 1 < FUNCTION_COUNT)
+                .then_some(node + 1)
+                .into_iter()
+                .collect();
+            locals.insert(
+                InterprocFunctionId(node),
+                (None, empty_local_summary(direct_callees)),
+            );
+        }
+
+        let chain_sccs = compute_summary_sccs(&locals);
+        let chain_order = chain_sccs
+            .iter()
+            .map(|component| {
+                assert_eq!(component.len(), 1);
+                component[0].0
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(chain_order, (0..FUNCTION_COUNT).rev().collect::<Vec<_>>());
+
+        locals
+            .get_mut(&InterprocFunctionId(FUNCTION_COUNT - 1))
+            .expect("last function")
+            .1
+            .direct_callees
+            .insert(0);
+        let cycle_sccs = compute_summary_sccs(&locals);
+        assert_eq!(cycle_sccs.len(), 1);
+        assert_eq!(
+            cycle_sccs[0],
+            (0..FUNCTION_COUNT)
+                .map(InterprocFunctionId)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

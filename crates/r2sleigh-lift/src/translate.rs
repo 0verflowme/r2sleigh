@@ -24,7 +24,7 @@ pub trait PcodeSource {
     fn input_count(&self) -> usize;
 
     /// Get the space ID from a space index (for LOAD/STORE operations).
-    fn space_from_index(&self, idx: u64) -> SpaceId;
+    fn space_from_index(&self, idx: u64) -> Option<SpaceId>;
 }
 
 /// Errors that can occur during translation.
@@ -183,7 +183,9 @@ pub fn translate_load<S: PcodeSource>(source: &S) -> Result<R2ILOp> {
         .input_raw_offset(0)
         .ok_or(TranslateError::MissingInput("LOAD", 0))?;
     let addr = require_input(source, 1, "LOAD")?;
-    let space = source.space_from_index(space_idx);
+    let space = source
+        .space_from_index(space_idx)
+        .ok_or(TranslateError::InvalidSpace(space_idx))?;
     Ok(R2ILOp::Load { dst, space, addr })
 }
 
@@ -194,7 +196,9 @@ pub fn translate_store<S: PcodeSource>(source: &S) -> Result<R2ILOp> {
         .ok_or(TranslateError::MissingInput("STORE", 0))?;
     let addr = require_input(source, 1, "STORE")?;
     let val = require_input(source, 2, "STORE")?;
-    let space = source.space_from_index(space_idx);
+    let space = source
+        .space_from_index(space_idx)
+        .ok_or(TranslateError::InvalidSpace(space_idx))?;
     Ok(R2ILOp::Store { space, addr, val })
 }
 
@@ -276,13 +280,13 @@ mod tests {
             self.inputs.len()
         }
 
-        fn space_from_index(&self, idx: u64) -> SpaceId {
-            match idx {
+        fn space_from_index(&self, idx: u64) -> Option<SpaceId> {
+            Some(match idx {
                 0 => SpaceId::Ram,
                 1 => SpaceId::Register,
                 2 => SpaceId::Unique,
                 n => SpaceId::Custom(n as u32),
-            }
+            })
         }
     }
 

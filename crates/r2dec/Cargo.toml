@@ -6,11 +6,19 @@ license.workspace = true
 description = "Native decompiler for r2sleigh"
 
 [dependencies]
+r2cert = { path = "../r2cert" }
 r2il = { path = "../r2il" }
 r2ssa = { path = "../r2ssa" }
 r2sym = { path = "../r2sym" }
 r2types = { path = "../r2types" }
+postcard.workspace = true
 serde.workspace = true
 
 [features]
 default = []
+
+[dev-dependencies]
+serde_json.workspace = true
+r2sleigh-lift = { path = "../r2sleigh-lift" }
+sleigh-config = { workspace = true, features = ["x86", "AARCH64"] }
+sha2 = "0.10"

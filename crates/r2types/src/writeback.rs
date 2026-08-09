@@ -19566,6 +19566,7 @@ mod tests {
             phis: vec![PhiNode {
                 dst: current.clone(),
                 sources: vec![(0xff0, SSAVar::new("X0", 0, 8)), (0x1010, next.clone())],
+                canonical_storage: None,
             }],
             ops: vec![
                 field_addr("len_addr", 1, 6),
@@ -19639,6 +19640,7 @@ mod tests {
                     (0xff0, SSAVar::new("X0", 0, 8)),
                     (0xff4, SSAVar::new("X1", 0, 8)),
                 ],
+                canonical_storage: None,
             }],
             ops: vec![
                 SSAOp::IntAdd {

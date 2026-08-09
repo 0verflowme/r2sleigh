@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::cfg::CFG;
+use crate::control::{SsaExecutionStopReason, SsaWorkControl, UncheckedSsaWorkControl};
 
 /// Dominator tree for a CFG.
 ///
@@ -29,6 +30,16 @@ pub struct DomTree {
 impl DomTree {
     /// Compute the dominator tree for a CFG using the Lengauer-Tarjan algorithm.
     pub fn compute(cfg: &CFG) -> Self {
+        Self::compute_with_control(cfg, &UncheckedSsaWorkControl)
+            .expect("unchecked dominator construction cannot stop")
+    }
+
+    /// Compute a dominator tree while polling iterative worklists.
+    pub fn compute_with_control<C: SsaWorkControl + ?Sized>(
+        cfg: &CFG,
+        control: &C,
+    ) -> Result<Self, SsaExecutionStopReason> {
+        control.poll()?;
         let mut domtree = Self {
             entry: cfg.entry,
             idom: HashMap::new(),
@@ -40,12 +51,13 @@ impl DomTree {
         // Get blocks in reverse postorder
         let rpo = cfg.reverse_postorder();
         if rpo.is_empty() {
-            return domtree;
+            return Ok(domtree);
         }
 
         // Map block addresses to RPO indices
         let mut rpo_idx: HashMap<u64, usize> = HashMap::new();
         for (i, &addr) in rpo.iter().enumerate() {
+            control.poll()?;
             rpo_idx.insert(addr, i);
         }
 
@@ -56,9 +68,11 @@ impl DomTree {
         // This is simpler than Lengauer-Tarjan and works well for most CFGs
         let mut changed = true;
         while changed {
+            control.poll()?;
             changed = false;
 
             for &block in rpo.iter().skip(1) {
+                control.poll()?;
                 // Skip entry block
                 let preds = cfg.predecessors(block);
 
@@ -95,21 +109,24 @@ impl DomTree {
 
         // Build children map
         for (&block, &idom) in &domtree.idom {
+            control.poll()?;
             if block != idom {
                 domtree.children.entry(idom).or_default().push(block);
             }
         }
         for children in domtree.children.values_mut() {
+            control.poll()?;
             children.sort_unstable();
         }
 
         // Compute depths
-        domtree.compute_depths(cfg.entry, 0);
+        domtree.compute_depths_with_control(cfg.entry, 0, control)?;
 
         // Compute dominance frontiers
-        domtree.compute_frontiers(cfg);
+        domtree.compute_frontiers_with_control(cfg, control)?;
 
-        domtree
+        control.poll()?;
+        Ok(domtree)
     }
 
     /// Intersect two dominators (find common dominator).
@@ -158,24 +175,40 @@ impl DomTree {
     }
 
     /// Compute depths in the dominator tree.
-    fn compute_depths(&mut self, block: u64, depth: usize) {
-        self.depth.insert(block, depth);
-        if let Some(children) = self.children.get(&block).cloned() {
-            for child in children {
-                self.compute_depths(child, depth + 1);
+    fn compute_depths_with_control<C: SsaWorkControl + ?Sized>(
+        &mut self,
+        block: u64,
+        depth: usize,
+        control: &C,
+    ) -> Result<(), SsaExecutionStopReason> {
+        let mut stack = vec![(block, depth)];
+        while let Some((block, depth)) = stack.pop() {
+            control.poll()?;
+            self.depth.insert(block, depth);
+            if let Some(children) = self.children.get(&block) {
+                for &child in children.iter().rev() {
+                    stack.push((child, depth + 1));
+                }
             }
         }
+        Ok(())
     }
 
     /// Compute dominance frontiers using the algorithm from Cytron et al.
-    fn compute_frontiers(&mut self, cfg: &CFG) {
+    fn compute_frontiers_with_control<C: SsaWorkControl + ?Sized>(
+        &mut self,
+        cfg: &CFG,
+        control: &C,
+    ) -> Result<(), SsaExecutionStopReason> {
         // Initialize empty frontiers
         for addr in cfg.block_addrs() {
+            control.poll()?;
             self.frontier.insert(addr, HashSet::new());
         }
 
         // For each block with multiple predecessors
         for addr in cfg.block_addrs() {
+            control.poll()?;
             let preds = cfg.predecessors(addr);
             if preds.len() >= 2 {
                 // For each predecessor
@@ -183,6 +216,7 @@ impl DomTree {
                     let mut runner = pred;
                     // Walk up the dominator tree
                     while runner != self.idom.get(&addr).copied().unwrap_or(addr) {
+                        control.poll()?;
                         self.frontier.entry(runner).or_default().insert(addr);
                         runner = match self.idom.get(&runner) {
                             Some(&idom) if idom != runner => idom,
@@ -192,6 +226,7 @@ impl DomTree {
                 }
             }
         }
+        Ok(())
     }
 
     /// Get the immediate dominator of a block.
@@ -282,12 +317,23 @@ impl DomTree {
     /// This is used for phi-node placement: we need to place phi nodes
     /// at all blocks in the iterated dominance frontier of the definition sites.
     pub fn iterated_frontier(&self, blocks: &[u64]) -> HashSet<u64> {
+        self.iterated_frontier_with_control(blocks, &UncheckedSsaWorkControl)
+            .expect("unchecked dominance-frontier construction cannot stop")
+    }
+
+    /// Compute an iterated dominance frontier while polling its worklist.
+    pub fn iterated_frontier_with_control<C: SsaWorkControl + ?Sized>(
+        &self,
+        blocks: &[u64],
+        control: &C,
+    ) -> Result<HashSet<u64>, SsaExecutionStopReason> {
         let mut result = HashSet::new();
         let mut worklist: Vec<u64> = blocks.to_vec();
         worklist.sort_unstable_by(|a, b| b.cmp(a));
         let mut processed = HashSet::new();
 
         while let Some(block) = worklist.pop() {
+            control.poll()?;
             if !processed.insert(block) {
                 continue;
             }
@@ -295,13 +341,14 @@ impl DomTree {
             let mut frontier_blocks: Vec<u64> = self.frontier(block).collect();
             frontier_blocks.sort_unstable_by(|a, b| b.cmp(a));
             for frontier_block in frontier_blocks {
+                control.poll()?;
                 if result.insert(frontier_block) {
                     worklist.push(frontier_block);
                 }
             }
         }
 
-        result
+        Ok(result)
     }
 }
 

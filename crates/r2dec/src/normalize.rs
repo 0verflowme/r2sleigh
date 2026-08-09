@@ -1,6 +1,7 @@
 use crate::analysis::PredicateAnalysisView;
 use crate::ast::CExpr;
-use r2ssa::{SSAFunction, SSAOp};
+use crate::control::{DecompileExecutionStop, DecompileWorkControl, DecompileWorkPhase};
+use r2ssa::{SSAFunction, SSAOp, SsaExecutionControl};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,12 +33,25 @@ fn is_block_terminator(op: &SSAOp) -> bool {
 /// Other phis remain immutable semantic expressions. Lowering every machine
 /// temporary or flag phi creates artificial C effects and obscures the proof
 /// boundary between SSA values and mutable loop state.
+#[allow(dead_code)]
 pub(crate) fn materialize_certified_loop_carriers(
     func: &SSAFunction,
     prepared: &r2ssa::SsaArtifact,
     render_facts: &r2types::FunctionRenderFacts,
 ) -> SSAFunction {
-    materialize_phis_where(func, |phi| {
+    let execution = SsaExecutionControl::default();
+    let control = DecompileWorkControl::new(&execution, DecompileWorkPhase::Normalization);
+    materialize_certified_loop_carriers_with_control(func, prepared, render_facts, control)
+        .expect("default decompiler work control cannot stop")
+}
+
+pub(crate) fn materialize_certified_loop_carriers_with_control(
+    func: &SSAFunction,
+    prepared: &r2ssa::SsaArtifact,
+    render_facts: &r2types::FunctionRenderFacts,
+    control: DecompileWorkControl<'_>,
+) -> Result<SSAFunction, DecompileExecutionStop> {
+    materialize_phis_where_with_control(func, control, |phi| {
         prepared
             .graph()
             .value_id_for_var(&phi.dst)
@@ -45,16 +59,19 @@ pub(crate) fn materialize_certified_loop_carriers(
     })
 }
 
-fn materialize_phis_where(
+fn materialize_phis_where_with_control(
     func: &SSAFunction,
+    control: DecompileWorkControl<'_>,
     mut eligible: impl FnMut(&r2ssa::PhiNode) -> bool,
-) -> SSAFunction {
+) -> Result<SSAFunction, DecompileExecutionStop> {
+    control.poll()?;
     let mut normalized = func.clone();
-    let liveness = PhiEdgeLiveness::compute(func);
+    let liveness = PhiEdgeLiveness::compute_with_control(func, control)?;
     let mut copies_by_pred: HashMap<u64, Vec<SSAOp>> = HashMap::new();
     let mut materialized_by_block = HashMap::<u64, HashSet<r2ssa::SSAVar>>::new();
 
     for block in func.blocks() {
+        control.poll()?;
         let mut moves_by_pred = HashMap::<u64, Vec<PhiMove>>::new();
         let mut complete = true;
         let selected = block
@@ -66,7 +83,9 @@ fn materialize_phis_where(
             continue;
         }
         for phi in &selected {
+            control.poll()?;
             for (pred, src) in &phi.sources {
+                control.poll()?;
                 if src == &phi.dst {
                     continue;
                 }
@@ -91,7 +110,8 @@ fn materialize_phis_where(
         }
         let mut scheduled = Vec::new();
         for (pred, moves) in moves_by_pred {
-            let Some(moves) = schedule_parallel_phi_moves(moves) else {
+            control.poll()?;
+            let Some(moves) = schedule_parallel_phi_moves_with_control(moves, control)? else {
                 complete = false;
                 break;
             };
@@ -112,12 +132,14 @@ fn materialize_phis_where(
     }
 
     for (addr, materialized) in materialized_by_block {
+        control.poll()?;
         if let Some(block) = normalized.get_block_mut(addr) {
             block.phis.retain(|phi| !materialized.contains(&phi.dst));
         }
     }
 
     for (pred, copies) in copies_by_pred {
+        control.poll()?;
         if copies.is_empty() {
             continue;
         }
@@ -131,12 +153,16 @@ fn materialize_phis_where(
         }
     }
 
-    normalized
+    control.poll()?;
+    Ok(normalized)
 }
 
 #[cfg(test)]
 fn materialize_all_phis(func: &SSAFunction) -> SSAFunction {
-    materialize_phis_where(func, |_| true)
+    let execution = SsaExecutionControl::default();
+    let control = DecompileWorkControl::new(&execution, DecompileWorkPhase::Normalization);
+    materialize_phis_where_with_control(func, control, |_| true)
+        .expect("default decompiler work control cannot stop")
 }
 
 struct PhiMove {
@@ -200,17 +226,24 @@ fn guarded_loop_backedge_phi_op(
 /// Order out-of-SSA moves without changing the simultaneous semantics of a
 /// phi bundle. Cyclic bundles stay in SSA until a temporary-backed lowering
 /// can represent them exactly.
-fn schedule_parallel_phi_moves(mut moves: Vec<PhiMove>) -> Option<Vec<PhiMove>> {
+fn schedule_parallel_phi_moves_with_control(
+    mut moves: Vec<PhiMove>,
+    control: DecompileWorkControl<'_>,
+) -> Result<Option<Vec<PhiMove>>, DecompileExecutionStop> {
     let mut scheduled = Vec::with_capacity(moves.len());
     while !moves.is_empty() {
+        control.poll()?;
         let ready = moves.iter().position(|candidate| {
             !moves
                 .iter()
                 .any(|other| other.dst != candidate.dst && other.src == candidate.dst)
-        })?;
+        });
+        let Some(ready) = ready else {
+            return Ok(None);
+        };
         scheduled.push(moves.remove(ready));
     }
-    Some(scheduled)
+    Ok(Some(scheduled))
 }
 
 pub(crate) struct PhiEdgeLiveness {
@@ -221,16 +254,29 @@ pub(crate) struct PhiEdgeLiveness {
 
 impl PhiEdgeLiveness {
     pub(crate) fn compute(func: &SSAFunction) -> Self {
+        let execution = SsaExecutionControl::default();
+        let control = DecompileWorkControl::new(&execution, DecompileWorkPhase::Normalization);
+        Self::compute_with_control(func, control)
+            .expect("default decompiler work control cannot stop")
+    }
+
+    pub(crate) fn compute_with_control(
+        func: &SSAFunction,
+        control: DecompileWorkControl<'_>,
+    ) -> Result<Self, DecompileExecutionStop> {
+        control.poll()?;
         let mut defs_by_block = HashMap::<u64, HashSet<r2ssa::SSAVar>>::new();
         let mut uses_by_block = HashMap::<u64, HashSet<r2ssa::SSAVar>>::new();
         let mut phi_defs = HashMap::<u64, HashSet<r2ssa::SSAVar>>::new();
         let mut edge_phi_uses = HashMap::<(u64, u64), HashSet<r2ssa::SSAVar>>::new();
 
         for block in func.blocks() {
+            control.poll()?;
             let mut defs = HashSet::new();
             let mut uses = HashSet::new();
             let mut defined = HashSet::new();
             for phi in &block.phis {
+                control.poll()?;
                 defs.insert(phi.dst.clone());
                 defined.insert(phi.dst.clone());
                 phi_defs
@@ -245,6 +291,7 @@ impl PhiEdgeLiveness {
                 }
             }
             for op in &block.ops {
+                control.poll()?;
                 for src in op.sources() {
                     if !defined.contains(src) {
                         uses.insert(src.clone());
@@ -268,10 +315,13 @@ impl PhiEdgeLiveness {
         let mut live_out = live_in.clone();
         let mut changed = true;
         while changed {
+            control.poll()?;
             changed = false;
             for &addr in func.block_addrs().iter().rev() {
+                control.poll()?;
                 let mut next_out = HashSet::new();
                 for successor in func.successors(addr) {
+                    control.poll()?;
                     next_out.extend(edge_live_in(
                         live_in.get(&successor),
                         phi_defs.get(&successor),
@@ -296,11 +346,12 @@ impl PhiEdgeLiveness {
                 }
             }
         }
-        Self {
+        control.poll()?;
+        Ok(Self {
             live_in,
             phi_defs,
             edge_phi_uses,
-        }
+        })
     }
 
     fn live_on_edge(&self, pred: u64, successor: u64) -> HashSet<r2ssa::SSAVar> {
@@ -370,12 +421,32 @@ fn can_materialize_unconditional_loop_backedge(
 /// initialization before the loop decision replaces redundant copies on the
 /// loop-entry edges, while latch updates remain at their original program
 /// point.
+#[allow(dead_code)]
 pub(crate) fn materialize_certified_loop_carrier_initializers(
     func: &mut SSAFunction,
     prepared: &r2ssa::SsaArtifact,
     render_facts: &r2types::FunctionRenderFacts,
 ) {
+    let execution = SsaExecutionControl::default();
+    let control = DecompileWorkControl::new(&execution, DecompileWorkPhase::Normalization);
+    materialize_certified_loop_carrier_initializers_with_control(
+        func,
+        prepared,
+        render_facts,
+        control,
+    )
+    .expect("default decompiler work control cannot stop");
+}
+
+pub(crate) fn materialize_certified_loop_carrier_initializers_with_control(
+    func: &mut SSAFunction,
+    prepared: &r2ssa::SsaArtifact,
+    render_facts: &r2types::FunctionRenderFacts,
+    control: DecompileWorkControl<'_>,
+) -> Result<(), DecompileExecutionStop> {
+    control.poll()?;
     for entity in render_facts.loop_carriers() {
+        control.poll()?;
         let r2types::CertifiedEntity::LoopCarrier {
             phi,
             identity_values,
@@ -406,6 +477,7 @@ pub(crate) fn materialize_certified_loop_carrier_initializers(
         }
 
         for entry in entries {
+            control.poll()?;
             if entry.value != initializer.value
                 || entry.predecessor == initializer.predecessor
                 || !prepared
@@ -438,6 +510,8 @@ pub(crate) fn materialize_certified_loop_carrier_initializers(
             .unwrap_or(block.ops.len());
         block.ops.insert(insert_at, SSAOp::Copy { dst, src });
     }
+    control.poll()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -532,6 +606,7 @@ mod tests {
         func.get_block_mut(0x1004).expect("header").phis = vec![PhiNode {
             dst: hash_2.clone(),
             sources: vec![(0x1000, hash_1), (0x1008, hash_4.clone())],
+            canonical_storage: None,
         }];
         func.get_block_mut(0x1004).expect("header").ops = vec![SSAOp::Branch {
             target: SSAVar::new("ram:1008", 0, 8),
@@ -593,6 +668,7 @@ mod tests {
         func.get_block_mut(0x1004).expect("header").phis = vec![PhiNode {
             dst: hash_2.clone(),
             sources: vec![(0x1000, hash_1), (0x1008, hash_4.clone())],
+            canonical_storage: None,
         }];
         func.get_block_mut(0x1004).expect("header").ops = vec![SSAOp::Branch {
             target: SSAVar::new("ram:1008", 0, 8),
@@ -660,6 +736,7 @@ mod tests {
         func.get_block_mut(0x1004).expect("header").phis = vec![PhiNode {
             dst: value_2.clone(),
             sources: vec![(0x1000, value_1), (0x1008, value_4.clone())],
+            canonical_storage: None,
         }];
         func.get_block_mut(0x1004).expect("header").ops = vec![SSAOp::Branch {
             target: SSAVar::new("ram:1008", 0, 8),
@@ -703,10 +780,12 @@ mod tests {
             PhiNode {
                 dst: a.clone(),
                 sources: vec![(0x1000, SSAVar::new("RAX", 1, 8)), (0x1008, b.clone())],
+                canonical_storage: None,
             },
             PhiNode {
                 dst: b.clone(),
                 sources: vec![(0x1000, SSAVar::new("RBX", 1, 8)), (0x1008, a.clone())],
+                canonical_storage: None,
             },
         ];
 

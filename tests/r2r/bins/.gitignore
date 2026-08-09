@@ -1,2 +1,4 @@
 *
 !.gitignore
+!r2sleigh_test_func_x86_64_macho_O2_v1
+!r2sleigh_vuln_test_x86_64_macho_O2_v1

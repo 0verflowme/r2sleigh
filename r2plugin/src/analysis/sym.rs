@@ -55,10 +55,10 @@ pub struct R2SymContext {
 
 #[repr(C)]
 pub struct R2ILFunctionBlocks {
-    entry_addr: u64,
-    name: *const c_char,
-    blocks: *const *const R2ILBlock,
-    num_blocks: usize,
+    pub(crate) entry_addr: u64,
+    pub(crate) name: *const c_char,
+    pub(crate) blocks: *const *const R2ILBlock,
+    pub(crate) num_blocks: usize,
 }
 
 #[repr(C)]
