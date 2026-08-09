@@ -1471,8 +1471,9 @@ impl SSAFunction {
     ) -> Result<Self, SsaPrepareError> {
         control.poll()?;
         let mut func = Self::from_blocks_raw_for_decompile_with_control(blocks, arch, control)?;
-        func.prepare_for_decompile_with_control(
+        func.prepare_for_decompile_with_interface_and_control(
             &crate::optimize::DecompilePrepConfig::default(),
+            function_interface,
             control,
         )?;
         func.refresh_decompile_prep_facts_with_interface_and_control(
@@ -2034,11 +2035,25 @@ impl SSAFunction {
         config: &crate::optimize::DecompilePrepConfig,
         control: &C,
     ) -> Result<crate::optimize::OptimizationStats, SsaExecutionStopReason> {
+        self.prepare_for_decompile_with_interface_and_control(config, None, control)
+    }
+
+    fn prepare_for_decompile_with_interface_and_control<C: SsaWorkControl + ?Sized>(
+        &mut self,
+        config: &crate::optimize::DecompilePrepConfig,
+        function_interface: Option<&SourceFunctionInterface>,
+        control: &C,
+    ) -> Result<crate::optimize::OptimizationStats, SsaExecutionStopReason> {
         control.poll()?;
         self.decompile_prep_facts = None;
         self.invalidate_query_index();
         let cfg: crate::optimize::OptimizationConfig = config.into();
-        crate::optimize::optimize_function_with_control(self, &cfg, control)
+        crate::optimize::optimize_function_with_interface_and_control(
+            self,
+            &cfg,
+            function_interface,
+            control,
+        )
     }
 
     #[cfg(test)]

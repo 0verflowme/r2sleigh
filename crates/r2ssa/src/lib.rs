@@ -26,6 +26,7 @@ pub mod control;
 pub mod data_ref;
 pub mod defuse;
 pub mod domtree;
+pub mod fingerprint;
 pub mod function;
 pub mod graph;
 pub mod interproc;
@@ -64,6 +65,7 @@ pub use data_ref::{
 pub use defuse::{
     BackwardSlice, DefUseInfo, SliceOpRef, backward_slice_from_op, backward_slice_from_var, def_use,
 };
+pub use fingerprint::{SSA_SEMANTIC_FINGERPRINT_SCHEMA_VERSION, stable_ssa_semantic_fingerprint};
 pub use function::{
     CFGRiskSummary, DecompilePrepFacts, DefRef, DefSite, FunctionPrepareMode, PhiNode,
     SSABlock as FunctionSSABlock, SSAFunction, SourceRef, SourceSite, SsaArtifact,

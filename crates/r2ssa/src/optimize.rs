@@ -7,7 +7,11 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::control::{SsaExecutionStopReason, SsaWorkControl, UncheckedSsaWorkControl};
-use crate::{BlockTerminator, PhiNode, SSAFunction, SSAOp, SSAVar, SourceSite};
+use crate::{
+    BlockTerminator, CanonicalStorageId, CanonicalStorageSpace, PhiNode, SSAFunction, SSAOp,
+    SSAVar, SourceCarrierKind, SourceFunctionInterface, SourceFunctionReturn, SourceSite,
+    SourceTypeKind,
+};
 
 /// Configuration for SSA optimization passes.
 #[derive(Debug, Clone)]
@@ -101,6 +105,15 @@ pub(crate) fn optimize_function_with_control<C: SsaWorkControl + ?Sized>(
     config: &OptimizationConfig,
     control: &C,
 ) -> Result<OptimizationStats, SsaExecutionStopReason> {
+    optimize_function_with_interface_and_control(func, config, None, control)
+}
+
+pub(crate) fn optimize_function_with_interface_and_control<C: SsaWorkControl + ?Sized>(
+    func: &mut SSAFunction,
+    config: &OptimizationConfig,
+    function_interface: Option<&SourceFunctionInterface>,
+    control: &C,
+) -> Result<OptimizationStats, SsaExecutionStopReason> {
     control.poll()?;
     let mut stats = OptimizationStats::default();
     let max_iters = config.max_iterations.max(1);
@@ -108,7 +121,13 @@ pub(crate) fn optimize_function_with_control<C: SsaWorkControl + ?Sized>(
     if config.enable_sccp {
         let (consts, executable_edges) = sccp_with_control(func, control)?;
         control.poll()?;
-        apply_sccp_results(func, &consts, &executable_edges, &mut stats);
+        apply_sccp_results(
+            func,
+            &consts,
+            &executable_edges,
+            function_interface,
+            &mut stats,
+        );
     }
 
     for _ in 0..max_iters {
@@ -118,7 +137,7 @@ pub(crate) fn optimize_function_with_control<C: SsaWorkControl + ?Sized>(
         if config.enable_const_prop && !config.enable_sccp {
             let consts = compute_constants_with_control(func, max_iters, control)?;
             control.poll()?;
-            if replace_sources_with_constants(func, &consts, &mut stats) {
+            if replace_sources_with_constants(func, &consts, function_interface, &mut stats) {
                 changed = true;
             }
         }
@@ -133,12 +152,12 @@ pub(crate) fn optimize_function_with_control<C: SsaWorkControl + ?Sized>(
         }
 
         control.poll()?;
-        if config.enable_copy_prop && copy_propagation(func, &mut stats) {
+        if config.enable_copy_prop && copy_propagation(func, function_interface, &mut stats) {
             changed = true;
         }
 
         control.poll()?;
-        if config.enable_dce && dead_code_elim(func, config, &mut stats) {
+        if config.enable_dce && dead_code_elim(func, config, function_interface, &mut stats) {
             changed = true;
         }
 
@@ -772,10 +791,13 @@ fn eval_const_op(op: &SSAOp, consts: &HashMap<VarKey, u64>) -> Option<u64> {
 fn replace_sources_with_constants(
     func: &mut SSAFunction,
     consts: &HashMap<VarKey, u64>,
+    function_interface: Option<&SourceFunctionInterface>,
     stats: &mut OptimizationStats,
 ) -> bool {
     let mut changed = false;
     let block_addrs = func.block_addrs().to_vec();
+    let return_storage =
+        coherent_return_projection(function_interface).map(|projection| projection.carrier);
 
     for addr in block_addrs {
         let is_return_block = func
@@ -787,8 +809,8 @@ fn replace_sources_with_constants(
         };
 
         for phi in &mut block.phis {
-            let preserve_phi_sources =
-                is_return_block && return_value_family(&phi.dst.name).is_some();
+            let preserve_phi_sources = is_return_block
+                && return_storage.is_some_and(|storage| phi.canonical_storage == Some(storage));
             for (_, src) in &mut phi.sources {
                 if preserve_phi_sources {
                     continue;
@@ -832,12 +854,13 @@ fn apply_sccp_results(
     func: &mut SSAFunction,
     consts: &HashMap<VarKey, u64>,
     executable_edges: &HashSet<(u64, u64)>,
+    function_interface: Option<&SourceFunctionInterface>,
     stats: &mut OptimizationStats,
 ) -> bool {
     let mut changed = false;
     let mut cfg_changed = false;
 
-    if replace_sources_with_constants(func, consts, stats) {
+    if replace_sources_with_constants(func, consts, function_interface, stats) {
         changed = true;
     }
     stats.sccp_constants_found = consts.len();
@@ -1226,12 +1249,16 @@ fn simplify_op(op: &SSAOp) -> Option<SSAOp> {
     Some(simplified)
 }
 
-fn copy_propagation(func: &mut SSAFunction, stats: &mut OptimizationStats) -> bool {
+fn copy_propagation(
+    func: &mut SSAFunction,
+    function_interface: Option<&SourceFunctionInterface>,
+    stats: &mut OptimizationStats,
+) -> bool {
     let (replacements, changed) = build_copy_replacements(func, stats);
     let applied = if replacements.is_empty() {
         false
     } else {
-        apply_replacements(func, &replacements, stats)
+        apply_replacements(func, &replacements, function_interface, stats)
     };
     changed || applied
 }
@@ -1306,10 +1333,13 @@ fn resolve_replacements(mut replacements: HashMap<VarKey, SSAVar>) -> HashMap<Va
 fn apply_replacements(
     func: &mut SSAFunction,
     replacements: &HashMap<VarKey, SSAVar>,
+    function_interface: Option<&SourceFunctionInterface>,
     stats: &mut OptimizationStats,
 ) -> bool {
     let mut changed = false;
     let block_addrs = func.block_addrs().to_vec();
+    let return_storage =
+        coherent_return_projection(function_interface).map(|projection| projection.carrier);
 
     let mapper = |var: &SSAVar| -> SSAVar {
         let mut visited = HashSet::new();
@@ -1335,8 +1365,8 @@ fn apply_replacements(
         };
 
         for phi in &mut block.phis {
-            let preserve_phi_sources =
-                is_return_block && return_value_family(&phi.dst.name).is_some();
+            let preserve_phi_sources = is_return_block
+                && return_storage.is_some_and(|storage| phi.canonical_storage == Some(storage));
             for (_, src) in &mut phi.sources {
                 let new_src = if preserve_phi_sources {
                     src.clone()
@@ -1565,12 +1595,13 @@ fn common_subexpr_elim(func: &mut SSAFunction, stats: &mut OptimizationStats) ->
 fn dead_code_elim(
     func: &mut SSAFunction,
     config: &OptimizationConfig,
+    function_interface: Option<&SourceFunctionInterface>,
     stats: &mut OptimizationStats,
 ) -> bool {
     let mut changed = false;
 
     loop {
-        let use_set = collect_uses(func);
+        let use_set = collect_uses(func, function_interface);
         let mut local_change = false;
         let block_addrs = func.block_addrs().to_vec();
 
@@ -1617,23 +1648,187 @@ fn dead_code_elim(
     changed
 }
 
-fn return_value_family(name: &str) -> Option<&'static str> {
-    let lower = name.to_ascii_lowercase();
-    match lower.as_str() {
-        "rax" | "eax" | "ax" | "al" | "ah" => Some("x86-gpr-ret"),
-        "xmm0" | "ymm0" | "zmm0" => Some("x86-simd-ret"),
-        "st0" | "st(0)" => Some("x86-fpu-ret"),
-        "r0" => Some("arm-gpr-ret"),
-        "x0" | "w0" => Some("aarch64-gpr-ret"),
-        "v0" | "q0" | "d0" | "s0" => Some("aarch64-simd-ret"),
-        "a0" => Some("riscv-gpr-ret"),
-        "fa0" => Some("riscv-fp-ret"),
-        _ => None,
+fn canonical_register_storages_overlap(
+    left: CanonicalStorageId,
+    right: CanonicalStorageId,
+) -> bool {
+    if left.space != CanonicalStorageSpace::Register
+        || right.space != CanonicalStorageSpace::Register
+    {
+        return false;
     }
+    let Some(left_end) = left.offset.checked_add(u64::from(left.size)) else {
+        return false;
+    };
+    let Some(right_end) = right.offset.checked_add(u64::from(right.size)) else {
+        return false;
+    };
+    left.offset < right_end && right.offset < left_end
 }
 
-fn collect_preserved_return_defs(func: &SSAFunction) -> HashSet<VarKey> {
+fn canonical_register_storage_is_contained(
+    container: CanonicalStorageId,
+    contained: CanonicalStorageId,
+) -> bool {
+    if container.space != CanonicalStorageSpace::Register
+        || contained.space != CanonicalStorageSpace::Register
+        || container.size == 0
+        || contained.size == 0
+        || contained.offset < container.offset
+    {
+        return false;
+    }
+    let Some(container_end) = container.offset.checked_add(u64::from(container.size)) else {
+        return false;
+    };
+    let Some(contained_end) = contained.offset.checked_add(u64::from(contained.size)) else {
+        return false;
+    };
+    contained_end <= container_end
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CoherentReturnProjection {
+    carrier: CanonicalStorageId,
+    logical: CanonicalStorageId,
+}
+
+fn coherent_return_projection(
+    function_interface: Option<&SourceFunctionInterface>,
+) -> Option<CoherentReturnProjection> {
+    let interface = function_interface?;
+    let SourceFunctionReturn::Register { storage } = interface.return_kind() else {
+        return None;
+    };
+    let logical = interface.return_logical_value()?;
+    let graph = interface.type_graph()?;
+    let source_type = graph
+        .types()
+        .get(usize::try_from(logical.type_id()).ok()?)?;
+    let carrier = logical.carrier();
+    let storage_bits = u64::from(storage.size).checked_mul(8)?;
+    if storage.space != CanonicalStorageSpace::Register
+        || storage.size == 0
+        || carrier.offset_bits() != 0
+        || carrier.size_bits() == 0
+        || carrier.size_bits() != source_type.size_bits()
+        || carrier.size_bits() % 8 != 0
+        || carrier.size_bits() > storage_bits
+    {
+        return None;
+    }
+    let logical = match carrier.kind() {
+        SourceCarrierKind::Full if carrier.size_bits() == storage_bits => storage,
+        SourceCarrierKind::LowBits
+            if carrier.size_bits() < storage_bits
+                && matches!(
+                    source_type.kind(),
+                    SourceTypeKind::SignedInteger | SourceTypeKind::UnsignedInteger
+                ) =>
+        {
+            CanonicalStorageId {
+                space: storage.space,
+                offset: storage.offset,
+                size: u32::try_from(carrier.size_bits() / 8).ok()?,
+            }
+        }
+        _ => return None,
+    };
+    Some(CoherentReturnProjection {
+        carrier: storage,
+        logical,
+    })
+}
+
+fn cover_uncovered_register_bytes(
+    uncovered: &mut Vec<(u64, u64)>,
+    storage: CanonicalStorageId,
+) -> bool {
+    let Some(storage_end) = storage.offset.checked_add(u64::from(storage.size)) else {
+        return false;
+    };
+    let mut covered = false;
+    let mut remaining = Vec::with_capacity(uncovered.len().saturating_add(1));
+    for &(start, end) in uncovered.iter() {
+        if storage_end <= start || storage.offset >= end {
+            remaining.push((start, end));
+            continue;
+        }
+        covered = true;
+        if start < storage.offset {
+            remaining.push((start, storage.offset));
+        }
+        if storage_end < end {
+            remaining.push((storage_end, end));
+        }
+    }
+    *uncovered = remaining;
+    covered
+}
+
+fn return_chain_in_block(
+    func: &SSAFunction,
+    block_addr: u64,
+    projection: CoherentReturnProjection,
+) -> Option<Vec<VarKey>> {
+    let block = func.get_block(block_addr)?;
+    let logical_end = projection
+        .logical
+        .offset
+        .checked_add(u64::from(projection.logical.size))?;
+    let mut uncovered = vec![(projection.logical.offset, logical_end)];
+    let mut reverse_chain = Vec::new();
+    for op in block.ops.iter().rev() {
+        let Some(dst) = op.dst() else {
+            continue;
+        };
+        let Some(storage) = func.canonical_storage_for_var(dst) else {
+            continue;
+        };
+        if !canonical_register_storages_overlap(storage, projection.logical) {
+            continue;
+        }
+        if !canonical_register_storage_is_contained(projection.carrier, storage) {
+            return None;
+        }
+        if cover_uncovered_register_bytes(&mut uncovered, storage) {
+            reverse_chain.push(VarKey::from_var(dst));
+            if uncovered.is_empty() {
+                reverse_chain.reverse();
+                return Some(reverse_chain);
+            }
+        }
+    }
+
+    for phi in block.phis.iter().rev() {
+        let Some(storage) = phi.canonical_storage else {
+            continue;
+        };
+        if !canonical_register_storages_overlap(storage, projection.logical) {
+            continue;
+        }
+        if !canonical_register_storage_is_contained(projection.carrier, storage) {
+            return None;
+        }
+        if cover_uncovered_register_bytes(&mut uncovered, storage) {
+            reverse_chain.push(VarKey::from_var(&phi.dst));
+            if uncovered.is_empty() {
+                reverse_chain.reverse();
+                return Some(reverse_chain);
+            }
+        }
+    }
+    None
+}
+
+fn collect_preserved_return_defs(
+    func: &SSAFunction,
+    function_interface: Option<&SourceFunctionInterface>,
+) -> HashSet<VarKey> {
     let mut preserved = HashSet::new();
+    let Some(projection) = coherent_return_projection(function_interface) else {
+        return preserved;
+    };
 
     for block in func.blocks() {
         let Some(cfg_block) = func.cfg().get_block(block.addr) else {
@@ -1643,33 +1838,18 @@ fn collect_preserved_return_defs(func: &SSAFunction) -> HashSet<VarKey> {
             continue;
         }
 
-        let mut seen_families = HashSet::new();
-        for op in block.ops.iter().rev() {
-            let Some(dst) = op.dst() else {
-                continue;
-            };
-            let Some(family) = return_value_family(&dst.name) else {
-                continue;
-            };
-            if seen_families.insert(family) {
-                preserved.insert(VarKey::from_var(dst));
-            }
-        }
-
-        for phi in block.phis.iter().rev() {
-            let Some(family) = return_value_family(&phi.dst.name) else {
-                continue;
-            };
-            if seen_families.insert(family) {
-                preserved.insert(VarKey::from_var(&phi.dst));
-            }
+        if let Some(chain) = return_chain_in_block(func, block.addr, projection) {
+            preserved.extend(chain);
         }
     }
 
     preserved
 }
 
-fn collect_uses(func: &SSAFunction) -> HashSet<VarKey> {
+fn collect_uses(
+    func: &SSAFunction,
+    function_interface: Option<&SourceFunctionInterface>,
+) -> HashSet<VarKey> {
     let mut uses = HashSet::new();
 
     for phi in func.all_phis() {
@@ -1684,7 +1864,7 @@ fn collect_uses(func: &SSAFunction) -> HashSet<VarKey> {
         }
     }
 
-    uses.extend(collect_preserved_return_defs(func));
+    uses.extend(collect_preserved_return_defs(func, function_interface));
 
     uses
 }
@@ -2134,8 +2314,11 @@ where
 #[cfg(test)]
 mod sccp_tests {
     use super::*;
-    use crate::{CanonicalStorageId, CanonicalStorageSpace, InstPayload, SsaGraph};
-    use r2il::{R2ILBlock, R2ILOp, SpaceId, Varnode};
+    use crate::{
+        CanonicalStorageId, CanonicalStorageSpace, InstPayload, SourceCarrierProjection,
+        SourceLogicalValue, SourceType, SourceTypeGraph, SsaGraph,
+    };
+    use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
 
     fn make_const(val: u64, size: u32) -> Varnode {
         Varnode {
@@ -2166,6 +2349,148 @@ mod sccp_tests {
 
     fn raw_func(blocks: Vec<R2ILBlock>) -> SSAFunction {
         SSAFunction::from_blocks_raw_no_arch(&blocks).expect("raw SSA function should build")
+    }
+
+    fn register_storage(offset: u64, size: u32) -> CanonicalStorageId {
+        CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset,
+            size,
+        }
+    }
+
+    fn exact_u32_return_interface(storage: CanonicalStorageId) -> SourceFunctionInterface {
+        let graph = SourceTypeGraph::new(
+            [SourceType::new(0, SourceTypeKind::UnsignedInteger, 32, 32)],
+            [],
+        )
+        .expect("u32 type graph");
+        SourceFunctionInterface::new_exact_with_logical_types(
+            b"return-liveness-test-v1".to_vec(),
+            "test-cc",
+            [],
+            SourceFunctionReturn::Register { storage },
+            [],
+            [],
+            Some(SourceLogicalValue::new(
+                0,
+                SourceCarrierProjection::new(SourceCarrierKind::LowBits, 0, 32),
+            )),
+            Some(graph),
+        )
+        .expect("exact logical return interface")
+    }
+
+    fn return_alias_function(whole_name: &str, low_name: &str) -> SSAFunction {
+        let mut arch = ArchSpec::new("return-alias-test");
+        arch.add_register(RegisterDef::new(whole_name, 0, 8));
+        arch.add_register(RegisterDef::sub(low_name, 0, 1, whole_name));
+        arch.add_register(RegisterDef::new("pc", 0x80, 8));
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push(R2ILOp::Copy {
+            dst: make_reg(0, 8),
+            src: make_const(0, 8),
+        });
+        block.push(R2ILOp::Copy {
+            dst: make_reg(0, 1),
+            src: make_const(1, 1),
+        });
+        block.push(R2ILOp::Return {
+            target: make_reg(0x80, 8),
+        });
+        SSAFunction::from_blocks_raw(&[block], Some(&arch)).expect("return alias SSA")
+    }
+
+    fn narrow_return_function(whole_name: &str, low_name: &str) -> SSAFunction {
+        let mut arch = ArchSpec::new("narrow-return-test");
+        arch.add_register(RegisterDef::new(whole_name, 0, 8));
+        arch.add_register(RegisterDef::sub(low_name, 0, 4, whole_name));
+        arch.add_register(RegisterDef::new("pc", 0x80, 8));
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push(R2ILOp::Copy {
+            dst: make_reg(0, 4),
+            src: make_const(7, 4),
+        });
+        block.push(R2ILOp::Return {
+            target: make_reg(0x80, 8),
+        });
+        SSAFunction::from_blocks_raw(&[block], Some(&arch)).expect("narrow return SSA")
+    }
+
+    fn return_phi_overlay_function(whole_name: &str, low_name: &str) -> SSAFunction {
+        let mut arch = ArchSpec::new("return-phi-overlay-test");
+        arch.add_register(RegisterDef::new(whole_name, 0, 8));
+        arch.add_register(RegisterDef::sub(low_name, 0, 1, whole_name));
+        arch.add_register(RegisterDef::new("cond", 0x40, 1));
+        arch.add_register(RegisterDef::new("pc", 0x80, 8));
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::CBranch {
+            target: make_const(0x1008, 8),
+            cond: make_reg(0x40, 1),
+        });
+        let mut left = R2ILBlock::new(0x1004, 4);
+        left.push(R2ILOp::Copy {
+            dst: make_reg(0, 8),
+            src: make_const(1, 8),
+        });
+        left.push(R2ILOp::Branch {
+            target: make_const(0x100c, 8),
+        });
+        let mut right = R2ILBlock::new(0x1008, 4);
+        right.push(R2ILOp::Copy {
+            dst: make_reg(0, 8),
+            src: make_const(2, 8),
+        });
+        right.push(R2ILOp::Branch {
+            target: make_const(0x100c, 8),
+        });
+        let mut merge = R2ILBlock::new(0x100c, 4);
+        merge.push(R2ILOp::Copy {
+            dst: make_reg(0, 1),
+            src: make_const(3, 1),
+        });
+        merge.push(R2ILOp::Return {
+            target: make_reg(0x80, 8),
+        });
+        SSAFunction::from_blocks_raw(&[entry, left, right, merge], Some(&arch))
+            .expect("return phi overlay SSA")
+    }
+
+    fn shadowed_overlay_function(whole_name: &str, low_name: &str) -> SSAFunction {
+        let mut arch = ArchSpec::new("shadowed-return-overlay-test");
+        arch.add_register(RegisterDef::new(whole_name, 0, 8));
+        arch.add_register(RegisterDef::sub(low_name, 0, 1, whole_name));
+        arch.add_register(RegisterDef::new("pc", 0x80, 8));
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push(R2ILOp::Copy {
+            dst: make_reg(0, 8),
+            src: make_const(0, 8),
+        });
+        block.push(R2ILOp::Copy {
+            dst: make_reg(0, 1),
+            src: make_const(1, 1),
+        });
+        block.push(R2ILOp::Copy {
+            dst: make_reg(0, 1),
+            src: make_const(2, 1),
+        });
+        block.push(R2ILOp::Return {
+            target: make_reg(0x80, 8),
+        });
+        SSAFunction::from_blocks_raw(&[block], Some(&arch)).expect("shadowed return overlay SSA")
+    }
+
+    fn optimize_with_interface(
+        function: &mut SSAFunction,
+        interface: &SourceFunctionInterface,
+    ) -> OptimizationStats {
+        optimize_function_with_interface_and_control(
+            function,
+            &OptimizationConfig::default(),
+            Some(interface),
+            &UncheckedSsaWorkControl,
+        )
+        .expect("unchecked typed optimization")
     }
 
     #[test]
@@ -2450,7 +2775,7 @@ mod sccp_tests {
 
         let (consts, executable) = sccp(&func);
         let mut stats = OptimizationStats::default();
-        let changed = apply_sccp_results(&mut func, &consts, &executable, &mut stats);
+        let changed = apply_sccp_results(&mut func, &consts, &executable, None, &mut stats);
         assert!(changed);
         assert!(
             func.get_block(0x1004).is_none(),
@@ -2462,7 +2787,7 @@ mod sccp_tests {
     }
 
     #[test]
-    fn dce_preserves_branch_merged_return_register_phi() {
+    fn dce_without_interface_does_not_guess_return_phi_from_name() {
         let mut func = raw_func(vec![
             R2ILBlock {
                 addr: 0x1000,
@@ -2536,22 +2861,25 @@ mod sccp_tests {
 
         let stats = optimize_function(&mut func, &OptimizationConfig::default());
         let merge = func.get_block(0x100c).expect("merge block");
-        assert_eq!(merge.phis.len(), 1, "return-value phi must survive DCE");
         assert!(
-            func.get_block(0x1004).expect("left block").ops.iter().any(
+            merge.phis.is_empty(),
+            "a detached textual register name must not preserve a phi"
+        );
+        assert!(
+            !func.get_block(0x1004).expect("left block").ops.iter().any(
                 |op| matches!(op, SSAOp::Copy { dst, .. } if dst == &SSAVar::new("rax", 1, 8))
             ),
-            "left return-value write must remain live through the exit phi"
+            "left name-only write must be removed"
         );
         assert!(
-            func.get_block(0x1008).expect("right block").ops.iter().any(
+            !func.get_block(0x1008).expect("right block").ops.iter().any(
                 |op| matches!(op, SSAOp::Copy { dst, .. } if dst == &SSAVar::new("rax", 2, 8))
             ),
-            "right return-value write must remain live through the exit phi"
+            "right name-only write must be removed"
         );
         assert!(
-            stats.dce_removed_phis == 0,
-            "DCE must not classify the exit return phi as dead"
+            stats.dce_removed_phis > 0,
+            "the detached name-only phi must be accounted as dead"
         );
     }
 
@@ -2658,7 +2986,7 @@ mod sccp_tests {
     }
 
     #[test]
-    fn dce_preserves_direct_return_register_write_in_return_block() {
+    fn dce_without_interface_does_not_guess_direct_return_from_name() {
         let mut func = raw_func(vec![R2ILBlock {
             addr: 0x1000,
             size: 4,
@@ -2681,10 +3009,187 @@ mod sccp_tests {
 
         optimize_function(&mut func, &OptimizationConfig::default());
         assert!(
-            func.get_block(0x1000).expect("entry block").ops.iter().any(
+            !func.get_block(0x1000).expect("entry block").ops.iter().any(
                 |op| matches!(op, SSAOp::Copy { dst, .. } if dst == &SSAVar::new("eax", 1, 4))
             ),
-            "the last return-register write in a return block must survive DCE"
+            "a return-like textual name has no authority without an exact interface"
+        );
+    }
+
+    #[test]
+    fn typed_dce_retains_wide_return_base_and_low_overlay() {
+        let mut func = return_alias_function("carrier", "low_lane");
+        let interface = exact_u32_return_interface(register_storage(0, 8));
+
+        optimize_with_interface(&mut func, &interface);
+
+        let retained = func
+            .get_block(0x1000)
+            .expect("return block")
+            .ops
+            .iter()
+            .filter_map(|op| op.dst())
+            .filter_map(|dst| func.canonical_storage_for_var(dst))
+            .filter(|storage| canonical_register_storages_overlap(*storage, register_storage(0, 8)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            retained,
+            vec![register_storage(0, 8), register_storage(0, 1)],
+            "the exact physical base and later low overlay form one return composition"
+        );
+    }
+
+    #[test]
+    fn typed_dce_retains_narrow_only_lowbits_return() {
+        let mut func = narrow_return_function("carrier", "logical_result");
+        let interface = exact_u32_return_interface(register_storage(0, 8));
+
+        optimize_with_interface(&mut func, &interface);
+
+        let retained = func
+            .get_block(0x1000)
+            .expect("return block")
+            .ops
+            .iter()
+            .filter_map(|op| op.dst())
+            .filter_map(|dst| func.canonical_storage_for_var(dst))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            retained,
+            vec![register_storage(0, 4)],
+            "a narrow write exactly covering the logical LowBits projection is the return value"
+        );
+    }
+
+    #[test]
+    fn typed_dce_retains_full_phi_beneath_later_overlay() {
+        let mut func = return_phi_overlay_function("carrier", "low_lane");
+        let interface = exact_u32_return_interface(register_storage(0, 8));
+
+        optimize_with_interface(&mut func, &interface);
+
+        let merge = func.get_block(0x100c).expect("return merge block");
+        assert_eq!(merge.phis.len(), 1, "the return base phi must remain live");
+        assert_eq!(
+            merge.phis[0].canonical_storage,
+            Some(register_storage(0, 8))
+        );
+        let overlays = merge
+            .ops
+            .iter()
+            .filter_map(|op| op.dst())
+            .filter_map(|dst| func.canonical_storage_for_var(dst))
+            .collect::<Vec<_>>();
+        assert_eq!(overlays, vec![register_storage(0, 1)]);
+        for predecessor in [0x1004, 0x1008] {
+            assert!(
+                func.get_block(predecessor)
+                    .expect("return predecessor")
+                    .ops
+                    .iter()
+                    .filter_map(|op| op.dst())
+                    .filter_map(|dst| func.canonical_storage_for_var(dst))
+                    .any(|storage| storage == register_storage(0, 8)),
+                "the retained phi must keep each predecessor definition live"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_dce_drops_shadowed_overlays_independent_of_names() {
+        let interface = exact_u32_return_interface(register_storage(0, 8));
+        let mut first = shadowed_overlay_function("whole_a", "slice_a");
+        let mut renamed = shadowed_overlay_function("whole_b", "slice_b");
+
+        optimize_with_interface(&mut first, &interface);
+        optimize_with_interface(&mut renamed, &interface);
+
+        let retained_writes = |function: &SSAFunction| {
+            function
+                .get_block(0x1000)
+                .expect("return block")
+                .ops
+                .iter()
+                .filter_map(|op| match op {
+                    SSAOp::Copy { dst, src } => function
+                        .canonical_storage_for_var(dst)
+                        .map(|storage| (storage, src.constant_bits())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let expected = vec![
+            (register_storage(0, 8), Some(0)),
+            (register_storage(0, 1), Some(2)),
+        ];
+        assert_eq!(retained_writes(&first), expected);
+        assert_eq!(retained_writes(&renamed), expected);
+    }
+
+    #[test]
+    fn typed_return_liveness_is_carrier_name_independent() {
+        let interface = exact_u32_return_interface(register_storage(0, 8));
+        let mut first = return_alias_function("whole_a", "slice_a");
+        let mut renamed = return_alias_function("whole_b", "slice_b");
+
+        optimize_with_interface(&mut first, &interface);
+        optimize_with_interface(&mut renamed, &interface);
+
+        let retained_storages = |function: &SSAFunction| {
+            function
+                .get_block(0x1000)
+                .expect("return block")
+                .ops
+                .iter()
+                .filter_map(|op| op.dst())
+                .filter_map(|dst| function.canonical_storage_for_var(dst))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(retained_storages(&first), retained_storages(&renamed));
+        let op_count = |function: &SSAFunction| {
+            function
+                .blocks()
+                .map(|block| block.ops.len())
+                .sum::<usize>()
+        };
+        assert_eq!(op_count(&first), op_count(&renamed));
+    }
+
+    #[test]
+    fn typed_dce_ignores_spoofed_return_like_register_name() {
+        let mut arch = ArchSpec::new("spoofed-return-name-test");
+        arch.add_register(RegisterDef::new("actual_carrier", 0, 8));
+        arch.add_register(RegisterDef::new("rax", 0x40, 8));
+        arch.add_register(RegisterDef::new("pc", 0x80, 8));
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push(R2ILOp::Copy {
+            dst: make_reg(0, 8),
+            src: make_const(7, 8),
+        });
+        block.push(R2ILOp::Copy {
+            dst: make_reg(0x40, 8),
+            src: make_const(9, 8),
+        });
+        block.push(R2ILOp::Return {
+            target: make_reg(0x80, 8),
+        });
+        let mut func = SSAFunction::from_blocks_raw(&[block], Some(&arch)).expect("spoofed SSA");
+        let interface = exact_u32_return_interface(register_storage(0, 8));
+
+        optimize_with_interface(&mut func, &interface);
+
+        let retained = func
+            .get_block(0x1000)
+            .expect("return block")
+            .ops
+            .iter()
+            .filter_map(|op| op.dst())
+            .filter_map(|dst| func.canonical_storage_for_var(dst))
+            .collect::<Vec<_>>();
+        assert!(retained.contains(&register_storage(0, 8)));
+        assert!(
+            !retained.contains(&register_storage(0x40, 8)),
+            "a spoofed rax name outside the source-owned return storage must be dead"
         );
     }
 }
