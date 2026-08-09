@@ -1321,6 +1321,42 @@ mod tests {
         NativeWorkerSummaryKind, RefinementStage, SemanticArtifactDiagnostics,
     };
     use r2il::{RegisterDef, SpaceId, Varnode};
+    use r2ssa::{
+        CanonicalStorageId, CanonicalStorageSpace, SourceAbiParameterSpec, SourceFunctionInterface,
+        SourceFunctionReturn,
+    };
+
+    fn register_storage(offset: u64, size: u32) -> CanonicalStorageId {
+        CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset,
+            size,
+        }
+    }
+
+    fn exact_affine_aarch64_fixture() -> (ArchSpec, SourceFunctionInterface) {
+        let mut arch = ArchSpec::new("aarch64");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("x0", 0x00, 8));
+        arch.add_register(RegisterDef::new("x1", 0x08, 8));
+        arch.add_register(RegisterDef::sub("w1", 0x08, 4, "x1"));
+        arch.add_register(RegisterDef::new("sp", 0x10, 8));
+        arch.add_register(RegisterDef::new("lr", 0x18, 8));
+        let interface = SourceFunctionInterface::new_exact(
+            b"affine-memory-evidence-v1".to_vec(),
+            "aarch64",
+            [
+                SourceAbiParameterSpec::new(0, register_storage(0x00, 8)),
+                SourceAbiParameterSpec::new(1, register_storage(0x08, 8)),
+            ],
+            SourceFunctionReturn::Void,
+            [],
+        )
+        .and_then(|interface| interface.with_return_address_storage(register_storage(0x18, 8)))
+        .and_then(|interface| interface.with_stack_pointer_storage(register_storage(0x10, 8)))
+        .expect("coherent affine memory interface");
+        (arch, interface)
+    }
 
     #[test]
     fn disjoint_parameter_store_preserves_exact_branch_input() {
@@ -1408,11 +1444,7 @@ mod tests {
 
     #[test]
     fn disjoint_affine_parameter_store_preserves_exact_branch_input() {
-        let mut arch = ArchSpec::new("aarch64");
-        arch.addr_size = 8;
-        arch.add_register(RegisterDef::new("x0", 0x00, 8));
-        arch.add_register(RegisterDef::new("w1", 0x08, 4));
-        arch.add_register(RegisterDef::new("sp", 0x10, 8));
+        let (arch, interface) = exact_affine_aarch64_fixture();
 
         let mut branch = r2il::R2ILBlock::new(0x1000, 4);
         branch.push(r2il::R2ILOp::IntSub {
@@ -1481,8 +1513,16 @@ mod tests {
         true_exit.push(r2il::R2ILOp::Return {
             target: Varnode::constant(1, 8),
         });
-        let artifact = SsaArtifact::for_symbolic(&[branch, false_exit, true_exit], Some(&arch))
-            .expect("affine memory branch fixture should build SSA");
+        let artifact = SsaArtifact::for_decompile_with_interface(
+            &[branch, false_exit, true_exit],
+            Some(&arch),
+            interface,
+        )
+        .expect("affine memory branch fixture should build SSA");
+        assert_eq!(
+            artifact.provenance_kind(),
+            r2ssa::SsaArtifactProvenanceKind::Manual
+        );
         let ctx = Context::thread_local();
 
         let (observations, diagnostics) = collect_branch_observations_for_branch_blocks(
@@ -1791,7 +1831,6 @@ mod tests {
                 residual_reasons: vec![crate::ResidualReason::LargeCfg],
                 interpreter: None,
                 ambiguous_targets: Vec::new(),
-                cache_hit: false,
             },
         };
 

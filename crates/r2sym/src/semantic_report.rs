@@ -57,7 +57,6 @@ pub struct CompiledSemanticInfo {
     pub vm_step: Option<VmStepSummaryInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vm_transfer: Option<VmStepSummaryInfo>,
-    pub cache_hit: bool,
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -760,7 +759,6 @@ fn compiled_semantic_info_with_seed(
             .vm_body()
             .and_then(|body| body.transfer_summary.as_ref())
             .map(vm_step_summary_info_from_sym),
-        cache_hit: compiled.diagnostics.cache_hit,
     }
 }
 
@@ -807,7 +805,6 @@ mod tests {
                 residual_reasons: Vec::new(),
                 interpreter: None,
                 ambiguous_targets: Vec::new(),
-                cache_hit: true,
             },
         };
 
@@ -831,6 +828,6 @@ mod tests {
         assert_eq!(value["branches_pruned"], 7);
         assert_eq!(value["branches_unknown"], 5);
         assert_eq!(value["skipped_large_cfg"], true);
-        assert_eq!(value["cache_hit"], true);
+        assert!(value.get("cache_hit").is_none());
     }
 }

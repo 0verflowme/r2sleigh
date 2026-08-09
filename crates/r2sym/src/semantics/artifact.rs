@@ -865,7 +865,6 @@ mod tests {
                 residual_reasons: residuals,
                 interpreter: None,
                 ambiguous_targets: ambiguous,
-                cache_hit: false,
             });
             let normalized = artifact.clone().normalized();
             prop_assert_eq!(normalized.clone().normalized(), normalized);

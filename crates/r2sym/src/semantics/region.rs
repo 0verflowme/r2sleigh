@@ -1708,7 +1708,6 @@ pub struct SemanticArtifactDiagnostics {
     pub interpreter: Option<InterpreterDispatchSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ambiguous_targets: Vec<u64>,
-    pub cache_hit: bool,
 }
 
 #[cfg(test)]

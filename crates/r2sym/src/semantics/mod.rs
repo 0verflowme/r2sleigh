@@ -15,10 +15,7 @@ pub use artifact::{
     SemanticEvidenceAmbiguity, SemanticEvidenceCoverage, SemanticEvidenceProvenance,
     SemanticEvidenceReason, SemanticEvidenceSoundness, SliceClass,
 };
-pub use cache::{
-    SEMANTIC_ARTIFACT_SCHEMA_VERSION, SemanticCompilationResult, SemanticSeedMode,
-    stable_scope_hash,
-};
+pub use cache::{SEMANTIC_ARTIFACT_SCHEMA_VERSION, stable_scope_hash};
 pub use claims::{
     CheckedClaim, PROOF_COVERAGE_SCHEMA_VERSION, ProofCoverage, ProofFailure, ProofObligation,
     ProofObligationKind, ProofOwner, RenderPermission, RenderPermissionKind,
@@ -28,11 +25,9 @@ pub use claims::{
 };
 pub use compiler::compile_semantic_artifact_default_with_scope;
 pub use compiler::{
-    compile_function_semantics_with_scope, compile_function_semantics_with_scope_and_replay_seed,
-    compile_named_native_worker_summary_artifact, compile_native_worker_summary_artifact,
-    compile_query_semantic_artifact_with_scope,
-    compile_query_semantic_artifact_with_scope_and_replay_seed,
-    compile_semantic_artifact_with_scope, compile_semantic_artifact_with_scope_and_replay_seed,
+    compile_function_semantics_with_scope, compile_named_native_worker_summary_artifact,
+    compile_native_worker_summary_artifact, compile_query_semantic_artifact_with_scope,
+    compile_semantic_artifact_with_scope,
     compile_summary_dense_worker_artifact_from_interproc_summary,
 };
 pub use facts::{SymbolicReachabilityStatus, augment_semantic_artifact_with_interproc_summary};

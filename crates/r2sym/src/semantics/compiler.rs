@@ -1,21 +1,15 @@
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
 use r2il::ArchSpec;
 use r2ssa::{CFGRiskSummary, FunctionSemanticSummary, InterprocFunctionId, SsaArtifact};
 use z3::Context;
 
 use crate::FunctionSymbolSnapshot;
-use crate::replay::{ReplaySeed, stable_replay_seed_fingerprint};
 use crate::sim::{
     DerivedSummaryDiagnostics, PreparedFunctionScope, SummaryProfile, SummaryRegistry,
 };
 
 use super::artifact::{ResidualReason, SemanticArtifact, SemanticArtifactBody};
-use super::cache::{
-    SemanticCompilationResult, SemanticSeedMode, cache_insert_bounded,
-    coarse_large_slice_cache_key, lookup_semantic_cache, semantic_cache_key,
-};
 use super::classify::classify_slice;
 use super::facts::{
     CollectedNativeSemanticRegions, SymbolicFunctionFactDiagnostics,
@@ -238,7 +232,6 @@ pub fn compile_summary_dense_worker_artifact_from_interproc_summary(
             residual_reasons: Vec::new(),
             interpreter: None,
             ambiguous_targets: Vec::new(),
-            cache_hit: false,
         },
     }
     .normalized()
@@ -518,7 +511,6 @@ fn build_semantic_artifact(input: BuildSemanticArtifactInput) -> SemanticArtifac
             ),
             interpreter: interpreter_diagnostic,
             ambiguous_targets,
-            cache_hit: false,
         },
     }
     .normalized()
@@ -625,7 +617,7 @@ fn bounded_query_scope(
     bounded_large_cfg_scope(func, Some(scope))
 }
 
-fn compile_function_semantics_uncached(
+fn compile_function_semantics_from_current_inputs(
     ctx: &Context,
     func: &SsaArtifact,
     scope: Option<&PreparedFunctionScope>,
@@ -800,111 +792,6 @@ fn compile_function_semantics_uncached(
     })
 }
 
-fn semantic_seed_identity(replay_seed: Option<&ReplaySeed>) -> (SemanticSeedMode, u64) {
-    match replay_seed {
-        Some(seed) => (
-            SemanticSeedMode::Replay,
-            stable_replay_seed_fingerprint(seed),
-        ),
-        None => (SemanticSeedMode::Static, 0),
-    }
-}
-
-fn compile_function_semantics_cached_with_scope_impl(
-    ctx: &Context,
-    func: &SsaArtifact,
-    scope: Option<&PreparedFunctionScope>,
-    arch: Option<&ArchSpec>,
-    symbols: &FunctionSymbolSnapshot,
-    summary_profile: SummaryProfile,
-    replay_seed: Option<&ReplaySeed>,
-) -> SemanticCompilationResult {
-    let (seed_mode, replay_seed_fingerprint) = semantic_seed_identity(replay_seed);
-    let key = semantic_cache_key(
-        func,
-        scope,
-        arch,
-        summary_profile,
-        seed_mode,
-        replay_seed_fingerprint,
-        symbols,
-    );
-    if let Some(existing) = lookup_semantic_cache(&key) {
-        return SemanticCompilationResult {
-            artifact: existing,
-            cache_hit: true,
-            seed_mode,
-            replay_seed_fingerprint,
-        };
-    }
-    let coarse_key = scope.map(|scope| {
-        coarse_large_slice_cache_key(
-            func.entry,
-            scope,
-            arch,
-            summary_profile,
-            seed_mode,
-            replay_seed_fingerprint,
-            symbols,
-        )
-    });
-    if let Some(coarse_key) = coarse_key.as_ref()
-        && let Some(existing) = lookup_semantic_cache(coarse_key)
-    {
-        return SemanticCompilationResult {
-            artifact: existing,
-            cache_hit: true,
-            seed_mode,
-            replay_seed_fingerprint,
-        };
-    }
-
-    let artifact = Arc::new(compile_function_semantics_uncached(
-        ctx,
-        func,
-        scope,
-        arch,
-        symbols,
-        summary_profile,
-    ));
-    let artifact = cache_insert_bounded(key, artifact);
-    let should_cache_coarsely = scope.is_some()
-        && (matches!(artifact.execution, ExecutionModel::Vm)
-            || artifact.diagnostics.skipped_large_cfg);
-    let artifact = if should_cache_coarsely {
-        let coarse_key =
-            coarse_key.expect("coarse large-slice cache key should exist when scope is present");
-        cache_insert_bounded(coarse_key, artifact)
-    } else {
-        artifact
-    };
-    SemanticCompilationResult {
-        artifact,
-        cache_hit: false,
-        seed_mode,
-        replay_seed_fingerprint,
-    }
-}
-
-pub(crate) fn compile_function_semantics_cached_with_scope(
-    ctx: &Context,
-    func: &SsaArtifact,
-    scope: Option<&PreparedFunctionScope>,
-    arch: Option<&ArchSpec>,
-    symbols: &FunctionSymbolSnapshot,
-    summary_profile: SummaryProfile,
-) -> SemanticCompilationResult {
-    compile_function_semantics_cached_with_scope_impl(
-        ctx,
-        func,
-        scope,
-        arch,
-        symbols,
-        summary_profile,
-        None,
-    )
-}
-
 pub fn compile_function_semantics_with_scope(
     ctx: &Context,
     func: &SsaArtifact,
@@ -913,40 +800,7 @@ pub fn compile_function_semantics_with_scope(
     symbols: &FunctionSymbolSnapshot,
     summary_profile: SummaryProfile,
 ) -> SemanticArtifact {
-    let result = compile_function_semantics_cached_with_scope(
-        ctx,
-        func,
-        scope,
-        arch,
-        symbols,
-        summary_profile,
-    );
-    let mut artifact = (*result.artifact).clone();
-    artifact.diagnostics.cache_hit = result.cache_hit;
-    artifact
-}
-
-pub fn compile_function_semantics_with_scope_and_replay_seed(
-    ctx: &Context,
-    func: &SsaArtifact,
-    scope: Option<&PreparedFunctionScope>,
-    arch: Option<&ArchSpec>,
-    symbols: &FunctionSymbolSnapshot,
-    summary_profile: SummaryProfile,
-    replay_seed: Option<&ReplaySeed>,
-) -> SemanticArtifact {
-    let result = compile_function_semantics_cached_with_scope_impl(
-        ctx,
-        func,
-        scope,
-        arch,
-        symbols,
-        summary_profile,
-        replay_seed,
-    );
-    let mut artifact = (*result.artifact).clone();
-    artifact.diagnostics.cache_hit = result.cache_hit;
-    artifact
+    compile_function_semantics_from_current_inputs(ctx, func, scope, arch, symbols, summary_profile)
 }
 
 pub fn compile_semantic_artifact_with_scope(
@@ -958,26 +812,6 @@ pub fn compile_semantic_artifact_with_scope(
     summary_profile: SummaryProfile,
 ) -> SemanticArtifact {
     compile_function_semantics_with_scope(ctx, func, scope, arch, symbols, summary_profile)
-}
-
-pub fn compile_semantic_artifact_with_scope_and_replay_seed(
-    ctx: &Context,
-    func: &SsaArtifact,
-    scope: Option<&PreparedFunctionScope>,
-    arch: Option<&ArchSpec>,
-    symbols: &FunctionSymbolSnapshot,
-    summary_profile: SummaryProfile,
-    replay_seed: Option<&ReplaySeed>,
-) -> SemanticArtifact {
-    compile_function_semantics_with_scope_and_replay_seed(
-        ctx,
-        func,
-        scope,
-        arch,
-        symbols,
-        summary_profile,
-        replay_seed,
-    )
 }
 
 pub fn compile_query_semantic_artifact_with_scope(
@@ -997,29 +831,6 @@ pub fn compile_query_semantic_artifact_with_scope(
         arch,
         symbols,
         summary_profile,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn compile_query_semantic_artifact_with_scope_and_replay_seed(
-    ctx: &Context,
-    func: &SsaArtifact,
-    scope: Option<&PreparedFunctionScope>,
-    target_addr: u64,
-    arch: Option<&ArchSpec>,
-    symbols: &FunctionSymbolSnapshot,
-    summary_profile: SummaryProfile,
-    replay_seed: Option<&ReplaySeed>,
-) -> SemanticArtifact {
-    let bounded_scope = bounded_query_scope(func, scope, target_addr);
-    compile_function_semantics_with_scope_and_replay_seed(
-        ctx,
-        func,
-        bounded_scope.as_ref().or(scope),
-        arch,
-        symbols,
-        summary_profile,
-        replay_seed,
     )
 }
 
@@ -1045,11 +856,14 @@ mod tests {
     use r2il::{
         ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, SwitchCase, SwitchInfo, Varnode,
     };
-    use r2ssa::{FunctionSemanticLinkage, SsaArtifact};
+    use r2ssa::{
+        CanonicalStorageId, CanonicalStorageSpace, FunctionSemanticLinkage, SourceAbiParameterSpec,
+        SourceFunctionInterface, SourceFunctionReturn, SourceStackSlotSpec, SsaArtifact,
+        StackAddressBase,
+    };
     use z3::Context;
 
     use crate::FunctionSymbol;
-    use crate::replay::{ReplayRegisterValue, ReplaySeed};
 
     use super::*;
     const RAX: u64 = 0;
@@ -1074,6 +888,41 @@ mod tests {
         arch.add_register(RegisterDef::new("RBP", RBP, 8));
         arch.add_register(RegisterDef::new("RDI", RDI, 8));
         arch
+    }
+
+    fn register_storage(offset: u64, size: u32) -> CanonicalStorageId {
+        CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset,
+            size,
+        }
+    }
+
+    fn exact_vm_memory_fixture() -> (ArchSpec, SourceFunctionInterface) {
+        const RSP: u64 = 0x28;
+        const RIP: u64 = 0x30;
+
+        let mut arch = test_arch();
+        arch.add_register(RegisterDef::new("RSP", RSP, 8));
+        arch.add_register(RegisterDef::new("RIP", RIP, 8));
+        let interface = SourceFunctionInterface::new_exact(
+            b"vm-handler-memory-evidence-v1".to_vec(),
+            "x86-64",
+            [SourceAbiParameterSpec::new(0, register_storage(RDI, 8))],
+            SourceFunctionReturn::Register {
+                storage: register_storage(RAX, 8),
+            },
+            [SourceStackSlotSpec::new_local(
+                StackAddressBase::FramePointer,
+                register_storage(RBP, 8),
+                0,
+                8,
+            )],
+        )
+        .and_then(|interface| interface.with_return_address_storage(register_storage(RIP, 8)))
+        .and_then(|interface| interface.with_stack_pointer_storage(register_storage(RSP, 8)))
+        .expect("coherent VM handler memory interface");
+        (arch, interface)
     }
 
     fn make_reg(offset: u64, size: u32) -> Varnode {
@@ -1113,7 +962,7 @@ mod tests {
     }
 
     #[test]
-    fn compile_semantics_cache_hits_on_repeat() {
+    fn repeated_compilation_is_request_local() {
         let blocks = vec![R2ILBlock {
             addr: 0x1000,
             size: 1,
@@ -1125,7 +974,7 @@ mod tests {
         }];
         let func = SsaArtifact::for_symbolic(&blocks, Some(&test_arch())).expect("ssa");
         let ctx = Context::thread_local();
-        let first = compile_function_semantics_cached_with_scope(
+        let mut first = compile_function_semantics_with_scope(
             &ctx,
             &func,
             None,
@@ -1133,7 +982,8 @@ mod tests {
             &FunctionSymbolSnapshot::default(),
             SummaryProfile::Default,
         );
-        let second = compile_function_semantics_cached_with_scope(
+        first.diagnostics.branches_evaluated = usize::MAX;
+        let second = compile_function_semantics_with_scope(
             &ctx,
             &func,
             None,
@@ -1141,130 +991,117 @@ mod tests {
             &FunctionSymbolSnapshot::default(),
             SummaryProfile::Default,
         );
-        assert!(!first.cache_hit);
-        assert!(second.cache_hit);
+
+        assert_eq!(first.diagnostics.branches_evaluated, usize::MAX);
+        assert_ne!(second.diagnostics.branches_evaluated, usize::MAX);
     }
 
     #[test]
-    fn compile_semantics_cache_partitions_typed_symbol_content_and_linkage() {
-        let blocks = vec![R2ILBlock {
-            addr: 0x1007,
-            size: 1,
-            ops: vec![R2ILOp::Return {
-                target: make_const(0, 8),
-            }],
-            switch_info: None,
-            op_metadata: Default::default(),
-        }];
+    fn compilation_consumes_current_imported_symbol_map() {
+        let blocks = vec![
+            R2ILBlock {
+                addr: 0x1000,
+                size: 4,
+                ops: vec![R2ILOp::Call {
+                    target: make_const(0x5000, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1004,
+                size: 4,
+                ops: vec![
+                    R2ILOp::IntEqual {
+                        dst: make_reg(RDI, 1),
+                        a: make_reg(RAX, 8),
+                        b: make_const(0, 8),
+                    },
+                    R2ILOp::CBranch {
+                        target: make_const(0x1010, 8),
+                        cond: make_reg(RDI, 1),
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1008,
+                size: 1,
+                ops: vec![R2ILOp::Return {
+                    target: make_const(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1010,
+                size: 1,
+                ops: vec![R2ILOp::Return {
+                    target: make_const(1, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ];
         let func = SsaArtifact::for_symbolic(&blocks, Some(&test_arch())).expect("ssa");
+        let helper = SsaArtifact::for_symbolic(
+            &[R2ILBlock {
+                addr: 0x5000,
+                size: 1,
+                ops: vec![R2ILOp::Return {
+                    target: make_const(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            }],
+            Some(&test_arch()),
+        )
+        .expect("helper");
+        let scope = PreparedFunctionScope::new(
+            func.entry,
+            vec![
+                crate::ScopedPreparedFunction {
+                    id: InterprocFunctionId(func.entry),
+                    name: Some("root".to_string()),
+                    prepared: func.clone(),
+                },
+                crate::ScopedPreparedFunction {
+                    id: InterprocFunctionId(helper.entry),
+                    name: Some("external".to_string()),
+                    prepared: helper,
+                },
+            ],
+        )
+        .expect("scope");
         let ctx = Context::thread_local();
-        let first_map = test_symbols(&[
-            (
-                0x5000,
-                "unclassified.memcpy",
-                FunctionSemanticLinkage::Internal,
-            ),
-            (
-                0x6000,
-                "unclassified.malloc",
-                FunctionSemanticLinkage::Internal,
-            ),
-        ]);
-        let reordered_map = test_symbols(&[
-            (
-                0x6000,
-                "unclassified.malloc",
-                FunctionSemanticLinkage::Internal,
-            ),
-            (
-                0x5000,
-                "unclassified.memcpy",
-                FunctionSemanticLinkage::Internal,
-            ),
-        ]);
-        let changed_map = test_symbols(&[
-            (
-                0x5000,
-                "unclassified.memmove",
-                FunctionSemanticLinkage::Internal,
-            ),
-            (
-                0x6000,
-                "unclassified.malloc",
-                FunctionSemanticLinkage::Internal,
-            ),
-        ]);
-        let changed_addr_map = test_symbols(&[
-            (
-                0x5001,
-                "unclassified.memcpy",
-                FunctionSemanticLinkage::Internal,
-            ),
-            (
-                0x6000,
-                "unclassified.malloc",
-                FunctionSemanticLinkage::Internal,
-            ),
-        ]);
-        let changed_linkage_map = test_symbols(&[
-            (
-                0x5000,
-                "unclassified.memcpy",
-                FunctionSemanticLinkage::Imported,
-            ),
-            (
-                0x6000,
-                "unclassified.malloc",
-                FunctionSemanticLinkage::Internal,
-            ),
-        ]);
+        let imported_map =
+            test_symbols(&[(0x5000, "sym.imp.malloc", FunctionSemanticLinkage::Imported)]);
+        let internal_map =
+            test_symbols(&[(0x5000, "sym.imp.malloc", FunctionSemanticLinkage::Internal)]);
 
-        let first = compile_function_semantics_cached_with_scope(
+        let imported = compile_function_semantics_with_scope(
             &ctx,
             &func,
-            None,
+            Some(&scope),
             Some(&test_arch()),
-            &first_map,
+            &imported_map,
             SummaryProfile::Default,
         );
-        let reordered = compile_function_semantics_cached_with_scope(
+        let internal = compile_function_semantics_with_scope(
             &ctx,
             &func,
-            None,
+            Some(&scope),
             Some(&test_arch()),
-            &reordered_map,
-            SummaryProfile::Default,
-        );
-        let changed = compile_function_semantics_cached_with_scope(
-            &ctx,
-            &func,
-            None,
-            Some(&test_arch()),
-            &changed_map,
-            SummaryProfile::Default,
-        );
-        let changed_addr = compile_function_semantics_cached_with_scope(
-            &ctx,
-            &func,
-            None,
-            Some(&test_arch()),
-            &changed_addr_map,
-            SummaryProfile::Default,
-        );
-        let changed_linkage = compile_function_semantics_cached_with_scope(
-            &ctx,
-            &func,
-            None,
-            Some(&test_arch()),
-            &changed_linkage_map,
+            &internal_map,
             SummaryProfile::Default,
         );
 
-        assert!(!first.cache_hit);
-        assert!(reordered.cache_hit);
-        assert!(!changed.cache_hit);
-        assert!(!changed_addr.cache_hit);
-        assert!(!changed_linkage.cache_hit);
+        let imported_summary = &imported.native_body().expect("native body").summary;
+        let internal_summary = &internal.native_body().expect("native body").summary;
+        assert_eq!(imported_summary.derived_diagnostics.skipped_core, 1);
+        assert!(internal_summary.derived_summaries >= 1);
+        assert_ne!(imported, internal);
     }
 
     #[test]
@@ -1606,133 +1443,7 @@ mod tests {
     }
 
     #[test]
-    fn compile_semantics_replay_seeds_partition_cache_identity() {
-        let blocks = vec![R2ILBlock {
-            addr: 0x2000,
-            size: 1,
-            ops: vec![R2ILOp::Return {
-                target: make_const(0, 8),
-            }],
-            switch_info: None,
-            op_metadata: Default::default(),
-        }];
-        let func = SsaArtifact::for_symbolic(&blocks, Some(&test_arch())).expect("ssa");
-        let ctx = Context::thread_local();
-        let replay_a = ReplaySeed {
-            checkpoint_id: Some(1),
-            entry_pc: Some(0x2000),
-            registers: vec![ReplayRegisterValue {
-                name: "rax".to_string(),
-                value: 0x1111,
-            }],
-            ..ReplaySeed::default()
-        };
-        let replay_b = ReplaySeed {
-            checkpoint_id: Some(2),
-            entry_pc: Some(0x2000),
-            registers: vec![ReplayRegisterValue {
-                name: "rax".to_string(),
-                value: 0x2222,
-            }],
-            ..ReplaySeed::default()
-        };
-
-        let first = compile_function_semantics_cached_with_scope_impl(
-            &ctx,
-            &func,
-            None,
-            Some(&test_arch()),
-            &FunctionSymbolSnapshot::default(),
-            SummaryProfile::Default,
-            Some(&replay_a),
-        );
-        let second = compile_function_semantics_cached_with_scope_impl(
-            &ctx,
-            &func,
-            None,
-            Some(&test_arch()),
-            &FunctionSymbolSnapshot::default(),
-            SummaryProfile::Default,
-            Some(&replay_a),
-        );
-        let third = compile_function_semantics_cached_with_scope_impl(
-            &ctx,
-            &func,
-            None,
-            Some(&test_arch()),
-            &FunctionSymbolSnapshot::default(),
-            SummaryProfile::Default,
-            Some(&replay_b),
-        );
-
-        assert_eq!(first.seed_mode, SemanticSeedMode::Replay);
-        assert_eq!(second.seed_mode, SemanticSeedMode::Replay);
-        assert_eq!(third.seed_mode, SemanticSeedMode::Replay);
-        assert_eq!(
-            first.replay_seed_fingerprint,
-            second.replay_seed_fingerprint
-        );
-        assert_ne!(first.replay_seed_fingerprint, third.replay_seed_fingerprint);
-        assert!(!first.cache_hit);
-        assert!(second.cache_hit);
-        assert!(!third.cache_hit);
-    }
-
-    #[test]
-    fn compile_semantics_cache_ignores_scope_display_names() {
-        let blocks = vec![R2ILBlock {
-            addr: 0x1000,
-            size: 1,
-            ops: vec![R2ILOp::Return {
-                target: make_const(0, 8),
-            }],
-            switch_info: None,
-            op_metadata: Default::default(),
-        }];
-        let func = SsaArtifact::for_symbolic(&blocks, Some(&test_arch())).expect("ssa");
-        let scope_a = crate::PreparedFunctionScope::new(
-            0x1000,
-            vec![crate::ScopedPreparedFunction {
-                id: r2ssa::InterprocFunctionId(0x1000),
-                name: Some("sym.display_a".to_string()),
-                prepared: func.clone(),
-            }],
-        )
-        .expect("scope a");
-        let scope_b = crate::PreparedFunctionScope::new(
-            0x1000,
-            vec![crate::ScopedPreparedFunction {
-                id: r2ssa::InterprocFunctionId(0x1000),
-                name: Some("dbg.display_b".to_string()),
-                prepared: func.clone(),
-            }],
-        )
-        .expect("scope b");
-        let ctx = Context::thread_local();
-
-        let first = compile_function_semantics_cached_with_scope(
-            &ctx,
-            &func,
-            Some(&scope_a),
-            Some(&test_arch()),
-            &FunctionSymbolSnapshot::default(),
-            SummaryProfile::Default,
-        );
-        let second = compile_function_semantics_cached_with_scope(
-            &ctx,
-            &func,
-            Some(&scope_b),
-            Some(&test_arch()),
-            &FunctionSymbolSnapshot::default(),
-            SummaryProfile::Default,
-        );
-
-        assert!(!first.cache_hit);
-        assert!(second.cache_hit);
-    }
-
-    #[test]
-    fn large_cfg_cache_does_not_alias_distinct_scopes() {
+    fn large_cfg_compilation_consumes_each_request_scope() {
         let mut blocks = vec![R2ILBlock {
             addr: 0x3000,
             size: 4,
@@ -1806,7 +1517,7 @@ mod tests {
         .expect("scope b");
         let ctx = Context::thread_local();
 
-        let first = compile_function_semantics_cached_with_scope(
+        let first = compile_function_semantics_with_scope(
             &ctx,
             &root,
             Some(&scope_a),
@@ -1814,7 +1525,7 @@ mod tests {
             &FunctionSymbolSnapshot::default(),
             SummaryProfile::Default,
         );
-        let second = compile_function_semantics_cached_with_scope(
+        let second = compile_function_semantics_with_scope(
             &ctx,
             &root,
             Some(&scope_b),
@@ -1823,10 +1534,14 @@ mod tests {
             SummaryProfile::Default,
         );
 
-        assert!(first.artifact.diagnostics.skipped_large_cfg);
-        assert!(second.artifact.diagnostics.skipped_large_cfg);
-        assert!(!first.cache_hit);
-        assert!(!second.cache_hit);
+        assert!(first.diagnostics.skipped_large_cfg);
+        assert!(second.diagnostics.skipped_large_cfg);
+        let first_summary = &first.native_body().expect("native body").summary;
+        let second_summary = &second.native_body().expect("native body").summary;
+        assert_eq!(first_summary.closure_functions, 1);
+        assert_eq!(second_summary.closure_functions, 2);
+        assert_eq!(first_summary.helper_functions, 0);
+        assert_eq!(second_summary.helper_functions, 1);
     }
 
     #[test]
@@ -2321,6 +2036,7 @@ mod tests {
 
     #[test]
     fn vm_step_summary_tracks_case_values_and_handler_regions() {
+        let (arch, interface) = exact_vm_memory_fixture();
         let blocks = vec![
             R2ILBlock {
                 addr: 0x3000,
@@ -2438,13 +2154,18 @@ mod tests {
                 op_metadata: Default::default(),
             },
         ];
-        let func = SsaArtifact::for_symbolic(&blocks, Some(&test_arch())).expect("ssa");
+        let func = SsaArtifact::for_decompile_with_interface(&blocks, Some(&arch), interface)
+            .expect("ssa");
+        assert_eq!(
+            func.provenance_kind(),
+            r2ssa::SsaArtifactProvenanceKind::Manual
+        );
         let ctx = Context::thread_local();
         let artifact = compile_function_semantics_with_scope(
             &ctx,
             &func,
             None,
-            Some(&test_arch()),
+            Some(&arch),
             &FunctionSymbolSnapshot::default(),
             SummaryProfile::Default,
         );

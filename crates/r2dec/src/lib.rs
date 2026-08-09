@@ -4372,7 +4372,6 @@ pub(crate) fn test_native_semantic_artifact(
             residual_reasons,
             interpreter: None,
             ambiguous_targets: Vec::new(),
-            cache_hit: false,
         },
     }
 }
@@ -7019,7 +7018,6 @@ mod tests {
                 residual_reasons: Vec::new(),
                 interpreter: None,
                 ambiguous_targets: Vec::new(),
-                cache_hit: false,
             },
         };
         let signature = signature_spec(

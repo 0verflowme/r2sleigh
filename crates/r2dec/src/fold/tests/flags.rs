@@ -422,7 +422,6 @@ fn actionable_control_island_shortcuts_when_branch_fact_is_not_decisive() {
             residual_reasons: Vec::new(),
             interpreter: None,
             ambiguous_targets: Vec::new(),
-            cache_hit: false,
         },
     };
     install_semantic_artifact(&mut ctx, artifact);

@@ -5834,31 +5834,15 @@ impl EngineSession {
         symbolic_execution.poll()?;
         let context = request.context;
         let mut query_config = symbolic_query_config_for_context(&context);
-        let compiled = match context.seed {
-            EngineSymbolicStateSeed::Replay { seed, .. } => {
-                r2sym::compile_query_semantic_artifact_with_scope_and_replay_seed(
-                    context.z3_ctx,
-                    context.prepared,
-                    context.scope,
-                    request.target_addr,
-                    context.arch,
-                    context.symbols,
-                    query_config.summary_profile,
-                    Some(seed),
-                )
-            }
-            EngineSymbolicStateSeed::Default { .. } | EngineSymbolicStateSeed::Scope { .. } => {
-                r2sym::compile_query_semantic_artifact_with_scope(
-                    context.z3_ctx,
-                    context.prepared,
-                    context.scope,
-                    request.target_addr,
-                    context.arch,
-                    context.symbols,
-                    query_config.summary_profile,
-                )
-            }
-        };
+        let compiled = r2sym::compile_query_semantic_artifact_with_scope(
+            context.z3_ctx,
+            context.prepared,
+            context.scope,
+            request.target_addr,
+            context.arch,
+            context.symbols,
+            query_config.summary_profile,
+        );
         symbolic_execution.poll()?;
         let initial_state = symbolic_initial_state(&context);
         let selected_route = target_query_route_decision(EngineTargetQueryRouteRequest {
@@ -12371,7 +12355,6 @@ mod tests {
                 residual_reasons: Vec::new(),
                 interpreter: None,
                 ambiguous_targets: Vec::new(),
-                cache_hit: false,
             },
         }
     }

@@ -371,7 +371,6 @@ mod tests {
             residual_reasons: Vec::new(),
             interpreter: None,
             ambiguous_targets: Vec::new(),
-            cache_hit: false,
         }
     }
 

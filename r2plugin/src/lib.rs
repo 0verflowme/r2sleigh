@@ -7254,7 +7254,6 @@ mod tests {
                 residual_reasons: vec![r2sym::ResidualReason::LargeCfg],
                 interpreter: None,
                 ambiguous_targets: Vec::new(),
-                cache_hit: false,
             },
         }
     }

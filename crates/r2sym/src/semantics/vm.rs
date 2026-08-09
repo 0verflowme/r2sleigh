@@ -2171,12 +2171,47 @@ mod tests {
     use std::collections::BTreeSet;
 
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
-    use r2ssa::SsaArtifact;
+    use r2ssa::{
+        CanonicalStorageId, CanonicalStorageSpace, SourceAbiParameterSpec, SourceFunctionInterface,
+        SourceFunctionReturn, SsaArtifact,
+    };
 
     use super::*;
 
     const RAX: u64 = 0;
     const RDI: u64 = 8;
+
+    fn register_storage(offset: u64, size: u32) -> CanonicalStorageId {
+        CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset,
+            size,
+        }
+    }
+
+    fn exact_affine_aarch64_fixture() -> (ArchSpec, SourceFunctionInterface) {
+        let mut arch = ArchSpec::new("aarch64");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("x0", 0x00, 8));
+        arch.add_register(RegisterDef::new("x1", 0x08, 8));
+        arch.add_register(RegisterDef::sub("w1", 0x08, 4, "x1"));
+        arch.add_register(RegisterDef::new("sp", 0x10, 8));
+        arch.add_register(RegisterDef::new("lr", 0x18, 8));
+        let interface = SourceFunctionInterface::new_exact(
+            b"affine-memory-evidence-v1".to_vec(),
+            "aarch64",
+            [
+                SourceAbiParameterSpec::new(0, register_storage(0x00, 8)),
+                SourceAbiParameterSpec::new(1, register_storage(0x08, 8)),
+            ],
+            SourceFunctionReturn::Void,
+            [],
+        )
+        .and_then(|interface| interface.with_return_address_storage(register_storage(0x18, 8)))
+        .and_then(|interface| interface.with_stack_pointer_storage(register_storage(0x10, 8)))
+        .expect("coherent affine memory interface");
+        (arch, interface)
+    }
 
     fn test_arch() -> ArchSpec {
         let mut arch = ArchSpec::new("x86-64");
@@ -2251,11 +2286,7 @@ mod tests {
 
     #[test]
     fn affine_parameter_memory_is_exact_vm_evidence() {
-        let mut arch = ArchSpec::new("aarch64");
-        arch.addr_size = 8;
-        arch.add_register(RegisterDef::new("x0", 0x00, 8));
-        arch.add_register(RegisterDef::new("w1", 0x08, 4));
-        arch.add_register(RegisterDef::new("sp", 0x10, 8));
+        let (arch, interface) = exact_affine_aarch64_fixture();
 
         let mut block = R2ILBlock::new(0x3000, 4);
         block.push(R2ILOp::IntSub {
@@ -2311,7 +2342,12 @@ mod tests {
             target: Varnode::constant(0, 8),
         });
 
-        let func = SsaArtifact::for_symbolic(&[block], Some(&arch)).expect("affine VM SSA fixture");
+        let func = SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface)
+            .expect("affine VM SSA fixture");
+        assert_eq!(
+            func.provenance_kind(),
+            r2ssa::SsaArtifactProvenanceKind::Manual
+        );
         let block = func.get_block(0x3000).expect("entry block");
         let mut affine_read = None;
         let mut affine_write = None;
