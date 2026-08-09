@@ -11,7 +11,8 @@ use r2cert::{
 };
 use r2ssa::{
     CanonicalInstructionId, MachineAddressSpace, MachineBuildError, MachineMemoryEndianness,
-    MachineType, MachineValueBinding, MachineValueUse, SemanticInstructionState, SsaArtifact,
+    MachineType, MachineValueBinding, MachineValueUse, SemanticInstructionState,
+    TrustedSsaArtifact,
 };
 use serde::Serialize;
 
@@ -138,12 +139,12 @@ fn memory_order(layer: &SemanticCBlockStepLayer) -> Vec<CanonicalInstructionId> 
 }
 
 impl CertifiedMemorySemanticCFunction {
-    /// Construct the complete proof chain internally from one immutable source
-    /// artifact. No caller-supplied permit or typed node can cross this seam.
+    /// Construct the complete proof chain internally from one immutable trusted
+    /// source artifact. No caller-supplied permit or typed node can cross this seam.
     pub fn from_artifact(
-        artifact: &SsaArtifact,
+        trusted: &TrustedSsaArtifact,
     ) -> Result<Self, CertifiedMemorySemanticCFunctionError> {
-        let certified = CertifiedMachineProjection::from_artifact(artifact)?;
+        let certified = CertifiedMachineProjection::from_artifact(trusted)?;
         let accounting = CertifiedSingleBlockAccounting::from_projection(&certified)?;
         let accounting_audit = accounting.audit();
         if !accounting_audit.has_exact_source_accounting() {
@@ -818,168 +819,3 @@ extern void r2s_ram_write_be_u16(uint64_t byte_address, uint16_t value);
 extern void r2s_ram_write_be_u32(uint64_t byte_address, uint32_t value);
 extern void r2s_ram_write_be_u64(uint64_t byte_address, uint64_t value);
 "#;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use r2il::{
-        AddressSpace, ArchSpec, Endianness, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode,
-    };
-    use r2ssa::{
-        CanonicalStorageId, CanonicalStorageSpace, SourceFunctionInterface, SourceFunctionReturn,
-    };
-
-    fn interface(return_kind: SourceFunctionReturn) -> SourceFunctionInterface {
-        SourceFunctionInterface::new(
-            b"memory-semantic-function-revision-1".to_vec(),
-            "test-register-abi",
-            [],
-            return_kind,
-            [],
-        )
-        .expect("explicit interface")
-    }
-
-    fn arch(endianness: Endianness, width_bytes: u32, word_size: u32) -> ArchSpec {
-        let mut arch = ArchSpec::new("memory-semantic-function-test");
-        arch.addr_size = 8;
-        arch.add_register(RegisterDef::new("ret", 0, width_bytes));
-        arch.add_register(RegisterDef::new("rip", 16, 8));
-        let mut ram = AddressSpace::ram(8);
-        ram.word_size = word_size;
-        arch.add_space(ram);
-        arch.set_memory_endianness(endianness);
-        arch
-    }
-
-    fn return_storage(width_bytes: u32) -> CanonicalStorageId {
-        CanonicalStorageId {
-            space: CanonicalStorageSpace::Register,
-            offset: 0,
-            size: width_bytes,
-        }
-    }
-
-    fn load_return(endianness: Endianness, width_bytes: u32) -> SsaArtifact {
-        let mut block = R2ILBlock::new(0x8100 + u64::from(width_bytes), 4);
-        block.push(R2ILOp::Load {
-            dst: Varnode::register(0, width_bytes),
-            space: SpaceId::Ram,
-            addr: Varnode::constant(0x40, 8),
-        });
-        block.push(R2ILOp::Return {
-            target: Varnode::register(16, 8),
-        });
-        SsaArtifact::raw_with_interface(
-            &[block],
-            Some(&arch(endianness, width_bytes, 1)),
-            interface(SourceFunctionReturn::Register {
-                storage: return_storage(width_bytes),
-            }),
-        )
-        .expect("load-return artifact")
-    }
-
-    fn ordered_aliasing() -> SsaArtifact {
-        let mut block = R2ILBlock::new(0x8200, 4);
-        block.push(R2ILOp::Store {
-            space: SpaceId::Ram,
-            addr: Varnode::constant(0x40, 8),
-            val: Varnode::constant(0xaa, 1),
-        });
-        block.push(R2ILOp::Load {
-            dst: Varnode::register(0, 1),
-            space: SpaceId::Ram,
-            addr: Varnode::constant(0x40, 8),
-        });
-        block.push(R2ILOp::Return {
-            target: Varnode::register(16, 8),
-        });
-        SsaArtifact::raw_with_interface(
-            &[block],
-            Some(&arch(Endianness::Little, 1, 1)),
-            interface(SourceFunctionReturn::Register {
-                storage: return_storage(1),
-            }),
-        )
-        .expect("ordered alias artifact")
-    }
-
-    fn assert_machine_context_refusal(artifact: &SsaArtifact) {
-        assert!(matches!(
-            CertifiedMemorySemanticCFunction::from_artifact(artifact),
-            Err(CertifiedMemorySemanticCFunctionError::Machine(
-                MachineBuildError::MachineContextMismatch
-            ))
-        ));
-    }
-
-    #[test]
-    fn hand_authored_width_endian_loads_cannot_authorize_memory_rendering() {
-        for endianness in [Endianness::Little, Endianness::Big] {
-            for width_bytes in [1, 2, 4, 8] {
-                assert_machine_context_refusal(&load_return(endianness, width_bytes));
-            }
-        }
-    }
-
-    #[test]
-    fn hand_authored_store_void_cannot_authorize_helper_or_return_rendering() {
-        let mut block = R2ILBlock::new(0x8300, 4);
-        block.push(R2ILOp::Store {
-            space: SpaceId::Ram,
-            addr: Varnode::constant(0x44, 8),
-            val: Varnode::constant(0x1122, 2),
-        });
-        block.push(R2ILOp::Return {
-            target: Varnode::register(16, 8),
-        });
-        let artifact = SsaArtifact::raw_with_interface(
-            &[block],
-            Some(&arch(Endianness::Big, 2, 1)),
-            interface(SourceFunctionReturn::Void),
-        )
-        .expect("store-void artifact");
-        assert_machine_context_refusal(&artifact);
-    }
-
-    #[test]
-    fn fabricated_memory_mutation_baseline_is_refused_at_public_constructor() {
-        assert_machine_context_refusal(&ordered_aliasing());
-    }
-
-    #[test]
-    fn hand_authored_missing_and_word_addressed_memory_are_refused_by_typed_context() {
-        let mut no_memory = R2ILBlock::new(0x8400, 4);
-        no_memory.push(R2ILOp::Return {
-            target: Varnode::register(16, 8),
-        });
-        let no_memory = SsaArtifact::raw_with_interface(
-            &[no_memory],
-            Some(&arch(Endianness::Little, 1, 1)),
-            interface(SourceFunctionReturn::Void),
-        )
-        .expect("memory-free artifact");
-        assert_machine_context_refusal(&no_memory);
-
-        let mut word_block = R2ILBlock::new(0x8404, 4);
-        word_block.push(R2ILOp::Load {
-            dst: Varnode::register(0, 1),
-            space: SpaceId::Ram,
-            addr: Varnode::constant(0x40, 8),
-        });
-        word_block.push(R2ILOp::Return {
-            target: Varnode::register(16, 8),
-        });
-        let word_artifact = SsaArtifact::raw_with_interface(
-            &[word_block],
-            Some(&arch(Endianness::Little, 1, 2)),
-            interface(SourceFunctionReturn::Register {
-                storage: return_storage(1),
-            }),
-        )
-        .expect("word-addressed artifact");
-        assert_machine_context_refusal(&word_artifact);
-    }
-}

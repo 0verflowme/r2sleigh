@@ -943,6 +943,7 @@ version = "0.1.0"
 dependencies = [
  "libsla",
  "r2il",
+ "r2source",
  "sleigh-config",
  "thiserror 2.0.17",
 ]
@@ -957,6 +958,7 @@ dependencies = [
  "r2il",
  "r2sleigh-export",
  "r2sleigh-lift",
+ "r2source",
  "r2ssa",
  "r2sym",
  "r2types",
@@ -968,6 +970,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "r2source"
+version = "0.1.0"
+dependencies = [
+ "r2il",
+ "serde",
+]
+
+[[package]]
 name = "r2ssa"
 version = "0.1.0"
 dependencies = [
@@ -975,6 +985,7 @@ dependencies = [
  "proptest",
  "r2il",
  "r2sleigh-lift",
+ "r2source",
  "serde",
  "sleigh-config",
 ]

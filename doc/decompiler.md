@@ -8,8 +8,9 @@ The r2dec decompiler converts SSA-form functions into readable C code. It
 operates as a pipeline of transformations: expression folding, control flow
 structuring, symbol resolution, and code generation.
 
-The decompiler is invoked via the `a:sla.dec` plugin command or
-programmatically through the `r2dec` crate.
+The production decompiler is invoked through radare2's `pdd` provider after
+`a:sla` loads the Sleigh architecture. Programmatic certified rendering accepts
+only an opaque trusted SSA artifact derived from the same source snapshot.
 
 Pipeline Overview
 -----------------
@@ -330,10 +331,10 @@ Plugin Command
 
 | Command | Output | Description |
 |---------|--------|-------------|
-| `a:sla.dec` | C code | Decompile the function at the current seek address |
+| `pdd` | C code or an explicit residual/refusal | Decompile the function from a bounded borrowed snapshot |
 
 Example:
 
 ```bash
-r2 -qc 'aaa; s main; a:sla.dec' /bin/ls
+r2 -qc 'a:sla; aaa; s main; pdd' /bin/ls
 ```

@@ -35,7 +35,12 @@ pub mod userops;
 use thiserror::Error;
 
 pub use context::LiftContext;
-pub use disasm::{Disassembler, SemanticMetadataOptions, SemanticMetadataPrecision};
+pub use disasm::{
+    Disassembler, GENUINE_LIFT_PROVENANCE_SCHEMA_VERSION, GenuineInstructionSpan,
+    GenuineLiftAuthority, GenuineLiftedBlock, GenuineLiftedFunction,
+    GenuineLiftedFunctionAuthority, SemanticMetadataOptions, SemanticMetadataPrecision,
+    TrustedLiftedFunction, TrustedSleighProfile,
+};
 pub use esil::{format_op, op_to_esil, op_to_esil_named};
 pub use pcode::{PcodeTranslator, RawPcodeOp, RawVarnode};
 use r2il::ArchSpec;

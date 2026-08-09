@@ -158,7 +158,7 @@ fn take_ffi_string(value: *mut c_char) -> String {
         .to_str()
         .expect("UTF-8 FFI string")
         .to_string();
-    r2il_string_free(value);
+    drop_test_ffi_string(value);
     owned
 }
 
@@ -529,9 +529,9 @@ fn assert_function_capture(function_name: &str) {
     );
 
     for block in lifted {
-        r2il_block_free(block);
+        drop_test_block(block);
     }
-    r2il_free(context);
+    drop_test_context(context);
 }
 
 #[test]

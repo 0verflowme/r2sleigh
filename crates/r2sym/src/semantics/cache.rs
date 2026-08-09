@@ -6,12 +6,14 @@ use std::sync::{Arc, OnceLock, RwLock};
 use r2il::ArchSpec;
 use r2ssa::{SSAOp, SsaArtifact};
 
+use crate::FunctionSymbolSnapshot;
 use crate::sim::{PreparedFunctionScope, SummaryProfile};
 
 use super::artifact::SemanticArtifact;
 
 const SEMANTIC_CACHE_LIMIT: usize = 128;
-pub const SEMANTIC_ARTIFACT_SCHEMA_VERSION: u32 = 9;
+// Schema 12 partitions the canonical typed symbol/linkage snapshot.
+pub const SEMANTIC_ARTIFACT_SCHEMA_VERSION: u32 = 12;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -35,6 +37,7 @@ pub(crate) struct SemanticCacheKey {
     pub summary_profile: SummaryProfile,
     pub seed_mode: SemanticSeedMode,
     pub replay_seed_fingerprint: u64,
+    pub symbol_snapshot_fingerprint: u64,
     pub scope_kind: SemanticCacheScopeKind,
 }
 
@@ -229,6 +232,19 @@ pub fn stable_scope_hash(scope: Option<&PreparedFunctionScope>) -> u64 {
     hasher.finish()
 }
 
+pub(crate) fn symbol_snapshot_fingerprint(symbols: &FunctionSymbolSnapshot) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    "r2sym-semantic-function-symbol-snapshot-v1".hash(&mut hasher);
+    symbols.evidence_provenance().hash(&mut hasher);
+    symbols.len().hash(&mut hasher);
+    for symbol in symbols.symbols() {
+        symbol.addr.hash(&mut hasher);
+        symbol.name.hash(&mut hasher);
+        symbol.linkage.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 pub(crate) fn semantic_cache_key(
     func: &SsaArtifact,
     scope: Option<&PreparedFunctionScope>,
@@ -236,6 +252,7 @@ pub(crate) fn semantic_cache_key(
     summary_profile: SummaryProfile,
     seed_mode: SemanticSeedMode,
     replay_seed_fingerprint: u64,
+    symbols: &FunctionSymbolSnapshot,
 ) -> SemanticCacheKey {
     SemanticCacheKey {
         schema_version: SEMANTIC_ARTIFACT_SCHEMA_VERSION,
@@ -249,6 +266,7 @@ pub(crate) fn semantic_cache_key(
         summary_profile,
         seed_mode,
         replay_seed_fingerprint,
+        symbol_snapshot_fingerprint: symbol_snapshot_fingerprint(symbols),
         scope_kind: SemanticCacheScopeKind::Exact,
     }
 }
@@ -260,6 +278,7 @@ pub(crate) fn coarse_large_slice_cache_key(
     summary_profile: SummaryProfile,
     seed_mode: SemanticSeedMode,
     replay_seed_fingerprint: u64,
+    symbols: &FunctionSymbolSnapshot,
 ) -> SemanticCacheKey {
     SemanticCacheKey {
         schema_version: SEMANTIC_ARTIFACT_SCHEMA_VERSION,
@@ -269,6 +288,7 @@ pub(crate) fn coarse_large_slice_cache_key(
         summary_profile,
         seed_mode,
         replay_seed_fingerprint,
+        symbol_snapshot_fingerprint: symbol_snapshot_fingerprint(symbols),
         scope_kind: SemanticCacheScopeKind::CoarseLargeSlice,
     }
 }
@@ -301,16 +321,29 @@ mod display_name_tests {
     use std::collections::BTreeMap;
 
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
-    use r2ssa::{InterprocFunctionId, SsaArtifact};
+    use r2ssa::{FunctionSemanticLinkage, InterprocFunctionId, SsaArtifact};
 
     use crate::sim::{PreparedFunctionScope, ScopedFunctionProvenance, ScopedPreparedFunction};
+    use crate::{FunctionSymbol, FunctionSymbolSnapshot};
 
     use super::{
         BoundedArcCache, SEMANTIC_ARTIFACT_SCHEMA_VERSION, SemanticCacheScopeKind,
         SemanticSeedMode, coarse_large_slice_cache_key, semantic_cache_key, stable_scope_hash,
+        symbol_snapshot_fingerprint,
     };
 
     const RAX: u64 = 0;
+
+    fn symbols(entries: &[(u64, &str, FunctionSemanticLinkage)]) -> FunctionSymbolSnapshot {
+        FunctionSymbolSnapshot::try_from_symbols(entries.iter().map(|(addr, name, linkage)| {
+            FunctionSymbol {
+                addr: *addr,
+                name: (*name).to_string(),
+                linkage: *linkage,
+            }
+        }))
+        .unwrap()
+    }
 
     fn test_arch() -> ArchSpec {
         let mut arch = ArchSpec::new("x86-64");
@@ -358,6 +391,25 @@ mod display_name_tests {
             Some(&test_arch()),
         )
         .expect("ssa");
+        let symbol_map = symbols(&[(
+            0x5000,
+            "unclassified.memcpy",
+            FunctionSemanticLinkage::Internal,
+        )]);
+        let changed_symbol_map = symbols(&[(
+            0x5001,
+            "unclassified.memcpy",
+            FunctionSemanticLinkage::Internal,
+        )]);
+        let scope = PreparedFunctionScope::new(
+            0x401000,
+            vec![ScopedPreparedFunction {
+                id: InterprocFunctionId(0x401000),
+                name: Some("sym.main".to_string()),
+                prepared: func.clone(),
+            }],
+        )
+        .expect("scope");
         let exact_key = semantic_cache_key(
             &func,
             None,
@@ -365,26 +417,48 @@ mod display_name_tests {
             crate::sim::SummaryProfile::Default,
             SemanticSeedMode::Static,
             0,
+            &symbol_map,
         );
         let coarse_key = coarse_large_slice_cache_key(
             func.entry,
-            &PreparedFunctionScope::new(
-                0x401000,
-                vec![ScopedPreparedFunction {
-                    id: InterprocFunctionId(0x401000),
-                    name: Some("sym.main".to_string()),
-                    prepared: func.clone(),
-                }],
-            )
-            .expect("scope"),
+            &scope,
             Some(&test_arch()),
             crate::sim::SummaryProfile::Default,
             SemanticSeedMode::Static,
             0,
+            &symbol_map,
+        );
+        let changed_exact_key = semantic_cache_key(
+            &func,
+            None,
+            Some(&test_arch()),
+            crate::sim::SummaryProfile::Default,
+            SemanticSeedMode::Static,
+            0,
+            &changed_symbol_map,
+        );
+        let changed_coarse_key = coarse_large_slice_cache_key(
+            func.entry,
+            &scope,
+            Some(&test_arch()),
+            crate::sim::SummaryProfile::Default,
+            SemanticSeedMode::Static,
+            0,
+            &changed_symbol_map,
         );
         assert_eq!(exact_key.schema_version, SEMANTIC_ARTIFACT_SCHEMA_VERSION);
         assert_eq!(coarse_key.schema_version, SEMANTIC_ARTIFACT_SCHEMA_VERSION);
         assert_eq!(exact_key.replay_seed_fingerprint, 0);
+        assert_eq!(
+            exact_key.symbol_snapshot_fingerprint,
+            symbol_snapshot_fingerprint(&symbol_map)
+        );
+        assert_eq!(
+            exact_key.symbol_snapshot_fingerprint,
+            coarse_key.symbol_snapshot_fingerprint
+        );
+        assert_ne!(exact_key, changed_exact_key);
+        assert_ne!(coarse_key, changed_coarse_key);
         assert!(matches!(
             exact_key.scope_kind,
             SemanticCacheScopeKind::Exact
@@ -417,6 +491,7 @@ mod display_name_tests {
             crate::sim::SummaryProfile::Default,
             SemanticSeedMode::Static,
             0,
+            &FunctionSymbolSnapshot::default(),
         );
         let replay_key_a = semantic_cache_key(
             &func,
@@ -425,6 +500,7 @@ mod display_name_tests {
             crate::sim::SummaryProfile::Default,
             SemanticSeedMode::Replay,
             0x11,
+            &FunctionSymbolSnapshot::default(),
         );
         let replay_key_b = semantic_cache_key(
             &func,
@@ -433,11 +509,67 @@ mod display_name_tests {
             crate::sim::SummaryProfile::Default,
             SemanticSeedMode::Replay,
             0x22,
+            &FunctionSymbolSnapshot::default(),
         );
 
         assert_eq!(static_key.seed_mode, SemanticSeedMode::Static);
         assert_eq!(static_key.replay_seed_fingerprint, 0);
         assert_ne!(replay_key_a, replay_key_b);
+    }
+
+    #[test]
+    fn symbol_snapshot_fingerprint_is_canonical_and_tracks_content_and_linkage() {
+        let first = symbols(&[
+            (0x1000, "sym.imp.memcpy", FunctionSemanticLinkage::Imported),
+            (0x2000, "sym.imp.malloc", FunctionSemanticLinkage::Imported),
+        ]);
+        let reordered = symbols(&[
+            (0x2000, "sym.imp.malloc", FunctionSemanticLinkage::Imported),
+            (0x1000, "sym.imp.memcpy", FunctionSemanticLinkage::Imported),
+        ]);
+        assert_eq!(
+            symbol_snapshot_fingerprint(&first),
+            symbol_snapshot_fingerprint(&reordered)
+        );
+
+        let changed_content = symbols(&[
+            (0x1000, "sym.imp.memcpy", FunctionSemanticLinkage::Imported),
+            (0x2000, "sym.imp.free", FunctionSemanticLinkage::Imported),
+        ]);
+        assert_ne!(
+            symbol_snapshot_fingerprint(&first),
+            symbol_snapshot_fingerprint(&changed_content)
+        );
+        let changed_linkage = symbols(&[
+            (0x1000, "sym.imp.memcpy", FunctionSemanticLinkage::Internal),
+            (0x2000, "sym.imp.malloc", FunctionSemanticLinkage::Imported),
+        ]);
+        assert_ne!(
+            symbol_snapshot_fingerprint(&first),
+            symbol_snapshot_fingerprint(&changed_linkage)
+        );
+    }
+
+    #[test]
+    fn semantic_cache_identity_excludes_query_only_merge_policy() {
+        let func = simple_function(0x401100);
+        let symbol_map = symbols(&[(0x5000, "sym.imp.memcpy", FunctionSemanticLinkage::Imported)]);
+        let keys = [false, true].map(|merge_states| {
+            let _query_only_merge_policy = merge_states;
+            semantic_cache_key(
+                &func,
+                None,
+                Some(&test_arch()),
+                crate::sim::SummaryProfile::Default,
+                SemanticSeedMode::Static,
+                0,
+                &symbol_map,
+            )
+        });
+        assert_eq!(
+            keys[0], keys[1],
+            "merge_states configures exploration after artifact compilation"
+        );
     }
 
     fn simple_function(entry: u64) -> SsaArtifact {

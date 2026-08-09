@@ -12,17 +12,18 @@ use std::{
 
 use r2ssa::{
     AssumptionSet, BlockTerminator, CallBoundarySlot, CallSiteId, CanonicalInstructionId,
-    CanonicalInstructionSite, CanonicalStorageId, FunctionPrepareMode, InstPayload, LoopId,
-    MACHINE_CONTEXT_SCHEMA_VERSION, MachineAddressSpace, MachineBitVector, MachineBuildError,
-    MachineEntity, MachineExprId, MachineExprKind, MachineMemoryEndianness, MachineMemoryModel,
-    MachineProjection, MachineType, MachineValueUse, ObjectId, ObjectKind, PredicateId,
+    CanonicalInstructionSite, CanonicalStorageId, FunctionPrepareMode,
+    GENUINE_LIFT_PROVENANCE_SCHEMA_VERSION, InstPayload, LoopId, MACHINE_CONTEXT_SCHEMA_VERSION,
+    MachineAddressSpace, MachineBitVector, MachineBuildError, MachineEntity, MachineExprId,
+    MachineExprKind, MachineMemoryEndianness, MachineMemoryModel, MachineProjection, MachineType,
+    MachineValueUse, ObjectId, ObjectKind, OwnedFunctionSnapshot, PredicateId,
     RelativeMemoryAddress, SEMANTIC_OBLIGATION_SCHEMA_VERSION,
     SOURCE_CALL_SITE_INTERFACE_SCHEMA_VERSION, SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION, SSAOp,
     SSAVar, SemanticInstructionState, SemanticObligationComponent, SemanticObligationId,
     SemanticObligationInventory, SemanticObligationKind, SourceCallResult, SourceCallSiteIdentity,
     SourceCarrierKind, SourceFunctionReturn, SourceLogicalValue, SourceMachineContext,
     SourceReturnStackPointerFact, SsaArtifact, SsaArtifactAuthority, StackAddressBase,
-    StackAddressRoot, StructuredAccessId, StructuredLoopKind,
+    StackAddressRoot, StructuredAccessId, StructuredLoopKind, TrustedSsaArtifact,
 };
 use serde::{Deserialize, Serialize};
 
@@ -34,7 +35,7 @@ pub use aggregate_member::{
     CertifiedNaturalScalarAggregateLayout,
 };
 
-pub const CERTIFICATION_SCHEMA_VERSION: u32 = 20;
+pub const CERTIFICATION_SCHEMA_VERSION: u32 = 22;
 
 /// Unforgeable run-local identity for one proof authority domain.
 ///
@@ -45,6 +46,7 @@ pub const CERTIFICATION_SCHEMA_VERSION: u32 = 20;
 #[derive(Clone)]
 struct CertifiedAuthoritySeal {
     artifact: Option<SsaArtifactAuthority>,
+    source_snapshot: Option<OwnedFunctionSnapshot>,
     local: Arc<()>,
 }
 
@@ -52,13 +54,15 @@ impl CertifiedAuthoritySeal {
     fn new() -> Self {
         Self {
             artifact: None,
+            source_snapshot: None,
             local: Arc::new(()),
         }
     }
 
-    fn for_artifact(artifact: &SsaArtifact) -> Self {
+    fn for_artifact(trusted: &TrustedSsaArtifact) -> Self {
         Self {
-            artifact: Some(artifact.authority().clone()),
+            artifact: Some(trusted.artifact().authority().clone()),
+            source_snapshot: Some(trusted.source().clone()),
             local: Arc::new(()),
         }
     }
@@ -72,9 +76,16 @@ impl std::fmt::Debug for CertifiedAuthoritySeal {
 
 impl PartialEq for CertifiedAuthoritySeal {
     fn eq(&self, other: &Self) -> bool {
-        match (&self.artifact, &other.artifact) {
-            (Some(left), Some(right)) => left == right,
-            (None, None) => Arc::ptr_eq(&self.local, &other.local),
+        match (
+            &self.artifact,
+            &self.source_snapshot,
+            &other.artifact,
+            &other.source_snapshot,
+        ) {
+            (Some(left_artifact), Some(left_source), Some(right_artifact), Some(right_source)) => {
+                left_artifact == right_artifact && left_source == right_source
+            }
+            (None, None, None, None) => Arc::ptr_eq(&self.local, &other.local),
             _ => false,
         }
     }
@@ -145,6 +156,10 @@ impl CertifiedDecompilerPreparationSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CertifiedArtifactOrigin {
     schema_version: u32,
+    lift_provenance_schema_version: u32,
+    /// Stable diagnostic binding only. Runtime authority remains opaque and
+    /// cannot be reconstructed from this hash.
+    lift_manifest_hash: u64,
     /// Runtime proof authority. Serialized origin fields are diagnostics and
     /// replay context only; they cannot be deserialized into permission.
     #[serde(skip_serializing)]
@@ -166,6 +181,7 @@ impl CertifiedArtifactOrigin {
 
     pub(crate) fn is_valid(&self) -> bool {
         self.schema_version == CERTIFICATION_SCHEMA_VERSION
+            && self.lift_provenance_schema_version == GENUINE_LIFT_PROVENANCE_SCHEMA_VERSION
             && !self.graph_snapshot.is_empty()
             && self.source.schema_version() == SEMANTIC_OBLIGATION_SCHEMA_VERSION
             && self.topology.schema_version() == CERTIFICATION_SCHEMA_VERSION
@@ -173,6 +189,14 @@ impl CertifiedArtifactOrigin {
 
     pub const fn schema_version(&self) -> u32 {
         self.schema_version
+    }
+
+    pub const fn lift_provenance_schema_version(&self) -> u32 {
+        self.lift_provenance_schema_version
+    }
+
+    pub const fn lift_manifest_hash(&self) -> u64 {
+        self.lift_manifest_hash
     }
 
     pub const fn machine_context(&self) -> &CertifiedMachineContext {
@@ -1155,19 +1179,6 @@ impl CertifiedDirectCall {
         }
         Ok(())
     }
-
-    #[cfg(test)]
-    fn validate_against_artifact(&self, artifact: &SsaArtifact) -> Result<(), MachineBuildError> {
-        let topology = certified_source_topology(artifact)?;
-        let expected = certified_direct_calls(artifact, &topology)?
-            .remove(&self.producer)
-            .ok_or(MachineBuildError::ObligationMismatch(self.source_inst))?;
-        if expected == *self {
-            Ok(())
-        } else {
-            Err(MachineBuildError::ObligationMismatch(self.source_inst))
-        }
-    }
 }
 
 /// Sealed machine/topology evidence for one direct intra-function branch.
@@ -1223,19 +1234,6 @@ impl CertifiedDirectControl {
             ));
         }
         Ok(())
-    }
-
-    #[cfg(test)]
-    fn validate_against_artifact(&self, artifact: &SsaArtifact) -> Result<(), MachineBuildError> {
-        let topology = certified_source_topology(artifact)?;
-        let expected = certified_direct_controls(artifact, &topology)?
-            .remove(&self.producer)
-            .ok_or(MachineBuildError::ObligationMismatch(self.source_inst))?;
-        if expected == *self {
-            Ok(())
-        } else {
-            Err(MachineBuildError::ObligationMismatch(self.source_inst))
-        }
     }
 }
 
@@ -1339,19 +1337,6 @@ impl CertifiedConditionalControl {
             ));
         }
         Ok(())
-    }
-
-    #[cfg(test)]
-    fn validate_against_artifact(&self, artifact: &SsaArtifact) -> Result<(), MachineBuildError> {
-        let topology = certified_source_topology(artifact)?;
-        let expected = certified_conditional_controls(artifact, &topology)?
-            .remove(&self.producer)
-            .ok_or(MachineBuildError::ObligationMismatch(self.source_inst))?;
-        if expected == *self {
-            Ok(())
-        } else {
-            Err(MachineBuildError::ObligationMismatch(self.source_inst))
-        }
     }
 }
 
@@ -4445,10 +4430,13 @@ impl CertifiedSourceTopology {
 }
 
 fn certified_artifact_origin(
-    artifact: &SsaArtifact,
+    trusted: &TrustedSsaArtifact,
     machine_context: &CertifiedMachineContext,
     topology: &CertifiedSourceTopology,
 ) -> Result<CertifiedArtifactOrigin, MachineBuildError> {
+    let authority = CertifiedAuthoritySeal::for_artifact(trusted);
+    let artifact = trusted.artifact();
+    let lift_authority = trusted.lift_authority();
     let graph = artifact.graph();
     let graph_snapshot = serde_json::to_vec(&(
         graph.entry,
@@ -4489,7 +4477,9 @@ fn certified_artifact_origin(
     });
     Ok(CertifiedArtifactOrigin {
         schema_version: CERTIFICATION_SCHEMA_VERSION,
-        authority: CertifiedAuthoritySeal::for_artifact(artifact),
+        lift_provenance_schema_version: lift_authority.lift_authority().schema_version(),
+        lift_manifest_hash: lift_authority.source_manifest_hash(),
+        authority,
         graph_snapshot: graph_snapshot.into_boxed_slice(),
         prepare_mode: artifact.mode().into(),
         decompile_preparation,
@@ -6001,12 +5991,13 @@ pub struct CertifiedMachineFunction {
 }
 
 impl CertifiedMachineFunction {
-    pub fn from_artifact(artifact: &SsaArtifact) -> Result<Self, MachineBuildError> {
+    pub fn from_artifact(trusted: &TrustedSsaArtifact) -> Result<Self, MachineBuildError> {
+        let artifact = trusted.artifact();
         let projection = MachineProjection::from_artifact(artifact)?;
         projection.validate_against(artifact)?;
         let machine_context = CertifiedMachineContext::from_artifact(artifact)?;
         let topology = certified_source_topology(artifact)?;
-        let origin = certified_artifact_origin(artifact, &machine_context, &topology)?;
+        let origin = certified_artifact_origin(trusted, &machine_context, &topology)?;
         let abi_parameters = certified_abi_parameters(artifact)?;
         let stack_slots = certified_stack_slots(artifact)?;
         let direct_calls = certified_direct_calls(artifact, &topology)?;
@@ -6442,12 +6433,13 @@ pub struct CertifiedMachineProjection {
 }
 
 impl CertifiedMachineProjection {
-    pub fn from_artifact(artifact: &SsaArtifact) -> Result<Self, MachineBuildError> {
+    pub fn from_artifact(trusted: &TrustedSsaArtifact) -> Result<Self, MachineBuildError> {
+        let artifact = trusted.artifact();
         let projection = MachineProjection::from_artifact(artifact)?;
         projection.validate_against(artifact)?;
         let machine_context = CertifiedMachineContext::from_artifact(artifact)?;
         let topology = certified_source_topology(artifact)?;
-        let origin = certified_artifact_origin(artifact, &machine_context, &topology)?;
+        let origin = certified_artifact_origin(trusted, &machine_context, &topology)?;
         let abi_parameters = certified_abi_parameters(artifact)?;
         let stack_slots = certified_stack_slots(artifact)?;
         let candidate_direct_calls = certified_direct_calls(artifact, &topology)?;
@@ -7371,8 +7363,7 @@ fn certified_expr_from_projection(
 mod tests {
     use super::*;
     use r2il::{
-        ArchSpec, Endianness, MemoryOrdering, R2ILBlock, R2ILOp, RegisterDef, SpaceId, SwitchCase,
-        SwitchInfo, Varnode,
+        ArchSpec, Endianness, MemoryOrdering, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode,
     };
     use r2ssa::{
         CanonicalStorageId, CanonicalStorageSpace, InstPayload, SSAOp, SourceAbiParameterSpec,
@@ -7524,111 +7515,6 @@ mod tests {
             .obligations()
             .clone()
     }
-
-    fn explicit_switch_return_artifact() -> SsaArtifact {
-        let storage = |offset| CanonicalStorageId {
-            space: CanonicalStorageSpace::Register,
-            offset,
-            size: 8,
-        };
-        let mut header = R2ILBlock::new(0x30e0, 4);
-        header.push(R2ILOp::BranchInd {
-            target: Varnode::register(8, 8),
-        });
-        header.set_switch_info(SwitchInfo {
-            switch_addr: 0x30e0,
-            min_val: 1,
-            max_val: 2,
-            default_target: Some(0x3140),
-            cases: vec![
-                SwitchCase {
-                    value: 1,
-                    target: 0x3100,
-                },
-                SwitchCase {
-                    value: 2,
-                    target: 0x3120,
-                },
-            ],
-        });
-        let arm = |addr, value| {
-            let mut block = R2ILBlock::new(addr, 4);
-            block.push(R2ILOp::Copy {
-                dst: Varnode::register(0, 8),
-                src: Varnode::constant(value, 8),
-            });
-            block.push(R2ILOp::Return {
-                target: Varnode::register(16, 8),
-            });
-            block
-        };
-        let interface = SourceFunctionInterface::new(
-            b"switch-return-certification-revision".to_vec(),
-            "test-register-abi",
-            [SourceAbiParameterSpec::new(0, storage(8))],
-            SourceFunctionReturn::Register {
-                storage: storage(0),
-            },
-            [],
-        )
-        .expect("switch function interface");
-        let mut arch = ArchSpec::new("switch-return-certification-test");
-        arch.add_register(RegisterDef::new("rax", 0, 8));
-        arch.add_register(RegisterDef::new("rdi", 8, 8));
-        arch.add_register(RegisterDef::new("rip", 16, 8));
-        SsaArtifact::raw_with_interface(
-            &[header, arm(0x3100, 11), arm(0x3120, 22), arm(0x3140, 33)],
-            Some(&arch),
-            interface,
-        )
-        .expect("switch-return artifact")
-    }
-
-    fn explicit_carrier_free_loop_return_artifact() -> SsaArtifact {
-        let storage = |offset, size| CanonicalStorageId {
-            space: CanonicalStorageSpace::Register,
-            offset,
-            size,
-        };
-        let mut preheader = R2ILBlock::new(0x3160, 4);
-        preheader.push(R2ILOp::Branch {
-            target: Varnode::ram(0x3170, 8),
-        });
-        let mut header = R2ILBlock::new(0x3170, 4);
-        header.push(R2ILOp::CBranch {
-            target: Varnode::ram(0x3190, 8),
-            cond: Varnode::register(8, 1),
-        });
-        let mut exit = R2ILBlock::new(0x3174, 4);
-        exit.push(R2ILOp::Copy {
-            dst: Varnode::register(0, 8),
-            src: Varnode::constant(0x2a, 8),
-        });
-        exit.push(R2ILOp::Return {
-            target: Varnode::register(16, 8),
-        });
-        let mut body = R2ILBlock::new(0x3190, 4);
-        body.push(R2ILOp::Branch {
-            target: Varnode::ram(0x3170, 8),
-        });
-        let interface = SourceFunctionInterface::new(
-            b"carrier-free-loop-return-certification-revision".to_vec(),
-            "test-register-abi",
-            [SourceAbiParameterSpec::new(0, storage(8, 1))],
-            SourceFunctionReturn::Register {
-                storage: storage(0, 8),
-            },
-            [],
-        )
-        .expect("loop function interface");
-        let mut arch = ArchSpec::new("carrier-free-loop-return-certification-test");
-        arch.add_register(RegisterDef::new("rax", 0, 8));
-        arch.add_register(RegisterDef::new("dil", 8, 1));
-        arch.add_register(RegisterDef::new("rip", 16, 8));
-        SsaArtifact::raw_with_interface(&[preheader, header, exit, body], Some(&arch), interface)
-            .expect("carrier-free-loop-return artifact")
-    }
-
     fn explicit_return_artifact(return_kind: SourceFunctionReturn) -> SsaArtifact {
         let mut block = R2ILBlock::new(0x3080, 4);
         block.push(R2ILOp::Copy {
@@ -7666,144 +7552,6 @@ mod tests {
         SsaArtifact::raw_with_interface(&[block], Some(&arch), interface)
             .expect("explicit return artifact")
     }
-
-    fn explicit_direct_call_return_artifact() -> SsaArtifact {
-        let target = Varnode::ram(0x31d0, 8);
-        let mut entry = R2ILBlock::new(0x30d0, 4);
-        entry.push(R2ILOp::Copy {
-            dst: Varnode::register(8, 8),
-            src: Varnode::register(16, 8),
-        });
-        entry.push(R2ILOp::Call {
-            target: target.clone(),
-        });
-        let mut returned = R2ILBlock::new(0x30d4, 4);
-        returned.push(R2ILOp::Return {
-            target: Varnode::register(24, 8),
-        });
-        let mut arch = ArchSpec::new("explicit-direct-call-return-interface-test");
-        arch.add_register(RegisterDef::new("rdi", 8, 8));
-        arch.add_register(RegisterDef::new("rsi", 16, 8));
-        arch.add_register(RegisterDef::new("rip", 24, 8));
-        let revision = b"certified-direct-call-return-revision-1".to_vec();
-        let argument_storage = CanonicalStorageId {
-            space: CanonicalStorageSpace::Register,
-            offset: 8,
-            size: 8,
-        };
-        let parameter_storage = CanonicalStorageId {
-            space: CanonicalStorageSpace::Register,
-            offset: 16,
-            size: 8,
-        };
-        let function_interface = SourceFunctionInterface::new(
-            revision.clone(),
-            "caller-test-abi",
-            [SourceAbiParameterSpec::new(0, parameter_storage)],
-            SourceFunctionReturn::Void,
-            [],
-        )
-        .expect("function interface");
-        let identity =
-            SourceCallSiteIdentity::new(0x30d0, 1, CanonicalStorageId::from_varnode(&target));
-        let call_interface = SourceCallSiteInterface::new(
-            revision,
-            identity,
-            true,
-            "callee-test-abi",
-            [SourceCallArgumentSpec::new(0, argument_storage)],
-            false,
-            false,
-            SourceCallResult::Void,
-        )
-        .expect("call interface");
-        SsaArtifact::raw_with_interfaces(
-            &[entry, returned],
-            Some(&arch),
-            Some(function_interface),
-            vec![call_interface],
-        )
-        .expect("explicit direct-call return artifact")
-    }
-
-    fn explicit_memory_return_artifact(word_size: u32) -> SsaArtifact {
-        let mut block = R2ILBlock::new(0x3090, 4);
-        block.push(R2ILOp::Load {
-            dst: Varnode::register(0, 8),
-            space: SpaceId::Ram,
-            addr: Varnode::constant(0x40, 8),
-        });
-        block.push(R2ILOp::Return {
-            target: Varnode::register(16, 8),
-        });
-        let mut arch = ArchSpec::new("explicit-memory-return-interface-test");
-        arch.add_register(RegisterDef::new("rax", 0, 8));
-        arch.add_register(RegisterDef::new("rip", 16, 8));
-        let mut ram = r2il::AddressSpace::ram(8);
-        ram.word_size = word_size;
-        arch.add_space(ram);
-        arch.set_memory_endianness(Endianness::Little);
-        let interface = SourceFunctionInterface::new(
-            b"certified-memory-return-revision-1".to_vec(),
-            "test-register-abi",
-            [],
-            SourceFunctionReturn::Register {
-                storage: CanonicalStorageId {
-                    space: CanonicalStorageSpace::Register,
-                    offset: 0,
-                    size: 8,
-                },
-            },
-            [],
-        )
-        .expect("valid memory-return interface");
-        SsaArtifact::raw_with_interface(&[block], Some(&arch), interface)
-            .expect("explicit memory return artifact")
-    }
-
-    fn explicit_conditional_return_artifact() -> SsaArtifact {
-        let mut header = R2ILBlock::new(0x30a0, 4);
-        header.push(R2ILOp::CBranch {
-            target: Varnode::ram(0x30c0, 8),
-            cond: Varnode::constant(1, 1),
-        });
-        let mut false_arm = R2ILBlock::new(0x30a4, 4);
-        false_arm.push(R2ILOp::Copy {
-            dst: Varnode::register(0, 8),
-            src: Varnode::constant(0, 8),
-        });
-        false_arm.push(R2ILOp::Return {
-            target: Varnode::register(16, 8),
-        });
-        let mut true_arm = R2ILBlock::new(0x30c0, 4);
-        true_arm.push(R2ILOp::Copy {
-            dst: Varnode::register(0, 8),
-            src: Varnode::constant(u64::MAX, 8),
-        });
-        true_arm.push(R2ILOp::Return {
-            target: Varnode::register(16, 8),
-        });
-        let mut arch = ArchSpec::new("explicit-conditional-return-interface-test");
-        arch.add_register(RegisterDef::new("rax", 0, 8));
-        arch.add_register(RegisterDef::new("rip", 16, 8));
-        let interface = SourceFunctionInterface::new(
-            b"certified-conditional-return-revision-1".to_vec(),
-            "test-register-abi",
-            [],
-            SourceFunctionReturn::Register {
-                storage: CanonicalStorageId {
-                    space: CanonicalStorageSpace::Register,
-                    offset: 0,
-                    size: 8,
-                },
-            },
-            [],
-        )
-        .expect("valid conditional-return interface");
-        SsaArtifact::raw_with_interface(&[header, false_arm, true_arm], Some(&arch), interface)
-            .expect("explicit conditional-return artifact")
-    }
-
     fn explicit_stack_slot_artifact(slot_size_bytes: u32) -> SsaArtifact {
         let mut block = R2ILBlock::new(0x30c0, 4);
         block.push(R2ILOp::Store {
@@ -7850,41 +7598,6 @@ mod tests {
         SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface)
             .expect("explicit stack artifact")
     }
-
-    fn loop_artifact() -> SsaArtifact {
-        let accumulator = Varnode::register(0, 8);
-        let mut entry = R2ILBlock::new(0x4000, 4);
-        entry.push(R2ILOp::Copy {
-            dst: accumulator.clone(),
-            src: Varnode::constant(0, 8),
-        });
-        entry.push(R2ILOp::Branch {
-            target: Varnode::ram(0x4010, 8),
-        });
-
-        let mut header = R2ILBlock::new(0x4010, 4);
-        header.push(R2ILOp::CBranch {
-            target: Varnode::ram(0x4020, 8),
-            cond: Varnode::constant(1, 1),
-        });
-
-        let mut exit = R2ILBlock::new(0x4014, 4);
-        exit.push(R2ILOp::Return {
-            target: Varnode::constant(0, 8),
-        });
-
-        let mut latch = R2ILBlock::new(0x4020, 4);
-        latch.push(R2ILOp::IntAdd {
-            dst: accumulator.clone(),
-            a: accumulator,
-            b: Varnode::constant(1, 8),
-        });
-        latch.push(R2ILOp::Branch {
-            target: Varnode::ram(0x4010, 8),
-        });
-        SsaArtifact::raw(&[entry, header, exit, latch], None).expect("loop artifact")
-    }
-
     fn obligation_ids(source: &SemanticObligationInventory) -> Vec<SemanticObligationId> {
         source.obligations().keys().copied().collect()
     }
@@ -7894,93 +7607,6 @@ mod tests {
         id: SemanticObligationId,
     ) -> CertifiedEntity {
         CertifiedEntity::certify(source, id.instruction, [id]).expect("certified output")
-    }
-
-    #[test]
-    fn plain_load_and_store_receive_exact_statement_dispositions() {
-        let artifact = typed_memory_artifact();
-        let certified = CertifiedMachineProjection::from_artifact(&artifact)
-            .expect("certified typed-memory projection");
-        assert!(certified.projection().failures().is_empty());
-
-        let load = artifact
-            .graph()
-            .insts
-            .iter()
-            .find(|inst| matches!(inst.payload, InstPayload::Op(SSAOp::Load { .. })))
-            .expect("load instruction");
-        let store = artifact
-            .graph()
-            .insts
-            .iter()
-            .find(|inst| matches!(inst.payload, InstPayload::Op(SSAOp::Store { .. })))
-            .expect("store instruction");
-        let load_producer = artifact
-            .obligations()
-            .instruction_for_inst(load.id)
-            .expect("load source")
-            .id;
-        let store_producer = artifact
-            .obligations()
-            .instruction_for_inst(store.id)
-            .expect("store source")
-            .id;
-        let load_statement = certified
-            .memory_statement_for_producer(load_producer)
-            .expect("certified load statement");
-        let store_statement = certified
-            .memory_statement_for_producer(store_producer)
-            .expect("certified store statement");
-
-        assert!(matches!(
-            load_statement.kind(),
-            CertifiedMemoryStatementKind::Read { result }
-                if result.binding().value() == load.output.expect("load output")
-        ));
-        assert!(matches!(
-            store_statement.kind(),
-            CertifiedMemoryStatementKind::Write { value }
-                if value.binding().value() == store.inputs[1]
-        ));
-        assert_eq!(load_statement.endianness(), MachineMemoryEndianness::Big);
-        assert_eq!(load_statement.width_bits(), 32);
-        assert_eq!(store_statement.width_bits(), 32);
-
-        for statement in [load_statement, store_statement] {
-            let mut obligations = statement.source_obligations().iter().copied();
-            let obligation = obligations.next().expect("one memory obligation");
-            assert!(obligations.next().is_none());
-            let [effect] = certified.ledger().effects(obligation) else {
-                panic!("one statement disposition expected");
-            };
-            assert_eq!(
-                effect.disposition(),
-                &EffectDisposition::AbsorbedIntoStatement {
-                    producer: statement.producer(),
-                }
-            );
-        }
-
-        let live_load = artifact
-            .obligations()
-            .instruction_for_inst(load.id)
-            .expect("load source")
-            .obligations
-            .iter()
-            .copied()
-            .find(|id| id.kind == SemanticObligationKind::LiveValueProducer)
-            .expect("live load result");
-        assert!(matches!(
-            certified.ledger().effects(live_load),
-            [effect]
-                if effect.disposition()
-                    == &EffectDisposition::AbsorbedIntoExpression {
-                        producer: load_producer,
-                    }
-        ));
-        let report = certified.finish();
-        assert!(!report.is_closed_semantic_ledger());
-        assert_eq!(report.pending_semantic_ast().len(), 3);
     }
 
     #[test]
@@ -8073,7 +7699,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_endian_memory_remains_residual_without_helper_semantics() {
+    fn mixed_endian_memory_has_no_certified_helper_semantics() {
         let address = Varnode::register(0, 8);
         let loaded = Varnode::unique(0x10, 4);
         let mut block = R2ILBlock::new(0x1850, 4);
@@ -8091,35 +7717,8 @@ mod tests {
         arch.addr_size = 8;
         arch.set_memory_endianness(Endianness::Mixed);
         let artifact = SsaArtifact::raw(&[block], Some(&arch)).expect("mixed memory artifact");
-        let certified = CertifiedMachineProjection::from_artifact(&artifact)
-            .expect("fail-closed mixed-memory projection");
-
-        assert!(
-            artifact
-                .obligations()
-                .instructions()
-                .keys()
-                .all(|producer| certified.memory_statement_for_producer(*producer).is_none())
-        );
-        for obligation in artifact
-            .obligations()
-            .obligations()
-            .values()
-            .filter(|obligation| {
-                matches!(
-                    obligation.id.kind,
-                    SemanticObligationKind::ObservableMemoryRead
-                        | SemanticObligationKind::ObservableMemoryWrite
-                )
-            })
-        {
-            assert!(matches!(
-                certified.ledger().effects(obligation.id),
-                [effect]
-                    if matches!(effect.disposition(), EffectDisposition::Residualized { .. })
-            ));
-        }
-        assert!(!certified.finish().is_closed_semantic_ledger());
+        let statements = certified_memory_statements(&artifact).expect("memory extraction");
+        assert!(statements.is_empty());
     }
 
     #[test]
@@ -8130,83 +7729,18 @@ mod tests {
         });
         let empty = R2ILBlock::new(0x3810, 4);
         let artifact = SsaArtifact::raw(&[entry, empty], None).expect("two-block artifact");
-        let certified =
-            CertifiedMachineFunction::from_artifact(&artifact).expect("certified machine");
+        let topology = certified_source_topology(&artifact).expect("source topology");
 
-        assert_eq!(
-            certified.topology().blocks().len(),
-            artifact.graph().blocks.len()
-        );
-        assert_eq!(certified.topology().entry_addr(), 0x3800);
+        assert_eq!(topology.blocks().len(), artifact.graph().blocks.len());
+        assert_eq!(topology.entry_addr(), 0x3800);
         assert!(matches!(
-            certified
-                .topology()
-                .block(0x3800)
-                .map(|block| block.terminator()),
+            topology.block(0x3800).map(|block| block.terminator()),
             Some(CertifiedSourceTerminator::Branch { target: 0x3810 })
         ));
         assert!(
-            certified
-                .topology()
+            topology
                 .block(0x3810)
                 .is_some_and(|block| block.instructions().is_empty())
-        );
-    }
-
-    #[test]
-    fn direct_branch_receives_exact_control_disposition_and_mutations_fail() {
-        let mut entry = R2ILBlock::new(0x3820, 4);
-        entry.push(R2ILOp::Branch {
-            target: Varnode::ram(0x3830, 8),
-        });
-        let target = R2ILBlock::new(0x3830, 4);
-        let artifact = SsaArtifact::raw(&[entry, target], None).expect("direct branch artifact");
-        let certified = CertifiedMachineProjection::from_artifact(&artifact)
-            .expect("certified direct branch projection");
-        let branch = artifact
-            .graph()
-            .insts
-            .iter()
-            .find(|inst| matches!(inst.payload, InstPayload::Op(SSAOp::Branch { .. })))
-            .expect("branch instruction");
-        let producer = artifact
-            .obligations()
-            .instruction_for_inst(branch.id)
-            .expect("branch source")
-            .id;
-        let control = certified
-            .direct_control_for_producer(producer)
-            .expect("direct control evidence");
-        assert_eq!(control.target(), 0x3830);
-        assert_eq!(control.target_value().binding().value(), branch.inputs[0]);
-        assert!(matches!(
-            certified.ledger().effects(control.source_obligation()),
-            [effect]
-                if effect.disposition()
-                    == &EffectDisposition::AbsorbedIntoControl { producer }
-        ));
-        control
-            .validate_against_artifact(&artifact)
-            .expect("control revalidates");
-
-        let mut corrupted = control.clone();
-        corrupted.target = 0x3840;
-        assert!(matches!(
-            corrupted.validate_against_artifact(&artifact),
-            Err(MachineBuildError::ObligationMismatch(_))
-        ));
-        let mut corrupted = control.clone();
-        corrupted.source_obligation.kind = SemanticObligationKind::ControlPredicate;
-        assert!(matches!(
-            corrupted.validate_against_artifact(&artifact),
-            Err(MachineBuildError::ObligationMismatch(_))
-        ));
-        let report = certified.finish();
-        assert!(!report.is_closed_semantic_ledger());
-        assert!(
-            report
-                .pending_semantic_ast()
-                .contains(&control.source_obligation())
         );
     }
 
@@ -8221,36 +7755,9 @@ mod tests {
         arch.addr_size = 4;
         let artifact =
             SsaArtifact::raw(&[entry, target], Some(&arch)).expect("direct branch artifact");
-        let certified = CertifiedMachineProjection::from_artifact(&artifact)
-            .expect("fail-closed direct projection");
-        let branch = artifact
-            .graph()
-            .insts
-            .iter()
-            .find(|inst| matches!(inst.payload, InstPayload::Op(SSAOp::Branch { .. })))
-            .expect("branch instruction");
-        let producer = artifact
-            .obligations()
-            .instruction_for_inst(branch.id)
-            .expect("branch source")
-            .id;
-        let transfer = artifact
-            .obligations()
-            .instructions()
-            .get(&producer)
-            .expect("branch disposition")
-            .obligations
-            .iter()
-            .copied()
-            .find(|obligation| obligation.kind == SemanticObligationKind::ControlTransfer)
-            .expect("control transfer obligation");
-
-        assert!(certified.direct_control_for_producer(producer).is_none());
-        assert!(matches!(
-            certified.ledger().effects(transfer),
-            [effect]
-                if matches!(effect.disposition(), EffectDisposition::Residualized { .. })
-        ));
+        let topology = certified_source_topology(&artifact).expect("source topology");
+        let controls = certified_direct_controls(&artifact, &topology).expect("direct controls");
+        assert!(controls.is_empty());
     }
 
     #[test]
@@ -8265,166 +7772,11 @@ mod tests {
         arch.add_register(RegisterDef::new("pc", 0, 8));
         let artifact =
             SsaArtifact::raw(&[entry, target], Some(&arch)).expect("direct branch artifact");
-        let certified = CertifiedMachineProjection::from_artifact(&artifact)
-            .expect("fail-closed direct projection");
-        let branch = artifact
-            .graph()
-            .insts
-            .iter()
-            .find(|inst| matches!(inst.payload, InstPayload::Op(SSAOp::Branch { .. })))
-            .expect("branch instruction");
-        let producer = artifact
-            .obligations()
-            .instruction_for_inst(branch.id)
-            .expect("branch source")
-            .id;
-
-        assert_eq!(
-            certified
-                .machine_context()
-                .memory_model()
-                .default_address_bits(),
-            64
-        );
-        assert!(certified.direct_control_for_producer(producer).is_none());
-    }
-
-    #[test]
-    fn conditional_control_receives_exact_predicate_and_transfer_dispositions() {
-        let mut entry = R2ILBlock::new(0x3840, 4);
-        entry.push(R2ILOp::CBranch {
-            target: Varnode::ram(0x3850, 8),
-            cond: Varnode::constant(1, 1),
-        });
-        let fallthrough = R2ILBlock::new(0x3844, 4);
-        let taken = R2ILBlock::new(0x3850, 4);
-        let artifact = SsaArtifact::raw(&[entry, fallthrough, taken], None)
-            .expect("conditional branch artifact");
-        let certified = CertifiedMachineProjection::from_artifact(&artifact)
-            .expect("certified conditional projection");
-        let branch = artifact
-            .graph()
-            .insts
-            .iter()
-            .find(|inst| matches!(inst.payload, InstPayload::Op(SSAOp::CBranch { .. })))
-            .expect("conditional instruction");
-        let producer = artifact
-            .obligations()
-            .instruction_for_inst(branch.id)
-            .expect("conditional source")
-            .id;
-        let control = certified
-            .conditional_control_for_producer(producer)
-            .expect("conditional control evidence");
-        assert_eq!(control.true_target(), 0x3850);
-        assert_eq!(control.false_target(), 0x3844);
-        assert_eq!(control.target_value().binding().value(), branch.inputs[0]);
-        assert_eq!(control.condition().binding().value(), branch.inputs[1]);
-        assert_eq!(
-            control.truthiness(),
-            CertifiedControlTruthiness::NonZeroIsTrue
-        );
-        assert_eq!(
-            control.source_obligations(),
-            BTreeSet::from([
-                control.predicate_obligation(),
-                control.transfer_obligation(),
-            ])
-        );
-        for obligation in control.source_obligations() {
-            assert!(matches!(
-                certified.ledger().effects(obligation),
-                [effect]
-                    if effect.disposition()
-                        == &EffectDisposition::AbsorbedIntoControl { producer }
-            ));
-        }
-        control
-            .validate_against_artifact(&artifact)
-            .expect("conditional control revalidates");
-
-        let mut corrupted = control.clone();
-        corrupted.true_target = 0x3860;
-        assert!(matches!(
-            corrupted.validate_against_artifact(&artifact),
-            Err(MachineBuildError::ObligationMismatch(_))
-        ));
-        let mut corrupted = control.clone();
-        corrupted.false_target = 0x3848;
-        assert!(matches!(
-            corrupted.validate_against_artifact(&artifact),
-            Err(MachineBuildError::ObligationMismatch(_))
-        ));
-        let mut corrupted = control.clone();
-        corrupted.truthiness = CertifiedControlTruthiness::NonZeroIsTrue;
-        corrupted.predicate_obligation.kind = SemanticObligationKind::ControlTransfer;
-        assert!(matches!(
-            corrupted.validate_against_artifact(&artifact),
-            Err(MachineBuildError::ObligationMismatch(_))
-        ));
-        let report = certified.finish();
-        for obligation in control.source_obligations() {
-            assert!(report.pending_semantic_ast().contains(&obligation));
-        }
-        assert!(!report.is_closed_semantic_ledger());
-    }
-
-    #[test]
-    fn conditional_control_with_residual_condition_is_fully_residualized() {
-        let loaded = Varnode::unique(0x10, 1);
-        let mut entry = R2ILBlock::new(0x3860, 4);
-        entry.push(R2ILOp::Load {
-            dst: loaded.clone(),
-            space: SpaceId::Ram,
-            addr: Varnode::register(0, 8),
-        });
-        entry.push(R2ILOp::CBranch {
-            target: Varnode::ram(0x3870, 8),
-            cond: loaded,
-        });
-        let fallthrough = R2ILBlock::new(0x3864, 4);
-        let taken = R2ILBlock::new(0x3870, 4);
-        let artifact = SsaArtifact::raw(&[entry, fallthrough, taken], None)
-            .expect("conditional load artifact");
-        let certified = CertifiedMachineProjection::from_artifact(&artifact)
-            .expect("fail-closed conditional projection");
-        let branch = artifact
-            .graph()
-            .insts
-            .iter()
-            .find(|inst| matches!(inst.payload, InstPayload::Op(SSAOp::CBranch { .. })))
-            .expect("conditional instruction");
-        let producer = artifact
-            .obligations()
-            .instruction_for_inst(branch.id)
-            .expect("conditional source")
-            .id;
-        assert!(
-            certified
-                .conditional_control_for_producer(producer)
-                .is_none()
-        );
-        for obligation in artifact
-            .obligations()
-            .instructions()
-            .get(&producer)
-            .expect("conditional disposition")
-            .obligations
-            .iter()
-            .filter(|obligation| {
-                matches!(
-                    obligation.kind,
-                    SemanticObligationKind::ControlPredicate
-                        | SemanticObligationKind::ControlTransfer
-                )
-            })
-        {
-            assert!(matches!(
-                certified.ledger().effects(*obligation),
-                [effect]
-                    if matches!(effect.disposition(), EffectDisposition::Residualized { .. })
-            ));
-        }
+        let context = CertifiedMachineContext::from_artifact(&artifact).expect("machine context");
+        assert_eq!(context.memory_model().default_address_bits(), 64);
+        let topology = certified_source_topology(&artifact).expect("source topology");
+        let controls = certified_direct_controls(&artifact, &topology).expect("direct controls");
+        assert!(controls.is_empty());
     }
 
     #[test]
@@ -8445,36 +7797,10 @@ mod tests {
         let wrong_target_width = build(1, Some(&arch));
 
         for artifact in [wide_condition, wrong_target_width] {
-            let certified = CertifiedMachineProjection::from_artifact(&artifact)
-                .expect("fail-closed conditional projection");
-            let branch = artifact
-                .graph()
-                .insts
-                .iter()
-                .find(|inst| matches!(inst.payload, InstPayload::Op(SSAOp::CBranch { .. })))
-                .expect("conditional instruction");
-            let producer = artifact
-                .obligations()
-                .instruction_for_inst(branch.id)
-                .expect("conditional source")
-                .id;
-            assert!(
-                certified
-                    .conditional_control_for_producer(producer)
-                    .is_none()
-            );
-            assert!(artifact
-                .obligations()
-                .instructions()
-                .get(&producer)
-                .expect("conditional disposition")
-                .obligations
-                .iter()
-                .all(|obligation| matches!(
-                    certified.ledger().effects(*obligation),
-                    [effect]
-                        if matches!(effect.disposition(), EffectDisposition::Residualized { .. })
-                )));
+            let topology = certified_source_topology(&artifact).expect("source topology");
+            let controls =
+                certified_conditional_controls(&artifact, &topology).expect("conditional controls");
+            assert!(controls.is_empty());
         }
     }
 
@@ -8491,25 +7817,10 @@ mod tests {
         arch.addr_size = 4;
         let artifact = SsaArtifact::raw(&[entry, taken, fallthrough], Some(&arch))
             .expect("boundary conditional artifact");
-        let certified = CertifiedMachineProjection::from_artifact(&artifact)
-            .expect("fail-closed conditional projection");
-        let branch = artifact
-            .graph()
-            .insts
-            .iter()
-            .find(|inst| matches!(inst.payload, InstPayload::Op(SSAOp::CBranch { .. })))
-            .expect("conditional instruction");
-        let producer = artifact
-            .obligations()
-            .instruction_for_inst(branch.id)
-            .expect("conditional source")
-            .id;
-
-        assert!(
-            certified
-                .conditional_control_for_producer(producer)
-                .is_none()
-        );
+        let topology = certified_source_topology(&artifact).expect("source topology");
+        let controls =
+            certified_conditional_controls(&artifact, &topology).expect("conditional controls");
+        assert!(controls.is_empty());
     }
 
     #[test]
@@ -8522,14 +7833,11 @@ mod tests {
         });
         let unavailable_artifact =
             SsaArtifact::raw(&[block.clone()], None).expect("untyped architecture artifact");
-        let unavailable = CertifiedMachineFunction::from_artifact(&unavailable_artifact)
-            .expect("certified machine");
-        assert!(!unavailable.machine_context().memory_model().is_available());
+        let unavailable = CertifiedMachineContext::from_artifact(&unavailable_artifact)
+            .expect("unavailable machine context");
+        assert!(!unavailable.memory_model().is_available());
         assert_eq!(
-            unavailable
-                .machine_context()
-                .source()
-                .memory_space_at(0x3850, 0),
+            unavailable.source().memory_space_at(0x3850, 0),
             Some(SpaceId::Ram)
         );
 
@@ -8538,12 +7846,11 @@ mod tests {
         let artifact =
             SsaArtifact::raw(&[block], Some(&arch)).expect("typed architecture artifact");
         let certified =
-            CertifiedMachineFunction::from_artifact(&artifact).expect("certified machine");
-        assert!(certified.machine_context().memory_model().is_available());
-        assert!(certified.machine_context().memory_model().is_coherent());
+            CertifiedMachineContext::from_artifact(&artifact).expect("typed machine context");
+        assert!(certified.memory_model().is_available());
+        assert!(certified.memory_model().is_coherent());
         assert_eq!(
             certified
-                .machine_context()
                 .memory_model()
                 .space(SpaceId::Ram)
                 .map(r2ssa::MachineMemorySpace::endianness),
@@ -8568,128 +7875,14 @@ mod tests {
         });
         let artifact = SsaArtifact::raw(&[entry, false_block, true_block], None)
             .expect("conditional artifact");
-        let certified =
-            CertifiedMachineFunction::from_artifact(&artifact).expect("certified machine");
+        let topology = certified_source_topology(&artifact).expect("source topology");
 
         assert!(matches!(
-            certified
-                .topology()
-                .block(0x3900)
-                .map(|block| block.terminator()),
+            topology.block(0x3900).map(|block| block.terminator()),
             Some(CertifiedSourceTerminator::ConditionalBranch {
                 true_target: 0x3910,
                 false_target: 0x3904,
             })
-        ));
-    }
-
-    #[test]
-    fn explicit_direct_void_call_certifies_target_and_ordered_register_arguments() {
-        let target = Varnode::ram(0x7600, 8);
-        let mut entry = R2ILBlock::new(0x7500, 4);
-        entry.push(R2ILOp::Copy {
-            dst: Varnode::register(8, 8),
-            src: Varnode::constant(0x2a, 8),
-        });
-        entry.push(R2ILOp::Call {
-            target: target.clone(),
-        });
-        let fallthrough = R2ILBlock::new(0x7504, 4);
-        let mut arch = ArchSpec::new("certified-call-test");
-        arch.add_register(RegisterDef::new("rdi", 8, 8));
-        arch.add_register(RegisterDef::new("rip", 16, 8));
-        let argument_storage = CanonicalStorageId {
-            space: CanonicalStorageSpace::Register,
-            offset: 8,
-            size: 8,
-        };
-        let identity =
-            SourceCallSiteIdentity::new(0x7500, 1, CanonicalStorageId::from_varnode(&target));
-        let interface = SourceCallSiteInterface::new(
-            b"certified-call-revision-1".to_vec(),
-            identity,
-            true,
-            "test-call-abi",
-            [SourceCallArgumentSpec::new(0, argument_storage)],
-            false,
-            false,
-            SourceCallResult::Void,
-        )
-        .expect("callsite interface");
-        let artifact = SsaArtifact::raw_with_interfaces(
-            &[entry, fallthrough],
-            Some(&arch),
-            None,
-            vec![interface],
-        )
-        .expect("direct call artifact");
-        let certified =
-            CertifiedMachineProjection::from_artifact(&artifact).expect("direct call projection");
-        let instruction = artifact
-            .graph()
-            .insts
-            .iter()
-            .find(|instruction| matches!(instruction.payload, InstPayload::Op(SSAOp::Call { .. })))
-            .expect("call instruction");
-        let producer = artifact
-            .obligations()
-            .instruction_for_inst(instruction.id)
-            .expect("call disposition")
-            .id;
-        let call = certified
-            .direct_call_for_producer(producer)
-            .expect("certified direct call");
-        assert_eq!(call.call_site(), CallSiteId(0));
-        assert_eq!(call.raw_identity(), identity);
-        assert_eq!(call.target(), 0x7600);
-        assert_eq!(call.fallthrough(), 0x7504);
-        assert_eq!(call.calling_convention(), "test-call-abi");
-        assert_eq!(call.arguments().len(), 1);
-        assert_eq!(
-            call.arguments()[0].slot(),
-            CallBoundarySlot::Register {
-                index: 0,
-                storage: argument_storage,
-            }
-        );
-        assert_eq!(
-            call.arguments()[0]
-                .value()
-                .producer()
-                .map(|id| id.block_addr),
-            Some(0x7500)
-        );
-        assert!(matches!(
-            call.arguments()[0].origin(),
-            CertifiedCallArgumentOrigin::Constant { value }
-                if value.width_bits() == 64 && value.bits() == 0x2a
-        ));
-        for obligation in call.source_obligations() {
-            assert!(matches!(
-                certified.ledger().effects(obligation),
-                [effect]
-                    if effect.disposition() == &EffectDisposition::AbsorbedIntoCall { producer }
-                        && effect.direct_call_evidence() == Some(call)
-            ));
-        }
-        call.validate_against_artifact(&artifact)
-            .expect("call revalidates");
-
-        let mut corrupted = call.clone();
-        corrupted.fallthrough = 0x7508;
-        assert!(matches!(
-            corrupted.validate_against_artifact(&artifact),
-            Err(MachineBuildError::ObligationMismatch(_))
-        ));
-        let mut corrupted = call.clone();
-        corrupted.arguments[0].source_obligation.component =
-            SemanticObligationComponent::RegisterSlot {
-                index: 1,
-                storage: argument_storage,
-            };
-        assert!(matches!(
-            corrupted.validate_against_artifact(&artifact),
-            Err(MachineBuildError::ObligationMismatch(_))
         ));
     }
 
@@ -8743,7 +7936,7 @@ mod tests {
         )
         .expect("parameter call artifact");
         assert!(matches!(
-            CertifiedMachineProjection::from_artifact(&artifact),
+            CertifiedMachineContext::from_artifact(&artifact),
             Err(MachineBuildError::MachineContextMismatch)
         ));
     }
@@ -8759,7 +7952,7 @@ mod tests {
             storage: return_storage,
         });
         assert!(matches!(
-            CertifiedMachineProjection::from_artifact(&artifact),
+            CertifiedMachineContext::from_artifact(&artifact),
             Err(MachineBuildError::MachineContextMismatch)
         ));
     }
@@ -8768,73 +7961,7 @@ mod tests {
     fn synthetic_void_return_refuses_incomplete_machine_roles() {
         let artifact = explicit_return_artifact(SourceFunctionReturn::Void);
         assert!(matches!(
-            CertifiedMachineProjection::from_artifact(&artifact),
-            Err(MachineBuildError::MachineContextMismatch)
-        ));
-    }
-
-    #[test]
-    fn synthetic_terminal_return_cannot_close_region_ledger() {
-        let artifact = explicit_return_artifact(SourceFunctionReturn::Register {
-            storage: CanonicalStorageId {
-                space: CanonicalStorageSpace::Register,
-                offset: 0,
-                size: 8,
-            },
-        });
-        assert!(matches!(
-            CertifiedMachineProjection::from_artifact(&artifact),
-            Err(MachineBuildError::MachineContextMismatch)
-        ));
-    }
-
-    #[test]
-    fn synthetic_plain_ram_memory_return_cannot_close_region_ledger() {
-        let artifact = explicit_memory_return_artifact(1);
-        assert!(matches!(
-            CertifiedMachineProjection::from_artifact(&artifact),
-            Err(MachineBuildError::MachineContextMismatch)
-        ));
-
-        let word_artifact = explicit_memory_return_artifact(2);
-        assert!(matches!(
-            CertifiedMachineProjection::from_artifact(&word_artifact),
-            Err(MachineBuildError::MachineContextMismatch)
-        ));
-    }
-
-    #[test]
-    fn synthetic_direct_call_return_cannot_close_region_ledger() {
-        let artifact = explicit_direct_call_return_artifact();
-        assert!(matches!(
-            CertifiedMachineProjection::from_artifact(&artifact),
-            Err(MachineBuildError::MachineContextMismatch)
-        ));
-    }
-
-    #[test]
-    fn synthetic_conditional_return_cannot_close_region_ledger() {
-        let artifact = explicit_conditional_return_artifact();
-        assert!(matches!(
-            CertifiedMachineProjection::from_artifact(&artifact),
-            Err(MachineBuildError::MachineContextMismatch)
-        ));
-    }
-
-    #[test]
-    fn synthetic_switch_return_cannot_close_region_ledger() {
-        let artifact = explicit_switch_return_artifact();
-        assert!(matches!(
-            CertifiedMachineProjection::from_artifact(&artifact),
-            Err(MachineBuildError::MachineContextMismatch)
-        ));
-    }
-
-    #[test]
-    fn synthetic_carrier_free_loop_return_cannot_close_region_ledger() {
-        let artifact = explicit_carrier_free_loop_return_artifact();
-        assert!(matches!(
-            CertifiedMachineProjection::from_artifact(&artifact),
+            CertifiedMachineContext::from_artifact(&artifact),
             Err(MachineBuildError::MachineContextMismatch)
         ));
     }
@@ -8843,160 +7970,9 @@ mod tests {
     fn synthetic_stack_slots_refuse_incomplete_machine_roles() {
         let artifact = explicit_stack_slot_artifact(8);
         assert!(matches!(
-            CertifiedMachineProjection::from_artifact(&artifact),
+            CertifiedMachineContext::from_artifact(&artifact),
             Err(MachineBuildError::MachineContextMismatch)
         ));
-    }
-
-    #[test]
-    fn explicit_stack_slot_rejects_access_wider_than_declared_resource() {
-        let artifact = explicit_stack_slot_artifact(4);
-        assert!(matches!(
-            CertifiedMachineProjection::from_artifact(&artifact),
-            Err(MachineBuildError::MachineContextMismatch)
-        ));
-    }
-
-    #[test]
-    fn phi_does_not_close_loop_state_or_transition_obligations() {
-        let artifact = loop_artifact();
-        let certified =
-            CertifiedMachineFunction::from_artifact(&artifact).expect("loop machine expressions");
-        assert!(certified.natural_loop_routing_for_header(0x4010).is_none());
-        let loop_state = artifact
-            .obligations()
-            .obligations()
-            .keys()
-            .copied()
-            .filter(|id| {
-                matches!(
-                    id.kind,
-                    SemanticObligationKind::LoopCarriedState
-                        | SemanticObligationKind::LiveStateTransition
-                )
-            })
-            .collect::<Vec<_>>();
-        assert!(!loop_state.is_empty());
-        for id in loop_state {
-            assert!(certified.ledger().effects(id).is_empty());
-            assert!(certified.finish().missing().contains(&id));
-        }
-    }
-
-    #[test]
-    fn partial_certification_residualizes_unsupported_values_and_dependents() {
-        let loaded = Varnode::unique(0x10, 8);
-        let sum = Varnode::unique(0x18, 8);
-        let mut block = R2ILBlock::new(0x5100, 4);
-        block.push(R2ILOp::Load {
-            dst: loaded.clone(),
-            space: SpaceId::Ram,
-            addr: Varnode::register(0, 8),
-        });
-        block.push(R2ILOp::IntAdd {
-            dst: sum,
-            a: loaded,
-            b: Varnode::constant(1, 8),
-        });
-        let artifact = SsaArtifact::raw(&[block], None).expect("load dependency artifact");
-        let certified = CertifiedMachineProjection::from_artifact(&artifact)
-            .expect("certified partial projection");
-
-        let residual_producers = certified.residual_producers();
-        assert_eq!(residual_producers.len(), 2);
-        assert!(certified.projection().failures().iter().all(|failure| {
-            residual_producers.contains(&failure.producer())
-                && matches!(
-                    failure.error(),
-                    MachineBuildError::UnsupportedOperation { op, .. }
-                        if matches!(op.as_ref(), SSAOp::Load { .. })
-                )
-        }));
-        for instruction in artifact.obligations().instructions().values() {
-            assert!(residual_producers.contains(&instruction.id));
-            for obligation in &instruction.obligations {
-                let [effect] = certified.ledger().effects(*obligation) else {
-                    panic!("one residual effect expected for {obligation}");
-                };
-                assert!(matches!(
-                    effect.disposition(),
-                    EffectDisposition::Residualized { .. }
-                ));
-            }
-            assert!(certified.expression_for_producer(instruction.id).is_none());
-        }
-        let report = certified.finish();
-        assert!(report.has_exactly_one_disposition_per_source());
-        assert!(!report.is_closed_semantic_ledger());
-    }
-
-    #[test]
-    fn unsupported_source_state_blocks_supported_downstream_machine_ops() {
-        let before_call = Varnode::unique(0x10, 8);
-        let after_call = Varnode::unique(0x18, 8);
-        let mut block = R2ILBlock::new(0x5200, 4);
-        block.push(R2ILOp::Copy {
-            dst: before_call.clone(),
-            src: Varnode::constant(7, 8),
-        });
-        block.push(R2ILOp::Call {
-            target: Varnode::ram(0x8000, 8),
-        });
-        block.push(R2ILOp::IntAdd {
-            dst: after_call.clone(),
-            a: before_call,
-            b: Varnode::constant(1, 8),
-        });
-        block.push(R2ILOp::Store {
-            space: SpaceId::Ram,
-            addr: Varnode::register(0, 8),
-            val: after_call,
-        });
-        let artifact = SsaArtifact::raw(&[block], None).expect("incomplete call artifact");
-        let certified = CertifiedMachineProjection::from_artifact(&artifact)
-            .expect("certified partial projection");
-
-        let value_producers = artifact
-            .graph()
-            .insts
-            .iter()
-            .filter(|instruction| {
-                matches!(
-                    &instruction.payload,
-                    InstPayload::Op(SSAOp::Copy { .. } | SSAOp::IntAdd { .. })
-                )
-            })
-            .map(|instruction| {
-                artifact
-                    .obligations()
-                    .instruction_for_inst(instruction.id)
-                    .expect("value producer disposition")
-                    .id
-            })
-            .collect::<BTreeSet<_>>();
-        assert_eq!(value_producers.len(), 2);
-        assert!(value_producers.is_subset(certified.residual_producers()));
-        assert!(
-            value_producers
-                .iter()
-                .all(|producer| certified.expression_for_producer(*producer).is_none())
-        );
-        for producer in value_producers {
-            let live = artifact
-                .obligations()
-                .instructions()
-                .get(&producer)
-                .expect("source producer")
-                .obligations
-                .iter()
-                .find(|obligation| obligation.kind == SemanticObligationKind::LiveValueProducer)
-                .expect("live value obligation");
-            assert!(matches!(
-                certified.ledger().effects(*live),
-                [effect]
-                    if matches!(effect.disposition(), EffectDisposition::Residualized { .. })
-            ));
-        }
     }
 
     #[test]
@@ -9173,136 +8149,5 @@ mod tests {
         assert_eq!(report.schema_version(), CERTIFICATION_SCHEMA_VERSION);
         assert_eq!(report.source_obligation_count(), report.missing().len());
         assert!(!report.is_closed_semantic_ledger());
-    }
-
-    #[test]
-    fn artifact_origin_commits_preparation_mode_assumptions_and_current_schema() {
-        let mut block = R2ILBlock::new(0x6100, 4);
-        block.push(R2ILOp::Copy {
-            dst: Varnode::unique(0x10, 4),
-            src: Varnode::constant(7, 4),
-        });
-        let raw = SsaArtifact::raw(&[block.clone()], None).expect("raw origin artifact");
-        let raw_certified =
-            CertifiedMachineProjection::from_artifact(&raw).expect("raw origin certification");
-        let cloned = raw_certified.clone();
-        let rebuilt =
-            CertifiedMachineProjection::from_artifact(&raw).expect("rebuilt certification");
-        assert_eq!(raw_certified.origin(), cloned.origin());
-        assert_eq!(raw_certified.origin(), rebuilt.origin());
-        assert!(raw_certified.ledger().matches_origin(rebuilt.origin()));
-
-        let independently_rebuilt =
-            SsaArtifact::raw(&[block.clone()], None).expect("independent origin artifact");
-        let independently_certified =
-            CertifiedMachineProjection::from_artifact(&independently_rebuilt)
-                .expect("independent origin certification");
-        assert_ne!(raw_certified.origin(), independently_certified.origin());
-        assert!(
-            !raw_certified
-                .ledger()
-                .matches_origin(independently_certified.origin())
-        );
-
-        let mut arch = ArchSpec::new("origin-context");
-        arch.addr_size = 8;
-        arch.set_memory_endianness(Endianness::Little);
-        let contextual =
-            SsaArtifact::raw(&[block.clone()], Some(&arch)).expect("contextual origin artifact");
-        let contextual_certified = CertifiedMachineProjection::from_artifact(&contextual)
-            .expect("contextual origin certification");
-        assert_ne!(raw_certified.origin(), contextual_certified.origin());
-
-        let symbolic = SsaArtifact::for_symbolic(&[block], None).expect("symbolic origin artifact");
-        let symbolic_certified = CertifiedMachineProjection::from_artifact(&symbolic)
-            .expect("symbolic origin certification");
-        assert_ne!(raw_certified.origin(), symbolic_certified.origin());
-        assert!(raw_certified.origin().decompile_preparation().is_none());
-        let symbolic_preparation = symbolic_certified
-            .origin()
-            .decompile_preparation()
-            .expect("symbolic preparation snapshot");
-        assert!(!symbolic_preparation.canonical_value_roots().is_empty());
-        let serialized_preparation =
-            serde_json::to_value(symbolic_preparation).expect("serialized preparation snapshot");
-        assert!(
-            serialized_preparation
-                .get("canonical_value_roots")
-                .is_some()
-        );
-        assert!(serialized_preparation.get("stack_address_roots").is_some());
-        assert!(serialized_preparation.get("formal_parameters").is_some());
-        assert!(
-            serialized_preparation
-                .get("formal_parameter_bases")
-                .is_some()
-        );
-
-        let assumptions = r2ssa::AssumptionSet::new(vec![r2ssa::AnalysisAssumption {
-            id: Some("origin-proof-context".to_string()),
-            subject: r2ssa::AssumptionSubject::Target { addr: 0x6100 },
-            value: r2ssa::AssumptionValue::Constant { value: 1 },
-            scope: r2ssa::AssumptionScope::Function,
-            provenance: r2ssa::AssumptionProvenance::User,
-        }]);
-        let assumed = raw.with_assumptions(&assumptions);
-        let assumed_certified = CertifiedMachineProjection::from_artifact(&assumed)
-            .expect("assumed origin certification");
-        assert_ne!(raw_certified.origin(), assumed_certified.origin());
-        let ordered = r2ssa::AssumptionSet::new(vec![
-            r2ssa::AnalysisAssumption {
-                id: Some("first".to_string()),
-                subject: r2ssa::AssumptionSubject::Target { addr: 0x6100 },
-                value: r2ssa::AssumptionValue::Constant { value: 1 },
-                scope: r2ssa::AssumptionScope::Function,
-                provenance: r2ssa::AssumptionProvenance::User,
-            },
-            r2ssa::AnalysisAssumption {
-                id: Some("second".to_string()),
-                subject: r2ssa::AssumptionSubject::Target { addr: 0x6200 },
-                value: r2ssa::AssumptionValue::Constant { value: 2 },
-                scope: r2ssa::AssumptionScope::Function,
-                provenance: r2ssa::AssumptionProvenance::User,
-            },
-        ]);
-        let reversed = r2ssa::AssumptionSet::new(ordered.items.iter().cloned().rev().collect());
-        let ordered = CertifiedMachineProjection::from_artifact(&raw.with_assumptions(&ordered))
-            .expect("ordered assumption certification");
-        let reversed = CertifiedMachineProjection::from_artifact(&raw.with_assumptions(&reversed))
-            .expect("reversed assumption certification");
-        assert_ne!(ordered.origin(), reversed.origin());
-
-        assert_eq!(CERTIFICATION_SCHEMA_VERSION, 20);
-        assert_eq!(
-            raw_certified.origin().schema_version(),
-            CERTIFICATION_SCHEMA_VERSION
-        );
-        assert_eq!(
-            raw_certified.origin().prepare_mode(),
-            CertifiedPreparationMode::Raw
-        );
-        let modes = [
-            CertifiedPreparationMode::Generic,
-            CertifiedPreparationMode::Raw,
-            CertifiedPreparationMode::Decompile,
-            CertifiedPreparationMode::Patterns,
-            CertifiedPreparationMode::DataRefs,
-            CertifiedPreparationMode::Symbolic,
-        ];
-        let serialized = modes
-            .iter()
-            .map(|mode| serde_json::to_value(mode).expect("serialized preparation mode"))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            serialized,
-            vec![
-                serde_json::json!("generic"),
-                serde_json::json!("raw"),
-                serde_json::json!("decompile"),
-                serde_json::json!("patterns"),
-                serde_json::json!("data_refs"),
-                serde_json::json!("symbolic"),
-            ]
-        );
     }
 }

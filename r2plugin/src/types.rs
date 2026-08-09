@@ -167,8 +167,7 @@ fn cache_counters_json(counters: r2engine::CacheCounters) -> String {
     )
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_engine_cache_stats_json() -> *mut c_char {
+pub(crate) fn r2sleigh_engine_cache_stats_json() -> *mut c_char {
     let profile = engine_session().profile(r2engine::EngineProfileRequest {
         reset_after_read: false,
     });
@@ -183,8 +182,7 @@ pub extern "C" fn r2sleigh_engine_cache_stats_json() -> *mut c_char {
     CString::new(json).map_or(ptr::null_mut(), |c| c.into_raw())
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_engine_cache_stats_reset() {
+pub(crate) fn r2sleigh_engine_cache_stats_reset() {
     let _ = engine_session().profile(r2engine::EngineProfileRequest {
         reset_after_read: true,
     });
@@ -816,8 +814,7 @@ fn recover_vars_for_ffi(
     ))
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_recover_vars_typed(
+pub(crate) fn r2sleigh_recover_vars_typed(
     ctx: *const R2ILContext,
     blocks: *const *const R2ILBlock,
     num_blocks: usize,
@@ -829,8 +826,7 @@ pub extern "C" fn r2sleigh_recover_vars_typed(
     Box::into_raw(Box::new(ffi_recovered_vars_from_vars(&vars)))
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_recovered_vars_items(
+pub(crate) fn r2sleigh_recovered_vars_items(
     vars: *const R2SleighRecoveredVars,
     count: *mut usize,
 ) -> *const R2SleighRecoveredVar {
@@ -851,8 +847,7 @@ pub extern "C" fn r2sleigh_recovered_vars_items(
     vars.vars.as_ptr()
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_recovered_vars_free(vars: *mut R2SleighRecoveredVars) {
+pub(crate) fn r2sleigh_recovered_vars_free(vars: *mut R2SleighRecoveredVars) {
     if !vars.is_null() {
         unsafe {
             drop(Box::from_raw(vars));
@@ -870,8 +865,7 @@ fn data_refs_for_ffi(
     r2ssa::data_refs_from_blocks(input.blocks.as_slice(), input.ctx.arch, input.ctx.disasm)
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_data_refs_typed(
+pub(crate) fn r2sleigh_data_refs_typed(
     ctx: *const R2ILContext,
     blocks: *const *const R2ILBlock,
     num_blocks: usize,
@@ -883,8 +877,7 @@ pub extern "C" fn r2sleigh_data_refs_typed(
     Box::into_raw(Box::new(ffi_data_refs_from_refs(&refs)))
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_data_refs_items(
+pub(crate) fn r2sleigh_data_refs_items(
     refs: *const R2SleighDataRefs,
     count: *mut usize,
 ) -> *const R2SleighDataRef {
@@ -905,8 +898,7 @@ pub extern "C" fn r2sleigh_data_refs_items(
     refs.refs.as_ptr()
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_data_refs_free(refs: *mut R2SleighDataRefs) {
+pub(crate) fn r2sleigh_data_refs_free(refs: *mut R2SleighDataRefs) {
     if !refs.is_null() {
         unsafe {
             drop(Box::from_raw(refs));

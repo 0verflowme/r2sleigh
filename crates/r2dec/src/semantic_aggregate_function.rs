@@ -14,7 +14,7 @@ use r2cert::{
 use r2ssa::{
     CanonicalInstructionId, CanonicalStorageId, InstPayload, MachineBuildError,
     MachineValueBinding, SSAOp, SourceCarrierKind, SourceFunctionInterface, SourceFunctionReturn,
-    SourceTypeGraph, SourceTypeKind, SsaArtifact, StructuredAccessId,
+    SourceTypeGraph, SourceTypeKind, SsaArtifact, StructuredAccessId, TrustedSsaArtifact,
 };
 use serde::Serialize;
 
@@ -650,10 +650,11 @@ fn direct_address_producers(
 
 impl CertifiedAggregateMemberSemanticCFunction {
     pub fn from_artifact(
-        artifact: &SsaArtifact,
+        trusted: &TrustedSsaArtifact,
     ) -> Result<Self, CertifiedAggregateMemberSemanticCFunctionError> {
-        let memory = CertifiedMemorySemanticCFunction::from_artifact(artifact)?;
-        let certified = CertifiedMachineProjection::from_artifact(artifact)?;
+        let artifact = trusted.artifact();
+        let memory = CertifiedMemorySemanticCFunction::from_artifact(trusted)?;
+        let certified = CertifiedMachineProjection::from_artifact(trusted)?;
         let memory_origin = memory.layer().accounting().origin();
         if certified.origin() != memory_origin {
             return Err(
@@ -1671,27 +1672,23 @@ mod tests {
         )
     }
 
-    fn assert_machine_context_refused(artifact: &SsaArtifact) {
-        assert!(matches!(
-            CertifiedAggregateMemberSemanticCFunction::from_artifact(artifact),
-            Err(CertifiedAggregateMemberSemanticCFunctionError::Memory(
-                CertifiedMemorySemanticCFunctionError::Machine(
-                    MachineBuildError::MachineContextMismatch
-                )
-            ))
-        ));
+    fn assert_hand_authored_non_authoritative(artifact: &SsaArtifact) {
+        assert_eq!(
+            artifact.provenance_kind(),
+            r2ssa::SsaArtifactProvenanceKind::Manual
+        );
     }
 
     #[test]
     fn hand_authored_aggregate_fixtures_refuse_renderer_authority() {
-        assert_machine_context_refused(&load_return_artifact());
-        assert_machine_context_refused(&store_parameter_artifact());
-        assert_machine_context_refused(&read_write_artifact());
+        assert_hand_authored_non_authoritative(&load_return_artifact());
+        assert_hand_authored_non_authoritative(&store_parameter_artifact());
+        assert_hand_authored_non_authoritative(&read_write_artifact());
     }
 
     #[test]
     fn hand_authored_aggregate_name_variant_refuses_renderer_authority() {
-        assert_machine_context_refused(&load_return_artifact_with_graph(
+        assert_hand_authored_non_authoritative(&load_return_artifact_with_graph(
             demo_struct_graph_with_names("CosmeticOnlyRename", "also_cosmetic"),
         ));
     }
@@ -1724,6 +1721,6 @@ mod tests {
             SourceFunctionReturn::Void,
             None,
         );
-        assert_machine_context_refused(&artifact);
+        assert_hand_authored_non_authoritative(&artifact);
     }
 }

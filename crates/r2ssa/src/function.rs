@@ -9,6 +9,8 @@ use std::ops::Deref;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use r2il::{ArchSpec, R2ILBlock};
+use r2sleigh_lift::{GenuineLiftedFunction, GenuineLiftedFunctionAuthority, TrustedLiftedFunction};
+use r2source::OwnedFunctionSnapshot;
 use serde::{Deserialize, Serialize};
 
 use crate::AssumptionSet;
@@ -54,12 +56,7 @@ pub struct CFGRiskSummary {
     pub max_switch_cases: usize,
 }
 
-/// Canonical base used to form a proven stack address.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum StackAddressBase {
-    FramePointer,
-    StackPointer,
-}
+pub use r2source::StackAddressBase;
 
 /// Proven stack-address root: `base +/- offset`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -119,16 +116,52 @@ impl PartialEq for SsaArtifactAuthority {
 
 impl Eq for SsaArtifactAuthority {}
 
+fn coherent_function_interface(
+    machine_context: &SourceMachineContext,
+) -> Option<&SourceFunctionInterface> {
+    machine_context
+        .abi_model()
+        .is_coherent()
+        .then(|| machine_context.function_interface())
+        .flatten()
+}
+
 /// Canonical SSA artifact consumed by downstream analysis layers.
 #[derive(Debug, Clone)]
 pub struct SsaArtifact {
     authority: SsaArtifactAuthority,
+    provenance: SsaArtifactProvenance,
     function: SSAFunction,
     graph: SsaGraph,
     mode: FunctionPrepareMode,
     facts: PreparedFunctionFacts,
     machine_context: SourceMachineContext,
     aggregate_accesses: AggregateAccessProjectionFacts,
+}
+
+/// Public classification of an artifact's construction boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SsaArtifactProvenanceKind {
+    Manual,
+    GenuineLiftOnly,
+    TrustedSource,
+}
+
+#[derive(Debug, Clone)]
+enum SsaArtifactProvenance {
+    Manual,
+    GenuineLiftOnly(GenuineLiftedFunctionAuthority),
+    TrustedSource(OwnedFunctionSnapshot),
+}
+
+/// Opaque certifiable SSA prepared only from a source-retaining trusted lift.
+/// Generic/manual [`SsaArtifact`] constructors cannot produce this wrapper.
+#[derive(Debug, Clone)]
+pub struct TrustedSsaArtifact {
+    artifact: SsaArtifact,
+    lift_authority: GenuineLiftedFunctionAuthority,
+    source_blocks: Arc<[R2ILBlock]>,
+    arch: ArchSpec,
 }
 
 impl SsaArtifact {
@@ -154,7 +187,23 @@ impl SsaArtifact {
     fn new_with_context_and_control<C: SsaWorkControl + ?Sized>(
         function: SSAFunction,
         mode: FunctionPrepareMode,
+        machine_context: SourceMachineContext,
+        control: &C,
+    ) -> Result<Self, SsaExecutionStopReason> {
+        Self::new_with_context_control_and_provenance(
+            function,
+            mode,
+            machine_context,
+            SsaArtifactProvenance::Manual,
+            control,
+        )
+    }
+
+    fn new_with_context_control_and_provenance<C: SsaWorkControl + ?Sized>(
+        function: SSAFunction,
+        mode: FunctionPrepareMode,
         mut machine_context: SourceMachineContext,
+        provenance: SsaArtifactProvenance,
         control: &C,
     ) -> Result<Self, SsaExecutionStopReason> {
         control.poll()?;
@@ -176,6 +225,7 @@ impl SsaArtifact {
         control.poll()?;
         Ok(Self {
             authority: SsaArtifactAuthority::new(),
+            provenance,
             function,
             graph,
             mode,
@@ -189,6 +239,24 @@ impl SsaArtifact {
     /// from this exact artifact instance.
     pub const fn authority(&self) -> &SsaArtifactAuthority {
         &self.authority
+    }
+
+    pub fn provenance_kind(&self) -> SsaArtifactProvenanceKind {
+        match &self.provenance {
+            SsaArtifactProvenance::Manual => SsaArtifactProvenanceKind::Manual,
+            SsaArtifactProvenance::GenuineLiftOnly(_) => SsaArtifactProvenanceKind::GenuineLiftOnly,
+            SsaArtifactProvenance::TrustedSource(_) => SsaArtifactProvenanceKind::TrustedSource,
+        }
+    }
+
+    /// Opaque genuine-lift authority retained by either lifted provenance kind.
+    /// Genuine lift authority alone is not sufficient for certification.
+    pub fn genuine_lift_authority(&self) -> Option<&GenuineLiftedFunctionAuthority> {
+        match &self.provenance {
+            SsaArtifactProvenance::Manual => None,
+            SsaArtifactProvenance::GenuineLiftOnly(authority) => Some(authority),
+            SsaArtifactProvenance::TrustedSource(_) => None,
+        }
     }
 
     pub fn from_blocks(blocks: &[R2ILBlock], arch: Option<&ArchSpec>) -> Option<Self> {
@@ -283,15 +351,20 @@ impl SsaArtifact {
         function_interface: Option<SourceFunctionInterface>,
         call_site_interfaces: Vec<SourceCallSiteInterface>,
     ) -> Option<Self> {
+        let machine_context = SourceMachineContext::from_blocks_with_interfaces(
+            blocks,
+            arch,
+            function_interface,
+            call_site_interfaces,
+        );
         Some(Self::new_with_context(
-            SSAFunction::from_blocks_for_decompile(blocks, arch)?,
-            FunctionPrepareMode::Decompile,
-            SourceMachineContext::from_blocks_with_interfaces(
+            SSAFunction::from_blocks_for_decompile_with_interface(
                 blocks,
                 arch,
-                function_interface,
-                call_site_interfaces,
-            ),
+                coherent_function_interface(&machine_context),
+            )?,
+            FunctionPrepareMode::Decompile,
+            machine_context,
         ))
     }
 
@@ -303,14 +376,19 @@ impl SsaArtifact {
         call_site_interfaces: Vec<SourceCallSiteInterface>,
         control: &C,
     ) -> Result<Self, SsaPrepareError> {
-        let function = SSAFunction::from_blocks_for_decompile_with_control(blocks, arch, control)?;
-        control.poll()?;
         let machine_context = SourceMachineContext::from_blocks_with_interfaces(
             blocks,
             arch,
             function_interface,
             call_site_interfaces,
         );
+        let function = SSAFunction::from_blocks_for_decompile_with_interface_and_control(
+            blocks,
+            arch,
+            coherent_function_interface(&machine_context),
+            control,
+        )?;
+        control.poll()?;
         Self::new_with_context_and_control(
             function,
             FunctionPrepareMode::Decompile,
@@ -318,6 +396,72 @@ impl SsaArtifact {
             control,
         )
         .map_err(Into::into)
+    }
+
+    /// Build analysis-only decompiler SSA directly from an immutable genuine lift.
+    ///
+    /// A genuine lift proves instruction origin, but detached source interfaces
+    /// do not prove that ABI facts came from the same immutable source snapshot.
+    /// This path therefore cannot grant certification authority.
+    pub fn for_decompile_from_genuine_lift_with_interfaces_and_control<
+        C: SsaWorkControl + ?Sized,
+    >(
+        lifted: &GenuineLiftedFunction,
+        function_interface: Option<SourceFunctionInterface>,
+        call_site_interfaces: Vec<SourceCallSiteInterface>,
+        control: &C,
+    ) -> Result<Self, SsaPrepareError> {
+        let Some(function_interface) = function_interface else {
+            return Err(SsaPrepareError::MalformedInput);
+        };
+        if function_interface.revision_identity() != lifted.authority().layout().revision_identity()
+        {
+            return Err(SsaPrepareError::MalformedInput);
+        }
+        let blocks = lifted
+            .blocks()
+            .iter()
+            .map(|block| block.block().clone())
+            .collect::<Vec<_>>();
+        let arch = lifted.arch_spec();
+        let machine_context = SourceMachineContext::from_blocks_with_interfaces(
+            &blocks,
+            Some(arch),
+            Some(function_interface),
+            call_site_interfaces,
+        );
+        let function = SSAFunction::from_blocks_for_decompile_with_interface_and_control(
+            &blocks,
+            Some(arch),
+            coherent_function_interface(&machine_context),
+            control,
+        )?;
+        if function.entry != lifted.authority().layout().entry_addr() {
+            return Err(SsaPrepareError::MalformedInput);
+        }
+        control.poll()?;
+        Self::new_with_context_control_and_provenance(
+            function,
+            FunctionPrepareMode::Decompile,
+            machine_context,
+            SsaArtifactProvenance::GenuineLiftOnly(lifted.authority().clone()),
+            control,
+        )
+        .map_err(Into::into)
+    }
+
+    /// Build analysis-only decompiler SSA from one complete genuine lift.
+    pub fn for_decompile_from_genuine_lift_with_interfaces(
+        lifted: &GenuineLiftedFunction,
+        function_interface: Option<SourceFunctionInterface>,
+        call_site_interfaces: Vec<SourceCallSiteInterface>,
+    ) -> Result<Self, SsaPrepareError> {
+        Self::for_decompile_from_genuine_lift_with_interfaces_and_control(
+            lifted,
+            function_interface,
+            call_site_interfaces,
+            &UncheckedSsaWorkControl,
+        )
     }
 
     pub fn for_patterns(blocks: &[R2ILBlock], arch: Option<&ArchSpec>) -> Option<Self> {
@@ -406,6 +550,7 @@ impl SsaArtifact {
         );
         Self {
             authority: SsaArtifactAuthority::new(),
+            provenance: SsaArtifactProvenance::Manual,
             function: self.function.clone(),
             graph: self.graph.clone(),
             mode: self.mode,
@@ -622,6 +767,93 @@ impl SsaArtifact {
                 ops: block.ops.clone(),
             })
             .collect()
+    }
+}
+
+impl TrustedSsaArtifact {
+    /// Prepare one certifiable SSA artifact from a source-retaining canonical
+    /// lift. No detached interface, architecture, layout, or raw block input is
+    /// accepted at this boundary.
+    pub fn prepare_with_control<C: SsaWorkControl + ?Sized>(
+        lifted: TrustedLiftedFunction,
+        control: &C,
+    ) -> Result<Self, SsaPrepareError> {
+        let source = lifted.source().clone();
+        let genuine = lifted.lifted();
+        let lift_authority = genuine.authority().clone();
+        let arch = genuine.arch_spec().clone();
+        let blocks = genuine
+            .blocks()
+            .iter()
+            .map(|block| block.block().clone())
+            .collect::<Vec<_>>();
+        let interface = source
+            .function_interface()
+            .cloned()
+            .ok_or(SsaPrepareError::MalformedInput)?;
+        let machine_context = SourceMachineContext::from_blocks_with_interfaces(
+            &blocks,
+            Some(&arch),
+            Some(interface),
+            Vec::new(),
+        );
+        let function = SSAFunction::from_blocks_for_decompile_with_interface_and_control(
+            &blocks,
+            Some(&arch),
+            coherent_function_interface(&machine_context),
+            control,
+        )?;
+        if function.entry != source.image().entry_address() {
+            return Err(SsaPrepareError::MalformedInput);
+        }
+        control.poll()?;
+        let artifact = SsaArtifact::new_with_context_control_and_provenance(
+            function,
+            FunctionPrepareMode::Decompile,
+            machine_context,
+            SsaArtifactProvenance::TrustedSource(source),
+            control,
+        )
+        .map_err(SsaPrepareError::from)?;
+        Ok(Self {
+            artifact,
+            lift_authority,
+            source_blocks: blocks.into(),
+            arch,
+        })
+    }
+
+    pub fn prepare(lifted: TrustedLiftedFunction) -> Result<Self, SsaPrepareError> {
+        Self::prepare_with_control(lifted, &UncheckedSsaWorkControl)
+    }
+
+    /// Read-only analysis view. This does not allow a generic artifact to be
+    /// converted back into a trusted wrapper.
+    pub const fn artifact(&self) -> &SsaArtifact {
+        &self.artifact
+    }
+
+    pub const fn lift_authority(&self) -> &GenuineLiftedFunctionAuthority {
+        &self.lift_authority
+    }
+
+    /// Exact immutable blocks retained from the same trusted lift event.
+    pub fn source_blocks(&self) -> &[R2ILBlock] {
+        &self.source_blocks
+    }
+
+    /// Architecture extracted from the same embedded trusted Sleigh profile.
+    pub const fn arch_spec(&self) -> &ArchSpec {
+        &self.arch
+    }
+
+    pub fn source(&self) -> &OwnedFunctionSnapshot {
+        match &self.artifact.provenance {
+            SsaArtifactProvenance::TrustedSource(source) => source,
+            SsaArtifactProvenance::Manual | SsaArtifactProvenance::GenuineLiftOnly(_) => {
+                unreachable!("TrustedSsaArtifact always retains source provenance")
+            }
+        }
     }
 }
 
@@ -1214,13 +1446,40 @@ impl SSAFunction {
         arch: Option<&ArchSpec>,
         control: &C,
     ) -> Result<Self, SsaPrepareError> {
+        Self::from_blocks_for_decompile_with_interface_and_control(blocks, arch, None, control)
+    }
+
+    fn from_blocks_for_decompile_with_interface(
+        blocks: &[R2ILBlock],
+        arch: Option<&ArchSpec>,
+        function_interface: Option<&SourceFunctionInterface>,
+    ) -> Option<Self> {
+        Self::from_blocks_for_decompile_with_interface_and_control(
+            blocks,
+            arch,
+            function_interface,
+            &UncheckedSsaWorkControl,
+        )
+        .ok()
+    }
+
+    fn from_blocks_for_decompile_with_interface_and_control<C: SsaWorkControl + ?Sized>(
+        blocks: &[R2ILBlock],
+        arch: Option<&ArchSpec>,
+        function_interface: Option<&SourceFunctionInterface>,
+        control: &C,
+    ) -> Result<Self, SsaPrepareError> {
         control.poll()?;
         let mut func = Self::from_blocks_raw_for_decompile_with_control(blocks, arch, control)?;
         func.prepare_for_decompile_with_control(
             &crate::optimize::DecompilePrepConfig::default(),
             control,
         )?;
-        func.refresh_decompile_prep_facts_with_control(arch, control)?;
+        func.refresh_decompile_prep_facts_with_interface_and_control(
+            arch,
+            function_interface,
+            control,
+        )?;
         control.poll()?;
         Ok(func)
     }
@@ -1971,8 +2230,12 @@ impl SSAFunction {
 
     /// Refresh the cached decompiler-prep facts for the current SSA state.
     pub fn refresh_decompile_prep_facts(&mut self, arch: Option<&ArchSpec>) {
-        self.refresh_decompile_prep_facts_with_control(arch, &UncheckedSsaWorkControl)
-            .expect("unchecked decompiler fact collection cannot stop");
+        self.refresh_decompile_prep_facts_with_interface_and_control(
+            arch,
+            None,
+            &UncheckedSsaWorkControl,
+        )
+        .expect("unchecked decompiler fact collection cannot stop");
     }
 
     fn refresh_decompile_prep_facts_with_control<C: SsaWorkControl + ?Sized>(
@@ -1980,7 +2243,17 @@ impl SSAFunction {
         arch: Option<&ArchSpec>,
         control: &C,
     ) -> Result<(), SsaExecutionStopReason> {
-        let facts = self.collect_decompile_prep_facts_with_control(arch, control)?;
+        self.refresh_decompile_prep_facts_with_interface_and_control(arch, None, control)
+    }
+
+    fn refresh_decompile_prep_facts_with_interface_and_control<C: SsaWorkControl + ?Sized>(
+        &mut self,
+        arch: Option<&ArchSpec>,
+        function_interface: Option<&SourceFunctionInterface>,
+        control: &C,
+    ) -> Result<(), SsaExecutionStopReason> {
+        let facts =
+            self.collect_decompile_prep_facts_with_control(arch, function_interface, control)?;
         control.poll()?;
         self.decompile_prep_facts = Some(facts);
         Ok(())
@@ -1989,6 +2262,7 @@ impl SSAFunction {
     fn collect_decompile_prep_facts_with_control<C: SsaWorkControl + ?Sized>(
         &self,
         arch: Option<&ArchSpec>,
+        function_interface: Option<&SourceFunctionInterface>,
         control: &C,
     ) -> Result<DecompilePrepFacts, SsaExecutionStopReason> {
         control.poll()?;
@@ -2002,6 +2276,32 @@ impl SSAFunction {
             self.compute_decompile_family_in_states_with_control(family_info, control)?
         };
         let mut facts = DecompilePrepFacts::default();
+        let mut declared_stack_bases = BTreeMap::new();
+        if let Some(interface) = function_interface.filter(|interface| {
+            interface.stack_slot_roles_complete()
+                && interface.stack_pointer_storage().is_some()
+                && interface.return_address_storage().is_some()
+        }) {
+            if let Some(storage) = interface.stack_pointer_storage() {
+                declared_stack_bases.insert(storage, StackAddressBase::StackPointer);
+            }
+            for slot in interface.stack_slots() {
+                declared_stack_bases.insert(slot.base_storage(), slot.base());
+            }
+            for var in self.canonical_storage_by_var.keys() {
+                if var.version != 0 {
+                    continue;
+                }
+                let Some(storage) = self.canonical_storage_for_var(var) else {
+                    continue;
+                };
+                if let Some(base) = declared_stack_bases.get(&storage).copied() {
+                    facts
+                        .stack_address_roots
+                        .insert(var.clone(), StackAddressRoot { base, offset: 0 });
+                }
+            }
+        }
         for block in self.blocks() {
             control.poll()?;
             for phi in &block.phis {
@@ -2080,6 +2380,12 @@ impl SSAFunction {
                         &family_state,
                         family_info,
                     ) {
+                        let root = rebase_declared_frame_pointer(
+                            self,
+                            &declared_stack_bases,
+                            &phi.dst,
+                            root,
+                        );
                         changed |= insert_stack_root(
                             &mut facts.stack_address_roots,
                             phi.dst.clone(),
@@ -2114,6 +2420,12 @@ impl SSAFunction {
                                 &family_state,
                                 family_info,
                             ) {
+                                let stack_root = rebase_declared_frame_pointer(
+                                    self,
+                                    &declared_stack_bases,
+                                    dst,
+                                    stack_root,
+                                );
                                 changed |= insert_stack_root(
                                     &mut facts.stack_address_roots,
                                     dst.clone(),
@@ -2145,6 +2457,12 @@ impl SSAFunction {
                                 &family_state,
                                 family_info,
                             ) {
+                                let root = rebase_declared_frame_pointer(
+                                    self,
+                                    &declared_stack_bases,
+                                    dst,
+                                    root,
+                                );
                                 changed |= insert_stack_root(
                                     &mut facts.stack_address_roots,
                                     dst.clone(),
@@ -2161,6 +2479,12 @@ impl SSAFunction {
                                 &family_state,
                                 family_info,
                             ) {
+                                let root = rebase_declared_frame_pointer(
+                                    self,
+                                    &declared_stack_bases,
+                                    dst,
+                                    root,
+                                );
                                 changed |= insert_stack_root(
                                     &mut facts.stack_address_roots,
                                     dst.clone(),
@@ -3397,6 +3721,24 @@ fn stack_address_root_from_sub(
     })
 }
 
+fn rebase_declared_frame_pointer(
+    function: &SSAFunction,
+    declared_stack_bases: &BTreeMap<CanonicalStorageId, StackAddressBase>,
+    dst: &SSAVar,
+    inherited: StackAddressRoot,
+) -> StackAddressRoot {
+    match function
+        .canonical_storage_for_var(dst)
+        .and_then(|storage| declared_stack_bases.get(&storage))
+    {
+        Some(StackAddressBase::FramePointer) => StackAddressRoot {
+            base: StackAddressBase::FramePointer,
+            offset: 0,
+        },
+        Some(StackAddressBase::StackPointer) | None => inherited,
+    }
+}
+
 fn signed_stack_delta(var: &SSAVar) -> Option<i64> {
     let value = var.constant_bits()?;
     let bits = var.size.checked_mul(8)?;
@@ -3565,6 +3907,7 @@ impl SSABlock {
 mod tests {
     use super::*;
     use crate::semantic::{CallArgumentLocation, ReturnCarrier, SemanticId, ValueOwner};
+    use crate::{SourceFunctionReturn, SourceStackSlotSpec};
     use r2il::{R2ILOp, RegisterDef, SpaceId, SwitchCase, SwitchInfo as R2ILSwitchInfo, Varnode};
     use std::cell::Cell;
     use std::collections::BTreeSet;
@@ -8115,6 +8458,142 @@ mod tests {
         assert_eq!(
             facts.canonical_root_of(&SSAVar::new("tmp:4", 1, 8)),
             Some(&SSAVar::new("tmp:3", 1, 8))
+        );
+    }
+
+    #[test]
+    fn test_decompile_prep_facts_use_only_exact_typed_stack_carriers() {
+        let mut arch = make_x86_64_prep_arch();
+        arch.add_register(RegisterDef::new("rip", 32, 8));
+        let rsp = make_reg(16, 8);
+        let rbp = make_reg(24, 8);
+        let blocks = vec![R2ILBlock {
+            addr: 0x3000,
+            size: 5,
+            ops: vec![
+                R2ILOp::Copy {
+                    dst: rbp.clone(),
+                    src: rsp.clone(),
+                },
+                R2ILOp::IntSub {
+                    dst: rsp.clone(),
+                    a: rsp.clone(),
+                    b: make_const(0x20, 8),
+                },
+                R2ILOp::IntAdd {
+                    dst: make_unique(0x10, 8),
+                    a: rsp.clone(),
+                    b: make_const(8, 8),
+                },
+                R2ILOp::IntSub {
+                    dst: make_unique(0x18, 8),
+                    a: rbp,
+                    b: make_const(0x10, 8),
+                },
+                R2ILOp::Return {
+                    target: make_const(0, 8),
+                },
+            ],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+        let sp_storage = CanonicalStorageId {
+            space: crate::CanonicalStorageSpace::Register,
+            offset: 16,
+            size: 8,
+        };
+        let fp_storage = CanonicalStorageId {
+            space: crate::CanonicalStorageSpace::Register,
+            offset: 24,
+            size: 8,
+        };
+        let ra_storage = CanonicalStorageId {
+            space: crate::CanonicalStorageSpace::Register,
+            offset: 32,
+            size: 8,
+        };
+        let interface = SourceFunctionInterface::new_exact(
+            b"typed-stack-roots".to_vec(),
+            "sysv",
+            [],
+            SourceFunctionReturn::Void,
+            [
+                SourceStackSlotSpec::new_local(
+                    StackAddressBase::FramePointer,
+                    fp_storage,
+                    -0x10,
+                    8,
+                ),
+                SourceStackSlotSpec::new_local(
+                    StackAddressBase::StackPointer,
+                    sp_storage,
+                    -0x18,
+                    8,
+                ),
+            ],
+        )
+        .expect("exact typed interface")
+        .with_return_address_storage(ra_storage)
+        .expect("return-address carrier")
+        .with_stack_pointer_storage(sp_storage)
+        .expect("stack-pointer carrier");
+
+        let typed = SsaArtifact::for_decompile_with_interface(&blocks, Some(&arch), interface)
+            .expect("typed decompile artifact");
+        let typed_function = typed.function();
+        let typed_facts = typed_function.decompile_prep_facts().expect("typed facts");
+        let op_roots = typed_function
+            .get_block(0x3000)
+            .expect("entry")
+            .ops
+            .iter()
+            .filter_map(|op| op.dst())
+            .filter_map(|dst| {
+                typed_facts
+                    .stack_address_root_of(dst)
+                    .copied()
+                    .map(|root| (typed_function.canonical_storage_for_var(dst), root))
+            })
+            .collect::<Vec<_>>();
+        assert!(op_roots.contains(&(
+            Some(fp_storage),
+            StackAddressRoot {
+                base: StackAddressBase::FramePointer,
+                offset: 0,
+            },
+        )));
+        assert!(op_roots.contains(&(
+            Some(sp_storage),
+            StackAddressRoot {
+                base: StackAddressBase::StackPointer,
+                offset: -0x20,
+            },
+        )));
+        assert!(op_roots.iter().any(|(_, root)| {
+            *root
+                == StackAddressRoot {
+                    base: StackAddressBase::StackPointer,
+                    offset: -0x18,
+                }
+        }));
+        assert!(op_roots.iter().any(|(_, root)| {
+            *root
+                == StackAddressRoot {
+                    base: StackAddressBase::FramePointer,
+                    offset: -0x10,
+                }
+        }));
+
+        let source_free = SsaArtifact::for_decompile(&blocks, Some(&arch))
+            .expect("source-free decompile artifact");
+        assert!(
+            source_free
+                .function()
+                .decompile_prep_facts()
+                .expect("source-free facts")
+                .stack_address_roots
+                .is_empty(),
+            "register names and architecture storage alone cannot grant stack roots"
         );
     }
 

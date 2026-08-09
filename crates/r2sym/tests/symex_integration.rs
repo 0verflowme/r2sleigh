@@ -1203,7 +1203,7 @@ fn compile_function_semantics_prunes_self_xor_dead_branch() {
         &func,
         None,
         Some(&arch),
-        &std::collections::HashMap::new(),
+        &r2sym::FunctionSymbolSnapshot::default(),
         r2sym::SummaryProfile::Default,
     );
     let region = region_for_anchor(&artifact, 0x1000);
@@ -1320,7 +1320,7 @@ fn compile_function_semantics_with_scope_prunes_helper_return_dead_branch() {
         &root,
         Some(&scope),
         Some(&arch),
-        &std::collections::HashMap::new(),
+        &r2sym::FunctionSymbolSnapshot::default(),
         r2sym::SummaryProfile::Default,
     );
     let region = region_for_anchor(&artifact, 0x1004);
@@ -1436,7 +1436,7 @@ fn compile_function_semantics_with_scope_marks_helper_scope_compiled() {
         &root,
         Some(&scope),
         Some(&arch),
-        &std::collections::HashMap::new(),
+        &r2sym::FunctionSymbolSnapshot::default(),
         r2sym::SummaryProfile::Default,
     );
 
@@ -1567,7 +1567,7 @@ fn compile_function_semantics_with_scope_prunes_helper_return_spilled_dead_branc
         &root,
         Some(&scope),
         Some(&arch),
-        &std::collections::HashMap::new(),
+        &r2sym::FunctionSymbolSnapshot::default(),
         r2sym::SummaryProfile::Default,
     );
     let region = region_for_anchor(&artifact, 0x1004);
@@ -1683,7 +1683,7 @@ fn compile_function_semantics_with_scope_prunes_helper_return_dead_branch_via_ea
         &root,
         Some(&scope),
         Some(&arch),
-        &std::collections::HashMap::new(),
+        &r2sym::FunctionSymbolSnapshot::default(),
         r2sym::SummaryProfile::Default,
     );
     let region = region_for_anchor(&artifact, 0x1004);

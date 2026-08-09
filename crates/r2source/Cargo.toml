@@ -1,0 +1,13 @@
+[package]
+name = "r2source"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Opaque ownership for coherent reverse-engineering source snapshots"
+
+[dependencies]
+r2il = { path = "../r2il" }
+serde.workspace = true
+
+[lints.rust]
+unsafe_code = "deny"

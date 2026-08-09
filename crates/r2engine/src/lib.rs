@@ -80,6 +80,8 @@ pub const AUTO_CALLBACK_MAX_LINEAR_SIZE: u64 = 256 * 1024;
 pub const SYMBOLIC_SCOPE_MAX_FUNCTIONS: usize = 32;
 pub const RUNTIME_MATERIALIZED_MAX_BYTES: u64 = 0x4000;
 pub const RUNTIME_MATERIALIZED_SLOT_BYTES: u64 = 16;
+const MISSING_SOURCE_SNAPSHOT_REFUSAL: &str =
+    "engine analysis requires an immutable source snapshot";
 
 /// Immutable, source-owned interface facts for one exact lifted revision.
 ///
@@ -2605,6 +2607,8 @@ impl EngineMetrics {
 #[derive(Debug, Clone)]
 pub struct EngineAnalysis {
     pub ssa_func: Arc<SsaArtifact>,
+    /// Transitional alias of `ssa_func` retained while callers migrate away
+    /// from the former context-free pattern-analysis artifact.
     pub pattern_ssa_func: Arc<SsaArtifact>,
 }
 
@@ -3616,6 +3620,11 @@ pub fn interproc_runtime_materialized_sources(
 #[derive(Debug, Clone)]
 pub struct EngineAnalysisArtifact {
     pub ssa_func: Arc<SsaArtifact>,
+    /// Certifying view of `ssa_func`, available only for the unmodified
+    /// source-retaining trusted preparation path.
+    pub trusted_ssa: Option<Arc<r2ssa::TrustedSsaArtifact>>,
+    /// Transitional alias of `ssa_func`; production analysis prepares one
+    /// source-aware artifact and shares it across both legacy views.
     pub pattern_ssa_func: Arc<SsaArtifact>,
     pub function_facts: FunctionFacts,
     pub writeback_plan: TypeWritebackPlan,
@@ -3907,6 +3916,7 @@ pub struct EngineAnalyzeRequest {
     pub blocks: Vec<R2ILBlock>,
     pub arch: Option<r2il::ArchSpec>,
     pub source_snapshot: Option<Arc<EngineSourceSnapshot>>,
+    trusted_ssa: Option<Arc<r2ssa::TrustedSsaArtifact>>,
     pub ptr_bits: u32,
     pub semantic_metadata_enabled: bool,
     pub reg_type_hints: HashMap<String, r2types::TypeHint>,
@@ -4136,6 +4146,7 @@ impl EngineAnalyzeRequest {
             blocks: parts.blocks,
             arch: parts.arch,
             source_snapshot: parts.source_snapshot,
+            trusted_ssa: None,
             ptr_bits: parts.ptr_bits,
             semantic_metadata_enabled: parts.semantic_metadata_enabled,
             reg_type_hints: parts.reg_type_hints,
@@ -4154,6 +4165,46 @@ impl EngineAnalyzeRequest {
     pub fn with_execution_control(mut self, execution: EngineExecutionControl) -> Self {
         self.execution = execution;
         self
+    }
+
+    /// Attach one request-local trusted SSA owner.
+    ///
+    /// The exact retained lift replaces every detached identity, block,
+    /// architecture, source snapshot, type hint, external context, scope, and
+    /// precomputed-semantic input. Trusted authority is never inserted into
+    /// the stable analysis cache.
+    pub fn with_trusted_ssa(mut self, trusted: Arc<r2ssa::TrustedSsaArtifact>) -> Self {
+        let function_addr = trusted.source().function().address();
+        self.function_name = format!("fcn_{function_addr:x}");
+        self.function_addr = function_addr;
+        self.blocks = trusted.source_blocks().to_vec();
+        self.arch = Some(trusted.arch_spec().clone());
+        self.ptr_bits = engine_arch_target(self.arch.as_ref()).1;
+        self.source_snapshot = None;
+        self.semantic_metadata_enabled = true;
+        self.reg_type_hints.clear();
+        self.parsed_context = r2types::ParsedExternalContext::default();
+        self.external_context_fallback_hash = 0;
+        self.scope_facts = InterprocScopeFacts::empty();
+        self.interproc_max_iterations = 1;
+        self.symbolic_scope = None;
+        self.precomputed_semantic_artifact = None;
+        self.semantic_mode = EngineSemanticMode::Full;
+        self.include_interproc_summary_set = false;
+        self.trusted_ssa = Some(trusted);
+        self
+    }
+
+    fn with_optional_trusted_ssa(self, trusted: Option<Arc<r2ssa::TrustedSsaArtifact>>) -> Self {
+        match trusted {
+            Some(trusted) => self.with_trusted_ssa(trusted),
+            None => self,
+        }
+    }
+
+    fn canonicalize_trusted(self) -> Self {
+        let trusted = self.trusted_ssa.clone();
+        self.with_optional_trusted_ssa(trusted)
     }
 
     pub fn with_cancellation(mut self, cancellation: EngineCancellationToken) -> Self {
@@ -4236,6 +4287,7 @@ pub struct EngineAnalyzeResponse {
 struct EngineDecompileRequest {
     pub function_name: String,
     pub prepared_ssa: Arc<SsaArtifact>,
+    pub trusted_ssa: Option<Arc<r2ssa::TrustedSsaArtifact>>,
     pub function_facts: FunctionFacts,
     pub render_target: EngineRenderTarget,
     pub execution: EngineExecutionControl,
@@ -4259,6 +4311,7 @@ pub struct EngineFunctionDecompileRequestInput {
     symbolic_scope: Option<r2sym::PreparedFunctionScope>,
     input_quality: EngineFunctionInputQuality,
     execution: EngineExecutionControl,
+    trusted_ssa: Option<Arc<r2ssa::TrustedSsaArtifact>>,
 }
 
 impl EngineFunctionDecompileRequestInput {
@@ -4279,6 +4332,7 @@ impl EngineFunctionDecompileRequestInput {
             symbolic_scope: None,
             input_quality: EngineFunctionInputQuality::complete(function_block_count),
             execution: EngineExecutionControl::default(),
+            trusted_ssa: None,
         }
     }
 
@@ -4302,6 +4356,11 @@ impl EngineFunctionDecompileRequestInput {
 
     pub fn with_execution_control(mut self, execution: EngineExecutionControl) -> Self {
         self.execution = execution;
+        self
+    }
+
+    pub fn with_trusted_ssa(mut self, trusted: Arc<r2ssa::TrustedSsaArtifact>) -> Self {
+        self.trusted_ssa = Some(trusted);
         self
     }
 
@@ -4339,6 +4398,7 @@ impl EngineFunctionDecompileRequestInput {
 
 impl EngineFunctionDecompileRequest {
     pub(crate) fn full_semantics_for_function(input: EngineFunctionDecompileRequestInput) -> Self {
+        let trusted_ssa = input.trusted_ssa;
         Self {
             input_quality: Some(input.input_quality),
             analysis: EngineAnalyzeRequest::full_semantics_for_function(
@@ -4355,7 +4415,8 @@ impl EngineFunctionDecompileRequest {
                     include_interproc_summary_set: true,
                 },
             )
-            .with_execution_control(input.execution),
+            .with_execution_control(input.execution)
+            .with_optional_trusted_ssa(trusted_ssa),
         }
     }
 }
@@ -4386,7 +4447,7 @@ pub struct EngineTargetQueryRouteRequest<'ctx, 'a> {
     pub compiled: &'a r2sym::SemanticArtifact,
     pub target_addr: u64,
     pub arch: Option<&'a r2il::ArchSpec>,
-    pub symbol_map: &'a HashMap<u64, String>,
+    pub symbols: &'a r2sym::FunctionSymbolSnapshot,
     pub explore_config: r2sym::ExploreConfig,
     pub summary_profile: r2sym::SummaryProfile,
     pub assumption_conflicted: bool,
@@ -4433,7 +4494,7 @@ pub struct EngineSymbolicContextRequest<'ctx, 'a> {
     pub prepared: &'a SsaArtifact,
     pub scope: Option<&'a r2sym::PreparedFunctionScope>,
     pub arch: Option<&'a r2il::ArchSpec>,
-    pub symbol_map: &'a HashMap<u64, String>,
+    pub symbols: &'a r2sym::FunctionSymbolSnapshot,
     pub merge_states: bool,
     pub config_profile: EngineSymbolicConfigProfile,
     pub seed: EngineSymbolicStateSeed<'a>,
@@ -4891,26 +4952,24 @@ impl EngineSession {
 
     pub fn prepare_analysis(
         &self,
-        function_name: &str,
-        blocks: &[R2ILBlock],
-        arch: Option<&r2il::ArchSpec>,
+        _function_name: &str,
+        _blocks: &[R2ILBlock],
+        _arch: Option<&r2il::ArchSpec>,
     ) -> Option<EngineAnalysis> {
-        self.prepare_analysis_shared(function_name, blocks, arch)
-            .map(|analysis| analysis.as_ref().clone())
+        // This legacy boundary cannot name an immutable source revision. It
+        // must therefore refuse instead of creating a source-free authority.
+        None
     }
 
     pub fn prepare_analysis_shared(
         &self,
-        function_name: &str,
-        blocks: &[R2ILBlock],
-        arch: Option<&r2il::ArchSpec>,
+        _function_name: &str,
+        _blocks: &[R2ILBlock],
+        _arch: Option<&r2il::ArchSpec>,
     ) -> Option<Arc<EngineAnalysis>> {
-        let key = function_analysis_cache_key(function_name, arch, blocks, None);
-        if let Some(cached) = self.cached_analysis(&key) {
-            return Some(cached);
-        }
-        let analysis = build_engine_analysis_from_parts(function_name, blocks, arch, None)?;
-        Some(self.insert_analysis(key, analysis))
+        // The checked request API owns source identity and is the only public
+        // path allowed to populate the semantic-analysis cache.
+        None
     }
 
     pub fn analyze(&self, request: EngineAnalyzeRequest) -> Option<EngineAnalyzeResponse> {
@@ -4919,12 +4978,23 @@ impl EngineSession {
 
     pub fn analyze_checked(
         &self,
-        request: EngineAnalyzeRequest,
+        mut request: EngineAnalyzeRequest,
     ) -> Result<EngineAnalyzeResponse, EngineExecutionRefusal> {
+        // Re-derive the complete request at the consumption boundary so a
+        // caller cannot attach authority and then mutate public analysis
+        // fields into a detached configuration.
+        request = request.canonicalize_trusted();
         let started = Instant::now();
         let mut metrics = EngineMetrics::default();
         poll_engine_execution(&request.execution, EnginePhase::SnapshotContext, &metrics)?;
         let phase_started = Instant::now();
+        if request.source_snapshot.is_none() && request.trusted_ssa.is_none() {
+            return Err(engine_execution_refusal(
+                MISSING_SOURCE_SNAPSHOT_REFUSAL.to_string(),
+                EnginePhase::SnapshotContext,
+                metrics,
+            ));
+        }
         let request_key = function_request_key(&request);
         metrics.record_phase(
             EnginePhase::SnapshotContext,
@@ -4945,6 +5015,7 @@ impl EngineSession {
             converged,
             scope_report,
         } = request;
+        let analysis = analysis.canonicalize_trusted();
         let symbolic_scope = analysis.symbolic_scope.clone();
         let response = self.analyze(analysis)?;
         let summary = response
@@ -4991,13 +5062,32 @@ impl EngineSession {
     ) -> Result<EngineAnalyzeResponse, EngineExecutionRefusal> {
         poll_engine_execution(&request.execution, EnginePhase::Ssa, &metrics)?;
         let ssa_started = Instant::now();
-        let analysis_key = function_analysis_cache_key(
-            &request.function_name,
-            request.arch.as_ref(),
-            &request.blocks,
-            request.source_snapshot.as_deref(),
-        );
-        let (analysis, analysis_cache_hit) =
+        let (analysis, analysis_cache_hit) = if let Some(trusted) = request.trusted_ssa.as_ref() {
+            ssa_control
+                .poll()
+                .map_err(|error| ssa_prepare_execution_refusal(error.into(), metrics.clone()))?;
+            let ssa_func = Arc::new(trusted.artifact().clone());
+            (
+                Arc::new(EngineAnalysis {
+                    pattern_ssa_func: Arc::clone(&ssa_func),
+                    ssa_func,
+                }),
+                false,
+            )
+        } else {
+            let Some(source_snapshot) = request.source_snapshot.as_deref() else {
+                return Err(engine_execution_refusal(
+                    MISSING_SOURCE_SNAPSHOT_REFUSAL.to_string(),
+                    EnginePhase::SnapshotContext,
+                    metrics,
+                ));
+            };
+            let analysis_key = function_analysis_cache_key(
+                &request.function_name,
+                request.arch.as_ref(),
+                &request.blocks,
+                Some(source_snapshot),
+            );
             if let Some(cached) = self.cached_analysis(&analysis_key) {
                 (cached, true)
             } else {
@@ -5005,7 +5095,7 @@ impl EngineSession {
                     &request.function_name,
                     &request.blocks,
                     request.arch.as_ref(),
-                    request.source_snapshot.as_deref(),
+                    source_snapshot,
                     ssa_control,
                 ) {
                     Ok(analysis) => analysis,
@@ -5019,7 +5109,8 @@ impl EngineSession {
                     }
                 };
                 (self.insert_analysis(analysis_key, analysis), false)
-            };
+            }
+        };
         let ssa_status = if analysis_cache_hit {
             EnginePhaseStatus::Reused
         } else {
@@ -5086,10 +5177,17 @@ impl EngineSession {
         request: EngineTypeAnalysisRequest,
     ) -> Result<EngineTypeAnalysisResponse, EngineExecutionRefusal> {
         let started = Instant::now();
-        let analysis_request = request.analysis;
+        let analysis_request = request.analysis.canonicalize_trusted();
         let execution = analysis_request.execution.clone();
         let mut preprobe_metrics = EngineMetrics::default();
         poll_engine_execution(&execution, EnginePhase::SnapshotContext, &preprobe_metrics)?;
+        if analysis_request.source_snapshot.is_none() && analysis_request.trusted_ssa.is_none() {
+            return Err(engine_execution_refusal(
+                MISSING_SOURCE_SNAPSHOT_REFUSAL.to_string(),
+                EnginePhase::SnapshotContext,
+                preprobe_metrics,
+            ));
+        }
         preprobe_metrics.record_phase(
             EnginePhase::SnapshotContext,
             EnginePhaseStatus::Executed,
@@ -5224,8 +5322,9 @@ impl EngineSession {
 
     pub fn type_function_report_payload(
         &self,
-        request: EngineFunctionAnalysisReportRequest,
+        mut request: EngineFunctionAnalysisReportRequest,
     ) -> Option<EngineFunctionAnalysisReportPayload> {
+        request.analysis = request.analysis.canonicalize_trusted();
         let function_name = request.analysis.function_name.clone();
         let function_addr = request.analysis.function_addr;
         let response = self.type_function(EngineTypeAnalysisRequest::from_interproc_budget(
@@ -5353,6 +5452,7 @@ impl EngineSession {
         self.decompile(EngineDecompileRequest {
             function_name: display_name,
             prepared_ssa: artifact.ssa_func,
+            trusted_ssa: artifact.trusted_ssa,
             function_facts: artifact.function_facts,
             render_target,
             execution,
@@ -5551,7 +5651,7 @@ impl EngineSession {
                 context.prepared,
                 context.scope,
                 context.arch,
-                context.symbol_map,
+                context.symbols,
                 query_config.summary_profile,
             )
         });
@@ -5668,7 +5768,7 @@ impl EngineSession {
             context.scope,
             request.target_addr,
             context.arch,
-            context.symbol_map,
+            context.symbols,
             query_config.summary_profile,
         );
         symbolic_execution.poll()?;
@@ -5680,7 +5780,7 @@ impl EngineSession {
             compiled: &compiled,
             target_addr: request.target_addr,
             arch: context.arch,
-            symbol_map: context.symbol_map,
+            symbols: context.symbols,
             explore_config: query_config.explore.clone(),
             summary_profile: query_config.summary_profile,
             assumption_conflicted: prepared_assumption_conflicted(context.prepared),
@@ -5742,7 +5842,7 @@ impl EngineSession {
                     context.scope,
                     request.target_addr,
                     context.arch,
-                    context.symbol_map,
+                    context.symbols,
                     query_config.summary_profile,
                     Some(seed),
                 )
@@ -5754,7 +5854,7 @@ impl EngineSession {
                     context.scope,
                     request.target_addr,
                     context.arch,
-                    context.symbol_map,
+                    context.symbols,
                     query_config.summary_profile,
                 )
             }
@@ -5768,7 +5868,7 @@ impl EngineSession {
             compiled: &compiled,
             target_addr: request.target_addr,
             arch: context.arch,
-            symbol_map: context.symbol_map,
+            symbols: context.symbols,
             explore_config: query_config.explore.clone(),
             summary_profile: query_config.summary_profile,
             assumption_conflicted: prepared_assumption_conflicted(context.prepared),
@@ -6024,7 +6124,7 @@ fn install_symbolic_hooks_for_context<'ctx>(
             context.z3_ctx,
             scope,
             context.arch,
-            context.symbol_map,
+            context.symbols.imported_names(),
             symbolic_query_config_for_context(context).summary_profile,
             policy,
         );
@@ -6251,9 +6351,14 @@ fn render_semantic_kernel_function<C: r2ssa::SsaWorkControl + ?Sized>(
     control: &C,
 ) -> Result<EngineSemanticKernelAttempt, EngineRenderExecutionStop> {
     poll_engine_render_control(control, EnginePhase::Rendering)?;
-    if let Ok(function) = r2dec::CertifiedAggregateMemberSemanticCFunction::from_artifact(
-        request.prepared_ssa.as_ref(),
-    ) && let Ok(output) = function.render_certified_c()
+    let Some(trusted) = request.trusted_ssa.as_deref() else {
+        return complete_engine_semantic_kernel_attempt(
+            control,
+            EngineSemanticKernelAttempt::NotApplicable,
+        );
+    };
+    if let Ok(function) = r2dec::CertifiedAggregateMemberSemanticCFunction::from_artifact(trusted)
+        && let Ok(output) = function.render_certified_c()
     {
         return complete_engine_semantic_kernel_attempt(
             control,
@@ -6269,9 +6374,8 @@ fn render_semantic_kernel_function<C: r2ssa::SsaWorkControl + ?Sized>(
         );
     }
     poll_engine_render_control(control, EnginePhase::Rendering)?;
-    if !prepared_artifact_has_source_aggregate_pointer(request.prepared_ssa.as_ref())
-        && let Ok(function) =
-            r2dec::CertifiedMemorySemanticCFunction::from_artifact(request.prepared_ssa.as_ref())
+    if !prepared_artifact_has_source_aggregate_pointer(trusted.artifact())
+        && let Ok(function) = r2dec::CertifiedMemorySemanticCFunction::from_artifact(trusted)
         && let Ok(output) = function.render_certified_c()
     {
         return complete_engine_semantic_kernel_attempt(
@@ -6288,8 +6392,7 @@ fn render_semantic_kernel_function<C: r2ssa::SsaWorkControl + ?Sized>(
         );
     }
     poll_engine_render_control(control, EnginePhase::Rendering)?;
-    if let Ok(function) =
-        r2dec::CertifiedDirectCallReturnFunction::from_artifact(request.prepared_ssa.as_ref())
+    if let Ok(function) = r2dec::CertifiedDirectCallReturnFunction::from_artifact(trusted)
         && let Ok(output) = function.render_certified_c()
     {
         return complete_engine_semantic_kernel_attempt(
@@ -6306,8 +6409,7 @@ fn render_semantic_kernel_function<C: r2ssa::SsaWorkControl + ?Sized>(
         );
     }
     poll_engine_render_control(control, EnginePhase::Rendering)?;
-    if let Ok(function) =
-        r2dec::CertifiedConditionalReturnFunction::from_artifact(request.prepared_ssa.as_ref())
+    if let Ok(function) = r2dec::CertifiedConditionalReturnFunction::from_artifact(trusted)
         && let Ok(output) = function.render_certified_c()
     {
         return complete_engine_semantic_kernel_attempt(
@@ -6324,8 +6426,7 @@ fn render_semantic_kernel_function<C: r2ssa::SsaWorkControl + ?Sized>(
         );
     }
     poll_engine_render_control(control, EnginePhase::Rendering)?;
-    if let Ok(function) =
-        r2dec::CertifiedSwitchReturnFunction::from_artifact(request.prepared_ssa.as_ref())
+    if let Ok(function) = r2dec::CertifiedSwitchReturnFunction::from_artifact(trusted)
         && let Ok(output) = function.render_certified_c()
     {
         return complete_engine_semantic_kernel_attempt(
@@ -6342,8 +6443,7 @@ fn render_semantic_kernel_function<C: r2ssa::SsaWorkControl + ?Sized>(
         );
     }
     poll_engine_render_control(control, EnginePhase::Rendering)?;
-    if let Ok(function) =
-        r2dec::CertifiedLoopReturnFunction::from_artifact(request.prepared_ssa.as_ref())
+    if let Ok(function) = r2dec::CertifiedLoopReturnFunction::from_artifact(trusted)
         && let Ok(output) = function.render_certified_c()
     {
         return complete_engine_semantic_kernel_attempt(
@@ -6360,8 +6460,7 @@ fn render_semantic_kernel_function<C: r2ssa::SsaWorkControl + ?Sized>(
         );
     }
     poll_engine_render_control(control, EnginePhase::Rendering)?;
-    if let Ok(function) =
-        r2dec::CertifiedSemanticCFunction::from_artifact(request.prepared_ssa.as_ref())
+    if let Ok(function) = r2dec::CertifiedSemanticCFunction::from_artifact(trusted)
         && let Ok(output) = function.render_certified_c()
     {
         return complete_engine_semantic_kernel_attempt(
@@ -6537,12 +6636,31 @@ pub fn function_analysis_cache_key(
 }
 
 pub fn function_request_key(request: &EngineAnalyzeRequest) -> EngineRequestKey {
-    let analysis = function_analysis_cache_key(
+    let canonicalized;
+    let request = if request.trusted_ssa.is_some() {
+        canonicalized = request.clone().canonicalize_trusted();
+        &canonicalized
+    } else {
+        request
+    };
+    let mut analysis = function_analysis_cache_key(
         &request.function_name,
         request.arch.as_ref(),
         &request.blocks,
         request.source_snapshot.as_deref(),
     );
+    if let Some(trusted) = request.trusted_ssa.as_ref() {
+        analysis.source_snapshot_schema_version =
+            Some(r2ssa::RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION);
+        analysis.source_revision_identity = Some(
+            trusted
+                .source()
+                .source_revision_identity()
+                .to_vec()
+                .into_boxed_slice(),
+        );
+        analysis.source_payload_identity = Some(trusted.source().diagnostic_identity().value());
+    }
     EngineRequestKey::from_request_hashes(
         analysis,
         request.function_addr,
@@ -6658,25 +6776,24 @@ pub fn rename_engine_analysis_artifact(
     artifact: EngineAnalysisArtifact,
     function_name: &str,
 ) -> EngineAnalysisArtifact {
+    let ssa_func = Arc::new(artifact.ssa_func.as_ref().clone().with_name(function_name));
     EngineAnalysisArtifact {
-        ssa_func: Arc::new(artifact.ssa_func.as_ref().clone().with_name(function_name)),
-        pattern_ssa_func: Arc::new(
-            artifact
-                .pattern_ssa_func
-                .as_ref()
-                .clone()
-                .with_name(function_name),
-        ),
+        pattern_ssa_func: Arc::clone(&ssa_func),
+        ssa_func,
+        // Renaming clones the SSA artifact and therefore intentionally drops
+        // the exact trusted wrapper instead of certifying a divergent owner.
+        trusted_ssa: None,
         function_facts: artifact.function_facts,
         writeback_plan: artifact.writeback_plan,
     }
 }
 
+#[cfg(test)]
 fn build_engine_analysis_from_parts(
     function_name: &str,
     blocks: &[R2ILBlock],
     arch: Option<&r2il::ArchSpec>,
-    source_snapshot: Option<&EngineSourceSnapshot>,
+    source_snapshot: &EngineSourceSnapshot,
 ) -> Option<EngineAnalysis> {
     build_engine_analysis_from_parts_with_control(
         function_name,
@@ -6692,47 +6809,25 @@ fn build_engine_analysis_from_parts_with_control<C: r2ssa::SsaWorkControl + ?Siz
     function_name: &str,
     blocks: &[R2ILBlock],
     arch: Option<&r2il::ArchSpec>,
-    source_snapshot: Option<&EngineSourceSnapshot>,
+    source_snapshot: &EngineSourceSnapshot,
     control: &C,
 ) -> Result<EngineAnalysis, r2ssa::SsaPrepareError> {
     let ssa_func = Arc::new(
-        if let Some(snapshot) = source_snapshot {
-            r2ssa::SsaArtifact::for_decompile_with_interfaces_and_control(
-                blocks,
-                arch,
-                snapshot.function_interface().cloned(),
-                snapshot.call_site_interfaces().to_vec(),
-                control,
-            )?
-        } else {
-            r2ssa::SsaArtifact::for_decompile_with_control(blocks, arch, control)?
-        }
+        r2ssa::SsaArtifact::for_decompile_with_interfaces_and_control(
+            blocks,
+            arch,
+            source_snapshot.function_interface().cloned(),
+            source_snapshot.call_site_interfaces().to_vec(),
+            control,
+        )?
         .with_name(function_name),
     );
     control.poll()?;
-    let pattern_ssa_func = if source_snapshot.is_none()
-        && should_reuse_decompile_ssa_for_pattern_analysis(&ssa_func)
-    {
-        Arc::clone(&ssa_func)
-    } else {
-        Arc::new(
-            r2ssa::SsaArtifact::for_patterns_with_control(blocks, arch, control)?
-                .with_name(function_name),
-        )
-    };
-    control.poll()?;
+    let pattern_ssa_func = Arc::clone(&ssa_func);
     Ok(EngineAnalysis {
         ssa_func,
         pattern_ssa_func,
     })
-}
-
-fn should_reuse_decompile_ssa_for_pattern_analysis(prepared: &r2ssa::SsaArtifact) -> bool {
-    let summary = prepared.function().cfg_risk_summary();
-    summary.block_count >= 96
-        && summary.switch_block_count > 0
-        && summary.max_switch_cases >= 32
-        && summary.back_edge_count == 0
 }
 
 fn callee_linkage_to_summary_linkage(
@@ -6830,41 +6925,39 @@ fn build_engine_analysis_artifact(
     request: &EngineAnalyzeRequest,
     analysis: &EngineAnalysis,
 ) -> Option<EngineAnalysisArtifact> {
+    let trusted_ssa = request
+        .parsed_context
+        .assumptions
+        .is_empty()
+        .then(|| request.trusted_ssa.clone())
+        .flatten();
+    let ssa_func = if request.parsed_context.assumptions.is_empty() {
+        Arc::clone(&analysis.ssa_func)
+    } else {
+        Arc::new(
+            analysis
+                .ssa_func
+                .as_ref()
+                .clone()
+                .with_assumptions(&request.parsed_context.assumptions),
+        )
+    };
+    let semantic_analysis = EngineAnalysis {
+        pattern_ssa_func: Arc::clone(&ssa_func),
+        ssa_func,
+    };
     let interproc_summary_set = request.include_interproc_summary_set.then(|| {
         build_interproc_summary_set_with_scope_facts(InterprocSummaryBuildInput {
             function_name: &request.function_name,
             function_addr: request.function_addr,
             arch: request.arch.as_ref(),
-            analysis,
+            analysis: &semantic_analysis,
             parsed_context: &request.parsed_context,
             scope_facts: &request.scope_facts,
             max_iterations: request.interproc_max_iterations,
             symbolic_scope: request.symbolic_scope.as_ref(),
         })
     });
-    let semantic_analysis = if request.parsed_context.assumptions.is_empty() {
-        EngineAnalysis {
-            ssa_func: Arc::clone(&analysis.ssa_func),
-            pattern_ssa_func: Arc::clone(&analysis.pattern_ssa_func),
-        }
-    } else {
-        EngineAnalysis {
-            ssa_func: Arc::new(
-                analysis
-                    .ssa_func
-                    .as_ref()
-                    .clone()
-                    .with_assumptions(&request.parsed_context.assumptions),
-            ),
-            pattern_ssa_func: Arc::new(
-                analysis
-                    .pattern_ssa_func
-                    .as_ref()
-                    .clone()
-                    .with_assumptions(&request.parsed_context.assumptions),
-            ),
-        }
-    };
     let pattern_ssa_blocks = semantic_analysis.pattern_ssa_func.local_ssa_blocks();
     let (arch_name, _, _) = EngineRenderTarget::for_arch(request.arch.as_ref());
     let signature = infer_signature_from_engine_analysis(
@@ -6874,7 +6967,7 @@ fn build_engine_analysis_artifact(
         request.arch.as_ref(),
         request.semantic_metadata_enabled,
         &request.reg_type_hints,
-        analysis,
+        &semantic_analysis,
     )?;
     let mut diagnostics = r2types::TypeWritebackDiagnostics::default();
     let local_structs = r2types::infer_local_struct_artifacts_from_prepared_views(
@@ -7069,6 +7162,9 @@ fn build_engine_analysis_artifact(
     Some(EngineAnalysisArtifact {
         ssa_func: semantic_analysis.ssa_func,
         pattern_ssa_func: semantic_analysis.pattern_ssa_func,
+        // Trusted capture authority is deliberately request-local and is
+        // never stored in or replayed from the stable analysis cache.
+        trusted_ssa,
         function_facts,
         writeback_plan,
     })
@@ -8258,7 +8354,7 @@ pub fn target_query_route_decision(
             &mut explorer,
             scope,
             request.arch,
-            request.symbol_map,
+            request.symbols.imported_names(),
         );
     }
     r2sym::selected_target_query_route_in_scope(
@@ -8626,6 +8722,13 @@ mod tests {
             target: r2il::Varnode::constant(value, 8),
         });
         vec![block]
+    }
+
+    fn test_source_snapshot(revision: &str) -> Arc<EngineSourceSnapshot> {
+        Arc::new(
+            EngineSourceSnapshot::new(revision.as_bytes().to_vec(), None, Vec::new())
+                .expect("test source snapshot"),
+        )
     }
 
     fn direct_call_return_blocks(addr: u64, target: u64) -> Vec<R2ILBlock> {
@@ -9249,15 +9352,11 @@ mod tests {
         )
     }
 
-    fn assert_handmade_machine_context_refusal(artifact: &r2ssa::SsaArtifact) {
-        assert!(
-            matches!(
-                r2dec::CertifiedSemanticCFunction::from_artifact(artifact),
-                Err(r2dec::CertifiedSemanticCFunctionError::Machine(
-                    r2ssa::MachineBuildError::MachineContextMismatch
-                ))
-            ),
-            "handmade source metadata without exact typed RA and SP must not authorize Certified C"
+    fn assert_handmade_analysis_only(artifact: &r2ssa::SsaArtifact) {
+        assert_ne!(
+            artifact.provenance_kind(),
+            r2ssa::SsaArtifactProvenanceKind::TrustedSource,
+            "caller-authored blocks and interfaces must remain analysis-only"
         );
     }
 
@@ -9276,7 +9375,7 @@ mod tests {
             source_snapshot.call_site_interfaces().to_vec(),
         )
         .expect("handmade fixture remains analyzable");
-        assert_handmade_machine_context_refusal(&artifact);
+        assert_handmade_analysis_only(&artifact);
 
         let response = EngineSession::new(4).decompile_function_from_input(
             EngineFunctionDecompileRequestInput::single_function(
@@ -9340,7 +9439,7 @@ mod tests {
                 .expect("aggregate load interface"),
         )
         .expect("prepared aggregate load");
-        assert_handmade_machine_context_refusal(&prepared_load);
+        assert_handmade_analysis_only(&prepared_load);
 
         let load = EngineSession::new(4).decompile_function_from_input(
             EngineFunctionDecompileRequestInput::single_function(
@@ -9401,7 +9500,7 @@ mod tests {
                 .expect("aggregate near-miss interface"),
         )
         .expect("prepared aggregate near miss");
-        assert_handmade_machine_context_refusal(&prepared_near_miss);
+        assert_handmade_analysis_only(&prepared_near_miss);
         let refused = EngineSession::new(4).decompile_function_from_input(
             EngineFunctionDecompileRequestInput::single_function(
                 EngineFunctionInput {
@@ -9453,7 +9552,7 @@ mod tests {
                 },
             ))
             .expect("prepared call/return analysis");
-        assert_handmade_machine_context_refusal(prepared.artifact.ssa_func.as_ref());
+        assert_handmade_analysis_only(prepared.artifact.ssa_func.as_ref());
         let response = EngineSession::new(4).decompile_function_from_input(
             EngineFunctionDecompileRequestInput::single_function(
                 EngineFunctionInput {
@@ -9543,7 +9642,7 @@ mod tests {
                 },
             ))
             .expect("prepared switch-return analysis");
-        assert_handmade_machine_context_refusal(prepared.artifact.ssa_func.as_ref());
+        assert_handmade_analysis_only(prepared.artifact.ssa_func.as_ref());
 
         let response = EngineSession::new(4).decompile_function_from_input(
             EngineFunctionDecompileRequestInput::single_function(
@@ -9646,7 +9745,7 @@ mod tests {
                 },
             ))
             .expect("prepared carrier-free loop-return analysis");
-        assert_handmade_machine_context_refusal(prepared.artifact.ssa_func.as_ref());
+        assert_handmade_analysis_only(prepared.artifact.ssa_func.as_ref());
 
         let response = EngineSession::new(4).decompile_function_from_input(
             EngineFunctionDecompileRequestInput::single_function(
@@ -9890,6 +9989,7 @@ mod tests {
             blocks,
             arch: None,
             source_snapshot: Some(Arc::new(first)),
+            trusted_ssa: None,
             ptr_bits: 64,
             semantic_metadata_enabled: false,
             reg_type_hints: HashMap::new(),
@@ -10129,43 +10229,110 @@ mod tests {
                 .expect("authoritative call boundary")
                 .complete
         );
-        assert!(
+        assert!(Arc::ptr_eq(
+            &response.artifact.ssa_func,
+            &response.artifact.pattern_ssa_func
+        ));
+        assert_eq!(
             response
                 .artifact
                 .pattern_ssa_func
                 .machine_context()
                 .function_interface()
-                .is_none(),
-            "pattern SSA must remain on the legacy constructor"
+                .expect("shared authoritative function interface")
+                .revision_identity(),
+            revision
         );
     }
 
     #[test]
-    fn absent_source_snapshot_preserves_legacy_prepared_ssa_path() {
+    fn absent_source_snapshot_refuses_without_preparing_or_caching_ssa() {
         let blocks = const_return_blocks(0x401000, 0);
         let arch = x86_64_result_arch();
-        let analysis = build_engine_analysis_from_parts("sym.legacy", &blocks, Some(&arch), None)
-            .expect("legacy engine analysis");
-        let legacy = r2ssa::SsaArtifact::for_decompile(&blocks, Some(&arch))
-            .expect("legacy prepared SSA")
-            .with_name("sym.legacy");
+        let session = EngineSession::new(4);
+        let request =
+            EngineAnalyzeRequest::full_semantics_for_function(EngineAnalyzeFunctionRequestInput {
+                function: EngineFunctionInput {
+                    function_name: "sym.no_snapshot".to_string(),
+                    function_addr: 0x401000,
+                    blocks: blocks.clone(),
+                    arch: Some(arch.clone()),
+                    source_snapshot: None,
+                    semantic_metadata_enabled: false,
+                },
+                ptr_bits: Some(64),
+                reg_type_hints: HashMap::new(),
+                parsed_context: r2types::ParsedExternalContext::default(),
+                external_context_fallback_hash: 0,
+                scope_facts: InterprocScopeFacts::empty(),
+                interproc_max_iterations: 1,
+                symbolic_scope: None,
+                precomputed_semantic_artifact: None,
+                include_interproc_summary_set: false,
+            });
 
-        assert_eq!(analysis.ssa_func.mode(), legacy.mode());
-        assert_eq!(
-            format!("{:?}", analysis.ssa_func.local_ssa_blocks()),
-            format!("{:?}", legacy.local_ssa_blocks())
-        );
-        assert_eq!(
-            analysis.ssa_func.machine_context(),
-            legacy.machine_context()
-        );
+        let refusal = session
+            .analyze_checked(request)
+            .expect_err("missing source snapshot must refuse");
+        assert_eq!(refusal.reason, MISSING_SOURCE_SNAPSHOT_REFUSAL);
+        assert_eq!(refusal.phase, EnginePhase::SnapshotContext);
         assert!(
-            analysis
-                .ssa_func
-                .machine_context()
-                .function_interface()
+            session
+                .prepare_analysis("sym.no_snapshot", &blocks, Some(&arch))
                 .is_none()
         );
+        assert!(
+            session
+                .prepare_analysis_shared("sym.no_snapshot", &blocks, Some(&arch))
+                .is_none()
+        );
+        assert_eq!(session.cache_metrics().analysis, CacheCounters::default());
+    }
+
+    #[test]
+    fn request_assumptions_produce_one_shared_semantic_artifact() {
+        let arch = x86_64_arg_arch();
+        let mut block = R2ILBlock::new(0x401000, 4);
+        block.push(r2il::R2ILOp::Copy {
+            dst: r2il::Varnode::unique(0, 8),
+            src: r2il::Varnode::register(0x10, 8),
+        });
+        block.push(r2il::R2ILOp::Return {
+            target: r2il::Varnode::unique(0, 8),
+        });
+        let mut parsed_context = r2types::ParsedExternalContext::default();
+        parsed_context.assumptions =
+            r2ssa::AssumptionSet::new(vec![cache_register_assumption("rdi-seven", "RDI", 7)]);
+        let response = EngineSession::new(4)
+            .analyze_checked(EngineAnalyzeRequest {
+                function_name: "sym.assumed".to_string(),
+                function_addr: 0x401000,
+                blocks: vec![block],
+                arch: Some(arch),
+                source_snapshot: Some(test_source_snapshot("sym.assumed/rev1")),
+                trusted_ssa: None,
+                ptr_bits: 64,
+                semantic_metadata_enabled: false,
+                reg_type_hints: HashMap::new(),
+                parsed_context,
+                external_context_fallback_hash: 0,
+                scope_facts: InterprocScopeFacts::empty(),
+                interproc_max_iterations: 1,
+                symbolic_scope: None,
+                precomputed_semantic_artifact: None,
+                semantic_mode: EngineSemanticMode::Optional,
+                include_interproc_summary_set: true,
+                execution: EngineExecutionControl::default(),
+            })
+            .expect("assumption-conditioned analysis");
+
+        assert!(Arc::ptr_eq(
+            &response.artifact.ssa_func,
+            &response.artifact.pattern_ssa_func
+        ));
+        let (usage, conditioned) = prepared_assumption_conditioning(&response.artifact.ssa_func);
+        assert!(conditioned);
+        assert_eq!(usage.applied.len(), 1);
     }
 
     fn x86_64_arg_arch() -> r2il::ArchSpec {
@@ -11417,7 +11584,7 @@ mod tests {
             function_addr: 0x401000,
             blocks: const_return_blocks(0x401000, 0),
             arch: None,
-            source_snapshot: None,
+            source_snapshot: Some(test_source_snapshot("sym.builder/rev1")),
             ptr_bits: 64,
             semantic_metadata_enabled: false,
             reg_type_hints: HashMap::new(),
@@ -11456,7 +11623,7 @@ mod tests {
             function_addr: 0x402000,
             blocks: const_return_blocks(0x402000, 0),
             arch: Some(arch),
-            source_snapshot: None,
+            source_snapshot: Some(test_source_snapshot("sym.input_builder/rev1")),
             ptr_bits: None,
             semantic_metadata_enabled: true,
             reg_type_hints: HashMap::new(),
@@ -11494,7 +11661,7 @@ mod tests {
                     function_addr: 0x403000,
                     blocks: const_return_blocks(0x403000, 0),
                     arch: explicit.arch.clone(),
-                    source_snapshot: None,
+                    source_snapshot: Some(test_source_snapshot("sym.grouped/rev1")),
                     semantic_metadata_enabled: false,
                 },
                 ptr_bits: Some(32),
@@ -11517,8 +11684,10 @@ mod tests {
         let mut arch = r2il::ArchSpec::new("amd64");
         arch.addr_size = 8;
         let blocks = const_return_blocks(0x401000, 0);
-        let analysis = build_engine_analysis_from_parts("sym.owner", &blocks, Some(&arch), None)
-            .expect("analysis");
+        let snapshot = test_source_snapshot("sym.owner/rev1");
+        let analysis =
+            build_engine_analysis_from_parts("sym.owner", &blocks, Some(&arch), &snapshot)
+                .expect("analysis");
 
         let signature = infer_signature_from_analysis(EngineSignatureInferenceRequest {
             function_name: "sym.owner",
@@ -11592,7 +11761,7 @@ mod tests {
                 function_addr: 0x401000,
                 blocks: vec![block],
                 arch: None,
-                source_snapshot: None,
+                source_snapshot: Some(test_source_snapshot("sym.hints/rev1")),
                 semantic_metadata_enabled: true,
             },
             ptr_bits: Some(64),
@@ -11646,8 +11815,9 @@ mod tests {
             src: ptr_reg,
         });
         let blocks = vec![block];
+        let snapshot = test_source_snapshot("sym.sig_hints/rev1");
         let analysis =
-            build_engine_analysis_from_parts("sym.sig_hints", &blocks, Some(&arch), None)
+            build_engine_analysis_from_parts("sym.sig_hints", &blocks, Some(&arch), &snapshot)
                 .expect("analysis");
 
         let signature = infer_signature_from_analysis_with_register_names(
@@ -12562,7 +12732,8 @@ mod tests {
             function_addr: 0x401000,
             blocks,
             arch: None,
-            source_snapshot: None,
+            source_snapshot: Some(test_source_snapshot("sym.main/rev1")),
+            trusted_ssa: None,
             ptr_bits: 64,
             semantic_metadata_enabled: false,
             reg_type_hints: HashMap::new(),
@@ -12654,7 +12825,8 @@ mod tests {
             function_addr: 0x401000,
             blocks: const_return_blocks(0x401000, 0),
             arch: None,
-            source_snapshot: None,
+            source_snapshot: Some(test_source_snapshot("sym.zero/analyze/rev1")),
+            trusted_ssa: None,
             ptr_bits: 64,
             semantic_metadata_enabled: false,
             reg_type_hints: HashMap::new(),
@@ -12708,7 +12880,7 @@ mod tests {
                     function_addr: 0x401000,
                     blocks: const_return_blocks(0x401000, 0),
                     arch: None,
-                    source_snapshot: None,
+                    source_snapshot: Some(test_source_snapshot("sym.zero/decompile/rev1")),
                     semantic_metadata_enabled: false,
                 },
                 Some(64),
@@ -12737,7 +12909,9 @@ mod tests {
                 function_addr: blocks.first().map(|block| block.addr).unwrap_or(0),
                 blocks,
                 arch: None,
-                source_snapshot: None,
+                source_snapshot: Some(test_source_snapshot(&format!(
+                    "{function_name}/controlled/rev1"
+                ))),
                 semantic_metadata_enabled: false,
             },
             ptr_bits: Some(64),
@@ -12798,6 +12972,7 @@ mod tests {
         EngineDecompileRequest {
             function_name: "sym.r2dec_controlled".to_string(),
             prepared_ssa: Arc::new(prepared),
+            trusted_ssa: None,
             function_facts,
             render_target: EngineRenderTarget::default(),
             execution: EngineExecutionControl::default(),
@@ -12844,6 +13019,7 @@ mod tests {
         EngineDecompileRequest {
             function_name: "sym.controlled_semantic_kernel".to_string(),
             prepared_ssa: analyzed.artifact.ssa_func,
+            trusted_ssa: analyzed.artifact.trusted_ssa,
             function_facts,
             render_target,
             execution: EngineExecutionControl::default(),
@@ -12891,6 +13067,7 @@ mod tests {
         EngineDecompileRequest {
             function_name: "sym.controlled_aggregate_member".to_string(),
             prepared_ssa: analyzed.artifact.ssa_func,
+            trusted_ssa: analyzed.artifact.trusted_ssa,
             function_facts,
             render_target,
             execution: EngineExecutionControl::default(),
@@ -12942,7 +13119,7 @@ mod tests {
     fn legacy_route_metadata_cannot_promote_handmade_fixtures() {
         let session = EngineSession::new(4);
         let mut terminal = controlled_semantic_kernel_render_request(&session);
-        assert_handmade_machine_context_refusal(terminal.prepared_ssa.as_ref());
+        assert_handmade_analysis_only(terminal.prepared_ssa.as_ref());
         terminal
             .function_facts
             .set_decompile_route(Some(test_decompile_route(
@@ -13224,7 +13401,7 @@ mod tests {
     fn handmade_terminal_cannot_reach_semantic_kernel_renderer() {
         let session = EngineSession::new(4);
         let request = controlled_semantic_kernel_render_request(&session);
-        assert_handmade_machine_context_refusal(request.prepared_ssa.as_ref());
+        assert_handmade_analysis_only(request.prepared_ssa.as_ref());
         let refused =
             session.decompile_with_r2dec_control(request, &r2ssa::SsaExecutionControl::default());
         assert!(refused.diagnostics.semantic_kernel_render.is_none());
@@ -13235,7 +13412,7 @@ mod tests {
     fn handmade_aggregate_member_cannot_reach_semantic_kernel_renderer() {
         let session = EngineSession::new(4);
         let request = controlled_aggregate_member_render_request(&session);
-        assert_handmade_machine_context_refusal(request.prepared_ssa.as_ref());
+        assert_handmade_analysis_only(request.prepared_ssa.as_ref());
         let refused =
             session.decompile_with_r2dec_control(request, &r2ssa::SsaExecutionControl::default());
         assert!(refused.diagnostics.semantic_kernel_render.is_none());
@@ -13387,26 +13564,32 @@ mod tests {
     #[test]
     fn controlled_ssa_build_is_unchanged_and_cache_hits_skip_worklist_polling() {
         let blocks = const_return_blocks(0x613000, 11);
-        let legacy = build_engine_analysis_from_parts("sym.ssa_same", &blocks, None, None)
-            .expect("legacy analysis");
+        let snapshot = test_source_snapshot("sym.ssa_same/rev1");
+        let prepared = build_engine_analysis_from_parts("sym.ssa_same", &blocks, None, &snapshot)
+            .expect("snapshot-backed analysis");
         let controlled = build_engine_analysis_from_parts_with_control(
             "sym.ssa_same",
             &blocks,
             None,
-            None,
+            &snapshot,
             &r2ssa::SsaExecutionControl::default(),
         )
         .expect("controlled analysis");
-        assert_eq!(legacy.ssa_func.graph(), controlled.ssa_func.graph());
-        assert_eq!(legacy.ssa_func.facts(), controlled.ssa_func.facts());
+        assert_eq!(prepared.ssa_func.graph(), controlled.ssa_func.graph());
+        assert_eq!(prepared.ssa_func.facts(), controlled.ssa_func.facts());
         assert_eq!(
-            legacy.pattern_ssa_func.graph(),
+            prepared.pattern_ssa_func.graph(),
             controlled.pattern_ssa_func.graph()
         );
         assert_eq!(
-            legacy.pattern_ssa_func.facts(),
+            prepared.pattern_ssa_func.facts(),
             controlled.pattern_ssa_func.facts()
         );
+        assert!(Arc::ptr_eq(&prepared.ssa_func, &prepared.pattern_ssa_func));
+        assert!(Arc::ptr_eq(
+            &controlled.ssa_func,
+            &controlled.pattern_ssa_func
+        ));
 
         let session = EngineSession::new(4);
         let request = controlled_ssa_test_request("sym.ssa_cached", blocks);
@@ -13454,7 +13637,7 @@ mod tests {
                     function_addr: 0x401000,
                     blocks: const_return_blocks(0x401000, 0),
                     arch: None,
-                    source_snapshot: None,
+                    source_snapshot: Some(test_source_snapshot("sym.cancelled/rev1")),
                     semantic_metadata_enabled: false,
                 },
                 ptr_bits: Some(64),
@@ -13499,7 +13682,7 @@ mod tests {
                 function_addr: 0x401000,
                 blocks: const_return_blocks(0x401000, 0),
                 arch: None,
-                source_snapshot: None,
+                source_snapshot: Some(test_source_snapshot("sym.expired/rev1")),
                 semantic_metadata_enabled: false,
             },
             Some(64),
@@ -13544,7 +13727,7 @@ mod tests {
                 function_addr: 0x401000,
                 blocks: const_return_blocks(0x401000, 7),
                 arch: None,
-                source_snapshot: None,
+                source_snapshot: Some(test_source_snapshot("sym.combined/rev1")),
                 semantic_metadata_enabled: false,
             },
             Some(64),
@@ -13638,12 +13821,13 @@ mod tests {
     fn session_cache_metrics_track_hits_misses_and_evictions() {
         let session = EngineSession::new(2);
         let blocks = const_return_blocks(0x1000, 0);
-        let key1 = function_analysis_cache_key("a", None, &blocks, None);
-        let key2 = function_analysis_cache_key("b", None, &blocks, None);
-        let key3 = function_analysis_cache_key("c", None, &blocks, None);
-        let analysis1 = build_engine_analysis_from_parts("a", &blocks, None, None).expect("a");
-        let analysis2 = build_engine_analysis_from_parts("b", &blocks, None, None).expect("b");
-        let analysis3 = build_engine_analysis_from_parts("c", &blocks, None, None).expect("c");
+        let snapshot = test_source_snapshot("cache-metrics/rev1");
+        let key1 = function_analysis_cache_key("a", None, &blocks, Some(&snapshot));
+        let key2 = function_analysis_cache_key("b", None, &blocks, Some(&snapshot));
+        let key3 = function_analysis_cache_key("c", None, &blocks, Some(&snapshot));
+        let analysis1 = build_engine_analysis_from_parts("a", &blocks, None, &snapshot).expect("a");
+        let analysis2 = build_engine_analysis_from_parts("b", &blocks, None, &snapshot).expect("b");
+        let analysis3 = build_engine_analysis_from_parts("c", &blocks, None, &snapshot).expect("c");
 
         assert!(session.cached_analysis(&key1).is_none());
         session.insert_analysis(key1.clone(), analysis1);
@@ -13669,10 +13853,19 @@ mod tests {
     fn session_cache_metrics_track_only_reusable_analysis() {
         let session = EngineSession::new(4);
         let blocks = const_return_blocks(0x2000, 0);
-        let analysis =
-            AnalysisCacheKey::from_parts(0x2000, "a", None, &blocks, 1, 2, "types-only", None);
+        let snapshot = test_source_snapshot("cache-reuse/rev1");
+        let analysis = AnalysisCacheKey::from_parts(
+            0x2000,
+            "a",
+            None,
+            &blocks,
+            1,
+            2,
+            "types-only",
+            Some(&snapshot),
+        );
         let reusable =
-            build_engine_analysis_from_parts("a", &blocks, None, None).expect("analysis");
+            build_engine_analysis_from_parts("a", &blocks, None, &snapshot).expect("analysis");
 
         assert!(session.cached_analysis(&analysis).is_none());
         session.insert_analysis(analysis.clone(), reusable);
@@ -13681,132 +13874,6 @@ mod tests {
         let metrics = session.cache_metrics();
         assert_eq!(metrics.analysis.hits, 1);
         assert_eq!(metrics.analysis.misses, 1);
-    }
-
-    #[test]
-    fn realistic_session_trace_reuses_shared_analysis_without_artifact_cache() {
-        let session = EngineSession::new(8);
-        let blocks = const_return_blocks(0x401000, 7);
-        let first = session
-            .prepare_analysis_shared("sym.session_trace", &blocks, None)
-            .expect("initial SSA analysis");
-        let repeated = session
-            .prepare_analysis_shared("sym.session_trace", &blocks, None)
-            .expect("repeated SSA analysis");
-        assert!(Arc::ptr_eq(&first, &repeated));
-        assert!(Arc::ptr_eq(&first.ssa_func, &repeated.ssa_func));
-
-        let render_request = EngineDecompileRequest {
-            function_name: "sym.session_trace".to_string(),
-            prepared_ssa: Arc::clone(&repeated.ssa_func),
-            function_facts: FunctionFacts::default(),
-            render_target: EngineRenderTarget::default(),
-            execution: EngineExecutionControl::default(),
-            metrics: EngineMetrics::default(),
-        };
-        let decompiler_input = decompiler_input_for_engine_request(&render_request);
-        assert!(Arc::ptr_eq(
-            &repeated.ssa_func,
-            &decompiler_input.prepared_ssa
-        ));
-
-        let analysis_request = EngineAnalyzeRequest {
-            function_name: "sym.session_trace".to_string(),
-            function_addr: 0x401000,
-            blocks: blocks.clone(),
-            arch: None,
-            source_snapshot: None,
-            ptr_bits: 64,
-            semantic_metadata_enabled: false,
-            reg_type_hints: HashMap::new(),
-            parsed_context: r2types::ParsedExternalContext::default(),
-            external_context_fallback_hash: 0,
-            scope_facts: InterprocScopeFacts::empty(),
-            interproc_max_iterations: 1,
-            symbolic_scope: None,
-            precomputed_semantic_artifact: None,
-            semantic_mode: EngineSemanticMode::Optional,
-            include_interproc_summary_set: false,
-            execution: EngineExecutionControl::default(),
-        };
-        let typed = session
-            .type_function(EngineTypeAnalysisRequest {
-                analysis: analysis_request,
-                caller_prefers_bounded_type_plan: false,
-            })
-            .expect("type analysis");
-        assert!(typed.analysis_cache_hit);
-        assert!(typed.metrics.cache_hit);
-
-        let decompiled = session.decompile_function_from_input(
-            EngineFunctionDecompileRequestInput::single_function(
-                EngineFunctionInput {
-                    function_name: "sym.session_trace".to_string(),
-                    function_addr: 0x401000,
-                    blocks,
-                    arch: None,
-                    source_snapshot: None,
-                    semantic_metadata_enabled: false,
-                },
-                Some(64),
-                r2types::ParsedExternalContext::default(),
-                0,
-            ),
-        );
-        assert!(decompiled.metrics.cache_hit);
-
-        let metrics = session.cache_metrics();
-        assert_eq!(
-            metrics.analysis,
-            CacheCounters {
-                hits: 3,
-                misses: 1,
-                insertions: 1,
-                evictions: 0,
-            }
-        );
-        assert_eq!(metrics.total(), metrics.analysis);
-    }
-
-    #[test]
-    fn concurrent_analysis_preparation_keeps_one_resident_arc() {
-        const WORKER_COUNT: usize = 8;
-
-        let session = Arc::new(EngineSession::new(4));
-        let blocks = Arc::new(const_return_blocks(0x402000, 7));
-        let barrier = Arc::new(std::sync::Barrier::new(WORKER_COUNT));
-        let workers = (0..WORKER_COUNT)
-            .map(|_| {
-                let session = Arc::clone(&session);
-                let blocks = Arc::clone(&blocks);
-                let barrier = Arc::clone(&barrier);
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    session
-                        .prepare_analysis_shared("sym.concurrent", &blocks, None)
-                        .expect("concurrent analysis")
-                })
-            })
-            .collect::<Vec<_>>();
-        let prepared = workers
-            .into_iter()
-            .map(|worker| worker.join().expect("analysis preparation worker"))
-            .collect::<Vec<_>>();
-
-        let resident = session
-            .prepare_analysis_shared("sym.concurrent", &blocks, None)
-            .expect("resident analysis");
-        assert!(
-            prepared
-                .iter()
-                .all(|analysis| Arc::ptr_eq(analysis, &resident))
-        );
-        assert!(
-            prepared
-                .iter()
-                .all(|analysis| Arc::ptr_eq(&analysis.ssa_func, &resident.ssa_func))
-        );
-        assert_eq!(session.cache_metrics().analysis.insertions, 1);
     }
 
     #[test]
@@ -14087,22 +14154,23 @@ mod tests {
     fn analysis_cache_refreshes_recency_and_evicts_oldest() {
         let session = EngineSession::new(2);
         let blocks = const_return_blocks(0x1000, 0);
-        let key1 = function_analysis_cache_key("a", None, &blocks, None);
-        let key2 = function_analysis_cache_key("b", None, &blocks, None);
-        let key3 = function_analysis_cache_key("c", None, &blocks, None);
+        let snapshot = test_source_snapshot("cache-recency/rev1");
+        let key1 = function_analysis_cache_key("a", None, &blocks, Some(&snapshot));
+        let key2 = function_analysis_cache_key("b", None, &blocks, Some(&snapshot));
+        let key3 = function_analysis_cache_key("c", None, &blocks, Some(&snapshot));
 
         session.insert_analysis(
             key1.clone(),
-            build_engine_analysis_from_parts("a", &blocks, None, None).expect("a"),
+            build_engine_analysis_from_parts("a", &blocks, None, &snapshot).expect("a"),
         );
         session.insert_analysis(
             key2.clone(),
-            build_engine_analysis_from_parts("b", &blocks, None, None).expect("b"),
+            build_engine_analysis_from_parts("b", &blocks, None, &snapshot).expect("b"),
         );
         assert!(session.cached_analysis(&key1).is_some());
         session.insert_analysis(
             key3.clone(),
-            build_engine_analysis_from_parts("c", &blocks, None, None).expect("c"),
+            build_engine_analysis_from_parts("c", &blocks, None, &snapshot).expect("c"),
         );
 
         assert!(session.cached_analysis(&key1).is_some());
@@ -14248,7 +14316,9 @@ mod tests {
                         function_addr: addr,
                         blocks,
                         arch: None,
-                        source_snapshot: None,
+                        source_snapshot: Some(test_source_snapshot(&format!(
+                            "{name}/decompile/rev1"
+                        ))),
                         semantic_metadata_enabled: false,
                     },
                     Some(64),
@@ -14686,11 +14756,12 @@ mod tests {
     #[test]
     fn engine_owns_interproc_direct_call_target_collection() {
         let arch = windows_x64_runtime_scope_arch();
+        let snapshot = test_source_snapshot("sym.wrapper/rev1");
         let analysis = build_engine_analysis_from_parts(
             "sym.wrapper",
             &direct_call_return_blocks(0x401000, 0x2000),
             Some(&arch),
-            None,
+            &snapshot,
         )
         .expect("analysis");
 
@@ -15140,8 +15211,9 @@ mod tests {
         block.push(r2il::R2ILOp::Return {
             target: r2il::Varnode::constant(0, 8),
         });
+        let snapshot = test_source_snapshot("sym.runtime_seed/rev1");
         let analysis =
-            build_engine_analysis_from_parts("sym.runtime_seed", &[block], Some(&arch), None)
+            build_engine_analysis_from_parts("sym.runtime_seed", &[block], Some(&arch), &snapshot)
                 .expect("analysis");
 
         assert_eq!(
@@ -15177,8 +15249,9 @@ mod tests {
         block.push(r2il::R2ILOp::Call {
             target: r2il::Varnode::constant(0x1800_1000, 8),
         });
+        let snapshot = test_source_snapshot("sym.runtime_seed/gated/rev1");
         let analysis =
-            build_engine_analysis_from_parts("sym.runtime_seed", &[block], Some(&arch), None)
+            build_engine_analysis_from_parts("sym.runtime_seed", &[block], Some(&arch), &snapshot)
                 .expect("analysis");
 
         assert!(
@@ -15226,8 +15299,9 @@ mod tests {
         block.push(r2il::R2ILOp::Return {
             target: r2il::Varnode::constant(0, 8),
         });
+        let snapshot = test_source_snapshot("sym.runtime_copy/rev1");
         let analysis =
-            build_engine_analysis_from_parts("sym.runtime_copy", &[block], Some(&arch), None)
+            build_engine_analysis_from_parts("sym.runtime_copy", &[block], Some(&arch), &snapshot)
                 .expect("analysis");
 
         assert_eq!(
@@ -15272,8 +15346,9 @@ mod tests {
         block.push(r2il::R2ILOp::Call {
             target: r2il::Varnode::constant(0x1800_2000, 8),
         });
+        let snapshot = test_source_snapshot("sym.runtime_copy/rejected/rev1");
         let analysis =
-            build_engine_analysis_from_parts("sym.runtime_copy", &[block], Some(&arch), None)
+            build_engine_analysis_from_parts("sym.runtime_copy", &[block], Some(&arch), &snapshot)
                 .expect("analysis");
 
         assert!(
@@ -15512,7 +15587,8 @@ mod tests {
                     function_addr: 0x55a0,
                     blocks,
                     arch: None,
-                    source_snapshot: None,
+                    source_snapshot: Some(test_source_snapshot("dbg.main/type/rev1")),
+                    trusted_ssa: None,
                     ptr_bits: 64,
                     semantic_metadata_enabled: false,
                     reg_type_hints: HashMap::new(),
@@ -15561,7 +15637,8 @@ mod tests {
                     function_addr: 0x55a0,
                     blocks,
                     arch: None,
-                    source_snapshot: None,
+                    source_snapshot: Some(test_source_snapshot("dbg.main/report/rev1")),
+                    trusted_ssa: None,
                     ptr_bits: 64,
                     semantic_metadata_enabled: false,
                     reg_type_hints: HashMap::new(),
@@ -15607,7 +15684,7 @@ mod tests {
                     function_addr: 0x55a0,
                     blocks: Vec::new(),
                     arch: None,
-                    source_snapshot: None,
+                    source_snapshot: Some(test_source_snapshot("dbg.session/rev1")),
                     semantic_metadata_enabled: false,
                 },
                 ptr_bits: Some(64),
@@ -15647,7 +15724,7 @@ mod tests {
                     function_addr: 0x6600,
                     blocks: Vec::new(),
                     arch: None,
-                    source_snapshot: None,
+                    source_snapshot: Some(test_source_snapshot("dbg.cached/rev1")),
                     semantic_metadata_enabled: false,
                 },
                 ptr_bits: Some(64),
@@ -15685,7 +15762,8 @@ mod tests {
                 function_addr: 0x401000,
                 blocks,
                 arch: None,
-                source_snapshot: None,
+                source_snapshot: Some(test_source_snapshot("dbg.init_node/rev1")),
+                trusted_ssa: None,
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
@@ -15721,7 +15799,7 @@ mod tests {
                 function_addr: 0x401000,
                 blocks,
                 arch: None,
-                source_snapshot: None,
+                source_snapshot: Some(test_source_snapshot("sym.partial/rev1")),
                 semantic_metadata_enabled: false,
             },
             ptr_bits: Some(64),
@@ -15739,6 +15817,7 @@ mod tests {
                 truncated_blocks: 0,
             },
             execution: EngineExecutionControl::default(),
+            trusted_ssa: None,
         });
 
         assert!(
@@ -15791,7 +15870,7 @@ mod tests {
                 function_addr: 0x401000,
                 blocks,
                 arch: None,
-                source_snapshot: None,
+                source_snapshot: Some(test_source_snapshot("sym.inconsistent/rev1")),
                 semantic_metadata_enabled: false,
             },
             ptr_bits: Some(64),
@@ -15802,6 +15881,7 @@ mod tests {
             symbolic_scope: None,
             input_quality: EngineFunctionInputQuality::complete(2),
             execution: EngineExecutionControl::default(),
+            trusted_ssa: None,
         });
 
         assert!(
@@ -15845,7 +15925,7 @@ mod tests {
                 function_addr: 0x401000,
                 blocks: Vec::new(),
                 arch: None,
-                source_snapshot: None,
+                source_snapshot: Some(test_source_snapshot("sym.all_failed/rev1")),
                 semantic_metadata_enabled: false,
             },
             ptr_bits: Some(64),
@@ -15863,6 +15943,7 @@ mod tests {
                 truncated_blocks: 0,
             },
             execution: EngineExecutionControl::default(),
+            trusted_ssa: None,
         });
 
         assert!(
@@ -15905,7 +15986,7 @@ mod tests {
                 function_addr: 0x401000,
                 blocks: Vec::new(),
                 arch: None,
-                source_snapshot: None,
+                source_snapshot: Some(test_source_snapshot("sym.empty/rev1")),
                 semantic_metadata_enabled: false,
             },
             ptr_bits: Some(64),
@@ -15916,6 +15997,7 @@ mod tests {
             symbolic_scope: None,
             input_quality: EngineFunctionInputQuality::complete(0),
             execution: EngineExecutionControl::default(),
+            trusted_ssa: None,
         });
 
         assert!(
@@ -15958,7 +16040,7 @@ mod tests {
                 function_addr: 0x401000,
                 blocks,
                 arch: None,
-                source_snapshot: None,
+                source_snapshot: Some(test_source_snapshot("sym.complete/rev1")),
                 semantic_metadata_enabled: false,
             },
             ptr_bits: Some(64),
@@ -15969,6 +16051,7 @@ mod tests {
             symbolic_scope: None,
             input_quality: EngineFunctionInputQuality::complete(1),
             execution: EngineExecutionControl::default(),
+            trusted_ssa: None,
         });
 
         let quality = response
@@ -16002,7 +16085,8 @@ mod tests {
                 function_addr: 0x401000,
                 blocks,
                 arch: None,
-                source_snapshot: None,
+                source_snapshot: Some(test_source_snapshot("sym.direct_partial/rev1")),
+                trusted_ssa: None,
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
@@ -16052,7 +16136,8 @@ mod tests {
                 function_addr: 0x401000,
                 blocks,
                 arch: None,
-                source_snapshot: None,
+                source_snapshot: Some(test_source_snapshot("dbg.raw_name/rev1")),
+                trusted_ssa: None,
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
@@ -16098,7 +16183,8 @@ mod tests {
                 function_addr: 0x401000,
                 blocks,
                 arch: None,
-                source_snapshot: None,
+                source_snapshot: Some(test_source_snapshot("sym.caller/rev1")),
+                trusted_ssa: None,
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
@@ -16142,7 +16228,8 @@ mod tests {
                 function_addr: 0x401000,
                 blocks,
                 arch: None,
-                source_snapshot: None,
+                source_snapshot: Some(test_source_snapshot("sym.string_const/rev1")),
+                trusted_ssa: None,
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
@@ -16174,7 +16261,7 @@ mod tests {
                     function_addr: 0x401000,
                     blocks: Vec::new(),
                     arch: None,
-                    source_snapshot: None,
+                    source_snapshot: Some(test_source_snapshot("sym.demo/rev1")),
                     semantic_metadata_enabled: false,
                 },
                 ptr_bits: Some(64),
@@ -16185,6 +16272,7 @@ mod tests {
                 symbolic_scope: None,
                 input_quality: EngineFunctionInputQuality::complete(0),
                 execution: EngineExecutionControl::default(),
+                trusted_ssa: None,
             },
         );
 
@@ -16310,7 +16398,7 @@ mod tests {
         )
         .expect("scope");
         let z3_ctx = z3::Context::thread_local();
-        let symbols = HashMap::new();
+        let symbols = r2sym::FunctionSymbolSnapshot::default();
         let session = EngineSession::new(4);
 
         let response = session.symbolic_paths(EngineSymbolicPathsRequest {
@@ -16319,7 +16407,7 @@ mod tests {
                 prepared: &prepared,
                 scope: Some(&scope),
                 arch: None,
-                symbol_map: &symbols,
+                symbols: &symbols,
                 merge_states: false,
                 config_profile: EngineSymbolicConfigProfile::PathListing,
                 seed: EngineSymbolicStateSeed::Default {
@@ -16344,7 +16432,7 @@ mod tests {
         let blocks = const_return_blocks(0x401000, 0);
         let prepared = r2ssa::SsaArtifact::for_symbolic(&blocks, None).expect("prepared");
         let z3_ctx = z3::Context::thread_local();
-        let symbols = HashMap::new();
+        let symbols = r2sym::FunctionSymbolSnapshot::default();
         let cancellation = EngineCancellationToken::default();
         cancellation.cancel();
 
@@ -16355,7 +16443,7 @@ mod tests {
                     prepared: &prepared,
                     scope: None,
                     arch: None,
-                    symbol_map: &symbols,
+                    symbols: &symbols,
                     merge_states: false,
                     config_profile: EngineSymbolicConfigProfile::PathListing,
                     seed: EngineSymbolicStateSeed::Default {
@@ -16473,7 +16561,7 @@ mod tests {
         let conditioned = condition_symbolic_scope_with_assumptions(&scope, &assumptions)
             .expect("conditioned scope");
         let z3_ctx = z3::Context::thread_local();
-        let symbols = HashMap::new();
+        let symbols = r2sym::FunctionSymbolSnapshot::default();
         let session = EngineSession::new(4);
 
         let response = session.symbolic_summary(EngineSymbolicSummaryRequest {
@@ -16482,7 +16570,7 @@ mod tests {
                 prepared: &conditioned.prepared,
                 scope: Some(&conditioned.scope),
                 arch: None,
-                symbol_map: &symbols,
+                symbols: &symbols,
                 merge_states: false,
                 config_profile: EngineSymbolicConfigProfile::PathListing,
                 seed: EngineSymbolicStateSeed::Scope {
@@ -16754,8 +16842,17 @@ mod tests {
     fn cache_lookup_decisions_report_repeated_analysis_reuse() {
         let session = EngineSession::new(4);
         let blocks = const_return_blocks(0x403000, 0);
-        let analysis =
-            AnalysisCacheKey::from_parts(0x403000, "sym.cache", None, &blocks, 1, 2, "aa", None);
+        let snapshot = test_source_snapshot("sym.cache/rev1");
+        let analysis = AnalysisCacheKey::from_parts(
+            0x403000,
+            "sym.cache",
+            None,
+            &blocks,
+            1,
+            2,
+            "aa",
+            Some(&snapshot),
+        );
 
         let miss = session.cached_analysis_with_decision(EngineRequestKind::Decompile, &analysis);
         assert!(miss.value.is_none());
@@ -16763,7 +16860,8 @@ mod tests {
 
         session.insert_analysis(
             analysis.clone(),
-            build_engine_analysis_from_parts("sym.cache", &blocks, None, None).expect("analysis"),
+            build_engine_analysis_from_parts("sym.cache", &blocks, None, &snapshot)
+                .expect("analysis"),
         );
         let hit = session.cached_analysis_with_decision(EngineRequestKind::Decompile, &analysis);
         assert!(hit.value.is_some());

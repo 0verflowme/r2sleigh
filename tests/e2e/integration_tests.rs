@@ -9,6 +9,45 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
+mod ffi_v2;
+
+mod borrowed_snapshot_provider {
+    use super::*;
+
+    fn embedded_dwarf_fixture() -> Option<&'static str> {
+        [
+            "../radare2/test/bins/elf/dwarf5_line_cl",
+            "../../../radare2/test/bins/elf/dwarf5_line_cl",
+        ]
+        .into_iter()
+        .find(|candidate| Path::new(candidate).is_file())
+    }
+
+    #[test]
+    fn embedded_dwarf_function_uses_the_ordinary_borrowed_snapshot_route() {
+        let Some(binary) = embedded_dwarf_fixture() else {
+            eprintln!("Skipping: sibling radare2 DWARF fixture is unavailable");
+            return;
+        };
+        let result = r2_cmd_timeout(
+            binary,
+            "a:sla >/dev/null; aaa; s dbg.new_foo; pdd",
+            Duration::from_secs(120),
+        );
+        result.assert_ok();
+        assert!(
+            result.stdout.contains("sub_1170(void)"),
+            "trusted presentation identity must be address-derived:\n{}",
+            result.stdout
+        );
+        assert!(
+            result.stdout.contains("r2dec residual:"),
+            "unsupported semantics must remain explicit rather than becoming test-shaped C:\n{}",
+            result.stdout
+        );
+    }
+}
+
 // ============================================================================
 // Test fixtures
 // ============================================================================
@@ -168,11 +207,12 @@ mod cli_run {
 // Direct FFI Tests (plugin library)
 // ============================================================================
 mod ffi {
-    use r2il::R2ILOp;
+    use crate::ffi_v2::{
+        ANALYSIS_BLOCK_DEFUSE, ANALYSIS_BLOCK_ESIL, ANALYSIS_BLOCK_MEMORY, ANALYSIS_BLOCK_SSA,
+        V2Library,
+    };
     use serde_json::Value;
     use std::collections::BTreeMap;
-    use std::ffi::{CStr, CString, c_void};
-    use std::os::raw::c_char;
     use std::path::Path;
 
     #[cfg(target_os = "macos")]
@@ -240,118 +280,37 @@ mod ffi {
         base_bytes: &[u8],
         _dec_bytes: &[u8],
     ) -> Option<FfiExports> {
-        unsafe {
-            let lib = libloading::Library::new(PLUGIN_PATH).expect("load plugin");
-            let r2il_arch_init: libloading::Symbol<
-                unsafe extern "C" fn(*const c_char) -> *mut c_void,
-            > = lib.get(b"r2il_arch_init").unwrap();
-            let r2il_is_loaded: libloading::Symbol<unsafe extern "C" fn(*const c_void) -> i32> =
-                lib.get(b"r2il_is_loaded").unwrap();
-            let r2il_lift: libloading::Symbol<
-                unsafe extern "C" fn(*mut c_void, *const u8, usize, u64) -> *mut c_void,
-            > = lib.get(b"r2il_lift").unwrap();
-            let r2il_block_validate: libloading::Symbol<
-                unsafe extern "C" fn(*mut c_void, *const c_void) -> i32,
-            > = lib.get(b"r2il_block_validate").unwrap();
-            let r2il_block_to_esil: libloading::Symbol<
-                unsafe extern "C" fn(*const c_void, *const c_void) -> *mut c_char,
-            > = lib.get(b"r2il_block_to_esil").unwrap();
-            let r2il_block_to_ssa_json: libloading::Symbol<
-                unsafe extern "C" fn(*const c_void, *const c_void) -> *mut c_char,
-            > = lib.get(b"r2il_block_to_ssa_json").unwrap();
-            let r2il_block_defuse_json: libloading::Symbol<
-                unsafe extern "C" fn(*const c_void, *const c_void) -> *mut c_char,
-            > = lib.get(b"r2il_block_defuse_json").unwrap();
-            let r2il_free: libloading::Symbol<unsafe extern "C" fn(*mut c_void)> =
-                lib.get(b"r2il_free").unwrap();
-            let r2il_block_free: libloading::Symbol<unsafe extern "C" fn(*mut c_void)> =
-                lib.get(b"r2il_block_free").unwrap();
-            let r2il_string_free: libloading::Symbol<unsafe extern "C" fn(*mut c_char)> =
-                lib.get(b"r2il_string_free").unwrap();
-
-            let arch_c = CString::new(arch).expect("valid arch");
-            let ctx = r2il_arch_init(arch_c.as_ptr());
-            if ctx.is_null() {
-                eprintln!(
-                    "Skipping {} parity conformance: architecture not built in plugin",
-                    arch
-                );
-                return None;
-            }
-            if r2il_is_loaded(ctx) != 1 {
-                eprintln!(
-                    "Skipping {} parity conformance: architecture not loaded in plugin",
-                    arch
-                );
-                r2il_free(ctx);
-                return None;
-            }
-
-            let base = padded_bytes(base_bytes);
-            let block = r2il_lift(ctx, base.as_ptr(), base.len(), 0x1000);
-            assert!(!block.is_null(), "Failed to lift base fixture for {}", arch);
-            assert_eq!(
-                r2il_block_validate(ctx, block),
-                1,
-                "Lifted base block should validate for {}",
-                arch
-            );
-
-            let esil_ptr = r2il_block_to_esil(ctx, block);
-            assert!(
-                !esil_ptr.is_null(),
-                "esil export should not be null for {}",
-                arch
-            );
-            let esil = CStr::from_ptr(esil_ptr).to_string_lossy().into_owned();
-            r2il_string_free(esil_ptr);
-
-            let ssa_ptr = r2il_block_to_ssa_json(ctx, block);
-            assert!(
-                !ssa_ptr.is_null(),
-                "ssa json export should not be null for {}",
-                arch
-            );
-            let ssa_json = CStr::from_ptr(ssa_ptr).to_string_lossy().into_owned();
-            r2il_string_free(ssa_ptr);
-
-            let defuse_ptr = r2il_block_defuse_json(ctx, block);
-            assert!(
-                !defuse_ptr.is_null(),
-                "defuse json export should not be null for {}",
-                arch
-            );
-            let defuse_json = CStr::from_ptr(defuse_ptr).to_string_lossy().into_owned();
-            r2il_string_free(defuse_ptr);
-
-            r2il_block_free(block);
-
-            r2il_free(ctx);
-
-            let ssa_parsed: Value = serde_json::from_str(&ssa_json).expect("valid ssa json");
-            assert!(
-                ssa_parsed.as_array().is_some(),
-                "ssa json must be an array for {}",
-                arch
-            );
-            let defuse_parsed: Value =
-                serde_json::from_str(&defuse_json).expect("valid defuse json");
-            assert!(
-                defuse_parsed.get("inputs").is_some(),
-                "defuse inputs missing"
-            );
-            assert!(
-                defuse_parsed.get("outputs").is_some(),
-                "defuse outputs missing"
-            );
-            assert!(defuse_parsed.get("live").is_some(), "defuse live missing");
-
-            Some(FfiExports {
-                esil,
-                ssa_json,
-                defuse_json,
-            })
-        }
+        let library = unsafe { V2Library::open(PLUGIN_PATH) };
+        let Some(context) = library.context(arch) else {
+            eprintln!("Skipping {arch} parity conformance: architecture unavailable");
+            return None;
+        };
+        let base = padded_bytes(base_bytes);
+        let block = context.lift(&base, 0x1000);
+        assert!(block.validate(), "lifted block should validate for {arch}");
+        let esil = block.render(ANALYSIS_BLOCK_ESIL, 0);
+        let ssa_json = block.render(ANALYSIS_BLOCK_SSA, 0);
+        let defuse_json = block.render(ANALYSIS_BLOCK_DEFUSE, 0);
+        let ssa_parsed: Value = serde_json::from_str(&ssa_json).expect("valid ssa json");
+        assert!(
+            ssa_parsed.as_array().is_some(),
+            "ssa json must be an array for {arch}"
+        );
+        let defuse_parsed: Value = serde_json::from_str(&defuse_json).expect("valid defuse json");
+        assert!(
+            defuse_parsed.get("inputs").is_some(),
+            "defuse inputs missing"
+        );
+        assert!(
+            defuse_parsed.get("outputs").is_some(),
+            "defuse outputs missing"
+        );
+        assert!(defuse_parsed.get("live").is_some(), "defuse live missing");
+        Some(FfiExports {
+            esil,
+            ssa_json,
+            defuse_json,
+        })
     }
 
     fn assert_ffi_deterministic_for_arch(arch: &str, base_bytes: &[u8], dec_bytes: &[u8]) {
@@ -380,21 +339,6 @@ mod ffi {
         let first_defuse = normalize_json_output(&first.defuse_json);
         let second_defuse = normalize_json_output(&second.defuse_json);
         assert_eq!(first_defuse, second_defuse, "defuse mismatch for {}", arch);
-    }
-
-    fn contains_unsigned_int_meta(value: &Value) -> bool {
-        match value {
-            Value::Object(map) => {
-                if let Some(meta) = map.get("meta").and_then(Value::as_object)
-                    && meta.get("scalar_kind").and_then(Value::as_str) == Some("unsigned_int")
-                {
-                    return true;
-                }
-                map.values().any(contains_unsigned_int_meta)
-            }
-            Value::Array(items) => items.iter().any(contains_unsigned_int_meta),
-            _ => false,
-        }
     }
 
     fn mem_access_has_addr_storage_class(mem_access_json: &str, storage_class: &str) -> bool {
@@ -430,904 +374,112 @@ mod ffi {
     #[test]
     fn lift_xor_instruction() {
         if !require_plugin() {
-            eprintln!("Skipping: plugin not built");
             return;
         }
-
-        unsafe {
-            let lib = libloading::Library::new(PLUGIN_PATH).expect("load plugin");
-
-            let r2il_arch_init: libloading::Symbol<
-                unsafe extern "C" fn(*const c_char) -> *mut std::ffi::c_void,
-            > = lib.get(b"r2il_arch_init").unwrap();
-            let r2il_is_loaded: libloading::Symbol<
-                unsafe extern "C" fn(*const std::ffi::c_void) -> i32,
-            > = lib.get(b"r2il_is_loaded").unwrap();
-            let r2il_lift: libloading::Symbol<
-                unsafe extern "C" fn(
-                    *mut std::ffi::c_void,
-                    *const u8,
-                    usize,
-                    u64,
-                ) -> *mut std::ffi::c_void,
-            > = lib.get(b"r2il_lift").unwrap();
-            let r2il_block_op_count: libloading::Symbol<
-                unsafe extern "C" fn(*const std::ffi::c_void) -> usize,
-            > = lib.get(b"r2il_block_op_count").unwrap();
-            let r2il_block_to_esil: libloading::Symbol<
-                unsafe extern "C" fn(
-                    *const std::ffi::c_void,
-                    *const std::ffi::c_void,
-                ) -> *mut c_char,
-            > = lib.get(b"r2il_block_to_esil").unwrap();
-            let r2il_free: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
-                lib.get(b"r2il_free").unwrap();
-            let r2il_block_free: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
-                lib.get(b"r2il_block_free").unwrap();
-            let r2il_string_free: libloading::Symbol<unsafe extern "C" fn(*mut c_char)> =
-                lib.get(b"r2il_string_free").unwrap();
-
-            // Init x86-64
-            let arch = CString::new("x86-64").unwrap();
-            let ctx = r2il_arch_init(arch.as_ptr());
-            assert!(!ctx.is_null(), "Failed to init arch");
-            assert_eq!(r2il_is_loaded(ctx), 1);
-
-            // Lift "xor eax, eax" (0x31 0xC0)
-            let mut bytes = vec![0x31u8, 0xC0];
-            bytes.resize(16, 0x90);
-
-            let block = r2il_lift(ctx, bytes.as_ptr(), bytes.len(), 0x1000);
-            assert!(!block.is_null(), "Failed to lift");
-
-            let op_count = r2il_block_op_count(block);
-            assert!(op_count > 0, "Should have ops");
-
-            let esil_ptr = r2il_block_to_esil(ctx, block);
-            if !esil_ptr.is_null() {
-                let esil = CStr::from_ptr(esil_ptr).to_string_lossy();
-                assert!(!esil.is_empty(), "ESIL not empty");
-                r2il_string_free(esil_ptr);
-            }
-
-            r2il_block_free(block);
-            r2il_free(ctx);
-        }
+        let library = unsafe { V2Library::open(PLUGIN_PATH) };
+        let Some(context) = library.context("x86-64") else {
+            return;
+        };
+        let block = context.lift(&padded_bytes(&[0x31, 0xc0]), 0x1000);
+        assert!(block.validate());
+        assert!(block.op_count() > 0);
+        assert!(
+            block
+                .render(ANALYSIS_BLOCK_ESIL, 0)
+                .to_ascii_lowercase()
+                .contains("eax")
+        );
     }
 
     #[test]
     fn lift_add_instruction_to_ssa() {
         if !require_plugin() {
-            eprintln!("Skipping: plugin not built");
             return;
         }
-
-        unsafe {
-            let lib = libloading::Library::new(PLUGIN_PATH).expect("load plugin");
-
-            let r2il_arch_init: libloading::Symbol<
-                unsafe extern "C" fn(*const c_char) -> *mut std::ffi::c_void,
-            > = lib.get(b"r2il_arch_init").unwrap();
-            let r2il_lift: libloading::Symbol<
-                unsafe extern "C" fn(
-                    *mut std::ffi::c_void,
-                    *const u8,
-                    usize,
-                    u64,
-                ) -> *mut std::ffi::c_void,
-            > = lib.get(b"r2il_lift").unwrap();
-            let r2il_block_to_ssa_json: libloading::Symbol<
-                unsafe extern "C" fn(
-                    *const std::ffi::c_void,
-                    *const std::ffi::c_void,
-                ) -> *mut c_char,
-            > = lib.get(b"r2il_block_to_ssa_json").unwrap();
-            let r2il_free: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
-                lib.get(b"r2il_free").unwrap();
-            let r2il_block_free: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
-                lib.get(b"r2il_block_free").unwrap();
-            let r2il_string_free: libloading::Symbol<unsafe extern "C" fn(*mut c_char)> =
-                lib.get(b"r2il_string_free").unwrap();
-
-            let arch = CString::new("x86-64").unwrap();
-            let ctx = r2il_arch_init(arch.as_ptr());
-            assert!(!ctx.is_null());
-
-            // "add rax, rbx" (0x48 0x01 0xd8)
-            let mut bytes = vec![0x48u8, 0x01, 0xd8];
-            bytes.resize(16, 0x90);
-
-            let block = r2il_lift(ctx, bytes.as_ptr(), bytes.len(), 0x1000);
-            assert!(!block.is_null());
-
-            let ssa_ptr = r2il_block_to_ssa_json(ctx, block);
-            if !ssa_ptr.is_null() {
-                let ssa = CStr::from_ptr(ssa_ptr).to_string_lossy();
-                assert!(
-                    ssa.contains("op") || ssa.contains("dst") || ssa.contains("["),
-                    "SSA should have structure"
-                );
-                r2il_string_free(ssa_ptr);
-            }
-
-            r2il_block_free(block);
-            r2il_free(ctx);
-        }
-    }
-
-    #[test]
-    fn block_validate_rejects_invalid_semantic_block() {
-        if !require_plugin() {
-            eprintln!("Skipping: plugin not built");
+        let library = unsafe { V2Library::open(PLUGIN_PATH) };
+        let Some(context) = library.context("x86-64") else {
             return;
-        }
-
-        unsafe {
-            let lib = libloading::Library::new(PLUGIN_PATH).expect("load plugin");
-
-            let r2il_arch_init: libloading::Symbol<
-                unsafe extern "C" fn(*const c_char) -> *mut std::ffi::c_void,
-            > = lib.get(b"r2il_arch_init").unwrap();
-            let r2il_lift: libloading::Symbol<
-                unsafe extern "C" fn(
-                    *mut std::ffi::c_void,
-                    *const u8,
-                    usize,
-                    u64,
-                ) -> *mut std::ffi::c_void,
-            > = lib.get(b"r2il_lift").unwrap();
-            let r2il_block_validate: libloading::Symbol<
-                unsafe extern "C" fn(*mut std::ffi::c_void, *const std::ffi::c_void) -> i32,
-            > = lib.get(b"r2il_block_validate").unwrap();
-            let r2il_error: libloading::Symbol<
-                unsafe extern "C" fn(*const std::ffi::c_void) -> *const c_char,
-            > = lib.get(b"r2il_error").unwrap();
-            let r2il_free: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
-                lib.get(b"r2il_free").unwrap();
-            let r2il_block_free: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
-                lib.get(b"r2il_block_free").unwrap();
-
-            let arch = CString::new("x86-64").unwrap();
-            let ctx = r2il_arch_init(arch.as_ptr());
-            assert!(!ctx.is_null(), "Failed to initialize x86-64 context");
-
-            let mut bytes = vec![0x31u8, 0xC0]; // xor eax, eax
-            bytes.resize(16, 0x90);
-            let block = r2il_lift(ctx, bytes.as_ptr(), bytes.len(), 0x1000);
-            assert!(!block.is_null(), "Failed to lift baseline instruction");
-
-            assert_eq!(
-                r2il_block_validate(ctx, block),
-                1,
-                "Freshly lifted block should validate"
-            );
-
-            let block_ref = &mut *(block as *mut r2il::R2ILBlock);
-            let mut mutated = false;
-            for op in &mut block_ref.ops {
-                if let R2ILOp::Copy { src, .. } = op {
-                    src.size = src.size.saturating_add(1);
-                    mutated = true;
-                    break;
-                }
-            }
-            assert!(mutated, "Expected at least one Copy op in xor block");
-
-            assert_eq!(
-                r2il_block_validate(ctx, block),
-                0,
-                "Validation should fail for semantic width mismatch"
-            );
-
-            let err_ptr = r2il_error(ctx);
-            assert!(
-                !err_ptr.is_null(),
-                "Validation failure should populate context error"
-            );
-            let err = CStr::from_ptr(err_ptr).to_string_lossy();
-            assert!(
-                err.contains("op.copy.width_mismatch") && err.contains("block.ops"),
-                "Validation error should mention semantic width issue: {}",
-                err
-            );
-
-            r2il_block_free(block);
-            r2il_free(ctx);
-        }
-    }
-
-    #[test]
-    fn block_validate_rejects_invalid_op_metadata_index() {
-        if !require_plugin() {
-            eprintln!("Skipping: plugin not built");
-            return;
-        }
-
-        unsafe {
-            let lib = libloading::Library::new(PLUGIN_PATH).expect("load plugin");
-
-            let r2il_arch_init: libloading::Symbol<
-                unsafe extern "C" fn(*const c_char) -> *mut std::ffi::c_void,
-            > = lib.get(b"r2il_arch_init").unwrap();
-            let r2il_lift: libloading::Symbol<
-                unsafe extern "C" fn(
-                    *mut std::ffi::c_void,
-                    *const u8,
-                    usize,
-                    u64,
-                ) -> *mut std::ffi::c_void,
-            > = lib.get(b"r2il_lift").unwrap();
-            let r2il_block_validate: libloading::Symbol<
-                unsafe extern "C" fn(*mut std::ffi::c_void, *const std::ffi::c_void) -> i32,
-            > = lib.get(b"r2il_block_validate").unwrap();
-            let r2il_error: libloading::Symbol<
-                unsafe extern "C" fn(*const std::ffi::c_void) -> *const c_char,
-            > = lib.get(b"r2il_error").unwrap();
-            let r2il_free: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
-                lib.get(b"r2il_free").unwrap();
-            let r2il_block_free: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
-                lib.get(b"r2il_block_free").unwrap();
-
-            let arch = CString::new("x86-64").unwrap();
-            let ctx = r2il_arch_init(arch.as_ptr());
-            assert!(!ctx.is_null(), "Failed to initialize x86-64 context");
-
-            let mut bytes = vec![0x31u8, 0xC0]; // xor eax, eax
-            bytes.resize(16, 0x90);
-            let block = r2il_lift(ctx, bytes.as_ptr(), bytes.len(), 0x1000);
-            assert!(!block.is_null(), "Failed to lift baseline instruction");
-
-            assert_eq!(
-                r2il_block_validate(ctx, block),
-                1,
-                "Freshly lifted block should validate"
-            );
-
-            let block_ref = &mut *(block as *mut r2il::R2ILBlock);
-            let invalid_index = block_ref.ops.len();
-            block_ref.set_op_metadata(invalid_index, r2il::OpMetadata::default());
-
-            assert_eq!(
-                r2il_block_validate(ctx, block),
-                0,
-                "Validation should fail for out-of-range op metadata index"
-            );
-
-            let err_ptr = r2il_error(ctx);
-            assert!(
-                !err_ptr.is_null(),
-                "Validation failure should populate context error"
-            );
-            let err = CStr::from_ptr(err_ptr).to_string_lossy();
-            assert!(
-                err.contains("block.op_metadata") && err.contains("index_oob"),
-                "Validation error should mention op_metadata index issue: {}",
-                err
-            );
-
-            r2il_block_free(block);
-            r2il_free(ctx);
-        }
-    }
-
-    #[test]
-    fn op_json_includes_varnode_metadata_when_present() {
-        if !require_plugin() {
-            eprintln!("Skipping: plugin not built");
-            return;
-        }
-
-        unsafe {
-            let lib = libloading::Library::new(PLUGIN_PATH).expect("load plugin");
-
-            let r2il_arch_init: libloading::Symbol<
-                unsafe extern "C" fn(*const c_char) -> *mut std::ffi::c_void,
-            > = lib.get(b"r2il_arch_init").unwrap();
-            let r2il_lift: libloading::Symbol<
-                unsafe extern "C" fn(
-                    *mut std::ffi::c_void,
-                    *const u8,
-                    usize,
-                    u64,
-                ) -> *mut std::ffi::c_void,
-            > = lib.get(b"r2il_lift").unwrap();
-            let r2il_block_op_json_named: libloading::Symbol<
-                unsafe extern "C" fn(
-                    *const std::ffi::c_void,
-                    *const std::ffi::c_void,
-                    usize,
-                ) -> *mut c_char,
-            > = lib.get(b"r2il_block_op_json_named").unwrap();
-            let r2il_free: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
-                lib.get(b"r2il_free").unwrap();
-            let r2il_block_free: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
-                lib.get(b"r2il_block_free").unwrap();
-            let r2il_string_free: libloading::Symbol<unsafe extern "C" fn(*mut c_char)> =
-                lib.get(b"r2il_string_free").unwrap();
-
-            let arch = CString::new("x86-64").unwrap();
-            let ctx = r2il_arch_init(arch.as_ptr());
-            assert!(!ctx.is_null(), "Failed to initialize x86-64 context");
-
-            let mut bytes = vec![0x31u8, 0xC0]; // xor eax, eax
-            bytes.resize(16, 0x90);
-            let block = r2il_lift(ctx, bytes.as_ptr(), bytes.len(), 0x1000);
-            assert!(!block.is_null(), "Failed to lift baseline instruction");
-
-            let mut meta = r2il::VarnodeMetadata::default();
-            meta.scalar_kind = Some(r2il::ScalarKind::UnsignedInt);
-
-            let block_ref = &mut *(block as *mut r2il::R2ILBlock);
-            let mut op_index = None;
-            for (idx, op) in block_ref.ops.iter_mut().enumerate() {
-                if let R2ILOp::Copy { dst, .. } = op {
-                    dst.set_meta(meta.clone());
-                    op_index = Some(idx);
-                    break;
-                }
-            }
-            let op_index = op_index.expect("Expected at least one Copy op in xor block");
-
-            let json_ptr = r2il_block_op_json_named(ctx, block, op_index);
-            assert!(!json_ptr.is_null(), "Expected operation JSON");
-            let json_str = CStr::from_ptr(json_ptr).to_string_lossy().to_string();
-            r2il_string_free(json_ptr);
-
-            let parsed: Value = serde_json::from_str(&json_str).expect("valid operation json");
-            assert!(
-                contains_unsigned_int_meta(&parsed),
-                "operation JSON should include varnode metadata: {}",
-                json_str
-            );
-
-            r2il_block_free(block);
-            r2il_free(ctx);
-        }
+        };
+        let block = context.lift(&padded_bytes(&[0x48, 0x01, 0xd8]), 0x1000);
+        let ssa = block.render(ANALYSIS_BLOCK_SSA, 0);
+        let parsed: Value = serde_json::from_str(&ssa).expect("valid SSA JSON");
+        assert!(parsed.as_array().is_some());
     }
 
     #[test]
     fn lift_auto_populates_semantic_metadata_for_stack_memory() {
         if !require_plugin() {
-            eprintln!("Skipping: plugin not built");
             return;
         }
-
-        unsafe {
-            let lib = libloading::Library::new(PLUGIN_PATH).expect("load plugin");
-            let r2il_arch_init: libloading::Symbol<
-                unsafe extern "C" fn(*const c_char) -> *mut std::ffi::c_void,
-            > = lib.get(b"r2il_arch_init").unwrap();
-            let r2il_lift: libloading::Symbol<
-                unsafe extern "C" fn(
-                    *mut std::ffi::c_void,
-                    *const u8,
-                    usize,
-                    u64,
-                ) -> *mut std::ffi::c_void,
-            > = lib.get(b"r2il_lift").unwrap();
-            let r2il_block_mem_access: libloading::Symbol<
-                unsafe extern "C" fn(
-                    *const std::ffi::c_void,
-                    *const std::ffi::c_void,
-                ) -> *mut c_char,
-            > = lib.get(b"r2il_block_mem_access").unwrap();
-            let r2il_free: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
-                lib.get(b"r2il_free").unwrap();
-            let r2il_block_free: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
-                lib.get(b"r2il_block_free").unwrap();
-            let r2il_string_free: libloading::Symbol<unsafe extern "C" fn(*mut c_char)> =
-                lib.get(b"r2il_string_free").unwrap();
-
-            let arch = CString::new("x86-64").unwrap();
-            let ctx = r2il_arch_init(arch.as_ptr());
-            assert!(!ctx.is_null(), "Failed to initialize x86-64 context");
-
-            // mov rax, qword [rsp]
-            let mut bytes = vec![0x48u8, 0x8b, 0x04, 0x24];
-            bytes.resize(16, 0x90);
-            let block = r2il_lift(ctx, bytes.as_ptr(), bytes.len(), 0x1000);
-            assert!(!block.is_null(), "Failed to lift stack load");
-
-            let mem_ptr = r2il_block_mem_access(ctx, block);
-            assert!(!mem_ptr.is_null(), "Expected mem-access JSON");
-            let mem_json = CStr::from_ptr(mem_ptr).to_string_lossy().to_string();
-            r2il_string_free(mem_ptr);
-            assert!(
-                mem_access_has_addr_storage_class(&mem_json, "stack")
-                    && mem_access_has_addr_pointer_hint(&mem_json, "pointer_like"),
-                "Automatic metadata should populate stack/pointer addr metadata: {}",
-                mem_json
-            );
-
-            r2il_block_free(block);
-            r2il_free(ctx);
-        }
+        let library = unsafe { V2Library::open(PLUGIN_PATH) };
+        let Some(context) = library.context("x86-64") else {
+            return;
+        };
+        let block = context.lift(&padded_bytes(&[0x48, 0x8b, 0x04, 0x24]), 0x1000);
+        let memory = block.render(ANALYSIS_BLOCK_MEMORY, 0);
+        assert!(mem_access_has_addr_storage_class(&memory, "stack"));
+        assert!(mem_access_has_addr_pointer_hint(&memory, "pointer_like"));
     }
 
     #[test]
     fn lift_respects_semantic_metadata_disable_toggle() {
         if !require_plugin() {
-            eprintln!("Skipping: plugin not built");
             return;
         }
-
-        unsafe {
-            let lib = libloading::Library::new(PLUGIN_PATH).expect("load plugin");
-            let r2il_arch_init: libloading::Symbol<
-                unsafe extern "C" fn(*const c_char) -> *mut std::ffi::c_void,
-            > = lib.get(b"r2il_arch_init").unwrap();
-            let r2il_set_semantic_metadata_enabled: libloading::Symbol<
-                unsafe extern "C" fn(*mut std::ffi::c_void, bool),
-            > = lib.get(b"r2il_set_semantic_metadata_enabled").unwrap();
-            let r2il_lift: libloading::Symbol<
-                unsafe extern "C" fn(
-                    *mut std::ffi::c_void,
-                    *const u8,
-                    usize,
-                    u64,
-                ) -> *mut std::ffi::c_void,
-            > = lib.get(b"r2il_lift").unwrap();
-            let r2il_block_mem_access: libloading::Symbol<
-                unsafe extern "C" fn(
-                    *const std::ffi::c_void,
-                    *const std::ffi::c_void,
-                ) -> *mut c_char,
-            > = lib.get(b"r2il_block_mem_access").unwrap();
-            let r2il_free: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
-                lib.get(b"r2il_free").unwrap();
-            let r2il_block_free: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
-                lib.get(b"r2il_block_free").unwrap();
-            let r2il_string_free: libloading::Symbol<unsafe extern "C" fn(*mut c_char)> =
-                lib.get(b"r2il_string_free").unwrap();
-
-            let arch = CString::new("x86-64").unwrap();
-            let ctx = r2il_arch_init(arch.as_ptr());
-            assert!(!ctx.is_null(), "Failed to initialize x86-64 context");
-
-            // mov rax, qword [rsp]
-            let mut bytes = vec![0x48u8, 0x8b, 0x04, 0x24];
-            bytes.resize(16, 0x90);
-
-            let enabled_block = r2il_lift(ctx, bytes.as_ptr(), bytes.len(), 0x1000);
-            assert!(
-                !enabled_block.is_null(),
-                "Failed to lift baseline stack load with metadata enabled"
-            );
-            let enabled_mem_ptr = r2il_block_mem_access(ctx, enabled_block);
-            assert!(
-                !enabled_mem_ptr.is_null(),
-                "Expected enabled mem-access JSON"
-            );
-            let enabled_json = CStr::from_ptr(enabled_mem_ptr)
-                .to_string_lossy()
-                .to_string();
-            r2il_string_free(enabled_mem_ptr);
-            assert!(
-                mem_access_has_addr_storage_class(&enabled_json, "stack")
-                    && mem_access_has_addr_pointer_hint(&enabled_json, "pointer_like"),
-                "Enabled path should include semantic addr metadata: {}",
-                enabled_json
-            );
-            r2il_block_free(enabled_block);
-
-            r2il_set_semantic_metadata_enabled(ctx, false);
-            let disabled_block = r2il_lift(ctx, bytes.as_ptr(), bytes.len(), 0x2000);
-            assert!(
-                !disabled_block.is_null(),
-                "Failed to lift stack load with metadata disabled"
-            );
-            let disabled_mem_ptr = r2il_block_mem_access(ctx, disabled_block);
-            assert!(
-                !disabled_mem_ptr.is_null(),
-                "Expected disabled mem-access JSON"
-            );
-            let disabled_json = CStr::from_ptr(disabled_mem_ptr)
-                .to_string_lossy()
-                .to_string();
-            r2il_string_free(disabled_mem_ptr);
-            assert!(
-                !mem_access_has_addr_storage_class(&disabled_json, "stack")
-                    && !mem_access_has_addr_pointer_hint(&disabled_json, "pointer_like"),
-                "Disabled path should suppress semantic addr metadata: {}",
-                disabled_json
-            );
-
-            r2il_block_free(disabled_block);
-            r2il_free(ctx);
+        let library = unsafe { V2Library::open(PLUGIN_PATH) };
+        let Some(context) = library.context("x86-64") else {
+            return;
+        };
+        let bytes = padded_bytes(&[0x48, 0x8b, 0x04, 0x24]);
+        {
+            let enabled = context.lift(&bytes, 0x1000);
+            let memory = enabled.render(ANALYSIS_BLOCK_MEMORY, 0);
+            assert!(mem_access_has_addr_storage_class(&memory, "stack"));
+            assert!(mem_access_has_addr_pointer_hint(&memory, "pointer_like"));
         }
+        context.set_semantic_metadata(false);
+        let disabled = context.lift(&bytes, 0x2000);
+        let memory = disabled.render(ANALYSIS_BLOCK_MEMORY, 0);
+        assert!(!mem_access_has_addr_storage_class(&memory, "stack"));
+        assert!(!mem_access_has_addr_pointer_hint(&memory, "pointer_like"));
     }
 
-    #[test]
-    fn block_validate_rejects_invalid_guarded_memory_op() {
-        if !require_plugin() {
-            eprintln!("Skipping: plugin not built");
+    fn assert_riscv_lift(arch: &str) {
+        let library = unsafe { V2Library::open(PLUGIN_PATH) };
+        let Some(context) = library.context(arch) else {
+            eprintln!("Skipping: plugin built without {arch} support");
             return;
-        }
-
-        unsafe {
-            let lib = libloading::Library::new(PLUGIN_PATH).expect("load plugin");
-
-            let r2il_arch_init: libloading::Symbol<
-                unsafe extern "C" fn(*const c_char) -> *mut std::ffi::c_void,
-            > = lib.get(b"r2il_arch_init").unwrap();
-            let r2il_lift: libloading::Symbol<
-                unsafe extern "C" fn(
-                    *mut std::ffi::c_void,
-                    *const u8,
-                    usize,
-                    u64,
-                ) -> *mut std::ffi::c_void,
-            > = lib.get(b"r2il_lift").unwrap();
-            let r2il_block_validate: libloading::Symbol<
-                unsafe extern "C" fn(*mut std::ffi::c_void, *const std::ffi::c_void) -> i32,
-            > = lib.get(b"r2il_block_validate").unwrap();
-            let r2il_error: libloading::Symbol<
-                unsafe extern "C" fn(*const std::ffi::c_void) -> *const c_char,
-            > = lib.get(b"r2il_error").unwrap();
-            let r2il_free: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
-                lib.get(b"r2il_free").unwrap();
-            let r2il_block_free: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
-                lib.get(b"r2il_block_free").unwrap();
-
-            let arch = CString::new("x86-64").unwrap();
-            let ctx = r2il_arch_init(arch.as_ptr());
-            assert!(!ctx.is_null(), "Failed to initialize x86-64 context");
-
-            let mut bytes = vec![0x31u8, 0xC0];
-            bytes.resize(16, 0x90);
-            let block = r2il_lift(ctx, bytes.as_ptr(), bytes.len(), 0x1000);
-            assert!(!block.is_null(), "Failed to lift baseline instruction");
-
-            let block_ref = &mut *(block as *mut r2il::R2ILBlock);
-            block_ref.ops.clear();
-            block_ref.push(r2il::R2ILOp::LoadGuarded {
-                dst: r2il::Varnode::register(0, 8),
-                space: r2il::SpaceId::Ram,
-                addr: r2il::Varnode::register(8, 8),
-                guard: r2il::Varnode::register(16, 8),
-                ordering: r2il::MemoryOrdering::Relaxed,
-            });
-
-            assert_eq!(
-                r2il_block_validate(ctx, block),
-                0,
-                "Validation should fail for invalid guarded load guard size"
-            );
-            let err_ptr = r2il_error(ctx);
-            assert!(!err_ptr.is_null(), "Expected validation error");
-            let err = CStr::from_ptr(err_ptr).to_string_lossy();
-            assert!(
-                err.contains("op.load_guarded.guard_size"),
-                "Expected guarded-load validation issue, got: {}",
-                err
-            );
-
-            r2il_block_free(block);
-            r2il_free(ctx);
-        }
-    }
-
-    #[test]
-    fn mem_access_json_includes_additive_memory_semantics_fields() {
-        if !require_plugin() {
-            eprintln!("Skipping: plugin not built");
-            return;
-        }
-
-        unsafe {
-            let lib = libloading::Library::new(PLUGIN_PATH).expect("load plugin");
-
-            let r2il_arch_init: libloading::Symbol<
-                unsafe extern "C" fn(*const c_char) -> *mut std::ffi::c_void,
-            > = lib.get(b"r2il_arch_init").unwrap();
-            let r2il_lift: libloading::Symbol<
-                unsafe extern "C" fn(
-                    *mut std::ffi::c_void,
-                    *const u8,
-                    usize,
-                    u64,
-                ) -> *mut std::ffi::c_void,
-            > = lib.get(b"r2il_lift").unwrap();
-            let r2il_block_mem_access: libloading::Symbol<
-                unsafe extern "C" fn(
-                    *const std::ffi::c_void,
-                    *const std::ffi::c_void,
-                ) -> *mut c_char,
-            > = lib.get(b"r2il_block_mem_access").unwrap();
-            let r2il_free: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
-                lib.get(b"r2il_free").unwrap();
-            let r2il_block_free: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
-                lib.get(b"r2il_block_free").unwrap();
-            let r2il_string_free: libloading::Symbol<unsafe extern "C" fn(*mut c_char)> =
-                lib.get(b"r2il_string_free").unwrap();
-
-            let arch = CString::new("x86-64").unwrap();
-            let ctx = r2il_arch_init(arch.as_ptr());
-            assert!(!ctx.is_null(), "Failed to initialize x86-64 context");
-
-            let mut bytes = vec![0x31u8, 0xC0];
-            bytes.resize(16, 0x90);
-            let block = r2il_lift(ctx, bytes.as_ptr(), bytes.len(), 0x1000);
-            assert!(!block.is_null(), "Failed to lift baseline instruction");
-
-            let block_ref = &mut *(block as *mut r2il::R2ILBlock);
-            block_ref.ops.clear();
-            block_ref.push_with_metadata(
-                r2il::R2ILOp::Load {
-                    dst: r2il::Varnode::register(0, 8),
-                    space: r2il::SpaceId::Ram,
-                    addr: r2il::Varnode::constant(0x1000, 8),
-                },
-                Some(r2il::OpMetadata {
-                    instruction_addr: None,
-                    memory_class: Some(r2il::MemoryClass::Stack),
-                    endianness: None,
-                    memory_ordering: Some(r2il::MemoryOrdering::AcqRel),
-                    permissions: Some(r2il::MemoryPermissions {
-                        read: true,
-                        write: false,
-                        execute: false,
-                        volatile: false,
-                        cacheable: true,
-                    }),
-                    valid_range: Some(r2il::MemoryRange {
-                        start: 0x1000,
-                        end: 0x2000,
-                    }),
-                    bank_id: Some("bank0".to_string()),
-                    segment_id: Some("seg0".to_string()),
-                    atomic_kind: Some(r2il::AtomicKind::ReadModifyWrite),
-                }),
-            );
-
-            let json_ptr = r2il_block_mem_access(ctx, block);
-            assert!(!json_ptr.is_null(), "Expected mem-access JSON");
-            let json = CStr::from_ptr(json_ptr).to_string_lossy().into_owned();
-            r2il_string_free(json_ptr);
-
-            let parsed: Value = serde_json::from_str(&json).expect("valid JSON");
-            let first = parsed
-                .as_array()
-                .and_then(|arr| arr.first())
-                .expect("at least one access");
-
-            assert!(first.get("addr").is_some(), "legacy addr key missing");
-            assert!(first.get("size").is_some(), "legacy size key missing");
-            assert!(first.get("write").is_some(), "legacy write key missing");
-
-            assert_eq!(
-                first.get("ordering").and_then(Value::as_str),
-                Some("acq_rel")
-            );
-            assert_eq!(
-                first.get("atomic_kind").and_then(Value::as_str),
-                Some("read_modify_write")
-            );
-            assert_eq!(first.get("guarded").and_then(Value::as_bool), None);
-            assert_eq!(first.get("bank_id").and_then(Value::as_str), Some("bank0"));
-            assert_eq!(
-                first.get("segment_id").and_then(Value::as_str),
-                Some("seg0")
-            );
-            assert_eq!(
-                first.get("memory_class").and_then(Value::as_str),
-                Some("stack")
-            );
-            assert_eq!(
-                first
-                    .get("permissions")
-                    .and_then(|v| v.get("volatile"))
-                    .and_then(Value::as_bool),
-                Some(false)
-            );
-            assert_eq!(
-                first
-                    .get("permissions")
-                    .and_then(|v| v.get("cacheable"))
-                    .and_then(Value::as_bool),
-                Some(true)
-            );
-
-            r2il_block_free(block);
-            r2il_free(ctx);
-        }
+        };
+        let block = context.lift(&padded_bytes(&[0x13, 0x05, 0x05, 0x00]), 0x1000);
+        assert!(block.validate());
     }
 
     #[test]
     fn riscv64_lift_and_validate_success() {
-        if !require_plugin() {
-            eprintln!("Skipping: plugin not built");
-            return;
-        }
-
-        unsafe {
-            let lib = libloading::Library::new(PLUGIN_PATH).expect("load plugin");
-            let r2il_arch_init: libloading::Symbol<
-                unsafe extern "C" fn(*const c_char) -> *mut std::ffi::c_void,
-            > = lib.get(b"r2il_arch_init").unwrap();
-            let r2il_lift: libloading::Symbol<
-                unsafe extern "C" fn(
-                    *mut std::ffi::c_void,
-                    *const u8,
-                    usize,
-                    u64,
-                ) -> *mut std::ffi::c_void,
-            > = lib.get(b"r2il_lift").unwrap();
-            let r2il_block_validate: libloading::Symbol<
-                unsafe extern "C" fn(*mut std::ffi::c_void, *const std::ffi::c_void) -> i32,
-            > = lib.get(b"r2il_block_validate").unwrap();
-            let r2il_is_loaded: libloading::Symbol<
-                unsafe extern "C" fn(*const std::ffi::c_void) -> i32,
-            > = lib.get(b"r2il_is_loaded").unwrap();
-            let r2il_free: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
-                lib.get(b"r2il_free").unwrap();
-            let r2il_block_free: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
-                lib.get(b"r2il_block_free").unwrap();
-
-            let arch = CString::new("riscv64").unwrap();
-            let ctx = r2il_arch_init(arch.as_ptr());
-            if ctx.is_null() {
-                eprintln!("Skipping: plugin built without riscv64 support");
-                return;
-            }
-            if r2il_is_loaded(ctx) != 1 {
-                eprintln!("Skipping: plugin built without riscv64 support (context not loaded)");
-                r2il_free(ctx);
-                return;
-            }
-
-            let mut bytes = vec![0x13u8, 0x05, 0x05, 0x00]; // addi a0, a0, 0
-            bytes.resize(16, 0x00);
-            let block = r2il_lift(ctx, bytes.as_ptr(), bytes.len(), 0x1000);
-            assert!(!block.is_null(), "Failed to lift riscv64 instruction");
-            assert_eq!(
-                r2il_block_validate(ctx, block),
-                1,
-                "riscv64 block should pass validation"
-            );
-
-            r2il_block_free(block);
-            r2il_free(ctx);
+        if require_plugin() {
+            assert_riscv_lift("riscv64");
         }
     }
 
     #[test]
     fn riscv64_export_paths_esil_ssa_defuse_nonnull() {
         if !require_plugin() {
-            eprintln!("Skipping: plugin not built");
             return;
         }
-
-        unsafe {
-            let lib = libloading::Library::new(PLUGIN_PATH).expect("load plugin");
-            let r2il_arch_init: libloading::Symbol<
-                unsafe extern "C" fn(*const c_char) -> *mut std::ffi::c_void,
-            > = lib.get(b"r2il_arch_init").unwrap();
-            let r2il_lift: libloading::Symbol<
-                unsafe extern "C" fn(
-                    *mut std::ffi::c_void,
-                    *const u8,
-                    usize,
-                    u64,
-                ) -> *mut std::ffi::c_void,
-            > = lib.get(b"r2il_lift").unwrap();
-            let r2il_is_loaded: libloading::Symbol<
-                unsafe extern "C" fn(*const std::ffi::c_void) -> i32,
-            > = lib.get(b"r2il_is_loaded").unwrap();
-            let r2il_block_to_esil: libloading::Symbol<
-                unsafe extern "C" fn(
-                    *const std::ffi::c_void,
-                    *const std::ffi::c_void,
-                ) -> *mut c_char,
-            > = lib.get(b"r2il_block_to_esil").unwrap();
-            let r2il_block_to_ssa_json: libloading::Symbol<
-                unsafe extern "C" fn(
-                    *const std::ffi::c_void,
-                    *const std::ffi::c_void,
-                ) -> *mut c_char,
-            > = lib.get(b"r2il_block_to_ssa_json").unwrap();
-            let r2il_block_defuse_json: libloading::Symbol<
-                unsafe extern "C" fn(
-                    *const std::ffi::c_void,
-                    *const std::ffi::c_void,
-                ) -> *mut c_char,
-            > = lib.get(b"r2il_block_defuse_json").unwrap();
-            let r2il_free: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
-                lib.get(b"r2il_free").unwrap();
-            let r2il_block_free: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
-                lib.get(b"r2il_block_free").unwrap();
-            let r2il_string_free: libloading::Symbol<unsafe extern "C" fn(*mut c_char)> =
-                lib.get(b"r2il_string_free").unwrap();
-
-            let arch = CString::new("riscv64").unwrap();
-            let ctx = r2il_arch_init(arch.as_ptr());
-            if ctx.is_null() {
-                eprintln!("Skipping: plugin built without riscv64 support");
-                return;
-            }
-            if r2il_is_loaded(ctx) != 1 {
-                eprintln!("Skipping: plugin built without riscv64 support (context not loaded)");
-                r2il_free(ctx);
-                return;
-            }
-
-            let mut bytes = vec![0x13u8, 0x05, 0x05, 0x00]; // addi a0, a0, 0
-            bytes.resize(16, 0x00);
-            let block = r2il_lift(ctx, bytes.as_ptr(), bytes.len(), 0x1000);
-            assert!(!block.is_null(), "Failed to lift riscv64 instruction");
-
-            let esil = r2il_block_to_esil(ctx, block);
-            assert!(!esil.is_null(), "ESIL export should not be null");
-            r2il_string_free(esil);
-
-            let ssa = r2il_block_to_ssa_json(ctx, block);
-            assert!(!ssa.is_null(), "SSA JSON export should not be null");
-            r2il_string_free(ssa);
-
-            let defuse = r2il_block_defuse_json(ctx, block);
-            assert!(!defuse.is_null(), "Def-use JSON export should not be null");
-            r2il_string_free(defuse);
-
-            r2il_block_free(block);
-            r2il_free(ctx);
-        }
+        let library = unsafe { V2Library::open(PLUGIN_PATH) };
+        let Some(context) = library.context("riscv64") else {
+            return;
+        };
+        let block = context.lift(&padded_bytes(&[0x13, 0x05, 0x05, 0x00]), 0x1000);
+        assert!(!block.render(ANALYSIS_BLOCK_ESIL, 0).is_empty());
+        assert!(!block.render(ANALYSIS_BLOCK_SSA, 0).is_empty());
+        assert!(!block.render(ANALYSIS_BLOCK_DEFUSE, 0).is_empty());
     }
 
     #[test]
     fn riscv32_lift_and_validate_success() {
-        if !require_plugin() {
-            eprintln!("Skipping: plugin not built");
-            return;
-        }
-
-        unsafe {
-            let lib = libloading::Library::new(PLUGIN_PATH).expect("load plugin");
-            let r2il_arch_init: libloading::Symbol<
-                unsafe extern "C" fn(*const c_char) -> *mut std::ffi::c_void,
-            > = lib.get(b"r2il_arch_init").unwrap();
-            let r2il_lift: libloading::Symbol<
-                unsafe extern "C" fn(
-                    *mut std::ffi::c_void,
-                    *const u8,
-                    usize,
-                    u64,
-                ) -> *mut std::ffi::c_void,
-            > = lib.get(b"r2il_lift").unwrap();
-            let r2il_block_validate: libloading::Symbol<
-                unsafe extern "C" fn(*mut std::ffi::c_void, *const std::ffi::c_void) -> i32,
-            > = lib.get(b"r2il_block_validate").unwrap();
-            let r2il_is_loaded: libloading::Symbol<
-                unsafe extern "C" fn(*const std::ffi::c_void) -> i32,
-            > = lib.get(b"r2il_is_loaded").unwrap();
-            let r2il_free: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
-                lib.get(b"r2il_free").unwrap();
-            let r2il_block_free: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
-                lib.get(b"r2il_block_free").unwrap();
-
-            let arch = CString::new("riscv32").unwrap();
-            let ctx = r2il_arch_init(arch.as_ptr());
-            if ctx.is_null() {
-                eprintln!("Skipping: plugin built without riscv32 support");
-                return;
-            }
-            if r2il_is_loaded(ctx) != 1 {
-                eprintln!("Skipping: plugin built without riscv32 support (context not loaded)");
-                r2il_free(ctx);
-                return;
-            }
-
-            let mut bytes = vec![0x13u8, 0x05, 0x05, 0x00]; // addi a0, a0, 0
-            bytes.resize(16, 0x00);
-            let block = r2il_lift(ctx, bytes.as_ptr(), bytes.len(), 0x1000);
-            assert!(!block.is_null(), "Failed to lift riscv32 instruction");
-            assert_eq!(
-                r2il_block_validate(ctx, block),
-                1,
-                "riscv32 block should pass validation"
-            );
-
-            r2il_block_free(block);
-            r2il_free(ctx);
+        if require_plugin() {
+            assert_riscv_lift("riscv32");
         }
     }
 
@@ -1365,123 +517,6 @@ mod ffi {
             return;
         }
         assert_ffi_deterministic_for_arch("riscv32", RISCV_BYTES_BASE, RISCV_BYTES_BASE);
-    }
-}
-
-#[cfg(target_os = "macos")]
-mod host_matrix {
-    use super::*;
-    use std::fs;
-    use std::path::{Path, PathBuf};
-
-    fn fixture_source_and_output_dir() -> (PathBuf, PathBuf) {
-        if Path::new("tests/e2e/vuln_test.c").exists() {
-            return (
-                PathBuf::from("tests/e2e/vuln_test.c"),
-                PathBuf::from("target/host-matrix-integration"),
-            );
-        }
-        if Path::new("vuln_test.c").exists() {
-            return (
-                PathBuf::from("vuln_test.c"),
-                PathBuf::from("../../target/host-matrix-integration"),
-            );
-        }
-        panic!("unable to locate vuln_test.c for host-matrix integration");
-    }
-
-    fn compile_host_matrix_binary(arch: &str) -> Result<PathBuf, String> {
-        let (source, out_dir) = fixture_source_and_output_dir();
-        fs::create_dir_all(&out_dir).expect("create host-matrix output dir");
-        let output_path = out_dir.join(format!("vuln_test_{arch}"));
-        let output = Command::new("clang")
-            .args([
-                "-O0",
-                "-g",
-                "-fno-stack-protector",
-                "-Wl,-no_pie",
-                "-arch",
-                arch,
-            ])
-            .arg(&source)
-            .arg("-o")
-            .arg(&output_path)
-            .output()
-            .expect("execute clang");
-        if !output.status.success() {
-            return Err(format!(
-                "clang failed for {arch}: stdout=\n{}\nstderr=\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-        Ok(output_path)
-    }
-
-    fn assert_check_secret_semantic_invariants(output: &str) {
-        assert!(
-            !output.trim().is_empty(),
-            "fresh host-matrix check_secret decompilation must be non-empty"
-        );
-        assert!(
-            output.contains("return 1;"),
-            "success path must keep return 1:\n{output}"
-        );
-        assert!(
-            output.contains("return 0;"),
-            "failure path must keep return 0:\n{output}"
-        );
-        assert!(
-            output.contains("0xdead") || output.contains("57005"),
-            "comparison constant must stay visible:\n{output}"
-        );
-    }
-
-    fn assert_complex_check_semantic_invariants(output: &str) {
-        for expected in ["100", "20", "return 1;", "return 0;"] {
-            assert!(
-                output.contains(expected),
-                "complex_check must preserve {expected:?}:\n{output}"
-            );
-        }
-        for forbidden in ["residual", "sp_", "register"] {
-            assert!(
-                !output.to_ascii_lowercase().contains(forbidden),
-                "complex_check leaked {forbidden:?}:\n{output}"
-            );
-        }
-    }
-
-    #[test]
-    fn fresh_clang_host_matrix_keeps_helper_semantics_consistent() {
-        let timeout = Duration::from_secs(180);
-        let mut checked = 0usize;
-        for arch in ["arm64", "arm64e", "x86_64", "x86_64h"] {
-            let Ok(binary) = compile_host_matrix_binary(arch) else {
-                eprintln!("Skipping unavailable host-matrix target {arch}");
-                continue;
-            };
-            let result = r2_cmd_timeout(
-                binary.to_str().expect("utf8 binary path"),
-                "aa; a:sla.dec `afl~check_secret$[0]`",
-                timeout,
-            );
-            result.assert_ok();
-            assert_check_secret_semantic_invariants(&result.stdout);
-
-            let complex = r2_cmd_timeout(
-                binary.to_str().expect("utf8 binary path"),
-                "aa; a:sla.dec `afl~complex_check$[0]`",
-                timeout,
-            );
-            complex.assert_ok();
-            assert_complex_check_semantic_invariants(&complex.stdout);
-            checked += 1;
-        }
-        assert!(
-            checked > 0,
-            "host-matrix must validate at least one fresh target"
-        );
     }
 }
 

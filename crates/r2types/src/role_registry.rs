@@ -390,11 +390,18 @@ pub fn signature_hint_for_role_identity(
     {
         return None;
     }
-    signature_hint_for_name_candidates(
-        std::iter::once(role.role_name.as_str())
-            .chain(role.source_names.iter().map(String::as_str)),
-        current_param_count,
-    )
+    if role.linkage == r2ssa::FunctionSemanticLinkage::Imported
+        && let Some(signature) = signature_hint_for_name_candidates(
+            role.source_names
+                .iter()
+                .map(String::as_str)
+                .chain(std::iter::once(role.role_name.as_str())),
+            current_param_count,
+        )
+    {
+        return Some(signature);
+    }
+    signature_hint_for_summary_kinds(&role.summary_kinds, current_param_count)
 }
 
 pub fn type_projection_for_role_identity(
@@ -507,6 +514,15 @@ pub(crate) fn signature_hint_for_role_name(
     current_param_count: usize,
 ) -> Option<FunctionSignatureSpec> {
     Some(match role_name {
+        "malloc" => sig(void_pointer_type(), vec![p("size", typedef_type("size_t"))]),
+        "memcpy" | "memmove" => sig(
+            void_pointer_type(),
+            vec![
+                p("dst", void_pointer_type()),
+                p("src", void_pointer_type()),
+                p("len", typedef_type("size_t")),
+            ],
+        ),
         "main" | "wmain" => sig(
             c_int_type(),
             vec![
@@ -3808,6 +3824,7 @@ mod tests {
                 .canonical_role_name()
                 .to_string(),
             source: r2sym::NativeWorkerRoleSource::NameHint,
+            linkage: r2ssa::FunctionSemanticLinkage::Unknown,
             confidence: r2sym::SemanticConfidence::Heuristic,
             source_names: vec!["sym.printf_fetchargs".to_string()],
             summary_kinds: BTreeSet::from([r2sym::NativeWorkerSummaryKind::FormatArgumentFetch]),
@@ -3826,6 +3843,125 @@ mod tests {
             .expect("structural role identity should project signature");
         assert_eq!(signature.ret_type, Some(typedef_type("printf_status_t")));
         assert!(type_projection_for_role_identity(&structural, 0).is_some());
+    }
+
+    #[test]
+    fn structural_role_source_names_are_presentation_only() {
+        let base = r2sym::NativeWorkerRoleIdentity {
+            role_name: r2sym::NativeWorkerSummaryKind::FileTransfer
+                .canonical_role_name()
+                .to_string(),
+            source: r2sym::NativeWorkerRoleSource::Structural,
+            linkage: r2ssa::FunctionSemanticLinkage::Internal,
+            confidence: r2sym::SemanticConfidence::Likely,
+            source_names: Vec::new(),
+            summary_kinds: BTreeSet::from([r2sym::NativeWorkerSummaryKind::FileTransfer]),
+            evidence: r2sym::SemanticEvidence::likely(r2sym::SemanticEvidenceReason::SummaryBudget),
+        };
+        let expected_signature = signature_hint_for_role_identity(&base, 3);
+        let expected_projection = type_projection_for_role_identity(&base, 3);
+        assert!(expected_signature.is_some());
+        assert!(expected_projection.is_some());
+
+        for source_names in [
+            vec!["xnmalloc".to_string()],
+            vec!["malloc".to_string()],
+            vec!["table_walk".to_string()],
+            vec!["renamed_worker".to_string()],
+            Vec::new(),
+        ] {
+            let role = r2sym::NativeWorkerRoleIdentity {
+                source_names,
+                ..base.clone()
+            };
+            assert_eq!(
+                signature_hint_for_role_identity(&role, 3),
+                expected_signature
+            );
+            assert_eq!(
+                type_projection_for_role_identity(&role, 3),
+                expected_projection
+            );
+        }
+    }
+
+    #[test]
+    fn imported_library_names_require_typed_linkage_for_exact_contracts() {
+        let mut block = r2il::R2ILBlock::new(0x401000, 1);
+        block.ops.push(r2il::R2ILOp::Return {
+            target: r2il::Varnode::constant(0, 8),
+        });
+        let arch = r2il::ArchSpec::new("test");
+        let function = r2ssa::SsaArtifact::for_symbolic(&[block], Some(&arch)).expect("ssa");
+        let imported_summary = r2sym::function_semantic_summary_seed_for_name_with_linkage(
+            r2ssa::InterprocFunctionId(function.entry),
+            "memcpy",
+            r2ssa::FunctionSemanticLinkage::Imported,
+        )
+        .expect("typed imported summary seed");
+        let imported_artifact = r2sym::compile_native_worker_summary_artifact(
+            &function,
+            None,
+            Some(&imported_summary),
+            true,
+        )
+        .expect("compiled imported worker");
+        let imported_role = imported_artifact
+            .native_body()
+            .and_then(|native| native.summary.role_identity.as_deref())
+            .expect("compiled imported role identity");
+        assert_eq!(
+            imported_role.source,
+            r2sym::NativeWorkerRoleSource::SummarySeed
+        );
+        assert_eq!(
+            imported_role.linkage,
+            r2ssa::FunctionSemanticLinkage::Imported
+        );
+        assert_eq!(imported_role.source_names, vec!["memcpy".to_string()]);
+        assert!(imported_role.evidence.allows_narrowing());
+
+        let memcpy =
+            signature_hint_for_role_identity(imported_role, 0).expect("imported memcpy contract");
+        assert_eq!(memcpy.ret_type, Some(void_pointer_type()));
+        assert_eq!(memcpy.params.len(), 3);
+        let memcpy_projection = type_projection_for_role_identity(imported_role, 0)
+            .expect("imported memcpy projection");
+        assert_eq!(memcpy_projection.ret_type, Some(void_pointer_type()));
+
+        let mut internal_summary = imported_summary;
+        internal_summary.linkage = r2ssa::FunctionSemanticLinkage::Internal;
+        assert!(
+            r2sym::compile_named_native_worker_summary_artifact(&internal_summary, true).is_none()
+        );
+        let internal_artifact = r2sym::compile_native_worker_summary_artifact(
+            &function,
+            None,
+            Some(&internal_summary),
+            true,
+        )
+        .expect("compiled structural worker");
+        let internal_role = internal_artifact
+            .native_body()
+            .and_then(|native| native.summary.role_identity.as_deref())
+            .expect("compiled structural role identity");
+        assert_eq!(
+            internal_role.source,
+            r2sym::NativeWorkerRoleSource::Structural
+        );
+        assert_eq!(
+            internal_role.linkage,
+            r2ssa::FunctionSemanticLinkage::Internal
+        );
+        assert!(internal_role.source_names.is_empty());
+        let structural_memcpy = signature_hint_for_role_identity(internal_role, 0)
+            .expect("structural memory-transfer contract");
+        assert_eq!(structural_memcpy.ret_type, None);
+        assert_ne!(structural_memcpy, memcpy);
+        let structural_projection = type_projection_for_role_identity(internal_role, 0)
+            .expect("structural memory-transfer projection");
+        assert_eq!(structural_projection.ret_type, None);
+        assert_ne!(structural_projection, memcpy_projection);
     }
 
     #[test]

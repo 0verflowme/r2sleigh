@@ -11,7 +11,7 @@ use r2cert::{
 };
 use r2ssa::{
     CanonicalInstructionId, CanonicalInstructionSite, MachineBuildError, SemanticObligationId,
-    SsaArtifact,
+    SsaArtifact, TrustedSsaArtifact,
 };
 use serde::Serialize;
 
@@ -239,8 +239,8 @@ impl From<SemanticCError> for SwitchReturnFunctionError {
 }
 
 impl CertifiedSwitchReturnFunction {
-    pub fn from_artifact(artifact: &SsaArtifact) -> Result<Self, SwitchReturnFunctionError> {
-        let certified = CertifiedMachineProjection::from_artifact(artifact)?;
+    pub fn from_artifact(trusted: &TrustedSsaArtifact) -> Result<Self, SwitchReturnFunctionError> {
+        let certified = CertifiedMachineProjection::from_artifact(trusted)?;
         Self::from_projection(&certified)
     }
 
@@ -798,11 +798,12 @@ impl SwitchReturnDifferentialReport {
 /// Bounded independent check of source switch routing, certified arms, and the
 /// strict rendered switch grammar. It covers every case plus one default probe.
 pub fn check_switch_return_differential(
-    artifact: &SsaArtifact,
+    trusted: &TrustedSsaArtifact,
     max_paths: u32,
 ) -> Result<SwitchReturnDifferentialReport, String> {
-    let function = CertifiedSwitchReturnFunction::from_artifact(artifact)
+    let function = CertifiedSwitchReturnFunction::from_artifact(trusted)
         .map_err(|error| format!("switch candidate not admitted: {error}"))?;
+    let artifact = trusted.artifact();
     let required = function.cases.len().saturating_add(1);
     if max_paths == 0 || required > max_paths as usize {
         return Err("switch differential path budget exceeded".to_string());
@@ -951,7 +952,7 @@ mod tests {
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SwitchCase, SwitchInfo, Varnode};
     use r2ssa::{
         CanonicalStorageId, CanonicalStorageSpace, SourceAbiParameterSpec, SourceFunctionInterface,
-        SourceFunctionReturn,
+        SourceFunctionReturn, SsaArtifactProvenanceKind,
     };
 
     fn storage(offset: u64, size: u32) -> CanonicalStorageId {
@@ -1019,35 +1020,41 @@ mod tests {
         vec![header, arm(0x9020, 11), arm(0x9040, 22), arm(0x9060, 33)]
     }
 
-    fn assert_refused(blocks: &[R2ILBlock], parameter_storage: CanonicalStorageId) {
+    fn assert_analysis_only(blocks: &[R2ILBlock], parameter_storage: CanonicalStorageId) {
         let artifact =
             SsaArtifact::raw_with_interface(blocks, Some(&arch()), interface(parameter_storage))
                 .expect("switch-return artifact");
-        assert!(CertifiedSwitchReturnFunction::from_artifact(&artifact).is_err());
+        assert_eq!(
+            artifact.provenance_kind(),
+            SsaArtifactProvenanceKind::Manual
+        );
     }
 
     #[test]
-    fn synthetic_switch_return_is_refused_without_typed_machine_roles() {
-        assert_refused(&source_blocks(), storage(8, 8));
+    fn synthetic_switch_return_remains_analysis_only() {
+        assert_analysis_only(&source_blocks(), storage(8, 8));
     }
 
     #[test]
-    fn synthetic_switch_certificate_baseline_is_refused() {
-        assert_refused(&source_blocks(), storage(8, 8));
+    fn synthetic_switch_cannot_mint_trusted_provenance() {
+        assert_analysis_only(&source_blocks(), storage(8, 8));
     }
 
     #[test]
-    fn missing_interface_and_wrong_parameter_storage_fail_closed() {
+    fn missing_interface_and_wrong_parameter_storage_remain_analysis_only() {
         let blocks = source_blocks();
         let no_interface =
             SsaArtifact::raw(&blocks, Some(&arch())).expect("switch without interface");
-        assert!(CertifiedSwitchReturnFunction::from_artifact(&no_interface).is_err());
+        assert_eq!(
+            no_interface.provenance_kind(),
+            SsaArtifactProvenanceKind::Manual
+        );
 
-        assert_refused(&blocks, storage(24, 8));
+        assert_analysis_only(&blocks, storage(24, 8));
     }
 
     #[test]
-    fn synthetic_switch_differential_baseline_is_refused() {
-        assert_refused(&source_blocks(), storage(8, 8));
+    fn synthetic_switch_differential_input_remains_analysis_only() {
+        assert_analysis_only(&source_blocks(), storage(8, 8));
     }
 }

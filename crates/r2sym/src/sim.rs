@@ -771,9 +771,8 @@ impl<'ctx> SummaryRegistry<'ctx> {
                         continue;
                     };
                     diagnostics.attempted += 1;
-                    if helper
-                        .name
-                        .as_deref()
+                    if symbol_map
+                        .get(&helper.id.0)
                         .is_some_and(|name| self.has_core_summary_name(name))
                     {
                         diagnostics.skipped_core += 1;
@@ -1067,20 +1066,21 @@ fn build_interproc_summary_set(
         if is_runtime_materialized_scope_function(scope, function) {
             continue;
         }
+        if let Some(name) = symbol_map.get(&function.id.0)
+            && let Some(summary) = crate::function_semantic_summary_seed_for_name_with_linkage(
+                function.id,
+                name,
+                r2ssa::FunctionSemanticLinkage::Imported,
+            )
+        {
+            seeds.insert(function.id, summary);
+            continue;
+        }
         inputs.push(InterprocFunctionInput {
             id: function.id,
             name: function.name.clone(),
             prepared: &function.prepared,
         });
-        if let Some(name) = symbol_map.get(&function.id.0)
-            && let Some(summary) = crate::function_semantic_summary_seed_for_name(function.id, name)
-        {
-            seeds.insert(function.id, summary);
-        } else if let Some(name) = function.name.as_deref()
-            && let Some(summary) = crate::function_semantic_summary_seed_for_name(function.id, name)
-        {
-            seeds.insert(function.id, summary);
-        }
     }
 
     solve_interproc_summary_set(
@@ -3134,6 +3134,86 @@ mod tests {
         let runtime = scope.functions().get(&runtime_id).expect("runtime source");
         assert!(!is_runtime_materialized_scope_function(&scope, helper));
         assert!(is_runtime_materialized_scope_function(&scope, runtime));
+    }
+
+    #[test]
+    fn imported_symbol_snapshot_alone_enables_name_backed_summary_seed() {
+        let root = SsaArtifact::for_symbolic(
+            &[R2ILBlock {
+                addr: 0x1000,
+                size: 1,
+                ops: vec![R2ILOp::Return {
+                    target: const_vn(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            }],
+            Some(&test_arch()),
+        )
+        .expect("root");
+        let helper = SsaArtifact::for_symbolic(
+            &[R2ILBlock {
+                addr: 0x2000,
+                size: 1,
+                ops: vec![R2ILOp::Return {
+                    target: const_vn(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            }],
+            Some(&test_arch()),
+        )
+        .expect("helper");
+        let scope = PreparedFunctionScope::new(
+            0x1000,
+            vec![
+                ScopedPreparedFunction {
+                    id: InterprocFunctionId(0x1000),
+                    name: Some("root".to_string()),
+                    prepared: root,
+                },
+                ScopedPreparedFunction {
+                    id: InterprocFunctionId(0x2000),
+                    name: Some("malloc".to_string()),
+                    prepared: helper,
+                },
+            ],
+        )
+        .expect("scope");
+        let imported = crate::FunctionSymbolSnapshot::try_from_symbols([crate::FunctionSymbol {
+            addr: 0x2000,
+            name: "malloc".to_string(),
+            linkage: r2ssa::FunctionSemanticLinkage::Imported,
+        }])
+        .unwrap();
+        let internal = crate::FunctionSymbolSnapshot::try_from_symbols([crate::FunctionSymbol {
+            addr: 0x2000,
+            name: "malloc".to_string(),
+            linkage: r2ssa::FunctionSemanticLinkage::Internal,
+        }])
+        .unwrap();
+
+        let imported_set = build_interproc_summary_set(&scope, None, imported.imported_names());
+        let imported_summary = imported_set
+            .summaries
+            .get(&InterprocFunctionId(0x2000))
+            .expect("imported helper summary");
+        assert_eq!(
+            imported_summary.linkage,
+            r2ssa::FunctionSemanticLinkage::Imported
+        );
+        assert!(!imported_summary.allocation_effects.is_empty());
+
+        let internal_set = build_interproc_summary_set(&scope, None, internal.imported_names());
+        let internal_summary = internal_set
+            .summaries
+            .get(&InterprocFunctionId(0x2000))
+            .expect("internal helper summary");
+        assert_ne!(
+            internal_summary.linkage,
+            r2ssa::FunctionSemanticLinkage::Imported
+        );
+        assert!(internal_summary.allocation_effects.is_empty());
     }
 
     #[test]

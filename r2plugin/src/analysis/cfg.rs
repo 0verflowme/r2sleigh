@@ -6,9 +6,8 @@ use std::ffi::CString;
 use std::ptr;
 
 /// Generate ASCII CFG for a function.
-/// Caller must free the returned string with r2il_string_free().
-#[unsafe(no_mangle)]
-pub extern "C" fn r2cfg_function_ascii(
+/// Internal V2 wrapper immediately adopts the returned CString allocation.
+pub(crate) fn r2cfg_function_ascii(
     ctx: *const R2ILContext,
     blocks: *const *const R2ILBlock,
     num_blocks: usize,
@@ -225,9 +224,8 @@ struct CFGEdgeJson {
 }
 
 /// Get CFG as JSON.
-/// Caller must free the returned string with r2il_string_free().
-#[unsafe(no_mangle)]
-pub extern "C" fn r2cfg_function_json(
+/// Internal V2 wrapper immediately adopts the returned CString allocation.
+pub(crate) fn r2cfg_function_json(
     _ctx: *const R2ILContext,
     blocks: *const *const R2ILBlock,
     num_blocks: usize,

@@ -67,7 +67,8 @@ pub use defuse::{
 pub use function::{
     CFGRiskSummary, DecompilePrepFacts, DefRef, DefSite, FunctionPrepareMode, PhiNode,
     SSABlock as FunctionSSABlock, SSAFunction, SourceRef, SourceSite, SsaArtifact,
-    SsaArtifactAuthority, StackAddressBase, StackAddressRoot, SwitchInfo,
+    SsaArtifactAuthority, SsaArtifactProvenanceKind, StackAddressBase, StackAddressRoot,
+    SwitchInfo, TrustedSsaArtifact,
 };
 pub use graph::{
     BlockId, GraphBlock, GraphInst, GraphValue, InstId, InstPayload, SsaGraph, UseSite, ValueId,
@@ -109,6 +110,11 @@ pub use obligation::{
 };
 pub use op::SSAOp;
 pub use optimize::{DecompilePrepConfig, OptimizationConfig, OptimizationStats, optimize_function};
+pub use r2sleigh_lift::{
+    GENUINE_LIFT_PROVENANCE_SCHEMA_VERSION, GenuineLiftedFunction, GenuineLiftedFunctionAuthority,
+    TrustedLiftedFunction,
+};
+pub use r2source::{OwnedFunctionSnapshot, RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION};
 pub use semantic::{
     BlockAssumption, CallArgumentCertificate, CallArgumentLocation, CallBoundarySlot,
     CallBoundaryValueFact, CallMemoryEffect, CallResultCertificate, CallResultValueRelation,

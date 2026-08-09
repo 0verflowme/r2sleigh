@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use r2ssa::{
-    SummaryAllocationEffect, SummaryAtomicEffect, SummaryLifetimeEffect, SummaryMemoryLocation,
-    SummaryMemoryRegion, SummarySyncEffect, SummaryTransferLength,
+    FunctionSemanticLinkage, SummaryAllocationEffect, SummaryAtomicEffect, SummaryLifetimeEffect,
+    SummaryMemoryLocation, SummaryMemoryRegion, SummarySyncEffect, SummaryTransferLength,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -348,6 +348,7 @@ pub enum NativeWorkerRoleSource {
 pub struct NativeWorkerRoleIdentity {
     pub role_name: String,
     pub source: NativeWorkerRoleSource,
+    pub linkage: FunctionSemanticLinkage,
     pub confidence: SemanticConfidence,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_names: Vec<String>,
@@ -1718,8 +1719,9 @@ mod tests {
 
     use super::{
         ControlFact, Judged, MemoryFact, NativeArtifactBody, NativeFunctionSummary,
-        NativeParserKind, NativeParserSummary, NativeSummarySpecificity, NativeWorkerSummary,
-        NativeWorkerSummaryKind, NativeWorkerTerminator, RegionKey, SemanticRegion, TargetFact,
+        NativeParserKind, NativeParserSummary, NativeSummarySpecificity, NativeWorkerRoleIdentity,
+        NativeWorkerSummary, NativeWorkerSummaryKind, NativeWorkerTerminator, RegionKey,
+        SemanticRegion, TargetFact,
     };
     use crate::sim::DerivedSummaryDiagnostics;
     use crate::{
@@ -1749,6 +1751,17 @@ mod tests {
             supported_paths: 1,
             total_paths: 1,
         }
+    }
+
+    #[test]
+    fn role_identity_rejects_payload_without_linkage_authority() {
+        let legacy = serde_json::json!({
+            "role_name": "allocation",
+            "source": "Structural",
+            "confidence": "Likely"
+        });
+
+        assert!(serde_json::from_value::<NativeWorkerRoleIdentity>(legacy).is_err());
     }
 
     fn worker_body(regions: impl IntoIterator<Item = SemanticRegion>) -> NativeArtifactBody {

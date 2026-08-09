@@ -11,19 +11,6 @@ pdfj | jq -c '([.ops[].bytes] | join("")) == "554889e585f67e0d89f183fe08730a31d2
 EOF_CMDS
 RUN
 
-NAME=plain_o2_check_secret_decj_has_no_benchmark_specific_kernel
-FILE=bins/r2sleigh_vuln_test_x86_64_macho_O2_v1
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s sym._check_secret >/dev/null
-a:sla.decj | jq -c '((.outcome == "completed") or (.outcome == "refused")) and (.diagnostics.semantic_kernel_render == null)'
-EOF_CMDS
-RUN
-
 NAME=plain_o2_check_secret_bytes_are_pinned
 FILE=bins/r2sleigh_vuln_test_x86_64_macho_O2_v1
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
@@ -37,19 +24,6 @@ pdfj | jq -c '(.size == 17) and ([.ops[].bytes] | join("")) == "554889e531c081ff
 EOF_CMDS
 RUN
 
-NAME=plain_o2_decj_exposes_owned_v2_diagnostics_and_all_timings
-FILE=bins/r2sleigh_vuln_test_x86_64_macho_O2_v1
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s sym._check_secret >/dev/null
-a:sla.decj | jq -c '(.schema_version == 1) and (.request_kind == "decompile") and (.request_kind_code == 1) and ((.outcome == "completed") or (.outcome == "refused")) and (.rendered_output | type == "string") and (.diagnostics | type == "object") and (.phase_timings | length == 11) and ([.phase_timings[].phase] == [0,1,2,3,4,5,6,7,8,9,10]) and (.ffi_conversion_elapsed_us == .phase_timings[10].elapsed_us) and (.refused == (.outcome == "refused")) and (.error == null)'
-EOF_CMDS
-RUN
-
 NAME=plain_o2_complex_check_bytes_are_pinned
 FILE=bins/r2sleigh_vuln_test_x86_64_macho_O2_v1
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
@@ -60,19 +34,6 @@ CMDS=<<EOF_CMDS
 aaa
 s sym._complex_check >/dev/null
 pdfj | jq -c '(.size == 24) and ([.ops[].bytes] | join("")) == "554889e58d0c3e29f783f16483f71431c009cf0f94c05dc3" and ([.ops[].opcode] | any(. == "lea ecx, [rsi + rdi]")) and ([.ops[].opcode] | any(. == "or edi, ecx"))'
-EOF_CMDS
-RUN
-
-NAME=plain_o2_complex_check_decj_has_no_benchmark_specific_kernel
-FILE=bins/r2sleigh_vuln_test_x86_64_macho_O2_v1
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s sym._complex_check >/dev/null
-a:sla.decj | jq -c '((.outcome == "completed") or (.outcome == "refused")) and (.diagnostics.semantic_kernel_render == null)'
 EOF_CMDS
 RUN
 

@@ -1,18 +1,20 @@
 //! Versioned, panic-contained production boundary for engine requests.
 //!
-//! V2 deliberately covers only decompilation and function typing. Both request
-//! kinds use one native, versioned request graph.
+//! V2 exposes the lift core plus decompilation and function typing. Engine
+//! requests use one native, versioned request graph.
 
 use super::analysis::sym::R2ILFunctionBlocks;
 use super::{R2ILBlock, R2ILContext};
-use std::collections::BTreeSet;
-use std::ffi::{CString, c_char, c_void};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::mem::{align_of, size_of};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::slice;
 use std::str;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::thread::{self, ThreadId};
 use std::time::{Duration, Instant};
 
 pub const R2SLEIGH_ABI_V2: u32 = 2;
@@ -25,6 +27,9 @@ pub const R2SLEIGH_CAP_RESPONSE_INFO_V2: u64 = 1 << 5;
 pub const R2SLEIGH_CAP_EXECUTION_CONTROL_V2: u64 = 1 << 6;
 pub const R2SLEIGH_CAP_EXACT_TYPE_LAYOUT_V2: u64 = 1 << 7;
 pub const R2SLEIGH_CAP_EXACT_STACK_SLOT_ROLES_V2: u64 = 1 << 8;
+pub const R2SLEIGH_CAP_LIFT_CORE_V2: u64 = 1 << 9;
+pub const R2SLEIGH_CAP_PLANNER_QUERY_V2: u64 = 1 << 10;
+pub const R2SLEIGH_CAP_OPAQUE_RADARE_SNAPSHOT_V2: u64 = 1 << 11;
 pub const R2SLEIGH_CAPABILITIES_V2: u64 = R2SLEIGH_CAP_DECOMPILE_V2
     | R2SLEIGH_CAP_TYPE_FUNCTION_V2
     | R2SLEIGH_CAP_EXACT_FUNCTION_INTERFACE_V2
@@ -33,8 +38,13 @@ pub const R2SLEIGH_CAPABILITIES_V2: u64 = R2SLEIGH_CAP_DECOMPILE_V2
     | R2SLEIGH_CAP_RESPONSE_INFO_V2
     | R2SLEIGH_CAP_EXECUTION_CONTROL_V2
     | R2SLEIGH_CAP_EXACT_TYPE_LAYOUT_V2
-    | R2SLEIGH_CAP_EXACT_STACK_SLOT_ROLES_V2;
-pub const R2SLEIGH_RADARE_ABI_V2: u32 = 137;
+    | R2SLEIGH_CAP_EXACT_STACK_SLOT_ROLES_V2
+    | R2SLEIGH_CAP_LIFT_CORE_V2
+    | R2SLEIGH_CAP_PLANNER_QUERY_V2
+    | R2SLEIGH_CAP_OPAQUE_RADARE_SNAPSHOT_V2;
+pub const R2SLEIGH_RADARE_ABI_V2: u32 = 138;
+pub const R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2: u32 = 7;
+pub const R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2: u32 = 1;
 
 pub const R2SLEIGH_STATUS_OK_V2: u32 = 0;
 pub const R2SLEIGH_STATUS_INVALID_ARGUMENT_V2: u32 = 1;
@@ -92,11 +102,88 @@ pub const R2SLEIGH_SOURCE_CARRIER_FULL_V2: u32 = 1;
 pub const R2SLEIGH_SOURCE_CARRIER_LOW_BITS_V2: u32 = 2;
 pub const R2SLEIGH_MAX_FUNCTION_BLOCKS_V2: usize = 200;
 pub const R2SLEIGH_MAX_FUNCTION_OPS_V2: usize = 512;
+pub const R2SLEIGH_MAX_SWITCH_CASES_V2: usize = 4_096;
+pub const R2SLEIGH_ANALYSIS_BLOCK_ESIL_V2: u32 = 1;
+pub const R2SLEIGH_ANALYSIS_BLOCK_OP_JSON_V2: u32 = 2;
+pub const R2SLEIGH_ANALYSIS_BLOCK_REGS_READ_V2: u32 = 3;
+pub const R2SLEIGH_ANALYSIS_BLOCK_REGS_WRITE_V2: u32 = 4;
+pub const R2SLEIGH_ANALYSIS_BLOCK_MEMORY_V2: u32 = 5;
+pub const R2SLEIGH_ANALYSIS_BLOCK_VARNODES_V2: u32 = 6;
+pub const R2SLEIGH_ANALYSIS_BLOCK_SSA_V2: u32 = 7;
+pub const R2SLEIGH_ANALYSIS_BLOCK_DEFUSE_V2: u32 = 8;
+pub const R2SLEIGH_ANALYSIS_FUNCTION_SSA_V2: u32 = 9;
+pub const R2SLEIGH_ANALYSIS_FUNCTION_SSA_OPT_V2: u32 = 10;
+pub const R2SLEIGH_ANALYSIS_FUNCTION_DEFUSE_V2: u32 = 11;
+pub const R2SLEIGH_ANALYSIS_FUNCTION_DOMTREE_V2: u32 = 12;
+pub const R2SLEIGH_ANALYSIS_FUNCTION_SLICE_V2: u32 = 13;
+pub const R2SLEIGH_ANALYSIS_FUNCTION_TAINT_V2: u32 = 14;
+pub const R2SLEIGH_ANALYSIS_FUNCTION_CFG_ASCII_V2: u32 = 15;
+pub const R2SLEIGH_ANALYSIS_FUNCTION_CFG_JSON_V2: u32 = 16;
+pub const R2SLEIGH_ANALYSIS_ENGINE_CACHE_STATS_V2: u32 = 17;
+pub const R2SLEIGH_SCOPE_FUNCTION_V2: u32 = 1;
+pub const R2SLEIGH_SCOPE_PATHS_V2: u32 = 2;
+pub const R2SLEIGH_SCOPE_EXPLORE_V2: u32 = 3;
+pub const R2SLEIGH_SCOPE_SOLVE_V2: u32 = 4;
+pub const R2SLEIGH_SCOPE_EXPLORE_REPLAY_V2: u32 = 5;
+pub const R2SLEIGH_SCOPE_SOLVE_REPLAY_V2: u32 = 6;
+pub const R2SLEIGH_SCOPE_RUN_SPEC_V2: u32 = 7;
+pub const R2SLEIGH_SCOPE_SYMBOL_SCHEMA_V2: u32 = 1;
+pub const R2SLEIGH_QUERY_BLOCK_VALUES_V2: u32 = 1;
+pub const R2SLEIGH_QUERY_TAINT_SUMMARY_V2: u32 = 2;
+pub const R2SLEIGH_QUERY_ANNOTATIONS_V2: u32 = 3;
+pub const R2SLEIGH_QUERY_DIRECT_TARGETS_V2: u32 = 4;
+pub const R2SLEIGH_QUERY_SYMBOLIC_TARGETS_V2: u32 = 5;
+pub const R2SLEIGH_QUERY_RUNTIME_SOURCES_V2: u32 = 6;
+pub const R2SLEIGH_QUERY_RECOVERED_VARS_V2: u32 = 7;
+pub const R2SLEIGH_QUERY_DATA_REFS_V2: u32 = 8;
+pub const R2SLEIGH_PLANNER_QUERY_SCHEMA_V2: u32 = 1;
+pub const R2SLEIGH_PLANNER_ANALYSIS_POLICY_V2: u32 = 1;
+pub const R2SLEIGH_PLANNER_POST_ANALYSIS_V2: u32 = 2;
+pub const R2SLEIGH_PLANNER_AUTO_CALLBACK_V2: u32 = 3;
+pub const R2SLEIGH_PLANNER_INTERPROC_SESSION_V2: u32 = 4;
+pub const R2SLEIGH_PLANNER_SYMBOLIC_SCOPE_V2: u32 = 5;
+pub const R2SLEIGH_PLANNER_RUNTIME_SOURCE_V2: u32 = 6;
+pub const R2SLEIGH_PLANNER_INTERPROC_TARGETS_V2: u32 = 7;
+pub const R2SLEIGH_PLANNER_TARGET_INPUT_SCHEMA_V2: u32 = 1;
+pub const R2SLEIGH_PLANNER_RESULT_SCHEMA_V2: u32 = 1;
+pub const R2SLEIGH_MAX_PLANNER_TARGETS_V2: usize = 4_096;
+pub const R2SLEIGH_INTERPROC_LINKAGE_UNKNOWN_V2: u32 = 0;
+pub const R2SLEIGH_INTERPROC_LINKAGE_INTERNAL_V2: u32 = 1;
+pub const R2SLEIGH_INTERPROC_LINKAGE_IMPORTED_V2: u32 = 2;
+pub const R2SLEIGH_PLANNER_RESULT_QUEUED_TARGETS_V2: u32 = 1;
+pub const R2SLEIGH_PLANNER_RESULT_REGISTRATION_TARGETS_V2: u32 = 2;
+pub const R2SLEIGH_PLANNER_RESULT_RUNTIME_COPY_TARGETS_V2: u32 = 3;
+pub const R2SLEIGH_MODE_FAST_V2: u32 = 0;
+pub const R2SLEIGH_MODE_BALANCED_V2: u32 = 1;
+pub const R2SLEIGH_MODE_FULL_V2: u32 = 2;
+pub const R2SLEIGH_TYPE_WRITEBACK_OFF_V2: u32 = 0;
+pub const R2SLEIGH_TYPE_WRITEBACK_BALANCED_V2: u32 = 1;
+pub const R2SLEIGH_TYPE_WRITEBACK_AGGRESSIVE_V2: u32 = 2;
+pub const R2SLEIGH_INTERPROC_SESSION_TYPE_ANALYSIS_V2: u32 = 0;
+pub const R2SLEIGH_INTERPROC_SESSION_DECOMPILE_V2: u32 = 1;
+pub const R2SLEIGH_AUTO_CALLBACK_ANALYZE_FUNCTION_V2: u32 = 0;
+pub const R2SLEIGH_AUTO_CALLBACK_RECOVER_VARS_V2: u32 = 1;
+pub const R2SLEIGH_AUTO_CALLBACK_DATA_REFS_V2: u32 = 2;
+pub const R2SLEIGH_AUTO_CALLBACK_POST_ANALYSIS_TAINT_V2: u32 = 3;
+pub const R2SLEIGH_AUTO_CALLBACK_POST_ANALYSIS_XREF_V2: u32 = 4;
+pub const R2SLEIGH_AUTO_CALLBACK_REASON_ALLOWED_V2: u32 = 0;
+pub const R2SLEIGH_AUTO_CALLBACK_REASON_MODE_NOT_FULL_V2: u32 = 1;
+pub const R2SLEIGH_AUTO_CALLBACK_REASON_TOO_MANY_BLOCKS_V2: u32 = 2;
+pub const R2SLEIGH_AUTO_CALLBACK_REASON_TOO_LARGE_V2: u32 = 3;
+pub const R2SLEIGH_AUTO_CALLBACK_REASON_TOO_COSTLY_V2: u32 = 4;
+pub const R2SLEIGH_SYMBOLIC_SCOPE_REASON_ALLOWED_V2: u32 = 0;
+pub const R2SLEIGH_SYMBOLIC_SCOPE_REASON_SCOPE_FULL_V2: u32 = 1;
+pub const R2SLEIGH_SYMBOLIC_SCOPE_REASON_INTERPROC_DISABLED_V2: u32 = 2;
+pub const R2SLEIGH_SYMBOLIC_SCOPE_REASON_TARGET_TERMINAL_V2: u32 = 3;
+pub const R2SLEIGH_RUNTIME_SOURCE_REASON_ALLOWED_V2: u32 = 0;
+pub const R2SLEIGH_RUNTIME_SOURCE_REASON_SCOPE_FULL_V2: u32 = 1;
+pub const R2SLEIGH_RUNTIME_SOURCE_REASON_EMPTY_SOURCE_V2: u32 = 2;
 #[allow(dead_code)] // Exported for the C-side pre-lift byte budget.
 pub const R2SLEIGH_MAX_FUNCTION_INPUT_BYTES_V2: usize = 16 << 20;
 pub const R2SLEIGH_MAX_AGGREGATE_BLOCKS_V2: usize = 1_024;
 pub const R2SLEIGH_MAX_AGGREGATE_OPS_V2: usize = 4_096;
 pub const R2SLEIGH_MAX_SCOPE_FUNCTIONS_V2: usize = 4_096;
+pub const R2SLEIGH_MAX_SCOPE_SYMBOLS_V2: usize = 4_096;
 pub const R2SLEIGH_MAX_CONTEXT_ITEMS_V2: usize = 65_536;
 pub const R2SLEIGH_MAX_NESTED_ITEMS_V2: usize = 262_144;
 pub const R2SLEIGH_MAX_STRING_BYTES_V2: usize = 1 << 20;
@@ -110,8 +197,11 @@ const MAX_INTERPROC_ITERATIONS: usize = 4_096;
 // ABI argument lists are expected to be small; cap caller hints before use.
 const MAX_ABI_ARGUMENTS: usize = 256;
 
-/// Borrowed bytes. A response view remains valid until response_free; an error
-/// view remains valid until the next operation on that session or session_free.
+/// Borrowed bytes. Its producing callback defines the lifetime: response views
+/// survive until response_free, session errors until the next session operation,
+/// lift-context views until the next context operation, lift-last-error views
+/// until the next lift callback on the current thread, and owned-byte views until
+/// owned_bytes_free.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct R2SleighByteViewV2 {
@@ -155,6 +245,317 @@ pub struct R2SleighStringViewV2 {
     pub data: *const u8,
     pub len: usize,
 }
+
+/// Borrowed opaque radare2 ABI 138 snapshot plus its immutable accessor table.
+/// Both pointers are valid only for the duration of one synchronous `execute`
+/// callback. Rust deep-copies the source before returning to the caller.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct R2SleighRadareSnapshotInputV2 {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub snapshot_schema_version: u32,
+    pub accessor_schema_version: u32,
+    pub snapshot: *const c_void,
+    pub accessors: *const R2SleighRadareAccessorsV2,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct R2SleighRadareSnapshotViewV2 {
+    pub schema_version: u32,
+    pub struct_size: u32,
+    pub capabilities: u64,
+    pub function_addr: u64,
+    pub function_size: u64,
+    pub bits: i32,
+    pub endian: u32,
+    pub maxstack: i64,
+    pub arch_id_length: usize,
+    pub cpu_id_length: usize,
+    pub function_name_length: usize,
+    pub num_base_types: usize,
+    pub type_context_hash: u64,
+    pub num_call_site_interfaces: usize,
+    pub num_stack_slots: usize,
+    pub revision_identity: u64,
+    pub num_types: usize,
+    pub num_aggregates: usize,
+    pub num_blocks: usize,
+    pub num_external_exits: usize,
+    pub total_source_bytes: usize,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct R2SleighRadareBlockViewV2 {
+    pub addr: u64,
+    pub size: u64,
+    pub num_successors: usize,
+    pub switch_addr: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct R2SleighRadareSuccessorViewV2 {
+    pub kind: i32,
+    pub target_addr: u64,
+    pub case_value: u64,
+    pub external: u8,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct R2SleighRadareRegisterStorageViewV2 {
+    pub name_length: usize,
+    pub offset: u64,
+    pub size: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct R2SleighRadareCarrierProjectionV2 {
+    pub kind: i32,
+    pub offset_bits: u64,
+    pub size_bits: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct R2SleighRadareParameterViewV2 {
+    pub index: u32,
+    pub storage: R2SleighRadareRegisterStorageViewV2,
+    pub logical_type_id: u32,
+    pub carrier: R2SleighRadareCarrierProjectionV2,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct R2SleighRadareFunctionInterfaceViewV2 {
+    pub calling_convention_length: usize,
+    pub num_parameters: usize,
+    pub return_kind: i32,
+    pub return_storage: R2SleighRadareRegisterStorageViewV2,
+    pub return_address_storage: R2SleighRadareRegisterStorageViewV2,
+    pub stack_pointer_storage: R2SleighRadareRegisterStorageViewV2,
+    pub variadic: u8,
+    pub noreturn: u8,
+    pub stack_resources_complete: u8,
+    pub stack_slot_roles_complete: u8,
+    pub complete: u8,
+    pub return_type_id: u32,
+    pub return_carrier: R2SleighRadareCarrierProjectionV2,
+    pub logical_types_complete: u8,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct R2SleighRadareCallSiteViewV2 {
+    pub instruction_addr: u64,
+    pub target_addr: u64,
+    pub calling_convention_length: usize,
+    pub num_arguments: usize,
+    pub result_kind: i32,
+    pub result_storage: R2SleighRadareRegisterStorageViewV2,
+    pub variadic: u8,
+    pub noreturn: u8,
+    pub complete: u8,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct R2SleighRadareTypeGraphViewV2 {
+    pub num_types: usize,
+    pub num_aggregates: usize,
+    pub complete: u8,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct R2SleighRadareTypeViewV2 {
+    pub id: u32,
+    pub kind: i32,
+    pub size_bits: u64,
+    pub align_bits: u64,
+    pub target_type_id: u32,
+    pub aggregate_id: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct R2SleighRadareAggregateViewV2 {
+    pub id: u32,
+    pub type_id: u32,
+    pub size_bits: u64,
+    pub align_bits: u64,
+    pub name_length: usize,
+    pub num_members: usize,
+    pub complete: u8,
+    pub c_layout_compatible: u8,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct R2SleighRadareAggregateMemberViewV2 {
+    pub member_id: u32,
+    pub type_id: u32,
+    pub offset_bits: u64,
+    pub size_bits: u64,
+    pub count: usize,
+    pub name_length: usize,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct R2SleighRadareStackSlotViewV2 {
+    pub name_length: usize,
+    pub type_length: usize,
+    pub base: i32,
+    pub base_name_length: usize,
+    pub base_offset: u64,
+    pub base_size: u32,
+    pub offset: i64,
+    pub size: u32,
+    pub offset_valid: u8,
+    pub role: i32,
+    pub arg_index: i32,
+    pub arg_name_length: usize,
+    pub home_reg_length: usize,
+    pub home_reg_offset: u64,
+    pub home_reg_size: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct R2SleighRadareAccessorsV2 {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub snapshot_schema_version: u32,
+    pub accessor_schema_version: u32,
+    pub snapshot_view:
+        Option<unsafe extern "C" fn(*const c_void, *mut R2SleighRadareSnapshotViewV2) -> u8>,
+    pub arch_id: Option<unsafe extern "C" fn(*const c_void, *mut u8, usize) -> u8>,
+    pub cpu_id: Option<unsafe extern "C" fn(*const c_void, *mut u8, usize) -> u8>,
+    pub function_name: Option<unsafe extern "C" fn(*const c_void, *mut u8, usize) -> u8>,
+    pub interface_view: Option<
+        unsafe extern "C" fn(*const c_void, *mut R2SleighRadareFunctionInterfaceViewV2) -> u8,
+    >,
+    pub interface_calling_convention:
+        Option<unsafe extern "C" fn(*const c_void, *mut u8, usize) -> u8>,
+    pub interface_storage_name:
+        Option<unsafe extern "C" fn(*const c_void, i32, *mut u8, usize) -> u8>,
+    pub parameter_view: Option<
+        unsafe extern "C" fn(*const c_void, usize, *mut R2SleighRadareParameterViewV2) -> u8,
+    >,
+    pub parameter_storage_name:
+        Option<unsafe extern "C" fn(*const c_void, usize, *mut u8, usize) -> u8>,
+    pub stack_slot_view: Option<
+        unsafe extern "C" fn(*const c_void, usize, *mut R2SleighRadareStackSlotViewV2) -> u8,
+    >,
+    pub stack_slot_string:
+        Option<unsafe extern "C" fn(*const c_void, usize, i32, *mut u8, usize) -> u8>,
+    pub call_site_view:
+        Option<unsafe extern "C" fn(*const c_void, usize, *mut R2SleighRadareCallSiteViewV2) -> u8>,
+    pub call_site_calling_convention:
+        Option<unsafe extern "C" fn(*const c_void, usize, *mut u8, usize) -> u8>,
+    pub call_site_result_storage_name:
+        Option<unsafe extern "C" fn(*const c_void, usize, *mut u8, usize) -> u8>,
+    pub call_argument_view: Option<
+        unsafe extern "C" fn(*const c_void, usize, usize, *mut R2SleighRadareParameterViewV2) -> u8,
+    >,
+    pub call_argument_storage_name:
+        Option<unsafe extern "C" fn(*const c_void, usize, usize, *mut u8, usize) -> u8>,
+    pub type_graph_view:
+        Option<unsafe extern "C" fn(*const c_void, *mut R2SleighRadareTypeGraphViewV2) -> u8>,
+    pub type_view:
+        Option<unsafe extern "C" fn(*const c_void, usize, *mut R2SleighRadareTypeViewV2) -> u8>,
+    pub aggregate_view: Option<
+        unsafe extern "C" fn(*const c_void, usize, *mut R2SleighRadareAggregateViewV2) -> u8,
+    >,
+    pub aggregate_name: Option<unsafe extern "C" fn(*const c_void, usize, *mut u8, usize) -> u8>,
+    pub aggregate_member_view: Option<
+        unsafe extern "C" fn(
+            *const c_void,
+            usize,
+            usize,
+            *mut R2SleighRadareAggregateMemberViewV2,
+        ) -> u8,
+    >,
+    pub aggregate_member_name:
+        Option<unsafe extern "C" fn(*const c_void, usize, usize, *mut u8, usize) -> u8>,
+    pub block_view:
+        Option<unsafe extern "C" fn(*const c_void, usize, *mut R2SleighRadareBlockViewV2) -> u8>,
+    pub block_bytes:
+        Option<unsafe extern "C" fn(*const c_void, usize, usize, *mut u8, usize) -> u8>,
+    pub successor_view: Option<
+        unsafe extern "C" fn(*const c_void, usize, usize, *mut R2SleighRadareSuccessorViewV2) -> u8,
+    >,
+    pub external_exit: Option<unsafe extern "C" fn(*const c_void, usize, *mut u64) -> u8>,
+}
+
+macro_rules! assert_wire_layout {
+    ($wire:ty, $source:ty) => {
+        const _: [(); size_of::<$wire>()] = [(); size_of::<$source>()];
+        const _: [(); align_of::<$wire>()] = [(); align_of::<$source>()];
+    };
+}
+
+assert_wire_layout!(
+    R2SleighRadareSnapshotInputV2,
+    r2source::RadareAbi138SnapshotInput
+);
+assert_wire_layout!(
+    R2SleighRadareSnapshotViewV2,
+    r2source::RadareAbi138SnapshotView
+);
+assert_wire_layout!(R2SleighRadareBlockViewV2, r2source::RadareAbi138BlockView);
+assert_wire_layout!(
+    R2SleighRadareSuccessorViewV2,
+    r2source::RadareAbi138SuccessorView
+);
+assert_wire_layout!(
+    R2SleighRadareRegisterStorageViewV2,
+    r2source::RadareAbi138RegisterStorageView
+);
+assert_wire_layout!(
+    R2SleighRadareCarrierProjectionV2,
+    r2source::RadareAbi138CarrierProjection
+);
+assert_wire_layout!(
+    R2SleighRadareParameterViewV2,
+    r2source::RadareAbi138ParameterView
+);
+assert_wire_layout!(
+    R2SleighRadareFunctionInterfaceViewV2,
+    r2source::RadareAbi138FunctionInterfaceView
+);
+assert_wire_layout!(
+    R2SleighRadareCallSiteViewV2,
+    r2source::RadareAbi138CallSiteView
+);
+assert_wire_layout!(
+    R2SleighRadareTypeGraphViewV2,
+    r2source::RadareAbi138TypeGraphView
+);
+assert_wire_layout!(R2SleighRadareTypeViewV2, r2source::RadareAbi138TypeView);
+assert_wire_layout!(
+    R2SleighRadareAggregateViewV2,
+    r2source::RadareAbi138AggregateView
+);
+assert_wire_layout!(
+    R2SleighRadareAggregateMemberViewV2,
+    r2source::RadareAbi138AggregateMemberView
+);
+assert_wire_layout!(
+    R2SleighRadareStackSlotViewV2,
+    r2source::RadareAbi138StackSlotView
+);
+assert_wire_layout!(R2SleighRadareAccessorsV2, r2source::RadareAbi138Accessors);
+const _: [(); R2SLEIGH_RADARE_ABI_V2 as usize] = [(); r2source::RADARE_ABI_VERSION as usize];
+const _: [(); R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 as usize] =
+    [(); r2source::RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION as usize];
+const _: [(); R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2 as usize] =
+    [(); r2source::RADARE_SNAPSHOT_ACCESSOR_SCHEMA_VERSION as usize];
 
 /// Typed external signature parameter in the native request graph.
 #[repr(C)]
@@ -226,6 +627,7 @@ pub struct R2SleighContextCallee {
 /// Immutable typed function context. Every pointer is borrowed only for the
 /// duration of `execute` and validated before conversion to owned engine data.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct R2SleighFunctionContext {
     pub schema_version: u32,
     pub dirty_epoch: u64,
@@ -257,6 +659,7 @@ pub struct R2SleighInterprocSeed {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct R2SleighInterprocScope {
     pub schema_version: u32,
     pub functions: *const R2ILFunctionBlocks,
@@ -266,13 +669,155 @@ pub struct R2SleighInterprocScope {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct R2SleighInterprocSessionPlan {
     pub include_type_interproc_scope: i32,
     pub include_root_symbolic_scope: i32,
     pub interproc_iter: usize,
     pub interproc_max_iters: usize,
     pub interproc_converged: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct R2SleighAnalysisPolicyV2 {
+    pub mode: u32,
+    pub type_writeback_mode: u32,
+    pub type_interproc_max_iters: i32,
+    pub type_max_blocks: i32,
+    pub type_global_max_links: i32,
+    pub type_max_decls: i32,
+    pub type_max_mutations: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct R2SleighPostAnalysisPlanV2 {
+    pub mode: u32,
+    pub type_writeback_mode: u32,
+    pub type_interproc_max_iters: i32,
+    pub type_max_blocks: i32,
+    pub type_global_max_links: i32,
+    pub type_max_decls: i32,
+    pub type_max_mutations: i32,
+    pub function_count: usize,
+    pub post_budget_us: u64,
+    pub xref_enabled: i32,
+    pub taint_enabled: i32,
+    pub sigwrite_enabled: i32,
+    pub type_writeback_enabled: i32,
+    pub semantic_comments_enabled: i32,
+    pub sigverify_enabled: i32,
+    pub balanced_focus_only: i32,
+    pub taint_focus_only: i32,
+    pub sigwrite_focus_only: i32,
+    pub type_writeback_focus_only: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct R2SleighAutoCallbackPlanV2 {
+    pub allowed: i32,
+    pub kind: u32,
+    pub reason: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct R2SleighSymbolicScopeFunctionPlanV2 {
+    pub append_function: i32,
+    pub expand_targets: i32,
+    pub reason: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct R2SleighRuntimeMaterializedSourcePlanV2 {
+    pub append_source: i32,
+    pub capped_size: u64,
+    pub slot_bytes: u64,
+    pub reason: u32,
+}
+
+/// One exact, independently versioned interprocedural target observation.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct R2SleighPlannerTargetInputV2 {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub schema_version: u32,
+    pub direct_target: u64,
+    pub name: R2SleighStringViewV2,
+    pub linkage: u32,
+    pub resolved_target: u64,
+    pub has_resolved_target: u32,
+    pub target_materialized: u32,
+    pub has_target_metrics: u32,
+    pub target_basic_block_count: u32,
+    pub target_cost: u32,
+}
+
+/// Opaque registry-owned planner result. `planner_result_free` is the only
+/// valid deallocator.
+pub struct R2SleighPlannerResultV2 {
+    queued_targets: Vec<u64>,
+    registration_targets: Vec<u64>,
+    runtime_copy_targets: Vec<u64>,
+}
+
+/// Pointer-free counts for one registry-owned planner result.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct R2SleighPlannerResultViewV2 {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub schema_version: u32,
+    pub queued_target_count: usize,
+    pub registration_target_count: usize,
+    pub runtime_copy_target_count: usize,
+}
+
+/// Versioned planner query. The selected `kind` determines which input fields
+/// are read; target arrays are copied and validated during the call.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct R2SleighPlannerQueryRequestV2 {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub schema_version: u32,
+    pub kind: u32,
+    pub depth: u32,
+    pub purpose: u32,
+    pub callback_kind: u32,
+    pub root_function: u32,
+    pub target_hint_function: u32,
+    pub current_scope_count: usize,
+    pub function_count: usize,
+    pub basic_block_count: usize,
+    pub cost: u32,
+    pub linear_size: u64,
+    pub addr: u64,
+    pub size: u64,
+    pub interproc: R2SleighInterprocSessionPlan,
+    pub targets: *const R2SleighPlannerTargetInputV2,
+    pub num_targets: usize,
+}
+
+/// Versioned planner response. Only the member selected by `kind` is authoritative.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct R2SleighPlannerQueryResponseV2 {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub schema_version: u32,
+    pub kind: u32,
+    pub analysis_policy: R2SleighAnalysisPolicyV2,
+    pub post_analysis: R2SleighPostAnalysisPlanV2,
+    pub auto_callback: R2SleighAutoCallbackPlanV2,
+    pub interproc_session: R2SleighInterprocSessionPlan,
+    pub symbolic_scope: R2SleighSymbolicScopeFunctionPlanV2,
+    pub runtime_source: R2SleighRuntimeMaterializedSourcePlanV2,
+    pub result: *mut R2SleighPlannerResultV2,
 }
 
 #[repr(C)]
@@ -461,6 +1006,7 @@ pub struct R2SleighSourceFunctionInterfaceV2 {
 /// combines with the session-owned cancellation token; request flags remain
 /// reserved and V2 rejects every nonzero production flag today.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct R2SleighEngineRequestPayloadV2 {
     pub abi_version: u32,
     pub struct_size: u32,
@@ -476,6 +1022,9 @@ pub struct R2SleighEngineRequestPayloadV2 {
     pub analysis_depth: u32,
     /// Relative request deadline. Zero disables the deadline.
     pub timeout_us: u64,
+    /// Opaque certifying source. Null keeps this request analysis-only.
+    pub radare_snapshot: *const R2SleighRadareSnapshotInputV2,
+    /// Detached interface metadata is advisory and never grants certification.
     pub source_interface: *const R2SleighSourceFunctionInterfaceV2,
 }
 
@@ -522,6 +1071,150 @@ pub struct R2SleighResponseV2 {
     ffi_conversion_elapsed_us: u64,
 }
 
+/// Opaque Rust-owned bytes. `owned_bytes_view` borrows its contents and
+/// `owned_bytes_free` is the only valid deallocator.
+pub struct R2SleighOwnedBytesV2 {
+    bytes: CString,
+}
+
+/// Opaque owner of one tagged structured analysis result.
+pub struct R2SleighAnalysisResultV2 {
+    kind: u32,
+    raw: *mut c_void,
+}
+
+impl Drop for R2SleighAnalysisResultV2 {
+    fn drop(&mut self) {
+        unsafe { free_analysis_result_payload(self) };
+        self.raw = ptr::null_mut();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiftHandleKind {
+    Context,
+    Block,
+    OwnedBytes,
+    AnalysisResult,
+    PlannerResult,
+}
+
+struct LiftHandleEntry {
+    kind: LiftHandleKind,
+    generation: u64,
+    owner: u64,
+    payload: usize,
+    creator_thread: ThreadId,
+}
+
+struct LiftHandleRegistry {
+    next_generation: u64,
+    handles: BTreeMap<usize, LiftHandleEntry>,
+}
+
+impl Default for LiftHandleRegistry {
+    fn default() -> Self {
+        Self {
+            next_generation: 1,
+            handles: BTreeMap::new(),
+        }
+    }
+}
+
+thread_local! {
+    static LIFT_LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
+}
+
+/// One immutable switch case copied into a lifted block.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct R2SleighSwitchCaseV2 {
+    pub value: u64,
+    pub target: u64,
+}
+
+/// Exact identity of one direct call in a lifted block.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct R2SleighDirectCallIdentityV2 {
+    pub op_index: usize,
+    pub target_space: u32,
+    pub target_custom_space: u32,
+    pub target_offset: u64,
+    pub target_size: u32,
+}
+
+/// One bounded text-analysis request over registry-owned lift handles.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct R2SleighAnalysisRenderRequestV2 {
+    pub kind: u32,
+    pub context: *const R2ILContext,
+    pub blocks: *const *const R2ILBlock,
+    pub num_blocks: usize,
+    pub op_index: usize,
+    pub argument: R2SleighStringViewV2,
+}
+
+/// One explicitly linked symbol in an immutable per-scope request snapshot.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct R2SleighScopeSymbolV2 {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub schema_version: u32,
+    pub addr: u64,
+    pub name: R2SleighStringViewV2,
+    pub linkage: u32,
+}
+
+/// One bounded symbolic request over registry-owned scoped lift handles.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct R2SleighScopeRenderRequestV2 {
+    pub kind: u32,
+    pub context: *const R2ILContext,
+    pub functions: *const R2ILFunctionBlocks,
+    pub num_functions: usize,
+    pub entry_addr: u64,
+    pub target_addr: u64,
+    pub replay_seed: *const c_void,
+    pub argument: R2SleighStringViewV2,
+    pub external_context: R2SleighStringViewV2,
+    pub symbols: *const R2SleighScopeSymbolV2,
+    pub num_symbols: usize,
+    pub merge_states: u32,
+}
+
+/// One bounded structured-analysis request over registry-owned lift handles.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct R2SleighAnalysisQueryRequestV2 {
+    pub kind: u32,
+    pub context: *const R2ILContext,
+    pub blocks: *const *const R2ILBlock,
+    pub num_blocks: usize,
+    pub function_addr: u64,
+    pub function_name: R2SleighStringViewV2,
+    pub input_values: *const u64,
+    pub num_input_values: usize,
+}
+
+/// Borrowed arrays owned by one `R2SleighAnalysisResultV2`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct R2SleighAnalysisResultViewV2 {
+    pub kind: u32,
+    pub primary: *const c_void,
+    pub primary_count: usize,
+    pub secondary: *const c_void,
+    pub secondary_count: usize,
+    pub tertiary: *const c_void,
+    pub tertiary_count: usize,
+    pub quaternary: *const c_void,
+    pub quaternary_count: usize,
+}
+
 /// Stable V2 function table. Every callback contains its own unwind barrier.
 #[repr(C)]
 pub struct R2SleighApiV2 {
@@ -556,14 +1249,32 @@ pub struct R2SleighApiV2 {
     pub source_call_argument_size: u32,
     pub source_call_site_interface_size: u32,
     pub byte_view_size: u32,
+    pub string_view_size: u32,
     pub phase_timing_size: u32,
     pub response_info_size: u32,
+    pub switch_case_size: u32,
+    pub direct_call_identity_size: u32,
+    pub analysis_render_request_size: u32,
+    pub scope_render_request_size: u32,
+    pub scope_symbol_size: u32,
+    pub analysis_query_request_size: u32,
+    pub analysis_result_view_size: u32,
+    pub planner_query_request_size: u32,
+    pub planner_query_response_size: u32,
+    pub planner_target_input_size: u32,
+    pub planner_result_view_size: u32,
+    pub radare_snapshot_input_size: u32,
+    pub radare_accessors_size: u32,
     pub session_create:
         extern "C" fn(*const R2SleighSessionConfigV2, *mut *mut R2SleighSessionV2) -> u32,
     pub session_free: extern "C" fn(*mut R2SleighSessionV2) -> u32,
     pub session_cancel: extern "C" fn(*const R2SleighSessionV2) -> u32,
     pub session_reset_cancellation: extern "C" fn(*const R2SleighSessionV2) -> u32,
-    pub execute: extern "C" fn(
+    /// # Safety
+    ///
+    /// Every borrowed request pointer, opaque source handle, and callback table
+    /// must remain valid and immutable for the full synchronous call.
+    pub execute: unsafe extern "C" fn(
         *mut R2SleighSessionV2,
         *const R2SleighRequestV2,
         *mut *mut R2SleighResponseV2,
@@ -572,6 +1283,76 @@ pub struct R2SleighApiV2 {
     pub response_info: extern "C" fn(*const R2SleighResponseV2, *mut R2SleighResponseInfoV2) -> u32,
     pub response_free: extern "C" fn(*mut R2SleighResponseV2) -> u32,
     pub session_error: extern "C" fn(*const R2SleighSessionV2, *mut R2SleighByteViewV2) -> u32,
+    pub lift_context_create: extern "C" fn(R2SleighStringViewV2, *mut *mut R2ILContext) -> u32,
+    pub lift_context_free: extern "C" fn(*mut R2ILContext) -> u32,
+    pub lift_context_is_loaded: extern "C" fn(*const R2ILContext, *mut u32) -> u32,
+    pub lift_context_arch_name: extern "C" fn(*const R2ILContext, *mut R2SleighByteViewV2) -> u32,
+    pub lift_context_error: extern "C" fn(*const R2ILContext, *mut R2SleighByteViewV2) -> u32,
+    pub lift_last_error: extern "C" fn(*mut R2SleighByteViewV2) -> u32,
+    pub lift_context_reg_profile:
+        extern "C" fn(*const R2ILContext, *mut *mut R2SleighOwnedBytesV2) -> u32,
+    pub lift_instruction:
+        extern "C" fn(*mut R2ILContext, R2SleighByteViewV2, u64, *mut *mut R2ILBlock) -> u32,
+    pub lift_block:
+        extern "C" fn(*mut R2ILContext, R2SleighByteViewV2, u64, u32, *mut *mut R2ILBlock) -> u32,
+    pub lift_context_set_semantic_metadata: extern "C" fn(*mut R2ILContext, u32) -> u32,
+    pub lift_block_free: extern "C" fn(*mut R2ILBlock) -> u32,
+    pub lift_block_validate: extern "C" fn(*mut R2ILContext, *const R2ILBlock) -> u32,
+    pub lift_block_set_switch_info: extern "C" fn(
+        *mut R2ILBlock,
+        u64,
+        u64,
+        u64,
+        u64,
+        u32,
+        *const R2SleighSwitchCaseV2,
+        usize,
+    ) -> u32,
+    pub lift_block_op_count: extern "C" fn(*const R2ILBlock, *mut usize) -> u32,
+    pub lift_block_direct_call_identity: extern "C" fn(
+        *const R2ILBlock,
+        u64,
+        u64,
+        *mut u32,
+        *mut R2SleighDirectCallIdentityV2,
+    ) -> u32,
+    pub lift_block_size: extern "C" fn(*const R2ILBlock, *mut u32) -> u32,
+    pub lift_block_addr: extern "C" fn(*const R2ILBlock, *mut u64) -> u32,
+    pub lift_block_mnemonic: extern "C" fn(
+        *const R2ILContext,
+        R2SleighByteViewV2,
+        u64,
+        *mut *mut R2SleighOwnedBytesV2,
+    ) -> u32,
+    pub lift_block_type: extern "C" fn(*const R2ILBlock, *mut u32) -> u32,
+    pub lift_block_jump: extern "C" fn(*const R2ILBlock, *mut u64) -> u32,
+    pub lift_block_fail: extern "C" fn(*const R2ILBlock, *mut u64) -> u32,
+    pub owned_bytes_view:
+        extern "C" fn(*const R2SleighOwnedBytesV2, *mut R2SleighByteViewV2) -> u32,
+    pub owned_bytes_free: extern "C" fn(*mut R2SleighOwnedBytesV2) -> u32,
+    pub analysis_render: extern "C" fn(
+        *const R2SleighAnalysisRenderRequestV2,
+        *mut *mut R2SleighOwnedBytesV2,
+    ) -> u32,
+    pub scope_render:
+        extern "C" fn(*const R2SleighScopeRenderRequestV2, *mut *mut R2SleighOwnedBytesV2) -> u32,
+    pub analysis_query: extern "C" fn(
+        *const R2SleighAnalysisQueryRequestV2,
+        *mut *mut R2SleighAnalysisResultV2,
+    ) -> u32,
+    pub analysis_result_view:
+        extern "C" fn(*const R2SleighAnalysisResultV2, *mut R2SleighAnalysisResultViewV2) -> u32,
+    pub analysis_result_free: extern "C" fn(*mut R2SleighAnalysisResultV2) -> u32,
+    pub engine_cache_reset: extern "C" fn() -> u32,
+    pub planner_query: extern "C" fn(
+        *const R2SleighPlannerQueryRequestV2,
+        *mut R2SleighPlannerQueryResponseV2,
+    ) -> u32,
+    pub planner_result_view:
+        extern "C" fn(*const R2SleighPlannerResultV2, *mut R2SleighPlannerResultViewV2) -> u32,
+    pub planner_result_copy:
+        extern "C" fn(*const R2SleighPlannerResultV2, u32, *mut u64, usize, *mut usize) -> u32,
+    pub planner_result_free: extern "C" fn(*mut R2SleighPlannerResultV2) -> u32,
 }
 
 #[derive(Debug)]
@@ -641,6 +1422,334 @@ fn valid_object_ptr<T>(value: *const T, label: &str) -> Result<(), BoundaryError
         return Err(BoundaryError::invalid(format!("{label} is misaligned")));
     }
     Ok(())
+}
+
+fn valid_output_ptr<T>(value: *mut T, label: &str) -> Result<(), BoundaryError> {
+    valid_object_ptr(value.cast_const(), label)
+}
+
+fn lift_registry() -> &'static Mutex<LiftHandleRegistry> {
+    static REGISTRY: OnceLock<Mutex<LiftHandleRegistry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(LiftHandleRegistry::default()))
+}
+
+fn lock_lift_registry() -> MutexGuard<'static, LiftHandleRegistry> {
+    lift_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn lift_handle_key<T>(handle: *const T, label: &str) -> Result<usize, BoundaryError> {
+    if handle.is_null() {
+        return Err(BoundaryError::invalid(format!("{label} is null")));
+    }
+    let key = handle as usize;
+    if !key.is_multiple_of(align_of::<T>()) {
+        return Err(BoundaryError::invalid(format!("{label} is misaligned")));
+    }
+    Ok(key)
+}
+
+impl LiftHandleRegistry {
+    fn allocate_generation(&mut self) -> Result<u64, BoundaryError> {
+        let generation = self.next_generation;
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .ok_or_else(|| BoundaryError::limit("lift handle generation exhausted"))?;
+        Ok(generation)
+    }
+
+    fn handle_key<T>(&self, generation: u64) -> Result<usize, BoundaryError> {
+        let stride = align_of::<R2ILContext>()
+            .max(align_of::<R2ILBlock>())
+            .max(align_of::<R2SleighOwnedBytesV2>())
+            .max(align_of::<R2SleighAnalysisResultV2>())
+            .max(align_of::<R2SleighPlannerResultV2>())
+            .max(2);
+        let generation = usize::try_from(generation)
+            .map_err(|_| BoundaryError::limit("lift handle token space exhausted"))?;
+        let key = generation
+            .checked_mul(stride)
+            .ok_or_else(|| BoundaryError::limit("lift handle token space exhausted"))?;
+        if key == 0 || !key.is_multiple_of(align_of::<T>()) {
+            return Err(BoundaryError::engine("invalid generated lift handle token"));
+        }
+        Ok(key)
+    }
+
+    fn insert_context(
+        &mut self,
+        context: Box<R2ILContext>,
+    ) -> Result<*mut R2ILContext, BoundaryError> {
+        let generation = self.allocate_generation()?;
+        let key = self.handle_key::<R2ILContext>(generation)?;
+        if self.handles.contains_key(&key) {
+            return Err(BoundaryError::engine("lift context handle collision"));
+        }
+        let payload = Box::into_raw(context) as usize;
+        self.handles.insert(
+            key,
+            LiftHandleEntry {
+                kind: LiftHandleKind::Context,
+                generation,
+                owner: generation,
+                payload,
+                creator_thread: thread::current().id(),
+            },
+        );
+        Ok(key as *mut R2ILContext)
+    }
+
+    fn insert_block(
+        &mut self,
+        owner: u64,
+        block: Box<R2ILBlock>,
+    ) -> Result<*mut R2ILBlock, BoundaryError> {
+        let generation = self.allocate_generation()?;
+        let key = self.handle_key::<R2ILBlock>(generation)?;
+        if self.handles.contains_key(&key) {
+            return Err(BoundaryError::engine("lift block handle collision"));
+        }
+        let payload = Box::into_raw(block) as usize;
+        self.handles.insert(
+            key,
+            LiftHandleEntry {
+                kind: LiftHandleKind::Block,
+                generation,
+                owner,
+                payload,
+                creator_thread: thread::current().id(),
+            },
+        );
+        Ok(key as *mut R2ILBlock)
+    }
+
+    fn insert_owned_bytes(
+        &mut self,
+        owner: u64,
+        bytes: R2SleighOwnedBytesV2,
+    ) -> Result<*mut R2SleighOwnedBytesV2, BoundaryError> {
+        let bytes = Box::new(bytes);
+        let generation = self.allocate_generation()?;
+        let key = self.handle_key::<R2SleighOwnedBytesV2>(generation)?;
+        if self.handles.contains_key(&key) {
+            return Err(BoundaryError::engine("owned-byte handle collision"));
+        }
+        let payload = Box::into_raw(bytes) as usize;
+        self.handles.insert(
+            key,
+            LiftHandleEntry {
+                kind: LiftHandleKind::OwnedBytes,
+                generation,
+                owner,
+                payload,
+                creator_thread: thread::current().id(),
+            },
+        );
+        Ok(key as *mut R2SleighOwnedBytesV2)
+    }
+
+    fn insert_analysis_result(
+        &mut self,
+        owner: u64,
+        result: R2SleighAnalysisResultV2,
+    ) -> Result<*mut R2SleighAnalysisResultV2, BoundaryError> {
+        let result = Box::new(result);
+        let generation = self.allocate_generation()?;
+        let key = self.handle_key::<R2SleighAnalysisResultV2>(generation)?;
+        if self.handles.contains_key(&key) {
+            return Err(BoundaryError::engine("analysis-result handle collision"));
+        }
+        let payload = Box::into_raw(result) as usize;
+        self.handles.insert(
+            key,
+            LiftHandleEntry {
+                kind: LiftHandleKind::AnalysisResult,
+                generation,
+                owner,
+                payload,
+                creator_thread: thread::current().id(),
+            },
+        );
+        Ok(key as *mut R2SleighAnalysisResultV2)
+    }
+
+    fn insert_planner_result(
+        &mut self,
+        result: R2SleighPlannerResultV2,
+    ) -> Result<*mut R2SleighPlannerResultV2, BoundaryError> {
+        let generation = self.allocate_generation()?;
+        let key = self.handle_key::<R2SleighPlannerResultV2>(generation)?;
+        if self.handles.contains_key(&key) {
+            return Err(BoundaryError::engine("planner-result handle collision"));
+        }
+        let payload = Box::into_raw(Box::new(result)) as usize;
+        self.handles.insert(
+            key,
+            LiftHandleEntry {
+                kind: LiftHandleKind::PlannerResult,
+                generation,
+                owner: 0,
+                payload,
+                creator_thread: thread::current().id(),
+            },
+        );
+        Ok(key as *mut R2SleighPlannerResultV2)
+    }
+
+    fn entry(
+        &self,
+        key: usize,
+        kind: LiftHandleKind,
+        label: &str,
+    ) -> Result<&LiftHandleEntry, BoundaryError> {
+        let entry = self
+            .handles
+            .get(&key)
+            .ok_or_else(|| BoundaryError::invalid(format!("{label} is unknown or stale")))?;
+        if entry.kind != kind {
+            return Err(BoundaryError::invalid(format!(
+                "{label} has the wrong handle kind or generation"
+            )));
+        }
+        if entry.creator_thread != thread::current().id() {
+            return Err(BoundaryError::invalid(format!(
+                "{label} belongs to a different thread"
+            )));
+        }
+        Ok(entry)
+    }
+
+    fn entry_mut(
+        &mut self,
+        key: usize,
+        kind: LiftHandleKind,
+        label: &str,
+    ) -> Result<&mut LiftHandleEntry, BoundaryError> {
+        let entry = self
+            .handles
+            .get_mut(&key)
+            .ok_or_else(|| BoundaryError::invalid(format!("{label} is unknown or stale")))?;
+        if entry.kind != kind {
+            return Err(BoundaryError::invalid(format!(
+                "{label} has the wrong handle kind or generation"
+            )));
+        }
+        if entry.creator_thread != thread::current().id() {
+            return Err(BoundaryError::invalid(format!(
+                "{label} belongs to a different thread"
+            )));
+        }
+        Ok(entry)
+    }
+
+    fn payload<T>(
+        &self,
+        key: usize,
+        kind: LiftHandleKind,
+        label: &str,
+    ) -> Result<*mut T, BoundaryError> {
+        let entry = self.entry(key, kind, label)?;
+        Ok(entry.payload as *mut T)
+    }
+
+    fn owner_for_key(&self, key: usize) -> Option<u64> {
+        self.handles.get(&key).map(|entry| entry.owner)
+    }
+
+    fn retire(
+        &mut self,
+        key: usize,
+        kind: LiftHandleKind,
+        label: &str,
+    ) -> Result<(), BoundaryError> {
+        self.entry(key, kind, label)?;
+        let entry = self
+            .handles
+            .remove(&key)
+            .expect("validated lift handle remains registered");
+        unsafe {
+            match entry.kind {
+                LiftHandleKind::Context => drop(Box::from_raw(entry.payload as *mut R2ILContext)),
+                LiftHandleKind::Block => drop(Box::from_raw(entry.payload as *mut R2ILBlock)),
+                LiftHandleKind::OwnedBytes => {
+                    drop(Box::from_raw(entry.payload as *mut R2SleighOwnedBytesV2))
+                }
+                LiftHandleKind::AnalysisResult => {
+                    drop(Box::from_raw(
+                        entry.payload as *mut R2SleighAnalysisResultV2,
+                    ));
+                }
+                LiftHandleKind::PlannerResult => {
+                    drop(Box::from_raw(entry.payload as *mut R2SleighPlannerResultV2));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn record_error(&mut self, key: Option<usize>, message: &str) {
+        let Some(owner) = key.and_then(|key| self.owner_for_key(key)) else {
+            return;
+        };
+        if let Some((key, _)) = self
+            .handles
+            .iter()
+            .find(|(_, entry)| entry.kind == LiftHandleKind::Context && entry.generation == owner)
+        {
+            let payload = self.handles[key].payload as *mut R2ILContext;
+            unsafe { (&mut *payload).set_error(message) };
+        }
+    }
+}
+
+unsafe fn free_analysis_result_payload(result: &R2SleighAnalysisResultV2) {
+    match result.kind {
+        R2SLEIGH_QUERY_BLOCK_VALUES_V2 => super::r2il_block_values_free(result.raw.cast()),
+        R2SLEIGH_QUERY_TAINT_SUMMARY_V2 => {
+            super::analysis::taint::r2taint_function_summary_free(result.raw.cast())
+        }
+        R2SLEIGH_QUERY_ANNOTATIONS_V2 => super::r2sleigh_annotations_free(result.raw.cast()),
+        R2SLEIGH_QUERY_DIRECT_TARGETS_V2 | R2SLEIGH_QUERY_SYMBOLIC_TARGETS_V2 => {
+            super::r2sleigh_u64_array_free(result.raw.cast())
+        }
+        R2SLEIGH_QUERY_RUNTIME_SOURCES_V2 => {
+            super::r2sleigh_runtime_sources_free(result.raw.cast())
+        }
+        R2SLEIGH_QUERY_RECOVERED_VARS_V2 => {
+            super::types::r2sleigh_recovered_vars_free(result.raw.cast())
+        }
+        R2SLEIGH_QUERY_DATA_REFS_V2 => super::types::r2sleigh_data_refs_free(result.raw.cast()),
+        _ => {}
+    }
+}
+
+fn lift_boundary_for<T>(
+    handle: *const T,
+    operation: impl FnOnce() -> Result<(), BoundaryError>,
+) -> u32 {
+    let key = (!handle.is_null()).then_some(handle as usize);
+    LIFT_LAST_ERROR.with(|error| *error.borrow_mut() = None);
+    match catch_unwind(AssertUnwindSafe(operation)) {
+        Ok(Ok(())) => R2SLEIGH_STATUS_OK_V2,
+        Ok(Err(error)) => {
+            LIFT_LAST_ERROR
+                .with(|slot| *slot.borrow_mut() = CString::new(error.message.as_str()).ok());
+            lock_lift_registry().record_error(key, &error.message);
+            error.status
+        }
+        Err(_) => {
+            LIFT_LAST_ERROR
+                .with(|slot| *slot.borrow_mut() = CString::new("panic in lift-core callback").ok());
+            lock_lift_registry().record_error(key, "panic in lift-core callback");
+            R2SLEIGH_STATUS_PANIC_V2
+        }
+    }
+}
+
+fn lift_boundary(operation: impl FnOnce() -> Result<(), BoundaryError>) -> u32 {
+    lift_boundary_for(ptr::null::<c_void>(), operation)
 }
 
 #[derive(Default)]
@@ -2590,6 +3699,93 @@ fn elapsed_us(started: Instant) -> u64 {
     started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
 }
 
+fn validate_opaque_snapshot_envelope(
+    payload: &R2SleighEngineRequestPayloadV2,
+) -> Result<(), BoundaryError> {
+    let context = payload.function_context;
+    let scope = payload.interproc_scope;
+    if !payload.ctx.is_null()
+        || !payload.blocks.is_null()
+        || payload.num_blocks != 0
+        || payload.function_addr != 0
+        || !payload.function_name.is_null()
+        || context.schema_version != 0
+        || context.dirty_epoch != 0
+        || context.context_hash != 0
+        || context.type_dirty_epoch != 0
+        || !context.external_context_json.is_null()
+        || !context.signature_name.is_null()
+        || !context.signature_ret_type.is_null()
+        || !context.signature_callconv.is_null()
+        || context.signature_noreturn != 0
+        || !context.params.is_null()
+        || context.num_params != 0
+        || !context.vars.is_null()
+        || context.num_vars != 0
+        || !context.base_types.is_null()
+        || context.num_base_types != 0
+        || !context.callees.is_null()
+        || context.num_callees != 0
+        || !context.assumptions_json.is_null()
+        || payload.lift_quality != R2SleighLiftQuality::default()
+        || scope.schema_version != 0
+        || !scope.functions.is_null()
+        || scope.num_functions != 0
+        || !scope.seeds.is_null()
+        || scope.num_seeds != 0
+        || payload.interproc_plan != R2SleighInterprocSessionPlan::default()
+        || payload.analysis_depth != 0
+        || !payload.source_interface.is_null()
+    {
+        return Err(BoundaryError::invalid(
+            "opaque snapshot request contains detached or inactive authority fields",
+        ));
+    }
+    Ok(())
+}
+
+unsafe fn capture_trusted_ssa(
+    input: *const R2SleighRadareSnapshotInputV2,
+    execution: &r2engine::EngineExecutionControl,
+) -> Result<Arc<r2ssa::TrustedSsaArtifact>, BoundaryError> {
+    let ssa_control = execution.ssa_execution_control();
+    r2ssa::SsaWorkControl::poll(&ssa_control)
+        .map_err(|error| BoundaryError::engine(format!("trusted ingress stopped: {error}")))?;
+    valid_object_ptr(input, "engine payload radare snapshot")?;
+    // The local wire declarations are compile-time size/alignment checked
+    // against r2source above and preserve the exact repr(C) field order.
+    let source_input = unsafe { &*input.cast::<r2source::RadareAbi138SnapshotInput>() };
+    let source = unsafe { r2source::capture_radare_abi138(source_input) }.map_err(|error| {
+        use r2source::RadareAbi138CaptureError as CaptureError;
+        match error {
+            CaptureError::InvalidInputSize
+            | CaptureError::UnsupportedVersion
+            | CaptureError::InvalidAccessorSize => {
+                BoundaryError::abi(format!("opaque source snapshot refused: {error}"))
+            }
+            CaptureError::BudgetExceeded => {
+                BoundaryError::limit(format!("opaque source snapshot refused: {error}"))
+            }
+            _ => BoundaryError::invalid(format!("opaque source snapshot refused: {error}")),
+        }
+    })?;
+    r2ssa::SsaWorkControl::poll(&ssa_control).map_err(|error| {
+        BoundaryError::engine(format!(
+            "trusted ingress stopped after source capture: {error}"
+        ))
+    })?;
+    let lifted = r2sleigh_lift::Disassembler::lift_owned_function(source)
+        .map_err(|error| BoundaryError::unsupported(format!("trusted lift refused: {error}")))?;
+    r2ssa::SsaWorkControl::poll(&ssa_control).map_err(|error| {
+        BoundaryError::engine(format!("trusted ingress stopped after lift: {error}"))
+    })?;
+    let trusted =
+        r2ssa::TrustedSsaArtifact::prepare_with_control(lifted, &ssa_control).map_err(|error| {
+            BoundaryError::engine(format!("trusted SSA preparation failed: {error}"))
+        })?;
+    Ok(Arc::new(trusted))
+}
+
 unsafe fn execute_request(
     request: &R2SleighRequestV2,
     cancellation: r2engine::EngineCancellationToken,
@@ -2628,6 +3824,124 @@ unsafe fn execute_request(
             "engine payload ABI version or struct size mismatch",
         ));
     }
+    if !payload.radare_snapshot.is_null() {
+        if !matches!(
+            request.kind,
+            R2SLEIGH_REQUEST_DECOMPILE_V2 | R2SLEIGH_REQUEST_TYPE_FUNCTION_V2
+        ) {
+            return Err(BoundaryError::unsupported("unsupported request kind"));
+        }
+        validate_opaque_snapshot_envelope(payload)?;
+        let deadline = (payload.timeout_us != 0).then(|| {
+            Instant::now()
+                .checked_add(Duration::from_micros(payload.timeout_us))
+                .unwrap_or_else(Instant::now)
+        });
+        let execution = r2engine::EngineExecutionControl::new(cancellation, deadline);
+        let trusted = unsafe { capture_trusted_ssa(payload.radare_snapshot, &execution) }?;
+        let ffi_conversion_elapsed_us = elapsed_us(ffi_started);
+        let output = match request.kind {
+            R2SLEIGH_REQUEST_DECOMPILE_V2 => {
+                super::r2sleigh_engine_decompile_trusted_output(payload, trusted, execution)
+                    .ok_or_else(|| BoundaryError::engine("decompile engine refused the request"))?
+            }
+            R2SLEIGH_REQUEST_TYPE_FUNCTION_V2 => {
+                super::r2sleigh_engine_type_function_trusted_output(payload, trusted, execution)
+                    .ok_or_else(|| BoundaryError::engine("type engine refused the request"))?
+            }
+            _ => return Err(BoundaryError::unsupported("unsupported request kind")),
+        };
+        return Ok(ExecutedRequest {
+            output,
+            request_kind: request.kind,
+            ffi_conversion_elapsed_us,
+        });
+    }
+    let root_block_handles = unsafe {
+        checked_slice(
+            payload.blocks,
+            payload.num_blocks,
+            R2SLEIGH_MAX_FUNCTION_BLOCKS_V2,
+            "engine payload blocks",
+        )?
+    };
+    let scope_function_handles = unsafe {
+        checked_slice(
+            payload.interproc_scope.functions,
+            payload.interproc_scope.num_functions,
+            R2SLEIGH_MAX_SCOPE_FUNCTIONS_V2,
+            "engine payload scope functions",
+        )?
+    };
+    let mut scope_block_handles = Vec::with_capacity(scope_function_handles.len());
+    for (index, function) in scope_function_handles.iter().enumerate() {
+        scope_block_handles.push(unsafe {
+            checked_slice(
+                function.blocks,
+                function.num_blocks,
+                R2SLEIGH_MAX_FUNCTION_BLOCKS_V2,
+                &format!("engine payload scope functions[{index}] blocks"),
+            )?
+        });
+    }
+
+    // Keep the registry locked for the full synchronous request. This pins
+    // every resolved allocation and prevents concurrent consume-on-free.
+    let registry = lock_lift_registry();
+    let context_key = lift_handle_key(payload.ctx, "engine payload lift context")?;
+    let context_entry = registry.entry(
+        context_key,
+        LiftHandleKind::Context,
+        "engine payload lift context",
+    )?;
+    let owner = context_entry.generation;
+    let context = context_entry.payload as *const R2ILContext;
+    let resolve_block = |handle: *const R2ILBlock, label: &str| {
+        let key = lift_handle_key(handle, label)?;
+        let entry = registry.entry(key, LiftHandleKind::Block, label)?;
+        if entry.owner != owner {
+            return Err(BoundaryError::invalid(format!(
+                "{label} belongs to a different lift context"
+            )));
+        }
+        Ok(entry.payload as *const R2ILBlock)
+    };
+    let mut root_blocks = Vec::with_capacity(root_block_handles.len());
+    for (index, block) in root_block_handles.iter().enumerate() {
+        root_blocks.push(resolve_block(
+            *block,
+            &format!("engine payload blocks[{index}]"),
+        )?);
+    }
+    let mut scoped_blocks = Vec::with_capacity(scope_block_handles.len());
+    for (function_index, blocks) in scope_block_handles.iter().enumerate() {
+        let mut resolved = Vec::with_capacity(blocks.len());
+        for (block_index, block) in blocks.iter().enumerate() {
+            resolved.push(resolve_block(
+                *block,
+                &format!("engine payload scope functions[{function_index}] blocks[{block_index}]"),
+            )?);
+        }
+        scoped_blocks.push(resolved);
+    }
+    let mut scoped_functions = Vec::with_capacity(scope_function_handles.len());
+    for (index, function) in scope_function_handles.iter().enumerate() {
+        scoped_functions.push(R2ILFunctionBlocks {
+            entry_addr: function.entry_addr,
+            name: function.name,
+            blocks: scoped_blocks[index].as_ptr(),
+            num_blocks: scoped_blocks[index].len(),
+            provenance: function.provenance,
+        });
+    }
+    let mut resolved_payload = *payload;
+    resolved_payload.ctx = context;
+    resolved_payload.blocks = root_blocks.as_ptr();
+    resolved_payload.num_blocks = root_blocks.len();
+    resolved_payload.interproc_scope.functions = scoped_functions.as_ptr();
+    resolved_payload.interproc_scope.num_functions = scoped_functions.len();
+    let payload = &resolved_payload;
+
     let deadline = (payload.timeout_us != 0).then(|| {
         Instant::now()
             .checked_add(Duration::from_micros(payload.timeout_us))
@@ -2886,7 +4200,7 @@ fn response_outcome(diagnostics: &r2engine::EngineDiagnostics) -> u32 {
     }
 }
 
-extern "C" fn execute(
+unsafe extern "C" fn execute(
     session: *mut R2SleighSessionV2,
     request: *const R2SleighRequestV2,
     output: *mut *mut R2SleighResponseV2,
@@ -3060,6 +4374,1786 @@ extern "C" fn session_error(
     .unwrap_or(R2SLEIGH_STATUS_PANIC_V2)
 }
 
+fn c_string_view(value: *const c_char) -> R2SleighByteViewV2 {
+    if value.is_null() {
+        return R2SleighByteViewV2::default();
+    }
+    let value = unsafe { CStr::from_ptr(value) };
+    R2SleighByteViewV2 {
+        data: value.as_ptr().cast(),
+        len: value.to_bytes().len(),
+    }
+}
+
+extern "C" fn lift_context_create(
+    arch: R2SleighStringViewV2,
+    output: *mut *mut R2ILContext,
+) -> u32 {
+    lift_boundary(|| {
+        valid_output_ptr(output, "lift context output")?;
+        unsafe { *output = ptr::null_mut() };
+        let mut budget = ValidationBudget::default();
+        let arch = unsafe {
+            string_view(
+                arch,
+                R2SLEIGH_MAX_STRING_BYTES_V2,
+                "lift architecture",
+                &mut budget,
+            )?
+        };
+        if arch.is_empty() {
+            return Err(BoundaryError::invalid("lift architecture is empty"));
+        }
+        let arch = CString::new(arch)
+            .map_err(|_| BoundaryError::invalid("lift architecture contains NUL"))?;
+        let context = super::r2il_arch_init(arch.as_ptr());
+        if context.is_null() {
+            return Err(BoundaryError::engine("failed to allocate lift context"));
+        }
+        // Trusted internal constructor result; no caller-supplied pointer is
+        // converted before registry insertion.
+        let context = unsafe { Box::from_raw(context) };
+        let handle = lock_lift_registry().insert_context(context)?;
+        unsafe { *output = handle };
+        Ok(())
+    })
+}
+
+extern "C" fn lift_context_free(context: *mut R2ILContext) -> u32 {
+    lift_boundary_for(context, || {
+        let key = lift_handle_key(context, "lift context")?;
+        let mut registry = lock_lift_registry();
+        let generation = registry
+            .entry(key, LiftHandleKind::Context, "lift context")?
+            .generation;
+        if registry
+            .handles
+            .values()
+            .any(|entry| entry.owner == generation && entry.generation != generation)
+        {
+            return Err(BoundaryError::engine(
+                "lift context still owns live child handles",
+            ));
+        }
+        registry.retire(key, LiftHandleKind::Context, "lift context")?;
+        Ok(())
+    })
+}
+
+extern "C" fn lift_context_is_loaded(context: *const R2ILContext, output: *mut u32) -> u32 {
+    lift_boundary_for(context, || {
+        valid_output_ptr(output, "lift loaded output")?;
+        unsafe { *output = 0 };
+        let key = lift_handle_key(context, "lift context")?;
+        let registry = lock_lift_registry();
+        let payload =
+            registry.payload::<R2ILContext>(key, LiftHandleKind::Context, "lift context")?;
+        unsafe { *output = u32::from(super::r2il_is_loaded(payload) != 0) };
+        Ok(())
+    })
+}
+
+extern "C" fn lift_context_arch_name(
+    context: *const R2ILContext,
+    output: *mut R2SleighByteViewV2,
+) -> u32 {
+    lift_boundary_for(context, || {
+        valid_output_ptr(output, "lift architecture name output")?;
+        unsafe { *output = R2SleighByteViewV2::default() };
+        let key = lift_handle_key(context, "lift context")?;
+        let registry = lock_lift_registry();
+        let payload =
+            registry.payload::<R2ILContext>(key, LiftHandleKind::Context, "lift context")?;
+        let value = super::r2il_arch_name(payload);
+        if value.is_null() {
+            return Err(BoundaryError::engine(
+                "lift context has no loaded architecture",
+            ));
+        }
+        unsafe { *output = c_string_view(value) };
+        Ok(())
+    })
+}
+
+extern "C" fn lift_context_error(
+    context: *const R2ILContext,
+    output: *mut R2SleighByteViewV2,
+) -> u32 {
+    lift_boundary_for(context, || {
+        valid_output_ptr(output, "lift error output")?;
+        unsafe { *output = R2SleighByteViewV2::default() };
+        let key = lift_handle_key(context, "lift context")?;
+        let registry = lock_lift_registry();
+        let payload =
+            registry.payload::<R2ILContext>(key, LiftHandleKind::Context, "lift context")?;
+        unsafe { *output = c_string_view(super::r2il_error(payload)) };
+        Ok(())
+    })
+}
+
+extern "C" fn lift_last_error(output: *mut R2SleighByteViewV2) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if valid_output_ptr(output, "lift last error output").is_err() {
+            return R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
+        }
+        unsafe { *output = R2SleighByteViewV2::default() };
+        LIFT_LAST_ERROR.with(|error| {
+            if let Some(error) = error.borrow().as_ref() {
+                unsafe {
+                    *output = R2SleighByteViewV2 {
+                        data: error.as_ptr().cast(),
+                        len: error.as_bytes().len(),
+                    }
+                };
+            }
+        });
+        R2SLEIGH_STATUS_OK_V2
+    }))
+    .unwrap_or(R2SLEIGH_STATUS_PANIC_V2)
+}
+
+extern "C" fn lift_context_reg_profile(
+    context: *const R2ILContext,
+    output: *mut *mut R2SleighOwnedBytesV2,
+) -> u32 {
+    lift_boundary_for(context, || {
+        valid_output_ptr(output, "register profile output")?;
+        unsafe { *output = ptr::null_mut() };
+        let key = lift_handle_key(context, "lift context")?;
+        let mut registry = lock_lift_registry();
+        let entry = registry.entry(key, LiftHandleKind::Context, "lift context")?;
+        let owner = entry.generation;
+        let payload = entry.payload as *const R2ILContext;
+        let bytes = super::r2il_get_reg_profile(payload);
+        if bytes.is_null() {
+            return Err(BoundaryError::engine(
+                "lift context has no register profile",
+            ));
+        }
+        let bytes = unsafe { CString::from_raw(bytes) };
+        let handle = registry.insert_owned_bytes(owner, R2SleighOwnedBytesV2 { bytes })?;
+        unsafe { *output = handle };
+        Ok(())
+    })
+}
+
+unsafe fn lift_input_bytes<'a>(
+    bytes: R2SleighByteViewV2,
+    label: &str,
+) -> Result<&'a [u8], BoundaryError> {
+    let bytes = unsafe {
+        checked_slice(
+            bytes.data,
+            bytes.len,
+            R2SLEIGH_MAX_FUNCTION_INPUT_BYTES_V2,
+            label,
+        )?
+    };
+    if bytes.is_empty() {
+        return Err(BoundaryError::invalid(format!("{label} is empty")));
+    }
+    Ok(bytes)
+}
+
+extern "C" fn lift_instruction(
+    context: *mut R2ILContext,
+    bytes: R2SleighByteViewV2,
+    addr: u64,
+    output: *mut *mut R2ILBlock,
+) -> u32 {
+    lift_boundary_for(context, || {
+        valid_output_ptr(output, "lifted instruction output")?;
+        unsafe { *output = ptr::null_mut() };
+        let key = lift_handle_key(context, "lift context")?;
+        let bytes = unsafe { lift_input_bytes(bytes, "instruction bytes")? };
+        let mut registry = lock_lift_registry();
+        let entry = registry.entry(key, LiftHandleKind::Context, "lift context")?;
+        let owner = entry.generation;
+        let payload = entry.payload as *mut R2ILContext;
+        let block = super::r2il_lift(payload, bytes.as_ptr(), bytes.len(), addr);
+        if block.is_null() {
+            return Err(BoundaryError::engine("instruction lift failed"));
+        }
+        // Trusted internal lift result, reclaimed before exposing its
+        // registry-proved opaque handle.
+        let block = unsafe { Box::from_raw(block) };
+        let handle = registry.insert_block(owner, block)?;
+        unsafe { *output = handle };
+        Ok(())
+    })
+}
+
+extern "C" fn lift_block(
+    context: *mut R2ILContext,
+    bytes: R2SleighByteViewV2,
+    addr: u64,
+    block_size: u32,
+    output: *mut *mut R2ILBlock,
+) -> u32 {
+    lift_boundary_for(context, || {
+        valid_output_ptr(output, "lifted block output")?;
+        unsafe { *output = ptr::null_mut() };
+        let key = lift_handle_key(context, "lift context")?;
+        let bytes = unsafe { lift_input_bytes(bytes, "basic block bytes")? };
+        if block_size == 0 || block_size as usize > bytes.len() {
+            return Err(BoundaryError::invalid(
+                "basic block size is zero or exceeds its byte view",
+            ));
+        }
+        let mut registry = lock_lift_registry();
+        let entry = registry.entry(key, LiftHandleKind::Context, "lift context")?;
+        let owner = entry.generation;
+        let payload = entry.payload as *mut R2ILContext;
+        let block = super::r2il_lift_block(payload, bytes.as_ptr(), bytes.len(), addr, block_size);
+        if block.is_null() {
+            return Err(BoundaryError::engine("basic block lift failed"));
+        }
+        // Trusted internal lift result, reclaimed before exposing its
+        // registry-proved opaque handle.
+        let block = unsafe { Box::from_raw(block) };
+        let handle = registry.insert_block(owner, block)?;
+        unsafe { *output = handle };
+        Ok(())
+    })
+}
+
+extern "C" fn lift_context_set_semantic_metadata(context: *mut R2ILContext, enabled: u32) -> u32 {
+    lift_boundary_for(context, || {
+        let key = lift_handle_key(context, "lift context")?;
+        if !matches!(enabled, 0 | 1) {
+            return Err(BoundaryError::invalid(
+                "semantic metadata flag is not boolean",
+            ));
+        }
+        let mut registry = lock_lift_registry();
+        let payload = registry
+            .entry_mut(key, LiftHandleKind::Context, "lift context")?
+            .payload as *mut R2ILContext;
+        super::r2il_set_semantic_metadata_enabled(payload, enabled != 0);
+        Ok(())
+    })
+}
+
+extern "C" fn lift_block_free(block: *mut R2ILBlock) -> u32 {
+    lift_boundary_for(block, || {
+        let key = lift_handle_key(block, "lifted block")?;
+        let mut registry = lock_lift_registry();
+        registry.retire(key, LiftHandleKind::Block, "lifted block")?;
+        Ok(())
+    })
+}
+
+extern "C" fn lift_block_validate(context: *mut R2ILContext, block: *const R2ILBlock) -> u32 {
+    lift_boundary_for(context, || {
+        let context_key = lift_handle_key(context, "lift context")?;
+        let block_key = lift_handle_key(block, "lifted block")?;
+        let mut registry = lock_lift_registry();
+        let context_owner = registry
+            .entry_mut(context_key, LiftHandleKind::Context, "lift context")?
+            .generation;
+        let block_entry = registry.entry(block_key, LiftHandleKind::Block, "lifted block")?;
+        if block_entry.owner != context_owner {
+            return Err(BoundaryError::invalid(
+                "lifted block belongs to a different lift context",
+            ));
+        }
+        let context_payload = registry
+            .entry(context_key, LiftHandleKind::Context, "lift context")?
+            .payload as *mut R2ILContext;
+        let block_payload = block_entry.payload as *const R2ILBlock;
+        if super::r2il_block_validate(context_payload, block_payload) == 0 {
+            return Err(BoundaryError::engine("lifted block validation failed"));
+        }
+        Ok(())
+    })
+}
+
+extern "C" fn lift_block_set_switch_info(
+    block: *mut R2ILBlock,
+    switch_addr: u64,
+    min_val: u64,
+    max_val: u64,
+    default_target: u64,
+    has_default: u32,
+    cases: *const R2SleighSwitchCaseV2,
+    case_count: usize,
+) -> u32 {
+    lift_boundary_for(block, || {
+        let key = lift_handle_key(block, "lifted block")?;
+        if !matches!(has_default, 0 | 1) {
+            return Err(BoundaryError::invalid("switch default flag is not boolean"));
+        }
+        let cases = unsafe {
+            checked_slice(
+                cases,
+                case_count,
+                R2SLEIGH_MAX_SWITCH_CASES_V2,
+                "switch cases",
+            )?
+        };
+        if cases.is_empty() {
+            return Err(BoundaryError::invalid("switch cases are empty"));
+        }
+        let mut registry = lock_lift_registry();
+        let payload = registry
+            .entry_mut(key, LiftHandleKind::Block, "lifted block")?
+            .payload as *mut R2ILBlock;
+        if super::r2il_block_set_switch_info(
+            payload,
+            switch_addr,
+            min_val,
+            max_val,
+            default_target,
+            has_default as i32,
+            cases.as_ptr(),
+            cases.len(),
+        ) == 0
+        {
+            return Err(BoundaryError::invalid("switch metadata was rejected"));
+        }
+        Ok(())
+    })
+}
+
+extern "C" fn lift_block_op_count(block: *const R2ILBlock, output: *mut usize) -> u32 {
+    lift_boundary_for(block, || {
+        valid_output_ptr(output, "block operation count output")?;
+        unsafe { *output = 0 };
+        let key = lift_handle_key(block, "lifted block")?;
+        let registry = lock_lift_registry();
+        let payload = registry.payload::<R2ILBlock>(key, LiftHandleKind::Block, "lifted block")?;
+        unsafe { *output = super::r2il_block_op_count(payload) };
+        Ok(())
+    })
+}
+
+extern "C" fn lift_block_direct_call_identity(
+    block: *const R2ILBlock,
+    raw_instruction_addr: u64,
+    raw_target_addr: u64,
+    found: *mut u32,
+    output: *mut R2SleighDirectCallIdentityV2,
+) -> u32 {
+    lift_boundary_for(block, || {
+        valid_output_ptr(found, "direct call found output")?;
+        valid_output_ptr(output, "direct call identity output")?;
+        unsafe {
+            *found = 0;
+            *output = R2SleighDirectCallIdentityV2::default();
+        }
+        let key = lift_handle_key(block, "lifted block")?;
+        let registry = lock_lift_registry();
+        let payload = registry.payload::<R2ILBlock>(key, LiftHandleKind::Block, "lifted block")?;
+        match super::r2il_block_direct_call_identity(
+            payload,
+            raw_instruction_addr,
+            raw_target_addr,
+            output,
+        ) {
+            1 => unsafe { *found = 1 },
+            0 => {}
+            _ => return Err(BoundaryError::engine("direct call identity is ambiguous")),
+        }
+        Ok(())
+    })
+}
+
+extern "C" fn lift_block_size(block: *const R2ILBlock, output: *mut u32) -> u32 {
+    lift_boundary_for(block, || {
+        valid_output_ptr(output, "block size output")?;
+        unsafe { *output = 0 };
+        let key = lift_handle_key(block, "lifted block")?;
+        let registry = lock_lift_registry();
+        let payload = registry.payload::<R2ILBlock>(key, LiftHandleKind::Block, "lifted block")?;
+        unsafe { *output = super::r2il_block_size(payload) };
+        Ok(())
+    })
+}
+
+extern "C" fn lift_block_addr(block: *const R2ILBlock, output: *mut u64) -> u32 {
+    lift_boundary_for(block, || {
+        valid_output_ptr(output, "block address output")?;
+        unsafe { *output = 0 };
+        let key = lift_handle_key(block, "lifted block")?;
+        let registry = lock_lift_registry();
+        let payload = registry.payload::<R2ILBlock>(key, LiftHandleKind::Block, "lifted block")?;
+        unsafe { *output = super::r2il_block_addr(payload) };
+        Ok(())
+    })
+}
+
+extern "C" fn lift_block_mnemonic(
+    context: *const R2ILContext,
+    bytes: R2SleighByteViewV2,
+    addr: u64,
+    output: *mut *mut R2SleighOwnedBytesV2,
+) -> u32 {
+    lift_boundary_for(context, || {
+        valid_output_ptr(output, "block mnemonic output")?;
+        unsafe { *output = ptr::null_mut() };
+        let key = lift_handle_key(context, "lift context")?;
+        let bytes = unsafe { lift_input_bytes(bytes, "mnemonic bytes")? };
+        let mut registry = lock_lift_registry();
+        let entry = registry.entry(key, LiftHandleKind::Context, "lift context")?;
+        let owner = entry.generation;
+        let payload = entry.payload as *const R2ILContext;
+        let mnemonic = super::r2il_block_mnemonic(payload, bytes.as_ptr(), bytes.len(), addr);
+        if mnemonic.is_null() {
+            return Err(BoundaryError::engine("instruction disassembly failed"));
+        }
+        let bytes = unsafe { CString::from_raw(mnemonic) };
+        let handle = registry.insert_owned_bytes(owner, R2SleighOwnedBytesV2 { bytes })?;
+        unsafe { *output = handle };
+        Ok(())
+    })
+}
+
+extern "C" fn lift_block_type(block: *const R2ILBlock, output: *mut u32) -> u32 {
+    lift_boundary_for(block, || {
+        valid_output_ptr(output, "block type output")?;
+        unsafe { *output = 0 };
+        let key = lift_handle_key(block, "lifted block")?;
+        let registry = lock_lift_registry();
+        let payload = registry.payload::<R2ILBlock>(key, LiftHandleKind::Block, "lifted block")?;
+        unsafe { *output = super::r2il_block_type(payload) };
+        Ok(())
+    })
+}
+
+extern "C" fn lift_block_jump(block: *const R2ILBlock, output: *mut u64) -> u32 {
+    lift_boundary_for(block, || {
+        valid_output_ptr(output, "block jump output")?;
+        unsafe { *output = 0 };
+        let key = lift_handle_key(block, "lifted block")?;
+        let registry = lock_lift_registry();
+        let payload = registry.payload::<R2ILBlock>(key, LiftHandleKind::Block, "lifted block")?;
+        unsafe { *output = super::r2il_block_jump(payload) };
+        Ok(())
+    })
+}
+
+extern "C" fn lift_block_fail(block: *const R2ILBlock, output: *mut u64) -> u32 {
+    lift_boundary_for(block, || {
+        valid_output_ptr(output, "block fail output")?;
+        unsafe { *output = 0 };
+        let key = lift_handle_key(block, "lifted block")?;
+        let registry = lock_lift_registry();
+        let payload = registry.payload::<R2ILBlock>(key, LiftHandleKind::Block, "lifted block")?;
+        unsafe { *output = super::r2il_block_fail(payload) };
+        Ok(())
+    })
+}
+
+extern "C" fn owned_bytes_view(
+    bytes: *const R2SleighOwnedBytesV2,
+    output: *mut R2SleighByteViewV2,
+) -> u32 {
+    lift_boundary_for(bytes, || {
+        valid_output_ptr(output, "owned bytes view output")?;
+        unsafe { *output = R2SleighByteViewV2::default() };
+        let key = lift_handle_key(bytes, "owned bytes")?;
+        let registry = lock_lift_registry();
+        let payload = registry.payload::<R2SleighOwnedBytesV2>(
+            key,
+            LiftHandleKind::OwnedBytes,
+            "owned bytes",
+        )?;
+        let bytes = unsafe { &*payload };
+        unsafe {
+            *output = R2SleighByteViewV2 {
+                data: bytes.bytes.as_ptr().cast(),
+                len: bytes.bytes.as_bytes().len(),
+            }
+        };
+        Ok(())
+    })
+}
+
+extern "C" fn owned_bytes_free(bytes: *mut R2SleighOwnedBytesV2) -> u32 {
+    lift_boundary_for(bytes, || {
+        let key = lift_handle_key(bytes, "owned bytes")?;
+        let mut registry = lock_lift_registry();
+        registry.retire(key, LiftHandleKind::OwnedBytes, "owned bytes")?;
+        Ok(())
+    })
+}
+
+extern "C" fn analysis_render(
+    request: *const R2SleighAnalysisRenderRequestV2,
+    output: *mut *mut R2SleighOwnedBytesV2,
+) -> u32 {
+    lift_boundary(|| {
+        valid_output_ptr(output, "analysis render output")?;
+        unsafe { *output = ptr::null_mut() };
+        valid_object_ptr(request, "analysis render request")?;
+        let request = unsafe { &*request };
+        let mut budget = ValidationBudget::default();
+        let argument = unsafe {
+            string_view(
+                request.argument,
+                R2SLEIGH_MAX_STRING_BYTES_V2,
+                "analysis render argument",
+                &mut budget,
+            )?
+        };
+        let argument = CString::new(argument)
+            .map_err(|_| BoundaryError::invalid("analysis render argument contains NUL"))?;
+
+        if request.kind == R2SLEIGH_ANALYSIS_ENGINE_CACHE_STATS_V2 {
+            if !request.context.is_null() || request.num_blocks != 0 {
+                return Err(BoundaryError::invalid(
+                    "cache-stats render does not accept lift handles",
+                ));
+            }
+            let raw = super::types::r2sleigh_engine_cache_stats_json();
+            if raw.is_null() {
+                return Err(BoundaryError::engine("cache-stats render failed"));
+            }
+            let bytes = unsafe { CString::from_raw(raw) };
+            let handle =
+                lock_lift_registry().insert_owned_bytes(0, R2SleighOwnedBytesV2 { bytes })?;
+            unsafe { *output = handle };
+            return Ok(());
+        }
+
+        let block_handles = unsafe {
+            checked_slice(
+                request.blocks,
+                request.num_blocks,
+                R2SLEIGH_MAX_FUNCTION_BLOCKS_V2,
+                "analysis render blocks",
+            )?
+        };
+        if block_handles.is_empty() {
+            return Err(BoundaryError::invalid("analysis render blocks are empty"));
+        }
+        let context_key = lift_handle_key(request.context, "analysis render context")?;
+        let mut registry = lock_lift_registry();
+        let context_entry = registry.entry(
+            context_key,
+            LiftHandleKind::Context,
+            "analysis render context",
+        )?;
+        let owner = context_entry.generation;
+        let context = context_entry.payload as *const R2ILContext;
+        let mut blocks = Vec::with_capacity(block_handles.len());
+        for (index, handle) in block_handles.iter().enumerate() {
+            let key = lift_handle_key(*handle, &format!("analysis render blocks[{index}]"))?;
+            let entry = registry.entry(
+                key,
+                LiftHandleKind::Block,
+                &format!("analysis render blocks[{index}]"),
+            )?;
+            if entry.owner != owner {
+                return Err(BoundaryError::invalid(format!(
+                    "analysis render blocks[{index}] belongs to a different lift context"
+                )));
+            }
+            blocks.push(entry.payload as *const R2ILBlock);
+        }
+        let block = blocks[0];
+        let raw: *mut c_char = match request.kind {
+            R2SLEIGH_ANALYSIS_BLOCK_ESIL_V2 if blocks.len() == 1 => {
+                super::r2il_block_to_esil(context, block)
+            }
+            R2SLEIGH_ANALYSIS_BLOCK_OP_JSON_V2 if blocks.len() == 1 => {
+                super::r2il_block_op_json_named(context, block, request.op_index)
+            }
+            R2SLEIGH_ANALYSIS_BLOCK_REGS_READ_V2 if blocks.len() == 1 => {
+                super::r2il_block_regs_read(context, block)
+            }
+            R2SLEIGH_ANALYSIS_BLOCK_REGS_WRITE_V2 if blocks.len() == 1 => {
+                super::r2il_block_regs_write(context, block)
+            }
+            R2SLEIGH_ANALYSIS_BLOCK_MEMORY_V2 if blocks.len() == 1 => {
+                super::r2il_block_mem_access(context, block)
+            }
+            R2SLEIGH_ANALYSIS_BLOCK_VARNODES_V2 if blocks.len() == 1 => {
+                super::r2il_block_varnodes(context, block)
+            }
+            R2SLEIGH_ANALYSIS_BLOCK_SSA_V2 if blocks.len() == 1 => {
+                super::analysis::ssa::r2il_block_to_ssa_json(context, block)
+            }
+            R2SLEIGH_ANALYSIS_BLOCK_DEFUSE_V2 if blocks.len() == 1 => {
+                super::analysis::ssa::r2il_block_defuse_json(context, block)
+            }
+            R2SLEIGH_ANALYSIS_FUNCTION_SSA_V2 => {
+                super::analysis::ssa::r2ssa_function_json(context, blocks.as_ptr(), blocks.len())
+            }
+            R2SLEIGH_ANALYSIS_FUNCTION_SSA_OPT_V2 => super::analysis::ssa::r2ssa_function_opt_json(
+                context,
+                blocks.as_ptr(),
+                blocks.len(),
+            ),
+            R2SLEIGH_ANALYSIS_FUNCTION_DEFUSE_V2 => {
+                super::analysis::ssa::r2ssa_defuse_function_json(
+                    context,
+                    blocks.as_ptr(),
+                    blocks.len(),
+                )
+            }
+            R2SLEIGH_ANALYSIS_FUNCTION_DOMTREE_V2 => {
+                super::analysis::ssa::r2ssa_domtree_json(context, blocks.as_ptr(), blocks.len())
+            }
+            R2SLEIGH_ANALYSIS_FUNCTION_SLICE_V2 => super::analysis::ssa::r2ssa_backward_slice_json(
+                context,
+                blocks.as_ptr(),
+                blocks.len(),
+                argument.as_ptr(),
+            ),
+            R2SLEIGH_ANALYSIS_FUNCTION_TAINT_V2 => super::analysis::taint::r2taint_function_json(
+                context,
+                blocks.as_ptr(),
+                blocks.len(),
+            ),
+            R2SLEIGH_ANALYSIS_FUNCTION_CFG_ASCII_V2 => {
+                super::analysis::cfg::r2cfg_function_ascii(context, blocks.as_ptr(), blocks.len())
+            }
+            R2SLEIGH_ANALYSIS_FUNCTION_CFG_JSON_V2 => {
+                super::analysis::cfg::r2cfg_function_json(context, blocks.as_ptr(), blocks.len())
+            }
+            kind if matches!(
+                kind,
+                R2SLEIGH_ANALYSIS_BLOCK_ESIL_V2
+                    | R2SLEIGH_ANALYSIS_BLOCK_OP_JSON_V2
+                    | R2SLEIGH_ANALYSIS_BLOCK_REGS_READ_V2
+                    | R2SLEIGH_ANALYSIS_BLOCK_REGS_WRITE_V2
+                    | R2SLEIGH_ANALYSIS_BLOCK_MEMORY_V2
+                    | R2SLEIGH_ANALYSIS_BLOCK_VARNODES_V2
+                    | R2SLEIGH_ANALYSIS_BLOCK_SSA_V2
+                    | R2SLEIGH_ANALYSIS_BLOCK_DEFUSE_V2
+            ) =>
+            {
+                return Err(BoundaryError::invalid(
+                    "block render requires exactly one block",
+                ));
+            }
+            _ => return Err(BoundaryError::unsupported("unknown analysis render kind")),
+        };
+        if raw.is_null() {
+            return Err(BoundaryError::engine("analysis render failed"));
+        }
+        let bytes = unsafe { CString::from_raw(raw) };
+        let handle = registry.insert_owned_bytes(owner, R2SleighOwnedBytesV2 { bytes })?;
+        unsafe { *output = handle };
+        Ok(())
+    })
+}
+
+unsafe fn scope_request_snapshot(
+    request: &R2SleighScopeRenderRequestV2,
+) -> Result<super::analysis::sym::SymScopeRequestSnapshot, BoundaryError> {
+    let merge_states = match request.merge_states {
+        0 => false,
+        1 => true,
+        _ => {
+            return Err(BoundaryError::invalid(
+                "scope render merge_states is not boolean",
+            ));
+        }
+    };
+    if request.symbols.is_null() != (request.num_symbols == 0) {
+        return Err(BoundaryError::invalid(
+            "scope render symbols pointer/count are not canonical",
+        ));
+    }
+    let symbols = unsafe {
+        checked_slice(
+            request.symbols,
+            request.num_symbols,
+            R2SLEIGH_MAX_SCOPE_SYMBOLS_V2,
+            "scope render symbols",
+        )?
+    };
+    let mut budget = ValidationBudget::default();
+    let mut copied = Vec::with_capacity(symbols.len());
+    for (index, symbol) in symbols.iter().enumerate() {
+        let label = format!("scope render symbols[{index}]");
+        if symbol.abi_version != R2SLEIGH_ABI_V2
+            || symbol.struct_size != u32_size::<R2SleighScopeSymbolV2>()
+            || symbol.schema_version != R2SLEIGH_SCOPE_SYMBOL_SCHEMA_V2
+        {
+            return Err(BoundaryError::abi(format!(
+                "{label} has an incompatible envelope"
+            )));
+        }
+        let linkage = match symbol.linkage {
+            R2SLEIGH_INTERPROC_LINKAGE_UNKNOWN_V2 => r2ssa::FunctionSemanticLinkage::Unknown,
+            R2SLEIGH_INTERPROC_LINKAGE_INTERNAL_V2 => r2ssa::FunctionSemanticLinkage::Internal,
+            R2SLEIGH_INTERPROC_LINKAGE_IMPORTED_V2 => r2ssa::FunctionSemanticLinkage::Imported,
+            _ => {
+                return Err(BoundaryError::invalid(format!(
+                    "{label}.linkage is invalid"
+                )));
+            }
+        };
+        let name = unsafe {
+            string_view(
+                symbol.name,
+                R2SLEIGH_MAX_STRING_BYTES_V2,
+                &format!("{label}.name"),
+                &mut budget,
+            )?
+        };
+        if name.is_empty() {
+            return Err(BoundaryError::invalid(format!("{label}.name is empty")));
+        }
+        if name.as_bytes().contains(&0) {
+            return Err(BoundaryError::invalid(format!("{label}.name contains NUL")));
+        }
+        copied.push(r2sym::FunctionSymbol {
+            addr: symbol.addr,
+            name: name.to_string(),
+            linkage,
+        });
+    }
+    let symbols = r2sym::FunctionSymbolSnapshot::try_from_symbols(copied).map_err(|err| {
+        BoundaryError::invalid(format!("scope render symbol snapshot is invalid: {err:?}"))
+    })?;
+    Ok(super::analysis::sym::SymScopeRequestSnapshot::new(
+        symbols,
+        merge_states,
+    ))
+}
+
+extern "C" fn scope_render(
+    request: *const R2SleighScopeRenderRequestV2,
+    output: *mut *mut R2SleighOwnedBytesV2,
+) -> u32 {
+    lift_boundary(|| {
+        valid_output_ptr(output, "scope render output")?;
+        unsafe { *output = ptr::null_mut() };
+        valid_object_ptr(request, "scope render request")?;
+        let request = unsafe { &*request };
+        let functions = unsafe {
+            checked_slice(
+                request.functions,
+                request.num_functions,
+                R2SLEIGH_MAX_SCOPE_FUNCTIONS_V2,
+                "scope render functions",
+            )?
+        };
+        if functions.is_empty() {
+            return Err(BoundaryError::invalid("scope render functions are empty"));
+        }
+        let mut budget = ValidationBudget::default();
+        let argument = unsafe {
+            string_view(
+                request.argument,
+                R2SLEIGH_MAX_JSON_BYTES_V2,
+                "scope render argument",
+                &mut budget,
+            )?
+        };
+        let external_context = unsafe {
+            string_view(
+                request.external_context,
+                R2SLEIGH_MAX_JSON_BYTES_V2,
+                "scope render external context",
+                &mut budget,
+            )?
+        };
+        let argument = CString::new(argument)
+            .map_err(|_| BoundaryError::invalid("scope render argument contains NUL"))?;
+        let external_context = CString::new(external_context)
+            .map_err(|_| BoundaryError::invalid("scope render external context contains NUL"))?;
+        let request_snapshot = unsafe { scope_request_snapshot(request)? };
+        let argument_ptr = (!request.argument.data.is_null()).then_some(argument.as_ptr());
+        let external_ptr =
+            (!request.external_context.data.is_null()).then_some(external_context.as_ptr());
+
+        let context_key = lift_handle_key(request.context, "scope render context")?;
+        let mut registry = lock_lift_registry();
+        let context_entry =
+            registry.entry(context_key, LiftHandleKind::Context, "scope render context")?;
+        let owner = context_entry.generation;
+        let context = context_entry.payload as *const R2ILContext;
+        let mut scoped_blocks = Vec::with_capacity(functions.len());
+        for (function_index, function) in functions.iter().enumerate() {
+            let handles = unsafe {
+                checked_slice(
+                    function.blocks,
+                    function.num_blocks,
+                    R2SLEIGH_MAX_FUNCTION_BLOCKS_V2,
+                    &format!("scope render functions[{function_index}] blocks"),
+                )?
+            };
+            let mut resolved = Vec::with_capacity(handles.len());
+            for (block_index, handle) in handles.iter().enumerate() {
+                let label =
+                    format!("scope render functions[{function_index}] blocks[{block_index}]");
+                let key = lift_handle_key(*handle, &label)?;
+                let entry = registry.entry(key, LiftHandleKind::Block, &label)?;
+                if entry.owner != owner {
+                    return Err(BoundaryError::invalid(format!(
+                        "{label} belongs to a different lift context"
+                    )));
+                }
+                resolved.push(entry.payload as *const R2ILBlock);
+            }
+            scoped_blocks.push(resolved);
+        }
+        let mut resolved_functions = Vec::with_capacity(functions.len());
+        for (index, function) in functions.iter().enumerate() {
+            resolved_functions.push(R2ILFunctionBlocks {
+                entry_addr: function.entry_addr,
+                name: function.name,
+                blocks: scoped_blocks[index].as_ptr(),
+                num_blocks: scoped_blocks[index].len(),
+                provenance: function.provenance,
+            });
+        }
+        let functions_ptr = resolved_functions.as_ptr();
+        let functions_len = resolved_functions.len();
+        let external_ptr = external_ptr.unwrap_or(ptr::null());
+        let raw = match request.kind {
+            R2SLEIGH_SCOPE_FUNCTION_V2 => super::analysis::sym::r2sym_function_scope(
+                context,
+                functions_ptr,
+                functions_len,
+                request.entry_addr,
+                external_ptr,
+                &request_snapshot,
+            ),
+            R2SLEIGH_SCOPE_PATHS_V2 => super::analysis::sym::r2sym_paths_scope(
+                context,
+                functions_ptr,
+                functions_len,
+                request.entry_addr,
+                external_ptr,
+                &request_snapshot,
+            ),
+            R2SLEIGH_SCOPE_EXPLORE_V2 => super::analysis::sym::r2sym_explore_to_scope(
+                context,
+                functions_ptr,
+                functions_len,
+                request.entry_addr,
+                request.target_addr,
+                external_ptr,
+                &request_snapshot,
+            ),
+            R2SLEIGH_SCOPE_SOLVE_V2 => super::analysis::sym::r2sym_solve_to_scope(
+                context,
+                functions_ptr,
+                functions_len,
+                request.entry_addr,
+                request.target_addr,
+                external_ptr,
+                &request_snapshot,
+            ),
+            R2SLEIGH_SCOPE_EXPLORE_REPLAY_V2 => {
+                super::analysis::sym::r2sym_explore_to_replay_scope(
+                    context,
+                    functions_ptr,
+                    functions_len,
+                    request.entry_addr,
+                    request.target_addr,
+                    request.replay_seed.cast(),
+                    external_ptr,
+                    &request_snapshot,
+                )
+            }
+            R2SLEIGH_SCOPE_SOLVE_REPLAY_V2 => super::analysis::sym::r2sym_solve_to_replay_scope(
+                context,
+                functions_ptr,
+                functions_len,
+                request.entry_addr,
+                request.target_addr,
+                request.replay_seed.cast(),
+                external_ptr,
+                &request_snapshot,
+            ),
+            R2SLEIGH_SCOPE_RUN_SPEC_V2 => super::analysis::sym::r2sym_run_spec_json_scope(
+                context,
+                functions_ptr,
+                functions_len,
+                request.entry_addr,
+                argument_ptr.unwrap_or(ptr::null()),
+                external_ptr,
+                &request_snapshot,
+            ),
+            _ => return Err(BoundaryError::unsupported("unknown scope render kind")),
+        };
+        if raw.is_null() {
+            return Err(BoundaryError::engine("scope render failed"));
+        }
+        let bytes = unsafe { CString::from_raw(raw) };
+        let handle = registry.insert_owned_bytes(owner, R2SleighOwnedBytesV2 { bytes })?;
+        unsafe { *output = handle };
+        Ok(())
+    })
+}
+
+extern "C" fn analysis_query(
+    request: *const R2SleighAnalysisQueryRequestV2,
+    output: *mut *mut R2SleighAnalysisResultV2,
+) -> u32 {
+    lift_boundary(|| {
+        valid_output_ptr(output, "analysis query output")?;
+        unsafe { *output = ptr::null_mut() };
+        valid_object_ptr(request, "analysis query request")?;
+        let request = unsafe { &*request };
+        let block_handles = unsafe {
+            checked_slice(
+                request.blocks,
+                request.num_blocks,
+                R2SLEIGH_MAX_FUNCTION_BLOCKS_V2,
+                "analysis query blocks",
+            )?
+        };
+        if block_handles.is_empty() {
+            return Err(BoundaryError::invalid("analysis query blocks are empty"));
+        }
+        let input_values = unsafe {
+            checked_slice(
+                request.input_values,
+                request.num_input_values,
+                R2SLEIGH_MAX_NESTED_ITEMS_V2,
+                "analysis query input values",
+            )?
+        };
+        let mut budget = ValidationBudget::default();
+        let function_name = unsafe {
+            string_view(
+                request.function_name,
+                R2SLEIGH_MAX_STRING_BYTES_V2,
+                "analysis query function name",
+                &mut budget,
+            )?
+        };
+        let function_name = CString::new(function_name)
+            .map_err(|_| BoundaryError::invalid("analysis query function name contains NUL"))?;
+        let context_key = lift_handle_key(request.context, "analysis query context")?;
+        let mut registry = lock_lift_registry();
+        let context_entry = registry.entry(
+            context_key,
+            LiftHandleKind::Context,
+            "analysis query context",
+        )?;
+        let owner = context_entry.generation;
+        let context = context_entry.payload as *const R2ILContext;
+        let mut blocks = Vec::with_capacity(block_handles.len());
+        for (index, handle) in block_handles.iter().enumerate() {
+            let label = format!("analysis query blocks[{index}]");
+            let key = lift_handle_key(*handle, &label)?;
+            let entry = registry.entry(key, LiftHandleKind::Block, &label)?;
+            if entry.owner != owner {
+                return Err(BoundaryError::invalid(format!(
+                    "{label} belongs to a different lift context"
+                )));
+            }
+            blocks.push(entry.payload as *const R2ILBlock);
+        }
+        let raw: *mut c_void = match request.kind {
+            R2SLEIGH_QUERY_BLOCK_VALUES_V2 if blocks.len() == 1 => {
+                super::r2il_block_values_typed(context, blocks[0]).cast()
+            }
+            R2SLEIGH_QUERY_BLOCK_VALUES_V2 => {
+                return Err(BoundaryError::invalid(
+                    "block-values query requires exactly one block",
+                ));
+            }
+            R2SLEIGH_QUERY_TAINT_SUMMARY_V2 => {
+                super::analysis::taint::r2taint_function_summary_typed(
+                    context,
+                    blocks.as_ptr(),
+                    blocks.len(),
+                )
+                .cast()
+            }
+            R2SLEIGH_QUERY_ANNOTATIONS_V2 => super::r2sleigh_analyze_fcn_annotations_typed(
+                context,
+                blocks.as_ptr(),
+                blocks.len(),
+                request.function_addr,
+            )
+            .cast(),
+            R2SLEIGH_QUERY_DIRECT_TARGETS_V2 => super::r2sleigh_get_direct_call_targets_typed(
+                context,
+                blocks.as_ptr(),
+                blocks.len(),
+                request.function_addr,
+                function_name.as_ptr(),
+            )
+            .cast(),
+            R2SLEIGH_QUERY_SYMBOLIC_TARGETS_V2 => super::r2sleigh_get_symbolic_scope_targets_typed(
+                context,
+                blocks.as_ptr(),
+                blocks.len(),
+                request.function_addr,
+                function_name.as_ptr(),
+                input_values.as_ptr(),
+                input_values.len(),
+            )
+            .cast(),
+            R2SLEIGH_QUERY_RUNTIME_SOURCES_V2 => {
+                super::r2sleigh_get_runtime_materialized_sources_typed(
+                    context,
+                    blocks.as_ptr(),
+                    blocks.len(),
+                    request.function_addr,
+                    function_name.as_ptr(),
+                    input_values.as_ptr(),
+                    input_values.len(),
+                )
+                .cast()
+            }
+            R2SLEIGH_QUERY_RECOVERED_VARS_V2 => super::types::r2sleigh_recover_vars_typed(
+                context,
+                blocks.as_ptr(),
+                blocks.len(),
+                request.function_addr,
+            )
+            .cast(),
+            R2SLEIGH_QUERY_DATA_REFS_V2 => super::types::r2sleigh_data_refs_typed(
+                context,
+                blocks.as_ptr(),
+                blocks.len(),
+                request.function_addr,
+            )
+            .cast(),
+            _ => return Err(BoundaryError::unsupported("unknown analysis query kind")),
+        };
+        if raw.is_null() {
+            return Err(BoundaryError::engine("analysis query failed"));
+        }
+        let handle = registry.insert_analysis_result(
+            owner,
+            R2SleighAnalysisResultV2 {
+                kind: request.kind,
+                raw,
+            },
+        )?;
+        unsafe { *output = handle };
+        Ok(())
+    })
+}
+
+extern "C" fn analysis_result_view(
+    result: *const R2SleighAnalysisResultV2,
+    output: *mut R2SleighAnalysisResultViewV2,
+) -> u32 {
+    lift_boundary_for(result, || {
+        valid_output_ptr(output, "analysis result view output")?;
+        unsafe { *output = R2SleighAnalysisResultViewV2::default() };
+        let key = lift_handle_key(result, "analysis result")?;
+        let registry = lock_lift_registry();
+        let payload = registry.payload::<R2SleighAnalysisResultV2>(
+            key,
+            LiftHandleKind::AnalysisResult,
+            "analysis result",
+        )?;
+        let result = unsafe { &*payload };
+        let mut view = R2SleighAnalysisResultViewV2 {
+            kind: result.kind,
+            ..R2SleighAnalysisResultViewV2::default()
+        };
+        match result.kind {
+            R2SLEIGH_QUERY_BLOCK_VALUES_V2 => {
+                view.primary =
+                    super::r2il_block_values_memory(result.raw.cast(), &mut view.primary_count)
+                        .cast();
+                view.secondary = super::r2il_block_values_immediates(
+                    result.raw.cast(),
+                    &mut view.secondary_count,
+                )
+                .cast();
+                view.tertiary =
+                    super::r2il_block_values_reg_reads(result.raw.cast(), &mut view.tertiary_count)
+                        .cast();
+                view.quaternary = super::r2il_block_values_reg_writes(
+                    result.raw.cast(),
+                    &mut view.quaternary_count,
+                )
+                .cast();
+            }
+            R2SLEIGH_QUERY_TAINT_SUMMARY_V2 => {
+                view.primary = super::analysis::taint::r2taint_function_summary_sources(
+                    result.raw.cast(),
+                    &mut view.primary_count,
+                )
+                .cast();
+                view.secondary = super::analysis::taint::r2taint_function_summary_sink_hits(
+                    result.raw.cast(),
+                    &mut view.secondary_count,
+                )
+                .cast();
+            }
+            R2SLEIGH_QUERY_ANNOTATIONS_V2 => {
+                view.primary =
+                    super::r2sleigh_annotations_items(result.raw.cast(), &mut view.primary_count)
+                        .cast();
+            }
+            R2SLEIGH_QUERY_DIRECT_TARGETS_V2 | R2SLEIGH_QUERY_SYMBOLIC_TARGETS_V2 => {
+                view.primary =
+                    super::r2sleigh_u64_array_items(result.raw.cast(), &mut view.primary_count)
+                        .cast();
+            }
+            R2SLEIGH_QUERY_RUNTIME_SOURCES_V2 => {
+                view.primary = super::r2sleigh_runtime_sources_items(
+                    result.raw.cast(),
+                    &mut view.primary_count,
+                )
+                .cast();
+            }
+            R2SLEIGH_QUERY_RECOVERED_VARS_V2 => {
+                view.primary = super::types::r2sleigh_recovered_vars_items(
+                    result.raw.cast(),
+                    &mut view.primary_count,
+                )
+                .cast();
+            }
+            R2SLEIGH_QUERY_DATA_REFS_V2 => {
+                view.primary = super::types::r2sleigh_data_refs_items(
+                    result.raw.cast(),
+                    &mut view.primary_count,
+                )
+                .cast();
+            }
+            _ => return Err(BoundaryError::engine("analysis result has an unknown kind")),
+        }
+        unsafe { *output = view };
+        Ok(())
+    })
+}
+
+extern "C" fn analysis_result_free(result: *mut R2SleighAnalysisResultV2) -> u32 {
+    lift_boundary_for(result, || {
+        let key = lift_handle_key(result, "analysis result")?;
+        lock_lift_registry().retire(key, LiftHandleKind::AnalysisResult, "analysis result")
+    })
+}
+
+extern "C" fn engine_cache_reset() -> u32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        super::types::r2sleigh_engine_cache_stats_reset();
+        R2SLEIGH_STATUS_OK_V2
+    }))
+    .unwrap_or(R2SLEIGH_STATUS_PANIC_V2)
+}
+
+fn planner_mode(mode: r2engine::EngineAnalysisMode) -> u32 {
+    match mode {
+        r2engine::EngineAnalysisMode::Fast => R2SLEIGH_MODE_FAST_V2,
+        r2engine::EngineAnalysisMode::Balanced => R2SLEIGH_MODE_BALANCED_V2,
+        r2engine::EngineAnalysisMode::Full => R2SLEIGH_MODE_FULL_V2,
+    }
+}
+
+fn planner_type_writeback_mode(mode: r2engine::EngineTypeWritebackMode) -> u32 {
+    match mode {
+        r2engine::EngineTypeWritebackMode::Off => R2SLEIGH_TYPE_WRITEBACK_OFF_V2,
+        r2engine::EngineTypeWritebackMode::Balanced => R2SLEIGH_TYPE_WRITEBACK_BALANCED_V2,
+        r2engine::EngineTypeWritebackMode::Aggressive => R2SLEIGH_TYPE_WRITEBACK_AGGRESSIVE_V2,
+    }
+}
+
+fn planner_usize_to_i32(value: usize) -> i32 {
+    value.min(i32::MAX as usize) as i32
+}
+
+fn planner_bool(value: bool) -> i32 {
+    if value { 1 } else { 0 }
+}
+
+fn planner_analysis_policy(policy: r2engine::EngineAnalysisPolicy) -> R2SleighAnalysisPolicyV2 {
+    R2SleighAnalysisPolicyV2 {
+        mode: planner_mode(policy.mode),
+        type_writeback_mode: planner_type_writeback_mode(policy.type_writeback_mode),
+        type_interproc_max_iters: planner_usize_to_i32(policy.type_interproc_max_iters),
+        type_max_blocks: planner_usize_to_i32(policy.type_max_blocks),
+        type_global_max_links: planner_usize_to_i32(policy.type_global_max_links),
+        type_max_decls: planner_usize_to_i32(policy.type_max_decls),
+        type_max_mutations: planner_usize_to_i32(policy.type_max_mutations),
+    }
+}
+
+fn planner_post_analysis(plan: r2engine::EnginePostAnalysisPlan) -> R2SleighPostAnalysisPlanV2 {
+    let policy = planner_analysis_policy(plan.policy);
+    R2SleighPostAnalysisPlanV2 {
+        mode: policy.mode,
+        type_writeback_mode: policy.type_writeback_mode,
+        type_interproc_max_iters: policy.type_interproc_max_iters,
+        type_max_blocks: policy.type_max_blocks,
+        type_global_max_links: policy.type_global_max_links,
+        type_max_decls: policy.type_max_decls,
+        type_max_mutations: policy.type_max_mutations,
+        function_count: plan.function_count,
+        post_budget_us: plan.post_budget_us,
+        xref_enabled: planner_bool(plan.xref_enabled),
+        taint_enabled: planner_bool(plan.taint_enabled),
+        sigwrite_enabled: planner_bool(plan.signature_writeback_enabled),
+        type_writeback_enabled: planner_bool(plan.type_writeback_enabled),
+        semantic_comments_enabled: planner_bool(plan.semantic_comments_enabled),
+        sigverify_enabled: planner_bool(plan.signature_verify_enabled),
+        balanced_focus_only: planner_bool(plan.balanced_focus_only),
+        taint_focus_only: planner_bool(plan.taint_focus_only),
+        sigwrite_focus_only: planner_bool(plan.signature_writeback_focus_only),
+        type_writeback_focus_only: planner_bool(plan.type_writeback_focus_only),
+    }
+}
+
+fn planner_auto_callback_kind(raw: u32) -> Option<r2engine::EngineAutoCallbackKind> {
+    match raw {
+        R2SLEIGH_AUTO_CALLBACK_ANALYZE_FUNCTION_V2 => {
+            Some(r2engine::EngineAutoCallbackKind::AnalyzeFunction)
+        }
+        R2SLEIGH_AUTO_CALLBACK_RECOVER_VARS_V2 => {
+            Some(r2engine::EngineAutoCallbackKind::RecoverVars)
+        }
+        R2SLEIGH_AUTO_CALLBACK_DATA_REFS_V2 => Some(r2engine::EngineAutoCallbackKind::DataRefs),
+        R2SLEIGH_AUTO_CALLBACK_POST_ANALYSIS_TAINT_V2 => {
+            Some(r2engine::EngineAutoCallbackKind::PostAnalysisTaint)
+        }
+        R2SLEIGH_AUTO_CALLBACK_POST_ANALYSIS_XREF_V2 => {
+            Some(r2engine::EngineAutoCallbackKind::PostAnalysisXref)
+        }
+        _ => None,
+    }
+}
+
+fn planner_auto_callback_kind_value(kind: r2engine::EngineAutoCallbackKind) -> u32 {
+    match kind {
+        r2engine::EngineAutoCallbackKind::AnalyzeFunction => {
+            R2SLEIGH_AUTO_CALLBACK_ANALYZE_FUNCTION_V2
+        }
+        r2engine::EngineAutoCallbackKind::RecoverVars => R2SLEIGH_AUTO_CALLBACK_RECOVER_VARS_V2,
+        r2engine::EngineAutoCallbackKind::DataRefs => R2SLEIGH_AUTO_CALLBACK_DATA_REFS_V2,
+        r2engine::EngineAutoCallbackKind::PostAnalysisTaint => {
+            R2SLEIGH_AUTO_CALLBACK_POST_ANALYSIS_TAINT_V2
+        }
+        r2engine::EngineAutoCallbackKind::PostAnalysisXref => {
+            R2SLEIGH_AUTO_CALLBACK_POST_ANALYSIS_XREF_V2
+        }
+    }
+}
+
+fn planner_auto_callback_reason(reason: r2engine::EngineAutoCallbackRefusalReason) -> u32 {
+    match reason {
+        r2engine::EngineAutoCallbackRefusalReason::Allowed => {
+            R2SLEIGH_AUTO_CALLBACK_REASON_ALLOWED_V2
+        }
+        r2engine::EngineAutoCallbackRefusalReason::ModeNotFull => {
+            R2SLEIGH_AUTO_CALLBACK_REASON_MODE_NOT_FULL_V2
+        }
+        r2engine::EngineAutoCallbackRefusalReason::TooManyBlocks => {
+            R2SLEIGH_AUTO_CALLBACK_REASON_TOO_MANY_BLOCKS_V2
+        }
+        r2engine::EngineAutoCallbackRefusalReason::TooLarge => {
+            R2SLEIGH_AUTO_CALLBACK_REASON_TOO_LARGE_V2
+        }
+        r2engine::EngineAutoCallbackRefusalReason::TooCostly => {
+            R2SLEIGH_AUTO_CALLBACK_REASON_TOO_COSTLY_V2
+        }
+    }
+}
+
+fn planner_auto_callback(plan: r2engine::EngineAutoCallbackPlan) -> R2SleighAutoCallbackPlanV2 {
+    R2SleighAutoCallbackPlanV2 {
+        allowed: planner_bool(plan.allowed),
+        kind: planner_auto_callback_kind_value(plan.kind),
+        reason: planner_auto_callback_reason(plan.reason),
+    }
+}
+
+fn planner_interproc_purpose(raw: u32) -> Option<r2engine::EngineInterprocSessionPurpose> {
+    match raw {
+        R2SLEIGH_INTERPROC_SESSION_TYPE_ANALYSIS_V2 => {
+            Some(r2engine::EngineInterprocSessionPurpose::TypeAnalysis)
+        }
+        R2SLEIGH_INTERPROC_SESSION_DECOMPILE_V2 => {
+            Some(r2engine::EngineInterprocSessionPurpose::Decompile)
+        }
+        _ => None,
+    }
+}
+
+fn planner_interproc_plan(
+    plan: r2engine::EngineInterprocSessionPlan,
+) -> R2SleighInterprocSessionPlan {
+    R2SleighInterprocSessionPlan {
+        include_type_interproc_scope: planner_bool(plan.include_type_interproc_scope),
+        include_root_symbolic_scope: planner_bool(plan.include_root_symbolic_scope),
+        interproc_iter: plan.interproc_iter,
+        interproc_max_iters: plan.interproc_max_iters,
+        interproc_converged: planner_bool(plan.interproc_converged),
+    }
+}
+
+fn planner_input_bool(raw: i32) -> Option<bool> {
+    match raw {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
+}
+
+fn planner_interproc_input(
+    plan: R2SleighInterprocSessionPlan,
+) -> Option<r2engine::EngineInterprocSessionPlan> {
+    Some(r2engine::EngineInterprocSessionPlan {
+        include_type_interproc_scope: planner_input_bool(plan.include_type_interproc_scope)?,
+        include_root_symbolic_scope: planner_input_bool(plan.include_root_symbolic_scope)?,
+        interproc_iter: plan.interproc_iter,
+        interproc_max_iters: plan.interproc_max_iters,
+        interproc_converged: planner_input_bool(plan.interproc_converged)?,
+    })
+}
+
+fn planner_symbolic_scope_reason(reason: r2engine::EngineSymbolicScopeFunctionReason) -> u32 {
+    match reason {
+        r2engine::EngineSymbolicScopeFunctionReason::Allowed => {
+            R2SLEIGH_SYMBOLIC_SCOPE_REASON_ALLOWED_V2
+        }
+        r2engine::EngineSymbolicScopeFunctionReason::ScopeFull => {
+            R2SLEIGH_SYMBOLIC_SCOPE_REASON_SCOPE_FULL_V2
+        }
+        r2engine::EngineSymbolicScopeFunctionReason::InterprocDisabled => {
+            R2SLEIGH_SYMBOLIC_SCOPE_REASON_INTERPROC_DISABLED_V2
+        }
+        r2engine::EngineSymbolicScopeFunctionReason::TargetTerminal => {
+            R2SLEIGH_SYMBOLIC_SCOPE_REASON_TARGET_TERMINAL_V2
+        }
+    }
+}
+
+fn planner_symbolic_scope(
+    plan: r2engine::EngineSymbolicScopeFunctionPlan,
+) -> R2SleighSymbolicScopeFunctionPlanV2 {
+    R2SleighSymbolicScopeFunctionPlanV2 {
+        append_function: planner_bool(plan.append_function),
+        expand_targets: planner_bool(plan.expand_targets),
+        reason: planner_symbolic_scope_reason(plan.reason),
+    }
+}
+
+fn planner_runtime_source_reason(reason: r2engine::EngineRuntimeMaterializedSourceReason) -> u32 {
+    match reason {
+        r2engine::EngineRuntimeMaterializedSourceReason::Allowed => {
+            R2SLEIGH_RUNTIME_SOURCE_REASON_ALLOWED_V2
+        }
+        r2engine::EngineRuntimeMaterializedSourceReason::ScopeFull => {
+            R2SLEIGH_RUNTIME_SOURCE_REASON_SCOPE_FULL_V2
+        }
+        r2engine::EngineRuntimeMaterializedSourceReason::EmptySource => {
+            R2SLEIGH_RUNTIME_SOURCE_REASON_EMPTY_SOURCE_V2
+        }
+    }
+}
+
+fn planner_runtime_source(
+    plan: r2engine::EngineRuntimeMaterializedSourcePlan,
+) -> R2SleighRuntimeMaterializedSourcePlanV2 {
+    R2SleighRuntimeMaterializedSourcePlanV2 {
+        append_source: planner_bool(plan.append_source),
+        capped_size: plan.capped_size,
+        slot_bytes: plan.slot_bytes,
+        reason: planner_runtime_source_reason(plan.reason),
+    }
+}
+
+fn planner_interproc_input_is_zero(plan: R2SleighInterprocSessionPlan) -> bool {
+    plan == R2SleighInterprocSessionPlan::default()
+}
+
+fn planner_query_inactive_fields_are_zero(request: &R2SleighPlannerQueryRequestV2) -> bool {
+    let no_depth = request.depth == 0;
+    let no_purpose = request.purpose == 0;
+    let no_callback = request.callback_kind == 0;
+    let no_scope_flags = request.root_function == 0 && request.target_hint_function == 0;
+    let no_scope_count = request.current_scope_count == 0;
+    let no_function_count = request.function_count == 0;
+    let no_metrics = request.basic_block_count == 0 && request.cost == 0;
+    let no_linear_size = request.linear_size == 0;
+    let no_source = request.addr == 0 && request.size == 0;
+    let no_interproc = planner_interproc_input_is_zero(request.interproc);
+    let no_targets = request.targets.is_null() && request.num_targets == 0;
+
+    match request.kind {
+        R2SLEIGH_PLANNER_ANALYSIS_POLICY_V2 => {
+            no_purpose
+                && no_callback
+                && no_scope_flags
+                && no_scope_count
+                && no_function_count
+                && no_metrics
+                && no_linear_size
+                && no_source
+                && no_interproc
+                && no_targets
+        }
+        R2SLEIGH_PLANNER_POST_ANALYSIS_V2 => {
+            no_purpose
+                && no_callback
+                && no_scope_flags
+                && no_scope_count
+                && no_metrics
+                && no_linear_size
+                && no_source
+                && no_interproc
+                && no_targets
+        }
+        R2SLEIGH_PLANNER_AUTO_CALLBACK_V2 => {
+            no_purpose
+                && no_scope_flags
+                && no_scope_count
+                && no_function_count
+                && no_source
+                && no_interproc
+                && no_targets
+        }
+        R2SLEIGH_PLANNER_INTERPROC_SESSION_V2 => {
+            no_callback
+                && no_scope_flags
+                && no_scope_count
+                && no_function_count
+                && no_linear_size
+                && no_source
+                && no_interproc
+                && no_targets
+        }
+        R2SLEIGH_PLANNER_SYMBOLIC_SCOPE_V2 => {
+            no_depth
+                && no_purpose
+                && no_callback
+                && no_function_count
+                && no_metrics
+                && no_linear_size
+                && no_source
+                && no_targets
+        }
+        R2SLEIGH_PLANNER_RUNTIME_SOURCE_V2 => {
+            no_depth
+                && no_purpose
+                && no_callback
+                && no_scope_flags
+                && no_function_count
+                && no_metrics
+                && no_linear_size
+                && no_interproc
+                && no_targets
+        }
+        R2SLEIGH_PLANNER_INTERPROC_TARGETS_V2 => {
+            no_depth
+                && no_purpose
+                && no_callback
+                && no_scope_flags
+                && no_scope_count
+                && no_function_count
+                && no_metrics
+                && no_linear_size
+                && no_source
+                && no_interproc
+        }
+        _ => false,
+    }
+}
+
+unsafe fn planner_target_inputs(
+    request: &R2SleighPlannerQueryRequestV2,
+) -> Result<Vec<r2engine::EngineInterprocTargetInput>, BoundaryError> {
+    let inputs = unsafe {
+        checked_slice(
+            request.targets,
+            request.num_targets,
+            R2SLEIGH_MAX_PLANNER_TARGETS_V2,
+            "planner targets",
+        )?
+    };
+    let mut budget = ValidationBudget::default();
+    let mut copied = Vec::with_capacity(inputs.len());
+    for (index, input) in inputs.iter().enumerate() {
+        let label = format!("planner targets[{index}]");
+        if input.abi_version != R2SLEIGH_ABI_V2
+            || input.struct_size != u32_size::<R2SleighPlannerTargetInputV2>()
+            || input.schema_version != R2SLEIGH_PLANNER_TARGET_INPUT_SCHEMA_V2
+        {
+            return Err(BoundaryError::abi(format!(
+                "{label} has an incompatible envelope"
+            )));
+        }
+        let linkage = match input.linkage {
+            R2SLEIGH_INTERPROC_LINKAGE_UNKNOWN_V2 => r2ssa::FunctionSemanticLinkage::Unknown,
+            R2SLEIGH_INTERPROC_LINKAGE_INTERNAL_V2 => r2ssa::FunctionSemanticLinkage::Internal,
+            R2SLEIGH_INTERPROC_LINKAGE_IMPORTED_V2 => r2ssa::FunctionSemanticLinkage::Imported,
+            _ => {
+                return Err(BoundaryError::invalid(format!(
+                    "{label}.linkage is invalid"
+                )));
+            }
+        };
+        let has_resolved_target = match input.has_resolved_target {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(BoundaryError::invalid(format!(
+                    "{label}.has_resolved_target is not boolean"
+                )));
+            }
+        };
+        let target_materialized = match input.target_materialized {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(BoundaryError::invalid(format!(
+                    "{label}.target_materialized is not boolean"
+                )));
+            }
+        };
+        let has_target_metrics = match input.has_target_metrics {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(BoundaryError::invalid(format!(
+                    "{label}.has_target_metrics is not boolean"
+                )));
+            }
+        };
+        if !has_resolved_target && input.resolved_target != 0 {
+            return Err(BoundaryError::invalid(format!(
+                "{label}.resolved_target must be zero when absent"
+            )));
+        }
+        if target_materialized && !has_resolved_target {
+            return Err(BoundaryError::invalid(format!(
+                "{label} cannot be materialized without a resolved target"
+            )));
+        }
+        if !has_target_metrics && (input.target_basic_block_count != 0 || input.target_cost != 0) {
+            return Err(BoundaryError::invalid(format!(
+                "{label} metrics must be zero when absent"
+            )));
+        }
+        if has_target_metrics && !target_materialized {
+            return Err(BoundaryError::invalid(format!(
+                "{label} cannot have metrics without a materialized target"
+            )));
+        }
+        let name = unsafe {
+            string_view(
+                input.name,
+                R2SLEIGH_MAX_STRING_BYTES_V2,
+                &format!("{label}.name"),
+                &mut budget,
+            )?
+        }
+        .trim();
+        copied.push(r2engine::EngineInterprocTargetInput {
+            direct_target: input.direct_target,
+            name: (!name.is_empty()).then(|| name.to_string()),
+            linkage,
+            semantic_summary: None,
+            resolved_target: has_resolved_target.then_some(input.resolved_target),
+            target_materialized,
+            target_metrics: has_target_metrics.then_some(r2engine::EngineInterprocTargetMetrics {
+                basic_block_count: input.target_basic_block_count,
+                cost: input.target_cost,
+            }),
+        });
+    }
+    Ok(copied)
+}
+
+fn planner_query_impl(
+    request: &R2SleighPlannerQueryRequestV2,
+) -> Result<R2SleighPlannerQueryResponseV2, BoundaryError> {
+    if !planner_query_inactive_fields_are_zero(request) {
+        return Err(BoundaryError::invalid(
+            "planner query contains nonzero inactive fields",
+        ));
+    }
+    let mut response = R2SleighPlannerQueryResponseV2 {
+        abi_version: R2SLEIGH_ABI_V2,
+        struct_size: u32_size::<R2SleighPlannerQueryResponseV2>(),
+        schema_version: R2SLEIGH_PLANNER_QUERY_SCHEMA_V2,
+        kind: request.kind,
+        ..R2SleighPlannerQueryResponseV2::default()
+    };
+    match request.kind {
+        R2SLEIGH_PLANNER_ANALYSIS_POLICY_V2 => {
+            response.analysis_policy =
+                planner_analysis_policy(r2engine::analysis_policy_for_radare2_depth(request.depth));
+        }
+        R2SLEIGH_PLANNER_POST_ANALYSIS_V2 => {
+            response.post_analysis =
+                planner_post_analysis(r2engine::post_analysis_plan_for_radare2_depth(
+                    request.depth,
+                    request.function_count,
+                ));
+        }
+        R2SLEIGH_PLANNER_AUTO_CALLBACK_V2 => {
+            let kind = planner_auto_callback_kind(request.callback_kind)
+                .ok_or_else(|| BoundaryError::invalid("planner callback kind is invalid"))?;
+            response.auto_callback =
+                planner_auto_callback(r2engine::auto_callback_plan_for_radare2_depth(
+                    request.depth,
+                    kind,
+                    r2engine::EngineAutoCallbackMetrics {
+                        basic_block_count: u32::try_from(request.basic_block_count)
+                            .unwrap_or(u32::MAX),
+                        cost: request.cost,
+                        linear_size: request.linear_size,
+                    },
+                ));
+        }
+        R2SLEIGH_PLANNER_INTERPROC_SESSION_V2 => {
+            let purpose = planner_interproc_purpose(request.purpose)
+                .ok_or_else(|| BoundaryError::invalid("planner purpose is invalid"))?;
+            response.interproc_session = planner_interproc_plan(r2engine::interproc_session_plan(
+                r2engine::analysis_policy_for_radare2_depth(request.depth),
+                purpose,
+                Some(r2engine::EngineInterprocTargetMetrics {
+                    basic_block_count: u32::try_from(request.basic_block_count).unwrap_or(u32::MAX),
+                    cost: request.cost,
+                }),
+            ));
+        }
+        R2SLEIGH_PLANNER_SYMBOLIC_SCOPE_V2 => {
+            let root_function = match request.root_function {
+                0 => false,
+                1 => true,
+                _ => return Err(BoundaryError::invalid("root_function is not boolean")),
+            };
+            let target_hint_function = match request.target_hint_function {
+                0 => false,
+                1 => true,
+                _ => {
+                    return Err(BoundaryError::invalid(
+                        "target_hint_function is not boolean",
+                    ));
+                }
+            };
+            let interproc = planner_interproc_input(request.interproc)
+                .ok_or_else(|| BoundaryError::invalid("interproc planner input is invalid"))?;
+            response.symbolic_scope =
+                planner_symbolic_scope(r2engine::symbolic_scope_function_plan(
+                    r2engine::EngineSymbolicScopeFunctionInput {
+                        current_scope_count: request.current_scope_count,
+                        root_function,
+                        target_hint_function,
+                        interproc,
+                    },
+                ));
+        }
+        R2SLEIGH_PLANNER_RUNTIME_SOURCE_V2 => {
+            response.runtime_source =
+                planner_runtime_source(r2engine::runtime_materialized_source_plan(
+                    request.current_scope_count,
+                    request.addr,
+                    request.size,
+                ));
+        }
+        R2SLEIGH_PLANNER_INTERPROC_TARGETS_V2 => {
+            let inputs = unsafe { planner_target_inputs(request)? };
+            let plan = r2engine::interproc_scope_target_plan(inputs);
+            response.result =
+                lock_lift_registry().insert_planner_result(R2SleighPlannerResultV2 {
+                    queued_targets: plan.queued_targets,
+                    registration_targets: plan.registration_targets,
+                    runtime_copy_targets: plan.runtime_copy_targets,
+                })?;
+        }
+        _ => return Err(BoundaryError::invalid("planner query kind is invalid")),
+    }
+    Ok(response)
+}
+
+extern "C" fn planner_query(
+    request: *const R2SleighPlannerQueryRequestV2,
+    output: *mut R2SleighPlannerQueryResponseV2,
+) -> u32 {
+    lift_boundary(|| {
+        valid_output_ptr(output, "planner query output")?;
+        unsafe { *output = R2SleighPlannerQueryResponseV2::default() };
+        valid_object_ptr(request, "planner query request")?;
+        let request = unsafe { &*request };
+        if request.abi_version != R2SLEIGH_ABI_V2
+            || request.struct_size != u32_size::<R2SleighPlannerQueryRequestV2>()
+            || request.schema_version != R2SLEIGH_PLANNER_QUERY_SCHEMA_V2
+        {
+            return Err(BoundaryError::abi(
+                "planner query request has an incompatible envelope",
+            ));
+        }
+        let response = planner_query_impl(request)?;
+        unsafe { *output = response };
+        Ok(())
+    })
+}
+
+extern "C" fn planner_result_view(
+    result: *const R2SleighPlannerResultV2,
+    output: *mut R2SleighPlannerResultViewV2,
+) -> u32 {
+    lift_boundary_for(result, || {
+        valid_output_ptr(output, "planner result view output")?;
+        unsafe { *output = R2SleighPlannerResultViewV2::default() };
+        let payload = lock_lift_registry().payload::<R2SleighPlannerResultV2>(
+            result as usize,
+            LiftHandleKind::PlannerResult,
+            "planner result",
+        )?;
+        let result = unsafe { &*payload };
+        unsafe {
+            *output = R2SleighPlannerResultViewV2 {
+                abi_version: R2SLEIGH_ABI_V2,
+                struct_size: u32_size::<R2SleighPlannerResultViewV2>(),
+                schema_version: R2SLEIGH_PLANNER_RESULT_SCHEMA_V2,
+                queued_target_count: result.queued_targets.len(),
+                registration_target_count: result.registration_targets.len(),
+                runtime_copy_target_count: result.runtime_copy_targets.len(),
+            };
+        }
+        Ok(())
+    })
+}
+
+extern "C" fn planner_result_copy(
+    result: *const R2SleighPlannerResultV2,
+    selector: u32,
+    output: *mut u64,
+    capacity: usize,
+    output_count: *mut usize,
+) -> u32 {
+    lift_boundary_for(result, || {
+        valid_output_ptr(output_count, "planner result copy count")?;
+        unsafe { *output_count = 0 };
+        let payload = lock_lift_registry().payload::<R2SleighPlannerResultV2>(
+            result as usize,
+            LiftHandleKind::PlannerResult,
+            "planner result",
+        )?;
+        let result = unsafe { &*payload };
+        let values = match selector {
+            R2SLEIGH_PLANNER_RESULT_QUEUED_TARGETS_V2 => &result.queued_targets,
+            R2SLEIGH_PLANNER_RESULT_REGISTRATION_TARGETS_V2 => &result.registration_targets,
+            R2SLEIGH_PLANNER_RESULT_RUNTIME_COPY_TARGETS_V2 => &result.runtime_copy_targets,
+            _ => return Err(BoundaryError::invalid("planner result selector is invalid")),
+        };
+        unsafe { *output_count = values.len() };
+        if capacity < values.len() {
+            return Err(BoundaryError::limit(
+                "planner result output capacity is too small",
+            ));
+        }
+        if !values.is_empty() {
+            valid_output_ptr(output, "planner result copy output")?;
+            unsafe { ptr::copy_nonoverlapping(values.as_ptr(), output, values.len()) };
+        }
+        Ok(())
+    })
+}
+
+extern "C" fn planner_result_free(result: *mut R2SleighPlannerResultV2) -> u32 {
+    lift_boundary_for(result, || {
+        lock_lift_registry().retire(
+            result as usize,
+            LiftHandleKind::PlannerResult,
+            "planner result",
+        )
+    })
+}
+
 static API_V2: R2SleighApiV2 = R2SleighApiV2 {
     abi_version: R2SLEIGH_ABI_V2,
     struct_size: size_of::<R2SleighApiV2>() as u32,
@@ -3092,8 +6186,22 @@ static API_V2: R2SleighApiV2 = R2SleighApiV2 {
     source_call_argument_size: size_of::<R2SleighSourceCallArgumentV2>() as u32,
     source_call_site_interface_size: size_of::<R2SleighSourceCallSiteInterfaceV2>() as u32,
     byte_view_size: size_of::<R2SleighByteViewV2>() as u32,
+    string_view_size: size_of::<R2SleighStringViewV2>() as u32,
     phase_timing_size: size_of::<R2SleighPhaseTimingV2>() as u32,
     response_info_size: size_of::<R2SleighResponseInfoV2>() as u32,
+    switch_case_size: size_of::<R2SleighSwitchCaseV2>() as u32,
+    direct_call_identity_size: size_of::<R2SleighDirectCallIdentityV2>() as u32,
+    analysis_render_request_size: size_of::<R2SleighAnalysisRenderRequestV2>() as u32,
+    scope_render_request_size: size_of::<R2SleighScopeRenderRequestV2>() as u32,
+    scope_symbol_size: size_of::<R2SleighScopeSymbolV2>() as u32,
+    analysis_query_request_size: size_of::<R2SleighAnalysisQueryRequestV2>() as u32,
+    analysis_result_view_size: size_of::<R2SleighAnalysisResultViewV2>() as u32,
+    planner_query_request_size: size_of::<R2SleighPlannerQueryRequestV2>() as u32,
+    planner_query_response_size: size_of::<R2SleighPlannerQueryResponseV2>() as u32,
+    planner_target_input_size: size_of::<R2SleighPlannerTargetInputV2>() as u32,
+    planner_result_view_size: size_of::<R2SleighPlannerResultViewV2>() as u32,
+    radare_snapshot_input_size: size_of::<R2SleighRadareSnapshotInputV2>() as u32,
+    radare_accessors_size: size_of::<R2SleighRadareAccessorsV2>() as u32,
     session_create,
     session_free,
     session_cancel,
@@ -3103,6 +6211,39 @@ static API_V2: R2SleighApiV2 = R2SleighApiV2 {
     response_info,
     response_free,
     session_error,
+    lift_context_create,
+    lift_context_free,
+    lift_context_is_loaded,
+    lift_context_arch_name,
+    lift_context_error,
+    lift_last_error,
+    lift_context_reg_profile,
+    lift_instruction,
+    lift_block,
+    lift_context_set_semantic_metadata,
+    lift_block_free,
+    lift_block_validate,
+    lift_block_set_switch_info,
+    lift_block_op_count,
+    lift_block_direct_call_identity,
+    lift_block_size,
+    lift_block_addr,
+    lift_block_mnemonic,
+    lift_block_type,
+    lift_block_jump,
+    lift_block_fail,
+    owned_bytes_view,
+    owned_bytes_free,
+    analysis_render,
+    scope_render,
+    analysis_query,
+    analysis_result_view,
+    analysis_result_free,
+    engine_cache_reset,
+    planner_query,
+    planner_result_view,
+    planner_result_copy,
+    planner_result_free,
 };
 
 /// Return the immutable V2 API table. The table and all callback addresses are
@@ -3122,6 +6263,1140 @@ mod tests {
             struct_size: u32_size::<R2SleighSessionConfigV2>(),
             required_capabilities: R2SLEIGH_CAP_DECOMPILE_V2,
         }
+    }
+
+    fn planner_request(kind: u32) -> R2SleighPlannerQueryRequestV2 {
+        R2SleighPlannerQueryRequestV2 {
+            abi_version: R2SLEIGH_ABI_V2,
+            struct_size: u32_size::<R2SleighPlannerQueryRequestV2>(),
+            schema_version: R2SLEIGH_PLANNER_QUERY_SCHEMA_V2,
+            kind,
+            ..R2SleighPlannerQueryRequestV2::default()
+        }
+    }
+
+    fn planner_query_for(
+        request: &R2SleighPlannerQueryRequestV2,
+    ) -> (u32, R2SleighPlannerQueryResponseV2) {
+        let mut response = R2SleighPlannerQueryResponseV2::default();
+        let status = (API_V2.planner_query)(request, &mut response);
+        (status, response)
+    }
+
+    fn scope_symbol(addr: u64, name: &[u8], linkage: u32) -> R2SleighScopeSymbolV2 {
+        R2SleighScopeSymbolV2 {
+            abi_version: R2SLEIGH_ABI_V2,
+            struct_size: u32_size::<R2SleighScopeSymbolV2>(),
+            schema_version: R2SLEIGH_SCOPE_SYMBOL_SCHEMA_V2,
+            addr,
+            name: R2SleighStringViewV2 {
+                data: name.as_ptr(),
+                len: name.len(),
+            },
+            linkage,
+        }
+    }
+
+    fn scope_snapshot_request(
+        symbols: &[R2SleighScopeSymbolV2],
+        merge_states: u32,
+    ) -> R2SleighScopeRenderRequestV2 {
+        R2SleighScopeRenderRequestV2 {
+            kind: R2SLEIGH_SCOPE_FUNCTION_V2,
+            context: ptr::null(),
+            functions: ptr::null(),
+            num_functions: 0,
+            entry_addr: 0,
+            target_addr: 0,
+            replay_seed: ptr::null(),
+            argument: R2SleighStringViewV2::default(),
+            external_context: R2SleighStringViewV2::default(),
+            symbols: if symbols.is_empty() {
+                ptr::null()
+            } else {
+                symbols.as_ptr()
+            },
+            num_symbols: symbols.len(),
+            merge_states,
+        }
+    }
+
+    #[test]
+    fn scope_symbol_snapshot_is_owned_and_imported_linkage_is_the_only_name_authority() {
+        let mut internal_name = b"memcpy".to_vec();
+        let mut imported_name = b"malloc".to_vec();
+        let symbols = [
+            scope_symbol(
+                0x4000,
+                &internal_name,
+                R2SLEIGH_INTERPROC_LINKAGE_INTERNAL_V2,
+            ),
+            scope_symbol(
+                0x5000,
+                &imported_name,
+                R2SLEIGH_INTERPROC_LINKAGE_IMPORTED_V2,
+            ),
+        ];
+        let request = scope_snapshot_request(&symbols, 1);
+        let snapshot = unsafe { scope_request_snapshot(&request) }.expect("valid snapshot");
+        internal_name.fill(b'x');
+        imported_name.fill(b'y');
+
+        assert!(snapshot.merge_states());
+        assert_eq!(snapshot.symbols().len(), 2);
+        assert!(!snapshot.symbols().imported_names().contains_key(&0x4000));
+        assert_eq!(
+            snapshot
+                .symbols()
+                .imported_names()
+                .get(&0x5000)
+                .map(String::as_str),
+            Some("malloc")
+        );
+    }
+
+    #[test]
+    fn scope_symbol_snapshot_rejects_envelopes_names_linkage_and_conflicts() {
+        let valid = scope_symbol(0x4000, b"local", R2SLEIGH_INTERPROC_LINKAGE_INTERNAL_V2);
+        for symbol in [
+            R2SleighScopeSymbolV2 {
+                struct_size: valid.struct_size - 1,
+                ..valid
+            },
+            R2SleighScopeSymbolV2 {
+                linkage: u32::MAX,
+                ..valid
+            },
+            scope_symbol(0x4000, b"", R2SLEIGH_INTERPROC_LINKAGE_INTERNAL_V2),
+            scope_symbol(0x4000, b"bad\0name", R2SLEIGH_INTERPROC_LINKAGE_INTERNAL_V2),
+            scope_symbol(0x4000, &[0xff], R2SLEIGH_INTERPROC_LINKAGE_INTERNAL_V2),
+        ] {
+            assert!(
+                unsafe { scope_request_snapshot(&scope_snapshot_request(&[symbol], 0)) }.is_err()
+            );
+        }
+
+        let conflicting = [
+            valid,
+            R2SleighScopeSymbolV2 {
+                linkage: R2SLEIGH_INTERPROC_LINKAGE_IMPORTED_V2,
+                ..valid
+            },
+        ];
+        assert!(
+            unsafe { scope_request_snapshot(&scope_snapshot_request(&conflicting, 0)) }.is_err()
+        );
+        let duplicate = [valid, valid];
+        assert_eq!(
+            unsafe { scope_request_snapshot(&scope_snapshot_request(&duplicate, 0)) }
+                .unwrap()
+                .symbols()
+                .len(),
+            1
+        );
+        assert!(unsafe { scope_request_snapshot(&scope_snapshot_request(&[], 2)) }.is_err());
+
+        let mut null_nonzero = scope_snapshot_request(&[], 0);
+        null_nonzero.num_symbols = 1;
+        assert!(unsafe { scope_request_snapshot(&null_nonzero) }.is_err());
+        let mut nonnull_zero = scope_snapshot_request(&[], 0);
+        nonnull_zero.symbols = &valid;
+        assert!(unsafe { scope_request_snapshot(&nonnull_zero) }.is_err());
+        let mut over_cap = scope_snapshot_request(&[], 0);
+        over_cap.num_symbols = R2SLEIGH_MAX_SCOPE_SYMBOLS_V2 + 1;
+        assert!(unsafe { scope_request_snapshot(&over_cap) }.is_err());
+        let mut misaligned = scope_snapshot_request(&[], 0);
+        misaligned.symbols = 1usize as *const R2SleighScopeSymbolV2;
+        misaligned.num_symbols = 1;
+        assert!(unsafe { scope_request_snapshot(&misaligned) }.is_err());
+    }
+
+    #[test]
+    fn scope_symbol_snapshot_enforces_aggregate_budget_and_is_concurrent_request_local() {
+        let exact_cap = (0..R2SLEIGH_MAX_SCOPE_SYMBOLS_V2)
+            .map(|index| {
+                scope_symbol(
+                    0x1000 + index as u64,
+                    b"x",
+                    R2SLEIGH_INTERPROC_LINKAGE_INTERNAL_V2,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            unsafe { scope_request_snapshot(&scope_snapshot_request(&exact_cap, 0)) }
+                .unwrap()
+                .symbols()
+                .len(),
+            R2SLEIGH_MAX_SCOPE_SYMBOLS_V2
+        );
+
+        let maximum_name = vec![b'x'; R2SLEIGH_MAX_STRING_BYTES_V2];
+        let symbols = (0..5)
+            .map(|index| {
+                scope_symbol(
+                    0x4000 + index,
+                    &maximum_name,
+                    R2SLEIGH_INTERPROC_LINKAGE_IMPORTED_V2,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(unsafe { scope_request_snapshot(&scope_snapshot_request(&symbols, 0)) }.is_err());
+
+        let outcomes = [false, true].map(|merge_states| {
+            std::thread::spawn(move || {
+                let name = if merge_states { b"malloc" } else { b"memcpy" };
+                let symbol = scope_symbol(0x5000, name, R2SLEIGH_INTERPROC_LINKAGE_IMPORTED_V2);
+                let symbols = [symbol];
+                let request = scope_snapshot_request(&symbols, u32::from(merge_states));
+                let snapshot = unsafe { scope_request_snapshot(&request) }.unwrap();
+                (
+                    snapshot.merge_states(),
+                    snapshot.symbols().imported_names().get(&0x5000).cloned(),
+                )
+            })
+        });
+        let [merge_off, merge_on] = outcomes;
+        assert_eq!(
+            merge_off.join().unwrap(),
+            (false, Some("memcpy".to_string()))
+        );
+        assert_eq!(merge_on.join().unwrap(), (true, Some("malloc".to_string())));
+    }
+
+    #[test]
+    fn planner_query_table_routes_scalar_engine_plans() {
+        assert_ne!(API_V2.capabilities & R2SLEIGH_CAP_PLANNER_QUERY_V2, 0);
+        assert_eq!(
+            API_V2.planner_query_request_size as usize,
+            size_of::<R2SleighPlannerQueryRequestV2>()
+        );
+        assert_eq!(
+            API_V2.planner_query_response_size as usize,
+            size_of::<R2SleighPlannerQueryResponseV2>()
+        );
+
+        let mut request = planner_request(R2SLEIGH_PLANNER_ANALYSIS_POLICY_V2);
+        request.depth = r2engine::RADARE2_ANALYSIS_DEPTH_BASIC;
+        let (status, response) = planner_query_for(&request);
+        assert_eq!(status, R2SLEIGH_STATUS_OK_V2);
+        assert_eq!(response.kind, request.kind);
+        assert_eq!(response.analysis_policy.mode, R2SLEIGH_MODE_FAST_V2);
+        assert_eq!(
+            response.analysis_policy.type_writeback_mode,
+            R2SLEIGH_TYPE_WRITEBACK_OFF_V2
+        );
+
+        request = planner_request(R2SLEIGH_PLANNER_POST_ANALYSIS_V2);
+        request.function_count = 1;
+        let (status, response) = planner_query_for(&request);
+        assert_eq!(status, R2SLEIGH_STATUS_OK_V2);
+        assert_eq!(response.post_analysis.mode, R2SLEIGH_MODE_BALANCED_V2);
+        assert_eq!(response.post_analysis.function_count, 1);
+        assert_eq!(response.post_analysis.xref_enabled, 1);
+
+        request = planner_request(R2SLEIGH_PLANNER_AUTO_CALLBACK_V2);
+        request.depth = r2engine::RADARE2_ANALYSIS_DEPTH_AGGRESSIVE;
+        request.callback_kind = R2SLEIGH_AUTO_CALLBACK_DATA_REFS_V2;
+        request.basic_block_count = r2engine::AUTO_CALLBACK_MAX_BLOCKS as usize;
+        request.cost = r2engine::AUTO_CALLBACK_MAX_COST;
+        request.linear_size = r2engine::AUTO_CALLBACK_MAX_LINEAR_SIZE;
+        let (status, response) = planner_query_for(&request);
+        assert_eq!(status, R2SLEIGH_STATUS_OK_V2);
+        assert_eq!(response.auto_callback.allowed, 1);
+        assert_eq!(
+            response.auto_callback.reason,
+            R2SLEIGH_AUTO_CALLBACK_REASON_ALLOWED_V2
+        );
+
+        request = planner_request(R2SLEIGH_PLANNER_INTERPROC_SESSION_V2);
+        request.purpose = R2SLEIGH_INTERPROC_SESSION_TYPE_ANALYSIS_V2;
+        request.basic_block_count = r2engine::ENGINE_INTERPROC_HELPER_MAX_BLOCKS as usize;
+        request.cost = r2engine::ENGINE_INTERPROC_HELPER_MAX_COST;
+        let (status, response) = planner_query_for(&request);
+        assert_eq!(status, R2SLEIGH_STATUS_OK_V2);
+        assert_eq!(response.interproc_session.include_type_interproc_scope, 1);
+        assert_eq!(response.interproc_session.interproc_converged, 1);
+
+        request = planner_request(R2SLEIGH_PLANNER_SYMBOLIC_SCOPE_V2);
+        request.root_function = 1;
+        request.interproc.interproc_converged = 1;
+        let (status, response) = planner_query_for(&request);
+        assert_eq!(status, R2SLEIGH_STATUS_OK_V2);
+        assert_eq!(response.symbolic_scope.append_function, 1);
+        assert_eq!(response.symbolic_scope.expand_targets, 1);
+        assert_eq!(
+            response.symbolic_scope.reason,
+            R2SLEIGH_SYMBOLIC_SCOPE_REASON_ALLOWED_V2
+        );
+
+        request = planner_request(R2SLEIGH_PLANNER_RUNTIME_SOURCE_V2);
+        request.addr = 0x9000;
+        request.size = 0x20;
+        let (status, response) = planner_query_for(&request);
+        assert_eq!(status, R2SLEIGH_STATUS_OK_V2);
+        assert_eq!(response.runtime_source.append_source, 1);
+        assert_eq!(response.runtime_source.capped_size, 0x20);
+        assert_eq!(
+            response.runtime_source.reason,
+            R2SLEIGH_RUNTIME_SOURCE_REASON_ALLOWED_V2
+        );
+    }
+
+    fn planner_target(
+        direct_target: u64,
+        name: &'static [u8],
+        linkage: u32,
+        resolved_target: u64,
+    ) -> R2SleighPlannerTargetInputV2 {
+        R2SleighPlannerTargetInputV2 {
+            abi_version: R2SLEIGH_ABI_V2,
+            struct_size: u32_size::<R2SleighPlannerTargetInputV2>(),
+            schema_version: R2SLEIGH_PLANNER_TARGET_INPUT_SCHEMA_V2,
+            direct_target,
+            name: R2SleighStringViewV2 {
+                data: name.as_ptr(),
+                len: name.len(),
+            },
+            linkage,
+            resolved_target,
+            has_resolved_target: 1,
+            target_materialized: 1,
+            has_target_metrics: 1,
+            target_basic_block_count: 1,
+            target_cost: 1,
+        }
+    }
+
+    #[test]
+    fn planner_target_result_is_registry_owned_copied_and_thread_affine() {
+        let targets = [
+            planner_target(
+                0x3000,
+                b"sym.imp.AddVectoredExceptionHandler",
+                R2SLEIGH_INTERPROC_LINKAGE_IMPORTED_V2,
+                0x3000,
+            ),
+            planner_target(
+                0x4000,
+                b"sym.local_helper",
+                R2SLEIGH_INTERPROC_LINKAGE_INTERNAL_V2,
+                0x4010,
+            ),
+            planner_target(
+                0x5000,
+                b"sym.imp.memcpy",
+                R2SLEIGH_INTERPROC_LINKAGE_IMPORTED_V2,
+                0x5000,
+            ),
+        ];
+        let mut request = planner_request(R2SLEIGH_PLANNER_INTERPROC_TARGETS_V2);
+        request.targets = targets.as_ptr();
+        request.num_targets = targets.len();
+        let (status, response) = planner_query_for(&request);
+        assert_eq!(status, R2SLEIGH_STATUS_OK_V2);
+        assert!(!response.result.is_null());
+
+        let mut view = R2SleighPlannerResultViewV2::default();
+        assert_eq!(
+            (API_V2.planner_result_view)(response.result, &mut view),
+            R2SLEIGH_STATUS_OK_V2
+        );
+        assert_eq!(view.queued_target_count, 2);
+        assert_eq!(view.registration_target_count, 1);
+        assert_eq!(view.runtime_copy_target_count, 1);
+
+        let mut count = 0;
+        assert_eq!(
+            (API_V2.planner_result_copy)(
+                response.result,
+                R2SLEIGH_PLANNER_RESULT_QUEUED_TARGETS_V2,
+                ptr::null_mut(),
+                0,
+                &mut count,
+            ),
+            R2SLEIGH_STATUS_LIMIT_EXCEEDED_V2
+        );
+        assert_eq!(count, 2);
+
+        let mut queued = [0u64; 2];
+        assert_eq!(
+            (API_V2.planner_result_copy)(
+                response.result,
+                R2SLEIGH_PLANNER_RESULT_QUEUED_TARGETS_V2,
+                queued.as_mut_ptr(),
+                queued.len(),
+                &mut count,
+            ),
+            R2SLEIGH_STATUS_OK_V2
+        );
+        assert_eq!(count, 2);
+        assert_eq!(queued, [0x4000, 0x4010]);
+        assert_eq!(
+            (API_V2.planner_result_copy)(
+                response.result,
+                R2SLEIGH_PLANNER_RESULT_QUEUED_TARGETS_V2,
+                queued.as_mut_ptr(),
+                1,
+                &mut count,
+            ),
+            R2SLEIGH_STATUS_LIMIT_EXCEEDED_V2
+        );
+        assert_eq!(count, 2);
+
+        let handle = response.result as usize;
+        assert_eq!(
+            std::thread::spawn(move || {
+                let mut view = R2SleighPlannerResultViewV2::default();
+                (API_V2.planner_result_view)(handle as *const _, &mut view)
+            })
+            .join()
+            .expect("planner thread"),
+            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
+        );
+        assert_eq!(
+            std::thread::spawn(move || {
+                (API_V2.planner_result_free)(handle as *mut R2SleighPlannerResultV2)
+            })
+            .join()
+            .expect("planner free thread"),
+            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
+        );
+        assert_eq!(
+            (API_V2.planner_result_view)(response.result, &mut view),
+            R2SLEIGH_STATUS_OK_V2,
+            "wrong-thread free refusal must retain the owner"
+        );
+        assert_eq!(
+            (API_V2.planner_result_free)(response.result),
+            R2SLEIGH_STATUS_OK_V2
+        );
+        assert_eq!(
+            (API_V2.planner_result_view)(response.result, &mut view),
+            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
+        );
+        assert_eq!(
+            (API_V2.planner_result_free)(response.result),
+            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2,
+            "double free must remain stale"
+        );
+    }
+
+    #[test]
+    fn planner_result_copy_validates_selector_count_and_empty_output() {
+        let request = planner_request(R2SLEIGH_PLANNER_INTERPROC_TARGETS_V2);
+        let (status, empty) = planner_query_for(&request);
+        assert_eq!(status, R2SLEIGH_STATUS_OK_V2);
+        assert!(!empty.result.is_null());
+        let mut count = usize::MAX;
+        assert_eq!(
+            (API_V2.planner_result_copy)(
+                empty.result,
+                R2SLEIGH_PLANNER_RESULT_QUEUED_TARGETS_V2,
+                ptr::null_mut(),
+                0,
+                &mut count,
+            ),
+            R2SLEIGH_STATUS_OK_V2
+        );
+        assert_eq!(count, 0);
+        count = usize::MAX;
+        assert_eq!(
+            (API_V2.planner_result_copy)(empty.result, u32::MAX, ptr::null_mut(), 0, &mut count,),
+            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
+        );
+        assert_eq!(count, 0);
+        assert_eq!(
+            (API_V2.planner_result_copy)(
+                empty.result,
+                R2SLEIGH_PLANNER_RESULT_QUEUED_TARGETS_V2,
+                ptr::null_mut(),
+                0,
+                ptr::null_mut(),
+            ),
+            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
+        );
+
+        let wrong_kind = lock_lift_registry()
+            .insert_owned_bytes(
+                0,
+                R2SleighOwnedBytesV2 {
+                    bytes: CString::new("planner wrong kind").unwrap(),
+                },
+            )
+            .expect("registered wrong-kind handle");
+        let mut view = R2SleighPlannerResultViewV2::default();
+        let mut count = usize::MAX;
+        assert_eq!(
+            (API_V2.planner_result_view)(wrong_kind.cast(), &mut view),
+            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
+        );
+        assert_eq!(
+            (API_V2.planner_result_copy)(
+                wrong_kind.cast(),
+                R2SLEIGH_PLANNER_RESULT_QUEUED_TARGETS_V2,
+                ptr::null_mut(),
+                0,
+                &mut count,
+            ),
+            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
+        );
+        assert_eq!(count, 0);
+        assert_eq!(
+            (API_V2.planner_result_free)(wrong_kind.cast()),
+            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
+        );
+        assert_eq!(
+            (API_V2.owned_bytes_free)(wrong_kind),
+            R2SLEIGH_STATUS_OK_V2,
+            "wrong-kind refusal must retain the true owner"
+        );
+        assert_eq!(
+            (API_V2.planner_result_free)(empty.result),
+            R2SLEIGH_STATUS_OK_V2
+        );
+    }
+
+    #[test]
+    fn planner_target_ingress_rejects_bad_envelopes_utf8_and_exact_tags() {
+        fn query_target(target: &R2SleighPlannerTargetInputV2) -> u32 {
+            let mut request = planner_request(R2SLEIGH_PLANNER_INTERPROC_TARGETS_V2);
+            request.targets = target;
+            request.num_targets = 1;
+            planner_query_for(&request).0
+        }
+
+        let mut target = planner_target(
+            0x4000,
+            b"local",
+            R2SLEIGH_INTERPROC_LINKAGE_INTERNAL_V2,
+            0x4000,
+        );
+        for invalid in [2, u32::MAX] {
+            target.target_materialized = invalid;
+            assert_eq!(query_target(&target), R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
+        }
+        target.target_materialized = 1;
+        target.linkage = u32::MAX;
+        assert_eq!(query_target(&target), R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
+        target.linkage = R2SLEIGH_INTERPROC_LINKAGE_INTERNAL_V2;
+        target.struct_size -= 1;
+        assert_eq!(query_target(&target), R2SLEIGH_STATUS_ABI_MISMATCH_V2);
+        target.struct_size = u32_size::<R2SleighPlannerTargetInputV2>();
+        let invalid_utf8 = [0xff];
+        target.name = R2SleighStringViewV2 {
+            data: invalid_utf8.as_ptr(),
+            len: invalid_utf8.len(),
+        };
+        assert_eq!(query_target(&target), R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
+        let mut request = planner_request(R2SLEIGH_PLANNER_INTERPROC_TARGETS_V2);
+        request.targets = ptr::null();
+        request.num_targets = 1;
+        assert_eq!(
+            planner_query_for(&request).0,
+            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
+        );
+        request.num_targets = R2SLEIGH_MAX_PLANNER_TARGETS_V2 + 1;
+        assert_eq!(
+            planner_query_for(&request).0,
+            R2SLEIGH_STATUS_LIMIT_EXCEEDED_V2
+        );
+
+        let exact_cap_target =
+            planner_target(0x4000, b"", R2SLEIGH_INTERPROC_LINKAGE_INTERNAL_V2, 0x4000);
+        let exact_cap_targets = vec![exact_cap_target; R2SLEIGH_MAX_PLANNER_TARGETS_V2];
+        request.targets = exact_cap_targets.as_ptr();
+        request.num_targets = exact_cap_targets.len();
+        let (status, response) = planner_query_for(&request);
+        assert_eq!(status, R2SLEIGH_STATUS_OK_V2);
+        assert_eq!(
+            (API_V2.planner_result_free)(response.result),
+            R2SLEIGH_STATUS_OK_V2
+        );
+
+        let maximum_name = vec![b'x'; R2SLEIGH_MAX_STRING_BYTES_V2];
+        let mut aggregate_targets = vec![exact_cap_target; 5];
+        for target in &mut aggregate_targets {
+            target.name = R2SleighStringViewV2 {
+                data: maximum_name.as_ptr(),
+                len: maximum_name.len(),
+            };
+        }
+        request.targets = aggregate_targets.as_ptr();
+        request.num_targets = aggregate_targets.len();
+        assert_eq!(
+            planner_query_for(&request).0,
+            R2SLEIGH_STATUS_LIMIT_EXCEEDED_V2,
+            "aggregate target-name bytes must remain bounded"
+        );
+    }
+
+    #[test]
+    fn planner_target_ingress_rejects_invalid_boolean_and_dependency_matrix() {
+        fn query_target(target: &R2SleighPlannerTargetInputV2) -> u32 {
+            let mut request = planner_request(R2SLEIGH_PLANNER_INTERPROC_TARGETS_V2);
+            request.targets = target;
+            request.num_targets = 1;
+            planner_query_for(&request).0
+        }
+
+        let valid = planner_target(
+            0x4000,
+            b"local",
+            R2SLEIGH_INTERPROC_LINKAGE_INTERNAL_V2,
+            0x4010,
+        );
+        for invalid in [2, u32::MAX] {
+            for target in [
+                R2SleighPlannerTargetInputV2 {
+                    has_resolved_target: invalid,
+                    ..valid
+                },
+                R2SleighPlannerTargetInputV2 {
+                    target_materialized: invalid,
+                    ..valid
+                },
+                R2SleighPlannerTargetInputV2 {
+                    has_target_metrics: invalid,
+                    ..valid
+                },
+            ] {
+                assert_eq!(query_target(&target), R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
+            }
+        }
+
+        for target in [
+            R2SleighPlannerTargetInputV2 {
+                has_resolved_target: 0,
+                ..valid
+            },
+            R2SleighPlannerTargetInputV2 {
+                has_resolved_target: 0,
+                resolved_target: 0,
+                ..valid
+            },
+            R2SleighPlannerTargetInputV2 {
+                has_target_metrics: 0,
+                ..valid
+            },
+            R2SleighPlannerTargetInputV2 {
+                target_materialized: 0,
+                ..valid
+            },
+        ] {
+            assert_eq!(query_target(&target), R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
+        }
+
+        let absent = R2SleighPlannerTargetInputV2 {
+            resolved_target: 0,
+            has_resolved_target: 0,
+            target_materialized: 0,
+            has_target_metrics: 0,
+            target_basic_block_count: 0,
+            target_cost: 0,
+            ..valid
+        };
+        let mut request = planner_request(R2SLEIGH_PLANNER_INTERPROC_TARGETS_V2);
+        request.targets = &absent;
+        request.num_targets = 1;
+        let (status, response) = planner_query_for(&request);
+        assert_eq!(status, R2SLEIGH_STATUS_OK_V2);
+        assert_eq!(
+            (API_V2.planner_result_free)(response.result),
+            R2SLEIGH_STATUS_OK_V2
+        );
+    }
+
+    #[test]
+    fn planner_query_rejects_bad_tags_kinds_enums_and_booleans() {
+        let mut response = R2SleighPlannerQueryResponseV2::default();
+        assert_eq!(
+            (API_V2.planner_query)(ptr::null(), &mut response),
+            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
+        );
+        let request = planner_request(R2SLEIGH_PLANNER_ANALYSIS_POLICY_V2);
+        assert_eq!(
+            (API_V2.planner_query)(&request, ptr::null_mut()),
+            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
+        );
+
+        for request in [
+            R2SleighPlannerQueryRequestV2 {
+                abi_version: R2SLEIGH_ABI_V2 + 1,
+                ..request
+            },
+            R2SleighPlannerQueryRequestV2 {
+                struct_size: request.struct_size - 1,
+                ..request
+            },
+            R2SleighPlannerQueryRequestV2 {
+                schema_version: R2SLEIGH_PLANNER_QUERY_SCHEMA_V2 + 1,
+                ..request
+            },
+        ] {
+            let (status, response) = planner_query_for(&request);
+            assert_eq!(status, R2SLEIGH_STATUS_ABI_MISMATCH_V2);
+            assert_eq!(response, R2SleighPlannerQueryResponseV2::default());
+        }
+
+        let invalid = [
+            R2SleighPlannerQueryRequestV2 {
+                kind: u32::MAX,
+                ..request
+            },
+            R2SleighPlannerQueryRequestV2 {
+                kind: R2SLEIGH_PLANNER_AUTO_CALLBACK_V2,
+                callback_kind: u32::MAX,
+                ..request
+            },
+            R2SleighPlannerQueryRequestV2 {
+                kind: R2SLEIGH_PLANNER_INTERPROC_SESSION_V2,
+                purpose: u32::MAX,
+                ..request
+            },
+            R2SleighPlannerQueryRequestV2 {
+                kind: R2SLEIGH_PLANNER_SYMBOLIC_SCOPE_V2,
+                root_function: 2,
+                ..request
+            },
+            R2SleighPlannerQueryRequestV2 {
+                kind: R2SLEIGH_PLANNER_SYMBOLIC_SCOPE_V2,
+                interproc: R2SleighInterprocSessionPlan {
+                    interproc_converged: 2,
+                    ..R2SleighInterprocSessionPlan::default()
+                },
+                ..request
+            },
+        ];
+        for request in invalid {
+            let (status, response) = planner_query_for(&request);
+            assert_eq!(status, R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
+            assert_eq!(response, R2SleighPlannerQueryResponseV2::default());
+        }
+    }
+
+    #[test]
+    fn planner_query_rejects_nonzero_inactive_fields_for_every_kind() {
+        let target = planner_target(
+            0x4000,
+            b"local",
+            R2SLEIGH_INTERPROC_LINKAGE_INTERNAL_V2,
+            0x4000,
+        );
+        let invalid = [
+            R2SleighPlannerQueryRequestV2 {
+                purpose: 1,
+                ..planner_request(R2SLEIGH_PLANNER_ANALYSIS_POLICY_V2)
+            },
+            R2SleighPlannerQueryRequestV2 {
+                targets: &target,
+                ..planner_request(R2SLEIGH_PLANNER_POST_ANALYSIS_V2)
+            },
+            R2SleighPlannerQueryRequestV2 {
+                function_count: 1,
+                callback_kind: R2SLEIGH_AUTO_CALLBACK_ANALYZE_FUNCTION_V2,
+                ..planner_request(R2SLEIGH_PLANNER_AUTO_CALLBACK_V2)
+            },
+            R2SleighPlannerQueryRequestV2 {
+                purpose: R2SLEIGH_INTERPROC_SESSION_TYPE_ANALYSIS_V2,
+                linear_size: 1,
+                ..planner_request(R2SLEIGH_PLANNER_INTERPROC_SESSION_V2)
+            },
+            R2SleighPlannerQueryRequestV2 {
+                depth: 1,
+                ..planner_request(R2SLEIGH_PLANNER_SYMBOLIC_SCOPE_V2)
+            },
+            R2SleighPlannerQueryRequestV2 {
+                interproc: R2SleighInterprocSessionPlan {
+                    interproc_iter: 1,
+                    ..R2SleighInterprocSessionPlan::default()
+                },
+                ..planner_request(R2SLEIGH_PLANNER_RUNTIME_SOURCE_V2)
+            },
+            R2SleighPlannerQueryRequestV2 {
+                addr: 1,
+                ..planner_request(R2SLEIGH_PLANNER_INTERPROC_TARGETS_V2)
+            },
+        ];
+        for request in invalid {
+            let (status, response) = planner_query_for(&request);
+            assert_eq!(status, R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
+            assert_eq!(response, R2SleighPlannerQueryResponseV2::default());
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn lift_core_table_round_trip_owns_strings_and_handles() {
+        let api = &API_V2;
+        assert_ne!(api.capabilities & R2SLEIGH_CAP_LIFT_CORE_V2, 0);
+        assert_eq!(api.struct_size as usize, size_of::<R2SleighApiV2>());
+        assert_eq!(
+            api.string_view_size as usize,
+            size_of::<R2SleighStringViewV2>()
+        );
+        assert_eq!(
+            api.switch_case_size as usize,
+            size_of::<R2SleighSwitchCaseV2>()
+        );
+        assert_eq!(
+            api.direct_call_identity_size as usize,
+            size_of::<R2SleighDirectCallIdentityV2>()
+        );
+
+        let arch = b"x86-64";
+        let mut context = ptr::null_mut();
+        assert_eq!(
+            (api.lift_context_create)(
+                R2SleighStringViewV2 {
+                    data: arch.as_ptr(),
+                    len: arch.len(),
+                },
+                &mut context,
+            ),
+            R2SLEIGH_STATUS_OK_V2
+        );
+        assert!(!context.is_null());
+        let context_token = context as usize;
+
+        let mut loaded = 0;
+        assert_eq!(
+            (api.lift_context_is_loaded)(context, &mut loaded),
+            R2SLEIGH_STATUS_OK_V2
+        );
+        assert_eq!(loaded, 1);
+
+        let mut arch_name = R2SleighByteViewV2::default();
+        assert_eq!(
+            (api.lift_context_arch_name)(context, &mut arch_name),
+            R2SLEIGH_STATUS_OK_V2
+        );
+        assert_eq!(
+            unsafe { slice::from_raw_parts(arch_name.data, arch_name.len) },
+            arch
+        );
+
+        let mut profile = ptr::null_mut();
+        assert_eq!(
+            (api.lift_context_reg_profile)(context, &mut profile),
+            R2SLEIGH_STATUS_OK_V2
+        );
+        assert!(!profile.is_null());
+        let mut profile_view = R2SleighByteViewV2::default();
+        assert_eq!(
+            (api.owned_bytes_view)(profile, &mut profile_view),
+            R2SLEIGH_STATUS_OK_V2
+        );
+        let profile_copy =
+            unsafe { slice::from_raw_parts(profile_view.data, profile_view.len).to_vec() };
+        assert!(profile_copy.windows(4).any(|window| window == b"=PC\t"));
+        assert_eq!((api.owned_bytes_free)(profile), R2SLEIGH_STATUS_OK_V2);
+
+        let bytes = [0x31, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let byte_view = R2SleighByteViewV2 {
+            data: bytes.as_ptr(),
+            len: bytes.len(),
+        };
+        let mut block = ptr::null_mut();
+        assert_eq!(
+            (api.lift_instruction)(context, byte_view, 0x1000, &mut block),
+            R2SLEIGH_STATUS_OK_V2
+        );
+        assert!(!block.is_null());
+        assert_eq!(
+            (api.lift_block_validate)(context, block),
+            R2SLEIGH_STATUS_OK_V2
+        );
+        let mut addr = 0;
+        let mut size = 0;
+        let mut op_count = 0;
+        assert_eq!(
+            (api.lift_block_addr)(block, &mut addr),
+            R2SLEIGH_STATUS_OK_V2
+        );
+        assert_eq!(
+            (api.lift_block_size)(block, &mut size),
+            R2SLEIGH_STATUS_OK_V2
+        );
+        assert_eq!(
+            (api.lift_block_op_count)(block, &mut op_count),
+            R2SLEIGH_STATUS_OK_V2
+        );
+        assert_eq!(addr, 0x1000);
+        assert!(size > 0);
+        assert!(op_count > 0);
+
+        let block_handles = [block as *const R2ILBlock];
+        let render_request = R2SleighAnalysisRenderRequestV2 {
+            kind: R2SLEIGH_ANALYSIS_BLOCK_ESIL_V2,
+            context,
+            blocks: block_handles.as_ptr(),
+            num_blocks: block_handles.len(),
+            op_index: 0,
+            argument: R2SleighStringViewV2::default(),
+        };
+        let mut rendered = ptr::null_mut();
+        assert_eq!(
+            (api.analysis_render)(&render_request, &mut rendered),
+            R2SLEIGH_STATUS_OK_V2
+        );
+        let mut rendered_view = R2SleighByteViewV2::default();
+        assert_eq!(
+            (api.owned_bytes_view)(rendered, &mut rendered_view),
+            R2SLEIGH_STATUS_OK_V2
+        );
+        assert!(rendered_view.len > 0);
+
+        let query_request = R2SleighAnalysisQueryRequestV2 {
+            kind: R2SLEIGH_QUERY_BLOCK_VALUES_V2,
+            context,
+            blocks: block_handles.as_ptr(),
+            num_blocks: block_handles.len(),
+            function_addr: 0,
+            function_name: R2SleighStringViewV2::default(),
+            input_values: ptr::null(),
+            num_input_values: 0,
+        };
+        let mut analysis_result = ptr::null_mut();
+        assert_eq!(
+            (api.analysis_query)(&query_request, &mut analysis_result),
+            R2SLEIGH_STATUS_OK_V2
+        );
+        let mut analysis_view = R2SleighAnalysisResultViewV2::default();
+        assert_eq!(
+            (api.analysis_result_view)(analysis_result, &mut analysis_view),
+            R2SLEIGH_STATUS_OK_V2
+        );
+        assert_eq!(analysis_view.kind, R2SLEIGH_QUERY_BLOCK_VALUES_V2);
+        assert_eq!(
+            (api.analysis_result_free)(analysis_result),
+            R2SLEIGH_STATUS_OK_V2
+        );
+        assert_eq!(
+            (api.analysis_result_view)(analysis_result, &mut analysis_view),
+            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
+        );
+        assert_eq!((api.owned_bytes_free)(rendered), R2SLEIGH_STATUS_OK_V2);
+
+        let mut mnemonic = ptr::null_mut();
+        assert_eq!(
+            (api.lift_block_mnemonic)(context, byte_view, 0x1000, &mut mnemonic),
+            R2SLEIGH_STATUS_OK_V2
+        );
+        let mut mnemonic_view = R2SleighByteViewV2::default();
+        assert_eq!(
+            (api.owned_bytes_view)(mnemonic, &mut mnemonic_view),
+            R2SLEIGH_STATUS_OK_V2
+        );
+        assert!(mnemonic_view.len > 0);
+        assert_eq!((api.owned_bytes_free)(mnemonic), R2SLEIGH_STATUS_OK_V2);
+        assert_eq!(
+            (api.lift_context_free)(context),
+            R2SLEIGH_STATUS_ENGINE_ERROR_V2,
+            "context consumption must reject live child handles"
+        );
+        let mut context_error = R2SleighByteViewV2::default();
+        assert_eq!(
+            (api.lift_context_error)(context, &mut context_error),
+            R2SLEIGH_STATUS_OK_V2
+        );
+        let context_error = unsafe { slice::from_raw_parts(context_error.data, context_error.len) };
+        assert!(String::from_utf8_lossy(context_error).contains("live child handles"));
+
+        let one_case = [R2SleighSwitchCaseV2 {
+            value: 0,
+            target: 0x1000,
+        }];
+        assert_eq!(
+            (api.lift_block_set_switch_info)(
+                block,
+                0x1000,
+                0,
+                0,
+                0,
+                2,
+                one_case.as_ptr(),
+                one_case.len(),
+            ),
+            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
+        );
+        let mut block_error = R2SleighByteViewV2::default();
+        assert_eq!(
+            (api.lift_context_error)(context, &mut block_error),
+            R2SLEIGH_STATUS_OK_V2
+        );
+        let block_error = unsafe { slice::from_raw_parts(block_error.data, block_error.len) };
+        assert!(String::from_utf8_lossy(block_error).contains("switch default flag"));
+        assert_eq!((api.lift_block_free)(block), R2SLEIGH_STATUS_OK_V2);
+        assert_eq!((api.lift_context_free)(context), R2SLEIGH_STATUS_OK_V2);
+
+        let mut next_context = ptr::null_mut();
+        assert_eq!(
+            (api.lift_context_create)(
+                R2SleighStringViewV2 {
+                    data: arch.as_ptr(),
+                    len: arch.len(),
+                },
+                &mut next_context,
+            ),
+            R2SLEIGH_STATUS_OK_V2
+        );
+        assert!(next_context as usize > context_token);
+        assert_eq!(
+            (api.lift_context_is_loaded)(context, &mut loaded),
+            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2,
+            "retired token must remain stale after later allocation"
+        );
+        assert_eq!((api.lift_context_free)(next_context), R2SLEIGH_STATUS_OK_V2);
+    }
+
+    #[test]
+    fn lift_core_rejects_malformed_pointers_and_byte_views() {
+        let api = &API_V2;
+        let arch = b"x86-64";
+        let arch_view = R2SleighStringViewV2 {
+            data: arch.as_ptr(),
+            len: arch.len(),
+        };
+        assert_eq!(
+            (api.lift_context_create)(arch_view, ptr::null_mut()),
+            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
+        );
+        assert_eq!(
+            (api.lift_context_create)(arch_view, 1usize as *mut *mut R2ILContext),
+            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
+        );
+        let mut block = ptr::null_mut();
+        assert_eq!(
+            (api.lift_instruction)(
+                ptr::null_mut(),
+                R2SleighByteViewV2 {
+                    data: ptr::null(),
+                    len: 1,
+                },
+                0,
+                &mut block,
+            ),
+            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
+        );
+        assert!(block.is_null());
+        assert_eq!(
+            (api.lift_instruction)(
+                align_of::<R2ILContext>() as *mut R2ILContext,
+                R2SleighByteViewV2 {
+                    data: ptr::null(),
+                    len: R2SLEIGH_MAX_FUNCTION_INPUT_BYTES_V2 + 1,
+                },
+                0,
+                &mut block,
+            ),
+            R2SLEIGH_STATUS_LIMIT_EXCEEDED_V2
+        );
+        assert_eq!(
+            (api.lift_block_op_count)(ptr::null(), 1usize as *mut usize),
+            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
+        );
+        let mut unknown_size = 0;
+        assert_eq!(
+            (api.lift_block_size)(
+                (align_of::<R2ILBlock>() * 128) as *const R2ILBlock,
+                &mut unknown_size,
+            ),
+            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2,
+            "an aligned fake handle must fail registry ownership proof"
+        );
+        let owned = lock_lift_registry()
+            .insert_owned_bytes(
+                0,
+                R2SleighOwnedBytesV2 {
+                    bytes: CString::new("wrong kind").unwrap(),
+                },
+            )
+            .expect("registered owned bytes");
+        let mut size = 0;
+        assert_eq!(
+            (api.lift_block_size)(owned.cast(), &mut size),
+            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
+        );
+        assert_eq!((api.owned_bytes_free)(owned), R2SLEIGH_STATUS_OK_V2);
+        assert_eq!(
+            (api.owned_bytes_free)(owned),
+            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
+        );
+        let mut error = R2SleighByteViewV2::default();
+        assert_eq!((api.lift_last_error)(&mut error), R2SLEIGH_STATUS_OK_V2);
+        let error = unsafe { slice::from_raw_parts(error.data, error.len) };
+        assert!(String::from_utf8_lossy(error).contains("stale"));
+
+        let cases = [R2SleighSwitchCaseV2::default()];
+        assert_eq!(
+            (api.lift_block_set_switch_info)(
+                align_of::<R2ILBlock>() as *mut R2ILBlock,
+                0,
+                0,
+                0,
+                0,
+                0,
+                cases.as_ptr(),
+                R2SLEIGH_MAX_SWITCH_CASES_V2 + 1,
+            ),
+            R2SLEIGH_STATUS_LIMIT_EXCEEDED_V2
+        );
+        assert_eq!(
+            (api.owned_bytes_free)(ptr::null_mut()),
+            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn lift_core_rejects_cross_context_blocks() {
+        let api = &API_V2;
+        let arch_bytes = b"x86-64";
+        let arch = R2SleighStringViewV2 {
+            data: arch_bytes.as_ptr(),
+            len: arch_bytes.len(),
+        };
+        let mut first = ptr::null_mut();
+        let mut second = ptr::null_mut();
+        assert_eq!(
+            (api.lift_context_create)(arch, &mut first),
+            R2SLEIGH_STATUS_OK_V2
+        );
+        assert_eq!(
+            (api.lift_context_create)(arch, &mut second),
+            R2SLEIGH_STATUS_OK_V2
+        );
+        let bytes = [0x31, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut block = ptr::null_mut();
+        assert_eq!(
+            (api.lift_instruction)(
+                first,
+                R2SleighByteViewV2 {
+                    data: bytes.as_ptr(),
+                    len: bytes.len(),
+                },
+                0x1000,
+                &mut block,
+            ),
+            R2SLEIGH_STATUS_OK_V2
+        );
+        assert_eq!(
+            (api.lift_block_validate)(second, block),
+            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
+        );
+        assert_eq!((api.lift_block_free)(block), R2SLEIGH_STATUS_OK_V2);
+        assert_eq!((api.lift_context_free)(first), R2SLEIGH_STATUS_OK_V2);
+        assert_eq!((api.lift_context_free)(second), R2SLEIGH_STATUS_OK_V2);
+    }
+
+    #[test]
+    fn lift_core_boundary_contains_panics() {
+        assert_eq!(
+            lift_boundary(|| -> Result<(), BoundaryError> {
+                panic!("lift-core boundary test panic")
+            }),
+            R2SLEIGH_STATUS_PANIC_V2
+        );
     }
 
     fn assert_semantic_kernel_render_diagnostics(
@@ -3302,6 +7577,7 @@ mod tests {
             },
             analysis_depth: 0,
             timeout_us,
+            radare_snapshot: ptr::null(),
             source_interface: ptr::null(),
         }
     }
@@ -3325,16 +7601,24 @@ mod tests {
     }
 
     #[cfg(feature = "x86")]
-    fn x86_return_fixture() -> (Box<R2ILContext>, R2ILBlock) {
+    fn x86_return_fixture() -> (*mut R2ILContext, *mut R2ILBlock) {
         let (arch, disasm) =
             super::super::create_disassembler_for_arch("x86-64").expect("x86-64 disassembler");
         let block = disasm
             .lift_block(&[0xc3], 0x401000, 1)
             .expect("lift return block");
-        (
-            Box::new(R2ILContext::with_arch_and_disasm(arch, disasm)),
-            block,
-        )
+        let mut registry = lock_lift_registry();
+        let context = registry
+            .insert_context(Box::new(R2ILContext::with_arch_and_disasm(arch, disasm)))
+            .expect("registered x86 context");
+        let owner = registry
+            .entry(context as usize, LiftHandleKind::Context, "x86 context")
+            .expect("registered context entry")
+            .generation;
+        let block = registry
+            .insert_block(owner, Box::new(block))
+            .expect("registered return block");
+        (context, block)
     }
 
     fn validate_seed_hint(
@@ -3822,7 +8106,7 @@ mod tests {
         };
         let mut response = ptr::null_mut();
         assert_eq!(
-            execute(session, &request, &mut response),
+            unsafe { execute(session, &request, &mut response) },
             R2SLEIGH_STATUS_ABI_MISMATCH_V2
         );
         assert!(response.is_null());
@@ -3836,11 +8120,10 @@ mod tests {
     #[test]
     fn session_cancel_and_reset_are_one_request_execution_controls() {
         let (ctx, block) = x86_return_fixture();
-        let blocks = [&block as *const R2ILBlock];
+        let blocks = [block as *const R2ILBlock];
         let function_name = CString::new("sym.cancel_transport").unwrap();
         let external_context = CString::new("{}").unwrap();
-        let payload =
-            native_decompile_payload(&*ctx, &blocks, &function_name, &external_context, 0);
+        let payload = native_decompile_payload(ctx, &blocks, &function_name, &external_context, 0);
         let request = native_request(&payload);
         let mut session = ptr::null_mut();
         assert_eq!(
@@ -3851,7 +8134,7 @@ mod tests {
 
         let mut response = ptr::null_mut();
         assert_eq!(
-            execute(session, &request, &mut response),
+            unsafe { execute(session, &request, &mut response) },
             R2SLEIGH_STATUS_OK_V2
         );
         assert!(!response.is_null());
@@ -3880,25 +8163,31 @@ mod tests {
         assert_eq!(session_reset_cancellation(session), R2SLEIGH_STATUS_OK_V2);
         response = ptr::null_mut();
         assert_eq!(
-            execute(session, &request, &mut response),
+            unsafe { execute(session, &request, &mut response) },
             R2SLEIGH_STATUS_OK_V2
         );
         assert_eq!(response_info(response, &mut info), R2SLEIGH_STATUS_OK_V2);
-        assert_eq!(info.outcome, R2SLEIGH_OUTCOME_COMPLETED_V2);
+        assert_eq!(info.outcome, R2SLEIGH_OUTCOME_REFUSED_V2);
+        let reset = response_text(response);
+        assert!(
+            !reset.contains("cancelled before snapshot_context"),
+            "reset must clear the one-request cancellation even when the mutable lift is refused by the genuine-lift certification gate: {reset}"
+        );
         assert_eq!(response_free(response), R2SLEIGH_STATUS_OK_V2);
         assert_eq!(session_free(session), R2SLEIGH_STATUS_OK_V2);
+        assert_eq!(lift_block_free(block), R2SLEIGH_STATUS_OK_V2);
+        assert_eq!(lift_context_free(ctx), R2SLEIGH_STATUS_OK_V2);
     }
 
     #[cfg(feature = "x86")]
     #[test]
     fn expired_native_timeout_refuses_without_partial_c() {
         let (ctx, block) = x86_return_fixture();
-        let blocks = [&block as *const R2ILBlock];
+        let blocks = [block as *const R2ILBlock];
         let function_name = CString::new("sym.timeout_transport").unwrap();
         let external_context =
             CString::new(format!("{{\"padding\":\"{}\"}}", "x".repeat(256 * 1024))).unwrap();
-        let payload =
-            native_decompile_payload(&*ctx, &blocks, &function_name, &external_context, 1);
+        let payload = native_decompile_payload(ctx, &blocks, &function_name, &external_context, 1);
         let request = native_request(&payload);
         let mut session = ptr::null_mut();
         assert_eq!(
@@ -3908,7 +8197,7 @@ mod tests {
 
         let mut response = ptr::null_mut();
         assert_eq!(
-            execute(session, &request, &mut response),
+            unsafe { execute(session, &request, &mut response) },
             R2SLEIGH_STATUS_OK_V2
         );
         assert!(!response.is_null());
@@ -3920,6 +8209,8 @@ mod tests {
         assert!(!refused.contains("return;"), "{refused}");
         assert_eq!(response_free(response), R2SLEIGH_STATUS_OK_V2);
         assert_eq!(session_free(session), R2SLEIGH_STATUS_OK_V2);
+        assert_eq!(lift_block_free(block), R2SLEIGH_STATUS_OK_V2);
+        assert_eq!(lift_context_free(ctx), R2SLEIGH_STATUS_OK_V2);
     }
 
     #[test]
@@ -3944,7 +8235,7 @@ mod tests {
     fn invalid_owners_clear_all_caller_owned_outputs() {
         let mut response = ptr::dangling_mut::<R2SleighResponseV2>();
         assert_eq!(
-            execute(ptr::null_mut(), ptr::null(), &mut response),
+            unsafe { execute(ptr::null_mut(), ptr::null(), &mut response) },
             R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
         );
         assert!(response.is_null());
@@ -4141,6 +8432,7 @@ mod tests {
             },
             analysis_depth: 0,
             timeout_us: 0,
+            radare_snapshot: ptr::null(),
             source_interface: ptr::null(),
         };
         let request = R2SleighRequestV2 {
@@ -4155,7 +8447,101 @@ mod tests {
             unsafe { execute_request(&request, r2engine::EngineCancellationToken::default()) }
                 .expect_err("oversized root CFG");
         assert_eq!(error.status, R2SLEIGH_STATUS_LIMIT_EXCEEDED_V2);
-        assert_eq!(error.message, "decompile.blocks count exceeds cap");
+        assert!(error.message.ends_with("blocks count exceeds cap"));
+    }
+
+    fn opaque_request(payload: &R2SleighEngineRequestPayloadV2) -> R2SleighRequestV2 {
+        R2SleighRequestV2 {
+            abi_version: R2SLEIGH_ABI_V2,
+            struct_size: u32_size::<R2SleighRequestV2>(),
+            kind: R2SLEIGH_REQUEST_DECOMPILE_V2,
+            flags: 0,
+            payload: (payload as *const R2SleighEngineRequestPayloadV2).cast(),
+            payload_size: size_of::<R2SleighEngineRequestPayloadV2>(),
+        }
+    }
+
+    fn opaque_payload(source: &R2SleighRadareSnapshotInputV2) -> R2SleighEngineRequestPayloadV2 {
+        // Zero is the canonical inactive representation for every detached
+        // request field in the opaque source route.
+        let mut payload = unsafe { std::mem::zeroed::<R2SleighEngineRequestPayloadV2>() };
+        payload.abi_version = R2SLEIGH_ABI_V2;
+        payload.struct_size = u32_size::<R2SleighEngineRequestPayloadV2>();
+        payload.radare_snapshot = source;
+        payload
+    }
+
+    #[test]
+    fn opaque_source_rejects_stale_schema_before_foreign_access() {
+        let source = R2SleighRadareSnapshotInputV2 {
+            struct_size: u32_size::<R2SleighRadareSnapshotInputV2>(),
+            abi_version: R2SLEIGH_RADARE_ABI_V2,
+            snapshot_schema_version: R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 - 1,
+            accessor_schema_version: R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2,
+            snapshot: ptr::null(),
+            accessors: ptr::null(),
+        };
+        let payload = opaque_payload(&source);
+        let error = unsafe {
+            execute_request(
+                &opaque_request(&payload),
+                r2engine::EngineCancellationToken::default(),
+            )
+        }
+        .expect_err("stale source schema");
+        assert_eq!(error.status, R2SLEIGH_STATUS_ABI_MISMATCH_V2);
+    }
+
+    #[test]
+    fn opaque_source_rejects_null_handles_and_detached_authority() {
+        let source = R2SleighRadareSnapshotInputV2 {
+            struct_size: u32_size::<R2SleighRadareSnapshotInputV2>(),
+            abi_version: R2SLEIGH_RADARE_ABI_V2,
+            snapshot_schema_version: R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2,
+            accessor_schema_version: R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2,
+            snapshot: ptr::null(),
+            accessors: ptr::null(),
+        };
+        let payload = opaque_payload(&source);
+        let error = unsafe {
+            execute_request(
+                &opaque_request(&payload),
+                r2engine::EngineCancellationToken::default(),
+            )
+        }
+        .expect_err("null opaque source handles");
+        assert_eq!(error.status, R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
+
+        let mut payload = opaque_payload(&source);
+        payload.function_addr = 0x401000;
+        let error = unsafe {
+            execute_request(
+                &opaque_request(&payload),
+                r2engine::EngineCancellationToken::default(),
+            )
+        }
+        .expect_err("detached identity beside opaque authority");
+        assert_eq!(error.status, R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
+        assert!(error.message.contains("detached or inactive authority"));
+    }
+
+    #[test]
+    fn opaque_source_honors_cancellation_before_foreign_access() {
+        let source = R2SleighRadareSnapshotInputV2 {
+            struct_size: u32_size::<R2SleighRadareSnapshotInputV2>(),
+            abi_version: R2SLEIGH_RADARE_ABI_V2,
+            snapshot_schema_version: R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2,
+            accessor_schema_version: R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2,
+            snapshot: std::ptr::NonNull::<u8>::dangling().as_ptr().cast(),
+            accessors: std::ptr::NonNull::<R2SleighRadareAccessorsV2>::dangling().as_ptr(),
+        };
+        let payload = opaque_payload(&source);
+        let cancellation = r2engine::EngineCancellationToken::default();
+        cancellation.cancel();
+        let error = unsafe { execute_request(&opaque_request(&payload), cancellation) }
+            .expect_err("cancelled opaque ingress");
+        assert_eq!(error.status, R2SLEIGH_STATUS_ENGINE_ERROR_V2);
+        assert!(error.message.contains("trusted ingress stopped"));
     }
 
     #[test]
@@ -4297,7 +8683,7 @@ mod tests {
         };
         let mut response = ptr::null_mut();
         assert_eq!(
-            execute(session, &request, &mut response),
+            unsafe { execute(session, &request, &mut response) },
             R2SLEIGH_STATUS_PANIC_V2
         );
         assert!(response.is_null());
@@ -4360,6 +8746,8 @@ mod tests {
         let api = unsafe { &*r2sleigh_api_v2() };
         assert_eq!(api.abi_version, R2SLEIGH_ABI_V2);
         assert_eq!(api.radare_abi_version, R2SLEIGH_RADARE_ABI_V2);
+        assert_eq!(R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2, 7);
+        assert_eq!(R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2, 1);
         assert_eq!(api.struct_size as usize, size_of::<R2SleighApiV2>());
         assert_eq!(api.request_size as usize, size_of::<R2SleighRequestV2>());
         assert_eq!(
@@ -4457,6 +8845,34 @@ mod tests {
         assert_eq!(
             api.response_info_size as usize,
             size_of::<R2SleighResponseInfoV2>()
+        );
+        assert_eq!(
+            api.analysis_render_request_size as usize,
+            size_of::<R2SleighAnalysisRenderRequestV2>()
+        );
+        assert_eq!(
+            api.scope_render_request_size as usize,
+            size_of::<R2SleighScopeRenderRequestV2>()
+        );
+        assert_eq!(
+            api.scope_symbol_size as usize,
+            size_of::<R2SleighScopeSymbolV2>()
+        );
+        assert_eq!(
+            api.analysis_query_request_size as usize,
+            size_of::<R2SleighAnalysisQueryRequestV2>()
+        );
+        assert_eq!(
+            api.analysis_result_view_size as usize,
+            size_of::<R2SleighAnalysisResultViewV2>()
+        );
+        assert_eq!(
+            api.radare_snapshot_input_size as usize,
+            size_of::<R2SleighRadareSnapshotInputV2>()
+        );
+        assert_eq!(
+            api.radare_accessors_size as usize,
+            size_of::<R2SleighRadareAccessorsV2>()
         );
     }
 

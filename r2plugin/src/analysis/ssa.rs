@@ -10,9 +10,8 @@ use std::os::raw::c_char;
 use std::ptr;
 
 /// Convert block to SSA and return JSON representation.
-/// Caller must free the returned string with r2il_string_free().
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_block_to_ssa_json(
+/// Internal V2 wrapper immediately adopts the returned CString allocation.
+pub(crate) fn r2il_block_to_ssa_json(
     ctx: *const R2ILContext,
     block: *const R2ILBlock,
 ) -> *mut c_char {
@@ -43,9 +42,8 @@ pub extern "C" fn r2il_block_to_ssa_json(
 }
 
 /// Get def-use analysis for block as JSON.
-/// Caller must free the returned string with r2il_string_free().
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_block_defuse_json(
+/// Internal V2 wrapper immediately adopts the returned CString allocation.
+pub(crate) fn r2il_block_defuse_json(
     ctx: *const R2ILContext,
     block: *const R2ILBlock,
 ) -> *mut c_char {
@@ -217,9 +215,8 @@ fn prepared_ssa_function_json_string(artifact: &r2ssa::SsaArtifact) -> Option<St
 }
 
 /// Get function-level SSA as JSON (includes phi nodes).
-/// Caller must free the returned string with r2il_string_free().
-#[unsafe(no_mangle)]
-pub extern "C" fn r2ssa_function_json(
+/// Internal V2 wrapper immediately adopts the returned CString allocation.
+pub(crate) fn r2ssa_function_json(
     ctx: *const R2ILContext,
     blocks: *const *const R2ILBlock,
     num_blocks: usize,
@@ -266,9 +263,8 @@ struct SSAFunctionOptJson {
 }
 
 /// Get optimized function-level SSA as JSON (includes phi nodes).
-/// Caller must free the returned string with r2il_string_free().
-#[unsafe(no_mangle)]
-pub extern "C" fn r2ssa_function_opt_json(
+/// Internal V2 wrapper immediately adopts the returned CString allocation.
+pub(crate) fn r2ssa_function_opt_json(
     ctx: *const R2ILContext,
     blocks: *const *const R2ILBlock,
     num_blocks: usize,
@@ -334,9 +330,8 @@ struct FunctionDefUseJson {
 }
 
 /// Get function-wide def-use analysis as JSON.
-/// Caller must free the returned string with r2il_string_free().
-#[unsafe(no_mangle)]
-pub extern "C" fn r2ssa_defuse_function_json(
+/// Internal V2 wrapper immediately adopts the returned CString allocation.
+pub(crate) fn r2ssa_defuse_function_json(
     ctx: *const R2ILContext,
     blocks: *const *const R2ILBlock,
     num_blocks: usize,
@@ -449,9 +444,8 @@ struct DomTreeJson {
 }
 
 /// Get dominator tree as JSON.
-/// Caller must free the returned string with r2il_string_free().
-#[unsafe(no_mangle)]
-pub extern "C" fn r2ssa_domtree_json(
+/// Internal V2 wrapper immediately adopts the returned CString allocation.
+pub(crate) fn r2ssa_domtree_json(
     ctx: *const R2ILContext,
     blocks: *const *const R2ILBlock,
     num_blocks: usize,
@@ -526,9 +520,8 @@ struct SliceOpJson {
 }
 
 /// Compute backward slice from a variable name at a given block.
-/// Caller must free the returned string with r2il_string_free().
-#[unsafe(no_mangle)]
-pub extern "C" fn r2ssa_backward_slice_json(
+/// Internal V2 wrapper immediately adopts the returned CString allocation.
+pub(crate) fn r2ssa_backward_slice_json(
     ctx: *const R2ILContext,
     blocks: *const *const R2ILBlock,
     num_blocks: usize,

@@ -22,10 +22,10 @@ mod types;
 
 use ffi_v2::{
     R2SleighContextCallee, R2SleighEngineRequestPayloadV2, R2SleighFunctionContext,
-    R2SleighInterprocScope, R2SleighInterprocSessionPlan, R2SleighLiftQuality,
+    R2SleighInterprocScope, R2SleighLiftQuality,
 };
 #[cfg(test)]
-use ffi_v2::{R2SleighContextParam, R2SleighInterprocSeed};
+use ffi_v2::{R2SleighContextParam, R2SleighInterprocSeed, R2SleighInterprocSessionPlan};
 
 #[cfg(test)]
 use analysis::ssa::{r2il_block_defuse_json, r2il_block_to_ssa_json};
@@ -53,13 +53,7 @@ pub struct R2ILContext {
     error: Option<CString>,
 }
 
-/// C ABI representation of one switch/jump-table case.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct R2ILSwitchCaseFfi {
-    pub value: u64,
-    pub target: u64,
-}
+type R2ILSwitchCaseFfi = ffi_v2::R2SleighSwitchCaseV2;
 
 impl R2ILContext {
     #[allow(dead_code)]
@@ -120,8 +114,7 @@ fn validate_block_in_context(ctx: &mut R2ILContext, block: &R2ILBlock) -> Result
 /// Initialize a context from a built-in architecture (Sleigh via sleigh-config).
 ///
 /// Returns NULL on failure.
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_arch_init(arch: *const c_char) -> *mut R2ILContext {
+pub(crate) fn r2il_arch_init(arch: *const c_char) -> *mut R2ILContext {
     if arch.is_null() {
         return ptr::null_mut();
     }
@@ -139,21 +132,10 @@ pub extern "C" fn r2il_arch_init(arch: *const c_char) -> *mut R2ILContext {
     }
 }
 
-/// Free a context handle.
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_free(ctx: *mut R2ILContext) {
-    if !ctx.is_null() {
-        unsafe {
-            drop(Box::from_raw(ctx));
-        }
-    }
-}
-
 /// Check if the context has a loaded architecture.
 ///
 /// Returns 1 if loaded, 0 otherwise.
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_is_loaded(ctx: *const R2ILContext) -> i32 {
+pub(crate) fn r2il_is_loaded(ctx: *const R2ILContext) -> i32 {
     if ctx.is_null() {
         return 0;
     }
@@ -164,8 +146,7 @@ pub extern "C" fn r2il_is_loaded(ctx: *const R2ILContext) -> i32 {
 /// Get the architecture name.
 ///
 /// Returns NULL if not loaded.
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_arch_name(ctx: *const R2ILContext) -> *const c_char {
+pub(crate) fn r2il_arch_name(ctx: *const R2ILContext) -> *const c_char {
     if ctx.is_null() {
         return ptr::null();
     }
@@ -181,8 +162,7 @@ pub extern "C" fn r2il_arch_name(ctx: *const R2ILContext) -> *const c_char {
 /// Get the last error message.
 ///
 /// Returns NULL if no error.
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_error(ctx: *const R2ILContext) -> *const c_char {
+pub(crate) fn r2il_error(ctx: *const R2ILContext) -> *const c_char {
     if ctx.is_null() {
         return ptr::null();
     }
@@ -195,10 +175,8 @@ pub extern "C" fn r2il_error(ctx: *const R2ILContext) -> *const c_char {
     }
 }
 
-/// Get the register profile string for radare2.
-/// Caller must free the returned string with r2il_string_free().
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_get_reg_profile(ctx: *const R2ILContext) -> *mut c_char {
+/// Build the register profile for the V2 ownership wrapper.
+pub(crate) fn r2il_get_reg_profile(ctx: *const R2ILContext) -> *mut c_char {
     if ctx.is_null() {
         return ptr::null_mut();
     }
@@ -378,8 +356,7 @@ pub extern "C" fn r2il_get_reg_profile(ctx: *const R2ILContext) -> *mut c_char {
 /// Lift a single instruction into an r2il block.
 ///
 /// Returns NULL on failure or if the context lacks a disassembler.
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_lift(
+pub(crate) fn r2il_lift(
     ctx: *mut R2ILContext,
     bytes: *const u8,
     len: usize,
@@ -426,8 +403,7 @@ pub extern "C" fn r2il_lift(
 /// * `block_size` - Size of the basic block in bytes (from radare2)
 ///
 /// Returns NULL on failure or if the context lacks a disassembler.
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_lift_block(
+pub(crate) fn r2il_lift_block(
     ctx: *mut R2ILContext,
     bytes: *const u8,
     len: usize,
@@ -467,8 +443,7 @@ pub extern "C" fn r2il_lift_block(
 }
 
 /// Enable/disable semantic metadata auto-population during lifting.
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_set_semantic_metadata_enabled(ctx: *mut R2ILContext, enabled: bool) {
+pub(crate) fn r2il_set_semantic_metadata_enabled(ctx: *mut R2ILContext, enabled: bool) {
     if ctx.is_null() {
         return;
     }
@@ -476,20 +451,11 @@ pub extern "C" fn r2il_set_semantic_metadata_enabled(ctx: *mut R2ILContext, enab
     ctx_ref.semantic_metadata_enabled = enabled;
 }
 
-/// Free a lifted block.
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_block_free(block: *mut R2ILBlock) {
-    if !block.is_null() {
-        unsafe { drop(Box::from_raw(block)) }
-    }
-}
-
 /// Validate a lifted block against full (structural + semantic) r2il invariants.
 ///
 /// Returns 1 when valid, 0 on invalid input or validation failure.
 /// On validation failure, the context error string is updated.
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_block_validate(ctx: *mut R2ILContext, block: *const R2ILBlock) -> i32 {
+pub(crate) fn r2il_block_validate(ctx: *mut R2ILContext, block: *const R2ILBlock) -> i32 {
     if ctx.is_null() || block.is_null() {
         return 0;
     }
@@ -518,8 +484,7 @@ pub extern "C" fn r2il_block_validate(ctx: *mut R2ILContext, block: *const R2ILB
 ///
 /// Returns 1 when switch metadata was accepted, 0 when the input is absent or
 /// cannot satisfy the r2il switch invariants.
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_block_set_switch_info(
+pub(crate) fn r2il_block_set_switch_info(
     block: *mut R2ILBlock,
     switch_addr: u64,
     min_val: u64,
@@ -592,30 +557,19 @@ pub extern "C" fn r2il_block_set_switch_info(
 }
 
 /// Get the number of operations in a block.
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_block_op_count(block: *const R2ILBlock) -> usize {
+pub(crate) fn r2il_block_op_count(block: *const R2ILBlock) -> usize {
     if block.is_null() {
         return 0;
     }
     unsafe { (*block).ops.len() }
 }
 
-/// Exact identity of one direct lifted call selected by source instruction
-/// address. Used only to bind immutable radare2 callsite facts to lifted IL.
-#[repr(C)]
-pub struct R2ILDirectCallIdentity {
-    pub op_index: usize,
-    pub target_space: u32,
-    pub target_custom_space: u32,
-    pub target_offset: u64,
-    pub target_size: u32,
-}
+type R2ILDirectCallIdentity = ffi_v2::R2SleighDirectCallIdentityV2;
 
 /// Resolve one raw call instruction to exactly one lifted direct call.
 /// Returns 1 on an exact match, 0 when absent, and -1 when ambiguous or when
 /// the raw target disagrees with the lifted constant target.
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_block_direct_call_identity(
+pub(crate) fn r2il_block_direct_call_identity(
     block: *const R2ILBlock,
     raw_instruction_addr: u64,
     raw_target_addr: u64,
@@ -669,11 +623,7 @@ pub extern "C" fn r2il_block_direct_call_identity(
 }
 
 /// Get the ESIL string for a block (one line per op, joined with ';').
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_block_to_esil(
-    ctx: *const R2ILContext,
-    block: *const R2ILBlock,
-) -> *mut c_char {
+pub(crate) fn r2il_block_to_esil(ctx: *const R2ILContext, block: *const R2ILBlock) -> *mut c_char {
     if ctx.is_null() || block.is_null() {
         return ptr::null_mut();
     }
@@ -710,8 +660,7 @@ pub extern "C" fn r2il_block_to_esil(
 }
 
 /// Get a JSON representation of an operation with register names resolved.
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_block_op_json_named(
+pub(crate) fn r2il_block_op_json_named(
     ctx: *const R2ILContext,
     block: *const R2ILBlock,
     index: usize,
@@ -738,8 +687,7 @@ pub extern "C" fn r2il_block_op_json_named(
 }
 
 /// Get the instruction size in bytes.
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_block_size(block: *const R2ILBlock) -> u32 {
+pub(crate) fn r2il_block_size(block: *const R2ILBlock) -> u32 {
     if block.is_null() {
         return 0;
     }
@@ -747,18 +695,15 @@ pub extern "C" fn r2il_block_size(block: *const R2ILBlock) -> u32 {
 }
 
 /// Get the block address.
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_block_addr(block: *const R2ILBlock) -> u64 {
+pub(crate) fn r2il_block_addr(block: *const R2ILBlock) -> u64 {
     if block.is_null() {
         return 0;
     }
     unsafe { (*block).addr }
 }
 
-/// Get the disassembly mnemonic for the instruction.
-/// Caller must free the returned string with r2il_string_free().
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_block_mnemonic(
+/// Build the disassembly mnemonic for the V2 ownership wrapper.
+pub(crate) fn r2il_block_mnemonic(
     ctx: *const R2ILContext,
     bytes: *const u8,
     len: usize,
@@ -820,8 +765,7 @@ impl R2AnalOpType {
 
 /// Infer the R_ANAL_OP_TYPE from the r2il operations in a block.
 /// Returns R_ANAL_OP_TYPE_* constant.
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_block_type(block: *const R2ILBlock) -> u32 {
+pub(crate) fn r2il_block_type(block: *const R2ILBlock) -> u32 {
     if block.is_null() {
         return R2AnalOpType::NULL;
     }
@@ -891,8 +835,7 @@ pub extern "C" fn r2il_block_type(block: *const R2ILBlock) -> u32 {
 
 /// Get the jump target address from a block (for JMP/CALL instructions).
 /// Returns 0 if no jump target is found or if indirect.
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_block_jump(block: *const R2ILBlock) -> u64 {
+pub(crate) fn r2il_block_jump(block: *const R2ILBlock) -> u64 {
     if block.is_null() {
         return 0;
     }
@@ -918,8 +861,7 @@ pub extern "C" fn r2il_block_jump(block: *const R2ILBlock) -> u64 {
 
 /// Get the fall-through address (for conditional jumps).
 /// Returns addr + size for conditional branches, 0 otherwise.
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_block_fail(block: *const R2ILBlock) -> u64 {
+pub(crate) fn r2il_block_fail(block: *const R2ILBlock) -> u64 {
     if block.is_null() {
         return 0;
     }
@@ -936,61 +878,25 @@ pub extern "C" fn r2il_block_fail(block: *const R2ILBlock) -> u64 {
     0
 }
 
-/// Free a string returned by r2il functions.
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_string_free(s: *mut c_char) {
+#[cfg(test)]
+fn drop_test_ffi_string(s: *mut c_char) {
     if !s.is_null() {
         unsafe { drop(CString::from_raw(s)) };
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_interproc_session_plan_for_depth(
-    depth: u32,
-    purpose: u32,
-    basic_block_count: usize,
-    cost: u32,
-) -> R2SleighInterprocSessionPlan {
-    let policy = r2engine::analysis_policy_for_radare2_depth(depth);
-    let basic_block_count = u32::try_from(basic_block_count).unwrap_or(u32::MAX);
-    r2sleigh_interproc_session_plan_from_engine(r2engine::interproc_session_plan(
-        policy,
-        r2sleigh_interproc_session_purpose_to_engine(purpose),
-        Some(r2engine::EngineInterprocTargetMetrics {
-            basic_block_count,
-            cost,
-        }),
-    ))
+#[cfg(test)]
+fn drop_test_context(context: *mut R2ILContext) {
+    if !context.is_null() {
+        unsafe { drop(Box::from_raw(context)) };
+    }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_symbolic_scope_function_plan(
-    current_scope_count: usize,
-    root_function: i32,
-    target_hint_function: i32,
-    interproc: R2SleighInterprocSessionPlan,
-) -> R2SleighSymbolicScopeFunctionPlan {
-    r2sleigh_symbolic_scope_plan_from_engine(r2engine::symbolic_scope_function_plan(
-        r2engine::EngineSymbolicScopeFunctionInput {
-            current_scope_count,
-            root_function: root_function != 0,
-            target_hint_function: target_hint_function != 0,
-            interproc: r2sleigh_interproc_session_plan_to_engine(interproc),
-        },
-    ))
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_runtime_materialized_source_plan(
-    current_scope_count: usize,
-    addr: u64,
-    size: u64,
-) -> R2SleighRuntimeMaterializedSourcePlan {
-    r2sleigh_runtime_source_plan_from_engine(r2engine::runtime_materialized_source_plan(
-        current_scope_count,
-        addr,
-        size,
-    ))
+#[cfg(test)]
+fn drop_test_block(block: *mut R2ILBlock) {
+    if !block.is_null() {
+        unsafe { drop(Box::from_raw(block)) };
+    }
 }
 
 // ========== Typed Analysis FFI ==========
@@ -1058,9 +964,8 @@ fn op_regs_write(op: &R2ILOp) -> Vec<&Varnode> {
 }
 
 /// Get registers read by the block as JSON array of names.
-/// Caller must free the returned string with r2il_string_free().
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_block_regs_read(
+/// Internal V2 wrapper immediately adopts the returned CString allocation.
+pub(crate) fn r2il_block_regs_read(
     ctx: *const R2ILContext,
     block: *const R2ILBlock,
 ) -> *mut c_char {
@@ -1092,9 +997,8 @@ pub extern "C" fn r2il_block_regs_read(
 
 /// Get memory accesses by the block as JSON array.
 /// Each entry includes legacy fields (`addr`, `size`, `write`) and richer metadata.
-/// Caller must free the returned string with r2il_string_free().
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_block_mem_access(
+/// Internal V2 wrapper immediately adopts the returned CString allocation.
+pub(crate) fn r2il_block_mem_access(
     ctx: *const R2ILContext,
     block: *const R2ILBlock,
 ) -> *mut c_char {
@@ -1399,12 +1303,8 @@ pub extern "C" fn r2il_block_mem_access(
 
 /// Get all varnodes used by the block as JSON.
 /// Includes registers, memory locations, constants, and temporaries.
-/// Caller must free the returned string with r2il_string_free().
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_block_varnodes(
-    ctx: *const R2ILContext,
-    block: *const R2ILBlock,
-) -> *mut c_char {
+/// Internal V2 wrapper immediately adopts the returned CString allocation.
+pub(crate) fn r2il_block_varnodes(ctx: *const R2ILContext, block: *const R2ILBlock) -> *mut c_char {
     if ctx.is_null() || block.is_null() {
         return ptr::null_mut();
     }
@@ -1570,8 +1470,7 @@ fn block_values_for_ffi(
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_block_values_typed(
+pub(crate) fn r2il_block_values_typed(
     ctx: *const R2ILContext,
     block: *const R2ILBlock,
 ) -> *mut R2ILBlockAnalValues {
@@ -1586,8 +1485,7 @@ pub extern "C" fn r2il_block_values_typed(
     Box::into_raw(Box::new(block_values_for_ffi(ctx_ref, blk, disasm)))
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_block_values_memory(
+pub(crate) fn r2il_block_values_memory(
     values: *const R2ILBlockAnalValues,
     count: *mut usize,
 ) -> *const R2ILBlockMemAccess {
@@ -1608,8 +1506,7 @@ pub extern "C" fn r2il_block_values_memory(
     values.memory.as_ptr()
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_block_values_immediates(
+pub(crate) fn r2il_block_values_immediates(
     values: *const R2ILBlockAnalValues,
     count: *mut usize,
 ) -> *const R2ILBlockImmediateValue {
@@ -1630,8 +1527,7 @@ pub extern "C" fn r2il_block_values_immediates(
     values.immediates.as_ptr()
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_block_values_reg_reads(
+pub(crate) fn r2il_block_values_reg_reads(
     values: *const R2ILBlockAnalValues,
     count: *mut usize,
 ) -> *const R2ILBlockRegValue {
@@ -1652,8 +1548,7 @@ pub extern "C" fn r2il_block_values_reg_reads(
     values.reg_reads.as_ptr()
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_block_values_reg_writes(
+pub(crate) fn r2il_block_values_reg_writes(
     values: *const R2ILBlockAnalValues,
     count: *mut usize,
 ) -> *const R2ILBlockRegValue {
@@ -1674,8 +1569,7 @@ pub extern "C" fn r2il_block_values_reg_writes(
     values.reg_writes.as_ptr()
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_block_values_free(values: *mut R2ILBlockAnalValues) {
+pub(crate) fn r2il_block_values_free(values: *mut R2ILBlockAnalValues) {
     if !values.is_null() {
         unsafe {
             drop(Box::from_raw(values));
@@ -1878,9 +1772,8 @@ use serde::Deserialize;
 use serde::Serialize;
 
 /// Get registers written by the block as JSON array of names.
-/// Caller must free the returned string with r2il_string_free().
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_block_regs_write(
+/// Internal V2 wrapper immediately adopts the returned CString allocation.
+pub(crate) fn r2il_block_regs_write(
     ctx: *const R2ILContext,
     block: *const R2ILBlock,
 ) -> *mut c_char {
@@ -3027,6 +2920,121 @@ fn r2sleigh_engine_decompile_function_output_with_source(
     })
 }
 
+fn trusted_engine_function_input(
+    trusted: &r2ssa::TrustedSsaArtifact,
+) -> r2engine::EngineFunctionInput {
+    let function_addr = trusted.source().function().address();
+    r2engine::EngineFunctionInput {
+        function_name: format!("fcn_{function_addr:x}"),
+        function_addr,
+        blocks: trusted.source_blocks().to_vec(),
+        arch: Some(trusted.arch_spec().clone()),
+        semantic_metadata_enabled: true,
+        source_snapshot: None,
+    }
+}
+
+fn r2sleigh_engine_decompile_trusted_output(
+    _input: &R2SleighEngineRequestPayloadV2,
+    trusted: std::sync::Arc<r2ssa::TrustedSsaArtifact>,
+    execution: r2engine::EngineExecutionControl,
+) -> Option<EngineV2Output> {
+    let block_count = trusted.source_blocks().len();
+    let function_input = trusted_engine_function_input(&trusted);
+    let ptr_bits = helpers::effective_ptr_bits(trusted.arch_spec());
+    let decompile_input = r2engine::EngineFunctionDecompileRequestInput::single_function(
+        function_input,
+        Some(ptr_bits),
+        r2types::ParsedExternalContext::default(),
+        0,
+    )
+    .with_input_quality(r2engine::EngineFunctionInputQuality::complete(block_count))
+    .with_execution_control(execution)
+    .with_trusted_ssa(trusted);
+    let response = decompiler::run_engine_decompile(decompile_input);
+    Some(EngineV2Output {
+        output: response.output,
+        metrics: response.metrics,
+        diagnostics: response.diagnostics,
+    })
+}
+
+fn r2sleigh_engine_type_function_trusted_output(
+    _input: &R2SleighEngineRequestPayloadV2,
+    trusted: std::sync::Arc<r2ssa::TrustedSsaArtifact>,
+    execution: r2engine::EngineExecutionControl,
+) -> Option<EngineV2Output> {
+    let function_addr = trusted.source().function().address();
+    let function_name = format!("fcn_{function_addr:x}");
+    let ptr_bits = helpers::effective_ptr_bits(trusted.arch_spec());
+    let policy = r2engine::analysis_policy_for_radare2_depth(0);
+    let writeback_budget = r2types::TypeWritebackMutationBudget::new(
+        policy.type_global_max_links,
+        policy.type_max_decls,
+        policy.type_max_mutations,
+    );
+    let writeback_apply_policy =
+        r2engine::type_writeback_apply_policy_for_mode(policy.type_writeback_mode);
+    let mut request = r2engine::EngineFunctionAnalysisReportRequest::full_semantics_for_function(
+        r2engine::EngineFunctionAnalysisReportRequestInput {
+            function: trusted_engine_function_input(&trusted),
+            ptr_bits: Some(ptr_bits),
+            parsed_context: r2types::ParsedExternalContext::default(),
+            external_context_fallback_hash: 0,
+            scope_facts: r2engine::InterprocScopeFacts::empty(),
+            interproc_max_iters: 1,
+            interproc_converged: false,
+            symbolic_scope: None,
+            writeback_budget,
+            writeback_apply_policy,
+        },
+    );
+    request.analysis = request
+        .analysis
+        .with_execution_control(execution)
+        .with_trusted_ssa(trusted);
+    let response = match types::engine_session().type_function_checked(
+        r2engine::EngineTypeAnalysisRequest::from_interproc_budget(request.analysis, 1, false),
+    ) {
+        Ok(response) => response,
+        Err(refusal) => {
+            return Some(EngineV2Output {
+                output: serde_json::json!({
+                    "refused": true,
+                    "reason": refusal.reason,
+                })
+                .to_string(),
+                metrics: *refusal.metrics,
+                diagnostics: *refusal.diagnostics,
+            });
+        }
+    };
+    let metrics = response.metrics.clone();
+    let diagnostics = response.diagnostics.clone();
+    let report = r2engine::function_analysis_report_payload_from_type_response(
+        function_name,
+        function_addr,
+        response,
+        writeback_budget,
+        writeback_apply_policy,
+    );
+    let type_writeback = r2engine::type_writeback_report_json_from_function_analysis(
+        r2engine::EngineFunctionAnalysisTypeWritebackJsonRequest {
+            report: &report,
+            iterations: 1,
+            max_iterations: 1,
+            converged: false,
+            scope_report: None,
+            symbolic_scope: None,
+        },
+    );
+    Some(EngineV2Output {
+        output: serde_json::to_string(&type_writeback).ok()?,
+        metrics,
+        diagnostics,
+    })
+}
+
 fn engine_function_input_quality_from_ffi(
     quality: R2SleighLiftQuality,
 ) -> r2engine::EngineFunctionInputQuality {
@@ -3140,337 +3148,12 @@ pub struct R2SleighTypeWritebackApplyPolicy {
     mode: u32,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct R2SleighAnalysisPolicy {
-    mode: u32,
-    type_writeback_mode: u32,
-    type_interproc_max_iters: i32,
-    type_max_blocks: i32,
-    type_global_max_links: i32,
-    type_max_decls: i32,
-    type_max_mutations: i32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct R2SleighPostAnalysisPlan {
-    mode: u32,
-    type_writeback_mode: u32,
-    type_interproc_max_iters: i32,
-    type_max_blocks: i32,
-    type_global_max_links: i32,
-    type_max_decls: i32,
-    type_max_mutations: i32,
-    function_count: usize,
-    post_budget_us: u64,
-    xref_enabled: i32,
-    taint_enabled: i32,
-    sigwrite_enabled: i32,
-    type_writeback_enabled: i32,
-    semantic_comments_enabled: i32,
-    sigverify_enabled: i32,
-    balanced_focus_only: i32,
-    taint_focus_only: i32,
-    sigwrite_focus_only: i32,
-    type_writeback_focus_only: i32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct R2SleighAutoCallbackPlan {
-    allowed: i32,
-    kind: u32,
-    reason: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct R2SleighSymbolicScopeFunctionPlan {
-    append_function: i32,
-    expand_targets: i32,
-    reason: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct R2SleighRuntimeMaterializedSourcePlan {
-    append_source: i32,
-    capped_size: u64,
-    slot_bytes: u64,
-    reason: u32,
-}
-
-const R2SLEIGH_MODE_FAST: u32 = 0;
-const R2SLEIGH_MODE_BALANCED: u32 = 1;
-const R2SLEIGH_MODE_FULL: u32 = 2;
+#[cfg(test)]
 const R2SLEIGH_TYPE_WRITEBACK_OFF: u32 = 0;
+#[cfg(test)]
 const R2SLEIGH_TYPE_WRITEBACK_BALANCED: u32 = 1;
+#[cfg(test)]
 const R2SLEIGH_TYPE_WRITEBACK_AGGRESSIVE: u32 = 2;
-const R2SLEIGH_INTERPROC_SESSION_DECOMPILE: u32 = 1;
-const R2SLEIGH_AUTO_CALLBACK_ANALYZE_FUNCTION: u32 = 0;
-const R2SLEIGH_AUTO_CALLBACK_RECOVER_VARS: u32 = 1;
-const R2SLEIGH_AUTO_CALLBACK_DATA_REFS: u32 = 2;
-const R2SLEIGH_AUTO_CALLBACK_POST_ANALYSIS_TAINT: u32 = 3;
-const R2SLEIGH_AUTO_CALLBACK_POST_ANALYSIS_XREF: u32 = 4;
-const R2SLEIGH_AUTO_CALLBACK_ALLOWED: u32 = 0;
-const R2SLEIGH_AUTO_CALLBACK_MODE_NOT_FULL: u32 = 1;
-const R2SLEIGH_AUTO_CALLBACK_TOO_MANY_BLOCKS: u32 = 2;
-const R2SLEIGH_AUTO_CALLBACK_TOO_LARGE: u32 = 3;
-const R2SLEIGH_AUTO_CALLBACK_TOO_COSTLY: u32 = 4;
-const R2SLEIGH_SYMBOLIC_SCOPE_REASON_ALLOWED: u32 = 0;
-const R2SLEIGH_SYMBOLIC_SCOPE_REASON_SCOPE_FULL: u32 = 1;
-const R2SLEIGH_SYMBOLIC_SCOPE_REASON_INTERPROC_DISABLED: u32 = 2;
-const R2SLEIGH_SYMBOLIC_SCOPE_REASON_TARGET_TERMINAL: u32 = 3;
-const R2SLEIGH_RUNTIME_SOURCE_REASON_ALLOWED: u32 = 0;
-const R2SLEIGH_RUNTIME_SOURCE_REASON_SCOPE_FULL: u32 = 1;
-const R2SLEIGH_RUNTIME_SOURCE_REASON_EMPTY_SOURCE: u32 = 2;
-
-fn r2sleigh_mode_from_engine(mode: r2engine::EngineAnalysisMode) -> u32 {
-    match mode {
-        r2engine::EngineAnalysisMode::Fast => R2SLEIGH_MODE_FAST,
-        r2engine::EngineAnalysisMode::Balanced => R2SLEIGH_MODE_BALANCED,
-        r2engine::EngineAnalysisMode::Full => R2SLEIGH_MODE_FULL,
-    }
-}
-
-fn r2sleigh_type_writeback_mode_from_engine(mode: r2engine::EngineTypeWritebackMode) -> u32 {
-    match mode {
-        r2engine::EngineTypeWritebackMode::Off => R2SLEIGH_TYPE_WRITEBACK_OFF,
-        r2engine::EngineTypeWritebackMode::Balanced => R2SLEIGH_TYPE_WRITEBACK_BALANCED,
-        r2engine::EngineTypeWritebackMode::Aggressive => R2SLEIGH_TYPE_WRITEBACK_AGGRESSIVE,
-    }
-}
-
-fn usize_to_ffi_i32(value: usize) -> i32 {
-    value.min(i32::MAX as usize) as i32
-}
-
-fn bool_to_ffi_i32(value: bool) -> i32 {
-    if value { 1 } else { 0 }
-}
-
-fn r2sleigh_analysis_policy_from_engine(
-    policy: r2engine::EngineAnalysisPolicy,
-) -> R2SleighAnalysisPolicy {
-    R2SleighAnalysisPolicy {
-        mode: r2sleigh_mode_from_engine(policy.mode),
-        type_writeback_mode: r2sleigh_type_writeback_mode_from_engine(policy.type_writeback_mode),
-        type_interproc_max_iters: usize_to_ffi_i32(policy.type_interproc_max_iters),
-        type_max_blocks: usize_to_ffi_i32(policy.type_max_blocks),
-        type_global_max_links: usize_to_ffi_i32(policy.type_global_max_links),
-        type_max_decls: usize_to_ffi_i32(policy.type_max_decls),
-        type_max_mutations: usize_to_ffi_i32(policy.type_max_mutations),
-    }
-}
-
-fn r2sleigh_post_analysis_plan_from_engine(
-    plan: r2engine::EnginePostAnalysisPlan,
-) -> R2SleighPostAnalysisPlan {
-    R2SleighPostAnalysisPlan {
-        mode: r2sleigh_mode_from_engine(plan.policy.mode),
-        type_writeback_mode: r2sleigh_type_writeback_mode_from_engine(
-            plan.policy.type_writeback_mode,
-        ),
-        type_interproc_max_iters: usize_to_ffi_i32(plan.policy.type_interproc_max_iters),
-        type_max_blocks: usize_to_ffi_i32(plan.policy.type_max_blocks),
-        type_global_max_links: usize_to_ffi_i32(plan.policy.type_global_max_links),
-        type_max_decls: usize_to_ffi_i32(plan.policy.type_max_decls),
-        type_max_mutations: usize_to_ffi_i32(plan.policy.type_max_mutations),
-        function_count: plan.function_count,
-        post_budget_us: plan.post_budget_us,
-        xref_enabled: bool_to_ffi_i32(plan.xref_enabled),
-        taint_enabled: bool_to_ffi_i32(plan.taint_enabled),
-        sigwrite_enabled: bool_to_ffi_i32(plan.signature_writeback_enabled),
-        type_writeback_enabled: bool_to_ffi_i32(plan.type_writeback_enabled),
-        semantic_comments_enabled: bool_to_ffi_i32(plan.semantic_comments_enabled),
-        sigverify_enabled: bool_to_ffi_i32(plan.signature_verify_enabled),
-        balanced_focus_only: bool_to_ffi_i32(plan.balanced_focus_only),
-        taint_focus_only: bool_to_ffi_i32(plan.taint_focus_only),
-        sigwrite_focus_only: bool_to_ffi_i32(plan.signature_writeback_focus_only),
-        type_writeback_focus_only: bool_to_ffi_i32(plan.type_writeback_focus_only),
-    }
-}
-
-fn r2sleigh_interproc_session_purpose_to_engine(
-    purpose: u32,
-) -> r2engine::EngineInterprocSessionPurpose {
-    match purpose {
-        R2SLEIGH_INTERPROC_SESSION_DECOMPILE => r2engine::EngineInterprocSessionPurpose::Decompile,
-        _ => r2engine::EngineInterprocSessionPurpose::TypeAnalysis,
-    }
-}
-
-fn r2sleigh_auto_callback_kind_to_engine(kind: u32) -> r2engine::EngineAutoCallbackKind {
-    match kind {
-        R2SLEIGH_AUTO_CALLBACK_RECOVER_VARS => r2engine::EngineAutoCallbackKind::RecoverVars,
-        R2SLEIGH_AUTO_CALLBACK_DATA_REFS => r2engine::EngineAutoCallbackKind::DataRefs,
-        R2SLEIGH_AUTO_CALLBACK_POST_ANALYSIS_TAINT => {
-            r2engine::EngineAutoCallbackKind::PostAnalysisTaint
-        }
-        R2SLEIGH_AUTO_CALLBACK_POST_ANALYSIS_XREF => {
-            r2engine::EngineAutoCallbackKind::PostAnalysisXref
-        }
-        _ => r2engine::EngineAutoCallbackKind::AnalyzeFunction,
-    }
-}
-
-fn r2sleigh_auto_callback_kind_from_engine(kind: r2engine::EngineAutoCallbackKind) -> u32 {
-    match kind {
-        r2engine::EngineAutoCallbackKind::AnalyzeFunction => {
-            R2SLEIGH_AUTO_CALLBACK_ANALYZE_FUNCTION
-        }
-        r2engine::EngineAutoCallbackKind::RecoverVars => R2SLEIGH_AUTO_CALLBACK_RECOVER_VARS,
-        r2engine::EngineAutoCallbackKind::DataRefs => R2SLEIGH_AUTO_CALLBACK_DATA_REFS,
-        r2engine::EngineAutoCallbackKind::PostAnalysisTaint => {
-            R2SLEIGH_AUTO_CALLBACK_POST_ANALYSIS_TAINT
-        }
-        r2engine::EngineAutoCallbackKind::PostAnalysisXref => {
-            R2SLEIGH_AUTO_CALLBACK_POST_ANALYSIS_XREF
-        }
-    }
-}
-
-fn r2sleigh_auto_callback_reason_from_engine(
-    reason: r2engine::EngineAutoCallbackRefusalReason,
-) -> u32 {
-    match reason {
-        r2engine::EngineAutoCallbackRefusalReason::Allowed => R2SLEIGH_AUTO_CALLBACK_ALLOWED,
-        r2engine::EngineAutoCallbackRefusalReason::ModeNotFull => {
-            R2SLEIGH_AUTO_CALLBACK_MODE_NOT_FULL
-        }
-        r2engine::EngineAutoCallbackRefusalReason::TooManyBlocks => {
-            R2SLEIGH_AUTO_CALLBACK_TOO_MANY_BLOCKS
-        }
-        r2engine::EngineAutoCallbackRefusalReason::TooLarge => R2SLEIGH_AUTO_CALLBACK_TOO_LARGE,
-        r2engine::EngineAutoCallbackRefusalReason::TooCostly => R2SLEIGH_AUTO_CALLBACK_TOO_COSTLY,
-    }
-}
-
-fn r2sleigh_auto_callback_plan_from_engine(
-    plan: r2engine::EngineAutoCallbackPlan,
-) -> R2SleighAutoCallbackPlan {
-    R2SleighAutoCallbackPlan {
-        allowed: bool_to_ffi_i32(plan.allowed),
-        kind: r2sleigh_auto_callback_kind_from_engine(plan.kind),
-        reason: r2sleigh_auto_callback_reason_from_engine(plan.reason),
-    }
-}
-
-fn r2sleigh_interproc_session_plan_from_engine(
-    plan: r2engine::EngineInterprocSessionPlan,
-) -> R2SleighInterprocSessionPlan {
-    R2SleighInterprocSessionPlan {
-        include_type_interproc_scope: bool_to_ffi_i32(plan.include_type_interproc_scope),
-        include_root_symbolic_scope: bool_to_ffi_i32(plan.include_root_symbolic_scope),
-        interproc_iter: plan.interproc_iter,
-        interproc_max_iters: plan.interproc_max_iters,
-        interproc_converged: bool_to_ffi_i32(plan.interproc_converged),
-    }
-}
-
-fn r2sleigh_interproc_session_plan_to_engine(
-    plan: R2SleighInterprocSessionPlan,
-) -> r2engine::EngineInterprocSessionPlan {
-    r2engine::EngineInterprocSessionPlan {
-        include_type_interproc_scope: plan.include_type_interproc_scope != 0,
-        include_root_symbolic_scope: plan.include_root_symbolic_scope != 0,
-        interproc_iter: plan.interproc_iter,
-        interproc_max_iters: plan.interproc_max_iters,
-        interproc_converged: plan.interproc_converged != 0,
-    }
-}
-
-fn r2sleigh_symbolic_scope_reason_from_engine(
-    reason: r2engine::EngineSymbolicScopeFunctionReason,
-) -> u32 {
-    match reason {
-        r2engine::EngineSymbolicScopeFunctionReason::Allowed => {
-            R2SLEIGH_SYMBOLIC_SCOPE_REASON_ALLOWED
-        }
-        r2engine::EngineSymbolicScopeFunctionReason::ScopeFull => {
-            R2SLEIGH_SYMBOLIC_SCOPE_REASON_SCOPE_FULL
-        }
-        r2engine::EngineSymbolicScopeFunctionReason::InterprocDisabled => {
-            R2SLEIGH_SYMBOLIC_SCOPE_REASON_INTERPROC_DISABLED
-        }
-        r2engine::EngineSymbolicScopeFunctionReason::TargetTerminal => {
-            R2SLEIGH_SYMBOLIC_SCOPE_REASON_TARGET_TERMINAL
-        }
-    }
-}
-
-fn r2sleigh_symbolic_scope_plan_from_engine(
-    plan: r2engine::EngineSymbolicScopeFunctionPlan,
-) -> R2SleighSymbolicScopeFunctionPlan {
-    R2SleighSymbolicScopeFunctionPlan {
-        append_function: bool_to_ffi_i32(plan.append_function),
-        expand_targets: bool_to_ffi_i32(plan.expand_targets),
-        reason: r2sleigh_symbolic_scope_reason_from_engine(plan.reason),
-    }
-}
-
-fn r2sleigh_runtime_source_reason_from_engine(
-    reason: r2engine::EngineRuntimeMaterializedSourceReason,
-) -> u32 {
-    match reason {
-        r2engine::EngineRuntimeMaterializedSourceReason::Allowed => {
-            R2SLEIGH_RUNTIME_SOURCE_REASON_ALLOWED
-        }
-        r2engine::EngineRuntimeMaterializedSourceReason::ScopeFull => {
-            R2SLEIGH_RUNTIME_SOURCE_REASON_SCOPE_FULL
-        }
-        r2engine::EngineRuntimeMaterializedSourceReason::EmptySource => {
-            R2SLEIGH_RUNTIME_SOURCE_REASON_EMPTY_SOURCE
-        }
-    }
-}
-
-fn r2sleigh_runtime_source_plan_from_engine(
-    plan: r2engine::EngineRuntimeMaterializedSourcePlan,
-) -> R2SleighRuntimeMaterializedSourcePlan {
-    R2SleighRuntimeMaterializedSourcePlan {
-        append_source: bool_to_ffi_i32(plan.append_source),
-        capped_size: plan.capped_size,
-        slot_bytes: plan.slot_bytes,
-        reason: r2sleigh_runtime_source_reason_from_engine(plan.reason),
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_analysis_policy_for_depth(depth: u32) -> R2SleighAnalysisPolicy {
-    r2sleigh_analysis_policy_from_engine(r2engine::analysis_policy_for_radare2_depth(depth))
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_post_analysis_plan_for_depth(
-    depth: u32,
-    function_count: usize,
-) -> R2SleighPostAnalysisPlan {
-    r2sleigh_post_analysis_plan_from_engine(r2engine::post_analysis_plan_for_radare2_depth(
-        depth,
-        function_count,
-    ))
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_auto_callback_plan_for_depth(
-    depth: u32,
-    kind: u32,
-    basic_block_count: u32,
-    cost: u32,
-    linear_size: u64,
-) -> R2SleighAutoCallbackPlan {
-    r2sleigh_auto_callback_plan_from_engine(r2engine::auto_callback_plan_for_radare2_depth(
-        depth,
-        r2sleigh_auto_callback_kind_to_engine(kind),
-        r2engine::EngineAutoCallbackMetrics {
-            basic_block_count,
-            cost,
-            linear_size,
-        },
-    ))
-}
 
 #[cfg(test)]
 fn type_writeback_apply_policy_from_ffi(
@@ -3689,237 +3372,6 @@ pub struct R2SleighRuntimeSource {
 
 pub struct R2SleighRuntimeSources {
     items: Vec<R2SleighRuntimeSource>,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct R2SleighInterprocTargetInput {
-    direct_target: u64,
-    name: *const c_char,
-    linkage: u32,
-    resolved_target: u64,
-    has_resolved_target: i32,
-    target_materialized: i32,
-    has_target_metrics: i32,
-    target_basic_block_count: u32,
-    target_cost: u32,
-}
-
-pub struct R2SleighInterprocTargetPlan {
-    queued_targets: Vec<u64>,
-    registration_targets: Vec<u64>,
-    runtime_copy_targets: Vec<u64>,
-}
-
-#[cfg(test)]
-mod policy_and_cache_tests {
-    use super::*;
-
-    #[test]
-    fn analysis_policy_ffi_translates_engine_owned_depths() {
-        let basic = r2sleigh_analysis_policy_for_depth(r2engine::RADARE2_ANALYSIS_DEPTH_BASIC);
-        assert_eq!(basic.mode, R2SLEIGH_MODE_FAST);
-        assert_eq!(basic.type_writeback_mode, R2SLEIGH_TYPE_WRITEBACK_OFF);
-        assert_eq!(basic.type_interproc_max_iters, 1);
-        assert_eq!(basic.type_max_blocks, 96);
-        assert_eq!(basic.type_global_max_links, 8);
-
-        let balanced = r2sleigh_analysis_policy_for_depth(0);
-        assert_eq!(balanced.mode, R2SLEIGH_MODE_BALANCED);
-        assert_eq!(
-            balanced.type_writeback_mode,
-            R2SLEIGH_TYPE_WRITEBACK_BALANCED
-        );
-        assert_eq!(balanced.type_interproc_max_iters, 4);
-        assert_eq!(balanced.type_max_blocks, 200);
-        assert_eq!(balanced.type_global_max_links, 32);
-
-        let aggressive =
-            r2sleigh_analysis_policy_for_depth(r2engine::RADARE2_ANALYSIS_DEPTH_AGGRESSIVE);
-        assert_eq!(aggressive.mode, R2SLEIGH_MODE_FULL);
-        assert_eq!(
-            aggressive.type_writeback_mode,
-            R2SLEIGH_TYPE_WRITEBACK_AGGRESSIVE
-        );
-        assert_eq!(aggressive.type_interproc_max_iters, 12);
-        assert_eq!(aggressive.type_max_blocks, 500);
-        assert_eq!(aggressive.type_global_max_links, 128);
-    }
-
-    #[test]
-    fn post_analysis_plan_ffi_routes_to_engine_owned_policy() {
-        let fast =
-            r2sleigh_post_analysis_plan_for_depth(r2engine::RADARE2_ANALYSIS_DEPTH_BASIC, 512);
-        assert_eq!(fast.mode, R2SLEIGH_MODE_FAST);
-        assert_eq!(
-            fast.post_budget_us,
-            r2engine::POST_ANALYSIS_FAST_BUDGET_USEC
-        );
-        assert_eq!(fast.xref_enabled, 0);
-        assert_eq!(fast.taint_enabled, 0);
-        assert_eq!(fast.sigwrite_enabled, 0);
-        assert_eq!(fast.type_writeback_enabled, 0);
-        assert_eq!(fast.type_writeback_focus_only, 0);
-
-        let balanced = r2sleigh_post_analysis_plan_for_depth(0, 1);
-        assert_eq!(balanced.mode, R2SLEIGH_MODE_BALANCED);
-        assert_eq!(
-            balanced.post_budget_us,
-            r2engine::POST_ANALYSIS_BALANCED_BUDGET_USEC
-        );
-        assert_eq!(balanced.xref_enabled, 1);
-        assert_eq!(balanced.taint_enabled, 0);
-        assert_eq!(balanced.sigwrite_enabled, 1);
-        assert_eq!(balanced.type_writeback_enabled, 1);
-        assert_eq!(balanced.balanced_focus_only, 1);
-        assert_eq!(balanced.sigwrite_focus_only, 1);
-        assert_eq!(balanced.type_writeback_focus_only, 1);
-
-        let full =
-            r2sleigh_post_analysis_plan_for_depth(r2engine::RADARE2_ANALYSIS_DEPTH_AGGRESSIVE, 129);
-        assert_eq!(full.mode, R2SLEIGH_MODE_FULL);
-        assert_eq!(
-            full.post_budget_us,
-            r2engine::POST_ANALYSIS_AGGRESSIVE_BUDGET_USEC
-        );
-        assert_eq!(full.taint_enabled, 1);
-        assert_eq!(full.balanced_focus_only, 0);
-        assert_eq!(full.taint_focus_only, 1);
-        assert_eq!(full.sigwrite_focus_only, 1);
-        assert_eq!(full.type_writeback_focus_only, 1);
-    }
-
-    #[test]
-    fn auto_callback_plan_ffi_routes_to_engine_owned_policy() {
-        let denied_by_mode = r2sleigh_auto_callback_plan_for_depth(
-            0,
-            R2SLEIGH_AUTO_CALLBACK_RECOVER_VARS,
-            r2engine::AUTO_CALLBACK_MAX_BLOCKS,
-            r2engine::AUTO_CALLBACK_MAX_COST,
-            r2engine::AUTO_CALLBACK_MAX_LINEAR_SIZE,
-        );
-        assert_eq!(denied_by_mode.allowed, 0);
-        assert_eq!(denied_by_mode.kind, R2SLEIGH_AUTO_CALLBACK_RECOVER_VARS);
-        assert_eq!(denied_by_mode.reason, R2SLEIGH_AUTO_CALLBACK_MODE_NOT_FULL);
-
-        let balanced_xref = r2sleigh_auto_callback_plan_for_depth(
-            0,
-            R2SLEIGH_AUTO_CALLBACK_POST_ANALYSIS_XREF,
-            r2engine::AUTO_CALLBACK_MAX_BLOCKS,
-            r2engine::AUTO_CALLBACK_MAX_COST,
-            0,
-        );
-        assert_eq!(balanced_xref.allowed, 1);
-        assert_eq!(balanced_xref.reason, R2SLEIGH_AUTO_CALLBACK_ALLOWED);
-
-        let allowed = r2sleigh_auto_callback_plan_for_depth(
-            r2engine::RADARE2_ANALYSIS_DEPTH_AGGRESSIVE,
-            R2SLEIGH_AUTO_CALLBACK_DATA_REFS,
-            r2engine::AUTO_CALLBACK_MAX_BLOCKS,
-            r2engine::AUTO_CALLBACK_MAX_COST,
-            r2engine::AUTO_CALLBACK_MAX_LINEAR_SIZE,
-        );
-        assert_eq!(allowed.allowed, 1);
-        assert_eq!(allowed.kind, R2SLEIGH_AUTO_CALLBACK_DATA_REFS);
-        assert_eq!(allowed.reason, R2SLEIGH_AUTO_CALLBACK_ALLOWED);
-
-        let too_many_blocks = r2sleigh_auto_callback_plan_for_depth(
-            r2engine::RADARE2_ANALYSIS_DEPTH_AGGRESSIVE,
-            R2SLEIGH_AUTO_CALLBACK_POST_ANALYSIS_XREF,
-            r2engine::AUTO_CALLBACK_MAX_BLOCKS + 1,
-            r2engine::AUTO_CALLBACK_MAX_COST,
-            r2engine::AUTO_CALLBACK_MAX_LINEAR_SIZE,
-        );
-        assert_eq!(too_many_blocks.allowed, 0);
-        assert_eq!(
-            too_many_blocks.reason,
-            R2SLEIGH_AUTO_CALLBACK_TOO_MANY_BLOCKS
-        );
-    }
-
-    #[test]
-    fn symbolic_scope_plan_ffi_routes_to_engine_owned_policy() {
-        let disabled_interproc = R2SleighInterprocSessionPlan {
-            include_type_interproc_scope: 0,
-            include_root_symbolic_scope: 1,
-            interproc_iter: 1,
-            interproc_max_iters: 1,
-            interproc_converged: 0,
-        };
-        let enabled_interproc = R2SleighInterprocSessionPlan {
-            include_type_interproc_scope: 1,
-            include_root_symbolic_scope: 0,
-            interproc_iter: 1,
-            interproc_max_iters: 1,
-            interproc_converged: 1,
-        };
-
-        let root = r2sleigh_symbolic_scope_function_plan(0, 1, 0, disabled_interproc);
-        assert_eq!(root.append_function, 1);
-        assert_eq!(root.expand_targets, 1);
-        assert_eq!(root.reason, R2SLEIGH_SYMBOLIC_SCOPE_REASON_ALLOWED);
-
-        let disabled = r2sleigh_symbolic_scope_function_plan(1, 0, 0, disabled_interproc);
-        assert_eq!(disabled.append_function, 0);
-        assert_eq!(disabled.expand_targets, 0);
-        assert_eq!(
-            disabled.reason,
-            R2SLEIGH_SYMBOLIC_SCOPE_REASON_INTERPROC_DISABLED
-        );
-
-        let target_terminal = r2sleigh_symbolic_scope_function_plan(1, 0, 1, disabled_interproc);
-        assert_eq!(target_terminal.append_function, 1);
-        assert_eq!(target_terminal.expand_targets, 0);
-        assert_eq!(
-            target_terminal.reason,
-            R2SLEIGH_SYMBOLIC_SCOPE_REASON_TARGET_TERMINAL
-        );
-
-        let helper = r2sleigh_symbolic_scope_function_plan(1, 0, 0, enabled_interproc);
-        assert_eq!(helper.append_function, 1);
-        assert_eq!(helper.expand_targets, 1);
-
-        let full = r2sleigh_symbolic_scope_function_plan(
-            r2engine::SYMBOLIC_SCOPE_MAX_FUNCTIONS,
-            1,
-            0,
-            enabled_interproc,
-        );
-        assert_eq!(full.append_function, 0);
-        assert_eq!(full.reason, R2SLEIGH_SYMBOLIC_SCOPE_REASON_SCOPE_FULL);
-    }
-
-    #[test]
-    fn runtime_materialized_source_plan_ffi_routes_to_engine_owned_caps() {
-        let allowed = r2sleigh_runtime_materialized_source_plan(0, 0x9000, 0x20);
-        assert_eq!(allowed.append_source, 1);
-        assert_eq!(allowed.capped_size, 0x20);
-        assert_eq!(
-            allowed.slot_bytes,
-            r2engine::RUNTIME_MATERIALIZED_SLOT_BYTES
-        );
-        assert_eq!(allowed.reason, R2SLEIGH_RUNTIME_SOURCE_REASON_ALLOWED);
-
-        let capped = r2sleigh_runtime_materialized_source_plan(
-            0,
-            0x9000,
-            r2engine::RUNTIME_MATERIALIZED_MAX_BYTES + 1,
-        );
-        assert_eq!(capped.append_source, 1);
-        assert_eq!(capped.capped_size, r2engine::RUNTIME_MATERIALIZED_MAX_BYTES);
-
-        let empty = r2sleigh_runtime_materialized_source_plan(0, 0, 0x20);
-        assert_eq!(empty.append_source, 0);
-        assert_eq!(empty.reason, R2SLEIGH_RUNTIME_SOURCE_REASON_EMPTY_SOURCE);
-
-        let full = r2sleigh_runtime_materialized_source_plan(
-            r2engine::SYMBOLIC_SCOPE_MAX_FUNCTIONS,
-            0x9000,
-            0x20,
-        );
-        assert_eq!(full.append_source, 0);
-        assert_eq!(full.reason, R2SLEIGH_RUNTIME_SOURCE_REASON_SCOPE_FULL);
-    }
 }
 
 #[cfg(test)]
@@ -5623,8 +5075,7 @@ fn score_global_type_links(
         .collect()
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_get_direct_call_targets_typed(
+pub(crate) fn r2sleigh_get_direct_call_targets_typed(
     ctx: *const R2ILContext,
     blocks: *const *const R2ILBlock,
     num_blocks: usize,
@@ -5643,8 +5094,7 @@ pub extern "C" fn r2sleigh_get_direct_call_targets_typed(
     }))
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_get_symbolic_scope_targets_typed(
+pub(crate) fn r2sleigh_get_symbolic_scope_targets_typed(
     ctx: *const R2ILContext,
     blocks: *const *const R2ILBlock,
     num_blocks: usize,
@@ -5676,8 +5126,7 @@ pub extern "C" fn r2sleigh_get_symbolic_scope_targets_typed(
     }))
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_get_runtime_materialized_sources_typed(
+pub(crate) fn r2sleigh_get_runtime_materialized_sources_typed(
     ctx: *const R2ILContext,
     blocks: *const *const R2ILBlock,
     num_blocks: usize,
@@ -5712,8 +5161,7 @@ pub extern "C" fn r2sleigh_get_runtime_materialized_sources_typed(
     Box::into_raw(Box::new(R2SleighRuntimeSources { items }))
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_u64_array_items(
+pub(crate) fn r2sleigh_u64_array_items(
     array: *const R2SleighU64Array,
     count: *mut usize,
 ) -> *const u64 {
@@ -5734,8 +5182,7 @@ pub extern "C" fn r2sleigh_u64_array_items(
     array.values.as_ptr()
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_u64_array_free(array: *mut R2SleighU64Array) {
+pub(crate) fn r2sleigh_u64_array_free(array: *mut R2SleighU64Array) {
     if !array.is_null() {
         unsafe {
             drop(Box::from_raw(array));
@@ -5743,8 +5190,7 @@ pub extern "C" fn r2sleigh_u64_array_free(array: *mut R2SleighU64Array) {
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_runtime_sources_items(
+pub(crate) fn r2sleigh_runtime_sources_items(
     sources: *const R2SleighRuntimeSources,
     count: *mut usize,
 ) -> *const R2SleighRuntimeSource {
@@ -5765,113 +5211,10 @@ pub extern "C" fn r2sleigh_runtime_sources_items(
     sources.items.as_ptr()
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_runtime_sources_free(sources: *mut R2SleighRuntimeSources) {
+pub(crate) fn r2sleigh_runtime_sources_free(sources: *mut R2SleighRuntimeSources) {
     if !sources.is_null() {
         unsafe {
             drop(Box::from_raw(sources));
-        }
-    }
-}
-
-#[allow(
-    unknown_lints,
-    r2plugin_raw_direct_call_target,
-    reason = "FFI bridge copies radare2-collected target facts into the engine-owned planner"
-)]
-fn interproc_target_input_from_ffi(
-    input: &R2SleighInterprocTargetInput,
-) -> r2engine::EngineInterprocTargetInput {
-    r2engine::EngineInterprocTargetInput {
-        direct_target: input.direct_target,
-        name: optional_cstr(input.name),
-        linkage: ffi_interproc_seed_linkage(input.linkage),
-        semantic_summary: None,
-        resolved_target: (input.has_resolved_target != 0).then_some(input.resolved_target),
-        target_materialized: input.target_materialized != 0,
-        target_metrics: (input.has_target_metrics != 0).then_some(
-            r2engine::EngineInterprocTargetMetrics {
-                basic_block_count: input.target_basic_block_count,
-                cost: input.target_cost,
-            },
-        ),
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_plan_interproc_scope_targets(
-    inputs: *const R2SleighInterprocTargetInput,
-    num_inputs: usize,
-) -> *mut R2SleighInterprocTargetPlan {
-    if inputs.is_null() && num_inputs != 0 {
-        return ptr::null_mut();
-    }
-    let inputs = if num_inputs == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(inputs, num_inputs) }
-    };
-    let plan =
-        r2engine::interproc_scope_target_plan(inputs.iter().map(interproc_target_input_from_ffi));
-    Box::into_raw(Box::new(R2SleighInterprocTargetPlan {
-        queued_targets: plan.queued_targets,
-        registration_targets: plan.registration_targets,
-        runtime_copy_targets: plan.runtime_copy_targets,
-    }))
-}
-
-fn interproc_target_plan_items(
-    plan: *const R2SleighInterprocTargetPlan,
-    count: *mut usize,
-    select: impl FnOnce(&R2SleighInterprocTargetPlan) -> &Vec<u64>,
-) -> *const u64 {
-    if plan.is_null() {
-        if !count.is_null() {
-            unsafe {
-                *count = 0;
-            }
-        }
-        return ptr::null();
-    }
-    let plan = unsafe { &*plan };
-    let items = select(plan);
-    if !count.is_null() {
-        unsafe {
-            *count = items.len();
-        }
-    }
-    items.as_ptr()
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_interproc_target_plan_queued_items(
-    plan: *const R2SleighInterprocTargetPlan,
-    count: *mut usize,
-) -> *const u64 {
-    interproc_target_plan_items(plan, count, |plan| &plan.queued_targets)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_interproc_target_plan_registration_items(
-    plan: *const R2SleighInterprocTargetPlan,
-    count: *mut usize,
-) -> *const u64 {
-    interproc_target_plan_items(plan, count, |plan| &plan.registration_targets)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_interproc_target_plan_runtime_copy_items(
-    plan: *const R2SleighInterprocTargetPlan,
-    count: *mut usize,
-) -> *const u64 {
-    interproc_target_plan_items(plan, count, |plan| &plan.runtime_copy_targets)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_interproc_target_plan_free(plan: *mut R2SleighInterprocTargetPlan) {
-    if !plan.is_null() {
-        unsafe {
-            drop(Box::from_raw(plan));
         }
     }
 }
@@ -6111,8 +5454,7 @@ fn ffi_annotations_from_annotations(annotations: Vec<FcnAnnotation>) -> R2Sleigh
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_analyze_fcn_annotations_typed(
+pub(crate) fn r2sleigh_analyze_fcn_annotations_typed(
     ctx: *const R2ILContext,
     blocks: *const *const R2ILBlock,
     num_blocks: usize,
@@ -6124,8 +5466,7 @@ pub extern "C" fn r2sleigh_analyze_fcn_annotations_typed(
     Box::into_raw(Box::new(ffi_annotations_from_annotations(annotations)))
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_annotations_items(
+pub(crate) fn r2sleigh_annotations_items(
     annotations: *const R2SleighAnnotations,
     count: *mut usize,
 ) -> *const R2SleighAnnotation {
@@ -6146,8 +5487,7 @@ pub extern "C" fn r2sleigh_annotations_items(
     annotations.items.as_ptr()
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_annotations_free(annotations: *mut R2SleighAnnotations) {
+pub(crate) fn r2sleigh_annotations_free(annotations: *mut R2SleighAnnotations) {
     if !annotations.is_null() {
         unsafe {
             drop(Box::from_raw(annotations));
@@ -6361,8 +5701,9 @@ mod tests {
         let decompile_block = &c_source[start..end];
 
         assert!(
-            c_source.contains("r2sleigh_interproc_session_plan_for_depth"),
-            "non-core analysis/debug C paths may still consume the interproc session plan"
+            c_source.contains("R2SLEIGH_CAP_PLANNER_QUERY_V2")
+                && c_source.contains("api->planner_query"),
+            "non-core analysis/debug C paths must consume the generated V2 planner table"
         );
         for forbidden in [
             "R2SleighSessionPolicyPlan",
@@ -6939,7 +6280,7 @@ mod tests {
         let out = unsafe { CStr::from_ptr(ptr) }
             .to_string_lossy()
             .into_owned();
-        r2il_string_free(ptr);
+        drop_test_ffi_string(ptr);
         out
     }
 
@@ -6994,8 +6335,8 @@ mod tests {
         assert!(esil.contains("eax"));
 
         unsafe { drop(CString::from_raw(esil_ptr as *mut c_char)) };
-        r2il_block_free(block);
-        r2il_free(ctx);
+        drop_test_block(block);
+        drop_test_context(ctx);
     }
 
     #[test]
@@ -7014,7 +6355,7 @@ mod tests {
             block_has_varnode_metadata(unsafe { &*enabled_block }),
             "default lift should annotate register varnodes"
         );
-        r2il_block_free(enabled_block);
+        drop_test_block(enabled_block);
 
         r2il_set_semantic_metadata_enabled(ctx, false);
         let disabled_block = r2il_lift(ctx, bytes.as_ptr(), bytes.len(), 0x1000);
@@ -7024,8 +6365,8 @@ mod tests {
             "disabled semantic metadata must be passed to single-instruction lift"
         );
 
-        r2il_block_free(disabled_block);
-        r2il_free(ctx);
+        drop_test_block(disabled_block);
+        drop_test_context(ctx);
     }
 
     #[test]
@@ -7044,7 +6385,7 @@ mod tests {
             block_has_varnode_metadata(unsafe { &*enabled_block }),
             "default block lift should annotate register varnodes"
         );
-        r2il_block_free(enabled_block);
+        drop_test_block(enabled_block);
 
         r2il_set_semantic_metadata_enabled(ctx, false);
         let disabled_block = r2il_lift_block(ctx, bytes.as_ptr(), bytes.len(), 0x1000, 2);
@@ -7054,8 +6395,8 @@ mod tests {
             "disabled semantic metadata must be passed to block lift"
         );
 
-        r2il_block_free(disabled_block);
-        r2il_free(ctx);
+        drop_test_block(disabled_block);
+        drop_test_context(ctx);
     }
 
     #[test]
@@ -7088,8 +6429,8 @@ mod tests {
         let ffi_val: Value = serde_json::from_str(&ffi_json).expect("ffi json value");
         assert_eq!(ffi_val, expected_val);
 
-        r2il_block_free(block);
-        r2il_free(ctx);
+        drop_test_block(block);
+        drop_test_context(ctx);
     }
 
     #[test]
@@ -7123,8 +6464,8 @@ mod tests {
             .join(";");
         assert_eq!(ffi_esil, expected_joined);
 
-        r2il_block_free(block);
-        r2il_free(ctx);
+        drop_test_block(block);
+        drop_test_context(ctx);
     }
 
     #[test]
@@ -7156,8 +6497,8 @@ mod tests {
         let expected_val: Value = serde_json::from_str(&expected).expect("expected json");
         assert_eq!(ffi_val, expected_val);
 
-        r2il_block_free(block);
-        r2il_free(ctx);
+        drop_test_block(block);
+        drop_test_context(ctx);
     }
 
     #[test]
@@ -7189,16 +6530,16 @@ mod tests {
         let expected_val: Value = serde_json::from_str(&expected).expect("expected json");
         assert_eq!(ffi_val, expected_val);
 
-        r2il_block_free(block);
-        r2il_free(ctx);
+        drop_test_block(block);
+        drop_test_context(ctx);
     }
 
     #[test]
     fn test_null_handling() {
         assert_eq!(r2il_is_loaded(ptr::null()), 0);
         assert!(r2il_arch_name(ptr::null()).is_null());
-        r2il_free(ptr::null_mut());
-        r2il_block_free(ptr::null_mut());
+        drop_test_context(ptr::null_mut());
+        drop_test_block(ptr::null_mut());
     }
 
     #[test]
@@ -7285,44 +6626,6 @@ mod tests {
             r2types::TypeWritebackApplyMode::Aggressive,
             "plugin FFI must route aggressive mode through engine-owned policy mapping"
         );
-        let in_budget_type = r2sleigh_interproc_session_plan_for_depth(
-            0,
-            0,
-            r2engine::ENGINE_INTERPROC_HELPER_MAX_BLOCKS as usize,
-            r2engine::ENGINE_INTERPROC_HELPER_MAX_COST,
-        );
-        assert_eq!(in_budget_type.include_type_interproc_scope, 1);
-        assert_eq!(in_budget_type.include_root_symbolic_scope, 0);
-        assert_eq!(in_budget_type.interproc_iter, 1);
-        assert_eq!(
-            in_budget_type.interproc_max_iters,
-            r2engine::analysis_policy_for_radare2_depth(0).type_interproc_max_iters
-        );
-        assert_eq!(in_budget_type.interproc_converged, 1);
-
-        let bounded_type = r2sleigh_interproc_session_plan_for_depth(
-            0,
-            0,
-            (r2engine::ENGINE_INTERPROC_HELPER_MAX_BLOCKS + 1) as usize,
-            r2engine::ENGINE_INTERPROC_HELPER_MAX_COST,
-        );
-        assert_eq!(bounded_type.include_type_interproc_scope, 0);
-        assert_eq!(bounded_type.include_root_symbolic_scope, 1);
-        assert_eq!(bounded_type.interproc_iter, 1);
-        assert_eq!(bounded_type.interproc_max_iters, 1);
-        assert_eq!(bounded_type.interproc_converged, 0);
-
-        let bounded_decompile = r2sleigh_interproc_session_plan_for_depth(
-            0,
-            R2SLEIGH_INTERPROC_SESSION_DECOMPILE,
-            r2engine::ENGINE_INTERPROC_HELPER_MAX_BLOCKS as usize,
-            r2engine::ENGINE_INTERPROC_HELPER_MAX_COST + 1,
-        );
-        assert_eq!(bounded_decompile.include_type_interproc_scope, 0);
-        assert_eq!(bounded_decompile.include_root_symbolic_scope, 0);
-        assert_eq!(bounded_decompile.interproc_iter, 1);
-        assert_eq!(bounded_decompile.interproc_max_iters, 1);
-        assert_eq!(bounded_decompile.interproc_converged, 1);
     }
 
     #[test]
@@ -7553,7 +6856,7 @@ mod tests {
         let ctx = r2il_arch_init(arch_name.as_ptr());
         assert!(!ctx.is_null(), "context should initialize");
         let mut arch = unsafe { (*ctx).arch.clone().expect("arch spec") };
-        r2il_free(ctx);
+        drop_test_context(ctx);
         arch.addr_size = 1;
         assert_eq!(
             crate::helpers::effective_addr_size_bytes(&arch),
@@ -8785,6 +8088,7 @@ mod integration_tests {
             analysis_depth: 0,
             timeout_us: 0,
             source_interface: ptr::null(),
+            radare_snapshot: ptr::null(),
         };
 
         let output = r2sleigh_engine_decompile_function_output_with_source(
@@ -8804,7 +8108,7 @@ mod integration_tests {
             output.output
         );
 
-        r2il_free(ctx);
+        drop_test_context(ctx);
     }
 
     #[cfg(feature = "x86")]
@@ -8893,6 +8197,7 @@ mod integration_tests {
             analysis_depth: 0,
             timeout_us: 0,
             source_interface: ptr::null(),
+            radare_snapshot: ptr::null(),
         };
 
         let output = r2sleigh_engine_decompile_function_output_with_source(
@@ -8910,7 +8215,7 @@ mod integration_tests {
             output.output
         );
 
-        r2il_free(ctx);
+        drop_test_context(ctx);
     }
 
     #[test]
@@ -9153,8 +8458,8 @@ mod integration_tests {
             );
         }
 
-        r2il_string_free(profile_ptr);
-        r2il_free(ctx_ptr);
+        drop_test_ffi_string(profile_ptr);
+        drop_test_context(ctx_ptr);
     }
 
     #[test]
@@ -9190,7 +8495,7 @@ mod integration_tests {
         let ctx_ptr = r2il_arch_init(arch_cstr.as_ptr());
         assert!(!ctx_ptr.is_null(), "context pointer should not be null");
         assert_eq!(r2il_is_loaded(ctx_ptr), 1, "arm64 context should be loaded");
-        r2il_free(ctx_ptr);
+        drop_test_context(ctx_ptr);
     }
 
     #[cfg(any(feature = "x86", feature = "arm", feature = "mips"))]
@@ -9209,8 +8514,8 @@ mod integration_tests {
             "register profile should not be null"
         );
         let profile = unsafe { CStr::from_ptr(profile_ptr).to_str().unwrap().to_string() };
-        r2il_string_free(profile_ptr);
-        r2il_free(ctx_ptr);
+        drop_test_ffi_string(profile_ptr);
+        drop_test_context(ctx_ptr);
         profile
     }
 
@@ -9344,7 +8649,7 @@ mod integration_tests {
             1,
             "riscv64 context should be loaded"
         );
-        r2il_free(ctx_ptr);
+        drop_test_context(ctx_ptr);
     }
 
     #[test]
@@ -9358,7 +8663,7 @@ mod integration_tests {
             1,
             "riscv32 context should be loaded"
         );
-        r2il_free(ctx_ptr);
+        drop_test_context(ctx_ptr);
     }
 
     #[test]
@@ -9387,7 +8692,7 @@ mod integration_tests {
             1,
             "mips32be context should be loaded"
         );
-        r2il_free(ctx_ptr);
+        drop_test_context(ctx_ptr);
     }
 
     #[test]
@@ -9663,97 +8968,10 @@ mod integration_tests {
         let targets = unsafe { std::slice::from_raw_parts(items, count) }.to_vec();
 
         r2sleigh_u64_array_free(out);
-        r2il_block_free(raw_block);
-        r2il_free(ctx);
+        drop_test_block(raw_block);
+        drop_test_context(ctx);
 
         assert_eq!(targets, vec![0x2000]);
-    }
-
-    #[test]
-    fn interproc_target_plan_ffi_routes_scope_policy_to_engine() {
-        let imported = CString::new("sym.imp.printf").expect("name");
-        let registration = CString::new("sym.imp.AddVectoredExceptionHandler").expect("name");
-        let runtime_copy = CString::new("sym.imp.memcpy").expect("name");
-        let local = CString::new("sym.local_helper").expect("name");
-        let inputs = [
-            R2SleighInterprocTargetInput {
-                direct_target: 0x2000,
-                name: imported.as_ptr(),
-                linkage: R2SLEIGH_INTERPROC_LINKAGE_IMPORTED,
-                resolved_target: 0x2000,
-                has_resolved_target: 1,
-                target_materialized: 1,
-                has_target_metrics: 1,
-                target_basic_block_count: 1,
-                target_cost: 1,
-            },
-            R2SleighInterprocTargetInput {
-                direct_target: 0x3000,
-                name: registration.as_ptr(),
-                linkage: R2SLEIGH_INTERPROC_LINKAGE_IMPORTED,
-                resolved_target: 0x3000,
-                has_resolved_target: 1,
-                target_materialized: 1,
-                has_target_metrics: 1,
-                target_basic_block_count: 1,
-                target_cost: 1,
-            },
-            R2SleighInterprocTargetInput {
-                direct_target: 0x4000,
-                name: local.as_ptr(),
-                linkage: R2SLEIGH_INTERPROC_LINKAGE_INTERNAL,
-                resolved_target: 0x4010,
-                has_resolved_target: 1,
-                target_materialized: 1,
-                has_target_metrics: 1,
-                target_basic_block_count: 1,
-                target_cost: 1,
-            },
-            R2SleighInterprocTargetInput {
-                direct_target: 0x5000,
-                name: runtime_copy.as_ptr(),
-                linkage: R2SLEIGH_INTERPROC_LINKAGE_IMPORTED,
-                resolved_target: 0x5000,
-                has_resolved_target: 1,
-                target_materialized: 1,
-                has_target_metrics: 1,
-                target_basic_block_count: 1,
-                target_cost: 1,
-            },
-        ];
-        let plan = r2sleigh_plan_interproc_scope_targets(inputs.as_ptr(), inputs.len());
-        assert!(!plan.is_null(), "planner should return an owned plan");
-
-        let mut queued_count = 0usize;
-        let queued = r2sleigh_interproc_target_plan_queued_items(plan, &mut queued_count);
-        let queued = unsafe { std::slice::from_raw_parts(queued, queued_count) }.to_vec();
-        let mut registration_count = 0usize;
-        let registrations =
-            r2sleigh_interproc_target_plan_registration_items(plan, &mut registration_count);
-        let registrations =
-            unsafe { std::slice::from_raw_parts(registrations, registration_count) }.to_vec();
-        let mut copy_count = 0usize;
-        let copies = r2sleigh_interproc_target_plan_runtime_copy_items(plan, &mut copy_count);
-        let copies = unsafe { std::slice::from_raw_parts(copies, copy_count) }.to_vec();
-        r2sleigh_interproc_target_plan_free(plan);
-
-        assert_eq!(queued, vec![0x4000, 0x4010]);
-        assert_eq!(registrations, vec![0x3000]);
-        assert_eq!(copies, vec![0x5000]);
-    }
-
-    #[test]
-    fn interproc_target_plan_ffi_rejects_null_inputs_with_nonzero_count() {
-        let plan = r2sleigh_plan_interproc_scope_targets(ptr::null(), 1);
-        assert!(plan.is_null());
-    }
-
-    #[test]
-    fn interproc_target_plan_ffi_null_plan_items_clear_count() {
-        let mut count = usize::MAX;
-        let items = r2sleigh_interproc_target_plan_queued_items(ptr::null(), &mut count);
-        assert!(items.is_null());
-        assert_eq!(count, 0);
     }
 
     #[test]
@@ -11125,5 +10343,173 @@ mod integration_tests {
             !type_db.structs.is_empty(),
             "expected inferred struct declarations in type db"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn semantic_validator_rejects_mutated_copy_width() {
+        let arch = CString::new("x86-64").unwrap();
+        let context = r2il_arch_init(arch.as_ptr());
+        let bytes = [
+            0x31, 0xc0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+            0x90, 0x90,
+        ];
+        let block = r2il_lift(context, bytes.as_ptr(), bytes.len(), 0x1000);
+        assert_eq!(r2il_block_validate(context, block), 1);
+        let block_ref = unsafe { &mut *block };
+        let mut mutated = false;
+        for op in &mut block_ref.ops {
+            if let R2ILOp::Copy { src, .. } = op {
+                src.size = src.size.saturating_add(1);
+                mutated = true;
+                break;
+            }
+        }
+        assert!(mutated);
+        assert_eq!(r2il_block_validate(context, block), 0);
+        let error = unsafe { CStr::from_ptr(r2il_error(context)) }.to_string_lossy();
+        assert!(error.contains("op.copy.width_mismatch") && error.contains("block.ops"));
+        drop_test_block(block);
+        drop_test_context(context);
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn semantic_validator_rejects_out_of_range_op_metadata() {
+        let arch = CString::new("x86-64").unwrap();
+        let context = r2il_arch_init(arch.as_ptr());
+        let bytes = [
+            0x31, 0xc0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+            0x90, 0x90,
+        ];
+        let block = r2il_lift(context, bytes.as_ptr(), bytes.len(), 0x1000);
+        let block_ref = unsafe { &mut *block };
+        block_ref.set_op_metadata(block_ref.ops.len(), r2il::OpMetadata::default());
+        assert_eq!(r2il_block_validate(context, block), 0);
+        let error = unsafe { CStr::from_ptr(r2il_error(context)) }.to_string_lossy();
+        assert!(error.contains("block.op_metadata") && error.contains("index_oob"));
+        drop_test_block(block);
+        drop_test_context(context);
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn semantic_validator_rejects_invalid_guarded_load() {
+        let arch = CString::new("x86-64").unwrap();
+        let context = r2il_arch_init(arch.as_ptr());
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push(R2ILOp::LoadGuarded {
+            dst: Varnode::register(0, 8),
+            space: r2il::SpaceId::Ram,
+            addr: Varnode::register(8, 8),
+            guard: Varnode::register(16, 8),
+            ordering: r2il::MemoryOrdering::Relaxed,
+        });
+        assert_eq!(r2il_block_validate(context, &block), 0);
+        let error = unsafe { CStr::from_ptr(r2il_error(context)) }.to_string_lossy();
+        assert!(error.contains("op.load_guarded.guard_size"));
+        drop_test_context(context);
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn op_json_preserves_mutated_varnode_metadata() {
+        let arch = CString::new("x86-64").unwrap();
+        let context = r2il_arch_init(arch.as_ptr());
+        let bytes = [
+            0x31, 0xc0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+            0x90, 0x90,
+        ];
+        let block = r2il_lift(context, bytes.as_ptr(), bytes.len(), 0x1000);
+        let mut metadata = r2il::VarnodeMetadata::default();
+        metadata.scalar_kind = Some(r2il::ScalarKind::UnsignedInt);
+        let block_ref = unsafe { &mut *block };
+        let op_index = block_ref
+            .ops
+            .iter_mut()
+            .enumerate()
+            .find_map(|(index, op)| {
+                let R2ILOp::Copy { dst, .. } = op else {
+                    return None;
+                };
+                dst.set_meta(metadata.clone());
+                Some(index)
+            })
+            .expect("copy op");
+        let raw = r2il_block_op_json_named(context, block, op_index);
+        let json = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
+        drop_test_ffi_string(raw);
+        assert!(json.contains("unsigned_int"));
+        drop_test_block(block);
+        drop_test_context(context);
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn memory_render_preserves_additive_semantics_fields() {
+        let arch = CString::new("x86-64").unwrap();
+        let context = r2il_arch_init(arch.as_ptr());
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push_with_metadata(
+            R2ILOp::Load {
+                dst: Varnode::register(0, 8),
+                space: r2il::SpaceId::Ram,
+                addr: Varnode::constant(0x1000, 8),
+            },
+            Some(r2il::OpMetadata {
+                memory_class: Some(r2il::MemoryClass::Stack),
+                memory_ordering: Some(r2il::MemoryOrdering::AcqRel),
+                permissions: Some(r2il::MemoryPermissions {
+                    read: true,
+                    write: false,
+                    execute: false,
+                    volatile: false,
+                    cacheable: true,
+                }),
+                valid_range: Some(r2il::MemoryRange {
+                    start: 0x1000,
+                    end: 0x2000,
+                }),
+                bank_id: Some("bank0".to_string()),
+                segment_id: Some("seg0".to_string()),
+                atomic_kind: Some(r2il::AtomicKind::ReadModifyWrite),
+                ..r2il::OpMetadata::default()
+            }),
+        );
+        let raw = r2il_block_mem_access(context, &block);
+        assert!(!raw.is_null());
+        let json = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
+        drop_test_ffi_string(raw);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let access = parsed.as_array().and_then(|items| items.first()).unwrap();
+        assert_eq!(
+            access.get("ordering").and_then(serde_json::Value::as_str),
+            Some("acq_rel")
+        );
+        assert_eq!(
+            access
+                .get("atomic_kind")
+                .and_then(serde_json::Value::as_str),
+            Some("read_modify_write")
+        );
+        assert_eq!(
+            access.get("bank_id").and_then(serde_json::Value::as_str),
+            Some("bank0")
+        );
+        assert_eq!(
+            access.get("segment_id").and_then(serde_json::Value::as_str),
+            Some("seg0")
+        );
+        assert_eq!(
+            access
+                .get("memory_class")
+                .and_then(serde_json::Value::as_str),
+            Some("stack")
+        );
+        drop_test_context(context);
     }
 }

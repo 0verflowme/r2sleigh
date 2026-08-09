@@ -345,7 +345,7 @@ def collect_target(
     addr = target["addr"]
     prefix = f"a:sla >/dev/null; {analysis}; s 0x{addr:x}; af"
     commands = {
-        "decompile_sla": "a:sla.dec",
+        "decompile_sla": "pdd",
         "decompile_pdd": "pdd",
         "decompile_pdD": "pdD",
         "types": "a:sla.debug.types",

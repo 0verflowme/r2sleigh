@@ -9,7 +9,6 @@
 #include <r_util/r_str.h>
 #include <r_util/r_type.h>
 #include <ctype.h>
-#include <dlfcn.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
@@ -18,61 +17,550 @@
 #include <string.h>
 #include "r2sleigh_api_v2.h"
 
-#if R2_ABIVERSION != 137
-#error "r2sleigh schema-7 source transport requires exactly radare2 ABI 137"
+#if R2_ABIVERSION != 138
+#error "r2sleigh borrowed snapshot transport requires exactly radare2 ABI 138"
 #endif
-#if R2SLEIGH_RADARE_ABI_V2 != 137
-#error "r2sleigh generated V2 header must target exactly radare2 ABI 137"
+#if R2SLEIGH_RADARE_ABI_V2 != 138
+#error "r2sleigh generated V2 header must target exactly radare2 ABI 138"
 #endif
-#if R_ANAL_FUNCTION_SNAPSHOT_SCHEMA_VERSION != 6
-#error "r2sleigh schema-7 source transport requires function snapshot schema 6"
-#endif
-#if R_ANAL_FUNCTION_SNAPSHOT_LIMITS_VERSION != 1
-#error "r2sleigh schema-7 source transport requires function snapshot limits API 1"
+#if R_ANAL_FUNCTION_SNAPSHOT_SCHEMA_VERSION != 7
+#error "r2sleigh borrowed snapshot transport requires function snapshot schema 7"
 #endif
 
-/* FFI declarations for r2sleigh Rust library */
-typedef struct {
-	unsigned long long value;
-	unsigned long long target;
-} R2ILSwitchCaseFfi;
+static bool sleigh_radare_storage_view(R2SleighRadareRegisterStorageViewV2 *destination, const RAnalSnapshotRegisterStorageView *source) {
+	if (!destination || !source) {
+		return false;
+	}
+	*destination = (R2SleighRadareRegisterStorageViewV2) {
+		.name_length = source->name_length,
+		.offset = source->offset,
+		.size = source->size,
+	};
+	return true;
+}
 
-/* Context management */
-extern R2ILContext *r2il_arch_init(const char *arch);
-extern void r2il_free(R2ILContext *ctx);
-extern int r2il_is_loaded(const R2ILContext *ctx);
-extern const char *r2il_arch_name(const R2ILContext *ctx);
-extern const char *r2il_error(const R2ILContext *ctx);
+static bool sleigh_radare_carrier(R2SleighRadareCarrierProjectionV2 *destination, const RAnalSnapshotCarrierProjection *source) {
+	if (!destination || !source) {
+		return false;
+	}
+	switch (source->kind) {
+	case R_ANAL_SNAPSHOT_CARRIER_INVALID:
+		destination->kind = 0;
+		break;
+	case R_ANAL_SNAPSHOT_CARRIER_FULL:
+		destination->kind = 1;
+		break;
+	case R_ANAL_SNAPSHOT_CARRIER_LOW_BITS:
+		destination->kind = 2;
+		break;
+	default:
+		return false;
+	}
+	destination->offset_bits = source->offset_bits;
+	destination->size_bits = source->size_bits;
+	return true;
+}
 
-/* Lifting */
-extern R2ILBlock *r2il_lift(R2ILContext *ctx, const unsigned char *bytes, size_t len, unsigned long long addr);
-extern R2ILBlock *r2il_lift_block(R2ILContext *ctx, const unsigned char *bytes, size_t len, unsigned long long addr, unsigned int block_size);
-extern void r2il_set_semantic_metadata_enabled(R2ILContext *ctx, bool enabled);
-extern void r2il_block_free(R2ILBlock *block);
-extern int r2il_block_validate(R2ILContext *ctx, const R2ILBlock *block);
-extern int r2il_block_set_switch_info(R2ILBlock *block, unsigned long long switch_addr,
-	unsigned long long min_val, unsigned long long max_val,
-	unsigned long long default_target, int has_default,
-	const R2ILSwitchCaseFfi *cases, size_t case_count);
+static bool sleigh_radare_return_kind(int32_t *destination, RAnalSnapshotReturnKind source) {
+	if (!destination) {
+		return false;
+	}
+	switch (source) {
+	case R_ANAL_SNAPSHOT_RETURN_UNKNOWN:
+		*destination = 0;
+		return true;
+	case R_ANAL_SNAPSHOT_RETURN_VOID:
+		*destination = 1;
+		return true;
+	case R_ANAL_SNAPSHOT_RETURN_REGISTER:
+		*destination = 2;
+		return true;
+	default:
+		return false;
+	}
+}
 
-/* Block inspection */
-extern size_t r2il_block_op_count(const R2ILBlock *block);
-extern unsigned int r2il_block_size(const R2ILBlock *block);
-extern unsigned long long r2il_block_addr(const R2ILBlock *block);
-extern unsigned int r2il_block_type(const R2ILBlock *block);
-extern unsigned long long r2il_block_jump(const R2ILBlock *block);
-extern unsigned long long r2il_block_fail(const R2ILBlock *block);
-typedef struct {
-	size_t op_index;
-	uint32_t target_space;
-	uint32_t target_custom_space;
-	uint64_t target_offset;
-	uint32_t target_size;
-} R2ILDirectCallIdentity;
-extern int r2il_block_direct_call_identity(const R2ILBlock *block,
-	uint64_t raw_instruction_addr, uint64_t raw_target_addr,
-	R2ILDirectCallIdentity *output);
-typedef struct R2ILBlockAnalValues R2ILBlockAnalValues;
+static uint8_t sleigh_radare_snapshot_view(const void *opaque, R2SleighRadareSnapshotViewV2 *destination) {
+	if (!opaque || !destination) {
+		return 0;
+	}
+	const RAnalFunctionSnapshot *snapshot = opaque;
+	RAnalFunctionSnapshotView source = {0};
+	if (!r_anal_function_snapshot_view (snapshot, &source)) {
+		return 0;
+	}
+	*destination = (R2SleighRadareSnapshotViewV2) {
+		.schema_version = source.schema_version,
+		.struct_size = sizeof (*destination),
+		.capabilities = source.capabilities,
+		.function_addr = source.function_addr,
+		.function_size = source.function_size,
+		.bits = source.bits,
+		.endian = source.endian,
+		.maxstack = source.maxstack,
+		.arch_id_length = source.arch_id_length,
+		.cpu_id_length = source.cpu_id_length,
+		.function_name_length = source.function_name_length,
+		.num_base_types = source.num_base_types,
+		.type_context_hash = source.type_context_hash,
+		.num_call_site_interfaces = source.num_call_site_interfaces,
+		.num_stack_slots = source.num_stack_slots,
+		.revision_identity = source.revision_identity,
+		.num_types = source.num_types,
+		.num_aggregates = source.num_aggregates,
+		.num_blocks = source.num_blocks,
+		.num_external_exits = source.num_external_exits,
+		.total_source_bytes = source.total_source_bytes,
+	};
+	return 1;
+}
+
+static uint8_t sleigh_radare_arch_id(const void *opaque, uint8_t *buffer, size_t buffer_size) {
+	return opaque && buffer
+		&& r_anal_function_snapshot_arch_id (opaque, (char *)buffer, buffer_size)? 1: 0;
+}
+
+static uint8_t sleigh_radare_cpu_id(const void *opaque, uint8_t *buffer, size_t buffer_size) {
+	return opaque && buffer
+		&& r_anal_function_snapshot_cpu_id (opaque, (char *)buffer, buffer_size)? 1: 0;
+}
+
+static uint8_t sleigh_radare_function_name(const void *opaque, uint8_t *buffer, size_t buffer_size) {
+	return opaque && buffer
+		&& r_anal_function_snapshot_function_name (opaque, (char *)buffer, buffer_size)? 1: 0;
+}
+
+static uint8_t sleigh_radare_interface_view(const void *opaque, R2SleighRadareFunctionInterfaceViewV2 *destination) {
+	if (!opaque || !destination) {
+		return 0;
+	}
+	RAnalFunctionInterfaceSnapshotView source = {0};
+	if (!r_anal_function_snapshot_interface_view (opaque, &source)) {
+		return 0;
+	}
+	R2SleighRadareFunctionInterfaceViewV2 result = {
+		.calling_convention_length = source.calling_convention_length,
+		.num_parameters = source.num_parameters,
+		.variadic = source.variadic? 1: 0,
+		.noreturn = source.noreturn? 1: 0,
+		.stack_resources_complete = source.stack_resources_complete? 1: 0,
+		.stack_slot_roles_complete = source.stack_slot_roles_complete? 1: 0,
+		.complete = source.complete? 1: 0,
+		.return_type_id = source.return_type_id,
+		.logical_types_complete = source.logical_types_complete? 1: 0,
+	};
+	if (!sleigh_radare_return_kind (&result.return_kind, source.return_kind)
+		|| !sleigh_radare_storage_view (&result.return_storage, &source.return_storage)
+		|| !sleigh_radare_storage_view (&result.return_address_storage, &source.return_address_storage)
+		|| !sleigh_radare_storage_view (&result.stack_pointer_storage, &source.stack_pointer_storage)
+		|| !sleigh_radare_carrier (&result.return_carrier, &source.return_carrier)) {
+		return 0;
+	}
+	*destination = result;
+	return 1;
+}
+
+static uint8_t sleigh_radare_interface_calling_convention(const void *opaque, uint8_t *buffer, size_t buffer_size) {
+	return opaque && buffer
+		&& r_anal_function_snapshot_interface_calling_convention (opaque, (char *)buffer, buffer_size)? 1: 0;
+}
+
+static uint8_t sleigh_radare_interface_storage_name(const void *opaque, int32_t kind, uint8_t *buffer, size_t buffer_size) {
+	if (!opaque || !buffer) {
+		return 0;
+	}
+	RAnalSnapshotInterfaceStorageKind source_kind;
+	switch (kind) {
+	case 0:
+		source_kind = R_ANAL_SNAPSHOT_INTERFACE_STORAGE_RETURN;
+		break;
+	case 1:
+		source_kind = R_ANAL_SNAPSHOT_INTERFACE_STORAGE_RETURN_ADDRESS;
+		break;
+	case 2:
+		source_kind = R_ANAL_SNAPSHOT_INTERFACE_STORAGE_STACK_POINTER;
+		break;
+	default:
+		return 0;
+	}
+	return r_anal_function_snapshot_interface_storage_name (
+		opaque, source_kind, (char *)buffer, buffer_size)? 1: 0;
+}
+
+static bool sleigh_radare_parameter_copy(R2SleighRadareParameterViewV2 *destination, const RAnalSnapshotParameterView *source) {
+	if (!destination || !source) {
+		return false;
+	}
+	R2SleighRadareParameterViewV2 result = {
+		.index = source->index,
+		.logical_type_id = source->logical_type_id,
+	};
+	if (!sleigh_radare_storage_view (&result.storage, &source->storage)
+		|| !sleigh_radare_carrier (&result.carrier, &source->carrier)) {
+		return false;
+	}
+	*destination = result;
+	return true;
+}
+
+static uint8_t sleigh_radare_parameter_view(const void *opaque, size_t index, R2SleighRadareParameterViewV2 *destination) {
+	if (!opaque || !destination) {
+		return 0;
+	}
+	RAnalSnapshotParameterView source = {0};
+	return r_anal_function_snapshot_parameter_view (opaque, index, &source)
+		&& sleigh_radare_parameter_copy (destination, &source)? 1: 0;
+}
+
+static uint8_t sleigh_radare_parameter_storage_name(const void *opaque, size_t index, uint8_t *buffer, size_t buffer_size) {
+	return opaque && buffer
+		&& r_anal_function_snapshot_parameter_storage_name (
+			opaque, index, (char *)buffer, buffer_size)? 1: 0;
+}
+
+static uint8_t sleigh_radare_stack_slot_view(const void *opaque, size_t index, R2SleighRadareStackSlotViewV2 *destination) {
+	if (!opaque || !destination) {
+		return 0;
+	}
+	RAnalSnapshotStackSlotView source = {0};
+	if (!r_anal_function_snapshot_stack_slot_view (opaque, index, &source)) {
+		return 0;
+	}
+	int32_t base;
+	switch (source.base) {
+	case R_ANAL_FCN_BASE_BP:
+		base = 0;
+		break;
+	case R_ANAL_FCN_BASE_SP:
+		base = 1;
+		break;
+	case R_ANAL_FCN_BASE_NAMED:
+		base = 2;
+		break;
+	default:
+		return 0;
+	}
+	int32_t role;
+	switch (source.role) {
+	case R_ANAL_FCN_SLOT_LOCAL:
+		role = 0;
+		break;
+	case R_ANAL_FCN_SLOT_ARG:
+		role = 1;
+		break;
+	case R_ANAL_FCN_SLOT_HOME:
+		role = 2;
+		break;
+	case R_ANAL_FCN_SLOT_UNKNOWN:
+		role = 3;
+		break;
+	default:
+		return 0;
+	}
+	*destination = (R2SleighRadareStackSlotViewV2) {
+		.name_length = source.name_length,
+		.type_length = source.type_length,
+		.base = base,
+		.base_name_length = source.base_name_length,
+		.base_offset = source.base_offset,
+		.base_size = source.base_size,
+		.offset = source.offset,
+		.size = source.size,
+		.offset_valid = source.offset_valid? 1: 0,
+		.role = role,
+		.arg_index = source.arg_index,
+		.arg_name_length = source.arg_name_length,
+		.home_reg_length = source.home_reg_length,
+		.home_reg_offset = source.home_reg_offset,
+		.home_reg_size = source.home_reg_size,
+	};
+	return 1;
+}
+
+static uint8_t sleigh_radare_stack_slot_string(const void *opaque, size_t index, int32_t kind, uint8_t *buffer, size_t buffer_size) {
+	if (!opaque || !buffer) {
+		return 0;
+	}
+	RAnalSnapshotStackSlotStringKind source_kind;
+	switch (kind) {
+	case 0:
+		source_kind = R_ANAL_SNAPSHOT_STACK_SLOT_STRING_NAME;
+		break;
+	case 1:
+		source_kind = R_ANAL_SNAPSHOT_STACK_SLOT_STRING_TYPE;
+		break;
+	case 2:
+		source_kind = R_ANAL_SNAPSHOT_STACK_SLOT_STRING_BASE_NAME;
+		break;
+	case 3:
+		source_kind = R_ANAL_SNAPSHOT_STACK_SLOT_STRING_ARG_NAME;
+		break;
+	case 4:
+		source_kind = R_ANAL_SNAPSHOT_STACK_SLOT_STRING_HOME_REGISTER;
+		break;
+	default:
+		return 0;
+	}
+	return r_anal_function_snapshot_stack_slot_string (
+		opaque, index, source_kind, (char *)buffer, buffer_size)? 1: 0;
+}
+
+static uint8_t sleigh_radare_call_site_view(const void *opaque, size_t index, R2SleighRadareCallSiteViewV2 *destination) {
+	if (!opaque || !destination) {
+		return 0;
+	}
+	RAnalCallSiteInterfaceSnapshotView source = {0};
+	if (!r_anal_function_snapshot_call_site_view (opaque, index, &source)) {
+		return 0;
+	}
+	R2SleighRadareCallSiteViewV2 result = {
+		.instruction_addr = source.instruction_addr,
+		.target_addr = source.target_addr,
+		.calling_convention_length = source.calling_convention_length,
+		.num_arguments = source.num_arguments,
+		.variadic = source.variadic? 1: 0,
+		.noreturn = source.noreturn? 1: 0,
+		.complete = source.complete? 1: 0,
+	};
+	if (!sleigh_radare_return_kind (&result.result_kind, source.result_kind)
+		|| !sleigh_radare_storage_view (&result.result_storage, &source.result_storage)) {
+		return 0;
+	}
+	*destination = result;
+	return 1;
+}
+
+static uint8_t sleigh_radare_call_site_calling_convention(const void *opaque, size_t index, uint8_t *buffer, size_t buffer_size) {
+	return opaque && buffer
+		&& r_anal_function_snapshot_call_site_calling_convention (
+			opaque, index, (char *)buffer, buffer_size)? 1: 0;
+}
+
+static uint8_t sleigh_radare_call_site_result_storage_name(const void *opaque, size_t index, uint8_t *buffer, size_t buffer_size) {
+	return opaque && buffer
+		&& r_anal_function_snapshot_call_site_result_storage_name (
+			opaque, index, (char *)buffer, buffer_size)? 1: 0;
+}
+
+static uint8_t sleigh_radare_call_argument_view(const void *opaque, size_t call_index, size_t argument_index, R2SleighRadareParameterViewV2 *destination) {
+	if (!opaque || !destination) {
+		return 0;
+	}
+	RAnalSnapshotParameterView source = {0};
+	return r_anal_function_snapshot_call_argument_view (
+			opaque, call_index, argument_index, &source)
+		&& sleigh_radare_parameter_copy (destination, &source)? 1: 0;
+}
+
+static uint8_t sleigh_radare_call_argument_storage_name(const void *opaque, size_t call_index, size_t argument_index, uint8_t *buffer, size_t buffer_size) {
+	return opaque && buffer
+		&& r_anal_function_snapshot_call_argument_storage_name (
+			opaque, call_index, argument_index, (char *)buffer, buffer_size)? 1: 0;
+}
+
+static uint8_t sleigh_radare_type_graph_view(const void *opaque, R2SleighRadareTypeGraphViewV2 *destination) {
+	if (!opaque || !destination) {
+		return 0;
+	}
+	RAnalSnapshotTypeGraphView source = {0};
+	if (!r_anal_function_snapshot_type_graph_view (opaque, &source)) {
+		return 0;
+	}
+	*destination = (R2SleighRadareTypeGraphViewV2) {
+		.num_types = source.num_types,
+		.num_aggregates = source.num_aggregates,
+		.complete = source.complete? 1: 0,
+	};
+	return 1;
+}
+
+static uint8_t sleigh_radare_type_view(const void *opaque, size_t index, R2SleighRadareTypeViewV2 *destination) {
+	if (!opaque || !destination) {
+		return 0;
+	}
+	RAnalSnapshotType source = {0};
+	if (!r_anal_function_snapshot_type_view (opaque, index, &source)) {
+		return 0;
+	}
+	int32_t kind;
+	switch (source.kind) {
+	case R_ANAL_SNAPSHOT_TYPE_INVALID:
+		kind = 0;
+		break;
+	case R_ANAL_SNAPSHOT_TYPE_SIGNED_INTEGER:
+		kind = 1;
+		break;
+	case R_ANAL_SNAPSHOT_TYPE_UNSIGNED_INTEGER:
+		kind = 2;
+		break;
+	case R_ANAL_SNAPSHOT_TYPE_POINTER:
+		kind = 3;
+		break;
+	case R_ANAL_SNAPSHOT_TYPE_STRUCT:
+		kind = 4;
+		break;
+	default:
+		return 0;
+	}
+	*destination = (R2SleighRadareTypeViewV2) {
+		.id = source.id,
+		.kind = kind,
+		.size_bits = source.size_bits,
+		.align_bits = source.align_bits,
+		.target_type_id = source.target_type_id,
+		.aggregate_id = source.aggregate_id,
+	};
+	return 1;
+}
+
+static uint8_t sleigh_radare_aggregate_view(const void *opaque, size_t index, R2SleighRadareAggregateViewV2 *destination) {
+	if (!opaque || !destination) {
+		return 0;
+	}
+	RAnalSnapshotAggregateLayoutView source = {0};
+	if (!r_anal_function_snapshot_aggregate_view (opaque, index, &source)) {
+		return 0;
+	}
+	*destination = (R2SleighRadareAggregateViewV2) {
+		.id = source.id,
+		.type_id = source.type_id,
+		.size_bits = source.size_bits,
+		.align_bits = source.align_bits,
+		.name_length = source.name_length,
+		.num_members = source.num_members,
+		.complete = source.complete? 1: 0,
+		.c_layout_compatible = source.c_layout_compatible? 1: 0,
+	};
+	return 1;
+}
+
+static uint8_t sleigh_radare_aggregate_name(const void *opaque, size_t index, uint8_t *buffer, size_t buffer_size) {
+	return opaque && buffer
+		&& r_anal_function_snapshot_aggregate_name (opaque, index, (char *)buffer, buffer_size)? 1: 0;
+}
+
+static uint8_t sleigh_radare_aggregate_member_view(const void *opaque, size_t aggregate_index, size_t member_index, R2SleighRadareAggregateMemberViewV2 *destination) {
+	if (!opaque || !destination) {
+		return 0;
+	}
+	RAnalSnapshotAggregateMemberView source = {0};
+	if (!r_anal_function_snapshot_aggregate_member_view (
+			opaque, aggregate_index, member_index, &source)) {
+		return 0;
+	}
+	*destination = (R2SleighRadareAggregateMemberViewV2) {
+		.member_id = source.member_id,
+		.type_id = source.type_id,
+		.offset_bits = source.offset_bits,
+		.size_bits = source.size_bits,
+		.count = source.count,
+		.name_length = source.name_length,
+	};
+	return 1;
+}
+
+static uint8_t sleigh_radare_aggregate_member_name(const void *opaque, size_t aggregate_index, size_t member_index, uint8_t *buffer, size_t buffer_size) {
+	return opaque && buffer
+		&& r_anal_function_snapshot_aggregate_member_name (
+			opaque, aggregate_index, member_index, (char *)buffer, buffer_size)? 1: 0;
+}
+
+static uint8_t sleigh_radare_block_view(const void *opaque, size_t index, R2SleighRadareBlockViewV2 *destination) {
+	if (!opaque || !destination) {
+		return 0;
+	}
+	RAnalSnapshotBlockView source = {0};
+	if (!r_anal_function_snapshot_block_view (opaque, index, &source)) {
+		return 0;
+	}
+	*destination = (R2SleighRadareBlockViewV2) {
+		.addr = source.addr,
+		.size = source.size,
+		.num_successors = source.num_successors,
+		.switch_addr = source.switch_addr,
+	};
+	return 1;
+}
+
+static uint8_t sleigh_radare_block_bytes(const void *opaque, size_t index, size_t offset, uint8_t *buffer, size_t length) {
+	return opaque && buffer
+		&& r_anal_function_snapshot_block_bytes (opaque, index, offset, buffer, length)? 1: 0;
+}
+
+static uint8_t sleigh_radare_successor_view(const void *opaque, size_t block_index, size_t successor_index, R2SleighRadareSuccessorViewV2 *destination) {
+	if (!opaque || !destination) {
+		return 0;
+	}
+	RAnalSnapshotSuccessorView source = {0};
+	if (!r_anal_function_snapshot_successor_view (
+			opaque, block_index, successor_index, &source)) {
+		return 0;
+	}
+	int32_t kind;
+	switch (source.kind) {
+	case R_ANAL_SNAPSHOT_SUCCESSOR_DIRECT:
+		kind = 0;
+		break;
+	case R_ANAL_SNAPSHOT_SUCCESSOR_FALLTHROUGH:
+		kind = 1;
+		break;
+	case R_ANAL_SNAPSHOT_SUCCESSOR_SWITCH_CASE:
+		kind = 2;
+		break;
+	case R_ANAL_SNAPSHOT_SUCCESSOR_SWITCH_DEFAULT:
+		kind = 3;
+		break;
+	default:
+		return 0;
+	}
+	*destination = (R2SleighRadareSuccessorViewV2) {
+		.kind = kind,
+		.target_addr = source.target_addr,
+		.case_value = source.case_value,
+		.external = source.external? 1: 0,
+	};
+	return 1;
+}
+
+static uint8_t sleigh_radare_external_exit(const void *opaque, size_t index, uint64_t *target) {
+	return opaque && target
+		&& r_anal_function_snapshot_external_exit (opaque, index, target)? 1: 0;
+}
+
+static const R2SleighRadareAccessorsV2 sleigh_radare_accessors = {
+	.struct_size = sizeof (sleigh_radare_accessors),
+	.abi_version = R2SLEIGH_RADARE_ABI_V2,
+	.snapshot_schema_version = R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2,
+	.accessor_schema_version = R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2,
+	.snapshot_view = sleigh_radare_snapshot_view,
+	.arch_id = sleigh_radare_arch_id,
+	.cpu_id = sleigh_radare_cpu_id,
+	.function_name = sleigh_radare_function_name,
+	.interface_view = sleigh_radare_interface_view,
+	.interface_calling_convention = sleigh_radare_interface_calling_convention,
+	.interface_storage_name = sleigh_radare_interface_storage_name,
+	.parameter_view = sleigh_radare_parameter_view,
+	.parameter_storage_name = sleigh_radare_parameter_storage_name,
+	.stack_slot_view = sleigh_radare_stack_slot_view,
+	.stack_slot_string = sleigh_radare_stack_slot_string,
+	.call_site_view = sleigh_radare_call_site_view,
+	.call_site_calling_convention = sleigh_radare_call_site_calling_convention,
+	.call_site_result_storage_name = sleigh_radare_call_site_result_storage_name,
+	.call_argument_view = sleigh_radare_call_argument_view,
+	.call_argument_storage_name = sleigh_radare_call_argument_storage_name,
+	.type_graph_view = sleigh_radare_type_graph_view,
+	.type_view = sleigh_radare_type_view,
+	.aggregate_view = sleigh_radare_aggregate_view,
+	.aggregate_name = sleigh_radare_aggregate_name,
+	.aggregate_member_view = sleigh_radare_aggregate_member_view,
+	.aggregate_member_name = sleigh_radare_aggregate_member_name,
+	.block_view = sleigh_radare_block_view,
+	.block_bytes = sleigh_radare_block_bytes,
+	.successor_view = sleigh_radare_successor_view,
+	.external_exit = sleigh_radare_external_exit,
+};
+
+/* Remaining direct value declarations for the Rust library. */
 typedef struct {
 	int is_write;
 	unsigned int size;
@@ -90,60 +578,11 @@ typedef struct {
 typedef struct {
 	const char *name;
 } R2ILBlockRegValue;
-extern R2ILBlockAnalValues *r2il_block_values_typed(const R2ILContext *ctx, const R2ILBlock *block);
-extern const R2ILBlockMemAccess *r2il_block_values_memory(const R2ILBlockAnalValues *values, size_t *count);
-extern const R2ILBlockImmediateValue *r2il_block_values_immediates(const R2ILBlockAnalValues *values, size_t *count);
-extern const R2ILBlockRegValue *r2il_block_values_reg_reads(const R2ILBlockAnalValues *values, size_t *count);
-extern const R2ILBlockRegValue *r2il_block_values_reg_writes(const R2ILBlockAnalValues *values, size_t *count);
-extern void r2il_block_values_free(R2ILBlockAnalValues *values);
 
-/* ESIL/mnemonic */
-extern char *r2il_block_to_esil(const R2ILContext *ctx, const R2ILBlock *block);
-extern char *r2il_block_mnemonic(const R2ILContext *ctx, const unsigned char *bytes, size_t len, unsigned long long addr);
-extern char *r2il_block_op_json_named(const R2ILContext *ctx, const R2ILBlock *block, size_t index);
-extern void r2il_string_free(char *s);
-extern char *r2sleigh_engine_cache_stats_json(void);
-extern void r2sleigh_engine_cache_stats_reset(void);
-#define R2SLEIGH_INTERPROC_SESSION_TYPE_ANALYSIS 0u
-#define R2SLEIGH_INTERPROC_SESSION_DECOMPILE 1u
-
-extern R2SleighInterprocSessionPlan r2sleigh_interproc_session_plan_for_depth(unsigned int depth, unsigned int purpose, size_t basic_block_count, unsigned int cost);
-typedef struct {
-	int append_function;
-	int expand_targets;
-	unsigned int reason;
-} R2SleighSymbolicScopeFunctionPlan;
-typedef struct {
-	int append_source;
-	unsigned long long capped_size;
-	unsigned long long slot_bytes;
-	unsigned int reason;
-} R2SleighRuntimeMaterializedSourcePlan;
-extern R2SleighSymbolicScopeFunctionPlan r2sleigh_symbolic_scope_function_plan(size_t current_scope_count, int root_function, int target_hint_function, R2SleighInterprocSessionPlan interproc);
-extern R2SleighRuntimeMaterializedSourcePlan r2sleigh_runtime_materialized_source_plan(size_t current_scope_count, unsigned long long addr, unsigned long long size);
-
-/* Typed analysis */
-extern char *r2il_block_regs_read(const R2ILContext *ctx, const R2ILBlock *block);
-extern char *r2il_block_regs_write(const R2ILContext *ctx, const R2ILBlock *block);
-extern char *r2il_block_mem_access(const R2ILContext *ctx, const R2ILBlock *block);
-extern char *r2il_block_varnodes(const R2ILContext *ctx, const R2ILBlock *block);
-
-/* SSA analysis (instruction-level) */
-extern char *r2il_block_to_ssa_json(const R2ILContext *ctx, const R2ILBlock *block);
-extern char *r2il_block_defuse_json(const R2ILContext *ctx, const R2ILBlock *block);
-
-/* SSA analysis (function-level) */
-extern char *r2ssa_function_json(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks);
-extern char *r2ssa_function_opt_json(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks);
-extern char *r2ssa_defuse_function_json(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks);
-extern char *r2ssa_domtree_json(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks);
-extern char *r2ssa_backward_slice_json(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks, const char *var_name);
-extern char *r2taint_function_json(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks);
 #define R2TAINT_OP_OTHER 0
 #define R2TAINT_OP_CALL 1
 #define R2TAINT_OP_CALL_IND 2
 #define R2TAINT_OP_STORE 3
-typedef struct R2TaintFunctionSummary R2TaintFunctionSummary;
 typedef struct {
 	unsigned long long block;
 	const char * const *labels;
@@ -163,10 +602,6 @@ typedef struct {
 	const R2TaintTaintedVar *tainted_vars;
 	size_t num_tainted_vars;
 } R2TaintSinkHit;
-extern R2TaintFunctionSummary *r2taint_function_summary_typed(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks);
-extern const R2TaintSource *r2taint_function_summary_sources(const R2TaintFunctionSummary *summary, size_t *count);
-extern const R2TaintSinkHit *r2taint_function_summary_sink_hits(const R2TaintFunctionSummary *summary, size_t *count);
-extern void r2taint_function_summary_free(R2TaintFunctionSummary *summary);
 
 /* Symbolic execution */
 struct R2ILFunctionBlocks {
@@ -214,11 +649,6 @@ typedef struct {
 	int skip_sleep_calls;
 } R2SymReplaySeed;
 
-typedef struct R2SleighRecoveredVars R2SleighRecoveredVars;
-typedef struct R2SleighDataRefs R2SleighDataRefs;
-typedef struct R2SleighAnnotations R2SleighAnnotations;
-typedef struct R2SleighU64Array R2SleighU64Array;
-typedef struct R2SleighRuntimeSources R2SleighRuntimeSources;
 #define R2SLEIGH_CONTEXT_VAR_REGISTER 0
 #define R2SLEIGH_CONTEXT_VAR_STACK 1
 #define R2SLEIGH_CONTEXT_STACK_LOCAL 0
@@ -258,61 +688,555 @@ typedef struct {
 	unsigned long long addr;
 	unsigned long long size;
 } R2SleighRuntimeSource;
-typedef struct {
-	unsigned long long direct_target;
-	const char *name;
-	unsigned int linkage;
-	unsigned long long resolved_target;
-	int has_resolved_target;
-	int target_materialized;
-	int has_target_metrics;
-	unsigned int target_basic_block_count;
-	unsigned int target_cost;
-} R2SleighInterprocTargetInput;
-typedef struct R2SleighInterprocTargetPlan R2SleighInterprocTargetPlan;
-extern R2SleighAnnotations *r2sleigh_analyze_fcn_annotations_typed(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks, unsigned long long fcn_addr);
-extern const R2SleighAnnotation *r2sleigh_annotations_items(const R2SleighAnnotations *annotations, size_t *count);
-extern void r2sleigh_annotations_free(R2SleighAnnotations *annotations);
-extern R2SleighU64Array *r2sleigh_get_direct_call_targets_typed(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks, unsigned long long fcn_addr, const char *fcn_name);
-extern R2SleighU64Array *r2sleigh_get_symbolic_scope_targets_typed(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks, unsigned long long fcn_addr, const char *fcn_name, const unsigned long long *registration_call_targets, size_t num_registration_call_targets);
-extern const unsigned long long *r2sleigh_u64_array_items(const R2SleighU64Array *array, size_t *count);
-extern void r2sleigh_u64_array_free(R2SleighU64Array *array);
-extern R2SleighRuntimeSources *r2sleigh_get_runtime_materialized_sources_typed(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks, unsigned long long fcn_addr, const char *fcn_name, const unsigned long long *copy_call_targets, size_t num_copy_call_targets);
-extern const R2SleighRuntimeSource *r2sleigh_runtime_sources_items(const R2SleighRuntimeSources *sources, size_t *count);
-extern void r2sleigh_runtime_sources_free(R2SleighRuntimeSources *sources);
-extern R2SleighInterprocTargetPlan *r2sleigh_plan_interproc_scope_targets(const R2SleighInterprocTargetInput *inputs, size_t num_inputs);
-extern const unsigned long long *r2sleigh_interproc_target_plan_queued_items(const R2SleighInterprocTargetPlan *plan, size_t *count);
-extern const unsigned long long *r2sleigh_interproc_target_plan_registration_items(const R2SleighInterprocTargetPlan *plan, size_t *count);
-extern const unsigned long long *r2sleigh_interproc_target_plan_runtime_copy_items(const R2SleighInterprocTargetPlan *plan, size_t *count);
-extern void r2sleigh_interproc_target_plan_free(R2SleighInterprocTargetPlan *plan);
-extern char *r2sym_function_scope(const R2ILContext *ctx, const R2ILFunctionBlocks *functions, size_t num_functions, unsigned long long entry_addr, const char *external_context_json);
-extern char *r2sym_paths_scope(const R2ILContext *ctx, const R2ILFunctionBlocks *functions, size_t num_functions, unsigned long long entry_addr, const char *external_context_json);
-extern char *r2sym_explore_to_scope(const R2ILContext *ctx, const R2ILFunctionBlocks *functions, size_t num_functions,
-	unsigned long long entry_addr, unsigned long long target_addr, const char *external_context_json);
-extern char *r2sym_solve_to_scope(const R2ILContext *ctx, const R2ILFunctionBlocks *functions, size_t num_functions,
-	unsigned long long entry_addr, unsigned long long target_addr, const char *external_context_json);
-extern char *r2sym_explore_to_replay_scope(const R2ILContext *ctx, const R2ILFunctionBlocks *functions, size_t num_functions,
-	unsigned long long entry_addr, unsigned long long target_addr, const R2SymReplaySeed *replay_seed, const char *external_context_json);
-extern char *r2sym_solve_to_replay_scope(const R2ILContext *ctx, const R2ILFunctionBlocks *functions, size_t num_functions,
-	unsigned long long entry_addr, unsigned long long target_addr, const R2SymReplaySeed *replay_seed, const char *external_context_json);
-extern char *r2sym_run_spec_json_scope(const R2ILContext *ctx, const R2ILFunctionBlocks *functions, size_t num_functions,
-	unsigned long long entry_addr, const char *spec_json, const char *external_context_json);
-extern int r2sym_set_symbol_map_json(const char *json);
-extern int r2sym_merge_is_enabled(void);
-extern void r2sym_merge_set_enabled(int enabled);
-
-/* CFG */
-extern char *r2cfg_function_ascii(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks);
-extern char *r2cfg_function_json(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks);
-extern char *r2il_get_reg_profile(const R2ILContext *ctx);
-
 /* radare2 Deep Integration */
-extern R2SleighRecoveredVars *r2sleigh_recover_vars_typed(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks, unsigned long long fcn_addr);
-extern const R2SleighRecoveredVar *r2sleigh_recovered_vars_items(const R2SleighRecoveredVars *vars, size_t *count);
-extern void r2sleigh_recovered_vars_free(R2SleighRecoveredVars *vars);
-extern R2SleighDataRefs *r2sleigh_data_refs_typed(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks, unsigned long long fcn_addr);
-extern const R2SleighDataRef *r2sleigh_data_refs_items(const R2SleighDataRefs *refs, size_t *count);
-extern void r2sleigh_data_refs_free(R2SleighDataRefs *refs);
+
+static const R2SleighApiV2 *sleigh_lift_api_v2(void) {
+	const R2SleighApiV2 *api = r2sleigh_api_v2 ();
+	if (!api || api->abi_version != R2SLEIGH_ABI_V2
+		|| api->struct_size != sizeof (*api)
+		|| api->radare_abi_version != R2_ABIVERSION
+		|| api->byte_view_size != sizeof (R2SleighByteViewV2)
+		|| api->string_view_size != sizeof (R2SleighStringViewV2)
+		|| api->switch_case_size != sizeof (R2SleighSwitchCaseV2)
+		|| api->direct_call_identity_size != sizeof (R2SleighDirectCallIdentityV2)
+		|| api->analysis_render_request_size != sizeof (R2SleighAnalysisRenderRequestV2)
+		|| api->scope_render_request_size != sizeof (R2SleighScopeRenderRequestV2)
+		|| api->scope_symbol_size != sizeof (R2SleighScopeSymbolV2)
+		|| api->analysis_query_request_size != sizeof (R2SleighAnalysisQueryRequestV2)
+		|| api->analysis_result_view_size != sizeof (R2SleighAnalysisResultViewV2)
+		|| api->planner_query_request_size != sizeof (R2SleighPlannerQueryRequestV2)
+		|| api->planner_query_response_size != sizeof (R2SleighPlannerQueryResponseV2)
+		|| api->planner_target_input_size != sizeof (R2SleighPlannerTargetInputV2)
+		|| api->planner_result_view_size != sizeof (R2SleighPlannerResultViewV2)
+		|| !(api->capabilities & R2SLEIGH_CAP_LIFT_CORE_V2)
+		|| !(api->capabilities & R2SLEIGH_CAP_PLANNER_QUERY_V2)
+		|| !api->lift_context_create || !api->lift_context_free
+		|| !api->lift_context_is_loaded || !api->lift_context_arch_name
+		|| !api->lift_context_error || !api->lift_last_error
+		|| !api->lift_context_reg_profile
+		|| !api->lift_instruction || !api->lift_block
+		|| !api->lift_context_set_semantic_metadata || !api->lift_block_free
+		|| !api->lift_block_validate || !api->lift_block_set_switch_info
+		|| !api->lift_block_op_count || !api->lift_block_direct_call_identity
+		|| !api->lift_block_size || !api->lift_block_addr
+		|| !api->lift_block_mnemonic || !api->lift_block_type
+		|| !api->lift_block_jump || !api->lift_block_fail
+		|| !api->owned_bytes_view || !api->owned_bytes_free
+		|| !api->analysis_render || !api->scope_render
+		|| !api->analysis_query || !api->analysis_result_view
+		|| !api->analysis_result_free || !api->engine_cache_reset
+		|| !api->planner_query || !api->planner_result_view
+		|| !api->planner_result_copy || !api->planner_result_free) {
+		return NULL;
+	}
+	return api;
+}
+
+static uint32_t sleigh_v2_planner_query(unsigned int kind, R2SleighPlannerQueryRequestV2 *request, R2SleighPlannerQueryResponseV2 *response) {
+	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
+	if (!request || !response) {
+		return R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
+	}
+	request->abi_version = R2SLEIGH_ABI_V2;
+	request->struct_size = sizeof (*request);
+	request->schema_version = R2SLEIGH_PLANNER_QUERY_SCHEMA_V2;
+	request->kind = kind;
+	memset (response, 0, sizeof (*response));
+	return api? api->planner_query (request, response): R2SLEIGH_STATUS_ABI_MISMATCH_V2;
+}
+
+static R2SleighAnalysisPolicyV2 sleigh_v2_query_analysis_policy(unsigned int depth) {
+	R2SleighPlannerQueryRequestV2 request = {0};
+	R2SleighPlannerQueryResponseV2 response = {0};
+	request.depth = depth;
+	uint32_t status = sleigh_v2_planner_query (R2SLEIGH_PLANNER_ANALYSIS_POLICY_V2, &request, &response);
+	if (status != R2SLEIGH_STATUS_OK_V2) {
+		R_LOG_ERROR ("r2sleigh: analysis policy query failed (%u)", status);
+		return (R2SleighAnalysisPolicyV2){0};
+	}
+	return response.analysis_policy;
+}
+
+static R2SleighPostAnalysisPlanV2 sleigh_v2_query_post_analysis(unsigned int depth, size_t function_count) {
+	R2SleighPlannerQueryRequestV2 request = {0};
+	R2SleighPlannerQueryResponseV2 response = {0};
+	request.depth = depth;
+	request.function_count = function_count;
+	uint32_t status = sleigh_v2_planner_query (R2SLEIGH_PLANNER_POST_ANALYSIS_V2, &request, &response);
+	if (status != R2SLEIGH_STATUS_OK_V2) {
+		R_LOG_ERROR ("r2sleigh: post-analysis plan query failed (%u)", status);
+		return (R2SleighPostAnalysisPlanV2){0};
+	}
+	return response.post_analysis;
+}
+
+static R2SleighAutoCallbackPlanV2 sleigh_v2_query_auto_callback(unsigned int depth, unsigned int kind, unsigned int basic_block_count, unsigned int cost, unsigned long long linear_size) {
+	R2SleighPlannerQueryRequestV2 request = {0};
+	R2SleighPlannerQueryResponseV2 response = {0};
+	request.depth = depth;
+	request.callback_kind = kind;
+	request.basic_block_count = basic_block_count;
+	request.cost = cost;
+	request.linear_size = linear_size;
+	uint32_t status = sleigh_v2_planner_query (R2SLEIGH_PLANNER_AUTO_CALLBACK_V2, &request, &response);
+	if (status != R2SLEIGH_STATUS_OK_V2) {
+		R_LOG_ERROR ("r2sleigh: auto-callback plan query failed (%u)", status);
+		R2SleighAutoCallbackPlanV2 denied = {
+			.kind = kind,
+			.reason = R2SLEIGH_AUTO_CALLBACK_REASON_MODE_NOT_FULL_V2,
+		};
+		return denied;
+	}
+	return response.auto_callback;
+}
+
+static R2SleighInterprocSessionPlan sleigh_v2_query_interproc_session(unsigned int depth, unsigned int purpose, size_t basic_block_count, unsigned int cost) {
+	R2SleighPlannerQueryRequestV2 request = {0};
+	R2SleighPlannerQueryResponseV2 response = {0};
+	request.depth = depth;
+	request.purpose = purpose;
+	request.basic_block_count = basic_block_count;
+	request.cost = cost;
+	uint32_t status = sleigh_v2_planner_query (R2SLEIGH_PLANNER_INTERPROC_SESSION_V2, &request, &response);
+	if (status != R2SLEIGH_STATUS_OK_V2) {
+		R_LOG_ERROR ("r2sleigh: interproc session plan query failed (%u)", status);
+		return (R2SleighInterprocSessionPlan){0};
+	}
+	return response.interproc_session;
+}
+
+static R2SleighSymbolicScopeFunctionPlanV2 sleigh_v2_query_symbolic_scope(size_t current_scope_count, int root_function, int target_hint_function, R2SleighInterprocSessionPlan interproc) {
+	R2SleighPlannerQueryRequestV2 request = {0};
+	R2SleighPlannerQueryResponseV2 response = {0};
+	request.current_scope_count = current_scope_count;
+	request.root_function = root_function? 1: 0;
+	request.target_hint_function = target_hint_function? 1: 0;
+	request.interproc = interproc;
+	uint32_t status = sleigh_v2_planner_query (R2SLEIGH_PLANNER_SYMBOLIC_SCOPE_V2, &request, &response);
+	if (status != R2SLEIGH_STATUS_OK_V2) {
+		R_LOG_ERROR ("r2sleigh: symbolic scope plan query failed (%u)", status);
+		return (R2SleighSymbolicScopeFunctionPlanV2){0};
+	}
+	return response.symbolic_scope;
+}
+
+static R2SleighRuntimeMaterializedSourcePlanV2 sleigh_v2_query_runtime_source(size_t current_scope_count, unsigned long long addr, unsigned long long size) {
+	R2SleighPlannerQueryRequestV2 request = {0};
+	R2SleighPlannerQueryResponseV2 response = {0};
+	request.current_scope_count = current_scope_count;
+	request.addr = addr;
+	request.size = size;
+	uint32_t status = sleigh_v2_planner_query (R2SLEIGH_PLANNER_RUNTIME_SOURCE_V2, &request, &response);
+	if (status != R2SLEIGH_STATUS_OK_V2) {
+		R_LOG_ERROR ("r2sleigh: runtime source plan query failed (%u)", status);
+		return (R2SleighRuntimeMaterializedSourcePlanV2){0};
+	}
+	return response.runtime_source;
+}
+
+static char *sleigh_lift_byte_view_copy(R2SleighByteViewV2 view) {
+	if ((!view.data && view.len) || view.len == SIZE_MAX) {
+		return NULL;
+	}
+	char *copy = malloc (view.len + 1);
+	if (!copy) {
+		return NULL;
+	}
+	if (view.len) {
+		memcpy (copy, view.data, view.len);
+	}
+	copy[view.len] = '\0';
+	return copy;
+}
+
+static uint32_t sleigh_lift_owned_bytes_copy(const R2SleighApiV2 *api, R2SleighOwnedBytesV2 *bytes, char **output) {
+	if (!output) {
+		return R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
+	}
+	*output = NULL;
+	if (!api || !bytes) {
+		return R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
+	}
+	R2SleighByteViewV2 view = {0};
+	uint32_t status = api->owned_bytes_view (bytes, &view);
+	if (status == R2SLEIGH_STATUS_OK_V2) {
+		*output = sleigh_lift_byte_view_copy (view);
+		if (!*output) {
+			status = R2SLEIGH_STATUS_ENGINE_ERROR_V2;
+		}
+	}
+	uint32_t free_status = api->owned_bytes_free (bytes);
+	return status == R2SLEIGH_STATUS_OK_V2? free_status: status;
+}
+
+static uint32_t sleigh_v2_context_create(const char *arch, R2ILContext **context) {
+	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
+	if (!context) {
+		return R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
+	}
+	*context = NULL;
+	if (!api || !arch) {
+		return R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
+	}
+	R2SleighStringViewV2 view = {
+		.data = (const uint8_t *)arch,
+		.len = strlen (arch),
+	};
+	return api->lift_context_create (view, context);
+}
+
+static uint32_t sleigh_v2_context_free(R2ILContext *context) {
+	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
+	return api && context? api->lift_context_free (context)
+		: R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
+}
+
+static uint32_t sleigh_v2_context_is_loaded(const R2ILContext *context, uint32_t *loaded) {
+	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
+	if (!loaded) {
+		return R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
+	}
+	*loaded = 0;
+	return api && context? api->lift_context_is_loaded (context, loaded)
+		: R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
+}
+
+static uint32_t sleigh_v2_context_arch_name(const R2ILContext *context, char **name) {
+	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
+	if (!name) {
+		return R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
+	}
+	*name = NULL;
+	R2SleighByteViewV2 view = {0};
+	if (!api || !context) {
+		return R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
+	}
+	uint32_t status = api->lift_context_arch_name (context, &view);
+	if (status != R2SLEIGH_STATUS_OK_V2) {
+		return status;
+	}
+	*name = sleigh_lift_byte_view_copy (view);
+	return *name? R2SLEIGH_STATUS_OK_V2: R2SLEIGH_STATUS_ENGINE_ERROR_V2;
+}
+
+static uint32_t sleigh_v2_context_error(const R2ILContext *context, char **message) {
+	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
+	if (!message) {
+		return R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
+	}
+	*message = NULL;
+	R2SleighByteViewV2 view = {0};
+	if (!api || !context) {
+		return R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
+	}
+	uint32_t status = api->lift_context_error (context, &view);
+	if (status != R2SLEIGH_STATUS_OK_V2) {
+		return status;
+	}
+	*message = sleigh_lift_byte_view_copy (view);
+	return *message? R2SLEIGH_STATUS_OK_V2: R2SLEIGH_STATUS_ENGINE_ERROR_V2;
+}
+
+static uint32_t sleigh_v2_context_reg_profile(const R2ILContext *context, char **profile) {
+	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
+	if (!profile) {
+		return R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
+	}
+	*profile = NULL;
+	R2SleighOwnedBytesV2 *bytes = NULL;
+	if (!api || !context) {
+		return R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
+	}
+	uint32_t status = api->lift_context_reg_profile (context, &bytes);
+	if (status != R2SLEIGH_STATUS_OK_V2) {
+		return status;
+	}
+	return sleigh_lift_owned_bytes_copy (api, bytes, profile);
+}
+
+static uint32_t sleigh_v2_lift_instruction(R2ILContext *context, const unsigned char *bytes, size_t len, unsigned long long addr, R2ILBlock **block) {
+	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
+	if (!block) {
+		return R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
+	}
+	*block = NULL;
+	R2SleighByteViewV2 view = {
+		.data = bytes,
+		.len = len,
+	};
+	return api? api->lift_instruction (context, view, addr, block)
+		: R2SLEIGH_STATUS_ABI_MISMATCH_V2;
+}
+
+static uint32_t sleigh_v2_lift_block(R2ILContext *context, const unsigned char *bytes, size_t len, unsigned long long addr, unsigned int block_size, R2ILBlock **block) {
+	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
+	if (!block) {
+		return R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
+	}
+	*block = NULL;
+	R2SleighByteViewV2 view = {
+		.data = bytes,
+		.len = len,
+	};
+	return api? api->lift_block (context, view, addr, block_size, block)
+		: R2SLEIGH_STATUS_ABI_MISMATCH_V2;
+}
+
+static uint32_t sleigh_v2_context_set_semantic_metadata(R2ILContext *context, bool enabled) {
+	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
+	return api && context? api->lift_context_set_semantic_metadata (context, enabled? 1: 0)
+		: R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
+}
+
+static uint32_t sleigh_v2_block_free(R2ILBlock *block) {
+	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
+	return api && block? api->lift_block_free (block)
+		: R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
+}
+
+static bool sleigh_v2_block_release(R2ILBlock **block) {
+	if (!block || !*block) {
+		return true;
+	}
+	uint32_t status = sleigh_v2_block_free (*block);
+	if (status != R2SLEIGH_STATUS_OK_V2) {
+		R_LOG_ERROR ("r2sleigh: retaining block after free failure (%u)", status);
+		return false;
+	}
+	*block = NULL;
+	return true;
+}
+
+static uint32_t sleigh_v2_block_validate(R2ILContext *context, const R2ILBlock *block) {
+	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
+	return api && context && block? api->lift_block_validate (context, block)
+		: R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
+}
+
+static uint32_t sleigh_v2_block_set_switch_info(R2ILBlock *block, unsigned long long switch_addr,
+	unsigned long long min_val, unsigned long long max_val,
+	unsigned long long default_target, int has_default,
+	const R2SleighSwitchCaseV2 *cases, size_t case_count) {
+	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
+	return api && block? api->lift_block_set_switch_info (block, switch_addr,
+		min_val, max_val, default_target, has_default? 1: 0, cases, case_count)
+		: R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
+}
+
+static uint32_t sleigh_v2_block_op_count(const R2ILBlock *block, size_t *count) {
+	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
+	if (!count) {
+		return R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
+	}
+	*count = 0;
+	return api && block? api->lift_block_op_count (block, count)
+		: R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
+}
+
+static uint32_t sleigh_v2_block_size(const R2ILBlock *block, uint32_t *value) {
+	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
+	if (value) {
+		*value = 0;
+	}
+	return api && block && value? api->lift_block_size (block, value)
+		: R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
+}
+
+static uint32_t sleigh_v2_block_addr(const R2ILBlock *block, uint64_t *value) {
+	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
+	if (value) {
+		*value = 0;
+	}
+	return api && block && value? api->lift_block_addr (block, value)
+		: R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
+}
+
+static uint32_t sleigh_v2_block_mnemonic(const R2ILContext *context, const unsigned char *bytes, size_t len, unsigned long long addr, char **text) {
+	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
+	if (!text) {
+		return R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
+	}
+	*text = NULL;
+	R2SleighOwnedBytesV2 *mnemonic = NULL;
+	R2SleighByteViewV2 view = {
+		.data = bytes,
+		.len = len,
+	};
+	if (!api) {
+		return R2SLEIGH_STATUS_ABI_MISMATCH_V2;
+	}
+	uint32_t status = api->lift_block_mnemonic (context, view, addr, &mnemonic);
+	if (status != R2SLEIGH_STATUS_OK_V2) {
+		return status;
+	}
+	return sleigh_lift_owned_bytes_copy (api, mnemonic, text);
+}
+
+static uint32_t sleigh_v2_block_type(const R2ILBlock *block, uint32_t *value) {
+	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
+	if (value) {
+		*value = 0;
+	}
+	return api && block && value? api->lift_block_type (block, value)
+		: R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
+}
+
+static uint32_t sleigh_v2_block_jump(const R2ILBlock *block, uint64_t *value) {
+	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
+	if (value) {
+		*value = 0;
+	}
+	return api && block && value? api->lift_block_jump (block, value)
+		: R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
+}
+
+static uint32_t sleigh_v2_block_fail(const R2ILBlock *block, uint64_t *value) {
+	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
+	if (value) {
+		*value = 0;
+	}
+	return api && block && value? api->lift_block_fail (block, value)
+		: R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
+}
+
+static uint32_t sleigh_v2_analysis_render(uint32_t kind, const R2ILContext *context,
+	const R2ILBlock *const *blocks, size_t num_blocks, size_t op_index,
+	const char *argument, char **text) {
+	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
+	if (!text) {
+		return R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
+	}
+	*text = NULL;
+	if (!api) {
+		return R2SLEIGH_STATUS_ABI_MISMATCH_V2;
+	}
+	R2SleighAnalysisRenderRequestV2 request = {
+		.kind = kind,
+		.context = context,
+		.blocks = blocks,
+		.num_blocks = num_blocks,
+		.op_index = op_index,
+		.argument = {
+			.data = (const uint8_t *)argument,
+			.len = argument? strlen (argument): 0,
+		},
+	};
+	R2SleighOwnedBytesV2 *bytes = NULL;
+	uint32_t status = api->analysis_render (&request, &bytes);
+	if (status != R2SLEIGH_STATUS_OK_V2) {
+		return status;
+	}
+	return sleigh_lift_owned_bytes_copy (api, bytes, text);
+}
+
+static uint32_t sleigh_v2_scope_render(uint32_t kind, const R2ILContext *context,
+	const R2ILFunctionBlocks *functions, size_t num_functions,
+	uint64_t entry_addr, uint64_t target_addr, const R2SymReplaySeed *replay_seed,
+	const char *argument, const char *external_context,
+	const R2SleighScopeSymbolV2 *symbols, size_t num_symbols, bool merge_states,
+	char **text) {
+	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
+	if (!text) {
+		return R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
+	}
+	*text = NULL;
+	if (!api) {
+		return R2SLEIGH_STATUS_ABI_MISMATCH_V2;
+	}
+	R2SleighScopeRenderRequestV2 request = {
+		.kind = kind,
+		.context = context,
+		.functions = functions,
+		.num_functions = num_functions,
+		.entry_addr = entry_addr,
+		.target_addr = target_addr,
+		.replay_seed = replay_seed,
+		.argument = {
+			.data = (const uint8_t *)argument,
+			.len = argument? strlen (argument): 0,
+		},
+		.external_context = {
+			.data = (const uint8_t *)external_context,
+			.len = external_context? strlen (external_context): 0,
+		},
+		.symbols = symbols,
+		.num_symbols = num_symbols,
+		.merge_states = merge_states? 1: 0,
+	};
+	R2SleighOwnedBytesV2 *bytes = NULL;
+	uint32_t status = api->scope_render (&request, &bytes);
+	if (status != R2SLEIGH_STATUS_OK_V2) {
+		return status;
+	}
+	return sleigh_lift_owned_bytes_copy (api, bytes, text);
+}
+
+static uint32_t sleigh_v2_analysis_query(uint32_t kind, const R2ILContext *context,
+	const R2ILBlock *const *blocks, size_t num_blocks, uint64_t function_addr,
+	const char *function_name, const uint64_t *input_values, size_t num_input_values,
+	R2SleighAnalysisResultV2 **result, R2SleighAnalysisResultViewV2 *view) {
+	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
+	if (!result || !view) {
+		return R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
+	}
+	*result = NULL;
+	memset (view, 0, sizeof (*view));
+	if (!api) {
+		return R2SLEIGH_STATUS_ABI_MISMATCH_V2;
+	}
+	R2SleighAnalysisQueryRequestV2 request = {
+		.kind = kind,
+		.context = context,
+		.blocks = blocks,
+		.num_blocks = num_blocks,
+		.function_addr = function_addr,
+		.function_name = {
+			.data = (const uint8_t *)function_name,
+			.len = function_name? strlen (function_name): 0,
+		},
+		.input_values = input_values,
+		.num_input_values = num_input_values,
+	};
+	uint32_t status = api->analysis_query (&request, result);
+	if (status != R2SLEIGH_STATUS_OK_V2) {
+		return status;
+	}
+	status = api->analysis_result_view (*result, view);
+	if (status != R2SLEIGH_STATUS_OK_V2) {
+		uint32_t free_status = api->analysis_result_free (*result);
+		if (free_status == R2SLEIGH_STATUS_OK_V2) {
+			*result = NULL;
+		} else {
+			R_LOG_ERROR ("r2sleigh: retaining analysis result after free failure (%u)", free_status);
+		}
+	}
+	return status;
+}
+
+static uint32_t sleigh_v2_analysis_result_free(R2SleighAnalysisResultV2 *result) {
+	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
+	return api && result? api->analysis_result_free (result)
+		: R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
+}
+
+static bool sleigh_v2_analysis_result_release(R2SleighAnalysisResultV2 **result) {
+	if (!result || !*result) {
+		return true;
+	}
+	uint32_t status = sleigh_v2_analysis_result_free (*result);
+	if (status != R2SLEIGH_STATUS_OK_V2) {
+		R_LOG_ERROR ("r2sleigh: retaining analysis result after free failure (%u)", status);
+		return false;
+	}
+	*result = NULL;
+	return true;
+}
+
+static uint32_t sleigh_v2_engine_cache_reset(void) {
+	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
+	return api? api->engine_cache_reset (): R2SLEIGH_STATUS_ABI_MISMATCH_V2;
+}
+
 /* Per-architecture context (lazy init)
  *
  * WARNING: These globals are NOT thread-safe. This plugin assumes
@@ -322,6 +1246,33 @@ extern void r2sleigh_data_refs_free(R2SleighDataRefs *refs);
 static R2ILContext *sleigh_ctx = NULL;
 static char *sleigh_arch = NULL;
 static char *sleigh_arch_override = NULL;
+static R_TH_LOCAL R2SleighPlannerResultV2 *sleigh_pending_target_plan = NULL;
+
+static bool sleigh_v2_planner_result_release(R2SleighPlannerResultV2 **result) {
+	if (!result || !*result) {
+		return true;
+	}
+	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
+	if (!api) {
+		R_LOG_ERROR ("r2sleigh: retaining planner result because the V2 API is unavailable");
+		return false;
+	}
+	R2SleighPlannerResultV2 *owned = *result;
+	uint32_t status = api->planner_result_free (owned);
+	if (status != R2SLEIGH_STATUS_OK_V2) {
+		R_LOG_ERROR ("r2sleigh: retaining planner result after free failure (%u)", status);
+		return false;
+	}
+	if (sleigh_pending_target_plan == owned) {
+		sleigh_pending_target_plan = NULL;
+	}
+	*result = NULL;
+	return true;
+}
+
+static bool sleigh_v2_planner_result_retry_pending(void) {
+	return sleigh_v2_planner_result_release (&sleigh_pending_target_plan);
+}
 
 void r2sleigh_set_arch_override(const char *arch) {
 	if (!arch || !*arch || (sleigh_arch_override && !strcmp (sleigh_arch_override, arch))) {
@@ -347,78 +1298,13 @@ static int collect_data_refs_from_typed(
 	RAnalFunction *fcn,
 	const R2SleighDataRef *items,
 	size_t count,
-	RVecAnalRef *refs,
-	bool apply_to_anal);
-
-typedef RAnalFunctionSnapshot *(*SleighFunctionSnapshotCollectWithLimitsFn)(
-	RAnal *anal, RAnalFunction *fcn, const RAnalFunctionSnapshotLimits *limits);
-typedef void (*SleighFunctionSnapshotFreeFn)(RAnalFunctionSnapshot *snapshot);
-
-typedef struct {
-	bool resolved;
-	bool available;
-	bool snapshot_available;
-	bool warned;
-	bool warned_unbounded_snapshot;
-	SleighFunctionSnapshotCollectWithLimitsFn snapshot_collect_with_limits;
-	SleighFunctionSnapshotFreeFn snapshot_free;
-} SleighFunctionContextApi;
-
-static SleighFunctionContextApi sleigh_function_context_api = {0};
+	RVecAnalRef *refs);
 
 typedef enum {
 	SLEIGH_MODE_FAST = 0,
 	SLEIGH_MODE_BALANCED = 1,
 	SLEIGH_MODE_FULL = 2,
 } SleighMode;
-
-typedef struct {
-	unsigned int mode;
-	unsigned int type_writeback_mode;
-	int type_interproc_max_iters;
-	int type_max_blocks;
-	int type_global_max_links;
-	int type_max_decls;
-	int type_max_mutations;
-} R2SleighAnalysisPolicy;
-
-extern R2SleighAnalysisPolicy r2sleigh_analysis_policy_for_depth(unsigned int depth);
-
-typedef struct {
-	unsigned int mode;
-	unsigned int type_writeback_mode;
-	int type_interproc_max_iters;
-	int type_max_blocks;
-	int type_global_max_links;
-	int type_max_decls;
-	int type_max_mutations;
-	size_t function_count;
-	ut64 post_budget_us;
-	int xref_enabled;
-	int taint_enabled;
-	int sigwrite_enabled;
-	int type_writeback_enabled;
-	int semantic_comments_enabled;
-	int sigverify_enabled;
-	int balanced_focus_only;
-	int taint_focus_only;
-	int sigwrite_focus_only;
-	int type_writeback_focus_only;
-} R2SleighPostAnalysisPlan;
-
-typedef struct {
-	int allowed;
-	unsigned int kind;
-	unsigned int reason;
-} R2SleighAutoCallbackPlan;
-
-extern R2SleighPostAnalysisPlan r2sleigh_post_analysis_plan_for_depth(unsigned int depth, size_t function_count);
-extern R2SleighAutoCallbackPlan r2sleigh_auto_callback_plan_for_depth(
-	unsigned int depth,
-	unsigned int kind,
-	unsigned int basic_block_count,
-	unsigned int cost,
-	unsigned long long linear_size);
 
 typedef enum {
 	SLEIGH_PROFILE_STAGE_LIFT,
@@ -468,22 +1354,6 @@ typedef struct {
 	size_t capacity;
 	R2SleighLiftQuality quality;
 } BlockArray;
-
-typedef enum {
-	R2SLEIGH_AUTO_CALLBACK_ANALYZE_FUNCTION = 0,
-	R2SLEIGH_AUTO_CALLBACK_RECOVER_VARS = 1,
-	R2SLEIGH_AUTO_CALLBACK_DATA_REFS = 2,
-	R2SLEIGH_AUTO_CALLBACK_POST_ANALYSIS_TAINT = 3,
-	R2SLEIGH_AUTO_CALLBACK_POST_ANALYSIS_XREF = 4,
-} R2SleighAutoCallbackKind;
-
-typedef enum {
-	R2SLEIGH_AUTO_CALLBACK_REASON_ALLOWED = 0,
-	R2SLEIGH_AUTO_CALLBACK_REASON_MODE_NOT_FULL = 1,
-	R2SLEIGH_AUTO_CALLBACK_REASON_TOO_MANY_BLOCKS = 2,
-	R2SLEIGH_AUTO_CALLBACK_REASON_TOO_LARGE = 3,
-	R2SLEIGH_AUTO_CALLBACK_REASON_TOO_COSTLY = 4,
-} R2SleighAutoCallbackReason;
 
 typedef struct {
 	ut64 start_us;
@@ -535,607 +1405,16 @@ typedef struct {
 } SymFunctionScope;
 
 typedef struct {
-	SymFunctionScope sym_scope;
-	R2SleighInterprocSeed *seeds;
-	size_t seed_count;
-	size_t seed_capacity;
-	size_t borrowed_seed_count;
-	R2SleighInterprocScope scope;
-	R2SleighInterprocSessionPlan plan;
-} SleighInterprocScope;
+	R2SleighScopeSymbolV2 *symbols;
+	char **owned_names;
+	size_t count;
+	size_t total_name_bytes;
+} SymScopeSymbolSnapshot;
 
-static const char *function_context_stack_base_name(RAnalFcnSlotBase base, const char *base_name);
-static unsigned int function_context_stack_slot_role_id(RAnalFcnSlotRole role);
-static unsigned int function_context_base_type_kind_id(RAnalBaseTypeKind kind);
-static unsigned int function_context_callee_linkage_id(RAnalFcnCalleeLinkage linkage);
-
-typedef struct {
-	R2SleighFunctionContext context;
-	RAnalFcnContext *typed_ctx;
-	RAnalFunctionSnapshot *snapshot;
-	RList *typed_base_types;
-	R2SleighContextParam *typed_params;
-	R2SleighContextVar *typed_vars;
-	R2SleighContextBaseType *typed_base_type_entries;
-	R2SleighContextCallee *typed_callees;
-	R2SleighContextParam *typed_callee_params;
-} SleighTypedFunctionContext;
-
-static void sleigh_typed_function_context_clear(SleighTypedFunctionContext *typed) {
-	if (!typed) {
-		return;
-	}
-	if (typed->typed_base_type_entries) {
-		for (size_t i = 0; i < typed->context.num_base_types; i++) {
-			free ((void *)typed->typed_base_type_entries[i].members);
-			free ((void *)typed->typed_base_type_entries[i].variants);
-		}
-	}
-	free (typed->typed_base_type_entries);
-	free (typed->typed_callee_params);
-	free (typed->typed_callees);
-	free (typed->typed_vars);
-	free (typed->typed_params);
-	if (typed->snapshot && sleigh_function_context_api.snapshot_free) {
-		sleigh_function_context_api.snapshot_free (typed->snapshot);
-	}
-	memset (typed, 0, sizeof (*typed));
-}
-
-typedef struct {
-	R2SleighSourceFunctionInterfaceV2 interface;
-	R2SleighSourceParameterV2 *parameters;
-	R2SleighSourceParameterTypeV2 *parameter_types;
-	R2SleighSourceTypeV2 *types;
-	R2SleighSourceAggregateLayoutV2 *aggregates;
-	R2SleighSourceAggregateMemberV2 *aggregate_members;
-	// The array is owned here; its names borrow immutable context.fcn_slots.
-	R2SleighSourceStackSlotV2 *stack_slots;
-	R2SleighSourceCallSiteInterfaceV2 *call_sites;
-	R2SleighSourceCallArgumentV2 *call_arguments;
-} SleighSourceInterfaceV2;
-
-static R2SleighStringViewV2 sleigh_string_view_v2(const char *text) {
-	R2SleighStringViewV2 view = {0};
-	if (text) {
-		view.data = (const uint8_t *)text;
-		view.len = strlen (text);
-	}
-	return view;
-}
-
-static void sleigh_source_interface_v2_clear(SleighSourceInterfaceV2 *source) {
-	if (!source) {
-		return;
-	}
-	free (source->parameters);
-	free (source->parameter_types);
-	free (source->types);
-	free (source->aggregates);
-	free (source->aggregate_members);
-	free (source->stack_slots);
-	free (source->call_sites);
-	free (source->call_arguments);
-	memset (source, 0, sizeof (*source));
-}
-
-static bool sleigh_source_carrier_v2_copy(
-	R2SleighSourceCarrierProjectionV2 *destination,
-	const RAnalSnapshotCarrierProjection *source
-) {
-	if (!destination || !source || source->offset_bits) {
-		return false;
-	}
-	switch (source->kind) {
-	case R_ANAL_SNAPSHOT_CARRIER_FULL:
-		destination->kind = R2SLEIGH_SOURCE_CARRIER_FULL_V2;
-		break;
-	case R_ANAL_SNAPSHOT_CARRIER_LOW_BITS:
-		destination->kind = R2SLEIGH_SOURCE_CARRIER_LOW_BITS_V2;
-		break;
-	default:
-		return false;
-	}
-	destination->size_bits = source->size_bits;
-	return destination->size_bits != 0;
-}
-
-static bool sleigh_source_type_graph_v2_build(
-	const RAnalFunctionSnapshot *snapshot,
-	SleighSourceInterfaceV2 *source
-) {
-	source->interface.return_type_id = R2SLEIGH_SOURCE_TYPE_ID_INVALID_V2;
-	if (!(snapshot->capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_FUNCTION_TYPES)) {
-		return true;
-	}
-	const RAnalFunctionInterfaceSnapshot *interface = &snapshot->function_interface;
-	const RAnalSnapshotTypeGraph *graph = &snapshot->type_graph;
-	if (!graph->complete || !interface->logical_types_complete
-		|| (graph->num_types && !graph->types)
-		|| (graph->num_aggregates && !graph->aggregates)
-		|| graph->num_types > R2SLEIGH_MAX_CONTEXT_ITEMS_V2
-		|| graph->num_aggregates > R2SLEIGH_MAX_CONTEXT_ITEMS_V2
-		|| graph->num_types > UINT32_MAX || graph->num_aggregates > UINT32_MAX
-		|| interface->num_parameters > R2SLEIGH_MAX_CONTEXT_ITEMS_V2) {
-		return false;
-	}
-	size_t total_members = 0;
-	size_t i;
-	for (i = 0; i < graph->num_aggregates; i++) {
-		const RAnalSnapshotAggregateLayout *aggregate = &graph->aggregates[i];
-		if ((aggregate->num_members && !aggregate->members)
-			|| aggregate->num_members > R2SLEIGH_MAX_NESTED_ITEMS_V2 - total_members) {
-			return false;
-		}
-		total_members += aggregate->num_members;
-	}
-	if (interface->num_parameters) {
-		source->parameter_types = calloc (interface->num_parameters,
-			sizeof (*source->parameter_types));
-		if (!source->parameter_types) {
-			return false;
-		}
-	}
-	if (graph->num_types) {
-		source->types = calloc (graph->num_types, sizeof (*source->types));
-		if (!source->types) {
-			return false;
-		}
-	}
-	if (graph->num_aggregates) {
-		source->aggregates = calloc (graph->num_aggregates,
-			sizeof (*source->aggregates));
-		if (!source->aggregates) {
-			return false;
-		}
-	}
-	if (total_members) {
-		source->aggregate_members = calloc (total_members,
-			sizeof (*source->aggregate_members));
-		if (!source->aggregate_members) {
-			return false;
-		}
-	}
-	for (i = 0; i < interface->num_parameters; i++) {
-		const RAnalSnapshotParameter *parameter = &interface->parameters[i];
-		R2SleighSourceParameterTypeV2 *destination = &source->parameter_types[i];
-		if (parameter->index != i
-			|| parameter->logical_type_id == R_ANAL_SNAPSHOT_TYPE_ID_INVALID
-			|| !sleigh_source_carrier_v2_copy (&destination->carrier,
-				&parameter->carrier)) {
-			return false;
-		}
-		destination->index = parameter->index;
-		destination->type_id = parameter->logical_type_id;
-	}
-	for (i = 0; i < graph->num_types; i++) {
-		const RAnalSnapshotType *type = &graph->types[i];
-		R2SleighSourceTypeV2 *destination = &source->types[i];
-		if (type->id != i) {
-			return false;
-		}
-		destination->id = type->id;
-		switch (type->kind) {
-		case R_ANAL_SNAPSHOT_TYPE_SIGNED_INTEGER:
-			destination->kind = R2SLEIGH_SOURCE_TYPE_SIGNED_INTEGER_V2;
-			break;
-		case R_ANAL_SNAPSHOT_TYPE_UNSIGNED_INTEGER:
-			destination->kind = R2SLEIGH_SOURCE_TYPE_UNSIGNED_INTEGER_V2;
-			break;
-		case R_ANAL_SNAPSHOT_TYPE_POINTER:
-			destination->kind = R2SLEIGH_SOURCE_TYPE_POINTER_V2;
-			break;
-		case R_ANAL_SNAPSHOT_TYPE_STRUCT:
-			destination->kind = R2SLEIGH_SOURCE_TYPE_STRUCT_V2;
-			break;
-		default:
-			return false;
-		}
-		destination->size_bits = type->size_bits;
-		destination->align_bits = type->align_bits;
-		destination->target_type_id = type->target_type_id;
-		destination->aggregate_id = type->aggregate_id;
-	}
-	size_t member_index = 0;
-	for (i = 0; i < graph->num_aggregates; i++) {
-		const RAnalSnapshotAggregateLayout *aggregate = &graph->aggregates[i];
-		R2SleighSourceAggregateLayoutV2 *destination = &source->aggregates[i];
-		destination->id = aggregate->id;
-		destination->type_id = aggregate->type_id;
-		destination->size_bits = aggregate->size_bits;
-		destination->align_bits = aggregate->align_bits;
-		destination->name = sleigh_string_view_v2 (aggregate->name);
-		destination->members = aggregate->num_members
-			? &source->aggregate_members[member_index]: NULL;
-		destination->num_members = aggregate->num_members;
-		destination->complete = aggregate->complete? 1: 0;
-		destination->c_layout_compatible = aggregate->c_layout_compatible? 1: 0;
-		size_t j;
-		for (j = 0; j < aggregate->num_members; j++) {
-			const RAnalSnapshotAggregateMember *member = &aggregate->members[j];
-			R2SleighSourceAggregateMemberV2 *member_destination =
-				&source->aggregate_members[member_index++];
-			member_destination->member_id = member->member_id;
-			member_destination->type_id = member->type_id;
-			member_destination->offset_bits = member->offset_bits;
-			member_destination->size_bits = member->size_bits;
-			member_destination->count = member->count;
-			member_destination->name = sleigh_string_view_v2 (member->name);
-		}
-	}
-	if (member_index != total_members) {
-		return false;
-	}
-	if (interface->return_kind == R_ANAL_SNAPSHOT_RETURN_REGISTER) {
-		if (interface->return_type_id == R_ANAL_SNAPSHOT_TYPE_ID_INVALID
-			|| !sleigh_source_carrier_v2_copy (&source->interface.return_carrier,
-				&interface->return_carrier)) {
-			return false;
-		}
-		source->interface.return_type_id = interface->return_type_id;
-	} else if (interface->return_kind != R_ANAL_SNAPSHOT_RETURN_VOID) {
-		return false;
-	}
-	source->interface.parameter_types = source->parameter_types;
-	source->interface.num_parameter_types = interface->num_parameters;
-	source->interface.types = source->types;
-	source->interface.num_types = graph->num_types;
-	source->interface.aggregates = source->aggregates;
-	source->interface.num_aggregates = graph->num_aggregates;
-	source->interface.exact_types_complete = 1;
-	return true;
-}
-
-static bool sleigh_call_site_snapshot_transportable(const RAnalCallSiteInterfaceSnapshot *call) {
-	if (!call || R_STR_ISEMPTY (call->calling_convention)
-		|| (call->num_arguments && !call->arguments)
-		|| (call->result_kind != R_ANAL_SNAPSHOT_RETURN_VOID
-			&& call->result_kind != R_ANAL_SNAPSHOT_RETURN_REGISTER)) {
-		return false;
-	}
-	size_t i;
-	for (i = 0; i < call->num_arguments; i++) {
-		if (call->arguments[i].index != i
-			|| R_STR_ISEMPTY (call->arguments[i].storage.name)
-			|| !call->arguments[i].storage.size) {
-			return false;
-		}
-	}
-	return call->result_kind != R_ANAL_SNAPSHOT_RETURN_REGISTER
-		|| (R_STR_ISNOTEMPTY (call->result_storage.name) && call->result_storage.size);
-}
-
-static int sleigh_call_site_lifted_identity(
-	const BlockArray *blocks,
-	const RAnalCallSiteInterfaceSnapshot *call,
-	ut64 *block_addr,
-	R2ILDirectCallIdentity *identity
-) {
-	if (!blocks || !call || !block_addr || !identity) {
-		return -1;
-	}
-	int matches = 0;
-	size_t i;
-	for (i = 0; i < blocks->count; i++) {
-		R2ILDirectCallIdentity candidate = {0};
-		int state = r2il_block_direct_call_identity (blocks->blocks[i],
-			call->instruction_addr, call->target_addr, &candidate);
-		if (state < 0) {
-			return -1;
-		}
-		if (!state) {
-			continue;
-		}
-		matches++;
-		if (matches != 1) {
-			return -1;
-		}
-		*block_addr = r2il_block_addr (blocks->blocks[i]);
-		*identity = candidate;
-	}
-	return matches == 1? 1: -1;
-}
-
-static bool sleigh_source_call_sites_v2_build(
-	const SleighTypedFunctionContext *typed,
-	const BlockArray *blocks,
-	SleighSourceInterfaceV2 *source
-) {
-	const RAnalFunctionSnapshot *snapshot = typed->snapshot;
-	if (!(snapshot->capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_CALL_SITE_INTERFACES)
-		|| !snapshot->num_call_site_interfaces) {
-		return true;
-	}
-	if (!snapshot->call_site_interfaces
-		|| snapshot->num_call_site_interfaces > R2SLEIGH_MAX_CONTEXT_ITEMS_V2
-		|| snapshot->num_call_site_interfaces > SIZE_MAX / sizeof (*source->call_sites)) {
-		return false;
-	}
-	size_t total_arguments = 0;
-	size_t transportable_count = 0;
-	size_t i, j;
-	for (i = 0; i < snapshot->num_call_site_interfaces; i++) {
-		const RAnalCallSiteInterfaceSnapshot *call = &snapshot->call_site_interfaces[i];
-		for (j = i + 1; j < snapshot->num_call_site_interfaces; j++) {
-			if (call->instruction_addr
-				== snapshot->call_site_interfaces[j].instruction_addr) {
-				return false;
-			}
-		}
-		if (!sleigh_call_site_snapshot_transportable (call)) {
-			// Never transport a partial source callsite set: an unavailable
-			// carrier contract leaves every callsite absent and residual.
-			return true;
-		}
-		if (call->num_arguments > R2SLEIGH_MAX_CONTEXT_ITEMS_V2 - total_arguments) {
-			return false;
-		}
-		total_arguments += call->num_arguments;
-		transportable_count++;
-	}
-	if (!transportable_count) {
-		return true;
-	}
-	source->call_sites = calloc (transportable_count, sizeof (*source->call_sites));
-	if (!source->call_sites) {
-		return false;
-	}
-	if (total_arguments) {
-		if (total_arguments > SIZE_MAX / sizeof (*source->call_arguments)) {
-			return false;
-		}
-		source->call_arguments = calloc (total_arguments, sizeof (*source->call_arguments));
-		if (!source->call_arguments) {
-			return false;
-		}
-	}
-	size_t call_index = 0;
-	size_t argument_index = 0;
-	for (i = 0; i < snapshot->num_call_site_interfaces; i++) {
-		const RAnalCallSiteInterfaceSnapshot *call = &snapshot->call_site_interfaces[i];
-		if (!sleigh_call_site_snapshot_transportable (call)) {
-			continue;
-		}
-		ut64 block_addr = 0;
-		R2ILDirectCallIdentity identity = {0};
-		if (sleigh_call_site_lifted_identity (
-				blocks, call, &block_addr, &identity) < 0) {
-			return false;
-		}
-		R2SleighSourceCallSiteInterfaceV2 *entry = &source->call_sites[call_index];
-		entry->schema_version = R2SLEIGH_SOURCE_CALL_SITE_SCHEMA_V2;
-		entry->struct_size = sizeof (*entry);
-		entry->revision_identity = snapshot->revision_identity;
-		entry->caller_function_addr = snapshot->function_addr;
-		entry->raw_instruction_addr = call->instruction_addr;
-		entry->raw_target_addr = call->target_addr;
-		entry->block_addr = block_addr;
-		entry->op_index = identity.op_index;
-		entry->target.space = identity.target_space;
-		entry->target.custom_space = identity.target_custom_space;
-		entry->target.offset = identity.target_offset;
-		entry->target.size = identity.target_size;
-		entry->calling_convention = sleigh_string_view_v2 (call->calling_convention);
-		entry->arguments = call->num_arguments
-			? &source->call_arguments[argument_index]
-			: NULL;
-		entry->num_arguments = call->num_arguments;
-		for (j = 0; j < call->num_arguments; j++) {
-			R2SleighSourceCallArgumentV2 *argument =
-				&source->call_arguments[argument_index++];
-			argument->index = call->arguments[j].index;
-			argument->storage.name = sleigh_string_view_v2 (call->arguments[j].storage.name);
-			argument->storage.offset = call->arguments[j].storage.offset;
-			argument->storage.size = call->arguments[j].storage.size;
-		}
-		entry->result_kind = call->result_kind == R_ANAL_SNAPSHOT_RETURN_VOID
-			? R2SLEIGH_SOURCE_RETURN_VOID_V2
-			: R2SLEIGH_SOURCE_RETURN_REGISTER_V2;
-		if (call->result_kind == R_ANAL_SNAPSHOT_RETURN_REGISTER) {
-			entry->result_storage.name = sleigh_string_view_v2 (call->result_storage.name);
-			entry->result_storage.offset = call->result_storage.offset;
-			entry->result_storage.size = call->result_storage.size;
-		}
-		entry->variadic = call->variadic? 1: 0;
-		entry->noreturn = call->noreturn? 1: 0;
-		entry->complete = call->complete? 1: 0;
-		call_index++;
-	}
-	if (call_index != transportable_count || argument_index != total_arguments) {
-		return false;
-	}
-	// This seals array transport completeness only: every callsite represented
-	// by this immutable snapshot was carried. `entry->complete` remains the
-	// independent semantic carrier-contract authority for each callsite.
-	source->interface.call_sites = source->call_sites;
-	source->interface.num_call_sites = transportable_count;
-	source->interface.call_sites_complete = 1;
-	return true;
-}
-// Returns 1 for exact authority, 0 when no exact source interface is present,
-// and -1 when an advertised exact interface is invalid or cannot be copied.
-static int sleigh_source_interface_v2_build(
-	const SleighTypedFunctionContext *typed,
-	const BlockArray *blocks,
-	SleighSourceInterfaceV2 *source
-) {
-	if (!typed || !source) {
-		return -1;
-	}
-	memset (source, 0, sizeof (*source));
-	if (!typed->snapshot
-		|| !(typed->snapshot->capabilities
-			& R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_FUNCTION_INTERFACE)
-		|| !(typed->snapshot->capabilities
-			& R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_STACK_SLOT_ROLES)
-		|| !(typed->snapshot->capabilities
-			& R_ANAL_FUNCTION_SNAPSHOT_CAP_RETURN_ADDRESS_STORAGE)
-		|| !(typed->snapshot->capabilities
-			& R_ANAL_FUNCTION_SNAPSHOT_CAP_STACK_POINTER_STORAGE)) {
-		return 0;
-	}
-	const RAnalFunctionInterfaceSnapshot *interface = &typed->snapshot->function_interface;
-	if (!typed->snapshot->revision_identity
-		|| typed->snapshot->revision_identity != typed->context.context_hash
-		|| !interface->complete || !interface->stack_resources_complete
-		|| !interface->stack_slot_roles_complete
-		|| interface->variadic || interface->noreturn
-		|| !interface->calling_convention
-		|| !typed->snapshot->context.fcn_slots
-		|| !interface->return_address_storage.name
-		|| !interface->return_address_storage.size
-		|| interface->return_address_storage.offset
-			> UINT64_MAX - interface->return_address_storage.size
-		|| !interface->stack_pointer_storage.name
-		|| !interface->stack_pointer_storage.size
-		|| interface->stack_pointer_storage.offset
-			> UINT64_MAX - interface->stack_pointer_storage.size
-		|| (interface->num_parameters && !interface->parameters)
-		|| (interface->return_kind != R_ANAL_SNAPSHOT_RETURN_VOID
-			&& interface->return_kind != R_ANAL_SNAPSHOT_RETURN_REGISTER)) {
-		return -1;
-	}
-	if (interface->num_parameters > SIZE_MAX / sizeof (*source->parameters)) {
-		return -1;
-	}
-	const size_t num_stack_slots = (size_t)r_list_length (typed->snapshot->context.fcn_slots);
-	if (num_stack_slots > SIZE_MAX / sizeof (*source->stack_slots)) {
-		return -1;
-	}
-	if (interface->num_parameters) {
-		source->parameters = calloc (interface->num_parameters, sizeof (*source->parameters));
-		if (!source->parameters) {
-			return -1;
-		}
-	}
-	if (num_stack_slots) {
-		source->stack_slots = calloc (num_stack_slots, sizeof (*source->stack_slots));
-		if (!source->stack_slots) {
-			sleigh_source_interface_v2_clear (source);
-			return -1;
-		}
-	}
-	size_t i;
-	for (i = 0; i < interface->num_parameters; i++) {
-		const RAnalSnapshotParameter *parameter = &interface->parameters[i];
-		if (parameter->index != i || !parameter->storage.name || !parameter->storage.size) {
-			sleigh_source_interface_v2_clear (source);
-			return -1;
-		}
-		source->parameters[i].index = parameter->index;
-		source->parameters[i].storage.name = sleigh_string_view_v2 (parameter->storage.name);
-		source->parameters[i].storage.offset = parameter->storage.offset;
-		source->parameters[i].storage.size = parameter->storage.size;
-	}
-	RListIter *iter;
-	RAnalFcnSlot *slot;
-	i = 0;
-	r_list_foreach (typed->snapshot->context.fcn_slots, iter, slot) {
-		if (i >= num_stack_slots || !slot
-			|| (slot->base != R_ANAL_FCN_BASE_BP && slot->base != R_ANAL_FCN_BASE_SP)
-			|| !slot->base_name || !*slot->base_name || !slot->base_size
-			|| slot->base_offset > UINT64_MAX - slot->base_size
-			|| !slot->offset_valid || !slot->size
-			|| slot->offset > INT64_MAX - (int64_t)slot->size) {
-			sleigh_source_interface_v2_clear (source);
-			return -1;
-		}
-		source->stack_slots[i].base_kind = slot->base == R_ANAL_FCN_BASE_BP
-			? R2SLEIGH_SOURCE_STACK_BASE_BP_V2
-			: R2SLEIGH_SOURCE_STACK_BASE_SP_V2;
-		source->stack_slots[i].base.name = sleigh_string_view_v2 (slot->base_name);
-		source->stack_slots[i].base.offset = slot->base_offset;
-		source->stack_slots[i].base.size = slot->base_size;
-		source->stack_slots[i].offset = slot->offset;
-		source->stack_slots[i].size = slot->size;
-		if (slot->role == R_ANAL_FCN_SLOT_LOCAL) {
-			if (slot->arg_index != -1 || slot->home_reg_offset || slot->home_reg_size) {
-				sleigh_source_interface_v2_clear (source);
-				return -1;
-			}
-			source->stack_slots[i].role = R2SLEIGH_SOURCE_STACK_ROLE_LOCAL_V2;
-			source->stack_slots[i].parameter_index = R2SLEIGH_SOURCE_PARAMETER_INDEX_INVALID_V2;
-		} else if (slot->role == R_ANAL_FCN_SLOT_HOME) {
-			if (slot->arg_index < 0 || (size_t)slot->arg_index >= interface->num_parameters
-				|| !slot->home_reg || !*slot->home_reg
-				|| !slot->home_reg_size
-				|| slot->home_reg_offset > UINT64_MAX - slot->home_reg_size) {
-				sleigh_source_interface_v2_clear (source);
-				return -1;
-			}
-			const RAnalSnapshotParameter *parameter = &interface->parameters[slot->arg_index];
-			if (parameter->index != (uint32_t)slot->arg_index
-				|| parameter->storage.offset != slot->home_reg_offset
-				|| parameter->storage.size != slot->home_reg_size) {
-				sleigh_source_interface_v2_clear (source);
-				return -1;
-			}
-			size_t previous;
-			for (previous = 0; previous < i; previous++) {
-				if (source->stack_slots[previous].role
-						== R2SLEIGH_SOURCE_STACK_ROLE_PARAMETER_HOME_V2
-					&& source->stack_slots[previous].parameter_index
-						== (uint32_t)slot->arg_index) {
-					sleigh_source_interface_v2_clear (source);
-					return -1;
-				}
-			}
-			source->stack_slots[i].role = R2SLEIGH_SOURCE_STACK_ROLE_PARAMETER_HOME_V2;
-			source->stack_slots[i].parameter_index = (uint32_t)slot->arg_index;
-			source->stack_slots[i].home_storage.name = sleigh_string_view_v2 (slot->home_reg);
-			source->stack_slots[i].home_storage.offset = slot->home_reg_offset;
-			source->stack_slots[i].home_storage.size = slot->home_reg_size;
-		} else {
-			sleigh_source_interface_v2_clear (source);
-			return -1;
-		}
-		i++;
-	}
-	if (i != num_stack_slots) {
-		sleigh_source_interface_v2_clear (source);
-		return -1;
-	}
-	source->interface.schema_version = R2SLEIGH_SOURCE_INTERFACE_SCHEMA_V2;
-	source->interface.struct_size = sizeof (source->interface);
-	source->interface.revision_identity = typed->snapshot->revision_identity;
-	source->interface.function_addr = typed->snapshot->function_addr;
-	source->interface.calling_convention = sleigh_string_view_v2 (interface->calling_convention);
-	source->interface.parameters = source->parameters;
-	source->interface.num_parameters = interface->num_parameters;
-	source->interface.stack_slots = source->stack_slots;
-	source->interface.num_stack_slots = num_stack_slots;
-	source->interface.return_kind = interface->return_kind == R_ANAL_SNAPSHOT_RETURN_VOID
-		? R2SLEIGH_SOURCE_RETURN_VOID_V2
-		: R2SLEIGH_SOURCE_RETURN_REGISTER_V2;
-	if (interface->return_kind == R_ANAL_SNAPSHOT_RETURN_REGISTER) {
-		if (!interface->return_storage.name || !interface->return_storage.size) {
-			sleigh_source_interface_v2_clear (source);
-			return -1;
-		}
-		source->interface.return_storage.name =
-			sleigh_string_view_v2 (interface->return_storage.name);
-		source->interface.return_storage.offset = interface->return_storage.offset;
-		source->interface.return_storage.size = interface->return_storage.size;
-	}
-	source->interface.stack_resources_complete = 1;
-	source->interface.stack_slot_roles_complete = 1;
-	source->interface.complete = 1;
-	source->interface.return_address_storage.space = R2SLEIGH_SOURCE_STORAGE_REGISTER_V2;
-	source->interface.return_address_storage.offset = interface->return_address_storage.offset;
-	source->interface.return_address_storage.size = interface->return_address_storage.size;
-	source->interface.stack_pointer_storage.space = R2SLEIGH_SOURCE_STORAGE_REGISTER_V2;
-	source->interface.stack_pointer_storage.offset = interface->stack_pointer_storage.offset;
-	source->interface.stack_pointer_storage.size = interface->stack_pointer_storage.size;
-	if (!sleigh_source_type_graph_v2_build (typed->snapshot, source)) {
-		sleigh_source_interface_v2_clear (source);
-		return -1;
-	}
-	if (!sleigh_source_call_sites_v2_build (typed, blocks, source)) {
-		sleigh_source_interface_v2_clear (source);
-		return -1;
-	}
-	return 1;
-}
+static uint32_t sleigh_v2_scope_render_for_scope(uint32_t kind, RCore *core, RAnal *anal,
+	const R2ILContext *context, const SymFunctionScope *scope, uint64_t entry_addr,
+	uint64_t target_addr, const R2SymReplaySeed *replay_seed, const char *argument,
+	const char *external_context, char **text);
 
 static void sleigh_engine_v2_log_error(
 	const R2SleighApiV2 *api,
@@ -1377,9 +1656,9 @@ static char *sleigh_engine_execute_v2_project(uint32_t kind, uint64_t required_c
 	required_capability |= R2SLEIGH_CAP_NATIVE_REQUEST_GRAPH_V2
 		| R2SLEIGH_CAP_RESPONSE_INFO_V2
 		| R2SLEIGH_CAP_EXECUTION_CONTROL_V2;
-	const R2SleighApiV2 *api = r2sleigh_api_v2 ();
+	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
 	if (!api || api->abi_version != R2SLEIGH_ABI_V2
-		|| api->struct_size < sizeof (*api)
+		|| api->struct_size != sizeof (*api)
 		|| api->radare_abi_version != R2_ABIVERSION
 		|| api->session_config_size != sizeof (R2SleighSessionConfigV2)
 		|| api->request_size != sizeof (R2SleighRequestV2)
@@ -1543,520 +1822,6 @@ static char *sleigh_engine_execute_v2(uint32_t kind, uint64_t required_capabilit
 		kind, required_capability, payload, false);
 }
 
-static char *sleigh_engine_execute_v2_json(uint32_t kind, uint64_t required_capability, const R2SleighEngineRequestPayloadV2 *payload) {
-	return sleigh_engine_execute_v2_project (
-		kind, required_capability, payload, true);
-}
-
-typedef struct {
-	size_t context_items;
-	size_t nested_items;
-	size_t string_bytes;
-	size_t json_bytes;
-} SleighContextPreflightBudget;
-
-static bool sleigh_context_preflight_add(
-	size_t *total,
-	size_t amount,
-	size_t cap,
-	const char *label,
-	ut64 function_addr
-) {
-	if (amount > cap - *total) {
-		R_LOG_ERROR ("r2sleigh: typed snapshot preflight refused function 0x%"PFMT64x": aggregate %s exceeds cap %zu",
-			function_addr, label, cap);
-		return false;
-	}
-	*total += amount;
-	return true;
-}
-
-static bool sleigh_context_preflight_string(
-	SleighContextPreflightBudget *budget,
-	const char *text,
-	bool json,
-	const char *label,
-	ut64 function_addr
-) {
-	if (!text) {
-		return true;
-	}
-	const size_t per_value_cap = json
-		? (size_t)R2SLEIGH_MAX_JSON_BYTES_V2
-		: (size_t)R2SLEIGH_MAX_STRING_BYTES_V2;
-	const size_t aggregate_cap = json
-		? (size_t)R2SLEIGH_MAX_AGGREGATE_JSON_BYTES_V2
-		: (size_t)R2SLEIGH_MAX_AGGREGATE_STRING_BYTES_V2;
-	const size_t length = r_str_nlen (text, (int)per_value_cap + 1);
-	if (length > per_value_cap) {
-		R_LOG_ERROR ("r2sleigh: typed snapshot preflight refused function 0x%"PFMT64x": %s exceeds per-value cap %zu",
-			function_addr, label, per_value_cap);
-		return false;
-	}
-	size_t *total = json? &budget->json_bytes: &budget->string_bytes;
-	return sleigh_context_preflight_add (total, length, aggregate_cap,
-		json? "JSON bytes": "string bytes", function_addr);
-}
-
-static bool sleigh_typed_context_preflight(
-	const RAnalFunction *fcn,
-	const RAnalFcnContext *ctx,
-	const RList *base_types
-) {
-	if (!fcn || !ctx || !base_types) {
-		return false;
-	}
-	SleighContextPreflightBudget budget = {0};
-#define PREFLIGHT_STRING(value, label) \
-	do { \
-		if (!sleigh_context_preflight_string (&budget, value, false, label, fcn->addr)) { \
-			return false; \
-		} \
-	} while (0)
-
-	PREFLIGHT_STRING (fcn->name, "function name");
-	if (ctx->signature) {
-		PREFLIGHT_STRING (ctx->signature->signature, "signature name");
-		PREFLIGHT_STRING (ctx->signature->ret_type, "signature return type");
-		PREFLIGHT_STRING (ctx->signature->callconv, "signature calling convention");
-		const size_t parameter_count = ctx->signature->params
-			? (size_t)r_list_length (ctx->signature->params): 0;
-		if (!sleigh_context_preflight_add (&budget.context_items, parameter_count,
-				(size_t)R2SLEIGH_MAX_CONTEXT_ITEMS_V2, "context items", fcn->addr)) {
-			return false;
-		}
-		RListIter *iter;
-		RAnalFunctionParam *parameter;
-		r_list_foreach (ctx->signature->params, iter, parameter) {
-			if (parameter) {
-				PREFLIGHT_STRING (parameter->name, "parameter name");
-				PREFLIGHT_STRING (parameter->type, "parameter type");
-			}
-		}
-	}
-
-	const size_t reg_arg_count = ctx->reg_args? (size_t)r_list_length (ctx->reg_args): 0;
-	const size_t stack_slot_count = ctx->fcn_slots? (size_t)r_list_length (ctx->fcn_slots): 0;
-	if (!sleigh_context_preflight_add (&budget.context_items, reg_arg_count,
-			(size_t)R2SLEIGH_MAX_CONTEXT_ITEMS_V2, "context items", fcn->addr)
-		|| !sleigh_context_preflight_add (&budget.context_items, stack_slot_count,
-			(size_t)R2SLEIGH_MAX_CONTEXT_ITEMS_V2, "context items", fcn->addr)) {
-		return false;
-	}
-	RListIter *iter;
-	RAnalFcnRegArg *reg_arg;
-	r_list_foreach (ctx->reg_args, iter, reg_arg) {
-		if (reg_arg) {
-			PREFLIGHT_STRING (reg_arg->name, "register argument name");
-			PREFLIGHT_STRING (reg_arg->type, "register argument type");
-			PREFLIGHT_STRING (reg_arg->reg, "register argument storage");
-		}
-	}
-	RAnalFcnSlot *slot;
-	r_list_foreach (ctx->fcn_slots, iter, slot) {
-		if (slot) {
-			PREFLIGHT_STRING (slot->name, "stack slot name");
-			PREFLIGHT_STRING (slot->type, "stack slot type");
-			PREFLIGHT_STRING (slot->base_name, "stack slot base");
-			PREFLIGHT_STRING (slot->arg_name, "stack slot argument name");
-			PREFLIGHT_STRING (slot->home_reg, "stack slot home register");
-		}
-	}
-
-	const size_t callee_count = ctx->callees? (size_t)r_list_length (ctx->callees): 0;
-	if (!sleigh_context_preflight_add (&budget.context_items, callee_count,
-			(size_t)R2SLEIGH_MAX_CONTEXT_ITEMS_V2, "context items", fcn->addr)) {
-		return false;
-	}
-	RAnalFcnCallee *callee;
-	r_list_foreach (ctx->callees, iter, callee) {
-		if (!callee) {
-			continue;
-		}
-		PREFLIGHT_STRING (callee->name, "callee name");
-		if (callee->signature) {
-			PREFLIGHT_STRING (callee->signature->signature, "callee signature name");
-			PREFLIGHT_STRING (callee->signature->ret_type, "callee return type");
-			PREFLIGHT_STRING (callee->signature->callconv, "callee calling convention");
-			const size_t callee_parameter_count = callee->signature->params
-				? (size_t)r_list_length (callee->signature->params): 0;
-			if (!sleigh_context_preflight_add (&budget.nested_items, callee_parameter_count,
-					(size_t)R2SLEIGH_MAX_NESTED_ITEMS_V2, "nested items", fcn->addr)) {
-				return false;
-			}
-			RListIter *param_iter;
-			RAnalFunctionParam *parameter;
-			r_list_foreach (callee->signature->params, param_iter, parameter) {
-				if (parameter) {
-					PREFLIGHT_STRING (parameter->name, "callee parameter name");
-					PREFLIGHT_STRING (parameter->type, "callee parameter type");
-				}
-			}
-		}
-	}
-
-	const size_t base_type_count = (size_t)r_list_length (base_types);
-	if (!sleigh_context_preflight_add (&budget.context_items, base_type_count,
-			(size_t)R2SLEIGH_MAX_CONTEXT_ITEMS_V2, "context items", fcn->addr)) {
-		return false;
-	}
-	RAnalBaseType *base_type;
-	r_list_foreach (base_types, iter, base_type) {
-		if (!base_type) {
-			continue;
-		}
-		PREFLIGHT_STRING (base_type->name, "base type name");
-		PREFLIGHT_STRING (base_type->type, "base type declaration");
-		switch (base_type->kind) {
-		case R_ANAL_BASE_TYPE_KIND_STRUCT: {
-			RAnalStructMember *member;
-			R_VEC_FOREACH (&base_type->struct_data.members, member) {
-				if (!sleigh_context_preflight_add (&budget.nested_items, 1,
-						(size_t)R2SLEIGH_MAX_NESTED_ITEMS_V2, "nested items", fcn->addr)) {
-					return false;
-				}
-				PREFLIGHT_STRING (member->name, "struct member name");
-				PREFLIGHT_STRING (member->type, "struct member type");
-			}
-			break;
-		}
-		case R_ANAL_BASE_TYPE_KIND_UNION: {
-			RAnalUnionMember *member;
-			R_VEC_FOREACH (&base_type->union_data.members, member) {
-				if (!sleigh_context_preflight_add (&budget.nested_items, 1,
-						(size_t)R2SLEIGH_MAX_NESTED_ITEMS_V2, "nested items", fcn->addr)) {
-					return false;
-				}
-				PREFLIGHT_STRING (member->name, "union member name");
-				PREFLIGHT_STRING (member->type, "union member type");
-			}
-			break;
-		}
-		case R_ANAL_BASE_TYPE_KIND_ENUM: {
-			RAnalEnumCase *cas;
-			R_VEC_FOREACH (&base_type->enum_data.cases, cas) {
-				if (!sleigh_context_preflight_add (&budget.nested_items, 1,
-						(size_t)R2SLEIGH_MAX_NESTED_ITEMS_V2, "nested items", fcn->addr)) {
-					return false;
-				}
-				PREFLIGHT_STRING (cas->name, "enum variant name");
-			}
-			break;
-		}
-		default:
-			break;
-		}
-	}
-	if (!sleigh_context_preflight_string (&budget, ctx->assumptions_json, true,
-			"assumptions JSON", fcn->addr)) {
-		return false;
-	}
-#undef PREFLIGHT_STRING
-	return true;
-}
-
-static bool sleigh_typed_function_context_build(
-	RAnal *anal,
-	RAnalFunction *fcn,
-	SleighTypedFunctionContext *typed
-) {
-	RListIter *iter;
-	size_t typed_param_count = 0;
-	size_t typed_var_count = 0;
-	size_t typed_base_type_count = 0;
-
-	if (!anal || !fcn || !typed) {
-		return false;
-	}
-	memset (typed, 0, sizeof (*typed));
-	typed->context.schema_version = R2SLEIGH_FUNCTION_CONTEXT_SCHEMA_V2;
-	typed->context.external_context_json = "{}";
-	if (!sleigh_function_context_api.snapshot_available) {
-		if (!sleigh_function_context_api.warned_unbounded_snapshot) {
-			sleigh_function_context_api.warned_unbounded_snapshot = true;
-			R_LOG_ERROR ("r2sleigh: incompatible radare2 runtime: bounded V2 requests require r_anal_function_snapshot_collect_with_limits; the unlimited collector is intentionally not used because it clones global types before caller limits can be enforced");
-		}
-		sleigh_typed_function_context_clear (typed);
-		return false;
-	}
-	RAnalFunctionSnapshotLimits snapshot_limits = {
-		.struct_size = sizeof (snapshot_limits),
-		.max_base_types = (size_t)R2SLEIGH_MAX_CONTEXT_ITEMS_V2,
-		.max_base_type_children = (size_t)R2SLEIGH_MAX_NESTED_ITEMS_V2,
-		.max_base_type_string_bytes = (size_t)R2SLEIGH_MAX_AGGREGATE_STRING_BYTES_V2,
-		.max_assumptions_json_bytes = (size_t)R2SLEIGH_MAX_AGGREGATE_JSON_BYTES_V2,
-	};
-	typed->snapshot = sleigh_function_context_api.snapshot_collect_with_limits (
-		anal, fcn, &snapshot_limits);
-	if (!typed->snapshot
-		|| typed->snapshot->schema_version != R_ANAL_FUNCTION_SNAPSHOT_SCHEMA_VERSION
-		|| typed->snapshot->struct_size < sizeof (RAnalFunctionSnapshot)
-		|| !(typed->snapshot->capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_REVISION)
-		|| typed->snapshot->context.context_hash != typed->snapshot->revision_identity) {
-		sleigh_typed_function_context_clear (typed);
-		return false;
-	}
-	typed->typed_ctx = &typed->snapshot->context;
-	typed->typed_base_types = typed->snapshot->base_types;
-	if (!typed->typed_ctx || !typed->typed_base_types) {
-		sleigh_typed_function_context_clear (typed);
-		return false;
-	}
-	if (!sleigh_typed_context_preflight (fcn, typed->typed_ctx, typed->typed_base_types)) {
-		sleigh_typed_function_context_clear (typed);
-		return false;
-	}
-	if (typed->typed_ctx) {
-		typed->context.dirty_epoch = typed->typed_ctx->function_dirty_epoch;
-		typed->context.context_hash = typed->typed_ctx->context_hash;
-		typed->context.type_dirty_epoch = typed->typed_ctx->type_dirty_epoch;
-		typed->context.signature_name = fcn->name;
-		if (typed->typed_ctx->signature) {
-			typed->context.signature_ret_type = typed->typed_ctx->signature->ret_type;
-			typed->context.signature_callconv = typed->typed_ctx->signature->callconv;
-			typed->context.signature_noreturn = typed->typed_ctx->signature->noreturn? 1: 0;
-			if (typed->typed_ctx->signature->params) {
-				typed_param_count = (size_t)r_list_length (typed->typed_ctx->signature->params);
-				if (typed_param_count) {
-					typed->typed_params = R_NEWS0 (R2SleighContextParam, typed_param_count);
-				}
-				if (typed->typed_params) {
-					size_t idx = 0;
-					RAnalFunctionParam *param;
-					r_list_foreach (typed->typed_ctx->signature->params, iter, param) {
-						if (idx >= typed_param_count) {
-							break;
-						}
-						typed->typed_params[idx].name = param? param->name: NULL;
-						typed->typed_params[idx].type_name = param? param->type: NULL;
-						typed->typed_params[idx].cc_reg = NULL;
-							if (typed->snapshot
-								&& (typed->snapshot->capabilities
-									& R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_FUNCTION_INTERFACE)
-								&& idx < typed->snapshot->function_interface.num_parameters
-								&& typed->snapshot->function_interface.parameters[idx].index == idx) {
-								typed->typed_params[idx].cc_reg =
-									typed->snapshot->function_interface.parameters[idx].storage.name;
-							}
-							idx++;
-					}
-					typed->context.params = typed->typed_params;
-					typed->context.num_params = idx;
-				}
-			}
-		}
-		typed_var_count = (typed->typed_ctx->reg_args? (size_t)r_list_length (typed->typed_ctx->reg_args): 0)
-			+ (typed->typed_ctx->fcn_slots? (size_t)r_list_length (typed->typed_ctx->fcn_slots): 0);
-		if (typed_var_count) {
-			typed->typed_vars = R_NEWS0 (R2SleighContextVar, typed_var_count);
-		}
-		if (typed->typed_vars) {
-			size_t idx = 0;
-			RAnalFcnRegArg *reg_arg;
-			RAnalFcnSlot *slot;
-			if (typed->typed_ctx->reg_args) {
-				r_list_foreach (typed->typed_ctx->reg_args, iter, reg_arg) {
-					if (idx >= typed_var_count) {
-						break;
-					}
-					typed->typed_vars[idx].kind = R2SLEIGH_CONTEXT_VAR_REGISTER;
-					typed->typed_vars[idx].name = reg_arg? reg_arg->name: NULL;
-					typed->typed_vars[idx].type_name = reg_arg? reg_arg->type: NULL;
-					typed->typed_vars[idx].reg = reg_arg? reg_arg->reg: NULL;
-					typed->typed_vars[idx].param_index = (reg_arg && reg_arg->arg_index >= 0)? reg_arg->arg_index: -1;
-					typed->typed_vars[idx].is_arg = (reg_arg && reg_arg->arg_index >= 0)? 1: 0;
-					idx++;
-				}
-			}
-			if (typed->typed_ctx->fcn_slots) {
-				r_list_foreach (typed->typed_ctx->fcn_slots, iter, slot) {
-					const bool is_arg = slot && (slot->role == R_ANAL_FCN_SLOT_ARG
-						|| slot->role == R_ANAL_FCN_SLOT_HOME);
-					if (idx >= typed_var_count) {
-						break;
-					}
-					typed->typed_vars[idx].kind = R2SLEIGH_CONTEXT_VAR_STACK;
-					typed->typed_vars[idx].name = slot? slot->name: NULL;
-					typed->typed_vars[idx].type_name = slot? slot->type: NULL;
-					typed->typed_vars[idx].base = slot? function_context_stack_base_name (slot->base, slot->base_name): NULL;
-					typed->typed_vars[idx].offset = slot? slot->offset: 0;
-					typed->typed_vars[idx].has_offset = slot? 1: 0;
-					typed->typed_vars[idx].role = slot? function_context_stack_slot_role_id (slot->role): R2SLEIGH_CONTEXT_STACK_UNKNOWN;
-					typed->typed_vars[idx].param_index = (slot && slot->arg_index >= 0)? slot->arg_index: -1;
-					typed->typed_vars[idx].param_name = slot? slot->arg_name: NULL;
-					typed->typed_vars[idx].source_reg = slot? slot->home_reg: NULL;
-					typed->typed_vars[idx].is_arg = is_arg? 1: 0;
-					idx++;
-				}
-			}
-			typed->context.vars = typed->typed_vars;
-			typed->context.num_vars = idx;
-		}
-		if (typed->typed_ctx->callees) {
-			size_t typed_callee_count = (size_t)r_list_length (typed->typed_ctx->callees);
-			size_t typed_callee_param_count = 0;
-			if (typed_callee_count) {
-				typed->typed_callees = R_NEWS0 (R2SleighContextCallee, typed_callee_count);
-				RAnalFcnCallee *callee;
-				r_list_foreach (typed->typed_ctx->callees, iter, callee) {
-					if (callee && callee->signature && callee->signature->params) {
-						typed_callee_param_count += (size_t)r_list_length (callee->signature->params);
-					}
-				}
-				if (typed_callee_param_count) {
-					typed->typed_callee_params = R_NEWS0 (R2SleighContextParam, typed_callee_param_count);
-				}
-			}
-			if (typed->typed_callees) {
-				size_t idx = 0;
-				size_t param_idx = 0;
-				RAnalFcnCallee *callee;
-				r_list_foreach (typed->typed_ctx->callees, iter, callee) {
-					if (idx >= typed_callee_count) {
-						break;
-					}
-					typed->typed_callees[idx].call_addr = callee? callee->call_addr: 0;
-					typed->typed_callees[idx].addr = callee? callee->addr: 0;
-					typed->typed_callees[idx].name = callee? callee->name: NULL;
-					typed->typed_callees[idx].linkage = callee
-						? function_context_callee_linkage_id (callee->linkage)
-						: R2SLEIGH_INTERPROC_LINKAGE_UNKNOWN;
-					if (callee && callee->signature) {
-						typed->typed_callees[idx].signature_name = callee->name;
-						typed->typed_callees[idx].signature_ret_type = callee->signature->ret_type;
-						typed->typed_callees[idx].signature_callconv = callee->signature->callconv;
-						typed->typed_callees[idx].signature_noreturn = callee->signature->noreturn? 1: 0;
-						if (typed->typed_callee_params && callee->signature->params) {
-							size_t callee_param_start = param_idx;
-							RListIter *param_iter;
-							RAnalFunctionParam *param;
-							r_list_foreach (callee->signature->params, param_iter, param) {
-								if (param_idx >= typed_callee_param_count) {
-									break;
-								}
-								typed->typed_callee_params[param_idx].name = param? param->name: NULL;
-								typed->typed_callee_params[param_idx].type_name = param? param->type: NULL;
-								typed->typed_callee_params[param_idx].cc_reg = NULL;
-								param_idx++;
-							}
-							typed->typed_callees[idx].signature_params = &typed->typed_callee_params[callee_param_start];
-							typed->typed_callees[idx].num_signature_params = param_idx - callee_param_start;
-						}
-					}
-					idx++;
-				}
-				typed->context.callees = typed->typed_callees;
-				typed->context.num_callees = idx;
-			}
-		}
-		typed->context.assumptions_json = typed->typed_ctx->assumptions_json;
-	}
-	if (typed->typed_base_types) {
-		typed_base_type_count = (size_t)r_list_length (typed->typed_base_types);
-		if (typed_base_type_count) {
-			typed->typed_base_type_entries = R_NEWS0 (R2SleighContextBaseType, typed_base_type_count);
-		}
-		if (typed->typed_base_type_entries) {
-			size_t idx = 0;
-			size_t struct_count = 0;
-			size_t struct_member_count = 0;
-			RAnalBaseType *base_type;
-			r_list_foreach (typed->typed_base_types, iter, base_type) {
-				if (!base_type || idx >= typed_base_type_count) {
-					break;
-				}
-				R2SleighContextBaseType *entry = &typed->typed_base_type_entries[idx];
-				entry->kind = function_context_base_type_kind_id (base_type->kind);
-				entry->name = base_type->name;
-				entry->type_name = base_type->type;
-				entry->size_bits = base_type->size;
-				entry->has_size_bits = base_type->size? 1: 0;
-				if (base_type->kind == R_ANAL_BASE_TYPE_KIND_STRUCT) {
-					struct_count++;
-					size_t member_count = 0;
-					RAnalStructMember *member;
-					R_VEC_FOREACH (&base_type->struct_data.members, member) {
-						member_count++;
-					}
-					struct_member_count += member_count;
-					if (member_count) {
-						R2SleighContextBaseMember *members = R_NEWS0 (R2SleighContextBaseMember, member_count);
-						if (members) {
-							size_t member_idx = 0;
-							R_VEC_FOREACH (&base_type->struct_data.members, member) {
-								if (member_idx >= member_count) {
-									break;
-								}
-								members[member_idx].name = member->name;
-								members[member_idx].type_name = member->type;
-								members[member_idx].offset = member->offset;
-								members[member_idx].size_bits = member->bitsize;
-								members[member_idx].has_size_bits = member->bitsize? 1: 0;
-								member_idx++;
-							}
-							entry->members = members;
-							entry->num_members = member_idx;
-						}
-					}
-				} else if (base_type->kind == R_ANAL_BASE_TYPE_KIND_UNION) {
-					size_t member_count = 0;
-					RAnalUnionMember *member;
-					R_VEC_FOREACH (&base_type->union_data.members, member) {
-						member_count++;
-					}
-					if (member_count) {
-						R2SleighContextBaseMember *members = R_NEWS0 (R2SleighContextBaseMember, member_count);
-						if (members) {
-							size_t member_idx = 0;
-							R_VEC_FOREACH (&base_type->union_data.members, member) {
-								if (member_idx >= member_count) {
-									break;
-								}
-								members[member_idx].name = member->name;
-								members[member_idx].type_name = member->type;
-								members[member_idx].offset = member->offset;
-								members[member_idx].size_bits = member->bitsize;
-								members[member_idx].has_size_bits = member->bitsize? 1: 0;
-								member_idx++;
-							}
-							entry->members = members;
-							entry->num_members = member_idx;
-						}
-					}
-				} else if (base_type->kind == R_ANAL_BASE_TYPE_KIND_ENUM) {
-					size_t variant_count = 0;
-					RAnalEnumCase *cas;
-					R_VEC_FOREACH (&base_type->enum_data.cases, cas) {
-						variant_count++;
-					}
-					if (variant_count) {
-						R2SleighContextEnumVariant *variants = R_NEWS0 (R2SleighContextEnumVariant, variant_count);
-						if (variants) {
-							size_t variant_idx = 0;
-							R_VEC_FOREACH (&base_type->enum_data.cases, cas) {
-								if (variant_idx >= variant_count) {
-									break;
-								}
-								variants[variant_idx].name = cas->name;
-								variants[variant_idx].value = cas->val;
-								variant_idx++;
-							}
-							entry->variants = variants;
-							entry->num_variants = variant_idx;
-						}
-					}
-				}
-				idx++;
-			}
-			typed->context.base_types = typed->typed_base_type_entries;
-			typed->context.num_base_types = idx;
-			R_LOG_DEBUG ("r2sleigh: typed context captured %zu base types (%zu structs, %zu struct members)",
-				idx, struct_count, struct_member_count);
-		}
-	}
-	return true;
-}
-
 typedef struct {
 	ut64 addr;
 	ut64 size;
@@ -2116,15 +1881,6 @@ static bool build_symbolic_function_scope_with_target(
 	SymFunctionScope *scope,
 	ut64 target_hint
 );
-static bool sleigh_interproc_scope_build(
-	RCore *core,
-	RAnal *anal,
-	RAnalFunction *fcn,
-	R2ILContext *ctx,
-	unsigned int purpose,
-	SleighInterprocScope *out
-);
-static void sleigh_interproc_scope_clear(SleighInterprocScope *scope);
 static char *resolve_interproc_seed_name(RCore *core, RAnal *anal, ut64 addr);
 static unsigned int resolve_interproc_seed_linkage(RCore *core, RAnal *anal, ut64 addr);
 static ut64 *collect_type_interproc_direct_targets_from_blocks(
@@ -2196,8 +1952,14 @@ static bool block_array_push(BlockArray *arr, R2ILBlock *block) {
 static int block_array_compare_addr(const void *a, const void *b) {
 	const R2ILBlock *const *block_a = (const R2ILBlock *const *)a;
 	const R2ILBlock *const *block_b = (const R2ILBlock *const *)b;
-	const ut64 addr_a = (block_a && *block_a)? r2il_block_addr (*block_a): 0;
-	const ut64 addr_b = (block_b && *block_b)? r2il_block_addr (*block_b): 0;
+	ut64 addr_a = 0;
+	ut64 addr_b = 0;
+	if (block_a && *block_a) {
+		(void)sleigh_v2_block_addr (*block_a, &addr_a);
+	}
+	if (block_b && *block_b) {
+		(void)sleigh_v2_block_addr (*block_b, &addr_b);
+	}
 	if (addr_a < addr_b) {
 		return -1;
 	}
@@ -2214,73 +1976,27 @@ static void block_array_sort(BlockArray *arr) {
 	qsort (arr->blocks, arr->count, sizeof (R2ILBlock *), block_array_compare_addr);
 }
 
-static void block_array_free(BlockArray *arr) {
+static bool block_array_free(BlockArray *arr) {
 	size_t i;
+	size_t retained = 0;
 	for (i = 0; i < arr->count; i++) {
-		r2il_block_free (arr->blocks[i]);
+		R2ILBlock *block = arr->blocks[i];
+		if (!sleigh_v2_block_release (&block)) {
+			arr->blocks[retained++] = block;
+		}
+	}
+	if (retained) {
+		arr->count = retained;
+		return false;
 	}
 	free (arr->blocks);
 	arr->blocks = NULL;
 	arr->count = 0;
 	arr->capacity = 0;
 	memset (&arr->quality, 0, sizeof (arr->quality));
+	return true;
 }
 
-static const char *function_context_stack_base_name(RAnalFcnSlotBase base, const char *base_name) {
-	if (base_name) {
-		return base_name;
-	}
-	switch (base) {
-	case R_ANAL_FCN_BASE_BP:
-		return "bp";
-	case R_ANAL_FCN_BASE_SP:
-		return "sp";
-	default:
-		return NULL;
-	}
-}
-
-static unsigned int function_context_stack_slot_role_id(RAnalFcnSlotRole role) {
-	switch (role) {
-	case R_ANAL_FCN_SLOT_LOCAL:
-		return R2SLEIGH_CONTEXT_STACK_LOCAL;
-	case R_ANAL_FCN_SLOT_ARG:
-		return R2SLEIGH_CONTEXT_STACK_ARG;
-	case R_ANAL_FCN_SLOT_HOME:
-		return R2SLEIGH_CONTEXT_STACK_HOME;
-	case R_ANAL_FCN_SLOT_UNKNOWN:
-	default:
-		return R2SLEIGH_CONTEXT_STACK_UNKNOWN;
-	}
-}
-
-static unsigned int function_context_base_type_kind_id(RAnalBaseTypeKind kind) {
-	switch (kind) {
-	case R_ANAL_BASE_TYPE_KIND_STRUCT:
-		return R2SLEIGH_CONTEXT_BASE_STRUCT;
-	case R_ANAL_BASE_TYPE_KIND_UNION:
-		return R2SLEIGH_CONTEXT_BASE_UNION;
-	case R_ANAL_BASE_TYPE_KIND_ENUM:
-		return R2SLEIGH_CONTEXT_BASE_ENUM;
-	case R_ANAL_BASE_TYPE_KIND_TYPEDEF:
-		return R2SLEIGH_CONTEXT_BASE_TYPEDEF;
-	case R_ANAL_BASE_TYPE_KIND_ATOMIC:
-	default:
-		return R2SLEIGH_CONTEXT_BASE_ATOMIC;
-	}
-}
-
-static unsigned int function_context_callee_linkage_id(RAnalFcnCalleeLinkage linkage) {
-	switch (linkage) {
-	case R_ANAL_FCN_CALLEE_INTERNAL:
-		return R2SLEIGH_INTERPROC_LINKAGE_INTERNAL;
-	case R_ANAL_FCN_CALLEE_IMPORTED:
-		return R2SLEIGH_INTERPROC_LINKAGE_IMPORTED;
-	case R_ANAL_FCN_CALLEE_UNKNOWN:
-	default:
-		return R2SLEIGH_INTERPROC_LINKAGE_UNKNOWN;
-	}
-}
 
 static char *sleigh_collect_sym_assumptions_json(RAnal *anal, RAnalFunction *fcn) {
 	if (!anal || !fcn) {
@@ -2306,34 +2022,6 @@ static char *sleigh_collect_function_assumptions_json(RAnal *anal, RAnalFunction
 		return strdup ("[]");
 	}
 	return assumptions_json;
-}
-
-static bool sleigh_resolve_function_context_api(void) {
-	if (sleigh_function_context_api.resolved) {
-		return sleigh_function_context_api.available;
-	}
-	sleigh_function_context_api.resolved = true;
-	sleigh_function_context_api.snapshot_collect_with_limits = (SleighFunctionSnapshotCollectWithLimitsFn)dlsym (RTLD_DEFAULT, "r_anal_function_snapshot_collect_with_limits");
-	sleigh_function_context_api.snapshot_free = (SleighFunctionSnapshotFreeFn)dlsym (RTLD_DEFAULT, "r_anal_function_snapshot_free");
-	sleigh_function_context_api.snapshot_available = sleigh_function_context_api.snapshot_collect_with_limits
-		&& sleigh_function_context_api.snapshot_free;
-	// Native V2 typed requests intentionally have no unbounded compatibility
-	// fallback: the legacy collectors clone global types before limits can apply.
-	sleigh_function_context_api.available = sleigh_function_context_api.snapshot_available;
-	return sleigh_function_context_api.available;
-}
-
-static void sleigh_report_missing_function_context_api(void) {
-	if (sleigh_function_context_api.warned) {
-		return;
-	}
-	sleigh_function_context_api.warned = true;
-	const char *msg =
-		"r2sleigh: incompatible radare2 runtime: missing bounded function-snapshot API "
-		"(r_anal_function_snapshot_collect_with_limits / r_anal_function_snapshot_free). "
-		"Use the matching radare2 build or upgrade the installed radare2.";
-	fprintf (stderr, "%s\n", msg);
-	R_LOG_ERROR ("%s", msg);
 }
 
 static void sym_state_cache_clear(void) {
@@ -3647,9 +3335,10 @@ static char *replay_sym_query_run(RCore *core, const R2ILContext *ctx, const Sym
 	seed.num_tty_fds = spec->tty_fd_count;
 	seed.skip_sleep_calls = spec->skip_sleep_calls? 1: 0;
 
-	result = is_explore
-		? r2sym_explore_to_replay_scope (ctx, scope->functions, scope->count, entry_addr, target_addr, &seed, external_context_json)
-		: r2sym_solve_to_replay_scope (ctx, scope->functions, scope->count, entry_addr, target_addr, &seed, external_context_json);
+	const uint32_t kind = is_explore
+		? R2SLEIGH_SCOPE_EXPLORE_REPLAY_V2: R2SLEIGH_SCOPE_SOLVE_REPLAY_V2;
+	(void)sleigh_v2_scope_render_for_scope (kind, core, core->anal, ctx, scope,
+		entry_addr, target_addr, &seed, NULL, external_context_json, &result);
 
 cleanup:
 	free (registers);
@@ -4488,7 +4177,7 @@ static R2SleighInterprocSessionPlan sleigh_interproc_session_plan_for_function(R
 	ut32 cost;
 	int bb_count;
 	if (!fcn) {
-		return r2sleigh_interproc_session_plan_for_depth (
+		return sleigh_v2_query_interproc_session (
 			anal? (unsigned int)anal->plugin_analysis_depth: 0,
 			purpose,
 			SIZE_MAX,
@@ -4496,14 +4185,14 @@ static R2SleighInterprocSessionPlan sleigh_interproc_session_plan_for_function(R
 	}
 	bb_count = function_bb_count (fcn);
 	if (bb_count < 0) {
-		return r2sleigh_interproc_session_plan_for_depth (
+		return sleigh_v2_query_interproc_session (
 			anal? (unsigned int)anal->plugin_analysis_depth: 0,
 			purpose,
 			SIZE_MAX,
 			UINT_MAX);
 	}
 	cost = r_anal_function_cost ((RAnalFunction *)fcn);
-	return r2sleigh_interproc_session_plan_for_depth (
+	return sleigh_v2_query_interproc_session (
 		anal? (unsigned int)anal->plugin_analysis_depth: 0,
 		purpose,
 		(size_t)bb_count,
@@ -4512,25 +4201,25 @@ static R2SleighInterprocSessionPlan sleigh_interproc_session_plan_for_function(R
 
 static const char *auto_callback_refusal_reason_name(unsigned int reason) {
 	switch (reason) {
-	case R2SLEIGH_AUTO_CALLBACK_REASON_ALLOWED:
+	case R2SLEIGH_AUTO_CALLBACK_REASON_ALLOWED_V2:
 		return "allowed";
-	case R2SLEIGH_AUTO_CALLBACK_REASON_MODE_NOT_FULL:
+	case R2SLEIGH_AUTO_CALLBACK_REASON_MODE_NOT_FULL_V2:
 		return "mode";
-	case R2SLEIGH_AUTO_CALLBACK_REASON_TOO_MANY_BLOCKS:
+	case R2SLEIGH_AUTO_CALLBACK_REASON_TOO_MANY_BLOCKS_V2:
 		return "blocks";
-	case R2SLEIGH_AUTO_CALLBACK_REASON_TOO_LARGE:
+	case R2SLEIGH_AUTO_CALLBACK_REASON_TOO_LARGE_V2:
 		return "size";
-	case R2SLEIGH_AUTO_CALLBACK_REASON_TOO_COSTLY:
+	case R2SLEIGH_AUTO_CALLBACK_REASON_TOO_COSTLY_V2:
 		return "cost";
 	default:
 		return "unknown";
 	}
 }
 
-static R2SleighAutoCallbackPlan auto_callback_plan_for_function(
+static R2SleighAutoCallbackPlanV2 auto_callback_plan_for_function(
 	RAnal *anal,
 	const RAnalFunction *fcn,
-	R2SleighAutoCallbackKind kind) {
+	unsigned int kind) {
 	unsigned int bb_count = UINT_MAX;
 	unsigned int cost = UINT_MAX;
 	unsigned long long linear_size = ULLONG_MAX;
@@ -4541,7 +4230,7 @@ static R2SleighAutoCallbackPlan auto_callback_plan_for_function(
 		cost = (unsigned int)r_anal_function_cost ((RAnalFunction *)fcn);
 		linear_size = raw_linear_size > 0? (unsigned long long)raw_linear_size: 0;
 	}
-	return r2sleigh_auto_callback_plan_for_depth (
+	return sleigh_v2_query_auto_callback (
 		anal? (unsigned int)anal->plugin_analysis_depth: 0,
 		(unsigned int)kind,
 		bb_count,
@@ -4552,9 +4241,9 @@ static R2SleighAutoCallbackPlan auto_callback_plan_for_function(
 static bool auto_callback_allows_function(
 	RAnal *anal,
 	const RAnalFunction *fcn,
-	R2SleighAutoCallbackKind kind,
+	unsigned int kind,
 	const char *stage) {
-	R2SleighAutoCallbackPlan plan = auto_callback_plan_for_function (anal, fcn, kind);
+	R2SleighAutoCallbackPlanV2 plan = auto_callback_plan_for_function (anal, fcn, kind);
 	if (plan.allowed) {
 		return true;
 	}
@@ -4661,26 +4350,90 @@ static RAnalFunction *resolve_or_materialize_current_function(RCore *core, RAnal
 	return materialize_function_at (anal, core->addr);
 }
 
-static char *build_sym_symbol_map_json(RCore *core, RAnal *anal, R2ILContext *ctx, const SymFunctionScope *scope) {
-	if (!core || !anal || !ctx || !scope || !scope->functions || !scope->count) {
-		return strdup ("{}");
+static void sym_scope_symbol_snapshot_fini(SymScopeSymbolSnapshot *snapshot) {
+	size_t i;
+	if (!snapshot) {
+		return;
 	}
-
-	PJ *pj = pj_new ();
-	if (!pj) {
-		return strdup ("{}");
+	for (i = 0; i < snapshot->count; i++) {
+		free (snapshot->owned_names[i]);
 	}
-	pj_o (pj);
+	free (snapshot->owned_names);
+	free (snapshot->symbols);
+	memset (snapshot, 0, sizeof (*snapshot));
+}
 
-	for (size_t i = 0; i < scope->count; i++) {
+static bool sym_scope_symbol_snapshot_append(SymScopeSymbolSnapshot *snapshot, ut64 addr,
+	const char *name, unsigned int linkage) {
+	size_t i;
+	size_t name_len;
+	char *owned_name;
+	if (!snapshot || !name || !*name
+		|| (linkage != R2SLEIGH_INTERPROC_LINKAGE_UNKNOWN_V2
+			&& linkage != R2SLEIGH_INTERPROC_LINKAGE_INTERNAL_V2
+			&& linkage != R2SLEIGH_INTERPROC_LINKAGE_IMPORTED_V2)) {
+		return false;
+	}
+	name_len = strlen (name);
+	if (name_len > R2SLEIGH_MAX_STRING_BYTES_V2
+		|| snapshot->total_name_bytes > R2SLEIGH_MAX_AGGREGATE_STRING_BYTES_V2 - name_len) {
+		return false;
+	}
+	for (i = 0; i < snapshot->count; i++) {
+		const R2SleighScopeSymbolV2 *existing = &snapshot->symbols[i];
+		if (existing->addr != addr) {
+			continue;
+		}
+		return existing->linkage == linkage
+			&& existing->name.len == name_len
+			&& !memcmp (existing->name.data, name, name_len);
+	}
+	if (snapshot->count >= R2SLEIGH_MAX_SCOPE_SYMBOLS_V2) {
+		return false;
+	}
+	if (!snapshot->symbols) {
+		snapshot->symbols = calloc (R2SLEIGH_MAX_SCOPE_SYMBOLS_V2, sizeof (*snapshot->symbols));
+		snapshot->owned_names = calloc (R2SLEIGH_MAX_SCOPE_SYMBOLS_V2, sizeof (*snapshot->owned_names));
+		if (!snapshot->symbols || !snapshot->owned_names) {
+			sym_scope_symbol_snapshot_fini (snapshot);
+			return false;
+		}
+	}
+	owned_name = strdup (name);
+	if (!owned_name) {
+		return false;
+	}
+	R2SleighScopeSymbolV2 *symbol = &snapshot->symbols[snapshot->count];
+	symbol->abi_version = R2SLEIGH_ABI_V2;
+	symbol->struct_size = sizeof (*symbol);
+	symbol->schema_version = R2SLEIGH_SCOPE_SYMBOL_SCHEMA_V2;
+	symbol->addr = addr;
+	symbol->name.data = (const uint8_t *)owned_name;
+	symbol->name.len = name_len;
+	symbol->linkage = linkage;
+	snapshot->owned_names[snapshot->count] = owned_name;
+	snapshot->count++;
+	snapshot->total_name_bytes += name_len;
+	return true;
+}
+
+static bool build_sym_scope_symbol_snapshot(RCore *core, RAnal *anal, R2ILContext *ctx,
+	const SymFunctionScope *scope, SymScopeSymbolSnapshot *snapshot) {
+	size_t i;
+	if (!core || !anal || !ctx || !scope || !scope->functions || !scope->count || !snapshot) {
+		return false;
+	}
+	memset (snapshot, 0, sizeof (*snapshot));
+	for (i = 0; i < scope->count; i++) {
 		const R2ILFunctionBlocks *function = &scope->functions[i];
 		const BlockArray *blocks = &scope->owned_blocks[i];
 		size_t direct_target_count = 0;
 		ut64 *direct_targets = NULL;
-		if (function->name && *function->name) {
-			char key[32];
-			snprintf (key, sizeof (key), "0x%llx", (unsigned long long)function->entry_addr);
-			pj_ks (pj, key, function->name);
+		size_t j;
+		if (function->name && *function->name
+			&& !sym_scope_symbol_snapshot_append (snapshot, function->entry_addr,
+				function->name, resolve_interproc_seed_linkage (core, anal, function->entry_addr))) {
+			goto fail;
 		}
 		direct_targets = collect_type_interproc_direct_targets_from_blocks (
 			ctx,
@@ -4689,20 +4442,52 @@ static char *build_sym_symbol_map_json(RCore *core, RAnal *anal, R2ILContext *ct
 			function->name,
 			&direct_target_count
 		);
-		for (size_t j = 0; j < direct_target_count; j++) {
+		for (j = 0; j < direct_target_count; j++) {
 			char *target_name = resolve_interproc_seed_name (core, anal, direct_targets[j]);
-			if (target_name && *target_name) {
-				char key[32];
-				snprintf (key, sizeof (key), "0x%llx", (unsigned long long)direct_targets[j]);
-				pj_ks (pj, key, target_name);
+			if (target_name && *target_name
+				&& !sym_scope_symbol_snapshot_append (snapshot, direct_targets[j], target_name,
+					resolve_interproc_seed_linkage (core, anal, direct_targets[j]))) {
+				free (target_name);
+				free (direct_targets);
+				goto fail;
 			}
 			free (target_name);
 		}
 		free (direct_targets);
 	}
+	return true;
 
-	pj_end (pj);
-	return pj_drain (pj);
+fail:
+	sym_scope_symbol_snapshot_fini (snapshot);
+	return false;
+}
+
+static bool sleigh_sym_merge_enabled(RCore *core) {
+	return core && core->config && r_config_get_b (core->config, "anal.sleigh.sym.merge");
+}
+
+static void sleigh_sym_merge_set_enabled(RCore *core, bool enabled) {
+	if (core && core->config) {
+		r_config_set_b (core->config, "anal.sleigh.sym.merge", enabled);
+	}
+}
+
+static uint32_t sleigh_v2_scope_render_for_scope(uint32_t kind, RCore *core, RAnal *anal,
+	const R2ILContext *context, const SymFunctionScope *scope, uint64_t entry_addr,
+	uint64_t target_addr, const R2SymReplaySeed *replay_seed, const char *argument,
+	const char *external_context, char **text) {
+	SymScopeSymbolSnapshot snapshot = {0};
+	if (text) {
+		*text = NULL;
+	}
+	if (!build_sym_scope_symbol_snapshot (core, anal, (R2ILContext *)context, scope, &snapshot)) {
+		return R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
+	}
+	uint32_t status = sleigh_v2_scope_render (kind, context, scope->functions, scope->count,
+		entry_addr, target_addr, replay_seed, argument, external_context,
+		snapshot.symbols, snapshot.count, sleigh_sym_merge_enabled (core), text);
+	sym_scope_symbol_snapshot_fini (&snapshot);
+	return status;
 }
 
 static bool vec_has_reg(const RVecRArchValue *vec, const char *reg_name) {
@@ -4815,7 +4600,8 @@ static void add_typed_immediate_archvalue(const R2ILBlockImmediateValue *imm, RV
 }
 
 static void fill_op_values_enhanced(RAnal *anal, RAnalOp *op, R2ILContext *ctx, const R2ILBlock *block) {
-	R2ILBlockAnalValues *values;
+	R2SleighAnalysisResultV2 *result = NULL;
+	R2SleighAnalysisResultViewV2 view = {0};
 	const R2ILBlockMemAccess *memory;
 	const R2ILBlockImmediateValue *immediates;
 	const R2ILBlockRegValue *reg_reads;
@@ -4831,13 +4617,16 @@ static void fill_op_values_enhanced(RAnal *anal, RAnalOp *op, R2ILContext *ctx, 
 	}
 
 	op->direction = 0;
-	values = r2il_block_values_typed (ctx, block);
-	if (!values) {
+	const R2ILBlock *blocks[] = { block };
+	if (sleigh_v2_analysis_query (R2SLEIGH_QUERY_BLOCK_VALUES_V2,
+		ctx, blocks, 1, 0, NULL, NULL, 0, &result, &view)
+		!= R2SLEIGH_STATUS_OK_V2) {
 		op->direction = R_ANAL_OP_DIR_READ;
 		return;
 	}
 
-	memory = r2il_block_values_memory (values, &memory_count);
+	memory = (const R2ILBlockMemAccess *)view.primary;
+	memory_count = view.primary_count;
 	for (i = 0; memory && i < memory_count; i++) {
 		const R2ILBlockMemAccess *mem = &memory[i];
 		if (mem->is_write) {
@@ -4856,17 +4645,20 @@ static void fill_op_values_enhanced(RAnal *anal, RAnalOp *op, R2ILContext *ctx, 
 		op->direction = R_ANAL_OP_DIR_READ;
 	}
 
-	immediates = r2il_block_values_immediates (values, &immediate_count);
+	immediates = (const R2ILBlockImmediateValue *)view.secondary;
+	immediate_count = view.secondary_count;
 	for (i = 0; immediates && i < immediate_count; i++) {
 		add_typed_immediate_archvalue (&immediates[i], &op->srcs, R_PERM_R);
 	}
 
-	reg_reads = r2il_block_values_reg_reads (values, &reg_read_count);
+	reg_reads = (const R2ILBlockRegValue *)view.tertiary;
+	reg_read_count = view.tertiary_count;
 	add_typed_reg_values (anal, reg_reads, reg_read_count, &op->srcs, R_PERM_R);
-	reg_writes = r2il_block_values_reg_writes (values, &reg_write_count);
+	reg_writes = (const R2ILBlockRegValue *)view.quaternary;
+	reg_write_count = view.quaternary_count;
 	add_typed_reg_values (anal, reg_writes, reg_write_count, &op->dsts, R_PERM_W);
 
-	r2il_block_values_free (values);
+	(void)sleigh_v2_analysis_result_release (&result);
 }
 
 static void print_reg_values_json(RCons *cons, const RVecRArchValue *vec) {
@@ -5717,7 +5509,8 @@ static void clear_taint_function_artifacts(RAnal *anal, RCore *core, const RAnal
 	}
 
 	for (i = 0; i < blocks->count; i++) {
-		ut64 block_addr = r2il_block_addr (blocks->blocks[i]);
+		ut64 block_addr = 0;
+		(void)sleigh_v2_block_addr (blocks->blocks[i], &block_addr);
 		set_sla_comment_line_with_prefix (anal, block_addr, NULL, SLEIGH_COMMENT_PREFIX_TAINT);
 		set_sla_comment_line_with_prefix (anal, block_addr, NULL, SLEIGH_COMMENT_PREFIX_TAINT_RISK);
 	}
@@ -5729,7 +5522,8 @@ static size_t write_semantic_comments_for_function(RAnal *anal, const R2ILContex
 		const BlockArray *blocks, ut64 fcn_addr, bool enabled) {
 	size_t i;
 	size_t emitted = 0;
-	R2SleighAnnotations *annotations = NULL;
+	R2SleighAnalysisResultV2 *result = NULL;
+	R2SleighAnalysisResultViewV2 view = {0};
 	const R2SleighAnnotation *items = NULL;
 	size_t count = 0;
 	bool got_annotation_array = false;
@@ -5741,7 +5535,9 @@ static size_t write_semantic_comments_for_function(RAnal *anal, const R2ILContex
 	/* Always clear stale semantic lines first to keep writeback idempotent. */
 	set_sla_comment_line_with_prefix (anal, fcn_addr, NULL, SLEIGH_COMMENT_PREFIX_SEMANTIC);
 	for (i = 0; i < blocks->count; i++) {
-		set_sla_comment_line_with_prefix (anal, r2il_block_addr (blocks->blocks[i]),
+		ut64 block_addr = 0;
+		(void)sleigh_v2_block_addr (blocks->blocks[i], &block_addr);
+		set_sla_comment_line_with_prefix (anal, block_addr,
 			NULL, SLEIGH_COMMENT_PREFIX_SEMANTIC);
 	}
 
@@ -5749,13 +5545,14 @@ static size_t write_semantic_comments_for_function(RAnal *anal, const R2ILContex
 		return 0;
 	}
 
-	annotations = r2sleigh_analyze_fcn_annotations_typed (ctx,
-		(const R2ILBlock **)blocks->blocks, blocks->count, fcn_addr);
-	if (!annotations) {
+	if (sleigh_v2_analysis_query (R2SLEIGH_QUERY_ANNOTATIONS_V2,
+		ctx, (const R2ILBlock *const *)blocks->blocks, blocks->count,
+		fcn_addr, NULL, NULL, 0, &result, &view) != R2SLEIGH_STATUS_OK_V2) {
 		R_LOG_DEBUG ("r2sleigh: semantic annotation generation returned empty payload for fcn=0x%"PFMT64x, fcn_addr);
 		goto cleanup;
 	}
-	items = r2sleigh_annotations_items (annotations, &count);
+	items = (const R2SleighAnnotation *)view.primary;
+	count = view.primary_count;
 	got_annotation_array = true;
 	if (!items && count > 0) {
 		R_LOG_DEBUG ("r2sleigh: semantic annotation typed payload failure for fcn=0x%"PFMT64x, fcn_addr);
@@ -5773,7 +5570,9 @@ static size_t write_semantic_comments_for_function(RAnal *anal, const R2ILContex
 	}
 
 cleanup:
-	r2sleigh_annotations_free (annotations);
+	if (result) {
+		(void)sleigh_v2_analysis_result_release (&result);
+	}
 	if (enabled && got_annotation_array && emitted == 0) {
 		set_sla_comment_line_with_prefix (anal, fcn_addr, "sla: analyzed",
 			SLEIGH_COMMENT_PREFIX_SEMANTIC);
@@ -6034,21 +5833,29 @@ static char *format_taint_risk_comment(
 	return comment;
 }
 
-static void attach_switch_info_to_block(R2ILBlock *block, const RAnalBlock *bb) {
+static bool attach_switch_info_to_block(R2ILBlock *block, const RAnalBlock *bb) {
 	if (!block || !bb || !bb->switch_op || !bb->switch_op->cases) {
-		return;
+		return true;
 	}
 
 	const RAnalSwitchOp *swop = bb->switch_op;
 	const int ncases = r_list_length (swop->cases);
 	if (ncases <= 0) {
-		return;
+		return true;
 	}
 
 	const size_t case_count = (size_t)ncases;
-	R2ILSwitchCaseFfi *cases = R_NEWS0 (R2ILSwitchCaseFfi, case_count);
+	if (case_count > R2SLEIGH_MAX_SWITCH_CASES_V2) {
+		/* Let the Rust boundary record the exact limit failure on the
+		 * owning lift context without allocating an oversized C buffer. */
+		(void)sleigh_v2_block_set_switch_info (block, swop->addr,
+			swop->min_val, swop->max_val, swop->def_val,
+			swop->def_val != UT64_MAX, NULL, case_count);
+		return false;
+	}
+	R2SleighSwitchCaseV2 *cases = R_NEWS0 (R2SleighSwitchCaseV2, case_count);
 	if (!cases) {
-		return;
+		return false;
 	}
 
 	RListIter *iter;
@@ -6070,11 +5877,14 @@ static void attach_switch_info_to_block(R2ILBlock *block, const RAnalBlock *bb) 
 		const ut64 switch_addr = (swop->jump_addr && swop->jump_addr != UT64_MAX)
 			? swop->jump_addr: swop->addr;
 		const int has_default = swop->def_val != UT64_MAX;
-		(void)r2il_block_set_switch_info (block, switch_addr,
+		const bool accepted = sleigh_v2_block_set_switch_info (block, switch_addr,
 			swop->min_val, swop->max_val, swop->def_val,
-			has_default, cases, i);
+			has_default, cases, i) == R2SLEIGH_STATUS_OK_V2;
+		free (cases);
+		return accepted;
 	}
 	free (cases);
+	return false;
 }
 
 static bool sleigh_engine_function_preflight(const RAnalFunction *fcn, const char *operation) {
@@ -6156,34 +5966,54 @@ static bool lift_function_blocks_with_limits(
 		}
 
 		/* Lift entire basic block (multiple instructions) */
-		R2ILBlock *block = r2il_lift_block (ctx, buf, to_read, bb->addr, (unsigned int)lift_size);
-		if (block) {
-			if (!r2il_block_validate (ctx, block)) {
-				const char *err = r2il_error (ctx);
+		R2ILBlock *block = NULL;
+		uint32_t lift_status = sleigh_v2_lift_block (ctx, buf, to_read,
+			bb->addr, (unsigned int)lift_size, &block);
+		if (lift_status == R2SLEIGH_STATUS_OK_V2 && block) {
+			if (sleigh_v2_block_validate (ctx, block) != R2SLEIGH_STATUS_OK_V2) {
+				char *err = NULL;
+				(void)sleigh_v2_context_error (ctx, &err);
 				if (err && *err) {
 					R_LOG_ERROR ("r2sleigh: invalid block at 0x%"PFMT64x": %s", bb->addr, err);
 				} else {
 					R_LOG_ERROR ("r2sleigh: invalid block at 0x%"PFMT64x, bb->addr);
 				}
-				r2il_block_free (block);
+				free (err);
+				(void)sleigh_v2_block_release (&block);
 				free (buf);
 				out->quality.invalid_blocks++;
 				continue;
 			}
-			const size_t block_ops = r2il_block_op_count (block);
+			size_t block_ops = 0;
+			if (sleigh_v2_block_op_count (block, &block_ops) != R2SLEIGH_STATUS_OK_V2) {
+				(void)sleigh_v2_block_release (&block);
+				free (buf);
+				out->quality.invalid_blocks++;
+				continue;
+			}
 			if ((max_blocks && out->count >= max_blocks)
 				|| (max_ops && (block_ops > max_ops || total_ops > max_ops - block_ops))) {
 				R_LOG_ERROR ("r2sleigh: lift budget refused function 0x%"PFMT64x": blocks cap %zu, operations cap %zu",
 					fcn->addr, max_blocks, max_ops);
-				r2il_block_free (block);
+				(void)sleigh_v2_block_release (&block);
 				free (buf);
 				block_array_free (out);
 				return false;
 			}
-			attach_switch_info_to_block (block, bb);
+			if (!attach_switch_info_to_block (block, bb)) {
+				char *err = NULL;
+				(void)sleigh_v2_context_error (ctx, &err);
+				R_LOG_ERROR ("r2sleigh: rejected switch metadata at 0x%"PFMT64x"%s%s",
+					bb->addr, err && *err? ": ": "", err && *err? err: "");
+				free (err);
+				out->quality.invalid_blocks++;
+				(void)sleigh_v2_block_release (&block);
+				free (buf);
+				continue;
+			}
 			if (!block_array_push (out, block)) {
 				R_LOG_ERROR ("r2sleigh: failed to grow lifted block array for function 0x%"PFMT64x, fcn->addr);
-				r2il_block_free (block);
+				(void)sleigh_v2_block_release (&block);
 				free (buf);
 				block_array_free (out);
 				return false;
@@ -6208,20 +6038,8 @@ static bool lift_function_blocks(
 	return lift_function_blocks_with_limits (anal, fcn, ctx, out, 0, 0);
 }
 
-static bool sleigh_engine_lift_function_blocks(
-	RAnal *anal,
-	RAnalFunction *fcn,
-	R2ILContext *ctx,
-	BlockArray *out
-) {
-	return lift_function_blocks_with_limits (
-		anal, fcn, ctx, out,
-		(size_t)R2SLEIGH_MAX_FUNCTION_BLOCKS_V2,
-		(size_t)R2SLEIGH_MAX_FUNCTION_OPS_V2);
-}
-
 static SleighMode sleigh_mode_from_analysis_depth(RAnal *anal) {
-	R2SleighAnalysisPolicy rust_policy = r2sleigh_analysis_policy_for_depth (anal? (unsigned int)anal->plugin_analysis_depth: 0);
+	R2SleighAnalysisPolicyV2 rust_policy = sleigh_v2_query_analysis_policy (anal? (unsigned int)anal->plugin_analysis_depth: 0);
 	return rust_policy.mode <= (unsigned int)SLEIGH_MODE_FULL? (SleighMode)rust_policy.mode: SLEIGH_MODE_BALANCED;
 }
 
@@ -6238,7 +6056,10 @@ static void sleigh_profile_clear(void) {
 	sleigh_profile_entries = NULL;
 	sleigh_profile_count = 0;
 	sleigh_profile_cap = 0;
-	r2sleigh_engine_cache_stats_reset ();
+	uint32_t reset_status = sleigh_v2_engine_cache_reset ();
+	if (reset_status != R2SLEIGH_STATUS_OK_V2) {
+		R_LOG_ERROR ("r2sleigh: engine cache reset failed (%u)", reset_status);
+	}
 }
 
 static SleighProfileEntry *sleigh_profile_entry_get(ut64 addr, const char *name) {
@@ -6323,7 +6144,9 @@ static char *sleigh_profile_json(RAnal *anal) {
 	}
 	size_t max_items = SLEIGH_PROFILE_MAX_DEFAULT;
 	SleighProfileEntry **items = NULL;
-	char *engine_cache = r2sleigh_engine_cache_stats_json ();
+	char *engine_cache = NULL;
+	(void)sleigh_v2_analysis_render (R2SLEIGH_ANALYSIS_ENGINE_CACHE_STATS_V2,
+		NULL, NULL, 0, 0, NULL, &engine_cache);
 	if (sleigh_profile_count > 0) {
 		items = calloc (sleigh_profile_count, sizeof (*items));
 		if (items) {
@@ -6363,9 +6186,7 @@ static char *sleigh_profile_json(RAnal *anal) {
 	pj_end (pj);
 	pj_end (pj);
 	free (items);
-	if (engine_cache) {
-		r2il_string_free (engine_cache);
-	}
+	free (engine_cache);
 	return pj_drain (pj);
 }
 
@@ -6373,7 +6194,7 @@ static void configure_context_runtime_options(RAnal *anal, R2ILContext *ctx) {
 	if (!ctx) {
 		return;
 	}
-	r2il_set_semantic_metadata_enabled (ctx, !sleigh_mode_is_fast (anal));
+	(void)sleigh_v2_context_set_semantic_metadata (ctx, !sleigh_mode_is_fast (anal));
 }
 
 R2ILContext *get_context(RAnal *anal) {
@@ -6435,7 +6256,11 @@ R2ILContext *get_context(RAnal *anal) {
 
 	/* Free old context */
 	if (sleigh_ctx) {
-		r2il_free (sleigh_ctx);
+		uint32_t free_status = sleigh_v2_context_free (sleigh_ctx);
+		if (free_status != R2SLEIGH_STATUS_OK_V2) {
+			R_LOG_ERROR ("r2sleigh: refusing architecture reload because context free failed (%u)", free_status);
+			return NULL;
+		}
 		sleigh_ctx = NULL;
 	}
 	free (sleigh_arch);
@@ -6443,31 +6268,39 @@ R2ILContext *get_context(RAnal *anal) {
 	sym_state_cache_clear ();
 
 	/* Initialize new context */
-	sleigh_ctx = r2il_arch_init (sleigh_arch_str);
-	if (!sleigh_ctx) {
+	uint32_t status = sleigh_v2_context_create (sleigh_arch_str, &sleigh_ctx);
+	if (status != R2SLEIGH_STATUS_OK_V2 || !sleigh_ctx) {
 		/* Optional-arch builds are expected to miss some backends; stay silent
 		 * so unsupported architectures fall back to other anal plugins. */
 		R_LOG_DEBUG ("r2sleigh: backend unavailable for %s", sleigh_arch_str);
 		return NULL;
 	}
 
-	if (!r2il_is_loaded (sleigh_ctx)) {
-		const char *err = r2il_error (sleigh_ctx);
+	uint32_t loaded = 0;
+	if (sleigh_v2_context_is_loaded (sleigh_ctx, &loaded) != R2SLEIGH_STATUS_OK_V2 || !loaded) {
+		char *err = NULL;
+		(void)sleigh_v2_context_error (sleigh_ctx, &err);
 		if (err && *err) {
 			R_LOG_DEBUG ("r2sleigh: %s", err);
 		}
-		r2il_free (sleigh_ctx);
-		sleigh_ctx = NULL;
+		free (err);
+		uint32_t free_status = sleigh_v2_context_free (sleigh_ctx);
+		if (free_status == R2SLEIGH_STATUS_OK_V2) {
+			sleigh_ctx = NULL;
+		} else {
+			R_LOG_ERROR ("r2sleigh: retaining failed context handle (%u)", free_status);
+		}
 		return NULL;
 	}
 
 	sleigh_arch = strdup (sleigh_arch_str);
 
 	/* Set register profile from Sleigh definitions */
-	char *profile = r2il_get_reg_profile (sleigh_ctx);
+	char *profile = NULL;
+	(void)sleigh_v2_context_reg_profile (sleigh_ctx, &profile);
 	if (profile) {
 		r_anal_set_reg_profile (anal, profile);
-		r2il_string_free (profile);
+		free (profile);
 	}
 
 	configure_context_runtime_options (anal, sleigh_ctx);
@@ -6494,36 +6327,50 @@ int sleigh_op(RAnal *anal, RAnalOp *op, ut64 addr, const ut8 *data, int len, RAn
 		use_len = SLEIGH_MIN_BYTES;
 	}
 
-	R2ILBlock *block = r2il_lift (sleigh_ctx, use_data, use_len, addr);
-	if (!block) {
+	R2ILBlock *block = NULL;
+	if (sleigh_v2_lift_instruction (sleigh_ctx, use_data, use_len, addr, &block)
+		!= R2SLEIGH_STATUS_OK_V2 || !block) {
 		return -1;
 	}
 
 	op->addr = addr;
-	op->size = r2il_block_size (block);
-	op->type = r2il_block_type (block);
-	ut64 jump_addr = r2il_block_jump (block);
+	uint32_t block_size = 0;
+	uint32_t block_type = 0;
+	if (sleigh_v2_block_size (block, &block_size) != R2SLEIGH_STATUS_OK_V2
+		|| sleigh_v2_block_type (block, &block_type) != R2SLEIGH_STATUS_OK_V2) {
+		(void)sleigh_v2_block_release (&block);
+		return -1;
+	}
+	op->size = block_size;
+	op->type = block_type;
+	ut64 jump_addr = 0;
+	(void)sleigh_v2_block_jump (block, &jump_addr);
 	if (jump_addr != 0) {
 		op->jump = jump_addr;
 	}
-	ut64 fail_addr = r2il_block_fail (block);
+	ut64 fail_addr = 0;
+	(void)sleigh_v2_block_fail (block, &fail_addr);
 	if (fail_addr != 0) {
 		op->fail = fail_addr;
 	}
 
 	if (mask & R_ARCH_OP_MASK_DISASM) {
-		char *mnem = r2il_block_mnemonic (ctx, use_data, use_len, addr);
+		char *mnem = NULL;
+		(void)sleigh_v2_block_mnemonic (ctx, use_data, use_len, addr, &mnem);
 		if (mnem) {
 			op->mnemonic = strdup (mnem);
-			r2il_string_free (mnem);
+			free (mnem);
 		}
 	}
 
 	if (mask & R_ARCH_OP_MASK_ESIL) {
-		char *esil = r2il_block_to_esil (ctx, block);
+		char *esil = NULL;
+		const R2ILBlock *blocks[] = { block };
+		(void)sleigh_v2_analysis_render (R2SLEIGH_ANALYSIS_BLOCK_ESIL_V2,
+			ctx, blocks, 1, 0, NULL, &esil);
 		if (esil) {
 			r_strbuf_set (&op->esil, esil);
-			r2il_string_free (esil);
+			free (esil);
 		}
 	}
 
@@ -6533,14 +6380,15 @@ int sleigh_op(RAnal *anal, RAnalOp *op, ut64 addr, const ut8 *data, int len, RAn
 		fill_op_values_enhanced (anal, op, ctx, block);
 	}
 
-	r2il_block_free (block);
+	(void)sleigh_v2_block_release (&block);
 	return op->size;
 }
 
 static bool sleigh_init(RAnal *anal) {
-	if (!sleigh_resolve_function_context_api ()) {
-		sleigh_report_missing_function_context_api ();
-		return false;
+	RCore *core = anal? anal->coreb.core: NULL;
+	if (core && core->config) {
+		r_config_set_b (core->config, "anal.sleigh.sym.merge",
+			r_config_get_b (core->config, "anal.sleigh.sym.merge"));
 	}
 	/* Prime context early so register aliases are available before aa/aaa passes. */
 	(void)get_context (anal);
@@ -6549,8 +6397,15 @@ static bool sleigh_init(RAnal *anal) {
 
 static bool sleigh_fini(RAnal *anal) {
 	(void)anal;
+	if (!sleigh_v2_planner_result_retry_pending ()) {
+		return false;
+	}
 	if (sleigh_ctx) {
-		r2il_free (sleigh_ctx);
+		uint32_t free_status = sleigh_v2_context_free (sleigh_ctx);
+		if (free_status != R2SLEIGH_STATUS_OK_V2) {
+			R_LOG_ERROR ("r2sleigh: retaining context after free failure (%u)", free_status);
+			return false;
+		}
 		sleigh_ctx = NULL;
 	}
 	free (sleigh_arch);
@@ -6615,132 +6470,45 @@ static bool sleigh_direct_sym_debug_only_command(const char *cmd) {
 
 static char *sleigh_decompile_execute(RAnal *anal, RAnalFunction *fcn, bool json_projection);
 
-static RCodeMeta *sleigh_decompile(RAnal *anal, RAnalFunction *fcn) {
-	char *result = sleigh_decompile_execute (anal, fcn, false);
-	RCodeMeta *metadata = result? r_codemeta_new (result): NULL;
-	free (result);
-	return metadata;
-}
 
 static char *sleigh_decompile_execute(RAnal *anal, RAnalFunction *fcn, bool json_projection) {
-	R_RETURN_VAL_IF_FAIL (anal && fcn, NULL);
-	if (!sleigh_engine_function_preflight (fcn, "decompile")) {
-		return json_projection
-			? sleigh_engine_v2_error_json ("preflight",
-				R2SLEIGH_STATUS_LIMIT_EXCEEDED_V2,
-				"function exceeds the V2 decompile input budget")
-			: NULL;
-	}
-	R2ILContext *ctx = get_context (anal);
-	RCore *core = anal->coreb.core;
-	if (!ctx || !core) {
-		R_LOG_ERROR ("r2sleigh: decompiler context is unavailable");
-		return json_projection
-			? sleigh_engine_v2_error_json ("context_unavailable",
-				R2SLEIGH_STATUS_ENGINE_ERROR_V2,
-				"decompiler context is unavailable")
-			: NULL;
-	}
+	(void)anal;
+	(void)fcn;
+	R_LOG_ERROR ("r2sleigh: direct decompile commands cannot construct source authority; use radare2's borrowed snapshot decompiler provider");
+	return json_projection
+		? sleigh_engine_v2_error_json ("borrowed_snapshot_required",
+			R2SLEIGH_STATUS_UNSUPPORTED_V2,
+			"decompilation requires the ABI-138 borrowed snapshot provider")
+		: NULL;
+}
 
-	BlockArray blocks = {0};
-	ut64 profile_start_us = r_time_now_mono ();
-	if (!sleigh_engine_lift_function_blocks (anal, fcn, ctx, &blocks)) {
-		R_LOG_ERROR ("r2sleigh: failed to lift function blocks within the decompile budget");
-		return json_projection
-			? sleigh_engine_v2_error_json ("lift",
-				R2SLEIGH_STATUS_LIMIT_EXCEEDED_V2,
-				"failed to lift function blocks within the decompile budget")
-			: NULL;
-	}
-	sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_LIFT,
-		r_time_now_mono () - profile_start_us);
-
-	SleighTypedFunctionContext typed_context = {0};
-	profile_start_us = r_time_now_mono ();
-	if (!sleigh_typed_function_context_build (anal, fcn, &typed_context)) {
-		R_LOG_ERROR ("r2sleigh: failed to collect typed function snapshot");
-		block_array_free (&blocks);
-		return json_projection
-			? sleigh_engine_v2_error_json ("snapshot_context",
-				R2SLEIGH_STATUS_ENGINE_ERROR_V2,
-				"failed to collect typed function snapshot")
-			: NULL;
-	}
-	sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_TYPED_CONTEXT,
-		r_time_now_mono () - profile_start_us);
-
-	SleighInterprocScope interproc_scope = {0};
-	if (!sleigh_interproc_scope_build (
-			core, anal, fcn, ctx, R2SLEIGH_INTERPROC_SESSION_DECOMPILE,
-			&interproc_scope)) {
-		R_LOG_ERROR ("r2sleigh: failed to build interprocedural scope");
-		sleigh_typed_function_context_clear (&typed_context);
-		block_array_free (&blocks);
-		return json_projection
-			? sleigh_engine_v2_error_json ("interprocedural_scope",
-				R2SLEIGH_STATUS_LIMIT_EXCEEDED_V2,
-				"failed to build interprocedural scope")
-			: NULL;
-	}
-
-	R2SleighEngineRequestPayloadV2 request_payload = {
-		.abi_version = R2SLEIGH_ABI_V2,
-		.struct_size = sizeof (request_payload),
-		.ctx = ctx,
-		.blocks = (const R2ILBlock **)blocks.blocks,
-		.num_blocks = blocks.count,
-		.function_addr = fcn->addr,
-		.function_name = fcn->name,
-		.function_context = typed_context.context,
-		.lift_quality = blocks.quality,
-		.interproc_scope = interproc_scope.scope,
-		.interproc_plan = interproc_scope.plan,
-		.analysis_depth = 0,
-		.timeout_us = 0,
+static RCodeMeta *sleigh_decompile(const RAnalFunctionSnapshot *snapshot) {
+	R_RETURN_VAL_IF_FAIL (snapshot, NULL);
+	const R2SleighRadareSnapshotInputV2 source = {
+		.struct_size = sizeof (source),
+		.abi_version = R2SLEIGH_RADARE_ABI_V2,
+		.snapshot_schema_version = R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2,
+		.accessor_schema_version = R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2,
+		.snapshot = snapshot,
+		.accessors = &sleigh_radare_accessors,
 	};
-	SleighSourceInterfaceV2 source_interface = {0};
-	int source_state = sleigh_source_interface_v2_build (
-		&typed_context, &blocks, &source_interface);
-	if (source_state < 0) {
-		R_LOG_ERROR ("r2sleigh: invalid exact source function interface");
-		sleigh_interproc_scope_clear (&interproc_scope);
-		sleigh_typed_function_context_clear (&typed_context);
-		block_array_free (&blocks);
-		return json_projection
-			? sleigh_engine_v2_error_json ("source_interface",
-				R2SLEIGH_STATUS_INVALID_ARGUMENT_V2,
-				"invalid exact source function interface")
-			: NULL;
+	const R2SleighEngineRequestPayloadV2 payload = {
+		.abi_version = R2SLEIGH_ABI_V2,
+		.struct_size = sizeof (payload),
+		.timeout_us = 0,
+		.radare_snapshot = &source,
+	};
+	char *result = sleigh_engine_execute_v2 (
+		R2SLEIGH_REQUEST_DECOMPILE_V2,
+		R2SLEIGH_CAP_DECOMPILE_V2 | R2SLEIGH_CAP_OPAQUE_RADARE_SNAPSHOT_V2,
+		&payload);
+	if (!result) {
+		R_LOG_ERROR ("r2sleigh: borrowed snapshot decompilation was refused");
+		return NULL;
 	}
-	profile_start_us = r_time_now_mono ();
-	uint64_t required_capabilities = R2SLEIGH_CAP_DECOMPILE_V2;
-	if (source_state > 0) {
-		required_capabilities |= R2SLEIGH_CAP_EXACT_FUNCTION_INTERFACE_V2
-			| R2SLEIGH_CAP_EXACT_STACK_SLOT_ROLES_V2;
-		if (source_interface.interface.exact_types_complete) {
-			required_capabilities |= R2SLEIGH_CAP_EXACT_TYPE_LAYOUT_V2;
-		}
-		if (source_interface.interface.num_call_sites) {
-			required_capabilities |= R2SLEIGH_CAP_CALL_SITE_INTERFACES_V2;
-		}
-	}
-	request_payload.source_interface = source_state > 0? &source_interface.interface: NULL;
-	char *result = json_projection
-		? sleigh_engine_execute_v2_json (
-			R2SLEIGH_REQUEST_DECOMPILE_V2,
-			required_capabilities,
-			&request_payload)
-		: sleigh_engine_execute_v2 (
-			R2SLEIGH_REQUEST_DECOMPILE_V2,
-			required_capabilities,
-			&request_payload);
-	sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_DECOMPILE,
-		r_time_now_mono () - profile_start_us);
-	sleigh_source_interface_v2_clear (&source_interface);
-	sleigh_interproc_scope_clear (&interproc_scope);
-	sleigh_typed_function_context_clear (&typed_context);
-	block_array_free (&blocks);
-	return result;
+	RCodeMeta *metadata = r_codemeta_new (result);
+	free (result);
+	return metadata;
 }
 
 static char *sleigh_cmd(RAnal *anal, const char *cmd) {
@@ -6780,15 +6548,13 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 	}
 	if (!strcmp (cmd, "sla.dec?") || !strcmp (cmd, "sla.dec ?")) {
 		if (cons) {
-			r_cons_println (cons, "Usage: a:sla.dec [name|addr]");
-			r_cons_println (cons, "Decompile the selected function and print rendered C.");
+			r_cons_println (cons, "sla.dec is unavailable outside radare2's borrowed-snapshot decompiler provider; use pdd.");
 		}
 		return strdup ("");
 	}
 	if (!strcmp (cmd, "sla.decj?") || !strcmp (cmd, "sla.decj ?")) {
 		if (cons) {
-			r_cons_println (cons, "Usage: a:sla.decj [name|addr]");
-			r_cons_println (cons, "Decompile through V2 and print output, diagnostics, outcomes, and timings as JSON.");
+			r_cons_println (cons, "sla.decj is unavailable outside radare2's borrowed-snapshot decompiler provider; use pdd.");
 		}
 		return strdup ("");
 	}
@@ -6807,8 +6573,8 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 	if (cmd[3] == '?') {
 		if (cons) {
 			r_cons_println (cons, "| a:sla        - Show r2sleigh status");
-			r_cons_println (cons, "| a:sla.dec [name|addr] - Decompile function (current by default)");
-			r_cons_println (cons, "| a:sla.decj [name|addr] - Decompile with V2 diagnostics as JSON");
+			r_cons_println (cons, "| pdd - decompile through the borrowed-snapshot provider");
+			r_cons_println (cons, "| a:sla.dec / a:sla.decj - unavailable outside that provider");
 			r_cons_println (cons, "| a:sym.explore <target> - Explore symbolic paths reaching target");
 			r_cons_println (cons, "| a:sym.solve <target> - Solve concrete input for target reachability");
 			r_cons_println (cons, "| a:sym.state  - Show last symbolic explore/solve cached result");
@@ -6842,7 +6608,6 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		char *spec_json = NULL;
 		char *external_context_json = NULL;
 		char *result = NULL;
-		bool rust_owned = true;
 
 		if (!arg || !*arg) {
 			if (cons) {
@@ -6865,11 +6630,6 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			R_LOG_ERROR ("r2sleigh: failed to build symbolic function scope");
 			return strdup("");
 		}
-		char *sym_map_json = build_sym_symbol_map_json (core, anal, ctx, &scope);
-		if (sym_map_json) {
-			r2sym_set_symbol_map_json (sym_map_json);
-			free (sym_map_json);
-		}
 		external_context_json = sleigh_collect_sym_assumptions_json (anal, fcn);
 
 		spec_json = strdup (arg);
@@ -6879,11 +6639,12 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			return strdup("");
 		}
 		r_str_unescape (spec_json);
-		result = r2sym_run_spec_json_scope (ctx, scope.functions, scope.count, fcn->addr, spec_json, external_context_json);
+		(void)sleigh_v2_scope_render_for_scope (R2SLEIGH_SCOPE_RUN_SPEC_V2,
+			core, anal, ctx, &scope, fcn->addr, 0, NULL,
+			spec_json, external_context_json, &result);
 		free (spec_json);
 		free (external_context_json);
 		if (!result) {
-			rust_owned = false;
 			result = strdup ("{\"error\":\"symbolic execution failed\"}");
 		}
 
@@ -6893,11 +6654,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		if (result && !sym_result_has_error (result)) {
 			sym_state_cache_update ("runj", fcn->addr, fcn->addr, 0, result);
 		}
-		if (rust_owned) {
-			r2il_string_free (result);
-		} else {
-			free (result);
-		}
+		free (result);
 		sym_function_scope_free (&scope);
 		return strdup("");
 	}
@@ -6949,7 +6706,6 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		char *spec_json = NULL;
 		char *external_context_json = NULL;
 		char *result = NULL;
-		bool rust_owned = true;
 
 		if (!arg || !*arg) {
 			if (cons) {
@@ -6996,17 +6752,11 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			replay_sym_seed_spec_fini (&spec);
 			return strdup ("");
 		}
-		char *sym_map_json = build_sym_symbol_map_json (core, anal, ctx, &scope);
-		if (sym_map_json) {
-			r2sym_set_symbol_map_json (sym_map_json);
-			free (sym_map_json);
-		}
 		external_context_json = sleigh_collect_sym_assumptions_json (anal, fcn);
 
 		result = replay_sym_query_run (core, ctx, &scope, fcn->addr, target, &spec, is_explore, external_context_json);
 		free (external_context_json);
 		if (!result) {
-			rust_owned = false;
 			result = strdup ("{\"error\":\"replay symbolic execution failed\"}");
 		}
 
@@ -7017,11 +6767,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			sym_state_cache_update (is_explore ? "explore.replayj" : "solve.replayj",
 				fcn->addr, spec.entry_addr? spec.entry_addr: fcn->addr, target, result);
 		}
-		if (rust_owned) {
-			r2il_string_free (result);
-		} else {
-			free (result);
-		}
+		free (result);
 		sym_function_scope_free (&scope);
 		replay_sym_seed_spec_fini (&spec);
 		return strdup ("");
@@ -7039,7 +6785,6 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		char *spec_json = NULL;
 		char *external_context_json = NULL;
 		char *result = NULL;
-		bool rust_owned = true;
 
 		if (!arg || !*arg) {
 			if (cons) {
@@ -7086,17 +6831,11 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			replay_sym_seed_spec_fini (&spec);
 			return strdup ("");
 		}
-		char *sym_map_json = build_sym_symbol_map_json (core, anal, ctx, &scope);
-		if (sym_map_json) {
-			r2sym_set_symbol_map_json (sym_map_json);
-			free (sym_map_json);
-		}
 		external_context_json = sleigh_collect_sym_assumptions_json (anal, fcn);
 
 		result = replay_sym_query_run (core, ctx, &scope, fcn->addr, target, &spec, is_explore, external_context_json);
 		free (external_context_json);
 		if (!result) {
-			rust_owned = false;
 			result = strdup ("{\"error\":\"state symbolic execution failed\"}");
 		}
 
@@ -7107,11 +6846,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			sym_state_cache_update (is_explore ? "explore.state" : "solve.state",
 				fcn->addr, spec.entry_addr? spec.entry_addr: core->addr, target, result);
 		}
-		if (rust_owned) {
-			r2il_string_free (result);
-		} else {
-			free (result);
-		}
+		free (result);
 		sym_function_scope_free (&scope);
 		replay_sym_seed_spec_fini (&spec);
 		return strdup ("");
@@ -7127,7 +6862,6 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		SymFunctionScope scope;
 		char *result = NULL;
 		char *external_context_json = NULL;
-		bool rust_owned = true;
 
 		if (!arg || !*arg) {
 			if (cons) {
@@ -7162,27 +6896,18 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			return strdup("");
 		}
 		sleigh_debug_scope_log ("sym_query_stage scope_ready count=%zu", scope.count);
-		sleigh_debug_scope_log ("sym_query_stage sym_map_begin");
-		char *sym_map_json = build_sym_symbol_map_json (core, anal, ctx, &scope);
-		if (sym_map_json) {
-			r2sym_set_symbol_map_json (sym_map_json);
-			free (sym_map_json);
-		}
-		sleigh_debug_scope_log ("sym_query_stage sym_map_done");
 		sleigh_debug_scope_log ("sym_query_stage assumptions_begin");
 		external_context_json = sleigh_collect_sym_assumptions_json (anal, fcn);
 		sleigh_debug_scope_log ("sym_query_stage assumptions_done");
 
 		sleigh_debug_scope_log ("sym_query_stage rust_call_begin target=0x%"PFMT64x, target);
-		if (is_explore) {
-			result = r2sym_explore_to_scope (ctx, scope.functions, scope.count, fcn->addr, target, external_context_json);
-		} else {
-			result = r2sym_solve_to_scope (ctx, scope.functions, scope.count, fcn->addr, target, external_context_json);
-		}
+		const uint32_t kind = is_explore
+			? R2SLEIGH_SCOPE_EXPLORE_V2: R2SLEIGH_SCOPE_SOLVE_V2;
+		(void)sleigh_v2_scope_render_for_scope (kind, core, anal, ctx, &scope,
+			fcn->addr, target, NULL, NULL, external_context_json, &result);
 		sleigh_debug_scope_log ("sym_query_stage rust_call_done");
 		free (external_context_json);
 		if (!result) {
-			rust_owned = false;
 			result = strdup ("{\"error\":\"symbolic execution failed\"}");
 		}
 
@@ -7193,11 +6918,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			sym_state_cache_update (is_explore ? "explore" : "solve", fcn->addr, fcn->addr, target, result);
 		}
 
-		if (rust_owned) {
-			r2il_string_free (result);
-		} else {
-			free (result);
-		}
+		free (result);
 		sym_function_scope_free (&scope);
 		return strdup("");
 	}
@@ -7288,14 +7009,18 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			arg++; // skip space
 			while (*arg == ' ') arg++;
 			if (*arg) {
+				if (sleigh_ctx) {
+					uint32_t free_status = sleigh_v2_context_free (sleigh_ctx);
+					if (free_status != R2SLEIGH_STATUS_OK_V2) {
+						R_LOG_ERROR ("r2sleigh: architecture unchanged because context free failed (%u)", free_status);
+						return strdup ("");
+					}
+					sleigh_ctx = NULL;
+				}
 				/* Set override */
 				free (sleigh_arch_override);
 				sleigh_arch_override = strdup (arg);
 				/* Force context reload on next use */
-				if (sleigh_ctx) {
-					r2il_free (sleigh_ctx);
-					sleigh_ctx = NULL;
-				}
 				free (sleigh_arch);
 				sleigh_arch = NULL;
 				if (cons) {
@@ -7305,7 +7030,10 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		} else {
 			/* Get current */
 			R2ILContext *ctx = get_context (anal);
-			const char *name = ctx ? r2il_arch_name (ctx) : NULL;
+			char *name = NULL;
+			if (ctx) {
+				(void)sleigh_v2_context_arch_name (ctx, &name);
+			}
 			if (cons) {
 				if (name) {
 					r_cons_printf (cons, "%s\n", name);
@@ -7313,6 +7041,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 					r_cons_println (cons, "none");
 				}
 			}
+			free (name);
 		}
 		return strdup("");
 	}
@@ -7320,10 +7049,12 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 	if (!strcmp (cmd, "sla") || !strcmp (cmd, "sla.info")) {
 		R2ILContext *ctx = get_context (anal);
 		if (ctx) {
-			const char *name = r2il_arch_name (ctx);
+			char *name = NULL;
+			(void)sleigh_v2_context_arch_name (ctx, &name);
 			if (cons) {
 				r_cons_printf (cons, "sla: loaded architecture '%s'\n", name ? name : "unknown");
 			}
+			free (name);
 		} else {
 			if (cons) {
 				r_cons_println (cons, "sla: no architecture loaded (unsupported or init failed)");
@@ -7348,13 +7079,15 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			return strdup("");
 		}
 
-		R2ILBlock *block = r2il_lift (ctx, buf, sizeof (buf), addr);
-		if (!block) {
+		R2ILBlock *block = NULL;
+		if (sleigh_v2_lift_instruction (ctx, buf, sizeof (buf), addr, &block)
+			!= R2SLEIGH_STATUS_OK_V2 || !block) {
 			R_LOG_ERROR ("r2sleigh: lift failed");
 			return strdup("");
 		}
 
-		size_t count = r2il_block_op_count (block);
+		size_t count = 0;
+		(void)sleigh_v2_block_op_count (block, &count);
 		if (cons) {
 			r_cons_println (cons, "[");
 		}
@@ -7365,18 +7098,21 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		} else {
 			size_t i;
 			for (i = 0; i < count; i++) {
-				char *json = r2il_block_op_json_named (ctx, block, i);
+				char *json = NULL;
+				const R2ILBlock *blocks[] = { block };
+				(void)sleigh_v2_analysis_render (R2SLEIGH_ANALYSIS_BLOCK_OP_JSON_V2,
+					ctx, blocks, 1, i, NULL, &json);
 				if (json && cons) {
 					r_cons_printf (cons, "  %s%s\n", json, (i + 1 < count) ? "," : "");
-					r2il_string_free (json);
 				}
+				free (json);
 			}
 		}
 		if (cons) {
 			r_cons_println (cons, "]");
 		}
 
-		r2il_block_free (block);
+		(void)sleigh_v2_block_release (&block);
 		return strdup("");
 	}
 
@@ -7394,14 +7130,20 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			return strdup("");
 		}
 
-		R2ILBlock *block = r2il_lift (ctx, buf, sizeof (buf), addr);
-		if (!block) {
+		R2ILBlock *block = NULL;
+		if (sleigh_v2_lift_instruction (ctx, buf, sizeof (buf), addr, &block)
+			!= R2SLEIGH_STATUS_OK_V2 || !block) {
 			R_LOG_ERROR ("r2sleigh: lift failed");
 			return strdup("");
 		}
 
-		char *read_json = r2il_block_regs_read (ctx, block);
-		char *write_json = r2il_block_regs_write (ctx, block);
+		char *read_json = NULL;
+		char *write_json = NULL;
+		const R2ILBlock *blocks[] = { block };
+		(void)sleigh_v2_analysis_render (R2SLEIGH_ANALYSIS_BLOCK_REGS_READ_V2,
+			ctx, blocks, 1, 0, NULL, &read_json);
+		(void)sleigh_v2_analysis_render (R2SLEIGH_ANALYSIS_BLOCK_REGS_WRITE_V2,
+			ctx, blocks, 1, 0, NULL, &write_json);
 
 		if (cons) {
 			r_cons_printf (cons, "{\"read\":%s,\"write\":%s}\n",
@@ -7409,9 +7151,9 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 				write_json ? write_json : "[]");
 		}
 
-		r2il_string_free (read_json);
-		r2il_string_free (write_json);
-		r2il_block_free (block);
+		free (read_json);
+		free (write_json);
+		(void)sleigh_v2_block_release (&block);
 		return strdup("");
 	}
 
@@ -7429,8 +7171,9 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			return strdup("");
 		}
 
-		R2ILBlock *block = r2il_lift (ctx, buf, sizeof (buf), addr);
-		if (!block) {
+		R2ILBlock *block = NULL;
+		if (sleigh_v2_lift_instruction (ctx, buf, sizeof (buf), addr, &block)
+			!= R2SLEIGH_STATUS_OK_V2 || !block) {
 			R_LOG_ERROR ("r2sleigh: lift failed");
 			return strdup("");
 		}
@@ -7440,18 +7183,20 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		RVecRArchValue_init (&srcs);
 		RVecRArchValue_init (&dsts);
 
-			R2ILBlockAnalValues *values = r2il_block_values_typed (ctx, block);
-			if (values) {
-				size_t read_count = 0;
-				size_t write_count = 0;
-				const R2ILBlockRegValue *reads = r2il_block_values_reg_reads (values, &read_count);
-				const R2ILBlockRegValue *writes = r2il_block_values_reg_writes (values, &write_count);
-				add_typed_reg_values (anal, reads, read_count, &srcs, R_PERM_R);
-				add_typed_reg_values (anal, writes, write_count, &dsts, R_PERM_W);
-				r2il_block_values_free (values);
-			}
+		R2SleighAnalysisResultV2 *result = NULL;
+		R2SleighAnalysisResultViewV2 view = {0};
+		const R2ILBlock *query_blocks[] = { block };
+		if (sleigh_v2_analysis_query (R2SLEIGH_QUERY_BLOCK_VALUES_V2,
+			ctx, query_blocks, 1, 0, NULL, NULL, 0, &result, &view)
+			== R2SLEIGH_STATUS_OK_V2) {
+			const R2ILBlockRegValue *reads = (const R2ILBlockRegValue *)view.tertiary;
+			const R2ILBlockRegValue *writes = (const R2ILBlockRegValue *)view.quaternary;
+			add_typed_reg_values (anal, reads, view.tertiary_count, &srcs, R_PERM_R);
+			add_typed_reg_values (anal, writes, view.quaternary_count, &dsts, R_PERM_W);
+			(void)sleigh_v2_analysis_result_release (&result);
+		}
 
-			if (cons) {
+		if (cons) {
 			r_cons_print (cons, "{\"srcs\":[");
 			print_reg_values_json (cons, &srcs);
 			r_cons_print (cons, "],\"dsts\":[");
@@ -7461,7 +7206,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 
 		RVecRArchValue_fini (&srcs);
 		RVecRArchValue_fini (&dsts);
-		r2il_block_free (block);
+		(void)sleigh_v2_block_release (&block);
 		return strdup("");
 	}
 
@@ -7479,19 +7224,23 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			return strdup("");
 		}
 
-		R2ILBlock *block = r2il_lift (ctx, buf, sizeof (buf), addr);
-		if (!block) {
+		R2ILBlock *block = NULL;
+		if (sleigh_v2_lift_instruction (ctx, buf, sizeof (buf), addr, &block)
+			!= R2SLEIGH_STATUS_OK_V2 || !block) {
 			R_LOG_ERROR ("r2sleigh: lift failed");
 			return strdup("");
 		}
 
-		char *mem_json = r2il_block_mem_access (ctx, block);
+		char *mem_json = NULL;
+		const R2ILBlock *blocks[] = { block };
+		(void)sleigh_v2_analysis_render (R2SLEIGH_ANALYSIS_BLOCK_MEMORY_V2,
+			ctx, blocks, 1, 0, NULL, &mem_json);
 		if (cons && mem_json) {
 			r_cons_printf (cons, "%s\n", mem_json);
 		}
 
-		r2il_string_free (mem_json);
-		r2il_block_free (block);
+		free (mem_json);
+		(void)sleigh_v2_block_release (&block);
 		return strdup("");
 	}
 
@@ -7509,19 +7258,23 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			return strdup("");
 		}
 
-		R2ILBlock *block = r2il_lift (ctx, buf, sizeof (buf), addr);
-		if (!block) {
+		R2ILBlock *block = NULL;
+		if (sleigh_v2_lift_instruction (ctx, buf, sizeof (buf), addr, &block)
+			!= R2SLEIGH_STATUS_OK_V2 || !block) {
 			R_LOG_ERROR ("r2sleigh: lift failed");
 			return strdup("");
 		}
 
-		char *vars_json = r2il_block_varnodes (ctx, block);
+		char *vars_json = NULL;
+		const R2ILBlock *blocks[] = { block };
+		(void)sleigh_v2_analysis_render (R2SLEIGH_ANALYSIS_BLOCK_VARNODES_V2,
+			ctx, blocks, 1, 0, NULL, &vars_json);
 		if (cons && vars_json) {
 			r_cons_printf (cons, "%s\n", vars_json);
 		}
 
-		r2il_string_free (vars_json);
-		r2il_block_free (block);
+		free (vars_json);
+		(void)sleigh_v2_block_release (&block);
 		return strdup("");
 	}
 
@@ -7539,19 +7292,23 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			return strdup("");
 		}
 
-		R2ILBlock *block = r2il_lift (ctx, buf, sizeof (buf), addr);
-		if (!block) {
+		R2ILBlock *block = NULL;
+		if (sleigh_v2_lift_instruction (ctx, buf, sizeof (buf), addr, &block)
+			!= R2SLEIGH_STATUS_OK_V2 || !block) {
 			R_LOG_ERROR ("r2sleigh: lift failed");
 			return strdup("");
 		}
 
-		char *ssa_json = r2il_block_to_ssa_json (ctx, block);
+		char *ssa_json = NULL;
+		const R2ILBlock *blocks[] = { block };
+		(void)sleigh_v2_analysis_render (R2SLEIGH_ANALYSIS_BLOCK_SSA_V2,
+			ctx, blocks, 1, 0, NULL, &ssa_json);
 		if (cons && ssa_json) {
 			r_cons_printf (cons, "%s\n", ssa_json);
 		}
 
-		r2il_string_free (ssa_json);
-		r2il_block_free (block);
+		free (ssa_json);
+		(void)sleigh_v2_block_release (&block);
 		return strdup("");
 	}
 
@@ -7569,123 +7326,30 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			return strdup("");
 		}
 
-		R2ILBlock *block = r2il_lift (ctx, buf, sizeof (buf), addr);
-		if (!block) {
+		R2ILBlock *block = NULL;
+		if (sleigh_v2_lift_instruction (ctx, buf, sizeof (buf), addr, &block)
+			!= R2SLEIGH_STATUS_OK_V2 || !block) {
 			R_LOG_ERROR ("r2sleigh: lift failed");
 			return strdup("");
 		}
 
-		char *defuse_json = r2il_block_defuse_json (ctx, block);
+		char *defuse_json = NULL;
+		const R2ILBlock *blocks[] = { block };
+		(void)sleigh_v2_analysis_render (R2SLEIGH_ANALYSIS_BLOCK_DEFUSE_V2,
+			ctx, blocks, 1, 0, NULL, &defuse_json);
 		if (cons && defuse_json) {
 			r_cons_printf (cons, "%s\n", defuse_json);
 		}
 
-		r2il_string_free (defuse_json);
-		r2il_block_free (block);
+		free (defuse_json);
+		(void)sleigh_v2_block_release (&block);
 		return strdup("");
 	}
 
 	if (!strncmp (cmd, "sla.types", 9) && (!cmd[9] || isspace ((unsigned char)cmd[9]))) {
-		R2ILContext *ctx = get_context (anal);
-		if (!ctx) {
-			R_LOG_ERROR ("r2sleigh: no context");
-			return strdup("");
-		}
-
-		RAnalFunction *fcn = resolve_or_materialize_current_function (core, anal);
-		if (!fcn) {
-			R_LOG_ERROR ("r2sleigh: no function at current address");
-			return strdup("");
-		}
-		if (!sleigh_engine_function_preflight (fcn, "type-function")) {
-			return strdup ("");
-		}
-
-		BlockArray blocks;
-		ut64 profile_start_us = r_time_now_mono ();
-		bool lift_ok = sleigh_engine_lift_function_blocks (anal, fcn, ctx, &blocks);
-		if (!lift_ok) {
-			R_LOG_ERROR ("r2sleigh: failed to lift function blocks within the type-function budget");
-			block_array_free (&blocks);
-			return strdup ("");
-		}
-		sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_LIFT, r_time_now_mono () - profile_start_us);
-
-			SleighTypedFunctionContext typed_context = {0};
-			profile_start_us = r_time_now_mono ();
-			if (!sleigh_typed_function_context_build (anal, fcn, &typed_context)) {
-				R_LOG_ERROR ("r2sleigh: failed to collect typed function context");
-				block_array_free (&blocks);
-				return strdup("");
-			}
-			sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_TYPED_CONTEXT, r_time_now_mono () - profile_start_us);
-
-			SleighInterprocScope interproc_scope = {0};
-			if (!sleigh_interproc_scope_build (
-				core,
-				anal,
-				fcn,
-				ctx,
-				R2SLEIGH_INTERPROC_SESSION_TYPE_ANALYSIS,
-				&interproc_scope
-			)) {
-				R_LOG_ERROR ("r2sleigh: failed to build interprocedural scope");
-				sleigh_typed_function_context_clear (&typed_context);
-				block_array_free (&blocks);
-				return strdup ("");
-			}
-
-			R2SleighEngineRequestPayloadV2 request_payload = {
-				.abi_version = R2SLEIGH_ABI_V2,
-				.struct_size = sizeof (request_payload),
-				.ctx = ctx,
-				.blocks = lift_ok ? (const R2ILBlock **)blocks.blocks : NULL,
-				.num_blocks = lift_ok ? blocks.count : 0,
-				.function_addr = fcn->addr,
-				.function_name = fcn->name,
-				.function_context = typed_context.context,
-				.lift_quality = blocks.quality,
-				.interproc_scope = interproc_scope.scope,
-				.interproc_plan = interproc_scope.plan,
-				.analysis_depth = anal? (unsigned int)anal->plugin_analysis_depth: 0,
-				.timeout_us = 0,
-			};
-			SleighSourceInterfaceV2 source_interface = {0};
-			int source_state = sleigh_source_interface_v2_build (
-				&typed_context, &blocks, &source_interface);
-			if (source_state < 0) {
-				R_LOG_ERROR ("r2sleigh: invalid exact source function interface");
-				sleigh_interproc_scope_clear (&interproc_scope);
-				sleigh_typed_function_context_clear (&typed_context);
-				block_array_free (&blocks);
-				return strdup ("");
-			}
-			uint64_t required_capabilities = R2SLEIGH_CAP_TYPE_FUNCTION_V2;
-			if (source_state > 0) {
-				required_capabilities |= R2SLEIGH_CAP_EXACT_FUNCTION_INTERFACE_V2
-					| R2SLEIGH_CAP_EXACT_STACK_SLOT_ROLES_V2;
-				if (source_interface.interface.exact_types_complete) {
-					required_capabilities |= R2SLEIGH_CAP_EXACT_TYPE_LAYOUT_V2;
-				}
-				if (source_interface.interface.num_call_sites) {
-					required_capabilities |= R2SLEIGH_CAP_CALL_SITE_INTERFACES_V2;
-				}
-			}
-			request_payload.source_interface = source_state > 0? &source_interface.interface: NULL;
-			char *result = sleigh_engine_execute_v2 (
-				R2SLEIGH_REQUEST_TYPE_FUNCTION_V2,
-				required_capabilities,
-				&request_payload);
-			if (cons && result) {
-				r_cons_printf (cons, "%s\n", result);
-			}
-			free (result);
-			sleigh_source_interface_v2_clear (&source_interface);
-			sleigh_interproc_scope_clear (&interproc_scope);
-			sleigh_typed_function_context_clear (&typed_context);
-			block_array_free (&blocks);
-			return strdup ("");
-		}
+		R_LOG_ERROR ("r2sleigh: sla.types cannot construct source authority from live mutable analysis state");
+		return strdup ("");
+	}
 
 	/* ========== Function-level SSA commands ========== */
 
@@ -7713,13 +7377,16 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_LIFT, r_time_now_mono () - profile_start_us);
 
 		/* Get function SSA */
-		char *result = r2ssa_function_json (ctx, (const R2ILBlock **)blocks.blocks, blocks.count);
+		char *result = NULL;
+		(void)sleigh_v2_analysis_render (R2SLEIGH_ANALYSIS_FUNCTION_SSA_V2,
+			ctx, (const R2ILBlock *const *)blocks.blocks, blocks.count,
+			0, NULL, &result);
 
 		if (cons && result) {
 			r_cons_printf (cons, "%s\n", result);
 		}
 
-		r2il_string_free (result);
+		free (result);
 		block_array_free (&blocks);
 		return strdup("");
 	}
@@ -7743,13 +7410,16 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			return strdup("");
 		}
 
-		char *result = r2ssa_function_opt_json (ctx, (const R2ILBlock **)blocks.blocks, blocks.count);
+		char *result = NULL;
+		(void)sleigh_v2_analysis_render (R2SLEIGH_ANALYSIS_FUNCTION_SSA_OPT_V2,
+			ctx, (const R2ILBlock *const *)blocks.blocks, blocks.count,
+			0, NULL, &result);
 
 		if (cons && result) {
 			r_cons_printf (cons, "%s\n", result);
 		}
 
-		r2il_string_free (result);
+		free (result);
 		block_array_free (&blocks);
 		return strdup("");
 	}
@@ -7776,13 +7446,16 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		}
 
 		/* Get function def-use analysis */
-		char *result = r2ssa_defuse_function_json (ctx, (const R2ILBlock **)blocks.blocks, blocks.count);
+		char *result = NULL;
+		(void)sleigh_v2_analysis_render (R2SLEIGH_ANALYSIS_FUNCTION_DEFUSE_V2,
+			ctx, (const R2ILBlock *const *)blocks.blocks, blocks.count,
+			0, NULL, &result);
 
 		if (cons && result) {
 			r_cons_printf (cons, "%s\n", result);
 		}
 
-		r2il_string_free (result);
+		free (result);
 		block_array_free (&blocks);
 		return strdup("");
 	}
@@ -7809,13 +7482,16 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		}
 
 		/* Get dominator tree */
-		char *result = r2ssa_domtree_json (ctx, (const R2ILBlock **)blocks.blocks, blocks.count);
+		char *result = NULL;
+		(void)sleigh_v2_analysis_render (R2SLEIGH_ANALYSIS_FUNCTION_DOMTREE_V2,
+			ctx, (const R2ILBlock *const *)blocks.blocks, blocks.count,
+			0, NULL, &result);
 
 		if (cons && result) {
 			r_cons_printf (cons, "%s\n", result);
 		}
 
-		r2il_string_free (result);
+		free (result);
 		block_array_free (&blocks);
 		return strdup("");
 	}
@@ -7859,13 +7535,16 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		}
 
 		/* Get backward slice */
-		char *result = r2ssa_backward_slice_json (ctx, (const R2ILBlock **)blocks.blocks, blocks.count, arg);
+		char *result = NULL;
+		(void)sleigh_v2_analysis_render (R2SLEIGH_ANALYSIS_FUNCTION_SLICE_V2,
+			ctx, (const R2ILBlock *const *)blocks.blocks, blocks.count,
+			0, arg, &result);
 
 		if (cons && result) {
 			r_cons_printf (cons, "%s\n", result);
 		}
 
-		r2il_string_free (result);
+		free (result);
 		block_array_free (&blocks);
 		return strdup("");
 	}
@@ -7883,20 +7562,20 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 
 		if (*arg) {
 			if (!strcmp (arg, "on") || !strcmp (arg, "1") || !strcmp (arg, "true")) {
-				r2sym_merge_set_enabled (1);
+				sleigh_sym_merge_set_enabled (core, true);
 			} else if (!strcmp (arg, "off") || !strcmp (arg, "0") || !strcmp (arg, "false")) {
-				r2sym_merge_set_enabled (0);
+				sleigh_sym_merge_set_enabled (core, false);
 			} else if (cons) {
 				r_cons_println (cons, "Usage: a:sla.debug.sym.merge [on|off]");
 				return strdup("");
 			}
 		} else {
-			int enabled = r2sym_merge_is_enabled ();
-			r2sym_merge_set_enabled (!enabled);
+			bool enabled = sleigh_sym_merge_enabled (core);
+			sleigh_sym_merge_set_enabled (core, !enabled);
 		}
 
 		if (cons) {
-			r_cons_printf (cons, "sym merge: %s\n", r2sym_merge_is_enabled () ? "on" : "off");
+			r_cons_printf (cons, "sym merge: %s\n", sleigh_sym_merge_enabled (core) ? "on" : "off");
 		}
 		return strdup("");
 	}
@@ -7931,27 +7610,20 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			R_LOG_ERROR ("r2sleigh: failed to build symbolic function scope");
 			return strdup("");
 		}
-		char *sym_map_json = build_sym_symbol_map_json (core, anal, ctx, &scope);
-		if (sym_map_json) {
-			r2sym_set_symbol_map_json (sym_map_json);
-			free (sym_map_json);
-		}
-
 		/* Call symbolic execution */
 		char *result;
 		char *external_context_json = sleigh_collect_sym_assumptions_json (anal, fcn);
-		if (is_paths_cmd) {
-			result = r2sym_paths_scope (ctx, scope.functions, scope.count, fcn->addr, external_context_json);
-		} else {
-			result = r2sym_function_scope (ctx, scope.functions, scope.count, fcn->addr, external_context_json);
-		}
+		const uint32_t kind = is_paths_cmd
+			? R2SLEIGH_SCOPE_PATHS_V2: R2SLEIGH_SCOPE_FUNCTION_V2;
+		(void)sleigh_v2_scope_render_for_scope (kind, core, anal, ctx, &scope,
+			fcn->addr, 0, NULL, NULL, external_context_json, &result);
 		free (external_context_json);
 
 		if (cons && result) {
 			r_cons_printf (cons, "%s\n", result);
 		}
 
-		r2il_string_free (result);
+		free (result);
 		sym_function_scope_free (&scope);
 		return strdup("");
 	}
@@ -7977,36 +7649,22 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			return strdup("");
 		}
 
-		char *result = r2taint_function_json (ctx, (const R2ILBlock **)blocks.blocks, blocks.count);
+		char *result = NULL;
+		(void)sleigh_v2_analysis_render (R2SLEIGH_ANALYSIS_FUNCTION_TAINT_V2,
+			ctx, (const R2ILBlock *const *)blocks.blocks, blocks.count,
+			0, NULL, &result);
 
 		if (cons && result) {
 			r_cons_printf (cons, "%s\n", result);
 		}
 
-		r2il_string_free (result);
+		free (result);
 		block_array_free (&blocks);
 		return strdup("");
 	}
 
 	if (cmd_matches_exact_or_arg (cmd, "sla.decj")) {
-		const char *target_arg = skip_cmd_spaces (cmd + strlen ("sla.decj"));
-		RAnalFunction *fcn = NULL;
-		if (target_arg && *target_arg) {
-			fcn = resolve_or_materialize_function_target (core, anal, target_arg);
-		} else {
-			fcn = resolve_or_materialize_current_function (core, anal);
-		}
-
-		char *json = NULL;
-		if (fcn) {
-			json = sleigh_decompile_execute (anal, fcn, true);
-		} else {
-			json = sleigh_engine_v2_error_json ("function_target",
-				R2SLEIGH_STATUS_INVALID_ARGUMENT_V2,
-				target_arg && *target_arg
-					? "function target not found"
-					: "no function at current address");
-		}
+		char *json = sleigh_decompile_execute (anal, NULL, true);
 		if (cons && json) {
 			r_cons_printf (cons, "%s\n", json);
 		}
@@ -8015,31 +7673,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 	}
 
 	if (cmd_matches_exact_or_arg (cmd, "sla.dec")) {
-		const char *target_arg = skip_cmd_spaces (cmd + 7);
-		RAnalFunction *fcn = NULL;
-		if (target_arg && *target_arg) {
-			fcn = resolve_or_materialize_function_target (core, anal, target_arg);
-		} else {
-			fcn = resolve_or_materialize_current_function (core, anal);
-		}
-
-		if (!fcn) {
-			if (target_arg && *target_arg) {
-				R_LOG_ERROR ("r2sleigh: function target not found: %s", target_arg);
-			} else {
-				R_LOG_ERROR ("r2sleigh: no function at current address");
-			}
-			return strdup("");
-		}
-		RCodeMeta *metadata = sleigh_decompile (anal, fcn);
-		if (metadata && cons) {
-			char *rendered = r_codemeta_print2 (metadata, NULL, anal);
-			if (rendered) {
-				r_cons_println (cons, rendered);
-			}
-			free (rendered);
-		}
-		r_codemeta_free (metadata);
+		(void)sleigh_decompile_execute (anal, NULL, false);
 		return strdup("");
 	}
 
@@ -8065,18 +7699,19 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		}
 
 		/* Generate CFG */
-		char *result;
-		if (!strcmp (cmd, "sla.cfg.json")) {
-			result = r2cfg_function_json (ctx, (const R2ILBlock **)blocks.blocks, blocks.count);
-		} else {
-			result = r2cfg_function_ascii (ctx, (const R2ILBlock **)blocks.blocks, blocks.count);
-		}
+		char *result = NULL;
+		const uint32_t kind = !strcmp (cmd, "sla.cfg.json")
+			? R2SLEIGH_ANALYSIS_FUNCTION_CFG_JSON_V2
+			: R2SLEIGH_ANALYSIS_FUNCTION_CFG_ASCII_V2;
+		(void)sleigh_v2_analysis_render (kind, ctx,
+			(const R2ILBlock *const *)blocks.blocks, blocks.count,
+			0, NULL, &result);
 
 		if (cons && result) {
 			r_cons_printf (cons, "%s\n", result);
 		}
 
-		r2il_string_free (result);
+		free (result);
 		block_array_free (&blocks);
 		return strdup("");
 	}
@@ -8099,7 +7734,7 @@ static bool sleigh_analyze_fcn(RAnal *anal, RAnalFunction *fcn) {
 	if (!auto_callback_allows_function (
 		anal,
 		fcn,
-		R2SLEIGH_AUTO_CALLBACK_ANALYZE_FUNCTION,
+		R2SLEIGH_AUTO_CALLBACK_ANALYZE_FUNCTION_V2,
 		"analyze_fcn")) {
 		return true;
 	}
@@ -8118,15 +7753,6 @@ static bool sleigh_analyze_fcn(RAnal *anal, RAnalFunction *fcn) {
 		anal, ctx, &blocks, fcn->addr, true);
 	R_LOG_DEBUG ("r2sleigh: semantic comments fcn=0x%"PFMT64x" enabled=%d emitted=%zu",
 		fcn->addr, 1, semantic_comments_emitted);
-
-	R2SleighDataRefs *typed_refs = r2sleigh_data_refs_typed (ctx,
-		(const R2ILBlock **)blocks.blocks, blocks.count, fcn->addr);
-	size_t typed_count = 0;
-	const R2SleighDataRef *typed_items = r2sleigh_data_refs_items (typed_refs, &typed_count);
-	if (typed_items && typed_count > 0) {
-		collect_data_refs_from_typed (anal, fcn, typed_items, typed_count, NULL, true);
-	}
-	r2sleigh_data_refs_free (typed_refs);
 
 	block_array_free (&blocks);
 	return true;
@@ -8151,7 +7777,7 @@ static RList *sleigh_recover_vars(RAnal *anal, RAnalFunction *fcn) {
 	if (!auto_callback_allows_function (
 		anal,
 		fcn,
-		R2SLEIGH_AUTO_CALLBACK_RECOVER_VARS,
+		R2SLEIGH_AUTO_CALLBACK_RECOVER_VARS_V2,
 		"recover_vars")) {
 		return NULL;
 	}
@@ -8166,21 +7792,27 @@ static RList *sleigh_recover_vars(RAnal *anal, RAnalFunction *fcn) {
 		return NULL;
 	}
 
-	R2SleighRecoveredVars *typed_vars = r2sleigh_recover_vars_typed (ctx,
-		(const R2ILBlock **)blocks.blocks, blocks.count, fcn->addr);
-	size_t typed_count = 0;
-	const R2SleighRecoveredVar *typed_items = r2sleigh_recovered_vars_items (typed_vars, &typed_count);
+	R2SleighAnalysisResultV2 *typed_vars = NULL;
+	R2SleighAnalysisResultViewV2 typed_vars_view = {0};
+	(void)sleigh_v2_analysis_query (R2SLEIGH_QUERY_RECOVERED_VARS_V2,
+		ctx, (const R2ILBlock *const *)blocks.blocks, blocks.count,
+		fcn->addr, fcn->name, NULL, 0, &typed_vars, &typed_vars_view);
+	size_t typed_count = typed_vars_view.primary_count;
+	const R2SleighRecoveredVar *typed_items =
+		(const R2SleighRecoveredVar *)typed_vars_view.primary;
 
 	block_array_free (&blocks);
 
 	if (!typed_items || typed_count == 0) {
-		r2sleigh_recovered_vars_free (typed_vars);
+		if (typed_vars) {
+			(void)sleigh_v2_analysis_result_release (&typed_vars);
+		}
 		return NULL;
 	}
 
 	RList *vars = r_list_newf ((RListFree)var_prot_free);
 	if (!vars) {
-		r2sleigh_recovered_vars_free (typed_vars);
+		(void)sleigh_v2_analysis_result_release (&typed_vars);
 		return NULL;
 	}
 
@@ -8249,7 +7881,7 @@ static RList *sleigh_recover_vars(RAnal *anal, RAnalFunction *fcn) {
 		r_list_append (vars, prot);
 	}
 
-	r2sleigh_recovered_vars_free (typed_vars);
+	(void)sleigh_v2_analysis_result_release (&typed_vars);
 
 	if (r_list_empty (vars)) {
 		r_list_free (vars);
@@ -8283,43 +7915,14 @@ static RAnalRefType data_ref_type_from_kind(RAnal *anal, ut64 to_addr, char kind
 	return data_ref_type_from_json (anal, to_addr, kind? type_name: NULL);
 }
 
-static void ensure_literal_ref_target_map(RAnal *anal, ut64 to_addr) {
-	RCore *core;
-	RIOMap *map;
-	int fd;
-	char map_name[64];
-
-	if (!anal || !to_addr) {
-		return;
-	}
-	core = anal->coreb.core;
-	if (!core || !core->io) {
-		return;
-	}
-	if (r_io_map_get_at (core->io, to_addr)) {
-		return;
-	}
-	fd = r_io_fd_get_current (core->io);
-	if (fd < 0) {
-		return;
-	}
-	map = r_io_map_add (core->io, fd, R_PERM_R, 0, to_addr, 1);
-	if (!map) {
-		return;
-	}
-	snprintf (map_name, sizeof (map_name), "sla.literal.%"PFMT64x, to_addr);
-	r_io_map_set_name (map, map_name);
-}
-
 static int collect_data_refs_from_typed(
 	RAnal *anal,
 	RAnalFunction *fcn,
 	const R2SleighDataRef *items,
 	size_t count,
-	RVecAnalRef *refs,
-	bool apply_to_anal
+	RVecAnalRef *refs
 ) {
-	int added = 0;
+	int discovered = 0;
 	size_t i;
 	if (!anal || !items || count == 0) {
 		return 0;
@@ -8332,9 +7935,6 @@ static int collect_data_refs_from_typed(
 			continue;
 		}
 		ref_type = data_ref_type_from_kind (anal, to_addr, items[i].ref_kind);
-		if (apply_to_anal && ref_type == R_ANAL_REF_TYPE_DATA) {
-			ensure_literal_ref_target_map (anal, to_addr);
-		}
 		if (refs) {
 			RAnalRef ref = {
 				.at = from_addr,
@@ -8343,22 +7943,9 @@ static int collect_data_refs_from_typed(
 			};
 			RVecAnalRef_push_back (refs, &ref);
 		}
-		if (apply_to_anal) {
-			RAnalMutation mutation = {
-				.kind = R_ANAL_MUTATION_XREF,
-				.fcn = fcn,
-				.from = from_addr,
-				.to = to_addr,
-				.ref_type = ref_type,
-			};
-			if (apply_typed_mutation (anal, &mutation)) {
-				added++;
-			}
-		} else {
-			added++;
-		}
+		discovered++;
 	}
-	return added;
+	return discovered;
 }
 
 /* Called during reference analysis (aar) */
@@ -8369,7 +7956,7 @@ static RVecAnalRef *sleigh_get_data_refs(RAnal *anal, RAnalFunction *fcn) {
 	if (!auto_callback_allows_function (
 		anal,
 		fcn,
-		R2SLEIGH_AUTO_CALLBACK_DATA_REFS,
+		R2SLEIGH_AUTO_CALLBACK_DATA_REFS_V2,
 		"get_data_refs")) {
 		return NULL;
 	}
@@ -8384,25 +7971,29 @@ static RVecAnalRef *sleigh_get_data_refs(RAnal *anal, RAnalFunction *fcn) {
 		return NULL;
 	}
 
-	R2SleighDataRefs *typed_refs = r2sleigh_data_refs_typed (ctx,
-		(const R2ILBlock **)blocks.blocks, blocks.count, fcn->addr);
-	size_t typed_count = 0;
-	const R2SleighDataRef *typed_items = r2sleigh_data_refs_items (typed_refs, &typed_count);
+	R2SleighAnalysisResultV2 *typed_refs = NULL;
+	R2SleighAnalysisResultViewV2 typed_view;
+	uint32_t typed_status = sleigh_v2_analysis_query (R2SLEIGH_QUERY_DATA_REFS_V2,
+		ctx, (const R2ILBlock *const *)blocks.blocks, blocks.count, fcn->addr,
+		NULL, NULL, 0, &typed_refs, &typed_view);
+	size_t typed_count = typed_status == R2SLEIGH_STATUS_OK_V2? typed_view.primary_count: 0;
+	const R2SleighDataRef *typed_items = typed_status == R2SLEIGH_STATUS_OK_V2
+		? (const R2SleighDataRef *)typed_view.primary: NULL;
 
 	if (!typed_items || typed_count == 0) {
-		r2sleigh_data_refs_free (typed_refs);
+		(void)sleigh_v2_analysis_result_release (&typed_refs);
 		block_array_free (&blocks);
 		return NULL;
 	}
 
 	RVecAnalRef *refs = RVecAnalRef_new ();
 	if (!refs) {
-		r2sleigh_data_refs_free (typed_refs);
+		(void)sleigh_v2_analysis_result_release (&typed_refs);
 		block_array_free (&blocks);
 		return NULL;
 	}
-	collect_data_refs_from_typed (anal, fcn, typed_items, typed_count, refs, true);
-	r2sleigh_data_refs_free (typed_refs);
+	collect_data_refs_from_typed (anal, fcn, typed_items, typed_count, refs);
+	(void)sleigh_v2_analysis_result_release (&typed_refs);
 	block_array_free (&blocks);
 
 	if (RVecAnalRef_empty (refs)) {
@@ -8439,20 +8030,26 @@ static unsigned int resolve_interproc_seed_linkage(RCore *core, RAnal *anal, ut6
 
 	if (anal) {
 		target_fcn = r_anal_get_fcn_in (anal, addr, R_ANAL_FCN_TYPE_ANY);
-		if (target_fcn && (target_fcn->type & R_ANAL_FCN_TYPE_IMP)) {
-			return R2SLEIGH_INTERPROC_LINKAGE_IMPORTED;
+		if (target_fcn) {
+			return (target_fcn->type & R_ANAL_FCN_TYPE_IMP)
+				? R2SLEIGH_INTERPROC_LINKAGE_IMPORTED
+				: R2SLEIGH_INTERPROC_LINKAGE_INTERNAL;
 		}
 		if (anal->binb.bin && anal->binb.get_symbol_at) {
 			symbol = anal->binb.get_symbol_at (anal->binb.bin, addr);
-			if (symbol && symbol->is_imported) {
-				return R2SLEIGH_INTERPROC_LINKAGE_IMPORTED;
+			if (symbol) {
+				return symbol->is_imported
+					? R2SLEIGH_INTERPROC_LINKAGE_IMPORTED
+					: R2SLEIGH_INTERPROC_LINKAGE_INTERNAL;
 			}
 		}
 	}
 	if (core && core->bin) {
 		symbol = r_bin_get_symbol_at (core->bin, addr);
-		if (symbol && symbol->is_imported) {
-			return R2SLEIGH_INTERPROC_LINKAGE_IMPORTED;
+		if (symbol) {
+			return symbol->is_imported
+				? R2SLEIGH_INTERPROC_LINKAGE_IMPORTED
+				: R2SLEIGH_INTERPROC_LINKAGE_INTERNAL;
 		}
 	}
 	return R2SLEIGH_INTERPROC_LINKAGE_UNKNOWN;
@@ -8465,7 +8062,8 @@ static ut64 *collect_type_interproc_direct_targets_from_blocks(
 	const char *fcn_name,
 	size_t *out_count
 ) {
-	R2SleighU64Array *typed_targets = NULL;
+	R2SleighAnalysisResultV2 *typed_targets = NULL;
+	R2SleighAnalysisResultViewV2 typed_view;
 	const unsigned long long *items = NULL;
 	ut64 *targets = NULL;
 	size_t count = 0;
@@ -8479,205 +8077,24 @@ static ut64 *collect_type_interproc_direct_targets_from_blocks(
 	if (!ctx || !blocks || !blocks->blocks || blocks->count == 0) {
 		return NULL;
 	}
-	typed_targets = r2sleigh_get_direct_call_targets_typed (ctx,
-		(const R2ILBlock **)blocks->blocks, blocks->count, fcn_addr, fcn_name);
-	if (!typed_targets) {
+	uint32_t typed_status = sleigh_v2_analysis_query (R2SLEIGH_QUERY_DIRECT_TARGETS_V2,
+		ctx, (const R2ILBlock *const *)blocks->blocks, blocks->count, fcn_addr,
+		fcn_name, NULL, 0, &typed_targets, &typed_view);
+	if (typed_status != R2SLEIGH_STATUS_OK_V2) {
 		return NULL;
 	}
-	items = r2sleigh_u64_array_items (typed_targets, &item_count);
+	items = (const unsigned long long *)typed_view.primary;
+	item_count = typed_view.primary_count;
 	for (i = 0; items && i < item_count; i++) {
 		append_unique_ut64 (&targets, &count, &cap, (ut64)items[i]);
 	}
-	r2sleigh_u64_array_free (typed_targets);
+	(void)sleigh_v2_analysis_result_release (&typed_targets);
 	if (out_count) {
 		*out_count = count;
 	}
 	return targets;
 }
 
-static bool sleigh_interproc_scope_ensure_seed_capacity(SleighInterprocScope *scope, size_t needed) {
-	R2SleighInterprocSeed *grown;
-	size_t new_capacity;
-
-	if (!scope) {
-		return false;
-	}
-	if (needed <= scope->seed_capacity) {
-		return true;
-	}
-	new_capacity = scope->seed_capacity? scope->seed_capacity * 2: 4;
-	while (new_capacity < needed) {
-		new_capacity *= 2;
-	}
-	grown = realloc (scope->seeds, new_capacity * sizeof (*scope->seeds));
-	if (!grown) {
-		return false;
-	}
-	memset (grown + scope->seed_capacity, 0,
-		(new_capacity - scope->seed_capacity) * sizeof (*grown));
-	scope->seeds = grown;
-	scope->seed_capacity = new_capacity;
-	return true;
-}
-
-static bool sleigh_interproc_scope_has_seed(const SleighInterprocScope *scope, ut64 id) {
-	size_t i;
-	if (!scope || !scope->seeds) {
-		return false;
-	}
-	for (i = 0; i < scope->seed_count; i++) {
-		if (scope->seeds[i].id == id) {
-			return true;
-		}
-	}
-	return false;
-}
-
-static bool sleigh_interproc_scope_append_seed(
-	SleighInterprocScope *scope,
-	ut64 id,
-	const char *name,
-	unsigned int linkage
-) {
-	R2SleighInterprocSeed *seed;
-	if (!scope || !sleigh_interproc_scope_ensure_seed_capacity (scope, scope->seed_count + 1)) {
-		return false;
-	}
-	seed = &scope->seeds[scope->seed_count++];
-	seed->id = id;
-	seed->name = name;
-	seed->linkage = linkage;
-	return true;
-}
-
-static void sleigh_interproc_scope_clear(SleighInterprocScope *scope) {
-	size_t i;
-	if (!scope) {
-		return;
-	}
-	if (scope->seeds) {
-		for (i = scope->borrowed_seed_count; i < scope->seed_count; i++) {
-			free ((void *)scope->seeds[i].name);
-		}
-	}
-	free (scope->seeds);
-	sym_function_scope_free (&scope->sym_scope);
-	memset (scope, 0, sizeof (*scope));
-}
-
-static bool sleigh_interproc_scope_append_import_seed(
-	SleighInterprocScope *scope,
-	RCore *core,
-	RAnal *anal,
-	ut64 target
-) {
-	char *target_name;
-	unsigned int linkage;
-
-	if (!scope || sleigh_interproc_scope_has_seed (scope, target)) {
-		return true;
-	}
-	linkage = resolve_interproc_seed_linkage (core, anal, target);
-	if (linkage != R2SLEIGH_INTERPROC_LINKAGE_IMPORTED) {
-		return true;
-	}
-	target_name = resolve_interproc_seed_name (core, anal, target);
-	if (!target_name || !*target_name) {
-		free (target_name);
-		return true;
-	}
-	if (!sleigh_interproc_scope_append_seed (scope, target, target_name, linkage)) {
-		free (target_name);
-		return false;
-	}
-	return true;
-}
-
-static bool sleigh_interproc_scope_append_helper_imports(
-	SleighInterprocScope *scope,
-	RCore *core,
-	RAnal *anal,
-	R2ILContext *ctx
-) {
-	size_t i;
-	if (!scope) {
-		return false;
-	}
-	for (i = 0; i < scope->sym_scope.count; i++) {
-		const R2ILFunctionBlocks *function = &scope->sym_scope.functions[i];
-		const BlockArray *scope_blocks = &scope->sym_scope.owned_blocks[i];
-		size_t direct_target_count = 0;
-		ut64 *direct_targets = collect_type_interproc_direct_targets_from_blocks (
-			ctx,
-			scope_blocks,
-			function->entry_addr,
-			function->name,
-			&direct_target_count
-		);
-		size_t j;
-		for (j = 0; j < direct_target_count; j++) {
-			if (!sleigh_interproc_scope_append_import_seed (scope, core, anal, direct_targets[j])) {
-				free (direct_targets);
-				return false;
-			}
-		}
-		free (direct_targets);
-	}
-	return true;
-}
-
-static bool sleigh_interproc_scope_build(
-	RCore *core,
-	RAnal *anal,
-	RAnalFunction *fcn,
-	R2ILContext *ctx,
-	unsigned int purpose,
-	SleighInterprocScope *out
-) {
-	size_t i;
-
-	if (!out) {
-		return false;
-	}
-	memset (out, 0, sizeof (*out));
-	sym_function_scope_init (&out->sym_scope);
-	out->plan = sleigh_interproc_session_plan_for_function (anal, fcn, purpose);
-	out->scope.schema_version = R2SLEIGH_INTERPROC_SCOPE_SCHEMA_V2;
-	if (!out->plan.include_type_interproc_scope && !out->plan.include_root_symbolic_scope) {
-		return true;
-	}
-	if (!build_symbolic_function_scope (anal, fcn, ctx, &out->sym_scope)) {
-		return true;
-	}
-	out->scope.functions = out->sym_scope.functions;
-	out->scope.num_functions = out->sym_scope.count;
-	if (!out->sym_scope.count) {
-		return true;
-	}
-	if (!sleigh_interproc_scope_ensure_seed_capacity (out, out->sym_scope.count)) {
-		sleigh_interproc_scope_clear (out);
-		return false;
-	}
-	for (i = 0; i < out->sym_scope.count; i++) {
-		if (!sleigh_interproc_scope_append_seed (
-			out,
-			out->sym_scope.functions[i].entry_addr,
-			out->sym_scope.functions[i].name,
-			R2SLEIGH_INTERPROC_LINKAGE_INTERNAL
-		)) {
-			sleigh_interproc_scope_clear (out);
-			return false;
-		}
-	}
-	out->borrowed_seed_count = out->seed_count;
-	if (!sleigh_interproc_scope_append_helper_imports (out, core, anal, ctx)) {
-		sleigh_interproc_scope_clear (out);
-		return false;
-	}
-	out->scope.seeds = out->seeds;
-	out->scope.num_seeds = out->seed_count;
-	return true;
-}
 
 static void free_interproc_target_names(char **target_names, size_t target_count) {
 	size_t i;
@@ -8690,33 +8107,34 @@ static void free_interproc_target_names(char **target_names, size_t target_count
 	free (target_names);
 }
 
-static R2SleighInterprocTargetPlan *plan_interproc_targets_from_direct_targets(
+static bool plan_interproc_targets_from_direct_targets(
 	RCore *core,
 	RAnal *anal,
 	const ut64 *direct_targets,
 	size_t target_count,
-	R2SleighInterprocTargetInput **out_inputs,
-	char ***out_target_names
+	R2SleighPlannerResultV2 **out
 ) {
-	R2SleighInterprocTargetInput *target_inputs = NULL;
+	R2SleighPlannerTargetInputV2 *target_inputs = NULL;
 	char **target_names = NULL;
-	R2SleighInterprocTargetPlan *target_plan = NULL;
+	R2SleighPlannerQueryRequestV2 request = {0};
+	R2SleighPlannerQueryResponseV2 response = {0};
+	uint32_t status;
 	size_t i;
-	if (out_inputs) {
-		*out_inputs = NULL;
+	if (out) {
+		*out = NULL;
 	}
-	if (out_target_names) {
-		*out_target_names = NULL;
+	if (!anal || !direct_targets || !target_count || target_count > R2SLEIGH_MAX_PLANNER_TARGETS_V2 || !out) {
+		return false;
 	}
-	if (!anal || !direct_targets || !target_count) {
-		return NULL;
+	if (!sleigh_v2_planner_result_retry_pending ()) {
+		return false;
 	}
 	target_inputs = calloc (target_count, sizeof (*target_inputs));
 	target_names = calloc (target_count, sizeof (*target_names));
 	if (!target_inputs || !target_names) {
 		free (target_inputs);
 		free_interproc_target_names (target_names, target_count);
-		return NULL;
+		return false;
 	}
 	for (i = 0; i < target_count; i++) {
 		ut64 scope_target = direct_targets[i];
@@ -8724,8 +8142,14 @@ static R2SleighInterprocTargetPlan *plan_interproc_targets_from_direct_targets(
 		target_names[i] = resolve_interproc_seed_name (core, anal, direct_targets[i]);
 		scope_target = resolve_local_direct_jump_thunk_target (anal, direct_targets[i]);
 		target_fcn = materialize_function_at (anal, scope_target);
+		target_inputs[i].abi_version = R2SLEIGH_ABI_V2;
+		target_inputs[i].struct_size = sizeof (target_inputs[i]);
+		target_inputs[i].schema_version = R2SLEIGH_PLANNER_TARGET_INPUT_SCHEMA_V2;
 		target_inputs[i].direct_target = direct_targets[i];
-		target_inputs[i].name = target_names[i];
+		if (target_names[i]) {
+			target_inputs[i].name.data = (const uint8_t *)target_names[i];
+			target_inputs[i].name.len = strlen (target_names[i]);
+		}
 		target_inputs[i].linkage = resolve_interproc_seed_linkage (core, anal, direct_targets[i]);
 		target_inputs[i].resolved_target = scope_target;
 		target_inputs[i].has_resolved_target = 1;
@@ -8745,18 +8169,49 @@ static R2SleighInterprocTargetPlan *plan_interproc_targets_from_direct_targets(
 			);
 		}
 	}
-	target_plan = r2sleigh_plan_interproc_scope_targets (target_inputs, target_count);
-	if (out_inputs) {
-		*out_inputs = target_inputs;
-	} else {
-		free (target_inputs);
+	request.targets = target_inputs;
+	request.num_targets = target_count;
+	status = sleigh_v2_planner_query (
+		R2SLEIGH_PLANNER_INTERPROC_TARGETS_V2,
+		&request,
+		&response);
+	if (response.result) {
+		sleigh_pending_target_plan = response.result;
 	}
-	if (out_target_names) {
-		*out_target_names = target_names;
-	} else {
-		free_interproc_target_names (target_names, target_count);
+	free (target_inputs);
+	free_interproc_target_names (target_names, target_count);
+	if (status != R2SLEIGH_STATUS_OK_V2 || !response.result) {
+		(void)sleigh_v2_planner_result_retry_pending ();
+		return false;
 	}
-	return target_plan;
+	*out = response.result;
+	return true;
+}
+
+static ut64 *copy_planner_result_targets(
+	const R2SleighApiV2 *api,
+	const R2SleighPlannerResultV2 *result,
+	unsigned int selector,
+	size_t count
+) {
+	ut64 *targets = NULL;
+	size_t copied = 0;
+	if (!count) {
+		return NULL;
+	}
+	if (!api || !result || count > SIZE_MAX / sizeof (*targets)) {
+		return NULL;
+	}
+	targets = calloc (count, sizeof (*targets));
+	if (!targets) {
+		return NULL;
+	}
+	if (api->planner_result_copy (result, selector, targets, count, &copied) != R2SLEIGH_STATUS_OK_V2
+		|| copied != count) {
+		free (targets);
+		return NULL;
+	}
+	return targets;
 }
 
 static ut64 *collect_runtime_scope_targets_from_blocks(
@@ -8768,7 +8223,8 @@ static ut64 *collect_runtime_scope_targets_from_blocks(
 	size_t registration_target_count,
 	size_t *out_count
 ) {
-	R2SleighU64Array *typed_targets = NULL;
+	R2SleighAnalysisResultV2 *typed_targets = NULL;
+	R2SleighAnalysisResultViewV2 typed_view;
 	const unsigned long long *items = NULL;
 	ut64 *targets = NULL;
 	size_t count = 0;
@@ -8782,17 +8238,18 @@ static ut64 *collect_runtime_scope_targets_from_blocks(
 	if (!ctx || !blocks || !blocks->blocks || blocks->count == 0 || !registration_target_count) {
 		return NULL;
 	}
-	typed_targets = r2sleigh_get_symbolic_scope_targets_typed (ctx,
-		(const R2ILBlock **)blocks->blocks, blocks->count, fcn_addr, fcn_name,
-		(const unsigned long long *)registration_targets, registration_target_count);
-	if (!typed_targets) {
+	uint32_t typed_status = sleigh_v2_analysis_query (R2SLEIGH_QUERY_SYMBOLIC_TARGETS_V2,
+		ctx, (const R2ILBlock *const *)blocks->blocks, blocks->count, fcn_addr,
+		fcn_name, registration_targets, registration_target_count, &typed_targets, &typed_view);
+	if (typed_status != R2SLEIGH_STATUS_OK_V2) {
 		return NULL;
 	}
-	items = r2sleigh_u64_array_items (typed_targets, &item_count);
+	items = (const unsigned long long *)typed_view.primary;
+	item_count = typed_view.primary_count;
 	for (i = 0; items && i < item_count; i++) {
 		append_unique_ut64 (&targets, &count, &cap, (ut64)items[i]);
 	}
-	r2sleigh_u64_array_free (typed_targets);
+	(void)sleigh_v2_analysis_result_release (&typed_targets);
 	if (out_count) {
 		*out_count = count;
 	}
@@ -8843,7 +8300,8 @@ static RuntimeMaterializedSource *collect_runtime_materialized_sources_from_bloc
 	size_t copy_target_count,
 	size_t *out_count
 ) {
-	R2SleighRuntimeSources *typed_sources = NULL;
+	R2SleighAnalysisResultV2 *typed_sources = NULL;
+	R2SleighAnalysisResultViewV2 typed_view;
 	const R2SleighRuntimeSource *items = NULL;
 	RuntimeMaterializedSource *sources = NULL;
 	size_t count = 0;
@@ -8857,13 +8315,14 @@ static RuntimeMaterializedSource *collect_runtime_materialized_sources_from_bloc
 	if (!ctx || !blocks || !blocks->blocks || blocks->count == 0 || !copy_target_count) {
 		return NULL;
 	}
-	typed_sources = r2sleigh_get_runtime_materialized_sources_typed (ctx,
-		(const R2ILBlock **)blocks->blocks, blocks->count, fcn_addr, fcn_name,
-		(const unsigned long long *)copy_targets, copy_target_count);
-	if (!typed_sources) {
+	uint32_t typed_status = sleigh_v2_analysis_query (R2SLEIGH_QUERY_RUNTIME_SOURCES_V2,
+		ctx, (const R2ILBlock *const *)blocks->blocks, blocks->count, fcn_addr,
+		fcn_name, copy_targets, copy_target_count, &typed_sources, &typed_view);
+	if (typed_status != R2SLEIGH_STATUS_OK_V2) {
 		return NULL;
 	}
-	items = r2sleigh_runtime_sources_items (typed_sources, &item_count);
+	items = (const R2SleighRuntimeSource *)typed_view.primary;
+	item_count = typed_view.primary_count;
 	for (i = 0; items && i < item_count; i++) {
 		ut64 addr;
 		ut64 size;
@@ -8873,7 +8332,7 @@ static RuntimeMaterializedSource *collect_runtime_materialized_sources_from_bloc
 			(void)append_runtime_materialized_source (&sources, &count, &cap, addr, size);
 		}
 	}
-	r2sleigh_runtime_sources_free (typed_sources);
+	(void)sleigh_v2_analysis_result_release (&typed_sources);
 	if (out_count) {
 		*out_count = count;
 	}
@@ -9003,7 +8462,12 @@ static bool sym_function_scope_append(
 	size_t lifted_ops = 0;
 	size_t block_index;
 	for (block_index = 0; block_index < blocks.count; block_index++) {
-		const size_t block_ops = r2il_block_op_count (blocks.blocks[block_index]);
+		size_t block_ops = 0;
+		if (sleigh_v2_block_op_count (blocks.blocks[block_index], &block_ops)
+			!= R2SLEIGH_STATUS_OK_V2) {
+			block_array_free (&blocks);
+			return false;
+		}
 		if (block_ops > function_op_cap - lifted_ops) {
 			block_array_free (&blocks);
 			return false;
@@ -9047,21 +8511,22 @@ static bool lift_runtime_materialized_source_blocks(
 		ut8 buf[SLEIGH_MIN_BYTES] = {0};
 		ut64 remaining = size - offset;
 		ut64 logical_size = R_MIN (remaining, slot_bytes);
-		R2ILBlock *block;
+		R2ILBlock *block = NULL;
 
 		if (!anal->iob.read_at (anal->iob.io, cur, buf, sizeof (buf))) {
 			break;
 		}
-		block = r2il_lift_block (ctx, buf, sizeof (buf), cur, (unsigned int)logical_size);
-		if (block) {
-			if (r2il_block_validate (ctx, block)) {
+		uint32_t status = sleigh_v2_lift_block (ctx, buf, sizeof (buf), cur,
+			(unsigned int)logical_size, &block);
+		if (status == R2SLEIGH_STATUS_OK_V2 && block) {
+			if (sleigh_v2_block_validate (ctx, block) == R2SLEIGH_STATUS_OK_V2) {
 				if (!block_array_push (out, block)) {
-					r2il_block_free (block);
+					(void)sleigh_v2_block_release (&block);
 					block_array_free (out);
 					return false;
 				}
 			} else {
-				r2il_block_free (block);
+				(void)sleigh_v2_block_release (&block);
 			}
 		}
 		offset += logical_size;
@@ -9079,12 +8544,12 @@ static bool sym_function_scope_append_runtime_source(
 ) {
 	BlockArray blocks;
 	char name[64];
-	R2SleighRuntimeMaterializedSourcePlan plan;
+	R2SleighRuntimeMaterializedSourcePlanV2 plan;
 
 	if (!scope || !anal || !ctx || !addr || !size) {
 		return false;
 	}
-	plan = r2sleigh_runtime_materialized_source_plan (scope->count, addr, size);
+	plan = sleigh_v2_query_runtime_source (scope->count, addr, size);
 	if (!plan.append_source || !plan.capped_size || !plan.slot_bytes) {
 		return false;
 	}
@@ -9109,7 +8574,12 @@ static bool sym_function_scope_append_runtime_source(
 	size_t lifted_ops = 0;
 	size_t block_index;
 	for (block_index = 0; block_index < blocks.count; block_index++) {
-		const size_t block_ops = r2il_block_op_count (blocks.blocks[block_index]);
+		size_t block_ops = 0;
+		if (sleigh_v2_block_op_count (blocks.blocks[block_index], &block_ops)
+			!= R2SLEIGH_STATUS_OK_V2) {
+			block_array_free (&blocks);
+			return false;
+		}
 		if (block_ops > scope_op_cap - scope->total_ops - lifted_ops) {
 			block_array_free (&blocks);
 			return false;
@@ -9155,8 +8625,13 @@ static bool build_symbolic_function_scope_with_target(
 	size_t seen_count = 0;
 	size_t seen_cap = 0;
 	ut64 target_entry = UT64_MAX;
+	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
+	bool build_ok = true;
 
-	if (!anal || !root_fcn || !ctx || !scope) {
+	if (!anal || !root_fcn || !ctx || !scope || !api) {
+		return false;
+	}
+	if (!sleigh_v2_planner_result_retry_pending ()) {
 		return false;
 	}
 	sym_function_scope_init (scope);
@@ -9195,23 +8670,22 @@ static bool build_symbolic_function_scope_with_target(
 		ut64 *queued_direct_targets = NULL;
 		ut64 *runtime_targets = NULL;
 		RuntimeMaterializedSource *runtime_sources = NULL;
-		R2SleighInterprocTargetInput *target_inputs = NULL;
-		R2SleighInterprocTargetPlan *target_plan = NULL;
-		char **target_names = NULL;
+		R2SleighPlannerResultV2 *target_plan = NULL;
+		R2SleighPlannerResultViewV2 target_plan_view = {0};
 		size_t target_count = 0;
 		size_t queued_direct_target_count = 0;
 		size_t queued_direct_target_cap = 0;
 		size_t runtime_target_count = 0;
 		size_t runtime_source_count = 0;
 		size_t planned_count = 0;
-		const unsigned long long *planned_items = NULL;
+		ut64 *planned_items = NULL;
 		size_t planned_runtime_copy_count = 0;
-		const unsigned long long *planned_runtime_copy_items = NULL;
+		ut64 *planned_runtime_copy_items = NULL;
 		size_t planned_queued_count = 0;
-		const unsigned long long *planned_queued_items = NULL;
+		ut64 *planned_queued_items = NULL;
 			size_t i;
 			const BlockArray *blocks;
-			R2SleighSymbolicScopeFunctionPlan scope_plan;
+			R2SleighSymbolicScopeFunctionPlanV2 scope_plan;
 
 			fcn = materialize_function_at (anal, addr);
 			if (!fcn || !append_unique_ut64 (&seen, &seen_count, &seen_cap, fcn->addr)) {
@@ -9219,8 +8693,8 @@ static bool build_symbolic_function_scope_with_target(
 		}
 		bool target_hint_function = target_entry != UT64_MAX && fcn->addr == target_entry;
 			R2SleighInterprocSessionPlan interproc_plan =
-				sleigh_interproc_session_plan_for_function (anal, fcn, R2SLEIGH_INTERPROC_SESSION_TYPE_ANALYSIS);
-			scope_plan = r2sleigh_symbolic_scope_function_plan (
+				sleigh_interproc_session_plan_for_function (anal, fcn, R2SLEIGH_INTERPROC_SESSION_TYPE_ANALYSIS_V2);
+			scope_plan = sleigh_v2_query_symbolic_scope (
 				scope->count,
 				fcn->addr == root_fcn->addr,
 				target_hint_function,
@@ -9267,28 +8741,43 @@ static bool build_symbolic_function_scope_with_target(
 			target_count
 		);
 		if (direct_targets && target_count) {
-			target_plan = plan_interproc_targets_from_direct_targets (
+			build_ok = plan_interproc_targets_from_direct_targets (
 				anal->coreb.core,
 				anal,
 				direct_targets,
 				target_count,
-				&target_inputs,
-				&target_names
+				&target_plan
 			);
 		}
-		if (!target_plan && target_count) {
+		if (!build_ok) {
 			sleigh_debug_scope_log ("scope_target_plan_failed addr=0x%"PFMT64x, fcn->addr);
+			free (direct_targets);
+			break;
 		}
 		if (target_plan) {
-			planned_items = r2sleigh_interproc_target_plan_registration_items (target_plan, &planned_count);
-			planned_runtime_copy_items = r2sleigh_interproc_target_plan_runtime_copy_items (
-				target_plan,
-				&planned_runtime_copy_count
-			);
-			planned_queued_items = r2sleigh_interproc_target_plan_queued_items (
-				target_plan,
-				&planned_queued_count
-			);
+			if (api->planner_result_view (target_plan, &target_plan_view) == R2SLEIGH_STATUS_OK_V2
+				&& target_plan_view.abi_version == R2SLEIGH_ABI_V2
+				&& target_plan_view.struct_size == sizeof (target_plan_view)
+				&& target_plan_view.schema_version == R2SLEIGH_PLANNER_RESULT_SCHEMA_V2) {
+				planned_count = target_plan_view.registration_target_count;
+				planned_runtime_copy_count = target_plan_view.runtime_copy_target_count;
+				planned_queued_count = target_plan_view.queued_target_count;
+				planned_items = copy_planner_result_targets (
+					api, target_plan, R2SLEIGH_PLANNER_RESULT_REGISTRATION_TARGETS_V2, planned_count);
+				planned_runtime_copy_items = copy_planner_result_targets (
+					api, target_plan, R2SLEIGH_PLANNER_RESULT_RUNTIME_COPY_TARGETS_V2, planned_runtime_copy_count);
+				planned_queued_items = copy_planner_result_targets (
+					api, target_plan, R2SLEIGH_PLANNER_RESULT_QUEUED_TARGETS_V2, planned_queued_count);
+				if (planned_count && !planned_items) {
+					planned_count = 0;
+				}
+				if (planned_runtime_copy_count && !planned_runtime_copy_items) {
+					planned_runtime_copy_count = 0;
+				}
+				if (planned_queued_count && !planned_queued_items) {
+					planned_queued_count = 0;
+				}
+			}
 			for (i = 0; planned_queued_items && i < planned_queued_count; i++) {
 				append_unique_ut64 (
 					&queued_direct_targets,
@@ -9338,17 +8827,27 @@ static bool build_symbolic_function_scope_with_target(
 		for (i = 0; i < queued_direct_target_count; i++) {
 			append_unique_ut64 (&queue, &queue_count, &queue_cap, queued_direct_targets[i]);
 		}
-		free_interproc_target_names (target_names, target_count);
-		r2sleigh_interproc_target_plan_free (target_plan);
-		free (target_inputs);
+		if (!sleigh_v2_planner_result_release (&target_plan)) {
+			build_ok = false;
+		}
+		free (planned_items);
+		free (planned_runtime_copy_items);
+		free (planned_queued_items);
 		free (queued_direct_targets);
 		free (runtime_targets);
 		free (runtime_sources);
 		free (direct_targets);
+		if (!build_ok) {
+			break;
+		}
 	}
 
 	free (queue);
 	free (seen);
+	if (!build_ok) {
+		sym_function_scope_free (scope);
+		return false;
+	}
 	sleigh_debug_scope_log ("scope_build_done count=%zu", scope->count);
 	return scope->count > 0;
 }
@@ -9372,7 +8871,7 @@ static int sleigh_eligible(RAnal *anal) {
 static bool sleigh_post_analysis(RAnal *anal) {
 	R2ILContext *ctx = get_context (anal);
 	RCore *core;
-	int xrefs_added = 0;
+	int xrefs_discovered = 0;
 	int xref_dirty_queued = 0;
 	int taint_comments = 0;
 	int taint_flags = 0;
@@ -9391,7 +8890,7 @@ static bool sleigh_post_analysis(RAnal *anal) {
 	ut64 focus_callee_addr = 0;
 	char *best_sink_label = NULL;
 	int num_fcns = anal && anal->fcns? r_list_length (anal->fcns): 0;
-	R2SleighPostAnalysisPlan plan = r2sleigh_post_analysis_plan_for_depth (
+	R2SleighPostAnalysisPlanV2 plan = sleigh_v2_query_post_analysis (
 		anal? (unsigned int)anal->plugin_analysis_depth: 0,
 		(size_t)num_fcns);
 	SleighMode post_mode = plan.mode <= (unsigned int)SLEIGH_MODE_FULL? (SleighMode)plan.mode: SLEIGH_MODE_BALANCED;
@@ -9437,7 +8936,7 @@ static bool sleigh_post_analysis(RAnal *anal) {
 			bool auto_callback_allowed = !taint_enabled || auto_callback_allows_function (
 				anal,
 				fcn,
-				R2SLEIGH_AUTO_CALLBACK_POST_ANALYSIS_TAINT,
+				R2SLEIGH_AUTO_CALLBACK_POST_ANALYSIS_TAINT_V2,
 				"post_analysis_taint");
 			bool taint_scope_eligible = !taint_focus_only
 				|| (focus_callee_addr && fcn && fcn->addr == focus_callee_addr);
@@ -9496,13 +8995,19 @@ static bool sleigh_post_analysis(RAnal *anal) {
 					block_array_free (&blocks);
 					break;
 				}
-				R2TaintFunctionSummary *taint_summary = r2taint_function_summary_typed (ctx,
-					(const R2ILBlock **)blocks.blocks, blocks.count);
+				R2SleighAnalysisResultV2 *taint_summary = NULL;
+				R2SleighAnalysisResultViewV2 taint_view;
+				uint32_t taint_status = sleigh_v2_analysis_query (R2SLEIGH_QUERY_TAINT_SUMMARY_V2,
+					ctx, (const R2ILBlock *const *)blocks.blocks, blocks.count, 0,
+					NULL, NULL, 0, &taint_summary, &taint_view);
+				if (taint_status != R2SLEIGH_STATUS_OK_V2) {
+					taint_summary = NULL;
+				}
 				if (taint_summary) {
-					size_t source_count = 0;
-					size_t sink_hit_count = 0;
-					const R2TaintSource *taint_sources = r2taint_function_summary_sources (taint_summary, &source_count);
-					const R2TaintSinkHit *sink_hits = r2taint_function_summary_sink_hits (taint_summary, &sink_hit_count);
+					size_t source_count = taint_view.primary_count;
+					size_t sink_hit_count = taint_view.secondary_count;
+					const R2TaintSource *taint_sources = (const R2TaintSource *)taint_view.primary;
+					const R2TaintSinkHit *sink_hits = (const R2TaintSinkHit *)taint_view.secondary;
 					if (!taint_sources && source_count > 0) {
 						taint_parse_failures++;
 						R_LOG_WARN ("r2sleigh: taint typed sources missing for %s @ 0x%"PFMT64x,
@@ -9736,7 +9241,7 @@ static bool sleigh_post_analysis(RAnal *anal) {
 						taint_summary_map_free (&summaries);
 						taint_source_map_free (&source_map);
 					}
-					r2taint_function_summary_free (taint_summary);
+					(void)sleigh_v2_analysis_result_release (&taint_summary);
 				}
 			}
 			sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_TAINT, r_time_now_mono () - profile_start_us);
@@ -9767,7 +9272,8 @@ static bool sleigh_post_analysis(RAnal *anal) {
 			ut64 faddr = xref_queue[--xref_queue_count];
 			RAnalFunction *xref_fcn_cur = r_anal_get_fcn_in (anal, faddr, 0);
 			BlockArray xref_blocks;
-			R2SleighDataRefs *typed_refs;
+			R2SleighAnalysisResultV2 *typed_refs = NULL;
+			R2SleighAnalysisResultViewV2 typed_view;
 			const R2SleighDataRef *typed_items;
 			size_t typed_count = 0;
 			ut64 profile_start_us;
@@ -9779,7 +9285,7 @@ static bool sleigh_post_analysis(RAnal *anal) {
 			if (!auto_callback_allows_function (
 				anal,
 				xref_fcn_cur,
-				R2SLEIGH_AUTO_CALLBACK_POST_ANALYSIS_XREF,
+				R2SLEIGH_AUTO_CALLBACK_POST_ANALYSIS_XREF_V2,
 				"post_analysis_xref")) {
 				continue;
 			}
@@ -9798,26 +9304,29 @@ static bool sleigh_post_analysis(RAnal *anal) {
 				break;
 			}
 			profile_start_us = r_time_now_mono ();
-			typed_refs = r2sleigh_data_refs_typed (ctx,
-				(const R2ILBlock **)xref_blocks.blocks, xref_blocks.count, xref_fcn_cur->addr);
-			typed_items = r2sleigh_data_refs_items (typed_refs, &typed_count);
+			uint32_t typed_status = sleigh_v2_analysis_query (R2SLEIGH_QUERY_DATA_REFS_V2,
+				ctx, (const R2ILBlock *const *)xref_blocks.blocks, xref_blocks.count,
+				xref_fcn_cur->addr, NULL, NULL, 0, &typed_refs, &typed_view);
+			typed_items = typed_status == R2SLEIGH_STATUS_OK_V2
+				? (const R2SleighDataRef *)typed_view.primary: NULL;
+			typed_count = typed_status == R2SLEIGH_STATUS_OK_V2? typed_view.primary_count: 0;
 			if (!typed_items || typed_count == 0) {
-				r2sleigh_data_refs_free (typed_refs);
+				(void)sleigh_v2_analysis_result_release (&typed_refs);
 				block_array_free (&xref_blocks);
 				continue;
 			}
 
-				ref_count = collect_data_refs_from_typed (anal, xref_fcn_cur, typed_items, typed_count, NULL, true);
-			xrefs_added += ref_count;
+			ref_count = collect_data_refs_from_typed (anal, xref_fcn_cur, typed_items, typed_count, NULL);
+			xrefs_discovered += ref_count;
 			sleigh_profile_add (anal, xref_fcn_cur, SLEIGH_PROFILE_STAGE_XREF, r_time_now_mono () - profile_start_us);
-			r2sleigh_data_refs_free (typed_refs);
+			(void)sleigh_v2_analysis_result_release (&typed_refs);
 			block_array_free (&xref_blocks);
 		}
 		free (xref_queue);
 	}
 
 	post_budget_exhausted = post_budget_exhausted || post_budget.exhausted;
-	R_LOG_INFO ("r2sleigh: post-analysis added %d xrefs", xrefs_added);
+	R_LOG_INFO ("r2sleigh: post-analysis discovered %d data references; core owns durable xref writeback", xrefs_discovered);
 	R_LOG_INFO ("r2sleigh: post-analysis taint enabled=%d eligible=%d skipped=%d comments=%d flags=%d xrefs=%d sink_hits=%d parse_failures=%d",
 		taint_enabled? 1: 0, taint_fcns_eligible, taint_fcns_skipped, taint_comments, taint_flags, taint_xrefs,
 		taint_sink_hits, taint_parse_failures);

@@ -105,7 +105,11 @@ class ReversingBenchmarkTests(unittest.TestCase):
                 expectation["id"],
             )
             self.assertTrue(
-                all(check["gate"] in {"hard", "soft"} for check in checks),
+                all(check["authority"] == "advisory" for check in checks),
+                expectation["id"],
+            )
+            self.assertTrue(
+                all(check["diagnostic"] in {"source_shape", "readability"} for check in checks),
                 expectation["id"],
             )
 
@@ -755,7 +759,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
 
     def test_phase0_primary_failure_taxonomy_is_total_for_known_kinds(self):
         known = (
-            set(benchmark.FAILURE_OWNER) - {benchmark.GOLD_ORACLE_FAILURE}
+            set(benchmark.FAILURE_OWNER)
             | set(benchmark.QUALITY_GATE_FAILURES)
             | {
                 "decompiler_fallback",
@@ -819,78 +823,180 @@ class ReversingBenchmarkTests(unittest.TestCase):
             case_result["measurement_observations"],
         )
 
-    def test_gold_oracle_gates_source_expectations(self):
+    def test_gold_oracle_exact_c_mismatch_is_advisory_to_closure(self):
         case = benchmark.BinaryCase(
-            name="vuln_test_x86",
-            path=Path("/tmp/vuln_test_x86"),
-            corpus="repo-fixtures",
-            analysis="aaa",
-            targets=("test_struct_array_index",),
+            name="sample",
+            path=Path("/tmp/sample"),
+            corpus="unit",
+            analysis="aa",
+            targets=("worker",),
             max_functions=1,
         )
-        target = {
-            "name": "sym.test_struct_array_index",
-            "requested": "test_struct_array_index",
-        }
+        target = {"name": "sym.worker", "requested": "worker"}
         gold = [
             {
-                "id": "struct-array-index",
-                "corpus": "repo-fixtures",
-                "case": "vuln_test_x86",
-                "target": "test_struct_array_index",
+                "id": "exact-c-shape",
+                "corpus": "unit",
+                "case": "sample",
+                "target": "worker",
                 "command": "decompile_sla",
-                "owner": "r2types",
-                "checks": {
-                    "type": {"contains": ["DemoStruct*"]},
-                    "readability": {
-                        "contains": ["arr[idx].third"],
-                        "not_contains": ["sla_struct_", "*(arr +"],
-                    },
-                },
+                "owner": "r2dec",
+                "checks": {"semantic": {"contains": ["return 1;"]}},
             }
         ]
         entry = benchmark.command_summary(
             "decompile_sla",
-            cmd_result(
-                "int32_t test_struct_array_index(struct sla_struct_bad* arr, int32_t idx)\n"
-                "{\n"
-                "    *(arr + idx * 56 + 8) = 1;\n"
-                "}\n"
-            ),
+            cmd_result("int worker(void) { return 0; }\n"),
             False,
             case=case,
             target=target,
             gold_manifest=gold,
         )
         case_result = {
+            "name": "sample",
+            "corpus": "unit",
             "discovery": {"returncode": 0, "function_count": 1},
             "targets": [{"name": target["name"], "commands": {"decompile_sla": entry}}],
         }
-
         failures = benchmark.collect_failures(case_result)
-        kinds = [failure["kind"] for failure in failures]
-
-        self.assertEqual(entry["gold_oracle"]["status"], "failed")
-        self.assertEqual(entry["gold_oracle"]["hard_status"], "failed")
-        self.assertEqual(entry["gold_oracle"]["soft_status"], "failed")
-        self.assertIn("source_oracle_failure", kinds)
-        self.assertTrue(any(failure.get("owner") == "r2types" for failure in failures))
-        self.assertTrue(
-            all(
-                failure.get("category") == "type" and failure.get("gate") == "hard"
-                for failure in failures
-                if failure["kind"] == benchmark.GOLD_ORACLE_FAILURE
-            )
-        )
-        self.assertTrue(
-            all(
-                failure.get("primary_failure_taxonomy") == "type"
-                for failure in failures
-                if failure["kind"] == benchmark.GOLD_ORACLE_FAILURE
-            )
-        )
         case_result["failures"] = failures
-        self.assertLess(benchmark.score_case(case_result), 100)
+        case_result["score"] = benchmark.score_case(case_result)
+        summary = benchmark.aggregate([case_result])
+        args = type(
+            "Args",
+            (),
+            {
+                "closure_gate": True,
+                "max_hard_failures": 0,
+                "max_residual_decompile": None,
+                "max_generic_args": None,
+                "max_generic_types": None,
+                "min_average_score": None,
+                "max_setup_command_ratio": None,
+                "require_pdg_comparison": False,
+                "max_pdg_quality_wins": None,
+                "max_pdg_perf_wins": None,
+                "max_pdg_quality_then_perf_wins": None,
+                "max_gold_failures": 0,
+                "require_gold": True,
+            },
+        )()
+        gate = benchmark.strict_quality_gate(args, {"status": "ok", "summary": summary})
+
+        advisory = entry["gold_oracle"]
+        self.assertEqual(advisory["authority"], "advisory")
+        self.assertEqual(advisory["status"], "advisory_mismatch")
+        self.assertEqual(advisory["advisory_mismatch_count"], 1)
+        self.assertEqual(
+            advisory["advisory_mismatches"][0]["kind"],
+            benchmark.GOLD_ORACLE_ADVISORY_MISMATCH,
+        )
+        self.assertEqual(advisory["advisory_mismatches"][0]["authority"], "advisory")
+        self.assertEqual(failures, [])
+        self.assertEqual(case_result["score"], 100)
+        self.assertEqual(gate["status"], "ok")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            manifest_path = tmp_path / "gold.json"
+            manifest_path.write_text(json.dumps({"expectations": gold}))
+            argv = [
+                "reversing_benchmark.py",
+                "--closure-gate",
+                "--require-gold",
+                "--max-gold-failures",
+                "0",
+                "--gold-manifest",
+                str(manifest_path),
+                "--commands",
+                "decompile_sla",
+                "--out",
+                str(tmp_path / "report.json"),
+            ]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(benchmark, "build_cases", return_value=[case]),
+                mock.patch.object(benchmark, "build_r2_env", return_value={}),
+                mock.patch.object(benchmark, "plugin_fingerprint", return_value={}),
+                mock.patch.object(
+                    benchmark,
+                    "run_cases_with_checkpoint",
+                    return_value=([case_result], 0),
+                ),
+                mock.patch.object(benchmark, "write_report") as write_report,
+                mock.patch("builtins.print"),
+            ):
+                exit_code = benchmark.main()
+
+        main_report = write_report.call_args.args[1]
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(main_report["status"], "ok")
+        self.assertEqual(main_report["strict_quality_gate"]["status"], "ok")
+        self.assertEqual(
+            main_report["benchmark_config"]["source_shape_advisory"],
+            {"authority": "advisory", "max_gold_failures_ignored": 0},
+        )
+
+    def test_execution_and_requested_gold_provenance_coverage_remain_hard(self):
+        entry = benchmark.command_summary(
+            "decompile_sla",
+            cmd_result("", returncode=2, stderr="runner failed"),
+            False,
+        )
+        case_result = {
+            "name": "sample",
+            "corpus": "unit",
+            "discovery": {"returncode": 0, "function_count": 1},
+            "targets": [{"name": "sym.worker", "commands": {"decompile_sla": entry}}],
+        }
+        case_result["failures"] = benchmark.collect_failures(case_result)
+        case_result["score"] = benchmark.score_case(case_result)
+        summary = benchmark.aggregate([case_result])
+        args = type(
+            "Args",
+            (),
+            {
+                "closure_gate": False,
+                "max_hard_failures": 0,
+                "max_residual_decompile": None,
+                "max_generic_args": None,
+                "max_generic_types": None,
+                "min_average_score": None,
+                "max_setup_command_ratio": None,
+                "require_pdg_comparison": False,
+                "max_pdg_quality_wins": None,
+                "max_pdg_perf_wins": None,
+                "max_pdg_quality_then_perf_wins": None,
+                "require_gold": True,
+            },
+        )()
+        gate = benchmark.strict_quality_gate(args, {"status": "ok", "summary": summary})
+
+        self.assertIn("command_return", {failure["kind"] for failure in case_result["failures"]})
+        self.assertEqual(gate["status"], "failed")
+        self.assertEqual(
+            {failure["metric"] for failure in gate["failures"]},
+            {"gold_expectations", "hard_failures"},
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = Path(tmp) / "gold.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "expectations": [
+                            {
+                                "target": "worker",
+                                "command": "decompile_sla",
+                                "owner": "not-a-canonical-owner",
+                                "contains": ["return 1;"],
+                            }
+                        ]
+                    }
+                )
+            )
+            with self.assertRaisesRegex(ValueError, "owner must be one of"):
+                benchmark.load_gold_manifest(manifest_path)
 
     def test_gold_oracle_passes_expected_source_shape(self):
         case = benchmark.BinaryCase(
@@ -931,14 +1037,15 @@ class ReversingBenchmarkTests(unittest.TestCase):
             gold_manifest=gold,
         )
 
-        self.assertEqual(entry["gold_oracle"]["status"], "ok")
+        self.assertEqual(entry["gold_oracle"]["authority"], "advisory")
+        self.assertEqual(entry["gold_oracle"]["status"], "matched")
         self.assertEqual(entry["gold_oracle"]["expectation_count"], 1)
-        self.assertEqual(entry["gold_oracle"]["hard_check_count"], 1)
-        self.assertEqual(entry["gold_oracle"]["soft_check_count"], 3)
-        self.assertEqual(entry["gold_oracle"]["legacy_check_count"], 0)
-        self.assertEqual(entry["gold_oracle"]["failures"], [])
+        self.assertEqual(entry["gold_oracle"]["source_shape_check_count"], 1)
+        self.assertEqual(entry["gold_oracle"]["readability_check_count"], 3)
+        self.assertEqual(entry["gold_oracle"]["unclassified_check_count"], 0)
+        self.assertEqual(entry["gold_oracle"]["advisory_mismatches"], [])
 
-    def test_soft_gold_failure_does_not_fail_semantic_hard_gate(self):
+    def test_readability_gold_mismatch_stays_advisory(self):
         case = benchmark.BinaryCase(
             name="sample",
             path=Path("/tmp/sample"),
@@ -978,16 +1085,17 @@ class ReversingBenchmarkTests(unittest.TestCase):
         case_result["failures"] = failures
         summary = benchmark.aggregate([case_result])
 
-        self.assertEqual(entry["gold_oracle"]["status"], "failed")
-        self.assertEqual(entry["gold_oracle"]["hard_status"], "ok")
-        self.assertEqual(entry["gold_oracle"]["soft_status"], "failed")
+        self.assertEqual(entry["gold_oracle"]["status"], "advisory_mismatch")
         self.assertEqual(
-            [(failure["category"], failure["gate"]) for failure in entry["gold_oracle"]["failures"]],
-            [("readability", "soft")],
+            [
+                (mismatch["category"], mismatch["diagnostic"], mismatch["authority"])
+                for mismatch in entry["gold_oracle"]["advisory_mismatches"]
+            ],
+            [("readability", "readability", "advisory")],
         )
-        self.assertFalse(any(failure["kind"] == benchmark.GOLD_ORACLE_FAILURE for failure in failures))
-        self.assertEqual(summary["quality"]["gold_oracle"]["hard_failures"], 0)
-        self.assertEqual(summary["quality"]["gold_oracle"]["soft_failures"], 1)
+        self.assertEqual(failures, [])
+        self.assertEqual(summary["quality"]["gold_oracle"]["source_shape_mismatches"], 0)
+        self.assertEqual(summary["quality"]["gold_oracle"]["readability_mismatches"], 1)
 
         args = type(
             "Args",
@@ -1004,13 +1112,11 @@ class ReversingBenchmarkTests(unittest.TestCase):
                 "max_pdg_quality_wins": None,
                 "max_pdg_perf_wins": None,
                 "max_pdg_quality_then_perf_wins": None,
-                "max_gold_failures": 0,
                 "require_gold": False,
             },
         )()
         gate = benchmark.strict_quality_gate(args, {"summary": summary})
-        self.assertEqual(gate["checks"]["gold_failures"]["value"], 0)
-        self.assertNotIn("gold_failures", {failure["metric"] for failure in gate["failures"]})
+        self.assertNotIn("gold_failures", gate["checks"])
 
     def test_load_gold_manifest_requires_canonical_owner(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1057,7 +1163,8 @@ class ReversingBenchmarkTests(unittest.TestCase):
                     "check": "contains",
                     "pattern": "return 1;",
                     "category": "unclassified",
-                    "gate": "legacy",
+                    "diagnostic": "unclassified",
+                    "authority": "advisory",
                 }
             ],
         )
@@ -1098,7 +1205,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "cannot mix categorized checks"):
                 benchmark.load_gold_manifest(path)
 
-    def test_legacy_gold_failure_is_explicit_and_not_hard(self):
+    def test_legacy_gold_mismatch_is_explicit_and_advisory(self):
         case = benchmark.BinaryCase(
             name="sample",
             path=Path("/tmp/sample"),
@@ -1128,18 +1235,16 @@ class ReversingBenchmarkTests(unittest.TestCase):
             "targets": [{"name": target["name"], "commands": {"decompile_sla": entry}}],
         }
 
-        self.assertEqual(entry["gold_oracle"]["hard_status"], "ok")
-        self.assertEqual(entry["gold_oracle"]["legacy_status"], "failed")
+        self.assertEqual(entry["gold_oracle"]["authority"], "advisory")
+        self.assertEqual(entry["gold_oracle"]["status"], "advisory_mismatch")
         self.assertEqual(
-            (entry["gold_oracle"]["failures"][0]["category"], entry["gold_oracle"]["failures"][0]["gate"]),
-            ("unclassified", "legacy"),
+            (
+                entry["gold_oracle"]["advisory_mismatches"][0]["category"],
+                entry["gold_oracle"]["advisory_mismatches"][0]["diagnostic"],
+            ),
+            ("unclassified", "unclassified"),
         )
-        self.assertFalse(
-            any(
-                failure["kind"] == benchmark.GOLD_ORACLE_FAILURE
-                for failure in benchmark.collect_failures(case_result)
-            )
-        )
+        self.assertEqual(benchmark.collect_failures(case_result), [])
 
     def test_run_case_classifies_native_discovery_as_radare2_candidate(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2964,7 +3069,6 @@ class ReversingBenchmarkTests(unittest.TestCase):
                 "max_pdg_quality_wins": None,
                 "max_pdg_perf_wins": None,
                 "max_pdg_quality_then_perf_wins": None,
-                "max_gold_failures": 0,
                 "require_gold": False,
             },
         )()
@@ -2986,7 +3090,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
                     "undefined_identifier_return_total": 1,
                     "generic_arg_total": 0,
                     "generic_type_total": 0,
-                    "gold_oracle": {"failures": 0, "expectations": 0},
+                    "gold_oracle": {"advisory_mismatches": 0, "expectations": 0},
                     "pdg_comparison": {},
                 },
             },
@@ -3022,11 +3126,6 @@ class ReversingBenchmarkTests(unittest.TestCase):
             "undefined_identifier_return",
             {failure["metric"] for failure in gate["failures"]},
         )
-        self.assertIn(
-            "gold_expectations",
-            {failure["metric"] for failure in gate["failures"]},
-        )
-
     def test_parallel_split_uses_case_and_command_workers(self):
         self.assertEqual(benchmark.parallel_split(1, 12), (1, 1))
         self.assertEqual(benchmark.parallel_split(64, 1), (1, 64))
@@ -3055,7 +3154,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertEqual(args.batch_target_size, 0)
         self.assertEqual(args.commands, "decompile_sla,types,profile")
 
-    def test_closure_gate_defaults_to_strict_gold_thresholds(self):
+    def test_closure_gate_does_not_promote_source_shape_advisories(self):
         args = type(
             "Args",
             (),
@@ -3091,8 +3190,8 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertEqual(args.max_generic_types, 0)
         self.assertEqual(args.min_average_score, 99.5)
         self.assertEqual(args.max_setup_command_ratio, 2.0)
-        self.assertEqual(args.max_gold_failures, 0)
-        self.assertTrue(args.require_gold)
+        self.assertFalse(hasattr(args, "max_gold_failures"))
+        self.assertFalse(hasattr(args, "require_gold"))
         self.assertTrue(args.require_pdg_comparison)
         self.assertEqual(args.max_pdg_quality_wins, 0)
         self.assertIsNone(args.max_pdg_perf_wins)
@@ -3516,7 +3615,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
         noop = cmd_result(
             batched_stdout(
                 [
-                    ("plugin_help", 0, "| a:sla.dec [name|addr]"),
+                    ("plugin_help", 0, "| pdd - borrowed-snapshot provider"),
                     ("plugin_status", 0, "sla: loaded architecture 'x86'"),
                     ("decompile_sla", 0, ""),
                     ("types", 0, ""),
@@ -3527,7 +3626,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
         healthy = cmd_result(
             batched_stdout(
                 [
-                    ("plugin_help", 0, "| a:sla.dec [name|addr]"),
+                    ("plugin_help", 0, "| pdd - borrowed-snapshot provider"),
                     ("plugin_status", 0, "sla: loaded architecture 'x86'"),
                     ("decompile_sla", 0, "int f(void) { return 1; }"),
                     ("types", 0, '{"ret_type":"int","params":[]}'),
@@ -3760,6 +3859,10 @@ class ReversingBenchmarkTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(report["status"], "ok")
+        self.assertEqual(
+            report["separation"]["source_shape_diagnostics"],
+            "not evaluated; non-authoritative advisory diagnostics run separately",
+        )
         self.assertEqual(run_case.call_count, 1 + config["contract"]["warm_sessions"])
         self.assertEqual(
             run_case.call_args_list[0].args[3],

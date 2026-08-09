@@ -3,8 +3,14 @@
 #include <r_arch.h>
 #include <r_anal.h>
 #include <r_core.h>
+#include <r_version.h>
+#include <stdlib.h>
 #include <string.h>
 #include "r2sleigh_plugin.h"
+
+#if R2_ABIVERSION != 138
+#error "r2sleigh lift-core V2 requires exactly radare2 ABI 138"
+#endif
 
 static const char *fallback_profile_generic(void) {
 	return "gpr\tpc\t.64\t0\t0\n\
@@ -159,8 +165,42 @@ static char *sleigh_arch_regs(RArchSession *as) {
 		return strdup (fallback);
 	}
 
-	char *profile = r2il_get_reg_profile (ctx);
-	return profile ? profile : strdup (fallback);
+	const R2SleighApiV2 *api = r2sleigh_api_v2 ();
+	if (!api || api->abi_version != R2SLEIGH_ABI_V2
+		|| api->struct_size != sizeof (*api)
+		|| api->radare_abi_version != R2_ABIVERSION
+		|| api->byte_view_size != sizeof (R2SleighByteViewV2)
+		|| api->string_view_size != sizeof (R2SleighStringViewV2)
+		|| !(api->capabilities & R2SLEIGH_CAP_LIFT_CORE_V2)
+		|| !api->lift_context_reg_profile
+		|| !api->owned_bytes_view || !api->owned_bytes_free) {
+		return strdup (fallback);
+	}
+
+	R2SleighOwnedBytesV2 *profile = NULL;
+	if (api->lift_context_reg_profile (ctx, &profile) != R2SLEIGH_STATUS_OK_V2
+		|| !profile) {
+		return strdup (fallback);
+	}
+	R2SleighByteViewV2 view = {0};
+	char *copy = NULL;
+	uint32_t view_status = api->owned_bytes_view (profile, &view);
+	if (view_status == R2SLEIGH_STATUS_OK_V2
+		&& (!view.len || view.data) && view.len != SIZE_MAX) {
+		copy = malloc (view.len + 1);
+		if (copy) {
+			if (view.len) {
+				memcpy (copy, view.data, view.len);
+			}
+			copy[view.len] = '\0';
+		}
+	}
+	uint32_t free_status = api->owned_bytes_free (profile);
+	if (view_status != R2SLEIGH_STATUS_OK_V2 || free_status != R2SLEIGH_STATUS_OK_V2) {
+		free (copy);
+		copy = NULL;
+	}
+	return copy ? copy : strdup (fallback);
 }
 
 static bool sleigh_arch_decode(RArchSession *as, RAnalOp *op, RArchDecodeMask mask) {

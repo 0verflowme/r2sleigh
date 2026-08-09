@@ -13130,6 +13130,7 @@ mod tests {
         native.summary.role_identity = Some(Box::new(r2sym::NativeWorkerRoleIdentity {
             role_name: role_name.to_string(),
             source: r2sym::NativeWorkerRoleSource::Structural,
+            linkage: r2ssa::FunctionSemanticLinkage::Imported,
             confidence: r2sym::SemanticConfidence::Likely,
             source_names: vec![role_name.to_string()],
             summary_kinds: BTreeSet::from([summary_kind]),
@@ -17523,6 +17524,7 @@ mod tests {
         native.summary.role_identity = Some(Box::new(r2sym::NativeWorkerRoleIdentity {
             role_name: "printf_fetchargs".to_string(),
             source: r2sym::NativeWorkerRoleSource::NameHint,
+            linkage: r2ssa::FunctionSemanticLinkage::Unknown,
             confidence: r2sym::SemanticConfidence::Heuristic,
             source_names: vec!["sym.printf_fetchargs".to_string()],
             summary_kinds: BTreeSet::from([r2sym::NativeWorkerSummaryKind::FormatArgumentFetch]),
@@ -17582,6 +17584,7 @@ mod tests {
         native.summary.role_identity = Some(Box::new(r2sym::NativeWorkerRoleIdentity {
             role_name: "printf_fetchargs".to_string(),
             source: r2sym::NativeWorkerRoleSource::Structural,
+            linkage: r2ssa::FunctionSemanticLinkage::Internal,
             confidence: r2sym::SemanticConfidence::Likely,
             source_names: Vec::new(),
             summary_kinds: BTreeSet::from([r2sym::NativeWorkerSummaryKind::FormatArgumentFetch]),

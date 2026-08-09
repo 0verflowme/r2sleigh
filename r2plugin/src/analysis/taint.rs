@@ -289,9 +289,8 @@ fn ffi_taint_summary_from_report(report: TaintSummaryReportJson) -> R2TaintFunct
 }
 
 /// Run taint analysis and return results as JSON.
-/// Caller must free the returned string with r2il_string_free().
-#[unsafe(no_mangle)]
-pub extern "C" fn r2taint_function_json(
+/// Internal V2 wrapper immediately adopts the returned CString allocation.
+pub(crate) fn r2taint_function_json(
     ctx: *const R2ILContext,
     blocks: *const *const R2ILBlock,
     num_blocks: usize,
@@ -354,8 +353,7 @@ pub extern "C" fn r2taint_function_json(
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2taint_function_summary_typed(
+pub(crate) fn r2taint_function_summary_typed(
     ctx: *const R2ILContext,
     blocks: *const *const R2ILBlock,
     num_blocks: usize,
@@ -373,8 +371,7 @@ pub extern "C" fn r2taint_function_summary_typed(
     Box::into_raw(Box::new(ffi_taint_summary_from_report(report)))
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2taint_function_summary_sources(
+pub(crate) fn r2taint_function_summary_sources(
     summary: *const R2TaintFunctionSummary,
     count: *mut usize,
 ) -> *const R2TaintSource {
@@ -395,8 +392,7 @@ pub extern "C" fn r2taint_function_summary_sources(
     summary.sources.as_ptr()
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2taint_function_summary_sink_hits(
+pub(crate) fn r2taint_function_summary_sink_hits(
     summary: *const R2TaintFunctionSummary,
     count: *mut usize,
 ) -> *const R2TaintSinkHit {
@@ -417,8 +413,7 @@ pub extern "C" fn r2taint_function_summary_sink_hits(
     summary.sink_hits.as_ptr()
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2taint_function_summary_free(summary: *mut R2TaintFunctionSummary) {
+pub(crate) fn r2taint_function_summary_free(summary: *mut R2TaintFunctionSummary) {
     if !summary.is_null() {
         unsafe {
             drop(Box::from_raw(summary));

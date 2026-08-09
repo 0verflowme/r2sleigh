@@ -43,6 +43,22 @@ Each fact has one owner:
 No downstream layer reconstructs a missing upstream fact. Names are cosmetic or
 weak hints only and cannot grant executable output.
 
+## Fixture policy
+
+Names such as `fnv_fold`, `sum_array`, and `struct_array` may appear in test
+sources and offline lift captures because they describe ordinary programs used
+to exercise hashing, loops, and aggregate addressing. They are never production
+route keys or certification inputs. Byte offsets and hashes in an offline
+capture prove which immutable binary slice was lifted; they do not authorize a
+semantic result.
+
+A positive certified test must enter through the same bounded radare2 snapshot
+provider as a user request. Hand-authored R2IL/SSA may test local analysis or an
+expected refusal, but it cannot produce `TrustedSsaArtifact`, a certification
+ledger, or executable C. Stripped benchmark fixtures without exact
+address-linked type provenance are expected to refuse certification rather than
+receive a test-only interface.
+
 ## Source obligations
 
 Every canonical instruction has one initial state:
@@ -68,6 +84,21 @@ tokens. Runtime proofs derived from one immutable `SsaArtifact` share an opaque
 run-local authority seal. Clones retain the seal; independently rebuilt or
 foreign artifacts receive a different seal even if their diagnostic bytes are
 equal. Ledgers, effects, controls, and region permits must share that seal.
+
+`r2source` owns the only coherent source capture. Its
+`OwnedFunctionSnapshot` has no public constructor from blocks, layouts,
+interfaces, hashes, or revision values. A synchronous radare ABI adapter must
+deep-copy the opaque callback payload, validate the closed machine tuple and
+bounded image, then create one run-local `Arc` lineage. Function names are
+presentation fields and are excluded from semantic identity and cache keys.
+Source CFG and call metadata remain advisory until the trusted Sleigh decoder
+independently derives and exactly matches them.
+
+Analysis-only SSA and trusted prepared SSA are different authority domains.
+The final r2cert API accepts only the opaque trusted prepared type retained from
+the source capture; it does not accept a generic `SsaArtifact` and perform a
+runtime provenance guess. Manual blocks and caller-created interfaces may be
+analyzed or used in refusal tests, but they cannot inhabit the certifying type.
 
 Return certification retains the exact source-declared return-address carrier
 and exit stack-pointer state. A generic source-boundary pass—not a recognizer—

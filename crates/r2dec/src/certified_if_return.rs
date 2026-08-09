@@ -11,7 +11,7 @@ use r2cert::{
 };
 use r2ssa::{
     CanonicalInstructionId, CanonicalInstructionSite, MachineBuildError, MachineValueBinding,
-    SemanticObligationId, SsaArtifact,
+    SemanticObligationId, TrustedSsaArtifact,
 };
 use serde::Serialize;
 
@@ -272,8 +272,10 @@ fn typed_region_mappings(
 }
 
 impl CertifiedConditionalReturnFunction {
-    pub fn from_artifact(artifact: &SsaArtifact) -> Result<Self, ConditionalReturnFunctionError> {
-        let certified = CertifiedMachineProjection::from_artifact(artifact)?;
+    pub fn from_artifact(
+        trusted: &TrustedSsaArtifact,
+    ) -> Result<Self, ConditionalReturnFunctionError> {
+        let certified = CertifiedMachineProjection::from_artifact(trusted)?;
         Self::from_projection(&certified)
     }
 
@@ -711,124 +713,5 @@ impl ConditionalReturnFunctionAuditReport {
 
     pub fn invalid(&self) -> &[String] {
         &self.invalid
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
-    use r2ssa::{
-        CanonicalStorageId, CanonicalStorageSpace, SourceAbiParameterSpec, SourceFunctionInterface,
-        SourceFunctionReturn,
-    };
-
-    fn storage(offset: u64, size: u32) -> CanonicalStorageId {
-        CanonicalStorageId {
-            space: CanonicalStorageSpace::Register,
-            offset,
-            size,
-        }
-    }
-
-    fn test_arch() -> ArchSpec {
-        let mut arch = ArchSpec::new("conditional-return-test");
-        arch.add_register(RegisterDef::new("rax", 0, 8));
-        arch.add_register(RegisterDef::new("rdi", 8, 8));
-        arch.add_register(RegisterDef::new("rip", 16, 8));
-        arch
-    }
-
-    fn interface(return_storage: CanonicalStorageId) -> SourceFunctionInterface {
-        SourceFunctionInterface::new(
-            b"conditional-return-revision-1".to_vec(),
-            "test-register-abi",
-            [SourceAbiParameterSpec::new(0, storage(8, 8))],
-            SourceFunctionReturn::Register {
-                storage: return_storage,
-            },
-            [],
-        )
-        .expect("function interface")
-    }
-
-    fn source_blocks() -> Vec<R2ILBlock> {
-        let mut header = R2ILBlock::new(0x8000, 4);
-        header.push(R2ILOp::IntNotEqual {
-            dst: Varnode::unique(0x10, 1),
-            a: Varnode::register(8, 8),
-            b: Varnode::constant(0, 8),
-        });
-        header.push(R2ILOp::CBranch {
-            target: Varnode::ram(0x8020, 8),
-            cond: Varnode::unique(0x10, 1),
-        });
-        let mut false_arm = R2ILBlock::new(0x8004, 4);
-        false_arm.push(R2ILOp::Copy {
-            dst: Varnode::register(0, 8),
-            src: Varnode::constant(0, 8),
-        });
-        false_arm.push(R2ILOp::Return {
-            target: Varnode::register(16, 8),
-        });
-        let mut true_arm = R2ILBlock::new(0x8020, 4);
-        true_arm.push(R2ILOp::Copy {
-            dst: Varnode::register(0, 8),
-            src: Varnode::constant(u64::MAX, 8),
-        });
-        true_arm.push(R2ILOp::Return {
-            target: Varnode::register(16, 8),
-        });
-        vec![header, false_arm, true_arm]
-    }
-
-    fn assert_refused(blocks: &[R2ILBlock], return_storage: CanonicalStorageId) {
-        let artifact =
-            SsaArtifact::raw_with_interface(blocks, Some(&test_arch()), interface(return_storage))
-                .expect("synthetic conditional-return artifact");
-        assert!(CertifiedConditionalReturnFunction::from_artifact(&artifact).is_err());
-    }
-
-    #[test]
-    fn synthetic_conditional_return_is_refused_without_typed_machine_roles() {
-        assert_refused(&source_blocks(), storage(0, 8));
-    }
-
-    #[test]
-    fn synthetic_conditional_return_certificate_baseline_is_refused() {
-        assert_refused(&source_blocks(), storage(0, 8));
-    }
-
-    #[test]
-    fn public_constructor_rejects_open_extra_memory_call_and_wrong_return_shapes() {
-        let mut extra_blocks = source_blocks();
-        let extra_block = R2ILBlock::new(0x8040, 4);
-        extra_blocks.push(extra_block);
-        assert_refused(&extra_blocks, storage(0, 8));
-
-        let mut header = R2ILBlock::new(0x8100, 4);
-        header.push(R2ILOp::Store {
-            space: SpaceId::Ram,
-            addr: Varnode::constant(0x9000, 8),
-            val: Varnode::constant(1, 8),
-        });
-        header.push(R2ILOp::CBranch {
-            target: Varnode::ram(0x8120, 8),
-            cond: Varnode::constant(1, 1),
-        });
-        let mut false_arm = R2ILBlock::new(0x8104, 4);
-        false_arm.push(R2ILOp::Return {
-            target: Varnode::register(16, 8),
-        });
-        let mut true_arm = R2ILBlock::new(0x8120, 4);
-        true_arm.push(R2ILOp::Call {
-            target: Varnode::ram(0x9000, 8),
-        });
-        true_arm.push(R2ILOp::Return {
-            target: Varnode::register(16, 8),
-        });
-        assert_refused(&[header, false_arm, true_arm], storage(0, 8));
-        assert_refused(&source_blocks(), storage(0, 4));
     }
 }

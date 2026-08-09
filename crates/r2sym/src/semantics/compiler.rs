@@ -1,10 +1,11 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use r2il::ArchSpec;
 use r2ssa::{CFGRiskSummary, FunctionSemanticSummary, InterprocFunctionId, SsaArtifact};
 use z3::Context;
 
+use crate::FunctionSymbolSnapshot;
 use crate::replay::{ReplaySeed, stable_replay_seed_fingerprint};
 use crate::sim::{
     DerivedSummaryDiagnostics, PreparedFunctionScope, SummaryProfile, SummaryRegistry,
@@ -216,6 +217,7 @@ pub fn compile_summary_dense_worker_artifact_from_interproc_summary(
                 slice_class,
                 role_identity: super::native_worker::role_identity_from_worker_summaries(
                     summary.name.as_deref(),
+                    summary.linkage,
                     &worker_summaries,
                 ),
                 closure_functions,
@@ -247,10 +249,11 @@ pub fn compile_named_native_worker_summary_artifact(
     summary: &FunctionSemanticSummary,
     skipped_large_cfg: bool,
 ) -> Option<SemanticArtifact> {
-    if !summary
-        .name
-        .as_deref()
-        .is_some_and(super::native_worker::has_native_worker_summary_family)
+    if summary.linkage != r2ssa::FunctionSemanticLinkage::Imported
+        || !summary
+            .name
+            .as_deref()
+            .is_some_and(super::native_worker::has_native_worker_summary_family)
     {
         return None;
     }
@@ -282,6 +285,7 @@ pub fn compile_named_native_worker_summary_artifact(
         execution: ExecutionModel::Native,
         suppress_large_cfg_reason: true,
         role_name_hint: summary.name.clone(),
+        role_linkage: summary.linkage,
         slice_class: crate::SliceClass::Worker,
         closure_functions: 1,
         helper_functions: summary.direct_callees.len(),
@@ -341,9 +345,13 @@ pub fn compile_native_worker_summary_artifact(
             .cloned()
             .collect::<Vec<_>>(),
     );
-    let summary_owned_worker = summary
-        .and_then(|summary| summary.name.as_deref())
-        .is_some_and(super::native_worker::has_native_worker_summary_family);
+    let summary_owned_worker = summary.is_some_and(|summary| {
+        summary.linkage == r2ssa::FunctionSemanticLinkage::Imported
+            && summary
+                .name
+                .as_deref()
+                .is_some_and(super::native_worker::has_native_worker_summary_family)
+    });
     let region_summaries = if summary_owned_worker && has_primary_interproc_summary {
         Vec::new()
     } else {
@@ -380,9 +388,18 @@ pub fn compile_native_worker_summary_artifact(
         RefinementStage::Residual
     };
     let role_name_hint = if has_primary_interproc_summary {
-        summary.and_then(|summary| summary.name.clone())
+        summary
+            .filter(|summary| summary.linkage == r2ssa::FunctionSemanticLinkage::Imported)
+            .and_then(|summary| summary.name.clone())
     } else {
         None
+    };
+    let role_linkage = if has_primary_interproc_summary {
+        summary
+            .map(|summary| summary.linkage)
+            .unwrap_or(r2ssa::FunctionSemanticLinkage::Unknown)
+    } else {
+        r2ssa::FunctionSemanticLinkage::Unknown
     };
     let closure_functions = scope.map(|scope| scope.functions().len()).unwrap_or(1);
     let collected = CollectedNativeSemanticRegions {
@@ -401,6 +418,7 @@ pub fn compile_native_worker_summary_artifact(
         execution: ExecutionModel::Native,
         suppress_large_cfg_reason: has_primary_summary,
         role_name_hint,
+        role_linkage,
         slice_class,
         closure_functions,
         helper_functions,
@@ -419,6 +437,7 @@ struct BuildSemanticArtifactInput {
     execution: ExecutionModel,
     suppress_large_cfg_reason: bool,
     role_name_hint: Option<String>,
+    role_linkage: r2ssa::FunctionSemanticLinkage,
     slice_class: crate::SliceClass,
     closure_functions: usize,
     helper_functions: usize,
@@ -437,6 +456,7 @@ fn build_semantic_artifact(input: BuildSemanticArtifactInput) -> SemanticArtifac
         execution,
         suppress_large_cfg_reason,
         role_name_hint,
+        role_linkage,
         slice_class,
         closure_functions,
         helper_functions,
@@ -451,6 +471,7 @@ fn build_semantic_artifact(input: BuildSemanticArtifactInput) -> SemanticArtifac
     let role_identity = if matches!(execution, ExecutionModel::Native) {
         super::native_worker::role_identity_from_worker_summaries(
             role_name_hint.as_deref(),
+            role_linkage,
             &collected.worker_summaries,
         )
     } else {
@@ -609,9 +630,10 @@ fn compile_function_semantics_uncached(
     func: &SsaArtifact,
     scope: Option<&PreparedFunctionScope>,
     arch: Option<&ArchSpec>,
-    symbol_map: &HashMap<u64, String>,
+    symbols: &FunctionSymbolSnapshot,
     summary_profile: SummaryProfile,
 ) -> SemanticArtifact {
+    let symbol_map = symbols.imported_names();
     let closure_functions = scope.map(|scope| scope.functions().len()).unwrap_or(1);
     let helper_functions = scope
         .map(|scope| scope.helper_functions().count())
@@ -684,6 +706,7 @@ fn compile_function_semantics_uncached(
                 suppress_large_cfg_reason: matches!(execution, ExecutionModel::Vm)
                     || has_island_compiled_regions,
                 role_name_hint: None,
+                role_linkage: r2ssa::FunctionSemanticLinkage::Internal,
                 slice_class,
                 closure_functions,
                 helper_functions,
@@ -764,6 +787,7 @@ fn compile_function_semantics_uncached(
         suppress_large_cfg_reason: matches!(execution, ExecutionModel::Vm)
             || has_island_compiled_regions,
         role_name_hint: func.function().name.clone(),
+        role_linkage: r2ssa::FunctionSemanticLinkage::Internal,
         slice_class,
         closure_functions,
         helper_functions,
@@ -791,7 +815,7 @@ fn compile_function_semantics_cached_with_scope_impl(
     func: &SsaArtifact,
     scope: Option<&PreparedFunctionScope>,
     arch: Option<&ArchSpec>,
-    symbol_map: &HashMap<u64, String>,
+    symbols: &FunctionSymbolSnapshot,
     summary_profile: SummaryProfile,
     replay_seed: Option<&ReplaySeed>,
 ) -> SemanticCompilationResult {
@@ -803,6 +827,7 @@ fn compile_function_semantics_cached_with_scope_impl(
         summary_profile,
         seed_mode,
         replay_seed_fingerprint,
+        symbols,
     );
     if let Some(existing) = lookup_semantic_cache(&key) {
         return SemanticCompilationResult {
@@ -820,6 +845,7 @@ fn compile_function_semantics_cached_with_scope_impl(
             summary_profile,
             seed_mode,
             replay_seed_fingerprint,
+            symbols,
         )
     });
     if let Some(coarse_key) = coarse_key.as_ref()
@@ -838,7 +864,7 @@ fn compile_function_semantics_cached_with_scope_impl(
         func,
         scope,
         arch,
-        symbol_map,
+        symbols,
         summary_profile,
     ));
     let artifact = cache_insert_bounded(key, artifact);
@@ -865,7 +891,7 @@ pub(crate) fn compile_function_semantics_cached_with_scope(
     func: &SsaArtifact,
     scope: Option<&PreparedFunctionScope>,
     arch: Option<&ArchSpec>,
-    symbol_map: &HashMap<u64, String>,
+    symbols: &FunctionSymbolSnapshot,
     summary_profile: SummaryProfile,
 ) -> SemanticCompilationResult {
     compile_function_semantics_cached_with_scope_impl(
@@ -873,7 +899,7 @@ pub(crate) fn compile_function_semantics_cached_with_scope(
         func,
         scope,
         arch,
-        symbol_map,
+        symbols,
         summary_profile,
         None,
     )
@@ -884,7 +910,7 @@ pub fn compile_function_semantics_with_scope(
     func: &SsaArtifact,
     scope: Option<&PreparedFunctionScope>,
     arch: Option<&ArchSpec>,
-    symbol_map: &HashMap<u64, String>,
+    symbols: &FunctionSymbolSnapshot,
     summary_profile: SummaryProfile,
 ) -> SemanticArtifact {
     let result = compile_function_semantics_cached_with_scope(
@@ -892,7 +918,7 @@ pub fn compile_function_semantics_with_scope(
         func,
         scope,
         arch,
-        symbol_map,
+        symbols,
         summary_profile,
     );
     let mut artifact = (*result.artifact).clone();
@@ -905,7 +931,7 @@ pub fn compile_function_semantics_with_scope_and_replay_seed(
     func: &SsaArtifact,
     scope: Option<&PreparedFunctionScope>,
     arch: Option<&ArchSpec>,
-    symbol_map: &HashMap<u64, String>,
+    symbols: &FunctionSymbolSnapshot,
     summary_profile: SummaryProfile,
     replay_seed: Option<&ReplaySeed>,
 ) -> SemanticArtifact {
@@ -914,7 +940,7 @@ pub fn compile_function_semantics_with_scope_and_replay_seed(
         func,
         scope,
         arch,
-        symbol_map,
+        symbols,
         summary_profile,
         replay_seed,
     );
@@ -928,10 +954,10 @@ pub fn compile_semantic_artifact_with_scope(
     func: &SsaArtifact,
     scope: Option<&PreparedFunctionScope>,
     arch: Option<&ArchSpec>,
-    symbol_map: &HashMap<u64, String>,
+    symbols: &FunctionSymbolSnapshot,
     summary_profile: SummaryProfile,
 ) -> SemanticArtifact {
-    compile_function_semantics_with_scope(ctx, func, scope, arch, symbol_map, summary_profile)
+    compile_function_semantics_with_scope(ctx, func, scope, arch, symbols, summary_profile)
 }
 
 pub fn compile_semantic_artifact_with_scope_and_replay_seed(
@@ -939,7 +965,7 @@ pub fn compile_semantic_artifact_with_scope_and_replay_seed(
     func: &SsaArtifact,
     scope: Option<&PreparedFunctionScope>,
     arch: Option<&ArchSpec>,
-    symbol_map: &HashMap<u64, String>,
+    symbols: &FunctionSymbolSnapshot,
     summary_profile: SummaryProfile,
     replay_seed: Option<&ReplaySeed>,
 ) -> SemanticArtifact {
@@ -948,7 +974,7 @@ pub fn compile_semantic_artifact_with_scope_and_replay_seed(
         func,
         scope,
         arch,
-        symbol_map,
+        symbols,
         summary_profile,
         replay_seed,
     )
@@ -960,7 +986,7 @@ pub fn compile_query_semantic_artifact_with_scope(
     scope: Option<&PreparedFunctionScope>,
     target_addr: u64,
     arch: Option<&ArchSpec>,
-    symbol_map: &HashMap<u64, String>,
+    symbols: &FunctionSymbolSnapshot,
     summary_profile: SummaryProfile,
 ) -> SemanticArtifact {
     let bounded_scope = bounded_query_scope(func, scope, target_addr);
@@ -969,7 +995,7 @@ pub fn compile_query_semantic_artifact_with_scope(
         func,
         bounded_scope.as_ref().or(scope),
         arch,
-        symbol_map,
+        symbols,
         summary_profile,
     )
 }
@@ -981,7 +1007,7 @@ pub fn compile_query_semantic_artifact_with_scope_and_replay_seed(
     scope: Option<&PreparedFunctionScope>,
     target_addr: u64,
     arch: Option<&ArchSpec>,
-    symbol_map: &HashMap<u64, String>,
+    symbols: &FunctionSymbolSnapshot,
     summary_profile: SummaryProfile,
     replay_seed: Option<&ReplaySeed>,
 ) -> SemanticArtifact {
@@ -991,7 +1017,7 @@ pub fn compile_query_semantic_artifact_with_scope_and_replay_seed(
         func,
         bounded_scope.as_ref().or(scope),
         arch,
-        symbol_map,
+        symbols,
         summary_profile,
         replay_seed,
     )
@@ -1009,27 +1035,37 @@ pub fn compile_semantic_artifact_default_with_scope(
         func,
         rebound_scope.as_ref(),
         arch,
-        &HashMap::new(),
+        &FunctionSymbolSnapshot::default(),
         SummaryProfile::Default,
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use r2il::{
         ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, SwitchCase, SwitchInfo, Varnode,
     };
-    use r2ssa::SsaArtifact;
+    use r2ssa::{FunctionSemanticLinkage, SsaArtifact};
     use z3::Context;
 
+    use crate::FunctionSymbol;
     use crate::replay::{ReplayRegisterValue, ReplaySeed};
 
     use super::*;
     const RAX: u64 = 0;
     const RBP: u64 = 8;
     const RDI: u64 = 0x20;
+
+    fn test_symbols(entries: &[(u64, &str, FunctionSemanticLinkage)]) -> FunctionSymbolSnapshot {
+        FunctionSymbolSnapshot::try_from_symbols(entries.iter().map(|(addr, name, linkage)| {
+            FunctionSymbol {
+                addr: *addr,
+                name: (*name).to_string(),
+                linkage: *linkage,
+            }
+        }))
+        .unwrap()
+    }
 
     fn test_arch() -> ArchSpec {
         let mut arch = ArchSpec::new("x86-64");
@@ -1094,7 +1130,7 @@ mod tests {
             &func,
             None,
             Some(&test_arch()),
-            &HashMap::new(),
+            &FunctionSymbolSnapshot::default(),
             SummaryProfile::Default,
         );
         let second = compile_function_semantics_cached_with_scope(
@@ -1102,11 +1138,133 @@ mod tests {
             &func,
             None,
             Some(&test_arch()),
-            &HashMap::new(),
+            &FunctionSymbolSnapshot::default(),
             SummaryProfile::Default,
         );
         assert!(!first.cache_hit);
         assert!(second.cache_hit);
+    }
+
+    #[test]
+    fn compile_semantics_cache_partitions_typed_symbol_content_and_linkage() {
+        let blocks = vec![R2ILBlock {
+            addr: 0x1007,
+            size: 1,
+            ops: vec![R2ILOp::Return {
+                target: make_const(0, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+        let func = SsaArtifact::for_symbolic(&blocks, Some(&test_arch())).expect("ssa");
+        let ctx = Context::thread_local();
+        let first_map = test_symbols(&[
+            (
+                0x5000,
+                "unclassified.memcpy",
+                FunctionSemanticLinkage::Internal,
+            ),
+            (
+                0x6000,
+                "unclassified.malloc",
+                FunctionSemanticLinkage::Internal,
+            ),
+        ]);
+        let reordered_map = test_symbols(&[
+            (
+                0x6000,
+                "unclassified.malloc",
+                FunctionSemanticLinkage::Internal,
+            ),
+            (
+                0x5000,
+                "unclassified.memcpy",
+                FunctionSemanticLinkage::Internal,
+            ),
+        ]);
+        let changed_map = test_symbols(&[
+            (
+                0x5000,
+                "unclassified.memmove",
+                FunctionSemanticLinkage::Internal,
+            ),
+            (
+                0x6000,
+                "unclassified.malloc",
+                FunctionSemanticLinkage::Internal,
+            ),
+        ]);
+        let changed_addr_map = test_symbols(&[
+            (
+                0x5001,
+                "unclassified.memcpy",
+                FunctionSemanticLinkage::Internal,
+            ),
+            (
+                0x6000,
+                "unclassified.malloc",
+                FunctionSemanticLinkage::Internal,
+            ),
+        ]);
+        let changed_linkage_map = test_symbols(&[
+            (
+                0x5000,
+                "unclassified.memcpy",
+                FunctionSemanticLinkage::Imported,
+            ),
+            (
+                0x6000,
+                "unclassified.malloc",
+                FunctionSemanticLinkage::Internal,
+            ),
+        ]);
+
+        let first = compile_function_semantics_cached_with_scope(
+            &ctx,
+            &func,
+            None,
+            Some(&test_arch()),
+            &first_map,
+            SummaryProfile::Default,
+        );
+        let reordered = compile_function_semantics_cached_with_scope(
+            &ctx,
+            &func,
+            None,
+            Some(&test_arch()),
+            &reordered_map,
+            SummaryProfile::Default,
+        );
+        let changed = compile_function_semantics_cached_with_scope(
+            &ctx,
+            &func,
+            None,
+            Some(&test_arch()),
+            &changed_map,
+            SummaryProfile::Default,
+        );
+        let changed_addr = compile_function_semantics_cached_with_scope(
+            &ctx,
+            &func,
+            None,
+            Some(&test_arch()),
+            &changed_addr_map,
+            SummaryProfile::Default,
+        );
+        let changed_linkage = compile_function_semantics_cached_with_scope(
+            &ctx,
+            &func,
+            None,
+            Some(&test_arch()),
+            &changed_linkage_map,
+            SummaryProfile::Default,
+        );
+
+        assert!(!first.cache_hit);
+        assert!(reordered.cache_hit);
+        assert!(!changed.cache_hit);
+        assert!(!changed_addr.cache_hit);
+        assert!(!changed_linkage.cache_hit);
     }
 
     #[test]
@@ -1174,7 +1332,7 @@ mod tests {
             &func,
             None,
             Some(&test_arch()),
-            &HashMap::new(),
+            &FunctionSymbolSnapshot::default(),
             SummaryProfile::Default,
         );
         let native = artifact.native_body().expect("native body");
@@ -1291,7 +1449,7 @@ mod tests {
     }
 
     #[test]
-    fn native_worker_summary_artifact_ignores_name_hint_and_keeps_structure() {
+    fn internal_native_worker_artifacts_and_routes_ignore_names() {
         let loaded = Varnode::unique(0x10, 1);
         let pred = Varnode::unique(0x11, 1);
         let blocks = vec![R2ILBlock {
@@ -1317,14 +1475,55 @@ mod tests {
             op_metadata: Default::default(),
         }];
         let func = SsaArtifact::for_symbolic(&blocks, Some(&test_arch())).expect("ssa");
-        let summary = r2ssa::FunctionSemanticSummary::unknown(
-            r2ssa::InterprocFunctionId(func.entry),
-            Some("sym.printf_fetchargs".to_string()),
+        let summaries = [Some("dbg.xnmalloc"), Some("renamed_worker"), None]
+            .into_iter()
+            .map(|name| {
+                let mut summary = r2ssa::FunctionSemanticSummary::unknown(
+                    r2ssa::InterprocFunctionId(func.entry),
+                    name.map(str::to_string),
+                );
+                summary.linkage = r2ssa::FunctionSemanticLinkage::Internal;
+                summary
+                    .allocation_effects
+                    .push(r2ssa::SummaryAllocationEffect {
+                        size_arg: Some(0),
+                        zeroed: false,
+                    });
+                summary.return_relation = r2ssa::SummaryReturnRelation::HeapAlloc;
+                summary
+            })
+            .collect::<Vec<_>>();
+        let policies = summaries
+            .iter()
+            .map(|summary| {
+                super::super::native_worker::native_worker_summary_route_policy_for_summary(
+                    func.entry, summary,
+                )
+            })
+            .collect::<Vec<_>>();
+        for (summary, policy) in summaries.iter().zip(&policies) {
+            assert_eq!(
+                policy.kind,
+                super::super::native_worker::NativeWorkerSummaryRouteKind::Standard
+            );
+            assert!(policy.certificate.is_some());
+            assert!(compile_named_native_worker_summary_artifact(summary, true).is_none());
+        }
+        assert!(
+            policies
+                .windows(2)
+                .all(|pair| pair[0].certificate == pair[1].certificate)
         );
+        let artifacts = summaries
+            .iter()
+            .map(|summary| {
+                compile_native_worker_summary_artifact(&func, None, Some(summary), true)
+                    .expect("structural worker summary")
+            })
+            .collect::<Vec<_>>();
+        assert!(artifacts.windows(2).all(|pair| pair[0] == pair[1]));
 
-        let artifact = compile_native_worker_summary_artifact(&func, None, Some(&summary), true)
-            .expect("structural worker summary");
-
+        let artifact = &artifacts[0];
         let native = artifact.native_body().expect("native artifact");
         assert!(native.summary.worker_summaries.iter().all(|summary| {
             !matches!(
@@ -1334,7 +1533,7 @@ mod tests {
         }));
         assert!(
             native.summary.worker_summaries.iter().any(|summary| {
-                matches!(summary.kind, crate::NativeWorkerSummaryKind::StringScan)
+                matches!(summary.kind, crate::NativeWorkerSummaryKind::Allocation)
             })
         );
         let role = native
@@ -1342,8 +1541,9 @@ mod tests {
             .role_identity
             .as_ref()
             .expect("role identity");
-        assert_eq!(role.role_name, "string_scan");
+        assert_eq!(role.role_name, "allocation");
         assert_eq!(role.source, crate::NativeWorkerRoleSource::Structural);
+        assert_eq!(role.linkage, r2ssa::FunctionSemanticLinkage::Internal);
         assert!(
             role.source_names.is_empty(),
             "structural worker evidence must not inherit an arbitrary summary name"
@@ -1354,6 +1554,55 @@ mod tests {
             crate::DecompilePlan::NativeSummaryIslands { .. }
                 | crate::DecompilePlan::NativeLinear { .. }
         ));
+    }
+
+    #[test]
+    fn named_native_worker_compilation_requires_imported_linkage() {
+        let mut summary = r2ssa::FunctionSemanticSummary::unknown(
+            r2ssa::InterprocFunctionId(0x2200),
+            Some("sym.copy_file_data".to_string()),
+        );
+        summary.linkage = r2ssa::FunctionSemanticLinkage::Imported;
+        summary.transfer_effects.push(r2ssa::SummaryTransferEffect {
+            dst: r2ssa::SummaryMemoryLocation {
+                region: r2ssa::SummaryMemoryRegion::Arg { index: 4 },
+                range: None,
+            },
+            src: r2ssa::SummaryMemoryLocation {
+                region: r2ssa::SummaryMemoryRegion::Arg { index: 0 },
+                range: None,
+            },
+            len: r2ssa::SummaryTransferLength::Const(8),
+        });
+
+        let artifact = compile_named_native_worker_summary_artifact(&summary, true)
+            .expect("explicit imported worker contract");
+        let native = artifact.native_body().expect("native artifact");
+        let role = native
+            .summary
+            .role_identity
+            .as_ref()
+            .expect("imported role identity");
+        assert_eq!(role.linkage, r2ssa::FunctionSemanticLinkage::Imported);
+        assert_eq!(role.source, crate::NativeWorkerRoleSource::SummarySeed);
+        assert_eq!(role.source_names, vec!["copy_file_data".to_string()]);
+        assert!(role.evidence.allows_narrowing());
+        assert!(native.summary.worker_summaries.iter().any(|worker| {
+            worker.kind == crate::NativeWorkerSummaryKind::FileTransfer
+                && worker.src
+                    == Some(r2ssa::SummaryMemoryLocation {
+                        region: r2ssa::SummaryMemoryRegion::Arg { index: 0 },
+                        range: None,
+                    })
+                && worker.dst
+                    == Some(r2ssa::SummaryMemoryLocation {
+                        region: r2ssa::SummaryMemoryRegion::Arg { index: 4 },
+                        range: None,
+                    })
+        }));
+
+        summary.linkage = r2ssa::FunctionSemanticLinkage::Internal;
+        assert!(compile_named_native_worker_summary_artifact(&summary, true).is_none());
     }
 
     #[test]
@@ -1393,7 +1642,7 @@ mod tests {
             &func,
             None,
             Some(&test_arch()),
-            &HashMap::new(),
+            &FunctionSymbolSnapshot::default(),
             SummaryProfile::Default,
             Some(&replay_a),
         );
@@ -1402,7 +1651,7 @@ mod tests {
             &func,
             None,
             Some(&test_arch()),
-            &HashMap::new(),
+            &FunctionSymbolSnapshot::default(),
             SummaryProfile::Default,
             Some(&replay_a),
         );
@@ -1411,7 +1660,7 @@ mod tests {
             &func,
             None,
             Some(&test_arch()),
-            &HashMap::new(),
+            &FunctionSymbolSnapshot::default(),
             SummaryProfile::Default,
             Some(&replay_b),
         );
@@ -1466,7 +1715,7 @@ mod tests {
             &func,
             Some(&scope_a),
             Some(&test_arch()),
-            &HashMap::new(),
+            &FunctionSymbolSnapshot::default(),
             SummaryProfile::Default,
         );
         let second = compile_function_semantics_cached_with_scope(
@@ -1474,7 +1723,7 @@ mod tests {
             &func,
             Some(&scope_b),
             Some(&test_arch()),
-            &HashMap::new(),
+            &FunctionSymbolSnapshot::default(),
             SummaryProfile::Default,
         );
 
@@ -1562,7 +1811,7 @@ mod tests {
             &root,
             Some(&scope_a),
             Some(&test_arch()),
-            &HashMap::new(),
+            &FunctionSymbolSnapshot::default(),
             SummaryProfile::Default,
         );
         let second = compile_function_semantics_cached_with_scope(
@@ -1570,7 +1819,7 @@ mod tests {
             &root,
             Some(&scope_b),
             Some(&test_arch()),
-            &HashMap::new(),
+            &FunctionSymbolSnapshot::default(),
             SummaryProfile::Default,
         );
 
@@ -1791,7 +2040,7 @@ mod tests {
             &func,
             None,
             Some(&test_arch()),
-            &HashMap::new(),
+            &FunctionSymbolSnapshot::default(),
             SummaryProfile::Default,
         );
         assert_eq!(artifact.execution, ExecutionModel::Vm);
@@ -1922,7 +2171,7 @@ mod tests {
             &func,
             None,
             Some(&test_arch()),
-            &HashMap::new(),
+            &FunctionSymbolSnapshot::default(),
             SummaryProfile::Default,
         );
         assert_eq!(artifact.execution, ExecutionModel::Native);
@@ -2062,7 +2311,7 @@ mod tests {
             &func,
             None,
             Some(&test_arch()),
-            &HashMap::new(),
+            &FunctionSymbolSnapshot::default(),
             SummaryProfile::Default,
         );
 
@@ -2196,7 +2445,7 @@ mod tests {
             &func,
             None,
             Some(&test_arch()),
-            &HashMap::new(),
+            &FunctionSymbolSnapshot::default(),
             SummaryProfile::Default,
         );
 
@@ -2360,7 +2609,7 @@ mod tests {
             &func,
             None,
             Some(&test_arch()),
-            &HashMap::new(),
+            &FunctionSymbolSnapshot::default(),
             SummaryProfile::Default,
         );
 
@@ -2485,6 +2734,7 @@ mod tests {
             execution: ExecutionModel::Native,
             suppress_large_cfg_reason: true,
             role_name_hint: None,
+            role_linkage: r2ssa::FunctionSemanticLinkage::Internal,
             slice_class: crate::SliceClass::Worker,
             closure_functions: 0,
             helper_functions: 0,

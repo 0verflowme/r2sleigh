@@ -2,53 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Name-independent storage identity retained from the lifted varnode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum CanonicalStorageSpace {
-    Ram,
-    Register,
-    Unique,
-    Constant,
-    Custom(u32),
-    /// Programmatically synthesized SSA with no lifted storage provenance.
-    Unknown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct CanonicalStorageId {
-    pub space: CanonicalStorageSpace,
-    pub offset: u64,
-    pub size: u32,
-}
-
-impl CanonicalStorageId {
-    pub const fn from_varnode(varnode: &r2il::Varnode) -> Self {
-        let space = match varnode.space {
-            r2il::SpaceId::Ram => CanonicalStorageSpace::Ram,
-            r2il::SpaceId::Register => CanonicalStorageSpace::Register,
-            r2il::SpaceId::Unique => CanonicalStorageSpace::Unique,
-            r2il::SpaceId::Const => CanonicalStorageSpace::Constant,
-            r2il::SpaceId::Custom(id) => CanonicalStorageSpace::Custom(id),
-        };
-        Self {
-            space,
-            offset: varnode.offset,
-            size: varnode.size,
-        }
-    }
-
-    pub const fn unknown(ordinal: u64, size: u32) -> Self {
-        Self {
-            space: CanonicalStorageSpace::Unknown,
-            offset: ordinal,
-            size,
-        }
-    }
-
-    pub const fn is_unknown(self) -> bool {
-        matches!(self.space, CanonicalStorageSpace::Unknown)
-    }
-}
+pub use r2source::{CanonicalStorageId, CanonicalStorageSpace};
 
 /// Canonical classification for SSA variable names.
 ///

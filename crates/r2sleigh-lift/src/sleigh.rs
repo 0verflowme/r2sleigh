@@ -3,11 +3,124 @@
 //! This module provides utilities for extracting architecture metadata from
 //! loaded Sleigh specifications using `libsla`.
 
-use libsla::{GhidraSleigh, Sleigh};
-use r2il::{ArchSpec, Endianness};
+use libsla::{AddressSpace, AddressSpaceId, GhidraSleigh, Sleigh};
+use r2il::{ArchSpec, Endianness, SpaceId};
+use std::collections::{HashMap, HashSet};
 
 use crate::LiftError;
 use crate::context::LiftContext;
+
+pub(crate) struct ExtractedSleighArchitecture {
+    pub arch: ArchSpec,
+    pub space_map: HashMap<AddressSpaceId, SpaceId>,
+}
+
+pub(crate) fn extract_address_space_map(
+    ctx: &mut LiftContext,
+    spaces: &[AddressSpace],
+    default_space: AddressSpaceId,
+) -> Result<HashMap<AddressSpaceId, SpaceId>, LiftError> {
+    let mut saw_default_space = false;
+    let mut source_ids = HashSet::new();
+    let mut target_ids = HashSet::new();
+    let mut space_map = HashMap::new();
+
+    for space in spaces {
+        if !source_ids.insert(space.id) {
+            return Err(LiftError::Parse(format!(
+                "Sleigh address space '{}' repeats source id {}",
+                space.name, space.id
+            )));
+        }
+        u64::try_from(space.id.raw_id()).map_err(|_| {
+            LiftError::Parse(format!(
+                "Sleigh address space '{}' id cannot be encoded by P-code: {}",
+                space.name, space.id
+            ))
+        })?;
+        let is_default = space.id == default_space;
+        let address_size = u32::try_from(space.address_size).map_err(|_| {
+            LiftError::Parse(format!(
+                "Sleigh address size for space '{}' does not fit u32: {}",
+                space.name, space.address_size
+            ))
+        })?;
+        let word_size = u32::try_from(space.word_size).map_err(|_| {
+            LiftError::Parse(format!(
+                "Sleigh word size for space '{}' does not fit u32: {}",
+                space.name, space.word_size
+            ))
+        })?;
+        if address_size == 0 || word_size == 0 {
+            return Err(LiftError::Parse(format!(
+                "Sleigh space '{}' has invalid layout: address_size={} word_size={}",
+                space.name, address_size, word_size
+            )));
+        }
+        let space_endianness = Endianness::from_big_endian(space.big_endian);
+        let space_id = ctx.add_space_with_layout(
+            &space.name,
+            address_size,
+            word_size,
+            is_default,
+            Some(space_endianness),
+        );
+        if !target_ids.insert(space_id) {
+            return Err(LiftError::Parse(format!(
+                "Sleigh address space '{}' aliases already-mapped r2il space {space_id}",
+                space.name
+            )));
+        }
+        space_map.insert(space.id, space_id);
+
+        if is_default {
+            if saw_default_space {
+                return Err(LiftError::Parse(
+                    "Sleigh returned the default code space more than once".to_string(),
+                ));
+            }
+            saw_default_space = true;
+            ctx.set_addr_size(address_size);
+            ctx.set_instruction_endianness(space_endianness);
+            ctx.set_memory_endianness(space_endianness);
+        }
+    }
+    if !saw_default_space {
+        return Err(LiftError::Parse(
+            "Sleigh default code space is absent from its address-space inventory".to_string(),
+        ));
+    }
+
+    Ok(space_map)
+}
+
+pub(crate) fn extract_architecture(
+    sleigh: &GhidraSleigh,
+    arch_name: &str,
+) -> Result<ExtractedSleighArchitecture, LiftError> {
+    let mut ctx = LiftContext::new(arch_name);
+    let spaces = sleigh.address_spaces();
+    let space_map = extract_address_space_map(&mut ctx, &spaces, sleigh.default_code_space().id)?;
+
+    if ctx.get_space("unique").is_none() {
+        ctx.add_space("unique", 4, false);
+    }
+
+    for (varnode, name) in sleigh.register_name_map() {
+        let size = u32::try_from(varnode.size).map_err(|_| {
+            LiftError::Parse(format!(
+                "Sleigh register '{name}' size does not fit u32: {}",
+                varnode.size
+            ))
+        })?;
+        ctx.add_register(&name, varnode.address.offset, size);
+    }
+
+    Ok(ExtractedSleighArchitecture {
+        arch: ctx.finish(),
+        space_map,
+    })
+}
 
 /// Extract architecture metadata from a loaded GhidraSleigh instance.
 ///
@@ -40,73 +153,7 @@ use crate::context::LiftContext;
 /// println!("Registers: {}", spec.registers.len());
 /// ```
 pub fn extract_arch_spec(sleigh: &GhidraSleigh, arch_name: &str) -> Result<ArchSpec, LiftError> {
-    let mut ctx = LiftContext::new(arch_name);
-
-    // Extract address spaces
-    let default_space = sleigh.default_code_space();
-    let mut saw_default_space = false;
-    for space in sleigh.address_spaces() {
-        let is_default = space.id == default_space.id;
-        let address_size = u32::try_from(space.address_size).map_err(|_| {
-            LiftError::Parse(format!(
-                "Sleigh address size for space '{}' does not fit u32: {}",
-                space.name, space.address_size
-            ))
-        })?;
-        let word_size = u32::try_from(space.word_size).map_err(|_| {
-            LiftError::Parse(format!(
-                "Sleigh word size for space '{}' does not fit u32: {}",
-                space.name, space.word_size
-            ))
-        })?;
-        if address_size == 0 || word_size == 0 {
-            return Err(LiftError::Parse(format!(
-                "Sleigh space '{}' has invalid layout: address_size={} word_size={}",
-                space.name, address_size, word_size
-            )));
-        }
-        let space_endianness = Endianness::from_big_endian(space.big_endian);
-
-        ctx.add_space_with_layout(
-            &space.name,
-            address_size,
-            word_size,
-            is_default,
-            Some(space_endianness),
-        );
-
-        // Set the architecture's address size from the default code space
-        if is_default {
-            if saw_default_space {
-                return Err(LiftError::Parse(
-                    "Sleigh returned the default code space more than once".to_string(),
-                ));
-            }
-            saw_default_space = true;
-            ctx.set_addr_size(address_size);
-            ctx.set_instruction_endianness(space_endianness);
-            ctx.set_memory_endianness(space_endianness);
-        }
-    }
-    if !saw_default_space {
-        return Err(LiftError::Parse(
-            "Sleigh default code space is absent from its address-space inventory".to_string(),
-        ));
-    }
-
-    // Add unique space if not already present
-    if ctx.get_space("unique").is_none() {
-        ctx.add_space("unique", 4, false);
-    }
-
-    // Extract registers using the register name map
-    // register_name_map() already returns only varnodes that are registers
-    let register_map = sleigh.register_name_map();
-    for (varnode, name) in register_map {
-        ctx.add_register(&name, varnode.address.offset, varnode.size as u32);
-    }
-
-    Ok(ctx.finish())
+    extract_architecture(sleigh, arch_name).map(|extracted| extracted.arch)
 }
 
 /// Build an ArchSpec from pre-compiled SLA data.

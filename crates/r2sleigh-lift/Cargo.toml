@@ -7,8 +7,20 @@ description = "Sleigh to r2il translator"
 
 [dependencies]
 r2il = { path = "../r2il" }
+r2source = { path = "../r2source" }
 libsla.workspace = true
 thiserror.workspace = true
+
+[dependencies.sleigh-config]
+workspace = true
+optional = true
+
+[features]
+default = []
+x86 = ["sleigh-config/x86"]
+arm = ["sleigh-config/ARM", "sleigh-config/AARCH64"]
+mips = ["sleigh-config/MIPS"]
+riscv = ["sleigh-config/RISCV"]
 
 [dev-dependencies]
 sleigh-config = { workspace = true, features = ["AARCH64"] }

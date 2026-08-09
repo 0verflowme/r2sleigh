@@ -803,11 +803,15 @@ pub fn native_worker_summary_route_policy_for_summary(
     summary: &FunctionSemanticSummary,
 ) -> NativeWorkerSummaryRoutePolicy {
     let applicability = native_worker_summary_applicability_for_summary(anchor, summary);
-    let route_name = summary
-        .name
-        .as_deref()
-        .and_then(normalize_native_worker_role_name)
-        .or_else(|| applicability.normalized_name.clone());
+    let route_name = (summary.linkage == r2ssa::FunctionSemanticLinkage::Imported)
+        .then(|| {
+            summary
+                .name
+                .as_deref()
+                .and_then(normalize_native_worker_role_name)
+                .or_else(|| applicability.normalized_name.clone())
+        })
+        .flatten();
     native_worker_summary_route_policy_from_applicability(
         anchor,
         route_name.as_deref(),
@@ -818,7 +822,7 @@ pub fn native_worker_summary_route_policy_for_summary(
 fn native_worker_summary_route_policy_from_applicability(
     anchor: u64,
     route_name: Option<&str>,
-    mut applicability: NativeWorkerSummaryApplicability,
+    applicability: NativeWorkerSummaryApplicability,
 ) -> NativeWorkerSummaryRoutePolicy {
     if !applicability.has_route_evidence() {
         return NativeWorkerSummaryRoutePolicy {
@@ -851,9 +855,6 @@ fn native_worker_summary_route_policy_from_applicability(
             NativeWorkerSummaryRouteKind::DirectSummary
                 if route_name_has_compatible_evidence(route_name, entry.kind, &applicability) =>
             {
-                applicability
-                    .sources
-                    .insert(NativeWorkerSummaryApplicabilitySource::TrustedSymbol);
                 let certificate = summary_route_certificate(
                     anchor,
                     entry.kind,
@@ -1048,9 +1049,7 @@ fn summary_route_certificate(
         anchor,
         summary_route_certificate_kind(kind),
         summary_route_claim_source(applicability),
-        route_name
-            .map(str::to_string)
-            .or_else(|| applicability.normalized_name.clone()),
+        route_name.map(str::to_string),
         applicability.route_evidence_kinds.clone(),
         applicability.evidence.clone(),
         reason,
@@ -1299,11 +1298,12 @@ fn is_direct_allocation_wrapper(name: &str) -> bool {
 }
 
 fn should_prefer_full_native_worker_summary(name: &str) -> bool {
-    name.contains("table_walk") || matches!(name, "diagnose")
+    matches!(name, "diagnose")
 }
 
 pub(super) fn role_identity_from_worker_summaries(
     summary_name: Option<&str>,
+    linkage: r2ssa::FunctionSemanticLinkage,
     worker_summaries: &[NativeWorkerSummary],
 ) -> Option<Box<NativeWorkerRoleIdentity>> {
     if worker_summaries.is_empty() {
@@ -1332,34 +1332,28 @@ pub(super) fn role_identity_from_worker_summaries(
     let primary_kind = primary_summary.kind;
     let structural_name = primary_kind.canonical_role_name();
     let source_name = summary_name.and_then(normalize_native_worker_role_name);
-    let has_name_hint_summary = worker_summaries.iter().any(|summary| {
-        summary
-            .evidence
-            .reasons
-            .iter()
-            .any(|reason| matches!(reason, SemanticEvidenceReason::NameHint))
-    });
-    let source = if source_name.is_some() && has_name_hint_summary {
-        NativeWorkerRoleSource::NameHint
-    } else if source_name.is_some() {
+    let source = if linkage == r2ssa::FunctionSemanticLinkage::Imported && source_name.is_some() {
         NativeWorkerRoleSource::SummarySeed
     } else {
         NativeWorkerRoleSource::Structural
     };
-    let role_name = if matches!(source, NativeWorkerRoleSource::NameHint) {
-        structural_name
-    } else {
-        source_name.as_deref().unwrap_or(structural_name)
-    }
-    .to_string();
+    let role_name = structural_name.to_string();
     let evidence = worker_summaries
         .iter()
+        .filter(|summary| !summary.has_name_hint_evidence())
         .map(|summary| summary.evidence.clone())
         .reduce(|acc, evidence| acc.combined_with(&evidence))
+        .or_else(|| {
+            worker_summaries
+                .iter()
+                .map(|summary| summary.evidence.clone())
+                .reduce(|acc, evidence| acc.combined_with(&evidence))
+        })
         .unwrap_or_else(bounded_evidence);
     Some(Box::new(NativeWorkerRoleIdentity {
         role_name,
         source,
+        linkage,
         confidence: evidence.tier,
         source_names: source_name.into_iter().collect(),
         summary_kinds,
@@ -4537,7 +4531,9 @@ fn semantic_family_worker_summaries(
     anchor: u64,
     summary: &FunctionSemanticSummary,
 ) -> Vec<NativeWorkerSummary> {
-    if !summary_has_semantic_role_evidence(summary) {
+    if summary.linkage != r2ssa::FunctionSemanticLinkage::Imported
+        || !summary_has_semantic_role_evidence(summary)
+    {
         return Vec::new();
     }
     let Some(name) = semantic_summary_name(summary) else {
@@ -9052,6 +9048,24 @@ mod tests {
         assert!(semantic_summary_has_runtime_copy_role(&typed_memcpy));
         assert!(semantic_summary_has_modeled_evidence(&malloc));
         assert!(!semantic_summary_has_runtime_copy_role(&malloc));
+        let malloc_workers =
+            bounded_worker_summaries(summaries_from_interproc_summary_unbounded(1, &malloc));
+        assert!(malloc_workers.iter().any(|worker| {
+            worker.kind == NativeWorkerSummaryKind::Allocation
+                && worker.allocation
+                    == Some(SummaryAllocationEffect {
+                        size_arg: Some(0),
+                        zeroed: false,
+                    })
+        }));
+        let memcpy_workers =
+            bounded_worker_summaries(summaries_from_interproc_summary_unbounded(2, &typed_memcpy));
+        assert!(memcpy_workers.iter().any(|worker| {
+            worker.kind == NativeWorkerSummaryKind::MemoryTransfer
+                && worker.dst == Some(arg_location(0))
+                && worker.src == Some(arg_location(1))
+                && worker.len == Some(SummaryTransferLength::Arg(2))
+        }));
         assert!(!semantic_summary_has_modeled_evidence(
             &FunctionSemanticSummary::unknown(InterprocFunctionId(3), Some("local".to_string()))
         ));
@@ -11977,32 +11991,99 @@ mod tests {
     }
 
     #[test]
-    fn native_worker_summary_route_policy_certifies_direct_summary_only_with_evidence() {
-        let mut summary = FunctionSemanticSummary::unknown(
-            InterprocFunctionId(0x401000),
-            Some("dbg.xnmalloc".to_string()),
-        );
-        summary.allocation_effects.push(SummaryAllocationEffect {
-            size_arg: Some(1),
-            zeroed: false,
-        });
-        summary.return_relation = SummaryReturnRelation::HeapAlloc;
+    fn internal_summary_semantics_and_routes_are_name_invariant() {
+        let summaries = [
+            Some("dbg.xnmalloc"),
+            Some("malloc"),
+            Some("table_walk"),
+            Some("renamed_worker"),
+            None,
+        ]
+        .into_iter()
+        .map(|name| {
+            let mut summary = FunctionSemanticSummary::unknown(
+                InterprocFunctionId(0x401000),
+                name.map(str::to_string),
+            );
+            summary.linkage = r2ssa::FunctionSemanticLinkage::Internal;
+            summary.allocation_effects.push(SummaryAllocationEffect {
+                size_arg: Some(1),
+                zeroed: false,
+            });
+            summary.return_relation = SummaryReturnRelation::HeapAlloc;
+            summary
+        })
+        .collect::<Vec<_>>();
+        let workers = summaries
+            .iter()
+            .map(|summary| {
+                bounded_worker_summaries(summaries_from_interproc_summary_unbounded(
+                    0x401000, summary,
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert!(workers.windows(2).all(|pair| pair[0] == pair[1]));
 
-        let policy = native_worker_summary_route_policy_for_summary(0x401000, &summary);
+        let policies = summaries
+            .iter()
+            .map(|summary| native_worker_summary_route_policy_for_summary(0x401000, summary))
+            .collect::<Vec<_>>();
+        for policy in &policies {
+            assert_eq!(policy.kind, NativeWorkerSummaryRouteKind::Standard);
+            assert!(!policy.should_use_direct_summary());
+            assert!(!policy.should_prefer_full());
+            assert!(
+                !policy
+                    .applicability
+                    .sources
+                    .contains(&NativeWorkerSummaryApplicabilitySource::TrustedSymbol)
+            );
+            let certificate = policy.certificate.as_ref().expect("route certificate");
+            assert_eq!(certificate.normalized_name, None);
+            assert_ne!(certificate.source, SemanticClaimSource::NameHint);
+            assert_eq!(
+                certificate.route_evidence_kinds,
+                BTreeSet::from([NativeWorkerSummaryKind::Allocation])
+            );
+        }
+        assert!(
+            policies
+                .windows(2)
+                .all(|pair| pair[0].certificate == pair[1].certificate)
+        );
 
-        assert_eq!(policy.kind, NativeWorkerSummaryRouteKind::DirectSummary);
-        assert!(policy.should_use_direct_summary());
-        let certificate = policy.certificate.as_ref().expect("route certificate");
+        let identities = summaries
+            .iter()
+            .zip(&workers)
+            .map(|(summary, workers)| {
+                role_identity_from_worker_summaries(
+                    summary.name.as_deref(),
+                    summary.linkage,
+                    workers,
+                )
+                .expect("worker role")
+            })
+            .collect::<Vec<_>>();
+        for identity in &identities {
+            assert_eq!(identity.role_name, "allocation");
+            assert_eq!(identity.source, NativeWorkerRoleSource::Structural);
+            assert_eq!(identity.linkage, r2ssa::FunctionSemanticLinkage::Internal);
+        }
+        assert!(identities.windows(2).all(|pair| {
+            pair[0].role_name == pair[1].role_name
+                && pair[0].source == pair[1].source
+                && pair[0].confidence == pair[1].confidence
+                && pair[0].summary_kinds == pair[1].summary_kinds
+                && pair[0].evidence == pair[1].evidence
+        }));
+        assert_eq!(identities[0].source_names, vec!["xnmalloc".to_string()]);
+        assert_eq!(identities[1].source_names, vec!["malloc".to_string()]);
+        assert_eq!(identities[2].source_names, vec!["table_walk".to_string()]);
         assert_eq!(
-            certificate.route_kind,
-            SummaryRouteCertificateKind::DirectSummary
+            identities[3].source_names,
+            vec!["renamed_worker".to_string()]
         );
-        assert_eq!(certificate.normalized_name.as_deref(), Some("xnmalloc"));
-        assert_ne!(certificate.source, SemanticClaimSource::NameHint);
-        assert_eq!(
-            certificate.route_evidence_kinds,
-            BTreeSet::from([NativeWorkerSummaryKind::Allocation])
-        );
+        assert!(identities[4].source_names.is_empty());
     }
 
     #[test]
@@ -12052,9 +12133,9 @@ mod tests {
             .certificate
             .as_mut()
             .expect("route certificate")
-            .route_kind = SummaryRouteCertificateKind::Standard;
+            .route_kind = SummaryRouteCertificateKind::DirectSummary;
 
-        assert_eq!(policy.kind, NativeWorkerSummaryRouteKind::DirectSummary);
+        assert_eq!(policy.kind, NativeWorkerSummaryRouteKind::Standard);
         assert!(!policy.has_route_certificate());
         assert!(!policy.should_use_direct_summary());
     }
@@ -12077,7 +12158,7 @@ mod tests {
             .expect("route certificate")
             .source = SemanticClaimSource::NameHint;
 
-        assert_eq!(policy.kind, NativeWorkerSummaryRouteKind::DirectSummary);
+        assert_eq!(policy.kind, NativeWorkerSummaryRouteKind::Standard);
         assert!(!policy.has_route_certificate());
         assert!(!policy.should_use_direct_summary());
     }

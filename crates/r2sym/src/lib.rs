@@ -52,6 +52,7 @@ pub mod sim;
 pub mod solver;
 pub mod spec;
 pub mod state;
+pub mod symbol;
 pub mod tactics;
 pub mod value;
 pub mod verification;
@@ -173,6 +174,10 @@ pub use spec::{
 pub use state::{
     PendingExceptionContinuation, RuntimeBlockReason, RuntimeRegionAlias, RuntimeState,
     RuntimeValueProvenance, SymState, SymbolicFdInput, SymbolicMemoryRegion,
+};
+pub use symbol::{
+    FunctionSymbol, FunctionSymbolEvidenceProvenance, FunctionSymbolSnapshot,
+    FunctionSymbolSnapshotError,
 };
 pub use tactics::{
     InputByteDomain, SolveTacticCandidate, SolveTacticConfig, TacticConstraintReport,

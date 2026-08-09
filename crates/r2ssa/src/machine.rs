@@ -532,6 +532,7 @@ impl MachineEntity {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum MachineBuildError {
+    UntrustedArtifactProvenance,
     IncompleteObligationInventory,
     MissingGraphValue(ValueId),
     MissingGraphBlock(BlockId),

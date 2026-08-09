@@ -56,19 +56,16 @@ Function-Level:
 - a:sla.sym -- Symbolic execution summary
 - a:sla.sym.paths -- Path exploration
 - a:sla.slice [var] -- Backward slice
-- a:sla.dec -- Decompile to C
-- a:sla.decj [name|addr] -- Decompile through V2 with structured diagnostics JSON
+- pdd -- Decompile through radare2's bounded borrowed-snapshot provider
 
 Both a:sla and a:sleigh prefixes work.
 
-`a:sla.decj` preserves the `a:sla.dec` render path and adds a machine-readable
-projection around its opaque V2 response. The schema-1 object contains
-`rendered_output`, object-valued `diagnostics`, `outcome`, `refused`, all eleven
-`phase_timings`, `ffi_conversion_elapsed_us`, and an `error` object or `null`.
-Refused requests retain the engine's refusal output and diagnostics. Transport,
-malformed-diagnostics, and preflight errors fail closed with a null rendered
-output. Cancellation is an engine refusal with refused phase status and
-non-executable refusal output, never partial C.
+Direct `a:sla.dec` and `a:sla.decj` requests are intentionally unavailable:
+they do not run inside radare2's locked snapshot transaction and therefore
+cannot construct source authority. `pdd` receives one ABI-138/schema-7 borrowed
+snapshot, deep-copies it synchronously, and either completes from that immutable
+source or refuses. It never falls back to live blocks, names, or detached test
+metadata.
 
 Executable semantic C is authorized only through the generic source-obligation
 ledger and typed output-node ownership. Every live machine effect from the
@@ -87,6 +84,11 @@ Function signatures, layouts, and calling-convention carriers come only from
 the immutable radare2 function snapshot. DWARF ingestion is a binary-load
 operation in radare2; the plugin never reparses or imports DWARF during
 analysis or decompilation.
+
+Snapshot-owned type inference and writeback are not yet exposed through a
+radare2 host callback. Direct `a:sla.types` therefore refuses instead of using
+detached state. Type/writeback integration tests must not be restored until an
+equivalent locked snapshot transaction exists for that host path.
 
 DATA xrefs are applied automatically during function analysis (`af`) and reference
 analysis (`aar`) via plugin callbacks.

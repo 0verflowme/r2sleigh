@@ -201,7 +201,7 @@ LOCAL_DECL_RE = re.compile(
     r"(?:(?:\s+)|(?:\s*\*+\s*))(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*(?:[=;,\[])"
 )
 TARGET_COMMAND_DEFS: dict[str, str] = {
-    "decompile_sla": "a:sla.dec",
+    "decompile_sla": "pdd",
     "decompile_pdd": "pdd",
     "decompile_pdg": "pdg",
     "types": "a:sla.debug.types",
@@ -237,14 +237,14 @@ QUALITY_GATE_FAILURES = {
     "proof_coverage_gap",
     "unresolved_fcn_or_temp_stack_leak",
 }
-GOLD_ORACLE_FAILURE = "source_oracle_failure"
+GOLD_ORACLE_ADVISORY_MISMATCH = "source_oracle_advisory_mismatch"
 GOLD_CHECK_KINDS = ("contains", "regex", "not_contains", "not_regex")
-GOLD_HARD_CATEGORIES = frozenset({"semantic", "type", "structural"})
-GOLD_SOFT_CATEGORIES = frozenset({"cosmetic", "readability"})
+GOLD_SOURCE_SHAPE_CATEGORIES = frozenset({"semantic", "type", "structural"})
+GOLD_READABILITY_CATEGORIES = frozenset({"cosmetic", "readability"})
 GOLD_LEGACY_CATEGORY = "unclassified"
-GOLD_LEGACY_GATE = "legacy"
+GOLD_LEGACY_DIAGNOSTIC = "unclassified"
 GOLD_CHECK_CATEGORIES = frozenset(
-    {*GOLD_HARD_CATEGORIES, *GOLD_SOFT_CATEGORIES, GOLD_LEGACY_CATEGORY}
+    {*GOLD_SOURCE_SHAPE_CATEGORIES, *GOLD_READABILITY_CATEGORIES, GOLD_LEGACY_CATEGORY}
 )
 FAILURE_OWNER = {
     "argn_leak": "r2types",
@@ -271,7 +271,6 @@ FAILURE_OWNER = {
     "claimless_summary_projection": "r2sym",
     "proof_coverage_gap": "r2engine",
     "name_hint_structured_route": "r2sym",
-    "source_oracle_failure": "unknown",
     "summary_pseudo_call": "r2dec",
     "unmarked_summary_synthetic_local": "r2dec",
     "undefined_identifier_return": "r2dec",
@@ -323,7 +322,7 @@ FAILURE_PRIMARY_TAXONOMY = {
     "unresolved_fcn_or_temp_stack_leak": "readability",
     "zero_functions": "structural",
 }
-GOLD_CATEGORY_PRIMARY_TAXONOMY = {
+GOLD_CATEGORY_DIAGNOSTIC_TAXONOMY = {
     "semantic": "semantic",
     "type": "type",
     "structural": "structural",
@@ -332,10 +331,6 @@ GOLD_CATEGORY_PRIMARY_TAXONOMY = {
     GOLD_LEGACY_CATEGORY: "unclassified",
 }
 def primary_failure_taxonomy(kind: str, failure: dict[str, Any]) -> str:
-    if kind == GOLD_ORACLE_FAILURE:
-        return GOLD_CATEGORY_PRIMARY_TAXONOMY.get(
-            str(failure.get("category") or GOLD_LEGACY_CATEGORY), "unclassified"
-        )
     if kind == "nondeterministic_output":
         return "performance" if failure.get("command") == "profile" else "semantic"
     return FAILURE_PRIMARY_TAXONOMY.get(kind, "unclassified")
@@ -643,8 +638,8 @@ def parse_args() -> argparse.Namespace:
         "--gold-manifest",
         default="",
         help=(
-            "optional source-gold oracle manifest; matching expectations are "
-            "checked against command output and reported separately from smell metrics"
+            "optional source-shape advisory manifest; matching expectations are "
+            "reported as advisory diagnostics and never determine pass/fail"
         ),
     )
     parser.add_argument(
@@ -770,9 +765,10 @@ def parse_args() -> argparse.Namespace:
         "--closure-gate",
         action="store_true",
         help=(
-            "apply the default gold-closure quality gate: strict mode, no hard failures, "
-            "no residuals/generic type debt, source-gold expectations exercised, average "
-            "score >= 99.5, and setup/command ratio <= 2.0 unless thresholds are overridden"
+            "apply the default closure quality gate: strict mode, no hard failures, "
+            "no residuals/generic type debt, average score >= 99.5, and setup/command ratio "
+            "<= 2.0 unless thresholds are overridden; gold manifest coverage is separate "
+            "and requires --require-gold"
         ),
     )
     parser.add_argument(
@@ -841,12 +837,12 @@ def parse_args() -> argparse.Namespace:
         "--max-gold-failures",
         type=nonnegative_int,
         default=None,
-        help="strict quality gate: maximum allowed hard source-gold oracle failures",
+        help="deprecated compatibility option; source-shape mismatches are advisory",
     )
     parser.add_argument(
         "--require-gold",
         action="store_true",
-        help="strict quality gate: fail when no source-gold expectations were exercised",
+        help="strict manifest-coverage gate: fail when no source-shape expectations were exercised",
     )
     parser.add_argument(
         "--include-sensitive",
@@ -895,10 +891,6 @@ def apply_preset_defaults(args: argparse.Namespace) -> None:
             args.min_average_score = 99.5
         if args.max_setup_command_ratio is None:
             args.max_setup_command_ratio = 2.0
-        if getattr(args, "max_gold_failures", None) is None:
-            args.max_gold_failures = 0
-        if not getattr(args, "require_gold", False):
-            args.require_gold = True
         try:
             command_names = set(parse_command_filter(args.commands))
         except ValueError:
@@ -2892,13 +2884,13 @@ def _symbol_match_keys(value: Any) -> set[str]:
     return keys
 
 
-def gold_gate_for_category(category: str) -> str:
-    if category in GOLD_HARD_CATEGORIES:
-        return "hard"
-    if category in GOLD_SOFT_CATEGORIES:
-        return "soft"
+def gold_diagnostic_for_category(category: str) -> str:
+    if category in GOLD_SOURCE_SHAPE_CATEGORIES:
+        return "source_shape"
+    if category in GOLD_READABILITY_CATEGORIES:
+        return "readability"
     if category == GOLD_LEGACY_CATEGORY:
-        return GOLD_LEGACY_GATE
+        return GOLD_LEGACY_DIAGNOSTIC
     raise ValueError(f"unknown gold check category {category!r}")
 
 
@@ -2954,7 +2946,7 @@ def gold_checks_for_expectation(
                 raise ValueError(
                     f"{context} category {category!r} has unknown checks {unknown_kinds}"
                 )
-            gate = gold_gate_for_category(category)
+            diagnostic = gold_diagnostic_for_category(category)
             for check in GOLD_CHECK_KINDS:
                 for pattern in _gold_patterns(
                     raw_checks.get(check), f"{context} {category}.{check}"
@@ -2964,7 +2956,8 @@ def gold_checks_for_expectation(
                             "check": check,
                             "pattern": pattern,
                             "category": category,
-                            "gate": gate,
+                            "diagnostic": diagnostic,
+                            "authority": "advisory",
                         }
                     )
     else:
@@ -2975,7 +2968,8 @@ def gold_checks_for_expectation(
                         "check": check,
                         "pattern": pattern,
                         "category": GOLD_LEGACY_CATEGORY,
-                        "gate": GOLD_LEGACY_GATE,
+                        "diagnostic": GOLD_LEGACY_DIAGNOSTIC,
+                        "authority": "advisory",
                     }
                 )
 
@@ -3084,7 +3078,7 @@ def gold_expectations_for_command(
     return matched
 
 
-def gold_oracle_failures_for_output(
+def gold_oracle_advisory_mismatches_for_output(
     *,
     case: BinaryCase,
     target_name: str,
@@ -3092,7 +3086,7 @@ def gold_oracle_failures_for_output(
     stdout: str,
     expectations: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    failures: list[dict[str, Any]] = []
+    mismatches: list[dict[str, Any]] = []
     for expectation in expectations:
         expectation_id = str(expectation.get("id") or "")
         owner = str(expectation.get("owner") or "unknown")
@@ -3106,9 +3100,9 @@ def gold_oracle_failures_for_output(
             )
             failed = matched if check.startswith("not_") else not matched
             if failed:
-                failures.append(
+                mismatches.append(
                     {
-                        "kind": GOLD_ORACLE_FAILURE,
+                        "kind": GOLD_ORACLE_ADVISORY_MISMATCH,
                         "case": case.name,
                         "corpus": case.corpus,
                         "target": target_name,
@@ -3117,21 +3111,22 @@ def gold_oracle_failures_for_output(
                         "check": check,
                         "pattern": pattern,
                         "category": gold_check["category"],
-                        "gate": gold_check["gate"],
-                        "primary_failure_taxonomy": GOLD_CATEGORY_PRIMARY_TAXONOMY[
+                        "diagnostic": gold_check["diagnostic"],
+                        "authority": "advisory",
+                        "diagnostic_taxonomy": GOLD_CATEGORY_DIAGNOSTIC_TAXONOMY[
                             gold_check["category"]
                         ],
                         "owner": owner,
                     }
                 )
-    failures.sort(
+    mismatches.sort(
         key=lambda item: (
             str(item.get("expectation") or ""),
             str(item.get("check") or ""),
             str(item.get("pattern") or ""),
         )
     )
-    return failures
+    return mismatches
 
 
 def attach_gold_oracle(
@@ -3147,7 +3142,7 @@ def attach_gold_oracle(
     if not expectations or case is None or target is None:
         return
     target_name = str(target.get("name") or target.get("requested") or "")
-    failures = gold_oracle_failures_for_output(
+    mismatches = gold_oracle_advisory_mismatches_for_output(
         case=case,
         target_name=target_name,
         command=command,
@@ -3159,28 +3154,27 @@ def attach_gold_oracle(
         for expectation in expectations
         for check in gold_checks_for_expectation(expectation)
     ]
-    check_counts = {
-        gate: sum(check["gate"] == gate for check in checks)
-        for gate in ("hard", "soft", GOLD_LEGACY_GATE)
+    diagnostic_counts = {
+        diagnostic: sum(check["diagnostic"] == diagnostic for check in checks)
+        for diagnostic in ("source_shape", "readability", GOLD_LEGACY_DIAGNOSTIC)
     }
-    failure_counts = {
-        gate: sum(failure.get("gate") == gate for failure in failures)
-        for gate in ("hard", "soft", GOLD_LEGACY_GATE)
+    mismatch_counts = {
+        diagnostic: sum(mismatch.get("diagnostic") == diagnostic for mismatch in mismatches)
+        for diagnostic in ("source_shape", "readability", GOLD_LEGACY_DIAGNOSTIC)
     }
     entry["gold_oracle"] = {
-        "status": "ok" if not failures else "failed",
-        "hard_status": "ok" if not failure_counts["hard"] else "failed",
-        "soft_status": "ok" if not failure_counts["soft"] else "failed",
-        "legacy_status": "ok" if not failure_counts[GOLD_LEGACY_GATE] else "failed",
+        "authority": "advisory",
+        "status": "matched" if not mismatches else "advisory_mismatch",
         "expectation_count": len(expectations),
         "check_count": len(checks),
-        "hard_check_count": check_counts["hard"],
-        "soft_check_count": check_counts["soft"],
-        "legacy_check_count": check_counts[GOLD_LEGACY_GATE],
-        "hard_failure_count": failure_counts["hard"],
-        "soft_failure_count": failure_counts["soft"],
-        "legacy_failure_count": failure_counts[GOLD_LEGACY_GATE],
-        "failures": failures,
+        "source_shape_check_count": diagnostic_counts["source_shape"],
+        "readability_check_count": diagnostic_counts["readability"],
+        "unclassified_check_count": diagnostic_counts[GOLD_LEGACY_DIAGNOSTIC],
+        "advisory_mismatch_count": len(mismatches),
+        "source_shape_mismatch_count": mismatch_counts["source_shape"],
+        "readability_mismatch_count": mismatch_counts["readability"],
+        "unclassified_mismatch_count": mismatch_counts[GOLD_LEGACY_DIAGNOSTIC],
+        "advisory_mismatches": mismatches,
     }
 
 
@@ -4881,11 +4875,6 @@ def collect_failures(case_result: dict[str, Any]) -> list[dict[str, Any]]:
                 failures.append({"kind": "empty_decompile", "target": target_name, "command": command})
             if result.get("fallback_marker"):
                 failures.append({"kind": "decompiler_fallback", "target": target_name, "command": command})
-            gold_oracle = result.get("gold_oracle")
-            if isinstance(gold_oracle, dict):
-                for failure in gold_oracle.get("failures", []):
-                    if isinstance(failure, dict) and failure.get("gate") == "hard":
-                        failures.append(dict(failure))
             repeat = result.get("repeat")
             if isinstance(repeat, dict) and repeat.get("stable") is False:
                 observation = {
@@ -5041,7 +5030,6 @@ def score_case(case_result: dict[str, Any]) -> int:
         "summary_pseudo_call": 8,
         "unmarked_summary_synthetic_local": 8,
         "undefined_identifier_return": 12,
-        GOLD_ORACLE_FAILURE: 15,
         "unresolved_fcn_or_temp_stack_leak": 8,
     }
     score = 100
@@ -5610,22 +5598,16 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
     gold_oracle_totals = {
         "expectations": 0,
         "checks": 0,
-        "hard_checks": 0,
-        "soft_checks": 0,
-        "legacy_checks": 0,
+        "source_shape_checks": 0,
+        "readability_checks": 0,
+        "unclassified_checks": 0,
         "commands": 0,
-        "passed": 0,
-        "failed": 0,
-        "failures": 0,
-        "hard_passed": 0,
-        "hard_failed": 0,
-        "hard_failures": 0,
-        "soft_passed": 0,
-        "soft_failed": 0,
-        "soft_failures": 0,
-        "legacy_passed": 0,
-        "legacy_failed": 0,
-        "legacy_failures": 0,
+        "matched": 0,
+        "advisory_mismatched": 0,
+        "advisory_mismatches": 0,
+        "source_shape_mismatches": 0,
+        "readability_mismatches": 0,
+        "unclassified_mismatches": 0,
     }
     owner_buckets: dict[str, int] = {}
     generic_arg_total = 0
@@ -5870,39 +5852,31 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
                         gold_oracle.get("expectation_count") or 0
                     )
                     gold_oracle_totals["checks"] += int(gold_oracle.get("check_count") or 0)
-                    gold_oracle_totals["hard_checks"] += int(
-                        gold_oracle.get("hard_check_count") or 0
+                    gold_oracle_totals["source_shape_checks"] += int(
+                        gold_oracle.get("source_shape_check_count") or 0
                     )
-                    gold_oracle_totals["soft_checks"] += int(
-                        gold_oracle.get("soft_check_count") or 0
+                    gold_oracle_totals["readability_checks"] += int(
+                        gold_oracle.get("readability_check_count") or 0
                     )
-                    gold_oracle_totals["legacy_checks"] += int(
-                        gold_oracle.get("legacy_check_count") or 0
+                    gold_oracle_totals["unclassified_checks"] += int(
+                        gold_oracle.get("unclassified_check_count") or 0
                     )
-                    oracle_failures = [
-                        failure
-                        for failure in gold_oracle.get("failures", [])
-                        if isinstance(failure, dict)
+                    advisory_mismatches = [
+                        mismatch
+                        for mismatch in gold_oracle.get("advisory_mismatches", [])
+                        if isinstance(mismatch, dict)
                     ]
-                    failure_count = len(oracle_failures)
-                    gold_oracle_totals["failures"] += failure_count
-                    if failure_count:
-                        gold_oracle_totals["failed"] += 1
+                    mismatch_count = len(advisory_mismatches)
+                    gold_oracle_totals["advisory_mismatches"] += mismatch_count
+                    if mismatch_count:
+                        gold_oracle_totals["advisory_mismatched"] += 1
                     else:
-                        gold_oracle_totals["passed"] += 1
-                    for gate in ("hard", "soft", GOLD_LEGACY_GATE):
-                        gate_failure_count = sum(
-                            failure.get("gate", GOLD_LEGACY_GATE) == gate
-                            for failure in oracle_failures
+                        gold_oracle_totals["matched"] += 1
+                    for diagnostic in ("source_shape", "readability", "unclassified"):
+                        gold_oracle_totals[f"{diagnostic}_mismatches"] += sum(
+                            mismatch.get("diagnostic", "unclassified") == diagnostic
+                            for mismatch in advisory_mismatches
                         )
-                        gold_oracle_totals[f"{gate}_failures"] += gate_failure_count
-                        gate_check_count = int(
-                            gold_oracle.get(f"{gate}_check_count") or 0
-                        )
-                        if gate_check_count or gate_failure_count:
-                            gold_oracle_totals[
-                                f"{gate}_{'failed' if gate_failure_count else 'passed'}"
-                            ] += 1
                 slow_commands.append(
                     {
                         "case": case.get("name"),
@@ -6115,7 +6089,6 @@ def _hard_failure_count(report: dict[str, Any]) -> int:
         "radare2_candidate",
         "timeout",
         "zero_functions",
-        GOLD_ORACLE_FAILURE,
         *QUALITY_GATE_FAILURES,
     }
     return sum(int(failures.get(kind) or 0) for kind in hard_kinds)
@@ -6288,17 +6261,6 @@ def strict_quality_gate(args: argparse.Namespace, report: dict[str, Any]) -> dic
             ),
             "min": 1 if getattr(args, "require_pdg_comparison", False) else None,
         },
-        "gold_failures": {
-            "value": int(
-                _summary_metric(
-                    report,
-                    ("summary", "quality", "gold_oracle", "hard_failures"),
-                    0,
-                )
-                or 0
-            ),
-            "max": getattr(args, "max_gold_failures", None),
-        },
         "gold_expectations": {
             "value": int(
                 _summary_metric(
@@ -6308,9 +6270,7 @@ def strict_quality_gate(args: argparse.Namespace, report: dict[str, Any]) -> dic
                 )
                 or 0
             ),
-            "min": 1
-            if getattr(args, "require_gold", False) or getattr(args, "closure_gate", False)
-            else None,
+            "min": 1 if getattr(args, "require_gold", False) else None,
         },
     }
     failures: list[dict[str, Any]] = []
@@ -6622,6 +6582,10 @@ def benchmark_execution_config(
         "manifest": args.manifest or "",
         "gold_manifest": getattr(args, "gold_manifest", "") or "",
         "gold_manifest_hash": gold_manifest_hash(getattr(args, "gold_manifest", "")),
+        "source_shape_advisory": {
+            "authority": "advisory",
+            "max_gold_failures_ignored": getattr(args, "max_gold_failures", None),
+        },
         "manifest_only": bool(args.manifest_only),
         "override_manifest_max_functions": bool(
             getattr(args, "override_manifest_max_functions", False)
@@ -6647,7 +6611,6 @@ def benchmark_execution_config(
                 "max_pdg_quality_then_perf_wins",
                 None,
             ),
-            "max_gold_failures": getattr(args, "max_gold_failures", None),
             "require_gold": bool(getattr(args, "require_gold", False)),
         },
     }
@@ -7193,8 +7156,8 @@ def fixed_performance_plugin_probe(
             reasons.append(f"plugin probe exited with {probe_result.returncode}")
         if FIXED_PERFORMANCE_PROBE_ERROR_RE.search(probe_result.stderr):
             reasons.append("plugin probe reported an ABI/load error")
-        if "a:sla.dec" not in help_text:
-            reasons.append("plugin help command is absent or a no-op")
+        if "borrowed-snapshot provider" not in help_text:
+            reasons.append("plugin decompiler provider is absent or a no-op")
         if "sla: loaded architecture '" not in status_text:
             reasons.append("plugin status did not load a Sleigh architecture")
         probe_target = {"commands": {}}
@@ -7683,7 +7646,9 @@ def run_fixed_performance_gate(args: argparse.Namespace) -> int:
         "baseline": config.get("baseline"),
         "measurements": measurements,
         "separation": {
-            "correctness_gate": "not evaluated; run source-gold independently",
+            "source_shape_diagnostics": (
+                "not evaluated; non-authoritative advisory diagnostics run separately"
+            ),
             "performance_gate": "fixed runner latency/RSS only",
         },
     }

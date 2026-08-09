@@ -6,18 +6,13 @@ use serde::Serialize;
 use serde_json::json;
 use std::any::Any;
 use std::collections::BTreeMap;
-use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::raw::c_char;
 use std::ptr;
 use std::slice;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
 use z3::Context;
-
-static MERGE_STATES: AtomicBool = AtomicBool::new(false);
 
 fn solve_pipeline_debug_enabled() -> bool {
     std::env::var_os("R2SLEIGH_DEBUG_SOLVE_PIPELINE").is_some()
@@ -39,10 +34,6 @@ fn solve_pipeline_debug_log(message: &str) {
 
 fn solve_pipeline_debug_stage(stage: &str) {
     solve_pipeline_debug_log(stage);
-}
-
-fn merge_states_enabled() -> bool {
-    MERGE_STATES.load(Ordering::Relaxed)
 }
 
 #[repr(C)]
@@ -113,16 +104,6 @@ pub struct R2SymReplaySeed {
     skip_sleep_calls: i32,
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sym_merge_is_enabled() -> i32 {
-    if merge_states_enabled() { 1 } else { 0 }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sym_merge_set_enabled(enabled: i32) {
-    MERGE_STATES.store(enabled != 0, Ordering::Relaxed);
-}
-
 fn sym_error_json(message: &str) -> *mut c_char {
     let payload = json!({ "error": message }).to_string();
     CString::new(payload).map_or(ptr::null_mut(), |c| c.into_raw())
@@ -141,50 +122,6 @@ fn sym_panic_json(default: &str, payload: Box<dyn Any + Send>) -> *mut c_char {
         .map(|details| format!("{default}: {details}"))
         .unwrap_or_else(|| default.to_string());
     sym_error_json(&message)
-}
-
-fn sym_symbol_map() -> &'static Mutex<HashMap<u64, String>> {
-    static MAP: OnceLock<Mutex<HashMap<u64, String>>> = OnceLock::new();
-    MAP.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn parse_sym_symbol_map_payload(json_str: &str) -> HashMap<u64, String> {
-    serde_json::from_str::<HashMap<String, String>>(json_str)
-        .ok()
-        .map(|map| {
-            map.into_iter()
-                .filter_map(|(key, value)| {
-                    let addr = key
-                        .strip_prefix("0x")
-                        .or_else(|| key.strip_prefix("0X"))
-                        .and_then(|hex| u64::from_str_radix(hex, 16).ok())
-                        .or_else(|| key.parse().ok());
-                    addr.map(|addr| (addr, value))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sym_set_symbol_map_json(json: *const c_char) -> i32 {
-    if json.is_null() {
-        return 0;
-    }
-    let json_str = unsafe {
-        match CStr::from_ptr(json).to_str() {
-            Ok(s) => s,
-            Err(_) => return 0,
-        }
-    };
-    let parsed = parse_sym_symbol_map_payload(json_str);
-    match sym_symbol_map().lock() {
-        Ok(mut map) => {
-            *map = parsed;
-            1
-        }
-        Err(_) => 0,
-    }
 }
 
 #[derive(Serialize, Clone)]
@@ -1056,11 +993,29 @@ pub(crate) unsafe fn build_symbolic_scope_from_ffi(
     )
 }
 
-fn symbol_map_snapshot() -> HashMap<u64, String> {
-    sym_symbol_map()
-        .lock()
-        .map(|map| map.clone())
-        .unwrap_or_default()
+#[derive(Debug, Clone)]
+pub(crate) struct SymScopeRequestSnapshot {
+    symbols: r2sym::FunctionSymbolSnapshot,
+    merge_states: bool,
+}
+
+impl SymScopeRequestSnapshot {
+    pub(crate) fn new(symbols: r2sym::FunctionSymbolSnapshot, merge_states: bool) -> Self {
+        Self {
+            symbols,
+            merge_states,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn symbols(&self) -> &r2sym::FunctionSymbolSnapshot {
+        &self.symbols
+    }
+
+    #[cfg(test)]
+    pub(crate) fn merge_states(&self) -> bool {
+        self.merge_states
+    }
 }
 
 fn scope_root_prepared(scope: &r2sym::PreparedFunctionScope) -> Option<&r2ssa::SsaArtifact> {
@@ -1072,7 +1027,7 @@ fn engine_symbolic_context<'ctx, 'a>(
     prepared: &'a r2ssa::SsaArtifact,
     scope: Option<&'a r2sym::PreparedFunctionScope>,
     arch: Option<&'a ArchSpec>,
-    symbol_map: &'a HashMap<u64, String>,
+    request_snapshot: &'a SymScopeRequestSnapshot,
     config_profile: r2engine::EngineSymbolicConfigProfile,
     seed: r2engine::EngineSymbolicStateSeed<'a>,
 ) -> r2engine::EngineSymbolicContextRequest<'ctx, 'a> {
@@ -1081,8 +1036,8 @@ fn engine_symbolic_context<'ctx, 'a>(
         prepared,
         scope,
         arch,
-        symbol_map,
-        merge_states: merge_states_enabled(),
+        symbols: &request_snapshot.symbols,
+        merge_states: request_snapshot.merge_states,
         config_profile,
         seed,
     }
@@ -1209,13 +1164,13 @@ unsafe fn replay_seed_from_ffi(
     })
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sym_function_scope(
+pub(crate) fn r2sym_function_scope(
     ctx: *const R2ILContext,
     functions: *const R2ILFunctionBlocks,
     num_functions: usize,
     entry_addr: u64,
     external_context_json: *const c_char,
+    request_snapshot: &SymScopeRequestSnapshot,
 ) -> *mut c_char {
     let Some(ctx_view) = require_ctx_view(ctx) else {
         return ptr::null_mut();
@@ -1233,7 +1188,6 @@ pub extern "C" fn r2sym_function_scope(
     let Some(prepared) = scope_root_prepared(&scope) else {
         return ptr::null_mut();
     };
-    let symbol_map = symbol_map_snapshot();
     let z3_ctx = Context::thread_local();
 
     let explore_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1243,7 +1197,7 @@ pub extern "C" fn r2sym_function_scope(
                 prepared,
                 Some(&scope),
                 ctx_view.arch,
-                &symbol_map,
+                request_snapshot,
                 r2engine::EngineSymbolicConfigProfile::PathListing,
                 r2engine::EngineSymbolicStateSeed::Scope { entry_addr },
             ),
@@ -1273,13 +1227,13 @@ pub extern "C" fn r2sym_function_scope(
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sym_paths_scope(
+pub(crate) fn r2sym_paths_scope(
     ctx: *const R2ILContext,
     functions: *const R2ILFunctionBlocks,
     num_functions: usize,
     entry_addr: u64,
     external_context_json: *const c_char,
+    request_snapshot: &SymScopeRequestSnapshot,
 ) -> *mut c_char {
     let Some(ctx_view) = require_ctx_view(ctx) else {
         return ptr::null_mut();
@@ -1297,7 +1251,6 @@ pub extern "C" fn r2sym_paths_scope(
     let Some(prepared) = scope_root_prepared(&scope) else {
         return ptr::null_mut();
     };
-    let symbol_map = symbol_map_snapshot();
     let z3_ctx = Context::thread_local();
 
     let explore_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1307,7 +1260,7 @@ pub extern "C" fn r2sym_paths_scope(
                 prepared,
                 Some(&scope),
                 ctx_view.arch,
-                &symbol_map,
+                request_snapshot,
                 r2engine::EngineSymbolicConfigProfile::PathListing,
                 r2engine::EngineSymbolicStateSeed::Scope { entry_addr },
             ),
@@ -1341,14 +1294,14 @@ pub extern "C" fn r2sym_paths_scope(
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sym_explore_to_scope(
+pub(crate) fn r2sym_explore_to_scope(
     ctx: *const R2ILContext,
     functions: *const R2ILFunctionBlocks,
     num_functions: usize,
     entry_addr: u64,
     target_addr: u64,
     external_context_json: *const c_char,
+    request_snapshot: &SymScopeRequestSnapshot,
 ) -> *mut c_char {
     let Some(ctx_view) = require_ctx_view(ctx) else {
         return sym_error_json("missing disassembler context");
@@ -1366,7 +1319,6 @@ pub extern "C" fn r2sym_explore_to_scope(
     let Some(prepared) = scope_root_prepared(&scope) else {
         return sym_error_json("failed to build root SSA function");
     };
-    let symbol_map = symbol_map_snapshot();
 
     let z3_ctx = Context::thread_local();
     let explore_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1377,7 +1329,7 @@ pub extern "C" fn r2sym_explore_to_scope(
                     prepared,
                     Some(&scope),
                     ctx_view.arch,
-                    &symbol_map,
+                    request_snapshot,
                     r2engine::EngineSymbolicConfigProfile::DefaultQuery,
                     r2engine::EngineSymbolicStateSeed::Scope { entry_addr },
                 ),
@@ -1439,14 +1391,14 @@ pub extern "C" fn r2sym_explore_to_scope(
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sym_solve_to_scope(
+pub(crate) fn r2sym_solve_to_scope(
     ctx: *const R2ILContext,
     functions: *const R2ILFunctionBlocks,
     num_functions: usize,
     entry_addr: u64,
     target_addr: u64,
     external_context_json: *const c_char,
+    request_snapshot: &SymScopeRequestSnapshot,
 ) -> *mut c_char {
     solve_pipeline_debug_stage("solve_to_scope:start");
     let Some(ctx_view) = require_ctx_view(ctx) else {
@@ -1476,7 +1428,6 @@ pub extern "C" fn r2sym_solve_to_scope(
         prepared.blocks().count(),
         prepared.call_sites().by_id.len()
     ));
-    let symbol_map = symbol_map_snapshot();
     let z3_ctx = Context::thread_local();
     solve_pipeline_debug_log(&format!(
         "solve_to_scope:compile_begin target={:#x}",
@@ -1491,7 +1442,7 @@ pub extern "C" fn r2sym_solve_to_scope(
                     prepared,
                     Some(&scope),
                     ctx_view.arch,
-                    &symbol_map,
+                    request_snapshot,
                     r2engine::EngineSymbolicConfigProfile::DefaultQuery,
                     r2engine::EngineSymbolicStateSeed::Scope { entry_addr },
                 ),
@@ -1603,14 +1554,14 @@ pub extern "C" fn r2sym_solve_to_scope(
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sym_run_spec_json_scope(
+pub(crate) fn r2sym_run_spec_json_scope(
     ctx: *const R2ILContext,
     functions: *const R2ILFunctionBlocks,
     num_functions: usize,
     entry_addr: u64,
     spec_json: *const c_char,
     external_context_json: *const c_char,
+    request_snapshot: &SymScopeRequestSnapshot,
 ) -> *mut c_char {
     if spec_json.is_null() {
         return sym_error_json("missing exploration spec json");
@@ -1645,7 +1596,6 @@ pub extern "C" fn r2sym_run_spec_json_scope(
     let Some(prepared) = scope_root_prepared(&scope) else {
         return sym_error_json("failed to build root SSA function");
     };
-    let symbol_map = symbol_map_snapshot();
     let z3_ctx = Context::thread_local();
 
     let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1656,7 +1606,7 @@ pub extern "C" fn r2sym_run_spec_json_scope(
                     prepared,
                     Some(&scope),
                     ctx_view.arch,
-                    &symbol_map,
+                    request_snapshot,
                     r2engine::EngineSymbolicConfigProfile::DefaultQuery,
                     r2engine::EngineSymbolicStateSeed::Scope { entry_addr },
                 ),
@@ -1715,8 +1665,7 @@ pub extern "C" fn r2sym_run_spec_json_scope(
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sym_explore_to_replay_scope(
+pub(crate) fn r2sym_explore_to_replay_scope(
     ctx: *const R2ILContext,
     functions: *const R2ILFunctionBlocks,
     num_functions: usize,
@@ -1724,6 +1673,7 @@ pub extern "C" fn r2sym_explore_to_replay_scope(
     target_addr: u64,
     replay_seed: *const R2SymReplaySeed,
     external_context_json: *const c_char,
+    request_snapshot: &SymScopeRequestSnapshot,
 ) -> *mut c_char {
     let Some(ctx_view) = require_ctx_view(ctx) else {
         return sym_error_json("missing disassembler context");
@@ -1747,7 +1697,6 @@ pub extern "C" fn r2sym_explore_to_replay_scope(
     let Some(prepared) = scope_root_prepared(&scope) else {
         return sym_error_json("failed to build root SSA function");
     };
-    let symbol_map = symbol_map_snapshot();
     let start_pc = replay_seed.entry_pc.unwrap_or(entry_addr);
     let z3_ctx = Context::thread_local();
 
@@ -1759,7 +1708,7 @@ pub extern "C" fn r2sym_explore_to_replay_scope(
                     prepared,
                     Some(&scope),
                     ctx_view.arch,
-                    &symbol_map,
+                    request_snapshot,
                     r2engine::EngineSymbolicConfigProfile::DefaultQuery,
                     r2engine::EngineSymbolicStateSeed::Replay {
                         entry_addr,
@@ -1829,8 +1778,7 @@ pub extern "C" fn r2sym_explore_to_replay_scope(
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sym_solve_to_replay_scope(
+pub(crate) fn r2sym_solve_to_replay_scope(
     ctx: *const R2ILContext,
     functions: *const R2ILFunctionBlocks,
     num_functions: usize,
@@ -1838,6 +1786,7 @@ pub extern "C" fn r2sym_solve_to_replay_scope(
     target_addr: u64,
     replay_seed: *const R2SymReplaySeed,
     external_context_json: *const c_char,
+    request_snapshot: &SymScopeRequestSnapshot,
 ) -> *mut c_char {
     let Some(ctx_view) = require_ctx_view(ctx) else {
         return sym_error_json("missing disassembler context");
@@ -1861,7 +1810,6 @@ pub extern "C" fn r2sym_solve_to_replay_scope(
     let Some(prepared) = scope_root_prepared(&scope) else {
         return sym_error_json("failed to build root SSA function");
     };
-    let symbol_map = symbol_map_snapshot();
     let start_pc = replay_seed.entry_pc.unwrap_or(entry_addr);
     let z3_ctx = Context::thread_local();
 
@@ -1873,7 +1821,7 @@ pub extern "C" fn r2sym_solve_to_replay_scope(
                     prepared,
                     Some(&scope),
                     ctx_view.arch,
-                    &symbol_map,
+                    request_snapshot,
                     r2engine::EngineSymbolicConfigProfile::DefaultQuery,
                     r2engine::EngineSymbolicStateSeed::Replay {
                         entry_addr,

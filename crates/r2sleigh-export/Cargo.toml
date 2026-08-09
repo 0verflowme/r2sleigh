@@ -7,7 +7,7 @@ description = "Unified instruction export pipeline for r2sleigh"
 
 [dependencies]
 r2il = { path = "../r2il" }
-r2sleigh-lift = { path = "../r2sleigh-lift" }
+r2sleigh-lift = { path = "../r2sleigh-lift", default-features = false }
 r2ssa = { path = "../r2ssa" }
 serde.workspace = true
 serde_json.workspace = true
@@ -20,4 +20,4 @@ sleigh-config = { workspace = true, features = ["x86"] }
 [features]
 default = []
 dec = []
-x86 = ["sleigh-config/x86"]
+x86 = ["sleigh-config/x86", "r2sleigh-lift/x86"]

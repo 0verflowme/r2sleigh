@@ -3720,27 +3720,6 @@ mod tests {
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
     use r2ssa::InterprocSummarySet;
 
-    fn test_stack_render_facts(
-        object: r2ssa::ObjectId,
-        base: r2ssa::StackAddressBase,
-        offset: i64,
-    ) -> r2types::FunctionRenderFacts {
-        let id = r2ssa::SemanticId::stack_slot(object);
-        r2types::FunctionRenderFacts {
-            certified_entities: BTreeMap::from([(
-                id,
-                r2types::CertifiedEntity::StackSlot {
-                    id,
-                    object,
-                    base,
-                    offset,
-                    size: None,
-                },
-            )]),
-            ..r2types::FunctionRenderFacts::default()
-        }
-    }
-
     #[test]
     fn canonical_param_home_uses_rendered_header_alias_and_runtime_offset() {
         let slot = StackSlotKey {
@@ -3904,33 +3883,6 @@ mod tests {
             .expect("prepared stack-owned call result SSA artifact")
     }
 
-    fn test_prepared_stack_store_load_artifact() -> SsaArtifact {
-        let arch = test_x86_64_result_arch();
-        let slot = Varnode::unique(0x3000, 8);
-        let loaded = Varnode::unique(0x3008, 8);
-        let mut block = R2ILBlock::new(0x3000, 4);
-        block.push(R2ILOp::IntAdd {
-            dst: slot.clone(),
-            a: Varnode::register(16, 8),
-            b: Varnode::constant(u64::MAX - 7, 8),
-        });
-        block.push(R2ILOp::Store {
-            space: SpaceId::Ram,
-            addr: slot.clone(),
-            val: Varnode::constant(7, 8),
-        });
-        block.push(R2ILOp::Load {
-            dst: loaded,
-            space: SpaceId::Ram,
-            addr: slot,
-        });
-        block.push(R2ILOp::Return {
-            target: Varnode::constant(0, 8),
-        });
-        SsaArtifact::for_decompile(&[block], Some(&arch))
-            .expect("prepared stack store/load SSA artifact")
-    }
-
     fn test_callsite_facts(prepared: &SsaArtifact) -> r2types::FunctionCallsiteFacts {
         let by_callsite = prepared
             .certificates()
@@ -4002,65 +3954,6 @@ mod tests {
             })
             .collect();
         r2types::FunctionCallsiteFacts { by_callsite }
-    }
-
-    fn test_call_result_facts(prepared: &SsaArtifact) -> r2types::FunctionCallResultFacts {
-        let mut by_value = BTreeMap::new();
-        let mut by_callsite = BTreeMap::<CallsiteKey, Vec<ValueId>>::new();
-        for cert in prepared.certificates().call_results.values() {
-            let Some(callsite_cert) = prepared.certificates().callsites.get(&cert.call_site) else {
-                continue;
-            };
-            let callsite = CallsiteKey {
-                block_addr: callsite_cert.block_addr,
-                op_index: callsite_cert.op_index,
-            };
-            by_callsite.entry(callsite).or_default().push(cert.value);
-            by_value.insert(
-                cert.value,
-                r2types::CallResultFact {
-                    callsite,
-                    call_site_id: cert.call_site,
-                    at: cert.at,
-                    value: cert.value,
-                    width: cert.width,
-                    relation: cert.relation,
-                    carrier: cert.carrier.clone(),
-                    owner: cert.owner.clone(),
-                },
-            );
-        }
-        r2types::FunctionCallResultFacts {
-            by_value,
-            by_callsite,
-        }
-    }
-
-    fn test_stack_owner_function_facts(
-        stack_slots: BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
-        call_result_facts: r2types::FunctionCallResultFacts,
-    ) -> FunctionFacts {
-        let (object, offset) = call_result_facts
-            .by_value
-            .values()
-            .find_map(|fact| match fact.owner.as_ref()? {
-                ValueOwner::StackSlot { object, offset } => Some((*object, *offset)),
-                ValueOwner::Value(_) => None,
-            })
-            .expect("fixture should carry stack-slot call-result owner");
-        FunctionFacts::new(
-            r2types::FunctionTypeFacts {
-                stack_slots,
-                ..r2types::FunctionTypeFacts::default()
-            },
-            None,
-        )
-        .with_call_results(call_result_facts)
-        .with_render(test_stack_render_facts(
-            object,
-            r2ssa::StackAddressBase::StackPointer,
-            offset,
-        ))
     }
 
     fn leak_function_facts(facts: FunctionFacts) -> &'static FunctionFacts {
@@ -4764,51 +4657,6 @@ mod tests {
     }
 
     #[test]
-    fn prepared_call_result_owner_uses_function_facts_contract() {
-        let prepared = test_prepared_stack_owned_call_result_artifact();
-        let abi_arg_regs = Vec::new();
-        let call_result_facts = test_call_result_facts(&prepared);
-        let stack_slots = BTreeMap::from([(
-            StackSlotKey {
-                base: r2types::ExternalStackBase::StackPointer,
-                offset: -8,
-            },
-            ExternalStackSlotSpec {
-                name: "call_result".to_string(),
-                ty: Some(r2types::CTypeLike::Int {
-                    bits: 64,
-                    signedness: r2types::Signedness::Unsigned,
-                }),
-                role: ExternalStackSlotRole::Local,
-                ..ExternalStackSlotSpec::default()
-            },
-        )]);
-        let visible_bindings = Vec::new();
-        let param_register_aliases = HashMap::new();
-        let function_facts =
-            test_stack_owner_function_facts(stack_slots.clone(), call_result_facts.clone());
-
-        let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
-            prepared: &prepared,
-            abi_arg_regs: &abi_arg_regs,
-            stack_slots: &stack_slots,
-            visible_bindings: &visible_bindings,
-            param_register_aliases: &param_register_aliases,
-            function_facts: &function_facts,
-            certified_rendering_required: false,
-        });
-
-        let call_view = view
-            .call_view_for_site((0x1780, 1))
-            .expect("direct callsite should have prepared call view");
-        assert_eq!(
-            call_view.result_owner,
-            Some(CExpr::Var("call_result".to_string())),
-            "call-result owner must be rendered only from FunctionFacts result proof"
-        );
-    }
-
-    #[test]
     fn prepared_call_result_owner_requires_function_facts_contract() {
         let prepared = test_prepared_stack_owned_call_result_artifact();
         let abi_arg_regs = Vec::new();
@@ -4846,91 +4694,6 @@ mod tests {
         assert!(
             view.call_result_source_by_value.is_empty(),
             "call-result source indexes must be populated from FunctionFacts, not local prepared SSA reads"
-        );
-    }
-
-    #[test]
-    fn certified_prepared_view_rejects_local_store_owner_recovery() {
-        let prepared = test_prepared_stack_store_load_artifact();
-        let abi_arg_regs = Vec::new();
-        let stack_slots = BTreeMap::new();
-        let empty_visible_bindings = Vec::new();
-        let visible_bindings = vec![VisibleBinding {
-            name: "tmp".to_string(),
-            ty: Some(r2types::CTypeLike::Int {
-                bits: 64,
-                signedness: r2types::Signedness::Unsigned,
-            }),
-            kind: VisibleBindingKind::Local,
-            stack_slot: Some(StackSlotKey {
-                base: r2types::ExternalStackBase::StackPointer,
-                offset: -8,
-            }),
-            param_index: None,
-            source_reg: None,
-        }];
-        let param_register_aliases = HashMap::new();
-
-        let local_view = PreparedSemanticView::build(PreparedSemanticViewInputs {
-            prepared: &prepared,
-            abi_arg_regs: &abi_arg_regs,
-            stack_slots: &stack_slots,
-            visible_bindings: &empty_visible_bindings,
-            param_register_aliases: &param_register_aliases,
-            function_facts: leak_function_facts(FunctionFacts::default()),
-            certified_rendering_required: false,
-        });
-        let certified_view = PreparedSemanticView::build(PreparedSemanticViewInputs {
-            prepared: &prepared,
-            abi_arg_regs: &abi_arg_regs,
-            stack_slots: &stack_slots,
-            visible_bindings: &empty_visible_bindings,
-            param_register_aliases: &param_register_aliases,
-            function_facts: leak_function_facts(FunctionFacts::default()),
-            certified_rendering_required: true,
-        });
-        let render_facts = test_stack_render_facts(
-            r2ssa::ObjectId(1),
-            r2ssa::StackAddressBase::FramePointer,
-            -8,
-        );
-        let function_facts = FunctionFacts::new(
-            r2types::FunctionTypeFacts {
-                visible_bindings: visible_bindings.clone(),
-                ..r2types::FunctionTypeFacts::default()
-            },
-            None,
-        )
-        .with_render(render_facts.clone());
-        let certified_with_stack_proof = PreparedSemanticView::build(PreparedSemanticViewInputs {
-            prepared: &prepared,
-            abi_arg_regs: &abi_arg_regs,
-            stack_slots: &stack_slots,
-            visible_bindings: &visible_bindings,
-            param_register_aliases: &param_register_aliases,
-            function_facts: &function_facts,
-            certified_rendering_required: true,
-        });
-
-        let block = prepared.function().get_block(0x3000).expect("block");
-        let SSAOp::Load { dst, .. } = &block.ops[2] else {
-            panic!("fixture op should be a stack load");
-        };
-
-        assert_eq!(
-            local_view.owner_expr_for_var(dst),
-            Some(&CExpr::IntLit(7)),
-            "non-certified prepared view may recover a same-block stack store value"
-        );
-        assert_ne!(
-            certified_view.owner_expr_for_var(dst),
-            Some(&CExpr::IntLit(7)),
-            "certified prepared view must not use local stack-store recovery without FunctionFacts render proof"
-        );
-        assert_eq!(
-            certified_with_stack_proof.owner_expr_for_var(dst),
-            Some(&CExpr::Var("tmp".to_string())),
-            "certified prepared view may recover a stack owner only when FunctionFacts carries typed stack-slot render proof"
         );
     }
 

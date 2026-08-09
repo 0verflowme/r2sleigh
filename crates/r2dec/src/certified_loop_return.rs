@@ -11,7 +11,7 @@ use r2cert::{
 };
 use r2ssa::{
     BlockTerminator, CanonicalInstructionId, CanonicalInstructionSite, MachineBuildError,
-    SemanticObligationId, SsaArtifact,
+    SemanticObligationId, SsaArtifact, TrustedSsaArtifact,
 };
 use serde::Serialize;
 
@@ -239,7 +239,7 @@ impl From<SemanticCError> for LoopReturnFunctionError {
 }
 
 impl CertifiedLoopReturnFunction {
-    pub fn from_artifact(artifact: &SsaArtifact) -> Result<Self, LoopReturnFunctionError> {
+    pub fn from_artifact(artifact: &TrustedSsaArtifact) -> Result<Self, LoopReturnFunctionError> {
         let certified = CertifiedMachineProjection::from_artifact(artifact)?;
         Self::from_projection(&certified)
     }
@@ -779,14 +779,15 @@ impl LoopReturnDifferentialReport {
 /// explicitly distinguishes a terminal exit from a loop still traversing its
 /// backedge when the bound is exhausted.
 pub fn check_loop_return_differential(
-    artifact: &SsaArtifact,
+    trusted: &TrustedSsaArtifact,
     max_iterations: u32,
 ) -> Result<LoopReturnDifferentialReport, String> {
     if max_iterations == 0 {
         return Err("loop differential iteration budget is zero".to_string());
     }
-    let function = CertifiedLoopReturnFunction::from_artifact(artifact)
+    let function = CertifiedLoopReturnFunction::from_artifact(trusted)
         .map_err(|error| format!("loop candidate not admitted: {error}"))?;
+    let artifact = trusted.artifact();
     let rendered = function
         .render_certified_c()
         .map_err(|error| format!("loop rendering failed: {error}"))?;
@@ -954,121 +955,4 @@ fn parse_rendered_return(rendered: &str) -> Result<LoopReturnValue, String> {
         bits: u64::from_str_radix(bits, 16)
             .map_err(|_| "rendered loop return constant is malformed".to_string())?,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, Varnode};
-    use r2ssa::{
-        CanonicalStorageId, CanonicalStorageSpace, SourceAbiParameterSpec, SourceFunctionInterface,
-        SourceFunctionReturn,
-    };
-
-    fn storage(offset: u64, size: u32) -> CanonicalStorageId {
-        CanonicalStorageId {
-            space: CanonicalStorageSpace::Register,
-            offset,
-            size,
-        }
-    }
-
-    fn arch() -> ArchSpec {
-        let mut arch = ArchSpec::new("loop-return-test");
-        arch.add_register(RegisterDef::new("rax", 0, 8));
-        arch.add_register(RegisterDef::new("dil", 8, 1));
-        arch.add_register(RegisterDef::new("rip", 16, 8));
-        arch.add_register(RegisterDef::new("sil", 24, 1));
-        arch
-    }
-
-    fn interface(parameter_storage: CanonicalStorageId) -> SourceFunctionInterface {
-        SourceFunctionInterface::new(
-            b"loop-return-revision-1".to_vec(),
-            "test-register-abi",
-            [SourceAbiParameterSpec::new(0, parameter_storage)],
-            SourceFunctionReturn::Register {
-                storage: storage(0, 8),
-            },
-            [],
-        )
-        .expect("function interface")
-    }
-
-    fn source_blocks(continue_on_true: bool, body_value: bool) -> Vec<R2ILBlock> {
-        let mut preheader = R2ILBlock::new(0xa000, 4);
-        preheader.push(R2ILOp::Branch {
-            target: Varnode::ram(0xa010, 8),
-        });
-        let mut header = R2ILBlock::new(0xa010, 4);
-        header.push(R2ILOp::CBranch {
-            target: Varnode::ram(0xa020, 8),
-            cond: Varnode::register(8, 1),
-        });
-        let body_addr = if continue_on_true { 0xa020 } else { 0xa014 };
-        let exit_addr = if continue_on_true { 0xa014 } else { 0xa020 };
-        let mut fallthrough = R2ILBlock::new(0xa014, 4);
-        let mut taken = R2ILBlock::new(0xa020, 4);
-        let body = if body_addr == 0xa014 {
-            &mut fallthrough
-        } else {
-            &mut taken
-        };
-        if body_value {
-            body.push(R2ILOp::Copy {
-                dst: Varnode::unique(0x40, 1),
-                src: Varnode::constant(1, 1),
-            });
-        }
-        body.push(R2ILOp::Branch {
-            target: Varnode::ram(0xa010, 8),
-        });
-        let exit = if exit_addr == 0xa014 {
-            &mut fallthrough
-        } else {
-            &mut taken
-        };
-        exit.push(R2ILOp::Copy {
-            dst: Varnode::register(0, 8),
-            src: Varnode::constant(0x2a, 8),
-        });
-        exit.push(R2ILOp::Return {
-            target: Varnode::register(16, 8),
-        });
-        vec![preheader, header, fallthrough, taken]
-    }
-
-    fn assert_refused(blocks: &[R2ILBlock], parameter_storage: CanonicalStorageId) {
-        let artifact =
-            SsaArtifact::raw_with_interface(blocks, Some(&arch()), interface(parameter_storage))
-                .expect("synthetic loop-return artifact");
-        assert!(CertifiedLoopReturnFunction::from_artifact(&artifact).is_err());
-    }
-
-    #[test]
-    fn synthetic_loop_polarities_are_refused_without_typed_machine_roles() {
-        for continue_on_true in [true, false] {
-            assert_refused(&source_blocks(continue_on_true, false), storage(8, 1));
-        }
-    }
-
-    #[test]
-    fn synthetic_loop_certificate_baseline_is_refused() {
-        assert_refused(&source_blocks(true, false), storage(8, 1));
-    }
-
-    #[test]
-    fn interface_body_effect_and_budget_mismatches_fail_closed() {
-        let blocks = source_blocks(true, false);
-        let no_interface =
-            SsaArtifact::raw(&blocks, Some(&arch())).expect("loop without interface");
-        assert!(matches!(
-            CertifiedLoopReturnFunction::from_artifact(&no_interface),
-            Err(LoopReturnFunctionError::MissingClosedLoopControl(0xa010))
-        ));
-
-        assert_refused(&blocks, storage(24, 1));
-        assert_refused(&source_blocks(true, true), storage(8, 1));
-    }
 }

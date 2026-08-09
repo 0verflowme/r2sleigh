@@ -59,8 +59,8 @@ r2sleigh disasm --arch x86-64 --bytes "4889e500000000000000000000000000"
 # CLI: one-liner instruction export (action + format)
 r2sleigh run --arch x86-64 --bytes "31c00000000000000000000000000000" --action lift --format r2cmd
 
-# Plugin: decompile a function
-r2 -qc 'aaa; s main; a:sla.dec' /bin/ls
+# Plugin: decompile through radare2's bounded snapshot provider
+r2 -qc 'a:sla; aaa; s main; pdd' /bin/ls
 
 # Plugin: SSA form
 r2 -qc 'aaa; s main; a:sla.ssa' /bin/ls

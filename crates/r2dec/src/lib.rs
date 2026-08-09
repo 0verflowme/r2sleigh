@@ -9266,6 +9266,7 @@ mod tests {
         native.summary.role_identity = Some(Box::new(r2sym::NativeWorkerRoleIdentity {
             role_name: "table_walk".to_string(),
             source: r2sym::NativeWorkerRoleSource::NameHint,
+            linkage: r2ssa::FunctionSemanticLinkage::Unknown,
             confidence: r2sym::SemanticConfidence::Heuristic,
             source_names: vec!["sym.name_ranked_table".to_string()],
             summary_kinds: BTreeSet::from([r2sym::NativeWorkerSummaryKind::TableWalk]),

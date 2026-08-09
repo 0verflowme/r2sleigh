@@ -22,7 +22,7 @@ use r2ssa::{
     MachineExprKind, MachineMemoryEndianness, MachineOvershiftBehavior, MachineShiftKind,
     MachineSignedness, MachineStackBase, MachineType, MachineValueBinding, MachineValueUse,
     ObjectId, SSAOp, SemanticInstructionState, SourceCallResult, SourceCallSiteIdentity,
-    SourceFunctionReturn, SsaArtifact, StructuredAccessId, ValueId,
+    SourceFunctionReturn, SsaArtifact, StructuredAccessId, TrustedSsaArtifact, ValueId,
 };
 use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Serialize, Serializer};
@@ -394,8 +394,8 @@ pub struct DifferentialState {
 }
 
 impl DifferentialState {
-    pub fn for_artifact(artifact: &SsaArtifact) -> Result<Self, String> {
-        let certified = CertifiedMachineProjection::from_artifact(artifact)
+    pub fn for_artifact(trusted: &TrustedSsaArtifact) -> Result<Self, String> {
+        let certified = CertifiedMachineProjection::from_artifact(trusted)
             .map_err(|error| format!("artifact certification failed: {error}"))?;
         let origin = certified.origin().clone();
         let artifact_identity = DifferentialArtifactIdentity::from_origin(&origin)?;
@@ -747,12 +747,13 @@ impl DifferentialReport {
 /// Certification, accounting, and the typed AST are constructed internally so
 /// artifact-local handles cannot be paired with a foreign source graph.
 pub fn check_block_differential(
-    artifact: &SsaArtifact,
+    trusted: &TrustedSsaArtifact,
     block_addr: u64,
     initial: &DifferentialState,
     limits: DifferentialLimits,
 ) -> DifferentialReport {
-    let certified = match CertifiedMachineProjection::from_artifact(artifact) {
+    let artifact = trusted.artifact();
+    let certified = match CertifiedMachineProjection::from_artifact(trusted) {
         Ok(certified) => certified,
         Err(error) => {
             let mut report = issued_report(
@@ -1088,12 +1089,13 @@ pub fn check_block_differential(
 /// semantic-C interpreters. Both sides stop at the call boundary; neither the
 /// callee nor post-call state is modeled or claimed.
 pub fn check_direct_call_differential(
-    artifact: &SsaArtifact,
+    trusted: &TrustedSsaArtifact,
     block_addr: u64,
     initial: &DifferentialState,
     limits: DifferentialLimits,
 ) -> DifferentialReport {
-    let certified = match CertifiedMachineProjection::from_artifact(artifact) {
+    let artifact = trusted.artifact();
+    let certified = match CertifiedMachineProjection::from_artifact(trusted) {
         Ok(certified) => certified,
         Err(error) => {
             let mut report = issued_report(
@@ -1321,11 +1323,12 @@ pub fn check_direct_call_differential(
 /// Execute one fully certified terminal-return function through independent
 /// source-SSA and semantic-C interpreters from the same initial state.
 pub fn check_terminal_return_differential(
-    artifact: &SsaArtifact,
+    trusted: &TrustedSsaArtifact,
     initial: &DifferentialState,
     limits: DifferentialLimits,
 ) -> DifferentialReport {
-    let certified = match CertifiedMachineProjection::from_artifact(artifact) {
+    let artifact = trusted.artifact();
+    let certified = match CertifiedMachineProjection::from_artifact(trusted) {
         Ok(certified) => certified,
         Err(error) => {
             let mut report = issued_report(
@@ -1573,11 +1576,12 @@ pub fn check_terminal_return_differential(
 /// finite byte memory. `NoMismatchObserved` remains bounded falsification
 /// evidence and never grants certification or helper-ABI authority.
 pub fn check_memory_terminal_return_differential(
-    artifact: &SsaArtifact,
+    trusted: &TrustedSsaArtifact,
     initial: &DifferentialState,
     limits: DifferentialLimits,
 ) -> DifferentialReport {
-    let certified = match CertifiedMachineProjection::from_artifact(artifact) {
+    let artifact = trusted.artifact();
+    let certified = match CertifiedMachineProjection::from_artifact(trusted) {
         Ok(certified) => certified,
         Err(error) => {
             let mut report = issued_report(
@@ -1662,7 +1666,7 @@ pub fn check_memory_terminal_return_differential(
         report.artifact_identity = Some(requested_artifact_identity);
         return report;
     }
-    let function = match CertifiedMemorySemanticCFunction::from_artifact(artifact) {
+    let function = match CertifiedMemorySemanticCFunction::from_artifact(trusted) {
         Ok(function) => function,
         Err(error) => {
             let mut report = candidate_not_admitted(
@@ -1863,12 +1867,13 @@ pub fn check_memory_terminal_return_differential(
 /// obtains edge polarity and return values directly from canonical CFG/SSA
 /// boundary facts; a finite match remains falsification evidence, not proof.
 pub fn check_conditional_return_differential(
-    artifact: &SsaArtifact,
+    trusted: &TrustedSsaArtifact,
     initial: &DifferentialState,
     limits: DifferentialLimits,
 ) -> DifferentialReport {
+    let artifact = trusted.artifact();
     let entry = artifact.function().entry;
-    let certified = match CertifiedMachineProjection::from_artifact(artifact) {
+    let certified = match CertifiedMachineProjection::from_artifact(trusted) {
         Ok(certified) => certified,
         Err(error) => {
             let mut report = issued_report(
@@ -5636,324 +5641,6 @@ fn semantic_write_memory(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use r2il::{ArchSpec, Endianness, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
-    use r2ssa::{
-        CanonicalStorageId, CanonicalStorageSpace, MachineBuildError, SourceAbiParameterSpec,
-        SourceCallArgumentSpec, SourceCallSiteInterface, SourceFunctionInterface,
-        SourceFunctionReturn,
-    };
-
-    fn terminal_return_artifact() -> SsaArtifact {
-        let mut block = R2ILBlock::new(0x7070, 4);
-        block.push(R2ILOp::IntAdd {
-            dst: Varnode::unique(0x10, 8),
-            a: Varnode::register(8, 8),
-            b: Varnode::constant(1, 8),
-        });
-        block.push(R2ILOp::Copy {
-            dst: Varnode::register(0, 8),
-            src: Varnode::unique(0x10, 8),
-        });
-        block.push(R2ILOp::Return {
-            target: Varnode::register(16, 8),
-        });
-        let mut arch = ArchSpec::new("terminal-return-differential-test");
-        arch.add_register(RegisterDef::new("rax", 0, 8));
-        arch.add_register(RegisterDef::new("rdi", 8, 8));
-        arch.add_register(RegisterDef::new("rip", 16, 8));
-        let interface = SourceFunctionInterface::new(
-            b"terminal-return-differential-revision-1".to_vec(),
-            "test-register-abi",
-            [SourceAbiParameterSpec::new(
-                0,
-                CanonicalStorageId {
-                    space: CanonicalStorageSpace::Register,
-                    offset: 8,
-                    size: 8,
-                },
-            )],
-            SourceFunctionReturn::Register {
-                storage: CanonicalStorageId {
-                    space: CanonicalStorageSpace::Register,
-                    offset: 0,
-                    size: 8,
-                },
-            },
-            [],
-        )
-        .expect("explicit interface");
-        SsaArtifact::raw_with_interface(&[block], Some(&arch), interface)
-            .expect("terminal return artifact")
-    }
-
-    fn memory_return_arch(endianness: Endianness, return_size: u32) -> ArchSpec {
-        let mut arch = ArchSpec::new("memory-return-differential-test");
-        arch.addr_size = 8;
-        arch.set_memory_endianness(endianness);
-        arch.add_register(RegisterDef::new("ret", 0, return_size));
-        arch.add_register(RegisterDef::new("rip", 16, 8));
-        arch
-    }
-
-    fn memory_return_interface(return_kind: SourceFunctionReturn) -> SourceFunctionInterface {
-        SourceFunctionInterface::new(
-            b"memory-return-differential-revision-1".to_vec(),
-            "test-register-abi",
-            [],
-            return_kind,
-            [],
-        )
-        .expect("memory-return interface")
-    }
-
-    fn load_return_artifact(endianness: Endianness, width_bytes: u32) -> SsaArtifact {
-        let mut block = R2ILBlock::new(0x7080 + u64::from(width_bytes), 4);
-        block.push(R2ILOp::Load {
-            dst: Varnode::register(0, width_bytes),
-            space: SpaceId::Ram,
-            addr: Varnode::constant(0x40, 8),
-        });
-        block.push(R2ILOp::Return {
-            target: Varnode::register(16, 8),
-        });
-        SsaArtifact::raw_with_interface(
-            &[block],
-            Some(&memory_return_arch(endianness, width_bytes)),
-            memory_return_interface(SourceFunctionReturn::Register {
-                storage: CanonicalStorageId {
-                    space: CanonicalStorageSpace::Register,
-                    offset: 0,
-                    size: width_bytes,
-                },
-            }),
-        )
-        .expect("load-return memory artifact")
-    }
-
-    fn ordered_memory_return_artifact(endianness: Endianness) -> SsaArtifact {
-        let mut block = R2ILBlock::new(0x70a0, 4);
-        block.push(R2ILOp::Store {
-            space: SpaceId::Ram,
-            addr: Varnode::constant(0x40, 8),
-            val: Varnode::constant(0x1020_3040, 4),
-        });
-        block.push(R2ILOp::Load {
-            dst: Varnode::register(0, 2),
-            space: SpaceId::Ram,
-            addr: Varnode::constant(0x40, 8),
-        });
-        block.push(R2ILOp::Return {
-            target: Varnode::register(16, 8),
-        });
-        SsaArtifact::raw_with_interface(
-            &[block],
-            Some(&memory_return_arch(endianness, 2)),
-            memory_return_interface(SourceFunctionReturn::Register {
-                storage: CanonicalStorageId {
-                    space: CanonicalStorageSpace::Register,
-                    offset: 0,
-                    size: 2,
-                },
-            }),
-        )
-        .expect("ordered memory-return artifact")
-    }
-
-    fn conditional_return_artifact() -> SsaArtifact {
-        let mut header = R2ILBlock::new(0x8000, 4);
-        header.push(R2ILOp::IntNotEqual {
-            dst: Varnode::unique(0x10, 1),
-            a: Varnode::register(8, 8),
-            b: Varnode::constant(0, 8),
-        });
-        header.push(R2ILOp::CBranch {
-            target: Varnode::ram(0x8020, 8),
-            cond: Varnode::unique(0x10, 1),
-        });
-        let mut false_arm = R2ILBlock::new(0x8004, 4);
-        false_arm.push(R2ILOp::Copy {
-            dst: Varnode::register(0, 8),
-            src: Varnode::constant(0, 8),
-        });
-        false_arm.push(R2ILOp::Return {
-            target: Varnode::register(16, 8),
-        });
-        let mut true_arm = R2ILBlock::new(0x8020, 4);
-        true_arm.push(R2ILOp::Copy {
-            dst: Varnode::register(0, 8),
-            src: Varnode::constant(u64::MAX, 8),
-        });
-        true_arm.push(R2ILOp::Return {
-            target: Varnode::register(16, 8),
-        });
-        let mut arch = ArchSpec::new("conditional-return-differential-test");
-        arch.add_register(RegisterDef::new("rax", 0, 8));
-        arch.add_register(RegisterDef::new("rdi", 8, 8));
-        arch.add_register(RegisterDef::new("rip", 16, 8));
-        let interface = SourceFunctionInterface::new(
-            b"conditional-return-differential-revision-1".to_vec(),
-            "test-register-abi",
-            [SourceAbiParameterSpec::new(
-                0,
-                CanonicalStorageId {
-                    space: CanonicalStorageSpace::Register,
-                    offset: 8,
-                    size: 8,
-                },
-            )],
-            SourceFunctionReturn::Register {
-                storage: CanonicalStorageId {
-                    space: CanonicalStorageSpace::Register,
-                    offset: 0,
-                    size: 8,
-                },
-            },
-            [],
-        )
-        .expect("conditional-return interface");
-        SsaArtifact::raw_with_interface(&[header, false_arm, true_arm], Some(&arch), interface)
-            .expect("conditional-return artifact")
-    }
-
-    fn direct_call_artifact() -> SsaArtifact {
-        let target = Varnode::ram(0x7600, 8);
-        let mut entry = R2ILBlock::new(0x7500, 4);
-        entry.push(R2ILOp::Copy {
-            dst: Varnode::register(8, 8),
-            src: Varnode::register(16, 8),
-        });
-        entry.push(R2ILOp::Call {
-            target: target.clone(),
-        });
-        let fallthrough = R2ILBlock::new(0x7504, 4);
-        let mut arch = ArchSpec::new("direct-call-differential-test");
-        arch.add_register(RegisterDef::new("rdi", 8, 8));
-        arch.add_register(RegisterDef::new("rsi", 16, 8));
-        let revision = b"direct-call-differential-revision-1".to_vec();
-        let argument_storage = CanonicalStorageId {
-            space: CanonicalStorageSpace::Register,
-            offset: 8,
-            size: 8,
-        };
-        let parameter_storage = CanonicalStorageId {
-            space: CanonicalStorageSpace::Register,
-            offset: 16,
-            size: 8,
-        };
-        let function_interface = SourceFunctionInterface::new(
-            revision.clone(),
-            "caller-test-abi",
-            [SourceAbiParameterSpec::new(0, parameter_storage)],
-            SourceFunctionReturn::Void,
-            [],
-        )
-        .expect("caller interface");
-        let raw_identity =
-            SourceCallSiteIdentity::new(0x7500, 1, CanonicalStorageId::from_varnode(&target));
-        let call_interface = SourceCallSiteInterface::new(
-            revision,
-            raw_identity,
-            true,
-            "callee-test-abi",
-            [SourceCallArgumentSpec::new(0, argument_storage)],
-            false,
-            false,
-            SourceCallResult::Void,
-        )
-        .expect("callee interface");
-        SsaArtifact::raw_with_interfaces(
-            &[entry, fallthrough],
-            Some(&arch),
-            Some(function_interface),
-            vec![call_interface],
-        )
-        .expect("direct-call artifact")
-    }
-
-    fn assert_machine_context_refusal(artifact: &SsaArtifact) {
-        assert!(matches!(
-            CertifiedMachineProjection::from_artifact(artifact),
-            Err(MachineBuildError::MachineContextMismatch)
-        ));
-        assert!(DifferentialState::for_artifact(artifact).is_err());
-    }
-
-    #[test]
-    fn hand_authored_direct_call_cannot_authorize_boundary_differential() {
-        assert_machine_context_refusal(&direct_call_artifact());
-    }
-
-    #[test]
-    fn hand_authored_direct_call_cannot_supply_budget_or_residual_baseline() {
-        assert_machine_context_refusal(&direct_call_artifact());
-    }
-
-    #[test]
-    fn fabricated_direct_call_mutation_baseline_is_refused_before_observation() {
-        assert_machine_context_refusal(&direct_call_artifact());
-    }
-
-    #[test]
-    fn hand_authored_terminal_return_cannot_authorize_differential() {
-        assert_machine_context_refusal(&terminal_return_artifact());
-    }
-
-    #[test]
-    fn hand_authored_memory_load_returns_cannot_authorize_differential() {
-        for endianness in [Endianness::Little, Endianness::Big] {
-            for width_bytes in [1_u32, 2, 4, 8] {
-                assert_machine_context_refusal(&load_return_artifact(endianness, width_bytes));
-            }
-        }
-    }
-
-    #[test]
-    fn hand_authored_memory_store_void_cannot_authorize_differential() {
-        let mut block = R2ILBlock::new(0x7090, 4);
-        block.push(R2ILOp::Store {
-            space: SpaceId::Ram,
-            addr: Varnode::constant(0x40, 8),
-            val: Varnode::constant(0x1122, 2),
-        });
-        block.push(R2ILOp::Return {
-            target: Varnode::register(16, 8),
-        });
-        let artifact = SsaArtifact::raw_with_interface(
-            &[block],
-            Some(&memory_return_arch(Endianness::Big, 2)),
-            memory_return_interface(SourceFunctionReturn::Void),
-        )
-        .expect("store-void artifact");
-        assert_machine_context_refusal(&artifact);
-    }
-
-    #[test]
-    fn hand_authored_memory_ordering_cannot_supply_aliasing_baseline() {
-        for endianness in [Endianness::Little, Endianness::Big] {
-            assert_machine_context_refusal(&ordered_memory_return_artifact(endianness));
-        }
-    }
-
-    #[test]
-    fn fabricated_memory_oob_baseline_is_refused_before_execution() {
-        assert_machine_context_refusal(&load_return_artifact(Endianness::Little, 4));
-    }
-
-    #[test]
-    fn fabricated_memory_budget_baseline_is_refused_before_execution() {
-        assert_machine_context_refusal(&load_return_artifact(Endianness::Little, 4));
-    }
-
-    #[test]
-    fn hand_authored_conditional_return_cannot_authorize_differential() {
-        assert_machine_context_refusal(&conditional_return_artifact());
-    }
-
-    #[test]
-    fn fabricated_conditional_budget_baseline_is_refused_before_execution() {
-        assert_machine_context_refusal(&conditional_return_artifact());
-    }
-
     #[test]
     fn rendered_conditional_oracle_observes_polarity_and_arm_order() {
         let state = ExecutionState {
@@ -6002,41 +5689,6 @@ mod tests {
             parse_rendered_conditional_return(&swapped, &state).expect("swapped"),
             (true, RenderedConditionalReturn::Value(ValueId(2)))
         );
-    }
-
-    #[test]
-    fn fabricated_terminal_identity_and_budget_baseline_is_refused_at_certification() {
-        let artifact = terminal_return_artifact();
-        assert_machine_context_refusal(&artifact);
-
-        let mut invalid_block = R2ILBlock::new(0x7090, 4);
-        invalid_block.push(R2ILOp::Return {
-            target: Varnode::register(16, 8),
-        });
-        let mut invalid_arch = ArchSpec::new("invalid-terminal-return-differential-test");
-        invalid_arch.add_register(RegisterDef::new("rip", 16, 8));
-        let invalid_interface = SourceFunctionInterface::new(
-            b"invalid-terminal-return-revision".to_vec(),
-            "test-register-abi",
-            [SourceAbiParameterSpec::new(
-                0,
-                CanonicalStorageId {
-                    space: CanonicalStorageSpace::Register,
-                    offset: 8,
-                    size: 8,
-                },
-            )],
-            SourceFunctionReturn::Void,
-            [],
-        )
-        .expect("syntactically valid interface");
-        let invalid_artifact = SsaArtifact::raw_with_interface(
-            &[invalid_block],
-            Some(&invalid_arch),
-            invalid_interface,
-        )
-        .expect("invalid-context artifact");
-        assert_machine_context_refusal(&invalid_artifact);
     }
 
     #[test]
@@ -6111,62 +5763,6 @@ mod tests {
     }
 
     #[test]
-    fn artifact_origin_rejects_colliding_value_ids() {
-        let artifact = |register_offset| {
-            let mut block = R2ILBlock::new(0x70f0, 4);
-            block.push(R2ILOp::Copy {
-                dst: Varnode::unique(0x10, 1),
-                src: Varnode::register(register_offset, 1),
-            });
-            SsaArtifact::raw(&[block], None).expect("origin artifact")
-        };
-        let first = artifact(0);
-        let second = artifact(8);
-        let first_input = first.graph().insts[0].inputs[0];
-        let second_input = second.graph().insts[0].inputs[0];
-        assert_eq!(first_input, second_input);
-        let mut state = DifferentialState::for_artifact(&first).expect("first state");
-        let second_state = DifferentialState::for_artifact(&second).expect("second state");
-        state.set_value(
-            first_input,
-            DifferentialBitVector::new(8, 0x42).expect("input"),
-        );
-        assert_ne!(state.artifact_identity(), second_state.artifact_identity());
-        let report =
-            check_block_differential(&second, 0x70f0, &state, DifferentialLimits::default());
-        assert_eq!(report.conclusion(), DifferentialConclusion::InvalidInput);
-        assert_eq!(
-            report.admission(),
-            DifferentialCandidateAdmission::NotEvaluated
-        );
-        assert!(matches!(
-            report.disposition(),
-            DifferentialCaseDisposition::InvalidInput { reason }
-                if reason == "differential state belongs to a different certified artifact origin"
-        ));
-        assert_eq!(
-            report.artifact_identity(),
-            Some(second_state.artifact_identity())
-        );
-        assert!(report.source().is_none());
-        assert!(report.semantic_c().is_none());
-
-        let zero_limits = DifferentialLimits {
-            max_source_steps: 0,
-            ..DifferentialLimits::default()
-        };
-        let early_report = check_block_differential(&second, 0x70f0, &state, zero_limits);
-        assert_eq!(
-            early_report.conclusion(),
-            DifferentialConclusion::InvalidInput
-        );
-        assert_eq!(
-            early_report.artifact_identity(),
-            Some(second_state.artifact_identity())
-        );
-    }
-
-    #[test]
     fn ordered_event_and_final_memory_mutations_are_detected() {
         let location = DifferentialMemoryLocation {
             space: MachineAddressSpace::Ram,
@@ -6223,142 +5819,6 @@ mod tests {
             first_difference(&run, &memory).map(|difference| difference.kind),
             Some(DifferentialMismatchKind::FinalMemory)
         );
-    }
-
-    #[test]
-    fn divergent_failure_prefixes_produce_a_structured_mismatch_report() {
-        let mut block = R2ILBlock::new(0x7304, 4);
-        block.push(R2ILOp::Nop);
-        let artifact = SsaArtifact::raw(&[block], None).expect("report artifact");
-        let state = DifferentialState::for_artifact(&artifact).expect("bound state");
-        let location = DifferentialMemoryLocation {
-            space: MachineAddressSpace::Ram,
-            byte_address: 0x40,
-        };
-        let event = DifferentialMemoryEvent {
-            producer: CanonicalInstructionId {
-                block_addr: 0x7304,
-                site: CanonicalInstructionSite::Op(0),
-            },
-            access: StructuredAccessId {
-                inst: r2ssa::InstId(0),
-                ordinal: 0,
-            },
-            object: ObjectId(0),
-            kind: DifferentialMemoryEventKind::Write,
-            space: MachineAddressSpace::Ram,
-            byte_address: 0x40,
-            width_bits: 8,
-            endianness: MachineMemoryEndianness::Little,
-            value: DifferentialBitVector::new(8, 1).expect("byte"),
-        };
-        let source = FailedRun {
-            failure: RunFailure::MemoryOutOfDomain(location),
-            trace: DifferentialObservedTrace {
-                memory_events: vec![event].into_boxed_slice(),
-                final_memory: Box::new([]),
-            },
-        };
-        let semantic_c = FailedRun {
-            failure: RunFailure::MemoryOutOfDomain(location),
-            trace: DifferentialObservedTrace {
-                memory_events: Box::new([]),
-                final_memory: Box::new([]),
-            },
-        };
-        let report = finish_report(
-            &state,
-            None,
-            0x7304,
-            DifferentialLimits::default(),
-            Err(source),
-            Err(semantic_c),
-        );
-        assert_eq!(
-            report.conclusion(),
-            DifferentialConclusion::MismatchObserved
-        );
-        assert!(matches!(
-            report.disposition(),
-            DifferentialCaseDisposition::SemanticMismatch {
-                mismatch: DifferentialMismatch {
-                    kind: DifferentialMismatchKind::MemoryEventSequence,
-                    index: Some(0),
-                    ..
-                }
-            }
-        ));
-        assert!(report.source_prefix().is_some());
-        assert!(report.semantic_c_prefix().is_some());
-    }
-
-    #[test]
-    fn equal_failure_prefixes_preserve_meta_failure_taxonomy() {
-        let mut block = R2ILBlock::new(0x7306, 4);
-        block.push(R2ILOp::Nop);
-        let artifact = SsaArtifact::raw(&[block], None).expect("report artifact");
-        let state = DifferentialState::for_artifact(&artifact).expect("bound state");
-        let empty_trace = || DifferentialObservedTrace {
-            memory_events: Box::new([]),
-            final_memory: Box::new([]),
-        };
-        let finish = |source_failure, semantic_failure| {
-            finish_report(
-                &state,
-                None,
-                0x7306,
-                DifferentialLimits::default(),
-                Err(FailedRun {
-                    failure: source_failure,
-                    trace: empty_trace(),
-                }),
-                Err(FailedRun {
-                    failure: semantic_failure,
-                    trace: empty_trace(),
-                }),
-            )
-        };
-
-        for report in [
-            finish(
-                RunFailure::Unsupported("source gap".to_string()),
-                RunFailure::BudgetExceeded,
-            ),
-            finish(
-                RunFailure::MissingBoundaryInput(ValueId(7)),
-                RunFailure::MemoryOutOfDomain(DifferentialMemoryLocation {
-                    space: MachineAddressSpace::Ram,
-                    byte_address: 0x40,
-                }),
-            ),
-        ] {
-            assert_eq!(report.conclusion(), DifferentialConclusion::Incomplete);
-            assert!(matches!(
-                report.disposition(),
-                DifferentialCaseDisposition::InconclusiveExecutionPair { .. }
-            ));
-        }
-
-        for report in [
-            finish(
-                RunFailure::Invalid("source invariant".to_string()),
-                RunFailure::BudgetExceeded,
-            ),
-            finish(
-                RunFailure::Unsupported("source gap".to_string()),
-                RunFailure::Invalid("semantic invariant".to_string()),
-            ),
-            finish(
-                RunFailure::Invalid("source invariant".to_string()),
-                RunFailure::Invalid("semantic invariant".to_string()),
-            ),
-        ] {
-            assert_eq!(report.conclusion(), DifferentialConclusion::HarnessFailure);
-            assert!(matches!(
-                report.disposition(),
-                DifferentialCaseDisposition::HarnessFailure { .. }
-            ));
-        }
     }
 
     #[test]
