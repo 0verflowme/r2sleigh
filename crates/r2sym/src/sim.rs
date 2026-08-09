@@ -328,6 +328,12 @@ pub struct SummaryInstallStats {
     pub duplicates: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScopedFunctionProvenance {
+    Analyzed,
+    RuntimeMaterialized,
+}
+
 #[derive(Debug, Clone)]
 pub struct ScopedPreparedFunction {
     pub id: InterprocFunctionId,
@@ -339,18 +345,38 @@ pub struct ScopedPreparedFunction {
 pub struct PreparedFunctionScope {
     root: InterprocFunctionId,
     functions: BTreeMap<InterprocFunctionId, ScopedPreparedFunction>,
+    provenance: BTreeMap<InterprocFunctionId, ScopedFunctionProvenance>,
 }
 
 impl PreparedFunctionScope {
     pub fn new(root_addr: u64, functions: Vec<ScopedPreparedFunction>) -> Option<Self> {
+        let provenance = functions
+            .iter()
+            .map(|function| (function.id, ScopedFunctionProvenance::Analyzed))
+            .collect();
+        Self::new_with_provenance(root_addr, functions, provenance)
+    }
+
+    pub fn new_with_provenance(
+        root_addr: u64,
+        functions: Vec<ScopedPreparedFunction>,
+        provenance: BTreeMap<InterprocFunctionId, ScopedFunctionProvenance>,
+    ) -> Option<Self> {
         let root = InterprocFunctionId(root_addr);
         let mut by_id = BTreeMap::new();
         for function in functions {
             by_id.insert(function.id, function);
         }
-        by_id.contains_key(&root).then_some(Self {
+        if !by_id.contains_key(&root)
+            || provenance.len() != by_id.len()
+            || provenance.keys().any(|id| !by_id.contains_key(id))
+        {
+            return None;
+        }
+        Some(Self {
             root,
             functions: by_id,
+            provenance,
         })
     }
 
@@ -364,6 +390,13 @@ impl PreparedFunctionScope {
 
     pub fn functions(&self) -> &BTreeMap<InterprocFunctionId, ScopedPreparedFunction> {
         &self.functions
+    }
+
+    pub fn provenance_of(
+        &self,
+        function: &ScopedPreparedFunction,
+    ) -> Option<ScopedFunctionProvenance> {
+        self.provenance.get(&function.id).copied()
     }
 
     pub fn function_containing_block(&self, pc: u64) -> Option<&ScopedPreparedFunction> {
@@ -392,15 +425,15 @@ impl PreparedFunctionScope {
                 }
             }
         }
-        Self::new(self.root.0, functions)
+        Self::new_with_provenance(self.root.0, functions, self.provenance.clone())
     }
 }
 
-fn is_runtime_materialized_scope_function(function: &ScopedPreparedFunction) -> bool {
-    function
-        .name
-        .as_deref()
-        .is_some_and(|name| name.starts_with("runtime.materialized."))
+fn is_runtime_materialized_scope_function(
+    scope: &PreparedFunctionScope,
+    function: &ScopedPreparedFunction,
+) -> bool {
+    scope.provenance_of(function) == Some(ScopedFunctionProvenance::RuntimeMaterialized)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -722,7 +755,7 @@ impl<'ctx> SummaryRegistry<'ctx> {
 
         let helper_scope = scope
             .helper_functions()
-            .filter(|helper| !is_runtime_materialized_scope_function(helper))
+            .filter(|helper| !is_runtime_materialized_scope_function(scope, helper))
             .map(|helper| (helper.id, helper))
             .collect::<BTreeMap<_, _>>();
         let sccs = compute_derived_summary_sccs(&helper_scope);
@@ -1031,7 +1064,7 @@ fn build_interproc_summary_set(
     let mut inputs = Vec::new();
     let mut seeds = BTreeMap::new();
     for function in scope.functions().values() {
-        if is_runtime_materialized_scope_function(function) {
+        if is_runtime_materialized_scope_function(scope, function) {
             continue;
         }
         inputs.push(InterprocFunctionInput {
@@ -3049,6 +3082,58 @@ mod tests {
                 .entry,
             helper.entry
         );
+    }
+
+    #[test]
+    fn scoped_function_provenance_not_display_name_controls_runtime_exclusion() {
+        let blocks = vec![R2ILBlock {
+            addr: 0x1000,
+            size: 1,
+            ops: vec![R2ILOp::Return {
+                target: const_vn(0, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+        let root = SsaArtifact::for_symbolic(&blocks, Some(&test_arch())).expect("root");
+        let helper = root
+            .clone()
+            .with_name("runtime.materialized.display-only".to_string());
+        let runtime = root.clone().with_name("ordinary-display-name".to_string());
+        let root_id = InterprocFunctionId(0x1000);
+        let helper_id = InterprocFunctionId(0x2000);
+        let runtime_id = InterprocFunctionId(0x3000);
+        let scope = PreparedFunctionScope::new_with_provenance(
+            root_id.0,
+            vec![
+                ScopedPreparedFunction {
+                    id: root_id,
+                    name: Some("root".to_string()),
+                    prepared: root,
+                },
+                ScopedPreparedFunction {
+                    id: helper_id,
+                    name: Some("runtime.materialized.display-only".to_string()),
+                    prepared: helper,
+                },
+                ScopedPreparedFunction {
+                    id: runtime_id,
+                    name: Some("ordinary-display-name".to_string()),
+                    prepared: runtime,
+                },
+            ],
+            BTreeMap::from([
+                (root_id, ScopedFunctionProvenance::Analyzed),
+                (helper_id, ScopedFunctionProvenance::Analyzed),
+                (runtime_id, ScopedFunctionProvenance::RuntimeMaterialized),
+            ]),
+        )
+        .expect("typed scope");
+
+        let helper = scope.functions().get(&helper_id).expect("helper");
+        let runtime = scope.functions().get(&runtime_id).expect("runtime source");
+        assert!(!is_runtime_materialized_scope_function(&scope, helper));
+        assert!(is_runtime_materialized_scope_function(&scope, runtime));
     }
 
     #[test]

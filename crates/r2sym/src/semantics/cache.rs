@@ -222,6 +222,7 @@ pub fn stable_scope_hash(scope: Option<&PreparedFunctionScope>) -> u64 {
     scope.root_id().hash(&mut hasher);
     for function in scope.functions().values() {
         function.id.hash(&mut hasher);
+        scope.provenance_of(function).hash(&mut hasher);
         function.prepared.function().entry.hash(&mut hasher);
         ssa_shape_hash(&function.prepared).hash(&mut hasher);
     }
@@ -297,10 +298,12 @@ pub(crate) fn cache_insert_bounded(
 
 #[cfg(test)]
 mod display_name_tests {
+    use std::collections::BTreeMap;
+
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
     use r2ssa::{InterprocFunctionId, SsaArtifact};
 
-    use crate::sim::{PreparedFunctionScope, ScopedPreparedFunction};
+    use crate::sim::{PreparedFunctionScope, ScopedFunctionProvenance, ScopedPreparedFunction};
 
     use super::{
         BoundedArcCache, SEMANTIC_ARTIFACT_SCHEMA_VERSION, SemanticCacheScopeKind,
@@ -475,6 +478,64 @@ mod display_name_tests {
         assert_eq!(
             stable_scope_hash(Some(&left)),
             stable_scope_hash(Some(&right))
+        );
+    }
+
+    #[test]
+    fn stable_scope_hash_binds_provenance_but_not_display_name() {
+        let root_id = InterprocFunctionId(0x1000);
+        let helper_id = InterprocFunctionId(0x2000);
+        let root = ScopedPreparedFunction {
+            id: root_id,
+            name: Some("root".to_string()),
+            prepared: simple_function(root_id.0),
+        };
+        let helper = ScopedPreparedFunction {
+            id: helper_id,
+            name: Some("runtime.materialized.display-only".to_string()),
+            prepared: simple_function(helper_id.0),
+        };
+        let normal = PreparedFunctionScope::new_with_provenance(
+            root_id.0,
+            vec![root.clone(), helper.clone()],
+            BTreeMap::from([
+                (root_id, ScopedFunctionProvenance::Analyzed),
+                (helper_id, ScopedFunctionProvenance::Analyzed),
+            ]),
+        )
+        .expect("normal scope");
+        let materialized = PreparedFunctionScope::new_with_provenance(
+            root_id.0,
+            vec![root.clone(), helper.clone()],
+            BTreeMap::from([
+                (root_id, ScopedFunctionProvenance::Analyzed),
+                (helper_id, ScopedFunctionProvenance::RuntimeMaterialized),
+            ]),
+        )
+        .expect("runtime scope");
+        let renamed = PreparedFunctionScope::new_with_provenance(
+            root_id.0,
+            vec![
+                root,
+                ScopedPreparedFunction {
+                    name: Some("unrelated-display-name".to_string()),
+                    ..helper
+                },
+            ],
+            BTreeMap::from([
+                (root_id, ScopedFunctionProvenance::Analyzed),
+                (helper_id, ScopedFunctionProvenance::Analyzed),
+            ]),
+        )
+        .expect("renamed normal scope");
+
+        assert_ne!(
+            stable_scope_hash(Some(&normal)),
+            stable_scope_hash(Some(&materialized))
+        );
+        assert_eq!(
+            stable_scope_hash(Some(&normal)),
+            stable_scope_hash(Some(&renamed))
         );
     }
 }

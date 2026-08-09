@@ -174,7 +174,11 @@ struct R2ILFunctionBlocks {
 	const char *name;
 	const R2ILBlock **blocks;
 	size_t num_blocks;
+	unsigned int provenance;
 };
+
+#define R2SLEIGH_SCOPED_FUNCTION_PROVENANCE_ANALYZED 0U
+#define R2SLEIGH_SCOPED_FUNCTION_PROVENANCE_RUNTIME_MATERIALIZED 1U
 typedef struct {
 	const char *name;
 	unsigned long long value;
@@ -9012,6 +9016,7 @@ static bool sym_function_scope_append(
 	scope->functions[scope->count].name = scope->owned_names[scope->count];
 	scope->functions[scope->count].blocks = (const R2ILBlock **)scope->owned_blocks[scope->count].blocks;
 	scope->functions[scope->count].num_blocks = scope->owned_blocks[scope->count].count;
+	scope->functions[scope->count].provenance = R2SLEIGH_SCOPED_FUNCTION_PROVENANCE_ANALYZED;
 	scope->total_blocks += blocks.count;
 	scope->total_ops += lifted_ops;
 	scope->count++;
@@ -9115,13 +9120,14 @@ static bool sym_function_scope_append_runtime_source(
 		block_array_free (&blocks);
 		return false;
 	}
-	snprintf (name, sizeof (name), "runtime.materialized.%"PFMT64x, addr);
+	snprintf (name, sizeof (name), "runtime.source.%"PFMT64x, addr);
 	scope->owned_blocks[scope->count] = blocks;
 	scope->owned_names[scope->count] = strdup (name);
 	scope->functions[scope->count].entry_addr = addr;
 	scope->functions[scope->count].name = scope->owned_names[scope->count];
 	scope->functions[scope->count].blocks = (const R2ILBlock **)scope->owned_blocks[scope->count].blocks;
 	scope->functions[scope->count].num_blocks = scope->owned_blocks[scope->count].count;
+	scope->functions[scope->count].provenance = R2SLEIGH_SCOPED_FUNCTION_PROVENANCE_RUNTIME_MATERIALIZED;
 	scope->total_blocks += blocks.count;
 	scope->total_ops += lifted_ops;
 	scope->count++;
