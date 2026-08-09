@@ -3023,7 +3023,15 @@ fn collect_renderable_expression_values(
 
 fn expression_leaf_is_renderable(value: &crate::graph::GraphValue) -> bool {
     value.var.size > 0
-        && (value.var.is_const() || (value.var.version == 0 && value.var.is_register()))
+        && (value.var.constant_bits().is_some()
+            || (value.var.version == 0
+                && matches!(
+                    value.canonical_storage,
+                    Some(CanonicalStorageId {
+                        space: CanonicalStorageSpace::Register,
+                        ..
+                    })
+                )))
 }
 
 fn expression_inst_is_renderable(
@@ -5438,10 +5446,11 @@ fn collect_call_sites(
             };
             let id = CallSiteId(next_id);
             next_id = next_id.saturating_add(1);
-            let direct_target = resolve_const_value(prep_facts, &target);
             let raw_identity = machine_context
                 .and_then(|context| context.raw_call_site_identity(id))
                 .filter(|identity| identity.block_addr() == block_addr);
+            let direct_target = resolve_graph_literal_value(graph, prep_facts, &target)
+                .or_else(|| raw_identity.and_then(direct_target_from_raw_identity));
             by_inst.insert(inst_id, id);
             by_id.insert(
                 id,
@@ -6040,10 +6049,10 @@ fn compare_values_equivalent_inner(
         if lhs_value.var.size != rhs_value.var.size {
             return Some(false);
         }
-        if lhs_value.var.is_const() || rhs_value.var.is_const() {
+        if lhs_value.var.constant_bits().is_some() || rhs_value.var.constant_bits().is_some() {
             return Some(
-                lhs_value.var.is_const()
-                    && rhs_value.var.is_const()
+                lhs_value.var.constant_bits().is_some()
+                    && rhs_value.var.constant_bits().is_some()
                     && const_value(&lhs_value.var) == const_value(&rhs_value.var),
             );
         }
@@ -6230,6 +6239,36 @@ fn resolve_const_value(facts: Option<&DecompilePrepFacts>, var: &SSAVar) -> Opti
     const_value(root).or_else(|| const_value(var))
 }
 
+fn resolve_graph_literal_value(
+    graph: &SsaGraph,
+    facts: Option<&DecompilePrepFacts>,
+    var: &SSAVar,
+) -> Option<u64> {
+    let root = canonical_value_root(facts, var);
+    let value = graph
+        .value_id_for_var(root)
+        .or_else(|| graph.value_id_for_var(var))
+        .and_then(|id| graph.value(id))?;
+    value.var.constant_bits().or_else(|| {
+        value.canonical_storage.and_then(|storage| {
+            matches!(
+                storage.space,
+                CanonicalStorageSpace::Constant | CanonicalStorageSpace::Ram
+            )
+            .then_some(storage.offset)
+        })
+    })
+}
+
+fn direct_target_from_raw_identity(identity: SourceCallSiteIdentity) -> Option<u64> {
+    let target = identity.target();
+    matches!(
+        target.space,
+        CanonicalStorageSpace::Constant | CanonicalStorageSpace::Ram
+    )
+    .then_some(target.offset)
+}
+
 fn resolve_stack_root(
     facts: Option<&DecompilePrepFacts>,
     var: &SSAVar,
@@ -6240,7 +6279,6 @@ fn resolve_stack_root(
         .stack_address_root_of(var)
         .copied()
         .or_else(|| facts.stack_address_root_of(root).copied())
-        .or_else(|| stack_base_root_for_name(&root.name))
 }
 
 fn canonical_value_root<'a>(facts: Option<&'a DecompilePrepFacts>, var: &'a SSAVar) -> &'a SSAVar {
@@ -6261,45 +6299,15 @@ fn canonical_value_root<'a>(facts: Option<&'a DecompilePrepFacts>, var: &'a SSAV
 }
 
 fn const_value(var: &SSAVar) -> Option<u64> {
-    let value_str = if let Some(value) = var.name.strip_prefix("const:") {
-        value
-    } else if let Some(value) = var.name.strip_prefix("ram:") {
-        value
-    } else {
-        return None;
-    };
-    let value_str = value_str.split('_').next().unwrap_or(value_str);
-    if let Some(dec) = value_str
-        .strip_prefix("0d")
-        .or_else(|| value_str.strip_prefix("0D"))
-    {
-        return dec.parse().ok();
-    }
-    if let Some(hex) = value_str
-        .strip_prefix("0x")
-        .or_else(|| value_str.strip_prefix("0X"))
-    {
-        return u64::from_str_radix(hex, 16).ok();
-    }
-    u64::from_str_radix(value_str, 16).ok()
-}
-
-fn stack_base_root_for_name(name: &str) -> Option<StackAddressRoot> {
-    let lower = name.trim().to_ascii_lowercase();
-    let base = match lower.as_str() {
-        "sp" | "rsp" | "esp" | "wsp" => StackAddressBase::StackPointer,
-        "fp" | "bp" | "rbp" | "ebp" | "x29" | "w29" | "s0" => StackAddressBase::FramePointer,
-        _ => return None,
-    };
-    Some(StackAddressRoot { base, offset: 0 })
+    var.constant_bits()
 }
 
 #[cfg(test)]
 mod tests {
     use super::ControlGuard;
     use crate::{
-        CanonicalStorageId, CanonicalStorageSpace, SemanticObligationKind, SourceAbiParameterSpec,
-        SourceFunctionInterface, SourceFunctionReturn, SsaArtifact,
+        CanonicalStorageId, CanonicalStorageSpace, SSAVar, SemanticObligationKind,
+        SourceAbiParameterSpec, SourceFunctionInterface, SourceFunctionReturn, SsaArtifact,
     };
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
 
@@ -6309,6 +6317,20 @@ mod tests {
 
     fn test_const(value: u64) -> Varnode {
         Varnode::constant(value, 8)
+    }
+
+    #[test]
+    fn display_names_do_not_resolve_constants_or_stack_roots() {
+        let named_constant = SSAVar::new("ram:0x401000", 0, 8);
+        assert_eq!(super::const_value(&named_constant), None);
+        assert_eq!(super::resolve_const_value(None, &named_constant), None);
+
+        let named_stack_pointer = SSAVar::new("rsp", 0, 8);
+        assert_eq!(super::resolve_stack_root(None, &named_stack_pointer), None);
+
+        let mut canonical_constant = SSAVar::constant(0x401000, 8);
+        canonical_constant.name = "unrelated-display-name".to_string();
+        assert_eq!(super::const_value(&canonical_constant), Some(0x401000));
     }
 
     fn conditional_block(addr: u64, selector: u64, target: u64) -> R2ILBlock {

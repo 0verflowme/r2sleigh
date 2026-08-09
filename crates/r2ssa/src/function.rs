@@ -559,8 +559,16 @@ impl SsaArtifact {
     pub fn resolved_call_target(&self, call: &crate::semantic::CallSiteFact) -> Option<u64> {
         call.direct_target.or_else(|| {
             let value_id = canonical_root_value_id(self, call.target);
-            let var = self.value_var(value_id)?;
-            parse_literal_value_name(&var.name)
+            let value = self.graph.value(value_id)?;
+            value.var.constant_bits().or_else(|| {
+                value.canonical_storage.and_then(|storage| {
+                    matches!(
+                        storage.space,
+                        crate::CanonicalStorageSpace::Constant | crate::CanonicalStorageSpace::Ram
+                    )
+                    .then_some(storage.offset)
+                })
+            })
         })
     }
 
@@ -643,30 +651,6 @@ fn canonical_root_value_id(
         current_id = next_id;
     }
     current_id
-}
-
-fn parse_literal_value_name(name: &str) -> Option<u64> {
-    let value_str = if let Some(value) = name.strip_prefix("const:") {
-        value
-    } else if let Some(value) = name.strip_prefix("ram:") {
-        value
-    } else {
-        return None;
-    };
-    let value_str = value_str.split('_').next().unwrap_or(value_str);
-    if let Some(dec) = value_str
-        .strip_prefix("0d")
-        .or_else(|| value_str.strip_prefix("0D"))
-    {
-        return dec.parse().ok();
-    }
-    if let Some(hex) = value_str
-        .strip_prefix("0x")
-        .or_else(|| value_str.strip_prefix("0X"))
-    {
-        return u64::from_str_radix(hex, 16).ok();
-    }
-    u64::from_str_radix(value_str, 16).ok()
 }
 
 impl Deref for SsaArtifact {
@@ -2133,7 +2117,7 @@ impl SSAFunction {
                                 changed |= insert_stack_root(
                                     &mut facts.stack_address_roots,
                                     dst.clone(),
-                                    normalize_copied_stack_root_for_dst(dst, stack_root),
+                                    stack_root,
                                 );
                             }
                         }
@@ -3120,15 +3104,16 @@ fn rewrite_decompile_family_source(
 
 fn adapt_family_root(root: &SSAVar, width: u32) -> Option<SSAVar> {
     if root.size == width {
-        return Some(root.clone());
+        return (!root.name_kind().is_constant() || root.constant_bits().is_some())
+            .then(|| root.clone());
+    }
+    if let Some(value) = root.constant_bits() {
+        return Some(SSAVar::constant(mask_const_to_width(value, width), width));
     }
     if root.size > width && can_width_adapt_register_family_root(root) {
         return Some(SSAVar::new(root.name.clone(), root.version, width));
     }
-    if !root.is_const() {
-        return None;
-    }
-    const_value(root).map(|value| SSAVar::constant(mask_const_to_width(value, width), width))
+    None
 }
 
 fn direct_family_root_value(root: &RegisterFamilyRoot, width: u32) -> Option<SSAVar> {
@@ -3237,11 +3222,7 @@ fn family_slots_overlap(a: RegisterFamilySlot, b: RegisterFamilySlot) -> bool {
 }
 
 fn const_value(var: &SSAVar) -> Option<u64> {
-    if !var.is_const() {
-        return None;
-    }
-    let hex = var.name.strip_prefix("const:")?;
-    u64::from_str_radix(hex, 16).ok()
+    var.constant_bits()
 }
 
 fn mask_const_to_width(value: u64, width: u32) -> u64 {
@@ -3297,16 +3278,6 @@ fn common_root(values: &[SSAVar]) -> Option<SSAVar> {
     }
 }
 
-fn stack_base_root_for_name(name: &str) -> Option<StackAddressRoot> {
-    let lower = name.trim().to_ascii_lowercase();
-    let base = match lower.as_str() {
-        "sp" | "rsp" | "esp" | "wsp" => StackAddressBase::StackPointer,
-        "fp" | "bp" | "rbp" | "ebp" | "x29" | "w29" | "s0" => StackAddressBase::FramePointer,
-        _ => return None,
-    };
-    Some(StackAddressRoot { base, offset: 0 })
-}
-
 fn resolve_value_root(
     var: &SSAVar,
     roots: &BTreeMap<SSAVar, SSAVar>,
@@ -3350,20 +3321,6 @@ fn resolve_stack_root(
         .get(var)
         .copied()
         .or_else(|| stack_roots.get(&resolved).copied())
-        .or_else(|| stack_base_root_for_name(&resolved.name))
-}
-
-fn normalize_copied_stack_root_for_dst(dst: &SSAVar, root: StackAddressRoot) -> StackAddressRoot {
-    match stack_base_root_for_name(&dst.name) {
-        Some(StackAddressRoot {
-            base: StackAddressBase::FramePointer,
-            ..
-        }) => StackAddressRoot {
-            base: StackAddressBase::FramePointer,
-            offset: 0,
-        },
-        _ => root,
-    }
 }
 
 fn common_stack_root(
@@ -3607,9 +3564,7 @@ impl SSABlock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::semantic::{
-        CallArgumentLocation, CallResultValueRelation, ReturnCarrier, SemanticId, ValueOwner,
-    };
+    use crate::semantic::{CallArgumentLocation, ReturnCarrier, SemanticId, ValueOwner};
     use r2il::{R2ILOp, RegisterDef, SpaceId, SwitchCase, SwitchInfo as R2ILSwitchInfo, Varnode};
     use std::cell::Cell;
     use std::collections::BTreeSet;
@@ -4391,7 +4346,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_function_ssa_collects_object_memory_and_predicate_facts() {
+    fn prepared_function_ssa_refuses_display_named_stack_object_facts() {
         let arch = make_x86_64_prep_arch();
         let blocks = vec![
             R2ILBlock {
@@ -4459,16 +4414,7 @@ mod tests {
         let prepared =
             SsaArtifact::for_decompile(&blocks, Some(&arch)).expect("prepared SSA should build");
 
-        assert!(
-            prepared
-                .objects()
-                .stack_objects
-                .contains_key(&StackAddressRoot {
-                    base: StackAddressBase::FramePointer,
-                    offset: -32,
-                }),
-            "stack-root-derived stack object should be materialized"
-        );
+        assert!(prepared.objects().stack_objects.is_empty());
         assert!(
             prepared
                 .objects()
@@ -4742,7 +4688,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_function_certifies_stack_reload_at_control_return() {
+    fn prepared_function_refuses_display_named_stack_reload_at_control_return() {
         let mut arch = make_x86_64_prep_arch();
         arch.add_register(RegisterDef::new("rip", 0x30, 8));
         let slot = make_unique(0x1880, 8);
@@ -4817,22 +4763,18 @@ mod tests {
         assert!(
             prepared
                 .stack_reload_certificate_for_value(cert.value)
-                .is_some_and(|reload| reload.offset == -8),
-            "control return value must retain stack reload proof, got {cert:?}"
+                .is_none()
         );
         assert!(
             prepared
                 .call_result_certificate_for_value(cert.value)
-                .is_some_and(|call| matches!(
-                    call.owner,
-                    Some(ValueOwner::StackSlot { offset: -8, .. })
-                )),
-            "control return value must retain malloc-result stack ownership"
+                .is_none_or(|call| !matches!(call.owner, Some(ValueOwner::StackSlot { .. }))),
+            "display-named stack storage cannot establish an owning stack slot"
         );
     }
 
     #[test]
-    fn prepared_function_merges_zero_return_with_equal_stack_slot_at_control_return() {
+    fn prepared_function_refuses_display_named_stack_merge_at_control_return() {
         let mut arch = make_x86_64_prep_arch();
         arch.add_register(RegisterDef::new("rip", 0x30, 8));
         let slot = make_unique(0x1900, 8);
@@ -4932,8 +4874,7 @@ mod tests {
         assert!(
             prepared
                 .stack_reload_certificate_for_value(cert.value)
-                .is_some_and(|reload| reload.offset == -8),
-            "merged control return must use the stack-slot value, got {cert:?}"
+                .is_none()
         );
     }
 
@@ -5653,7 +5594,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_call_result_certifies_stack_store_reload_owner() {
+    fn prepared_call_result_refuses_display_named_stack_store_reload_owner() {
         let arch = make_x86_64_prep_arch();
         let slot = make_unique(0x1780, 8);
         let stored = make_unique(0x1788, 8);
@@ -5716,13 +5657,10 @@ mod tests {
             .graph()
             .value_id_for_var(&alias_var)
             .expect("alias value");
-        let cert = prepared
-            .call_result_certificate_for_value(alias_value)
-            .expect("reloaded alias should have call-result certificate");
-        assert_eq!(cert.relation, CallResultValueRelation::Identity);
         assert!(
-            matches!(cert.owner, Some(ValueOwner::StackSlot { offset: -8, .. })),
-            "reloaded call result should be owned by the frame slot, got {cert:?}"
+            prepared
+                .call_result_certificate_for_value(alias_value)
+                .is_none()
         );
         let truncated_var = prepared
             .function()
@@ -5734,20 +5672,17 @@ mod tests {
                 })
             })
             .expect("truncated call-result value");
-        let truncated_cert = prepared
-            .graph()
-            .value_id_for_var(truncated_var)
-            .and_then(|value| prepared.call_result_certificate_for_value(value))
-            .expect("derived call-result certificate");
-        assert_eq!(
-            truncated_cert.relation,
-            CallResultValueRelation::Derived,
-            "width-changing transforms must retain provenance without claiming identity"
+        assert!(
+            prepared
+                .graph()
+                .value_id_for_var(truncated_var)
+                .and_then(|value| prepared.call_result_certificate_for_value(value))
+                .is_none()
         );
     }
 
     #[test]
-    fn prepared_stack_reload_certifies_param_home_source_through_extension() {
+    fn prepared_stack_reload_refuses_display_named_param_home() {
         let mut arch = make_x86_64_prep_arch();
         arch.add_register(RegisterDef::new("rsi", 32, 8));
         arch.add_register(RegisterDef::new("esi", 32, 4));
@@ -5785,39 +5720,25 @@ mod tests {
 
         let prepared =
             SsaArtifact::for_decompile(&blocks, Some(&arch)).expect("prepared SSA should build");
-        let source_value = prepared
-            .graph()
-            .value_id_for_var(&SSAVar::new("esi", 0, 4))
-            .expect("entry esi value");
-        let load_cert = prepared
-            .stack_reload_certificate_for_op(0x1820, 2)
-            .expect("direct stack reload certificate");
-        assert_eq!(load_cert.source, source_value);
-        assert_eq!(load_cert.canonical_source, source_value);
-        assert_eq!(load_cert.base, StackAddressBase::FramePointer);
-        assert_eq!(load_cert.offset, -32);
-        assert_eq!(load_cert.value_width, 4);
-        assert_eq!(load_cert.memory_width, 4);
+        assert!(
+            prepared
+                .stack_reload_certificate_for_op(0x1820, 2)
+                .is_none()
+        );
 
         let extended_value = prepared
             .graph()
             .value_id_for_var(&SSAVar::new("tmp:1830", 1, 8))
             .expect("extended index value");
-        let extended_cert = prepared
-            .stack_reload_certificate_for_value(extended_value)
-            .expect("extension should carry stack reload source");
-        assert_eq!(extended_cert.reload, load_cert.value);
-        assert_eq!(extended_cert.source, source_value);
-        assert_eq!(extended_cert.canonical_source, source_value);
-        assert_eq!(extended_cert.offset, -32);
-        assert_eq!(extended_cert.value_width, 8);
-        assert_eq!(extended_cert.memory_width, 4);
-        assert_eq!(extended_cert.store_access, load_cert.store_access);
-        assert_eq!(extended_cert.load_access, load_cert.load_access);
+        assert!(
+            prepared
+                .stack_reload_certificate_for_value(extended_value)
+                .is_none()
+        );
     }
 
     #[test]
-    fn prepared_callsite_certifies_stack_home_arguments() {
+    fn prepared_callsite_refuses_display_named_stack_home_arguments() {
         let arch = make_x86_64_prep_arch();
         let stack_home = Varnode {
             space: SpaceId::Unique,
@@ -5853,37 +5774,12 @@ mod tests {
             .callsite_certificate_for_op(0x1740, 2)
             .expect("callsite certificate");
 
-        assert_eq!(call.stack_argument_values.len(), 1);
-        let stack_arg = &call.stack_argument_values[0];
-        assert_eq!(stack_arg.stack_offset, 0x20);
-        let value = prepared
-            .value_var(stack_arg.value)
-            .expect("stack argument value");
-        assert!(value.is_const());
-        assert_eq!(value.name, "const:7");
-
-        assert_eq!(call.argument_certificates.len(), 1);
-        let typed_arg = &call.argument_certificates[0];
-        assert_eq!(typed_arg.index, 0);
-        assert_eq!(typed_arg.value, stack_arg.value);
-        assert_eq!(typed_arg.source_inst, Some(stack_arg.memory_access.inst));
-        let memory = prepared
-            .memory_certificate_for_op_site(0x1740, 1, true)
-            .expect("stack argument write certificate");
-        match &typed_arg.location {
-            CallArgumentLocation::Stack {
-                object,
-                offset,
-                memory_access,
-            } => {
-                assert_eq!(*object, memory.object);
-                assert_eq!(*offset, 0x20);
-                assert_eq!(*memory_access, stack_arg.memory_access);
-            }
-            CallArgumentLocation::Register { name } => {
-                panic!("stack argument should not be certified as register {name}");
-            }
-        }
+        assert!(call.stack_argument_values.is_empty());
+        assert!(
+            call.argument_certificates
+                .iter()
+                .all(|argument| !matches!(argument.location, CallArgumentLocation::Stack { .. }))
+        );
     }
 
     #[test]
@@ -8158,7 +8054,7 @@ mod tests {
     }
 
     #[test]
-    fn test_decompile_prep_facts_track_stack_pointer_and_frame_pointer_roots() {
+    fn test_decompile_prep_facts_refuse_display_named_stack_roots() {
         let blocks = vec![R2ILBlock {
             addr: 0x2000,
             size: 4,
@@ -8208,40 +8104,9 @@ mod tests {
         func.refresh_decompile_prep_facts(None);
 
         let facts = func.decompile_prep_facts().expect("prep facts");
-        let rsp_root = StackAddressRoot {
-            base: StackAddressBase::StackPointer,
-            offset: -16,
-        };
-        let rbp_root = StackAddressRoot {
-            base: StackAddressBase::FramePointer,
-            offset: -32,
-        };
-
-        assert_eq!(
-            facts.stack_address_root_of(&SSAVar::new("tmp:1", 1, 8)),
-            Some(&rsp_root)
-        );
-        assert_eq!(
-            facts.stack_address_root_of(&SSAVar::new("tmp:2", 1, 8)),
-            Some(&rsp_root)
-        );
-        assert_eq!(
-            facts.stack_address_root_of(&SSAVar::new("tmp:3", 1, 8)),
-            Some(&rbp_root)
-        );
-        assert_eq!(
-            facts.stack_address_root_of(&SSAVar::new("tmp:4", 1, 8)),
-            Some(&rbp_root)
-        );
-        assert_eq!(
-            facts.stack_address_root_of(&SSAVar::new("tmp:5", 1, 8)),
-            Some(&rsp_root),
-            "32-bit negative stack deltas must be sign-extended"
-        );
-        assert_eq!(
-            facts.stack_address_root_of(&SSAVar::new("tmp:overflow", 1, 8)),
-            None,
-            "overflowing stack offsets must not saturate into false provenance"
+        assert!(
+            facts.stack_address_roots.is_empty(),
+            "display names cannot establish stack roots without typed carrier evidence"
         );
         assert_eq!(
             facts.canonical_root_of(&SSAVar::new("tmp:2", 1, 8)),
@@ -8254,7 +8119,7 @@ mod tests {
     }
 
     #[test]
-    fn test_frame_pointer_copy_rebases_stack_root_to_zero() {
+    fn test_decompile_prep_facts_refuse_renamed_stack_carriers() {
         let blocks = vec![R2ILBlock {
             addr: 0x1000,
             size: 4,
@@ -8267,17 +8132,17 @@ mod tests {
         let mut func = SSAFunction::from_blocks_raw_no_arch(&blocks).expect("raw SSA should build");
         func.get_block_mut(0x1000).expect("entry").ops = vec![
             SSAOp::IntSub {
-                dst: SSAVar::new("rsp", 1, 8),
-                a: SSAVar::new("rsp", 0, 8),
+                dst: SSAVar::new("runtime.materialized.rsp", 1, 8),
+                a: SSAVar::new("runtime.materialized.rsp", 0, 8),
                 b: SSAVar::constant(8, 8),
             },
             SSAOp::Copy {
-                dst: SSAVar::new("rbp", 1, 8),
-                src: SSAVar::new("rsp", 1, 8),
+                dst: SSAVar::new("runtime.materialized.rbp", 1, 8),
+                src: SSAVar::new("runtime.materialized.rsp", 1, 8),
             },
             SSAOp::IntAdd {
                 dst: SSAVar::new("tmp:fp_slot", 1, 8),
-                a: SSAVar::new("rbp", 1, 8),
+                a: SSAVar::new("runtime.materialized.rbp", 1, 8),
                 b: SSAVar::constant(0xffffffffffffffe8, 8),
             },
         ];
@@ -8285,25 +8150,31 @@ mod tests {
 
         let facts = func.decompile_prep_facts().expect("prep facts");
         assert_eq!(
-            facts.stack_address_root_of(&SSAVar::new("rsp", 1, 8)),
-            Some(&StackAddressRoot {
-                base: StackAddressBase::StackPointer,
-                offset: -8,
-            })
+            facts.stack_address_root_of(&SSAVar::new("runtime.materialized.rsp", 1, 8)),
+            None
         );
         assert_eq!(
-            facts.stack_address_root_of(&SSAVar::new("rbp", 1, 8)),
-            Some(&StackAddressRoot {
-                base: StackAddressBase::FramePointer,
-                offset: 0,
-            })
+            facts.stack_address_root_of(&SSAVar::new("runtime.materialized.rbp", 1, 8)),
+            None
         );
         assert_eq!(
             facts.stack_address_root_of(&SSAVar::new("tmp:fp_slot", 1, 8)),
-            Some(&StackAddressRoot {
-                base: StackAddressBase::FramePointer,
-                offset: -24,
-            })
+            None
+        );
+    }
+
+    #[test]
+    fn test_constant_display_names_do_not_supply_bits() {
+        let named_constant = SSAVar::new("const:0x1234", 0, 8);
+        assert_eq!(named_constant.constant_bits(), None);
+        assert_eq!(adapt_family_root(&named_constant, 4), None);
+
+        let mut canonical_constant = SSAVar::constant(0x1234, 8);
+        canonical_constant.name = "not-a-constant".to_string();
+        assert_eq!(canonical_constant.constant_bits(), Some(0x1234));
+        assert_eq!(
+            adapt_family_root(&canonical_constant, 4),
+            Some(SSAVar::constant(0x1234, 4))
         );
     }
 }

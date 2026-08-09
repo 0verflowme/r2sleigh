@@ -222,6 +222,9 @@ impl SSAVar {
     }
 
     /// Check if this is a constant SSA value.
+    ///
+    /// This classifies the presentation form only. Proof-bearing consumers
+    /// must use [`Self::constant_bits`] instead.
     pub fn is_const(&self) -> bool {
         self.name_kind().is_constant()
     }
@@ -237,6 +240,9 @@ impl SSAVar {
     }
 
     /// Check if this is a register (not const or temp).
+    ///
+    /// This is a presentation classifier only. Proof-bearing consumers must
+    /// use the graph value's canonical storage identity instead.
     pub fn is_register(&self) -> bool {
         !self.is_const() && !self.is_temp()
     }

@@ -8,7 +8,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
-use crate::data_ref::parse_const_value;
 use crate::{
     CanonicalStorageId, SSAFunction, SSAOp, SSAVar, SourceMachineContext, SsaGraph,
     StackAddressRoot, ValueId,
@@ -442,7 +441,7 @@ fn add_delta(
 }
 
 fn signed_constant(var: &SSAVar) -> Option<i64> {
-    let value = parse_const_value(&var.name)?;
+    let value = var.constant_bits()?;
     let bits = var.size.saturating_mul(8).min(64);
     if bits == 0 || bits == 64 {
         return Some(value as i64);
@@ -483,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn parameter_address_survives_stack_spill_and_affine_index() {
+    fn context_free_parameter_spill_does_not_invent_a_stack_root() {
         let arch = aarch64_two_arg_arch();
         let mut block = R2ILBlock::new(0x1000, 4);
         block.push(R2ILOp::IntSub {
@@ -523,14 +522,12 @@ mod tests {
             .iter()
             .find(|value| value.var.name.starts_with("tmp:50"))
             .expect("address value");
-        let expression = artifact
-            .addresses()
-            .parameter_expression(value.id)
-            .expect("parameter-relative expression");
-        assert_eq!(expression.parameter, 0);
-        assert_eq!(expression.offset, 16);
-        assert_eq!(expression.terms.len(), 1);
-        assert_eq!(expression.terms[0].coefficient, 40);
+        assert!(
+            artifact
+                .addresses()
+                .parameter_expression(value.id)
+                .is_none()
+        );
     }
 
     #[test]
@@ -577,7 +574,7 @@ mod tests {
     }
 
     #[test]
-    fn parameter_address_survives_pointer_spill_after_affine_index() {
+    fn context_free_pointer_spill_does_not_invent_a_stack_root() {
         let arch = aarch64_two_arg_arch();
         let mut block = R2ILBlock::new(0x1000, 4);
         block.push(R2ILOp::IntSub {
@@ -657,18 +654,16 @@ mod tests {
             .iter()
             .find(|value| value.var.name.starts_with("tmp:90"))
             .expect("field address value");
-        let expression = artifact
-            .addresses()
-            .parameter_expression(value.id)
-            .expect("parameter-relative expression after second spill");
-        assert_eq!(expression.parameter, 0);
-        assert_eq!(expression.offset, 4);
-        assert_eq!(expression.terms.len(), 1);
-        assert_eq!(expression.terms[0].coefficient, 40);
+        assert!(
+            artifact
+                .addresses()
+                .parameter_expression(value.id)
+                .is_none()
+        );
     }
 
     #[test]
-    fn parameter_spill_survives_a_loop_backedge() {
+    fn context_free_loop_spill_does_not_invent_a_stack_root() {
         let arch = aarch64_two_arg_arch();
         let mut entry = R2ILBlock::new(0x1000, 4);
         entry.push(R2ILOp::IntSub {
@@ -714,13 +709,12 @@ mod tests {
             .iter()
             .find(|value| value.var.name == "tmp:10" && value.var.version == 2)
             .expect("reloaded parameter");
-        let expression = artifact
-            .addresses()
-            .parameter_expression(loaded.id)
-            .expect("loop-carried stack spill");
-        assert_eq!(expression.parameter, 0);
-        assert!(expression.terms.is_empty());
-        assert_eq!(expression.offset, 0);
+        assert!(
+            artifact
+                .addresses()
+                .parameter_expression(loaded.id)
+                .is_none()
+        );
     }
 
     #[test]
