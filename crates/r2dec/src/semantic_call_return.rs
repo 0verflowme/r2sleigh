@@ -28,7 +28,7 @@ use crate::certified_region::{
 use crate::semantic_c::{
     SEMANTIC_C_HELPERS, SemanticCCallArgumentValue, SemanticCError, SemanticCExprKind,
     SemanticCFunctionInterface, SemanticCFunctionReturn, SemanticCInputOrigin, SemanticCReturn,
-    storage_type, value_name,
+    logical_return_type, render_logical_return_statement, storage_type, value_name,
 };
 use crate::semantic_stmt::{SemanticCBlockStepLayer, SemanticCStatementError};
 
@@ -653,9 +653,18 @@ impl CertifiedDirectCallReturnFunction {
                     self.return_block.return_producer(),
                 ))?;
         match returned.values() {
-            [] => output.push_str("\treturn;\n"),
-            [value] => writeln!(&mut output, "\treturn {};", value_name(value.binding()))
-                .expect("String writes cannot fail"),
+            [] => writeln!(
+                &mut output,
+                "\t{}",
+                render_logical_return_statement(interface, None)?
+            )
+            .expect("String writes cannot fail"),
+            [value] => writeln!(
+                &mut output,
+                "\t{}",
+                render_logical_return_statement(interface, Some(&value_name(value.binding())))?
+            )
+            .expect("String writes cannot fail"),
             _ => {
                 return Err(DirectCallReturnFunctionError::MissingValue(
                     self.return_block.return_producer(),
@@ -751,10 +760,7 @@ fn return_is_call_independent(return_block: &CertifiedDirectCallReturnBlock) -> 
 fn return_type(
     interface: &SemanticCFunctionInterface,
 ) -> Result<&'static str, DirectCallReturnFunctionError> {
-    match interface.return_kind() {
-        SemanticCFunctionReturn::Void => Ok("void"),
-        SemanticCFunctionReturn::Register { ty, .. } => Ok(storage_type(ty)?),
-    }
+    Ok(logical_return_type(interface)?)
 }
 
 fn render_function_parameters(

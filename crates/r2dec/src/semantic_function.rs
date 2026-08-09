@@ -10,10 +10,10 @@ use crate::certified_region::{CertifiedSingleBlockAccounting, RegionBuildError};
 use crate::certified_return::{CertifiedTerminalReturnBlockRegion, TerminalReturnRegionError};
 use crate::semantic_c::{
     SEMANTIC_C_HELPERS, SemanticCError, SemanticCFunctionReturn, SemanticCInputOrigin,
-    storage_type, value_name,
+    logical_return_type, render_logical_return_statement, storage_type, value_name,
 };
 
-pub const CERTIFIED_SEMANTIC_C_FUNCTION_SCHEMA_VERSION: u32 = 2;
+pub const CERTIFIED_SEMANTIC_C_FUNCTION_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum CertifiedSemanticCFunctionScope {
@@ -35,6 +35,7 @@ pub enum CertifiedSemanticCFunctionError {
     TerminalReturn(TerminalReturnRegionError),
     InvalidRegion(Vec<String>),
     MissingFunctionInterface,
+    MissingReturnProjection,
     MemoryRequiresSemanticRenderer,
     StackAddressRequiresMemoryRenderer,
     MissingReturnedEntity,
@@ -112,6 +113,16 @@ impl CertifiedSemanticCFunction {
         let returned = region
             .returned()
             .ok_or(CertifiedSemanticCFunctionError::MissingReturnedEntity)?;
+        let interface = accounting
+            .expression_layer()
+            .function_interface()
+            .ok_or(CertifiedSemanticCFunctionError::MissingFunctionInterface)?;
+        match (interface.return_kind(), interface.return_projection()) {
+            (SemanticCFunctionReturn::Void, None) => {}
+            (SemanticCFunctionReturn::Register { ty, .. }, Some(projection))
+                if projection.physical_ty() == ty => {}
+            _ => return Err(CertifiedSemanticCFunctionError::MissingReturnProjection),
+        }
         if let [value] = returned.values() {
             let return_position = region
                 .layer()
@@ -160,8 +171,8 @@ impl CertifiedSemanticCFunction {
         &self.region
     }
 
-    /// Render the authorized unsigned-carrier C11 subset. Recovered source
-    /// types and cosmetic names are deliberately not consulted.
+    /// Render the authorized carrier-safe C11 subset. The exact source-logical
+    /// return projection is honored; cosmetic names remain non-authoritative.
     pub fn render_certified_c(&self) -> Result<String, CertifiedSemanticCFunctionError> {
         let report = self.region.audit();
         if self.schema_version != CERTIFIED_SEMANTIC_C_FUNCTION_SCHEMA_VERSION
@@ -177,10 +188,7 @@ impl CertifiedSemanticCFunction {
         let interface = expressions
             .function_interface()
             .ok_or(CertifiedSemanticCFunctionError::MissingFunctionInterface)?;
-        let return_type = match interface.return_kind() {
-            SemanticCFunctionReturn::Void => "void",
-            SemanticCFunctionReturn::Register { ty, .. } => storage_type(ty)?,
-        };
+        let return_type = logical_return_type(interface)?;
         let mut output = String::new();
         output.push_str("#include <stdint.h>\n\n");
         output.push_str(SEMANTIC_C_HELPERS);
@@ -231,9 +239,18 @@ impl CertifiedSemanticCFunction {
             .returned()
             .ok_or(CertifiedSemanticCFunctionError::MissingReturnedEntity)?;
         match returned.values() {
-            [] => output.push_str("\treturn;\n"),
-            [value] => writeln!(&mut output, "\treturn {};", value_name(value.binding()))
-                .expect("String writes cannot fail"),
+            [] => writeln!(
+                &mut output,
+                "\t{}",
+                render_logical_return_statement(interface, None)?
+            )
+            .expect("String writes cannot fail"),
+            [value] => writeln!(
+                &mut output,
+                "\t{}",
+                render_logical_return_statement(interface, Some(&value_name(value.binding())))?
+            )
+            .expect("String writes cannot fail"),
             _ => return Err(CertifiedSemanticCFunctionError::MissingReturnedEntity),
         }
         output.push_str("}\n");

@@ -25,10 +25,11 @@ use serde::Serialize;
 use crate::semantic_c::{
     SEMANTIC_C_SCHEMA_VERSION, SemanticCCallArgumentValue, SemanticCDirectCall, SemanticCError,
     SemanticCExprId, SemanticCExpressionLayer, SemanticCIdentityScope, SemanticCReturn,
-    SemanticCScope, semantic_call_from_control, semantic_return_from_control,
+    SemanticCReturnMechanicsOwner, SemanticCScope, semantic_call_from_control,
+    semantic_return_from_control,
 };
 
-pub const CERTIFIED_REGION_SCHEMA_VERSION: u32 = 8;
+pub const CERTIFIED_REGION_SCHEMA_VERSION: u32 = 9;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum SingleBlockAccountingScope {
@@ -81,6 +82,10 @@ pub enum RegionTypedOwner {
     Return {
         producer: CanonicalInstructionId,
         component: SemanticObligationComponent,
+    },
+    ReturnMechanics {
+        source_producer: CanonicalInstructionId,
+        return_producers: Box<[CanonicalInstructionId]>,
     },
 }
 
@@ -259,6 +264,106 @@ fn require_source_block(
     topology
         .block(block_addr)
         .ok_or(RegionBuildError::MissingBlock(block_addr))
+}
+
+fn ledger_expression_inputs(
+    ledger: &ObligationLedger,
+    source: &SemanticObligationInventory,
+    producer: CanonicalInstructionId,
+) -> Option<BTreeSet<CanonicalInstructionId>> {
+    let instruction = source.instructions().get(&producer)?;
+    let live = instruction
+        .obligations
+        .iter()
+        .copied()
+        .filter(|obligation| obligation.kind == SemanticObligationKind::LiveValueProducer)
+        .collect::<Vec<_>>();
+    let [obligation] = live.as_slice() else {
+        return None;
+    };
+    let [effect] = ledger.effects(*obligation) else {
+        return None;
+    };
+    let expression = effect.expression_evidence()?;
+    (effect.disposition() == &EffectDisposition::AbsorbedIntoExpression { producer }
+        && expression.entity().producer() == producer
+        && expression
+            .entity()
+            .source_obligations()
+            .contains(obligation))
+    .then(|| expression.inputs().clone())
+}
+
+fn return_mechanics_reaches_producer(
+    source: &SemanticObligationInventory,
+    ledger: &ObligationLedger,
+    control: &CertifiedReturnControl,
+    expected: CanonicalInstructionId,
+) -> bool {
+    let mut frontier = [
+        control.return_address().value().producer(),
+        control
+            .exit_stack_pointer()
+            .value()
+            .and_then(|value| value.producer()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let mut visited = BTreeSet::new();
+    while let Some(producer) = frontier.pop() {
+        if producer == expected {
+            return true;
+        }
+        if !visited.insert(producer) {
+            continue;
+        }
+        let Some(inputs) = ledger_expression_inputs(ledger, source, producer) else {
+            return false;
+        };
+        frontier.extend(inputs);
+    }
+    false
+}
+
+fn return_mechanics_manifest_has_exact_order(
+    owners: &[SemanticCReturnMechanicsOwner],
+    source_order: &[CanonicalInstructionId],
+    return_order: &[CanonicalInstructionId],
+) -> bool {
+    let producer_set = owners
+        .iter()
+        .map(SemanticCReturnMechanicsOwner::source_producer)
+        .collect::<BTreeSet<_>>();
+    let actual_producers = owners
+        .iter()
+        .map(SemanticCReturnMechanicsOwner::source_producer)
+        .collect::<Vec<_>>();
+    if owners.len() != producer_set.len()
+        || actual_producers
+            != source_order
+                .iter()
+                .copied()
+                .filter(|producer| producer_set.contains(producer))
+                .collect::<Vec<_>>()
+    {
+        return false;
+    }
+    owners.iter().all(|owner| {
+        let return_set = owner
+            .return_producers()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        !return_set.is_empty()
+            && owner.return_producers().len() == return_set.len()
+            && owner.return_producers()
+                == return_order
+                    .iter()
+                    .copied()
+                    .filter(|producer| return_set.contains(producer))
+                    .collect::<Vec<_>>()
+    })
 }
 
 struct CertifiedBlockParts {
@@ -557,7 +662,7 @@ impl CertifiedSingleBlockAccounting {
         }
         let CertifiedBlockParts {
             expression_layer,
-            memory_statements,
+            mut memory_statements,
             direct_calls,
             direct_controls,
             conditional_controls,
@@ -565,6 +670,13 @@ impl CertifiedSingleBlockAccounting {
             return_controls,
         } = parts;
         let source_block = require_source_block(topology, block_addr)?;
+        let mechanics = expression_layer
+            .return_mechanics()
+            .owners()
+            .iter()
+            .map(|owner| (owner.source_producer(), owner))
+            .collect::<BTreeMap<_, _>>();
+        memory_statements.retain(|statement| !mechanics.contains_key(&statement.producer()));
         let semantic_returns = return_controls
             .iter()
             .map(|control| semantic_return_from_control(control, &expression_layer))
@@ -655,7 +767,49 @@ impl CertifiedSingleBlockAccounting {
                 return_producer,
             });
             for obligation in &disposition.obligations {
-                let mapping = if obligation.kind == SemanticObligationKind::LiveValueProducer {
+                let mapping = if let Some(mechanics_owner) = mechanics.get(id) {
+                    if !mechanics_owner.source_obligations().contains(obligation) {
+                        return Err(RegionBuildError::ExpressionObligationMismatch(*obligation));
+                    }
+                    let [effect] = ledger.effects(*obligation) else {
+                        return Err(RegionBuildError::ExpressionObligationMismatch(*obligation));
+                    };
+                    let exact_source_owner = match obligation.kind {
+                        SemanticObligationKind::LiveValueProducer => {
+                            effect.disposition()
+                                == &(EffectDisposition::AbsorbedIntoExpression { producer: *id })
+                                && effect.expression_evidence().is_some_and(|expression| {
+                                    expression.entity().producer() == *id
+                                        && expression
+                                            .entity()
+                                            .source_obligations()
+                                            .contains(obligation)
+                                })
+                        }
+                        SemanticObligationKind::ObservableMemoryRead => {
+                            effect.disposition()
+                                == &(EffectDisposition::AbsorbedIntoStatement { producer: *id })
+                                && effect.statement_evidence().is_some_and(|statement| {
+                                    statement.producer() == *id
+                                        && statement.source_obligations().contains(obligation)
+                                })
+                        }
+                        _ => false,
+                    };
+                    if !exact_source_owner {
+                        return Err(RegionBuildError::ExpressionObligationMismatch(*obligation));
+                    }
+                    (
+                        RegionObligationDisposition::AbsorbedIntoReturn { producer: *id },
+                        Some(RegionTypedOwner::ReturnMechanics {
+                            source_producer: *id,
+                            return_producers: mechanics_owner
+                                .return_producers()
+                                .to_vec()
+                                .into_boxed_slice(),
+                        }),
+                    )
+                } else if obligation.kind == SemanticObligationKind::LiveValueProducer {
                     if let Some(entity) = expression_entities.get(id) {
                         if !entity.source_obligations().contains(obligation) {
                             return Err(RegionBuildError::ExpressionObligationMismatch(
@@ -977,6 +1131,16 @@ impl CertifiedSingleBlockAccounting {
             .iter()
             .map(|entity| (entity.producer(), entity))
             .collect::<BTreeMap<_, _>>();
+        let mechanics_owners = self.expression_layer.return_mechanics().owners();
+        let mechanics_entities = mechanics_owners
+            .iter()
+            .map(|owner| (owner.source_producer(), owner))
+            .collect::<BTreeMap<_, _>>();
+        let mechanics_producers = mechanics_entities.keys().copied().collect::<BTreeSet<_>>();
+        let mechanics_obligations = mechanics_owners
+            .iter()
+            .flat_map(|owner| owner.source_obligations().iter().copied())
+            .collect::<BTreeSet<_>>();
         let expected_expression_producers = self
             .source
             .instructions()
@@ -994,6 +1158,7 @@ impl CertifiedSingleBlockAccounting {
                     })
                     .then_some(*id)
             })
+            .filter(|producer| !mechanics_producers.contains(producer))
             .collect::<BTreeSet<_>>();
         let actual_expression_producers =
             expression_entities.keys().copied().collect::<BTreeSet<_>>();
@@ -1005,6 +1170,7 @@ impl CertifiedSingleBlockAccounting {
             .filter(|id| {
                 id.kind == SemanticObligationKind::LiveValueProducer
                     && !self.expression_layer.open_obligations().contains(id)
+                    && !mechanics_obligations.contains(id)
             })
             .collect::<BTreeSet<_>>();
         let expected_block_expression_obligations = expected_obligations
@@ -1013,6 +1179,7 @@ impl CertifiedSingleBlockAccounting {
             .filter(|id| {
                 id.kind == SemanticObligationKind::LiveValueProducer
                     && !self.expression_layer.open_obligations().contains(id)
+                    && !mechanics_obligations.contains(id)
             })
             .collect::<BTreeSet<_>>();
         let entity_expression_obligations = self
@@ -1144,9 +1311,17 @@ impl CertifiedSingleBlockAccounting {
             .mappings
             .iter()
             .filter_map(|mapping| {
+                matches!(&mapping.owner, Some(RegionTypedOwner::Return { .. }))
+                    .then_some(mapping.obligation)
+            })
+            .collect::<BTreeSet<_>>();
+        let mapped_mechanics_obligations = self
+            .mappings
+            .iter()
+            .filter_map(|mapping| {
                 matches!(
-                    mapping.disposition,
-                    RegionObligationDisposition::AbsorbedIntoReturn { .. }
+                    &mapping.owner,
+                    Some(RegionTypedOwner::ReturnMechanics { .. })
                 )
                 .then_some(mapping.obligation)
             })
@@ -1233,6 +1408,18 @@ impl CertifiedSingleBlockAccounting {
                             })
                         && semantic_return_entities.contains_key(producer)
                 }
+                (
+                    RegionObligationDisposition::AbsorbedIntoReturn { producer },
+                    Some(RegionTypedOwner::ReturnMechanics {
+                        source_producer,
+                        return_producers,
+                    }),
+                ) => mechanics_entities.get(producer).is_some_and(|owner| {
+                    producer == source_producer
+                        && return_producers.as_ref() == owner.return_producers()
+                        && owner.source_obligations().contains(&mapping.obligation)
+                        && !return_producers.is_empty()
+                }),
                 (RegionObligationDisposition::Residualized { .. }, None) => true,
                 _ => false,
             };
@@ -1266,6 +1453,144 @@ impl CertifiedSingleBlockAccounting {
         }
         if !self.ledger.matches_origin(&self.origin) {
             invalid.push("region obligation ledger does not match artifact origin".to_string());
+        }
+        let source_instruction_order = self
+            .topology
+            .blocks()
+            .iter()
+            .flat_map(|block| block.instructions().iter().copied())
+            .collect::<Vec<_>>();
+        let certified_return_order = self
+            .topology
+            .blocks()
+            .iter()
+            .filter(|block| {
+                matches!(
+                    block.terminator(),
+                    r2cert::CertifiedSourceTerminator::Return
+                )
+            })
+            .filter_map(|block| block.instructions().last().copied())
+            .filter(|producer| {
+                let obligation = SemanticObligationId {
+                    instruction: *producer,
+                    kind: SemanticObligationKind::Return,
+                    component: SemanticObligationComponent::Whole,
+                };
+                matches!(
+                    self.ledger.effects(obligation),
+                    [effect]
+                        if effect.disposition()
+                            == &EffectDisposition::AbsorbedIntoReturn {
+                                producer: *producer,
+                            }
+                            && effect.return_control_evidence().is_some_and(|control| {
+                                control.producer() == *producer
+                                    && control.return_obligation() == obligation
+                            })
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected_block_mechanics_obligations = mechanics_owners
+            .iter()
+            .filter(|owner| expected_instructions.contains(&owner.source_producer()))
+            .flat_map(|owner| owner.source_obligations().iter().copied())
+            .collect::<BTreeSet<_>>();
+        if mechanics_entities.len() != mechanics_owners.len()
+            || !return_mechanics_manifest_has_exact_order(
+                mechanics_owners,
+                &source_instruction_order,
+                &certified_return_order,
+            )
+            || mapped_mechanics_obligations != expected_block_mechanics_obligations
+            || mechanics_obligations.len()
+                != mechanics_owners
+                    .iter()
+                    .map(|owner| owner.source_obligations().len())
+                    .sum::<usize>()
+        {
+            invalid.push("return-mechanics ownership manifest is not exact".to_string());
+        }
+        for owner in mechanics_owners {
+            let source_obligations = self
+                .source
+                .instructions()
+                .get(&owner.source_producer())
+                .map(|instruction| instruction.obligations.iter().copied().collect::<Vec<_>>());
+            let return_set = owner
+                .return_producers()
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            let expected_returns = certified_return_order
+                .iter()
+                .copied()
+                .filter(|producer| return_set.contains(producer))
+                .collect::<Vec<_>>();
+            let returns_are_grounded = !owner.return_producers().is_empty()
+                && owner.return_producers().len() == return_set.len()
+                && owner.return_producers() == expected_returns
+                && owner.return_producers().iter().all(|return_producer| {
+                    let obligation = SemanticObligationId {
+                        instruction: *return_producer,
+                        kind: SemanticObligationKind::Return,
+                        component: SemanticObligationComponent::Whole,
+                    };
+                    matches!(
+                        self.ledger.effects(obligation),
+                        [effect]
+                            if effect.return_control_evidence().is_some_and(|control| {
+                                return_mechanics_reaches_producer(
+                                    &self.source,
+                                    &self.ledger,
+                                    control,
+                                    owner.source_producer(),
+                                )
+                            })
+                    )
+                });
+            let obligations_are_grounded = owner.source_obligations().iter().all(|obligation| {
+                let [effect] = self.ledger.effects(*obligation) else {
+                    return false;
+                };
+                match obligation.kind {
+                    SemanticObligationKind::LiveValueProducer => {
+                        effect.disposition()
+                            == &EffectDisposition::AbsorbedIntoExpression {
+                                producer: owner.source_producer(),
+                            }
+                            && effect.expression_evidence().is_some_and(|expression| {
+                                expression.entity().producer() == owner.source_producer()
+                                    && expression
+                                        .entity()
+                                        .source_obligations()
+                                        .contains(obligation)
+                            })
+                    }
+                    SemanticObligationKind::ObservableMemoryRead => {
+                        effect.disposition()
+                            == &EffectDisposition::AbsorbedIntoStatement {
+                                producer: owner.source_producer(),
+                            }
+                            && effect.statement_evidence().is_some_and(|statement| {
+                                statement.producer() == owner.source_producer()
+                                    && statement.source_obligations().contains(obligation)
+                            })
+                    }
+                    _ => false,
+                }
+            });
+            if source_obligations.as_deref() != Some(owner.source_obligations())
+                || !returns_are_grounded
+                || !obligations_are_grounded
+                || expression_entities.contains_key(&owner.source_producer())
+                || statement_entities.contains_key(&owner.source_producer())
+            {
+                invalid.push(format!(
+                    "invalid return-mechanics owner for {}",
+                    owner.source_producer()
+                ));
+            }
         }
         if self.topology.schema_version() != CERTIFICATION_SCHEMA_VERSION
             || source_block.is_none_or(|block| {
@@ -1937,6 +2262,63 @@ impl CertifiedSingleBlockAccounting {
                     }
                 }
                 RegionObligationDisposition::AbsorbedIntoReturn { producer } => {
+                    if let Some(RegionTypedOwner::ReturnMechanics {
+                        source_producer,
+                        return_producers,
+                    }) = &mapping.owner
+                    {
+                        let mechanics_matches = producer == *source_producer
+                            && mechanics_entities.get(&producer).is_some_and(|owner| {
+                                owner.return_producers() == return_producers.as_ref()
+                                    && owner.source_obligations().contains(&mapping.obligation)
+                            });
+                        let ledger_matches = matches!(
+                            self.ledger.effects(mapping.obligation),
+                            [effect]
+                                if match mapping.obligation.kind {
+                                    SemanticObligationKind::LiveValueProducer => {
+                                        effect.disposition()
+                                            == &EffectDisposition::AbsorbedIntoExpression {
+                                                producer,
+                                            }
+                                            && effect.expression_evidence().is_some_and(|expression| {
+                                                expression.entity().producer() == producer
+                                                    && expression
+                                                        .entity()
+                                                        .source_obligations()
+                                                        .contains(&mapping.obligation)
+                                            })
+                                    }
+                                    SemanticObligationKind::ObservableMemoryRead => {
+                                        effect.disposition()
+                                            == &EffectDisposition::AbsorbedIntoStatement {
+                                                producer,
+                                            }
+                                            && effect.statement_evidence().is_some_and(|statement| {
+                                                statement.producer() == producer
+                                                    && statement
+                                                        .source_obligations()
+                                                        .contains(&mapping.obligation)
+                                            })
+                                    }
+                                    _ => false,
+                                }
+                        );
+                        if !mechanics_matches
+                            || !ledger_matches
+                            || !self.instructions.iter().any(|instruction| {
+                                instruction.source == producer
+                                    && instruction.expression_producer.is_none()
+                                    && instruction.statement_producer.is_none()
+                            })
+                        {
+                            invalid.push(format!(
+                                "invalid return-mechanics mapping for {}",
+                                mapping.obligation
+                            ));
+                        }
+                        continue;
+                    }
                     let return_matches =
                         return_control_entities
                             .get(&producer)
@@ -2059,6 +2441,7 @@ impl CertifiedSingleBlockAccounting {
             .chain(mapped_call_obligations.iter().copied())
             .chain(mapped_control_obligations.iter().copied())
             .chain(mapped_return_obligations.iter().copied())
+            .chain(mapped_mechanics_obligations.iter().copied())
             .collect::<BTreeSet<_>>();
         let expected_residual_set = expected_obligations
             .difference(&closed_set)
@@ -2084,7 +2467,22 @@ impl CertifiedSingleBlockAccounting {
     }
 }
 
-fn ledger_mapping_for_typed_owner(mapping: &RegionObligationMapping) -> Option<TypedRegionMapping> {
+fn ledger_mapping_for_typed_owner(
+    ledger: &ObligationLedger,
+    mapping: &RegionObligationMapping,
+) -> Option<TypedRegionMapping> {
+    if matches!(
+        &mapping.owner,
+        Some(RegionTypedOwner::ReturnMechanics { .. })
+    ) {
+        let [effect] = ledger.effects(mapping.obligation) else {
+            return None;
+        };
+        return Some(TypedRegionMapping::new(
+            mapping.obligation,
+            effect.disposition().clone(),
+        ));
+    }
     let disposition = match mapping.disposition {
         RegionObligationDisposition::AbsorbedIntoExpression { producer } => {
             EffectDisposition::AbsorbedIntoExpression { producer }
@@ -2136,7 +2534,7 @@ fn exact_typed_output_manifest<'a>(
                     mapping.obligation(),
                 ));
             }
-            let ledger_mapping = ledger_mapping_for_typed_owner(mapping)
+            let ledger_mapping = ledger_mapping_for_typed_owner(accounting.ledger(), mapping)
                 .ok_or(TypedOutputSealError::ResidualMapping(mapping.obligation()))?;
             mappings.push(mapping.clone());
             ledger_mappings.push(ledger_mapping);
@@ -2336,5 +2734,84 @@ fn residual_reason(kind: SemanticObligationKind) -> RegionResidualReason {
         SemanticObligationKind::LiveValueProducer => {
             RegionResidualReason::UnsupportedSourceSemantics
         }
+    }
+}
+
+#[cfg(test)]
+mod return_mechanics_manifest_tests {
+    use super::*;
+    use r2ssa::CanonicalInstructionSite;
+
+    fn id(ordinal: u64) -> CanonicalInstructionId {
+        CanonicalInstructionId {
+            block_addr: 0x2000,
+            site: CanonicalInstructionSite::Op(ordinal),
+        }
+    }
+
+    fn owner(
+        source_producer: CanonicalInstructionId,
+        return_producers: impl IntoIterator<Item = CanonicalInstructionId>,
+    ) -> SemanticCReturnMechanicsOwner {
+        SemanticCReturnMechanicsOwner {
+            source_producer,
+            return_producers: return_producers
+                .into_iter()
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            source_obligations: Vec::new().into_boxed_slice(),
+        }
+    }
+
+    #[test]
+    fn return_mechanics_manifest_refuses_duplicate_reorder_and_owner_mutation() {
+        let first = id(0);
+        let second = id(1);
+        let first_return = id(2);
+        let second_return = id(3);
+        let source_order = [first, second, first_return, second_return];
+        let return_order = [first_return, second_return];
+        let canonical = [
+            owner(first, [first_return, second_return]),
+            owner(second, [second_return]),
+        ];
+        assert!(return_mechanics_manifest_has_exact_order(
+            &canonical,
+            &source_order,
+            &return_order,
+        ));
+        assert!(!return_mechanics_manifest_has_exact_order(
+            &[
+                owner(second, [second_return]),
+                owner(first, [first_return, second_return]),
+            ],
+            &source_order,
+            &return_order,
+        ));
+        assert!(!return_mechanics_manifest_has_exact_order(
+            &[
+                owner(first, [first_return, second_return]),
+                owner(first, [first_return, second_return]),
+                owner(second, [second_return]),
+            ],
+            &source_order,
+            &return_order,
+        ));
+        assert!(!return_mechanics_manifest_has_exact_order(
+            &[
+                owner(first, [second_return, first_return]),
+                owner(second, [second_return]),
+            ],
+            &source_order,
+            &return_order,
+        ));
+        assert!(!return_mechanics_manifest_has_exact_order(
+            &[
+                owner(first, [first_return, id(99)]),
+                owner(second, [second_return]),
+            ],
+            &source_order,
+            &return_order,
+        ));
     }
 }

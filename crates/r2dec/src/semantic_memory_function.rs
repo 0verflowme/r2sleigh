@@ -22,7 +22,8 @@ use crate::certified_region::{
 };
 use crate::semantic_c::{
     SEMANTIC_C_HELPERS, SemanticCError, SemanticCExprId, SemanticCExprKind,
-    SemanticCFunctionReturn, SemanticCInputOrigin, SemanticCReturn, storage_type, value_name,
+    SemanticCFunctionReturn, SemanticCInputOrigin, SemanticCReturn, logical_return_type,
+    render_logical_return_statement, storage_type, value_name,
 };
 use crate::semantic_stmt::{SemanticCBlockStepLayer, SemanticCStatementError};
 
@@ -400,10 +401,7 @@ impl CertifiedMemorySemanticCFunction {
         let interface = expressions
             .function_interface()
             .ok_or(CertifiedMemorySemanticCFunctionError::MissingFunctionInterface)?;
-        let return_type = match interface.return_kind() {
-            SemanticCFunctionReturn::Void => "void",
-            SemanticCFunctionReturn::Register { ty, .. } => storage_type(ty)?,
-        };
+        let return_type = logical_return_type(interface)?;
         let mut output = String::new();
         output.push_str("#include <stdint.h>\n\n");
         output.push_str(SEMANTIC_C_HELPERS);
@@ -477,11 +475,13 @@ impl CertifiedMemorySemanticCFunction {
             )
             .expect("String writes cannot fail");
         }
-        match self.returned_value {
-            None => output.push_str("\treturn;\n"),
-            Some(binding) => writeln!(&mut output, "\treturn {};", value_name(binding))
-                .expect("String writes cannot fail"),
-        }
+        let returned_name = self.returned_value.map(value_name);
+        writeln!(
+            &mut output,
+            "\t{}",
+            render_logical_return_statement(interface, returned_name.as_deref())?
+        )
+        .expect("String writes cannot fail");
         output.push_str("}\n");
         Ok(output)
     }

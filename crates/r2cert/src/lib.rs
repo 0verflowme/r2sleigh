@@ -2438,12 +2438,12 @@ pub enum CertifiedTypedRegionKind {
     CarrierFreeLoopTerminalReturnFunction,
 }
 
-pub const CERTIFIED_TERMINAL_RETURN_REGION_CONTRACT_VERSION: u32 = 2;
-pub const CERTIFIED_PLAIN_RAM_MEMORY_RETURN_CONTRACT_VERSION: u32 = 2;
-pub const CERTIFIED_DIRECT_CALL_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 2;
-pub const CERTIFIED_CONDITIONAL_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 2;
-pub const CERTIFIED_SWITCH_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 2;
-pub const CERTIFIED_CARRIER_FREE_LOOP_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 2;
+pub const CERTIFIED_TERMINAL_RETURN_REGION_CONTRACT_VERSION: u32 = 3;
+pub const CERTIFIED_PLAIN_RAM_MEMORY_RETURN_CONTRACT_VERSION: u32 = 3;
+pub const CERTIFIED_DIRECT_CALL_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 3;
+pub const CERTIFIED_CONDITIONAL_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 3;
+pub const CERTIFIED_SWITCH_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 3;
+pub const CERTIFIED_CARRIER_FREE_LOOP_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TypedRegionMapping {
@@ -2582,6 +2582,166 @@ impl std::fmt::Display for LedgerClosureError {
 
 impl std::error::Error for LedgerClosureError {}
 
+fn terminal_return_mechanics_producers(
+    dependencies: &BTreeMap<CanonicalInstructionId, BTreeSet<CanonicalInstructionId>>,
+    roots: impl IntoIterator<Item = CanonicalInstructionId>,
+    semantic_seeds: impl IntoIterator<Item = CanonicalInstructionId>,
+) -> Option<BTreeSet<CanonicalInstructionId>> {
+    let mut candidates = BTreeSet::new();
+    let mut active = BTreeSet::new();
+    let mut complete = BTreeSet::new();
+    for root in roots {
+        let mut stack = vec![(root, false)];
+        while let Some((producer, leaving)) = stack.pop() {
+            candidates.insert(producer);
+            if leaving {
+                active.remove(&producer);
+                complete.insert(producer);
+                continue;
+            }
+            if complete.contains(&producer) {
+                continue;
+            }
+            let inputs = dependencies.get(&producer)?;
+            if !active.insert(producer) {
+                return None;
+            }
+            stack.push((producer, true));
+            stack.extend(inputs.iter().rev().map(|input| (*input, false)));
+        }
+    }
+
+    let mut semantic = semantic_seeds
+        .into_iter()
+        .filter(|producer| candidates.contains(producer))
+        .collect::<BTreeSet<_>>();
+    for (producer, inputs) in dependencies {
+        if candidates.contains(producer) {
+            continue;
+        }
+        semantic.extend(
+            inputs
+                .iter()
+                .copied()
+                .filter(|input| candidates.contains(input)),
+        );
+    }
+    let mut frontier = semantic.iter().copied().collect::<Vec<_>>();
+    while let Some(producer) = frontier.pop() {
+        let inputs = dependencies.get(&producer)?;
+        for input in inputs {
+            if candidates.contains(input) && semantic.insert(*input) {
+                frontier.push(*input);
+            }
+        }
+    }
+    Some(candidates.difference(&semantic).copied().collect())
+}
+
+fn exact_terminal_return_mechanical_reads(
+    origin: &CertifiedArtifactOrigin,
+    ledger: &ObligationLedger,
+    mappings: &BTreeMap<SemanticObligationId, &TypedRegionMapping>,
+    return_control: &CertifiedReturnControl,
+) -> Option<BTreeSet<SemanticObligationId>> {
+    let mut dependencies = BTreeMap::new();
+    for instruction in origin.source().instructions().values() {
+        let live = instruction
+            .obligations
+            .iter()
+            .copied()
+            .filter(|obligation| obligation.kind == SemanticObligationKind::LiveValueProducer)
+            .collect::<Vec<_>>();
+        if live.is_empty() {
+            continue;
+        }
+        let [obligation] = live.as_slice() else {
+            return None;
+        };
+        let [effect] = ledger.effects(*obligation) else {
+            return None;
+        };
+        let expression = effect.expression_evidence()?;
+        if effect.disposition()
+            != &(EffectDisposition::AbsorbedIntoExpression {
+                producer: instruction.id,
+            })
+            || expression.entity().producer() != instruction.id
+            || expression.entity().source_obligations() != &BTreeSet::from([*obligation])
+            || dependencies
+                .insert(instruction.id, expression.inputs().clone())
+                .is_some()
+        {
+            return None;
+        }
+    }
+    let roots = [
+        return_control.return_address().value().producer(),
+        return_control
+            .exit_stack_pointer()
+            .value()
+            .and_then(MachineValueUse::producer),
+    ]
+    .into_iter()
+    .flatten();
+    let semantic_seeds = return_control
+        .values()
+        .iter()
+        .filter_map(|returned| returned.value().producer());
+    let mechanics = terminal_return_mechanics_producers(&dependencies, roots, semantic_seeds)?;
+
+    let mut reads = BTreeSet::new();
+    for obligation in origin
+        .source()
+        .obligations()
+        .values()
+        .filter(|obligation| obligation.id.kind == SemanticObligationKind::ObservableMemoryRead)
+    {
+        if !mechanics.contains(&obligation.id.instruction) {
+            return None;
+        }
+        let [effect] = ledger.effects(obligation.id) else {
+            return None;
+        };
+        let statement = effect.statement_evidence()?;
+        let Some(mapping) = mappings.get(&obligation.id) else {
+            return None;
+        };
+        if effect.disposition()
+            != &(EffectDisposition::AbsorbedIntoStatement {
+                producer: obligation.id.instruction,
+            })
+            || mapping.source_disposition() != effect.disposition()
+            || statement.producer() != obligation.id.instruction
+            || statement.source_obligations() != &BTreeSet::from([obligation.id])
+            || statement.execution()
+                != CertifiedMemoryExecutionPolicy::ExactlyOnceInSourceOrderViaHelper
+            || !matches!(
+                statement.kind(),
+                CertifiedMemoryStatementKind::Read { result }
+                    if result.producer() == Some(obligation.id.instruction)
+            )
+        {
+            return None;
+        }
+        reads.insert(obligation.id);
+    }
+    Some(reads)
+}
+
+fn terminal_return_obligation_is_admitted(
+    obligation: SemanticObligationId,
+    mechanical_reads: &BTreeSet<SemanticObligationId>,
+) -> bool {
+    matches!(
+        obligation.kind,
+        SemanticObligationKind::LiveValueProducer
+            | SemanticObligationKind::Return
+            | SemanticObligationKind::ReturnValue
+    ) || obligation.kind == SemanticObligationKind::ObservableMemoryRead
+        && mechanical_reads.contains(&obligation)
+}
+
 pub fn certify_terminal_return_region(
     origin: &CertifiedArtifactOrigin,
     ledger: &ObligationLedger,
@@ -2604,14 +2764,6 @@ pub fn certify_terminal_return_region(
     if !matches!(block.terminator(), CertifiedSourceTerminator::Return)
         || !block.successors().is_empty()
         || block.instructions().is_empty()
-        || origin.source().obligations().values().any(|obligation| {
-            !matches!(
-                obligation.id.kind,
-                SemanticObligationKind::LiveValueProducer
-                    | SemanticObligationKind::Return
-                    | SemanticObligationKind::ReturnValue
-            )
-        })
     {
         return Err(LedgerClosureError::InvalidRegionTopology);
     }
@@ -2631,6 +2783,20 @@ pub fn certify_terminal_return_region(
         return Err(LedgerClosureError::UnsupportedSourceSemantics(
             instruction.id,
         ));
+    }
+    let mappings = mappings.into_iter().collect::<Vec<_>>();
+    let mut by_obligation = BTreeMap::<SemanticObligationId, &TypedRegionMapping>::new();
+    for mapping in &mappings {
+        if !origin
+            .source()
+            .obligations()
+            .contains_key(&mapping.obligation)
+        {
+            return Err(LedgerClosureError::UnexpectedMapping(mapping.obligation));
+        }
+        if by_obligation.insert(mapping.obligation, mapping).is_some() {
+            return Err(LedgerClosureError::DuplicateMapping(mapping.obligation));
+        }
     }
     let return_effects = origin
         .source()
@@ -2670,6 +2836,17 @@ pub fn certify_terminal_return_region(
     {
         return Err(LedgerClosureError::InvalidRegionTopology);
     }
+    let mechanical_reads =
+        exact_terminal_return_mechanical_reads(origin, ledger, &by_obligation, return_control)
+            .ok_or(LedgerClosureError::InvalidRegionTopology)?;
+    if origin
+        .source()
+        .obligations()
+        .values()
+        .any(|obligation| !terminal_return_obligation_is_admitted(obligation.id, &mechanical_reads))
+    {
+        return Err(LedgerClosureError::InvalidRegionTopology);
+    }
     for obligation in origin.source().obligations().values() {
         let [effect] = ledger.effects(obligation.id) else {
             return Err(LedgerClosureError::IncompleteLedger);
@@ -2687,24 +2864,18 @@ pub fn certify_terminal_return_region(
                             if *producer == return_control.producer()
                     )
             }
+            SemanticObligationKind::ObservableMemoryRead => {
+                mechanical_reads.contains(&obligation.id)
+                    && matches!(
+                        effect.disposition(),
+                        EffectDisposition::AbsorbedIntoStatement { producer }
+                            if *producer == obligation.id.instruction
+                    )
+            }
             _ => false,
         };
         if !valid {
             return Err(LedgerClosureError::InvalidRegionDisposition(obligation.id));
-        }
-    }
-    let mappings = mappings.into_iter().collect::<Vec<_>>();
-    let mut by_obligation = BTreeMap::<SemanticObligationId, &TypedRegionMapping>::new();
-    for mapping in &mappings {
-        if !origin
-            .source()
-            .obligations()
-            .contains_key(&mapping.obligation)
-        {
-            return Err(LedgerClosureError::UnexpectedMapping(mapping.obligation));
-        }
-        if by_obligation.insert(mapping.obligation, mapping).is_some() {
-            return Err(LedgerClosureError::DuplicateMapping(mapping.obligation));
         }
     }
     for obligation in origin.source().obligations().keys() {
@@ -8136,6 +8307,107 @@ mod tests {
         let report = certificate.audit(&source);
         assert_eq!(report.invalid.len(), 2);
         assert!(!report.is_closed());
+    }
+
+    #[test]
+    fn terminal_return_mechanics_preserve_shared_producers_and_reject_malformed_closures() {
+        let id = |ordinal| CanonicalInstructionId {
+            block_addr: 0x5000,
+            site: CanonicalInstructionSite::Op(ordinal),
+        };
+        let leaf = id(0);
+        let return_address_read = id(1);
+        let exit_stack_pointer = id(2);
+        let semantic_consumer = id(3);
+        let dependencies = BTreeMap::from([
+            (leaf, BTreeSet::new()),
+            (return_address_read, BTreeSet::from([leaf])),
+            (exit_stack_pointer, BTreeSet::from([leaf])),
+        ]);
+
+        let pure = terminal_return_mechanics_producers(
+            &dependencies,
+            [return_address_read, exit_stack_pointer],
+            [],
+        )
+        .expect("acyclic exact closure");
+        assert_eq!(
+            pure,
+            BTreeSet::from([leaf, return_address_read, exit_stack_pointer])
+        );
+
+        let shared = terminal_return_mechanics_producers(
+            &dependencies,
+            [return_address_read, exit_stack_pointer],
+            [return_address_read],
+        )
+        .expect("returned-value sharing remains structurally valid");
+        assert_eq!(shared, BTreeSet::from([exit_stack_pointer]));
+
+        let mut dependencies_with_outside_use = dependencies.clone();
+        dependencies_with_outside_use
+            .insert(semantic_consumer, BTreeSet::from([return_address_read]));
+        let outside_use = terminal_return_mechanics_producers(
+            &dependencies_with_outside_use,
+            [return_address_read, exit_stack_pointer],
+            [],
+        )
+        .expect("outside use is retained semantically");
+        assert!(!outside_use.contains(&return_address_read));
+        assert!(!outside_use.contains(&leaf));
+
+        let cyclic = BTreeMap::from([
+            (leaf, BTreeSet::from([return_address_read])),
+            (return_address_read, BTreeSet::from([leaf])),
+        ]);
+        assert!(terminal_return_mechanics_producers(&cyclic, [return_address_read], []).is_none());
+        assert!(
+            terminal_return_mechanics_producers(
+                &BTreeMap::from([(return_address_read, BTreeSet::from([leaf]))]),
+                [return_address_read],
+                [],
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn terminal_return_contract_admits_only_manifested_mechanical_reads() {
+        let producer = CanonicalInstructionId {
+            block_addr: 0x5100,
+            site: CanonicalInstructionSite::Op(0),
+        };
+        let read = SemanticObligationId {
+            instruction: producer,
+            kind: SemanticObligationKind::ObservableMemoryRead,
+            component: SemanticObligationComponent::MemoryAccess(0),
+        };
+        let write = SemanticObligationId {
+            kind: SemanticObligationKind::ObservableMemoryWrite,
+            ..read
+        };
+        let live = SemanticObligationId {
+            kind: SemanticObligationKind::LiveValueProducer,
+            component: SemanticObligationComponent::Whole,
+            ..read
+        };
+
+        assert!(terminal_return_obligation_is_admitted(
+            read,
+            &BTreeSet::from([read]),
+        ));
+        assert!(!terminal_return_obligation_is_admitted(
+            read,
+            &BTreeSet::new(),
+        ));
+        assert!(!terminal_return_obligation_is_admitted(
+            write,
+            &BTreeSet::from([write]),
+        ));
+        assert!(terminal_return_obligation_is_admitted(
+            live,
+            &BTreeSet::new(),
+        ));
     }
 
     #[test]

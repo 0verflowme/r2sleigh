@@ -7,8 +7,9 @@
 
 use r2cert::{
     CertifiedAbiParameter, CertifiedCallArgument, CertifiedCallArgumentOrigin, CertifiedDirectCall,
-    CertifiedExpr, CertifiedMachineFunction, CertifiedMachineProjection, CertifiedReturnControl,
-    CertifiedStackSlot, EffectDisposition, ObligationLedger,
+    CertifiedExpr, CertifiedMachineFunction, CertifiedMachineProjection, CertifiedMemoryStatement,
+    CertifiedMemoryStatementKind, CertifiedReturnControl, CertifiedSourceTerminator,
+    CertifiedSourceTopology, CertifiedStackSlot, EffectDisposition, ObligationLedger,
 };
 use r2ssa::{
     CallBoundarySlot, CallSiteId, CanonicalInstructionId, CanonicalStorageId,
@@ -17,14 +18,14 @@ use r2ssa::{
     MachineEntity, MachineExpr, MachineExprId, MachineExprKind, MachineMemoryEndianness,
     MachineOvershiftBehavior, MachineProjection, MachineShiftKind, MachineSignedness,
     MachineStackBase, MachineType, MachineValueBinding, ObjectId, SemanticObligationId,
-    SemanticObligationInventory, SemanticObligationKind, SourceCallSiteIdentity,
-    SourceFunctionReturn, SourceMachineContext, StackAddressBase, StackAddressRoot,
-    StructuredAccessId, ValueId,
+    SemanticObligationInventory, SemanticObligationKind, SourceCallSiteIdentity, SourceCarrierKind,
+    SourceCarrierProjection, SourceFunctionInterface, SourceFunctionReturn, SourceMachineContext,
+    SourceTypeKind, StackAddressBase, StackAddressRoot, StructuredAccessId, ValueId,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const SEMANTIC_C_SCHEMA_VERSION: u32 = 8;
+pub const SEMANTIC_C_SCHEMA_VERSION: u32 = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SemanticCParameter {
@@ -87,12 +88,40 @@ pub enum SemanticCFunctionReturn {
     },
 }
 
+/// Exact source-logical view of one physical ABI return carrier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SemanticCReturnProjection {
+    source_type_id: u32,
+    carrier: SourceCarrierProjection,
+    physical_ty: MachineType,
+    logical_ty: MachineType,
+}
+
+impl SemanticCReturnProjection {
+    pub const fn source_type_id(&self) -> u32 {
+        self.source_type_id
+    }
+
+    pub const fn carrier(&self) -> SourceCarrierProjection {
+        self.carrier
+    }
+
+    pub const fn physical_ty(&self) -> &MachineType {
+        &self.physical_ty
+    }
+
+    pub const fn logical_ty(&self) -> &MachineType {
+        &self.logical_ty
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SemanticCFunctionInterface {
     revision_identity: Box<[u8]>,
     calling_convention: String,
     parameters: Box<[SemanticCParameter]>,
     return_kind: SemanticCFunctionReturn,
+    return_projection: Option<SemanticCReturnProjection>,
     stack_slots: Box<[SemanticCStackSlot]>,
 }
 
@@ -113,8 +142,106 @@ impl SemanticCFunctionInterface {
         &self.return_kind
     }
 
+    pub const fn return_projection(&self) -> Option<&SemanticCReturnProjection> {
+        self.return_projection.as_ref()
+    }
+
     pub const fn stack_slots(&self) -> &[SemanticCStackSlot] {
         &self.stack_slots
+    }
+}
+
+fn logical_scalar_type(logical_ty: &MachineType) -> Result<&'static str, SemanticCError> {
+    match logical_ty {
+        MachineType::Integer {
+            width_bits: 8,
+            signedness: MachineSignedness::Signed,
+        } => Ok("int8_t"),
+        MachineType::Integer {
+            width_bits: 16,
+            signedness: MachineSignedness::Signed,
+        } => Ok("int16_t"),
+        MachineType::Integer {
+            width_bits: 32,
+            signedness: MachineSignedness::Signed,
+        } => Ok("int32_t"),
+        MachineType::Integer {
+            width_bits: 64,
+            signedness: MachineSignedness::Signed,
+        } => Ok("int64_t"),
+        MachineType::Integer {
+            width_bits: 8,
+            signedness: MachineSignedness::Unsigned,
+        } => Ok("uint8_t"),
+        MachineType::Integer {
+            width_bits: 16,
+            signedness: MachineSignedness::Unsigned,
+        } => Ok("uint16_t"),
+        MachineType::Integer {
+            width_bits: 32,
+            signedness: MachineSignedness::Unsigned,
+        } => Ok("uint32_t"),
+        MachineType::Integer {
+            width_bits: 64,
+            signedness: MachineSignedness::Unsigned,
+        } => Ok("uint64_t"),
+        _ => Err(SemanticCError::InvalidReturnProjection),
+    }
+}
+
+pub(crate) fn logical_return_type(
+    interface: &SemanticCFunctionInterface,
+) -> Result<&'static str, SemanticCError> {
+    match (interface.return_kind(), interface.return_projection()) {
+        (SemanticCFunctionReturn::Void, None) => Ok("void"),
+        (SemanticCFunctionReturn::Register { ty, .. }, Some(projection))
+            if projection.physical_ty() == ty =>
+        {
+            logical_scalar_type(projection.logical_ty())
+        }
+        _ => Err(SemanticCError::InvalidReturnProjection),
+    }
+}
+
+fn render_logical_return_value(
+    logical_ty: &MachineType,
+    value: &str,
+) -> Result<String, SemanticCError> {
+    let width = logical_ty.width_bits();
+    match logical_ty {
+        MachineType::Integer {
+            signedness: MachineSignedness::Unsigned,
+            ..
+        } if matches!(width, 8 | 16 | 32 | 64) => Ok(format!("(uint{width}_t)({value})")),
+        MachineType::Integer {
+            signedness: MachineSignedness::Signed,
+            ..
+        } if matches!(width, 8 | 16 | 32 | 64) => {
+            Ok(format!("r2s_i{width}_from_bits((uint{width}_t)({value}))"))
+        }
+        _ => Err(SemanticCError::InvalidReturnProjection),
+    }
+}
+
+pub(crate) fn render_logical_return_statement(
+    interface: &SemanticCFunctionInterface,
+    value: Option<&str>,
+) -> Result<String, SemanticCError> {
+    match (
+        interface.return_kind(),
+        interface.return_projection(),
+        value,
+    ) {
+        (SemanticCFunctionReturn::Void, None, None) => Ok("return;".to_string()),
+        (SemanticCFunctionReturn::Register { ty, .. }, Some(projection), Some(value))
+            if projection.physical_ty() == ty =>
+        {
+            Ok(format!(
+                "return {};",
+                render_logical_return_value(projection.logical_ty(), value)?
+            ))
+        }
+        _ => Err(SemanticCError::InvalidReturnProjection),
     }
 }
 
@@ -441,7 +568,50 @@ pub struct SemanticCExpressionLayer {
     function_interface: Option<SemanticCFunctionInterface>,
     inputs: BTreeMap<MachineValueBinding, MachineType>,
     input_origins: BTreeMap<MachineValueBinding, SemanticCInputOrigin>,
+    return_mechanics: SemanticCReturnMechanicsOwnership,
     open_obligations: BTreeSet<SemanticObligationId>,
+}
+
+/// Exact source producers whose only certified consumers are architectural
+/// return-address or exit-stack-pointer roots. These remain owned by the
+/// terminal return node and are deliberately absent from semantic C steps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct SemanticCReturnMechanicsOwner {
+    pub(crate) source_producer: CanonicalInstructionId,
+    pub(crate) return_producers: Box<[CanonicalInstructionId]>,
+    pub(crate) source_obligations: Box<[SemanticObligationId]>,
+}
+
+impl SemanticCReturnMechanicsOwner {
+    pub(crate) const fn source_producer(&self) -> CanonicalInstructionId {
+        self.source_producer
+    }
+
+    pub(crate) const fn return_producers(&self) -> &[CanonicalInstructionId] {
+        &self.return_producers
+    }
+
+    pub(crate) const fn source_obligations(&self) -> &[SemanticObligationId] {
+        &self.source_obligations
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct SemanticCReturnMechanicsOwnership {
+    owners: Box<[SemanticCReturnMechanicsOwner]>,
+}
+
+impl SemanticCReturnMechanicsOwnership {
+    pub(crate) const fn owners(&self) -> &[SemanticCReturnMechanicsOwner] {
+        &self.owners
+    }
+
+    fn source_obligations(&self) -> BTreeSet<SemanticObligationId> {
+        self.owners
+            .iter()
+            .flat_map(|owner| owner.source_obligations.iter().copied())
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -468,6 +638,7 @@ pub enum SemanticCError {
     InconsistentInputType(ValueId),
     UnclassifiedSourceInput(ValueId),
     InvalidCertifiedFunctionInterface,
+    InvalidReturnProjection,
     MissingReturnExpression(CanonicalInstructionId),
     ReturnBindingMismatch(CanonicalInstructionId),
     MissingCallExpression(CanonicalInstructionId),
@@ -475,6 +646,8 @@ pub enum SemanticCError {
     CheckedArithmeticRequiresHelper(SemanticCExprId),
     UnsupportedShiftPolicy(SemanticCExprId),
     MemoryReadRequiresCertifiedStatement(SemanticCExprId),
+    InvalidReturnMechanics(CanonicalInstructionId),
+    CyclicReturnMechanics(CanonicalInstructionId),
 }
 
 impl std::fmt::Display for SemanticCError {
@@ -521,6 +694,15 @@ trait CertifiedSemanticSource {
     fn machine_context(&self) -> &SourceMachineContext;
     fn abi_parameters(&self) -> &BTreeMap<u32, CertifiedAbiParameter>;
     fn stack_slots(&self) -> &BTreeMap<StackAddressRoot, CertifiedStackSlot>;
+    fn topology(&self) -> &CertifiedSourceTopology;
+    fn return_control_for_producer(
+        &self,
+        producer: CanonicalInstructionId,
+    ) -> Option<&CertifiedReturnControl>;
+    fn memory_statement_for_producer(
+        &self,
+        producer: CanonicalInstructionId,
+    ) -> Option<&CertifiedMemoryStatement>;
 }
 
 impl CertifiedSemanticSource for CertifiedMachineFunction {
@@ -550,6 +732,24 @@ impl CertifiedSemanticSource for CertifiedMachineFunction {
 
     fn stack_slots(&self) -> &BTreeMap<StackAddressRoot, CertifiedStackSlot> {
         CertifiedMachineFunction::stack_slots(self)
+    }
+
+    fn topology(&self) -> &CertifiedSourceTopology {
+        CertifiedMachineFunction::topology(self)
+    }
+
+    fn return_control_for_producer(
+        &self,
+        producer: CanonicalInstructionId,
+    ) -> Option<&CertifiedReturnControl> {
+        CertifiedMachineFunction::return_control_for_producer(self, producer)
+    }
+
+    fn memory_statement_for_producer(
+        &self,
+        producer: CanonicalInstructionId,
+    ) -> Option<&CertifiedMemoryStatement> {
+        CertifiedMachineFunction::memory_statement_for_producer(self, producer)
     }
 }
 
@@ -581,6 +781,76 @@ impl CertifiedSemanticSource for CertifiedMachineProjection {
     fn stack_slots(&self) -> &BTreeMap<StackAddressRoot, CertifiedStackSlot> {
         CertifiedMachineProjection::stack_slots(self)
     }
+
+    fn topology(&self) -> &CertifiedSourceTopology {
+        CertifiedMachineProjection::topology(self)
+    }
+
+    fn return_control_for_producer(
+        &self,
+        producer: CanonicalInstructionId,
+    ) -> Option<&CertifiedReturnControl> {
+        CertifiedMachineProjection::return_control_for_producer(self, producer)
+    }
+
+    fn memory_statement_for_producer(
+        &self,
+        producer: CanonicalInstructionId,
+    ) -> Option<&CertifiedMemoryStatement> {
+        CertifiedMachineProjection::memory_statement_for_producer(self, producer)
+    }
+}
+
+fn exact_semantic_return_projection(
+    source: &SourceFunctionInterface,
+    storage: CanonicalStorageId,
+) -> Result<Option<SemanticCReturnProjection>, SemanticCError> {
+    let (logical, graph) = match (source.return_logical_value(), source.type_graph()) {
+        (None, None) => return Ok(None),
+        (Some(logical), Some(graph)) => (logical, graph),
+        _ => return Err(SemanticCError::InvalidReturnProjection),
+    };
+    let source_type = usize::try_from(logical.type_id())
+        .ok()
+        .and_then(|index| graph.types().get(index))
+        .filter(|source_type| source_type.id() == logical.type_id())
+        .ok_or(SemanticCError::InvalidReturnProjection)?;
+    let signedness = match source_type.kind() {
+        SourceTypeKind::SignedInteger => MachineSignedness::Signed,
+        SourceTypeKind::UnsignedInteger => MachineSignedness::Unsigned,
+        SourceTypeKind::Pointer { .. } | SourceTypeKind::Struct { .. } => return Ok(None),
+    };
+    let physical_width = storage
+        .size
+        .checked_mul(8)
+        .filter(|width| matches!(width, 8 | 16 | 32 | 64))
+        .ok_or(SemanticCError::InvalidReturnProjection)?;
+    let carrier = logical.carrier();
+    let logical_width = u32::try_from(source_type.size_bits())
+        .ok()
+        .filter(|width| matches!(width, 8 | 16 | 32 | 64))
+        .ok_or(SemanticCError::InvalidReturnProjection)?;
+    let coherent_carrier = carrier.offset_bits() == 0
+        && carrier.size_bits() == u64::from(logical_width)
+        && match carrier.kind() {
+            SourceCarrierKind::Full => logical_width == physical_width,
+            SourceCarrierKind::LowBits => logical_width < physical_width,
+        };
+    if !coherent_carrier {
+        return Err(SemanticCError::InvalidReturnProjection);
+    }
+    Ok(Some(SemanticCReturnProjection {
+        source_type_id: logical.type_id(),
+        carrier,
+        physical_ty: MachineType::Integer {
+            width_bits: physical_width,
+            signedness: MachineSignedness::Unsigned,
+        },
+        logical_ty: MachineType::Integer {
+            width_bits: logical_width,
+            signedness,
+        },
+    }))
 }
 
 fn semantic_function_interface(
@@ -634,21 +904,30 @@ fn semantic_function_interface(
             ty,
         });
     }
-    let return_kind = match source.return_kind() {
-        SourceFunctionReturn::Void => SemanticCFunctionReturn::Void,
+    let (return_kind, return_projection) = match source.return_kind() {
+        SourceFunctionReturn::Void => {
+            if source.return_logical_value().is_some() {
+                return Err(SemanticCError::InvalidReturnProjection);
+            }
+            (SemanticCFunctionReturn::Void, None)
+        }
         SourceFunctionReturn::Register { storage } => {
             let width_bits = storage
                 .size
                 .checked_mul(8)
                 .filter(|width| *width > 0)
                 .ok_or(SemanticCError::InvalidCertifiedFunctionInterface)?;
-            SemanticCFunctionReturn::Register {
-                storage,
-                ty: MachineType::Integer {
-                    width_bits,
-                    signedness: MachineSignedness::Unsigned,
+            let projection = exact_semantic_return_projection(source, storage)?;
+            (
+                SemanticCFunctionReturn::Register {
+                    storage,
+                    ty: MachineType::Integer {
+                        width_bits,
+                        signedness: MachineSignedness::Unsigned,
+                    },
                 },
-            }
+                projection,
+            )
         }
     };
     let mut stack_slots = Vec::with_capacity(source.stack_slots().len());
@@ -674,6 +953,7 @@ fn semantic_function_interface(
         calling_convention: source.calling_convention().to_string(),
         parameters: parameters.into_boxed_slice(),
         return_kind,
+        return_projection,
         stack_slots: stack_slots.into_boxed_slice(),
     }))
 }
@@ -717,6 +997,360 @@ fn classify_input(
         .unwrap_or(SemanticCInputOrigin::UnclassifiedSource)
 }
 
+fn exact_expression_dependencies(
+    certified: &impl CertifiedSemanticSource,
+    machine: MachineView<'_>,
+) -> Result<
+    (
+        BTreeMap<CanonicalInstructionId, BTreeSet<CanonicalInstructionId>>,
+        BTreeMap<ValueId, CanonicalInstructionId>,
+        BTreeMap<CanonicalInstructionId, MachineValueBinding>,
+    ),
+    SemanticCError,
+> {
+    let mut dependencies = BTreeMap::new();
+    let mut output_producers = BTreeMap::new();
+    let mut outputs = BTreeMap::new();
+    for entity in machine.entities() {
+        output_producers.insert(entity.output().value(), entity.producer());
+        outputs.insert(entity.producer(), entity.output());
+        let live_obligations = entity
+            .source_obligations()
+            .iter()
+            .copied()
+            .filter(|id| id.kind == SemanticObligationKind::LiveValueProducer)
+            .collect::<BTreeSet<_>>();
+        if live_obligations.is_empty() {
+            continue;
+        }
+        let Some(expression) = certified.expression_for_producer(entity.producer()) else {
+            continue;
+        };
+        if live_obligations.len() != 1
+            || expression.entity().producer() != entity.producer()
+            || expression.entity().source_obligations() != &live_obligations
+            || expression.root() != entity.root()
+        {
+            return Err(SemanticCError::InvalidReturnMechanics(entity.producer()));
+        }
+        let Some(obligation) = live_obligations.iter().next().copied() else {
+            return Err(SemanticCError::InvalidReturnMechanics(entity.producer()));
+        };
+        let [effect] = certified.ledger().effects(obligation) else {
+            return Err(SemanticCError::InvalidReturnMechanics(entity.producer()));
+        };
+        if effect.disposition()
+            != &(EffectDisposition::AbsorbedIntoExpression {
+                producer: entity.producer(),
+            })
+            || effect.expression_evidence() != Some(expression)
+        {
+            return Err(SemanticCError::InvalidReturnMechanics(entity.producer()));
+        }
+        if dependencies
+            .insert(entity.producer(), expression.inputs().clone())
+            .is_some()
+        {
+            return Err(SemanticCError::InvalidReturnMechanics(entity.producer()));
+        }
+    }
+    Ok((dependencies, output_producers, outputs))
+}
+
+fn add_return_mechanics_closure(
+    root: CanonicalInstructionId,
+    return_producer: CanonicalInstructionId,
+    dependencies: &BTreeMap<CanonicalInstructionId, BTreeSet<CanonicalInstructionId>>,
+    candidates: &mut BTreeMap<CanonicalInstructionId, BTreeSet<CanonicalInstructionId>>,
+) -> Result<(), SemanticCError> {
+    let mut stack = vec![(root, false)];
+    let mut active = BTreeSet::new();
+    let mut complete = BTreeSet::new();
+    while let Some((producer, leaving)) = stack.pop() {
+        candidates
+            .entry(producer)
+            .or_default()
+            .insert(return_producer);
+        if leaving {
+            active.remove(&producer);
+            complete.insert(producer);
+            continue;
+        }
+        if complete.contains(&producer) {
+            continue;
+        }
+        let Some(inputs) = dependencies.get(&producer) else {
+            return Err(SemanticCError::InvalidReturnMechanics(producer));
+        };
+        if !active.insert(producer) {
+            return Err(SemanticCError::CyclicReturnMechanics(producer));
+        }
+        stack.push((producer, true));
+        stack.extend(inputs.iter().rev().map(|input| (*input, false)));
+    }
+    Ok(())
+}
+
+fn is_exact_mechanical_read(
+    certified: &impl CertifiedSemanticSource,
+    producer: CanonicalInstructionId,
+    output: Option<MachineValueBinding>,
+) -> bool {
+    let Some(statement) = certified.memory_statement_for_producer(producer) else {
+        return false;
+    };
+    let CertifiedMemoryStatementKind::Read { result } = statement.kind() else {
+        return false;
+    };
+    if output != Some(result.binding())
+        || statement.producer() != producer
+        || statement.source_obligations().len() != 1
+    {
+        return false;
+    }
+    statement.source_obligations().iter().all(|obligation| {
+        obligation.instruction == producer
+            && obligation.kind == SemanticObligationKind::ObservableMemoryRead
+            && matches!(
+                certified.ledger().effects(*obligation),
+                [effect]
+                    if effect.disposition()
+                        == &EffectDisposition::AbsorbedIntoStatement { producer }
+                        && effect.statement_evidence() == Some(statement)
+            )
+    })
+}
+
+fn backward_close_semantic_producers(
+    candidates: &BTreeMap<CanonicalInstructionId, BTreeSet<CanonicalInstructionId>>,
+    dependencies: &BTreeMap<CanonicalInstructionId, BTreeSet<CanonicalInstructionId>>,
+    mut semantic: BTreeSet<CanonicalInstructionId>,
+) -> Result<BTreeSet<CanonicalInstructionId>, SemanticCError> {
+    let mut frontier = semantic.iter().copied().collect::<Vec<_>>();
+    while let Some(producer) = frontier.pop() {
+        let Some(inputs) = dependencies.get(&producer) else {
+            return Err(SemanticCError::InvalidReturnMechanics(producer));
+        };
+        for input in inputs {
+            if candidates.contains_key(input) && semantic.insert(*input) {
+                frontier.push(*input);
+            }
+        }
+    }
+    Ok(semantic)
+}
+
+fn derive_return_mechanics(
+    certified: &impl CertifiedSemanticSource,
+) -> Result<SemanticCReturnMechanicsOwnership, SemanticCError> {
+    let machine = certified.machine_view();
+    let (dependencies, output_producers, outputs) =
+        exact_expression_dependencies(certified, machine)?;
+    let interface = certified.machine_context().function_interface();
+    let mut controls = Vec::new();
+    for block in certified.topology().blocks() {
+        if !matches!(block.terminator(), CertifiedSourceTerminator::Return) {
+            continue;
+        }
+        let Some(producer) = block.instructions().last().copied() else {
+            continue;
+        };
+        let Some(control) = certified.return_control_for_producer(producer) else {
+            continue;
+        };
+        let Some(interface) = interface else {
+            return Err(SemanticCError::InvalidReturnMechanics(producer));
+        };
+        if interface.return_address_storage() != Some(control.return_address().storage())
+            || interface.stack_pointer_storage() != Some(control.exit_stack_pointer().storage())
+            || control.return_address().value() != control.control_target()
+        {
+            return Err(SemanticCError::InvalidReturnMechanics(producer));
+        }
+        for obligation in control.source_obligations() {
+            let [effect] = certified.ledger().effects(obligation) else {
+                return Err(SemanticCError::InvalidReturnMechanics(producer));
+            };
+            if effect.disposition() != &(EffectDisposition::AbsorbedIntoReturn { producer })
+                || effect.return_control_evidence() != Some(control)
+            {
+                return Err(SemanticCError::InvalidReturnMechanics(producer));
+            }
+        }
+        controls.push(control);
+    }
+    if controls.is_empty() {
+        return Ok(SemanticCReturnMechanicsOwnership::default());
+    }
+
+    let return_order = controls
+        .iter()
+        .map(|control| control.producer())
+        .collect::<Vec<_>>();
+    let mut candidates =
+        BTreeMap::<CanonicalInstructionId, BTreeSet<CanonicalInstructionId>>::new();
+    for control in &controls {
+        for root in [
+            control.return_address().value().producer(),
+            control
+                .exit_stack_pointer()
+                .value()
+                .and_then(|value| value.producer()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            add_return_mechanics_closure(root, control.producer(), &dependencies, &mut candidates)?;
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(SemanticCReturnMechanicsOwnership::default());
+    }
+
+    let mut semantic = BTreeSet::new();
+    for control in &controls {
+        for returned in control.values() {
+            if let Some(producer) = returned.value().producer()
+                && candidates.contains_key(&producer)
+            {
+                semantic.insert(producer);
+            }
+        }
+    }
+    for (producer, inputs) in &dependencies {
+        if candidates.contains_key(producer) {
+            continue;
+        }
+        semantic.extend(
+            inputs
+                .iter()
+                .copied()
+                .filter(|input| candidates.contains_key(input)),
+        );
+    }
+    let return_controls = controls
+        .iter()
+        .map(|control| (control.producer(), *control))
+        .collect::<BTreeMap<_, _>>();
+    for obligation in certified.source().obligations().values() {
+        if obligation.id.kind == SemanticObligationKind::LiveValueProducer {
+            continue;
+        }
+        let exact_return_target = obligation.id.kind == SemanticObligationKind::Return
+            && return_controls
+                .get(&obligation.id.instruction)
+                .is_some_and(|control| {
+                    control.return_obligation() == obligation.id
+                        && obligation.inputs == [control.control_target().binding().value()]
+                });
+        if exact_return_target {
+            continue;
+        }
+        let exact_mechanical_read = obligation.id.kind
+            == SemanticObligationKind::ObservableMemoryRead
+            && candidates.contains_key(&obligation.id.instruction)
+            && is_exact_mechanical_read(
+                certified,
+                obligation.id.instruction,
+                outputs.get(&obligation.id.instruction).copied(),
+            );
+        if exact_mechanical_read {
+            continue;
+        }
+        if candidates.contains_key(&obligation.id.instruction) {
+            semantic.insert(obligation.id.instruction);
+        }
+        semantic.extend(obligation.inputs.iter().filter_map(|input| {
+            output_producers
+                .get(input)
+                .copied()
+                .filter(|producer| candidates.contains_key(producer))
+        }));
+    }
+
+    let semantic = backward_close_semantic_producers(&candidates, &dependencies, semantic)?;
+    let mechanics = candidates
+        .keys()
+        .copied()
+        .filter(|producer| !semantic.contains(producer))
+        .collect::<BTreeSet<_>>();
+    if mechanics.is_empty() {
+        return Ok(SemanticCReturnMechanicsOwnership::default());
+    }
+
+    let mut owners = Vec::with_capacity(mechanics.len());
+    for producer in certified
+        .topology()
+        .blocks()
+        .iter()
+        .flat_map(|block| block.instructions().iter().copied())
+        .filter(|producer| mechanics.contains(producer))
+    {
+        let instruction = certified
+            .source()
+            .instructions()
+            .get(&producer)
+            .ok_or(SemanticCError::InvalidReturnMechanics(producer))?;
+        for obligation in &instruction.obligations {
+            let valid = match obligation.kind {
+                SemanticObligationKind::LiveValueProducer => matches!(
+                    certified.ledger().effects(*obligation),
+                    [effect]
+                        if effect.disposition()
+                            == &EffectDisposition::AbsorbedIntoExpression { producer }
+                            && effect.expression_evidence().is_some_and(|expression| {
+                                expression.entity().producer() == producer
+                                    && expression.entity().source_obligations().contains(obligation)
+                            })
+                ),
+                SemanticObligationKind::ObservableMemoryRead => {
+                    is_exact_mechanical_read(certified, producer, outputs.get(&producer).copied())
+                }
+                _ => false,
+            };
+            if !valid {
+                return Err(SemanticCError::InvalidReturnMechanics(producer));
+            }
+        }
+        let served = candidates
+            .get(&producer)
+            .ok_or(SemanticCError::InvalidReturnMechanics(producer))?;
+        let return_producers = return_order
+            .iter()
+            .copied()
+            .filter(|return_producer| served.contains(return_producer))
+            .collect::<Vec<_>>();
+        if return_producers.is_empty() {
+            return Err(SemanticCError::InvalidReturnMechanics(producer));
+        }
+        owners.push(SemanticCReturnMechanicsOwner {
+            source_producer: producer,
+            return_producers: return_producers.into_boxed_slice(),
+            source_obligations: instruction
+                .obligations
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        });
+    }
+    if owners.len() != mechanics.len() {
+        let producer = mechanics
+            .iter()
+            .copied()
+            .find(|producer| {
+                !owners
+                    .iter()
+                    .any(|owner| owner.source_producer == *producer)
+            })
+            .unwrap_or(return_order[0]);
+        return Err(SemanticCError::InvalidReturnMechanics(producer));
+    }
+    Ok(SemanticCReturnMechanicsOwnership {
+        owners: owners.into_boxed_slice(),
+    })
+}
+
 impl SemanticCExpressionLayer {
     /// Lower the certified live-value seam into an immutable semantic-C arena.
     ///
@@ -737,10 +1371,17 @@ impl SemanticCExpressionLayer {
     fn from_source(certified: &impl CertifiedSemanticSource) -> Result<Self, SemanticCError> {
         let function_interface = semantic_function_interface(certified)?;
         let machine = certified.machine_view();
+        let return_mechanics = derive_return_mechanics(certified)?;
+        let mechanical_producers = return_mechanics
+            .owners()
+            .iter()
+            .map(SemanticCReturnMechanicsOwner::source_producer)
+            .collect::<BTreeSet<_>>();
         let output_producers = machine.output_producers();
         let certified_producers = machine
             .entities()
             .iter()
+            .filter(|entity| !mechanical_producers.contains(&entity.producer()))
             .filter_map(|entity| {
                 certified
                     .expression_for_producer(entity.producer())
@@ -758,6 +1399,9 @@ impl SemanticCExpressionLayer {
         let mut entities = Vec::new();
 
         for machine_entity in machine.entities() {
+            if mechanical_producers.contains(&machine_entity.producer()) {
+                continue;
+            }
             let live_obligations = machine_entity
                 .source_obligations()
                 .iter()
@@ -833,12 +1477,13 @@ impl SemanticCExpressionLayer {
             .iter()
             .flat_map(|entity| entity.source_obligations.iter().copied())
             .collect::<BTreeSet<_>>();
+        let mechanical_obligations = return_mechanics.source_obligations();
         let open_obligations = certified
             .source()
             .obligations()
             .keys()
             .copied()
-            .filter(|id| !absorbed_expressions.contains(id))
+            .filter(|id| !absorbed_expressions.contains(id) && !mechanical_obligations.contains(id))
             .collect();
         let input_origins = builder
             .inputs
@@ -877,6 +1522,7 @@ impl SemanticCExpressionLayer {
             function_interface,
             inputs: builder.inputs,
             input_origins,
+            return_mechanics,
             open_obligations,
         })
     }
@@ -920,6 +1566,10 @@ impl SemanticCExpressionLayer {
 
     pub const fn input_origins(&self) -> &BTreeMap<MachineValueBinding, SemanticCInputOrigin> {
         &self.input_origins
+    }
+
+    pub(crate) const fn return_mechanics(&self) -> &SemanticCReturnMechanicsOwnership {
+        &self.return_mechanics
     }
 
     pub const fn open_obligations(&self) -> &BTreeSet<SemanticObligationId> {
@@ -1726,6 +2376,22 @@ pub(crate) const SEMANTIC_C_HELPERS: &str = r#"static inline uint64_t r2s_mask(u
 	return width >= 64U ? UINT64_MAX : ((UINT64_C(1) << width) - UINT64_C(1));
 }
 
+static inline int8_t r2s_i8_from_bits(uint8_t bits) {
+	return bits <= INT8_MAX ? (int8_t)bits : (int8_t)(-INT8_C(1) - (int16_t)(UINT8_MAX - bits));
+}
+
+static inline int16_t r2s_i16_from_bits(uint16_t bits) {
+	return bits <= INT16_MAX ? (int16_t)bits : (int16_t)(-INT16_C(1) - (int32_t)(UINT16_MAX - bits));
+}
+
+static inline int32_t r2s_i32_from_bits(uint32_t bits) {
+	return bits <= INT32_MAX ? (int32_t)bits : (int32_t)(-INT32_C(1) - (int64_t)(UINT32_MAX - bits));
+}
+
+static inline int64_t r2s_i64_from_bits(uint64_t bits) {
+	return bits <= INT64_MAX ? (int64_t)bits : -INT64_C(1) - (int64_t)(UINT64_MAX - bits);
+}
+
 static inline uint64_t r2s_wrap_add(uint64_t left, uint64_t right, unsigned width) {
 	return (left + right) & r2s_mask(width);
 }
@@ -1848,3 +2514,355 @@ static inline uint64_t r2s_sext(uint64_t value, unsigned from_width, unsigned to
 	return ((value & sign) != 0U ? (value | (to_mask ^ from_mask)) : value) & to_mask;
 }
 "#;
+
+#[cfg(test)]
+mod return_mechanics_tests {
+    use super::*;
+    use r2ssa::{
+        CanonicalInstructionSite, CanonicalStorageSpace, SourceLogicalValue, SourceType,
+        SourceTypeGraph,
+    };
+
+    fn id(ordinal: u64) -> CanonicalInstructionId {
+        CanonicalInstructionId {
+            block_addr: 0x1000,
+            site: CanonicalInstructionSite::Op(ordinal),
+        }
+    }
+
+    fn logical_return_interface(
+        kind: SourceTypeKind,
+        carrier_kind: SourceCarrierKind,
+        carrier_bits: u64,
+    ) -> SourceFunctionInterface {
+        let storage = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 0,
+            size: 8,
+        };
+        SourceFunctionInterface::new_with_logical_types(
+            b"logical-return-projection:v1".to_vec(),
+            "test-abi",
+            [],
+            SourceFunctionReturn::Register { storage },
+            [],
+            [],
+            Some(SourceLogicalValue::new(
+                0,
+                SourceCarrierProjection::new(carrier_kind, 0, carrier_bits),
+            )),
+            Some(
+                SourceTypeGraph::new([SourceType::new(0, kind, carrier_bits, carrier_bits)], [])
+                    .expect("scalar source type"),
+            ),
+        )
+        .expect("coherent logical return interface")
+    }
+
+    #[test]
+    fn exact_logical_return_projection_preserves_physical_and_logical_widths() {
+        let storage = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 0,
+            size: 8,
+        };
+        let unsigned = logical_return_interface(
+            SourceTypeKind::UnsignedInteger,
+            SourceCarrierKind::LowBits,
+            32,
+        );
+        let projection = exact_semantic_return_projection(&unsigned, storage)
+            .expect("valid unsigned projection")
+            .expect("logical return projection");
+        assert_eq!(projection.physical_ty().width_bits(), 64);
+        assert_eq!(
+            projection.logical_ty(),
+            &MachineType::Integer {
+                width_bits: 32,
+                signedness: MachineSignedness::Unsigned,
+            }
+        );
+
+        let signed = logical_return_interface(
+            SourceTypeKind::SignedInteger,
+            SourceCarrierKind::LowBits,
+            32,
+        );
+        assert_eq!(
+            exact_semantic_return_projection(&signed, storage)
+                .expect("valid signed projection")
+                .expect("logical return projection")
+                .logical_ty(),
+            &MachineType::Integer {
+                width_bits: 32,
+                signedness: MachineSignedness::Signed,
+            }
+        );
+
+        let full =
+            logical_return_interface(SourceTypeKind::UnsignedInteger, SourceCarrierKind::Full, 64);
+        assert_eq!(
+            exact_semantic_return_projection(&full, storage)
+                .expect("valid full-width projection")
+                .expect("logical return projection")
+                .logical_ty()
+                .width_bits(),
+            64
+        );
+    }
+
+    fn semantic_return_interface(
+        kind: SourceTypeKind,
+        carrier_kind: SourceCarrierKind,
+        carrier_bits: u64,
+    ) -> SemanticCFunctionInterface {
+        let source = logical_return_interface(kind, carrier_kind, carrier_bits);
+        let SourceFunctionReturn::Register { storage } = source.return_kind() else {
+            unreachable!("logical return fixture is register-backed")
+        };
+        let projection = exact_semantic_return_projection(&source, storage)
+            .expect("valid return projection")
+            .expect("logical return projection");
+        SemanticCFunctionInterface {
+            revision_identity: source.revision_identity().into(),
+            calling_convention: source.calling_convention().to_string(),
+            parameters: Box::new([]),
+            return_kind: SemanticCFunctionReturn::Register {
+                storage,
+                ty: projection.physical_ty().clone(),
+            },
+            return_projection: Some(projection),
+            stack_slots: Box::new([]),
+        }
+    }
+
+    #[test]
+    fn shared_logical_return_renderer_is_exact_for_every_certified_route() {
+        let unsigned = semantic_return_interface(
+            SourceTypeKind::UnsignedInteger,
+            SourceCarrierKind::LowBits,
+            32,
+        );
+        assert_eq!(logical_return_type(&unsigned), Ok("uint32_t"));
+        assert_eq!(
+            render_logical_return_statement(&unsigned, Some("v_7")),
+            Ok("return (uint32_t)(v_7);".to_string())
+        );
+
+        let signed = semantic_return_interface(
+            SourceTypeKind::SignedInteger,
+            SourceCarrierKind::LowBits,
+            32,
+        );
+        assert_eq!(logical_return_type(&signed), Ok("int32_t"));
+        assert_eq!(
+            render_logical_return_statement(&signed, Some("v_7")),
+            Ok("return r2s_i32_from_bits((uint32_t)(v_7));".to_string())
+        );
+
+        let void = SemanticCFunctionInterface {
+            revision_identity: b"void-return:v1".to_vec().into_boxed_slice(),
+            calling_convention: "test-abi".to_string(),
+            parameters: Box::new([]),
+            return_kind: SemanticCFunctionReturn::Void,
+            return_projection: None,
+            stack_slots: Box::new([]),
+        };
+        assert_eq!(logical_return_type(&void), Ok("void"));
+        assert_eq!(
+            render_logical_return_statement(&void, None),
+            Ok("return;".to_string())
+        );
+        assert_eq!(
+            render_logical_return_statement(&void, Some("v_1")),
+            Err(SemanticCError::InvalidReturnProjection)
+        );
+
+        let mut missing = signed;
+        missing.return_projection = None;
+        assert_eq!(
+            logical_return_type(&missing),
+            Err(SemanticCError::InvalidReturnProjection)
+        );
+        assert_eq!(
+            render_logical_return_statement(&missing, Some("v_7")),
+            Err(SemanticCError::InvalidReturnProjection)
+        );
+    }
+
+    #[test]
+    fn missing_or_noncanonical_logical_return_projection_refuses_typed_projection() {
+        let storage = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 0,
+            size: 8,
+        };
+        let missing = SourceFunctionInterface::new(
+            b"missing-logical-return:v1".to_vec(),
+            "test-abi",
+            [],
+            SourceFunctionReturn::Register { storage },
+            [],
+        )
+        .expect("physical-only interface");
+        assert_eq!(
+            exact_semantic_return_projection(&missing, storage).expect("missing is not malformed"),
+            None
+        );
+
+        let malformed = SourceFunctionInterface::new_with_logical_types(
+            b"noncanonical-logical-return:v1".to_vec(),
+            "test-abi",
+            [],
+            SourceFunctionReturn::Register { storage },
+            [],
+            [],
+            Some(SourceLogicalValue::new(
+                0,
+                SourceCarrierProjection::new(SourceCarrierKind::LowBits, 0, 64),
+            )),
+            Some(
+                SourceTypeGraph::new(
+                    [SourceType::new(0, SourceTypeKind::UnsignedInteger, 64, 64)],
+                    [],
+                )
+                .expect("scalar source type"),
+            ),
+        );
+        assert!(malformed.is_err());
+    }
+
+    #[test]
+    fn structural_return_mechanics_closure_uses_only_exact_producer_edges() {
+        let leaf = id(0);
+        let shared = id(1);
+        let return_address = id(2);
+        let exit_stack_pointer = id(3);
+        let returned = id(4);
+        let mut dependencies = BTreeMap::from([
+            (leaf, BTreeSet::new()),
+            (shared, BTreeSet::from([leaf])),
+            (return_address, BTreeSet::from([shared])),
+            (exit_stack_pointer, BTreeSet::from([shared])),
+            (returned, BTreeSet::from([shared])),
+        ]);
+        let return_producer = id(5);
+        let mut candidates = BTreeMap::new();
+        add_return_mechanics_closure(
+            return_address,
+            return_producer,
+            &dependencies,
+            &mut candidates,
+        )
+        .expect("return-address closure");
+        add_return_mechanics_closure(
+            exit_stack_pointer,
+            return_producer,
+            &dependencies,
+            &mut candidates,
+        )
+        .expect("exit-stack-pointer closure");
+        assert_eq!(
+            candidates.keys().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from([leaf, shared, return_address, exit_stack_pointer])
+        );
+        assert!(!candidates.contains_key(&returned));
+        assert!(
+            candidates
+                .values()
+                .all(|owners| owners == &BTreeSet::from([return_producer]))
+        );
+
+        dependencies.remove(&leaf);
+        let mut malformed = BTreeMap::new();
+        assert!(matches!(
+            add_return_mechanics_closure(
+                return_address,
+                return_producer,
+                &dependencies,
+                &mut malformed,
+            ),
+            Err(SemanticCError::InvalidReturnMechanics(producer)) if producer == leaf
+        ));
+    }
+
+    #[test]
+    fn shared_return_value_producers_and_ancestors_remain_semantic() {
+        let leaf = id(0);
+        let shared = id(1);
+        let return_address = id(2);
+        let exit_stack_pointer = id(3);
+        let return_producer = id(4);
+        let dependencies = BTreeMap::from([
+            (leaf, BTreeSet::new()),
+            (shared, BTreeSet::from([leaf])),
+            (return_address, BTreeSet::from([shared])),
+            (exit_stack_pointer, BTreeSet::from([shared])),
+        ]);
+        let mut candidates = BTreeMap::new();
+        add_return_mechanics_closure(
+            return_address,
+            return_producer,
+            &dependencies,
+            &mut candidates,
+        )
+        .expect("return-address closure");
+        add_return_mechanics_closure(
+            exit_stack_pointer,
+            return_producer,
+            &dependencies,
+            &mut candidates,
+        )
+        .expect("exit-stack-pointer closure");
+
+        let semantic =
+            backward_close_semantic_producers(&candidates, &dependencies, BTreeSet::from([shared]))
+                .expect("shared semantic closure");
+        assert_eq!(semantic, BTreeSet::from([leaf, shared]));
+        assert_eq!(
+            candidates
+                .keys()
+                .copied()
+                .filter(|producer| !semantic.contains(producer))
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([return_address, exit_stack_pointer])
+        );
+    }
+
+    #[test]
+    fn cyclic_duplicate_and_reordered_return_mechanics_do_not_mint_authority() {
+        let first = id(0);
+        let second = id(1);
+        let return_producer = id(2);
+        let dependencies = BTreeMap::from([
+            (first, BTreeSet::from([second])),
+            (second, BTreeSet::from([first])),
+        ]);
+        assert!(matches!(
+            add_return_mechanics_closure(
+                first,
+                return_producer,
+                &dependencies,
+                &mut BTreeMap::new(),
+            ),
+            Err(SemanticCError::CyclicReturnMechanics(_))
+        ));
+
+        let owner = |producer| SemanticCReturnMechanicsOwner {
+            source_producer: producer,
+            return_producers: vec![return_producer].into_boxed_slice(),
+            source_obligations: Vec::new().into_boxed_slice(),
+        };
+        let canonical = SemanticCReturnMechanicsOwnership {
+            owners: vec![owner(first), owner(second)].into_boxed_slice(),
+        };
+        let reordered = SemanticCReturnMechanicsOwnership {
+            owners: vec![owner(second), owner(first)].into_boxed_slice(),
+        };
+        let duplicated = SemanticCReturnMechanicsOwnership {
+            owners: vec![owner(first), owner(first), owner(second)].into_boxed_slice(),
+        };
+        assert_ne!(canonical, reordered);
+        assert_ne!(canonical, duplicated);
+    }
+}

@@ -27,7 +27,7 @@ use crate::semantic_memory_function::{
     PLAIN_RAM_HELPER_DECLARATIONS, memory_helper_name, render_value_use,
 };
 
-pub const CERTIFIED_AGGREGATE_MEMBER_SEMANTIC_C_FUNCTION_SCHEMA_VERSION: u32 = 2;
+pub const CERTIFIED_AGGREGATE_MEMBER_SEMANTIC_C_FUNCTION_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum CertifiedAggregateMemberSemanticCFunctionScope {

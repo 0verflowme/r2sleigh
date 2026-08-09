@@ -24,7 +24,8 @@ use crate::certified_region::{
 };
 use crate::semantic_c::{
     SEMANTIC_C_HELPERS, SemanticCError, SemanticCFunctionInterface, SemanticCFunctionReturn,
-    SemanticCInputOrigin, SemanticCReturn, storage_type, value_name,
+    SemanticCInputOrigin, SemanticCReturn, logical_return_type, render_logical_return_statement,
+    storage_type, value_name,
 };
 use crate::semantic_stmt::{SemanticCBlockStepLayer, SemanticCStatementError};
 
@@ -562,9 +563,9 @@ impl CertifiedConditionalReturnFunction {
             "\tif ((uint8_t)({condition}) != UINT8_C(0)) {{"
         )
         .expect("String writes cannot fail");
-        render_return_arm(&mut output, &self.true_arm, "\t\t")?;
+        render_return_arm(&mut output, &self.true_arm, "\t\t", interface)?;
         output.push_str("\t} else {\n");
-        render_return_arm(&mut output, &self.false_arm, "\t\t")?;
+        render_return_arm(&mut output, &self.false_arm, "\t\t", interface)?;
         output.push_str("\t}\n}\n");
         Ok(output)
     }
@@ -573,10 +574,7 @@ impl CertifiedConditionalReturnFunction {
 fn return_type(
     interface: &SemanticCFunctionInterface,
 ) -> Result<&'static str, ConditionalReturnFunctionError> {
-    match interface.return_kind() {
-        SemanticCFunctionReturn::Void => Ok("void"),
-        SemanticCFunctionReturn::Register { ty, .. } => Ok(storage_type(ty)?),
-    }
+    Ok(logical_return_type(interface)?)
 }
 
 fn render_parameters(
@@ -661,15 +659,25 @@ fn render_return_arm(
     output: &mut String,
     arm: &CertifiedConditionalReturnArm,
     indent: &str,
+    interface: &SemanticCFunctionInterface,
 ) -> Result<(), ConditionalReturnFunctionError> {
     render_value_steps(output, arm.layer(), indent)?;
     let returned = arm
         .returned()
         .ok_or(ConditionalReturnFunctionError::MissingReturnedEntity)?;
     match returned.values() {
-        [] => writeln!(output, "{indent}return;").expect("String writes cannot fail"),
-        [value] => writeln!(output, "{indent}return {};", value_name(value.binding()))
-            .expect("String writes cannot fail"),
+        [] => writeln!(
+            output,
+            "{indent}{}",
+            render_logical_return_statement(interface, None)?
+        )
+        .expect("String writes cannot fail"),
+        [value] => writeln!(
+            output,
+            "{indent}{}",
+            render_logical_return_statement(interface, Some(&value_name(value.binding())))?
+        )
+        .expect("String writes cannot fail"),
         _ => return Err(ConditionalReturnFunctionError::MissingReturnedEntity),
     }
     Ok(())

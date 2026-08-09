@@ -20,8 +20,9 @@ use crate::certified_region::{
     RegionObligationMapping, TypedOutputSealError,
 };
 use crate::semantic_c::{
-    SemanticCError, SemanticCExprId, SemanticCExprKind, SemanticCFunctionInterface,
-    SemanticCFunctionReturn, SemanticCInputOrigin, SemanticCReturn, storage_type, value_name,
+    SEMANTIC_C_HELPERS, SemanticCError, SemanticCExprId, SemanticCExprKind,
+    SemanticCFunctionInterface, SemanticCFunctionReturn, SemanticCInputOrigin, SemanticCReturn,
+    logical_return_type, render_logical_return_statement, storage_type, value_name,
 };
 use crate::semantic_stmt::{SemanticCBlockStepLayer, SemanticCStatementError};
 
@@ -556,6 +557,8 @@ impl CertifiedSwitchReturnFunction {
         let selector = self.switch_control.selector().binding();
         let mut output = String::new();
         output.push_str("#include <stdint.h>\n\n");
+        output.push_str(SEMANTIC_C_HELPERS);
+        output.push('\n');
         write!(&mut output, "{} {}(", return_type(interface)?, self.name)
             .expect("String writes cannot fail");
         render_parameters(&mut output, interface)?;
@@ -674,10 +677,7 @@ fn typed_region_mappings<'a>(
 fn return_type(
     interface: &SemanticCFunctionInterface,
 ) -> Result<&'static str, SwitchReturnFunctionError> {
-    match interface.return_kind() {
-        SemanticCFunctionReturn::Void => Ok("void"),
-        SemanticCFunctionReturn::Register { ty, .. } => Ok(storage_type(ty)?),
-    }
+    Ok(logical_return_type(interface)?)
 }
 
 fn render_parameters(
@@ -710,16 +710,22 @@ fn render_return(
 ) -> Result<(), SwitchReturnFunctionError> {
     match (interface.return_kind(), outcome) {
         (SemanticCFunctionReturn::Void, SwitchReturnOutcome::Void) => {
-            writeln!(output, "{indent}return;").expect("String writes cannot fail");
+            writeln!(
+                output,
+                "{indent}{}",
+                render_logical_return_statement(interface, None)?
+            )
+            .expect("String writes cannot fail");
         }
         (
             SemanticCFunctionReturn::Register { ty, .. },
             SwitchReturnOutcome::Value { width_bits, bits },
         ) if ty.width_bits() == width_bits => {
+            let carrier = format!("(({})UINT64_C(0x{bits:x}))", storage_type(ty)?);
             writeln!(
                 output,
-                "{indent}return (({})UINT64_C(0x{bits:x}));",
-                storage_type(ty)?
+                "{indent}{}",
+                render_logical_return_statement(interface, Some(&carrier))?
             )
             .expect("String writes cannot fail");
         }
