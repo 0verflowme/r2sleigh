@@ -93,6 +93,8 @@ struct ApiV2 {
     planner_query_response_size: u32,
     planner_target_input_size: u32,
     planner_result_view_size: u32,
+    radare_snapshot_input_size: u32,
+    radare_accessors_size: u32,
     session_create: usize,
     session_free: usize,
     session_cancel: usize,

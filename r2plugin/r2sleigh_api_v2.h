@@ -348,14 +348,17 @@ typedef struct R2SleighOwnedBytesV2 R2SleighOwnedBytesV2;
 typedef struct R2SleighPlannerResultV2 R2SleighPlannerResultV2;
 
 /**
- * Opaque, caller-owned response. response_free is the only valid deallocator.
+ * Opaque registry-owned response handle. The caller owns the obligation to
+ * release the handle exactly once with response_free. response_free must not
+ * race response_bytes, response_info, or use of their borrowed views.
  */
 typedef struct R2SleighResponseV2 R2SleighResponseV2;
 
 /**
- * Opaque, caller-owned session. `session_cancel` may run concurrently with
- * execute; `session_reset_cancellation` is valid only between execute calls.
- * session_free is the only valid deallocator.
+ * Opaque registry-owned session handle. The caller owns the obligation to
+ * release the handle exactly once, after every concurrent session operation
+ * has finished. `session_cancel` may run concurrently with execute;
+ * `session_reset_cancellation` is valid only between execute calls.
  */
 typedef struct R2SleighSessionV2 R2SleighSessionV2;
 

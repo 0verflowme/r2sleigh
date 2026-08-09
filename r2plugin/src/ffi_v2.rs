@@ -1053,15 +1053,18 @@ pub struct R2SleighResponseInfoV2 {
     pub diagnostics_json: R2SleighByteViewV2,
 }
 
-/// Opaque, caller-owned session. `session_cancel` may run concurrently with
-/// execute; `session_reset_cancellation` is valid only between execute calls.
-/// session_free is the only valid deallocator.
+/// Opaque registry-owned session handle. The caller owns the obligation to
+/// release the handle exactly once, after every concurrent session operation
+/// has finished. `session_cancel` may run concurrently with execute;
+/// `session_reset_cancellation` is valid only between execute calls.
 pub struct R2SleighSessionV2 {
     error: Mutex<Option<CString>>,
     cancellation: Mutex<r2engine::EngineCancellationToken>,
 }
 
-/// Opaque, caller-owned response. response_free is the only valid deallocator.
+/// Opaque registry-owned response handle. The caller owns the obligation to
+/// release the handle exactly once with response_free. response_free must not
+/// race response_bytes, response_info, or use of their borrowed views.
 pub struct R2SleighResponseV2 {
     bytes: CString,
     diagnostics: CString,
@@ -1110,6 +1113,25 @@ struct LiftHandleEntry {
 struct LiftHandleRegistry {
     next_generation: u64,
     handles: BTreeMap<usize, LiftHandleEntry>,
+}
+
+enum EngineHandlePayload {
+    Session(Arc<R2SleighSessionV2>),
+    Response(Arc<R2SleighResponseV2>),
+}
+
+struct EngineHandleRegistry {
+    next_generation: u64,
+    handles: BTreeMap<usize, EngineHandlePayload>,
+}
+
+impl Default for EngineHandleRegistry {
+    fn default() -> Self {
+        Self {
+            next_generation: 1,
+            handles: BTreeMap::new(),
+        }
+    }
 }
 
 impl Default for LiftHandleRegistry {
@@ -1428,6 +1450,63 @@ fn valid_output_ptr<T>(value: *mut T, label: &str) -> Result<(), BoundaryError> 
     valid_object_ptr(value.cast_const(), label)
 }
 
+fn registered_session(
+    handle: *const R2SleighSessionV2,
+) -> Result<Arc<R2SleighSessionV2>, BoundaryError> {
+    let key = engine_handle_key(handle, "session")?;
+    lock_engine_registry().session(key)
+}
+
+fn registered_response(
+    handle: *const R2SleighResponseV2,
+) -> Result<Arc<R2SleighResponseV2>, BoundaryError> {
+    let key = engine_handle_key(handle, "response")?;
+    lock_engine_registry().response(key)
+}
+
+fn retire_session(handle: *mut R2SleighSessionV2) -> Result<(), BoundaryError> {
+    let key = engine_handle_key(handle, "session")?;
+    lock_engine_registry().retire_session(key)
+}
+
+fn retire_response(handle: *mut R2SleighResponseV2) -> Result<(), BoundaryError> {
+    let key = engine_handle_key(handle, "response")?;
+    lock_engine_registry().retire_response(key)
+}
+
+fn engine_registry() -> &'static Mutex<EngineHandleRegistry> {
+    static REGISTRY: OnceLock<Mutex<EngineHandleRegistry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(EngineHandleRegistry::default()))
+}
+
+fn lock_engine_registry() -> MutexGuard<'static, EngineHandleRegistry> {
+    engine_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn engine_handle_key<T>(handle: *const T, label: &str) -> Result<usize, BoundaryError> {
+    if handle.is_null() {
+        return Err(BoundaryError::invalid(format!("{label} is null")));
+    }
+    let key = handle as usize;
+    if !key.is_multiple_of(align_of::<T>()) {
+        return Err(BoundaryError::invalid(format!("{label} is misaligned")));
+    }
+    Ok(key)
+}
+
+fn opaque_handle_stride() -> usize {
+    align_of::<R2SleighSessionV2>()
+        .max(align_of::<R2SleighResponseV2>())
+        .max(align_of::<R2ILContext>())
+        .max(align_of::<R2ILBlock>())
+        .max(align_of::<R2SleighOwnedBytesV2>())
+        .max(align_of::<R2SleighAnalysisResultV2>())
+        .max(align_of::<R2SleighPlannerResultV2>())
+        .max(2)
+}
+
 fn lift_registry() -> &'static Mutex<LiftHandleRegistry> {
     static REGISTRY: OnceLock<Mutex<LiftHandleRegistry>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(LiftHandleRegistry::default()))
@@ -1461,14 +1540,12 @@ impl LiftHandleRegistry {
     }
 
     fn handle_key<T>(&self, generation: u64) -> Result<usize, BoundaryError> {
-        let stride = align_of::<R2ILContext>()
-            .max(align_of::<R2ILBlock>())
-            .max(align_of::<R2SleighOwnedBytesV2>())
-            .max(align_of::<R2SleighAnalysisResultV2>())
-            .max(align_of::<R2SleighPlannerResultV2>())
-            .max(2);
+        let stride = opaque_handle_stride();
         let generation = usize::try_from(generation)
             .map_err(|_| BoundaryError::limit("lift handle token space exhausted"))?;
+        let generation = generation
+            .checked_mul(2)
+            .ok_or_else(|| BoundaryError::limit("lift handle token space exhausted"))?;
         let key = generation
             .checked_mul(stride)
             .ok_or_else(|| BoundaryError::limit("lift handle token space exhausted"))?;
@@ -1701,6 +1778,117 @@ impl LiftHandleRegistry {
             let payload = self.handles[key].payload as *mut R2ILContext;
             unsafe { (&mut *payload).set_error(message) };
         }
+    }
+}
+
+impl EngineHandleRegistry {
+    fn allocate_generation(&mut self) -> Result<u64, BoundaryError> {
+        let generation = self.next_generation;
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .ok_or_else(|| BoundaryError::limit("engine handle generation exhausted"))?;
+        Ok(generation)
+    }
+
+    fn handle_key<T>(&self, generation: u64) -> Result<usize, BoundaryError> {
+        let generation = usize::try_from(generation)
+            .map_err(|_| BoundaryError::limit("engine handle token space exhausted"))?;
+        let slot = generation
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| BoundaryError::limit("engine handle token space exhausted"))?;
+        let key = slot
+            .checked_mul(opaque_handle_stride())
+            .ok_or_else(|| BoundaryError::limit("engine handle token space exhausted"))?;
+        if key == 0 || !key.is_multiple_of(align_of::<T>()) {
+            return Err(BoundaryError::engine(
+                "invalid generated engine handle token",
+            ));
+        }
+        Ok(key)
+    }
+
+    fn insert_session(
+        &mut self,
+        session: Arc<R2SleighSessionV2>,
+    ) -> Result<*mut R2SleighSessionV2, BoundaryError> {
+        let generation = self.allocate_generation()?;
+        let key = self.handle_key::<R2SleighSessionV2>(generation)?;
+        if self.handles.contains_key(&key) {
+            return Err(BoundaryError::engine("session handle collision"));
+        }
+        self.handles
+            .insert(key, EngineHandlePayload::Session(session));
+        Ok(key as *mut R2SleighSessionV2)
+    }
+
+    fn insert_response(
+        &mut self,
+        response: Arc<R2SleighResponseV2>,
+    ) -> Result<*mut R2SleighResponseV2, BoundaryError> {
+        let generation = self.allocate_generation()?;
+        let key = self.handle_key::<R2SleighResponseV2>(generation)?;
+        if self.handles.contains_key(&key) {
+            return Err(BoundaryError::engine("response handle collision"));
+        }
+        self.handles
+            .insert(key, EngineHandlePayload::Response(response));
+        Ok(key as *mut R2SleighResponseV2)
+    }
+
+    fn session(&self, key: usize) -> Result<Arc<R2SleighSessionV2>, BoundaryError> {
+        let payload = self
+            .handles
+            .get(&key)
+            .ok_or_else(|| BoundaryError::invalid("session is unknown or stale"))?;
+        match payload {
+            EngineHandlePayload::Session(session) => Ok(Arc::clone(session)),
+            EngineHandlePayload::Response(_) => Err(BoundaryError::invalid(
+                "session has the wrong handle kind or generation",
+            )),
+        }
+    }
+
+    fn response(&self, key: usize) -> Result<Arc<R2SleighResponseV2>, BoundaryError> {
+        let payload = self
+            .handles
+            .get(&key)
+            .ok_or_else(|| BoundaryError::invalid("response is unknown or stale"))?;
+        match payload {
+            EngineHandlePayload::Response(response) => Ok(Arc::clone(response)),
+            EngineHandlePayload::Session(_) => Err(BoundaryError::invalid(
+                "response has the wrong handle kind or generation",
+            )),
+        }
+    }
+
+    fn retire_session(&mut self, key: usize) -> Result<(), BoundaryError> {
+        match self.handles.get(&key) {
+            Some(EngineHandlePayload::Session(_)) => {}
+            Some(EngineHandlePayload::Response(_)) => {
+                return Err(BoundaryError::invalid(
+                    "session has the wrong handle kind or generation",
+                ));
+            }
+            None => return Err(BoundaryError::invalid("session is unknown or stale")),
+        }
+        self.handles.remove(&key);
+        Ok(())
+    }
+
+    fn retire_response(&mut self, key: usize) -> Result<(), BoundaryError> {
+        match self.handles.get(&key) {
+            Some(EngineHandlePayload::Response(_)) => {}
+            Some(EngineHandlePayload::Session(_)) => {
+                return Err(BoundaryError::invalid(
+                    "response has the wrong handle kind or generation",
+                ));
+            }
+            None => return Err(BoundaryError::invalid("response is unknown or stale")),
+        }
+        self.handles.remove(&key);
+        Ok(())
     }
 }
 
@@ -4003,22 +4191,26 @@ extern "C" fn session_create(
         if config.required_capabilities & !R2SLEIGH_CAPABILITIES_V2 != 0 {
             return R2SLEIGH_STATUS_UNSUPPORTED_V2;
         }
-        let session = Box::new(R2SleighSessionV2 {
+        let session = Arc::new(R2SleighSessionV2 {
             error: Mutex::new(None),
             cancellation: Mutex::new(r2engine::EngineCancellationToken::default()),
         });
-        unsafe { *output = Box::into_raw(session) };
-        R2SLEIGH_STATUS_OK_V2
+        match lock_engine_registry().insert_session(session) {
+            Ok(session) => {
+                unsafe { *output = session };
+                R2SLEIGH_STATUS_OK_V2
+            }
+            Err(error) => error.status,
+        }
     }))
     .unwrap_or(R2SLEIGH_STATUS_PANIC_V2)
 }
 
 extern "C" fn session_cancel(session: *const R2SleighSessionV2) -> u32 {
     catch_unwind(AssertUnwindSafe(|| {
-        if valid_object_ptr(session, "session").is_err() {
+        let Ok(session) = registered_session(session) else {
             return R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
-        }
-        let session = unsafe { &*session };
+        };
         let Ok(cancellation) = session.cancellation.lock() else {
             return R2SLEIGH_STATUS_ENGINE_ERROR_V2;
         };
@@ -4030,10 +4222,9 @@ extern "C" fn session_cancel(session: *const R2SleighSessionV2) -> u32 {
 
 extern "C" fn session_reset_cancellation(session: *const R2SleighSessionV2) -> u32 {
     catch_unwind(AssertUnwindSafe(|| {
-        if valid_object_ptr(session, "session").is_err() {
+        let Ok(session) = registered_session(session) else {
             return R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
-        }
-        let session = unsafe { &*session };
+        };
         let Ok(mut cancellation) = session.cancellation.lock() else {
             return R2SLEIGH_STATUS_ENGINE_ERROR_V2;
         };
@@ -4045,11 +4236,9 @@ extern "C" fn session_reset_cancellation(session: *const R2SleighSessionV2) -> u
 
 extern "C" fn session_free(session: *mut R2SleighSessionV2) -> u32 {
     catch_unwind(AssertUnwindSafe(|| {
-        if valid_object_ptr(session, "session").is_err() {
-            return R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
-        }
-        unsafe { drop(Box::from_raw(session)) };
-        R2SLEIGH_STATUS_OK_V2
+        retire_session(session)
+            .map(|_| R2SLEIGH_STATUS_OK_V2)
+            .unwrap_or(R2SLEIGH_STATUS_INVALID_ARGUMENT_V2)
     }))
     .unwrap_or(R2SLEIGH_STATUS_PANIC_V2)
 }
@@ -4212,13 +4401,12 @@ unsafe extern "C" fn execute(
             return R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
         }
         unsafe { *output = ptr::null_mut() };
-        if valid_object_ptr(session, "session").is_err() {
+        let Ok(session) = registered_session(session) else {
             return R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
-        }
-        let session = unsafe { &*session };
+        };
         let result = catch_unwind(AssertUnwindSafe(|| {
             valid_object_ptr(request, "request")?;
-            clear_session_error(session);
+            clear_session_error(&session);
             let cancellation = session
                 .cancellation
                 .lock()
@@ -4257,17 +4445,18 @@ unsafe extern "C" fn execute(
                     status: R2SLEIGH_PHASE_STATUS_EXECUTED_V2,
                     elapsed_us: ffi_conversion_elapsed_us,
                 };
-            unsafe { *output = Box::into_raw(owned_response) };
+            let response = lock_engine_registry().insert_response(Arc::from(owned_response))?;
+            unsafe { *output = response };
             Ok(())
         }));
         match result {
             Ok(Ok(())) => R2SLEIGH_STATUS_OK_V2,
             Ok(Err(error)) => {
-                set_session_error(session, &error.message);
+                set_session_error(&session, &error.message);
                 error.status
             }
             Err(_) => {
-                set_session_error(session, "panic contained at r2sleigh V2 execute boundary");
+                set_session_error(&session, "panic contained at r2sleigh V2 execute boundary");
                 R2SLEIGH_STATUS_PANIC_V2
             }
         }
@@ -4284,10 +4473,9 @@ extern "C" fn response_bytes(
             return R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
         }
         unsafe { *output = R2SleighByteViewV2::default() };
-        if valid_object_ptr(response, "response").is_err() {
+        let Ok(response) = registered_response(response) else {
             return R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
-        }
-        let response = unsafe { &*response };
+        };
         unsafe {
             *output = R2SleighByteViewV2 {
                 data: response.bytes.as_ptr().cast(),
@@ -4310,10 +4498,9 @@ extern "C" fn response_info(
             return R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
         }
         unsafe { output.write_bytes(0, 1) };
-        if valid_object_ptr(response, "response").is_err() {
+        let Ok(response) = registered_response(response) else {
             return R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
-        }
-        let response = unsafe { &*response };
+        };
         unsafe {
             *output = R2SleighResponseInfoV2 {
                 schema_version: R2SLEIGH_RESPONSE_INFO_SCHEMA_V2,
@@ -4336,11 +4523,9 @@ extern "C" fn response_info(
 
 extern "C" fn response_free(response: *mut R2SleighResponseV2) -> u32 {
     catch_unwind(AssertUnwindSafe(|| {
-        if valid_object_ptr(response, "response").is_err() {
-            return R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
-        }
-        unsafe { drop(Box::from_raw(response)) };
-        R2SLEIGH_STATUS_OK_V2
+        retire_response(response)
+            .map(|_| R2SLEIGH_STATUS_OK_V2)
+            .unwrap_or(R2SLEIGH_STATUS_INVALID_ARGUMENT_V2)
     }))
     .unwrap_or(R2SLEIGH_STATUS_PANIC_V2)
 }
@@ -4354,10 +4539,9 @@ extern "C" fn session_error(
             return R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
         }
         unsafe { *output = R2SleighByteViewV2::default() };
-        if valid_object_ptr(session, "session").is_err() {
+        let Ok(session) = registered_session(session) else {
             return R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
-        }
-        let session = unsafe { &*session };
+        };
         let Ok(error) = session.error.lock() else {
             return R2SLEIGH_STATUS_ENGINE_ERROR_V2;
         };
@@ -7433,7 +7617,7 @@ mod tests {
         assert_semantic_kernel_render_diagnostics(
             r2engine::EngineSemanticKernelRegion::AggregateMemberTerminalReturnFunction,
             "aggregate_member_terminal_return_function",
-            2,
+            3,
         );
     }
 
@@ -7442,7 +7626,7 @@ mod tests {
         assert_semantic_kernel_render_diagnostics(
             r2engine::EngineSemanticKernelRegion::TerminalReturnBlock,
             "terminal_return_block",
-            2,
+            3,
         );
     }
 
@@ -7452,37 +7636,37 @@ mod tests {
             (
                 r2engine::EngineSemanticKernelRegion::TerminalReturnBlock,
                 "terminal_return_block",
-                2,
+                3,
             ),
             (
                 r2engine::EngineSemanticKernelRegion::AggregateMemberTerminalReturnFunction,
                 "aggregate_member_terminal_return_function",
-                2,
+                3,
             ),
             (
                 r2engine::EngineSemanticKernelRegion::PlainRamMemoryTerminalReturnFunction,
                 "plain_ram_memory_terminal_return_function",
-                2,
+                3,
             ),
             (
                 r2engine::EngineSemanticKernelRegion::DirectCallTerminalReturnFunction,
                 "direct_call_terminal_return_function",
-                2,
+                3,
             ),
             (
                 r2engine::EngineSemanticKernelRegion::ConditionalTerminalReturnFunction,
                 "conditional_terminal_return_function",
-                2,
+                3,
             ),
             (
                 r2engine::EngineSemanticKernelRegion::SwitchTerminalReturnFunction,
                 "switch_terminal_return_function",
-                2,
+                3,
             ),
             (
                 r2engine::EngineSemanticKernelRegion::CarrierFreeLoopTerminalReturnFunction,
                 "carrier_free_loop_terminal_return_function",
-                2,
+                3,
             ),
         ];
         for (region, expected, expected_schema_version) in regions {
@@ -8709,14 +8893,33 @@ mod tests {
             status: R2SLEIGH_PHASE_STATUS_EXECUTED_V2,
             elapsed_us: 7,
         };
-        let response = Box::into_raw(Box::new(R2SleighResponseV2 {
-            bytes: CString::new("owned response").unwrap(),
-            diagnostics: CString::new("{\"warnings\":[]}").unwrap(),
-            phase_timings,
-            request_kind: R2SLEIGH_REQUEST_DECOMPILE_V2,
-            outcome: R2SLEIGH_OUTCOME_COMPLETED_V2,
-            ffi_conversion_elapsed_us: 7,
-        }));
+        let response = lock_engine_registry()
+            .insert_response(Arc::new(R2SleighResponseV2 {
+                bytes: CString::new("owned response").unwrap(),
+                diagnostics: CString::new("{\"warnings\":[]}").unwrap(),
+                phase_timings,
+                request_kind: R2SLEIGH_REQUEST_DECOMPILE_V2,
+                outcome: R2SLEIGH_OUTCOME_COMPLETED_V2,
+                ffi_conversion_elapsed_us: 7,
+            }))
+            .expect("registered response");
+        let forged = 0x1000usize as *mut R2SleighResponseV2;
+        let mut forged_bytes = R2SleighByteViewV2 {
+            data: ptr::dangling(),
+            len: usize::MAX,
+        };
+        assert_eq!(
+            response_bytes(forged, &mut forged_bytes),
+            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
+        );
+        assert!(forged_bytes.data.is_null());
+        assert_eq!(forged_bytes.len, 0);
+        assert_eq!(response_free(forged), R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
+        assert_eq!(
+            session_free(response.cast::<R2SleighSessionV2>()),
+            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2,
+            "reverse wrong-kind free must preserve the response owner"
+        );
         let mut first = R2SleighByteViewV2::default();
         let mut second = R2SleighByteViewV2::default();
         assert_eq!(response_bytes(response, &mut first), R2SLEIGH_STATUS_OK_V2);
@@ -8739,6 +8942,121 @@ mod tests {
             info.ffi_conversion_elapsed_us
         );
         assert_eq!(response_free(response), R2SLEIGH_STATUS_OK_V2);
+        assert_eq!(response_free(response), R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
+        assert_eq!(
+            response_bytes(response, &mut first),
+            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
+        );
+        assert!(first.data.is_null());
+        assert_eq!(first.len, 0);
+        let mut stale_info = unsafe { std::mem::zeroed::<R2SleighResponseInfoV2>() };
+        stale_info.schema_version = u32::MAX;
+        stale_info.phase_timings = ptr::dangling();
+        assert_eq!(
+            response_info(response, &mut stale_info),
+            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
+        );
+        assert_eq!(stale_info.schema_version, 0);
+        assert!(stale_info.phase_timings.is_null());
+    }
+
+    #[test]
+    fn session_tokens_reject_forgery_cross_kind_stale_and_double_free() {
+        let mut session = ptr::null_mut();
+        assert_eq!(
+            session_create(&config(), &mut session),
+            R2SLEIGH_STATUS_OK_V2
+        );
+        let forged = 0x1000usize as *mut R2SleighSessionV2;
+        assert_eq!(session_cancel(forged), R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
+        assert_eq!(session_free(forged), R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
+
+        assert_eq!(
+            response_free(session.cast::<R2SleighResponseV2>()),
+            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2,
+            "wrong-kind free must preserve the real session owner"
+        );
+        assert_eq!(session_cancel(session), R2SLEIGH_STATUS_OK_V2);
+
+        let retained =
+            registered_session(session).expect("active call retains the session allocation");
+        assert_eq!(session_free(session), R2SLEIGH_STATUS_OK_V2);
+        assert_eq!(session_free(session), R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
+        assert_eq!(session_cancel(session), R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
+        assert_eq!(
+            session_reset_cancellation(session),
+            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
+        );
+        let mut error = R2SleighByteViewV2 {
+            data: ptr::dangling(),
+            len: usize::MAX,
+        };
+        assert_eq!(
+            session_error(session, &mut error),
+            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
+        );
+        assert!(error.data.is_null());
+        assert_eq!(error.len, 0);
+        let mut response = ptr::dangling_mut::<R2SleighResponseV2>();
+        assert_eq!(
+            unsafe { execute(session, ptr::null(), &mut response) },
+            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
+        );
+        assert!(response.is_null());
+        retained
+            .cancellation
+            .lock()
+            .expect("retained cancellation")
+            .cancel();
+
+        let mut replacement = ptr::null_mut();
+        assert_eq!(
+            session_create(&config(), &mut replacement),
+            R2SLEIGH_STATUS_OK_V2
+        );
+        assert_ne!(session, replacement, "retired tokens are never reused");
+        assert_eq!(session_free(replacement), R2SLEIGH_STATUS_OK_V2);
+    }
+
+    #[test]
+    fn session_cancel_is_valid_from_another_thread() {
+        let mut session = ptr::null_mut();
+        assert_eq!(
+            session_create(&config(), &mut session),
+            R2SLEIGH_STATUS_OK_V2
+        );
+        let token = session as usize;
+        let status = std::thread::spawn(move || session_cancel(token as *const R2SleighSessionV2))
+            .join()
+            .expect("cross-thread cancel does not panic");
+        assert_eq!(status, R2SLEIGH_STATUS_OK_V2);
+        assert_eq!(session_free(session), R2SLEIGH_STATUS_OK_V2);
+    }
+
+    #[test]
+    fn session_cancel_does_not_wait_for_pinned_lift_handles() {
+        let mut session = ptr::null_mut();
+        assert_eq!(
+            session_create(&config(), &mut session),
+            R2SLEIGH_STATUS_OK_V2
+        );
+        let pinned_lift_handles = lock_lift_registry();
+        let token = session as usize;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let cancel = std::thread::spawn(move || {
+            sender
+                .send(session_cancel(token as *const R2SleighSessionV2))
+                .expect("cancellation status receiver remains live");
+        });
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("session cancellation must not share the pinned lift registry"),
+            R2SLEIGH_STATUS_OK_V2
+        );
+        drop(pinned_lift_handles);
+        cancel.join().expect("cross-thread cancel does not panic");
+        assert_eq!(session_free(session), R2SLEIGH_STATUS_OK_V2);
     }
 
     #[test]
