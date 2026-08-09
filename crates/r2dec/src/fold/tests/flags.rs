@@ -72,22 +72,22 @@ fn install_semantic_artifact(ctx: &mut FoldingContext<'_>, artifact: r2sym::Sema
     ctx.inputs.function_facts = Box::leak(Box::new(function_facts));
 }
 
-fn install_certified_route(ctx: &mut FoldingContext<'_>) {
+fn install_typed_rendering_for_test(ctx: &mut FoldingContext<'_>) {
     let mut function_facts = ctx.inputs.function_facts.clone();
     function_facts = function_facts.with_decompile_route(r2types::DecompileRouteFacts {
         kind: r2types::DecompileRouteKind::Standard,
-        reason: Some("test certified Standard".to_string()),
+        reason: Some("test typed rendering".to_string()),
         fallback_comment: None,
         skip_runtime_type_inference: true,
         use_prepared_semantic_view: true,
         proof_coverage: r2sym::ProofCoverage::default(),
-        render_permission: r2sym::RenderPermission::certified(
+        render_permission: r2sym::RenderPermission::residual(
             r2sym::ProofOwner::R2engine,
-            "test certified Standard",
+            "test typed rendering",
         ),
     });
     ctx.inputs.function_facts = Box::leak(Box::new(function_facts));
-    ctx.inputs.certified_rendering_required = false;
+    ctx.inputs.certified_rendering_required = true;
 }
 
 fn install_call_owner(
@@ -529,7 +529,7 @@ fn actionable_memory_island_parses_memory_condition_expr() {
     let prepared =
         prepared_from_r2il_blocks(&[entry, fallthrough, taken], &arch).with_name("memory_island");
     let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
-    install_certified_route(&mut ctx);
+    install_typed_rendering_for_test(&mut ctx);
     let region = crate::test_semantic_region(
         0x4000,
         std::collections::BTreeSet::new(),

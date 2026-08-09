@@ -536,11 +536,11 @@ pub(crate) fn build_detached_function_analysis_artifact_with_scope_and_optional_
         .map(|response| rename_function_analysis_artifact(response.artifact, function_name))
 }
 
-#[derive(Debug, serde::Serialize)]
+#[cfg(test)]
+#[derive(Debug)]
 pub(crate) struct DataRef {
     pub(crate) from: u64,
     pub(crate) to: u64,
-    #[serde(rename = "type")]
     pub(crate) ref_type: String,
 }
 
@@ -603,6 +603,7 @@ fn ffi_recovered_vars_from_vars(vars: &[VarProt]) -> R2SleighRecoveredVars {
     }
 }
 
+#[cfg(test)]
 fn data_ref_from_fact(fact: &r2ssa::DataRefFact) -> DataRef {
     DataRef {
         from: fact.from,
@@ -815,25 +816,6 @@ fn recover_vars_for_ffi(
     ))
 }
 
-/// Recover variables from SSA analysis.
-/// Caller must free with r2il_string_free().
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_recover_vars(
-    ctx: *const R2ILContext,
-    blocks: *const *const R2ILBlock,
-    num_blocks: usize,
-    fcn_addr: u64,
-) -> *mut c_char {
-    let Some(vars) = recover_vars_for_ffi(ctx, blocks, num_blocks, fcn_addr) else {
-        return ptr::null_mut();
-    };
-
-    match serde_json::to_string(&vars) {
-        Ok(s) => CString::new(s).map_or(ptr::null_mut(), |c| c.into_raw()),
-        Err(_) => ptr::null_mut(),
-    }
-}
-
 #[unsafe(no_mangle)]
 pub extern "C" fn r2sleigh_recover_vars_typed(
     ctx: *const R2ILContext,
@@ -886,25 +868,6 @@ fn data_refs_for_ffi(
 ) -> Option<Vec<r2ssa::DataRefFact>> {
     let input = build_function_input(ctx, blocks, num_blocks, 0, ptr::null())?;
     r2ssa::data_refs_from_blocks(input.blocks.as_slice(), input.ctx.arch, input.ctx.disasm)
-}
-
-/// Get data flow references from def-use analysis.
-/// Caller must free with r2il_string_free().
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_get_data_refs(
-    ctx: *const R2ILContext,
-    blocks: *const *const R2ILBlock,
-    num_blocks: usize,
-    fcn_addr: u64,
-) -> *mut c_char {
-    let Some(refs) = data_refs_for_ffi(ctx, blocks, num_blocks, fcn_addr) else {
-        return ptr::null_mut();
-    };
-    let refs: Vec<DataRef> = refs.iter().map(data_ref_from_fact).collect();
-    match serde_json::to_string(&refs) {
-        Ok(s) => CString::new(s).map_or(ptr::null_mut(), |c| c.into_raw()),
-        Err(_) => ptr::null_mut(),
-    }
 }
 
 #[unsafe(no_mangle)]

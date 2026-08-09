@@ -70,22 +70,18 @@ malformed-diagnostics, and preflight errors fail closed with a null rendered
 output. Cancellation is an engine refusal with refused phase status and
 non-executable refusal output, never partial C.
 
-For the exact one-block x86-64 O2 integer-guard subset, completed diagnostics
-report `semantic_kernel_render.region_id` as `branchless_guard_function_v1`
-with exact obligation closure. The boundary accepts physical full-width
-RDI/RSI/RAX ABI carriers only after exact register name, offset, and size
-validation, then binds their signed 32-bit values through low-bit projections.
-If the retained guard fact cannot certify or pass its render audit,
-decompilation refuses instead of falling through to generic or legacy C.
+Executable semantic C is authorized only through the generic source-obligation
+ledger and typed output-node ownership. Every live machine effect from the
+immutable source revision must have exactly one certified typed owner; missing,
+duplicate, unsupported, or foreign ownership residualizes or refuses without
+falling through to legacy C.
 
-The exact x86-64 `DemoStruct` array-update subset similarly reports
-`semantic_kernel_render.region_id` as `struct_array_index_function_v1`. Its
-revision-bound source graph must describe the natural 14-member signed-32
-layout, the full pointer carrier, signed low-32 index/value/return carriers,
-and every ordered member-2/member-13 access. O0 parameter homes and the O2
-register form share the same sealed semantic C renderer; a retained exact fact
-that fails certification or rendering refuses without downgrading to generic
-aggregate or memory output.
+Benchmark-shaped branchless guards and struct-array updates are regression
+inputs, not production recognizers or renderer routes. They currently remain
+residual until generic typed expression, return, aggregate-memory, and lvalue
+regions can close their complete ledgers. Consequently,
+`semantic_kernel_render` is present only when a generic certified region owns
+the exact source revision; its absence for those fixtures is expected.
 
 Function signatures, layouts, and calling-convention carriers come only from
 the immutable radare2 function snapshot. DWARF ingestion is a binary-load
@@ -107,8 +103,8 @@ pipeline internally:
 - `r2il_block_defuse_json`
 - `r2dec_block`
 
-This keeps CLI and plugin output logic aligned while preserving plugin ABI.
-The external C-ABI signatures are unchanged.
+This keeps CLI and plugin output logic aligned. The supported external C ABI is
+the versioned V2 function table; retired direct legacy exports are not preserved.
 
 The shared action/format policy is:
 
@@ -117,12 +113,12 @@ The shared action/format policy is:
 - `defuse`: `json`, `text`
 - `dec`: `c_like`, `json`, `text`
 
-Endianness Compatibility
-------------------------
+Endianness
+----------
 
-- `r2il_is_big_endian(ctx)` remains ABI-stable.
-- It now derives from `arch.memory_endianness` via legacy shim mapping.
-- New canonical endianness fields live in `ArchSpec` (`instruction_endianness`, `memory_endianness`).
+Canonical endianness fields live in `ArchSpec` (`instruction_endianness`,
+`memory_endianness`). The retired direct `r2il_is_big_endian` export is not part
+of the V2 ABI.
 
 Configuration
 -------------

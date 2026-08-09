@@ -1,39 +1,15 @@
 use crate::blocks::BlockSlice;
 use crate::{R2ILBlock, R2ILContext, SSAOpInfo, ssa_op_to_info};
 use r2ssa::TaintPolicy;
-use serde::{Deserialize, Serialize};
-use std::ffi::{CStr, CString};
+use serde::Serialize;
+use std::ffi::CString;
 use std::os::raw::c_char;
 use std::ptr;
-use std::sync::{Mutex, OnceLock};
 
 const R2TAINT_OP_OTHER: u32 = 0;
 const R2TAINT_OP_CALL: u32 = 1;
 const R2TAINT_OP_CALL_IND: u32 = 2;
 const R2TAINT_OP_STORE: u32 = 3;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-struct TaintConfig {
-    sources: Vec<String>,
-    sink_calls: bool,
-    sink_stores: bool,
-}
-
-impl Default for TaintConfig {
-    fn default() -> Self {
-        Self {
-            sources: Vec::new(),
-            sink_calls: true,
-            sink_stores: true,
-        }
-    }
-}
-
-fn taint_config() -> &'static Mutex<TaintConfig> {
-    static CONFIG: OnceLock<Mutex<TaintConfig>> = OnceLock::new();
-    CONFIG.get_or_init(|| Mutex::new(TaintConfig::default()))
-}
 
 #[derive(Serialize)]
 struct TaintSourceJson {
@@ -122,19 +98,10 @@ fn labels_to_strings(labels: &r2ssa::taint::TaintSet) -> Vec<String> {
     out
 }
 
-fn current_taint_policy() -> Option<r2ssa::DefaultTaintPolicy> {
-    let cfg = taint_config().lock().ok()?.clone();
-    let mut policy = if cfg.sources.is_empty() {
-        r2ssa::DefaultTaintPolicy::all_inputs()
-    } else {
-        r2ssa::DefaultTaintPolicy::new()
-    }
-    .with_sink_calls(cfg.sink_calls)
-    .with_sink_stores(cfg.sink_stores);
-    for src in cfg.sources {
-        policy = policy.with_source(src);
-    }
-    Some(policy)
+fn current_taint_policy() -> r2ssa::DefaultTaintPolicy {
+    r2ssa::DefaultTaintPolicy::all_inputs()
+        .with_sink_calls(true)
+        .with_sink_stores(true)
 }
 
 fn collect_taint_sources(
@@ -196,7 +163,7 @@ fn build_taint_summary_report(
     blocks: &[r2il::R2ILBlock],
 ) -> Option<TaintSummaryReportJson> {
     let ssa_func = r2ssa::SSAFunction::from_blocks_with_arch(blocks, ctx_ref.arch.as_ref())?;
-    let policy = current_taint_policy()?;
+    let policy = current_taint_policy();
     let sources = collect_taint_sources(&ssa_func, &policy);
     let analysis = r2ssa::TaintAnalysis::with_arch(&ssa_func, policy, ctx_ref.arch.as_ref());
     let result = analysis.analyze();
@@ -321,41 +288,6 @@ fn ffi_taint_summary_from_report(report: TaintSummaryReportJson) -> R2TaintFunct
     }
 }
 
-/// Configure taint sources/sinks via JSON.
-/// If `json` is NULL or empty, returns the current configuration.
-/// Caller must free the returned string with r2il_string_free().
-#[unsafe(no_mangle)]
-pub extern "C" fn r2taint_sources_sinks_json(json: *const c_char) -> *mut c_char {
-    if !json.is_null() {
-        let json_str = unsafe {
-            match CStr::from_ptr(json).to_str() {
-                Ok(s) => s.trim(),
-                Err(_) => return ptr::null_mut(),
-            }
-        };
-        if !json_str.is_empty() {
-            match serde_json::from_str::<TaintConfig>(json_str) {
-                Ok(new_cfg) => {
-                    if let Ok(mut cfg) = taint_config().lock() {
-                        *cfg = new_cfg;
-                    }
-                }
-                Err(_) => return ptr::null_mut(),
-            }
-        }
-    }
-
-    let cfg = match taint_config().lock() {
-        Ok(cfg) => cfg.clone(),
-        Err(_) => return ptr::null_mut(),
-    };
-
-    match serde_json::to_string_pretty(&cfg) {
-        Ok(s) => CString::new(s).map_or(ptr::null_mut(), |c| c.into_raw()),
-        Err(_) => ptr::null_mut(),
-    }
-}
-
 /// Run taint analysis and return results as JSON.
 /// Caller must free the returned string with r2il_string_free().
 #[unsafe(no_mangle)]
@@ -377,10 +309,7 @@ pub extern "C" fn r2taint_function_json(
             Some(f) => f,
             None => return ptr::null_mut(),
         };
-    let policy = match current_taint_policy() {
-        Some(policy) => policy,
-        None => return ptr::null_mut(),
-    };
+    let policy = current_taint_policy();
     let sources = collect_taint_sources(&ssa_func, &policy);
 
     let mut sinks = Vec::new();
@@ -420,32 +349,6 @@ pub extern "C" fn r2taint_function_json(
     };
 
     match serde_json::to_string_pretty(&report) {
-        Ok(s) => CString::new(s).map_or(ptr::null_mut(), |c| c.into_raw()),
-        Err(_) => ptr::null_mut(),
-    }
-}
-
-/// Run taint analysis and return post-analysis summary JSON.
-/// Caller must free the returned string with r2il_string_free().
-#[unsafe(no_mangle)]
-pub extern "C" fn r2taint_function_summary_json(
-    ctx: *const R2ILContext,
-    blocks: *const *const R2ILBlock,
-    num_blocks: usize,
-) -> *mut c_char {
-    if ctx.is_null() {
-        return ptr::null_mut();
-    }
-    let Some(blocks) = (unsafe { BlockSlice::from_ffi(blocks, num_blocks) }) else {
-        return ptr::null_mut();
-    };
-    let ctx_ref = unsafe { &*ctx };
-
-    let Some(report) = build_taint_summary_report(ctx_ref, blocks.as_slice()) else {
-        return ptr::null_mut();
-    };
-
-    match serde_json::to_string(&report) {
         Ok(s) => CString::new(s).map_or(ptr::null_mut(), |c| c.into_raw()),
         Err(_) => ptr::null_mut(),
     }

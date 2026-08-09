@@ -426,11 +426,7 @@ fn rename_block<C: SsaWorkControl + ?Sized>(
     Ok(())
 }
 
-fn record_renamed_op_storage(
-    source: &r2il::R2ILOp,
-    renamed: &SSAOp,
-    result: &mut RenamedFunction,
-) {
+fn record_renamed_op_storage(source: &r2il::R2ILOp, renamed: &SSAOp, result: &mut RenamedFunction) {
     if let (Some(varnode), Some(var)) = (source.output(), renamed.dst()) {
         record_canonical_storage(
             &mut result.canonical_storage_by_var,
@@ -557,6 +553,24 @@ fn fill_phi_sources(
         return;
     };
 
+    let incoming = phis
+        .iter()
+        .map(|phi| {
+            let source = ctx.read_var(&phi.var_name);
+            if let Some(storage) = phi.storage
+                && storage.size == source.size
+            {
+                record_canonical_storage(
+                    &mut result.canonical_storage_by_var,
+                    &mut result.ambiguous_storage_vars,
+                    &source,
+                    storage,
+                );
+            }
+            source
+        })
+        .collect::<Vec<_>>();
+
     // Update phi sources in the result
     let block_ops = result.blocks.get_mut(&succ_addr).unwrap();
     let mut phi_idx = 0;
@@ -565,9 +579,8 @@ fn fill_phi_sources(
         if let SSAOp::Phi { sources, .. } = op
             && phi_idx < phis.len()
         {
-            let phi = &phis[phi_idx];
             if pred_idx < sources.len() {
-                sources[pred_idx] = ctx.read_var(&phi.var_name);
+                sources[pred_idx] = incoming[phi_idx].clone();
             }
             phi_idx += 1;
         }
@@ -1610,6 +1623,69 @@ mod tests {
         } else {
             panic!("Expected Phi op, got {:?}", merge_ops[0]);
         }
+    }
+
+    #[test]
+    fn phi_live_in_source_retains_lifted_storage() {
+        let blocks = vec![
+            R2ILBlock {
+                addr: 0x1000,
+                size: 4,
+                ops: vec![R2ILOp::CBranch {
+                    target: make_const(0x1008, 8),
+                    cond: make_const(1, 1),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1004,
+                size: 4,
+                ops: vec![
+                    R2ILOp::Copy {
+                        dst: make_reg(0, 8),
+                        src: make_const(1, 8),
+                    },
+                    R2ILOp::Branch {
+                        target: make_const(0x100c, 8),
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1008,
+                size: 4,
+                ops: Vec::new(),
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x100c,
+                size: 4,
+                ops: vec![R2ILOp::Return {
+                    target: make_ram(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ];
+        let cfg = CFG::from_blocks(&blocks).unwrap();
+        let domtree = DomTree::compute(&cfg);
+        let (defs, var_sizes) = collect_defs_from_cfg(&cfg);
+        let storage = CanonicalStorageId::from_varnode(&make_reg(0, 8));
+        let storage_by_name = HashMap::from([("reg:0".to_string(), storage)]);
+        let phi_placement =
+            PhiPlacement::compute_with_storage(&cfg, &domtree, &defs, &var_sizes, &storage_by_name);
+        let result = rename_function(&cfg, &domtree, &phi_placement, &var_sizes);
+        let SSAOp::Phi { sources, .. } = &result.get_block(0x100c)[0] else {
+            panic!("expected merge phi");
+        };
+        let live_in = sources
+            .iter()
+            .find(|source| source.version == 0)
+            .expect("entry live-in source");
+        assert_eq!(result.canonical_storage_by_var.get(live_in), Some(&storage));
     }
 
     #[test]

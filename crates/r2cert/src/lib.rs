@@ -5,7 +5,10 @@
 //! final disposition to every obligation. Rendered text, names, statement
 //! counts, and AST positions are intentionally absent from this API.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use r2ssa::{
     AssumptionSet, BlockTerminator, CallBoundarySlot, CallSiteId, CanonicalInstructionId,
@@ -17,20 +20,13 @@ use r2ssa::{
     SOURCE_CALL_SITE_INTERFACE_SCHEMA_VERSION, SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION, SSAOp,
     SSAVar, SemanticInstructionState, SemanticObligationComponent, SemanticObligationId,
     SemanticObligationInventory, SemanticObligationKind, SourceCallResult, SourceCallSiteIdentity,
-    SourceFunctionReturn, SourceMachineContext, SsaArtifact, StackAddressBase, StackAddressRoot,
-    StructuredAccessId, StructuredLoopKind,
+    SourceCarrierKind, SourceFunctionReturn, SourceLogicalValue, SourceMachineContext,
+    SourceReturnStackPointerFact, SsaArtifact, SsaArtifactAuthority, StackAddressBase,
+    StackAddressRoot, StructuredAccessId, StructuredLoopKind,
 };
 use serde::{Deserialize, Serialize};
 
 mod aggregate_member;
-mod branchless_guard;
-mod conditional_return;
-mod fnv_fold;
-mod fnv_fold_o0;
-mod nested_wrap32_guard_o0;
-mod private_frame;
-mod struct_array_index;
-mod sum_array;
 
 pub use aggregate_member::{
     CERTIFIED_AGGREGATE_MEMBER_ACCESS_CONTRACT_VERSION, CertifiedAggregateMemberAccess,
@@ -38,96 +34,53 @@ pub use aggregate_member::{
     CertifiedNaturalScalarAggregateLayout,
 };
 
-pub use branchless_guard::{
-    CERTIFIED_BRANCHLESS_GUARD_CONTRACT_VERSION, CertifiedBranchlessGuardDispositionClass,
-    CertifiedBranchlessGuardFunction, CertifiedBranchlessGuardKind,
-    CertifiedBranchlessGuardParameter, CertifiedBranchlessGuardReturn,
-    certify_branchless_guard_function,
-};
+pub const CERTIFICATION_SCHEMA_VERSION: u32 = 20;
 
-pub use conditional_return::{
-    CERTIFIED_CONDITIONAL_RETURN_FUNNEL_CONTRACT_VERSION, CertifiedConditionalReturnCandidate,
-    CertifiedConditionalReturnCarrier, CertifiedConditionalReturnFunnelControl,
-    CertifiedConditionalReturnPhiInput, CertifiedConditionalReturnRegisterPhi,
-    CertifiedMemoryVersion, CertifiedPrivateStackScalar, certify_conditional_return_funnel_region,
-};
+/// Unforgeable run-local identity for one proof authority domain.
+///
+/// Artifact-bound proofs retain the identity created with the immutable SSA
+/// artifact, so independently certifying that same artifact composes safely.
+/// Standalone certification owners receive a private local identity. Rebuilding
+/// identical source bytes still creates a distinct artifact identity.
+#[derive(Clone)]
+struct CertifiedAuthoritySeal {
+    artifact: Option<SsaArtifactAuthority>,
+    local: Arc<()>,
+}
 
-pub use fnv_fold::{
-    CERTIFIED_FNV_FOLD_LOOP_CONTRACT_VERSION, CERTIFIED_FNV_OFFSET_BASIS, CERTIFIED_FNV_PRIME,
-    CertifiedFnvFoldCarrier, CertifiedFnvFoldLatchControl, CertifiedFnvFoldLoop,
-    CertifiedFnvFoldMemoryVersion, CertifiedFnvFoldPhase, CertifiedFnvFoldPhaseOrder,
-    CertifiedFnvFoldUnsignedLess, certify_fnv_fold_loop_region,
-};
+impl CertifiedAuthoritySeal {
+    fn new() -> Self {
+        Self {
+            artifact: None,
+            local: Arc::new(()),
+        }
+    }
 
-pub use fnv_fold_o0::{
-    CERTIFIED_FNV_FOLD_O0_CONTRACT_VERSION, CERTIFIED_FNV_FOLD_O0_OFFSET_BASIS,
-    CERTIFIED_FNV_FOLD_O0_PRIME, CertifiedFnvFoldO0Access, CertifiedFnvFoldO0AccessId,
-    CertifiedFnvFoldO0Ascii, CertifiedFnvFoldO0CompareKind, CertifiedFnvFoldO0DispositionClass,
-    CertifiedFnvFoldO0ExternalAliasPolicy, CertifiedFnvFoldO0Frame, CertifiedFnvFoldO0Function,
-    CertifiedFnvFoldO0Hash, CertifiedFnvFoldO0Index, CertifiedFnvFoldO0MemoryDef,
-    CertifiedFnvFoldO0MemoryLocation, CertifiedFnvFoldO0MemoryPhi, CertifiedFnvFoldO0MemoryUse,
-    CertifiedFnvFoldO0MemoryVersion, CertifiedFnvFoldO0ParameterHomeRelay, CertifiedFnvFoldO0Phase,
-    CertifiedFnvFoldO0PhiDispositionClass, CertifiedFnvFoldO0Predicate,
-    CertifiedFnvFoldO0RelativeAddress, CertifiedFnvFoldO0Slot, CertifiedFnvFoldO0Topology,
-    certify_fnv_fold_o0_region,
-};
+    fn for_artifact(artifact: &SsaArtifact) -> Self {
+        Self {
+            artifact: Some(artifact.authority().clone()),
+            local: Arc::new(()),
+        }
+    }
+}
 
-pub use nested_wrap32_guard_o0::{
-    CERTIFIED_NESTED_WRAP32_GUARD_O0_CONTRACT_VERSION, CertifiedNestedWrap32GuardO0Abi,
-    CertifiedNestedWrap32GuardO0AccessId, CertifiedNestedWrap32GuardO0Arithmetic,
-    CertifiedNestedWrap32GuardO0BlockAssumption, CertifiedNestedWrap32GuardO0CompareKind,
-    CertifiedNestedWrap32GuardO0CompareProvenance, CertifiedNestedWrap32GuardO0Comparison,
-    CertifiedNestedWrap32GuardO0Control, CertifiedNestedWrap32GuardO0DispositionClass,
-    CertifiedNestedWrap32GuardO0FlagPacket, CertifiedNestedWrap32GuardO0Frame,
-    CertifiedNestedWrap32GuardO0Function, CertifiedNestedWrap32GuardO0InstructionDisposition,
-    CertifiedNestedWrap32GuardO0MemoryAccess, CertifiedNestedWrap32GuardO0MemoryDef,
-    CertifiedNestedWrap32GuardO0MemoryLocation, CertifiedNestedWrap32GuardO0MemoryPhi,
-    CertifiedNestedWrap32GuardO0MemoryUse, CertifiedNestedWrap32GuardO0MemoryVersion,
-    CertifiedNestedWrap32GuardO0Object, CertifiedNestedWrap32GuardO0ObjectKind,
-    CertifiedNestedWrap32GuardO0Parameter, CertifiedNestedWrap32GuardO0Phi,
-    CertifiedNestedWrap32GuardO0PhiLayer, CertifiedNestedWrap32GuardO0PhysicalRange,
-    CertifiedNestedWrap32GuardO0Predicate, CertifiedNestedWrap32GuardO0RelativeAddress,
-    CertifiedNestedWrap32GuardO0ResultCarrier, CertifiedNestedWrap32GuardO0Return,
-    CertifiedNestedWrap32GuardO0Slot, CertifiedNestedWrap32GuardO0SlotAccess,
-    CertifiedNestedWrap32GuardO0Slots, CertifiedNestedWrap32GuardO0Topology,
-    certify_nested_wrap32_guard_o0_function,
-};
+impl std::fmt::Debug for CertifiedAuthoritySeal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CertifiedAuthoritySeal(..)")
+    }
+}
 
-pub use private_frame::{
-    CERTIFIED_PRIVATE_FRAME_CONDITIONAL_RETURN_CONTRACT_VERSION, CertifiedPrivateFrameAccessMemory,
-    CertifiedPrivateFrameConditionalReturn, CertifiedPrivateFrameEnvelopePolicy,
-    CertifiedPrivateFrameHome, CertifiedPrivateFrameHomeReload, CertifiedPrivateFrameLocal,
-    CertifiedPrivateFrameMemoryDef, CertifiedPrivateFrameMemoryLocation,
-    CertifiedPrivateFrameMemoryUse, CertifiedPrivateFrameMemoryVersion,
-    CertifiedPrivateFramePhysicalRange, CertifiedPrivateFrameRawLoad,
-    CertifiedPrivateFrameRegisterCopy, CertifiedPrivateFrameStackUpdate,
-    certify_private_frame_conditional_return_region,
-};
+impl PartialEq for CertifiedAuthoritySeal {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.artifact, &other.artifact) {
+            (Some(left), Some(right)) => left == right,
+            (None, None) => Arc::ptr_eq(&self.local, &other.local),
+            _ => false,
+        }
+    }
+}
 
-pub use struct_array_index::{
-    CERTIFIED_STRUCT_ARRAY_INDEX_CONTRACT_VERSION, CertifiedStructArrayIndexAccess,
-    CertifiedStructArrayIndexAccessKind, CertifiedStructArrayIndexDispositionClass,
-    CertifiedStructArrayIndexFlagPacket, CertifiedStructArrayIndexFunction,
-    CertifiedStructArrayIndexHome, CertifiedStructArrayIndexHomeReload,
-    CertifiedStructArrayIndexLayout, CertifiedStructArrayIndexLowering,
-    CertifiedStructArrayIndexParameter, CertifiedStructArrayIndexReturn,
-    CertifiedStructArrayIndexScale, certify_struct_array_index_function,
-};
-
-pub use sum_array::{
-    CERTIFIED_SUM_ARRAY_CONTRACT_VERSION, CertifiedSumArrayAbi, CertifiedSumArrayBinding,
-    CertifiedSumArrayDispositionClass, CertifiedSumArrayFrame, CertifiedSumArrayFunction,
-    CertifiedSumArrayHome, CertifiedSumArrayHomeRole, CertifiedSumArrayInstructionDisposition,
-    CertifiedSumArrayLowering, CertifiedSumArrayO0Binding, CertifiedSumArrayO0Loop,
-    CertifiedSumArrayO0Predicate, CertifiedSumArrayO2Binding, CertifiedSumArrayO2Guard,
-    CertifiedSumArrayO2Lane, CertifiedSumArrayO2Reduction, CertifiedSumArrayO2ReturnPath,
-    CertifiedSumArrayO2ScalarTail, CertifiedSumArrayO2Topology, CertifiedSumArrayO2VectorLoop,
-    CertifiedSumArrayO2VectorRead, CertifiedSumArrayParameter, CertifiedSumArrayRead,
-    CertifiedSumArrayReload, CertifiedSumArrayReturn, CertifiedSumArrayType,
-    certify_sum_array_function,
-};
-
-pub const CERTIFICATION_SCHEMA_VERSION: u32 = 17;
+impl Eq for CertifiedAuthoritySeal {}
 
 /// Stable preparation mode committed by a certification origin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -192,6 +145,10 @@ impl CertifiedDecompilerPreparationSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CertifiedArtifactOrigin {
     schema_version: u32,
+    /// Runtime proof authority. Serialized origin fields are diagnostics and
+    /// replay context only; they cannot be deserialized into permission.
+    #[serde(skip_serializing)]
+    authority: CertifiedAuthoritySeal,
     graph_snapshot: Box<[u8]>,
     prepare_mode: CertifiedPreparationMode,
     decompile_preparation: Option<CertifiedDecompilerPreparationSnapshot>,
@@ -203,6 +160,17 @@ pub struct CertifiedArtifactOrigin {
 }
 
 impl CertifiedArtifactOrigin {
+    fn authority(&self) -> &CertifiedAuthoritySeal {
+        &self.authority
+    }
+
+    pub(crate) fn is_valid(&self) -> bool {
+        self.schema_version == CERTIFICATION_SCHEMA_VERSION
+            && !self.graph_snapshot.is_empty()
+            && self.source.schema_version() == SEMANTIC_OBLIGATION_SCHEMA_VERSION
+            && self.topology.schema_version() == CERTIFICATION_SCHEMA_VERSION
+    }
+
     pub const fn schema_version(&self) -> u32 {
         self.schema_version
     }
@@ -238,10 +206,7 @@ impl CertifiedArtifactOrigin {
         source: &SemanticObligationInventory,
         topology: &CertifiedSourceTopology,
     ) -> bool {
-        self.schema_version == CERTIFICATION_SCHEMA_VERSION
-            && !self.graph_snapshot.is_empty()
-            && self.source == *source
-            && self.topology == *topology
+        self.is_valid() && self.source == *source && self.topology == *topology
     }
 }
 
@@ -388,7 +353,9 @@ impl CertifiedMachineContext {
 pub struct CertifiedAbiParameter {
     schema_version: u32,
     index: u32,
-    storage: CanonicalStorageId,
+    abi_storage: CanonicalStorageId,
+    graph_storage: CanonicalStorageId,
+    logical_value: SourceLogicalValue,
     value: Option<MachineValueUse>,
 }
 
@@ -398,7 +365,15 @@ impl CertifiedAbiParameter {
     }
 
     pub const fn storage(&self) -> CanonicalStorageId {
-        self.storage
+        self.abi_storage
+    }
+
+    pub const fn graph_storage(&self) -> CanonicalStorageId {
+        self.graph_storage
+    }
+
+    pub const fn logical_value(&self) -> SourceLogicalValue {
+        self.logical_value
     }
 
     /// Exact entry SSA carrier when the parameter is used by the graph.
@@ -415,9 +390,14 @@ impl CertifiedAbiParameter {
             .ok_or(MachineBuildError::MachineContextMismatch)?;
         let expected = interface
             .parameters()
-            .get(self.index as usize)
-            .filter(|parameter| {
-                parameter.index() == self.index && parameter.storage() == self.storage
+            .iter()
+            .zip(interface.parameter_logical_values())
+            .find(|(parameter, _)| parameter.index() == self.index)
+            .filter(|(parameter, logical)| {
+                parameter.storage() == self.abi_storage
+                    && **logical == self.logical_value
+                    && projected_parameter_storage(parameter.storage(), **logical)
+                        == Some(self.graph_storage)
             })
             .ok_or(MachineBuildError::MachineContextMismatch)?;
         let source = artifact.facts().boundaries.parameters.get(&self.index);
@@ -425,16 +405,65 @@ impl CertifiedAbiParameter {
             (None, None) => {}
             (Some(value), Some(source))
                 if source.index == self.index
-                    && source.storage == expected.storage()
+                    && source.abi_storage == expected.0.storage()
+                    && source.graph_storage == self.graph_storage
+                    && source.logical_value == self.logical_value
                     && value.binding().value() == source.value
                     && value.binding().width_bits()
-                        == expected.storage().size.checked_mul(8).unwrap_or(0)
+                        == self.graph_storage.size.checked_mul(8).unwrap_or(0)
                     && value.producer().is_none()
                     && value.constant().is_none() => {}
             _ => return Err(MachineBuildError::MachineContextMismatch),
         }
         Ok(())
     }
+}
+
+fn projected_parameter_storage(
+    abi_storage: CanonicalStorageId,
+    logical: SourceLogicalValue,
+) -> Option<CanonicalStorageId> {
+    let abi_bits = u64::from(abi_storage.size).checked_mul(8)?;
+    let carrier = logical.carrier();
+    let size_bits = carrier.size_bits();
+    if carrier.offset_bits() != 0 || size_bits == 0 || size_bits % 8 != 0 {
+        return None;
+    }
+    match carrier.kind() {
+        SourceCarrierKind::Full if size_bits == abi_bits => Some(abi_storage),
+        SourceCarrierKind::LowBits if size_bits <= abi_bits => Some(CanonicalStorageId {
+            size: u32::try_from(size_bits / 8).ok()?,
+            ..abi_storage
+        }),
+        _ => None,
+    }
+}
+
+fn exact_parameter_projection(
+    abi_storage: CanonicalStorageId,
+    graph_storage: CanonicalStorageId,
+    logical_value: SourceLogicalValue,
+) -> bool {
+    projected_parameter_storage(abi_storage, logical_value) == Some(graph_storage)
+}
+
+fn interface_has_exact_parameter_projection(
+    interface: &r2ssa::SourceFunctionInterface,
+    index: u32,
+    abi_storage: CanonicalStorageId,
+    graph_storage: CanonicalStorageId,
+    logical_value: SourceLogicalValue,
+) -> bool {
+    interface
+        .parameters()
+        .iter()
+        .zip(interface.parameter_logical_values())
+        .find(|(parameter, _)| parameter.index() == index)
+        .is_some_and(|(parameter, logical)| {
+            parameter.storage() == abi_storage
+                && *logical == logical_value
+                && exact_parameter_projection(abi_storage, graph_storage, logical_value)
+        })
 }
 
 fn certified_abi_parameters(
@@ -444,7 +473,13 @@ fn certified_abi_parameters(
         return Ok(BTreeMap::new());
     };
     let mut parameters = BTreeMap::new();
-    for parameter in interface.parameters() {
+    for (parameter, logical_value) in interface
+        .parameters()
+        .iter()
+        .zip(interface.parameter_logical_values())
+    {
+        let graph_storage = projected_parameter_storage(parameter.storage(), *logical_value)
+            .ok_or(MachineBuildError::MachineContextMismatch)?;
         let value = artifact
             .facts()
             .boundaries
@@ -455,7 +490,9 @@ fn certified_abi_parameters(
         let certified = CertifiedAbiParameter {
             schema_version: CERTIFICATION_SCHEMA_VERSION,
             index: parameter.index(),
-            storage: parameter.storage(),
+            abi_storage: parameter.storage(),
+            graph_storage,
+            logical_value: *logical_value,
             value,
         };
         certified.validate_against_artifact(artifact)?;
@@ -635,54 +672,6 @@ pub enum EffectDisposition {
     AbsorbedIntoReturn {
         producer: CanonicalInstructionId,
     },
-    /// Exact mutable-carrier ownership by a sealed counted-loop witness.
-    /// This remains pending typed counted-loop-region validation.
-    AbsorbedIntoLoopState {
-        producer: CanonicalInstructionId,
-    },
-    /// Exact register-phi or private-stack carrier ownership by a sealed
-    /// conditional-return funnel witness. This is not rendering permission.
-    AbsorbedIntoConditionalReturnState {
-        producer: CanonicalInstructionId,
-    },
-    /// Exact private prologue, epilogue, Home, or Local state owned by a
-    /// sealed private-frame conditional-return witness.
-    AbsorbedIntoPrivateFrameState {
-        producer: CanonicalInstructionId,
-    },
-    /// Exact ownership of the three canonical FNV loop carriers. Visible
-    /// expressions, byte read, controls, and return retain their own evidence.
-    AbsorbedIntoFnvFoldState {
-        producer: CanonicalInstructionId,
-    },
-    /// Exact private O0 frame ownership in the sealed stack-backed FNV fold.
-    AbsorbedIntoFnvFoldO0FrameState {
-        producer: CanonicalInstructionId,
-    },
-    /// Exact effective loop-invariant pointer/length Home MemorySSA relays.
-    AbsorbedIntoFnvFoldO0InvariantHomeRelay {
-        producer: CanonicalInstructionId,
-    },
-    /// The exact escaped-byte read plus its retained conservative frame versions.
-    AbsorbedIntoFnvFoldO0ExternalAlias {
-        producer: CanonicalInstructionId,
-    },
-    /// Exact acyclic forwarding control in the eleven-block O0 FNV topology.
-    AbsorbedIntoFnvFoldO0Forwarder {
-        producer: CanonicalInstructionId,
-    },
-    /// Exact O0 FNV loop guard, predicate routing, and latch/backedge control.
-    AbsorbedIntoFnvFoldO0LoopControl {
-        producer: CanonicalInstructionId,
-    },
-    /// Exact index, ASCII normalization, and FNV recurrence semantics.
-    AbsorbedIntoFnvFoldO0Semantics {
-        producer: CanonicalInstructionId,
-    },
-    /// Exact restored-frame return of the O0 FNV accumulator.
-    AbsorbedIntoFnvFoldO0Return {
-        producer: CanonicalInstructionId,
-    },
     Rewritten {
         pass: String,
     },
@@ -699,7 +688,7 @@ pub enum EffectDisposition {
 }
 
 impl EffectDisposition {
-    pub const fn permits_certified_c(&self) -> bool {
+    const fn is_semantically_preserving(&self) -> bool {
         matches!(
             self,
             Self::Rendered
@@ -708,17 +697,6 @@ impl EffectDisposition {
                 | Self::AbsorbedIntoCall { .. }
                 | Self::AbsorbedIntoControl { .. }
                 | Self::AbsorbedIntoReturn { .. }
-                | Self::AbsorbedIntoLoopState { .. }
-                | Self::AbsorbedIntoConditionalReturnState { .. }
-                | Self::AbsorbedIntoPrivateFrameState { .. }
-                | Self::AbsorbedIntoFnvFoldState { .. }
-                | Self::AbsorbedIntoFnvFoldO0FrameState { .. }
-                | Self::AbsorbedIntoFnvFoldO0InvariantHomeRelay { .. }
-                | Self::AbsorbedIntoFnvFoldO0ExternalAlias { .. }
-                | Self::AbsorbedIntoFnvFoldO0Forwarder { .. }
-                | Self::AbsorbedIntoFnvFoldO0LoopControl { .. }
-                | Self::AbsorbedIntoFnvFoldO0Semantics { .. }
-                | Self::AbsorbedIntoFnvFoldO0Return { .. }
                 | Self::Rewritten { .. }
                 | Self::Superseded { .. }
                 | Self::ProvenDead
@@ -1385,6 +1363,50 @@ pub struct CertifiedReturnValue {
     source_obligation: SemanticObligationId,
 }
 
+/// Exact typed return-address carrier consumed by one machine return.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CertifiedReturnAddress {
+    storage: CanonicalStorageId,
+    value: MachineValueUse,
+}
+
+impl CertifiedReturnAddress {
+    pub const fn storage(&self) -> CanonicalStorageId {
+        self.storage
+    }
+
+    pub const fn value(&self) -> &MachineValueUse {
+        &self.value
+    }
+}
+
+/// Exact typed stack-pointer state reaching one machine return.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum CertifiedExitStackPointer {
+    PreservedEntry {
+        storage: CanonicalStorageId,
+    },
+    ReachingValue {
+        storage: CanonicalStorageId,
+        value: MachineValueUse,
+    },
+}
+
+impl CertifiedExitStackPointer {
+    pub const fn storage(&self) -> CanonicalStorageId {
+        match self {
+            Self::PreservedEntry { storage } | Self::ReachingValue { storage, .. } => *storage,
+        }
+    }
+
+    pub const fn value(&self) -> Option<&MachineValueUse> {
+        match self {
+            Self::PreservedEntry { .. } => None,
+            Self::ReachingValue { value, .. } => Some(value),
+        }
+    }
+}
+
 impl CertifiedReturnValue {
     pub const fn slot(&self) -> CallBoundarySlot {
         self.slot
@@ -1406,6 +1428,8 @@ pub struct CertifiedReturnControl {
     producer: CanonicalInstructionId,
     source_inst: r2ssa::InstId,
     control_target: MachineValueUse,
+    return_address: CertifiedReturnAddress,
+    exit_stack_pointer: CertifiedExitStackPointer,
     values: Box<[CertifiedReturnValue]>,
     return_obligation: SemanticObligationId,
 }
@@ -1417,6 +1441,14 @@ impl CertifiedReturnControl {
 
     pub const fn control_target(&self) -> &MachineValueUse {
         &self.control_target
+    }
+
+    pub const fn return_address(&self) -> &CertifiedReturnAddress {
+        &self.return_address
+    }
+
+    pub const fn exit_stack_pointer(&self) -> &CertifiedExitStackPointer {
+        &self.exit_stack_pointer
     }
 
     pub const fn values(&self) -> &[CertifiedReturnValue] {
@@ -1440,6 +1472,7 @@ impl CertifiedReturnControl {
             || self.return_obligation.kind != SemanticObligationKind::Return
             || self.return_obligation.component != SemanticObligationComponent::Whole
             || self.source_obligations().len() != self.values.len().saturating_add(1)
+            || self.return_address.value != self.control_target
         {
             return Err(CertificationError::ObligationNotMapped(
                 self.return_obligation,
@@ -1571,7 +1604,9 @@ pub struct CertifiedClosedNaturalLoopControl {
     routing: CertifiedNaturalLoopRouting,
     preheader_transfer: CertifiedDirectControl,
     parameter_index: u32,
-    parameter_storage: CanonicalStorageId,
+    parameter_abi_storage: CanonicalStorageId,
+    parameter_graph_storage: CanonicalStorageId,
+    parameter_logical_value: SourceLogicalValue,
 }
 
 impl CertifiedClosedNaturalLoopControl {
@@ -1595,242 +1630,20 @@ impl CertifiedClosedNaturalLoopControl {
         self.parameter_index
     }
 
-    pub const fn parameter_storage(&self) -> CanonicalStorageId {
-        self.parameter_storage
+    pub const fn parameter_abi_storage(&self) -> CanonicalStorageId {
+        self.parameter_abi_storage
+    }
+
+    pub const fn parameter_graph_storage(&self) -> CanonicalStorageId {
+        self.parameter_graph_storage
+    }
+
+    pub const fn parameter_logical_value(&self) -> SourceLogicalValue {
+        self.parameter_logical_value
     }
 
     pub const fn condition(&self) -> &MachineValueUse {
         self.routing.header_control().condition()
-    }
-}
-
-/// Sealed ownership of one exact mutable counter carried by a header phi.
-///
-/// The three source obligations on `phi` -- its live value, loop-carried
-/// identity, and sole latch-edge transition -- are inseparable here. The
-/// initializer, condition, and update retain their own exact producers.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct CertifiedCountedLoopState {
-    schema_version: u32,
-    origin: CertifiedArtifactOrigin,
-    loop_id: LoopId,
-    preheader: u64,
-    header: u64,
-    latch: u64,
-    exit: u64,
-    carrier_storage: CanonicalStorageId,
-    initializer: MachineValueUse,
-    phi: MachineValueUse,
-    bound: MachineValueUse,
-    condition: MachineValueUse,
-    update: MachineValueUse,
-    source_obligations: BTreeSet<SemanticObligationId>,
-}
-
-impl CertifiedCountedLoopState {
-    pub const fn schema_version(&self) -> u32 {
-        self.schema_version
-    }
-
-    pub const fn origin(&self) -> &CertifiedArtifactOrigin {
-        &self.origin
-    }
-
-    pub const fn loop_id(&self) -> LoopId {
-        self.loop_id
-    }
-
-    pub const fn preheader(&self) -> u64 {
-        self.preheader
-    }
-
-    pub const fn header(&self) -> u64 {
-        self.header
-    }
-
-    pub const fn latch(&self) -> u64 {
-        self.latch
-    }
-
-    pub const fn exit(&self) -> u64 {
-        self.exit
-    }
-
-    pub const fn carrier_storage(&self) -> CanonicalStorageId {
-        self.carrier_storage
-    }
-
-    pub const fn initializer(&self) -> &MachineValueUse {
-        &self.initializer
-    }
-
-    pub const fn phi(&self) -> &MachineValueUse {
-        &self.phi
-    }
-
-    pub const fn bound(&self) -> &MachineValueUse {
-        &self.bound
-    }
-
-    pub const fn condition(&self) -> &MachineValueUse {
-        &self.condition
-    }
-
-    pub const fn update(&self) -> &MachineValueUse {
-        &self.update
-    }
-
-    pub const fn source_obligations(&self) -> &BTreeSet<SemanticObligationId> {
-        &self.source_obligations
-    }
-
-    pub const fn producer(&self) -> CanonicalInstructionId {
-        self.phi
-            .producer()
-            .expect("certified counted-loop phi has one producer")
-    }
-
-    fn validate(&self, source: &SemanticObligationInventory) -> Result<(), CertificationError> {
-        validate_schema(self.schema_version)?;
-        if self.origin.source() != source
-            || self.carrier_storage.size.checked_mul(8) != Some(self.phi.binding().width_bits())
-            || self.initializer.binding().width_bits() != self.phi.binding().width_bits()
-            || self.bound.binding().width_bits() != self.phi.binding().width_bits()
-            || self.update.binding().width_bits() != self.phi.binding().width_bits()
-            || self.condition.binding().width_bits() != 8
-            || self.initializer.producer().is_none()
-            || self.phi.producer().is_none()
-            || self.bound.producer().is_some()
-            || self.condition.producer().is_none()
-            || self.update.producer().is_none()
-        {
-            return Err(CertificationError::ObligationNotMapped(
-                self.source_obligations
-                    .iter()
-                    .copied()
-                    .next()
-                    .unwrap_or(SemanticObligationId {
-                        instruction: self.producer(),
-                        kind: SemanticObligationKind::LoopCarriedState,
-                        component: SemanticObligationComponent::Whole,
-                    }),
-            ));
-        }
-        let producer = self.producer();
-        let expected = BTreeSet::from([
-            SemanticObligationId {
-                instruction: producer,
-                kind: SemanticObligationKind::LiveValueProducer,
-                component: SemanticObligationComponent::Whole,
-            },
-            SemanticObligationId {
-                instruction: producer,
-                kind: SemanticObligationKind::LoopCarriedState,
-                component: SemanticObligationComponent::Whole,
-            },
-            SemanticObligationId {
-                instruction: producer,
-                kind: SemanticObligationKind::LiveStateTransition,
-                component: SemanticObligationComponent::LoopTransition {
-                    carrier: self.carrier_storage,
-                    predecessor: self.latch,
-                },
-            },
-        ]);
-        if self.source_obligations != expected
-            || source
-                .instructions()
-                .get(&producer)
-                .is_none_or(|instruction| instruction.obligations != expected)
-        {
-            return Err(CertificationError::ObligationNotMapped(
-                expected
-                    .iter()
-                    .copied()
-                    .next()
-                    .expect("counted loop obligation set is nonempty"),
-            ));
-        }
-        for obligation in &expected {
-            let Some(source_obligation) = source.obligations().get(obligation) else {
-                return Err(CertificationError::UnknownObligation(*obligation));
-            };
-            let inputs_match = match obligation.kind {
-                SemanticObligationKind::LiveValueProducer
-                | SemanticObligationKind::LoopCarriedState => {
-                    source_obligation.inputs.len() == 2
-                        && source_obligation
-                            .inputs
-                            .iter()
-                            .copied()
-                            .collect::<BTreeSet<_>>()
-                            == BTreeSet::from([
-                                self.initializer.binding().value(),
-                                self.update.binding().value(),
-                            ])
-                }
-                SemanticObligationKind::LiveStateTransition => {
-                    source_obligation.inputs == [self.update.binding().value()]
-                }
-                _ => false,
-            };
-            if !inputs_match {
-                return Err(CertificationError::ObligationNotMapped(*obligation));
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Sealed whole-function evidence for the canonical unsigned counted loop.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct CertifiedClosedCountedLoopControl {
-    schema_version: u32,
-    origin: CertifiedArtifactOrigin,
-    state: CertifiedCountedLoopState,
-    preheader_transfer: CertifiedDirectControl,
-    header_control: CertifiedConditionalControl,
-    backedge_transfer: CertifiedDirectControl,
-    return_control: CertifiedReturnControl,
-    parameter_index: u32,
-    parameter_storage: CanonicalStorageId,
-}
-
-impl CertifiedClosedCountedLoopControl {
-    pub const fn schema_version(&self) -> u32 {
-        self.schema_version
-    }
-
-    pub const fn origin(&self) -> &CertifiedArtifactOrigin {
-        &self.origin
-    }
-
-    pub const fn state(&self) -> &CertifiedCountedLoopState {
-        &self.state
-    }
-
-    pub const fn preheader_transfer(&self) -> &CertifiedDirectControl {
-        &self.preheader_transfer
-    }
-
-    pub const fn header_control(&self) -> &CertifiedConditionalControl {
-        &self.header_control
-    }
-
-    pub const fn backedge_transfer(&self) -> &CertifiedDirectControl {
-        &self.backedge_transfer
-    }
-
-    pub const fn return_control(&self) -> &CertifiedReturnControl {
-        &self.return_control
-    }
-
-    pub const fn parameter_index(&self) -> u32 {
-        self.parameter_index
-    }
-
-    pub const fn parameter_storage(&self) -> CanonicalStorageId {
-        self.parameter_storage
     }
 }
 
@@ -1867,7 +1680,9 @@ pub struct CertifiedSwitchControl {
     topology: CertifiedSwitchTopology,
     selector: MachineValueUse,
     parameter_index: u32,
-    parameter_storage: CanonicalStorageId,
+    parameter_abi_storage: CanonicalStorageId,
+    parameter_graph_storage: CanonicalStorageId,
+    parameter_logical_value: SourceLogicalValue,
 }
 
 impl CertifiedSwitchControl {
@@ -1903,8 +1718,16 @@ impl CertifiedSwitchControl {
         self.parameter_index
     }
 
-    pub const fn parameter_storage(&self) -> CanonicalStorageId {
-        self.parameter_storage
+    pub const fn parameter_abi_storage(&self) -> CanonicalStorageId {
+        self.parameter_abi_storage
+    }
+
+    pub const fn parameter_graph_storage(&self) -> CanonicalStorageId {
+        self.parameter_graph_storage
+    }
+
+    pub const fn parameter_logical_value(&self) -> SourceLogicalValue {
+        self.parameter_logical_value
     }
 
     fn validate(&self, source: &SemanticObligationInventory) -> Result<(), CertificationError> {
@@ -1913,14 +1736,33 @@ impl CertifiedSwitchControl {
         let obligation = source.obligations().get(&self.source_obligation()).ok_or(
             CertificationError::UnknownObligation(self.source_obligation()),
         )?;
+        let parameter_matches = self
+            .origin
+            .machine_context()
+            .source()
+            .function_interface()
+            .is_some_and(|interface| {
+                interface_has_exact_parameter_projection(
+                    interface,
+                    self.parameter_index,
+                    self.parameter_abi_storage,
+                    self.parameter_graph_storage,
+                    self.parameter_logical_value,
+                )
+            });
         if self.origin != *self.topology.origin()
             || obligation.id.kind != SemanticObligationKind::ControlTransfer
             || obligation.id.instruction != self.producer()
             || self.selector.binding().width_bits()
-                != self.parameter_storage.size.checked_mul(8).unwrap_or(0)
+                != self
+                    .parameter_graph_storage
+                    .size
+                    .checked_mul(8)
+                    .unwrap_or(0)
             || self.selector.producer().is_some()
             || self.selector.constant().is_some()
             || self.selector.memory_access().is_some()
+            || !parameter_matches
         {
             return Err(CertificationError::ObligationNotMapped(
                 self.source_obligation(),
@@ -1974,15 +1816,6 @@ impl CertifiedSwitchTopology {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-struct CertifiedFnvFoldO0EvidenceRef {
-    proof_slot: u32,
-    class: CertifiedFnvFoldO0DispositionClass,
-}
-
-const CERTIFIED_FNV_FOLD_O0_PROOF_SLOT: u32 = 0;
-
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 enum DispositionEvidence {
     Output(CertifiedEntity),
@@ -1991,14 +1824,8 @@ enum DispositionEvidence {
     Call(CertifiedDirectCall),
     Control(CertifiedDirectControl),
     ConditionalControl(CertifiedConditionalControl),
-    FnvFoldLatchControl(CertifiedFnvFoldLatchControl),
     SwitchControl(Box<CertifiedSwitchControl>),
     ReturnControl(CertifiedReturnControl),
-    LoopState(Box<CertifiedCountedLoopState>),
-    ConditionalReturnState(Box<CertifiedConditionalReturnCarrier>),
-    PrivateFrameState(Box<CertifiedPrivateFrameConditionalReturn>),
-    FnvFoldState(Box<CertifiedFnvFoldLoop>),
-    FnvFoldO0(CertifiedFnvFoldO0EvidenceRef),
     Rewrite { schema_version: u32, pass: String },
     Diagnostic,
 }
@@ -2007,6 +1834,8 @@ enum DispositionEvidence {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CertifiedEffect {
     schema_version: u32,
+    #[serde(skip_serializing)]
+    authority: CertifiedAuthoritySeal,
     obligation: SemanticObligationId,
     disposition: EffectDisposition,
     evidence: DispositionEvidence,
@@ -2056,13 +1885,6 @@ impl CertifiedEffect {
         }
     }
 
-    pub const fn fnv_fold_latch_control_evidence(&self) -> Option<&CertifiedFnvFoldLatchControl> {
-        match &self.evidence {
-            DispositionEvidence::FnvFoldLatchControl(control) => Some(control),
-            _ => None,
-        }
-    }
-
     pub fn switch_control_evidence(&self) -> Option<&CertifiedSwitchControl> {
         match &self.evidence {
             DispositionEvidence::SwitchControl(control) => Some(control.as_ref()),
@@ -2074,93 +1896,6 @@ impl CertifiedEffect {
         match &self.evidence {
             DispositionEvidence::ReturnControl(control) => Some(control),
             _ => None,
-        }
-    }
-
-    pub fn counted_loop_state_evidence(&self) -> Option<&CertifiedCountedLoopState> {
-        match &self.evidence {
-            DispositionEvidence::LoopState(state) => Some(state.as_ref()),
-            _ => None,
-        }
-    }
-
-    pub fn conditional_return_state_evidence(&self) -> Option<&CertifiedConditionalReturnCarrier> {
-        match &self.evidence {
-            DispositionEvidence::ConditionalReturnState(state) => Some(state.as_ref()),
-            _ => None,
-        }
-    }
-
-    pub fn private_frame_state_evidence(&self) -> Option<&CertifiedPrivateFrameConditionalReturn> {
-        match &self.evidence {
-            DispositionEvidence::PrivateFrameState(state) => Some(state.as_ref()),
-            _ => None,
-        }
-    }
-
-    pub fn fnv_fold_state_evidence(&self) -> Option<&CertifiedFnvFoldLoop> {
-        match &self.evidence {
-            DispositionEvidence::FnvFoldState(state) => Some(state.as_ref()),
-            _ => None,
-        }
-    }
-
-    fn fnv_fold_o0_evidence_ref(&self) -> Option<CertifiedFnvFoldO0EvidenceRef> {
-        match &self.evidence {
-            DispositionEvidence::FnvFoldO0(reference) => Some(*reference),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn is_exact_fnv_fold_o0(
-        &self,
-        witness: &CertifiedFnvFoldO0Function,
-        obligation: SemanticObligationId,
-    ) -> bool {
-        if self.obligation != obligation {
-            return false;
-        }
-        let Ok(index) = witness
-            .obligation_dispositions()
-            .binary_search_by_key(&obligation, |(candidate, _)| *candidate)
-        else {
-            return false;
-        };
-        let class = witness.obligation_dispositions()[index].1;
-        self.fnv_fold_o0_evidence_ref().is_some_and(|reference| {
-            reference.proof_slot == CERTIFIED_FNV_FOLD_O0_PROOF_SLOT
-                && reference.class == class
-                && fnv_fold_o0_disposition_matches(class, &self.disposition, obligation.instruction)
-        })
-    }
-
-    fn has_fnv_fold_o0_class(&self, class: CertifiedFnvFoldO0DispositionClass) -> bool {
-        self.fnv_fold_o0_evidence_ref().is_some_and(|reference| {
-            reference.proof_slot == CERTIFIED_FNV_FOLD_O0_PROOF_SLOT
-                && reference.class == class
-                && fnv_fold_o0_disposition_matches(
-                    class,
-                    &self.disposition,
-                    self.obligation.instruction,
-                )
-        })
-    }
-
-    fn validate_fnv_fold_o0_ref(
-        &self,
-        reference: CertifiedFnvFoldO0EvidenceRef,
-    ) -> Result<(), CertificationError> {
-        if reference.proof_slot == CERTIFIED_FNV_FOLD_O0_PROOF_SLOT
-            && reference.class != CertifiedFnvFoldO0DispositionClass::ProvenDead
-            && fnv_fold_o0_disposition_matches(
-                reference.class,
-                &self.disposition,
-                self.obligation.instruction,
-            )
-        {
-            Ok(())
-        } else {
-            Err(CertificationError::ObligationNotMapped(self.obligation))
         }
     }
 
@@ -2228,18 +1963,6 @@ impl CertifiedEffect {
             }
             (
                 EffectDisposition::AbsorbedIntoControl { producer },
-                DispositionEvidence::FnvFoldLatchControl(control),
-            ) => {
-                control.validate(source)?;
-                if control.producer() != *producer
-                    || !control.source_obligations().contains(&self.obligation)
-                {
-                    return Err(CertificationError::ObligationNotMapped(self.obligation));
-                }
-                Ok(())
-            }
-            (
-                EffectDisposition::AbsorbedIntoControl { producer },
                 DispositionEvidence::SwitchControl(control),
             ) => {
                 control.validate(source)?;
@@ -2260,53 +1983,6 @@ impl CertifiedEffect {
                     return Err(CertificationError::ObligationNotMapped(self.obligation));
                 }
                 Ok(())
-            }
-            (
-                EffectDisposition::AbsorbedIntoLoopState { producer },
-                DispositionEvidence::LoopState(state),
-            ) => {
-                state.validate(source)?;
-                if state.producer() != *producer
-                    || !state.source_obligations().contains(&self.obligation)
-                {
-                    return Err(CertificationError::ObligationNotMapped(self.obligation));
-                }
-                Ok(())
-            }
-            (
-                EffectDisposition::AbsorbedIntoConditionalReturnState { producer },
-                DispositionEvidence::ConditionalReturnState(state),
-            ) => {
-                state.validate(source)?;
-                if state.producer() != *producer
-                    || !state.source_obligations().contains(&self.obligation)
-                {
-                    return Err(CertificationError::ObligationNotMapped(self.obligation));
-                }
-                Ok(())
-            }
-            (
-                EffectDisposition::AbsorbedIntoPrivateFrameState { producer },
-                DispositionEvidence::PrivateFrameState(state),
-            ) => {
-                if state.owns_obligation(source, self.obligation, *producer) {
-                    Ok(())
-                } else {
-                    Err(CertificationError::ObligationNotMapped(self.obligation))
-                }
-            }
-            (
-                EffectDisposition::AbsorbedIntoFnvFoldState { producer },
-                DispositionEvidence::FnvFoldState(state),
-            ) => {
-                if state.owns_obligation(source, self.obligation, *producer) {
-                    Ok(())
-                } else {
-                    Err(CertificationError::ObligationNotMapped(self.obligation))
-                }
-            }
-            (_, DispositionEvidence::FnvFoldO0(reference)) => {
-                self.validate_fnv_fold_o0_ref(*reference)
             }
             (
                 EffectDisposition::Rewritten { pass },
@@ -2330,45 +2006,6 @@ impl CertifiedEffect {
             ) if !reason.trim().is_empty() => Ok(()),
             _ => Err(CertificationError::ObligationNotMapped(self.obligation)),
         }
-    }
-}
-
-fn fnv_fold_o0_disposition_matches(
-    class: CertifiedFnvFoldO0DispositionClass,
-    disposition: &EffectDisposition,
-    producer: CanonicalInstructionId,
-) -> bool {
-    match (class, disposition) {
-        (
-            CertifiedFnvFoldO0DispositionClass::FrameState,
-            EffectDisposition::AbsorbedIntoFnvFoldO0FrameState { producer: actual },
-        )
-        | (
-            CertifiedFnvFoldO0DispositionClass::InvariantHomeRelay,
-            EffectDisposition::AbsorbedIntoFnvFoldO0InvariantHomeRelay { producer: actual },
-        )
-        | (
-            CertifiedFnvFoldO0DispositionClass::ExternalAliasSealing,
-            EffectDisposition::AbsorbedIntoFnvFoldO0ExternalAlias { producer: actual },
-        )
-        | (
-            CertifiedFnvFoldO0DispositionClass::ForwarderControl,
-            EffectDisposition::AbsorbedIntoFnvFoldO0Forwarder { producer: actual },
-        )
-        | (
-            CertifiedFnvFoldO0DispositionClass::LoopControl,
-            EffectDisposition::AbsorbedIntoFnvFoldO0LoopControl { producer: actual },
-        )
-        | (
-            CertifiedFnvFoldO0DispositionClass::Semantics,
-            EffectDisposition::AbsorbedIntoFnvFoldO0Semantics { producer: actual },
-        )
-        | (
-            CertifiedFnvFoldO0DispositionClass::Return,
-            EffectDisposition::AbsorbedIntoFnvFoldO0Return { producer: actual },
-        ) => *actual == producer,
-        (CertifiedFnvFoldO0DispositionClass::ProvenDead, _) => false,
-        _ => false,
     }
 }
 
@@ -2491,18 +2128,7 @@ impl RewriteCertificate {
                     | EffectDisposition::AbsorbedIntoStatement { .. }
                     | EffectDisposition::AbsorbedIntoCall { .. }
                     | EffectDisposition::AbsorbedIntoControl { .. }
-                    | EffectDisposition::AbsorbedIntoReturn { .. }
-                    | EffectDisposition::AbsorbedIntoLoopState { .. }
-                    | EffectDisposition::AbsorbedIntoConditionalReturnState { .. }
-                    | EffectDisposition::AbsorbedIntoPrivateFrameState { .. }
-                    | EffectDisposition::AbsorbedIntoFnvFoldState { .. }
-                    | EffectDisposition::AbsorbedIntoFnvFoldO0FrameState { .. }
-                    | EffectDisposition::AbsorbedIntoFnvFoldO0InvariantHomeRelay { .. }
-                    | EffectDisposition::AbsorbedIntoFnvFoldO0ExternalAlias { .. }
-                    | EffectDisposition::AbsorbedIntoFnvFoldO0Forwarder { .. }
-                    | EffectDisposition::AbsorbedIntoFnvFoldO0LoopControl { .. }
-                    | EffectDisposition::AbsorbedIntoFnvFoldO0Semantics { .. }
-                    | EffectDisposition::AbsorbedIntoFnvFoldO0Return { .. } => false,
+                    | EffectDisposition::AbsorbedIntoReturn { .. } => false,
                 };
                 if !valid {
                     report.invalid.push(format!(
@@ -2538,6 +2164,8 @@ impl RewriteCertificateReport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ObligationLedger {
     schema_version: u32,
+    #[serde(skip_serializing)]
+    authority: CertifiedAuthoritySeal,
     effects: BTreeMap<SemanticObligationId, Vec<CertifiedEffect>>,
 }
 
@@ -2551,8 +2179,21 @@ impl ObligationLedger {
     pub fn new() -> Self {
         Self {
             schema_version: CERTIFICATION_SCHEMA_VERSION,
+            authority: CertifiedAuthoritySeal::new(),
             effects: BTreeMap::new(),
         }
+    }
+
+    fn bound(origin: &CertifiedArtifactOrigin) -> Self {
+        Self {
+            schema_version: CERTIFICATION_SCHEMA_VERSION,
+            authority: origin.authority().clone(),
+            effects: BTreeMap::new(),
+        }
+    }
+
+    pub fn matches_origin(&self, origin: &CertifiedArtifactOrigin) -> bool {
+        self.schema_version == CERTIFICATION_SCHEMA_VERSION && self.authority == *origin.authority()
     }
 
     pub fn effects(&self, id: SemanticObligationId) -> &[CertifiedEffect] {
@@ -2595,6 +2236,13 @@ impl ObligationLedger {
                 0 => report.missing.push(*id),
                 1 => {
                     let effect = &effects[0];
+                    if effect.authority != self.authority {
+                        push_failure(
+                            &mut report,
+                            Some(*id),
+                            "effect authority does not match its obligation ledger",
+                        );
+                    }
                     if let Err(error) = effect.validate(source) {
                         push_failure(&mut report, Some(*id), format!("{error:?}"));
                     }
@@ -2606,47 +2254,22 @@ impl ObligationLedger {
                             | EffectDisposition::AbsorbedIntoCall { .. }
                             | EffectDisposition::AbsorbedIntoControl { .. }
                             | EffectDisposition::AbsorbedIntoReturn { .. }
-                            | EffectDisposition::AbsorbedIntoLoopState { .. }
-                            | EffectDisposition::AbsorbedIntoConditionalReturnState { .. }
-                            | EffectDisposition::AbsorbedIntoPrivateFrameState { .. }
-                            | EffectDisposition::AbsorbedIntoFnvFoldState { .. }
-                            | EffectDisposition::AbsorbedIntoFnvFoldO0FrameState { .. }
-                            | EffectDisposition::AbsorbedIntoFnvFoldO0InvariantHomeRelay { .. }
-                            | EffectDisposition::AbsorbedIntoFnvFoldO0ExternalAlias { .. }
-                            | EffectDisposition::AbsorbedIntoFnvFoldO0Forwarder { .. }
-                            | EffectDisposition::AbsorbedIntoFnvFoldO0LoopControl { .. }
-                            | EffectDisposition::AbsorbedIntoFnvFoldO0Semantics { .. }
-                            | EffectDisposition::AbsorbedIntoFnvFoldO0Return { .. }
                     ) {
                         report.pending_semantic_ast.push(*id);
                     }
-                    if !disposition.permits_certified_c() {
+                    if !disposition.is_semantically_preserving() {
                         match disposition {
                             EffectDisposition::Residualized { .. } => report.residualized.push(*id),
                             EffectDisposition::Refused { .. } => report.refused.push(*id),
                             _ => {}
                         }
                     }
-                    let sealed_unknown = matches!(
-                        (&effect.disposition, &effect.evidence),
-                        (
-                            EffectDisposition::AbsorbedIntoPrivateFrameState { .. },
-                            DispositionEvidence::PrivateFrameState(state),
-                        ) if state.owns_obligation(
-                            source,
-                            effect.obligation,
-                            effect.obligation.instruction,
-                        )
-                    ) || effect.has_fnv_fold_o0_class(
-                        CertifiedFnvFoldO0DispositionClass::ExternalAliasSealing,
-                    );
                     if source
                         .instructions()
                         .get(&id.instruction)
                         .is_some_and(|instruction| {
                             instruction.state == SemanticInstructionState::UnsupportedUnknown
-                                && disposition.permits_certified_c()
-                                && !sealed_unknown
+                                && disposition.is_semantically_preserving()
                         })
                     {
                         push_failure(
@@ -2714,7 +2337,7 @@ fn validate_supersession_graph(
                     );
                     break;
                 };
-                if !terminal.disposition().permits_certified_c() {
+                if !terminal.disposition().is_semantically_preserving() {
                     push_failure(
                         report,
                         Some(*start),
@@ -2809,7 +2432,7 @@ impl CertificationReport {
         self.missing.is_empty() && self.duplicate.is_empty() && self.unexpected.is_empty()
     }
 
-    pub fn authorizes_certified_c(&self) -> bool {
+    pub fn is_closed_semantic_ledger(&self) -> bool {
         self.schema_version == CERTIFICATION_SCHEMA_VERSION
             && self.has_exactly_one_disposition_per_source()
             && self.residualized.is_empty()
@@ -2828,20 +2451,14 @@ pub enum CertifiedTypedRegionKind {
     ConditionalTerminalReturnFunction,
     SwitchTerminalReturnFunction,
     CarrierFreeLoopTerminalReturnFunction,
-    CountedLoopTerminalReturnFunction,
-    ConditionalReturnFunnelFunction,
-    PrivateFrameConditionalReturnFunction,
-    FnvFoldLoopFunction,
-    FnvFoldO0Function,
 }
 
-pub const CERTIFIED_TERMINAL_RETURN_REGION_CONTRACT_VERSION: u32 = 1;
-pub const CERTIFIED_PLAIN_RAM_MEMORY_RETURN_CONTRACT_VERSION: u32 = 1;
-pub const CERTIFIED_DIRECT_CALL_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 1;
-pub const CERTIFIED_CONDITIONAL_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 1;
-pub const CERTIFIED_SWITCH_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 1;
-pub const CERTIFIED_CARRIER_FREE_LOOP_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 1;
-pub const CERTIFIED_COUNTED_LOOP_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 1;
+pub const CERTIFIED_TERMINAL_RETURN_REGION_CONTRACT_VERSION: u32 = 2;
+pub const CERTIFIED_PLAIN_RAM_MEMORY_RETURN_CONTRACT_VERSION: u32 = 2;
+pub const CERTIFIED_DIRECT_CALL_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 2;
+pub const CERTIFIED_CONDITIONAL_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 2;
+pub const CERTIFIED_SWITCH_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 2;
+pub const CERTIFIED_CARRIER_FREE_LOOP_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TypedRegionMapping {
@@ -2869,11 +2486,14 @@ impl TypedRegionMapping {
     }
 }
 
-/// Opaque final authorization bound to one exact artifact origin and one
-/// source-to-typed-region manifest. It is intentionally not deserializable or
-/// publicly constructible.
+/// Opaque proof that one sealed artifact ledger is closed exactly once for a
+/// recognized structural region contract.
+///
+/// This token contains no typed-output identity and grants no C rendering
+/// authority. A consumer must bind it to its own exact artifact-local output
+/// owners before any rendering decision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct CertifiedRenderPermit {
+pub struct CertifiedLedgerClosure {
     schema_version: u32,
     origin: CertifiedArtifactOrigin,
     region_kind: CertifiedTypedRegionKind,
@@ -2881,7 +2501,7 @@ pub struct CertifiedRenderPermit {
     mappings: Box<[TypedRegionMapping]>,
 }
 
-impl CertifiedRenderPermit {
+impl CertifiedLedgerClosure {
     pub const fn origin(&self) -> &CertifiedArtifactOrigin {
         &self.origin
     }
@@ -2898,7 +2518,7 @@ impl CertifiedRenderPermit {
         &self.mappings
     }
 
-    pub fn authorizes_certified_c(&self) -> bool {
+    fn has_closed_ledger_mapping(&self) -> bool {
         let recognized_contract = match self.region_kind {
             CertifiedTypedRegionKind::TerminalReturnBlock => {
                 self.region_schema_version == CERTIFIED_TERMINAL_RETURN_REGION_CONTRACT_VERSION
@@ -2919,60 +2539,43 @@ impl CertifiedRenderPermit {
                 self.region_schema_version
                     == CERTIFIED_CARRIER_FREE_LOOP_TERMINAL_RETURN_CONTRACT_VERSION
             }
-            CertifiedTypedRegionKind::CountedLoopTerminalReturnFunction => {
-                self.region_schema_version
-                    == CERTIFIED_COUNTED_LOOP_TERMINAL_RETURN_CONTRACT_VERSION
-            }
-            CertifiedTypedRegionKind::ConditionalReturnFunnelFunction => {
-                self.region_schema_version == CERTIFIED_CONDITIONAL_RETURN_FUNNEL_CONTRACT_VERSION
-            }
-            CertifiedTypedRegionKind::PrivateFrameConditionalReturnFunction => {
-                self.region_schema_version
-                    == CERTIFIED_PRIVATE_FRAME_CONDITIONAL_RETURN_CONTRACT_VERSION
-            }
-            CertifiedTypedRegionKind::FnvFoldLoopFunction => {
-                self.region_schema_version == CERTIFIED_FNV_FOLD_LOOP_CONTRACT_VERSION
-            }
-            CertifiedTypedRegionKind::FnvFoldO0Function => {
-                self.region_schema_version == CERTIFIED_FNV_FOLD_O0_CONTRACT_VERSION
-            }
         };
+        let mapped_obligations = self
+            .mappings
+            .iter()
+            .map(TypedRegionMapping::obligation)
+            .collect::<BTreeSet<_>>();
+        let source_obligations = self
+            .origin
+            .source()
+            .obligations()
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
         self.schema_version == CERTIFICATION_SCHEMA_VERSION
             && self.origin.schema_version() == CERTIFICATION_SCHEMA_VERSION
             && recognized_contract
-            && self.mappings.len() == self.origin.source().obligations().len()
+            && self.mappings.len() == mapped_obligations.len()
+            && mapped_obligations == source_obligations
     }
 
-    pub fn matches_region(
+    pub fn matches_ledger(
         &self,
         origin: &CertifiedArtifactOrigin,
         region_kind: CertifiedTypedRegionKind,
         region_schema_version: u32,
         mappings: &[TypedRegionMapping],
     ) -> bool {
-        self.authorizes_certified_c()
+        self.has_closed_ledger_mapping()
             && self.origin == *origin
             && self.region_kind == region_kind
             && self.region_schema_version == region_schema_version
             && self.mappings.as_ref() == mappings
     }
-
-    pub(crate) fn new_fnv_fold_o0(
-        origin: CertifiedArtifactOrigin,
-        mappings: Box<[TypedRegionMapping]>,
-    ) -> Self {
-        Self {
-            schema_version: CERTIFICATION_SCHEMA_VERSION,
-            origin,
-            region_kind: CertifiedTypedRegionKind::FnvFoldO0Function,
-            region_schema_version: CERTIFIED_FNV_FOLD_O0_CONTRACT_VERSION,
-            mappings,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RenderAuthorizationError {
+pub enum LedgerClosureError {
     InvalidOrigin,
     InvalidRegionSchema,
     InvalidRegionTopology,
@@ -2986,31 +2589,32 @@ pub enum RenderAuthorizationError {
     DispositionMismatch(SemanticObligationId),
 }
 
-impl std::fmt::Display for RenderAuthorizationError {
+impl std::fmt::Display for LedgerClosureError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "typed-region render authorization failed: {self:?}")
+        write!(f, "typed-region ledger closure failed: {self:?}")
     }
 }
 
-impl std::error::Error for RenderAuthorizationError {}
+impl std::error::Error for LedgerClosureError {}
 
 pub fn certify_terminal_return_region(
     origin: &CertifiedArtifactOrigin,
     ledger: &ObligationLedger,
     mappings: impl IntoIterator<Item = TypedRegionMapping>,
-) -> Result<CertifiedRenderPermit, RenderAuthorizationError> {
-    if origin.schema_version() != CERTIFICATION_SCHEMA_VERSION
-        || !origin.matches_retained_source(origin.source(), origin.topology())
+) -> Result<CertifiedLedgerClosure, LedgerClosureError> {
+    if !origin.is_valid()
+        || !ledger.matches_origin(origin)
+        || !return_machine_state_matches_origin(origin, ledger)
         || origin
             .machine_context()
             .source()
             .function_interface()
             .is_none()
     {
-        return Err(RenderAuthorizationError::InvalidOrigin);
+        return Err(LedgerClosureError::InvalidOrigin);
     }
     let [block] = origin.topology().blocks() else {
-        return Err(RenderAuthorizationError::InvalidRegionTopology);
+        return Err(LedgerClosureError::InvalidRegionTopology);
     };
     if !matches!(block.terminator(), CertifiedSourceTerminator::Return)
         || !block.successors().is_empty()
@@ -3024,16 +2628,14 @@ pub fn certify_terminal_return_region(
             )
         })
     {
-        return Err(RenderAuthorizationError::InvalidRegionTopology);
+        return Err(LedgerClosureError::InvalidRegionTopology);
     }
     let report = ledger.audit(origin.source());
     if !report.has_exactly_one_disposition_per_source() || !report.invalid().is_empty() {
-        return Err(RenderAuthorizationError::IncompleteLedger);
+        return Err(LedgerClosureError::IncompleteLedger);
     }
     if let Some(obligation) = report.residualized().iter().chain(report.refused()).next() {
-        return Err(RenderAuthorizationError::ResidualOrRefusedObligation(
-            *obligation,
-        ));
+        return Err(LedgerClosureError::ResidualOrRefusedObligation(*obligation));
     }
     if let Some(instruction) = origin
         .source()
@@ -3041,7 +2643,7 @@ pub fn certify_terminal_return_region(
         .values()
         .find(|instruction| instruction.state == SemanticInstructionState::UnsupportedUnknown)
     {
-        return Err(RenderAuthorizationError::UnsupportedSourceSemantics(
+        return Err(LedgerClosureError::UnsupportedSourceSemantics(
             instruction.id,
         ));
     }
@@ -3053,10 +2655,10 @@ pub fn certify_terminal_return_region(
         .map(|obligation| ledger.effects(obligation.id))
         .collect::<Vec<_>>();
     let [[return_effect]] = return_effects.as_slice() else {
-        return Err(RenderAuthorizationError::InvalidRegionTopology);
+        return Err(LedgerClosureError::InvalidRegionTopology);
     };
     let Some(return_control) = return_effect.return_control_evidence() else {
-        return Err(RenderAuthorizationError::InvalidRegionDisposition(
+        return Err(LedgerClosureError::InvalidRegionDisposition(
             return_effect.obligation(),
         ));
     };
@@ -3081,11 +2683,11 @@ pub fn certify_terminal_return_region(
             None => true,
         }
     {
-        return Err(RenderAuthorizationError::InvalidRegionTopology);
+        return Err(LedgerClosureError::InvalidRegionTopology);
     }
     for obligation in origin.source().obligations().values() {
         let [effect] = ledger.effects(obligation.id) else {
-            return Err(RenderAuthorizationError::IncompleteLedger);
+            return Err(LedgerClosureError::IncompleteLedger);
         };
         let valid = match obligation.id.kind {
             SemanticObligationKind::LiveValueProducer => matches!(
@@ -3103,9 +2705,7 @@ pub fn certify_terminal_return_region(
             _ => false,
         };
         if !valid {
-            return Err(RenderAuthorizationError::InvalidRegionDisposition(
-                obligation.id,
-            ));
+            return Err(LedgerClosureError::InvalidRegionDisposition(obligation.id));
         }
     }
     let mappings = mappings.into_iter().collect::<Vec<_>>();
@@ -3116,22 +2716,18 @@ pub fn certify_terminal_return_region(
             .obligations()
             .contains_key(&mapping.obligation)
         {
-            return Err(RenderAuthorizationError::UnexpectedMapping(
-                mapping.obligation,
-            ));
+            return Err(LedgerClosureError::UnexpectedMapping(mapping.obligation));
         }
         if by_obligation.insert(mapping.obligation, mapping).is_some() {
-            return Err(RenderAuthorizationError::DuplicateMapping(
-                mapping.obligation,
-            ));
+            return Err(LedgerClosureError::DuplicateMapping(mapping.obligation));
         }
     }
     for obligation in origin.source().obligations().keys() {
         let mapping = by_obligation
             .get(obligation)
-            .ok_or(RenderAuthorizationError::MissingMapping(*obligation))?;
+            .ok_or(LedgerClosureError::MissingMapping(*obligation))?;
         let [effect] = ledger.effects(*obligation) else {
-            return Err(RenderAuthorizationError::IncompleteLedger);
+            return Err(LedgerClosureError::IncompleteLedger);
         };
         if effect.disposition() != mapping.source_disposition()
             || matches!(
@@ -3139,10 +2735,10 @@ pub fn certify_terminal_return_region(
                 EffectDisposition::Residualized { .. } | EffectDisposition::Refused { .. }
             )
         {
-            return Err(RenderAuthorizationError::DispositionMismatch(*obligation));
+            return Err(LedgerClosureError::DispositionMismatch(*obligation));
         }
     }
-    Ok(CertifiedRenderPermit {
+    Ok(CertifiedLedgerClosure {
         schema_version: CERTIFICATION_SCHEMA_VERSION,
         origin: origin.clone(),
         region_kind: CertifiedTypedRegionKind::TerminalReturnBlock,
@@ -3162,19 +2758,20 @@ pub fn certify_plain_ram_memory_return_region(
     origin: &CertifiedArtifactOrigin,
     ledger: &ObligationLedger,
     mappings: impl IntoIterator<Item = TypedRegionMapping>,
-) -> Result<CertifiedRenderPermit, RenderAuthorizationError> {
-    if origin.schema_version() != CERTIFICATION_SCHEMA_VERSION
-        || !origin.matches_retained_source(origin.source(), origin.topology())
+) -> Result<CertifiedLedgerClosure, LedgerClosureError> {
+    if !origin.is_valid()
+        || !ledger.matches_origin(origin)
+        || !return_machine_state_matches_origin(origin, ledger)
         || origin
             .machine_context()
             .source()
             .function_interface()
             .is_none()
     {
-        return Err(RenderAuthorizationError::InvalidOrigin);
+        return Err(LedgerClosureError::InvalidOrigin);
     }
     let [block] = origin.topology().blocks() else {
-        return Err(RenderAuthorizationError::InvalidRegionTopology);
+        return Err(LedgerClosureError::InvalidRegionTopology);
     };
     if origin.topology().entry_addr() != block.addr()
         || !block.predecessors().is_empty()
@@ -3196,16 +2793,14 @@ pub fn certify_plain_ram_memory_return_region(
             )
         })
     {
-        return Err(RenderAuthorizationError::InvalidRegionTopology);
+        return Err(LedgerClosureError::InvalidRegionTopology);
     }
     let report = ledger.audit(origin.source());
     if !report.has_exactly_one_disposition_per_source() || !report.invalid().is_empty() {
-        return Err(RenderAuthorizationError::IncompleteLedger);
+        return Err(LedgerClosureError::IncompleteLedger);
     }
     if let Some(obligation) = report.residualized().iter().chain(report.refused()).next() {
-        return Err(RenderAuthorizationError::ResidualOrRefusedObligation(
-            *obligation,
-        ));
+        return Err(LedgerClosureError::ResidualOrRefusedObligation(*obligation));
     }
 
     let return_effects = origin
@@ -3216,10 +2811,10 @@ pub fn certify_plain_ram_memory_return_region(
         .map(|obligation| ledger.effects(obligation.id))
         .collect::<Vec<_>>();
     let [[return_effect]] = return_effects.as_slice() else {
-        return Err(RenderAuthorizationError::InvalidRegionTopology);
+        return Err(LedgerClosureError::InvalidRegionTopology);
     };
     let Some(return_control) = return_effect.return_control_evidence() else {
-        return Err(RenderAuthorizationError::InvalidRegionDisposition(
+        return Err(LedgerClosureError::InvalidRegionDisposition(
             return_effect.obligation(),
         ));
     };
@@ -3244,13 +2839,13 @@ pub fn certify_plain_ram_memory_return_region(
             None => true,
         }
     {
-        return Err(RenderAuthorizationError::InvalidRegionTopology);
+        return Err(LedgerClosureError::InvalidRegionTopology);
     }
 
     let mut memory_count = 0_usize;
     for obligation in origin.source().obligations().values() {
         let [effect] = ledger.effects(obligation.id) else {
-            return Err(RenderAuthorizationError::IncompleteLedger);
+            return Err(LedgerClosureError::IncompleteLedger);
         };
         let valid = match obligation.id.kind {
             SemanticObligationKind::LiveValueProducer => matches!(
@@ -3299,13 +2894,11 @@ pub fn certify_plain_ram_memory_return_region(
             _ => false,
         };
         if !valid {
-            return Err(RenderAuthorizationError::InvalidRegionDisposition(
-                obligation.id,
-            ));
+            return Err(LedgerClosureError::InvalidRegionDisposition(obligation.id));
         }
     }
     if memory_count == 0 {
-        return Err(RenderAuthorizationError::InvalidRegionTopology);
+        return Err(LedgerClosureError::InvalidRegionTopology);
     }
 
     let mappings = mappings.into_iter().collect::<Vec<_>>();
@@ -3316,22 +2909,18 @@ pub fn certify_plain_ram_memory_return_region(
             .obligations()
             .contains_key(&mapping.obligation)
         {
-            return Err(RenderAuthorizationError::UnexpectedMapping(
-                mapping.obligation,
-            ));
+            return Err(LedgerClosureError::UnexpectedMapping(mapping.obligation));
         }
         if by_obligation.insert(mapping.obligation, mapping).is_some() {
-            return Err(RenderAuthorizationError::DuplicateMapping(
-                mapping.obligation,
-            ));
+            return Err(LedgerClosureError::DuplicateMapping(mapping.obligation));
         }
     }
     for obligation in origin.source().obligations().keys() {
         let mapping = by_obligation
             .get(obligation)
-            .ok_or(RenderAuthorizationError::MissingMapping(*obligation))?;
+            .ok_or(LedgerClosureError::MissingMapping(*obligation))?;
         let [effect] = ledger.effects(*obligation) else {
-            return Err(RenderAuthorizationError::IncompleteLedger);
+            return Err(LedgerClosureError::IncompleteLedger);
         };
         if effect.disposition() != mapping.source_disposition()
             || matches!(
@@ -3339,10 +2928,10 @@ pub fn certify_plain_ram_memory_return_region(
                 EffectDisposition::Residualized { .. } | EffectDisposition::Refused { .. }
             )
         {
-            return Err(RenderAuthorizationError::DispositionMismatch(*obligation));
+            return Err(LedgerClosureError::DispositionMismatch(*obligation));
         }
     }
-    Ok(CertifiedRenderPermit {
+    Ok(CertifiedLedgerClosure {
         schema_version: CERTIFICATION_SCHEMA_VERSION,
         origin: origin.clone(),
         region_kind: CertifiedTypedRegionKind::PlainRamMemoryTerminalReturnFunction,
@@ -3365,21 +2954,22 @@ pub fn certify_direct_call_terminal_return_region(
     mappings: impl IntoIterator<Item = TypedRegionMapping>,
     entry_addr: u64,
     return_addr: u64,
-) -> Result<CertifiedRenderPermit, RenderAuthorizationError> {
-    if origin.schema_version() != CERTIFICATION_SCHEMA_VERSION
-        || !origin.matches_retained_source(origin.source(), origin.topology())
+) -> Result<CertifiedLedgerClosure, LedgerClosureError> {
+    if !origin.is_valid()
+        || !ledger.matches_origin(origin)
+        || !return_machine_state_matches_origin(origin, ledger)
         || origin
             .machine_context()
             .source()
             .function_interface()
             .is_none_or(|interface| !interface.stack_slots().is_empty())
     {
-        return Err(RenderAuthorizationError::InvalidOrigin);
+        return Err(LedgerClosureError::InvalidOrigin);
     }
     let topology = origin.topology();
     let (Some(entry), Some(returned)) = (topology.block(entry_addr), topology.block(return_addr))
     else {
-        return Err(RenderAuthorizationError::InvalidRegionTopology);
+        return Err(LedgerClosureError::InvalidRegionTopology);
     };
     if topology.entry_addr() != entry_addr
         || topology.blocks().len() != 2
@@ -3405,7 +2995,7 @@ pub fn certify_direct_call_terminal_return_region(
             )
         })
     {
-        return Err(RenderAuthorizationError::InvalidRegionTopology);
+        return Err(LedgerClosureError::InvalidRegionTopology);
     }
 
     let call_effects = origin
@@ -3416,10 +3006,10 @@ pub fn certify_direct_call_terminal_return_region(
         .map(|obligation| ledger.effects(obligation.id))
         .collect::<Vec<_>>();
     let [[call_effect]] = call_effects.as_slice() else {
-        return Err(RenderAuthorizationError::InvalidRegionTopology);
+        return Err(LedgerClosureError::InvalidRegionTopology);
     };
     let Some(call) = call_effect.direct_call_evidence() else {
-        return Err(RenderAuthorizationError::InvalidRegionDisposition(
+        return Err(LedgerClosureError::InvalidRegionDisposition(
             call_effect.obligation(),
         ));
     };
@@ -3461,7 +3051,7 @@ pub fn certify_direct_call_terminal_return_region(
                 })
     });
     if !call_topology_matches || !source_call_matches {
-        return Err(RenderAuthorizationError::InvalidRegionTopology);
+        return Err(LedgerClosureError::InvalidRegionTopology);
     }
 
     let return_effects = origin
@@ -3472,10 +3062,10 @@ pub fn certify_direct_call_terminal_return_region(
         .map(|obligation| ledger.effects(obligation.id))
         .collect::<Vec<_>>();
     let [[return_effect]] = return_effects.as_slice() else {
-        return Err(RenderAuthorizationError::InvalidRegionTopology);
+        return Err(LedgerClosureError::InvalidRegionTopology);
     };
     let Some(return_control) = return_effect.return_control_evidence() else {
-        return Err(RenderAuthorizationError::InvalidRegionDisposition(
+        return Err(LedgerClosureError::InvalidRegionDisposition(
             return_effect.obligation(),
         ));
     };
@@ -3501,21 +3091,19 @@ pub fn certify_direct_call_terminal_return_region(
             None => false,
         };
     if !return_matches {
-        return Err(RenderAuthorizationError::InvalidRegionTopology);
+        return Err(LedgerClosureError::InvalidRegionTopology);
     }
 
     let report = ledger.audit(origin.source());
     if !report.has_exactly_one_disposition_per_source() || !report.invalid().is_empty() {
-        return Err(RenderAuthorizationError::IncompleteLedger);
+        return Err(LedgerClosureError::IncompleteLedger);
     }
     if let Some(obligation) = report.residualized().iter().chain(report.refused()).next() {
-        return Err(RenderAuthorizationError::ResidualOrRefusedObligation(
-            *obligation,
-        ));
+        return Err(LedgerClosureError::ResidualOrRefusedObligation(*obligation));
     }
     for obligation in origin.source().obligations().values() {
         let [effect] = ledger.effects(obligation.id) else {
-            return Err(RenderAuthorizationError::IncompleteLedger);
+            return Err(LedgerClosureError::IncompleteLedger);
         };
         let valid = match obligation.id.kind {
             SemanticObligationKind::LiveValueProducer => matches!(
@@ -3541,9 +3129,7 @@ pub fn certify_direct_call_terminal_return_region(
             _ => false,
         };
         if !valid {
-            return Err(RenderAuthorizationError::InvalidRegionDisposition(
-                obligation.id,
-            ));
+            return Err(LedgerClosureError::InvalidRegionDisposition(obligation.id));
         }
     }
 
@@ -3555,22 +3141,18 @@ pub fn certify_direct_call_terminal_return_region(
             .obligations()
             .contains_key(&mapping.obligation)
         {
-            return Err(RenderAuthorizationError::UnexpectedMapping(
-                mapping.obligation,
-            ));
+            return Err(LedgerClosureError::UnexpectedMapping(mapping.obligation));
         }
         if by_obligation.insert(mapping.obligation, mapping).is_some() {
-            return Err(RenderAuthorizationError::DuplicateMapping(
-                mapping.obligation,
-            ));
+            return Err(LedgerClosureError::DuplicateMapping(mapping.obligation));
         }
     }
     for obligation in origin.source().obligations().keys() {
         let mapping = by_obligation
             .get(obligation)
-            .ok_or(RenderAuthorizationError::MissingMapping(*obligation))?;
+            .ok_or(LedgerClosureError::MissingMapping(*obligation))?;
         let [effect] = ledger.effects(*obligation) else {
-            return Err(RenderAuthorizationError::IncompleteLedger);
+            return Err(LedgerClosureError::IncompleteLedger);
         };
         if effect.disposition() != mapping.source_disposition()
             || matches!(
@@ -3578,10 +3160,10 @@ pub fn certify_direct_call_terminal_return_region(
                 EffectDisposition::Residualized { .. } | EffectDisposition::Refused { .. }
             )
         {
-            return Err(RenderAuthorizationError::DispositionMismatch(*obligation));
+            return Err(LedgerClosureError::DispositionMismatch(*obligation));
         }
     }
-    Ok(CertifiedRenderPermit {
+    Ok(CertifiedLedgerClosure {
         schema_version: CERTIFICATION_SCHEMA_VERSION,
         origin: origin.clone(),
         region_kind: CertifiedTypedRegionKind::DirectCallTerminalReturnFunction,
@@ -3602,33 +3184,34 @@ pub fn certify_conditional_terminal_return_region(
     header_addr: u64,
     true_addr: u64,
     false_addr: u64,
-) -> Result<CertifiedRenderPermit, RenderAuthorizationError> {
-    if origin.schema_version() != CERTIFICATION_SCHEMA_VERSION
-        || !origin.matches_retained_source(origin.source(), origin.topology())
+) -> Result<CertifiedLedgerClosure, LedgerClosureError> {
+    if !origin.is_valid()
+        || !ledger.matches_origin(origin)
+        || !return_machine_state_matches_origin(origin, ledger)
         || origin
             .machine_context()
             .source()
             .function_interface()
             .is_none()
     {
-        return Err(RenderAuthorizationError::InvalidOrigin);
+        return Err(LedgerClosureError::InvalidOrigin);
     }
     let topology = origin.topology();
     if topology.entry_addr() != header_addr
         || BTreeSet::from([header_addr, true_addr, false_addr]).len() != 3
         || topology.blocks().len() != 3
     {
-        return Err(RenderAuthorizationError::InvalidRegionTopology);
+        return Err(LedgerClosureError::InvalidRegionTopology);
     }
     let header = topology
         .block(header_addr)
-        .ok_or(RenderAuthorizationError::InvalidRegionTopology)?;
+        .ok_or(LedgerClosureError::InvalidRegionTopology)?;
     let true_block = topology
         .block(true_addr)
-        .ok_or(RenderAuthorizationError::InvalidRegionTopology)?;
+        .ok_or(LedgerClosureError::InvalidRegionTopology)?;
     let false_block = topology
         .block(false_addr)
-        .ok_or(RenderAuthorizationError::InvalidRegionTopology)?;
+        .ok_or(LedgerClosureError::InvalidRegionTopology)?;
     if !header.predecessors().is_empty()
         || !matches!(
             header.terminator(),
@@ -3650,13 +3233,13 @@ pub fn certify_conditional_terminal_return_region(
         || true_block.instructions().is_empty()
         || false_block.instructions().is_empty()
     {
-        return Err(RenderAuthorizationError::InvalidRegionTopology);
+        return Err(LedgerClosureError::InvalidRegionTopology);
     }
     if origin.source().instructions().values().any(|instruction| {
         instruction.state == SemanticInstructionState::UnsupportedUnknown
             || matches!(instruction.id.site, r2ssa::CanonicalInstructionSite::Phi(_))
     }) {
-        return Err(RenderAuthorizationError::UnsupportedSourceSemantics(
+        return Err(LedgerClosureError::UnsupportedSourceSemantics(
             origin
                 .source()
                 .instructions()
@@ -3679,16 +3262,14 @@ pub fn certify_conditional_terminal_return_region(
                 | SemanticObligationKind::ReturnValue
         )
     }) {
-        return Err(RenderAuthorizationError::InvalidRegionTopology);
+        return Err(LedgerClosureError::InvalidRegionTopology);
     }
     let report = ledger.audit(origin.source());
     if !report.has_exactly_one_disposition_per_source() || !report.invalid().is_empty() {
-        return Err(RenderAuthorizationError::IncompleteLedger);
+        return Err(LedgerClosureError::IncompleteLedger);
     }
     if let Some(obligation) = report.residualized().iter().chain(report.refused()).next() {
-        return Err(RenderAuthorizationError::ResidualOrRefusedObligation(
-            *obligation,
-        ));
+        return Err(LedgerClosureError::ResidualOrRefusedObligation(*obligation));
     }
 
     let predicate = origin
@@ -3704,12 +3285,12 @@ pub fn certify_conditional_terminal_return_region(
         .filter(|obligation| obligation.id.kind == SemanticObligationKind::ControlTransfer)
         .collect::<Vec<_>>();
     let ([predicate], [transfer]) = (predicate.as_slice(), transfer.as_slice()) else {
-        return Err(RenderAuthorizationError::InvalidRegionTopology);
+        return Err(LedgerClosureError::InvalidRegionTopology);
     };
     let ([predicate_effect], [transfer_effect]) =
         (ledger.effects(predicate.id), ledger.effects(transfer.id))
     else {
-        return Err(RenderAuthorizationError::IncompleteLedger);
+        return Err(LedgerClosureError::IncompleteLedger);
     };
     let conditional = predicate_effect
         .conditional_control_evidence()
@@ -3729,9 +3310,7 @@ pub fn certify_conditional_terminal_return_region(
                     producer: control.producer(),
                 }
     }) {
-        return Err(RenderAuthorizationError::InvalidRegionDisposition(
-            predicate.id,
-        ));
+        return Err(LedgerClosureError::InvalidRegionDisposition(predicate.id));
     }
 
     let interface = origin
@@ -3754,13 +3333,13 @@ pub fn certify_conditional_terminal_return_region(
             })
             .collect::<Vec<_>>();
         let [return_obligation] = return_obligations.as_slice() else {
-            return Err(RenderAuthorizationError::InvalidRegionTopology);
+            return Err(LedgerClosureError::InvalidRegionTopology);
         };
         let [return_effect] = ledger.effects(return_obligation.id) else {
-            return Err(RenderAuthorizationError::IncompleteLedger);
+            return Err(LedgerClosureError::IncompleteLedger);
         };
         let Some(return_control) = return_effect.return_control_evidence() else {
-            return Err(RenderAuthorizationError::InvalidRegionDisposition(
+            return Err(LedgerClosureError::InvalidRegionDisposition(
                 return_obligation.id,
             ));
         };
@@ -3776,7 +3355,7 @@ pub fn certify_conditional_terminal_return_region(
                 ),
             };
         if !return_matches {
-            return Err(RenderAuthorizationError::InvalidRegionDisposition(
+            return Err(LedgerClosureError::InvalidRegionDisposition(
                 return_obligation.id,
             ));
         }
@@ -3784,7 +3363,7 @@ pub fn certify_conditional_terminal_return_region(
 
     for obligation in origin.source().obligations().values() {
         let [effect] = ledger.effects(obligation.id) else {
-            return Err(RenderAuthorizationError::IncompleteLedger);
+            return Err(LedgerClosureError::IncompleteLedger);
         };
         let valid = match obligation.id.kind {
             SemanticObligationKind::LiveValueProducer => matches!(
@@ -3806,9 +3385,7 @@ pub fn certify_conditional_terminal_return_region(
             _ => false,
         };
         if !valid {
-            return Err(RenderAuthorizationError::InvalidRegionDisposition(
-                obligation.id,
-            ));
+            return Err(LedgerClosureError::InvalidRegionDisposition(obligation.id));
         }
     }
 
@@ -3820,22 +3397,18 @@ pub fn certify_conditional_terminal_return_region(
             .obligations()
             .contains_key(&mapping.obligation)
         {
-            return Err(RenderAuthorizationError::UnexpectedMapping(
-                mapping.obligation,
-            ));
+            return Err(LedgerClosureError::UnexpectedMapping(mapping.obligation));
         }
         if by_obligation.insert(mapping.obligation, mapping).is_some() {
-            return Err(RenderAuthorizationError::DuplicateMapping(
-                mapping.obligation,
-            ));
+            return Err(LedgerClosureError::DuplicateMapping(mapping.obligation));
         }
     }
     for obligation in origin.source().obligations().keys() {
         let mapping = by_obligation
             .get(obligation)
-            .ok_or(RenderAuthorizationError::MissingMapping(*obligation))?;
+            .ok_or(LedgerClosureError::MissingMapping(*obligation))?;
         let [effect] = ledger.effects(*obligation) else {
-            return Err(RenderAuthorizationError::IncompleteLedger);
+            return Err(LedgerClosureError::IncompleteLedger);
         };
         if effect.disposition() != mapping.source_disposition()
             || matches!(
@@ -3843,10 +3416,10 @@ pub fn certify_conditional_terminal_return_region(
                 EffectDisposition::Residualized { .. } | EffectDisposition::Refused { .. }
             )
         {
-            return Err(RenderAuthorizationError::DispositionMismatch(*obligation));
+            return Err(LedgerClosureError::DispositionMismatch(*obligation));
         }
     }
-    Ok(CertifiedRenderPermit {
+    Ok(CertifiedLedgerClosure {
         schema_version: CERTIFICATION_SCHEMA_VERSION,
         origin: origin.clone(),
         region_kind: CertifiedTypedRegionKind::ConditionalTerminalReturnFunction,
@@ -3864,16 +3437,17 @@ pub fn certify_switch_terminal_return_region(
     mappings: impl IntoIterator<Item = TypedRegionMapping>,
     topology_witness: &CertifiedSwitchTopology,
     switch_control: &CertifiedSwitchControl,
-) -> Result<CertifiedRenderPermit, RenderAuthorizationError> {
-    if origin.schema_version() != CERTIFICATION_SCHEMA_VERSION
-        || !origin.matches_retained_source(origin.source(), origin.topology())
+) -> Result<CertifiedLedgerClosure, LedgerClosureError> {
+    if !origin.is_valid()
+        || !ledger.matches_origin(origin)
+        || !return_machine_state_matches_origin(origin, ledger)
         || origin
             .machine_context()
             .source()
             .function_interface()
             .is_none()
     {
-        return Err(RenderAuthorizationError::InvalidOrigin);
+        return Err(LedgerClosureError::InvalidOrigin);
     }
     if topology_witness.schema_version() != CERTIFICATION_SCHEMA_VERSION
         || switch_control.schema_version() != CERTIFICATION_SCHEMA_VERSION
@@ -3890,19 +3464,19 @@ pub fn certify_switch_terminal_return_region(
             .machine_context()
             .source()
             .function_interface()
-            .and_then(|interface| {
-                interface
-                    .parameters()
-                    .get(switch_control.parameter_index() as usize)
+            .is_none_or(|interface| {
+                !interface_has_exact_parameter_projection(
+                    interface,
+                    switch_control.parameter_index(),
+                    switch_control.parameter_abi_storage(),
+                    switch_control.parameter_graph_storage(),
+                    switch_control.parameter_logical_value(),
+                )
             })
-            .is_none_or(|parameter| {
-                parameter.index() != switch_control.parameter_index()
-                    || parameter.storage() != switch_control.parameter_storage()
-                    || parameter.storage().size.checked_mul(8)
-                        != Some(switch_control.selector().binding().width_bits())
-            })
+        || switch_control.parameter_graph_storage().size.checked_mul(8)
+            != Some(switch_control.selector().binding().width_bits())
     {
-        return Err(RenderAuthorizationError::InvalidRegionTopology);
+        return Err(LedgerClosureError::InvalidRegionTopology);
     }
 
     let topology = origin.topology();
@@ -3918,11 +3492,11 @@ pub fn certify_switch_terminal_return_region(
         || arm_addrs.len() != topology_witness.cases().len() + 1
         || arm_addrs.contains(&header_addr)
     {
-        return Err(RenderAuthorizationError::InvalidRegionTopology);
+        return Err(LedgerClosureError::InvalidRegionTopology);
     }
     let header = topology
         .block(header_addr)
-        .ok_or(RenderAuthorizationError::InvalidRegionTopology)?;
+        .ok_or(LedgerClosureError::InvalidRegionTopology)?;
     if !header.predecessors().is_empty()
         || !matches!(
             header.terminator(),
@@ -3943,18 +3517,18 @@ pub fn certify_switch_terminal_return_region(
         || header.instructions().last() != Some(&topology_witness.producer())
         || header.successors().iter().copied().collect::<BTreeSet<_>>() != arm_addrs
     {
-        return Err(RenderAuthorizationError::InvalidRegionTopology);
+        return Err(LedgerClosureError::InvalidRegionTopology);
     }
     for arm_addr in &arm_addrs {
         let arm = topology
             .block(*arm_addr)
-            .ok_or(RenderAuthorizationError::InvalidRegionTopology)?;
+            .ok_or(LedgerClosureError::InvalidRegionTopology)?;
         if arm.predecessors() != [header_addr]
             || !matches!(arm.terminator(), CertifiedSourceTerminator::Return)
             || !arm.successors().is_empty()
             || arm.instructions().is_empty()
         {
-            return Err(RenderAuthorizationError::InvalidRegionTopology);
+            return Err(LedgerClosureError::InvalidRegionTopology);
         }
     }
     if origin.source().instructions().values().any(|instruction| {
@@ -3969,20 +3543,18 @@ pub fn certify_switch_terminal_return_region(
                 | SemanticObligationKind::ReturnValue
         )
     }) {
-        return Err(RenderAuthorizationError::InvalidRegionTopology);
+        return Err(LedgerClosureError::InvalidRegionTopology);
     }
 
     let report = ledger.audit(origin.source());
     if !report.has_exactly_one_disposition_per_source() || !report.invalid().is_empty() {
-        return Err(RenderAuthorizationError::IncompleteLedger);
+        return Err(LedgerClosureError::IncompleteLedger);
     }
     if let Some(obligation) = report.residualized().iter().chain(report.refused()).next() {
-        return Err(RenderAuthorizationError::ResidualOrRefusedObligation(
-            *obligation,
-        ));
+        return Err(LedgerClosureError::ResidualOrRefusedObligation(*obligation));
     }
     let [switch_effect] = ledger.effects(topology_witness.source_obligation()) else {
-        return Err(RenderAuthorizationError::IncompleteLedger);
+        return Err(LedgerClosureError::IncompleteLedger);
     };
     if switch_effect.switch_control_evidence() != Some(switch_control)
         || switch_effect.disposition()
@@ -3990,7 +3562,7 @@ pub fn certify_switch_terminal_return_region(
                 producer: topology_witness.producer(),
             })
     {
-        return Err(RenderAuthorizationError::InvalidRegionDisposition(
+        return Err(LedgerClosureError::InvalidRegionDisposition(
             topology_witness.source_obligation(),
         ));
     }
@@ -4015,13 +3587,13 @@ pub fn certify_switch_terminal_return_region(
             })
             .collect::<Vec<_>>();
         let [return_obligation] = returns.as_slice() else {
-            return Err(RenderAuthorizationError::InvalidRegionTopology);
+            return Err(LedgerClosureError::InvalidRegionTopology);
         };
         let [effect] = ledger.effects(return_obligation.id) else {
-            return Err(RenderAuthorizationError::IncompleteLedger);
+            return Err(LedgerClosureError::IncompleteLedger);
         };
         let Some(control) = effect.return_control_evidence() else {
-            return Err(RenderAuthorizationError::InvalidRegionDisposition(
+            return Err(LedgerClosureError::InvalidRegionDisposition(
                 return_obligation.id,
             ));
         };
@@ -4037,7 +3609,7 @@ pub fn certify_switch_terminal_return_region(
             || effect.disposition() != &(EffectDisposition::AbsorbedIntoReturn { producer })
             || !matches_interface
         {
-            return Err(RenderAuthorizationError::InvalidRegionDisposition(
+            return Err(LedgerClosureError::InvalidRegionDisposition(
                 return_obligation.id,
             ));
         }
@@ -4045,7 +3617,7 @@ pub fn certify_switch_terminal_return_region(
 
     for obligation in origin.source().obligations().values() {
         let [effect] = ledger.effects(obligation.id) else {
-            return Err(RenderAuthorizationError::IncompleteLedger);
+            return Err(LedgerClosureError::IncompleteLedger);
         };
         let valid = match obligation.id.kind {
             SemanticObligationKind::LiveValueProducer => matches!(
@@ -4069,9 +3641,7 @@ pub fn certify_switch_terminal_return_region(
             _ => false,
         };
         if !valid {
-            return Err(RenderAuthorizationError::InvalidRegionDisposition(
-                obligation.id,
-            ));
+            return Err(LedgerClosureError::InvalidRegionDisposition(obligation.id));
         }
     }
 
@@ -4083,22 +3653,18 @@ pub fn certify_switch_terminal_return_region(
             .obligations()
             .contains_key(&mapping.obligation)
         {
-            return Err(RenderAuthorizationError::UnexpectedMapping(
-                mapping.obligation,
-            ));
+            return Err(LedgerClosureError::UnexpectedMapping(mapping.obligation));
         }
         if by_obligation.insert(mapping.obligation, mapping).is_some() {
-            return Err(RenderAuthorizationError::DuplicateMapping(
-                mapping.obligation,
-            ));
+            return Err(LedgerClosureError::DuplicateMapping(mapping.obligation));
         }
     }
     for obligation in origin.source().obligations().keys() {
         let mapping = by_obligation
             .get(obligation)
-            .ok_or(RenderAuthorizationError::MissingMapping(*obligation))?;
+            .ok_or(LedgerClosureError::MissingMapping(*obligation))?;
         let [effect] = ledger.effects(*obligation) else {
-            return Err(RenderAuthorizationError::IncompleteLedger);
+            return Err(LedgerClosureError::IncompleteLedger);
         };
         if effect.disposition() != mapping.source_disposition()
             || matches!(
@@ -4106,10 +3672,10 @@ pub fn certify_switch_terminal_return_region(
                 EffectDisposition::Residualized { .. } | EffectDisposition::Refused { .. }
             )
         {
-            return Err(RenderAuthorizationError::DispositionMismatch(*obligation));
+            return Err(LedgerClosureError::DispositionMismatch(*obligation));
         }
     }
-    Ok(CertifiedRenderPermit {
+    Ok(CertifiedLedgerClosure {
         schema_version: CERTIFICATION_SCHEMA_VERSION,
         origin: origin.clone(),
         region_kind: CertifiedTypedRegionKind::SwitchTerminalReturnFunction,
@@ -4127,12 +3693,13 @@ pub fn certify_carrier_free_loop_terminal_return_region(
     ledger: &ObligationLedger,
     mappings: impl IntoIterator<Item = TypedRegionMapping>,
     loop_control: &CertifiedClosedNaturalLoopControl,
-) -> Result<CertifiedRenderPermit, RenderAuthorizationError> {
+) -> Result<CertifiedLedgerClosure, LedgerClosureError> {
     let Some(interface) = origin.machine_context().source().function_interface() else {
-        return Err(RenderAuthorizationError::InvalidOrigin);
+        return Err(LedgerClosureError::InvalidOrigin);
     };
-    if origin.schema_version() != CERTIFICATION_SCHEMA_VERSION
-        || !origin.matches_retained_source(origin.source(), origin.topology())
+    if !origin.is_valid()
+        || !ledger.matches_origin(origin)
+        || !return_machine_state_matches_origin(origin, ledger)
         || loop_control.schema_version() != CERTIFICATION_SCHEMA_VERSION
         || loop_control.origin() != origin
         || loop_control.routing().schema_version() != CERTIFICATION_SCHEMA_VERSION
@@ -4142,17 +3709,17 @@ pub fn certify_carrier_free_loop_terminal_return_region(
         || loop_control.condition().constant().is_some()
         || loop_control.condition().memory_access().is_some()
         || interface.parameters().len() != 1
-        || interface
-            .parameters()
-            .get(loop_control.parameter_index() as usize)
-            .is_none_or(|parameter| {
-                parameter.index() != loop_control.parameter_index()
-                    || parameter.storage() != loop_control.parameter_storage()
-                    || parameter.storage().size.checked_mul(8)
-                        != Some(loop_control.condition().binding().width_bits())
-            })
+        || !interface_has_exact_parameter_projection(
+            interface,
+            loop_control.parameter_index(),
+            loop_control.parameter_abi_storage(),
+            loop_control.parameter_graph_storage(),
+            loop_control.parameter_logical_value(),
+        )
+        || loop_control.parameter_graph_storage().size.checked_mul(8)
+            != Some(loop_control.condition().binding().width_bits())
     {
-        return Err(RenderAuthorizationError::InvalidOrigin);
+        return Err(LedgerClosureError::InvalidOrigin);
     }
 
     let topology = origin.topology();
@@ -4165,20 +3732,20 @@ pub fn certify_carrier_free_loop_terminal_return_region(
         || topology.blocks().len() != 4
         || BTreeSet::from([preheader_addr, header_addr, body_addr, exit_addr]).len() != 4
     {
-        return Err(RenderAuthorizationError::InvalidRegionTopology);
+        return Err(LedgerClosureError::InvalidRegionTopology);
     }
     let preheader = topology
         .block(preheader_addr)
-        .ok_or(RenderAuthorizationError::InvalidRegionTopology)?;
+        .ok_or(LedgerClosureError::InvalidRegionTopology)?;
     let header = topology
         .block(header_addr)
-        .ok_or(RenderAuthorizationError::InvalidRegionTopology)?;
+        .ok_or(LedgerClosureError::InvalidRegionTopology)?;
     let body = topology
         .block(body_addr)
-        .ok_or(RenderAuthorizationError::InvalidRegionTopology)?;
+        .ok_or(LedgerClosureError::InvalidRegionTopology)?;
     let exit = topology
         .block(exit_addr)
-        .ok_or(RenderAuthorizationError::InvalidRegionTopology)?;
+        .ok_or(LedgerClosureError::InvalidRegionTopology)?;
     let continuation_target = if routing.continuation_on_true() {
         routing.header_control().true_target()
     } else {
@@ -4221,7 +3788,7 @@ pub fn certify_carrier_free_loop_terminal_return_region(
         || !matches!(exit.terminator(), CertifiedSourceTerminator::Return)
         || exit.instructions().is_empty()
     {
-        return Err(RenderAuthorizationError::InvalidRegionTopology);
+        return Err(LedgerClosureError::InvalidRegionTopology);
     }
     if origin.source().instructions().values().any(|instruction| {
         instruction.state == SemanticInstructionState::UnsupportedUnknown
@@ -4237,17 +3804,15 @@ pub fn certify_carrier_free_loop_terminal_return_region(
         ) || (obligation.id.kind == SemanticObligationKind::LiveValueProducer
             && obligation.id.instruction.block_addr != exit_addr)
     }) {
-        return Err(RenderAuthorizationError::InvalidRegionTopology);
+        return Err(LedgerClosureError::InvalidRegionTopology);
     }
 
     let report = ledger.audit(origin.source());
     if !report.has_exactly_one_disposition_per_source() || !report.invalid().is_empty() {
-        return Err(RenderAuthorizationError::IncompleteLedger);
+        return Err(LedgerClosureError::IncompleteLedger);
     }
     if let Some(obligation) = report.residualized().iter().chain(report.refused()).next() {
-        return Err(RenderAuthorizationError::ResidualOrRefusedObligation(
-            *obligation,
-        ));
+        return Err(LedgerClosureError::ResidualOrRefusedObligation(*obligation));
     }
 
     let preheader_obligation = loop_control.preheader_transfer().source_obligation();
@@ -4263,19 +3828,19 @@ pub fn certify_carrier_free_loop_terminal_return_region(
     .len()
         != 4
     {
-        return Err(RenderAuthorizationError::InvalidRegionTopology);
+        return Err(LedgerClosureError::InvalidRegionTopology);
     }
     let [preheader_effect] = ledger.effects(preheader_obligation) else {
-        return Err(RenderAuthorizationError::IncompleteLedger);
+        return Err(LedgerClosureError::IncompleteLedger);
     };
     let [predicate_effect] = ledger.effects(predicate_obligation) else {
-        return Err(RenderAuthorizationError::IncompleteLedger);
+        return Err(LedgerClosureError::IncompleteLedger);
     };
     let [header_transfer_effect] = ledger.effects(header_transfer_obligation) else {
-        return Err(RenderAuthorizationError::IncompleteLedger);
+        return Err(LedgerClosureError::IncompleteLedger);
     };
     let [backedge_effect] = ledger.effects(backedge_obligation) else {
-        return Err(RenderAuthorizationError::IncompleteLedger);
+        return Err(LedgerClosureError::IncompleteLedger);
     };
     let preheader_producer = loop_control.preheader_transfer().producer();
     let header_producer = routing.header_control().producer();
@@ -4301,7 +3866,7 @@ pub fn certify_carrier_free_loop_terminal_return_region(
                 producer: backedge_producer,
             })
     {
-        return Err(RenderAuthorizationError::InvalidRegionDisposition(
+        return Err(LedgerClosureError::InvalidRegionDisposition(
             preheader_obligation,
         ));
     }
@@ -4320,15 +3885,13 @@ pub fn certify_carrier_free_loop_terminal_return_region(
         })
         .collect::<Vec<_>>();
     let [exit_return] = exit_returns.as_slice() else {
-        return Err(RenderAuthorizationError::InvalidRegionTopology);
+        return Err(LedgerClosureError::InvalidRegionTopology);
     };
     let [exit_return_effect] = ledger.effects(exit_return.id) else {
-        return Err(RenderAuthorizationError::IncompleteLedger);
+        return Err(LedgerClosureError::IncompleteLedger);
     };
     let Some(return_control) = exit_return_effect.return_control_evidence() else {
-        return Err(RenderAuthorizationError::InvalidRegionDisposition(
-            exit_return.id,
-        ));
+        return Err(LedgerClosureError::InvalidRegionDisposition(exit_return.id));
     };
     let return_matches = match interface.return_kind() {
         SourceFunctionReturn::Void => return_control.values().is_empty(),
@@ -4344,14 +3907,12 @@ pub fn certify_carrier_free_loop_terminal_return_region(
             })
         || !return_matches
     {
-        return Err(RenderAuthorizationError::InvalidRegionDisposition(
-            exit_return.id,
-        ));
+        return Err(LedgerClosureError::InvalidRegionDisposition(exit_return.id));
     }
 
     for obligation in origin.source().obligations().values() {
         let [effect] = ledger.effects(obligation.id) else {
-            return Err(RenderAuthorizationError::IncompleteLedger);
+            return Err(LedgerClosureError::IncompleteLedger);
         };
         let valid = match obligation.id.kind {
             SemanticObligationKind::LiveValueProducer => {
@@ -4385,9 +3946,7 @@ pub fn certify_carrier_free_loop_terminal_return_region(
             _ => false,
         };
         if !valid {
-            return Err(RenderAuthorizationError::InvalidRegionDisposition(
-                obligation.id,
-            ));
+            return Err(LedgerClosureError::InvalidRegionDisposition(obligation.id));
         }
     }
 
@@ -4399,22 +3958,18 @@ pub fn certify_carrier_free_loop_terminal_return_region(
             .obligations()
             .contains_key(&mapping.obligation)
         {
-            return Err(RenderAuthorizationError::UnexpectedMapping(
-                mapping.obligation,
-            ));
+            return Err(LedgerClosureError::UnexpectedMapping(mapping.obligation));
         }
         if by_obligation.insert(mapping.obligation, mapping).is_some() {
-            return Err(RenderAuthorizationError::DuplicateMapping(
-                mapping.obligation,
-            ));
+            return Err(LedgerClosureError::DuplicateMapping(mapping.obligation));
         }
     }
     for obligation in origin.source().obligations().keys() {
         let mapping = by_obligation
             .get(obligation)
-            .ok_or(RenderAuthorizationError::MissingMapping(*obligation))?;
+            .ok_or(LedgerClosureError::MissingMapping(*obligation))?;
         let [effect] = ledger.effects(*obligation) else {
-            return Err(RenderAuthorizationError::IncompleteLedger);
+            return Err(LedgerClosureError::IncompleteLedger);
         };
         if effect.disposition() != mapping.source_disposition()
             || matches!(
@@ -4422,10 +3977,10 @@ pub fn certify_carrier_free_loop_terminal_return_region(
                 EffectDisposition::Residualized { .. } | EffectDisposition::Refused { .. }
             )
         {
-            return Err(RenderAuthorizationError::DispositionMismatch(*obligation));
+            return Err(LedgerClosureError::DispositionMismatch(*obligation));
         }
     }
-    Ok(CertifiedRenderPermit {
+    Ok(CertifiedLedgerClosure {
         schema_version: CERTIFICATION_SCHEMA_VERSION,
         origin: origin.clone(),
         region_kind: CertifiedTypedRegionKind::CarrierFreeLoopTerminalReturnFunction,
@@ -4434,187 +3989,12 @@ pub fn certify_carrier_free_loop_terminal_return_region(
     })
 }
 
-/// Authorize the exact closed unsigned counted-loop function sealed by
-/// [`CertifiedClosedCountedLoopControl`]. The typed consumer must preserve the
-/// ordered initializer, header test, latch update, and final carrier return.
-pub fn certify_counted_loop_terminal_return_region(
-    origin: &CertifiedArtifactOrigin,
-    ledger: &ObligationLedger,
-    mappings: impl IntoIterator<Item = TypedRegionMapping>,
-    loop_control: &CertifiedClosedCountedLoopControl,
-) -> Result<CertifiedRenderPermit, RenderAuthorizationError> {
-    let state = loop_control.state();
-    if origin.schema_version() != CERTIFICATION_SCHEMA_VERSION
-        || !origin.matches_retained_source(origin.source(), origin.topology())
-        || loop_control.schema_version() != CERTIFICATION_SCHEMA_VERSION
-        || loop_control.origin() != origin
-        || state.schema_version() != CERTIFICATION_SCHEMA_VERSION
-        || state.origin() != origin
-        || state.validate(origin.source()).is_err()
-        || loop_control.header_control().condition() != state.condition()
-        || loop_control.preheader_transfer().target() != state.header()
-        || loop_control.header_control().true_target() != state.latch()
-        || loop_control.header_control().false_target() != state.exit()
-        || loop_control.backedge_transfer().target() != state.header()
-        || origin
-            .machine_context()
-            .source()
-            .function_interface()
-            .is_none_or(|interface| {
-                interface.parameters().len() != 1
-                    || !interface.stack_slots().is_empty()
-                    || interface
-                        .parameters()
-                        .get(loop_control.parameter_index() as usize)
-                        .is_none_or(|parameter| {
-                            parameter.index() != loop_control.parameter_index()
-                                || parameter.storage() != loop_control.parameter_storage()
-                                || parameter.storage().size.checked_mul(8)
-                                    != Some(state.bound().binding().width_bits())
-                        })
-            })
-    {
-        return Err(RenderAuthorizationError::InvalidOrigin);
-    }
-    let topology = origin.topology();
-    let (Some(preheader), Some(header), Some(latch), Some(exit)) = (
-        topology.block(state.preheader()),
-        topology.block(state.header()),
-        topology.block(state.latch()),
-        topology.block(state.exit()),
-    ) else {
-        return Err(RenderAuthorizationError::InvalidRegionTopology);
-    };
-    if topology.entry_addr() != state.preheader()
-        || topology.blocks().len() != 4
-        || preheader.instructions().last() != Some(&loop_control.preheader_transfer().producer())
-        || header.instructions().last() != Some(&loop_control.header_control().producer())
-        || latch.instructions().last() != Some(&loop_control.backedge_transfer().producer())
-        || exit.instructions().last() != Some(&loop_control.return_control().producer())
-        || preheader.successors() != [state.header()]
-        || header.successors().iter().copied().collect::<BTreeSet<_>>()
-            != BTreeSet::from([state.latch(), state.exit()])
-        || latch.successors() != [state.header()]
-        || !exit.successors().is_empty()
-        || origin.source().obligations().values().any(|obligation| {
-            !matches!(
-                obligation.id.kind,
-                SemanticObligationKind::LiveValueProducer
-                    | SemanticObligationKind::LoopCarriedState
-                    | SemanticObligationKind::LiveStateTransition
-                    | SemanticObligationKind::ControlPredicate
-                    | SemanticObligationKind::ControlTransfer
-                    | SemanticObligationKind::Return
-                    | SemanticObligationKind::ReturnValue
-            )
-        })
-    {
-        return Err(RenderAuthorizationError::InvalidRegionTopology);
-    }
-    let report = ledger.audit(origin.source());
-    if !report.has_exactly_one_disposition_per_source() || !report.invalid().is_empty() {
-        return Err(RenderAuthorizationError::IncompleteLedger);
-    }
-    if let Some(obligation) = report.residualized().iter().chain(report.refused()).next() {
-        return Err(RenderAuthorizationError::ResidualOrRefusedObligation(
-            *obligation,
-        ));
-    }
-    for obligation in origin.source().obligations().values() {
-        let [effect] = ledger.effects(obligation.id) else {
-            return Err(RenderAuthorizationError::IncompleteLedger);
-        };
-        let valid = if state.source_obligations().contains(&obligation.id) {
-            effect.disposition()
-                == &(EffectDisposition::AbsorbedIntoLoopState {
-                    producer: state.producer(),
-                })
-                && effect.counted_loop_state_evidence() == Some(state)
-        } else {
-            match obligation.id.kind {
-                SemanticObligationKind::LiveValueProducer => matches!(
-                    effect.disposition(),
-                    EffectDisposition::AbsorbedIntoExpression { producer }
-                        if *producer == obligation.id.instruction
-                ),
-                SemanticObligationKind::ControlPredicate => {
-                    obligation.id.instruction == loop_control.header_control().producer()
-                        && effect.conditional_control_evidence()
-                            == Some(loop_control.header_control())
-                }
-                SemanticObligationKind::ControlTransfer => {
-                    (obligation.id.instruction == loop_control.preheader_transfer().producer()
-                        && effect.direct_control_evidence()
-                            == Some(loop_control.preheader_transfer()))
-                        || (obligation.id.instruction == loop_control.header_control().producer()
-                            && effect.conditional_control_evidence()
-                                == Some(loop_control.header_control()))
-                        || (obligation.id.instruction
-                            == loop_control.backedge_transfer().producer()
-                            && effect.direct_control_evidence()
-                                == Some(loop_control.backedge_transfer()))
-                }
-                SemanticObligationKind::Return | SemanticObligationKind::ReturnValue => {
-                    obligation.id.instruction == loop_control.return_control().producer()
-                        && effect.return_control_evidence() == Some(loop_control.return_control())
-                }
-                _ => false,
-            }
-        };
-        if !valid {
-            return Err(RenderAuthorizationError::InvalidRegionDisposition(
-                obligation.id,
-            ));
-        }
-    }
-
-    let mappings = mappings.into_iter().collect::<Vec<_>>();
-    let mut by_obligation = BTreeMap::<SemanticObligationId, &TypedRegionMapping>::new();
-    for mapping in &mappings {
-        if !origin
-            .source()
-            .obligations()
-            .contains_key(&mapping.obligation)
-        {
-            return Err(RenderAuthorizationError::UnexpectedMapping(
-                mapping.obligation,
-            ));
-        }
-        if by_obligation.insert(mapping.obligation, mapping).is_some() {
-            return Err(RenderAuthorizationError::DuplicateMapping(
-                mapping.obligation,
-            ));
-        }
-    }
-    for obligation in origin.source().obligations().keys() {
-        let mapping = by_obligation
-            .get(obligation)
-            .ok_or(RenderAuthorizationError::MissingMapping(*obligation))?;
-        let [effect] = ledger.effects(*obligation) else {
-            return Err(RenderAuthorizationError::IncompleteLedger);
-        };
-        if effect.disposition() != mapping.source_disposition()
-            || matches!(
-                mapping.source_disposition(),
-                EffectDisposition::Residualized { .. } | EffectDisposition::Refused { .. }
-            )
-        {
-            return Err(RenderAuthorizationError::DispositionMismatch(*obligation));
-        }
-    }
-    Ok(CertifiedRenderPermit {
-        schema_version: CERTIFICATION_SCHEMA_VERSION,
-        origin: origin.clone(),
-        region_kind: CertifiedTypedRegionKind::CountedLoopTerminalReturnFunction,
-        region_schema_version: CERTIFIED_COUNTED_LOOP_TERMINAL_RETURN_CONTRACT_VERSION,
-        mappings: mappings.into_boxed_slice(),
-    })
-}
-
 /// Certification owner for one canonical function.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CertifiedFunction {
     schema_version: u32,
+    #[serde(skip_serializing)]
+    authority: CertifiedAuthoritySeal,
     source: SemanticObligationInventory,
     ledger: ObligationLedger,
 }
@@ -4622,10 +4002,29 @@ pub struct CertifiedFunction {
 impl CertifiedFunction {
     pub fn new(source: SemanticObligationInventory) -> Result<Self, CertificationError> {
         validate_source(&source)?;
+        let authority = CertifiedAuthoritySeal::new();
         Ok(Self {
             schema_version: CERTIFICATION_SCHEMA_VERSION,
+            authority: authority.clone(),
             source,
-            ledger: ObligationLedger::new(),
+            ledger: ObligationLedger {
+                schema_version: CERTIFICATION_SCHEMA_VERSION,
+                authority,
+                effects: BTreeMap::new(),
+            },
+        })
+    }
+
+    fn bound(
+        source: SemanticObligationInventory,
+        origin: &CertifiedArtifactOrigin,
+    ) -> Result<Self, CertificationError> {
+        validate_source(&source)?;
+        Ok(Self {
+            schema_version: CERTIFICATION_SCHEMA_VERSION,
+            authority: origin.authority().clone(),
+            source,
+            ledger: ObligationLedger::bound(origin),
         })
     }
 
@@ -4647,6 +4046,7 @@ impl CertifiedFunction {
     ) -> Result<(), CertificationError> {
         let effect = CertifiedEffect {
             schema_version: CERTIFICATION_SCHEMA_VERSION,
+            authority: self.authority.clone(),
             obligation,
             disposition: EffectDisposition::Rendered,
             evidence: DispositionEvidence::Output(output),
@@ -4667,6 +4067,7 @@ impl CertifiedFunction {
         let producer = expression.entity().producer();
         let effect = CertifiedEffect {
             schema_version: CERTIFICATION_SCHEMA_VERSION,
+            authority: self.authority.clone(),
             obligation,
             disposition: EffectDisposition::AbsorbedIntoExpression { producer },
             evidence: DispositionEvidence::Expression(expression),
@@ -4691,6 +4092,7 @@ impl CertifiedFunction {
         let producer = statement.producer();
         let effect = CertifiedEffect {
             schema_version: CERTIFICATION_SCHEMA_VERSION,
+            authority: self.authority.clone(),
             obligation,
             disposition: EffectDisposition::AbsorbedIntoStatement { producer },
             evidence: DispositionEvidence::Statement(statement),
@@ -4711,6 +4113,7 @@ impl CertifiedFunction {
         let producer = control.producer();
         let effect = CertifiedEffect {
             schema_version: CERTIFICATION_SCHEMA_VERSION,
+            authority: self.authority.clone(),
             obligation,
             disposition: EffectDisposition::AbsorbedIntoControl { producer },
             evidence: DispositionEvidence::Control(control),
@@ -4734,6 +4137,7 @@ impl CertifiedFunction {
             }
             let effect = CertifiedEffect {
                 schema_version: CERTIFICATION_SCHEMA_VERSION,
+                authority: self.authority.clone(),
                 obligation,
                 disposition: EffectDisposition::AbsorbedIntoCall { producer },
                 evidence: DispositionEvidence::Call(call.clone()),
@@ -4758,6 +4162,7 @@ impl CertifiedFunction {
             }
             let effect = CertifiedEffect {
                 schema_version: CERTIFICATION_SCHEMA_VERSION,
+                authority: self.authority.clone(),
                 obligation,
                 disposition: EffectDisposition::AbsorbedIntoControl { producer },
                 evidence: DispositionEvidence::ConditionalControl(control.clone()),
@@ -4779,6 +4184,7 @@ impl CertifiedFunction {
         let producer = control.producer();
         let effect = CertifiedEffect {
             schema_version: CERTIFICATION_SCHEMA_VERSION,
+            authority: self.authority.clone(),
             obligation,
             disposition: EffectDisposition::AbsorbedIntoControl { producer },
             evidence: DispositionEvidence::SwitchControl(Box::new(control)),
@@ -4802,195 +4208,10 @@ impl CertifiedFunction {
             }
             let effect = CertifiedEffect {
                 schema_version: CERTIFICATION_SCHEMA_VERSION,
+                authority: self.authority.clone(),
                 obligation,
                 disposition: EffectDisposition::AbsorbedIntoReturn { producer },
                 evidence: DispositionEvidence::ReturnControl(control.clone()),
-            };
-            effect.validate(&self.source)?;
-            self.ledger.record(effect);
-        }
-        Ok(())
-    }
-
-    fn record_absorbed_counted_loop_state(
-        &mut self,
-        state: CertifiedCountedLoopState,
-    ) -> Result<(), CertificationError> {
-        let producer = state.producer();
-        for obligation in state.source_obligations() {
-            if !matches!(
-                obligation.kind,
-                SemanticObligationKind::LiveValueProducer
-                    | SemanticObligationKind::LoopCarriedState
-                    | SemanticObligationKind::LiveStateTransition
-            ) {
-                return Err(CertificationError::ObligationNotMapped(*obligation));
-            }
-            let effect = CertifiedEffect {
-                schema_version: CERTIFICATION_SCHEMA_VERSION,
-                obligation: *obligation,
-                disposition: EffectDisposition::AbsorbedIntoLoopState { producer },
-                evidence: DispositionEvidence::LoopState(Box::new(state.clone())),
-            };
-            effect.validate(&self.source)?;
-            self.ledger.record(effect);
-        }
-        Ok(())
-    }
-
-    fn record_absorbed_conditional_return_state(
-        &mut self,
-        state: CertifiedConditionalReturnCarrier,
-    ) -> Result<(), CertificationError> {
-        let producer = state.producer();
-        for obligation in state.source_obligations() {
-            if !matches!(
-                obligation.kind,
-                SemanticObligationKind::LiveValueProducer
-                    | SemanticObligationKind::ObservableMemoryRead
-                    | SemanticObligationKind::ObservableMemoryWrite
-            ) {
-                return Err(CertificationError::ObligationNotMapped(*obligation));
-            }
-            let effect = CertifiedEffect {
-                schema_version: CERTIFICATION_SCHEMA_VERSION,
-                obligation: *obligation,
-                disposition: EffectDisposition::AbsorbedIntoConditionalReturnState { producer },
-                evidence: DispositionEvidence::ConditionalReturnState(Box::new(state.clone())),
-            };
-            effect.validate(&self.source)?;
-            self.ledger.record(effect);
-        }
-        Ok(())
-    }
-
-    fn record_absorbed_private_frame_state(
-        &mut self,
-        state: CertifiedPrivateFrameConditionalReturn,
-    ) -> Result<(), CertificationError> {
-        for obligation in state.source_obligations() {
-            if !matches!(
-                obligation.kind,
-                SemanticObligationKind::LiveValueProducer
-                    | SemanticObligationKind::ObservableMemoryRead
-                    | SemanticObligationKind::ObservableMemoryWrite
-                    | SemanticObligationKind::VolatileOrUnknownEffect
-            ) {
-                return Err(CertificationError::ObligationNotMapped(*obligation));
-            }
-            let producer = obligation.instruction;
-            let effect = CertifiedEffect {
-                schema_version: CERTIFICATION_SCHEMA_VERSION,
-                obligation: *obligation,
-                disposition: EffectDisposition::AbsorbedIntoPrivateFrameState { producer },
-                evidence: DispositionEvidence::PrivateFrameState(Box::new(state.clone())),
-            };
-            effect.validate(&self.source)?;
-            self.ledger.record(effect);
-        }
-        Ok(())
-    }
-
-    fn record_absorbed_fnv_fold_state(
-        &mut self,
-        state: CertifiedFnvFoldLoop,
-    ) -> Result<(), CertificationError> {
-        for obligation in state.source_obligations() {
-            if !matches!(
-                obligation.kind,
-                SemanticObligationKind::LiveValueProducer
-                    | SemanticObligationKind::LoopCarriedState
-                    | SemanticObligationKind::LiveStateTransition
-            ) {
-                return Err(CertificationError::ObligationNotMapped(*obligation));
-            }
-            let producer = obligation.instruction;
-            let effect = CertifiedEffect {
-                schema_version: CERTIFICATION_SCHEMA_VERSION,
-                obligation: *obligation,
-                disposition: EffectDisposition::AbsorbedIntoFnvFoldState { producer },
-                evidence: DispositionEvidence::FnvFoldState(Box::new(state.clone())),
-            };
-            effect.validate(&self.source)?;
-            self.ledger.record(effect);
-        }
-        Ok(())
-    }
-
-    fn record_absorbed_fnv_fold_o0(
-        &mut self,
-        state: &CertifiedFnvFoldO0Function,
-    ) -> Result<(), CertificationError> {
-        state
-            .validate(&self.source)
-            .map_err(|_| CertificationError::IncompleteSourceInventory)?;
-        if state
-            .obligation_dispositions()
-            .iter()
-            .any(|(_, class)| *class == CertifiedFnvFoldO0DispositionClass::ProvenDead)
-        {
-            return Err(CertificationError::IncompleteSourceInventory);
-        }
-        for (obligation, class) in state.obligation_dispositions() {
-            let producer = obligation.instruction;
-            let disposition = match class {
-                CertifiedFnvFoldO0DispositionClass::ProvenDead => {
-                    return Err(CertificationError::ObligationNotMapped(*obligation));
-                }
-                CertifiedFnvFoldO0DispositionClass::FrameState => {
-                    EffectDisposition::AbsorbedIntoFnvFoldO0FrameState { producer }
-                }
-                CertifiedFnvFoldO0DispositionClass::InvariantHomeRelay => {
-                    EffectDisposition::AbsorbedIntoFnvFoldO0InvariantHomeRelay { producer }
-                }
-                CertifiedFnvFoldO0DispositionClass::ExternalAliasSealing => {
-                    EffectDisposition::AbsorbedIntoFnvFoldO0ExternalAlias { producer }
-                }
-                CertifiedFnvFoldO0DispositionClass::ForwarderControl => {
-                    EffectDisposition::AbsorbedIntoFnvFoldO0Forwarder { producer }
-                }
-                CertifiedFnvFoldO0DispositionClass::LoopControl => {
-                    EffectDisposition::AbsorbedIntoFnvFoldO0LoopControl { producer }
-                }
-                CertifiedFnvFoldO0DispositionClass::Semantics => {
-                    EffectDisposition::AbsorbedIntoFnvFoldO0Semantics { producer }
-                }
-                CertifiedFnvFoldO0DispositionClass::Return => {
-                    EffectDisposition::AbsorbedIntoFnvFoldO0Return { producer }
-                }
-            };
-            let effect = CertifiedEffect {
-                schema_version: CERTIFICATION_SCHEMA_VERSION,
-                obligation: *obligation,
-                disposition,
-                evidence: DispositionEvidence::FnvFoldO0(CertifiedFnvFoldO0EvidenceRef {
-                    proof_slot: CERTIFIED_FNV_FOLD_O0_PROOF_SLOT,
-                    class: *class,
-                }),
-            };
-            effect.validate(&self.source)?;
-            self.ledger.record(effect);
-        }
-        Ok(())
-    }
-
-    fn record_absorbed_fnv_latch_control(
-        &mut self,
-        control: CertifiedFnvFoldLatchControl,
-    ) -> Result<(), CertificationError> {
-        let producer = control.producer();
-        for obligation in control.source_obligations() {
-            if !matches!(
-                obligation.kind,
-                SemanticObligationKind::ControlPredicate | SemanticObligationKind::ControlTransfer
-            ) {
-                return Err(CertificationError::ObligationNotMapped(obligation));
-            }
-            let effect = CertifiedEffect {
-                schema_version: CERTIFICATION_SCHEMA_VERSION,
-                obligation,
-                disposition: EffectDisposition::AbsorbedIntoControl { producer },
-                evidence: DispositionEvidence::FnvFoldLatchControl(control.clone()),
             };
             effect.validate(&self.source)?;
             self.ledger.record(effect);
@@ -5030,6 +4251,7 @@ impl CertifiedFunction {
         };
         let effect = CertifiedEffect {
             schema_version: CERTIFICATION_SCHEMA_VERSION,
+            authority: self.authority.clone(),
             obligation,
             disposition,
             evidence: DispositionEvidence::Diagnostic,
@@ -5059,6 +4281,7 @@ impl CertifiedFunction {
                 };
                 self.ledger.record(CertifiedEffect {
                     schema_version: CERTIFICATION_SCHEMA_VERSION,
+                    authority: self.authority.clone(),
                     obligation: *id,
                     disposition: disposition.clone(),
                     evidence,
@@ -5266,6 +4489,7 @@ fn certified_artifact_origin(
     });
     Ok(CertifiedArtifactOrigin {
         schema_version: CERTIFICATION_SCHEMA_VERSION,
+        authority: CertifiedAuthoritySeal::for_artifact(artifact),
         graph_snapshot: graph_snapshot.into_boxed_slice(),
         prepare_mode: artifact.mode().into(),
         decompile_preparation,
@@ -5513,8 +4737,9 @@ fn call_argument_origin_before_boundary(
                     .parameters
                     .iter()
                     .filter_map(|(index, parameter)| {
-                        (parameter.storage == storage && parameter.value == input.binding().value())
-                            .then_some(*index)
+                        (parameter.abi_storage == storage
+                            && parameter.value == input.binding().value())
+                        .then_some(*index)
                     })
                     .collect::<Vec<_>>();
                 if let [index] = matching.as_slice() {
@@ -5530,7 +4755,7 @@ fn call_argument_origin_before_boundary(
         .parameters
         .iter()
         .filter_map(|(index, parameter)| {
-            (parameter.storage == storage && parameter.value == value.binding().value())
+            (parameter.abi_storage == storage && parameter.value == value.binding().value())
                 .then_some(*index)
         })
         .collect::<Vec<_>>();
@@ -5840,6 +5065,44 @@ fn certified_return_controls(
             continue;
         }
         let boundary = boundary.expect("checked complete return boundary");
+        let Some(interface) = artifact.machine_context().function_interface() else {
+            continue;
+        };
+        let (Some(return_address_storage), Some(stack_pointer_storage)) = (
+            interface.return_address_storage(),
+            interface.stack_pointer_storage(),
+        ) else {
+            continue;
+        };
+        let Some(return_address_fact) = boundary.return_address else {
+            continue;
+        };
+        if !boundary.register_compositions.is_empty()
+            || return_address_fact.storage != return_address_storage
+            || return_address_fact.value != inst.inputs[0]
+        {
+            continue;
+        }
+        let return_address = CertifiedReturnAddress {
+            storage: return_address_fact.storage,
+            value: MachineValueUse::from_artifact(artifact, return_address_fact.value)?,
+        };
+        let exit_stack_pointer = match boundary.exit_stack_pointer {
+            Some(SourceReturnStackPointerFact::PreservedEntry { storage })
+                if storage == stack_pointer_storage =>
+            {
+                CertifiedExitStackPointer::PreservedEntry { storage }
+            }
+            Some(SourceReturnStackPointerFact::ReachingValue { storage, value })
+                if storage == stack_pointer_storage =>
+            {
+                CertifiedExitStackPointer::ReachingValue {
+                    storage,
+                    value: MachineValueUse::from_artifact(artifact, value)?,
+                }
+            }
+            _ => continue,
+        };
         let values = boundary
             .values
             .iter()
@@ -5872,6 +5135,8 @@ fn certified_return_controls(
             producer,
             source_inst: inst.id,
             control_target,
+            return_address,
+            exit_stack_pointer,
             values: values.into_boxed_slice(),
             return_obligation,
         };
@@ -6089,7 +5354,12 @@ fn certified_switch_controls(
                         && value.producer().is_none()
                         && value.constant().is_none()
                         && value.memory_access().is_none()
-                        && parameter.storage().size.checked_mul(8) == Some(selector_bits)
+                        && parameter.graph_storage().size.checked_mul(8) == Some(selector_bits)
+                        && exact_parameter_projection(
+                            parameter.storage(),
+                            parameter.graph_storage(),
+                            parameter.logical_value(),
+                        )
                 })
             })
             .collect::<Vec<_>>();
@@ -6102,7 +5372,9 @@ fn certified_switch_controls(
             topology: topology.clone(),
             selector,
             parameter_index: parameter.index(),
-            parameter_storage: parameter.storage(),
+            parameter_abi_storage: parameter.storage(),
+            parameter_graph_storage: parameter.graph_storage(),
+            parameter_logical_value: parameter.logical_value(),
         };
         witness
             .validate(artifact.obligations())
@@ -6345,15 +5617,15 @@ fn certified_closed_natural_loop_controls(
             .values()
             .filter(|parameter| {
                 parameter.value() == Some(condition)
-                    && parameter.storage().size.checked_mul(8)
+                    && parameter.graph_storage().size.checked_mul(8)
                         == Some(condition.binding().width_bits())
-                    && interface
-                        .parameters()
-                        .get(parameter.index() as usize)
-                        .is_some_and(|source| {
-                            source.index() == parameter.index()
-                                && source.storage() == parameter.storage()
-                        })
+                    && interface_has_exact_parameter_projection(
+                        interface,
+                        parameter.index(),
+                        parameter.storage(),
+                        parameter.graph_storage(),
+                        parameter.logical_value(),
+                    )
             })
             .collect::<Vec<_>>();
         let [parameter] = matching_parameters.as_slice() else {
@@ -6366,276 +5638,11 @@ fn certified_closed_natural_loop_controls(
             routing: routing.clone(),
             preheader_transfer: preheader_transfer.clone(),
             parameter_index: parameter.index(),
-            parameter_storage: parameter.storage(),
+            parameter_abi_storage: parameter.storage(),
+            parameter_graph_storage: parameter.graph_storage(),
+            parameter_logical_value: parameter.logical_value(),
         };
         if controls.insert(*header_addr, control).is_some() {
-            return Err(MachineBuildError::TopologyMismatch);
-        }
-    }
-    Ok(controls)
-}
-
-fn certified_closed_counted_loop_controls(
-    artifact: &SsaArtifact,
-    origin: &CertifiedArtifactOrigin,
-    topology: &CertifiedSourceTopology,
-    direct_controls: &BTreeMap<CanonicalInstructionId, CertifiedDirectControl>,
-    conditional_controls: &BTreeMap<CanonicalInstructionId, CertifiedConditionalControl>,
-    return_controls: &BTreeMap<CanonicalInstructionId, CertifiedReturnControl>,
-    abi_parameters: &BTreeMap<u32, CertifiedAbiParameter>,
-) -> Result<BTreeMap<u64, CertifiedClosedCountedLoopControl>, MachineBuildError> {
-    let mut controls = BTreeMap::new();
-    let Some(interface) = artifact.machine_context().function_interface() else {
-        return Ok(controls);
-    };
-    if interface.parameters().len() != 1
-        || !interface.stack_slots().is_empty()
-        || !matches!(
-            interface.return_kind(),
-            SourceFunctionReturn::Register { .. }
-        )
-    {
-        return Ok(controls);
-    }
-    let source = artifact.obligations();
-    let canonical = |inst| {
-        source
-            .instruction_for_inst(inst)
-            .map(|instruction| instruction.id)
-    };
-    for fact in artifact.structured().canonical_counted_loops.values() {
-        if fact
-            .width
-            .checked_mul(8)
-            .is_none_or(|width| !matches!(width, 8 | 16 | 32 | 64))
-            || topology.entry_addr() != fact.preheader
-            || topology.blocks().len() != 4
-        {
-            continue;
-        }
-        let (Some(preheader), Some(header), Some(latch), Some(exit)) = (
-            topology.block(fact.preheader),
-            topology.block(fact.header),
-            topology.block(fact.latch),
-            topology.block(fact.exit),
-        ) else {
-            continue;
-        };
-        let (
-            Some(initializer_producer),
-            Some(phi_producer),
-            Some(condition_producer),
-            Some(update_producer),
-        ) = (
-            canonical(fact.initializer_inst),
-            canonical(fact.phi_inst),
-            canonical(fact.condition_inst),
-            canonical(fact.update_inst),
-        )
-        else {
-            continue;
-        };
-        let (
-            Some(preheader_producer),
-            Some(header_producer),
-            Some(backedge_producer),
-            Some(return_producer),
-        ) = (
-            preheader.instructions().last().copied(),
-            header.instructions().last().copied(),
-            latch.instructions().last().copied(),
-            exit.instructions().last().copied(),
-        )
-        else {
-            continue;
-        };
-        let (
-            Some(preheader_transfer),
-            Some(header_control),
-            Some(backedge_transfer),
-            Some(return_control),
-        ) = (
-            direct_controls.get(&preheader_producer),
-            conditional_controls.get(&header_producer),
-            direct_controls.get(&backedge_producer),
-            return_controls.get(&return_producer),
-        )
-        else {
-            continue;
-        };
-        let header_phi_position = header
-            .instructions()
-            .iter()
-            .position(|producer| *producer == phi_producer);
-        let header_condition_position = header
-            .instructions()
-            .iter()
-            .position(|producer| *producer == condition_producer);
-        let header_prefix_is_exact = match (header_phi_position, header_condition_position) {
-            (Some(phi_position), Some(condition_position)) if phi_position < condition_position => {
-                header.instructions()[..condition_position]
-                    .iter()
-                    .enumerate()
-                    .all(|(position, producer)| {
-                        if position == phi_position {
-                            true
-                        } else {
-                            source
-                                .instructions()
-                                .get(producer)
-                                .is_some_and(|instruction| {
-                                    instruction.state == SemanticInstructionState::ProvenDead
-                                        && instruction.obligations.is_empty()
-                                        && matches!(producer.site, CanonicalInstructionSite::Phi(_))
-                                })
-                        }
-                    })
-            }
-            _ => false,
-        };
-        let live_value_only = |producer| {
-            let obligation = SemanticObligationId {
-                instruction: producer,
-                kind: SemanticObligationKind::LiveValueProducer,
-                component: SemanticObligationComponent::Whole,
-            };
-            source
-                .instructions()
-                .get(&producer)
-                .is_some_and(|instruction| {
-                    instruction.state == SemanticInstructionState::LiveObligation
-                        && instruction.obligations == BTreeSet::from([obligation])
-                })
-        };
-        if preheader.instructions() != [initializer_producer, preheader_producer]
-            || header
-                .instructions()
-                .get(header.instructions().len().saturating_sub(2))
-                != Some(&condition_producer)
-            || !header_prefix_is_exact
-            || latch.instructions() != [update_producer, backedge_producer]
-            || exit.instructions() != [return_producer]
-            || !preheader.predecessors().is_empty()
-            || preheader.successors() != [fact.header]
-            || header
-                .predecessors()
-                .iter()
-                .copied()
-                .collect::<BTreeSet<_>>()
-                != BTreeSet::from([fact.preheader, fact.latch])
-            || header.successors().iter().copied().collect::<BTreeSet<_>>()
-                != BTreeSet::from([fact.latch, fact.exit])
-            || latch.predecessors() != [fact.header]
-            || latch.successors() != [fact.header]
-            || exit.predecessors() != [fact.header]
-            || !exit.successors().is_empty()
-            || preheader_transfer.target() != fact.header
-            || header_control.true_target() != fact.latch
-            || header_control.false_target() != fact.exit
-            || backedge_transfer.target() != fact.header
-            || !live_value_only(initializer_producer)
-            || !live_value_only(condition_producer)
-            || !live_value_only(update_producer)
-            || source.instructions().values().any(|instruction| {
-                instruction.state == SemanticInstructionState::UnsupportedUnknown
-            })
-            || source.obligations().values().any(|obligation| {
-                !matches!(
-                    obligation.id.kind,
-                    SemanticObligationKind::LiveValueProducer
-                        | SemanticObligationKind::LoopCarriedState
-                        | SemanticObligationKind::LiveStateTransition
-                        | SemanticObligationKind::ControlPredicate
-                        | SemanticObligationKind::ControlTransfer
-                        | SemanticObligationKind::Return
-                        | SemanticObligationKind::ReturnValue
-                )
-            })
-        {
-            continue;
-        }
-
-        let initializer = MachineValueUse::from_artifact(artifact, fact.initializer)?;
-        let phi = MachineValueUse::from_artifact(artifact, fact.phi)?;
-        let bound = MachineValueUse::from_artifact(artifact, fact.bound)?;
-        let condition = MachineValueUse::from_artifact(artifact, fact.condition)?;
-        let update = MachineValueUse::from_artifact(artifact, fact.update)?;
-        if initializer.producer() != Some(initializer_producer)
-            || phi.producer() != Some(phi_producer)
-            || condition.producer() != Some(condition_producer)
-            || update.producer() != Some(update_producer)
-            || header_control.condition() != &condition
-            || phi.binding().width_bits() != fact.width.saturating_mul(8)
-        {
-            continue;
-        }
-        let matching_parameters = abi_parameters
-            .values()
-            .filter(|parameter| {
-                parameter.value() == Some(&bound)
-                    && parameter.storage().size == fact.width
-                    && parameter.storage() != fact.carrier_storage
-            })
-            .collect::<Vec<_>>();
-        let [parameter] = matching_parameters.as_slice() else {
-            continue;
-        };
-        let SourceFunctionReturn::Register {
-            storage: return_storage,
-        } = interface.return_kind()
-        else {
-            continue;
-        };
-        if return_storage != fact.carrier_storage
-            || !matches!(
-                return_control.values(),
-                [returned]
-                    if returned.slot()
-                        == (CallBoundarySlot::Register {
-                            index: 0,
-                            storage: fact.carrier_storage,
-                        })
-                        && returned.value() == &phi
-            )
-        {
-            continue;
-        }
-        let state_obligations = source
-            .instructions()
-            .get(&phi_producer)
-            .map(|instruction| instruction.obligations.clone())
-            .unwrap_or_default();
-        let state = CertifiedCountedLoopState {
-            schema_version: CERTIFICATION_SCHEMA_VERSION,
-            origin: origin.clone(),
-            loop_id: fact.loop_id,
-            preheader: fact.preheader,
-            header: fact.header,
-            latch: fact.latch,
-            exit: fact.exit,
-            carrier_storage: fact.carrier_storage,
-            initializer,
-            phi,
-            bound,
-            condition,
-            update,
-            source_obligations: state_obligations,
-        };
-        if state.validate(source).is_err() {
-            continue;
-        }
-        let control = CertifiedClosedCountedLoopControl {
-            schema_version: CERTIFICATION_SCHEMA_VERSION,
-            origin: origin.clone(),
-            state,
-            preheader_transfer: preheader_transfer.clone(),
-            header_control: header_control.clone(),
-            backedge_transfer: backedge_transfer.clone(),
-            return_control: return_control.clone(),
-            parameter_index: parameter.index(),
-            parameter_storage: parameter.storage(),
-        };
-        if controls.insert(fact.header, control).is_some() {
             return Err(MachineBuildError::TopologyMismatch);
         }
     }
@@ -6855,8 +5862,83 @@ fn return_control_input_producers(
 ) -> BTreeSet<CanonicalInstructionId> {
     std::iter::once(control.control_target())
         .chain(control.values().iter().map(CertifiedReturnValue::value))
+        .chain(control.exit_stack_pointer().value())
         .filter_map(MachineValueUse::producer)
         .collect()
+}
+
+pub(crate) fn return_machine_state_matches_origin(
+    origin: &CertifiedArtifactOrigin,
+    ledger: &ObligationLedger,
+) -> bool {
+    let Some(interface) = origin.machine_context().source().function_interface() else {
+        return false;
+    };
+    let (Some(return_address_storage), Some(stack_pointer_storage)) = (
+        interface.return_address_storage(),
+        interface.stack_pointer_storage(),
+    ) else {
+        return false;
+    };
+    let mut controls = BTreeMap::<CanonicalInstructionId, &CertifiedReturnControl>::new();
+    for obligation in origin.source().obligations().values().filter(|obligation| {
+        matches!(
+            obligation.id.kind,
+            SemanticObligationKind::Return | SemanticObligationKind::ReturnValue
+        )
+    }) {
+        let [effect] = ledger.effects(obligation.id) else {
+            return false;
+        };
+        let Some(control) = effect.return_control_evidence() else {
+            return false;
+        };
+        if controls
+            .insert(control.producer(), control)
+            .is_some_and(|existing| existing != control)
+        {
+            return false;
+        }
+    }
+    if controls.is_empty() {
+        return false;
+    }
+    controls.values().all(|control| {
+        if control.return_address().storage() != return_address_storage
+            || control.return_address().value() != control.control_target()
+            || control.exit_stack_pointer().storage() != stack_pointer_storage
+        {
+            return false;
+        }
+        let Some(value) = control.exit_stack_pointer().value() else {
+            return true;
+        };
+        let Some(producer) = value.producer() else {
+            return true;
+        };
+        let Some(instruction) = origin.source().instructions().get(&producer) else {
+            return false;
+        };
+        let live = instruction.obligations.iter().filter(|obligation| {
+            obligation.kind == SemanticObligationKind::LiveValueProducer
+        });
+        let mut count = 0_usize;
+        for obligation in live {
+            count += 1;
+            let [effect] = ledger.effects(*obligation) else {
+                return false;
+            };
+            if effect.expression_evidence().is_none_or(|expression| {
+                expression.entity().producer() != producer
+            }) || !matches!(
+                effect.disposition(),
+                EffectDisposition::AbsorbedIntoExpression { producer: owner } if *owner == producer
+            ) {
+                return false;
+            }
+        }
+        count == 1
+    })
 }
 
 fn certified_read_matches_machine_entity(
@@ -6913,11 +5995,6 @@ pub struct CertifiedMachineFunction {
     return_controls: BTreeMap<CanonicalInstructionId, CertifiedReturnControl>,
     natural_loop_routings: BTreeMap<u64, CertifiedNaturalLoopRouting>,
     closed_natural_loop_controls: BTreeMap<u64, CertifiedClosedNaturalLoopControl>,
-    closed_counted_loop_controls: BTreeMap<u64, CertifiedClosedCountedLoopControl>,
-    conditional_return_funnels: BTreeMap<PredicateId, CertifiedConditionalReturnFunnelControl>,
-    private_frame_conditional_return: Option<CertifiedPrivateFrameConditionalReturn>,
-    fnv_fold_loop: Option<CertifiedFnvFoldLoop>,
-    fnv_fold_o0: Option<CertifiedFnvFoldO0Function>,
     switch_topologies: BTreeMap<u64, CertifiedSwitchTopology>,
     switch_controls: BTreeMap<u64, CertifiedSwitchControl>,
     topology: CertifiedSourceTopology,
@@ -6961,26 +6038,6 @@ impl CertifiedMachineFunction {
             &direct_controls,
             &abi_parameters,
         )?;
-        let closed_counted_loop_controls = certified_closed_counted_loop_controls(
-            artifact,
-            &origin,
-            &topology,
-            &direct_controls,
-            &conditional_controls,
-            &return_controls,
-            &abi_parameters,
-        )?;
-        let conditional_return_funnels = conditional_return::certified_conditional_return_funnels(
-            artifact,
-            &origin,
-            &topology,
-            &stack_slots,
-            &memory_statements,
-            &direct_controls,
-            &conditional_controls,
-            &return_controls,
-        )?;
-
         let mut expressions = BTreeMap::new();
         for machine_entity in projection.entities() {
             let source_obligations = machine_entity
@@ -7009,222 +6066,10 @@ impl CertifiedMachineFunction {
                 return Err(MachineBuildError::ObligationMismatch(inst_id));
             }
         }
-        let private_frame_conditional_return =
-            private_frame::certified_private_frame_conditional_return(
-                artifact,
-                &origin,
-                &topology,
-                &abi_parameters,
-                &stack_slots,
-                &memory_statements,
-                &direct_controls,
-                &conditional_controls,
-                &return_controls,
-                &expressions,
-            )?;
-        let fnv_fold_loop = fnv_fold::certified_fnv_fold_loop(
-            artifact,
-            &origin,
-            &topology,
-            &projection,
-            &abi_parameters,
-            &memory_statements,
-            &conditional_controls,
-            &return_controls,
-            &expressions,
-        )?;
-        let fnv_fold_o0 = fnv_fold_o0::certified_fnv_fold_o0(
-            artifact,
-            &origin,
-            &topology,
-            &projection,
-            &abi_parameters,
-        )?;
-        match (
-            private_frame_conditional_return.as_ref(),
-            fnv_fold_o0.as_ref(),
-        ) {
-            (Some(_), Some(_)) => return Err(MachineBuildError::TopologyMismatch),
-            (Some(private), None) => private_frame::validate_private_frame_projection(
-                artifact,
-                &projection,
-                Some(private),
-            )?,
-            (None, Some(o0)) => {
-                fnv_fold_o0::validate_fnv_fold_o0_projection(artifact, &projection, o0)?
-            }
-            (None, None) => {
-                private_frame::validate_private_frame_projection(artifact, &projection, None)?
-            }
-        }
-        let private_state_producers = private_frame_conditional_return
-            .as_ref()
-            .map(CertifiedPrivateFrameConditionalReturn::state_producers)
-            .cloned()
-            .unwrap_or_default();
-
         let source = artifact.obligations().clone();
-        let mut certification = CertifiedFunction {
-            schema_version: CERTIFICATION_SCHEMA_VERSION,
-            source,
-            ledger: ObligationLedger::new(),
-        };
+        let mut certification = CertifiedFunction::bound(source, &origin)
+            .map_err(|_| MachineBuildError::IncompleteObligationInventory)?;
         let mut absorbed = BTreeSet::new();
-
-        if let Some(state) = &fnv_fold_o0 {
-            for (obligation, _) in state.obligation_dispositions() {
-                if !absorbed.insert(*obligation) {
-                    return Err(MachineBuildError::ObligationMismatch(
-                        artifact
-                            .obligations()
-                            .obligations()
-                            .get(obligation)
-                            .map(|source| source.source_inst)
-                            .unwrap_or(r2ssa::InstId(u32::MAX)),
-                    ));
-                }
-            }
-            certification
-                .record_absorbed_fnv_fold_o0(state)
-                .map_err(|_| MachineBuildError::ObligationMismatch(r2ssa::InstId(u32::MAX)))?;
-        }
-
-        if let Some(state) = &fnv_fold_loop {
-            if state
-                .source_obligations()
-                .iter()
-                .all(|obligation| absorbed.contains(obligation))
-            {
-                // The exact O0 whole-function certificate, when present, owns the
-                // complete source ledger before generic loop recognizers run.
-            } else {
-                for obligation in state.source_obligations() {
-                    if !absorbed.insert(*obligation) {
-                        return Err(MachineBuildError::ObligationMismatch(
-                            artifact
-                                .obligations()
-                                .obligations()
-                                .get(obligation)
-                                .map(|source| source.source_inst)
-                                .unwrap_or(r2ssa::InstId(u32::MAX)),
-                        ));
-                    }
-                }
-                certification
-                    .record_absorbed_fnv_fold_state(state.clone())
-                    .map_err(|_| MachineBuildError::ObligationMismatch(r2ssa::InstId(u32::MAX)))?;
-            }
-        }
-
-        if let Some(state) = &private_frame_conditional_return {
-            if state
-                .source_obligations()
-                .iter()
-                .all(|obligation| absorbed.contains(obligation))
-            {
-                // Already sealed by the exact O0 whole-function witness.
-            } else {
-                for obligation in state.source_obligations() {
-                    if !absorbed.insert(*obligation) {
-                        return Err(MachineBuildError::ObligationMismatch(
-                            artifact
-                                .obligations()
-                                .obligations()
-                                .get(obligation)
-                                .map(|source| source.source_inst)
-                                .unwrap_or(r2ssa::InstId(u32::MAX)),
-                        ));
-                    }
-                }
-                certification
-                    .record_absorbed_private_frame_state(state.clone())
-                    .map_err(|_| MachineBuildError::ObligationMismatch(r2ssa::InstId(u32::MAX)))?;
-            }
-        }
-
-        for control in closed_counted_loop_controls.values() {
-            if control
-                .state()
-                .source_obligations()
-                .iter()
-                .all(|obligation| absorbed.contains(obligation))
-            {
-                continue;
-            }
-            for obligation in control.state().source_obligations() {
-                if !absorbed.insert(*obligation) {
-                    return Err(MachineBuildError::ObligationMismatch(
-                        artifact
-                            .obligations()
-                            .obligations()
-                            .get(obligation)
-                            .map(|source| source.source_inst)
-                            .unwrap_or(r2ssa::InstId(u32::MAX)),
-                    ));
-                }
-            }
-            certification
-                .record_absorbed_counted_loop_state(control.state().clone())
-                .map_err(|_| {
-                    MachineBuildError::ObligationMismatch(
-                        artifact
-                            .obligations()
-                            .obligations()
-                            .get(
-                                control
-                                    .state()
-                                    .source_obligations()
-                                    .iter()
-                                    .next()
-                                    .expect("counted loop state obligations are nonempty"),
-                            )
-                            .map(|source| source.source_inst)
-                            .unwrap_or(r2ssa::InstId(u32::MAX)),
-                    )
-                })?;
-        }
-
-        for control in conditional_return_funnels.values() {
-            if control
-                .carrier()
-                .source_obligations()
-                .iter()
-                .all(|obligation| absorbed.contains(obligation))
-            {
-                continue;
-            }
-            for obligation in control.carrier().source_obligations() {
-                if !absorbed.insert(*obligation) {
-                    return Err(MachineBuildError::ObligationMismatch(
-                        artifact
-                            .obligations()
-                            .obligations()
-                            .get(obligation)
-                            .map(|source| source.source_inst)
-                            .unwrap_or(r2ssa::InstId(u32::MAX)),
-                    ));
-                }
-            }
-            certification
-                .record_absorbed_conditional_return_state(control.carrier().clone())
-                .map_err(|_| {
-                    MachineBuildError::ObligationMismatch(
-                        artifact
-                            .obligations()
-                            .obligations()
-                            .get(
-                                control
-                                    .carrier()
-                                    .source_obligations()
-                                    .iter()
-                                    .next()
-                                    .expect("conditional return state obligations are nonempty"),
-                            )
-                            .map(|source| source.source_inst)
-                            .unwrap_or(r2ssa::InstId(u32::MAX)),
-                    )
-                })?;
-        }
 
         let mut absorbed_calls = BTreeSet::new();
         for call in direct_calls.values() {
@@ -7246,29 +6091,6 @@ impl CertifiedMachineFunction {
         }
 
         let mut absorbed_controls = BTreeSet::new();
-        if let Some(fnv) = &fnv_fold_loop {
-            if fnv
-                .latch_control()
-                .source_obligations()
-                .iter()
-                .all(|obligation| absorbed.contains(obligation))
-            {
-                // Already owned by the exact O0 loop-control disposition.
-            } else {
-                for obligation in fnv.latch_control().source_obligations() {
-                    if !absorbed_controls.insert(obligation) {
-                        return Err(MachineBuildError::ObligationMismatch(
-                            fnv.latch_control().source_inst(),
-                        ));
-                    }
-                }
-                certification
-                    .record_absorbed_fnv_latch_control(fnv.latch_control().clone())
-                    .map_err(|_| {
-                        MachineBuildError::ObligationMismatch(fnv.latch_control().source_inst())
-                    })?;
-            }
-        }
         for control in direct_controls.values() {
             if absorbed.contains(&control.source_obligation()) {
                 continue;
@@ -7393,19 +6215,7 @@ impl CertifiedMachineFunction {
                 .copied()
                 .filter(|producer| !expressions.contains_key(producer))
                 .collect::<BTreeSet<_>>();
-            let exact_o0_raw_byte_store = fnv_fold_o0.as_ref().is_some_and(|fnv| {
-                let initial_store = fnv.ascii().initial_store();
-                missing_inputs
-                    == BTreeSet::from([fnv.external_alias_policy().external_read().producer()])
-                    && statement.producer() == initial_store.producer()
-                    && statement.access().ordinal == initial_store.ordinal()
-                    && statement.object() == fnv.ascii().object()
-                    && matches!(statement.kind(), CertifiedMemoryStatementKind::Write { value }
-                        if value.binding().value() == fnv.index().raw_byte()
-                            && value.producer()
-                                == Some(fnv.external_alias_policy().external_read().producer()))
-            });
-            if !missing_inputs.is_empty() && !exact_o0_raw_byte_store {
+            if !missing_inputs.is_empty() {
                 return Err(MachineBuildError::ObligationMismatch(
                     statement.access().inst,
                 ));
@@ -7449,10 +6259,7 @@ impl CertifiedMachineFunction {
         for control in return_controls.values() {
             if return_control_input_producers(control)
                 .iter()
-                .any(|producer| {
-                    !expressions.contains_key(producer)
-                        && !private_state_producers.contains(producer)
-                })
+                .any(|producer| !expressions.contains_key(producer))
             {
                 return Err(MachineBuildError::ObligationMismatch(control.source_inst));
             }
@@ -7474,11 +6281,6 @@ impl CertifiedMachineFunction {
             return_controls,
             natural_loop_routings,
             closed_natural_loop_controls,
-            closed_counted_loop_controls,
-            conditional_return_funnels,
-            private_frame_conditional_return,
-            fnv_fold_loop,
-            fnv_fold_o0,
             switch_topologies,
             switch_controls,
             topology,
@@ -7597,40 +6399,6 @@ impl CertifiedMachineFunction {
         self.closed_natural_loop_controls.get(&header)
     }
 
-    pub fn closed_counted_loop_control_for_header(
-        &self,
-        header: u64,
-    ) -> Option<&CertifiedClosedCountedLoopControl> {
-        self.closed_counted_loop_controls.get(&header)
-    }
-
-    pub fn conditional_return_funnel(
-        &self,
-        predicate: PredicateId,
-    ) -> Option<&CertifiedConditionalReturnFunnelControl> {
-        self.conditional_return_funnels.get(&predicate)
-    }
-
-    pub const fn conditional_return_funnels(
-        &self,
-    ) -> &BTreeMap<PredicateId, CertifiedConditionalReturnFunnelControl> {
-        &self.conditional_return_funnels
-    }
-
-    pub const fn private_frame_conditional_return(
-        &self,
-    ) -> Option<&CertifiedPrivateFrameConditionalReturn> {
-        self.private_frame_conditional_return.as_ref()
-    }
-
-    pub const fn fnv_fold_loop(&self) -> Option<&CertifiedFnvFoldLoop> {
-        self.fnv_fold_loop.as_ref()
-    }
-
-    pub const fn fnv_fold_o0(&self) -> Option<&CertifiedFnvFoldO0Function> {
-        self.fnv_fold_o0.as_ref()
-    }
-
     pub fn switch_topology_for_block(&self, block_addr: u64) -> Option<&CertifiedSwitchTopology> {
         self.switch_topologies.get(&block_addr)
     }
@@ -7698,11 +6466,8 @@ impl CertifiedMachineProjection {
         )?;
         let graph = artifact.graph();
         let source = artifact.obligations().clone();
-        let mut certification = CertifiedFunction {
-            schema_version: CERTIFICATION_SCHEMA_VERSION,
-            source,
-            ledger: ObligationLedger::new(),
-        };
+        let mut certification = CertifiedFunction::bound(source, &origin)
+            .map_err(|_| MachineBuildError::IncompleteObligationInventory)?;
         let candidate_memory_statements = certified_memory_statements(artifact)?;
         let mut absorbed_controls = BTreeSet::new();
         for control in direct_controls.values() {
@@ -8610,8 +7375,7 @@ mod tests {
         SwitchInfo, Varnode,
     };
     use r2ssa::{
-        CanonicalStorageId, CanonicalStorageSpace, InstPayload, MachineArithmeticMode,
-        MachineArithmeticOp, MachineExprKind, SSAOp, SourceAbiParameterSpec,
+        CanonicalStorageId, CanonicalStorageSpace, InstPayload, SSAOp, SourceAbiParameterSpec,
         SourceCallArgumentSpec, SourceCallResult, SourceCallSiteIdentity, SourceCallSiteInterface,
         SourceFunctionInterface, SourceFunctionReturn, SourceStackSlotSpec, SsaArtifact,
     };
@@ -8634,6 +7398,100 @@ mod tests {
             .expect("source artifact")
             .obligations()
             .clone()
+    }
+
+    #[test]
+    fn projected_control_carrier_uses_graph_width_not_full_abi_width() {
+        let abi_storage = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 48,
+            size: 8,
+        };
+        let graph_storage = CanonicalStorageId {
+            size: 4,
+            ..abi_storage
+        };
+        let logical_value = SourceLogicalValue::new(
+            0,
+            r2ssa::SourceCarrierProjection::new(SourceCarrierKind::LowBits, 0, 32),
+        );
+        let type_graph = r2ssa::SourceTypeGraph::new(
+            [r2ssa::SourceType::new(
+                0,
+                r2ssa::SourceTypeKind::UnsignedInteger,
+                32,
+                32,
+            )],
+            [],
+        )
+        .expect("scalar source type");
+        let interface = SourceFunctionInterface::new_with_logical_types(
+            b"projected-control-carrier".to_vec(),
+            "test-abi",
+            [SourceAbiParameterSpec::new(0, abi_storage)],
+            SourceFunctionReturn::Void,
+            [],
+            [logical_value],
+            None,
+            Some(type_graph),
+        )
+        .expect("projected source interface");
+
+        assert_ne!(abi_storage.size, graph_storage.size);
+        assert_eq!(graph_storage.size.checked_mul(8), Some(32));
+        assert!(interface_has_exact_parameter_projection(
+            &interface,
+            0,
+            abi_storage,
+            graph_storage,
+            logical_value,
+        ));
+    }
+
+    #[test]
+    fn projected_control_carrier_rejects_graph_and_logical_mutations() {
+        let abi_storage = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 48,
+            size: 8,
+        };
+        let graph_storage = CanonicalStorageId {
+            size: 4,
+            ..abi_storage
+        };
+        let low_bits = SourceLogicalValue::new(
+            0,
+            r2ssa::SourceCarrierProjection::new(SourceCarrierKind::LowBits, 0, 32),
+        );
+        let shifted = SourceLogicalValue::new(
+            0,
+            r2ssa::SourceCarrierProjection::new(SourceCarrierKind::LowBits, 8, 32),
+        );
+        let full_width = SourceLogicalValue::new(
+            0,
+            r2ssa::SourceCarrierProjection::new(SourceCarrierKind::Full, 0, 64),
+        );
+
+        assert!(exact_parameter_projection(
+            abi_storage,
+            graph_storage,
+            low_bits
+        ));
+        assert!(!exact_parameter_projection(
+            abi_storage,
+            abi_storage,
+            low_bits
+        ));
+        assert!(!exact_parameter_projection(
+            abi_storage,
+            graph_storage,
+            shifted
+        ));
+        assert!(!exact_parameter_projection(
+            abi_storage,
+            graph_storage,
+            full_width
+        ));
     }
 
     fn typed_memory_artifact() -> SsaArtifact {
@@ -8769,41 +7627,6 @@ mod tests {
         arch.add_register(RegisterDef::new("rip", 16, 8));
         SsaArtifact::raw_with_interface(&[preheader, header, exit, body], Some(&arch), interface)
             .expect("carrier-free-loop-return artifact")
-    }
-
-    fn fnv_artifact() -> SsaArtifact {
-        let offset = Varnode::unique(0x10, 8);
-        let mixed = Varnode::unique(0x20, 8);
-        let product = Varnode::unique(0x30, 8);
-        let mut entry = R2ILBlock::new(0x3000, 4);
-        entry.push(R2ILOp::Copy {
-            dst: offset.clone(),
-            src: Varnode::constant(1_469_598_103_934_665_603, 8),
-        });
-        entry.push(R2ILOp::IntXor {
-            dst: mixed.clone(),
-            a: offset,
-            b: Varnode::register(0, 8),
-        });
-        entry.push(R2ILOp::IntMult {
-            dst: product.clone(),
-            a: mixed,
-            b: Varnode::constant(1_099_511_628_211, 8),
-        });
-        entry.push(R2ILOp::Store {
-            space: SpaceId::Ram,
-            addr: Varnode::register(8, 8),
-            val: product,
-        });
-        entry.push(R2ILOp::Branch {
-            target: Varnode::ram(0x3010, 8),
-        });
-
-        let mut exit = R2ILBlock::new(0x3010, 4);
-        exit.push(R2ILOp::Return {
-            target: Varnode::constant(0, 8),
-        });
-        SsaArtifact::raw(&[entry, exit], None).expect("FNV artifact")
     }
 
     fn explicit_return_artifact(return_kind: SourceFunctionReturn) -> SsaArtifact {
@@ -9156,7 +7979,7 @@ mod tests {
                     }
         ));
         let report = certified.finish();
-        assert!(!report.authorizes_certified_c());
+        assert!(!report.is_closed_semantic_ledger());
         assert_eq!(report.pending_semantic_ast().len(), 3);
     }
 
@@ -9296,80 +8119,7 @@ mod tests {
                     if matches!(effect.disposition(), EffectDisposition::Residualized { .. })
             ));
         }
-        assert!(!certified.finish().authorizes_certified_c());
-    }
-
-    #[test]
-    fn machine_seam_absorbs_fnv_wrapping_multiply_producer() {
-        let artifact = fnv_artifact();
-        let mult_inst = artifact
-            .graph()
-            .insts
-            .iter()
-            .find(|inst| matches!(&inst.payload, InstPayload::Op(SSAOp::IntMult { .. })))
-            .expect("FNV multiply instruction");
-        let producer = artifact
-            .obligations()
-            .instruction_for_inst(mult_inst.id)
-            .expect("multiply disposition")
-            .id;
-        let live_value = artifact
-            .obligations()
-            .instruction_for_inst(mult_inst.id)
-            .expect("multiply disposition")
-            .obligations
-            .iter()
-            .copied()
-            .find(|id| id.kind == SemanticObligationKind::LiveValueProducer)
-            .expect("live multiply obligation");
-
-        let certified = CertifiedMachineFunction::from_artifact(&artifact)
-            .expect("certified machine expressions");
-        let [effect] = certified.ledger().effects(live_value) else {
-            panic!("one exact multiply disposition expected");
-        };
-        assert_eq!(
-            effect.disposition(),
-            &EffectDisposition::AbsorbedIntoExpression { producer }
-        );
-
-        let entity = certified
-            .projection()
-            .entity_for_producer(producer)
-            .expect("multiply machine entity");
-        let expression = certified
-            .expression_for_producer(producer)
-            .expect("certified multiply expression");
-        assert_eq!(expression.root(), entity.root());
-        assert_eq!(expression.entity().producer(), producer);
-        assert!(matches!(
-            certified
-                .projection()
-                .expr(entity.root())
-                .expect("multiply root")
-                .kind(),
-            MachineExprKind::Arithmetic {
-                op: MachineArithmeticOp::Multiply,
-                mode: MachineArithmeticMode::Wrapping,
-                ..
-            }
-        ));
-
-        let xor_inst = artifact
-            .graph()
-            .insts
-            .iter()
-            .find(|inst| matches!(&inst.payload, InstPayload::Op(SSAOp::IntXor { .. })))
-            .expect("FNV xor instruction");
-        let xor_producer = artifact
-            .obligations()
-            .instruction_for_inst(xor_inst.id)
-            .expect("xor disposition")
-            .id;
-        let DispositionEvidence::Expression(expression) = &effect.evidence else {
-            panic!("expression evidence expected");
-        };
-        assert_eq!(expression.inputs(), &BTreeSet::from([xor_producer]));
+        assert!(!certified.finish().is_closed_semantic_ledger());
     }
 
     #[test]
@@ -9452,7 +8202,7 @@ mod tests {
             Err(MachineBuildError::ObligationMismatch(_))
         ));
         let report = certified.finish();
-        assert!(!report.authorizes_certified_c());
+        assert!(!report.is_closed_semantic_ledger());
         assert!(
             report
                 .pending_semantic_ast()
@@ -9616,7 +8366,7 @@ mod tests {
         for obligation in control.source_obligations() {
             assert!(report.pending_semantic_ast().contains(&obligation));
         }
-        assert!(!report.authorizes_certified_c());
+        assert!(!report.is_closed_semantic_ledger());
     }
 
     #[test]
@@ -9834,40 +8584,6 @@ mod tests {
     }
 
     #[test]
-    fn machine_seam_leaves_non_value_obligations_unclosed() {
-        let artifact = fnv_artifact();
-        let certified = CertifiedMachineFunction::from_artifact(&artifact)
-            .expect("certified machine expressions");
-        let report = certified.finish();
-
-        for id in artifact
-            .obligations()
-            .obligations()
-            .keys()
-            .filter(|id| id.kind != SemanticObligationKind::LiveValueProducer)
-        {
-            if id.kind == SemanticObligationKind::ControlTransfer
-                && certified
-                    .direct_control_for_producer(id.instruction)
-                    .is_some()
-            {
-                assert!(matches!(
-                    certified.ledger().effects(*id),
-                    [effect]
-                        if matches!(
-                            effect.disposition(),
-                            EffectDisposition::AbsorbedIntoControl { .. }
-                        )
-                ));
-                assert!(report.pending_semantic_ast().contains(id));
-            } else {
-                assert!(certified.ledger().effects(*id).is_empty());
-                assert!(report.missing().contains(id));
-            }
-        }
-    }
-
-    #[test]
     fn explicit_direct_void_call_certifies_target_and_ordered_register_arguments() {
         let target = Varnode::ram(0x7600, 8);
         let mut entry = R2ILBlock::new(0x7500, 4);
@@ -9978,7 +8694,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_direct_void_call_classifies_caller_abi_parameter_argument() {
+    fn synthetic_direct_void_caller_parameter_refuses_incomplete_machine_roles() {
         let target = Varnode::ram(0x7620, 8);
         let argument = Varnode::register(8, 8);
         let mut entry = R2ILBlock::new(0x7520, 4);
@@ -10026,58 +8742,14 @@ mod tests {
             vec![call_interface],
         )
         .expect("parameter call artifact");
-        let certified = CertifiedMachineProjection::from_artifact(&artifact)
-            .expect("parameter call projection");
-        let instruction = artifact
-            .graph()
-            .insts
-            .iter()
-            .find(|instruction| matches!(instruction.payload, InstPayload::Op(SSAOp::Call { .. })))
-            .expect("call instruction");
-        let producer = artifact
-            .obligations()
-            .instruction_for_inst(instruction.id)
-            .expect("call disposition")
-            .id;
-        let call = certified
-            .direct_call_for_producer(producer)
-            .expect("certified direct call");
-        let [argument] = call.arguments() else {
-            panic!("one exact call argument expected");
-        };
-
-        assert_eq!(
-            argument.origin(),
-            &CertifiedCallArgumentOrigin::AbiParameter { index: 0 }
-        );
-        assert_eq!(
-            argument.slot(),
-            CallBoundarySlot::Register {
-                index: 0,
-                storage: argument_storage,
-            }
-        );
-        assert_eq!(argument.value().ty().width_bits(), 64);
-        assert!(argument.value().constant().is_none());
-        assert!(argument.value().producer().is_some());
-        assert_eq!(
-            call.source_obligations(),
-            BTreeSet::from([call.call_obligation(), argument.source_obligation()])
-        );
-        for obligation in call.source_obligations() {
-            assert!(matches!(
-                certified.ledger().effects(obligation),
-                [effect]
-                    if effect.disposition() == &EffectDisposition::AbsorbedIntoCall { producer }
-                        && effect.direct_call_evidence() == Some(call)
-            ));
-        }
-        call.validate_against_artifact(&artifact)
-            .expect("parameter call revalidates");
+        assert!(matches!(
+            CertifiedMachineProjection::from_artifact(&artifact),
+            Err(MachineBuildError::MachineContextMismatch)
+        ));
     }
 
     #[test]
-    fn explicit_interface_certifies_parameter_and_register_return_exactly_once() {
+    fn synthetic_interface_register_return_refuses_incomplete_machine_roles() {
         let return_storage = CanonicalStorageId {
             space: CanonicalStorageSpace::Register,
             offset: 0,
@@ -10086,73 +8758,23 @@ mod tests {
         let artifact = explicit_return_artifact(SourceFunctionReturn::Register {
             storage: return_storage,
         });
-        let certified =
-            CertifiedMachineProjection::from_artifact(&artifact).expect("certified return");
-        let parameter = certified.abi_parameters().get(&0).expect("parameter");
-        assert_eq!(parameter.index(), 0);
-        assert_eq!(parameter.storage().offset, 8);
-        assert!(parameter.value().is_some());
-
-        let producer = CanonicalInstructionId {
-            block_addr: 0x3080,
-            site: r2ssa::CanonicalInstructionSite::Op(2),
-        };
-        let returned = certified
-            .return_control_for_producer(producer)
-            .expect("return control");
-        assert_eq!(returned.values().len(), 1);
-        assert_eq!(
-            returned.values()[0].slot(),
-            CallBoundarySlot::Register {
-                index: 0,
-                storage: return_storage,
-            }
-        );
-        for obligation in returned.source_obligations() {
-            assert!(matches!(
-                certified.ledger().effects(obligation),
-                [effect]
-                    if effect.disposition()
-                        == &EffectDisposition::AbsorbedIntoReturn { producer }
-            ));
-            assert!(
-                certified
-                    .finish()
-                    .pending_semantic_ast()
-                    .contains(&obligation)
-            );
-        }
-    }
-
-    #[test]
-    fn explicit_void_return_is_distinct_from_unknown_return_state() {
-        let artifact = explicit_return_artifact(SourceFunctionReturn::Void);
-        let certified =
-            CertifiedMachineProjection::from_artifact(&artifact).expect("certified void return");
-        let producer = CanonicalInstructionId {
-            block_addr: 0x3080,
-            site: r2ssa::CanonicalInstructionSite::Op(1),
-        };
-        let returned = certified
-            .return_control_for_producer(producer)
-            .expect("void return control");
-        assert!(returned.values().is_empty());
         assert!(matches!(
-            certified.ledger().effects(returned.return_obligation()),
-            [effect]
-                if effect.disposition()
-                    == &EffectDisposition::AbsorbedIntoReturn { producer }
+            CertifiedMachineProjection::from_artifact(&artifact),
+            Err(MachineBuildError::MachineContextMismatch)
         ));
-        assert!(certified.finish().missing().iter().all(|obligation| {
-            !matches!(
-                obligation.kind,
-                SemanticObligationKind::Return | SemanticObligationKind::ReturnValue
-            )
-        }));
     }
 
     #[test]
-    fn final_render_permit_is_origin_ledger_and_manifest_bound() {
+    fn synthetic_void_return_refuses_incomplete_machine_roles() {
+        let artifact = explicit_return_artifact(SourceFunctionReturn::Void);
+        assert!(matches!(
+            CertifiedMachineProjection::from_artifact(&artifact),
+            Err(MachineBuildError::MachineContextMismatch)
+        ));
+    }
+
+    #[test]
+    fn synthetic_terminal_return_cannot_close_region_ledger() {
         let artifact = explicit_return_artifact(SourceFunctionReturn::Register {
             storage: CanonicalStorageId {
                 space: CanonicalStorageSpace::Register,
@@ -10160,467 +8782,70 @@ mod tests {
                 size: 8,
             },
         });
-        let certified =
-            CertifiedMachineProjection::from_artifact(&artifact).expect("certified projection");
-        let mappings = artifact
-            .obligations()
-            .obligations()
-            .keys()
-            .map(|obligation| {
-                let [effect] = certified.ledger().effects(*obligation) else {
-                    panic!("one effect per obligation");
-                };
-                TypedRegionMapping::new(*obligation, effect.disposition().clone())
-            })
-            .collect::<Vec<_>>();
-        let permit = certify_terminal_return_region(
-            certified.origin(),
-            certified.ledger(),
-            mappings.clone(),
-        )
-        .expect("final render permit");
-        assert!(permit.authorizes_certified_c());
-        assert!(permit.matches_region(
-            certified.origin(),
-            CertifiedTypedRegionKind::TerminalReturnBlock,
-            CERTIFIED_TERMINAL_RETURN_REGION_CONTRACT_VERSION,
-            &mappings,
-        ));
-        let mut wrong_schema = permit.clone();
-        wrong_schema.region_schema_version = CERTIFIED_TERMINAL_RETURN_REGION_CONTRACT_VERSION + 1;
-        assert!(!wrong_schema.authorizes_certified_c());
-
-        let mut nonterminal_origin = certified.origin().clone();
-        nonterminal_origin.topology.blocks[0].terminator = CertifiedSourceTerminator::None;
         assert!(matches!(
-            certify_terminal_return_region(
-                &nonterminal_origin,
-                certified.ledger(),
-                mappings.clone(),
-            ),
-            Err(RenderAuthorizationError::InvalidRegionTopology)
-        ));
-        assert!(matches!(
-            certify_terminal_return_region(
-                certified.origin(),
-                &ObligationLedger::new(),
-                mappings.clone(),
-            ),
-            Err(RenderAuthorizationError::IncompleteLedger)
-        ));
-
-        let mut duplicated = mappings.clone();
-        duplicated.push(mappings[0].clone());
-        assert!(matches!(
-            certify_terminal_return_region(certified.origin(), certified.ledger(), duplicated,),
-            Err(RenderAuthorizationError::DuplicateMapping(_))
-        ));
-
-        let mut mismatched = mappings;
-        mismatched[0].source_disposition = EffectDisposition::ProvenDead;
-        assert!(matches!(
-            certify_terminal_return_region(certified.origin(), certified.ledger(), mismatched,),
-            Err(RenderAuthorizationError::DispositionMismatch(_))
+            CertifiedMachineProjection::from_artifact(&artifact),
+            Err(MachineBuildError::MachineContextMismatch)
         ));
     }
 
     #[test]
-    fn plain_ram_memory_return_permit_is_narrow_and_manifest_bound() {
+    fn synthetic_plain_ram_memory_return_cannot_close_region_ledger() {
         let artifact = explicit_memory_return_artifact(1);
-        let certified =
-            CertifiedMachineProjection::from_artifact(&artifact).expect("certified projection");
-        let mappings = artifact
-            .obligations()
-            .obligations()
-            .keys()
-            .map(|obligation| {
-                let [effect] = certified.ledger().effects(*obligation) else {
-                    panic!("one effect per obligation");
-                };
-                TypedRegionMapping::new(*obligation, effect.disposition().clone())
-            })
-            .collect::<Vec<_>>();
-        let permit = certify_plain_ram_memory_return_region(
-            certified.origin(),
-            certified.ledger(),
-            mappings.clone(),
-        )
-        .expect("plain RAM memory return permit");
-        assert!(permit.authorizes_certified_c());
-        assert!(permit.matches_region(
-            certified.origin(),
-            CertifiedTypedRegionKind::PlainRamMemoryTerminalReturnFunction,
-            CERTIFIED_PLAIN_RAM_MEMORY_RETURN_CONTRACT_VERSION,
-            &mappings,
-        ));
         assert!(matches!(
-            certify_terminal_return_region(
-                certified.origin(),
-                certified.ledger(),
-                mappings.clone(),
-            ),
-            Err(RenderAuthorizationError::InvalidRegionTopology)
-        ));
-
-        let mut duplicated = mappings.clone();
-        duplicated.push(mappings[0].clone());
-        assert!(matches!(
-            certify_plain_ram_memory_return_region(
-                certified.origin(),
-                certified.ledger(),
-                duplicated,
-            ),
-            Err(RenderAuthorizationError::DuplicateMapping(_))
+            CertifiedMachineProjection::from_artifact(&artifact),
+            Err(MachineBuildError::MachineContextMismatch)
         ));
 
         let word_artifact = explicit_memory_return_artifact(2);
-        let word_certified = CertifiedMachineProjection::from_artifact(&word_artifact)
-            .expect("word-addressed projection");
-        let word_mappings = word_artifact
-            .obligations()
-            .obligations()
-            .keys()
-            .map(|obligation| {
-                let [effect] = word_certified.ledger().effects(*obligation) else {
-                    panic!("one word-addressed effect per obligation");
-                };
-                TypedRegionMapping::new(*obligation, effect.disposition().clone())
-            })
-            .collect::<Vec<_>>();
         assert!(matches!(
-            certify_plain_ram_memory_return_region(
-                word_certified.origin(),
-                word_certified.ledger(),
-                word_mappings,
-            ),
-            Err(RenderAuthorizationError::InvalidRegionDisposition(_))
+            CertifiedMachineProjection::from_artifact(&word_artifact),
+            Err(MachineBuildError::MachineContextMismatch)
         ));
     }
 
     #[test]
-    fn direct_call_return_permit_is_closed_interface_and_manifest_bound() {
+    fn synthetic_direct_call_return_cannot_close_region_ledger() {
         let artifact = explicit_direct_call_return_artifact();
-        let certified = CertifiedMachineProjection::from_artifact(&artifact)
-            .expect("certified direct-call return projection");
-        let mappings = artifact
-            .obligations()
-            .obligations()
-            .keys()
-            .map(|obligation| {
-                let [effect] = certified.ledger().effects(*obligation) else {
-                    panic!("one effect per obligation");
-                };
-                TypedRegionMapping::new(*obligation, effect.disposition().clone())
-            })
-            .collect::<Vec<_>>();
-        let permit = certify_direct_call_terminal_return_region(
-            certified.origin(),
-            certified.ledger(),
-            mappings.clone(),
-            0x30d0,
-            0x30d4,
-        )
-        .expect("direct-call return render permit");
-        assert!(permit.authorizes_certified_c());
-        assert!(permit.matches_region(
-            certified.origin(),
-            CertifiedTypedRegionKind::DirectCallTerminalReturnFunction,
-            CERTIFIED_DIRECT_CALL_TERMINAL_RETURN_CONTRACT_VERSION,
-            &mappings,
-        ));
         assert!(matches!(
-            certify_direct_call_terminal_return_region(
-                certified.origin(),
-                certified.ledger(),
-                mappings.clone(),
-                0x30d4,
-                0x30d0,
-            ),
-            Err(RenderAuthorizationError::InvalidRegionTopology)
-        ));
-        let mut duplicated = mappings;
-        duplicated.push(duplicated[0].clone());
-        assert!(matches!(
-            certify_direct_call_terminal_return_region(
-                certified.origin(),
-                certified.ledger(),
-                duplicated,
-                0x30d0,
-                0x30d4,
-            ),
-            Err(RenderAuthorizationError::DuplicateMapping(_))
+            CertifiedMachineProjection::from_artifact(&artifact),
+            Err(MachineBuildError::MachineContextMismatch)
         ));
     }
 
     #[test]
-    fn conditional_return_permit_is_closed_polarity_and_manifest_bound() {
+    fn synthetic_conditional_return_cannot_close_region_ledger() {
         let artifact = explicit_conditional_return_artifact();
-        let certified = CertifiedMachineProjection::from_artifact(&artifact)
-            .expect("certified conditional-return projection");
-        let mappings = artifact
-            .obligations()
-            .obligations()
-            .keys()
-            .map(|obligation| {
-                let [effect] = certified.ledger().effects(*obligation) else {
-                    panic!("one effect per obligation");
-                };
-                TypedRegionMapping::new(*obligation, effect.disposition().clone())
-            })
-            .collect::<Vec<_>>();
-        let permit = certify_conditional_terminal_return_region(
-            certified.origin(),
-            certified.ledger(),
-            mappings.clone(),
-            0x30a0,
-            0x30c0,
-            0x30a4,
-        )
-        .expect("conditional-return render permit");
-        assert!(permit.authorizes_certified_c());
-        assert!(permit.matches_region(
-            certified.origin(),
-            CertifiedTypedRegionKind::ConditionalTerminalReturnFunction,
-            CERTIFIED_CONDITIONAL_TERMINAL_RETURN_CONTRACT_VERSION,
-            &mappings,
-        ));
         assert!(matches!(
-            certify_conditional_terminal_return_region(
-                certified.origin(),
-                certified.ledger(),
-                mappings.clone(),
-                0x30a0,
-                0x30a4,
-                0x30c0,
-            ),
-            Err(RenderAuthorizationError::InvalidRegionTopology)
-        ));
-        let mut duplicated = mappings.clone();
-        duplicated.push(mappings[0].clone());
-        assert!(matches!(
-            certify_conditional_terminal_return_region(
-                certified.origin(),
-                certified.ledger(),
-                duplicated,
-                0x30a0,
-                0x30c0,
-                0x30a4,
-            ),
-            Err(RenderAuthorizationError::DuplicateMapping(_))
-        ));
-        assert!(matches!(
-            certify_conditional_terminal_return_region(
-                certified.origin(),
-                certified.ledger(),
-                mappings[1..].to_vec(),
-                0x30a0,
-                0x30c0,
-                0x30a4,
-            ),
-            Err(RenderAuthorizationError::MissingMapping(_))
+            CertifiedMachineProjection::from_artifact(&artifact),
+            Err(MachineBuildError::MachineContextMismatch)
         ));
     }
 
     #[test]
-    fn switch_return_permit_requires_closed_switch_control_and_manifest() {
+    fn synthetic_switch_return_cannot_close_region_ledger() {
         let artifact = explicit_switch_return_artifact();
-        let certified = CertifiedMachineProjection::from_artifact(&artifact)
-            .expect("certified switch-return projection");
-        let topology = certified
-            .switch_topology_for_block(0x30e0)
-            .expect("switch topology");
-        let control = certified
-            .switch_control_for_block(0x30e0)
-            .expect("sealed switch control");
-        let effect = certified.ledger().effects(control.source_obligation());
         assert!(matches!(
-            effect,
-            [effect]
-                if effect.disposition()
-                    == &(EffectDisposition::AbsorbedIntoControl {
-                        producer: control.producer(),
-                    })
-                    && effect.switch_control_evidence() == Some(control)
-        ));
-        assert!(certified.finish().residualized().is_empty());
-
-        let mappings = artifact
-            .obligations()
-            .obligations()
-            .keys()
-            .map(|obligation| {
-                let [effect] = certified.ledger().effects(*obligation) else {
-                    panic!("one effect per obligation");
-                };
-                TypedRegionMapping::new(*obligation, effect.disposition().clone())
-            })
-            .collect::<Vec<_>>();
-        let permit = certify_switch_terminal_return_region(
-            certified.origin(),
-            certified.ledger(),
-            mappings.clone(),
-            topology,
-            control,
-        )
-        .expect("switch-return permit");
-        assert!(permit.authorizes_certified_c());
-        assert!(permit.matches_region(
-            certified.origin(),
-            CertifiedTypedRegionKind::SwitchTerminalReturnFunction,
-            CERTIFIED_SWITCH_TERMINAL_RETURN_CONTRACT_VERSION,
-            &mappings,
-        ));
-
-        let mut wrong_parameter = control.clone();
-        wrong_parameter.parameter_storage.offset = 24;
-        assert!(matches!(
-            certify_switch_terminal_return_region(
-                certified.origin(),
-                certified.ledger(),
-                mappings.clone(),
-                topology,
-                &wrong_parameter,
-            ),
-            Err(RenderAuthorizationError::InvalidRegionTopology)
-        ));
-        let mut duplicated = mappings;
-        duplicated.push(duplicated[0].clone());
-        assert!(matches!(
-            certify_switch_terminal_return_region(
-                certified.origin(),
-                certified.ledger(),
-                duplicated,
-                topology,
-                control,
-            ),
-            Err(RenderAuthorizationError::DuplicateMapping(_))
+            CertifiedMachineProjection::from_artifact(&artifact),
+            Err(MachineBuildError::MachineContextMismatch)
         ));
     }
 
     #[test]
-    fn carrier_free_loop_return_permit_requires_closed_control_and_manifest() {
+    fn synthetic_carrier_free_loop_return_cannot_close_region_ledger() {
         let artifact = explicit_carrier_free_loop_return_artifact();
-        let certified = CertifiedMachineProjection::from_artifact(&artifact)
-            .expect("certified loop-return projection");
-        let control = certified
-            .closed_natural_loop_control_for_header(0x3170)
-            .expect("sealed closed loop control");
-        assert_eq!(control.parameter_storage().offset, 8);
-        assert_eq!(control.parameter_storage().size, 1);
-        let routing = control.routing();
-        for (obligation, producer, direct) in [
-            (
-                control.preheader_transfer().source_obligation(),
-                control.preheader_transfer().producer(),
-                true,
-            ),
-            (
-                routing.header_control().predicate_obligation(),
-                routing.header_control().producer(),
-                false,
-            ),
-            (
-                routing.header_control().transfer_obligation(),
-                routing.header_control().producer(),
-                false,
-            ),
-            (
-                routing.body_transfer().source_obligation(),
-                routing.body_transfer().producer(),
-                true,
-            ),
-        ] {
-            let [effect] = certified.ledger().effects(obligation) else {
-                panic!("one sealed loop control effect");
-            };
-            assert_eq!(
-                effect.disposition(),
-                &EffectDisposition::AbsorbedIntoControl { producer }
-            );
-            if direct {
-                assert!(effect.direct_control_evidence().is_some());
-            } else {
-                assert_eq!(
-                    effect.conditional_control_evidence(),
-                    Some(routing.header_control())
-                );
-            }
-        }
-        assert!(certified.finish().residualized().is_empty());
-
-        let mappings = artifact
-            .obligations()
-            .obligations()
-            .keys()
-            .map(|obligation| {
-                let [effect] = certified.ledger().effects(*obligation) else {
-                    panic!("one effect per obligation");
-                };
-                TypedRegionMapping::new(*obligation, effect.disposition().clone())
-            })
-            .collect::<Vec<_>>();
-        let permit = certify_carrier_free_loop_terminal_return_region(
-            certified.origin(),
-            certified.ledger(),
-            mappings.clone(),
-            control,
-        )
-        .expect("carrier-free loop return permit");
-        assert!(permit.authorizes_certified_c());
-        assert!(permit.matches_region(
-            certified.origin(),
-            CertifiedTypedRegionKind::CarrierFreeLoopTerminalReturnFunction,
-            CERTIFIED_CARRIER_FREE_LOOP_TERMINAL_RETURN_CONTRACT_VERSION,
-            &mappings,
-        ));
-
-        let mut wrong_parameter = control.clone();
-        wrong_parameter.parameter_storage.offset = 24;
         assert!(matches!(
-            certify_carrier_free_loop_terminal_return_region(
-                certified.origin(),
-                certified.ledger(),
-                mappings.clone(),
-                &wrong_parameter,
-            ),
-            Err(RenderAuthorizationError::InvalidOrigin)
-        ));
-        let mut duplicated = mappings;
-        duplicated.push(duplicated[0].clone());
-        assert!(matches!(
-            certify_carrier_free_loop_terminal_return_region(
-                certified.origin(),
-                certified.ledger(),
-                duplicated,
-                control,
-            ),
-            Err(RenderAuthorizationError::DuplicateMapping(_))
+            CertifiedMachineProjection::from_artifact(&artifact),
+            Err(MachineBuildError::MachineContextMismatch)
         ));
     }
 
     #[test]
-    fn explicit_stack_slots_bind_exact_objects_and_retain_unused_resources() {
+    fn synthetic_stack_slots_refuse_incomplete_machine_roles() {
         let artifact = explicit_stack_slot_artifact(8);
-        let certified =
-            CertifiedMachineProjection::from_artifact(&artifact).expect("certified stack slots");
-        let used_root = StackAddressRoot {
-            base: StackAddressBase::StackPointer,
-            offset: 0,
-        };
-        let used = certified.stack_slots().get(&used_root).expect("used slot");
-        assert_eq!(used.size_bytes(), 8);
-        assert!(used.object().is_some());
-
-        let unused_root = StackAddressRoot {
-            base: StackAddressBase::StackPointer,
-            offset: 16,
-        };
-        let unused = certified
-            .stack_slots()
-            .get(&unused_root)
-            .expect("unused declared slot");
-        assert_eq!(unused.size_bytes(), 4);
-        assert_eq!(unused.object(), None);
+        assert!(matches!(
+            CertifiedMachineProjection::from_artifact(&artifact),
+            Err(MachineBuildError::MachineContextMismatch)
+        ));
     }
 
     #[test]
@@ -10656,22 +8881,6 @@ mod tests {
             assert!(certified.ledger().effects(id).is_empty());
             assert!(certified.finish().missing().contains(&id));
         }
-    }
-
-    #[test]
-    fn unsupported_value_operation_fails_machine_certification_closed() {
-        let mut block = R2ILBlock::new(0x5000, 4);
-        block.push(R2ILOp::Load {
-            dst: Varnode::unique(0x10, 8),
-            space: SpaceId::Ram,
-            addr: Varnode::register(0, 8),
-        });
-        let artifact = SsaArtifact::raw(&[block], None).expect("load artifact");
-        assert!(matches!(
-            CertifiedMachineFunction::from_artifact(&artifact),
-            Err(MachineBuildError::UnsupportedOperation { op, .. })
-                if matches!(*op, SSAOp::Load { .. })
-        ));
     }
 
     #[test]
@@ -10718,7 +8927,7 @@ mod tests {
         }
         let report = certified.finish();
         assert!(report.has_exactly_one_disposition_per_source());
-        assert!(!report.authorizes_certified_c());
+        assert!(!report.is_closed_semantic_ledger());
     }
 
     #[test]
@@ -10791,35 +9000,13 @@ mod tests {
     }
 
     #[test]
-    fn value_expressions_cannot_authorize_without_effect_control_and_return_closure() {
-        let artifact = fnv_artifact();
-        let certified = CertifiedMachineFunction::from_artifact(&artifact)
-            .expect("certified machine expressions");
-        let report = certified.finish();
-        for kind in [
-            SemanticObligationKind::ObservableMemoryWrite,
-            SemanticObligationKind::Return,
-        ] {
-            assert!(report.missing().iter().any(|id| id.kind == kind));
-        }
-        assert!(
-            report
-                .pending_semantic_ast()
-                .iter()
-                .any(|id| id.kind == SemanticObligationKind::ControlTransfer)
-        );
-        assert!(report.requires_typed_region_validation());
-        assert!(!report.authorizes_certified_c());
-    }
-
-    #[test]
     fn exact_once_ledger_authorizes_fully_proven_source() {
         let mut function = CertifiedFunction::new(inventory()).expect("complete source");
         for id in obligation_ids(function.source()) {
             let output = output_for(function.source(), id);
             function.record_rendered(id, output).expect("output proof");
         }
-        assert!(function.finish().authorizes_certified_c());
+        assert!(function.finish().is_closed_semantic_ledger());
     }
 
     #[test]
@@ -10839,7 +9026,7 @@ mod tests {
         let report = function.finish();
         assert_eq!(report.missing(), &[missing]);
         assert_eq!(report.duplicate(), &[duplicate]);
-        assert!(!report.authorizes_certified_c());
+        assert!(!report.is_closed_semantic_ledger());
     }
 
     #[test]
@@ -10868,7 +9055,7 @@ mod tests {
         let report = residual.finish();
         assert!(report.has_exactly_one_disposition_per_source());
         assert_eq!(report.residualized().len(), ids.len());
-        assert!(!report.authorizes_certified_c());
+        assert!(!report.is_closed_semantic_ledger());
     }
 
     #[test]
@@ -10920,7 +9107,7 @@ mod tests {
         certificate.push(write, EffectDisposition::ProvenDead);
         assert!(!function.apply_rewrite(&certificate).is_closed());
         assert!(function.finish().missing().contains(&write));
-        assert!(!function.finish().authorizes_certified_c());
+        assert!(!function.finish().is_closed_semantic_ledger());
     }
 
     #[test]
@@ -10936,7 +9123,7 @@ mod tests {
         let report = function.finish();
         assert!(report.missing().contains(&first));
         assert!(report.missing().contains(&second));
-        assert!(!report.authorizes_certified_c());
+        assert!(!report.is_closed_semantic_ledger());
     }
 
     #[test]
@@ -10985,99 +9172,7 @@ mod tests {
         );
         assert_eq!(report.schema_version(), CERTIFICATION_SCHEMA_VERSION);
         assert_eq!(report.source_obligation_count(), report.missing().len());
-        assert!(!report.authorizes_certified_c());
-    }
-
-    #[test]
-    fn counted_loop_state_owns_phi_value_carrier_and_transition_exactly() {
-        let counter = Varnode::register(0, 8);
-        let bound = Varnode::register(8, 8);
-        let mut preheader = R2ILBlock::new(0x6200, 4);
-        preheader.push(R2ILOp::Copy {
-            dst: counter.clone(),
-            src: Varnode::constant(0, 8),
-        });
-        preheader.push(R2ILOp::Branch {
-            target: Varnode::ram(0x6210, 8),
-        });
-        let condition = Varnode::unique(0x40, 1);
-        let mut header = R2ILBlock::new(0x6210, 4);
-        header.push(R2ILOp::IntLess {
-            dst: condition.clone(),
-            a: counter.clone(),
-            b: bound,
-        });
-        header.push(R2ILOp::CBranch {
-            target: Varnode::ram(0x6220, 8),
-            cond: condition,
-        });
-        let mut exit = R2ILBlock::new(0x6214, 4);
-        exit.push(R2ILOp::Return {
-            target: Varnode::register(16, 8),
-        });
-        let mut latch = R2ILBlock::new(0x6220, 4);
-        latch.push(R2ILOp::IntAdd {
-            dst: counter.clone(),
-            a: counter,
-            b: Varnode::constant(1, 8),
-        });
-        latch.push(R2ILOp::Branch {
-            target: Varnode::ram(0x6210, 8),
-        });
-
-        let mut arch = ArchSpec::new("counted-loop-cert-test");
-        arch.add_register(RegisterDef::new("rax", 0, 8));
-        arch.add_register(RegisterDef::new("rdi", 8, 8));
-        arch.add_register(RegisterDef::new("rip", 16, 8));
-        let counter_storage = CanonicalStorageId {
-            space: CanonicalStorageSpace::Register,
-            offset: 0,
-            size: 8,
-        };
-        let bound_storage = CanonicalStorageId {
-            space: CanonicalStorageSpace::Register,
-            offset: 8,
-            size: 8,
-        };
-        let interface = SourceFunctionInterface::new(
-            b"counted-loop-cert-revision-1".to_vec(),
-            "test-register-abi",
-            [SourceAbiParameterSpec::new(0, bound_storage)],
-            SourceFunctionReturn::Register {
-                storage: counter_storage,
-            },
-            [],
-        )
-        .expect("counted loop interface");
-        let artifact = SsaArtifact::raw_with_interface(
-            &[preheader, header, exit, latch],
-            Some(&arch),
-            interface,
-        )
-        .expect("counted loop artifact");
-        let certified =
-            CertifiedMachineFunction::from_artifact(&artifact).expect("counted loop certificate");
-        let control = certified
-            .closed_counted_loop_control_for_header(0x6210)
-            .expect("closed counted loop control");
-        assert_eq!(control.parameter_storage(), bound_storage);
-        assert_eq!(control.state().carrier_storage(), counter_storage);
-        assert_eq!(control.state().source_obligations().len(), 3);
-        for obligation in control.state().source_obligations() {
-            assert!(matches!(
-                certified.ledger().effects(*obligation),
-                [effect]
-                    if effect.disposition()
-                        == &EffectDisposition::AbsorbedIntoLoopState {
-                            producer: control.state().producer(),
-                        }
-                        && effect.counted_loop_state_evidence() == Some(control.state())
-            ));
-        }
-        let report = certified.finish();
-        assert!(report.has_exactly_one_disposition_per_source());
-        assert!(report.residualized().is_empty());
-        assert!(report.refused().is_empty());
+        assert!(!report.is_closed_semantic_ledger());
     }
 
     #[test]
@@ -11090,9 +9185,24 @@ mod tests {
         let raw = SsaArtifact::raw(&[block.clone()], None).expect("raw origin artifact");
         let raw_certified =
             CertifiedMachineProjection::from_artifact(&raw).expect("raw origin certification");
+        let cloned = raw_certified.clone();
         let rebuilt =
             CertifiedMachineProjection::from_artifact(&raw).expect("rebuilt certification");
+        assert_eq!(raw_certified.origin(), cloned.origin());
         assert_eq!(raw_certified.origin(), rebuilt.origin());
+        assert!(raw_certified.ledger().matches_origin(rebuilt.origin()));
+
+        let independently_rebuilt =
+            SsaArtifact::raw(&[block.clone()], None).expect("independent origin artifact");
+        let independently_certified =
+            CertifiedMachineProjection::from_artifact(&independently_rebuilt)
+                .expect("independent origin certification");
+        assert_ne!(raw_certified.origin(), independently_certified.origin());
+        assert!(
+            !raw_certified
+                .ledger()
+                .matches_origin(independently_certified.origin())
+        );
 
         let mut arch = ArchSpec::new("origin-context");
         arch.addr_size = 8;
@@ -11162,7 +9272,7 @@ mod tests {
             .expect("reversed assumption certification");
         assert_ne!(ordered.origin(), reversed.origin());
 
-        assert_eq!(CERTIFICATION_SCHEMA_VERSION, 17);
+        assert_eq!(CERTIFICATION_SCHEMA_VERSION, 20);
         assert_eq!(
             raw_certified.origin().schema_version(),
             CERTIFICATION_SCHEMA_VERSION

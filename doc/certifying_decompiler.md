@@ -31,10 +31,11 @@ Owners
 - `r2plugin`: typed context collection, FFI, command dispatch, and apply/render
   glue only.
 
-Render Permissions
-------------------
+Output Authority
+----------------
 
-- `CertifiedC`: emitted C is backed by checked canonical facts.
+- Executable C requires an opaque `CertifiedTypedOutputSeal` backed by checked
+  canonical facts, a closed ledger, and exact typed owners.
 - `SummaryComment`: output is intentionally summary-driven and visibly marked.
 - `Residual`: facts are insufficient for structured C, but partial information
   can be rendered honestly.
@@ -59,7 +60,7 @@ Rules
    certificate.
 2. Do not invent case values, locals, stack slots, call arguments, signatures, or
    struct fields.
-3. Name hints are weak evidence only. They cannot grant `CertifiedC`.
+3. Name hints are weak evidence only. They cannot grant executable C authority.
 4. Cache hits and budget caps never justify semantics.
 5. Any downstream cleanup that hides missing upstream facts is a correctness bug.
 6. Closure gates must fail on incomplete status, timeouts, source-oracle

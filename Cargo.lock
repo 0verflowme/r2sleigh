@@ -852,14 +852,10 @@ checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
 name = "r2cert"
 version = "0.1.0"
 dependencies = [
- "postcard",
  "r2il",
- "r2sleigh-lift",
  "r2ssa",
  "serde",
  "serde_json",
- "sha2",
- "sleigh-config",
 ]
 
 [[package]]
@@ -869,14 +865,11 @@ dependencies = [
  "postcard",
  "r2cert",
  "r2il",
- "r2sleigh-lift",
  "r2ssa",
  "r2sym",
  "r2types",
  "serde",
  "serde_json",
- "sha2",
- "sleigh-config",
 ]
 
 [[package]]
@@ -885,14 +878,11 @@ version = "0.1.0"
 dependencies = [
  "r2dec",
  "r2il",
- "r2sleigh-lift",
  "r2ssa",
  "r2sym",
  "r2types",
  "serde",
  "serde_json",
- "sha2",
- "sleigh-config",
  "z3",
 ]
 
@@ -972,6 +962,7 @@ dependencies = [
  "r2types",
  "serde",
  "serde_json",
+ "sha2",
  "sleigh-config",
  "z3",
 ]
@@ -985,7 +976,6 @@ dependencies = [
  "r2il",
  "r2sleigh-lift",
  "serde",
- "sha2",
  "sleigh-config",
 ]
 

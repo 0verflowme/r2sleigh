@@ -2,9 +2,9 @@ use super::*;
 use crate::analysis::ssa::r2ssa_function_json;
 use serde::Deserialize;
 use serde_json::Value;
-use std::sync::Arc;
+use sha2::{Digest, Sha256};
 
-const CAPTURE_JSON: &str = include_str!("../tests/plain_o2_lift_v1.json");
+const CAPTURE_JSON: &str = include_str!("../tests/plain_o2_lift_v2.json");
 const ORIGIN_MANIFEST_JSON: &str =
     include_str!("../../tests/r2r/fixtures/plain_o2_v1/manifest.json");
 const ORIGIN_CORE_JSON: &str =
@@ -13,6 +13,8 @@ const TEST_FUNC_BINARY: &[u8] =
     include_bytes!("../../tests/r2r/bins/r2sleigh_test_func_x86_64_macho_O2_v1");
 const VULN_TEST_BINARY: &[u8] =
     include_bytes!("../../tests/r2r/bins/r2sleigh_vuln_test_x86_64_macho_O2_v1");
+const TEST_FUNC_SOURCE: &[u8] = include_bytes!("../../tests/e2e/test_func.c");
+const VULN_TEST_SOURCE: &[u8] = include_bytes!("../../tests/e2e/vuln_test.c");
 
 #[derive(Debug, Deserialize)]
 struct LiftCapture {
@@ -119,6 +121,10 @@ fn fnv1a64(bytes: &[u8]) -> String {
     format!("{hash:016x}")
 }
 
+fn sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
 fn canonical_json(value: Value) -> Value {
     match value {
         Value::Array(values) => {
@@ -164,11 +170,19 @@ fn artifact_bytes(artifact: &str) -> &'static [u8] {
     }
 }
 
+fn source_bytes(artifact: &str) -> &'static [u8] {
+    match artifact {
+        "test_func-x86_64-macho-O2-v1" => TEST_FUNC_SOURCE,
+        "vuln_test-x86_64-macho-O2-v1" => VULN_TEST_SOURCE,
+        artifact => panic!("unknown plain O2 artifact {artifact}"),
+    }
+}
+
 fn assert_origin(capture: &LiftCapture, function: &FunctionCapture) {
-    assert_eq!(capture.schema_version, 1);
+    assert_eq!(capture.schema_version, 2);
     assert_eq!(
         capture.fixture_set,
-        "r2sleigh-plain-o2-x86_64-macho-sleigh-lift-v1"
+        "r2sleigh-plain-o2-x86_64-macho-sleigh-lift-v2"
     );
     assert_eq!(
         capture.origin_manifest,
@@ -191,6 +205,7 @@ fn assert_origin(capture: &LiftCapture, function: &FunctionCapture) {
         .expect("fixture artifact");
     let binary = artifact_bytes(&artifact.id);
     assert_eq!(binary.len(), artifact.size_bytes);
+    assert_eq!(sha256(binary), artifact.sha256);
     assert_eq!(fnv1a64(binary), artifact.fnv1a64);
 
     let manifest: Value = serde_json::from_str(ORIGIN_MANIFEST_JSON).expect("origin manifest");
@@ -203,6 +218,11 @@ fn assert_origin(capture: &LiftCapture, function: &FunctionCapture) {
         .expect("manifest artifact");
     assert_eq!(manifest_artifact["path"], artifact.path);
     assert_eq!(manifest_artifact["sha256"], artifact.sha256);
+    assert_eq!(manifest_artifact["sha256"], sha256(binary));
+    assert_eq!(
+        manifest_artifact["source_sha256"],
+        sha256(source_bytes(&artifact.id))
+    );
     assert_eq!(manifest_artifact["size_bytes"], artifact.size_bytes);
     assert_eq!(manifest_artifact["source"], function.source);
     let manifest_symbol = manifest_artifact["required_symbols"]
@@ -251,7 +271,7 @@ fn assert_origin(capture: &LiftCapture, function: &FunctionCapture) {
     }
 }
 
-fn assert_source_snapshot(function: &FunctionCapture, ssa: &Value, blocks: &[R2ILBlock]) {
+fn assert_captured_abi_facts(function: &FunctionCapture, ssa: &Value, blocks: &[R2ILBlock]) {
     assert_eq!(function.source_abi.calling_convention, "sysv_amd64");
     assert_eq!(function.source_abi.return_type, "int32_t");
     let prepared = ssa["prepared"].as_object().expect("prepared SSA facts");
@@ -340,339 +360,6 @@ fn assert_source_snapshot(function: &FunctionCapture, ssa: &Value, blocks: &[R2I
     }
 }
 
-fn full_register_storage(arch: &ArchSpec, name: &str) -> r2ssa::CanonicalStorageId {
-    let register = arch
-        .registers
-        .iter()
-        .find(|register| register.name.eq_ignore_ascii_case(name))
-        .unwrap_or_else(|| panic!("missing physical {name} register"));
-    assert_eq!(register.size, 8, "{name} must be a full ABI carrier");
-    r2ssa::CanonicalStorageId {
-        space: r2ssa::CanonicalStorageSpace::Register,
-        offset: register.offset,
-        size: register.size,
-    }
-}
-
-fn exact_branchless_source_snapshot(
-    function: &FunctionCapture,
-    arch: &ArchSpec,
-) -> Arc<r2engine::EngineSourceSnapshot> {
-    let revision = format!(
-        "plain-o2-branchless-{}-{}",
-        function.address, function.bytes_fnv1a64
-    )
-    .into_bytes();
-    let parameter_count = function.source_abi.parameters.len();
-    assert!(matches!(parameter_count, 1 | 2));
-    let parameter_storages = [
-        full_register_storage(arch, "RDI"),
-        full_register_storage(arch, "RSI"),
-    ];
-    let return_storage = full_register_storage(arch, "RAX");
-    let low32 = r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::LowBits, 0, 32);
-    let graph = r2ssa::SourceTypeGraph::new(
-        [r2ssa::SourceType::new(
-            0,
-            r2ssa::SourceTypeKind::SignedInteger,
-            32,
-            32,
-        )],
-        [],
-    )
-    .expect("exact signed-32 source graph");
-    let interface = r2ssa::SourceFunctionInterface::new_exact_with_logical_types(
-        revision.clone(),
-        "sysv_amd64",
-        parameter_storages
-            .into_iter()
-            .take(parameter_count)
-            .enumerate()
-            .map(|(index, storage)| r2ssa::SourceAbiParameterSpec::new(index as u32, storage)),
-        r2ssa::SourceFunctionReturn::Register {
-            storage: return_storage,
-        },
-        [],
-        (0..parameter_count).map(|_| r2ssa::SourceLogicalValue::new(0, low32)),
-        Some(r2ssa::SourceLogicalValue::new(0, low32)),
-        Some(graph),
-    )
-    .expect("exact branchless source interface");
-    Arc::new(
-        r2engine::EngineSourceSnapshot::new(revision, Some(interface), [])
-            .expect("exact branchless source snapshot"),
-    )
-}
-
-fn exact_struct_array_source_snapshot(
-    function: &FunctionCapture,
-    arch: &ArchSpec,
-) -> Arc<r2engine::EngineSourceSnapshot> {
-    let revision = format!(
-        "plain-o2-struct-array-{}-{}",
-        function.address, function.bytes_fnv1a64
-    )
-    .into_bytes();
-    let parameter_storages = [
-        full_register_storage(arch, "RDI"),
-        full_register_storage(arch, "RSI"),
-        full_register_storage(arch, "RDX"),
-    ];
-    let return_storage = full_register_storage(arch, "RAX");
-    let low32 = r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::LowBits, 0, 32);
-    let full64 = r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::Full, 0, 64);
-    let graph = r2ssa::SourceTypeGraph::new(
-        [
-            r2ssa::SourceType::new(0, r2ssa::SourceTypeKind::SignedInteger, 32, 32),
-            r2ssa::SourceType::new(
-                1,
-                r2ssa::SourceTypeKind::Struct { aggregate_id: 0 },
-                448,
-                32,
-            ),
-            r2ssa::SourceType::new(
-                2,
-                r2ssa::SourceTypeKind::Pointer { target_type_id: 1 },
-                64,
-                64,
-            ),
-        ],
-        [r2ssa::SourceAggregateLayout::new(
-            0,
-            1,
-            448,
-            32,
-            "DemoStruct",
-            (0..14).map(|index| {
-                r2ssa::SourceAggregateMember::new(
-                    index,
-                    0,
-                    u64::from(index) * 32,
-                    32,
-                    format!("member{index}"),
-                )
-            }),
-        )],
-    )
-    .expect("exact natural struct-array source graph");
-    let interface = r2ssa::SourceFunctionInterface::new_exact_with_logical_types(
-        revision.clone(),
-        "sysv_amd64",
-        parameter_storages
-            .into_iter()
-            .enumerate()
-            .map(|(index, storage)| r2ssa::SourceAbiParameterSpec::new(index as u32, storage)),
-        r2ssa::SourceFunctionReturn::Register {
-            storage: return_storage,
-        },
-        [],
-        [
-            r2ssa::SourceLogicalValue::new(2, full64),
-            r2ssa::SourceLogicalValue::new(0, low32),
-            r2ssa::SourceLogicalValue::new(0, low32),
-        ],
-        Some(r2ssa::SourceLogicalValue::new(0, low32)),
-        Some(graph),
-    )
-    .expect("exact struct-array source interface");
-    Arc::new(
-        r2engine::EngineSourceSnapshot::new(revision, Some(interface), [])
-            .expect("exact struct-array source snapshot"),
-    )
-}
-
-fn exact_sum_array_source_snapshot(
-    function: &FunctionCapture,
-    arch: &ArchSpec,
-) -> Arc<r2engine::EngineSourceSnapshot> {
-    assert_eq!(function.name, "sum_array");
-    assert_eq!(function.source_abi.parameters.len(), 2);
-    let revision = format!(
-        "plain-o2-sum-array-{}-{}",
-        function.address, function.bytes_fnv1a64
-    )
-    .into_bytes();
-    let return_storage = full_register_storage(arch, "RAX");
-    let low32 = r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::LowBits, 0, 32);
-    let full64 = r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::Full, 0, 64);
-    let graph = r2ssa::SourceTypeGraph::new(
-        [
-            r2ssa::SourceType::new(0, r2ssa::SourceTypeKind::SignedInteger, 32, 32),
-            r2ssa::SourceType::new(
-                1,
-                r2ssa::SourceTypeKind::Pointer { target_type_id: 0 },
-                64,
-                64,
-            ),
-        ],
-        [],
-    )
-    .expect("exact sum-array source graph");
-    let interface = r2ssa::SourceFunctionInterface::new_exact_with_logical_types(
-        revision.clone(),
-        "sysv_amd64",
-        [
-            r2ssa::SourceAbiParameterSpec::new(0, full_register_storage(arch, "RDI")),
-            r2ssa::SourceAbiParameterSpec::new(1, full_register_storage(arch, "RSI")),
-        ],
-        r2ssa::SourceFunctionReturn::Register {
-            storage: return_storage,
-        },
-        [],
-        [
-            r2ssa::SourceLogicalValue::new(1, full64),
-            r2ssa::SourceLogicalValue::new(0, low32),
-        ],
-        Some(r2ssa::SourceLogicalValue::new(0, low32)),
-        Some(graph),
-    )
-    .expect("exact sum-array source interface");
-    Arc::new(
-        r2engine::EngineSourceSnapshot::new(revision, Some(interface), [])
-            .expect("exact sum-array source snapshot"),
-    )
-}
-
-fn assert_branchless_production_route(
-    function: &FunctionCapture,
-    blocks: &[R2ILBlock],
-    arch: &ArchSpec,
-) {
-    if !matches!(function.name.as_str(), "check_secret" | "complex_check") {
-        return;
-    }
-    let response = r2engine::EngineSession::new(4).decompile_function_from_input(
-        r2engine::EngineFunctionDecompileRequestInput::single_function(
-            r2engine::EngineFunctionInput {
-                function_name: function.symbol.clone(),
-                function_addr: function.address,
-                blocks: blocks.to_vec(),
-                arch: Some(arch.clone()),
-                source_snapshot: Some(exact_branchless_source_snapshot(function, arch)),
-                semantic_metadata_enabled: true,
-            },
-            Some(64),
-            r2types::ParsedExternalContext::default(),
-            0,
-        ),
-    );
-    assert_eq!(
-        response.diagnostics.semantic_kernel_render,
-        Some(r2engine::EngineSemanticKernelRender {
-            region: r2engine::EngineSemanticKernelRegion::BranchlessGuardFunction,
-            region_schema_version:
-                r2dec::CERTIFIED_BRANCHLESS_GUARD_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-            exact_obligation_closure: true,
-        }),
-        "{} must reach the exact production route: {}",
-        function.name,
-        response.output
-    );
-    assert!(response.output.contains("#include <stdint.h>"));
-    if function.name == "check_secret" {
-        assert!(response.output.contains("== UINT32_C(0xdead)"));
-    } else {
-        assert!(response.output.contains("sum_bits == UINT32_C(0x64)"));
-        assert!(
-            response
-                .output
-                .contains("difference_bits == UINT32_C(0x14)")
-        );
-    }
-}
-
-fn assert_struct_array_production_route(
-    function: &FunctionCapture,
-    blocks: &[R2ILBlock],
-    arch: &ArchSpec,
-) {
-    if function.name != "test_struct_array_index" {
-        return;
-    }
-    let response = r2engine::EngineSession::new(4).decompile_function_from_input(
-        r2engine::EngineFunctionDecompileRequestInput::single_function(
-            r2engine::EngineFunctionInput {
-                function_name: function.symbol.clone(),
-                function_addr: function.address,
-                blocks: blocks.to_vec(),
-                arch: Some(arch.clone()),
-                source_snapshot: Some(exact_struct_array_source_snapshot(function, arch)),
-                semantic_metadata_enabled: true,
-            },
-            Some(64),
-            r2types::ParsedExternalContext::default(),
-            0,
-        ),
-    );
-    assert_eq!(
-        response.diagnostics.semantic_kernel_render,
-        Some(r2engine::EngineSemanticKernelRender {
-            region: r2engine::EngineSemanticKernelRegion::StructArrayIndexFunction,
-            region_schema_version:
-                r2dec::CERTIFIED_STRUCT_ARRAY_INDEX_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-            exact_obligation_closure: true,
-        }),
-        "{} must reach the exact production route: {}",
-        function.name,
-        response.output
-    );
-    assert!(
-        response
-            .output
-            .contains("typedef struct r2s_type_DemoStruct")
-    );
-    assert!(response.output.contains("member2 = r2s_arg2_value"));
-    assert!(response.output.contains("member13"));
-}
-
-fn assert_sum_array_production_route(
-    function: &FunctionCapture,
-    blocks: &[R2ILBlock],
-    arch: &ArchSpec,
-) {
-    if function.name != "sum_array" {
-        return;
-    }
-    let response = r2engine::EngineSession::new(4).decompile_function_from_input(
-        r2engine::EngineFunctionDecompileRequestInput::single_function(
-            r2engine::EngineFunctionInput {
-                function_name: function.symbol.clone(),
-                function_addr: function.address,
-                blocks: blocks.to_vec(),
-                arch: Some(arch.clone()),
-                source_snapshot: Some(exact_sum_array_source_snapshot(function, arch)),
-                semantic_metadata_enabled: true,
-            },
-            Some(64),
-            r2types::ParsedExternalContext::default(),
-            0,
-        ),
-    );
-    assert_eq!(
-        response.diagnostics.semantic_kernel_render,
-        Some(r2engine::EngineSemanticKernelRender {
-            region: r2engine::EngineSemanticKernelRegion::SumArrayFunction,
-            region_schema_version: r2dec::CERTIFIED_SUM_ARRAY_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-            exact_obligation_closure: true,
-        }),
-        "{} must reach the exact production route: {}",
-        function.name,
-        response.output
-    );
-    assert!(response.output.contains("#include <stdint.h>"));
-    assert!(response.output.contains("const int32_t *r2s_arg0_array"));
-    assert!(response.output.contains("int32_t r2s_arg1_length"));
-    assert!(response.output.contains("if (r2s_arg1_length <= 0)"));
-    assert!(response.output.contains("uint32_t r2s_sum_sum_bits"));
-    assert!(
-        response
-            .output
-            .contains("r2s_sum_sum_bits += (uint32_t)r2s_arg0_array[r2s_index_index]")
-    );
-    assert!(!response.output.contains("__m128"));
-    assert!(!response.output.contains("goto"));
-}
-
 fn assert_function_capture(function_name: &str) {
     let capture = fixture();
     let function = capture
@@ -699,6 +386,7 @@ fn assert_function_capture(function_name: &str) {
     let context = r2il_arch_init(arch_name.as_ptr());
     assert!(!context.is_null(), "x86-64 context");
     let mut lifted = Vec::new();
+    let mut capture_mismatches = Vec::new();
     for expected in &function.blocks {
         let bytes = decode_hex(&expected.bytes);
         let block = r2il_lift_block(
@@ -741,10 +429,14 @@ fn assert_function_capture(function_name: &str) {
             .collect::<Vec<_>>()
             .join(",");
         assert_eq!(kinds, expected.op_kinds);
-        assert_eq!(
-            json_fnv1a64(serde_json::to_value(&block_ref.ops).expect("R2IL ops JSON")),
-            expected.ops_fnv1a64
-        );
+        let actual_ops_hash =
+            json_fnv1a64(serde_json::to_value(&block_ref.ops).expect("R2IL ops JSON"));
+        if actual_ops_hash != expected.ops_fnv1a64 {
+            capture_mismatches.push(format!(
+                "block 0x{:x} R2IL hash: expected {}, actual {}",
+                expected.address, expected.ops_fnv1a64, actual_ops_hash
+            ));
+        }
         lifted.push(block);
     }
 
@@ -764,7 +456,13 @@ fn assert_function_capture(function_name: &str) {
             })
             .collect(),
     );
-    assert_eq!(json_fnv1a64(r2il_capture), function.r2il_fnv1a64);
+    let actual_r2il_hash = json_fnv1a64(r2il_capture);
+    if actual_r2il_hash != function.r2il_fnv1a64 {
+        capture_mismatches.push(format!(
+            "function R2IL hash: expected {}, actual {}",
+            function.r2il_fnv1a64, actual_r2il_hash
+        ));
+    }
 
     let lifted_ptrs = lifted
         .iter()
@@ -782,36 +480,53 @@ fn assert_function_capture(function_name: &str) {
     ));
     assert_eq!(first_ssa, second_ssa, "deterministic SSA reconstruction");
     let ssa: Value = serde_json::from_str(&first_ssa).expect("prepared SSA JSON");
-    assert_eq!(json_fnv1a64(ssa.clone()), function.ssa_fnv1a64);
+    let actual_ssa_hash = json_fnv1a64(ssa.clone());
+    if actual_ssa_hash != function.ssa_fnv1a64 {
+        capture_mismatches.push(format!(
+            "function SSA hash: expected {}, actual {}",
+            function.ssa_fnv1a64, actual_ssa_hash
+        ));
+    }
     let ssa_blocks = ssa["blocks"].as_array().expect("SSA blocks");
     assert_eq!(ssa_blocks.len(), function.ssa_blocks.len());
     for (actual, expected) in ssa_blocks.iter().zip(&function.ssa_blocks) {
         assert_eq!(actual["addr"], expected.address);
         assert_eq!(actual["size"], expected.size);
-        assert_eq!(
-            actual["phis"].as_array().expect("SSA phis").len(),
-            expected.phi_count
-        );
-        assert_eq!(
-            actual["ops"].as_array().expect("SSA ops").len(),
-            expected.op_count
-        );
-        assert_eq!(json_fnv1a64(actual.clone()), expected.fnv1a64);
+        let actual_phi_count = actual["phis"].as_array().expect("SSA phis").len();
+        if actual_phi_count != expected.phi_count {
+            capture_mismatches.push(format!(
+                "SSA block 0x{:x} phi count: expected {}, actual {}",
+                expected.address, expected.phi_count, actual_phi_count
+            ));
+        }
+        let actual_op_count = actual["ops"].as_array().expect("SSA ops").len();
+        if actual_op_count != expected.op_count {
+            capture_mismatches.push(format!(
+                "SSA block 0x{:x} op count: expected {}, actual {}",
+                expected.address, expected.op_count, actual_op_count
+            ));
+        }
+        let actual_block_hash = json_fnv1a64(actual.clone());
+        if actual_block_hash != expected.fnv1a64 {
+            capture_mismatches.push(format!(
+                "SSA block 0x{:x} hash: expected {}, actual {}",
+                expected.address, expected.fnv1a64, actual_block_hash
+            ));
+        }
     }
 
     let owned_blocks = lifted_refs
         .iter()
         .map(|block| (**block).clone())
         .collect::<Vec<_>>();
-    assert_source_snapshot(function, &ssa, &owned_blocks);
-    let engine_arch = unsafe { &*context }
-        .arch
-        .as_ref()
-        .expect("x86-64 architecture")
-        .clone();
-    assert_branchless_production_route(function, &owned_blocks, &engine_arch);
-    assert_struct_array_production_route(function, &owned_blocks, &engine_arch);
-    assert_sum_array_production_route(function, &owned_blocks, &engine_arch);
+    assert_captured_abi_facts(function, &ssa, &owned_blocks);
+
+    assert!(
+        capture_mismatches.is_empty(),
+        "{} capture drift:\n{}",
+        function.name,
+        capture_mismatches.join("\n")
+    );
 
     for block in lifted {
         r2il_block_free(block);

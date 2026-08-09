@@ -5,15 +5,10 @@
 //! arena. Stable SSA values and canonical instruction IDs provide provenance;
 //! names and rendered positions are never consulted as evidence.
 
-use std::collections::{BTreeMap, BTreeSet};
-#[cfg(test)]
-use std::fmt::Write as _;
-
 use r2cert::{
-    CertifiedAbiParameter, CertifiedCallArgument, CertifiedCallArgumentOrigin,
-    CertifiedConditionalReturnCarrier, CertifiedConditionalReturnFunnelControl,
-    CertifiedDirectCall, CertifiedExpr, CertifiedMachineFunction, CertifiedMachineProjection,
-    CertifiedReturnControl, CertifiedStackSlot, EffectDisposition, ObligationLedger,
+    CertifiedAbiParameter, CertifiedCallArgument, CertifiedCallArgumentOrigin, CertifiedDirectCall,
+    CertifiedExpr, CertifiedMachineFunction, CertifiedMachineProjection, CertifiedReturnControl,
+    CertifiedStackSlot, EffectDisposition, ObligationLedger,
 };
 use r2ssa::{
     CallBoundarySlot, CallSiteId, CanonicalInstructionId, CanonicalStorageId,
@@ -21,15 +16,15 @@ use r2ssa::{
     MachineBitVector, MachineBitwiseOp, MachineBooleanOp, MachineCastKind, MachineComparisonOp,
     MachineEntity, MachineExpr, MachineExprId, MachineExprKind, MachineMemoryEndianness,
     MachineOvershiftBehavior, MachineProjection, MachineShiftKind, MachineSignedness,
-    MachineStackBase, MachineType, MachineValueBinding, MachineValueUse, ObjectId,
-    SemanticObligationId,
+    MachineStackBase, MachineType, MachineValueBinding, ObjectId, SemanticObligationId,
     SemanticObligationInventory, SemanticObligationKind, SourceCallSiteIdentity,
     SourceFunctionReturn, SourceMachineContext, StackAddressBase, StackAddressRoot,
     StructuredAccessId, ValueId,
 };
 use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet};
 
-pub const SEMANTIC_C_SCHEMA_VERSION: u32 = 7;
+pub const SEMANTIC_C_SCHEMA_VERSION: u32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SemanticCParameter {
@@ -134,9 +129,6 @@ pub enum SemanticCInputOrigin {
         offset: i64,
         size_bytes: u32,
         object: Option<ObjectId>,
-    },
-    ConditionalReturnCarrier {
-        producer: CanonicalInstructionId,
     },
     UnclassifiedSource,
 }
@@ -247,31 +239,6 @@ pub enum SemanticCExprKind {
         if_true: SemanticCExprId,
         if_false: SemanticCExprId,
     },
-}
-
-impl SemanticCExprKind {
-    fn children(&self) -> Vec<SemanticCExprId> {
-        match self {
-            Self::Input { .. } | Self::Constant { .. } => Vec::new(),
-            Self::MemoryRead { address, .. } => vec![*address],
-            Self::Copy { input }
-            | Self::BitwiseNot { input }
-            | Self::BooleanNot { input }
-            | Self::Cast { input, .. }
-            | Self::Extract { input, .. } => vec![*input],
-            Self::Arithmetic { left, right, .. }
-            | Self::ArithmeticFlag { left, right, .. }
-            | Self::Bitwise { left, right, .. }
-            | Self::Boolean { left, right, .. }
-            | Self::Compare { left, right, .. } => vec![*left, *right],
-            Self::Shift { value, count, .. } => vec![*value, *count],
-            Self::Select {
-                condition,
-                if_true,
-                if_false,
-            } => vec![*condition, *if_true, *if_false],
-        }
-    }
 }
 
 /// One certified output assignment in source order.
@@ -461,7 +428,7 @@ pub enum SemanticCIdentityScope {
 /// Partial, proof-bound semantic-C expression layer.
 ///
 /// The serialized scope and open-obligation set make incompleteness durable;
-/// this envelope is never a complete source function or a `CertifiedC` claim.
+/// this envelope is never a complete source function or a typed-output seal.
 /// Its value/arena handles are explicitly artifact-local and must not enter a
 /// cache or cross-artifact merge until a function revision identity exists.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -505,13 +472,6 @@ pub enum SemanticCError {
     ReturnBindingMismatch(CanonicalInstructionId),
     MissingCallExpression(CanonicalInstructionId),
     CallBindingMismatch(CanonicalInstructionId),
-    #[cfg(test)]
-    UnknownEntity(CanonicalInstructionId),
-    #[cfg(test)]
-    DependencyOrder {
-        producer: CanonicalInstructionId,
-        value: ValueId,
-    },
     CheckedArithmeticRequiresHelper(SemanticCExprId),
     UnsupportedShiftPolicy(SemanticCExprId),
     MemoryReadRequiresCertifiedStatement(SemanticCExprId),
@@ -638,14 +598,21 @@ fn semantic_function_interface(
         return Err(SemanticCError::InvalidCertifiedFunctionInterface);
     }
     let mut parameters = Vec::with_capacity(source.parameters().len());
-    for declared in source.parameters() {
+    for (declared, logical_value) in source
+        .parameters()
+        .iter()
+        .zip(source.parameter_logical_values())
+    {
         let certified_parameter = certified
             .abi_parameters()
             .get(&declared.index())
-            .filter(|parameter| parameter.storage() == declared.storage())
+            .filter(|parameter| {
+                parameter.storage() == declared.storage()
+                    && parameter.logical_value() == *logical_value
+            })
             .ok_or(SemanticCError::InvalidCertifiedFunctionInterface)?;
-        let width_bits = declared
-            .storage()
+        let width_bits = certified_parameter
+            .graph_storage()
             .size
             .checked_mul(8)
             .filter(|width| *width > 0)
@@ -756,48 +723,7 @@ impl SemanticCExpressionLayer {
     /// Effect, control, return, and loop-state obligations remain open in
     /// `r2cert`; this expression layer cannot authorize a complete C function.
     pub fn from_certified(certified: &CertifiedMachineFunction) -> Result<Self, SemanticCError> {
-        Self::from_source(certified, None, None)
-    }
-
-    /// Lower expressions for one sealed conditional-return funnel.
-    ///
-    /// The carrier is admitted as an explicit local input only when every
-    /// obligation owned by it has the exact conditional-return-state ledger
-    /// disposition and the same sealed carrier evidence.
-    pub fn from_conditional_return_funnel(
-        certified: &CertifiedMachineFunction,
-        control: &CertifiedConditionalReturnFunnelControl,
-    ) -> Result<Self, SemanticCError> {
-        if control.origin() != certified.origin() {
-            return Err(SemanticCError::InvalidCertifiedFunctionInterface);
-        }
-        let carrier = control.carrier();
-        let evidence_is_exact = carrier.source_obligations().iter().all(|obligation| {
-            matches!(certified.ledger().effects(*obligation), [effect]
-                if effect.disposition()
-                    == &EffectDisposition::AbsorbedIntoConditionalReturnState {
-                        producer: carrier.producer(),
-                    }
-                    && effect.conditional_return_state_evidence() == Some(carrier))
-        });
-        if carrier.source_obligations().is_empty() || !evidence_is_exact {
-            return Err(SemanticCError::CertifiedSourceMismatch(carrier.producer()));
-        }
-        let selected_producers = [
-            control.branch_control().condition().producer(),
-            control.true_candidate().value().producer(),
-            control.false_candidate().value().producer(),
-        ]
-        .into_iter()
-        .flatten()
-        .chain(
-            control
-                .return_value_chain()
-                .iter()
-                .filter_map(MachineValueUse::producer),
-        )
-        .collect::<BTreeSet<_>>();
-        Self::from_source(certified, Some(carrier), Some(&selected_producers))
+        Self::from_source(certified)
     }
 
     /// Lower all supported values from a certified partial machine projection.
@@ -805,18 +731,14 @@ impl SemanticCExpressionLayer {
     /// Failed producers and their transitive dependents stay absent from the C
     /// arena and remain explicit in `open_obligations`.
     pub fn from_projection(certified: &CertifiedMachineProjection) -> Result<Self, SemanticCError> {
-        Self::from_source(certified, None, None)
+        Self::from_source(certified)
     }
 
-    fn from_source(
-        certified: &impl CertifiedSemanticSource,
-        conditional_carrier: Option<&CertifiedConditionalReturnCarrier>,
-        selected_producers: Option<&BTreeSet<CanonicalInstructionId>>,
-    ) -> Result<Self, SemanticCError> {
+    fn from_source(certified: &impl CertifiedSemanticSource) -> Result<Self, SemanticCError> {
         let function_interface = semantic_function_interface(certified)?;
         let machine = certified.machine_view();
         let output_producers = machine.output_producers();
-        let mut certified_producers = machine
+        let certified_producers = machine
             .entities()
             .iter()
             .filter_map(|entity| {
@@ -825,24 +747,10 @@ impl SemanticCExpressionLayer {
                     .map(|_| entity.producer())
             })
             .collect::<BTreeSet<_>>();
-        let conditional_carrier_inputs = conditional_carrier
-            .map(|carrier| {
-                let binding = match carrier {
-                    CertifiedConditionalReturnCarrier::RegisterPhi(state) => state.phi().binding(),
-                    CertifiedConditionalReturnCarrier::PrivateStackScalar(state) => {
-                        state.loaded_value().binding()
-                    }
-                };
-                BTreeMap::from([(binding, carrier.producer())])
-            })
-            .unwrap_or_default();
-        certified_producers.extend(conditional_carrier_inputs.values().copied());
-
         let mut builder = SemanticCBuilder {
             machine,
             output_producers: &output_producers,
             certified_producers: &certified_producers,
-            conditional_carrier_inputs: &conditional_carrier_inputs,
             translated: BTreeMap::new(),
             expressions: Vec::new(),
             inputs: BTreeMap::new(),
@@ -850,11 +758,6 @@ impl SemanticCExpressionLayer {
         let mut entities = Vec::new();
 
         for machine_entity in machine.entities() {
-            if selected_producers
-                .is_some_and(|selected| !selected.contains(&machine_entity.producer()))
-            {
-                continue;
-            }
             let live_obligations = machine_entity
                 .source_obligations()
                 .iter()
@@ -862,22 +765,6 @@ impl SemanticCExpressionLayer {
                 .filter(|id| id.kind == SemanticObligationKind::LiveValueProducer)
                 .collect::<BTreeSet<_>>();
             if live_obligations.is_empty() {
-                continue;
-            }
-            let carrier_owned = conditional_carrier.is_some_and(|carrier| {
-                !live_obligations.is_empty()
-                    && live_obligations.iter().all(|obligation| {
-                        carrier.source_obligations().contains(obligation)
-                            && matches!(certified.ledger().effects(*obligation), [effect]
-                                if effect.disposition()
-                                    == &EffectDisposition::AbsorbedIntoConditionalReturnState {
-                                        producer: carrier.producer(),
-                                    }
-                                    && effect.conditional_return_state_evidence()
-                                        == Some(carrier))
-                    })
-            });
-            if carrier_owned {
                 continue;
             }
             let Some(expression) = certified.expression_for_producer(machine_entity.producer())
@@ -959,13 +846,7 @@ impl SemanticCExpressionLayer {
             .map(|(binding, ty)| {
                 (
                     *binding,
-                    conditional_carrier_inputs
-                        .get(binding)
-                        .copied()
-                        .map(|producer| SemanticCInputOrigin::ConditionalReturnCarrier { producer })
-                        .unwrap_or_else(|| {
-                            classify_input(*binding, ty, function_interface.as_ref())
-                        }),
+                    classify_input(*binding, ty, function_interface.as_ref()),
                 )
             })
             .collect::<BTreeMap<_, _>>();
@@ -1016,34 +897,6 @@ impl SemanticCExpressionLayer {
         self.expressions.get(id.index())
     }
 
-    #[cfg(test)]
-    pub(crate) fn replace_expr_kind_for_test(
-        &mut self,
-        id: SemanticCExprId,
-        kind: SemanticCExprKind,
-    ) -> Result<(), SemanticCError> {
-        let expression = self
-            .expressions
-            .get_mut(id.index())
-            .ok_or(SemanticCError::MissingSemanticExpression(id))?;
-        expression.kind = kind;
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn replace_expr_type_for_test(
-        &mut self,
-        id: SemanticCExprId,
-        ty: MachineType,
-    ) -> Result<(), SemanticCError> {
-        let expression = self
-            .expressions
-            .get_mut(id.index())
-            .ok_or(SemanticCError::MissingSemanticExpression(id))?;
-        expression.ty = ty;
-        Ok(())
-    }
-
     pub const fn entities(&self) -> &[SemanticCEntity] {
         &self.entities
     }
@@ -1073,140 +926,15 @@ impl SemanticCExpressionLayer {
         &self.open_obligations
     }
 
-    /// Render a conservative C11 expression kernel for the compiler test gate.
-    ///
-    /// This stays test-only until effect, control, and return obligations are
-    /// closed by certified structuring. Production callers receive only the
-    /// typed AST and cannot mistake a value-expression kernel for a decompiled
-    /// source function. Machine values are evaluated as unsigned bit patterns;
-    /// signed interpretation is confined to explicit helpers.
-    #[cfg(test)]
-    fn render_test_entity_translation_unit(
-        &self,
-        output_producer: CanonicalInstructionId,
-    ) -> Result<String, SemanticCError> {
-        const FUNCTION_NAME: &str = "semantic_c_test_kernel";
-        let return_index = self
-            .entities
-            .iter()
-            .position(|entity| entity.producer == output_producer)
-            .ok_or(SemanticCError::UnknownEntity(output_producer))?;
-        let entities = &self.entities[..=return_index];
-        let return_entity = &entities[return_index];
-        let return_type = storage_type(self.expr_type(return_entity.root)?)?;
-        let mut required_inputs = BTreeSet::new();
-        for entity in entities {
-            required_inputs.extend(
-                self.source_bindings(entity.root)?
-                    .into_iter()
-                    .filter(|binding| self.inputs.contains_key(binding)),
-            );
-        }
-        let mut output = String::new();
-        output.push_str("#include <stdint.h>\n\n");
-        output.push_str(SEMANTIC_C_HELPERS);
-        write!(&mut output, "\n{} {}(", return_type, FUNCTION_NAME)
-            .expect("String writes cannot fail");
-        if required_inputs.is_empty() {
-            output.push_str("void");
-        } else {
-            for (index, binding) in required_inputs.iter().enumerate() {
-                if index > 0 {
-                    output.push_str(", ");
-                }
-                write!(
-                    &mut output,
-                    "{} {}",
-                    storage_type(
-                        self.inputs
-                            .get(binding)
-                            .ok_or(SemanticCError::InconsistentInputType(binding.value()))?
-                    )?,
-                    value_name(*binding)
-                )
-                .expect("String writes cannot fail");
-            }
-        }
-        output.push_str(") {\n");
-
-        let mut defined = required_inputs;
-        for entity in entities {
-            for binding in self.source_bindings(entity.root)? {
-                if !defined.contains(&binding) {
-                    return Err(SemanticCError::DependencyOrder {
-                        producer: entity.producer,
-                        value: binding.value(),
-                    });
-                }
-            }
-            let expression = self.render_expr(entity.root)?;
-            writeln!(
-                &mut output,
-                "\t{} {} = {};",
-                storage_type(self.expr_type(entity.root)?)?,
-                value_name(entity.output),
-                expression
-            )
-            .expect("String writes cannot fail");
-            defined.insert(entity.output);
-        }
-        writeln!(
-            &mut output,
-            "\treturn {};",
-            value_name(return_entity.output)
-        )
-        .expect("String writes cannot fail");
-        output.push_str("}\n");
-        Ok(output)
-    }
-
     pub(crate) fn expr_type(&self, id: SemanticCExprId) -> Result<&MachineType, SemanticCError> {
         self.expr(id)
             .map(SemanticCExpr::ty)
             .ok_or(SemanticCError::MissingSemanticExpression(id))
     }
 
-    pub(crate) fn source_bindings(
-        &self,
-        root: SemanticCExprId,
-    ) -> Result<BTreeSet<MachineValueBinding>, SemanticCError> {
-        let mut result = BTreeSet::new();
-        let mut ready = vec![root];
-        let mut visited = BTreeSet::new();
-        while let Some(id) = ready.pop() {
-            if !visited.insert(id) {
-                continue;
-            }
-            let expr = self
-                .expr(id)
-                .ok_or(SemanticCError::MissingSemanticExpression(id))?;
-            match expr.kind {
-                SemanticCExprKind::Input { binding } => {
-                    result.insert(binding);
-                }
-                SemanticCExprKind::Constant { .. } => {}
-                _ => ready.extend(expr.kind.children()),
-            }
-        }
-        Ok(result)
-    }
-
     pub(crate) fn render_expr(&self, id: SemanticCExprId) -> Result<String, SemanticCError> {
         self.render_expr_inner(id, None)
             .map(|rendered| rendered.source)
-    }
-
-    /// Render one semantic expression while replacing only exact input nodes
-    /// carrying `binding`. The returned count is derived from AST identity,
-    /// never from generated names or textual occurrences.
-    pub(crate) fn render_expr_substituting_input(
-        &self,
-        id: SemanticCExprId,
-        binding: MachineValueBinding,
-        replacement: &str,
-    ) -> Result<(String, usize), SemanticCError> {
-        self.render_expr_inner(id, Some((binding, replacement)))
-            .map(|rendered| (rendered.source, rendered.substitutions))
     }
 
     fn render_expr_inner(
@@ -1673,7 +1401,6 @@ struct SemanticCBuilder<'a> {
     machine: MachineView<'a>,
     output_producers: &'a BTreeMap<ValueId, CanonicalInstructionId>,
     certified_producers: &'a BTreeSet<CanonicalInstructionId>,
-    conditional_carrier_inputs: &'a BTreeMap<MachineValueBinding, CanonicalInstructionId>,
     translated: BTreeMap<MachineExprId, SemanticCExprId>,
     expressions: Vec<SemanticCExpr>,
     inputs: BTreeMap<MachineValueBinding, MachineType>,
@@ -1701,16 +1428,7 @@ impl SemanticCBuilder<'_> {
         }
         let kind = match machine_expr.kind() {
             MachineExprKind::Source { binding } => {
-                if let Some(dependency) = self.conditional_carrier_inputs.get(binding).copied() {
-                    source_instructions.insert(dependency);
-                    if let Some(existing) = self.inputs.insert(*binding, machine_expr.ty().clone())
-                        && existing != *machine_expr.ty()
-                    {
-                        return Err(SemanticCError::InconsistentInputType(binding.value()));
-                    }
-                } else if let Some(dependency) =
-                    self.output_producers.get(&binding.value()).copied()
-                {
+                if let Some(dependency) = self.output_producers.get(&binding.value()).copied() {
                     if !self.certified_producers.contains(&dependency) {
                         let producer = machine_expr.origin().unwrap_or(dependency);
                         return Err(SemanticCError::UncertifiedDependency {
@@ -1809,9 +1527,9 @@ impl SemanticCBuilder<'_> {
                         .expr(*right)
                         .is_none_or(|input| input.ty() != &output_ty)
                 {
-                    return Err(SemanticCError::InvalidBooleanExpression(
-                        SemanticCExprId(u32::MAX),
-                    ));
+                    return Err(SemanticCError::InvalidBooleanExpression(SemanticCExprId(
+                        u32::MAX,
+                    )));
                 }
                 SemanticCExprKind::Boolean {
                     op: *op,
@@ -2134,600 +1852,15 @@ static inline uint64_t r2s_sext(uint64_t value, unsigned from_width, unsigned to
 #[cfg(test)]
 mod tests {
     use super::*;
-    use r2cert::{CertifiedMachineFunction, CertifiedMachineProjection};
-    use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
+    use r2cert::CertifiedMachineProjection;
+    use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, Varnode};
     use r2ssa::{
-        CanonicalStorageSpace, InstPayload, SSAOp, SourceAbiParameterSpec, SourceCallArgumentSpec,
+        CanonicalStorageSpace, MachineBuildError, SourceAbiParameterSpec, SourceCallArgumentSpec,
         SourceCallResult, SourceCallSiteInterface, SourceFunctionInterface, SsaArtifact,
     };
-    use std::io::Write as _;
-    use std::process::{Command, Stdio};
-
-    fn compile_semantic_c(source: &str) {
-        let mut compiler = Command::new("cc")
-            .args([
-                "-std=c11",
-                "-Wall",
-                "-Wextra",
-                "-Wpedantic",
-                "-Wno-unused-function",
-                "-Werror",
-                "-fsyntax-only",
-                "-x",
-                "c",
-                "-",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("C compiler required for semantic-C gate");
-        compiler
-            .stdin
-            .as_mut()
-            .expect("compiler stdin")
-            .write_all(source.as_bytes())
-            .expect("write semantic C");
-        let result = compiler.wait_with_output().expect("compile semantic C");
-        assert!(
-            result.status.success(),
-            "generated semantic C did not compile: {}",
-            String::from_utf8_lossy(&result.stderr)
-        );
-    }
-
-    fn fnv_artifact() -> SsaArtifact {
-        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-        const FNV_PRIME: u64 = 0x100000001b3;
-        let initial = Varnode::unique(0x10, 8);
-        let mixed = Varnode::unique(0x18, 8);
-        let product = Varnode::unique(0x20, 8);
-        let mut block = R2ILBlock::new(0x1000, 4);
-        block.push(R2ILOp::Copy {
-            dst: initial.clone(),
-            src: Varnode::constant(FNV_OFFSET, 8),
-        });
-        block.push(R2ILOp::IntXor {
-            dst: mixed.clone(),
-            a: initial,
-            b: Varnode::register(0, 8),
-        });
-        block.push(R2ILOp::IntMult {
-            dst: product.clone(),
-            a: mixed,
-            b: Varnode::constant(FNV_PRIME, 8),
-        });
-        block.push(R2ILOp::Store {
-            space: SpaceId::Ram,
-            addr: Varnode::register(8, 8),
-            val: product,
-        });
-        SsaArtifact::raw(&[block], None).expect("FNV artifact")
-    }
-
-    fn reverse_le_bool_not_select_fnv_artifact() -> SsaArtifact {
-        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-        const FNV_PRIME: u64 = 0x100000001b3;
-        let input = Varnode::register(0, 8);
-        let reverse_le = Varnode::unique(0x30, 1);
-        let inverted = Varnode::unique(0x38, 1);
-        let adjusted = Varnode::unique(0x40, 8);
-        let selected = Varnode::unique(0x48, 8);
-        let mixed = Varnode::unique(0x50, 8);
-        let product = Varnode::unique(0x58, 8);
-        let mut block = R2ILBlock::new(0x1100, 4);
-        block.push(R2ILOp::IntLessEqual {
-            dst: reverse_le.clone(),
-            a: Varnode::constant(0x1a, 8),
-            b: input.clone(),
-        });
-        block.push(R2ILOp::BoolNot {
-            dst: inverted.clone(),
-            src: reverse_le,
-        });
-        block.push(R2ILOp::IntAdd {
-            dst: adjusted.clone(),
-            a: input.clone(),
-            b: Varnode::constant(0x20, 8),
-        });
-        block.push(R2ILOp::Select {
-            dst: selected.clone(),
-            cond: inverted,
-            if_true: adjusted,
-            if_false: input,
-        });
-        block.push(R2ILOp::IntXor {
-            dst: mixed.clone(),
-            a: selected,
-            b: Varnode::constant(FNV_OFFSET, 8),
-        });
-        block.push(R2ILOp::IntMult {
-            dst: product.clone(),
-            a: mixed,
-            b: Varnode::constant(FNV_PRIME, 8),
-        });
-        block.push(R2ILOp::Store {
-            space: SpaceId::Ram,
-            addr: Varnode::register(8, 8),
-            val: product,
-        });
-        SsaArtifact::raw(&[block], None).expect("reverse-LE FNV-shaped artifact")
-    }
 
     #[test]
-    fn input_substitution_preserves_a_distinct_prefix_name_binding() {
-        let mut arch = ArchSpec::new("semantic-input-identity-test");
-        let mut parameters = Vec::new();
-        for index in 0..=10_u32 {
-            let offset = u64::from(index) * 8;
-            arch.add_register(RegisterDef::new(format!("p{index}"), offset, 8));
-            parameters.push(SourceAbiParameterSpec::new(
-                index,
-                CanonicalStorageId {
-                    space: CanonicalStorageSpace::Register,
-                    offset,
-                    size: 8,
-                },
-            ));
-        }
-        let mut block = R2ILBlock::new(0x1080, 4);
-        for index in 0..=10_u64 {
-            block.push(R2ILOp::Copy {
-                dst: Varnode::unique(0x100 + index * 8, 8),
-                src: Varnode::register(index * 8, 8),
-            });
-        }
-        let sum = Varnode::unique(0x200, 8);
-        block.push(R2ILOp::IntAdd {
-            dst: sum.clone(),
-            // The decoy is deliberately rendered first. A textual replacement
-            // of the shorter target name would corrupt this distinct binding.
-            a: Varnode::register(10 * 8, 8),
-            b: Varnode::register(8, 8),
-        });
-        block.push(R2ILOp::Store {
-            space: SpaceId::Ram,
-            addr: Varnode::constant(0x9000, 8),
-            val: sum,
-        });
-        let interface = SourceFunctionInterface::new(
-            b"semantic-input-identity-v1".to_vec(),
-            "test-register-abi",
-            parameters,
-            SourceFunctionReturn::Void,
-            [],
-        )
-        .expect("identity test interface");
-        let artifact = SsaArtifact::raw_with_interface(&[block], Some(&arch), interface)
-            .expect("identity test artifact");
-        let certified =
-            CertifiedMachineFunction::from_artifact(&artifact).expect("certified identity test");
-        let semantic =
-            SemanticCExpressionLayer::from_certified(&certified).expect("semantic identity test");
-        let interface = semantic.function_interface().expect("function interface");
-        let target = interface.parameters()[1].value().expect("target input");
-        let decoy = interface.parameters()[10].value().expect("decoy input");
-        let target_name = value_name(target);
-        let decoy_name = value_name(decoy);
-        assert!(decoy_name.starts_with(&target_name));
-        let entity = semantic
-            .entities()
-            .iter()
-            .find(|entity| {
-                semantic
-                    .source_bindings(entity.root())
-                    .is_ok_and(|bindings| bindings == BTreeSet::from([target, decoy]))
-            })
-            .expect("two-input arithmetic expression");
-        let (rendered, substitutions) = semantic
-            .render_expr_substituting_input(entity.root(), target, "R2S_EXACT_TARGET")
-            .expect("identity substitution");
-        assert_eq!(substitutions, 1);
-        assert!(rendered.contains(&format!("(uint64_t)({decoy_name})")));
-        assert!(rendered.contains("(uint64_t)(R2S_EXACT_TARGET)"));
-    }
-
-    #[test]
-    fn fnv_lowering_keeps_unsigned_wrapping_multiply_and_bitvector_constant() {
-        let artifact = fnv_artifact();
-        let certified =
-            CertifiedMachineFunction::from_artifact(&artifact).expect("certified machine");
-        assert!(!certified.finish().authorizes_certified_c());
-        let semantic =
-            SemanticCExpressionLayer::from_certified(&certified).expect("semantic C expressions");
-        assert_eq!(semantic.scope(), SemanticCScope::LiveValueExpressionsOnly);
-        assert_eq!(
-            semantic.identity_scope(),
-            SemanticCIdentityScope::ArtifactLocalHandles
-        );
-        for id in certified
-            .source()
-            .obligations()
-            .keys()
-            .filter(|id| id.kind != SemanticObligationKind::LiveValueProducer)
-        {
-            assert!(semantic.open_obligations().contains(id));
-        }
-        let multiply = semantic.entities().last().expect("multiply entity");
-        let expression = semantic.expr(multiply.root()).expect("multiply root");
-        assert_eq!(
-            expression.ty(),
-            &MachineType::Integer {
-                width_bits: 64,
-                signedness: MachineSignedness::Unsigned,
-            }
-        );
-        assert!(matches!(
-            expression.kind(),
-            SemanticCExprKind::Arithmetic {
-                op: MachineArithmeticOp::Multiply,
-                mode: MachineArithmeticMode::Wrapping,
-                ..
-            }
-        ));
-        assert!(
-            multiply
-                .source_obligations()
-                .iter()
-                .all(|id| id.kind == SemanticObligationKind::LiveValueProducer)
-        );
-
-        let source = semantic
-            .render_test_entity_translation_unit(multiply.producer())
-            .expect("rendered semantic C");
-        assert!(source.contains("uint64_t semantic_c_test_kernel("));
-        assert!(source.contains("r2s_wrap_mul"));
-        assert!(source.contains("UINT64_C(0x100000001b3)"));
-        assert!(!source.contains(" int64_t "));
-
-        compile_semantic_c(&source);
-    }
-
-    #[test]
-    fn reverse_le_boolean_not_select_chain_is_typed_ordered_and_c11_safe() {
-        let artifact = reverse_le_bool_not_select_fnv_artifact();
-        let certified = CertifiedMachineProjection::from_artifact(&artifact)
-            .expect("certified reverse-LE projection");
-        let semantic = SemanticCExpressionLayer::from_projection(&certified)
-            .expect("semantic reverse-LE projection");
-        let boolean = semantic
-            .entities()
-            .iter()
-            .find(|entity| {
-                matches!(
-                    semantic.expr(entity.root()).map(SemanticCExpr::kind),
-                    Some(SemanticCExprKind::BooleanNot { .. })
-                )
-            })
-            .expect("boolean-not entity");
-        assert_eq!(
-            semantic.expr(boolean.root()).map(SemanticCExpr::ty),
-            Some(&MachineType::Bool { storage_bits: 8 })
-        );
-
-        let select = semantic
-            .entities()
-            .iter()
-            .find(|entity| {
-                matches!(
-                    semantic.expr(entity.root()).map(SemanticCExpr::kind),
-                    Some(SemanticCExprKind::Select { .. })
-                )
-            })
-            .expect("select entity");
-        let SemanticCExprKind::Select {
-            condition,
-            if_true,
-            if_false,
-        } = semantic.expr(select.root()).expect("select root").kind()
-        else {
-            unreachable!();
-        };
-        assert!(matches!(
-            semantic.expr(*condition).map(SemanticCExpr::kind),
-            Some(SemanticCExprKind::Input { .. })
-        ));
-        assert!(matches!(
-            semantic.expr(*if_true).map(SemanticCExpr::kind),
-            Some(SemanticCExprKind::Input { .. })
-        ));
-        assert!(matches!(
-            semantic.expr(*if_false).map(SemanticCExpr::kind),
-            Some(SemanticCExprKind::Input { .. })
-        ));
-        assert_eq!(
-            semantic
-                .source_bindings(select.root())
-                .expect("select sources"),
-            BTreeSet::from([
-                match semantic.expr(*condition).expect("condition").kind() {
-                    SemanticCExprKind::Input { binding } => *binding,
-                    _ => unreachable!(),
-                },
-                match semantic.expr(*if_true).expect("true arm").kind() {
-                    SemanticCExprKind::Input { binding } => *binding,
-                    _ => unreachable!(),
-                },
-                match semantic.expr(*if_false).expect("false arm").kind() {
-                    SemanticCExprKind::Input { binding } => *binding,
-                    _ => unreachable!(),
-                },
-            ])
-        );
-
-        let product = semantic.entities().last().expect("FNV product entity");
-        let source = semantic
-            .render_test_entity_translation_unit(product.producer())
-            .expect("rendered reverse-LE chain");
-        assert!(source.contains("== UINT64_C(0)) ? 1U : 0U"));
-        assert!(source.contains("!= UINT64_C(0)) ? ("));
-        assert!(source.contains("r2s_wrap_mul"));
-        let select_definition = source
-            .find(&format!(" {} = ", value_name(select.output())))
-            .expect("select definition");
-        for arm in [condition, if_true] {
-            let SemanticCExprKind::Input { binding } =
-                semantic.expr(*arm).expect("produced select input").kind()
-            else {
-                unreachable!();
-            };
-            assert!(
-                source
-                    .find(&format!(" {} = ", value_name(*binding)))
-                    .is_some_and(|definition| definition < select_definition),
-                "produced Select dependencies must be assigned before its ternary"
-            );
-        }
-        compile_semantic_c(&source);
-    }
-
-    #[test]
-    fn boolean_not_and_select_type_guards_reject_mismatches() {
-        let artifact = reverse_le_bool_not_select_fnv_artifact();
-        let certified = CertifiedMachineProjection::from_artifact(&artifact).expect("projection");
-        let machine = certified.projection();
-        let boolean = machine
-            .entities()
-            .iter()
-            .find(|entity| {
-                machine.expr(entity.root()).is_some_and(|expression| {
-                    matches!(expression.kind(), MachineExprKind::BooleanNot { .. })
-                })
-            })
-            .expect("boolean-not entity")
-            .root();
-        let select = machine
-            .entities()
-            .iter()
-            .find(|entity| {
-                machine.expr(entity.root()).is_some_and(|expression| {
-                    matches!(expression.kind(), MachineExprKind::Select { .. })
-                })
-            })
-            .expect("select entity")
-            .root();
-        let bool8 = MachineType::Bool { storage_bits: 8 };
-        let unsigned8 = MachineType::Integer {
-            width_bits: 8,
-            signedness: MachineSignedness::Unsigned,
-        };
-        let unsigned64 = MachineType::Integer {
-            width_bits: 64,
-            signedness: MachineSignedness::Unsigned,
-        };
-        assert_eq!(
-            validate_boolean_not_types(boolean, &bool8, &unsigned8),
-            Err(SemanticCError::InvalidBooleanNotType(boolean))
-        );
-        assert_eq!(
-            validate_select_types(select, &unsigned64, &unsigned8, &unsigned64, &unsigned64),
-            Err(SemanticCError::InvalidSelectType(select))
-        );
-        assert_eq!(
-            validate_select_types(select, &unsigned64, &bool8, &unsigned8, &unsigned64),
-            Err(SemanticCError::InvalidSelectType(select))
-        );
-    }
-
-    #[test]
-    fn select_value_arm_gate_rejects_a_corrupted_memory_read_arm() {
-        let artifact = reverse_le_bool_not_select_fnv_artifact();
-        let certified = CertifiedMachineProjection::from_artifact(&artifact).expect("projection");
-        let machine_select = certified
-            .projection()
-            .entities()
-            .iter()
-            .find(|entity| {
-                certified
-                    .projection()
-                    .expr(entity.root())
-                    .is_some_and(|expression| {
-                        matches!(expression.kind(), MachineExprKind::Select { .. })
-                    })
-            })
-            .expect("machine select entity")
-            .root();
-        let mut semantic =
-            SemanticCExpressionLayer::from_projection(&certified).expect("semantic projection");
-        let select = semantic
-            .entities()
-            .iter()
-            .find(|entity| {
-                matches!(
-                    semantic.expr(entity.root()).map(SemanticCExpr::kind),
-                    Some(SemanticCExprKind::Select { .. })
-                )
-            })
-            .expect("select entity")
-            .root();
-        let SemanticCExprKind::Select {
-            if_true, if_false, ..
-        } = semantic.expr(select).expect("select root").kind()
-        else {
-            unreachable!();
-        };
-        let (if_true, if_false) = (*if_true, *if_false);
-        semantic
-            .replace_expr_kind_for_test(
-                if_true,
-                SemanticCExprKind::MemoryRead {
-                    access: StructuredAccessId {
-                        inst: r2ssa::InstId(0),
-                        ordinal: 0,
-                    },
-                    object: ObjectId(0),
-                    space: r2ssa::MachineAddressSpace::Ram,
-                    endianness: MachineMemoryEndianness::Little,
-                    word_size_bytes: 1,
-                    address: if_false,
-                    width_bits: 64,
-                },
-            )
-            .expect("corrupt true arm");
-        assert_eq!(
-            require_select_value_arms(machine_select, &semantic.expressions, if_true, if_false),
-            Err(SemanticCError::SelectRequiresValueArms(machine_select))
-        );
-        assert!(matches!(
-            semantic.render_expr(select),
-            Err(SemanticCError::SelectRequiresValueArmExpression(id)) if id == select
-        ));
-    }
-
-    #[test]
-    fn partial_projection_keeps_supported_values_and_opens_unsupported_dependencies() {
-        let independent = Varnode::unique(0x10, 8);
-        let loaded = Varnode::unique(0x18, 8);
-        let dependent = Varnode::unique(0x20, 8);
-        let mut block = R2ILBlock::new(0x1800, 4);
-        block.push(R2ILOp::Copy {
-            dst: independent.clone(),
-            src: Varnode::constant(7, 8),
-        });
-        block.push(R2ILOp::Store {
-            space: SpaceId::Ram,
-            addr: Varnode::register(8, 8),
-            val: independent,
-        });
-        block.push(R2ILOp::Load {
-            dst: loaded.clone(),
-            space: SpaceId::Ram,
-            addr: Varnode::register(0, 8),
-        });
-        block.push(R2ILOp::IntAdd {
-            dst: dependent,
-            a: loaded,
-            b: Varnode::constant(1, 8),
-        });
-        let artifact = SsaArtifact::raw(&[block], None).expect("partial artifact");
-        let certified = CertifiedMachineProjection::from_artifact(&artifact)
-            .expect("certified partial projection");
-        let semantic = SemanticCExpressionLayer::from_projection(&certified)
-            .expect("partial semantic expressions");
-
-        assert_eq!(semantic.entities().len(), 1);
-        assert!(
-            !semantic.open_obligations().contains(
-                semantic.entities()[0]
-                    .source_obligations()
-                    .iter()
-                    .next()
-                    .unwrap()
-            )
-        );
-        for producer in certified.residual_producers() {
-            let instruction = certified
-                .source()
-                .instructions()
-                .get(producer)
-                .expect("residual source instruction");
-            assert!(
-                instruction
-                    .obligations
-                    .iter()
-                    .all(|obligation| semantic.open_obligations().contains(obligation))
-            );
-        }
-    }
-
-    #[test]
-    fn direct_void_call_preserves_constant_register_argument_value() {
-        let target = Varnode::ram(0x7200, 8);
-        let mut entry = R2ILBlock::new(0x7100, 4);
-        entry.push(R2ILOp::Copy {
-            dst: Varnode::register(8, 8),
-            src: Varnode::constant(0x2a, 8),
-        });
-        entry.push(R2ILOp::Call {
-            target: target.clone(),
-        });
-        let fallthrough = R2ILBlock::new(0x7104, 4);
-        let mut arch = ArchSpec::new("semantic-call-constant-test");
-        arch.add_register(RegisterDef::new("rdi", 8, 8));
-        let argument_storage = CanonicalStorageId {
-            space: CanonicalStorageSpace::Register,
-            offset: 8,
-            size: 8,
-        };
-        let identity =
-            SourceCallSiteIdentity::new(0x7100, 1, CanonicalStorageId::from_varnode(&target));
-        let interface = SourceCallSiteInterface::new(
-            b"semantic-call-constant-revision-1".to_vec(),
-            identity,
-            true,
-            "test-call-abi",
-            [SourceCallArgumentSpec::new(0, argument_storage)],
-            false,
-            false,
-            SourceCallResult::Void,
-        )
-        .expect("callsite interface");
-        let artifact = SsaArtifact::raw_with_interfaces(
-            &[entry, fallthrough],
-            Some(&arch),
-            None,
-            vec![interface],
-        )
-        .expect("constant call artifact");
-        let certified =
-            CertifiedMachineProjection::from_artifact(&artifact).expect("constant call projection");
-        let instruction = artifact
-            .graph()
-            .insts
-            .iter()
-            .find(|instruction| matches!(instruction.payload, InstPayload::Op(SSAOp::Call { .. })))
-            .expect("call instruction");
-        let producer = artifact
-            .obligations()
-            .instruction_for_inst(instruction.id)
-            .expect("call disposition")
-            .id;
-        let witness = certified
-            .direct_call_for_producer(producer)
-            .expect("certified direct call");
-        let semantic = SemanticCExpressionLayer::from_projection(&certified)
-            .expect("semantic expression layer");
-        let call = semantic_call_from_control(witness, &semantic).expect("semantic direct call");
-        let [argument] = call.arguments() else {
-            panic!("one exact call argument expected");
-        };
-
-        assert!(matches!(
-            argument.value(),
-            SemanticCCallArgumentValue::Constant(value)
-                if value.width_bits() == 64 && value.bits() == 0x2a
-        ));
-        assert_eq!(argument.binding(), witness.arguments()[0].value().binding());
-        assert_eq!(argument.slot(), witness.arguments()[0].slot());
-        assert_eq!(argument.ty(), witness.arguments()[0].value().ty());
-        assert_eq!(call.source_obligations(), &witness.source_obligations());
-        assert_eq!(call.producer(), producer);
-        assert_eq!(call.target(), 0x7200);
-        assert_eq!(call.fallthrough(), 0x7104);
-    }
-
-    #[test]
-    fn direct_void_call_preserves_exact_caller_abi_parameter_argument() {
+    fn hand_authored_direct_void_call_fixture_refuses_machine_authority() {
         let target = Varnode::ram(0x7220, 8);
         let parameter = Varnode::register(8, 8);
         let mut entry = R2ILBlock::new(0x7120, 4);
@@ -2775,229 +1908,9 @@ mod tests {
             vec![call_interface],
         )
         .expect("parameter call artifact");
-        let certified = CertifiedMachineProjection::from_artifact(&artifact)
-            .expect("parameter call projection");
-        let instruction = artifact
-            .graph()
-            .insts
-            .iter()
-            .find(|instruction| matches!(instruction.payload, InstPayload::Op(SSAOp::Call { .. })))
-            .expect("call instruction");
-        let producer = artifact
-            .obligations()
-            .instruction_for_inst(instruction.id)
-            .expect("call disposition")
-            .id;
-        let witness = certified
-            .direct_call_for_producer(producer)
-            .expect("certified direct call");
-        assert_eq!(
-            witness.arguments()[0].origin(),
-            &CertifiedCallArgumentOrigin::AbiParameter { index: 0 }
-        );
-        let semantic = SemanticCExpressionLayer::from_projection(&certified)
-            .expect("semantic expression layer");
-        let call = semantic_call_from_control(witness, &semantic).expect("semantic direct call");
-        let [argument] = call.arguments() else {
-            panic!("one exact call argument expected");
-        };
-
-        assert_eq!(
-            argument.value(),
-            &SemanticCCallArgumentValue::AbiParameter {
-                index: 0,
-                input: semantic
-                    .function_interface()
-                    .expect("function interface")
-                    .parameters()[0]
-                    .value()
-                    .expect("parameter input"),
-            }
-        );
-        assert_eq!(argument.binding(), witness.arguments()[0].value().binding());
-        assert_eq!(argument.slot(), witness.arguments()[0].slot());
-        assert_eq!(argument.ty(), witness.arguments()[0].value().ty());
-        assert_eq!(call.source_obligations(), &witness.source_obligations());
-        assert!(semantic.function_interface().is_some_and(|interface| {
-            interface.parameters().len() == 1
-                && interface.parameters()[0].index() == 0
-                && interface.parameters()[0].storage() == argument_storage
-        }));
-    }
-
-    #[test]
-    fn phi_refuses_before_c_rendering() {
-        let accumulator = Varnode::register(0, 8);
-        let mut entry = R2ILBlock::new(0x2000, 4);
-        entry.push(R2ILOp::Copy {
-            dst: accumulator.clone(),
-            src: Varnode::constant(0, 8),
-        });
-        entry.push(R2ILOp::Branch {
-            target: Varnode::ram(0x2010, 8),
-        });
-        let mut header = R2ILBlock::new(0x2010, 4);
-        header.push(R2ILOp::CBranch {
-            target: Varnode::ram(0x2020, 8),
-            cond: Varnode::constant(1, 1),
-        });
-        let mut exit = R2ILBlock::new(0x2014, 4);
-        exit.push(R2ILOp::Return {
-            target: Varnode::constant(0, 8),
-        });
-        let mut latch = R2ILBlock::new(0x2020, 4);
-        latch.push(R2ILOp::IntAdd {
-            dst: accumulator.clone(),
-            a: accumulator,
-            b: Varnode::constant(1, 8),
-        });
-        latch.push(R2ILOp::Branch {
-            target: Varnode::ram(0x2010, 8),
-        });
-        let artifact =
-            SsaArtifact::raw(&[entry, header, exit, latch], None).expect("loop artifact");
-        let certified =
-            CertifiedMachineFunction::from_artifact(&artifact).expect("certified machine");
         assert!(matches!(
-            SemanticCExpressionLayer::from_certified(&certified),
-            Err(SemanticCError::PhiRequiresCertifiedStructuring(_))
+            CertifiedMachineProjection::from_artifact(&artifact),
+            Err(MachineBuildError::MachineContextMismatch)
         ));
-    }
-
-    #[test]
-    fn signed_comparison_uses_operand_width_not_boolean_storage_width() {
-        let result = Varnode::unique(0x10, 1);
-        let mut block = R2ILBlock::new(0x3000, 4);
-        block.push(R2ILOp::IntSLess {
-            dst: result.clone(),
-            a: Varnode::register(0, 8),
-            b: Varnode::register(8, 8),
-        });
-        block.push(R2ILOp::Store {
-            space: SpaceId::Ram,
-            addr: Varnode::register(16, 8),
-            val: result,
-        });
-        let artifact = SsaArtifact::raw(&[block], None).expect("comparison artifact");
-        let certified =
-            CertifiedMachineFunction::from_artifact(&artifact).expect("certified machine");
-        let semantic =
-            SemanticCExpressionLayer::from_certified(&certified).expect("semantic C expressions");
-        let source = semantic
-            .render_test_entity_translation_unit(semantic.entities()[0].producer())
-            .expect("rendered semantic C");
-        assert!(source.contains("r2s_signed_key"));
-        assert!(source.contains("r2s_signed_key((uint64_t)(v_"));
-        assert!(source.contains(", 64U) < r2s_signed_key"));
-        assert!(source.contains("uint8_t semantic_c_test_kernel("));
-        compile_semantic_c(&source);
-    }
-
-    #[test]
-    fn arithmetic_shift_cast_and_extract_kernels_compile_strict_c11() {
-        let wide = Varnode::unique(0x10, 8);
-        let difference = Varnode::unique(0x18, 8);
-        let shifted_left = Varnode::unique(0x20, 8);
-        let shifted_right = Varnode::unique(0x28, 8);
-        let shifted_signed = Varnode::unique(0x30, 8);
-        let byte = Varnode::unique(0x38, 1);
-        let signed_wide = Varnode::unique(0x40, 8);
-        let narrow32 = Varnode::unique(0x48, 4);
-        let wide32 = Varnode::unique(0x50, 8);
-        let narrow16 = Varnode::unique(0x58, 2);
-        let wide16 = Varnode::unique(0x60, 8);
-        let narrow8 = Varnode::unique(0x68, 1);
-        let zero_wide = Varnode::unique(0x70, 8);
-        let address = Varnode::register(24, 8);
-        let mut block = R2ILBlock::new(0x4000, 4);
-        block.push(R2ILOp::IntAdd {
-            dst: wide.clone(),
-            a: Varnode::register(0, 8),
-            b: Varnode::constant(u64::MAX, 8),
-        });
-        block.push(R2ILOp::IntSub {
-            dst: difference.clone(),
-            a: wide,
-            b: Varnode::register(8, 8),
-        });
-        block.push(R2ILOp::IntLeft {
-            dst: shifted_left.clone(),
-            a: difference,
-            b: Varnode::register(16, 8),
-        });
-        block.push(R2ILOp::IntRight {
-            dst: shifted_right.clone(),
-            a: shifted_left,
-            b: Varnode::register(16, 8),
-        });
-        block.push(R2ILOp::IntSRight {
-            dst: shifted_signed.clone(),
-            a: shifted_right,
-            b: Varnode::register(16, 8),
-        });
-        block.push(R2ILOp::Subpiece {
-            dst: byte.clone(),
-            src: shifted_signed,
-            offset: 0,
-        });
-        block.push(R2ILOp::IntSExt {
-            dst: signed_wide.clone(),
-            src: byte,
-        });
-        block.push(R2ILOp::Trunc {
-            dst: narrow32.clone(),
-            src: signed_wide.clone(),
-        });
-        block.push(R2ILOp::IntZExt {
-            dst: wide32.clone(),
-            src: narrow32,
-        });
-        block.push(R2ILOp::Trunc {
-            dst: narrow16.clone(),
-            src: wide32,
-        });
-        block.push(R2ILOp::IntZExt {
-            dst: wide16.clone(),
-            src: narrow16,
-        });
-        block.push(R2ILOp::Trunc {
-            dst: narrow8.clone(),
-            src: wide16,
-        });
-        block.push(R2ILOp::IntZExt {
-            dst: zero_wide.clone(),
-            src: narrow8,
-        });
-        block.push(R2ILOp::Store {
-            space: SpaceId::Ram,
-            addr: address,
-            val: zero_wide,
-        });
-
-        let artifact = SsaArtifact::raw(&[block], None).expect("operation artifact");
-        let certified =
-            CertifiedMachineFunction::from_artifact(&artifact).expect("certified machine");
-        let semantic =
-            SemanticCExpressionLayer::from_certified(&certified).expect("semantic C expressions");
-        let target = semantic.entities().last().expect("last expression");
-        let source = semantic
-            .render_test_entity_translation_unit(target.producer())
-            .expect("rendered semantic C");
-
-        for expected in [
-            "r2s_wrap_add",
-            "r2s_wrap_sub",
-            "r2s_shl",
-            "r2s_lshr",
-            "r2s_ashr",
-            "r2s_sext",
-            "uint8_t",
-            "uint16_t",
-            "uint32_t",
-            "uint64_t",
-        ] {
-            assert!(source.contains(expected), "missing {expected} in {source}");
-        }
-        compile_semantic_c(&source);
     }
 }

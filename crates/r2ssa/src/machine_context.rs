@@ -14,8 +14,8 @@ use crate::op::SSAOp;
 use crate::semantic::CallSiteId;
 use crate::{CanonicalStorageId, CanonicalStorageSpace, StackAddressBase};
 
-pub const MACHINE_CONTEXT_SCHEMA_VERSION: u32 = 8;
-pub const SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION: u32 = 5;
+pub const MACHINE_CONTEXT_SCHEMA_VERSION: u32 = 9;
+pub const SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION: u32 = 6;
 pub const SOURCE_CALL_SITE_INTERFACE_SCHEMA_VERSION: u32 = 1;
 pub const SOURCE_TYPE_GRAPH_SCHEMA_VERSION: u32 = 1;
 
@@ -570,6 +570,7 @@ pub struct SourceFunctionInterface {
     parameters: Box<[SourceAbiParameterSpec]>,
     return_kind: SourceFunctionReturn,
     return_address_storage: Option<CanonicalStorageId>,
+    stack_pointer_storage: Option<CanonicalStorageId>,
     stack_slots: Box<[SourceStackSlotSpec]>,
     parameter_logical_values: Box<[SourceLogicalValue]>,
     return_logical_value: Option<SourceLogicalValue>,
@@ -584,6 +585,7 @@ pub enum SourceFunctionInterfaceError {
     InvalidParameterOrder,
     InvalidRegisterStorage,
     InvalidReturnAddressStorage,
+    InvalidStackPointerStorage,
     OverlappingRegisterStorages,
     InvalidStackSlot,
     InvalidStackSlotRole,
@@ -832,6 +834,7 @@ impl SourceFunctionInterface {
             parameters: parameters.into_boxed_slice(),
             return_kind,
             return_address_storage: None,
+            stack_pointer_storage: None,
             stack_slots: stack_slots.into_boxed_slice(),
             parameter_logical_values: parameter_logical_values.into_boxed_slice(),
             return_logical_value,
@@ -860,6 +863,58 @@ impl SourceFunctionInterface {
         self.return_kind
     }
 
+    fn return_address_storage_is_valid(&self, storage: CanonicalStorageId) -> bool {
+        valid_register_storage(storage)
+            && !self
+                .parameters
+                .iter()
+                .map(SourceAbiParameterSpec::storage)
+                .chain(match self.return_kind {
+                    SourceFunctionReturn::Void => None,
+                    SourceFunctionReturn::Register { storage } => Some(storage),
+                })
+                .chain(self.stack_pointer_storage)
+                .chain(
+                    self.stack_slots
+                        .iter()
+                        .map(SourceStackSlotSpec::base_storage),
+                )
+                .chain(self.stack_slots.iter().filter_map(|slot| match slot.role {
+                    SourceStackSlotRole::ParameterHome { home_storage, .. } => Some(home_storage),
+                    SourceStackSlotRole::UnclassifiedResource | SourceStackSlotRole::Local => None,
+                }))
+                .any(|other| register_storages_overlap(storage, other))
+    }
+
+    fn stack_pointer_storage_is_valid(&self, storage: CanonicalStorageId) -> bool {
+        let overlaps_non_stack_role = self
+            .parameters
+            .iter()
+            .map(SourceAbiParameterSpec::storage)
+            .chain(match self.return_kind {
+                SourceFunctionReturn::Void => None,
+                SourceFunctionReturn::Register { storage } => Some(storage),
+            })
+            .chain(self.return_address_storage)
+            .chain(self.stack_slots.iter().filter_map(|slot| match slot.role {
+                SourceStackSlotRole::ParameterHome { home_storage, .. } => Some(home_storage),
+                SourceStackSlotRole::UnclassifiedResource | SourceStackSlotRole::Local => None,
+            }))
+            .chain(
+                self.stack_slots
+                    .iter()
+                    .filter(|slot| slot.base == StackAddressBase::FramePointer)
+                    .map(SourceStackSlotSpec::base_storage),
+            )
+            .any(|other| register_storages_overlap(storage, other));
+        let mismatched_stack_base = self
+            .stack_slots
+            .iter()
+            .filter(|slot| slot.base == StackAddressBase::StackPointer)
+            .any(|slot| slot.base_storage != storage);
+        valid_register_storage(storage) && !overlaps_non_stack_role && !mismatched_stack_base
+    }
+
     /// Bind the machine return-address carrier supplied by the immutable
     /// source snapshot. Exact frame/return certificates require this role;
     /// they never infer it from a register name.
@@ -867,7 +922,7 @@ impl SourceFunctionInterface {
         mut self,
         storage: CanonicalStorageId,
     ) -> Result<Self, SourceFunctionInterfaceError> {
-        if !valid_register_storage(storage) {
+        if !self.return_address_storage_is_valid(storage) {
             return Err(SourceFunctionInterfaceError::InvalidReturnAddressStorage);
         }
         self.return_address_storage = Some(storage);
@@ -876,6 +931,23 @@ impl SourceFunctionInterface {
 
     pub const fn return_address_storage(&self) -> Option<CanonicalStorageId> {
         self.return_address_storage
+    }
+
+    /// Bind the source-owned full-width stack-pointer carrier. This identity
+    /// is never inferred from stack resources or register names.
+    pub fn with_stack_pointer_storage(
+        mut self,
+        storage: CanonicalStorageId,
+    ) -> Result<Self, SourceFunctionInterfaceError> {
+        if !self.stack_pointer_storage_is_valid(storage) {
+            return Err(SourceFunctionInterfaceError::InvalidStackPointerStorage);
+        }
+        self.stack_pointer_storage = Some(storage);
+        Ok(self)
+    }
+
+    pub const fn stack_pointer_storage(&self) -> Option<CanonicalStorageId> {
+        self.stack_pointer_storage
     }
 
     pub const fn stack_slots(&self) -> &[SourceStackSlotSpec] {
@@ -1411,6 +1483,15 @@ impl SourceMachineContext {
             .collect();
         let mut abi_model = MachineAbiModel::from_interface(function_interface.as_ref());
         if let Some(interface) = function_interface.as_ref() {
+            let exact_interface_roles_exist = interface.stack_slot_roles_complete()
+                && interface.return_address_storage().is_some()
+                && interface.stack_pointer_storage().is_some();
+            let carrier_storages_are_disjoint = interface
+                .return_address_storage()
+                .is_none_or(|storage| interface.return_address_storage_is_valid(storage))
+                && interface
+                    .stack_pointer_storage()
+                    .is_none_or(|storage| interface.stack_pointer_storage_is_valid(storage));
             let declared_storages_exist = interface
                 .parameters()
                 .iter()
@@ -1425,12 +1506,43 @@ impl SourceMachineContext {
                         .iter()
                         .map(SourceStackSlotSpec::base_storage),
                 )
+                .chain(interface.return_address_storage())
+                .chain(interface.stack_pointer_storage())
                 .all(|storage| {
                     register_storages_by_name
                         .values()
                         .any(|actual| *actual == storage)
                 });
-            abi_model.coherent &= declared_storages_exist;
+            let is_exact_address_register = |storage: CanonicalStorageId| {
+                arch.is_some_and(|arch| {
+                    storage.size == effective_arch_address_size(arch)
+                        && arch.registers.iter().any(|register| {
+                            register.parent.is_none()
+                                && register.offset == storage.offset
+                                && register.size == storage.size
+                        })
+                        && !arch.registers.iter().any(|register| {
+                            register.offset <= storage.offset
+                                && register
+                                    .offset
+                                    .checked_add(u64::from(register.size))
+                                    .is_some_and(|end| {
+                                        end >= storage.offset + u64::from(storage.size)
+                                    })
+                                && register.size > storage.size
+                        })
+                })
+            };
+            let machine_carriers_are_exact_address_registers = interface
+                .return_address_storage()
+                .is_none_or(is_exact_address_register)
+                && interface
+                    .stack_pointer_storage()
+                    .is_none_or(is_exact_address_register);
+            abi_model.coherent &= exact_interface_roles_exist
+                && carrier_storages_are_disjoint
+                && declared_storages_exist
+                && machine_carriers_are_exact_address_registers;
         }
         let raw_call_sites_by_id = collect_raw_call_site_identities(blocks);
         let raw_call_sites = raw_call_sites_by_id
@@ -1786,6 +1898,232 @@ mod tests {
             compatibility.stack_slots()[0].role(),
             SourceStackSlotRole::UnclassifiedResource
         );
+    }
+
+    #[test]
+    fn stack_pointer_binding_is_explicit_disjoint_and_matches_stack_resources() {
+        let parameter = register_storage(0, 8);
+        let result = register_storage(8, 8);
+        let stack_pointer = register_storage(64, 8);
+        let frame_pointer = register_storage(72, 8);
+        let return_address = register_storage(80, 8);
+        let unbound = |slots| {
+            SourceFunctionInterface::new_exact(
+                b"typed-stack-pointer".to_vec(),
+                "test-abi",
+                [SourceAbiParameterSpec::new(0, parameter)],
+                SourceFunctionReturn::Register { storage: result },
+                slots,
+            )
+        };
+        let build = |slots| {
+            unbound(slots)
+                .and_then(|interface| interface.with_return_address_storage(return_address))
+        };
+
+        assert_eq!(
+            unbound(Vec::new())
+                .and_then(|interface| interface.with_return_address_storage(parameter)),
+            Err(SourceFunctionInterfaceError::InvalidReturnAddressStorage)
+        );
+        assert_eq!(
+            unbound(Vec::new()).and_then(|interface| interface.with_return_address_storage(result)),
+            Err(SourceFunctionInterfaceError::InvalidReturnAddressStorage)
+        );
+        assert_eq!(
+            unbound(vec![SourceStackSlotSpec::new_local(
+                StackAddressBase::FramePointer,
+                frame_pointer,
+                -8,
+                8,
+            )])
+            .and_then(|interface| interface.with_return_address_storage(frame_pointer)),
+            Err(SourceFunctionInterfaceError::InvalidReturnAddressStorage)
+        );
+        assert_eq!(
+            unbound(vec![SourceStackSlotSpec::new_local(
+                StackAddressBase::StackPointer,
+                stack_pointer,
+                0,
+                8,
+            )])
+            .and_then(|interface| interface.with_return_address_storage(stack_pointer)),
+            Err(SourceFunctionInterfaceError::InvalidReturnAddressStorage)
+        );
+
+        let slotless = build(Vec::new())
+            .and_then(|interface| interface.with_stack_pointer_storage(stack_pointer))
+            .expect("slotless interfaces still carry exit machine state");
+        assert_eq!(slotless.stack_pointer_storage(), Some(stack_pointer));
+
+        let frame_only = build(vec![SourceStackSlotSpec::new_local(
+            StackAddressBase::FramePointer,
+            frame_pointer,
+            -8,
+            8,
+        )])
+        .and_then(|interface| interface.with_stack_pointer_storage(stack_pointer))
+        .expect("frame-pointer resources are disjoint from the stack pointer");
+        assert_eq!(frame_only.stack_pointer_storage(), Some(stack_pointer));
+
+        let mixed = build(vec![
+            SourceStackSlotSpec::new_local(StackAddressBase::FramePointer, frame_pointer, -8, 8),
+            SourceStackSlotSpec::new_local(StackAddressBase::StackPointer, stack_pointer, 0, 8),
+        ])
+        .and_then(|interface| interface.with_stack_pointer_storage(stack_pointer))
+        .expect("mixed bases retain the exact stack-pointer carrier");
+        assert_eq!(mixed.stack_pointer_storage(), Some(stack_pointer));
+
+        assert_eq!(
+            build(vec![SourceStackSlotSpec::new_local(
+                StackAddressBase::StackPointer,
+                stack_pointer,
+                0,
+                8,
+            )])
+            .and_then(|interface| {
+                interface.with_stack_pointer_storage(register_storage(88, 8))
+            }),
+            Err(SourceFunctionInterfaceError::InvalidStackPointerStorage)
+        );
+        assert_eq!(
+            build(Vec::new()).and_then(|interface| interface.with_stack_pointer_storage(parameter)),
+            Err(SourceFunctionInterfaceError::InvalidStackPointerStorage)
+        );
+        assert_eq!(
+            build(vec![SourceStackSlotSpec::new_local(
+                StackAddressBase::FramePointer,
+                frame_pointer,
+                -8,
+                8,
+            )])
+            .and_then(|interface| interface.with_stack_pointer_storage(frame_pointer)),
+            Err(SourceFunctionInterfaceError::InvalidStackPointerStorage)
+        );
+    }
+
+    #[test]
+    fn exact_machine_interface_requires_declared_full_width_ra_and_sp() {
+        let stack_pointer = register_storage(64, 8);
+        let return_address = register_storage(80, 8);
+        let make = || {
+            SourceFunctionInterface::new_exact(
+                b"exact-machine-roles".to_vec(),
+                "test-abi",
+                [],
+                SourceFunctionReturn::Void,
+                [],
+            )
+            .expect("exact interface")
+        };
+        let mut arch = ArchSpec::new("exact-machine-roles");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("sp", stack_pointer.offset, 8));
+        arch.add_register(RegisterDef::new("lr", return_address.offset, 8));
+
+        let without_roles = SourceMachineContext::from_blocks_with_interfaces(
+            &[],
+            Some(&arch),
+            Some(make()),
+            Vec::new(),
+        );
+        assert!(!without_roles.abi_model().is_coherent());
+
+        let return_only = SourceMachineContext::from_blocks_with_interfaces(
+            &[],
+            Some(&arch),
+            Some(
+                make()
+                    .with_return_address_storage(return_address)
+                    .expect("return-address role"),
+            ),
+            Vec::new(),
+        );
+        assert!(!return_only.abi_model().is_coherent());
+
+        let complete = SourceMachineContext::from_blocks_with_interfaces(
+            &[],
+            Some(&arch),
+            Some(
+                make()
+                    .with_return_address_storage(return_address)
+                    .and_then(|interface| interface.with_stack_pointer_storage(stack_pointer))
+                    .expect("exact machine roles"),
+            ),
+            Vec::new(),
+        );
+        assert!(complete.abi_model().is_coherent());
+
+        let compatibility = SourceMachineContext::from_blocks_with_interfaces(
+            &[],
+            Some(&arch),
+            Some(
+                SourceFunctionInterface::new(
+                    b"compatibility-machine-roles".to_vec(),
+                    "test-abi",
+                    [],
+                    SourceFunctionReturn::Void,
+                    [],
+                )
+                .and_then(|interface| interface.with_return_address_storage(return_address))
+                .and_then(|interface| interface.with_stack_pointer_storage(stack_pointer))
+                .expect("compatibility interface remains representable for refusal diagnostics"),
+            ),
+            Vec::new(),
+        );
+        assert!(
+            !compatibility.abi_model().is_coherent(),
+            "legacy incomplete-role interfaces must never supply usable ABI authority"
+        );
+
+        let narrow_stack_pointer = register_storage(96, 4);
+        arch.add_register(RegisterDef::new("narrow_sp", 96, 4));
+        let narrow = SourceMachineContext::from_blocks_with_interfaces(
+            &[],
+            Some(&arch),
+            Some(
+                make()
+                    .with_return_address_storage(return_address)
+                    .and_then(|interface| {
+                        interface.with_stack_pointer_storage(narrow_stack_pointer)
+                    })
+                    .expect("standalone binding is architecture-independent"),
+            ),
+            Vec::new(),
+        );
+        assert!(!narrow.abi_model().is_coherent());
+
+        let subregister_stack_pointer = register_storage(104, 8);
+        arch.add_register(RegisterDef::sub("sp_alias", 104, 8, "missing_sp_parent"));
+        let subregister_sp = SourceMachineContext::from_blocks_with_interfaces(
+            &[],
+            Some(&arch),
+            Some(
+                make()
+                    .with_return_address_storage(return_address)
+                    .and_then(|interface| {
+                        interface.with_stack_pointer_storage(subregister_stack_pointer)
+                    })
+                    .expect("standalone binding cannot inspect ArchSpec parentage"),
+            ),
+            Vec::new(),
+        );
+        assert!(!subregister_sp.abi_model().is_coherent());
+
+        let subregister_return_address = register_storage(112, 8);
+        arch.add_register(RegisterDef::sub("lr_alias", 112, 8, "missing_lr_parent"));
+        let subregister_ra = SourceMachineContext::from_blocks_with_interfaces(
+            &[],
+            Some(&arch),
+            Some(
+                make()
+                    .with_return_address_storage(subregister_return_address)
+                    .and_then(|interface| interface.with_stack_pointer_storage(stack_pointer))
+                    .expect("standalone binding cannot inspect ArchSpec parentage"),
+            ),
+            Vec::new(),
+        );
+        assert!(!subregister_ra.abi_model().is_coherent());
     }
 
     #[test]

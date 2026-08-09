@@ -149,7 +149,7 @@ R2IL Format / Endianness / Memory Semantics
 - Saving emits v4 (`postcard` encoding).
 - Optional legacy loader support for v1/v2/v3 (`bincode` encoding) is available via the `r2il/legacy-bincode` feature.
 - Legacy v1/v2 files are auto-upgraded in memory on load when legacy support is enabled.
-- Legacy bool endianness remains as compatibility shim (`big_endian` / `r2il_is_big_endian`), while canonical fields are:
+- Legacy serialized bool endianness remains an internal compatibility shim (`big_endian`), while canonical fields are:
   - `instruction_endianness`
   - `memory_endianness`
 - Memory semantics baseline includes explicit ops and ordering:

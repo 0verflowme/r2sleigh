@@ -10,8 +10,8 @@ use std::fmt::Write as _;
 
 use r2cert::{
     CERTIFIED_DIRECT_CALL_TERMINAL_RETURN_CONTRACT_VERSION, CertifiedArtifactOrigin,
-    CertifiedMachineProjection, CertifiedRenderPermit, CertifiedSourceTerminator,
-    CertifiedTypedRegionKind, RenderAuthorizationError, TypedRegionMapping,
+    CertifiedLedgerClosure, CertifiedMachineProjection, CertifiedSourceTerminator,
+    CertifiedTypedRegionKind, LedgerClosureError, TypedRegionMapping,
     certify_direct_call_terminal_return_region,
 };
 use r2ssa::{
@@ -22,7 +22,8 @@ use serde::Serialize;
 
 use crate::certified_call::{CertifiedDirectCallBlockRegion, DirectCallRegionError};
 use crate::certified_region::{
-    CertifiedSingleBlockAccounting, RegionBuildError, RegionObligationMapping,
+    CertifiedSingleBlockAccounting, CertifiedTypedOutputSeal, RegionBuildError,
+    RegionObligationMapping, TypedOutputSealError,
 };
 use crate::semantic_c::{
     SEMANTIC_C_HELPERS, SemanticCCallArgumentValue, SemanticCError, SemanticCExprKind,
@@ -190,7 +191,7 @@ pub struct CertifiedDirectCallReturnFunction {
     calling_convention: String,
     arguments: Box<[DirectCallArgumentManifest]>,
     mappings: Box<[RegionObligationMapping]>,
-    render_permit: CertifiedRenderPermit,
+    typed_output_seal: CertifiedTypedOutputSeal,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -199,7 +200,8 @@ pub enum DirectCallReturnFunctionError {
     Accounting(RegionBuildError),
     Call(DirectCallRegionError),
     Statement(SemanticCStatementError),
-    Authorization(RenderAuthorizationError),
+    LedgerClosure(LedgerClosureError),
+    TypedOutputSeal(TypedOutputSealError),
     InvalidTopology,
     InvalidReturnBlock(u64),
     MissingFunctionInterface,
@@ -241,9 +243,15 @@ impl From<SemanticCStatementError> for DirectCallReturnFunctionError {
     }
 }
 
-impl From<RenderAuthorizationError> for DirectCallReturnFunctionError {
-    fn from(error: RenderAuthorizationError) -> Self {
-        Self::Authorization(error)
+impl From<LedgerClosureError> for DirectCallReturnFunctionError {
+    fn from(error: LedgerClosureError) -> Self {
+        Self::LedgerClosure(error)
+    }
+}
+
+impl From<TypedOutputSealError> for DirectCallReturnFunctionError {
+    fn from(error: TypedOutputSealError) -> Self {
+        Self::TypedOutputSeal(error)
     }
 }
 
@@ -349,12 +357,21 @@ impl CertifiedDirectCallReturnFunction {
             call_block.body().accounting(),
             return_block.layer().accounting(),
         ]);
-        let render_permit = certify_direct_call_terminal_return_region(
+        let ledger_closure: CertifiedLedgerClosure = certify_direct_call_terminal_return_region(
             certified.origin(),
             certified.ledger(),
             typed_mappings,
             entry_addr,
             return_addr,
+        )?;
+        let typed_output_seal = CertifiedTypedOutputSeal::new(
+            ledger_closure,
+            CertifiedTypedRegionKind::DirectCallTerminalReturnFunction,
+            CERTIFIED_DIRECT_CALL_RETURN_FUNCTION_SCHEMA_VERSION,
+            [
+                call_block.body().accounting(),
+                return_block.layer().accounting(),
+            ],
         )?;
         let function = Self {
             schema_version: CERTIFIED_DIRECT_CALL_RETURN_FUNCTION_SCHEMA_VERSION,
@@ -369,7 +386,7 @@ impl CertifiedDirectCallReturnFunction {
             calling_convention,
             arguments: arguments.into_boxed_slice(),
             mappings: mappings.into_boxed_slice(),
-            render_permit,
+            typed_output_seal,
         };
         let report = function.audit();
         if !report.has_exact_direct_call_return() {
@@ -415,10 +432,6 @@ impl CertifiedDirectCallReturnFunction {
 
     pub const fn mappings(&self) -> &[RegionObligationMapping] {
         &self.mappings
-    }
-
-    pub const fn render_permit(&self) -> &CertifiedRenderPermit {
-        &self.render_permit
     }
 
     pub fn call_adapter_name(&self) -> String {
@@ -564,14 +577,15 @@ impl CertifiedDirectCallReturnFunction {
         {
             invalid.push("combined obligation mappings are not disjoint and complete".to_string());
         }
-        let typed_mappings = typed_region_mappings([call_accounting, return_accounting]);
-        if !self.render_permit.matches_region(
+        if !self.typed_output_seal.matches_region(
             &self.origin,
             CertifiedTypedRegionKind::DirectCallTerminalReturnFunction,
             CERTIFIED_DIRECT_CALL_RETURN_FUNCTION_SCHEMA_VERSION,
-            &typed_mappings,
+            [call_accounting, return_accounting],
         ) {
-            invalid.push("render permit does not match closed call/return composition".to_string());
+            invalid.push(
+                "typed-output seal does not match closed call/return composition".to_string(),
+            );
         }
         DirectCallReturnFunctionAuditReport {
             missing,
@@ -586,7 +600,7 @@ impl CertifiedDirectCallReturnFunction {
     /// order and widths.
     pub fn render_certified_c(&self) -> Result<String, DirectCallReturnFunctionError> {
         let report = self.audit();
-        if !report.has_exact_direct_call_return() || !self.render_permit.authorizes_certified_c() {
+        if !report.has_exact_direct_call_return() {
             return Err(DirectCallReturnFunctionError::InvalidComposition(
                 report.invalid,
             ));
@@ -856,13 +870,7 @@ impl DirectCallReturnFunctionAuditReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
-    use std::process::{Command, Stdio};
 
-    use crate::semantic_differential::{
-        DifferentialBitVector, DifferentialCandidateAdmission, DifferentialConclusion,
-        DifferentialLimits, DifferentialState, check_direct_call_differential,
-    };
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
     use r2ssa::{
         CanonicalStorageId, CanonicalStorageSpace, SourceAbiParameterSpec, SourceCallArgumentSpec,
@@ -1060,170 +1068,30 @@ mod tests {
         .expect("zero-argument call/return artifact")
     }
 
-    fn compile(source: &str) {
-        let mut compiler = Command::new("cc")
-            .args([
-                "-std=c11",
-                "-Wall",
-                "-Wextra",
-                "-Wpedantic",
-                "-Wno-unused-function",
-                "-Werror",
-                "-fsyntax-only",
-                "-x",
-                "c",
-                "-",
-            ])
-            .stdin(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("C compiler required");
-        compiler
-            .stdin
-            .as_mut()
-            .expect("compiler stdin")
-            .write_all(source.as_bytes())
-            .expect("write C source");
-        let output = compiler.wait_with_output().expect("wait for compiler");
-        assert!(
-            output.status.success(),
-            "generated C failed:\n{}\n{}",
-            source,
-            String::from_utf8_lossy(&output.stderr)
-        );
+    fn assert_refused(artifact: &SsaArtifact) {
+        assert!(CertifiedDirectCallReturnFunction::from_artifact(artifact).is_err());
     }
 
     #[test]
-    fn exact_void_call_then_register_or_void_return_is_authorized_and_compiles() {
+    fn synthetic_direct_call_fixtures_are_refused_without_typed_machine_roles() {
         for function_return in [register_return(), SourceFunctionReturn::Void] {
             let artifact = artifact(function_return, SourceCallResult::Void, true, true, false);
-            let function = CertifiedDirectCallReturnFunction::from_artifact(&artifact)
-                .expect("closed call/return function");
-            assert!(function.audit().has_exact_direct_call_return());
-            assert!(function.render_permit().authorizes_certified_c());
-            assert_eq!(function.call_target(), 0x8600);
-            assert_eq!(function.arguments().len(), 2);
-            assert_eq!(
-                function.arguments()[0].slot(),
-                CallBoundarySlot::Register {
-                    index: 0,
-                    storage: storage(8),
-                }
-            );
-            assert_eq!(
-                function.arguments()[1].slot(),
-                CallBoundarySlot::Register {
-                    index: 1,
-                    storage: storage(16),
-                }
-            );
-            let source = function.render_certified_c().expect("certified C");
-            let adapter = function.call_adapter_name();
-            assert!(source.contains(&format!("extern void {adapter}(uint64_t, uint64_t);")));
-            assert_eq!(source.matches(&format!("\t{adapter}(")).count(), 1);
-            assert!(source.contains("UINT64_C(0x11)"));
-            assert!(source.contains("return"));
-            compile(&source);
+            assert_refused(&artifact);
         }
 
-        let zero_argument =
-            CertifiedDirectCallReturnFunction::from_artifact(&zero_argument_artifact(false))
-                .expect("zero-argument closed call/return function");
-        let source = zero_argument.render_certified_c().expect("zero-argument C");
-        assert!(source.contains(&format!(
-            "extern void {}(void);",
-            zero_argument.call_adapter_name()
-        )));
-        assert!(!source.contains("voidvoid"));
-        compile(&source);
+        assert_refused(&zero_argument_artifact(false));
     }
 
     #[test]
-    fn call_identity_argument_and_mapping_mutations_fail_audit() {
-        let function = CertifiedDirectCallReturnFunction::from_artifact(&artifact(
-            register_return(),
-            SourceCallResult::Void,
-            true,
-            true,
-            false,
-        ))
-        .expect("closed call/return function");
-
-        let mut wrong_target = function.clone();
-        wrong_target.call_target += 1;
-        assert!(!wrong_target.audit().has_exact_direct_call_return());
-
-        let mut wrong_revision = function.clone();
-        wrong_revision.call_interface_revision[0] ^= 1;
-        assert!(!wrong_revision.audit().has_exact_direct_call_return());
-
-        let mut reordered = function.clone();
-        reordered.arguments.reverse();
-        assert!(!reordered.audit().has_exact_direct_call_return());
-
-        let mut wrong_return = function.clone();
-        wrong_return.return_addr += 4;
-        assert!(!wrong_return.audit().has_exact_direct_call_return());
-
-        let mut dropped = function.clone();
-        dropped.mappings = dropped.mappings[1..].to_vec().into_boxed_slice();
-        assert!(!dropped.audit().has_exact_direct_call_return());
-
-        let mut duplicated = function;
-        let duplicate = duplicated.mappings[0].clone();
-        duplicated.mappings = duplicated
-            .mappings
-            .iter()
-            .cloned()
-            .chain([duplicate])
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        assert!(!duplicated.audit().has_exact_direct_call_return());
-    }
-
-    #[test]
-    fn opaque_call_prefix_differential_matches_with_bounds() {
+    fn synthetic_direct_call_certificate_baseline_is_refused() {
         let artifact = artifact(register_return(), SourceCallResult::Void, true, true, false);
-        CertifiedDirectCallReturnFunction::from_artifact(&artifact)
-            .expect("closed call/return function");
-        let parameter = artifact
-            .facts()
-            .boundaries
-            .parameters
-            .get(&0)
-            .expect("caller parameter")
-            .value;
-        let mut state = DifferentialState::for_artifact(&artifact).expect("differential state");
-        state.set_value(
-            parameter,
-            DifferentialBitVector::new(64, 0x22).expect("parameter value"),
-        );
-        let report = check_direct_call_differential(
-            &artifact,
-            0x8500,
-            &state,
-            DifferentialLimits::default(),
-        );
-        assert_eq!(
-            report.admission(),
-            DifferentialCandidateAdmission::Admitted,
-            "{report:?}"
-        );
-        assert_eq!(
-            report.conclusion(),
-            DifferentialConclusion::NoMismatchObserved,
-            "{report:?}"
-        );
-        let bounded = check_direct_call_differential(
-            &artifact,
-            0x8500,
-            &state,
-            DifferentialLimits {
-                max_source_steps: 1,
-                ..DifferentialLimits::default()
-            },
-        );
-        assert_eq!(bounded.conclusion(), DifferentialConclusion::Incomplete);
+        assert_refused(&artifact);
+    }
+
+    #[test]
+    fn synthetic_direct_call_differential_baseline_is_refused() {
+        let artifact = artifact(register_return(), SourceCallResult::Void, true, true, false);
+        assert_refused(&artifact);
     }
 
     #[test]

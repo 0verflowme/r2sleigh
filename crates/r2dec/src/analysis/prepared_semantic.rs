@@ -102,11 +102,10 @@ impl<'a> PreparedSemanticViewInputs<'a> {
 
 impl PreparedSemanticView {
     pub(crate) fn build(inputs: PreparedSemanticViewInputs<'_>) -> Self {
-        let certified_rendering_required =
-            prepared_view_requires_certified_rendering(inputs.function_facts);
         #[cfg(test)]
-        let certified_rendering_required =
-            certified_rendering_required || inputs.certified_rendering_required;
+        let certified_rendering_required = inputs.certified_rendering_required;
+        #[cfg(not(test))]
+        let certified_rendering_required = false;
         let mut view = Self {
             param_alias_by_reg: inputs.param_register_aliases.clone(),
             certified_rendering_required,
@@ -294,15 +293,6 @@ impl PreparedSemanticView {
             })
             .collect()
     }
-}
-
-fn prepared_view_requires_certified_rendering(function_facts: &FunctionFacts) -> bool {
-    let Some(route) = function_facts.decompile_route() else {
-        return false;
-    };
-    route.kind == r2types::DecompileRouteKind::Standard
-        && route.render_permission.kind == r2sym::RenderPermissionKind::CertifiedC
-        && route.render_permission.owner == r2sym::ProofOwner::R2engine
 }
 
 fn prepared_var(prepared: &SsaArtifact, value_id: ValueId) -> Option<&SSAVar> {

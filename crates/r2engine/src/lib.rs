@@ -54,8 +54,8 @@ pub use stable_hash::{
     stable_fnv1a_hash,
 };
 
-pub const ENGINE_SCHEMA_VERSION: u32 = 7;
-pub const ENGINE_SOURCE_SNAPSHOT_SCHEMA_VERSION: u32 = 3;
+pub const ENGINE_SCHEMA_VERSION: u32 = 10;
+pub const ENGINE_SOURCE_SNAPSHOT_SCHEMA_VERSION: u32 = 4;
 pub const DEFAULT_ENGINE_CACHE_LIMIT: usize = 256;
 pub const SYMBOLIC_PATHS_LIMIT: usize = 32;
 pub const SYMBOLIC_PATHS_CALL_FREE_MAX_STATES: usize = 16;
@@ -5483,67 +5483,31 @@ impl EngineSession {
             let (plan, reason) = match status.region {
                 EngineSemanticKernelRegion::TerminalReturnBlock => (
                     EnginePlan::FastLocal,
-                    "r2cert authorized exact terminal-return obligation closure",
+                    "r2dec sealed exact terminal-return typed-output ownership",
                 ),
                 EngineSemanticKernelRegion::AggregateMemberTerminalReturnFunction => (
                     EnginePlan::FastLocal,
-                    "r2cert authorized exact aggregate-member terminal-return obligation closure",
+                    "r2dec sealed exact aggregate-member terminal-return typed-output ownership",
                 ),
                 EngineSemanticKernelRegion::PlainRamMemoryTerminalReturnFunction => (
                     EnginePlan::FastLocal,
-                    "r2cert authorized exact plain-RAM-memory terminal-return obligation closure",
+                    "r2dec sealed exact plain-RAM-memory terminal-return typed-output ownership",
                 ),
                 EngineSemanticKernelRegion::DirectCallTerminalReturnFunction => (
                     EnginePlan::SemanticStructured,
-                    "r2cert authorized exact direct-call terminal-return obligation closure",
+                    "r2dec sealed exact direct-call terminal-return typed-output ownership",
                 ),
                 EngineSemanticKernelRegion::ConditionalTerminalReturnFunction => (
                     EnginePlan::SemanticStructured,
-                    "r2cert authorized exact conditional-return obligation closure",
-                ),
-                EngineSemanticKernelRegion::PrivateFrameConditionalReturnFunction => (
-                    EnginePlan::SemanticStructured,
-                    "r2cert authorized exact private-frame conditional-return obligation closure",
-                ),
-                EngineSemanticKernelRegion::CanonicalFnvFoldLoopFunction => (
-                    EnginePlan::SemanticStructured,
-                    "r2cert authorized exact canonical FNV-fold loop obligation closure",
-                ),
-                EngineSemanticKernelRegion::CanonicalFnvFoldO0Function => (
-                    EnginePlan::SemanticStructured,
-                    "r2cert authorized exact stack-backed O0 FNV-fold obligation closure",
-                ),
-                EngineSemanticKernelRegion::BranchlessGuardFunction => (
-                    EnginePlan::FastLocal,
-                    "r2cert authorized exact branchless-guard obligation closure",
-                ),
-                EngineSemanticKernelRegion::StructArrayIndexFunction => (
-                    EnginePlan::SemanticStructured,
-                    "r2cert authorized exact struct-array-index obligation closure",
-                ),
-                EngineSemanticKernelRegion::NestedWrap32GuardO0Function => (
-                    EnginePlan::SemanticStructured,
-                    "r2cert authorized exact nested wrap32 O0 obligation closure",
-                ),
-                EngineSemanticKernelRegion::SumArrayFunction => (
-                    EnginePlan::SemanticStructured,
-                    "r2cert authorized exact sum-array obligation closure",
-                ),
-                EngineSemanticKernelRegion::ConditionalFunnelSharedReturnFunction => (
-                    EnginePlan::SemanticStructured,
-                    "r2cert authorized exact conditional-funnel shared-return obligation closure",
+                    "r2dec sealed exact conditional-return typed-output ownership",
                 ),
                 EngineSemanticKernelRegion::SwitchTerminalReturnFunction => (
                     EnginePlan::SemanticStructured,
-                    "r2cert authorized exact switch terminal-return obligation closure",
+                    "r2dec sealed exact switch terminal-return typed-output ownership",
                 ),
                 EngineSemanticKernelRegion::CarrierFreeLoopTerminalReturnFunction => (
                     EnginePlan::SemanticStructured,
-                    "r2cert authorized exact carrier-free loop terminal-return obligation closure",
-                ),
-                EngineSemanticKernelRegion::CountedLoopTerminalReturnFunction => (
-                    EnginePlan::SemanticStructured,
-                    "r2cert authorized exact counted-loop carrier terminal-return obligation closure",
+                    "r2dec sealed exact carrier-free loop terminal-return typed-output ownership",
                 ),
             };
             diagnostics.plan = Some(plan);
@@ -6247,226 +6211,10 @@ fn prepared_artifact_has_source_aggregate_pointer(artifact: &SsaArtifact) -> boo
     })
 }
 
-fn prepared_artifact_exact_branchless_guard_applicability(
-    artifact: &SsaArtifact,
-) -> Result<bool, String> {
-    let facts = &artifact.structured().branchless_guards;
-    if facts.is_empty() {
-        return Ok(false);
-    }
-    if facts.len() != 1 {
-        return Err(format!(
-            "branchless-guard applicability retained {} exact facts instead of one",
-            facts.len()
-        ));
-    }
-    let Some(fact) = facts.values().next() else {
-        return Err("branchless-guard applicability lost its exact fact".to_string());
-    };
-    if !fact.validate_against(artifact) {
-        return Err("branchless-guard exact fact failed artifact validation".to_string());
-    }
-    Ok(true)
-}
-
-fn prepared_artifact_exact_nested_wrap32_guard_o0_applicability(
-    artifact: &SsaArtifact,
-) -> Result<bool, String> {
-    let facts = &artifact.structured().nested_wrap32_guard_o0;
-    if facts.is_empty() {
-        return Ok(false);
-    }
-    if facts.len() != 1 {
-        return Err(format!(
-            "nested wrap32 O0 applicability retained {} exact facts instead of one",
-            facts.len()
-        ));
-    }
-    let Some(fact) = facts.values().next() else {
-        return Err("nested wrap32 O0 applicability lost its exact fact".to_string());
-    };
-    if !fact.validate_against_parts(
-        artifact.function(),
-        artifact.graph(),
-        artifact.objects(),
-        artifact.memory(),
-        artifact.predicates(),
-        &artifact.facts().boundaries,
-        &artifact.structured().memory_accesses,
-        artifact.machine_context(),
-    ) {
-        return Err("nested wrap32 O0 exact fact failed artifact validation".to_string());
-    }
-    Ok(true)
-}
-
-fn prepared_artifact_exact_struct_array_index_applicability(
-    artifact: &SsaArtifact,
-) -> Result<bool, String> {
-    let facts = &artifact.structured().struct_array_indexes;
-    if facts.is_empty() {
-        return Ok(false);
-    }
-    if facts.len() != 1 {
-        return Err(format!(
-            "struct-array-index applicability retained {} exact facts instead of one",
-            facts.len()
-        ));
-    }
-    let Some(fact) = facts.values().next() else {
-        return Err("struct-array-index applicability lost its exact fact".to_string());
-    };
-    if !fact.validate_against(artifact) {
-        return Err("struct-array-index exact fact failed artifact validation".to_string());
-    }
-    Ok(true)
-}
-
-fn prepared_artifact_exact_sum_array_applicability(artifact: &SsaArtifact) -> Result<bool, String> {
-    let o0 = &artifact.structured().sum_arrays;
-    let o2 = &artifact.structured().sum_array_o2;
-    if o0.is_empty() && o2.is_empty() {
-        return Ok(false);
-    }
-    if o0.len() + o2.len() != 1 {
-        return Err(format!(
-            "sum-array applicability retained {} exact facts instead of one",
-            o0.len() + o2.len()
-        ));
-    }
-    let valid = o0
-        .values()
-        .next()
-        .is_some_and(|fact| fact.validate_against(artifact))
-        || o2
-            .values()
-            .next()
-            .is_some_and(|fact| fact.validate_against(artifact));
-    if !valid {
-        return Err("sum-array exact fact failed artifact validation".to_string());
-    }
-    Ok(true)
-}
-
-fn prepared_artifact_exact_fnv_fold_applicability(artifact: &SsaArtifact) -> Result<bool, String> {
-    let facts = &artifact.structured().canonical_fnv_fold_loops;
-    if facts.is_empty() {
-        return Ok(false);
-    }
-    if facts.len() != 1 {
-        return Err(format!(
-            "canonical FNV-fold applicability retained {} exact facts instead of one",
-            facts.len()
-        ));
-    }
-    let Some(fact) = facts.values().next() else {
-        return Err("canonical FNV-fold applicability lost its exact fact".to_string());
-    };
-    if !fact.validate_against(artifact) {
-        return Err("canonical FNV-fold exact fact failed artifact validation".to_string());
-    }
-    let Some(interface) = artifact.machine_context().function_interface() else {
-        return Err("canonical FNV-fold exact fact has no source interface".to_string());
-    };
-    let Some(graph) = interface.type_graph() else {
-        return Err("canonical FNV-fold exact fact has no source type graph".to_string());
-    };
-    let [byte, pointer, integer] = graph.types() else {
-        return Err("canonical FNV-fold exact fact has a non-exact source type graph".to_string());
-    };
-    let [pointer_logical, length_logical] = interface.parameter_logical_values() else {
-        return Err("canonical FNV-fold exact fact has non-exact logical parameters".to_string());
-    };
-    let Some(return_logical) = interface.return_logical_value() else {
-        return Err("canonical FNV-fold exact fact has no logical return".to_string());
-    };
-    let [pointer_parameter, length_parameter] = interface.parameters() else {
-        return Err("canonical FNV-fold exact fact has non-exact ABI parameters".to_string());
-    };
-    let r2ssa::SourceFunctionReturn::Register {
-        storage: return_storage,
-    } = interface.return_kind()
-    else {
-        return Err("canonical FNV-fold exact fact has no register return".to_string());
-    };
-    let full64 = |logical: r2ssa::SourceLogicalValue| {
-        logical.carrier().kind() == r2ssa::SourceCarrierKind::Full
-            && logical.carrier().offset_bits() == 0
-            && logical.carrier().size_bits() == 64
-    };
-    let exact_interface = interface.schema_version()
-        == r2ssa::SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION
-        && graph.schema_version() == r2ssa::SOURCE_TYPE_GRAPH_SCHEMA_VERSION
-        && interface
-            .calling_convention()
-            .eq_ignore_ascii_case("aapcs64")
-        && interface.stack_slot_roles_complete()
-        && interface.stack_slots().is_empty()
-        && interface.revision_identity() == fact.abi.revision_identity.as_ref()
-        && pointer_parameter.index() == fact.abi.pointer_parameter.index
-        && pointer_parameter.storage() == fact.abi.pointer_parameter.storage
-        && length_parameter.index() == fact.abi.remaining_parameter.index
-        && length_parameter.storage() == fact.abi.remaining_parameter.storage
-        && return_storage == fact.abi.return_storage
-        && graph.aggregates().is_empty()
-        && byte.kind() == r2ssa::SourceTypeKind::UnsignedInteger
-        && byte.size_bits() == 8
-        && byte.align_bits() == 8
-        && matches!(
-            pointer.kind(),
-            r2ssa::SourceTypeKind::Pointer { target_type_id: 0 }
-        )
-        && pointer.size_bits() == 64
-        && pointer.align_bits() == 64
-        && integer.kind() == r2ssa::SourceTypeKind::UnsignedInteger
-        && integer.size_bits() == 64
-        && integer.align_bits() == 64
-        && *pointer_logical == fact.abi.pointer_logical
-        && *length_logical == fact.abi.remaining_logical
-        && return_logical == fact.abi.return_logical
-        && full64(*pointer_logical)
-        && full64(*length_logical)
-        && full64(return_logical);
-    if !exact_interface {
-        return Err(
-            "canonical FNV-fold exact fact does not match its exact source interface".to_string(),
-        );
-    }
-    Ok(true)
-}
-
-fn prepared_artifact_exact_fnv_fold_o0_applicability(
-    artifact: &SsaArtifact,
-) -> Result<bool, String> {
-    let facts = &artifact.structured().canonical_fnv_fold_o0;
-    if facts.is_empty() {
-        return Ok(false);
-    }
-    if facts.len() != 1 {
-        return Err(format!(
-            "stack-backed O0 FNV-fold applicability retained {} exact facts instead of one",
-            facts.len()
-        ));
-    }
-    let Some(fact) = facts.values().next() else {
-        return Err("stack-backed O0 FNV-fold applicability lost its exact fact".to_string());
-    };
-    if !fact.validate_against(artifact) {
-        return Err("stack-backed O0 FNV-fold exact fact failed artifact validation".to_string());
-    }
-    Ok(true)
-}
-
 #[derive(Debug)]
 enum EngineSemanticKernelAttempt {
     NotApplicable,
     Rendered(EngineRenderedDecompile),
-    Rejected {
-        reason: String,
-        phase: EnginePhase,
-        certification_completed: bool,
-        structuring_completed: bool,
-    },
 }
 
 fn complete_engine_semantic_kernel_attempt<C: r2ssa::SsaWorkControl + ?Sized>(
@@ -6474,7 +6222,6 @@ fn complete_engine_semantic_kernel_attempt<C: r2ssa::SsaWorkControl + ?Sized>(
     attempt: EngineSemanticKernelAttempt,
 ) -> Result<EngineSemanticKernelAttempt, EngineRenderExecutionStop> {
     match &attempt {
-        EngineSemanticKernelAttempt::Rejected { .. } => {}
         EngineSemanticKernelAttempt::Rendered(rendered) => {
             poll_engine_render_control_with_completion(
                 control,
@@ -6490,30 +6237,12 @@ fn complete_engine_semantic_kernel_attempt<C: r2ssa::SsaWorkControl + ?Sized>(
     Ok(attempt)
 }
 
-fn poll_engine_semantic_kernel_after_certification<C: r2ssa::SsaWorkControl + ?Sized>(
-    control: &C,
-) -> Result<(), EngineRenderExecutionStop> {
-    poll_engine_render_control_with_completion(control, EnginePhase::Rendering, true, false)
-}
-
 fn resolve_engine_semantic_kernel_attempt(
     attempt: EngineSemanticKernelAttempt,
 ) -> Result<Option<EngineRenderedDecompile>, EngineRenderExecutionStop> {
     match attempt {
         EngineSemanticKernelAttempt::NotApplicable => Ok(None),
         EngineSemanticKernelAttempt::Rendered(rendered) => Ok(Some(rendered)),
-        EngineSemanticKernelAttempt::Rejected {
-            reason,
-            phase,
-            certification_completed,
-            structuring_completed,
-        } => Err(EngineRenderExecutionStop {
-            reason,
-            phase,
-            certification_completed,
-            normalization_completed: false,
-            structuring_completed,
-        }),
     }
 }
 
@@ -6521,487 +6250,6 @@ fn render_semantic_kernel_function<C: r2ssa::SsaWorkControl + ?Sized>(
     request: &EngineDecompileRequest,
     control: &C,
 ) -> Result<EngineSemanticKernelAttempt, EngineRenderExecutionStop> {
-    poll_engine_render_control(control, EnginePhase::Rendering)?;
-    let branchless_guard_applicable =
-        match prepared_artifact_exact_branchless_guard_applicability(request.prepared_ssa.as_ref())
-        {
-            Ok(applicable) => applicable,
-            Err(reason) => {
-                return complete_engine_semantic_kernel_attempt(
-                    control,
-                    EngineSemanticKernelAttempt::Rejected {
-                        reason,
-                        phase: EnginePhase::Certification,
-                        certification_completed: false,
-                        structuring_completed: false,
-                    },
-                );
-            }
-        };
-    if branchless_guard_applicable {
-        let function = match r2dec::CertifiedBranchlessGuardSemanticCFunction::from_artifact(
-            request.prepared_ssa.as_ref(),
-        ) {
-            Ok(function) => function,
-            Err(error) => {
-                return complete_engine_semantic_kernel_attempt(
-                    control,
-                    EngineSemanticKernelAttempt::Rejected {
-                        reason: format!(
-                            "exact branchless-guard fact failed certification: {error:?}"
-                        ),
-                        phase: EnginePhase::Certification,
-                        certification_completed: false,
-                        structuring_completed: false,
-                    },
-                );
-            }
-        };
-        poll_engine_semantic_kernel_after_certification(control)?;
-        let output = match function
-            .with_cosmetic_names(&request.function_name, "first", "second")
-            .render_certified_c()
-        {
-            Ok(output) => output,
-            Err(error) => {
-                return complete_engine_semantic_kernel_attempt(
-                    control,
-                    EngineSemanticKernelAttempt::Rejected {
-                        reason: format!(
-                            "exact branchless-guard fact failed certified rendering: {error:?}"
-                        ),
-                        phase: EnginePhase::Rendering,
-                        certification_completed: true,
-                        structuring_completed: true,
-                    },
-                );
-            }
-        };
-        return complete_engine_semantic_kernel_attempt(
-            control,
-            EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
-                output,
-                structuring_executed: true,
-                semantic_kernel_render: Some(EngineSemanticKernelRender {
-                    region: EngineSemanticKernelRegion::BranchlessGuardFunction,
-                    region_schema_version:
-                        r2dec::CERTIFIED_BRANCHLESS_GUARD_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-                    exact_obligation_closure: true,
-                }),
-            }),
-        );
-    }
-    poll_engine_render_control(control, EnginePhase::Rendering)?;
-    let nested_wrap32_guard_o0_applicable =
-        match prepared_artifact_exact_nested_wrap32_guard_o0_applicability(
-            request.prepared_ssa.as_ref(),
-        ) {
-            Ok(applicable) => applicable,
-            Err(reason) => {
-                return complete_engine_semantic_kernel_attempt(
-                    control,
-                    EngineSemanticKernelAttempt::Rejected {
-                        reason,
-                        phase: EnginePhase::Certification,
-                        certification_completed: false,
-                        structuring_completed: false,
-                    },
-                );
-            }
-        };
-    if nested_wrap32_guard_o0_applicable {
-        let function = match r2dec::CertifiedNestedWrap32GuardO0SemanticCFunction::from_artifact(
-            request.prepared_ssa.as_ref(),
-        ) {
-            Ok(function) => function,
-            Err(error) => {
-                return complete_engine_semantic_kernel_attempt(
-                    control,
-                    EngineSemanticKernelAttempt::Rejected {
-                        reason: format!(
-                            "exact nested wrap32 O0 fact failed certification: {error:?}"
-                        ),
-                        phase: EnginePhase::Certification,
-                        certification_completed: false,
-                        structuring_completed: false,
-                    },
-                );
-            }
-        };
-        poll_engine_semantic_kernel_after_certification(control)?;
-        let output = match function
-            .with_cosmetic_names(&request.function_name, "first", "second")
-            .render_certified_c()
-        {
-            Ok(output) => output,
-            Err(error) => {
-                return complete_engine_semantic_kernel_attempt(
-                    control,
-                    EngineSemanticKernelAttempt::Rejected {
-                        reason: format!(
-                            "exact nested wrap32 O0 fact failed certified rendering: {error:?}"
-                        ),
-                        phase: EnginePhase::Rendering,
-                        certification_completed: true,
-                        structuring_completed: true,
-                    },
-                );
-            }
-        };
-        return complete_engine_semantic_kernel_attempt(
-            control,
-            EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
-                output,
-                structuring_executed: true,
-                semantic_kernel_render: Some(EngineSemanticKernelRender {
-                    region: EngineSemanticKernelRegion::NestedWrap32GuardO0Function,
-                    region_schema_version:
-                        r2dec::CERTIFIED_NESTED_WRAP32_GUARD_O0_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-                    exact_obligation_closure: true,
-                }),
-            }),
-        );
-    }
-    poll_engine_render_control(control, EnginePhase::Rendering)?;
-    let struct_array_index_applicable =
-        match prepared_artifact_exact_struct_array_index_applicability(
-            request.prepared_ssa.as_ref(),
-        ) {
-            Ok(applicable) => applicable,
-            Err(reason) => {
-                return complete_engine_semantic_kernel_attempt(
-                    control,
-                    EngineSemanticKernelAttempt::Rejected {
-                        reason,
-                        phase: EnginePhase::Certification,
-                        certification_completed: false,
-                        structuring_completed: false,
-                    },
-                );
-            }
-        };
-    if struct_array_index_applicable {
-        let function = match r2dec::CertifiedStructArrayIndexSemanticCFunction::from_artifact(
-            request.prepared_ssa.as_ref(),
-        ) {
-            Ok(function) => function,
-            Err(error) => {
-                return complete_engine_semantic_kernel_attempt(
-                    control,
-                    EngineSemanticKernelAttempt::Rejected {
-                        reason: format!(
-                            "exact struct-array-index fact failed certification: {error:?}"
-                        ),
-                        phase: EnginePhase::Certification,
-                        certification_completed: false,
-                        structuring_completed: false,
-                    },
-                );
-            }
-        };
-        poll_engine_semantic_kernel_after_certification(control)?;
-        let output = match function
-            .with_cosmetic_names(
-                &request.function_name,
-                "DemoStruct",
-                "array",
-                "index",
-                "value",
-            )
-            .render_certified_c()
-        {
-            Ok(output) => output,
-            Err(error) => {
-                return complete_engine_semantic_kernel_attempt(
-                    control,
-                    EngineSemanticKernelAttempt::Rejected {
-                        reason: format!(
-                            "exact struct-array-index fact failed certified rendering: {error:?}"
-                        ),
-                        phase: EnginePhase::Rendering,
-                        certification_completed: true,
-                        structuring_completed: true,
-                    },
-                );
-            }
-        };
-        return complete_engine_semantic_kernel_attempt(
-            control,
-            EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
-                output,
-                structuring_executed: true,
-                semantic_kernel_render: Some(EngineSemanticKernelRender {
-                    region: EngineSemanticKernelRegion::StructArrayIndexFunction,
-                    region_schema_version:
-                        r2dec::CERTIFIED_STRUCT_ARRAY_INDEX_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-                    exact_obligation_closure: true,
-                }),
-            }),
-        );
-    }
-    poll_engine_render_control(control, EnginePhase::Rendering)?;
-    if request.prepared_ssa.private_frame().is_some() {
-        let function = match r2dec::CertifiedPrivateFrameSemanticCFunction::from_artifact(
-            request.prepared_ssa.as_ref(),
-        ) {
-            Ok(function) => function,
-            Err(error) => {
-                return complete_engine_semantic_kernel_attempt(
-                    control,
-                    EngineSemanticKernelAttempt::Rejected {
-                        reason: format!("exact private-frame fact failed certification: {error:?}"),
-                        phase: EnginePhase::Certification,
-                        certification_completed: false,
-                        structuring_completed: false,
-                    },
-                );
-            }
-        };
-        poll_engine_semantic_kernel_after_certification(control)?;
-        let output = match function
-            .with_cosmetic_names(&request.function_name, "argument", "result")
-            .render_certified_c()
-        {
-            Ok(output) => output,
-            Err(error) => {
-                return complete_engine_semantic_kernel_attempt(
-                    control,
-                    EngineSemanticKernelAttempt::Rejected {
-                        reason: format!(
-                            "exact private-frame fact failed certified rendering: {error:?}"
-                        ),
-                        phase: EnginePhase::Rendering,
-                        certification_completed: true,
-                        structuring_completed: true,
-                    },
-                );
-            }
-        };
-        return complete_engine_semantic_kernel_attempt(
-            control,
-            EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
-                output,
-                structuring_executed: true,
-                semantic_kernel_render: Some(EngineSemanticKernelRender {
-                    region: EngineSemanticKernelRegion::PrivateFrameConditionalReturnFunction,
-                    region_schema_version:
-                        r2dec::CERTIFIED_PRIVATE_FRAME_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-                    exact_obligation_closure: true,
-                }),
-            }),
-        );
-    }
-    poll_engine_render_control(control, EnginePhase::Rendering)?;
-    let sum_array_applicable =
-        match prepared_artifact_exact_sum_array_applicability(request.prepared_ssa.as_ref()) {
-            Ok(applicable) => applicable,
-            Err(reason) => {
-                return complete_engine_semantic_kernel_attempt(
-                    control,
-                    EngineSemanticKernelAttempt::Rejected {
-                        reason,
-                        phase: EnginePhase::Certification,
-                        certification_completed: false,
-                        structuring_completed: false,
-                    },
-                );
-            }
-        };
-    if sum_array_applicable {
-        let function = match r2dec::CertifiedSumArraySemanticCFunction::from_artifact(
-            request.prepared_ssa.as_ref(),
-        ) {
-            Ok(function) => function,
-            Err(error) => {
-                return complete_engine_semantic_kernel_attempt(
-                    control,
-                    EngineSemanticKernelAttempt::Rejected {
-                        reason: format!("exact sum-array fact failed certification: {error:?}"),
-                        phase: EnginePhase::Certification,
-                        certification_completed: false,
-                        structuring_completed: false,
-                    },
-                );
-            }
-        };
-        poll_engine_semantic_kernel_after_certification(control)?;
-        let output = match function
-            .with_cosmetic_names(
-                &request.function_name,
-                "array",
-                "length",
-                "index",
-                "sum_bits",
-            )
-            .render_certified_c()
-        {
-            Ok(output) => output,
-            Err(error) => {
-                return complete_engine_semantic_kernel_attempt(
-                    control,
-                    EngineSemanticKernelAttempt::Rejected {
-                        reason: format!(
-                            "exact sum-array fact failed certified rendering: {error:?}"
-                        ),
-                        phase: EnginePhase::Rendering,
-                        certification_completed: true,
-                        structuring_completed: true,
-                    },
-                );
-            }
-        };
-        return complete_engine_semantic_kernel_attempt(
-            control,
-            EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
-                output,
-                structuring_executed: true,
-                semantic_kernel_render: Some(EngineSemanticKernelRender {
-                    region: EngineSemanticKernelRegion::SumArrayFunction,
-                    region_schema_version:
-                        r2dec::CERTIFIED_SUM_ARRAY_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-                    exact_obligation_closure: true,
-                }),
-            }),
-        );
-    }
-    poll_engine_render_control(control, EnginePhase::Rendering)?;
-    let fnv_fold_applicable =
-        match prepared_artifact_exact_fnv_fold_applicability(request.prepared_ssa.as_ref()) {
-            Ok(applicable) => applicable,
-            Err(reason) => {
-                return complete_engine_semantic_kernel_attempt(
-                    control,
-                    EngineSemanticKernelAttempt::Rejected {
-                        reason,
-                        phase: EnginePhase::Certification,
-                        certification_completed: false,
-                        structuring_completed: false,
-                    },
-                );
-            }
-        };
-    if fnv_fold_applicable {
-        let function = match r2dec::CertifiedFnvFoldSemanticCFunction::from_artifact(
-            request.prepared_ssa.as_ref(),
-        ) {
-            Ok(function) => function,
-            Err(error) => {
-                return complete_engine_semantic_kernel_attempt(
-                    control,
-                    EngineSemanticKernelAttempt::Rejected {
-                        reason: format!(
-                            "exact canonical FNV-fold fact failed certification: {error:?}"
-                        ),
-                        phase: EnginePhase::Certification,
-                        certification_completed: false,
-                        structuring_completed: false,
-                    },
-                );
-            }
-        };
-        poll_engine_semantic_kernel_after_certification(control)?;
-        let output = match function
-            .with_cosmetic_names(&request.function_name, "bytes", "length")
-            .render_certified_c()
-        {
-            Ok(output) => output,
-            Err(error) => {
-                return complete_engine_semantic_kernel_attempt(
-                    control,
-                    EngineSemanticKernelAttempt::Rejected {
-                        reason: format!(
-                            "exact canonical FNV-fold fact failed certified rendering: {error:?}"
-                        ),
-                        phase: EnginePhase::Rendering,
-                        certification_completed: true,
-                        structuring_completed: true,
-                    },
-                );
-            }
-        };
-        return complete_engine_semantic_kernel_attempt(
-            control,
-            EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
-                output,
-                structuring_executed: true,
-                semantic_kernel_render: Some(EngineSemanticKernelRender {
-                    region: EngineSemanticKernelRegion::CanonicalFnvFoldLoopFunction,
-                    region_schema_version:
-                        r2dec::CERTIFIED_FNV_FOLD_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-                    exact_obligation_closure: true,
-                }),
-            }),
-        );
-    }
-    poll_engine_render_control(control, EnginePhase::Rendering)?;
-    let fnv_fold_o0_applicable =
-        match prepared_artifact_exact_fnv_fold_o0_applicability(request.prepared_ssa.as_ref()) {
-            Ok(applicable) => applicable,
-            Err(reason) => {
-                return complete_engine_semantic_kernel_attempt(
-                    control,
-                    EngineSemanticKernelAttempt::Rejected {
-                        reason,
-                        phase: EnginePhase::Certification,
-                        certification_completed: false,
-                        structuring_completed: false,
-                    },
-                );
-            }
-        };
-    if fnv_fold_o0_applicable {
-        let function = match r2dec::CertifiedFnvFoldO0SemanticCFunction::from_artifact(
-            request.prepared_ssa.as_ref(),
-        ) {
-            Ok(function) => function,
-            Err(error) => {
-                return complete_engine_semantic_kernel_attempt(
-                    control,
-                    EngineSemanticKernelAttempt::Rejected {
-                        reason: format!(
-                            "exact stack-backed O0 FNV-fold fact failed certification: {error:?}"
-                        ),
-                        phase: EnginePhase::Certification,
-                        certification_completed: false,
-                        structuring_completed: false,
-                    },
-                );
-            }
-        };
-        poll_engine_semantic_kernel_after_certification(control)?;
-        let output = match function
-            .with_cosmetic_names(&request.function_name, "bytes", "length")
-            .render_certified_c()
-        {
-            Ok(output) => output,
-            Err(error) => {
-                return complete_engine_semantic_kernel_attempt(
-                    control,
-                    EngineSemanticKernelAttempt::Rejected {
-                        reason: format!(
-                            "exact stack-backed O0 FNV-fold fact failed certified rendering: {error:?}"
-                        ),
-                        phase: EnginePhase::Rendering,
-                        certification_completed: true,
-                        structuring_completed: true,
-                    },
-                );
-            }
-        };
-        return complete_engine_semantic_kernel_attempt(
-            control,
-            EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
-                output,
-                structuring_executed: true,
-                semantic_kernel_render: Some(EngineSemanticKernelRender {
-                    region: EngineSemanticKernelRegion::CanonicalFnvFoldO0Function,
-                    region_schema_version:
-                        r2dec::CERTIFIED_FNV_FOLD_O0_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-                    exact_obligation_closure: true,
-                }),
-            }),
-        );
-    }
     poll_engine_render_control(control, EnginePhase::Rendering)?;
     if let Ok(function) = r2dec::CertifiedAggregateMemberSemanticCFunction::from_artifact(
         request.prepared_ssa.as_ref(),
@@ -7076,24 +6324,6 @@ fn render_semantic_kernel_function<C: r2ssa::SsaWorkControl + ?Sized>(
         );
     }
     poll_engine_render_control(control, EnginePhase::Rendering)?;
-    if let Ok(function) = r2dec::CertifiedConditionalFunnelReturnFunction::from_artifact(
-        request.prepared_ssa.as_ref(),
-    ) && let Ok(output) = function.render_certified_c()
-    {
-        return complete_engine_semantic_kernel_attempt(
-            control,
-            EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
-                output,
-                structuring_executed: true,
-                semantic_kernel_render: Some(EngineSemanticKernelRender {
-                    region: EngineSemanticKernelRegion::ConditionalFunnelSharedReturnFunction,
-                    region_schema_version: function.schema_version(),
-                    exact_obligation_closure: true,
-                }),
-            }),
-        );
-    }
-    poll_engine_render_control(control, EnginePhase::Rendering)?;
     if let Ok(function) =
         r2dec::CertifiedSwitchReturnFunction::from_artifact(request.prepared_ssa.as_ref())
         && let Ok(output) = function.render_certified_c()
@@ -7105,24 +6335,6 @@ fn render_semantic_kernel_function<C: r2ssa::SsaWorkControl + ?Sized>(
                 structuring_executed: true,
                 semantic_kernel_render: Some(EngineSemanticKernelRender {
                     region: EngineSemanticKernelRegion::SwitchTerminalReturnFunction,
-                    region_schema_version: function.schema_version(),
-                    exact_obligation_closure: true,
-                }),
-            }),
-        );
-    }
-    poll_engine_render_control(control, EnginePhase::Rendering)?;
-    if let Ok(function) =
-        r2dec::CertifiedCountedLoopReturnFunction::from_artifact(request.prepared_ssa.as_ref())
-        && let Ok(output) = function.render_certified_c()
-    {
-        return complete_engine_semantic_kernel_attempt(
-            control,
-            EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
-                output,
-                structuring_executed: true,
-                semantic_kernel_render: Some(EngineSemanticKernelRender {
-                    region: EngineSemanticKernelRegion::CountedLoopTerminalReturnFunction,
                     region_schema_version: function.schema_version(),
                     exact_obligation_closure: true,
                 }),
@@ -9204,13 +8416,6 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::collections::{BTreeMap, BTreeSet, HashMap};
-    use std::fmt::Write;
-    use std::fs;
-    use std::process::Command;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    use r2sleigh_lift::{Disassembler, build_arch_spec};
-    use sha2::{Digest, Sha256};
 
     fn test_decompile_route(
         kind: r2types::DecompileRouteKind,
@@ -9922,584 +9127,6 @@ mod tests {
         (vec![header, false_arm, true_arm], arch, Arc::new(snapshot))
     }
 
-    fn source_snapshot_conditional_funnel_return_function(
-        private_stack: bool,
-    ) -> (Vec<R2ILBlock>, r2il::ArchSpec, Arc<EngineSourceSnapshot>) {
-        let revision: &[u8] = if private_stack {
-            b"production-conditional-funnel-stack-revision"
-        } else {
-            b"production-conditional-funnel-register-revision"
-        };
-        let mut arch = r2il::ArchSpec::new("production-conditional-funnel-return-test");
-        arch.addr_size = 8;
-        arch.set_memory_endianness(r2il::Endianness::Little);
-        arch.add_register(r2il::RegisterDef::new("sp", 0, 8));
-        arch.add_register(r2il::RegisterDef::new("x0", 8, 8));
-        arch.add_register(r2il::RegisterDef::new("arg0", 16, 8));
-        arch.add_register(r2il::RegisterDef::new("pc", 24, 8));
-        let register = |offset, size| r2ssa::CanonicalStorageId {
-            space: r2ssa::CanonicalStorageSpace::Register,
-            offset,
-            size,
-        };
-        let stack_slots = private_stack
-            .then(|| {
-                r2ssa::SourceStackSlotSpec::new_local(
-                    r2ssa::StackAddressBase::StackPointer,
-                    register(0, 8),
-                    -4,
-                    4,
-                )
-            })
-            .into_iter();
-        let interface = r2ssa::SourceFunctionInterface::new_exact(
-            revision.to_vec(),
-            "test-register-abi",
-            [r2ssa::SourceAbiParameterSpec::new(0, register(16, 8))],
-            r2ssa::SourceFunctionReturn::Register {
-                storage: register(8, 8),
-            },
-            stack_slots,
-        )
-        .expect("conditional funnel function interface");
-        let snapshot = EngineSourceSnapshot::new(revision.to_vec(), Some(interface), Vec::new())
-            .expect("conditional funnel source snapshot");
-
-        let condition = r2il::Varnode::unique(0x10, 1);
-        let mut entry = R2ILBlock::new(0x7600, 4);
-        entry.push(r2il::R2ILOp::IntEqual {
-            dst: condition.clone(),
-            a: r2il::Varnode::register(16, 8),
-            b: r2il::Varnode::constant(7, 8),
-        });
-        entry.push(r2il::R2ILOp::CBranch {
-            target: r2il::Varnode::ram(0x7620, 8),
-            cond: condition,
-        });
-
-        let blocks = if private_stack {
-            let mut forwarder = R2ILBlock::new(0x7604, 4);
-            forwarder.push(r2il::R2ILOp::Branch {
-                target: r2il::Varnode::ram(0x7608, 8),
-            });
-            let stack_address = |unique| {
-                let address = r2il::Varnode::unique(unique, 8);
-                (
-                    r2il::R2ILOp::IntAdd {
-                        dst: address.clone(),
-                        a: r2il::Varnode::register(0, 8),
-                        b: r2il::Varnode::constant((-4_i64) as u64, 8),
-                    },
-                    address,
-                )
-            };
-            let (false_address_op, false_address) = stack_address(0x30);
-            let mut false_arm = R2ILBlock::new(0x7608, 4);
-            false_arm.push(false_address_op);
-            false_arm.push(r2il::R2ILOp::Store {
-                space: r2il::SpaceId::Ram,
-                addr: false_address,
-                val: r2il::Varnode::constant(0, 4),
-            });
-            false_arm.push(r2il::R2ILOp::Branch {
-                target: r2il::Varnode::ram(0x7630, 8),
-            });
-            let (true_address_op, true_address) = stack_address(0x40);
-            let mut true_arm = R2ILBlock::new(0x7620, 4);
-            true_arm.push(true_address_op);
-            true_arm.push(r2il::R2ILOp::Store {
-                space: r2il::SpaceId::Ram,
-                addr: true_address,
-                val: r2il::Varnode::constant(1, 4),
-            });
-            true_arm.push(r2il::R2ILOp::Branch {
-                target: r2il::Varnode::ram(0x7630, 8),
-            });
-            let (join_address_op, join_address) = stack_address(0x50);
-            let loaded = r2il::Varnode::unique(0x60, 4);
-            let mut join = R2ILBlock::new(0x7630, 4);
-            join.push(join_address_op);
-            join.push(r2il::R2ILOp::Load {
-                dst: loaded.clone(),
-                space: r2il::SpaceId::Ram,
-                addr: join_address,
-            });
-            join.push(r2il::R2ILOp::IntZExt {
-                dst: r2il::Varnode::register(8, 8),
-                src: loaded,
-            });
-            join.push(r2il::R2ILOp::Return {
-                target: r2il::Varnode::register(24, 8),
-            });
-            vec![entry, forwarder, false_arm, true_arm, join]
-        } else {
-            let mut false_arm = R2ILBlock::new(0x7604, 4);
-            false_arm.push(r2il::R2ILOp::Copy {
-                dst: r2il::Varnode::register(8, 8),
-                src: r2il::Varnode::constant(0, 8),
-            });
-            false_arm.push(r2il::R2ILOp::Branch {
-                target: r2il::Varnode::ram(0x7630, 8),
-            });
-            let mut true_arm = R2ILBlock::new(0x7620, 4);
-            true_arm.push(r2il::R2ILOp::Copy {
-                dst: r2il::Varnode::register(8, 8),
-                src: r2il::Varnode::constant(1, 8),
-            });
-            true_arm.push(r2il::R2ILOp::Branch {
-                target: r2il::Varnode::ram(0x7630, 8),
-            });
-            let mut join = R2ILBlock::new(0x7630, 4);
-            join.push(r2il::R2ILOp::Return {
-                target: r2il::Varnode::register(24, 8),
-            });
-            vec![entry, false_arm, true_arm, join]
-        };
-        (blocks, arch, Arc::new(snapshot))
-    }
-
-    fn source_snapshot_private_frame_function(
-        revision: &[u8],
-    ) -> (Vec<R2ILBlock>, r2il::ArchSpec, Arc<EngineSourceSnapshot>) {
-        let mut arch = r2il::ArchSpec::new("production-private-frame-test");
-        arch.addr_size = 8;
-        arch.set_memory_endianness(r2il::Endianness::Little);
-        arch.add_register(r2il::RegisterDef::new("rax", 0, 8));
-        arch.add_register(r2il::RegisterDef::new("eax", 0, 4));
-        arch.add_register(r2il::RegisterDef::new("rdi", 8, 8));
-        arch.add_register(r2il::RegisterDef::new("edi", 8, 4));
-        arch.add_register(r2il::RegisterDef::new("rsp", 16, 8));
-        arch.add_register(r2il::RegisterDef::new("rbp", 24, 8));
-        arch.add_register(r2il::RegisterDef::new("rip", 32, 8));
-        let register = |offset, size| r2ssa::CanonicalStorageId {
-            space: r2ssa::CanonicalStorageSpace::Register,
-            offset,
-            size,
-        };
-        let interface = r2ssa::SourceFunctionInterface::new_exact(
-            revision.to_vec(),
-            "sysv",
-            [r2ssa::SourceAbiParameterSpec::new(0, register(8, 4))],
-            r2ssa::SourceFunctionReturn::Register {
-                storage: register(0, 4),
-            },
-            [
-                r2ssa::SourceStackSlotSpec::new_parameter_home(
-                    r2ssa::StackAddressBase::FramePointer,
-                    register(24, 8),
-                    -8,
-                    4,
-                    0,
-                    register(8, 4),
-                ),
-                r2ssa::SourceStackSlotSpec::new_local(
-                    r2ssa::StackAddressBase::FramePointer,
-                    register(24, 8),
-                    -4,
-                    4,
-                ),
-            ],
-        )
-        .expect("private-frame source interface");
-        let snapshot = EngineSourceSnapshot::new(revision.to_vec(), Some(interface), Vec::new())
-            .expect("private-frame source snapshot");
-        let frame_address = |unique, offset: i64| {
-            let address = r2il::Varnode::unique(unique, 8);
-            (
-                r2il::R2ILOp::IntAdd {
-                    dst: address.clone(),
-                    a: r2il::Varnode::register(24, 8),
-                    b: r2il::Varnode::constant(offset as u64, 8),
-                },
-                address,
-            )
-        };
-
-        let mut entry = R2ILBlock::new(0x7800, 0x10);
-        let saved_fp = r2il::Varnode::unique(0x10, 8);
-        entry.push(r2il::R2ILOp::Copy {
-            dst: saved_fp.clone(),
-            src: r2il::Varnode::register(24, 8),
-        });
-        entry.push(r2il::R2ILOp::IntSub {
-            dst: r2il::Varnode::register(16, 8),
-            a: r2il::Varnode::register(16, 8),
-            b: r2il::Varnode::constant(8, 8),
-        });
-        entry.push(r2il::R2ILOp::Store {
-            space: r2il::SpaceId::Ram,
-            addr: r2il::Varnode::register(16, 8),
-            val: saved_fp,
-        });
-        entry.push(r2il::R2ILOp::Copy {
-            dst: r2il::Varnode::register(24, 8),
-            src: r2il::Varnode::register(16, 8),
-        });
-        let (home_address_op, home_address) = frame_address(0x20, -8);
-        entry.push(home_address_op);
-        entry.push(r2il::R2ILOp::Store {
-            space: r2il::SpaceId::Ram,
-            addr: home_address.clone(),
-            val: r2il::Varnode::register(8, 4),
-        });
-        let home_value = r2il::Varnode::unique(0x28, 4);
-        entry.push(r2il::R2ILOp::Load {
-            dst: home_value.clone(),
-            space: r2il::SpaceId::Ram,
-            addr: home_address,
-        });
-        let condition = r2il::Varnode::unique(0x30, 1);
-        entry.push(r2il::R2ILOp::IntEqual {
-            dst: condition.clone(),
-            a: home_value,
-            b: r2il::Varnode::constant(0x5ec2e7, 4),
-        });
-        entry.push(r2il::R2ILOp::CBranch {
-            target: r2il::Varnode::ram(0x7820, 8),
-            cond: condition,
-        });
-
-        let mut false_arm = R2ILBlock::new(0x7810, 0x10);
-        let (false_address_op, false_address) = frame_address(0x40, -4);
-        false_arm.push(false_address_op);
-        false_arm.push(r2il::R2ILOp::Store {
-            space: r2il::SpaceId::Ram,
-            addr: false_address,
-            val: r2il::Varnode::constant(0, 4),
-        });
-        false_arm.push(r2il::R2ILOp::Branch {
-            target: r2il::Varnode::ram(0x7830, 8),
-        });
-
-        let mut true_arm = R2ILBlock::new(0x7820, 0x10);
-        let (true_address_op, true_address) = frame_address(0x50, -4);
-        true_arm.push(true_address_op);
-        true_arm.push(r2il::R2ILOp::Store {
-            space: r2il::SpaceId::Ram,
-            addr: true_address,
-            val: r2il::Varnode::constant(1, 4),
-        });
-        true_arm.push(r2il::R2ILOp::Branch {
-            target: r2il::Varnode::ram(0x7830, 8),
-        });
-
-        let mut join = R2ILBlock::new(0x7830, 0x10);
-        let (local_address_op, local_address) = frame_address(0x60, -4);
-        join.push(local_address_op);
-        join.push(r2il::R2ILOp::Load {
-            dst: r2il::Varnode::register(0, 4),
-            space: r2il::SpaceId::Ram,
-            addr: local_address,
-        });
-        let restored_fp = r2il::Varnode::unique(0x70, 8);
-        join.push(r2il::R2ILOp::Load {
-            dst: restored_fp.clone(),
-            space: r2il::SpaceId::Ram,
-            addr: r2il::Varnode::register(16, 8),
-        });
-        join.push(r2il::R2ILOp::IntAdd {
-            dst: r2il::Varnode::register(16, 8),
-            a: r2il::Varnode::register(16, 8),
-            b: r2il::Varnode::constant(8, 8),
-        });
-        join.push(r2il::R2ILOp::Copy {
-            dst: r2il::Varnode::register(24, 8),
-            src: restored_fp,
-        });
-        join.push(r2il::R2ILOp::Load {
-            dst: r2il::Varnode::register(32, 8),
-            space: r2il::SpaceId::Ram,
-            addr: r2il::Varnode::register(16, 8),
-        });
-        join.push(r2il::R2ILOp::IntAdd {
-            dst: r2il::Varnode::register(16, 8),
-            a: r2il::Varnode::register(16, 8),
-            b: r2il::Varnode::constant(8, 8),
-        });
-        join.push(r2il::R2ILOp::Return {
-            target: r2il::Varnode::register(32, 8),
-        });
-
-        (
-            vec![entry, false_arm, true_arm, join],
-            arch,
-            Arc::new(snapshot),
-        )
-    }
-
-    // The only positive O2 FNV authority in these engine tests is this pinned real lift.
-    const REAL_FNV_SOURCE_SHA256: &str =
-        "6524278ba4cd32a72dcf9cbcc385275999a50c3449d0e97035736891bcddff09";
-    const REAL_FNV_O2_FUNCTION_SHA256: &str =
-        "127862f7bb0f1efcdd2830dd5bec8eadd8ac9812a847f477909b95fec671b6ac";
-    const REAL_FNV_O2_BINARY_SHA256: &str =
-        "e15adf9d8916bdbc1a45a07741734279cc815b87a5b2762cfb24cd78d33503c1";
-    const REAL_FNV_O2_BINARY_PATH: &str = "tests/r2r/bins/r2sleigh_manual_limits_O2";
-    const REAL_FNV_O2_COMPILER_COMMAND: &str =
-        "cc -O2 -g -o tests/r2r/bins/r2sleigh_manual_limits_O2 tests/gold/manual_limits.c";
-    const REAL_FNV_O2_BASE: u64 = 0x1_0000_0594;
-    const REAL_FNV_O2_SETUP: u64 = 0x1_0000_05ac;
-    const REAL_FNV_O2_LOOP: u64 = 0x1_0000_05b4;
-    const REAL_FNV_O2_EXIT: u64 = 0x1_0000_05d8;
-    const REAL_FNV_O2_BLOCKS: &[&str] = &[
-        "e80300aa607080d2a073aef200f6c1f2a08ce2f2810100b4",
-        "693680d20920c0f2",
-        "0a1540384b0501514c011b327f6900718a318a1a0a000aca407d099b210400f101ffff54",
-        "c0035fd6",
-    ];
-
-    const EXPECTED_FNV_SEMANTIC_C: &str = concat!(
-        "#include <stdint.h>\n",
-        "\n",
-        "uint64_t r2s_fn_sym_production_fnv_fold(const uint8_t *r2s_arg_bytes, uint64_t r2s_arg_length) {\n",
-        "\tconst uint8_t *r2s_local_pointer = r2s_arg_bytes;\n",
-        "\tuint64_t r2s_local_hash = UINT64_C(0x14650fb0739d0383);\n",
-        "\tuint64_t r2s_local_remaining = r2s_arg_length;\n",
-        "\twhile (r2s_local_remaining != UINT64_C(0x0)) {\n",
-        "\t\tuint8_t r2s_local_byte = *r2s_local_pointer;\n",
-        "\t\tuint32_t r2s_local_original = (uint32_t)r2s_local_byte;\n",
-        "\t\tuint32_t r2s_local_range = (uint32_t)(r2s_local_original - UINT32_C(0x41));\n",
-        "\t\tuint32_t r2s_local_lowercase = (uint32_t)(r2s_local_original | UINT32_C(0x20));\n",
-        "\t\tuint32_t r2s_local_folded = (r2s_local_range < UINT32_C(0x1a)) ? r2s_local_lowercase : r2s_local_original;\n",
-        "\t\tr2s_local_hash = (uint64_t)((r2s_local_hash ^ (uint64_t)r2s_local_folded) * UINT64_C(0x100000001b3));\n",
-        "\t\tr2s_local_pointer = r2s_local_pointer + UINT64_C(0x1);\n",
-        "\t\tr2s_local_remaining = (uint64_t)(r2s_local_remaining - UINT64_C(0x1));\n",
-        "\t}\n",
-        "\treturn r2s_local_hash;\n",
-        "}\n",
-    );
-
-    fn decode_real_fnv_hex(encoded: &str) -> Vec<u8> {
-        encoded
-            .as_bytes()
-            .chunks_exact(2)
-            .map(|pair| {
-                let high = (pair[0] as char).to_digit(16).expect("hex digit") as u8;
-                let low = (pair[1] as char).to_digit(16).expect("hex digit") as u8;
-                (high << 4) | low
-            })
-            .collect()
-    }
-
-    fn real_fnv_sha256(bytes: &[u8]) -> String {
-        format!("{:x}", Sha256::digest(bytes))
-    }
-
-    fn real_fnv_arch() -> r2il::ArchSpec {
-        build_arch_spec(
-            sleigh_config::processor_aarch64::SLA_AARCH64_APPLESILICON,
-            sleigh_config::processor_aarch64::PSPEC_AARCH64,
-            "aarch64",
-        )
-        .expect("AARCH64 architecture")
-    }
-
-    fn real_fnv_storage(arch: &r2il::ArchSpec, register: &str) -> r2ssa::CanonicalStorageId {
-        let register = arch
-            .get_register(register)
-            .expect("pinned AARCH64 register");
-        r2ssa::CanonicalStorageId {
-            space: r2ssa::CanonicalStorageSpace::Register,
-            offset: register.offset,
-            size: register.size,
-        }
-    }
-
-    fn real_fnv_source_snapshot(
-        arch: &r2il::ArchSpec,
-        revision: &[u8],
-    ) -> Arc<EngineSourceSnapshot> {
-        let types = r2ssa::SourceTypeGraph::new(
-            [
-                r2ssa::SourceType::new(0, r2ssa::SourceTypeKind::UnsignedInteger, 8, 8),
-                r2ssa::SourceType::new(
-                    1,
-                    r2ssa::SourceTypeKind::Pointer { target_type_id: 0 },
-                    64,
-                    64,
-                ),
-                r2ssa::SourceType::new(2, r2ssa::SourceTypeKind::UnsignedInteger, 64, 64),
-            ],
-            [],
-        )
-        .expect("real FNV source type graph");
-        let full64 = r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::Full, 0, 64);
-        let interface = r2ssa::SourceFunctionInterface::new_exact_with_logical_types(
-            revision.to_vec(),
-            "aapcs64",
-            [
-                r2ssa::SourceAbiParameterSpec::new(0, real_fnv_storage(arch, "x0")),
-                r2ssa::SourceAbiParameterSpec::new(1, real_fnv_storage(arch, "x1")),
-            ],
-            r2ssa::SourceFunctionReturn::Register {
-                storage: real_fnv_storage(arch, "x0"),
-            },
-            [],
-            [
-                r2ssa::SourceLogicalValue::new(1, full64),
-                r2ssa::SourceLogicalValue::new(2, full64),
-            ],
-            Some(r2ssa::SourceLogicalValue::new(2, full64)),
-            Some(types),
-        )
-        .and_then(|interface| interface.with_return_address_storage(real_fnv_storage(arch, "x30")))
-        .expect("real FNV source interface");
-        Arc::new(
-            EngineSourceSnapshot::new(revision.to_vec(), Some(interface), Vec::new())
-                .expect("real FNV source snapshot"),
-        )
-    }
-
-    fn real_fnv_fold_function(
-        revision: &[u8],
-    ) -> (Vec<R2ILBlock>, r2il::ArchSpec, Arc<EngineSourceSnapshot>) {
-        let provenance = format!(
-            "binary={REAL_FNV_O2_BINARY_PATH} binary_sha256={REAL_FNV_O2_BINARY_SHA256} command={REAL_FNV_O2_COMPILER_COMMAND}"
-        );
-        assert_eq!(
-            real_fnv_sha256(include_bytes!("../../../tests/gold/manual_limits.c")),
-            REAL_FNV_SOURCE_SHA256,
-            "source provenance changed: {provenance}"
-        );
-        assert_eq!(
-            real_fnv_sha256(include_bytes!(
-                "../../../tests/r2r/bins/r2sleigh_manual_limits_O2"
-            )),
-            REAL_FNV_O2_BINARY_SHA256,
-            "full-binary provenance changed: {provenance}"
-        );
-        let function_bytes = REAL_FNV_O2_BLOCKS
-            .iter()
-            .flat_map(|encoded| decode_real_fnv_hex(encoded))
-            .collect::<Vec<_>>();
-        assert_eq!(function_bytes.len(), 72, "{provenance}");
-        assert_eq!(
-            real_fnv_sha256(&function_bytes),
-            REAL_FNV_O2_FUNCTION_SHA256,
-            "function-byte provenance changed: {provenance}"
-        );
-
-        let arch = real_fnv_arch();
-        let disassembler = Disassembler::from_sla(
-            sleigh_config::processor_aarch64::SLA_AARCH64_APPLESILICON,
-            sleigh_config::processor_aarch64::PSPEC_AARCH64,
-            "aarch64",
-        )
-        .expect("AARCH64 disassembler");
-        let mut address = REAL_FNV_O2_BASE;
-        let blocks = REAL_FNV_O2_BLOCKS
-            .iter()
-            .map(|encoded| {
-                let bytes = decode_real_fnv_hex(encoded);
-                let block = disassembler
-                    .lift_block(&bytes, address, bytes.len())
-                    .expect("pinned real ARM64 O2 FNV block");
-                assert_eq!(
-                    block.size as usize,
-                    bytes.len(),
-                    "real block must be fully consumed"
-                );
-                address += bytes.len() as u64;
-                block
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(blocks.len(), 4, "{provenance}");
-        let memory_spaces = blocks
-            .iter()
-            .flat_map(|block| &block.ops)
-            .filter_map(|op| match op {
-                r2il::R2ILOp::Load { space, .. } | r2il::R2ILOp::Store { space, .. } => {
-                    Some(*space)
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            !memory_spaces.is_empty(),
-            "real FNV lift must access memory"
-        );
-        assert!(
-            memory_spaces
-                .iter()
-                .all(|space| *space == r2il::SpaceId::Ram),
-            "real ARM64 FNV accesses must use Ram: {memory_spaces:?}"
-        );
-        let snapshot = real_fnv_source_snapshot(&arch, revision);
-        (blocks, arch, snapshot)
-    }
-
-    fn reference_fnv_fold(bytes: &[u8]) -> u64 {
-        bytes.iter().fold(0x1465_0fb0_739d_0383_u64, |hash, byte| {
-            let folded = if byte.is_ascii_uppercase() {
-                byte.to_ascii_lowercase()
-            } else {
-                *byte
-            };
-            (hash ^ u64::from(folded)).wrapping_mul(0x0000_0100_0000_01b3)
-        })
-    }
-
-    fn compiled_fnv_results(source: &str, probes: &[Vec<u8>]) -> Vec<u64> {
-        let mut source = source.to_string();
-        source.push_str("\n#include <inttypes.h>\n#include <stdio.h>\n\nint main(void) {\n");
-        for (index, bytes) in probes.iter().enumerate() {
-            write!(&mut source, "\tstatic const uint8_t case_{index}[] = {{")
-                .expect("String writes cannot fail");
-            if bytes.is_empty() {
-                source.push_str("UINT8_C(0x0)");
-            } else {
-                for (byte_index, byte) in bytes.iter().enumerate() {
-                    if byte_index != 0 {
-                        source.push_str(", ");
-                    }
-                    write!(&mut source, "UINT8_C(0x{byte:02x})")
-                        .expect("String writes cannot fail");
-                }
-            }
-            source.push_str("};\n");
-            writeln!(
-                &mut source,
-                "\tprintf(\"%\" PRIu64 \"\\n\", r2s_fn_sym_production_fnv_fold(case_{index}, UINT64_C(0x{:x})));",
-                bytes.len()
-            )
-            .expect("String writes cannot fail");
-        }
-        source.push_str("\treturn 0;\n}\n");
-
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let directory =
-            std::env::temp_dir().join(format!("r2engine-fnv-o2-{}-{nonce}", std::process::id()));
-        fs::create_dir(&directory).expect("temporary directory");
-        let source_path = directory.join("probe.c");
-        let executable = directory.join("probe");
-        fs::write(&source_path, source).expect("C source");
-        let compiler = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
-        let status = Command::new(compiler)
-            .args(["-std=c11", "-Wall", "-Wextra", "-Wpedantic", "-Werror"])
-            .arg(&source_path)
-            .arg("-o")
-            .arg(&executable)
-            .status()
-            .expect("C compiler");
-        assert!(status.success());
-        let output = Command::new(&executable)
-            .output()
-            .expect("compiled C probe");
-        assert!(output.status.success());
-        let results = String::from_utf8(output.stdout)
-            .expect("UTF-8 output")
-            .lines()
-            .map(|line| line.parse::<u64>().expect("integer output"))
-            .collect();
-        let _ = fs::remove_file(&source_path);
-        let _ = fs::remove_file(&executable);
-        let _ = fs::remove_dir(&directory);
-        results
-    }
-
     fn source_snapshot_switch_return_function()
     -> (Vec<R2ILBlock>, r2il::ArchSpec, Arc<EngineSourceSnapshot>) {
         let revision = b"production-switch-return-revision";
@@ -10622,146 +9249,42 @@ mod tests {
         )
     }
 
-    fn source_snapshot_counted_loop_return_function()
-    -> (Vec<R2ILBlock>, r2il::ArchSpec, Arc<EngineSourceSnapshot>) {
-        let revision = b"production-counted-loop-return-revision";
-        let mut arch = r2il::ArchSpec::new("production-counted-loop-return-test");
-        arch.addr_size = 8;
-        arch.set_memory_endianness(r2il::Endianness::Little);
-        arch.add_register(r2il::RegisterDef::new("rax", 0, 8));
-        arch.add_register(r2il::RegisterDef::new("rdi", 8, 8));
-        arch.add_register(r2il::RegisterDef::new("rip", 16, 8));
-        arch.add_register(r2il::RegisterDef::new("rsi", 24, 8));
-        let register = |offset, size| r2ssa::CanonicalStorageId {
-            space: r2ssa::CanonicalStorageSpace::Register,
-            offset,
-            size,
-        };
-        let interface = r2ssa::SourceFunctionInterface::new(
-            revision.to_vec(),
-            "test-register-abi",
-            [r2ssa::SourceAbiParameterSpec::new(0, register(8, 8))],
-            r2ssa::SourceFunctionReturn::Register {
-                storage: register(0, 8),
-            },
-            Vec::<r2ssa::SourceStackSlotSpec>::new(),
-        )
-        .expect("source function interface");
-        let snapshot = EngineSourceSnapshot::new(revision.to_vec(), Some(interface), Vec::new())
-            .expect("source snapshot");
-
-        let counter = r2il::Varnode::register(0, 8);
-        let mut preheader = R2ILBlock::new(0x7500, 4);
-        preheader.push(r2il::R2ILOp::Copy {
-            dst: counter.clone(),
-            src: r2il::Varnode::constant(0, 8),
-        });
-        preheader.push(r2il::R2ILOp::Branch {
-            target: r2il::Varnode::ram(0x7510, 8),
-        });
-        let condition = r2il::Varnode::unique(0x40, 1);
-        let mut header = R2ILBlock::new(0x7510, 4);
-        header.push(r2il::R2ILOp::IntLess {
-            dst: condition.clone(),
-            a: counter.clone(),
-            b: r2il::Varnode::register(8, 8),
-        });
-        header.push(r2il::R2ILOp::CBranch {
-            target: r2il::Varnode::ram(0x7530, 8),
-            cond: condition,
-        });
-        let mut exit = R2ILBlock::new(0x7514, 4);
-        exit.push(r2il::R2ILOp::Return {
-            target: r2il::Varnode::register(16, 8),
-        });
-        let mut latch = R2ILBlock::new(0x7530, 4);
-        latch.push(r2il::R2ILOp::IntAdd {
-            dst: counter.clone(),
-            a: counter,
-            b: r2il::Varnode::constant(1, 8),
-        });
-        latch.push(r2il::R2ILOp::Branch {
-            target: r2il::Varnode::ram(0x7510, 8),
-        });
-        (
-            vec![preheader, header, exit, latch],
-            arch,
-            Arc::new(snapshot),
-        )
+    fn assert_handmade_machine_context_refusal(artifact: &r2ssa::SsaArtifact) {
+        assert!(
+            matches!(
+                r2dec::CertifiedSemanticCFunction::from_artifact(artifact),
+                Err(r2dec::CertifiedSemanticCFunctionError::Machine(
+                    r2ssa::MachineBuildError::MachineContextMismatch
+                ))
+            ),
+            "handmade source metadata without exact typed RA and SP must not authorize Certified C"
+        );
     }
 
-    #[test]
-    fn production_engine_renders_only_exact_certified_terminal_subset() {
-        let (blocks, arch, source_snapshot) = source_snapshot_terminal_function();
+    fn assert_handmade_engine_refusal(
+        function_name: &str,
+        function_addr: u64,
+        blocks: Vec<R2ILBlock>,
+        arch: r2il::ArchSpec,
+        source_snapshot: Arc<EngineSourceSnapshot>,
+        forbidden_output: &str,
+    ) {
+        let artifact = r2ssa::SsaArtifact::for_decompile_with_interfaces(
+            &blocks,
+            Some(&arch),
+            source_snapshot.function_interface().cloned(),
+            source_snapshot.call_site_interfaces().to_vec(),
+        )
+        .expect("handmade fixture remains analyzable");
+        assert_handmade_machine_context_refusal(&artifact);
+
         let response = EngineSession::new(4).decompile_function_from_input(
             EngineFunctionDecompileRequestInput::single_function(
                 EngineFunctionInput {
-                    function_name: "sym.production_terminal".to_string(),
-                    function_addr: 0x7200,
-                    blocks: blocks.clone(),
-                    arch: Some(arch.clone()),
-                    source_snapshot: Some(source_snapshot),
-                    semantic_metadata_enabled: true,
-                },
-                Some(64),
-                r2types::ParsedExternalContext::default(),
-                0,
-            ),
-        );
-        assert!(
-            response
-                .output
-                .contains("uint64_t certified_sub_7200(uint64_t v_")
-                && response.output.contains("return v_"),
-            "exact terminal source snapshot must reach certified semantic C:\n{}",
-            response.output
-        );
-        assert_eq!(
-            response.diagnostics.semantic_kernel_render,
-            Some(EngineSemanticKernelRender {
-                region: EngineSemanticKernelRegion::TerminalReturnBlock,
-                region_schema_version: r2dec::CERTIFIED_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-                exact_obligation_closure: true,
-            })
-        );
-        assert!(response.diagnostics.render_permission.is_none());
-        assert!(response.diagnostics.proof_coverage.is_none());
-        assert!(response.diagnostics.refusal.is_none());
-
-        let absent = EngineSession::new(4).decompile_function_from_input(
-            EngineFunctionDecompileRequestInput::single_function(
-                EngineFunctionInput {
-                    function_name: "sym.production_terminal".to_string(),
-                    function_addr: 0x7200,
+                    function_name: function_name.to_string(),
+                    function_addr,
                     blocks,
                     arch: Some(arch),
-                    source_snapshot: None,
-                    semantic_metadata_enabled: true,
-                },
-                Some(64),
-                r2types::ParsedExternalContext::default(),
-                0,
-            ),
-        );
-        assert!(
-            absent.output.contains("r2dec residual:")
-                && !absent.output.contains("certified_sub_7200"),
-            "missing source snapshot must fail closed:\n{}",
-            absent.output
-        );
-        assert!(absent.diagnostics.semantic_kernel_render.is_none());
-    }
-
-    #[test]
-    fn production_engine_renders_only_exact_certified_memory_terminal_subset() {
-        let (blocks, arch, source_snapshot) = source_snapshot_memory_terminal_function();
-        let response = EngineSession::new(4).decompile_function_from_input(
-            EngineFunctionDecompileRequestInput::single_function(
-                EngineFunctionInput {
-                    function_name: "sym.production_memory_terminal".to_string(),
-                    function_addr: 0x7280,
-                    blocks: blocks.clone(),
-                    arch: Some(arch.clone()),
                     source_snapshot: Some(source_snapshot),
                     semantic_metadata_enabled: true,
                 },
@@ -10770,73 +9293,44 @@ mod tests {
                 0,
             ),
         );
+        assert!(response.diagnostics.semantic_kernel_render.is_none());
         assert!(
-            response
-                .output
-                .contains("uint32_t certified_mem_sub_7280(void)")
-                && response.output.contains("r2s_ram_read_le_u32")
-                && response.output.contains("return v_"),
-            "exact memory source snapshot must reach certified semantic C:\n{}",
-            response.output
+            response.output.contains("r2dec residual:")
+                || response.output.contains("r2dec fallback:")
         );
-        assert_eq!(
-            response.diagnostics.semantic_kernel_render,
-            Some(EngineSemanticKernelRender {
-                region: EngineSemanticKernelRegion::PlainRamMemoryTerminalReturnFunction,
-                region_schema_version: r2dec::CERTIFIED_MEMORY_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-                exact_obligation_closure: true,
-            })
-        );
-        assert_eq!(response.diagnostics.plan, Some(EnginePlan::FastLocal));
-        assert!(response.diagnostics.render_permission.is_none());
-        assert!(response.diagnostics.proof_coverage.is_none());
-        assert!(response.diagnostics.refusal.is_none());
-
-        for source_snapshot in [
-            None,
-            Some(Arc::new(
-                EngineSourceSnapshot::new(
-                    b"production-memory-terminal-revision".to_vec(),
-                    None,
-                    Vec::new(),
-                )
-                .expect("source snapshot without interface"),
-            )),
-        ] {
-            let refused = EngineSession::new(4).decompile_function_from_input(
-                EngineFunctionDecompileRequestInput::single_function(
-                    EngineFunctionInput {
-                        function_name: "sym.production_memory_terminal".to_string(),
-                        function_addr: 0x7280,
-                        blocks: blocks.clone(),
-                        arch: Some(arch.clone()),
-                        source_snapshot,
-                        semantic_metadata_enabled: true,
-                    },
-                    Some(64),
-                    r2types::ParsedExternalContext::default(),
-                    0,
-                ),
-            );
-            assert!(
-                refused.output.contains("r2dec residual:")
-                    && !refused.output.contains("certified_mem_sub_7280"),
-                "absent or incomplete source authority must fail closed:\n{}",
-                refused.output
-            );
-            assert!(refused.diagnostics.semantic_kernel_render.is_none());
-        }
+        assert!(!response.output.contains(forbidden_output));
     }
 
     #[test]
-    fn production_engine_prefers_exact_aggregate_member_terminal_subset() {
+    fn handmade_terminal_fixture_refuses_certified_c() {
+        let (blocks, arch, source_snapshot) = source_snapshot_terminal_function();
+        assert_handmade_engine_refusal(
+            "sym.production_terminal",
+            0x7200,
+            blocks,
+            arch,
+            source_snapshot,
+            "certified_sub_7200",
+        );
+    }
+
+    #[test]
+    fn handmade_memory_terminal_fixture_refuses_certified_c() {
+        let (blocks, arch, source_snapshot) = source_snapshot_memory_terminal_function();
+        assert_handmade_engine_refusal(
+            "sym.production_memory_terminal",
+            0x7280,
+            blocks,
+            arch,
+            source_snapshot,
+            "certified_mem_sub_7280",
+        );
+    }
+
+    #[test]
+    fn handmade_aggregate_member_fixtures_refuse_certified_c() {
         let (load_blocks, load_arch, load_snapshot) =
             source_snapshot_aggregate_member_load_return_function();
-        assert!(
-            load_snapshot
-                .function_interface()
-                .is_some_and(r2ssa::SourceFunctionInterface::stack_slot_roles_complete)
-        );
         let prepared_load = r2ssa::SsaArtifact::for_decompile_with_interface(
             &load_blocks,
             Some(&load_arch),
@@ -10846,10 +9340,7 @@ mod tests {
                 .expect("aggregate load interface"),
         )
         .expect("prepared aggregate load");
-        assert!(
-            r2dec::CertifiedAggregateMemberSemanticCFunction::from_artifact(&prepared_load).is_ok()
-        );
-        assert!(r2dec::CertifiedMemorySemanticCFunction::from_artifact(&prepared_load).is_ok());
+        assert_handmade_machine_context_refusal(&prepared_load);
 
         let load = EngineSession::new(4).decompile_function_from_input(
             EngineFunctionDecompileRequestInput::single_function(
@@ -10866,28 +9357,8 @@ mod tests {
                 0,
             ),
         );
-        assert!(
-            load.output
-                .contains("int32_t certified_aggregate_sub_7700(r2s_struct_0 *arg_0)")
-                && load.output.contains(
-                    "r2s_ram_read_le_u32(((uint64_t)(uintptr_t)((const uint8_t *)&arg_0->field_2)))"
-                ),
-            "exact aggregate load must use the typed member renderer:\n{}",
-            load.output
-        );
-        assert_eq!(
-            load.diagnostics.semantic_kernel_render,
-            Some(EngineSemanticKernelRender {
-                region: EngineSemanticKernelRegion::AggregateMemberTerminalReturnFunction,
-                region_schema_version:
-                    r2dec::CERTIFIED_AGGREGATE_MEMBER_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-                exact_obligation_closure: true,
-            })
-        );
-        assert_eq!(load.diagnostics.plan, Some(EnginePlan::FastLocal));
-        assert!(load.diagnostics.render_permission.is_none());
-        assert!(load.diagnostics.proof_coverage.is_none());
-        assert!(load.diagnostics.refusal.is_none());
+        assert!(load.diagnostics.semantic_kernel_render.is_none());
+        assert!(!load.output.contains("certified_aggregate_sub_7700"));
 
         let (store_blocks, store_arch, store_snapshot) =
             source_snapshot_aggregate_member_store_function();
@@ -10906,25 +9377,8 @@ mod tests {
                 0,
             ),
         );
-        assert!(
-            store
-                .output
-                .contains("void certified_aggregate_sub_7710(r2s_struct_0 *arg_0, int32_t arg_1)")
-                && store.output.contains(
-                    "r2s_ram_write_le_u32(((uint64_t)(uintptr_t)((uint8_t *)&arg_0->field_13))"
-                ),
-            "exact aggregate store must retain signed ABI and member address:\n{}",
-            store.output
-        );
-        assert_eq!(
-            store.diagnostics.semantic_kernel_render,
-            Some(EngineSemanticKernelRender {
-                region: EngineSemanticKernelRegion::AggregateMemberTerminalReturnFunction,
-                region_schema_version:
-                    r2dec::CERTIFIED_AGGREGATE_MEMBER_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-                exact_obligation_closure: true,
-            })
-        );
+        assert!(store.diagnostics.semantic_kernel_render.is_none());
+        assert!(!store.output.contains("certified_aggregate_sub_7710"));
 
         let mut indirect_address = load_blocks;
         indirect_address[0].ops.insert(
@@ -10947,13 +9401,7 @@ mod tests {
                 .expect("aggregate near-miss interface"),
         )
         .expect("prepared aggregate near miss");
-        assert!(
-            r2dec::CertifiedAggregateMemberSemanticCFunction::from_artifact(&prepared_near_miss)
-                .is_err()
-        );
-        assert!(
-            r2dec::CertifiedMemorySemanticCFunction::from_artifact(&prepared_near_miss).is_ok()
-        );
+        assert_handmade_machine_context_refusal(&prepared_near_miss);
         let refused = EngineSession::new(4).decompile_function_from_input(
             EngineFunctionDecompileRequestInput::single_function(
                 EngineFunctionInput {
@@ -10980,7 +9428,7 @@ mod tests {
     }
 
     #[test]
-    fn production_engine_renders_only_exact_certified_direct_call_return_subset() {
+    fn handmade_direct_call_return_fixture_refuses_certified_c() {
         let (blocks, arch, source_snapshot) = source_snapshot_direct_call_return_function();
         let prepared = EngineSession::new(4)
             .analyze(EngineAnalyzeRequest::full_semantics_for_function(
@@ -11005,10 +9453,7 @@ mod tests {
                 },
             ))
             .expect("prepared call/return analysis");
-        r2dec::CertifiedDirectCallReturnFunction::from_artifact(
-            prepared.artifact.ssa_func.as_ref(),
-        )
-        .unwrap_or_else(|error| panic!("engine-prepared call/return artifact: {error:?}"));
+        assert_handmade_machine_context_refusal(prepared.artifact.ssa_func.as_ref());
         let response = EngineSession::new(4).decompile_function_from_input(
             EngineFunctionDecompileRequestInput::single_function(
                 EngineFunctionInput {
@@ -11024,31 +9469,8 @@ mod tests {
                 0,
             ),
         );
-        assert!(
-            response
-                .output
-                .contains("uint64_t certified_call_sub_7500(uint64_t arg_0)")
-                && response.output.contains("extern void r2s_call_")
-                && response.output.contains("_at_0000000000007500_1")
-                && response.output.contains("return v_"),
-            "exact callsite source snapshot must reach certified semantic C:\n{}",
-            response.output
-        );
-        assert_eq!(
-            response.diagnostics.semantic_kernel_render,
-            Some(EngineSemanticKernelRender {
-                region: EngineSemanticKernelRegion::DirectCallTerminalReturnFunction,
-                region_schema_version: r2dec::CERTIFIED_DIRECT_CALL_RETURN_FUNCTION_SCHEMA_VERSION,
-                exact_obligation_closure: true,
-            })
-        );
-        assert_eq!(
-            response.diagnostics.plan,
-            Some(EnginePlan::SemanticStructured)
-        );
-        assert!(response.diagnostics.render_permission.is_none());
-        assert!(response.diagnostics.proof_coverage.is_none());
-        assert!(response.diagnostics.refusal.is_none());
+        assert!(response.diagnostics.semantic_kernel_render.is_none());
+        assert!(!response.output.contains("certified_call_sub_7500"));
 
         let missing_callsite = Arc::new(
             EngineSourceSnapshot::new(
@@ -11083,694 +9505,20 @@ mod tests {
     }
 
     #[test]
-    fn production_engine_renders_exact_certified_conditional_return_subset() {
+    fn handmade_conditional_return_fixture_refuses_certified_c() {
         let (blocks, arch, source_snapshot) = source_snapshot_conditional_return_function();
-        let response = EngineSession::new(4).decompile_function_from_input(
-            EngineFunctionDecompileRequestInput::single_function(
-                EngineFunctionInput {
-                    function_name: "sym.production_conditional_return".to_string(),
-                    function_addr: 0x7300,
-                    blocks,
-                    arch: Some(arch),
-                    source_snapshot: Some(source_snapshot),
-                    semantic_metadata_enabled: true,
-                },
-                Some(64),
-                r2types::ParsedExternalContext::default(),
-                0,
-            ),
-        );
-        assert!(
-            response
-                .output
-                .contains("uint64_t certified_sub_7300(uint64_t v_")
-                && response.output.contains("if ((uint8_t)(v_")
-                && response.output.contains("} else {")
-                && response.output.matches("return v_").count() == 2,
-            "exact conditional source snapshot must reach certified semantic C:\n{}",
-            response.output
-        );
-        assert_eq!(
-            response.diagnostics.semantic_kernel_render,
-            Some(EngineSemanticKernelRender {
-                region: EngineSemanticKernelRegion::ConditionalTerminalReturnFunction,
-                region_schema_version: r2dec::CERTIFIED_CONDITIONAL_RETURN_FUNCTION_SCHEMA_VERSION,
-                exact_obligation_closure: true,
-            })
-        );
-        assert_eq!(
-            response.diagnostics.plan,
-            Some(EnginePlan::SemanticStructured)
-        );
-        assert!(response.diagnostics.render_permission.is_none());
-        assert!(response.diagnostics.proof_coverage.is_none());
-        assert!(response.diagnostics.refusal.is_none());
-    }
-
-    #[test]
-    fn production_engine_renders_exact_register_phi_conditional_funnel_subset() {
-        let (blocks, arch, source_snapshot) =
-            source_snapshot_conditional_funnel_return_function(false);
-        assert!(
-            source_snapshot
-                .function_interface()
-                .is_some_and(r2ssa::SourceFunctionInterface::stack_slot_roles_complete)
-        );
-        let session = EngineSession::new(4);
-        let response = session.decompile_function_from_input(
-            EngineFunctionDecompileRequestInput::single_function(
-                EngineFunctionInput {
-                    function_name: "sym.production_conditional_funnel_register".to_string(),
-                    function_addr: 0x7600,
-                    blocks: blocks.clone(),
-                    arch: Some(arch.clone()),
-                    source_snapshot: Some(Arc::clone(&source_snapshot)),
-                    semantic_metadata_enabled: true,
-                },
-                Some(64),
-                r2types::ParsedExternalContext::default(),
-                0,
-            ),
-        );
-        assert!(
-            response
-                .output
-                .contains("uint64_t certified_sub_7600(uint64_t v_")
-                && response.output.contains("\tuint64_t v_")
-                && response.output.contains("\tif ((uint8_t)(")
-                && response.output.contains("\t} else {")
-                && response
-                    .output
-                    .lines()
-                    .filter(|line| line.starts_with("\treturn (uint64_t)("))
-                    .count()
-                    == 1,
-            "exact register-phi funnel must reach certified semantic C:\n{}",
-            response.output
-        );
-        assert_eq!(
-            response.diagnostics.semantic_kernel_render,
-            Some(EngineSemanticKernelRender {
-                region: EngineSemanticKernelRegion::ConditionalFunnelSharedReturnFunction,
-                region_schema_version:
-                    r2dec::CERTIFIED_CONDITIONAL_FUNNEL_RETURN_FUNCTION_SCHEMA_VERSION,
-                exact_obligation_closure: true,
-            })
-        );
-        assert_eq!(
-            response.diagnostics.plan,
-            Some(EnginePlan::SemanticStructured)
-        );
-        assert_eq!(
-            response.diagnostics.route_reason.as_deref(),
-            Some("r2cert authorized exact conditional-funnel shared-return obligation closure")
-        );
-        assert!(response.diagnostics.render_permission.is_none());
-        assert!(response.diagnostics.proof_coverage.is_none());
-        assert!(response.diagnostics.refusal.is_none());
-
-        let cache_after_uncached = session.cache_metrics();
-        let cached = session.decompile_function_from_input(
-            EngineFunctionDecompileRequestInput::single_function(
-                EngineFunctionInput {
-                    function_name: "sym.production_conditional_funnel_register".to_string(),
-                    function_addr: 0x7600,
-                    blocks: blocks.clone(),
-                    arch: Some(arch.clone()),
-                    source_snapshot: Some(Arc::clone(&source_snapshot)),
-                    semantic_metadata_enabled: true,
-                },
-                Some(64),
-                r2types::ParsedExternalContext::default(),
-                0,
-            ),
-        );
-        assert_eq!(cached.output, response.output);
-        assert_eq!(
-            cached.diagnostics.semantic_kernel_render,
-            response.diagnostics.semantic_kernel_render
-        );
-        let cache_after_reuse = session.cache_metrics();
-        assert!(cache_after_reuse.analysis.hits > cache_after_uncached.analysis.hits);
-        assert_eq!(
-            cache_after_reuse.analysis.insertions,
-            cache_after_uncached.analysis.insertions
-        );
-
-        let mut wrong_width = blocks;
-        wrong_width[1].ops[0] = r2il::R2ILOp::Copy {
-            dst: r2il::Varnode::register(8, 4),
-            src: r2il::Varnode::constant(0, 4),
-        };
-        let refused = session.decompile_function_from_input(
-            EngineFunctionDecompileRequestInput::single_function(
-                EngineFunctionInput {
-                    function_name: "sym.production_conditional_funnel_register".to_string(),
-                    function_addr: 0x7600,
-                    blocks: wrong_width,
-                    arch: Some(arch),
-                    source_snapshot: Some(source_snapshot),
-                    semantic_metadata_enabled: true,
-                },
-                Some(64),
-                r2types::ParsedExternalContext::default(),
-                0,
-            ),
-        );
-        assert!(
-            refused.output.contains("r2dec residual:")
-                && !refused.output.contains("certified_sub_7600"),
-            "carrier-width mutation must fail closed:\n{}",
-            refused.output
-        );
-        assert!(refused.diagnostics.semantic_kernel_render.is_none());
-    }
-
-    #[test]
-    fn production_engine_renders_exact_private_stack_conditional_funnel_subset() {
-        let (blocks, arch, source_snapshot) =
-            source_snapshot_conditional_funnel_return_function(true);
-        assert!(
-            source_snapshot
-                .function_interface()
-                .is_some_and(r2ssa::SourceFunctionInterface::stack_slot_roles_complete)
-        );
-        let response = EngineSession::new(4).decompile_function_from_input(
-            EngineFunctionDecompileRequestInput::single_function(
-                EngineFunctionInput {
-                    function_name: "sym.production_conditional_funnel_stack".to_string(),
-                    function_addr: 0x7600,
-                    blocks: blocks.clone(),
-                    arch: Some(arch.clone()),
-                    source_snapshot: Some(source_snapshot),
-                    semantic_metadata_enabled: true,
-                },
-                Some(64),
-                r2types::ParsedExternalContext::default(),
-                0,
-            ),
-        );
-        assert!(
-            response
-                .output
-                .contains("uint64_t certified_sub_7600(uint64_t v_")
-                && response.output.contains("\tuint32_t v_")
-                && response.output.contains("\tif ((uint8_t)(")
-                && response.output.contains("\t} else {")
-                && response
-                    .output
-                    .lines()
-                    .filter(|line| line.starts_with("\treturn (uint64_t)("))
-                    .count()
-                    == 1,
-            "exact private-stack funnel must reach certified semantic C:\n{}",
-            response.output
-        );
-        for forbidden in ["r2s_load", "r2s_store", "*(", "sp_", "fp_"] {
-            assert!(
-                !response.output.contains(forbidden),
-                "private stack carrier leaked through {forbidden}:\n{}",
-                response.output
-            );
-        }
-        assert_eq!(
-            response.diagnostics.semantic_kernel_render,
-            Some(EngineSemanticKernelRender {
-                region: EngineSemanticKernelRegion::ConditionalFunnelSharedReturnFunction,
-                region_schema_version:
-                    r2dec::CERTIFIED_CONDITIONAL_FUNNEL_RETURN_FUNCTION_SCHEMA_VERSION,
-                exact_obligation_closure: true,
-            })
-        );
-        assert_eq!(
-            response.diagnostics.plan,
-            Some(EnginePlan::SemanticStructured)
-        );
-        assert!(response.diagnostics.render_permission.is_none());
-        assert!(response.diagnostics.proof_coverage.is_none());
-        assert!(response.diagnostics.refusal.is_none());
-
-        let refused = EngineSession::new(4).decompile_function_from_input(
-            EngineFunctionDecompileRequestInput::single_function(
-                EngineFunctionInput {
-                    function_name: "sym.production_conditional_funnel_stack".to_string(),
-                    function_addr: 0x7600,
-                    blocks,
-                    arch: Some(arch),
-                    source_snapshot: None,
-                    semantic_metadata_enabled: true,
-                },
-                Some(64),
-                r2types::ParsedExternalContext::default(),
-                0,
-            ),
-        );
-        assert!(
-            refused.output.contains("r2dec residual:")
-                && !refused.output.contains("certified_sub_7600"),
-            "missing private-stack authority must fail closed:\n{}",
-            refused.output
-        );
-        assert!(refused.diagnostics.semantic_kernel_render.is_none());
-    }
-
-    #[test]
-    fn production_engine_prefers_exact_private_frame_and_invalidates_by_revision() {
-        let revision = b"production-private-frame-revision";
-        let (blocks, arch, source_snapshot) = source_snapshot_private_frame_function(revision);
-        let session = EngineSession::new(4);
-        let request = || {
-            EngineFunctionDecompileRequestInput::single_function(
-                EngineFunctionInput {
-                    function_name: "sym.production_private_frame".to_string(),
-                    function_addr: 0x7800,
-                    blocks: blocks.clone(),
-                    arch: Some(arch.clone()),
-                    source_snapshot: Some(Arc::clone(&source_snapshot)),
-                    semantic_metadata_enabled: true,
-                },
-                Some(64),
-                r2types::ParsedExternalContext::default(),
-                0,
-            )
-        };
-        let response = session.decompile_function_from_input(request());
-        assert!(
-            response.output.contains(
-                "uint32_t r2s_fn_sym_production_private_frame(uint32_t r2s_arg_argument)"
-            ) && response
-                .output
-                .contains("r2s_arg_argument == ((uint32_t)UINT64_C(0x5ec2e7))")
-                && response
-                    .output
-                    .contains("r2s_local_result = (uint32_t)UINT64_C(0x1)")
-                && response.output.contains("return r2s_local_result;"),
-            "exact private frame must use its whole-function renderer:\n{}",
-            response.output
-        );
-        for forbidden in [
-            "saved_fp",
-            "return_address",
-            "home_reload",
-            "frame_address",
-            "r2s_read",
-            "r2s_write",
-            "rsp",
-            "rbp",
-            "rip",
-        ] {
-            assert!(
-                !response.output.contains(forbidden),
-                "private-frame state leaked through {forbidden}:\n{}",
-                response.output
-            );
-        }
-        assert_eq!(
-            response.diagnostics.semantic_kernel_render,
-            Some(EngineSemanticKernelRender {
-                region: EngineSemanticKernelRegion::PrivateFrameConditionalReturnFunction,
-                region_schema_version:
-                    r2dec::CERTIFIED_PRIVATE_FRAME_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-                exact_obligation_closure: true,
-            })
-        );
-        assert_eq!(
-            response.diagnostics.plan,
-            Some(EnginePlan::SemanticStructured)
-        );
-        assert_eq!(
-            response.diagnostics.route_reason.as_deref(),
-            Some("r2cert authorized exact private-frame conditional-return obligation closure")
-        );
-        assert!(!response.metrics.cache_hit);
-        assert!(response.diagnostics.render_permission.is_none());
-        assert!(response.diagnostics.proof_coverage.is_none());
-        assert!(response.diagnostics.refusal.is_none());
-
-        let cached = session.decompile_function_from_input(request());
-        assert!(cached.metrics.cache_hit);
-        assert_eq!(cached.output, response.output);
-        assert_eq!(
-            cached.diagnostics.semantic_kernel_render,
-            response.diagnostics.semantic_kernel_render
-        );
-
-        let changed_revision = b"production-private-frame-revision-2";
-        let (_, _, changed_snapshot) = source_snapshot_private_frame_function(changed_revision);
-        let changed = session.decompile_function_from_input(
-            EngineFunctionDecompileRequestInput::single_function(
-                EngineFunctionInput {
-                    function_name: "sym.production_private_frame".to_string(),
-                    function_addr: 0x7800,
-                    blocks: blocks.clone(),
-                    arch: Some(arch.clone()),
-                    source_snapshot: Some(changed_snapshot),
-                    semantic_metadata_enabled: true,
-                },
-                Some(64),
-                r2types::ParsedExternalContext::default(),
-                0,
-            ),
-        );
-        assert!(!changed.metrics.cache_hit);
-        assert_eq!(changed.output, response.output);
-        assert_eq!(
-            changed.diagnostics.semantic_kernel_render,
-            response.diagnostics.semantic_kernel_render
-        );
-
-        let mut near_miss = blocks;
-        near_miss[2].ops[1] = r2il::R2ILOp::Store {
-            space: r2il::SpaceId::Ram,
-            addr: r2il::Varnode::unique(0x50, 8),
-            val: r2il::Varnode::constant(2, 4),
-        };
-        let refused = session.decompile_function_from_input(
-            EngineFunctionDecompileRequestInput::single_function(
-                EngineFunctionInput {
-                    function_name: "sym.production_private_frame".to_string(),
-                    function_addr: 0x7800,
-                    blocks: near_miss,
-                    arch: Some(arch),
-                    source_snapshot: Some(source_snapshot),
-                    semantic_metadata_enabled: true,
-                },
-                Some(64),
-                r2types::ParsedExternalContext::default(),
-                0,
-            ),
-        );
-        assert!(
-            refused.output.contains("r2dec residual:")
-                && !refused
-                    .output
-                    .contains("r2s_fn_sym_production_private_frame")
-                && !refused.output.contains("certified_sub_7800"),
-            "private-frame near miss must not downgrade to generic C:\n{}",
-            refused.output
-        );
-        assert!(refused.diagnostics.semantic_kernel_render.is_none());
-    }
-
-    #[test]
-    fn production_engine_prefers_exact_fnv_fold_and_residualizes_transition_near_miss() {
-        let revision = b"production-real-fnv-fold-o2-revision";
-        let (blocks, arch, source_snapshot) = real_fnv_fold_function(revision);
-        let analysis = build_engine_analysis_from_parts(
-            "sym.production_fnv_fold",
-            &blocks,
-            Some(&arch),
-            Some(source_snapshot.as_ref()),
-        )
-        .expect("prepared exact FNV analysis");
-        let prepared = analysis.ssa_func.as_ref();
-        assert_eq!(
-            prepared_artifact_exact_fnv_fold_applicability(prepared),
-            Ok(true)
-        );
-        let facts = prepared
-            .structured()
-            .canonical_fnv_fold_loops
-            .values()
-            .collect::<Vec<_>>();
-        let [fact] = facts.as_slice() else {
-            panic!("one exact FNV fact")
-        };
-        assert_eq!(fact.topology.entry, REAL_FNV_O2_BASE);
-        assert_eq!(fact.topology.setup, REAL_FNV_O2_SETUP);
-        assert_eq!(fact.topology.header_latch, REAL_FNV_O2_LOOP);
-        assert_eq!(fact.topology.exit, REAL_FNV_O2_EXIT);
-        assert!(fact.validate_against(prepared));
-        assert!(prepared.memory().defs_by_inst.is_empty());
-        assert!(prepared.memory().phis_by_block.is_empty());
-        assert_eq!(
-            prepared
-                .memory()
-                .uses_by_inst
-                .values()
-                .map(Vec::len)
-                .sum::<usize>(),
-            1
-        );
-        let access = prepared
-            .structured()
-            .memory_accesses
-            .values()
-            .next()
-            .expect("one exact FNV byte access");
-        assert_eq!(prepared.structured().memory_accesses.len(), 1);
-        assert!(!access.is_write);
-        assert_eq!(access.width, 1);
-        assert!(access.provenance_complete);
-        let session = EngineSession::new(4);
-        let request = |blocks, source_snapshot| {
-            EngineFunctionDecompileRequestInput::single_function(
-                EngineFunctionInput {
-                    function_name: "sym.production_fnv_fold".to_string(),
-                    function_addr: REAL_FNV_O2_BASE,
-                    blocks,
-                    arch: Some(arch.clone()),
-                    source_snapshot: Some(source_snapshot),
-                    semantic_metadata_enabled: true,
-                },
-                Some(64),
-                r2types::ParsedExternalContext::default(),
-                0,
-            )
-        };
-        let response = session
-            .decompile_function_from_input(request(blocks.clone(), Arc::clone(&source_snapshot)));
-        assert_eq!(response.output, EXPECTED_FNV_SEMANTIC_C);
-        assert!(
-            response.output.contains(
-                "uint64_t r2s_fn_sym_production_fnv_fold(const uint8_t *r2s_arg_bytes, uint64_t r2s_arg_length)"
-            ) && response.output.contains("UINT64_C(0x14650fb0739d0383)")
-                && response.output.contains("UINT64_C(0x100000001b3)")
-                && response
-                    .output
-                    .contains("while (r2s_local_remaining != UINT64_C(0x0))")
-                && response.output.contains("= *r2s_local_pointer;")
-                && response.output.contains("r2s_local_pointer = r2s_local_pointer +")
-                && response.output.contains("r2s_local_remaining = (uint64_t)(r2s_local_remaining -"),
-            "exact FNV fold must use the certified canonical loop:\n{}",
-            response.output
-        );
-        assert_eq!(
-            response.diagnostics.semantic_kernel_render,
-            Some(EngineSemanticKernelRender {
-                region: EngineSemanticKernelRegion::CanonicalFnvFoldLoopFunction,
-                region_schema_version: r2dec::CERTIFIED_FNV_FOLD_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-                exact_obligation_closure: true,
-            })
-        );
-        assert_eq!(
-            response.diagnostics.plan,
-            Some(EnginePlan::SemanticStructured)
-        );
-        assert_eq!(
-            response.diagnostics.route_reason.as_deref(),
-            Some("r2cert authorized exact canonical FNV-fold loop obligation closure")
-        );
-        assert!(!response.metrics.cache_hit);
-        assert!(response.diagnostics.render_permission.is_none());
-        assert!(response.diagnostics.proof_coverage.is_none());
-        assert!(response.diagnostics.refusal.is_none());
-        assert!(response.diagnostics.warnings.is_empty());
-
-        let probes = vec![
-            Vec::new(),
-            b"A".to_vec(),
-            b"Z".to_vec(),
-            b"AbC".to_vec(),
-            b"abc".to_vec(),
-            vec![0x00, 0x40, 0x41, 0x5a, 0x5b, 0x7f, 0x80, 0xff],
-            (0_u8..=u8::MAX).collect(),
-        ];
-        let expected_results = probes
-            .iter()
-            .map(|bytes| reference_fnv_fold(bytes))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            compiled_fnv_results(&response.output, &probes),
-            expected_results
-        );
-
-        let cached = session
-            .decompile_function_from_input(request(blocks.clone(), Arc::clone(&source_snapshot)));
-        assert!(cached.metrics.cache_hit);
-        assert_eq!(cached.output, response.output);
-        assert_eq!(
-            cached.diagnostics.semantic_kernel_render,
-            response.diagnostics.semantic_kernel_render
-        );
-
-        let changed_snapshot =
-            real_fnv_source_snapshot(&arch, b"production-real-fnv-fold-o2-revision-2");
-        let changed =
-            session.decompile_function_from_input(request(blocks.clone(), changed_snapshot));
-        assert!(!changed.metrics.cache_hit);
-        assert_eq!(changed.output, response.output);
-        assert_eq!(
-            changed.diagnostics.semantic_kernel_render,
-            response.diagnostics.semantic_kernel_render
-        );
-
-        let mut near_miss = blocks;
-        let mut changed_prime_chunks = 0;
-        for op in near_miss.iter_mut().flat_map(|block| &mut block.ops) {
-            if let r2il::R2ILOp::Copy { src, .. } = op
-                && src.space == r2il::SpaceId::Const
-                && src.offset == 0x01b3
-                && src.size == 8
-            {
-                *src = r2il::Varnode::constant(0x01b5, 8);
-                changed_prime_chunks += 1;
-            }
-        }
-        assert_eq!(
-            changed_prime_chunks, 1,
-            "one real-lift FNV prime low initializer"
-        );
-        let near_miss_analysis = build_engine_analysis_from_parts(
-            "sym.production_fnv_fold",
-            &near_miss,
-            Some(&arch),
-            Some(source_snapshot.as_ref()),
-        )
-        .expect("prepared FNV transition near miss");
-        assert!(
-            near_miss_analysis
-                .ssa_func
-                .structured()
-                .canonical_fnv_fold_loops
-                .is_empty(),
-            "a changed prime must remove exact FNV applicability"
-        );
-        let residual = session.decompile_function_from_input(request(near_miss, source_snapshot));
-        assert!(
-            residual.output.contains("r2dec residual:")
-                && !residual.output.contains("r2s_fn_sym_production_fnv_fold")
-                && !residual.output.contains("certified_sub_100000594"),
-            "FNV transition near miss must remain residual without an exact fact:\n{}",
-            residual.output
-        );
-        assert!(residual.diagnostics.semantic_kernel_render.is_none());
-    }
-
-    #[test]
-    fn specialized_source_shapes_without_exact_facts_do_not_hijack_terminal_route() {
-        let private_revision = b"production-private-frame-shape-only-revision";
-        let (_, private_arch, private_snapshot) =
-            source_snapshot_private_frame_function(private_revision);
-        let mut private_terminal = R2ILBlock::new(0x7800, 4);
-        let private_result = r2il::Varnode::unique(0x200, 4);
-        private_terminal.push(r2il::R2ILOp::IntAdd {
-            dst: private_result.clone(),
-            a: r2il::Varnode::register(8, 4),
-            b: r2il::Varnode::constant(1, 4),
-        });
-        private_terminal.push(r2il::R2ILOp::Copy {
-            dst: r2il::Varnode::register(0, 4),
-            src: private_result,
-        });
-        private_terminal.push(r2il::R2ILOp::Return {
-            target: r2il::Varnode::register(32, 8),
-        });
-        let private_blocks = vec![private_terminal];
-        let private_analysis = build_engine_analysis_from_parts(
-            "sym.private_shape_terminal",
-            &private_blocks,
-            Some(&private_arch),
-            Some(private_snapshot.as_ref()),
-        )
-        .expect("prepared private-frame-shape terminal");
-        assert!(private_analysis.ssa_func.private_frame().is_none());
-        let private_response = EngineSession::new(4).decompile_function_from_input(
-            EngineFunctionDecompileRequestInput::single_function(
-                EngineFunctionInput {
-                    function_name: "sym.private_shape_terminal".to_string(),
-                    function_addr: 0x7800,
-                    blocks: private_blocks,
-                    arch: Some(private_arch),
-                    source_snapshot: Some(private_snapshot),
-                    semantic_metadata_enabled: true,
-                },
-                Some(64),
-                r2types::ParsedExternalContext::default(),
-                0,
-            ),
-        );
-        assert_eq!(
-            private_response
-                .diagnostics
-                .semantic_kernel_render
-                .map(|render| render.region),
-            Some(EngineSemanticKernelRegion::TerminalReturnBlock),
-            "a stack-slot source shape without a private-frame fact must reach the later terminal route:\n{}",
-            private_response.output
-        );
-
-        let fnv_revision = b"refusal-only-fnv-shape-revision";
-        let fnv_arch = real_fnv_arch();
-        let fnv_snapshot = real_fnv_source_snapshot(&fnv_arch, fnv_revision);
-        let mut refusal_only_fnv_terminal = R2ILBlock::new(REAL_FNV_O2_BASE, 4);
-        refusal_only_fnv_terminal.push(r2il::R2ILOp::Copy {
-            dst: r2il::Varnode::register(0, 8),
-            src: r2il::Varnode::register(8, 8),
-        });
-        refusal_only_fnv_terminal.push(r2il::R2ILOp::Return {
-            target: r2il::Varnode::register(
-                fnv_arch.get_register("x30").expect("AARCH64 x30").offset,
-                8,
-            ),
-        });
-        let refusal_only_fnv_blocks = vec![refusal_only_fnv_terminal];
-        let fnv_analysis = build_engine_analysis_from_parts(
-            "sym.fnv_shape_terminal",
-            &refusal_only_fnv_blocks,
-            Some(&fnv_arch),
-            Some(fnv_snapshot.as_ref()),
-        )
-        .expect("prepared FNV-shape terminal");
-        assert!(
-            fnv_analysis
-                .ssa_func
-                .structured()
-                .canonical_fnv_fold_loops
-                .is_empty()
-        );
-        assert_eq!(
-            prepared_artifact_exact_fnv_fold_applicability(fnv_analysis.ssa_func.as_ref()),
-            Ok(false)
-        );
-        let fnv_response = EngineSession::new(4).decompile_function_from_input(
-            EngineFunctionDecompileRequestInput::single_function(
-                EngineFunctionInput {
-                    function_name: "sym.fnv_shape_terminal".to_string(),
-                    function_addr: REAL_FNV_O2_BASE,
-                    blocks: refusal_only_fnv_blocks,
-                    arch: Some(fnv_arch),
-                    source_snapshot: Some(fnv_snapshot),
-                    semantic_metadata_enabled: true,
-                },
-                Some(64),
-                r2types::ParsedExternalContext::default(),
-                0,
-            ),
-        );
-        assert_eq!(
-            fnv_response
-                .diagnostics
-                .semantic_kernel_render
-                .map(|render| render.region),
-            Some(EngineSemanticKernelRegion::TerminalReturnBlock),
-            "an FNV ABI/type shape without an exact FNV fact must reach the later terminal route:\n{}",
-            fnv_response.output
+        assert_handmade_engine_refusal(
+            "sym.production_conditional_return",
+            0x7300,
+            blocks,
+            arch,
+            source_snapshot,
+            "certified_sub_7300",
         );
     }
 
     #[test]
-    fn production_engine_renders_only_exact_certified_switch_return_subset() {
+    fn handmade_switch_return_fixture_refuses_certified_c() {
         let (blocks, arch, source_snapshot) = source_snapshot_switch_return_function();
         let prepared = EngineSession::new(4)
             .analyze(EngineAnalyzeRequest::full_semantics_for_function(
@@ -11795,8 +9543,7 @@ mod tests {
                 },
             ))
             .expect("prepared switch-return analysis");
-        r2dec::CertifiedSwitchReturnFunction::from_artifact(prepared.artifact.ssa_func.as_ref())
-            .expect("engine-prepared switch-return artifact");
+        assert_handmade_machine_context_refusal(prepared.artifact.ssa_func.as_ref());
 
         let response = EngineSession::new(4).decompile_function_from_input(
             EngineFunctionDecompileRequestInput::single_function(
@@ -11813,37 +9560,8 @@ mod tests {
                 0,
             ),
         );
-        assert!(
-            response
-                .output
-                .contains("uint64_t certified_sub_7380(uint64_t v_")
-                && response.output.contains("switch ((uint64_t)v_")
-                && response.output.contains("case UINT64_C(0x1):")
-                && response.output.contains("case UINT64_C(0x7):")
-                && response.output.contains("default:")
-                && response
-                    .output
-                    .matches("return ((uint64_t)UINT64_C(")
-                    .count()
-                    == 3,
-            "exact switch source snapshot must reach certified semantic C:\n{}",
-            response.output
-        );
-        assert_eq!(
-            response.diagnostics.semantic_kernel_render,
-            Some(EngineSemanticKernelRender {
-                region: EngineSemanticKernelRegion::SwitchTerminalReturnFunction,
-                region_schema_version: r2dec::CERTIFIED_SWITCH_RETURN_FUNCTION_SCHEMA_VERSION,
-                exact_obligation_closure: true,
-            })
-        );
-        assert_eq!(
-            response.diagnostics.plan,
-            Some(EnginePlan::SemanticStructured)
-        );
-        assert!(response.diagnostics.render_permission.is_none());
-        assert!(response.diagnostics.proof_coverage.is_none());
-        assert!(response.diagnostics.refusal.is_none());
+        assert!(response.diagnostics.semantic_kernel_render.is_none());
+        assert!(!response.output.contains("certified_sub_7380"));
 
         let register = |offset| r2ssa::CanonicalStorageId {
             space: r2ssa::CanonicalStorageSpace::Register,
@@ -11903,7 +9621,7 @@ mod tests {
     }
 
     #[test]
-    fn production_engine_renders_only_exact_carrier_free_loop_return_subset() {
+    fn handmade_carrier_free_loop_return_fixture_refuses_certified_c() {
         let (blocks, arch, source_snapshot) = source_snapshot_carrier_free_loop_return_function();
         let prepared = EngineSession::new(4)
             .analyze(EngineAnalyzeRequest::full_semantics_for_function(
@@ -11928,8 +9646,7 @@ mod tests {
                 },
             ))
             .expect("prepared carrier-free loop-return analysis");
-        r2dec::CertifiedLoopReturnFunction::from_artifact(prepared.artifact.ssa_func.as_ref())
-            .expect("engine-prepared carrier-free loop-return artifact");
+        assert_handmade_machine_context_refusal(prepared.artifact.ssa_func.as_ref());
 
         let response = EngineSession::new(4).decompile_function_from_input(
             EngineFunctionDecompileRequestInput::single_function(
@@ -11946,33 +9663,8 @@ mod tests {
                 0,
             ),
         );
-        assert!(
-            response
-                .output
-                .contains("uint64_t certified_sub_7400(uint8_t v_")
-                && response.output.contains("while ((uint8_t)v_")
-                && response.output.contains(" != UINT8_C(0x0)")
-                && response
-                    .output
-                    .contains("return ((uint64_t)UINT64_C(0x2a));"),
-            "exact carrier-free loop snapshot must reach certified semantic C:\n{}",
-            response.output
-        );
-        assert_eq!(
-            response.diagnostics.semantic_kernel_render,
-            Some(EngineSemanticKernelRender {
-                region: EngineSemanticKernelRegion::CarrierFreeLoopTerminalReturnFunction,
-                region_schema_version: r2dec::CERTIFIED_LOOP_RETURN_FUNCTION_SCHEMA_VERSION,
-                exact_obligation_closure: true,
-            })
-        );
-        assert_eq!(
-            response.diagnostics.plan,
-            Some(EnginePlan::SemanticStructured)
-        );
-        assert!(response.diagnostics.render_permission.is_none());
-        assert!(response.diagnostics.proof_coverage.is_none());
-        assert!(response.diagnostics.refusal.is_none());
+        assert!(response.diagnostics.semantic_kernel_render.is_none());
+        assert!(!response.output.contains("certified_sub_7400"));
 
         let register = |offset, size| r2ssa::CanonicalStorageId {
             space: r2ssa::CanonicalStorageSpace::Register,
@@ -12029,167 +9721,6 @@ mod tests {
             );
             assert!(refused.diagnostics.semantic_kernel_render.is_none());
         }
-    }
-
-    #[test]
-    fn production_engine_renders_only_exact_counted_loop_return_subset() {
-        let (blocks, arch, source_snapshot) = source_snapshot_counted_loop_return_function();
-        let prepared = EngineSession::new(4)
-            .analyze(EngineAnalyzeRequest::full_semantics_for_function(
-                EngineAnalyzeFunctionRequestInput {
-                    function: EngineFunctionInput {
-                        function_name: "sym.production_counted_loop_return".to_string(),
-                        function_addr: 0x7500,
-                        blocks: blocks.clone(),
-                        arch: Some(arch.clone()),
-                        source_snapshot: Some(Arc::clone(&source_snapshot)),
-                        semantic_metadata_enabled: true,
-                    },
-                    ptr_bits: Some(64),
-                    reg_type_hints: HashMap::new(),
-                    parsed_context: r2types::ParsedExternalContext::default(),
-                    external_context_fallback_hash: 0,
-                    scope_facts: InterprocScopeFacts::empty(),
-                    interproc_max_iterations: 1,
-                    symbolic_scope: None,
-                    precomputed_semantic_artifact: None,
-                    include_interproc_summary_set: false,
-                },
-            ))
-            .expect("prepared counted-loop return analysis");
-        let function = r2dec::CertifiedCountedLoopReturnFunction::from_artifact(
-            prepared.artifact.ssa_func.as_ref(),
-        )
-        .expect("engine-prepared counted-loop return artifact");
-        assert!(function.render_permit().authorizes_certified_c());
-        assert!(
-            r2dec::check_counted_loop_return_differential(prepared.artifact.ssa_func.as_ref(), 3,)
-                .expect("counted-loop differential")
-                .all_match()
-        );
-
-        let response = EngineSession::new(4).decompile_function_from_input(
-            EngineFunctionDecompileRequestInput::single_function(
-                EngineFunctionInput {
-                    function_name: "sym.production_counted_loop_return".to_string(),
-                    function_addr: 0x7500,
-                    blocks: blocks.clone(),
-                    arch: Some(arch.clone()),
-                    source_snapshot: Some(Arc::clone(&source_snapshot)),
-                    semantic_metadata_enabled: true,
-                },
-                Some(64),
-                r2types::ParsedExternalContext::default(),
-                0,
-            ),
-        );
-        assert!(
-            response
-                .output
-                .contains("uint64_t certified_sub_7500(uint64_t v_")
-                && response.output.contains(" = UINT64_C(0x0);")
-                && response.output.contains("while (v_")
-                && response.output.contains(" < v_")
-                && response.output.contains(" + UINT64_C(0x1)")
-                && response.output.contains("return v_"),
-            "exact counted-loop snapshot must reach certified semantic C:\n{}",
-            response.output
-        );
-        assert_eq!(
-            response.diagnostics.semantic_kernel_render,
-            Some(EngineSemanticKernelRender {
-                region: EngineSemanticKernelRegion::CountedLoopTerminalReturnFunction,
-                region_schema_version: r2dec::CERTIFIED_COUNTED_LOOP_RETURN_FUNCTION_SCHEMA_VERSION,
-                exact_obligation_closure: true,
-            })
-        );
-        assert_eq!(
-            response.diagnostics.plan,
-            Some(EnginePlan::SemanticStructured)
-        );
-        assert!(response.diagnostics.render_permission.is_none());
-        assert!(response.diagnostics.proof_coverage.is_none());
-        assert!(response.diagnostics.refusal.is_none());
-
-        let register = |offset, size| r2ssa::CanonicalStorageId {
-            space: r2ssa::CanonicalStorageSpace::Register,
-            offset,
-            size,
-        };
-        let wrong_interface = r2ssa::SourceFunctionInterface::new(
-            source_snapshot.revision_identity().to_vec(),
-            "test-register-abi",
-            [r2ssa::SourceAbiParameterSpec::new(0, register(24, 8))],
-            r2ssa::SourceFunctionReturn::Register {
-                storage: register(0, 8),
-            },
-            Vec::<r2ssa::SourceStackSlotSpec>::new(),
-        )
-        .expect("wrong counted-loop bound interface");
-        let wrong_storage = Arc::new(
-            EngineSourceSnapshot::new(
-                source_snapshot.revision_identity().to_vec(),
-                Some(wrong_interface),
-                Vec::new(),
-            )
-            .expect("wrong counted-loop bound snapshot"),
-        );
-        let missing_interface = Arc::new(
-            EngineSourceSnapshot::new(
-                source_snapshot.revision_identity().to_vec(),
-                None,
-                Vec::new(),
-            )
-            .expect("snapshot without counted-loop function interface"),
-        );
-        for source_snapshot in [missing_interface, wrong_storage] {
-            let refused = EngineSession::new(4).decompile_function_from_input(
-                EngineFunctionDecompileRequestInput::single_function(
-                    EngineFunctionInput {
-                        function_name: "sym.production_counted_loop_return".to_string(),
-                        function_addr: 0x7500,
-                        blocks: blocks.clone(),
-                        arch: Some(arch.clone()),
-                        source_snapshot: Some(source_snapshot),
-                        semantic_metadata_enabled: true,
-                    },
-                    Some(64),
-                    r2types::ParsedExternalContext::default(),
-                    0,
-                ),
-            );
-            assert!(
-                refused.output.contains("r2dec residual:")
-                    && !refused.output.contains("certified_sub_7500"),
-                "missing or wrong counted-loop bound authority must fail closed:\n{}",
-                refused.output
-            );
-            assert!(refused.diagnostics.semantic_kernel_render.is_none());
-        }
-
-        let mut wrong_update = blocks;
-        wrong_update[3].ops[0] = r2il::R2ILOp::IntSub {
-            dst: r2il::Varnode::register(0, 8),
-            a: r2il::Varnode::register(0, 8),
-            b: r2il::Varnode::constant(1, 8),
-        };
-        let refused = EngineSession::new(4).decompile_function_from_input(
-            EngineFunctionDecompileRequestInput::single_function(
-                EngineFunctionInput {
-                    function_name: "sym.production_counted_loop_return".to_string(),
-                    function_addr: 0x7500,
-                    blocks: wrong_update,
-                    arch: Some(arch),
-                    source_snapshot: Some(source_snapshot),
-                    semantic_metadata_enabled: true,
-                },
-                Some(64),
-                r2types::ParsedExternalContext::default(),
-                0,
-            ),
-        );
-        assert!(!refused.output.contains("certified_sub_7500"));
-        assert!(refused.diagnostics.semantic_kernel_render.is_none());
     }
 
     #[test]
@@ -12314,6 +9845,42 @@ mod tests {
         assert_eq!(
             key.source_revision_identity.as_deref(),
             Some(b"revision-a".as_slice())
+        );
+
+        let stack_snapshot = |offset| {
+            let interface = source_snapshot_function_interface(b"revision-sp")
+                .with_stack_pointer_storage(r2ssa::CanonicalStorageId {
+                    space: r2ssa::CanonicalStorageSpace::Register,
+                    offset,
+                    size: 8,
+                })
+                .expect("disjoint typed stack pointer");
+            EngineSourceSnapshot::new(b"revision-sp".to_vec(), Some(interface), Vec::new())
+                .expect("stack-pointer source snapshot")
+        };
+        let stack_key = AnalysisCacheKey::from_parts(
+            0x401000,
+            "sym.snapshot",
+            None,
+            &blocks,
+            0,
+            0,
+            "aa",
+            Some(&stack_snapshot(0x20)),
+        );
+        let changed_stack_key = AnalysisCacheKey::from_parts(
+            0x401000,
+            "sym.snapshot",
+            None,
+            &blocks,
+            0,
+            0,
+            "aa",
+            Some(&stack_snapshot(0x28)),
+        );
+        assert_ne!(
+            stack_key, changed_stack_key,
+            "typed SP coordinates participate in source-snapshot cache identity"
         );
 
         let session = EngineSession::new(4);
@@ -12473,23 +10040,48 @@ mod tests {
     #[test]
     fn authoritative_source_interface_reaches_prepared_ssa_through_request() {
         let revision = b"source-revision-1";
+        let register = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let function_interface = r2ssa::SourceFunctionInterface::new_exact(
+            revision.to_vec(),
+            "sysv",
+            Vec::<r2ssa::SourceAbiParameterSpec>::new(),
+            r2ssa::SourceFunctionReturn::Register {
+                storage: register(0),
+            },
+            Vec::<r2ssa::SourceStackSlotSpec>::new(),
+        )
+        .expect("exact source interface")
+        .with_return_address_storage(register(0x10))
+        .and_then(|interface| interface.with_stack_pointer_storage(register(0x18)))
+        .expect("exact source machine carriers");
         let snapshot = Arc::new(
             EngineSourceSnapshot::new(
                 revision.to_vec(),
-                Some(source_snapshot_function_interface(revision)),
+                Some(function_interface),
                 vec![source_snapshot_call_interface(
                     revision, 0x401000, 0, 0x5000,
                 )],
             )
             .expect("source snapshot"),
         );
+        let mut blocks = direct_call_return_blocks(0x401000, 0x5000);
+        blocks[0].ops[1] = r2il::R2ILOp::Return {
+            target: r2il::Varnode::register(0x10, 8),
+        };
+        let mut arch = x86_64_result_arch();
+        arch.add_register(r2il::RegisterDef::new("rip", 0x10, 8));
+        arch.add_register(r2il::RegisterDef::new("rsp", 0x18, 8));
         let request =
             EngineAnalyzeRequest::full_semantics_for_function(EngineAnalyzeFunctionRequestInput {
                 function: EngineFunctionInput {
                     function_name: "sym.snapshot".to_string(),
                     function_addr: 0x401000,
-                    blocks: direct_call_return_blocks(0x401000, 0x5000),
-                    arch: Some(x86_64_result_arch()),
+                    blocks,
+                    arch: Some(arch),
                     source_snapshot: Some(snapshot.clone()),
                     semantic_metadata_enabled: false,
                 },
@@ -12519,7 +10111,10 @@ mod tests {
                 .revision_identity(),
             revision
         );
-        assert!(context.abi_model().is_coherent());
+        assert!(
+            context.abi_model().is_coherent(),
+            "authoritative source context must remain coherent: {context:#?}"
+        );
         assert!(context.call_site_interfaces_are_coherent());
         assert_eq!(context.call_site_interfaces().len(), 1);
         assert!(
@@ -13335,7 +10930,7 @@ mod tests {
             semantic_build_plan: None,
             semantic_route: Some(r2types::DecompileRouteFacts {
                 kind: r2types::DecompileRouteKind::Standard,
-                reason: Some("legacy rendered proofs complete".to_string()),
+                reason: Some("legacy rendered proofs remain residual".to_string()),
                 fallback_comment: None,
                 skip_runtime_type_inference: false,
                 use_prepared_semantic_view: true,
@@ -13346,9 +10941,9 @@ mod tests {
                     certified_returns: 1,
                     ..r2sym::ProofCoverage::default()
                 },
-                render_permission: r2sym::RenderPermission::certified(
+                render_permission: r2sym::RenderPermission::residual(
                     r2sym::ProofOwner::R2engine,
-                    "legacy rendered proofs complete",
+                    "legacy rendered proofs remain residual",
                 ),
             }),
             summary_diagnostics: None,
@@ -13388,11 +10983,11 @@ mod tests {
             value["legacy_rendered_proof_coverage"],
             expected_proof_coverage
         );
-        assert_eq!(value["legacy_render_permission"]["kind"], "CertifiedC");
+        assert_eq!(value["legacy_render_permission"]["kind"], "Residual");
         assert_eq!(value["legacy_render_permission"]["owner"], "R2engine");
         assert_eq!(
             value["legacy_render_permission"]["reason"],
-            "legacy rendered proofs complete"
+            "legacy rendered proofs remain residual"
         );
         assert_eq!(
             value["legacy_rendered_proof_coverage"]["certified_loops"],
@@ -15171,14 +12766,14 @@ mod tests {
         };
         let route = r2types::DecompileRouteFacts {
             kind: r2types::DecompileRouteKind::Standard,
-            reason: Some("controlled r2dec render test".to_string()),
+            reason: Some("controlled r2dec residual test".to_string()),
             fallback_comment: None,
             skip_runtime_type_inference: true,
             use_prepared_semantic_view: true,
             proof_coverage: r2sym::ProofCoverage::default(),
-            render_permission: r2sym::RenderPermission::certified(
+            render_permission: r2sym::RenderPermission::residual(
                 r2sym::ProofOwner::R2engine,
-                "controlled r2dec render test",
+                "controlled r2dec residual test",
             ),
         };
         let function_facts = FunctionFacts::new(
@@ -15303,53 +12898,6 @@ mod tests {
         }
     }
 
-    fn controlled_conditional_funnel_render_request(
-        session: &EngineSession,
-    ) -> EngineDecompileRequest {
-        let (blocks, arch, source_snapshot) =
-            source_snapshot_conditional_funnel_return_function(true);
-        let analyzed = session
-            .analyze(EngineAnalyzeRequest::full_semantics_for_function(
-                EngineAnalyzeFunctionRequestInput {
-                    function: EngineFunctionInput {
-                        function_name: "sym.controlled_conditional_funnel".to_string(),
-                        function_addr: 0x7600,
-                        blocks,
-                        arch: Some(arch.clone()),
-                        source_snapshot: Some(source_snapshot),
-                        semantic_metadata_enabled: true,
-                    },
-                    ptr_bits: Some(64),
-                    reg_type_hints: HashMap::new(),
-                    parsed_context: r2types::ParsedExternalContext::default(),
-                    external_context_fallback_hash: 0,
-                    scope_facts: InterprocScopeFacts::empty(),
-                    interproc_max_iterations: 1,
-                    symbolic_scope: None,
-                    precomputed_semantic_artifact: None,
-                    include_interproc_summary_set: false,
-                },
-            ))
-            .expect("controlled conditional-funnel analysis");
-        let (arch_name, render_target) =
-            EngineRenderTarget::for_arch_with_ptr_bits(Some(&arch), 64);
-        let param_slots = ParamSlotResolver::from_arch_name(Some(&arch_name));
-        let function_facts = function_facts_for_decompile(
-            "sym.controlled_conditional_funnel",
-            &analyzed.artifact.ssa_func,
-            analyzed.artifact.function_facts,
-            &param_slots,
-        );
-        EngineDecompileRequest {
-            function_name: "sym.controlled_conditional_funnel".to_string(),
-            prepared_ssa: analyzed.artifact.ssa_func,
-            function_facts,
-            render_target,
-            execution: EngineExecutionControl::default(),
-            metrics: EngineMetrics::default(),
-        }
-    }
-
     #[derive(Default)]
     struct CountingRenderControl {
         polls: Cell<usize>,
@@ -15391,11 +12939,10 @@ mod tests {
     }
 
     #[test]
-    fn exact_semantic_kernel_permits_override_legacy_route_metadata() {
+    fn legacy_route_metadata_cannot_promote_handmade_fixtures() {
         let session = EngineSession::new(4);
         let mut terminal = controlled_semantic_kernel_render_request(&session);
-        let terminal_baseline = session
-            .decompile_with_r2dec_control(terminal.clone(), &r2ssa::SsaExecutionControl::default());
+        assert_handmade_machine_context_refusal(terminal.prepared_ssa.as_ref());
         terminal
             .function_facts
             .set_decompile_route(Some(test_decompile_route(
@@ -15405,65 +12952,8 @@ mod tests {
             )));
         let terminal =
             session.decompile_with_r2dec_control(terminal, &r2ssa::SsaExecutionControl::default());
-        assert_eq!(terminal.output, terminal_baseline.output);
-        assert!(terminal.output.contains("certified_sub_7200"));
-        assert_eq!(
-            terminal.diagnostics.semantic_kernel_render,
-            terminal_baseline.diagnostics.semantic_kernel_render
-        );
-        assert!(terminal.diagnostics.render_permission.is_none());
-        assert!(terminal.diagnostics.refusal.is_none());
-
-        let mut funnel = controlled_conditional_funnel_render_request(&session);
-        let funnel_baseline = session
-            .decompile_with_r2dec_control(funnel.clone(), &r2ssa::SsaExecutionControl::default());
-        funnel
-            .function_facts
-            .set_decompile_route(Some(test_decompile_route(
-                r2types::DecompileRouteKind::StructuredWorker,
-                Some("forced legacy structured-worker summary"),
-                Some("/* forced legacy structured-worker fallback */"),
-            )));
-        let funnel =
-            session.decompile_with_r2dec_control(funnel, &r2ssa::SsaExecutionControl::default());
-        assert_eq!(funnel.output, funnel_baseline.output);
-        assert!(funnel.output.contains("certified_sub_7600"));
-        assert_eq!(
-            funnel.diagnostics.semantic_kernel_render,
-            funnel_baseline.diagnostics.semantic_kernel_render
-        );
-        assert!(funnel.diagnostics.render_permission.is_none());
-        assert!(funnel.diagnostics.refusal.is_none());
-    }
-
-    #[test]
-    fn legacy_certified_c_claim_cannot_authorize_a_semantic_kernel_near_miss() {
-        let session = EngineSession::new(4);
-        let request = controlled_r2dec_render_request();
-        assert_eq!(
-            request
-                .function_facts
-                .decompile_route()
-                .map(|route| route.render_permission.kind),
-            Some(r2sym::RenderPermissionKind::CertifiedC),
-            "fixture must carry the obsolete authority claim"
-        );
-
-        let response =
-            session.decompile_with_r2dec_control(request, &r2ssa::SsaExecutionControl::default());
-
-        assert!(response.diagnostics.semantic_kernel_render.is_none());
-        assert_eq!(
-            response
-                .diagnostics
-                .render_permission
-                .as_ref()
-                .map(|permission| permission.kind),
-            Some(r2sym::RenderPermissionKind::CertifiedC),
-            "the compatibility diagnostic may report the stale claim without authorizing it"
-        );
-        assert!(response.output.contains("r2dec residual:"));
-        assert!(!response.output.contains("() {"));
+        assert!(terminal.diagnostics.semantic_kernel_render.is_none());
+        assert!(!terminal.output.contains("certified_sub_7200"));
     }
 
     #[test]
@@ -15687,162 +13177,42 @@ mod tests {
     }
 
     #[test]
-    fn semantic_kernel_rejection_preserves_certification_and_rendering_phases() {
-        let cancellation = StopRenderAtPoll::new(1, r2ssa::SsaExecutionStopReason::Cancelled);
-        let injected_rejection = complete_engine_semantic_kernel_attempt(
-            &cancellation,
-            EngineSemanticKernelAttempt::Rejected {
-                reason: "forced certificate rejection".to_string(),
-                phase: EnginePhase::Certification,
-                certification_completed: false,
-                structuring_completed: false,
-            },
-        )
-        .expect("a known exact rejection must not run a masking cancellation poll");
-        assert_eq!(cancellation.polls.get(), 0);
-        let certification = resolve_engine_semantic_kernel_attempt(injected_rejection)
-            .expect_err("forced certificate rejection must not yield partial C");
-        let certification_metrics = engine_metrics_for_render_stop(
-            EngineMetrics::default(),
-            &certification,
-            Duration::from_micros(3),
-            Duration::from_micros(5),
-        );
-        assert_eq!(certification.reason, "forced certificate rejection");
-        assert_eq!(certification.phase, EnginePhase::Certification);
-        assert_eq!(
-            certification_metrics.phase_timings[EnginePhase::Certification as usize].status,
-            EnginePhaseStatus::Refused
-        );
-        assert_eq!(
-            certification_metrics.phase_timings[EnginePhase::Structuring as usize].status,
-            EnginePhaseStatus::NotExecuted
-        );
-        assert_eq!(
-            certification_metrics.phase_timings[EnginePhase::Rendering as usize].status,
-            EnginePhaseStatus::NotExecuted
-        );
-        assert_eq!(
-            certification_metrics.phase_timings[EnginePhase::FfiConversion as usize].status,
-            EnginePhaseStatus::NotExecuted
-        );
-
-        let rendering =
-            resolve_engine_semantic_kernel_attempt(EngineSemanticKernelAttempt::Rejected {
-                reason: "forced certified-render rejection".to_string(),
-                phase: EnginePhase::Rendering,
-                certification_completed: true,
-                structuring_completed: true,
-            })
-            .expect_err("forced rendering rejection must not yield partial C");
-        let rendering_metrics = engine_metrics_for_render_stop(
-            EngineMetrics::default(),
-            &rendering,
-            Duration::from_micros(7),
-            Duration::from_micros(11),
-        );
-        assert_eq!(rendering.reason, "forced certified-render rejection");
-        assert_eq!(rendering.phase, EnginePhase::Rendering);
-        assert_eq!(
-            rendering_metrics.phase_timings[EnginePhase::Certification as usize].status,
-            EnginePhaseStatus::Folded
-        );
-        assert_eq!(
-            rendering_metrics.phase_timings[EnginePhase::Structuring as usize].status,
-            EnginePhaseStatus::Folded
-        );
-        assert_eq!(
-            rendering_metrics.phase_timings[EnginePhase::Rendering as usize].status,
-            EnginePhaseStatus::Refused
-        );
-        assert_eq!(
-            rendering_metrics.phase_timings[EnginePhase::FfiConversion as usize].status,
-            EnginePhaseStatus::NotExecuted
-        );
-    }
-
-    #[test]
     fn semantic_kernel_region_schema_table_tracks_exact_r2dec_contracts() {
         for (region, contract, expected_wire) in [
             (
                 EngineSemanticKernelRegion::TerminalReturnBlock,
                 r2dec::CERTIFIED_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-                1,
+                2,
             ),
             (
                 EngineSemanticKernelRegion::AggregateMemberTerminalReturnFunction,
                 r2dec::CERTIFIED_AGGREGATE_MEMBER_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-                1,
+                2,
             ),
             (
                 EngineSemanticKernelRegion::PlainRamMemoryTerminalReturnFunction,
                 r2dec::CERTIFIED_MEMORY_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-                1,
+                2,
             ),
             (
                 EngineSemanticKernelRegion::DirectCallTerminalReturnFunction,
                 r2dec::CERTIFIED_DIRECT_CALL_RETURN_FUNCTION_SCHEMA_VERSION,
-                1,
+                2,
             ),
             (
                 EngineSemanticKernelRegion::ConditionalTerminalReturnFunction,
                 r2dec::CERTIFIED_CONDITIONAL_RETURN_FUNCTION_SCHEMA_VERSION,
-                1,
-            ),
-            (
-                EngineSemanticKernelRegion::PrivateFrameConditionalReturnFunction,
-                r2dec::CERTIFIED_PRIVATE_FRAME_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-                1,
-            ),
-            (
-                EngineSemanticKernelRegion::CanonicalFnvFoldLoopFunction,
-                r2dec::CERTIFIED_FNV_FOLD_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-                1,
-            ),
-            (
-                EngineSemanticKernelRegion::ConditionalFunnelSharedReturnFunction,
-                r2dec::CERTIFIED_CONDITIONAL_FUNNEL_RETURN_FUNCTION_SCHEMA_VERSION,
-                1,
+                2,
             ),
             (
                 EngineSemanticKernelRegion::SwitchTerminalReturnFunction,
                 r2dec::CERTIFIED_SWITCH_RETURN_FUNCTION_SCHEMA_VERSION,
-                1,
+                2,
             ),
             (
                 EngineSemanticKernelRegion::CarrierFreeLoopTerminalReturnFunction,
                 r2dec::CERTIFIED_LOOP_RETURN_FUNCTION_SCHEMA_VERSION,
-                1,
-            ),
-            (
-                EngineSemanticKernelRegion::CountedLoopTerminalReturnFunction,
-                r2dec::CERTIFIED_COUNTED_LOOP_RETURN_FUNCTION_SCHEMA_VERSION,
-                1,
-            ),
-            (
-                EngineSemanticKernelRegion::CanonicalFnvFoldO0Function,
-                r2dec::CERTIFIED_FNV_FOLD_O0_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-                1,
-            ),
-            (
-                EngineSemanticKernelRegion::BranchlessGuardFunction,
-                r2dec::CERTIFIED_BRANCHLESS_GUARD_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-                1,
-            ),
-            (
-                EngineSemanticKernelRegion::StructArrayIndexFunction,
-                r2dec::CERTIFIED_STRUCT_ARRAY_INDEX_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-                1,
-            ),
-            (
-                EngineSemanticKernelRegion::NestedWrap32GuardO0Function,
-                r2dec::CERTIFIED_NESTED_WRAP32_GUARD_O0_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-                1,
-            ),
-            (
-                EngineSemanticKernelRegion::SumArrayFunction,
-                r2dec::CERTIFIED_SUM_ARRAY_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-                1,
+                2,
             ),
         ] {
             assert_eq!(contract, expected_wire);
@@ -15851,243 +13221,25 @@ mod tests {
     }
 
     #[test]
-    fn engine_execution_cancellation_reaches_r2dec_inner_normalization() {
-        let session = EngineSession::new(4);
-        let cancellation = EngineCancellationToken::default();
-        let mut request = controlled_r2dec_render_request();
-        request.execution = EngineExecutionControl::with_cancellation(cancellation.clone());
-        let control = DeterministicSsaControl {
-            polls: Cell::new(0),
-            stop_at: 5,
-            trigger: SsaPollTrigger::Cancel(cancellation),
-            downstream: Some(request.execution.ssa_execution_control()),
-        };
-
-        let response =
-            session.decompile_with_r2dec_control_and_kernel_policy(request, &control, false);
-
-        assert_eq!(control.polls.get(), 5);
-        assert_eq!(
-            response.diagnostics.route_reason.as_deref(),
-            Some("engine request cancelled during normalization phase")
-        );
-        assert!(response.metrics.phase_timings.iter().any(|timing| {
-            timing.phase == EnginePhase::Normalization
-                && timing.status == EnginePhaseStatus::Refused
-        }));
-        assert_eq!(
-            response
-                .metrics
-                .phase_timings
-                .iter()
-                .filter(|timing| timing.status == EnginePhaseStatus::Refused)
-                .count(),
-            1
-        );
-        assert_eq!(
-            response.metrics.phase_timings[EnginePhase::Structuring as usize].status,
-            EnginePhaseStatus::NotExecuted
-        );
-        assert_eq!(
-            response.metrics.phase_timings[EnginePhase::Rendering as usize].status,
-            EnginePhaseStatus::NotExecuted
-        );
-        assert!(response.output.starts_with("/* r2dec fallback:"));
-        assert!(!response.output.contains("() {"));
-    }
-
-    #[test]
-    fn semantic_kernel_renderers_poll_without_reclassifying_certification() {
+    fn handmade_terminal_cannot_reach_semantic_kernel_renderer() {
         let session = EngineSession::new(4);
         let request = controlled_semantic_kernel_render_request(&session);
-        let baseline = session
-            .decompile_with_r2dec_control(request.clone(), &r2ssa::SsaExecutionControl::default());
-        assert!(
-            baseline.diagnostics.semantic_kernel_render.is_some(),
-            "exact terminal-return fixture should retain its semantic-kernel authorization"
-        );
-        assert!(baseline.diagnostics.refusal.is_none());
-
-        let cache_before = session.cache_metrics();
-        let stop = StopRenderAtPoll::new(1, r2ssa::SsaExecutionStopReason::Cancelled);
-        let refused = session.decompile_with_r2dec_control(request, &stop);
-        assert_eq!(stop.polls.get(), 1);
-        assert_eq!(
-            refused.diagnostics.route_reason.as_deref(),
-            Some("engine request cancelled during rendering phase")
-        );
+        assert_handmade_machine_context_refusal(request.prepared_ssa.as_ref());
+        let refused =
+            session.decompile_with_r2dec_control(request, &r2ssa::SsaExecutionControl::default());
         assert!(refused.diagnostics.semantic_kernel_render.is_none());
-        assert!(refused.metrics.phase_timings.iter().any(|timing| {
-            timing.phase == EnginePhase::Normalization
-                && timing.status == EnginePhaseStatus::NotExecuted
-        }));
-        assert!(refused.metrics.phase_timings.iter().any(|timing| {
-            timing.phase == EnginePhase::Structuring
-                && timing.status == EnginePhaseStatus::NotExecuted
-        }));
-        assert!(refused.metrics.phase_timings.iter().any(|timing| {
-            timing.phase == EnginePhase::Rendering && timing.status == EnginePhaseStatus::Refused
-        }));
-        assert_eq!(
-            refused
-                .metrics
-                .phase_timings
-                .iter()
-                .filter(|timing| timing.status == EnginePhaseStatus::Refused)
-                .count(),
-            1
-        );
-        assert!(refused.output.starts_with("/* r2dec fallback:"));
-        assert!(!refused.output.contains("() {"));
-        assert_eq!(session.cache_metrics(), cache_before);
+        assert!(!refused.output.contains("certified_sub_7200"));
     }
 
     #[test]
-    fn aggregate_member_renderer_cancellation_is_atomic_and_cache_invariant() {
+    fn handmade_aggregate_member_cannot_reach_semantic_kernel_renderer() {
         let session = EngineSession::new(4);
         let request = controlled_aggregate_member_render_request(&session);
-        let counting = CountingRenderControl::default();
-        let baseline = session.decompile_with_r2dec_control(request.clone(), &counting);
-        assert_eq!(
-            baseline.diagnostics.semantic_kernel_render,
-            Some(EngineSemanticKernelRender {
-                region: EngineSemanticKernelRegion::AggregateMemberTerminalReturnFunction,
-                region_schema_version:
-                    r2dec::CERTIFIED_AGGREGATE_MEMBER_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-                exact_obligation_closure: true,
-            })
-        );
-        assert!(baseline.output.contains("certified_aggregate_sub_7700"));
-        let aggregate_completion_poll = counting.polls.get();
-        assert!(
-            aggregate_completion_poll >= 2,
-            "aggregate route must poll before construction and before publishing C"
-        );
-
-        let cache_before = session.cache_metrics();
-        let stop = StopRenderAtPoll::new(
-            aggregate_completion_poll,
-            r2ssa::SsaExecutionStopReason::DeadlineExceeded,
-        );
-        let refused = session.decompile_with_r2dec_control(request.clone(), &stop);
-        assert_eq!(stop.polls.get(), aggregate_completion_poll);
-        assert_eq!(
-            refused.diagnostics.route_reason.as_deref(),
-            Some("engine request deadline exceeded during rendering phase")
-        );
+        assert_handmade_machine_context_refusal(request.prepared_ssa.as_ref());
+        let refused =
+            session.decompile_with_r2dec_control(request, &r2ssa::SsaExecutionControl::default());
         assert!(refused.diagnostics.semantic_kernel_render.is_none());
-        assert!(refused.output.starts_with("/* r2dec fallback:"));
         assert!(!refused.output.contains("certified_aggregate_sub_7700"));
-        assert!(!refused.output.contains("() {"));
-        assert_eq!(
-            refused
-                .metrics
-                .phase_timings
-                .iter()
-                .filter(|timing| timing.status == EnginePhaseStatus::Refused)
-                .count(),
-            1
-        );
-        assert_eq!(
-            refused.metrics.phase_timings[EnginePhase::Rendering as usize].status,
-            EnginePhaseStatus::Refused
-        );
-        assert_eq!(
-            refused.metrics.phase_timings[EnginePhase::Certification as usize].status,
-            EnginePhaseStatus::Folded
-        );
-        assert_eq!(
-            refused.metrics.phase_timings[EnginePhase::Structuring as usize].status,
-            EnginePhaseStatus::Folded
-        );
-        assert_eq!(
-            refused.metrics.phase_timings[EnginePhase::FfiConversion as usize].status,
-            EnginePhaseStatus::NotExecuted
-        );
-        assert_eq!(session.cache_metrics(), cache_before);
-
-        let resumed =
-            session.decompile_with_r2dec_control(request, &r2ssa::SsaExecutionControl::default());
-        assert_eq!(resumed.output, baseline.output);
-        assert_eq!(
-            resumed.diagnostics.semantic_kernel_render,
-            baseline.diagnostics.semantic_kernel_render
-        );
-        assert_eq!(session.cache_metrics(), cache_before);
-    }
-
-    #[test]
-    fn conditional_funnel_renderer_cancellation_is_atomic_and_cache_invariant() {
-        let session = EngineSession::new(4);
-        let request = controlled_conditional_funnel_render_request(&session);
-        let counting = CountingRenderControl::default();
-        let baseline = session.decompile_with_r2dec_control(request.clone(), &counting);
-        assert_eq!(
-            baseline.diagnostics.semantic_kernel_render,
-            Some(EngineSemanticKernelRender {
-                region: EngineSemanticKernelRegion::ConditionalFunnelSharedReturnFunction,
-                region_schema_version:
-                    r2dec::CERTIFIED_CONDITIONAL_FUNNEL_RETURN_FUNCTION_SCHEMA_VERSION,
-                exact_obligation_closure: true,
-            })
-        );
-        assert!(baseline.output.contains("certified_sub_7600"));
-        let funnel_completion_poll = counting.polls.get();
-        assert!(
-            funnel_completion_poll > 4,
-            "funnel route must remain interruptible after earlier exact route attempts"
-        );
-
-        let cache_before = session.cache_metrics();
-        let stop = StopRenderAtPoll::new(
-            funnel_completion_poll,
-            r2ssa::SsaExecutionStopReason::Cancelled,
-        );
-        let refused = session.decompile_with_r2dec_control(request.clone(), &stop);
-        assert_eq!(stop.polls.get(), funnel_completion_poll);
-        assert_eq!(
-            refused.diagnostics.route_reason.as_deref(),
-            Some("engine request cancelled during rendering phase")
-        );
-        assert!(refused.diagnostics.semantic_kernel_render.is_none());
-        assert!(refused.output.starts_with("/* r2dec fallback:"));
-        assert!(!refused.output.contains("certified_sub_7600"));
-        assert!(!refused.output.contains("() {"));
-        assert_eq!(
-            refused
-                .metrics
-                .phase_timings
-                .iter()
-                .filter(|timing| timing.status == EnginePhaseStatus::Refused)
-                .count(),
-            1
-        );
-        assert_eq!(
-            refused.metrics.phase_timings[EnginePhase::Rendering as usize].status,
-            EnginePhaseStatus::Refused
-        );
-        assert_eq!(
-            refused.metrics.phase_timings[EnginePhase::Certification as usize].status,
-            EnginePhaseStatus::Folded
-        );
-        assert_eq!(
-            refused.metrics.phase_timings[EnginePhase::Structuring as usize].status,
-            EnginePhaseStatus::Folded
-        );
-        assert_eq!(
-            refused.metrics.phase_timings[EnginePhase::FfiConversion as usize].status,
-            EnginePhaseStatus::NotExecuted
-        );
-        assert_eq!(session.cache_metrics(), cache_before);
-
-        let resumed =
-            session.decompile_with_r2dec_control(request, &r2ssa::SsaExecutionControl::default());
-        assert_eq!(resumed.output, baseline.output);
-        assert_eq!(
-            resumed.diagnostics.semantic_kernel_render,
-            baseline.diagnostics.semantic_kernel_render
-        );
-        assert_eq!(session.cache_metrics(), cache_before);
     }
 
     fn analyze_with_injected_ssa_control<C: r2ssa::SsaWorkControl + ?Sized>(
@@ -19538,7 +16690,7 @@ mod tests {
         let artifact = summary_only_exact_hash_fold_artifact();
         let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), Some(artifact));
 
-        let route = semantic_route_plan("dbg.fnv_fold", &function_facts, &cfg_summary);
+        let route = semantic_route_plan("dbg.hash_fold_worker", &function_facts, &cfg_summary);
 
         assert!(
             route.kind != r2types::DecompileRouteKind::Standard,
@@ -19555,7 +16707,7 @@ mod tests {
         let artifact = pad_summary_only_artifact_to_dense(summary_only_exact_hash_fold_artifact());
         let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), Some(artifact));
 
-        let route = semantic_route_plan("dbg.fnv_fold", &function_facts, &cfg_summary);
+        let route = semantic_route_plan("dbg.hash_fold_worker", &function_facts, &cfg_summary);
 
         assert!(
             route.kind != r2types::DecompileRouteKind::Standard,

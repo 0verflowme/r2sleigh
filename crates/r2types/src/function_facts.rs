@@ -6566,9 +6566,9 @@ mod tests {
             skip_runtime_type_inference: false,
             use_prepared_semantic_view: false,
             proof_coverage: r2sym::ProofCoverage::default(),
-            render_permission: r2sym::RenderPermission::certified(
+            render_permission: r2sym::RenderPermission::residual(
                 r2sym::ProofOwner::R2engine,
-                "standard route",
+                "standard route remains residual",
             ),
         };
 

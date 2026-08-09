@@ -11,7 +11,7 @@ pdfj | jq -c '([.ops[].bytes] | join("")) == "554889e585f67e0d89f183fe08730a31d2
 EOF_CMDS
 RUN
 
-NAME=plain_o2_check_secret_decj_uses_exact_branchless_kernel
+NAME=plain_o2_check_secret_decj_has_no_benchmark_specific_kernel
 FILE=bins/r2sleigh_vuln_test_x86_64_macho_O2_v1
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
@@ -20,7 +20,7 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
 s sym._check_secret >/dev/null
-a:sla.decj | jq -c '(.outcome == "completed") and (.refused == false) and (.diagnostics.semantic_kernel_render.region_id == "branchless_guard_function_v1") and (.diagnostics.semantic_kernel_render.region_schema_version == 1) and (.diagnostics.semantic_kernel_render.exact_obligation_closure == true) and (.rendered_output | contains("int32_t")) and (.rendered_output | contains("UINT32_C(0xdead)"))'
+a:sla.decj | jq -c '((.outcome == "completed") or (.outcome == "refused")) and (.diagnostics.semantic_kernel_render == null)'
 EOF_CMDS
 RUN
 
@@ -63,7 +63,7 @@ pdfj | jq -c '(.size == 24) and ([.ops[].bytes] | join("")) == "554889e58d0c3e29
 EOF_CMDS
 RUN
 
-NAME=plain_o2_complex_check_decj_uses_exact_branchless_kernel
+NAME=plain_o2_complex_check_decj_has_no_benchmark_specific_kernel
 FILE=bins/r2sleigh_vuln_test_x86_64_macho_O2_v1
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
@@ -72,7 +72,7 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
 s sym._complex_check >/dev/null
-a:sla.decj | jq -c '(.outcome == "completed") and (.refused == false) and (.diagnostics.semantic_kernel_render.region_id == "branchless_guard_function_v1") and (.diagnostics.semantic_kernel_render.region_schema_version == 1) and (.diagnostics.semantic_kernel_render.exact_obligation_closure == true) and (.rendered_output | contains("uint32_t sum_bits")) and (.rendered_output | contains("sum_bits == UINT32_C(0x64)")) and (.rendered_output | contains("difference_bits == UINT32_C(0x14)"))'
+a:sla.decj | jq -c '((.outcome == "completed") or (.outcome == "refused")) and (.diagnostics.semantic_kernel_render == null)'
 EOF_CMDS
 RUN
 

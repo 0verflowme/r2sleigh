@@ -34,7 +34,7 @@ pub const R2SLEIGH_CAPABILITIES_V2: u64 = R2SLEIGH_CAP_DECOMPILE_V2
     | R2SLEIGH_CAP_EXECUTION_CONTROL_V2
     | R2SLEIGH_CAP_EXACT_TYPE_LAYOUT_V2
     | R2SLEIGH_CAP_EXACT_STACK_SLOT_ROLES_V2;
-pub const R2SLEIGH_RADARE_ABI_V2: u32 = 136;
+pub const R2SLEIGH_RADARE_ABI_V2: u32 = 137;
 
 pub const R2SLEIGH_STATUS_OK_V2: u32 = 0;
 pub const R2SLEIGH_STATUS_INVALID_ARGUMENT_V2: u32 = 1;
@@ -80,7 +80,7 @@ pub const R2SLEIGH_SOURCE_STORAGE_REGISTER_V2: u32 = 2;
 pub const R2SLEIGH_SOURCE_STORAGE_UNIQUE_V2: u32 = 3;
 pub const R2SLEIGH_SOURCE_STORAGE_CONSTANT_V2: u32 = 4;
 pub const R2SLEIGH_SOURCE_STORAGE_CUSTOM_V2: u32 = 5;
-pub const R2SLEIGH_SOURCE_INTERFACE_SCHEMA_V2: u32 = 6;
+pub const R2SLEIGH_SOURCE_INTERFACE_SCHEMA_V2: u32 = 7;
 pub const R2SLEIGH_SOURCE_CALL_SITE_SCHEMA_V2: u32 = 1;
 pub const R2SLEIGH_SOURCE_TYPE_ID_INVALID_V2: u32 = u32::MAX;
 pub const R2SLEIGH_SOURCE_TYPE_SIGNED_INTEGER_V2: u32 = 1;
@@ -452,6 +452,8 @@ pub struct R2SleighSourceFunctionInterfaceV2 {
     pub stack_slot_roles_complete: u32,
     /// Exact name-independent register consumed by the lifted return.
     pub return_address_storage: R2SleighSourceStorageV2,
+    /// Exact name-independent register carrying the architectural stack pointer.
+    pub stack_pointer_storage: R2SleighSourceStorageV2,
 }
 
 /// Native engine request graph shared by decompile and type-function requests.
@@ -1279,7 +1281,8 @@ fn validate_full_width_register_storage_against_arch(
     });
     if !exact_coordinate {
         return Err(BoundaryError::invalid(format!(
-            "{label} does not match a full-width ArchSpec register coordinate"
+            "{label} does not match a full-width ArchSpec register coordinate: offset={} size={}",
+            source.offset, source.size
         )));
     }
     Ok(r2ssa::CanonicalStorageId {
@@ -2076,7 +2079,7 @@ unsafe fn source_snapshot(
             .len()
             .checked_add(stack_slots.len())
             .and_then(|count| count.checked_add(call_sites.len()))
-            .and_then(|count| count.checked_add(1))
+            .and_then(|count| count.checked_add(2))
             .ok_or_else(|| BoundaryError::limit("source interface item count overflow"))?,
         "source interface items",
     )?;
@@ -2090,6 +2093,16 @@ unsafe fn source_snapshot(
         source.return_address_storage,
         "source_interface.return_address_storage",
     )?;
+    let stack_pointer_storage = validate_full_width_register_storage_against_arch(
+        arch,
+        source.stack_pointer_storage,
+        "source_interface.stack_pointer_storage",
+    )?;
+    if canonical_storage_ranges_overlap(return_address_storage, stack_pointer_storage) {
+        return Err(BoundaryError::invalid(
+            "source_interface.stack_pointer_storage overlaps return-address storage",
+        ));
+    }
     let mut parameter_specs = Vec::with_capacity(parameters.len());
     for (position, parameter) in parameters.iter().enumerate() {
         if usize::try_from(parameter.index) != Ok(position) {
@@ -2160,6 +2173,22 @@ unsafe fn source_snapshot(
             slot.base.offset,
             slot.base.size,
         )?;
+        match base {
+            r2ssa::StackAddressBase::StackPointer => {
+                if canonical_storage != stack_pointer_storage {
+                    return Err(BoundaryError::invalid(format!(
+                        "source_interface.stack_slots[{position}] SP base does not exactly match stack-pointer storage"
+                    )));
+                }
+            }
+            r2ssa::StackAddressBase::FramePointer => {
+                if canonical_storage_ranges_overlap(stack_pointer_storage, canonical_storage) {
+                    return Err(BoundaryError::invalid(format!(
+                        "source_interface.stack_pointer_storage overlaps BP base storage at index {position}"
+                    )));
+                }
+            }
+        }
         if canonical_storage_ranges_overlap(return_address_storage, canonical_storage) {
             return Err(BoundaryError::invalid(format!(
                 "source_interface.return_address_storage overlaps stack base storage at index {position}"
@@ -2241,6 +2270,11 @@ unsafe fn source_snapshot(
                         "source_interface.return_address_storage overlaps parameter-home storage at index {position}"
                     )));
                 }
+                if canonical_storage_ranges_overlap(stack_pointer_storage, home_storage) {
+                    return Err(BoundaryError::invalid(format!(
+                        "source_interface.stack_pointer_storage overlaps parameter-home storage at index {position}"
+                    )));
+                }
                 r2ssa::SourceStackSlotSpec::new_parameter_home(
                     base,
                     canonical_storage,
@@ -2265,11 +2299,25 @@ unsafe fn source_snapshot(
             "source_interface.return_address_storage overlaps parameter storage",
         ));
     }
+    if parameter_specs.iter().any(|parameter| {
+        canonical_storage_ranges_overlap(stack_pointer_storage, parameter.storage())
+    }) {
+        return Err(BoundaryError::invalid(
+            "source_interface.stack_pointer_storage overlaps parameter storage",
+        ));
+    }
     if return_storage
         .is_some_and(|storage| canonical_storage_ranges_overlap(return_address_storage, storage))
     {
         return Err(BoundaryError::invalid(
             "source_interface.return_address_storage overlaps non-void return storage",
+        ));
+    }
+    if return_storage
+        .is_some_and(|storage| canonical_storage_ranges_overlap(stack_pointer_storage, storage))
+    {
+        return Err(BoundaryError::invalid(
+            "source_interface.stack_pointer_storage overlaps non-void return storage",
         ));
     }
     stack_slot_specs.sort_by_key(|slot| (slot.base(), slot.offset(), slot.size_bytes()));
@@ -2442,6 +2490,7 @@ unsafe fn source_snapshot(
         type_graph,
     )
     .and_then(|interface| interface.with_return_address_storage(return_address_storage))
+    .and_then(|interface| interface.with_stack_pointer_storage(stack_pointer_storage))
     .map_err(|error| BoundaryError::invalid(error.to_string()))?;
     r2engine::EngineSourceSnapshot::new(revision, Some(function_interface), call_site_specs)
         .map(Arc::new)
@@ -2767,36 +2816,11 @@ fn engine_semantic_kernel_region_name(
         r2engine::EngineSemanticKernelRegion::ConditionalTerminalReturnFunction => {
             "conditional_terminal_return_function"
         }
-        r2engine::EngineSemanticKernelRegion::PrivateFrameConditionalReturnFunction => {
-            "private_frame_conditional_return_function"
-        }
-        r2engine::EngineSemanticKernelRegion::CanonicalFnvFoldLoopFunction => {
-            "canonical_fnv_fold_loop_function"
-        }
-        r2engine::EngineSemanticKernelRegion::CanonicalFnvFoldO0Function => {
-            "canonical_fnv_fold_o0_function"
-        }
-        r2engine::EngineSemanticKernelRegion::BranchlessGuardFunction => {
-            "branchless_guard_function"
-        }
-        r2engine::EngineSemanticKernelRegion::StructArrayIndexFunction => {
-            "struct_array_index_function"
-        }
-        r2engine::EngineSemanticKernelRegion::NestedWrap32GuardO0Function => {
-            "nested_wrap32_guard_o0_function"
-        }
-        r2engine::EngineSemanticKernelRegion::SumArrayFunction => "sum_array_function",
-        r2engine::EngineSemanticKernelRegion::ConditionalFunnelSharedReturnFunction => {
-            "conditional_funnel_shared_return_function"
-        }
         r2engine::EngineSemanticKernelRegion::SwitchTerminalReturnFunction => {
             "switch_terminal_return_function"
         }
         r2engine::EngineSemanticKernelRegion::CarrierFreeLoopTerminalReturnFunction => {
             "carrier_free_loop_terminal_return_function"
-        }
-        r2engine::EngineSemanticKernelRegion::CountedLoopTerminalReturnFunction => {
-            "counted_loop_terminal_return_function"
         }
     }
 }
@@ -3130,74 +3154,11 @@ mod tests {
     }
 
     #[test]
-    fn private_frame_semantic_kernel_diagnostics_are_stable_json() {
-        assert_semantic_kernel_render_diagnostics(
-            r2engine::EngineSemanticKernelRegion::PrivateFrameConditionalReturnFunction,
-            "private_frame_conditional_return_function",
-            1,
-        );
-    }
-
-    #[test]
-    fn optimized_fnv_semantic_kernel_diagnostics_are_stable_json() {
-        assert_semantic_kernel_render_diagnostics(
-            r2engine::EngineSemanticKernelRegion::CanonicalFnvFoldLoopFunction,
-            "canonical_fnv_fold_loop_function",
-            1,
-        );
-    }
-
-    #[test]
-    fn stack_backed_o0_fnv_semantic_kernel_diagnostics_are_stable_json() {
-        assert_semantic_kernel_render_diagnostics(
-            r2engine::EngineSemanticKernelRegion::CanonicalFnvFoldO0Function,
-            "canonical_fnv_fold_o0_function",
-            1,
-        );
-    }
-
-    #[test]
     fn aggregate_semantic_kernel_diagnostics_are_stable_json() {
         assert_semantic_kernel_render_diagnostics(
             r2engine::EngineSemanticKernelRegion::AggregateMemberTerminalReturnFunction,
             "aggregate_member_terminal_return_function",
-            1,
-        );
-    }
-
-    #[test]
-    fn branchless_guard_semantic_kernel_diagnostics_are_stable_json() {
-        assert_semantic_kernel_render_diagnostics(
-            r2engine::EngineSemanticKernelRegion::BranchlessGuardFunction,
-            "branchless_guard_function",
-            1,
-        );
-    }
-
-    #[test]
-    fn struct_array_index_semantic_kernel_diagnostics_are_stable_json() {
-        assert_semantic_kernel_render_diagnostics(
-            r2engine::EngineSemanticKernelRegion::StructArrayIndexFunction,
-            "struct_array_index_function",
-            1,
-        );
-    }
-
-    #[test]
-    fn nested_wrap32_guard_o0_semantic_kernel_diagnostics_are_stable_json() {
-        assert_semantic_kernel_render_diagnostics(
-            r2engine::EngineSemanticKernelRegion::NestedWrap32GuardO0Function,
-            "nested_wrap32_guard_o0_function",
-            1,
-        );
-    }
-
-    #[test]
-    fn sum_array_semantic_kernel_diagnostics_are_stable_json() {
-        assert_semantic_kernel_render_diagnostics(
-            r2engine::EngineSemanticKernelRegion::SumArrayFunction,
-            "sum_array_function",
-            1,
+            2,
         );
     }
 
@@ -3206,7 +3167,7 @@ mod tests {
         assert_semantic_kernel_render_diagnostics(
             r2engine::EngineSemanticKernelRegion::TerminalReturnBlock,
             "terminal_return_block",
-            1,
+            2,
         );
     }
 
@@ -3216,82 +3177,37 @@ mod tests {
             (
                 r2engine::EngineSemanticKernelRegion::TerminalReturnBlock,
                 "terminal_return_block",
-                1,
+                2,
             ),
             (
                 r2engine::EngineSemanticKernelRegion::AggregateMemberTerminalReturnFunction,
                 "aggregate_member_terminal_return_function",
-                1,
+                2,
             ),
             (
                 r2engine::EngineSemanticKernelRegion::PlainRamMemoryTerminalReturnFunction,
                 "plain_ram_memory_terminal_return_function",
-                1,
+                2,
             ),
             (
                 r2engine::EngineSemanticKernelRegion::DirectCallTerminalReturnFunction,
                 "direct_call_terminal_return_function",
-                1,
+                2,
             ),
             (
                 r2engine::EngineSemanticKernelRegion::ConditionalTerminalReturnFunction,
                 "conditional_terminal_return_function",
-                1,
-            ),
-            (
-                r2engine::EngineSemanticKernelRegion::PrivateFrameConditionalReturnFunction,
-                "private_frame_conditional_return_function",
-                1,
-            ),
-            (
-                r2engine::EngineSemanticKernelRegion::CanonicalFnvFoldLoopFunction,
-                "canonical_fnv_fold_loop_function",
-                1,
-            ),
-            (
-                r2engine::EngineSemanticKernelRegion::CanonicalFnvFoldO0Function,
-                "canonical_fnv_fold_o0_function",
-                1,
-            ),
-            (
-                r2engine::EngineSemanticKernelRegion::ConditionalFunnelSharedReturnFunction,
-                "conditional_funnel_shared_return_function",
-                1,
+                2,
             ),
             (
                 r2engine::EngineSemanticKernelRegion::SwitchTerminalReturnFunction,
                 "switch_terminal_return_function",
-                1,
+                2,
             ),
             (
                 r2engine::EngineSemanticKernelRegion::CarrierFreeLoopTerminalReturnFunction,
                 "carrier_free_loop_terminal_return_function",
-                1,
-            ),
-            (
-                r2engine::EngineSemanticKernelRegion::CountedLoopTerminalReturnFunction,
-                "counted_loop_terminal_return_function",
-                1,
-            ),
-            (
-                r2engine::EngineSemanticKernelRegion::BranchlessGuardFunction,
-                "branchless_guard_function",
-                1,
-            ),
-            (
-                r2engine::EngineSemanticKernelRegion::StructArrayIndexFunction,
-                "struct_array_index_function",
-                1,
-            ),
-            (
-                r2engine::EngineSemanticKernelRegion::NestedWrap32GuardO0Function,
-                "nested_wrap32_guard_o0_function",
-                1,
-            ),
-            (
-                r2engine::EngineSemanticKernelRegion::SumArrayFunction,
-                "sum_array_function",
-                1,
+                2,
             ),
         ];
         for (region, expected, expected_schema_version) in regions {
@@ -3476,6 +3392,7 @@ mod tests {
         calling_convention: &[u8],
         stack_slots: &[R2SleighSourceStackSlotV2],
         return_address_storage: R2SleighSourceStorageV2,
+        stack_pointer_storage: R2SleighSourceStorageV2,
     ) -> R2SleighSourceFunctionInterfaceV2 {
         R2SleighSourceFunctionInterfaceV2 {
             schema_version: R2SLEIGH_SOURCE_INTERFACE_SCHEMA_V2,
@@ -3517,6 +3434,7 @@ mod tests {
             exact_types_complete: 0,
             stack_slot_roles_complete: 1,
             return_address_storage,
+            stack_pointer_storage,
         }
     }
 
@@ -3646,7 +3564,12 @@ mod tests {
                 },
             },
         ];
-        let mut source = void_source_interface(b"sysv", &[], wire_register_storage(0, 8));
+        let mut source = void_source_interface(
+            b"sysv",
+            &[],
+            wire_register_storage(0, 8),
+            wire_register_storage(24, 8),
+        );
         source.parameters = parameters.as_ptr();
         source.num_parameters = parameters.len();
         source.return_kind = R2SLEIGH_SOURCE_RETURN_REGISTER_V2;
@@ -3826,7 +3749,12 @@ mod tests {
                 },
             },
         ];
-        let mut source = void_source_interface(b"aapcs64", &[], wire_register_storage(0, 8));
+        let mut source = void_source_interface(
+            b"aapcs64",
+            &[],
+            wire_register_storage(0, 8),
+            wire_register_storage(24, 8),
+        );
         source.parameters = parameters.as_ptr();
         source.num_parameters = parameters.len();
         source.return_kind = R2SLEIGH_SOURCE_RETURN_REGISTER_V2;
@@ -4554,6 +4482,12 @@ mod tests {
             .find(|register| register.name.eq_ignore_ascii_case("rbp"))
             .expect("rbp register")
             .clone();
+        let stack_pointer_register = arch
+            .registers
+            .iter()
+            .find(|register| register.name.eq_ignore_ascii_case("rsp"))
+            .expect("rsp register")
+            .clone();
         let return_address_register = arch
             .registers
             .iter()
@@ -4562,9 +4496,12 @@ mod tests {
             .clone();
         let return_address_storage =
             wire_register_storage(return_address_register.offset, return_address_register.size);
+        let stack_pointer_storage =
+            wire_register_storage(stack_pointer_register.offset, stack_pointer_register.size);
         let parameter_name = parameter_register.name.as_bytes().to_vec();
         let return_name = return_register.name.as_bytes().to_vec();
         let frame_name = frame_register.name.as_bytes().to_vec();
+        let stack_pointer_name = stack_pointer_register.name.as_bytes().to_vec();
         let source_frame_offset = frame_register.offset;
         let (base, canonical_frame_storage) = validate_stack_base_against_arch(
             &arch,
@@ -4663,6 +4600,7 @@ mod tests {
             exact_types_complete: 0,
             stack_slot_roles_complete: 1,
             return_address_storage,
+            stack_pointer_storage,
         };
 
         source.schema_version = R2SLEIGH_SOURCE_INTERFACE_SCHEMA_V2 - 1;
@@ -4676,7 +4614,7 @@ mod tests {
                     0x0102_0304_0506_0708,
                 )
             }
-            .expect_err("schema 5 source interface must not retain a compatibility path")
+            .expect_err("schema 6 source interface must not retain a compatibility path")
             .status,
             R2SLEIGH_STATUS_ABI_MISMATCH_V2
         );
@@ -4740,6 +4678,14 @@ mod tests {
                 size: return_address_register.size,
             })
         );
+        assert_eq!(
+            interface.stack_pointer_storage(),
+            Some(r2ssa::CanonicalStorageId {
+                space: r2ssa::CanonicalStorageSpace::Register,
+                offset: stack_pointer_register.offset,
+                size: stack_pointer_register.size,
+            })
+        );
         assert_eq!(interface.stack_slots().len(), 1);
         assert!(interface.stack_slot_roles_complete());
         assert_eq!(
@@ -4767,6 +4713,83 @@ mod tests {
         assert_eq!(error.status, R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
         source.return_address_storage = return_address_storage;
 
+        source.stack_pointer_storage.size = stack_pointer_register.size / 2;
+        let error = unsafe {
+            source_snapshot_with_new_budget(&source, &*ctx, &[], 0x401000, 0x0102_0304_0506_0708)
+        }
+        .expect_err("partial-width stack-pointer storage must fail closed");
+        assert_eq!(error.status, R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
+        source.stack_pointer_storage = stack_pointer_storage;
+
+        source.stack_pointer_storage = return_address_storage;
+        let error = unsafe {
+            source_snapshot_with_new_budget(&source, &*ctx, &[], 0x401000, 0x0102_0304_0506_0708)
+        }
+        .expect_err("stack pointer overlapping return-address storage must fail closed");
+        assert_eq!(error.status, R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
+        source.stack_pointer_storage = stack_pointer_storage;
+
+        source.stack_pointer_storage =
+            wire_register_storage(parameter_register.offset, parameter_register.size);
+        let error = unsafe {
+            source_snapshot_with_new_budget(&source, &*ctx, &[], 0x401000, 0x0102_0304_0506_0708)
+        }
+        .expect_err("stack pointer overlapping a parameter home must fail closed");
+        assert_eq!(error.status, R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
+        assert!(error.message.contains("overlaps parameter-home storage"));
+        source.stack_pointer_storage = stack_pointer_storage;
+
+        source.stack_pointer_storage =
+            wire_register_storage(return_register.offset, return_register.size);
+        let error = unsafe {
+            source_snapshot_with_new_budget(&source, &*ctx, &[], 0x401000, 0x0102_0304_0506_0708)
+        }
+        .expect_err("stack pointer overlapping a non-void return must fail closed");
+        assert_eq!(error.status, R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
+        assert!(error.message.contains("overlaps non-void return storage"));
+        source.stack_pointer_storage = stack_pointer_storage;
+
+        source.stack_pointer_storage =
+            wire_register_storage(frame_register.offset, frame_register.size);
+        let error = unsafe {
+            source_snapshot_with_new_budget(&source, &*ctx, &[], 0x401000, 0x0102_0304_0506_0708)
+        }
+        .expect_err("stack pointer overlapping a BP base must fail closed");
+        assert_eq!(error.status, R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
+        assert!(error.message.contains("overlaps BP base storage"));
+        source.stack_pointer_storage = stack_pointer_storage;
+
+        stack_slots[0].base_kind = R2SLEIGH_SOURCE_STACK_BASE_SP_V2;
+        stack_slots[0].base.name = R2SleighStringViewV2 {
+            data: stack_pointer_name.as_ptr(),
+            len: stack_pointer_name.len(),
+        };
+        stack_slots[0].base.offset = stack_pointer_register.offset;
+        stack_slots[0].base.size = stack_pointer_register.size;
+        unsafe {
+            source_snapshot_with_new_budget(&source, &*ctx, &[], 0x401000, 0x0102_0304_0506_0708)
+        }
+        .expect("SP stack base exactly equal to the stack-pointer carrier")
+        .expect("exact SP source snapshot");
+        stack_slots[0].base.name = R2SleighStringViewV2 {
+            data: frame_name.as_ptr(),
+            len: frame_name.len(),
+        };
+        stack_slots[0].base.offset = frame_register.offset;
+        stack_slots[0].base.size = frame_register.size;
+        let error = unsafe {
+            source_snapshot_with_new_budget(&source, &*ctx, &[], 0x401000, 0x0102_0304_0506_0708)
+        }
+        .expect_err("SP stack base mismatching the stack-pointer carrier must fail closed");
+        assert_eq!(error.status, R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
+        assert!(
+            error
+                .message
+                .contains("does not exactly match stack-pointer storage")
+        );
+        stack_slots[0].base_kind = R2SLEIGH_SOURCE_STACK_BASE_BP_V2;
+        source.stack_pointer_storage = stack_pointer_storage;
+
         source.stack_slots = ptr::null();
         source.num_stack_slots = 0;
         source.return_address_storage =
@@ -4777,6 +4800,16 @@ mod tests {
         .expect_err("return-address overlap with a parameter must fail closed");
         assert_eq!(error.status, R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
         assert!(error.message.contains("overlaps parameter storage"));
+        source.return_address_storage = return_address_storage;
+        source.stack_pointer_storage =
+            wire_register_storage(parameter_register.offset, parameter_register.size);
+        let error = unsafe {
+            source_snapshot_with_new_budget(&source, &*ctx, &[], 0x401000, 0x0102_0304_0506_0708)
+        }
+        .expect_err("stack-pointer overlap with a parameter must fail closed");
+        assert_eq!(error.status, R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
+        assert!(error.message.contains("overlaps parameter storage"));
+        source.stack_pointer_storage = stack_pointer_storage;
 
         source.stack_slots = stack_slots.as_ptr();
         source.num_stack_slots = stack_slots.len();
@@ -4872,8 +4905,16 @@ mod tests {
             .find(|register| register.name.eq_ignore_ascii_case("rip"))
             .expect("rip register")
             .clone();
+        let stack_pointer_register = arch
+            .registers
+            .iter()
+            .find(|register| register.name.eq_ignore_ascii_case("rsp"))
+            .expect("rsp register")
+            .clone();
         let return_address_storage =
             wire_register_storage(return_address_register.offset, return_address_register.size);
+        let stack_pointer_storage =
+            wire_register_storage(stack_pointer_register.offset, stack_pointer_register.size);
         let frame_name = frame_register.name.as_bytes().to_vec();
         let mut arm_arch = r2il::ArchSpec::new("arm-stack-base-test");
         arm_arch.addr_size = 4;
@@ -4944,19 +4985,34 @@ mod tests {
                 },
             },
         ];
-        let source = void_source_interface(b"sysv", &overlapping, return_address_storage);
+        let source = void_source_interface(
+            b"sysv",
+            &overlapping,
+            return_address_storage,
+            stack_pointer_storage,
+        );
         let error = unsafe { source_snapshot_with_new_budget(&source, &*ctx, &[], 0x401000, 1) }
             .expect_err("overlapping source stack slots");
         assert_eq!(error.status, R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
 
         let duplicate = [overlapping[0], overlapping[0]];
-        let source = void_source_interface(b"sysv", &duplicate, return_address_storage);
+        let source = void_source_interface(
+            b"sysv",
+            &duplicate,
+            return_address_storage,
+            stack_pointer_storage,
+        );
         let error = unsafe { source_snapshot_with_new_budget(&source, &*ctx, &[], 0x401000, 1) }
             .expect_err("duplicate source stack slots");
         assert_eq!(error.status, R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
 
         let exact = [overlapping[0]];
-        let mut source = void_source_interface(b"sysv", &exact, return_address_storage);
+        let mut source = void_source_interface(
+            b"sysv",
+            &exact,
+            return_address_storage,
+            stack_pointer_storage,
+        );
         source.stack_resources_complete = 0;
         let error = unsafe { source_snapshot_with_new_budget(&source, &*ctx, &[], 0x401000, 1) }
             .expect_err("incomplete source stack resource set");
@@ -5034,10 +5090,19 @@ mod tests {
             .find(|register| register.name.eq_ignore_ascii_case("rip"))
             .expect("rip register")
             .clone();
+        let stack_pointer_register = arch
+            .registers
+            .iter()
+            .find(|register| register.name.eq_ignore_ascii_case("rsp"))
+            .expect("rsp register")
+            .clone();
         let return_address_storage =
             wire_register_storage(return_address_register.offset, return_address_register.size);
+        let stack_pointer_storage =
+            wire_register_storage(stack_pointer_register.offset, stack_pointer_register.size);
         let ctx = Box::new(R2ILContext::with_arch_and_disasm(arch, disasm));
-        let mut source = void_source_interface(b"sysv", &[], return_address_storage);
+        let mut source =
+            void_source_interface(b"sysv", &[], return_address_storage, stack_pointer_storage);
 
         source.revision_identity = 0;
         let error = unsafe { source_snapshot_with_new_budget(&source, &*ctx, &[], 0x401000, 1) }
@@ -5055,13 +5120,14 @@ mod tests {
     }
 
     #[test]
-    fn exact_v2_callsite_reaches_production_kernel_and_rejects_bad_identity() {
+    fn exact_v2_synthetic_callsite_stays_residual_and_rejects_bad_identity() {
         let mut arch = r2il::ArchSpec::new("v2-direct-call-return-test");
         arch.addr_size = 8;
         arch.set_memory_endianness(r2il::Endianness::Little);
         arch.add_register(r2il::RegisterDef::new("rax", 0, 8));
         arch.add_register(r2il::RegisterDef::new("rdi", 8, 8));
         arch.add_register(r2il::RegisterDef::new("rip", 16, 8));
+        arch.add_register(r2il::RegisterDef::new("rsp", 24, 8));
         let (_, disasm) = super::super::create_disassembler_for_arch("x86-64")
             .expect("x86-64 disassembler for context view");
         let parameter_register = arch
@@ -5081,6 +5147,12 @@ mod tests {
             .iter()
             .find(|register| register.name.eq_ignore_ascii_case("rip"))
             .expect("rip register")
+            .clone();
+        let stack_pointer_register = arch
+            .registers
+            .iter()
+            .find(|register| register.name.eq_ignore_ascii_case("rsp"))
+            .expect("rsp register")
             .clone();
         let engine_arch = arch.clone();
         let ctx = Box::new(R2ILContext::with_arch_and_disasm(arch, disasm));
@@ -5183,6 +5255,10 @@ mod tests {
                 instruction_register.offset,
                 instruction_register.size,
             ),
+            stack_pointer_storage: wire_register_storage(
+                stack_pointer_register.offset,
+                stack_pointer_register.size,
+            ),
         };
         let mut call = R2ILBlock::new(0x7500, 4);
         call.push(r2il::R2ILOp::Copy {
@@ -5250,13 +5326,10 @@ mod tests {
                 0,
             ),
         );
-        assert_eq!(
-            response
-                .diagnostics
-                .semantic_kernel_render
-                .map(|render| render.region),
-            Some(r2engine::EngineSemanticKernelRegion::DirectCallTerminalReturnFunction),
-            "exact V2 callsite must reach the certified production route: {}",
+        assert!(response.diagnostics.semantic_kernel_render.is_none());
+        assert!(
+            response.output.contains("r2dec residual"),
+            "a fabricated call graph cannot grant CertifiedC authority: {}",
             response.output
         );
 

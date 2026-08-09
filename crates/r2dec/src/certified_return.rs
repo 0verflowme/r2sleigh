@@ -2,13 +2,16 @@
 
 use r2cert::{
     CERTIFIED_TERMINAL_RETURN_REGION_CONTRACT_VERSION, CertifiedArtifactOrigin,
-    CertifiedRenderPermit, CertifiedSourceTerminator, CertifiedTypedRegionKind,
-    RenderAuthorizationError, TypedRegionMapping, certify_terminal_return_region,
+    CertifiedSourceTerminator, CertifiedTypedRegionKind, LedgerClosureError, TypedRegionMapping,
+    certify_terminal_return_region,
 };
 use r2ssa::{CanonicalInstructionId, SemanticObligationKind};
 use serde::Serialize;
 
-use crate::certified_region::{CertifiedSingleBlockAccounting, RegionObligationDisposition};
+use crate::certified_region::{
+    CertifiedSingleBlockAccounting, CertifiedTypedOutputSeal, RegionObligationDisposition,
+    TypedOutputSealError,
+};
 use crate::semantic_c::{SemanticCFunctionReturn, SemanticCReturn};
 use crate::semantic_stmt::{SemanticCBlockStepLayer, SemanticCStatementError};
 
@@ -27,7 +30,7 @@ pub struct CertifiedTerminalReturnBlockRegion {
     origin: CertifiedArtifactOrigin,
     layer: SemanticCBlockStepLayer,
     return_producer: CanonicalInstructionId,
-    render_permit: CertifiedRenderPermit,
+    typed_output_seal: CertifiedTypedOutputSeal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,7 +41,8 @@ pub enum TerminalReturnRegionError {
     NotTerminalReturn,
     InvalidReturnCardinality,
     ReturnIsNotFinalStep,
-    Authorization(RenderAuthorizationError),
+    LedgerClosure(LedgerClosureError),
+    TypedOutputSeal(TypedOutputSealError),
     InvalidConstructedRegion(Vec<String>),
 }
 
@@ -56,9 +60,15 @@ impl From<SemanticCStatementError> for TerminalReturnRegionError {
     }
 }
 
-impl From<RenderAuthorizationError> for TerminalReturnRegionError {
-    fn from(error: RenderAuthorizationError) -> Self {
-        Self::Authorization(error)
+impl From<LedgerClosureError> for TerminalReturnRegionError {
+    fn from(error: LedgerClosureError) -> Self {
+        Self::LedgerClosure(error)
+    }
+}
+
+impl From<TypedOutputSealError> for TerminalReturnRegionError {
+    fn from(error: TypedOutputSealError) -> Self {
+        Self::TypedOutputSeal(error)
     }
 }
 
@@ -119,10 +129,16 @@ impl CertifiedTerminalReturnBlockRegion {
             return Err(TerminalReturnRegionError::ReturnIsNotFinalStep);
         }
         let mappings = typed_region_mappings(layer.accounting());
-        let render_permit = certify_terminal_return_region(
+        let ledger_closure = certify_terminal_return_region(
             layer.accounting().origin(),
             layer.accounting().ledger(),
             mappings,
+        )?;
+        let typed_output_seal = CertifiedTypedOutputSeal::new(
+            ledger_closure,
+            CertifiedTypedRegionKind::TerminalReturnBlock,
+            CERTIFIED_TERMINAL_RETURN_REGION_SCHEMA_VERSION,
+            [layer.accounting()],
         )?;
         let region = Self {
             schema_version: CERTIFIED_TERMINAL_RETURN_REGION_SCHEMA_VERSION,
@@ -130,7 +146,7 @@ impl CertifiedTerminalReturnBlockRegion {
             origin: layer.accounting().origin().clone(),
             layer,
             return_producer,
-            render_permit,
+            typed_output_seal,
         };
         let report = region.audit();
         if !report.has_exact_terminal_return() {
@@ -161,10 +177,6 @@ impl CertifiedTerminalReturnBlockRegion {
         self.return_producer
     }
 
-    pub const fn render_permit(&self) -> &CertifiedRenderPermit {
-        &self.render_permit
-    }
-
     pub fn returned(&self) -> Option<&SemanticCReturn> {
         self.layer
             .accounting()
@@ -187,14 +199,13 @@ impl CertifiedTerminalReturnBlockRegion {
         if self.origin != *accounting.origin() {
             invalid.push("terminal return origin does not match nested accounting".to_string());
         }
-        let mappings = typed_region_mappings(accounting);
-        if !self.render_permit.matches_region(
+        if !self.typed_output_seal.matches_region(
             &self.origin,
             CertifiedTypedRegionKind::TerminalReturnBlock,
             CERTIFIED_TERMINAL_RETURN_REGION_SCHEMA_VERSION,
-            &mappings,
+            [accounting],
         ) {
-            invalid.push("terminal return render permit does not match region".to_string());
+            invalid.push("terminal return typed-output seal does not match region".to_string());
         }
         if !statement_report.has_exact_source_order()
             || !accounting_report.has_exact_source_accounting()
@@ -296,7 +307,6 @@ impl TerminalReturnRegionAuditReport {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use r2cert::CertifiedMachineProjection;
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, Varnode};
     use r2ssa::{
@@ -304,7 +314,7 @@ mod tests {
         SourceFunctionReturn, SsaArtifact,
     };
 
-    fn accounting(return_kind: SourceFunctionReturn) -> CertifiedSingleBlockAccounting {
+    fn assert_hand_authored_return_refused(return_kind: SourceFunctionReturn) {
         let mut block = R2ILBlock::new(0x7100, 4);
         block.push(R2ILOp::Copy {
             dst: Varnode::unique(0x10, 8),
@@ -338,10 +348,10 @@ mod tests {
         .expect("explicit interface");
         let artifact = SsaArtifact::raw_with_interface(&[block], Some(&arch), interface)
             .expect("terminal return artifact");
-        let certified = CertifiedMachineProjection::from_artifact(&artifact)
-            .expect("terminal return projection");
-        CertifiedSingleBlockAccounting::from_projection(&certified)
-            .expect("terminal return accounting")
+        assert!(matches!(
+            CertifiedMachineProjection::from_artifact(&artifact),
+            Err(r2ssa::MachineBuildError::MachineContextMismatch)
+        ));
     }
 
     fn register_return() -> SourceFunctionReturn {
@@ -355,43 +365,15 @@ mod tests {
     }
 
     #[test]
-    fn exact_register_and_void_returns_form_closed_terminal_regions() {
+    fn hand_authored_register_and_void_returns_refuse_terminal_authority() {
         for return_kind in [register_return(), SourceFunctionReturn::Void] {
-            let region =
-                CertifiedTerminalReturnBlockRegion::from_accounting(accounting(return_kind))
-                    .expect("closed return region");
-            assert!(region.audit().has_exact_terminal_return());
-            assert_eq!(
-                region
-                    .layer()
-                    .accounting()
-                    .audit()
-                    .residualized_obligations(),
-                []
-            );
-            assert!(region.returned().is_some());
+            assert_hand_authored_return_refused(return_kind);
         }
     }
 
     #[test]
-    fn wrong_return_identity_and_foreign_return_shape_fail_audit() {
-        let mut wrong =
-            CertifiedTerminalReturnBlockRegion::from_accounting(accounting(register_return()))
-                .expect("closed return region");
-        wrong.return_producer = CanonicalInstructionId {
-            block_addr: 0x7100,
-            site: r2ssa::CanonicalInstructionSite::Op(0),
-        };
-        assert!(!wrong.audit().has_exact_terminal_return());
-
-        let foreign_void = CertifiedTerminalReturnBlockRegion::from_accounting(accounting(
-            SourceFunctionReturn::Void,
-        ))
-        .expect("void return region");
-        let mut swapped =
-            CertifiedTerminalReturnBlockRegion::from_accounting(accounting(register_return()))
-                .expect("register return region");
-        swapped.layer = foreign_void.layer;
-        assert!(!swapped.audit().has_exact_terminal_return());
+    fn hand_authored_return_identity_variants_never_reach_audit() {
+        assert_hand_authored_return_refused(register_return());
+        assert_hand_authored_return_refused(SourceFunctionReturn::Void);
     }
 }

@@ -30,16 +30,13 @@ use ffi_v2::{R2SleighContextParam, R2SleighInterprocSeed};
 #[cfg(test)]
 use analysis::ssa::{r2il_block_defuse_json, r2il_block_to_ssa_json};
 use r2il::serialize::UserOpDef;
-use r2il::{
-    ArchSpec, R2ILBlock, R2ILOp, SwitchCase, SwitchInfo, Varnode, serialize, validate_block_full,
-};
+use r2il::{ArchSpec, R2ILBlock, R2ILOp, SwitchCase, SwitchInfo, Varnode, validate_block_full};
 use r2sleigh_export::{
     ExportFormat, InstructionAction, InstructionExportInput, export_instruction, op_json_named,
 };
 use r2sleigh_lift::{Disassembler, SemanticMetadataOptions, build_arch_spec, userop_map_for_arch};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
-use std::path::Path;
 use std::ptr;
 use std::slice;
 #[cfg(test)]
@@ -70,17 +67,6 @@ impl R2ILContext {
         Self {
             arch: None,
             arch_name_cstr: None,
-            disasm: None,
-            semantic_metadata_enabled: true,
-            error: None,
-        }
-    }
-
-    fn with_arch(arch: ArchSpec) -> Self {
-        let name = CString::new(arch.name.clone()).ok();
-        Self {
-            arch: Some(arch),
-            arch_name_cstr: name,
             disasm: None,
             semantic_metadata_enabled: true,
             error: None,
@@ -129,28 +115,6 @@ fn validate_block_in_context(ctx: &mut R2ILContext, block: &R2ILBlock) -> Result
         ctx.set_error(&msg);
         msg
     })
-}
-
-/// Load an r2il file and return a context handle.
-///
-/// Returns NULL on failure.
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_load(path: *const c_char) -> *mut R2ILContext {
-    if path.is_null() {
-        return ptr::null_mut();
-    }
-
-    let path_str = unsafe {
-        match CStr::from_ptr(path).to_str() {
-            Ok(s) => s,
-            Err(_) => return ptr::null_mut(),
-        }
-    };
-
-    match serialize::load(Path::new(path_str)) {
-        Ok(arch) => Box::into_raw(Box::new(R2ILContext::with_arch(arch))),
-        Err(e) => Box::into_raw(Box::new(R2ILContext::with_error(&e.to_string()))),
-    }
 }
 
 /// Initialize a context from a built-in architecture (Sleigh via sleigh-config).
@@ -227,57 +191,6 @@ pub extern "C" fn r2il_error(ctx: *const R2ILContext) -> *const c_char {
         match &(*ctx).error {
             Some(s) => s.as_ptr(),
             None => ptr::null(),
-        }
-    }
-}
-
-/// Get the address size in bytes.
-///
-/// Returns 0 if not loaded.
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_addr_size(ctx: *const R2ILContext) -> u32 {
-    if ctx.is_null() {
-        return 0;
-    }
-
-    unsafe {
-        match &(*ctx).arch {
-            Some(arch) => helpers::effective_addr_size_bytes(arch),
-            None => 0,
-        }
-    }
-}
-
-/// Check if the architecture is big-endian.
-///
-/// Returns 1 for big-endian, 0 for little-endian or if not loaded.
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_is_big_endian(ctx: *const R2ILContext) -> i32 {
-    if ctx.is_null() {
-        return 0;
-    }
-
-    unsafe {
-        match &(*ctx).arch {
-            Some(arch) => i32::from(arch.memory_endianness.to_legacy_big_endian()),
-            None => 0,
-        }
-    }
-}
-
-/// Get the number of registers.
-///
-/// Returns 0 if not loaded.
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_register_count(ctx: *const R2ILContext) -> usize {
-    if ctx.is_null() {
-        return 0;
-    }
-
-    unsafe {
-        match &(*ctx).arch {
-            Some(arch) => arch.registers.len(),
-            None => 0,
         }
     }
 }
@@ -792,24 +705,6 @@ pub extern "C" fn r2il_block_to_esil(
                 .join(";");
             CString::new(joined).map_or(ptr::null_mut(), |s| s.into_raw())
         }
-        Err(_) => ptr::null_mut(),
-    }
-}
-
-/// Get a JSON representation of an operation in a block.
-#[unsafe(no_mangle)]
-pub extern "C" fn r2il_block_op_json(block: *const R2ILBlock, index: usize) -> *mut c_char {
-    if block.is_null() {
-        return ptr::null_mut();
-    }
-
-    let blk = unsafe { &*block };
-    if index >= blk.ops.len() {
-        return ptr::null_mut();
-    }
-
-    match serde_json::to_string(&blk.ops[index]) {
-        Ok(s) => CString::new(s).map_or(ptr::null_mut(), |c| c.into_raw()),
         Err(_) => ptr::null_mut(),
     }
 }
@@ -5729,28 +5624,6 @@ fn score_global_type_links(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_get_direct_call_targets_json(
-    ctx: *const R2ILContext,
-    blocks: *const *const R2ILBlock,
-    num_blocks: usize,
-    fcn_addr: u64,
-    fcn_name: *const c_char,
-) -> *mut c_char {
-    let Some(input) = types::build_function_input(ctx, blocks, num_blocks, fcn_addr, fcn_name)
-    else {
-        return ptr::null_mut();
-    };
-    let Some(analysis) = types::build_function_analysis(&input) else {
-        return ptr::null_mut();
-    };
-    let payload = r2engine::interproc_direct_call_targets(&analysis);
-    match serde_json::to_string(&payload) {
-        Ok(s) => CString::new(s).map_or(ptr::null_mut(), |c| c.into_raw()),
-        Err(_) => ptr::null_mut(),
-    }
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn r2sleigh_get_direct_call_targets_typed(
     ctx: *const R2ILContext,
     blocks: *const *const R2ILBlock,
@@ -6003,26 +5876,6 @@ pub extern "C" fn r2sleigh_interproc_target_plan_free(plan: *mut R2SleighInterpr
     }
 }
 
-/// Analyze a function and build SSA representation.
-/// This is called after radare2 completes basic function analysis.
-/// Returns 1 on success, 0 on failure.
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_analyze_fcn(
-    ctx: *const R2ILContext,
-    blocks: *const *const R2ILBlock,
-    num_blocks: usize,
-    _fcn_addr: u64,
-) -> i32 {
-    let Some(input) = types::build_function_input(ctx, blocks, num_blocks, 0, ptr::null()) else {
-        return 0;
-    };
-    if types::build_function_analysis(&input).is_none() {
-        return 0;
-    }
-
-    1 // Success
-}
-
 fn enum_label<T: serde::Serialize>(value: T) -> Option<String> {
     serde_json::to_value(value)
         .ok()?
@@ -6125,7 +5978,6 @@ fn is_real_reg(name: &str) -> bool {
 }
 
 /// Annotation entry for analyze_fcn writeback.
-#[derive(serde::Serialize)]
 struct FcnAnnotation {
     addr: u64,
     comment: String,
@@ -6256,27 +6108,6 @@ fn ffi_annotations_from_annotations(annotations: Vec<FcnAnnotation>) -> R2Sleigh
     R2SleighAnnotations {
         items,
         _strings: strings,
-    }
-}
-
-/// Analyze a function and return per-block annotations as JSON.
-/// Returns a JSON array of {addr, comment} pairs summarizing SSA def-use info.
-/// Uses function-level SSA with phi nodes for meaningful annotations.
-/// Caller must free with r2il_string_free().
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_analyze_fcn_annotations(
-    ctx: *const R2ILContext,
-    blocks: *const *const R2ILBlock,
-    num_blocks: usize,
-    _fcn_addr: u64,
-) -> *mut c_char {
-    let Some(annotations) = function_annotations_for_ffi(ctx, blocks, num_blocks) else {
-        return ptr::null_mut();
-    };
-
-    match serde_json::to_string(&annotations) {
-        Ok(s) => CString::new(s).map_or(ptr::null_mut(), |c| c.into_raw()),
-        Err(_) => ptr::null_mut(),
     }
 }
 
@@ -6634,11 +6465,14 @@ mod tests {
         let limited_snapshot = typed_builder
             .find("typed->snapshot = sleigh_function_context_api.snapshot_collect_with_limits")
             .expect("bounded snapshot collection");
+        let unavailable_snapshot = typed_builder
+            .find("if (!sleigh_function_context_api.snapshot_available)")
+            .expect("bounded snapshot availability refusal");
         let copied_context_preflight = typed_builder
             .find("sleigh_typed_context_preflight")
             .expect("post-collection typed context validation");
         assert!(
-            limited_snapshot < copied_context_preflight,
+            unavailable_snapshot < limited_snapshot && limited_snapshot < copied_context_preflight,
             "global type limits must be applied by radare2 before plugin-side copied-context validation"
         );
         for cap in [
@@ -6657,12 +6491,25 @@ mod tests {
                 && !typed_builder.contains("r_anal_types_snapshot ("),
             "bounded V2 context collection must not call legacy unbounded collectors"
         );
+        let resolver_start = c_source
+            .find("static bool sleigh_resolve_function_context_api(void)")
+            .expect("bounded snapshot resolver");
+        let resolver_end = c_source[resolver_start..]
+            .find("static void sleigh_report_missing_function_context_api(void)")
+            .map(|offset| resolver_start + offset)
+            .expect("function after bounded snapshot resolver");
+        let resolver = &c_source[resolver_start..resolver_end];
         assert!(
-            c_source
-                .contains("dlsym (RTLD_DEFAULT, \"r_anal_function_snapshot_collect_with_limits\")")
-                && c_source
-                    .contains("legacy context and type collectors are intentionally fail-closed"),
-            "limited snapshot resolution and no-header compatibility policy must be explicit"
+            resolver.contains(
+                "dlsym (RTLD_DEFAULT, \"r_anal_function_snapshot_collect_with_limits\")",
+            ) && resolver.contains(
+                "dlsym (RTLD_DEFAULT, \"r_anal_function_snapshot_free\")",
+            ) && resolver.contains(
+                "snapshot_available = sleigh_function_context_api.snapshot_collect_with_limits",
+            ) && resolver.contains(
+                "sleigh_function_context_api.available = sleigh_function_context_api.snapshot_available",
+            ),
+            "the exact runtime resolver must require bounded collect and matching free ownership"
         );
 
         let start = c_source
@@ -7125,26 +6972,6 @@ mod tests {
     }
 
     #[test]
-    fn test_context_lifecycle_from_file() {
-        let spec = r2sleigh_lift::create_x86_64_spec();
-        let temp_path = "/tmp/test_r2il_plugin.r2il";
-        serialize::save(&spec, Path::new(temp_path)).unwrap();
-
-        let path_cstr = CString::new(temp_path).unwrap();
-        let ctx = r2il_load(path_cstr.as_ptr());
-        assert!(!ctx.is_null());
-        assert_eq!(r2il_is_loaded(ctx), 1);
-
-        let name_ptr = r2il_arch_name(ctx);
-        assert!(!name_ptr.is_null());
-        let name = unsafe { CStr::from_ptr(name_ptr) };
-        assert_eq!(name.to_str().unwrap(), "x86-64");
-
-        r2il_free(ctx);
-        std::fs::remove_file(temp_path).ok();
-    }
-
-    #[test]
     #[cfg(feature = "x86")]
     fn test_lift_and_esil() {
         let arch = CString::new("x86-64").unwrap();
@@ -7368,26 +7195,10 @@ mod tests {
 
     #[test]
     fn test_null_handling() {
-        assert!(r2il_load(ptr::null()).is_null());
         assert_eq!(r2il_is_loaded(ptr::null()), 0);
         assert!(r2il_arch_name(ptr::null()).is_null());
         r2il_free(ptr::null_mut());
         r2il_block_free(ptr::null_mut());
-    }
-
-    #[test]
-    fn is_big_endian_uses_memory_endianness_shim() {
-        let mut arch = ArchSpec::new("shim");
-        arch.set_memory_endianness(r2il::Endianness::Big);
-        let ctx = Box::into_raw(Box::new(R2ILContext::with_arch(arch)));
-        assert_eq!(r2il_is_big_endian(ctx), 1);
-        r2il_free(ctx);
-
-        let mut arch = ArchSpec::new("shim2");
-        arch.set_memory_endianness(r2il::Endianness::Mixed);
-        let ctx = Box::into_raw(Box::new(R2ILContext::with_arch(arch)));
-        assert_eq!(r2il_is_big_endian(ctx), 0);
-        r2il_free(ctx);
     }
 
     #[test]
@@ -9804,90 +9615,6 @@ mod integration_tests {
         assert_eq!(value["max_iterations"], 12);
         assert_eq!(value["converged"], false);
         assert_eq!(value["scope"]["mode"], "worklist");
-    }
-
-    #[test]
-    fn direct_call_targets_json_reports_constant_call_target() {
-        let arch = CString::new("x86-64").expect("valid arch");
-        let ctx = r2il_arch_init(arch.as_ptr());
-        assert!(!ctx.is_null(), "context should initialize");
-
-        let mut block = R2ILBlock::new(0x401000, 4);
-        block.push(R2ILOp::Call {
-            target: Varnode::constant(0x2000, 8),
-        });
-        block.push(R2ILOp::Return {
-            target: Varnode {
-                space: r2il::SpaceId::Register,
-                offset: 0,
-                size: 8,
-                meta: None,
-            },
-        });
-        let raw_block = Box::into_raw(Box::new(block));
-        let blocks = [raw_block as *const R2ILBlock];
-        let func_name = CString::new("sym.alloc_wrapper").expect("valid function name");
-
-        let out = r2sleigh_get_direct_call_targets_json(
-            ctx,
-            blocks.as_ptr(),
-            blocks.len(),
-            0x401000,
-            func_name.as_ptr(),
-        );
-        assert!(!out.is_null(), "direct target payload should not be null");
-        let output = unsafe { CStr::from_ptr(out) }.to_string_lossy().to_string();
-        let targets: Vec<u64> = serde_json::from_str(&output).expect("targets should parse");
-
-        r2il_string_free(out);
-        r2il_block_free(raw_block);
-        r2il_free(ctx);
-
-        assert_eq!(targets, vec![0x2000], "payload={output}");
-    }
-
-    #[test]
-    fn direct_call_targets_json_reports_copied_constant_indirect_call_target() {
-        let arch = CString::new("x86-64").expect("valid arch");
-        let ctx = r2il_arch_init(arch.as_ptr());
-        assert!(!ctx.is_null(), "context should initialize");
-
-        let mut block = R2ILBlock::new(0x401000, 4);
-        block.push(R2ILOp::Copy {
-            dst: Varnode::unique(1, 8),
-            src: Varnode::constant(0x2000, 8),
-        });
-        block.push(R2ILOp::CallInd {
-            target: Varnode::unique(1, 8),
-        });
-        block.push(R2ILOp::Return {
-            target: Varnode {
-                space: r2il::SpaceId::Register,
-                offset: 0,
-                size: 8,
-                meta: None,
-            },
-        });
-        let raw_block = Box::into_raw(Box::new(block));
-        let blocks = [raw_block as *const R2ILBlock];
-        let func_name = CString::new("sym.alloc_wrapper").expect("valid function name");
-
-        let out = r2sleigh_get_direct_call_targets_json(
-            ctx,
-            blocks.as_ptr(),
-            blocks.len(),
-            0x401000,
-            func_name.as_ptr(),
-        );
-        assert!(!out.is_null(), "direct target payload should not be null");
-        let output = unsafe { CStr::from_ptr(out) }.to_string_lossy().to_string();
-        let targets: Vec<u64> = serde_json::from_str(&output).expect("targets should parse");
-
-        r2il_string_free(out);
-        r2il_block_free(raw_block);
-        r2il_free(ctx);
-
-        assert_eq!(targets, vec![0x2000], "payload={output}");
     }
 
     #[test]

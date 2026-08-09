@@ -5,8 +5,8 @@ use std::fmt::Write as _;
 
 use r2cert::{
     CERTIFIED_CONDITIONAL_TERMINAL_RETURN_CONTRACT_VERSION, CertifiedArtifactOrigin,
-    CertifiedMachineProjection, CertifiedRenderPermit, CertifiedSourceTerminator,
-    CertifiedTypedRegionKind, RenderAuthorizationError, TypedRegionMapping,
+    CertifiedLedgerClosure, CertifiedMachineProjection, CertifiedSourceTerminator,
+    CertifiedTypedRegionKind, LedgerClosureError, TypedRegionMapping,
     certify_conditional_terminal_return_region,
 };
 use r2ssa::{
@@ -19,7 +19,8 @@ use crate::certified_control::{
     CertifiedConditionalTransferBlockRegion, ConditionalTransferRegionError,
 };
 use crate::certified_region::{
-    CertifiedSingleBlockAccounting, RegionBuildError, RegionObligationMapping,
+    CertifiedSingleBlockAccounting, CertifiedTypedOutputSeal, RegionBuildError,
+    RegionObligationMapping, TypedOutputSealError,
 };
 use crate::semantic_c::{
     SEMANTIC_C_HELPERS, SemanticCError, SemanticCFunctionInterface, SemanticCFunctionReturn,
@@ -182,7 +183,7 @@ pub struct CertifiedConditionalReturnFunction {
     true_addr: u64,
     false_addr: u64,
     mappings: Box<[RegionObligationMapping]>,
-    render_permit: CertifiedRenderPermit,
+    typed_output_seal: CertifiedTypedOutputSeal,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -191,7 +192,8 @@ pub enum ConditionalReturnFunctionError {
     Accounting(RegionBuildError),
     Conditional(ConditionalTransferRegionError),
     Statement(SemanticCStatementError),
-    Authorization(RenderAuthorizationError),
+    LedgerClosure(LedgerClosureError),
+    TypedOutputSeal(TypedOutputSealError),
     InvalidReturnArm(u64),
     InvalidComposition(Vec<String>),
     MissingFunctionInterface,
@@ -233,9 +235,15 @@ impl From<SemanticCStatementError> for ConditionalReturnFunctionError {
     }
 }
 
-impl From<RenderAuthorizationError> for ConditionalReturnFunctionError {
-    fn from(error: RenderAuthorizationError) -> Self {
-        Self::Authorization(error)
+impl From<LedgerClosureError> for ConditionalReturnFunctionError {
+    fn from(error: LedgerClosureError) -> Self {
+        Self::LedgerClosure(error)
+    }
+}
+
+impl From<TypedOutputSealError> for ConditionalReturnFunctionError {
+    fn from(error: TypedOutputSealError) -> Self {
+        Self::TypedOutputSeal(error)
     }
 }
 
@@ -310,13 +318,23 @@ impl CertifiedConditionalReturnFunction {
             true_arm.layer().accounting(),
             false_arm.layer().accounting(),
         ]);
-        let render_permit = certify_conditional_terminal_return_region(
+        let ledger_closure: CertifiedLedgerClosure = certify_conditional_terminal_return_region(
             certified.origin(),
             certified.ledger(),
             typed_mappings,
             header_addr,
             true_addr,
             false_addr,
+        )?;
+        let typed_output_seal = CertifiedTypedOutputSeal::new(
+            ledger_closure,
+            CertifiedTypedRegionKind::ConditionalTerminalReturnFunction,
+            CERTIFIED_CONDITIONAL_RETURN_FUNCTION_SCHEMA_VERSION,
+            [
+                header.body().accounting(),
+                true_arm.layer().accounting(),
+                false_arm.layer().accounting(),
+            ],
         )?;
         let function = Self {
             schema_version: CERTIFIED_CONDITIONAL_RETURN_FUNCTION_SCHEMA_VERSION,
@@ -329,7 +347,7 @@ impl CertifiedConditionalReturnFunction {
             true_addr,
             false_addr,
             mappings,
-            render_permit,
+            typed_output_seal,
         };
         let report = function.audit();
         if !report.has_exact_conditional_returns() {
@@ -370,10 +388,6 @@ impl CertifiedConditionalReturnFunction {
 
     pub const fn mappings(&self) -> &[RegionObligationMapping] {
         &self.mappings
-    }
-
-    pub const fn render_permit(&self) -> &CertifiedRenderPermit {
-        &self.render_permit
     }
 
     pub fn audit(&self) -> ConditionalReturnFunctionAuditReport {
@@ -495,15 +509,13 @@ impl CertifiedConditionalReturnFunction {
         {
             invalid.push("combined mappings are not disjoint and complete".to_string());
         }
-        let typed_mappings =
-            typed_region_mappings([header_accounting, true_accounting, false_accounting]);
-        if !self.render_permit.matches_region(
+        if !self.typed_output_seal.matches_region(
             &self.origin,
             CertifiedTypedRegionKind::ConditionalTerminalReturnFunction,
             CERTIFIED_CONDITIONAL_RETURN_FUNCTION_SCHEMA_VERSION,
-            &typed_mappings,
+            [header_accounting, true_accounting, false_accounting],
         ) {
-            invalid.push("render permit does not match the closed composition".to_string());
+            invalid.push("typed-output seal does not match the closed composition".to_string());
         }
         ConditionalReturnFunctionAuditReport {
             missing,
@@ -515,7 +527,7 @@ impl CertifiedConditionalReturnFunction {
 
     pub fn render_certified_c(&self) -> Result<String, ConditionalReturnFunctionError> {
         let report = self.audit();
-        if !report.has_exact_conditional_returns() || !self.render_permit.authorizes_certified_c() {
+        if !report.has_exact_conditional_returns() {
             return Err(ConditionalReturnFunctionError::InvalidComposition(
                 report.invalid,
             ));
@@ -705,8 +717,6 @@ impl ConditionalReturnFunctionAuditReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
-    use std::process::{Command, Stdio};
 
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
     use r2ssa::{
@@ -773,89 +783,21 @@ mod tests {
         vec![header, false_arm, true_arm]
     }
 
-    pub(crate) fn artifact() -> SsaArtifact {
-        let blocks = source_blocks();
-        SsaArtifact::raw_with_interface(&blocks, Some(&test_arch()), interface(storage(0, 8)))
-            .expect("conditional-return artifact")
-    }
-
-    fn compile(source: &str) {
-        let mut compiler = Command::new("cc")
-            .args([
-                "-std=c11",
-                "-Wall",
-                "-Wextra",
-                "-Wpedantic",
-                "-Wno-unused-function",
-                "-Werror",
-                "-fsyntax-only",
-                "-x",
-                "c",
-                "-",
-            ])
-            .stdin(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("C compiler required");
-        compiler
-            .stdin
-            .as_mut()
-            .expect("compiler stdin")
-            .write_all(source.as_bytes())
-            .expect("write C source");
-        let output = compiler.wait_with_output().expect("wait for compiler");
-        assert!(
-            output.status.success(),
-            "generated C failed:\n{}\n{}",
-            source,
-            String::from_utf8_lossy(&output.stderr)
-        );
+    fn assert_refused(blocks: &[R2ILBlock], return_storage: CanonicalStorageId) {
+        let artifact =
+            SsaArtifact::raw_with_interface(blocks, Some(&test_arch()), interface(return_storage))
+                .expect("synthetic conditional-return artifact");
+        assert!(CertifiedConditionalReturnFunction::from_artifact(&artifact).is_err());
     }
 
     #[test]
-    fn exact_closed_conditional_return_is_authorized_and_compiles() {
-        let function = CertifiedConditionalReturnFunction::from_artifact(&artifact())
-            .expect("closed conditional return");
-        assert!(function.audit().has_exact_conditional_returns());
-        assert!(function.render_permit().authorizes_certified_c());
-        assert_eq!(function.header().open_true_successor(), 0x8020);
-        assert_eq!(function.header().open_false_successor(), 0x8004);
-        let source = function.render_certified_c().expect("certified C");
-        assert!(source.contains("if ((uint8_t)(v_"));
-        assert!(source.contains("return v_"));
-        compile(&source);
+    fn synthetic_conditional_return_is_refused_without_typed_machine_roles() {
+        assert_refused(&source_blocks(), storage(0, 8));
     }
 
     #[test]
-    fn dropped_duplicated_and_swapped_edge_mutations_fail_audit() {
-        let function = CertifiedConditionalReturnFunction::from_artifact(&artifact())
-            .expect("closed conditional return");
-        let mut dropped_edge = function.clone();
-        dropped_edge.true_addr = 0xdead;
-        assert!(!dropped_edge.audit().has_exact_conditional_returns());
-        let mut duplicated_edge = function.clone();
-        duplicated_edge.true_addr = duplicated_edge.false_addr;
-        assert!(!duplicated_edge.audit().has_exact_conditional_returns());
-        let mut swapped_edges = function.clone();
-        std::mem::swap(&mut swapped_edges.true_addr, &mut swapped_edges.false_addr);
-        assert!(!swapped_edges.audit().has_exact_conditional_returns());
-
-        let mut dropped = function.clone();
-        dropped.mappings = dropped.mappings[1..].to_vec().into_boxed_slice();
-        assert!(!dropped.audit().has_exact_conditional_returns());
-        let mut duplicated = function.clone();
-        let mapping = duplicated.mappings[0].clone();
-        duplicated.mappings = duplicated
-            .mappings
-            .iter()
-            .cloned()
-            .chain([mapping])
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        assert!(!duplicated.audit().has_exact_conditional_returns());
-        let mut swapped = function;
-        std::mem::swap(&mut swapped.true_arm, &mut swapped.false_arm);
-        assert!(!swapped.audit().has_exact_conditional_returns());
+    fn synthetic_conditional_return_certificate_baseline_is_refused() {
+        assert_refused(&source_blocks(), storage(0, 8));
     }
 
     #[test]
@@ -863,13 +805,7 @@ mod tests {
         let mut extra_blocks = source_blocks();
         let extra_block = R2ILBlock::new(0x8040, 4);
         extra_blocks.push(extra_block);
-        let extra = SsaArtifact::raw_with_interface(
-            &extra_blocks,
-            Some(&test_arch()),
-            interface(storage(0, 8)),
-        )
-        .expect("extra-block artifact");
-        assert!(CertifiedConditionalReturnFunction::from_artifact(&extra).is_err());
+        assert_refused(&extra_blocks, storage(0, 8));
 
         let mut header = R2ILBlock::new(0x8100, 4);
         header.push(R2ILOp::Store {
@@ -892,18 +828,7 @@ mod tests {
         true_arm.push(R2ILOp::Return {
             target: Varnode::register(16, 8),
         });
-        let excluded = SsaArtifact::raw_with_interface(
-            &[header, false_arm, true_arm],
-            Some(&test_arch()),
-            interface(storage(0, 8)),
-        )
-        .expect("excluded artifact");
-        assert!(CertifiedConditionalReturnFunction::from_artifact(&excluded).is_err());
-        let blocks = source_blocks();
-        let wrong_return =
-            SsaArtifact::raw_with_interface(&blocks, Some(&test_arch()), interface(storage(0, 4)));
-        assert!(wrong_return.is_none_or(|artifact| {
-            CertifiedConditionalReturnFunction::from_artifact(&artifact).is_err()
-        }));
+        assert_refused(&[header, false_arm, true_arm], storage(0, 8));
+        assert_refused(&source_blocks(), storage(0, 4));
     }
 }

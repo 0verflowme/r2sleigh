@@ -87,7 +87,6 @@ pub struct ProofFailure {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum RenderPermissionKind {
-    CertifiedC,
     SummaryComment,
     Residual,
     Refuse,
@@ -101,14 +100,6 @@ pub struct RenderPermission {
 }
 
 impl RenderPermission {
-    pub fn certified(owner: ProofOwner, reason: impl Into<String>) -> Self {
-        Self {
-            kind: RenderPermissionKind::CertifiedC,
-            owner,
-            reason: reason.into(),
-        }
-    }
-
     pub fn summary(owner: ProofOwner, reason: impl Into<String>) -> Self {
         Self {
             kind: RenderPermissionKind::SummaryComment,
@@ -295,70 +286,6 @@ impl ProofCoverage {
 
     pub fn has_fake_semantics_risk(&self) -> bool {
         !self.failures.is_empty() || self.refusals > 0
-    }
-
-    pub fn standard_control_render_permission(
-        &self,
-        cfg_summary: &r2ssa::CFGRiskSummary,
-        prepared_available: bool,
-    ) -> RenderPermission {
-        let cfg_loop_obligations = if cfg_summary.loop_count > 0 {
-            cfg_summary.loop_count
-        } else if cfg_summary.back_edge_count > 0 {
-            1
-        } else {
-            0
-        };
-        let cfg_switch_obligations = cfg_summary.switch_block_count;
-        if !prepared_available {
-            return RenderPermission::residual(
-                ProofOwner::R2engine,
-                "missing prepared SSA certificates for Standard executable rendering",
-            );
-        }
-
-        let mut reasons = Vec::new();
-        if cfg_loop_obligations > 0 && self.certified_loops < cfg_loop_obligations {
-            reasons.push(format!(
-                "loop CFG requires {} LoopCertificate(s), found {}",
-                cfg_loop_obligations, self.certified_loops
-            ));
-        }
-        if cfg_switch_obligations > 0 && self.certified_switches < cfg_switch_obligations {
-            reasons.push(format!(
-                "switch CFG requires {} SwitchCertificate(s), found {}",
-                cfg_switch_obligations, self.certified_switches
-            ));
-        }
-        if self.certified_signatures == 0 {
-            reasons
-                .push("Standard executable rendering requires a certified signature".to_string());
-        }
-        if self.certified_returns == 0
-            && self.certified_expressions == 0
-            && self.certified_memory_accesses == 0
-            && self.certified_callsites == 0
-        {
-            reasons.push(
-                "Standard executable rendering requires certified return/expression/memory/call evidence"
-                    .to_string(),
-            );
-        }
-
-        if reasons.is_empty() {
-            RenderPermission::certified(
-                ProofOwner::R2engine,
-                "standard route executable rendering is backed by certified control, type, and value evidence",
-            )
-        } else {
-            RenderPermission::residual(
-                ProofOwner::R2engine,
-                format!(
-                    "uncertified Standard executable rendering: {}",
-                    reasons.join(", ")
-                ),
-            )
-        }
     }
 }
 
@@ -1177,71 +1104,5 @@ mod tests {
             ProofCoverage::default().schema_version,
             PROOF_COVERAGE_SCHEMA_VERSION
         );
-    }
-
-    #[test]
-    fn proof_coverage_refuses_standard_control_without_prepared_certificates() {
-        let permission = ProofCoverage::default().standard_control_render_permission(
-            &r2ssa::CFGRiskSummary {
-                block_count: 3,
-                loop_count: 1,
-                back_edge_count: 1,
-                switch_block_count: 0,
-                max_switch_cases: 0,
-            },
-            false,
-        );
-
-        assert_eq!(permission.kind, RenderPermissionKind::Residual);
-        assert!(
-            permission
-                .reason
-                .contains("missing prepared SSA certificates")
-        );
-    }
-
-    #[test]
-    fn proof_coverage_residualizes_standard_without_executable_evidence() {
-        let permission = ProofCoverage::default().standard_control_render_permission(
-            &r2ssa::CFGRiskSummary {
-                block_count: 1,
-                loop_count: 0,
-                back_edge_count: 0,
-                switch_block_count: 0,
-                max_switch_cases: 0,
-            },
-            true,
-        );
-
-        assert_eq!(permission.kind, RenderPermissionKind::Residual);
-        assert!(permission.reason.contains("certified signature"));
-        assert!(
-            permission
-                .reason
-                .contains("return/expression/memory/call evidence")
-        );
-    }
-
-    #[test]
-    fn proof_coverage_certifies_standard_when_control_type_and_value_counts_cover_cfg() {
-        let permission = ProofCoverage {
-            certified_loops: 1,
-            certified_switches: 1,
-            certified_signatures: 1,
-            certified_returns: 1,
-            ..ProofCoverage::default()
-        }
-        .standard_control_render_permission(
-            &r2ssa::CFGRiskSummary {
-                block_count: 4,
-                loop_count: 1,
-                back_edge_count: 1,
-                switch_block_count: 1,
-                max_switch_cases: 2,
-            },
-            true,
-        );
-
-        assert_eq!(permission.kind, RenderPermissionKind::CertifiedC);
     }
 }

@@ -2,10 +2,10 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{CanonicalStorageId, CanonicalStorageSpace};
 use crate::function::SSAFunction;
 use crate::op::SSAOp;
 use crate::var::SSAVar;
+use crate::{CanonicalStorageId, CanonicalStorageSpace};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct BlockId(pub u32);

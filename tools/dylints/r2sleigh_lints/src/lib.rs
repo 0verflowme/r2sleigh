@@ -619,7 +619,7 @@ rustc_session::declare_lint!(
     ///
     /// Warns when summary-only `r2dec` renderer files construct executable
     /// `CStmt` nodes such as returns, branches, loops, switches, or expression
-    /// statements without an explicit CertifiedC permission gate.
+    /// statements.
     ///
     /// ### Why is this bad?
     ///
@@ -634,11 +634,11 @@ rustc_session::declare_lint!(
     /// vec![CStmt::Return(Some(expr))]
     /// ```
     ///
-    /// Use `CStmt::comment(...)` or residualize unless the enclosing function
-    /// has explicitly checked `RenderPermissionKind::CertifiedC`.
+    /// Use `CStmt::comment(...)` or residualize. Executable output must be
+    /// produced by an exact typed-output seal, outside summary renderers.
     pub R2DEC_SUMMARY_RENDER_EXECUTABLE_CSTMT,
     Warn,
-    "summary/VM renderers must not construct executable CStmt bodies without CertifiedC permission"
+    "summary/VM renderers must not construct executable CStmt bodies"
 );
 
 rustc_session::declare_lint!(
@@ -8067,9 +8067,6 @@ fn summary_render_executable_cstmt_expr(cx: &LateContext<'_>, expr: &Expr<'_>) -
     if is_inside_test_item(cx, expr) {
         return false;
     }
-    if enclosing_item_snippet_contains(cx, expr, "RenderPermissionKind::CertifiedC") {
-        return false;
-    }
     if !matches!(expr.kind, ExprKind::Call(_, _) | ExprKind::Struct(_, _, _)) {
         return false;
     }
@@ -8841,88 +8838,6 @@ fn r2dec_raw_address_rendering_does_not_use_function_string_symbol_maps() {
 }
 
 #[test]
-fn r2dec_certified_render_gate_uses_engine_permission_not_prepared_presence() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
-    let op_lower_path = root.join("crates/r2dec/src/fold/op_lower/mod.rs");
-    let context_path = root.join("crates/r2dec/src/fold/context.rs");
-    let prepared_path = root.join("crates/r2dec/src/analysis/prepared_semantic.rs");
-    let op_lower = std::fs::read_to_string(&op_lower_path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", op_lower_path.display()));
-    let context = std::fs::read_to_string(&context_path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", context_path.display()));
-    let prepared = std::fs::read_to_string(&prepared_path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", prepared_path.display()));
-
-    let marker = "pub(crate) fn requires_certified_rendering";
-    let start = op_lower
-        .find(marker)
-        .unwrap_or_else(|| panic!("missing {marker} in {}", op_lower_path.display()));
-    let body = &op_lower[start
-        ..op_lower[start..]
-            .find("\n    pub(super) fn is_certified_materialized_phi_carrier")
-            .map(|offset| start + offset)
-            .unwrap_or_else(|| panic!("missing certified render gate end marker"))];
-
-    let field = "pub(crate) certified_rendering_required: bool";
-    if let Some(field_at) = context.find(field) {
-        let prefix = &context[..field_at];
-        assert!(
-            prefix.ends_with("#[cfg(test)]\n    #[allow(dead_code)]\n    "),
-            "standalone certified_rendering_required must be test-only fixture scaffolding"
-        );
-    }
-    for required in [
-        "self.inputs.function_facts.decompile_route()",
-        "route.kind == r2types::DecompileRouteKind::Standard",
-        "route.render_permission.kind == r2sym::RenderPermissionKind::CertifiedC",
-        "route.render_permission.owner == r2sym::ProofOwner::R2engine",
-    ] {
-        assert!(
-            body.contains(required),
-            "requires_certified_rendering must derive from engine-owned FunctionFacts route proof {required:?}"
-        );
-    }
-    assert!(
-        !body.contains("self.inputs.certified_rendering_required"),
-        "requires_certified_rendering must not read standalone certified render side-channel"
-    );
-    assert!(
-        !body.contains("prepared_ssa.is_some()"),
-        "prepared SSA presence is evidence input, not executable-C render permission"
-    );
-
-    let input_marker = "pub(crate) struct PreparedSemanticViewInputs";
-    let input_start = prepared
-        .find(input_marker)
-        .unwrap_or_else(|| panic!("missing {input_marker} in {}", prepared_path.display()));
-    let input_rest = &prepared[input_start..];
-    let input_end = input_rest
-        .find("\nimpl PreparedSemanticView")
-        .unwrap_or_else(|| panic!("missing PreparedSemanticView impl after inputs"));
-    let input_block = &input_rest[..input_end];
-    if let Some(field_at) = input_block.find(field) {
-        let prefix = &input_block[..field_at];
-        let nearby = &prefix[prefix.len().saturating_sub(80)..];
-        assert!(
-            nearby.contains("#[cfg(test)]"),
-            "PreparedSemanticViewInputs standalone certified_rendering_required must be test-only fixture scaffolding"
-        );
-    }
-    for required in [
-        "prepared_view_requires_certified_rendering(inputs.function_facts)",
-        "function_facts.decompile_route()",
-        "route.kind == r2types::DecompileRouteKind::Standard",
-        "route.render_permission.kind == r2sym::RenderPermissionKind::CertifiedC",
-        "route.render_permission.owner == r2sym::ProofOwner::R2engine",
-    ] {
-        assert!(
-            prepared.contains(required),
-            "PreparedSemanticView must derive certified mode from FunctionFacts route proof {required:?}"
-        );
-    }
-}
-
-#[test]
 fn r2dec_certified_source_call_args_do_not_replay_prepared_or_local_args() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../..")
@@ -8961,86 +8876,6 @@ fn r2dec_certified_source_call_args_do_not_replay_prepared_or_local_args() {
         assert!(
             !helper.contains(forbidden),
             "certified source-call replay must not use local/prepared argument source {forbidden:?}"
-        );
-    }
-}
-
-#[test]
-fn r2dec_certified_c_residualizes_non_engine_owner_and_requires_effect_proofs() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../..")
-        .join("crates/r2dec/src/lib.rs");
-    let source = std::fs::read_to_string(&path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
-
-    let permission_marker = "fn render_permission_residual_reason";
-    let permission_start = source
-        .find(permission_marker)
-        .unwrap_or_else(|| panic!("missing {permission_marker} in {}", path.display()));
-    let permission_rest = &source[permission_start..];
-    let permission_end = permission_rest
-        .find("\nfn render_permission_allows_executable_c")
-        .unwrap_or_else(|| panic!("missing render permission helper end marker"));
-    let permission_body = &permission_rest[..permission_end];
-
-    for required in [
-        "r2sym::RenderPermissionKind::CertifiedC",
-        "permission.owner != r2sym::ProofOwner::R2engine",
-        "CertifiedC render permission from non-engine proof owner",
-    ] {
-        assert!(
-            permission_body.contains(required),
-            "CertifiedC render permission must fail closed unless r2engine owns the proof: {required:?}"
-        );
-    }
-    assert!(
-        !permission_body.contains("r2sym::RenderPermissionKind::CertifiedC => None"),
-        "CertifiedC must not bypass residualization without checking proof owner"
-    );
-
-    let production_gate_marker =
-        "#[cfg(not(test))]\nfn render_permission_allows_executable_c";
-    let production_gate_start = source.find(production_gate_marker).unwrap_or_else(|| {
-        panic!("missing production legacy CertifiedC interlock in {}", path.display())
-    });
-    let production_gate_rest = &source[production_gate_start..];
-    let production_gate_end = production_gate_rest
-        .find("#[cfg(test)]\nfn render_permission_allows_executable_c")
-        .unwrap_or_else(|| panic!("missing test-only legacy render-permission fixture branch"));
-    let production_gate = &production_gate_rest[..production_gate_end];
-    for required in ["let _ = permission;", "false"] {
-        assert!(
-            production_gate.contains(required),
-            "production r2dec must keep legacy render permissions inert: {required:?}"
-        );
-    }
-    assert!(
-        !production_gate.contains("RenderPermissionKind::CertifiedC"),
-        "production r2dec must not derive executable authority from the legacy CertifiedC token"
-    );
-
-    let contract_marker = "fn certified_standard_output_residual_reason_with_effect_proofs";
-    let contract_start = source
-        .find(contract_marker)
-        .unwrap_or_else(|| panic!("missing {contract_marker} in {}", path.display()));
-    let contract_rest = &source[contract_start..];
-    let contract_end = contract_rest
-        .find("\nfn field_accesses_are_certified")
-        .unwrap_or_else(|| panic!("missing certified Standard verifier end marker"));
-    let contract_body = &contract_rest[..contract_end];
-
-    assert!(
-        contract_body.contains("missing exact FunctionFacts render proof"),
-        "certified Standard output must residualize executable effects when exact render proofs are absent"
-    );
-    for forbidden in [
-        "counts.calls > callsite_facts.by_callsite.len()",
-        "counts.returns_with_value > render_facts.returns_by_op.len()",
-        "counts.memory_like_accesses > render_facts.memory_accesses.len()",
-    ] {
-        assert!(
-            !contract_body.contains(forbidden),
-            "certified Standard verification must not fall back to count-only proof acceptance: {forbidden:?}"
         );
     }
 }
@@ -11703,38 +11538,4 @@ fn function_facts_spine_fields_stay_private() {
             "r2dec must expose read-only spine accessor: {required}"
         );
     }
-}
-
-#[test]
-fn standard_certified_c_requires_executable_proof_not_just_easy_control() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../..")
-        .join("crates/r2sym/src/semantics/claims.rs");
-    let source = std::fs::read_to_string(&path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
-    let start = source
-        .find("pub fn standard_control_render_permission")
-        .expect("missing standard_control_render_permission");
-    let rest = &source[start..];
-    let end = rest
-        .find("\n    }\n}\n\nfn proof_owner_from_label")
-        .expect("missing standard_control_render_permission end");
-    let body = &rest[..end];
-    for required in [
-        "self.certified_signatures == 0",
-        "self.certified_returns == 0",
-        "self.certified_expressions == 0",
-        "self.certified_memory_accesses == 0",
-        "self.certified_callsites == 0",
-        "uncertified Standard executable rendering",
-    ] {
-        assert!(
-            body.contains(required),
-            "CertifiedC gate must require executable proof condition: {required}"
-        );
-    }
-    assert!(
-        !body.contains("standard route has no structured-control proof obligations"),
-        "Standard CertifiedC must not be granted only because CFG has no loop/switch obligations"
-    );
 }

@@ -24,6 +24,7 @@ z3.workspace = true
 [dev-dependencies]
 r2dec = { path = "../crates/r2dec" }
 r2engine = { path = "../crates/r2engine" }
+sha2 = "0.10"
 
 [build-dependencies]
 cbindgen = "0.29"

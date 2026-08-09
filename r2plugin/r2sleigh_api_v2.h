@@ -34,7 +34,7 @@ typedef struct R2ILFunctionBlocks R2ILFunctionBlocks;
 
 #define R2SLEIGH_CAPABILITIES_V2 ((((((((R2SLEIGH_CAP_DECOMPILE_V2 | R2SLEIGH_CAP_TYPE_FUNCTION_V2) | R2SLEIGH_CAP_EXACT_FUNCTION_INTERFACE_V2) | R2SLEIGH_CAP_CALL_SITE_INTERFACES_V2) | R2SLEIGH_CAP_NATIVE_REQUEST_GRAPH_V2) | R2SLEIGH_CAP_RESPONSE_INFO_V2) | R2SLEIGH_CAP_EXECUTION_CONTROL_V2) | R2SLEIGH_CAP_EXACT_TYPE_LAYOUT_V2) | R2SLEIGH_CAP_EXACT_STACK_SLOT_ROLES_V2)
 
-#define R2SLEIGH_RADARE_ABI_V2 136
+#define R2SLEIGH_RADARE_ABI_V2 137
 
 #define R2SLEIGH_STATUS_OK_V2 0
 
@@ -122,7 +122,7 @@ typedef struct R2ILFunctionBlocks R2ILFunctionBlocks;
 
 #define R2SLEIGH_SOURCE_STORAGE_CUSTOM_V2 5
 
-#define R2SLEIGH_SOURCE_INTERFACE_SCHEMA_V2 6
+#define R2SLEIGH_SOURCE_INTERFACE_SCHEMA_V2 7
 
 #define R2SLEIGH_SOURCE_CALL_SITE_SCHEMA_V2 1
 
@@ -582,6 +582,10 @@ typedef struct R2SleighSourceFunctionInterfaceV2 {
    * Exact name-independent register consumed by the lifted return.
    */
   struct R2SleighSourceStorageV2 return_address_storage;
+  /**
+   * Exact name-independent register carrying the architectural stack pointer.
+   */
+  struct R2SleighSourceStorageV2 stack_pointer_storage;
 } R2SleighSourceFunctionInterfaceV2;
 
 /**

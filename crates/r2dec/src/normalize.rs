@@ -253,13 +253,6 @@ pub(crate) struct PhiEdgeLiveness {
 }
 
 impl PhiEdgeLiveness {
-    pub(crate) fn compute(func: &SSAFunction) -> Self {
-        let execution = SsaExecutionControl::default();
-        let control = DecompileWorkControl::new(&execution, DecompileWorkPhase::Normalization);
-        Self::compute_with_control(func, control)
-            .expect("default decompiler work control cannot stop")
-    }
-
     pub(crate) fn compute_with_control(
         func: &SSAFunction,
         control: DecompileWorkControl<'_>,
@@ -360,16 +353,6 @@ impl PhiEdgeLiveness {
             self.phi_defs.get(&successor),
             self.edge_phi_uses.get(&(pred, successor)),
         )
-    }
-
-    pub(crate) fn dst_is_dead_on_other_loop_edges(
-        &self,
-        func: &SSAFunction,
-        pred: u64,
-        target: u64,
-        dst: &r2ssa::SSAVar,
-    ) -> bool {
-        can_materialize_unconditional_loop_backedge(func, self, pred, target, dst)
     }
 }
 

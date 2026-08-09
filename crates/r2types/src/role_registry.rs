@@ -1224,7 +1224,6 @@ pub(crate) fn signature_hint_for_role_name(
                 p("invalid", typedef_pointer_type("strtol_error")),
             ],
         ),
-        "parse_number" => sig(c_int_type(), vec![p("str", signed_byte_pointer_type())]),
         "traverse_raw_number" => sig(
             signed_int_type(8),
             vec![p("number", signed_byte_pointer_pointer_type())],
@@ -1254,21 +1253,6 @@ pub(crate) fn signature_hint_for_role_name(
         "argv_iter_free" => sig(
             CTypeLike::Void,
             vec![p("iter", struct_pointer_type("argv_iterator"))],
-        ),
-        "check_secret" => sig(c_int_type(), vec![p("x", c_int_type())]),
-        "process_string" => sig(c_int_type(), vec![p("s", signed_byte_pointer_type())]),
-        "test_boolxor" => sig(
-            c_int_type(),
-            vec![p("a", c_int_type()), p("b", c_int_type())],
-        ),
-        "alloc_wrapper2" => sig(allocation_ptr_type(), vec![p("n", typedef_type("size_t"))]),
-        "large_basic_block_guard" => sig(c_int_type(), vec![p("x", c_int_type())]),
-        "tiny_vm_dispatch" => sig(
-            c_int_type(),
-            vec![
-                p("code", unsigned_byte_pointer_type()),
-                p("len", c_int_type()),
-            ],
         ),
         "xnumtoumax" => sig(
             typedef_type("uintmax_t"),
@@ -3971,19 +3955,12 @@ mod tests {
             "parse_gnu_standard_options_only",
             "human_options",
             "parse_integer",
-            "parse_number",
             "traverse_raw_number",
             "argv_iter_init_argv",
             "argv_iter_init_stream",
             "argv_iter",
             "argv_iter_n_args",
             "argv_iter_free",
-            "check_secret",
-            "process_string",
-            "test_boolxor",
-            "alloc_wrapper2",
-            "large_basic_block_guard",
-            "tiny_vm_dispatch",
             "xnumtoumax",
             "synchronize_output",
             "stream_open",
@@ -4749,10 +4726,6 @@ mod tests {
             parse_integer.params[1].ty,
             Some(typedef_pointer_type("strtol_error"))
         );
-        let parse_number =
-            signature_hint_for_role_name("parse_number", 0).expect("expected parse number");
-        assert_eq!(parse_number.ret_type, Some(c_int_type()));
-        assert_eq!(parse_number.params[0].ty, Some(signed_byte_pointer_type()));
         let argv_iter =
             signature_hint_for_role_name("argv_iter", 0).expect("expected argv iterator");
         assert_eq!(argv_iter.ret_type, Some(signed_byte_pointer_type()));
@@ -4770,22 +4743,6 @@ mod tests {
         let usage = signature_hint_for_role_name("usage", 0).expect("expected usage");
         assert_eq!(usage.ret_type, Some(CTypeLike::Void));
         assert_eq!(usage.params[0].ty, Some(c_int_type()));
-
-        let boolxor = signature_hint_for_role_name("test_boolxor", 0).expect("expected boolxor");
-        assert_eq!(boolxor.ret_type, Some(c_int_type()));
-        assert_eq!(boolxor.params[0].ty, Some(c_int_type()));
-        assert_eq!(boolxor.params[1].ty, Some(c_int_type()));
-
-        let alloc =
-            signature_hint_for_role_name("alloc_wrapper2", 0).expect("expected alloc wrapper");
-        assert_eq!(alloc.ret_type, Some(allocation_ptr_type()));
-        assert_eq!(alloc.params[0].ty, Some(typedef_type("size_t")));
-
-        let vm =
-            signature_hint_for_role_name("tiny_vm_dispatch", 0).expect("expected tiny vm role");
-        assert_eq!(vm.ret_type, Some(c_int_type()));
-        assert_eq!(vm.params[0].ty, Some(unsigned_byte_pointer_type()));
-        assert_eq!(vm.params[1].ty, Some(c_int_type()));
 
         let sync =
             signature_hint_for_role_name("synchronize_output", 0).expect("expected output sync");

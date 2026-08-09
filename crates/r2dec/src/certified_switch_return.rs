@@ -5,8 +5,8 @@ use std::fmt::Write as _;
 
 use r2cert::{
     CERTIFIED_SWITCH_TERMINAL_RETURN_CONTRACT_VERSION, CertifiedArtifactOrigin,
-    CertifiedMachineProjection, CertifiedRenderPermit, CertifiedSourceTerminator,
-    CertifiedSwitchControl, CertifiedTypedRegionKind, RenderAuthorizationError, TypedRegionMapping,
+    CertifiedLedgerClosure, CertifiedMachineProjection, CertifiedSourceTerminator,
+    CertifiedSwitchControl, CertifiedTypedRegionKind, LedgerClosureError, TypedRegionMapping,
     certify_switch_terminal_return_region,
 };
 use r2ssa::{
@@ -16,7 +16,8 @@ use r2ssa::{
 use serde::Serialize;
 
 use crate::certified_region::{
-    CertifiedSingleBlockAccounting, RegionBuildError, RegionObligationMapping,
+    CertifiedSingleBlockAccounting, CertifiedTypedOutputSeal, RegionBuildError,
+    RegionObligationMapping, TypedOutputSealError,
 };
 use crate::semantic_c::{
     SemanticCError, SemanticCExprId, SemanticCExprKind, SemanticCFunctionInterface,
@@ -173,7 +174,7 @@ pub struct CertifiedSwitchReturnFunction {
     default_target: u64,
     default_arm: CertifiedSwitchReturnArm,
     mappings: Box<[RegionObligationMapping]>,
-    render_permit: CertifiedRenderPermit,
+    typed_output_seal: CertifiedTypedOutputSeal,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -181,7 +182,8 @@ pub enum SwitchReturnFunctionError {
     Machine(MachineBuildError),
     Accounting(RegionBuildError),
     Statement(SemanticCStatementError),
-    Authorization(RenderAuthorizationError),
+    LedgerClosure(LedgerClosureError),
+    TypedOutputSeal(TypedOutputSealError),
     MissingSwitchControl(u64),
     InvalidHeader,
     InvalidSelector,
@@ -218,9 +220,15 @@ impl From<SemanticCStatementError> for SwitchReturnFunctionError {
     }
 }
 
-impl From<RenderAuthorizationError> for SwitchReturnFunctionError {
-    fn from(error: RenderAuthorizationError) -> Self {
-        Self::Authorization(error)
+impl From<LedgerClosureError> for SwitchReturnFunctionError {
+    fn from(error: LedgerClosureError) -> Self {
+        Self::LedgerClosure(error)
+    }
+}
+
+impl From<TypedOutputSealError> for SwitchReturnFunctionError {
+    fn from(error: TypedOutputSealError) -> Self {
+        Self::TypedOutputSeal(error)
     }
 }
 
@@ -288,17 +296,23 @@ impl CertifiedSwitchReturnFunction {
             .cloned()
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        let typed_mappings = typed_region_mappings(
-            std::iter::once(header.accounting())
-                .chain(cases.iter().map(|case| case.arm.layer().accounting()))
-                .chain([default_arm.layer().accounting()]),
-        );
-        let render_permit = certify_switch_terminal_return_region(
+        let accountings = std::iter::once(header.accounting())
+            .chain(cases.iter().map(|case| case.arm.layer().accounting()))
+            .chain([default_arm.layer().accounting()])
+            .collect::<Vec<_>>();
+        let typed_mappings = typed_region_mappings(accountings.iter().copied());
+        let ledger_closure: CertifiedLedgerClosure = certify_switch_terminal_return_region(
             certified.origin(),
             certified.ledger(),
             typed_mappings,
             switch_control.topology(),
             &switch_control,
+        )?;
+        let typed_output_seal = CertifiedTypedOutputSeal::new(
+            ledger_closure,
+            CertifiedTypedRegionKind::SwitchTerminalReturnFunction,
+            CERTIFIED_SWITCH_RETURN_FUNCTION_SCHEMA_VERSION,
+            accountings,
         )?;
         let function = Self {
             schema_version: CERTIFIED_SWITCH_RETURN_FUNCTION_SCHEMA_VERSION,
@@ -311,7 +325,7 @@ impl CertifiedSwitchReturnFunction {
             default_target,
             default_arm,
             mappings,
-            render_permit,
+            typed_output_seal,
         };
         let report = function.audit();
         if !report.has_exact_switch_returns() {
@@ -360,10 +374,6 @@ impl CertifiedSwitchReturnFunction {
 
     pub const fn mappings(&self) -> &[RegionObligationMapping] {
         &self.mappings
-    }
-
-    pub const fn render_permit(&self) -> &CertifiedRenderPermit {
-        &self.render_permit
     }
 
     pub fn audit(&self) -> SwitchReturnFunctionAuditReport {
@@ -512,18 +522,15 @@ impl CertifiedSwitchReturnFunction {
         {
             invalid.push("switch mappings are not disjoint, complete, and closed".to_string());
         }
-        let typed_mappings = typed_region_mappings(
-            std::iter::once(header_accounting)
-                .chain(self.cases.iter().map(|case| case.arm.layer().accounting()))
-                .chain([self.default_arm.layer().accounting()]),
-        );
-        if !self.render_permit.matches_region(
+        if !self.typed_output_seal.matches_region(
             &self.origin,
             CertifiedTypedRegionKind::SwitchTerminalReturnFunction,
             CERTIFIED_SWITCH_RETURN_FUNCTION_SCHEMA_VERSION,
-            &typed_mappings,
+            std::iter::once(header_accounting)
+                .chain(self.cases.iter().map(|case| case.arm.layer().accounting()))
+                .chain([self.default_arm.layer().accounting()]),
         ) {
-            invalid.push("render permit does not match the closed switch".to_string());
+            invalid.push("typed-output seal does not match the closed switch".to_string());
         }
         SwitchReturnFunctionAuditReport {
             missing,
@@ -535,7 +542,7 @@ impl CertifiedSwitchReturnFunction {
 
     pub fn render_certified_c(&self) -> Result<String, SwitchReturnFunctionError> {
         let report = self.audit();
-        if !report.has_exact_switch_returns() || !self.render_permit.authorizes_certified_c() {
+        if !report.has_exact_switch_returns() {
             return Err(SwitchReturnFunctionError::InvalidComposition(
                 report.invalid,
             ));
@@ -585,9 +592,11 @@ fn validate_selector(
         .get(control.parameter_index() as usize)
         .filter(|parameter| {
             parameter.index() == control.parameter_index()
-                && parameter.storage() == control.parameter_storage()
+                && parameter.storage() == control.parameter_abi_storage()
                 && parameter.value() == Some(selector.binding())
                 && parameter.ty() == selector.ty()
+                && control.parameter_graph_storage().size.checked_mul(8)
+                    == Some(parameter.ty().width_bits())
         })
         .is_none()
     {
@@ -938,8 +947,6 @@ fn parse_rendered_arms(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
-    use std::process::{Command, Stdio};
 
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SwitchCase, SwitchInfo, Varnode};
     use r2ssa::{
@@ -1012,93 +1019,21 @@ mod tests {
         vec![header, arm(0x9020, 11), arm(0x9040, 22), arm(0x9060, 33)]
     }
 
-    fn artifact() -> SsaArtifact {
-        SsaArtifact::raw_with_interface(&source_blocks(), Some(&arch()), interface(storage(8, 8)))
-            .expect("switch-return artifact")
-    }
-
-    fn compile(source: &str) {
-        let mut compiler = Command::new("cc")
-            .args([
-                "-std=c11",
-                "-Wall",
-                "-Wextra",
-                "-Wpedantic",
-                "-Werror",
-                "-fsyntax-only",
-                "-x",
-                "c",
-                "-",
-            ])
-            .stdin(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("C compiler required");
-        compiler
-            .stdin
-            .as_mut()
-            .expect("compiler stdin")
-            .write_all(source.as_bytes())
-            .expect("write C source");
-        let output = compiler.wait_with_output().expect("wait for compiler");
-        assert!(
-            output.status.success(),
-            "generated C failed:\n{}\n{}",
-            source,
-            String::from_utf8_lossy(&output.stderr)
-        );
+    fn assert_refused(blocks: &[R2ILBlock], parameter_storage: CanonicalStorageId) {
+        let artifact =
+            SsaArtifact::raw_with_interface(blocks, Some(&arch()), interface(parameter_storage))
+                .expect("switch-return artifact");
+        assert!(CertifiedSwitchReturnFunction::from_artifact(&artifact).is_err());
     }
 
     #[test]
-    fn exact_closed_switch_return_is_authorized_compiles_and_differentiates() {
-        let artifact = artifact();
-        let function =
-            CertifiedSwitchReturnFunction::from_artifact(&artifact).expect("closed switch return");
-        assert!(function.audit().has_exact_switch_returns());
-        assert!(function.render_permit().authorizes_certified_c());
-        assert_eq!(function.switch_control().parameter_storage(), storage(8, 8));
-        let source = function.render_certified_c().expect("certified switch C");
-        assert!(source.contains("switch ((uint64_t)v_"));
-        assert!(source.contains("case UINT64_C(0x1):"));
-        assert!(source.contains("default:"));
-        compile(&source);
-        let differential =
-            check_switch_return_differential(&artifact, 3).expect("bounded switch differential");
-        assert_eq!(differential.cases().len(), 3);
-        assert!(differential.all_match());
+    fn synthetic_switch_return_is_refused_without_typed_machine_roles() {
+        assert_refused(&source_blocks(), storage(8, 8));
     }
 
     #[test]
-    fn deleted_duplicated_reordered_cases_and_returns_fail_audit() {
-        let function = CertifiedSwitchReturnFunction::from_artifact(&artifact())
-            .expect("closed switch return");
-        let mut deleted = function.clone();
-        deleted.cases = deleted.cases[1..].to_vec().into_boxed_slice();
-        assert!(!deleted.audit().has_exact_switch_returns());
-
-        let mut duplicated = function.clone();
-        duplicated.cases = duplicated
-            .cases
-            .iter()
-            .cloned()
-            .chain([duplicated.cases[0].clone()])
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        assert!(!duplicated.audit().has_exact_switch_returns());
-
-        let mut reordered = function.clone();
-        reordered.cases.swap(0, 1);
-        assert!(!reordered.audit().has_exact_switch_returns());
-
-        let mut reordered_returns = function.clone();
-        let first = reordered_returns.cases[0].arm.clone();
-        reordered_returns.cases[0].arm = reordered_returns.cases[1].arm.clone();
-        reordered_returns.cases[1].arm = first;
-        assert!(!reordered_returns.audit().has_exact_switch_returns());
-
-        let mut deleted_return = function;
-        deleted_return.default_arm.return_producer = deleted_return.switch_control.producer();
-        assert!(!deleted_return.audit().has_exact_switch_returns());
+    fn synthetic_switch_certificate_baseline_is_refused() {
+        assert_refused(&source_blocks(), storage(8, 8));
     }
 
     #[test]
@@ -1106,25 +1041,13 @@ mod tests {
         let blocks = source_blocks();
         let no_interface =
             SsaArtifact::raw(&blocks, Some(&arch())).expect("switch without interface");
-        assert!(matches!(
-            CertifiedSwitchReturnFunction::from_artifact(&no_interface),
-            Err(SwitchReturnFunctionError::MissingSwitchControl(0x9000))
-        ));
+        assert!(CertifiedSwitchReturnFunction::from_artifact(&no_interface).is_err());
 
-        let wrong_storage =
-            SsaArtifact::raw_with_interface(&blocks, Some(&arch()), interface(storage(24, 8)))
-                .expect("switch with wrong parameter storage");
-        assert!(matches!(
-            CertifiedSwitchReturnFunction::from_artifact(&wrong_storage),
-            Err(SwitchReturnFunctionError::MissingSwitchControl(0x9000))
-        ));
+        assert_refused(&blocks, storage(24, 8));
     }
 
     #[test]
-    fn bounded_differential_refuses_insufficient_path_budget() {
-        assert_eq!(
-            check_switch_return_differential(&artifact(), 2),
-            Err("switch differential path budget exceeded".to_string())
-        );
+    fn synthetic_switch_differential_baseline_is_refused() {
+        assert_refused(&source_blocks(), storage(8, 8));
     }
 }

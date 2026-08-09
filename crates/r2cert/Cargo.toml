@@ -8,11 +8,5 @@ description = "Source-obligation certification kernel for r2sleigh"
 [dependencies]
 r2il = { path = "../r2il" }
 r2ssa = { path = "../r2ssa" }
-postcard.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-
-[dev-dependencies]
-r2sleigh-lift = { path = "../r2sleigh-lift" }
-sleigh-config = { workspace = true, features = ["x86", "AARCH64"] }
-sha2 = "0.10"

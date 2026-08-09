@@ -17,8 +17,6 @@ sleigh-config = ["dep:sleigh-config"]
 
 [dev-dependencies]
 proptest = "1.6"
-sha2 = "0.10"
-sleigh-config = { workspace = true, features = ["AARCH64"] }
 
 [dependencies.sleigh-config]
 workspace = true

@@ -11,23 +11,24 @@ use std::collections::{BTreeMap, BTreeSet};
 use r2cert::{
     CERTIFICATION_SCHEMA_VERSION, CertifiedArtifactOrigin, CertifiedCallArgumentOrigin,
     CertifiedConditionalControl, CertifiedControlTruthiness, CertifiedDirectCall,
-    CertifiedDirectControl, CertifiedMachineFunction, CertifiedMachineProjection,
-    CertifiedMemoryStatement, CertifiedReturnControl, CertifiedSourceTopology,
-    CertifiedSwitchControl, EffectDisposition, ObligationLedger,
+    CertifiedDirectControl, CertifiedLedgerClosure, CertifiedMachineFunction,
+    CertifiedMachineProjection, CertifiedMemoryStatement, CertifiedReturnControl,
+    CertifiedSourceTopology, CertifiedSwitchControl, CertifiedTypedRegionKind, EffectDisposition,
+    ObligationLedger, TypedRegionMapping,
 };
 use r2ssa::{
-    CanonicalInstructionId, SemanticInstructionState, SemanticObligationId,
-    SemanticObligationInventory, SemanticObligationKind,
+    CanonicalInstructionId, SemanticInstructionState, SemanticObligationComponent,
+    SemanticObligationId, SemanticObligationInventory, SemanticObligationKind,
 };
 use serde::Serialize;
 
 use crate::semantic_c::{
     SEMANTIC_C_SCHEMA_VERSION, SemanticCCallArgumentValue, SemanticCDirectCall, SemanticCError,
-    SemanticCExpressionLayer, SemanticCIdentityScope, SemanticCReturn, SemanticCScope,
-    semantic_call_from_control, semantic_return_from_control,
+    SemanticCExprId, SemanticCExpressionLayer, SemanticCIdentityScope, SemanticCReturn,
+    SemanticCScope, semantic_call_from_control, semantic_return_from_control,
 };
 
-pub const CERTIFIED_REGION_SCHEMA_VERSION: u32 = 6;
+pub const CERTIFIED_REGION_SCHEMA_VERSION: u32 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum SingleBlockAccountingScope {
@@ -55,11 +56,71 @@ pub enum RegionObligationDisposition {
     Residualized { reason: RegionResidualReason },
 }
 
+/// Exact semantic output node that owns one source obligation. These handles
+/// are created only while the corresponding typed node is present in the
+/// artifact-local semantic layer; producer counts and AST positions are never
+/// accepted as substitutes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum RegionTypedOwner {
+    Expression {
+        producer: CanonicalInstructionId,
+        root: SemanticCExprId,
+    },
+    Statement {
+        producer: CanonicalInstructionId,
+        component: SemanticObligationComponent,
+    },
+    Call {
+        producer: CanonicalInstructionId,
+        component: SemanticObligationComponent,
+    },
+    Control {
+        producer: CanonicalInstructionId,
+        component: SemanticObligationComponent,
+    },
+    Return {
+        producer: CanonicalInstructionId,
+        component: SemanticObligationComponent,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RegionObligationMapping {
     obligation: SemanticObligationId,
     disposition: RegionObligationDisposition,
+    owner: Option<RegionTypedOwner>,
 }
+
+/// Opaque final typed-output authority owned by the semantic-C layer.
+///
+/// The certification token proves only ledger closure. This seal additionally
+/// retains the exact artifact-local owners, including expression arena roots,
+/// and cannot be constructed until every contributing accounting audits cleanly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CertifiedTypedOutputSeal {
+    schema_version: u32,
+    ledger_closure: CertifiedLedgerClosure,
+    mappings: Box<[RegionObligationMapping]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypedOutputSealError {
+    EmptyAccountingSet,
+    InexactAccounting,
+    ResidualMapping(SemanticObligationId),
+    MissingTypedOwner(SemanticObligationId),
+    IncompleteManifest,
+    ArtifactOriginMismatch,
+    LedgerClosureMismatch,
+}
+
+impl std::fmt::Display for TypedOutputSealError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "typed output sealing failed: {self:?}")
+    }
+}
+
+impl std::error::Error for TypedOutputSealError {}
 
 impl RegionObligationMapping {
     pub const fn obligation(&self) -> SemanticObligationId {
@@ -68,6 +129,10 @@ impl RegionObligationMapping {
 
     pub const fn disposition(&self) -> &RegionObligationDisposition {
         &self.disposition
+    }
+
+    pub const fn owner(&self) -> Option<&RegionTypedOwner> {
+        self.owner.as_ref()
     }
 }
 
@@ -157,6 +222,7 @@ pub enum RegionBuildError {
     ControlObligationMismatch(SemanticObligationId),
     ReturnObligationMismatch(SemanticObligationId),
     AmbiguousControl(CanonicalInstructionId),
+    ArtifactOriginMismatch,
 }
 
 impl std::fmt::Display for RegionBuildError {
@@ -486,6 +552,9 @@ impl CertifiedSingleBlockAccounting {
         block_addr: u64,
         parts: CertifiedBlockParts,
     ) -> Result<Self, RegionBuildError> {
+        if !ledger.matches_origin(origin) {
+            return Err(RegionBuildError::ArtifactOriginMismatch);
+        }
         let CertifiedBlockParts {
             expression_layer,
             memory_statements,
@@ -593,11 +662,20 @@ impl CertifiedSingleBlockAccounting {
                                 *obligation,
                             ));
                         }
-                        RegionObligationDisposition::AbsorbedIntoExpression { producer: *id }
+                        (
+                            RegionObligationDisposition::AbsorbedIntoExpression { producer: *id },
+                            Some(RegionTypedOwner::Expression {
+                                producer: *id,
+                                root: entity.root(),
+                            }),
+                        )
                     } else if expression_layer.open_obligations().contains(obligation) {
-                        RegionObligationDisposition::Residualized {
-                            reason: residual_reason(obligation.kind),
-                        }
+                        (
+                            RegionObligationDisposition::Residualized {
+                                reason: residual_reason(obligation.kind),
+                            },
+                            None,
+                        )
                     } else {
                         return Err(RegionBuildError::MissingExpression(*id));
                     }
@@ -617,7 +695,13 @@ impl CertifiedSingleBlockAccounting {
                     {
                         return Err(RegionBuildError::StatementObligationMismatch(*obligation));
                     }
-                    RegionObligationDisposition::AbsorbedIntoStatement { producer: *id }
+                    (
+                        RegionObligationDisposition::AbsorbedIntoStatement { producer: *id },
+                        Some(RegionTypedOwner::Statement {
+                            producer: *id,
+                            component: obligation.component,
+                        }),
+                    )
                 } else if matches!(
                     obligation.kind,
                     SemanticObligationKind::Call | SemanticObligationKind::CallArgument
@@ -634,7 +718,13 @@ impl CertifiedSingleBlockAccounting {
                     {
                         return Err(RegionBuildError::CallObligationMismatch(*obligation));
                     }
-                    RegionObligationDisposition::AbsorbedIntoCall { producer: *id }
+                    (
+                        RegionObligationDisposition::AbsorbedIntoCall { producer: *id },
+                        Some(RegionTypedOwner::Call {
+                            producer: *id,
+                            component: obligation.component,
+                        }),
+                    )
                 } else if matches!(
                     obligation.kind,
                     SemanticObligationKind::ControlPredicate
@@ -660,7 +750,13 @@ impl CertifiedSingleBlockAccounting {
                     {
                         return Err(RegionBuildError::ControlObligationMismatch(*obligation));
                     }
-                    RegionObligationDisposition::AbsorbedIntoControl { producer: *id }
+                    (
+                        RegionObligationDisposition::AbsorbedIntoControl { producer: *id },
+                        Some(RegionTypedOwner::Control {
+                            producer: *id,
+                            component: obligation.component,
+                        }),
+                    )
                 } else if matches!(
                     obligation.kind,
                     SemanticObligationKind::Return | SemanticObligationKind::ReturnValue
@@ -676,15 +772,26 @@ impl CertifiedSingleBlockAccounting {
                     {
                         return Err(RegionBuildError::ReturnObligationMismatch(*obligation));
                     }
-                    RegionObligationDisposition::AbsorbedIntoReturn { producer: *id }
+                    (
+                        RegionObligationDisposition::AbsorbedIntoReturn { producer: *id },
+                        Some(RegionTypedOwner::Return {
+                            producer: *id,
+                            component: obligation.component,
+                        }),
+                    )
                 } else {
-                    RegionObligationDisposition::Residualized {
-                        reason: residual_reason(obligation.kind),
-                    }
+                    (
+                        RegionObligationDisposition::Residualized {
+                            reason: residual_reason(obligation.kind),
+                        },
+                        None,
+                    )
                 };
+                let (mapping, owner) = mapping;
                 mappings.push(RegionObligationMapping {
                     obligation: *obligation,
                     disposition: mapping,
+                    owner,
                 });
             }
         }
@@ -1045,6 +1152,98 @@ impl CertifiedSingleBlockAccounting {
             })
             .collect::<BTreeSet<_>>();
 
+        for mapping in &self.mappings {
+            let owner_matches = match (&mapping.disposition, &mapping.owner) {
+                (
+                    RegionObligationDisposition::AbsorbedIntoExpression { producer },
+                    Some(RegionTypedOwner::Expression {
+                        producer: owner,
+                        root,
+                    }),
+                ) => expression_entities.get(producer).is_some_and(|entity| {
+                    producer == owner
+                        && entity.root() == *root
+                        && entity.source_obligations().contains(&mapping.obligation)
+                }),
+                (
+                    RegionObligationDisposition::AbsorbedIntoStatement { producer },
+                    Some(RegionTypedOwner::Statement {
+                        producer: owner,
+                        component,
+                    }),
+                ) => {
+                    producer == owner
+                        && *component == mapping.obligation.component
+                        && statement_entities.get(producer).is_some_and(|statement| {
+                            statement.source_obligations().contains(&mapping.obligation)
+                        })
+                }
+                (
+                    RegionObligationDisposition::AbsorbedIntoCall { producer },
+                    Some(RegionTypedOwner::Call {
+                        producer: owner,
+                        component,
+                    }),
+                ) => {
+                    producer == owner
+                        && *component == mapping.obligation.component
+                        && direct_call_entities.get(producer).is_some_and(|call| {
+                            call.source_obligations().contains(&mapping.obligation)
+                        })
+                        && semantic_call_entities.contains_key(producer)
+                }
+                (
+                    RegionObligationDisposition::AbsorbedIntoControl { producer },
+                    Some(RegionTypedOwner::Control {
+                        producer: owner,
+                        component,
+                    }),
+                ) => {
+                    producer == owner
+                        && *component == mapping.obligation.component
+                        && (direct_control_entities
+                            .get(producer)
+                            .is_some_and(|control| {
+                                control.source_obligation() == mapping.obligation
+                            })
+                            || conditional_control_entities
+                                .get(producer)
+                                .is_some_and(|control| {
+                                    control.source_obligations().contains(&mapping.obligation)
+                                })
+                            || switch_control_entities
+                                .get(producer)
+                                .is_some_and(|control| {
+                                    control.source_obligation() == mapping.obligation
+                                }))
+                }
+                (
+                    RegionObligationDisposition::AbsorbedIntoReturn { producer },
+                    Some(RegionTypedOwner::Return {
+                        producer: owner,
+                        component,
+                    }),
+                ) => {
+                    producer == owner
+                        && *component == mapping.obligation.component
+                        && return_control_entities
+                            .get(producer)
+                            .is_some_and(|control| {
+                                control.source_obligations().contains(&mapping.obligation)
+                            })
+                        && semantic_return_entities.contains_key(producer)
+                }
+                (RegionObligationDisposition::Residualized { .. }, None) => true,
+                _ => false,
+            };
+            if !owner_matches {
+                invalid.push(format!(
+                    "typed output owner does not match obligation {}",
+                    mapping.obligation
+                ));
+            }
+        }
+
         if self.schema_version != CERTIFIED_REGION_SCHEMA_VERSION {
             invalid.push("region schema version mismatch".to_string());
         }
@@ -1064,6 +1263,9 @@ impl CertifiedSingleBlockAccounting {
             .matches_retained_source(&self.source, &self.topology)
         {
             invalid.push("region artifact origin does not match retained source".to_string());
+        }
+        if !self.ledger.matches_origin(&self.origin) {
+            invalid.push("region obligation ledger does not match artifact origin".to_string());
         }
         if self.topology.schema_version() != CERTIFICATION_SCHEMA_VERSION
             || source_block.is_none_or(|block| {
@@ -1882,6 +2084,135 @@ impl CertifiedSingleBlockAccounting {
     }
 }
 
+fn ledger_mapping_for_typed_owner(mapping: &RegionObligationMapping) -> Option<TypedRegionMapping> {
+    let disposition = match mapping.disposition {
+        RegionObligationDisposition::AbsorbedIntoExpression { producer } => {
+            EffectDisposition::AbsorbedIntoExpression { producer }
+        }
+        RegionObligationDisposition::AbsorbedIntoStatement { producer } => {
+            EffectDisposition::AbsorbedIntoStatement { producer }
+        }
+        RegionObligationDisposition::AbsorbedIntoCall { producer } => {
+            EffectDisposition::AbsorbedIntoCall { producer }
+        }
+        RegionObligationDisposition::AbsorbedIntoControl { producer } => {
+            EffectDisposition::AbsorbedIntoControl { producer }
+        }
+        RegionObligationDisposition::AbsorbedIntoReturn { producer } => {
+            EffectDisposition::AbsorbedIntoReturn { producer }
+        }
+        RegionObligationDisposition::Residualized { .. } => return None,
+    };
+    Some(TypedRegionMapping::new(mapping.obligation, disposition))
+}
+
+fn exact_typed_output_manifest<'a>(
+    origin: &CertifiedArtifactOrigin,
+    accountings: impl IntoIterator<Item = &'a CertifiedSingleBlockAccounting>,
+) -> Result<(Vec<RegionObligationMapping>, Vec<TypedRegionMapping>), TypedOutputSealError> {
+    let accountings = accountings.into_iter().collect::<Vec<_>>();
+    if accountings.is_empty() {
+        return Err(TypedOutputSealError::EmptyAccountingSet);
+    }
+    let mut mappings = Vec::new();
+    let mut ledger_mappings = Vec::new();
+    for accounting in accountings {
+        if accounting.origin() != origin || !accounting.ledger().matches_origin(origin) {
+            return Err(TypedOutputSealError::ArtifactOriginMismatch);
+        }
+        let report = accounting.audit();
+        if !report.has_exact_source_accounting() {
+            return Err(TypedOutputSealError::InexactAccounting);
+        }
+        for mapping in accounting.mappings() {
+            if matches!(
+                mapping.disposition(),
+                RegionObligationDisposition::Residualized { .. }
+            ) {
+                return Err(TypedOutputSealError::ResidualMapping(mapping.obligation()));
+            }
+            if mapping.owner().is_none() {
+                return Err(TypedOutputSealError::MissingTypedOwner(
+                    mapping.obligation(),
+                ));
+            }
+            let ledger_mapping = ledger_mapping_for_typed_owner(mapping)
+                .ok_or(TypedOutputSealError::ResidualMapping(mapping.obligation()))?;
+            mappings.push(mapping.clone());
+            ledger_mappings.push(ledger_mapping);
+        }
+    }
+
+    let expected = origin
+        .source()
+        .obligations()
+        .keys()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let counts = counts(mappings.iter().map(RegionObligationMapping::obligation));
+    let actual = counts.keys().copied().collect::<BTreeSet<_>>();
+    if actual != expected
+        || mappings.len() != expected.len()
+        || counts.values().any(|count| *count != 1)
+    {
+        return Err(TypedOutputSealError::IncompleteManifest);
+    }
+    Ok((mappings, ledger_mappings))
+}
+
+impl CertifiedTypedOutputSeal {
+    pub(crate) fn new<'a>(
+        ledger_closure: CertifiedLedgerClosure,
+        region_kind: CertifiedTypedRegionKind,
+        region_schema_version: u32,
+        accountings: impl IntoIterator<Item = &'a CertifiedSingleBlockAccounting>,
+    ) -> Result<Self, TypedOutputSealError> {
+        let accountings = accountings.into_iter().collect::<Vec<_>>();
+        let (mappings, ledger_mappings) =
+            exact_typed_output_manifest(ledger_closure.origin(), accountings.iter().copied())?;
+        if !ledger_closure.matches_ledger(
+            ledger_closure.origin(),
+            region_kind,
+            region_schema_version,
+            &ledger_mappings,
+        ) {
+            return Err(TypedOutputSealError::LedgerClosureMismatch);
+        }
+        Ok(Self {
+            schema_version: CERTIFIED_REGION_SCHEMA_VERSION,
+            ledger_closure,
+            mappings: mappings.into_boxed_slice(),
+        })
+    }
+
+    pub(crate) const fn mappings(&self) -> &[RegionObligationMapping] {
+        &self.mappings
+    }
+
+    pub(crate) fn matches_region<'a>(
+        &self,
+        origin: &CertifiedArtifactOrigin,
+        region_kind: CertifiedTypedRegionKind,
+        region_schema_version: u32,
+        accountings: impl IntoIterator<Item = &'a CertifiedSingleBlockAccounting>,
+    ) -> bool {
+        let accountings = accountings.into_iter().collect::<Vec<_>>();
+        let Ok((mappings, ledger_mappings)) =
+            exact_typed_output_manifest(origin, accountings.iter().copied())
+        else {
+            return false;
+        };
+        self.schema_version == CERTIFIED_REGION_SCHEMA_VERSION
+            && self.mappings.as_ref() == mappings.as_slice()
+            && self.ledger_closure.matches_ledger(
+                origin,
+                region_kind,
+                region_schema_version,
+                &ledger_mappings,
+            )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RegionAuditReport {
     missing_instructions: Vec<CanonicalInstructionId>,
@@ -2011,124 +2342,13 @@ fn residual_reason(kind: SemanticObligationKind) -> RegionResidualReason {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use r2il::{ArchSpec, Endianness, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
+    use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, Varnode};
     use r2ssa::{
-        CanonicalStorageId, CanonicalStorageSpace, SourceAbiParameterSpec, SourceCallArgumentSpec,
-        SourceCallResult, SourceCallSiteIdentity, SourceCallSiteInterface, SourceFunctionInterface,
+        CanonicalStorageId, CanonicalStorageSpace, SourceAbiParameterSpec, SourceFunctionInterface,
         SourceFunctionReturn, SsaArtifact,
     };
 
-    fn straight_line_artifact() -> SsaArtifact {
-        let initial = Varnode::unique(0x10, 8);
-        let product = Varnode::unique(0x18, 8);
-        let mut block = R2ILBlock::new(0x5000, 4);
-        block.push(R2ILOp::Copy {
-            dst: initial.clone(),
-            src: Varnode::constant(0xcbf29ce484222325, 8),
-        });
-        block.push(R2ILOp::IntMult {
-            dst: product.clone(),
-            a: initial,
-            b: Varnode::constant(0x100000001b3, 8),
-        });
-        block.push(R2ILOp::Store {
-            space: SpaceId::Ram,
-            addr: Varnode::register(0, 8),
-            val: product,
-        });
-        block.push(R2ILOp::Return {
-            target: Varnode::constant(0, 8),
-        });
-        SsaArtifact::raw(&[block], None).expect("straight-line artifact")
-    }
-
-    fn typed_memory_accounting() -> CertifiedSingleBlockAccounting {
-        let address = Varnode::register(0, 8);
-        let loaded = Varnode::unique(0x10, 4);
-        let mut block = R2ILBlock::new(0x5050, 4);
-        block.push(R2ILOp::Load {
-            dst: loaded.clone(),
-            space: SpaceId::Ram,
-            addr: address.clone(),
-        });
-        block.push(R2ILOp::Store {
-            space: SpaceId::Ram,
-            addr: address,
-            val: loaded,
-        });
-        let mut arch = ArchSpec::new("region-memory-test");
-        arch.addr_size = 8;
-        arch.set_memory_endianness(Endianness::Little);
-        let artifact = SsaArtifact::raw(&[block], Some(&arch)).expect("typed memory artifact");
-        let certified = CertifiedMachineProjection::from_artifact(&artifact)
-            .expect("certified memory projection");
-        CertifiedSingleBlockAccounting::from_projection(&certified)
-            .expect("typed memory accounting")
-    }
-
-    fn conditional_accounting(condition: u64) -> CertifiedSingleBlockAccounting {
-        let mut entry = R2ILBlock::new(0x5080, 4);
-        entry.push(R2ILOp::CBranch {
-            target: Varnode::ram(0x5090, 8),
-            cond: Varnode::constant(condition, 1),
-        });
-        let fallthrough = R2ILBlock::new(0x5084, 4);
-        let taken = R2ILBlock::new(0x5090, 4);
-        let artifact =
-            SsaArtifact::raw(&[entry, fallthrough, taken], None).expect("conditional artifact");
-        let certified =
-            CertifiedMachineProjection::from_artifact(&artifact).expect("conditional projection");
-        CertifiedSingleBlockAccounting::from_projection_block(&certified, 0x5080)
-            .expect("conditional accounting")
-    }
-
-    fn direct_call_accounting() -> CertifiedSingleBlockAccounting {
-        let target = Varnode::ram(0x6000, 8);
-        let mut entry = R2ILBlock::new(0x50a0, 4);
-        entry.push(R2ILOp::Copy {
-            dst: Varnode::register(8, 8),
-            src: Varnode::constant(0x2a, 8),
-        });
-        entry.push(R2ILOp::Call {
-            target: target.clone(),
-        });
-        let fallthrough = R2ILBlock::new(0x50a4, 4);
-        let mut arch = ArchSpec::new("region-direct-call-test");
-        arch.add_register(RegisterDef::new("rdi", 8, 8));
-        let argument_storage = CanonicalStorageId {
-            space: CanonicalStorageSpace::Register,
-            offset: 8,
-            size: 8,
-        };
-        let identity =
-            SourceCallSiteIdentity::new(0x50a0, 1, CanonicalStorageId::from_varnode(&target));
-        let interface = SourceCallSiteInterface::new(
-            b"region-direct-call-revision-1".to_vec(),
-            identity,
-            true,
-            "test-call-abi",
-            [SourceCallArgumentSpec::new(0, argument_storage)],
-            false,
-            false,
-            SourceCallResult::Void,
-        )
-        .expect("direct call interface");
-        let artifact = SsaArtifact::raw_with_interfaces(
-            &[entry, fallthrough],
-            Some(&arch),
-            None,
-            vec![interface],
-        )
-        .expect("direct call artifact");
-        let certified = CertifiedMachineProjection::from_artifact(&artifact)
-            .expect("certified direct call projection");
-        CertifiedSingleBlockAccounting::from_projection_block(&certified, 0x50a0)
-            .expect("direct call accounting")
-    }
-
-    fn explicit_return_accounting(
-        return_kind: SourceFunctionReturn,
-    ) -> CertifiedSingleBlockAccounting {
+    fn assert_hand_authored_return_refused(return_kind: SourceFunctionReturn) {
         let mut block = R2ILBlock::new(0x50c0, 4);
         block.push(R2ILOp::Copy {
             dst: Varnode::unique(0x10, 8),
@@ -2160,438 +2380,33 @@ mod tests {
         .expect("explicit interface");
         let artifact = SsaArtifact::raw_with_interface(&[block], Some(&arch), interface)
             .expect("explicit return artifact");
-        let certified = CertifiedMachineProjection::from_artifact(&artifact)
-            .expect("explicit return projection");
-        CertifiedSingleBlockAccounting::from_projection(&certified)
-            .expect("explicit return accounting")
-    }
-
-    fn colliding_direct_control() -> CertifiedDirectControl {
-        let mut entry = R2ILBlock::new(0x5080, 4);
-        entry.push(R2ILOp::Branch {
-            target: Varnode::ram(0x5090, 8),
-        });
-        let target = R2ILBlock::new(0x5090, 4);
-        let artifact = SsaArtifact::raw(&[entry, target], None).expect("direct artifact");
-        let certified =
-            CertifiedMachineProjection::from_artifact(&artifact).expect("direct projection");
-        let accounting = CertifiedSingleBlockAccounting::from_projection_block(&certified, 0x5080)
-            .expect("direct accounting");
-        accounting.direct_controls()[0].clone()
+        assert!(matches!(
+            CertifiedMachineProjection::from_artifact(&artifact),
+            Err(r2ssa::MachineBuildError::MachineContextMismatch)
+        ));
     }
 
     #[test]
-    fn conditional_control_maps_exact_predicate_and_transfer_evidence() {
-        let accounting = conditional_accounting(1);
-        let report = accounting.audit();
-        let [control] = accounting.conditional_controls() else {
-            panic!("one conditional control expected");
-        };
-
-        assert!(report.has_exact_source_accounting(), "{report:?}");
-        assert!(!report.has_residuals(), "{report:?}");
-        assert!(accounting.direct_controls().is_empty());
-        assert_eq!(control.source_obligations().len(), 2);
-        assert_eq!(
-            accounting
-                .mappings()
-                .iter()
-                .filter(|mapping| matches!(
-                    mapping.disposition(),
-                    RegionObligationDisposition::AbsorbedIntoControl { producer }
-                        if *producer == control.producer()
-                ))
-                .count(),
-            2
-        );
-    }
-
-    #[test]
-    fn direct_call_maps_exact_typed_boundary_without_residuals() {
-        let accounting = direct_call_accounting();
-        let report = accounting.audit();
-        let [call] = accounting.direct_calls() else {
-            panic!("one certified direct call expected");
-        };
-        let [semantic] = accounting.semantic_calls() else {
-            panic!("one semantic direct call expected");
-        };
-        let [argument] = call.arguments() else {
-            panic!("one certified call argument expected");
-        };
-        let [semantic_argument] = semantic.arguments() else {
-            panic!("one semantic call argument expected");
-        };
-
-        assert!(report.has_exact_source_accounting(), "{report:?}");
-        assert!(!report.has_residuals(), "{report:?}");
-        assert_eq!(semantic.producer(), call.producer());
-        assert_eq!(semantic.call_site(), call.call_site());
-        assert_eq!(semantic.target(), call.target());
-        assert_eq!(semantic.fallthrough(), call.fallthrough());
-        assert_eq!(semantic.calling_convention(), call.calling_convention());
-        assert_eq!(semantic_argument.slot(), argument.slot());
-        assert_eq!(semantic_argument.binding(), argument.value().binding());
-        assert_eq!(semantic_argument.ty(), argument.value().ty());
-        let argument_producer = argument.value().producer().expect("argument producer");
-        let argument_entity = accounting
-            .expression_layer()
-            .entity_for_producer(argument_producer)
-            .expect("argument expression");
-        assert_eq!(argument_entity.output(), semantic_argument.binding());
-        assert_eq!(semantic_argument.expression(), None);
-        let SemanticCCallArgumentValue::Constant(value) = semantic_argument.value() else {
-            panic!("constant-backed call argument expected");
-        };
-        assert_eq!(value.width_bits(), 64);
-        assert_eq!(value.bits(), 0x2a);
-        assert_eq!(semantic.source_obligations(), &call.source_obligations());
-        assert_eq!(
-            accounting
-                .mappings()
-                .iter()
-                .filter(|mapping| matches!(
-                    mapping.disposition(),
-                    RegionObligationDisposition::AbsorbedIntoCall { producer }
-                        if *producer == call.producer()
-                ))
-                .count(),
-            call.source_obligations().len()
-        );
-        assert!(accounting.instructions().iter().any(|instruction| {
-            instruction.source() == call.producer()
-                && instruction.call_producer() == Some(call.producer())
-        }));
-    }
-
-    #[test]
-    fn direct_call_evidence_and_mapping_mutations_fail_audit() {
-        let accounting = direct_call_accounting();
-        let producer = accounting.direct_calls()[0].producer();
-
-        let mut certified_deleted = accounting.clone();
-        certified_deleted.direct_calls = Box::new([]);
-        assert!(!certified_deleted.audit().has_exact_source_accounting());
-
-        let mut certified_duplicated = accounting.clone();
-        let call = certified_duplicated.direct_calls[0].clone();
-        certified_duplicated.direct_calls = vec![call.clone(), call].into_boxed_slice();
-        assert!(!certified_duplicated.audit().has_exact_source_accounting());
-
-        let mut semantic_deleted = accounting.clone();
-        semantic_deleted.semantic_calls = Box::new([]);
-        assert!(!semantic_deleted.audit().has_exact_source_accounting());
-
-        let mut semantic_duplicated = accounting.clone();
-        let call = semantic_duplicated.semantic_calls[0].clone();
-        semantic_duplicated.semantic_calls = vec![call.clone(), call].into_boxed_slice();
-        assert!(!semantic_duplicated.audit().has_exact_source_accounting());
-
-        let mut producer_cleared = accounting.clone();
-        producer_cleared
-            .instructions
-            .iter_mut()
-            .find(|instruction| instruction.source == producer)
-            .expect("call instruction")
-            .call_producer = None;
-        assert!(!producer_cleared.audit().has_exact_source_accounting());
-
-        let mut downgraded = accounting;
-        let mapping = downgraded
-            .mappings
-            .iter_mut()
-            .find(|mapping| {
-                matches!(
-                    mapping.disposition,
-                    RegionObligationDisposition::AbsorbedIntoCall { .. }
-                )
-            })
-            .expect("call mapping");
-        mapping.disposition = RegionObligationDisposition::Residualized {
-            reason: RegionResidualReason::CallBoundaryRequiresCertifiedCall,
-        };
-        assert!(!downgraded.audit().has_exact_source_accounting());
-    }
-
-    #[test]
-    fn explicit_return_maps_to_typed_semantic_return_without_residuals() {
-        let accounting = explicit_return_accounting(SourceFunctionReturn::Register {
+    fn hand_authored_return_cannot_supply_typed_semantic_authority() {
+        assert_hand_authored_return_refused(SourceFunctionReturn::Register {
             storage: CanonicalStorageId {
                 space: CanonicalStorageSpace::Register,
                 offset: 0,
                 size: 8,
             },
         });
-        let report = accounting.audit();
-        assert!(report.has_exact_source_accounting(), "{report:?}");
-        assert!(!report.has_residuals(), "{report:?}");
-        let [returned] = accounting.semantic_returns() else {
-            panic!("one semantic return expected");
-        };
-        assert_eq!(returned.values().len(), 1);
-        assert_eq!(accounting.return_controls().len(), 1);
-        assert_eq!(returned.source_obligations().len(), 2);
-        let interface = accounting
-            .expression_layer()
-            .function_interface()
-            .expect("semantic function interface");
-        assert_eq!(interface.parameters().len(), 1);
-        assert!(matches!(
-            interface.return_kind(),
-            crate::semantic_c::SemanticCFunctionReturn::Register { .. }
-        ));
-        assert!(
-            accounting
-                .expression_layer()
-                .input_origins()
-                .values()
-                .all(|origin| matches!(
-                    origin,
-                    crate::semantic_c::SemanticCInputOrigin::AbiParameter { .. }
-                ))
-        );
-        assert!(
-            accounting
-                .mappings()
-                .iter()
-                .filter(|mapping| matches!(
-                    mapping.disposition(),
-                    RegionObligationDisposition::AbsorbedIntoReturn { .. }
-                ))
-                .count()
-                == 2
-        );
     }
 
     #[test]
-    fn return_evidence_deletion_downgrade_and_foreign_swap_fail_audit() {
-        let return_storage = CanonicalStorageId {
-            space: CanonicalStorageSpace::Register,
-            offset: 0,
-            size: 8,
-        };
-        let accounting = explicit_return_accounting(SourceFunctionReturn::Register {
-            storage: return_storage,
+    fn hand_authored_register_and_void_return_variants_both_refuse() {
+        assert_hand_authored_return_refused(SourceFunctionReturn::Register {
+            storage: CanonicalStorageId {
+                space: CanonicalStorageSpace::Register,
+                offset: 0,
+                size: 8,
+            },
         });
-
-        let mut missing_semantic = accounting.clone();
-        missing_semantic.semantic_returns = Box::new([]);
-        assert!(!missing_semantic.audit().has_exact_source_accounting());
-
-        let mut missing_certificate = accounting.clone();
-        missing_certificate.return_controls = Box::new([]);
-        assert!(!missing_certificate.audit().has_exact_source_accounting());
-
-        let mut downgraded = accounting.clone();
-        let mapping = downgraded
-            .mappings
-            .iter_mut()
-            .find(|mapping| {
-                matches!(
-                    mapping.disposition,
-                    RegionObligationDisposition::AbsorbedIntoReturn { .. }
-                )
-            })
-            .expect("return mapping");
-        mapping.disposition = RegionObligationDisposition::Residualized {
-            reason: RegionResidualReason::ReturnRequiresCertifiedControl,
-        };
-        assert!(!downgraded.audit().has_exact_source_accounting());
-
-        let foreign_void = explicit_return_accounting(SourceFunctionReturn::Void);
-        let mut swapped = accounting;
-        swapped.semantic_returns = foreign_void.semantic_returns;
-        assert!(!swapped.audit().has_exact_source_accounting());
-    }
-
-    #[test]
-    fn conditional_control_mutations_collisions_and_downgrades_fail_audit() {
-        let accounting = conditional_accounting(1);
-
-        let mut deleted = accounting.clone();
-        deleted.conditional_controls = Box::new([]);
-        assert!(!deleted.audit().has_exact_source_accounting());
-
-        let mut duplicated = accounting.clone();
-        let control = duplicated.conditional_controls[0].clone();
-        duplicated.conditional_controls = vec![control.clone(), control].into_boxed_slice();
-        assert!(!duplicated.audit().has_exact_source_accounting());
-
-        let mut downgraded = accounting.clone();
-        let mapping = downgraded
-            .mappings
-            .iter_mut()
-            .find(|mapping| {
-                matches!(
-                    mapping.disposition,
-                    RegionObligationDisposition::AbsorbedIntoControl { .. }
-                )
-            })
-            .expect("conditional control mapping");
-        mapping.disposition = RegionObligationDisposition::Residualized {
-            reason: RegionResidualReason::ControlRequiresCertifiedRegion,
-        };
-        assert!(!downgraded.audit().has_exact_source_accounting());
-
-        let mut collision = accounting.clone();
-        collision.direct_controls = vec![colliding_direct_control()].into_boxed_slice();
-        assert!(!collision.audit().has_exact_source_accounting());
-
-        let mut foreign = accounting;
-        foreign.conditional_controls = conditional_accounting(0).conditional_controls;
-        assert!(!foreign.audit().has_exact_source_accounting());
-    }
-
-    #[test]
-    fn statement_mapping_deletion_or_downgrade_fails_region_audit() {
-        let accounting = typed_memory_accounting();
-        let report = accounting.audit();
-        assert!(report.has_exact_source_accounting(), "{report:?}");
-        assert!(!report.has_residuals());
-
-        let mut downgraded = accounting.clone();
-        let mapping = downgraded
-            .mappings
-            .iter_mut()
-            .find(|mapping| {
-                matches!(
-                    mapping.disposition,
-                    RegionObligationDisposition::AbsorbedIntoStatement { .. }
-                )
-            })
-            .expect("statement mapping");
-        mapping.disposition = RegionObligationDisposition::Residualized {
-            reason: RegionResidualReason::MemoryEffectRequiresCertifiedStatement,
-        };
-        assert!(!downgraded.audit().has_exact_source_accounting());
-
-        let mut deleted = accounting;
-        let mut statements = deleted.memory_statements.to_vec();
-        statements.remove(0);
-        deleted.memory_statements = statements.into_boxed_slice();
-        assert!(!deleted.audit().has_exact_source_accounting());
-    }
-
-    #[test]
-    fn straight_line_region_maps_every_source_and_residualizes_open_effects() {
-        let artifact = straight_line_artifact();
-        let certified =
-            CertifiedMachineFunction::from_artifact(&artifact).expect("certified machine");
-        let region =
-            CertifiedSingleBlockAccounting::from_certified(&certified).expect("source accounting");
-        let report = region.audit();
-
-        assert!(report.has_exact_source_accounting(), "{report:?}");
-        assert_eq!(
-            region.instructions().len(),
-            artifact.obligations().instructions().len()
-        );
-        assert_eq!(
-            region.mappings().len(),
-            artifact.obligations().obligations().len()
-        );
-        assert!(region.mappings().iter().any(|mapping| {
-            mapping.obligation.kind == SemanticObligationKind::LiveValueProducer
-                && matches!(
-                    mapping.disposition,
-                    RegionObligationDisposition::AbsorbedIntoExpression { .. }
-                )
-        }));
-        for kind in [
-            SemanticObligationKind::ObservableMemoryWrite,
-            SemanticObligationKind::Return,
-        ] {
-            assert!(region.mappings().iter().any(|mapping| {
-                mapping.obligation.kind == kind
-                    && matches!(
-                        mapping.disposition,
-                        RegionObligationDisposition::Residualized { .. }
-                    )
-            }));
-        }
-        assert!(report.has_residuals());
-    }
-
-    #[test]
-    fn effect_only_block_has_empty_expression_layer_and_exact_residual_accounting() {
-        let mut block = R2ILBlock::new(0x5100, 4);
-        block.push(R2ILOp::Store {
-            space: SpaceId::Ram,
-            addr: Varnode::register(0, 8),
-            val: Varnode::constant(7, 8),
-        });
-        let artifact = SsaArtifact::raw(&[block], None).expect("effect-only artifact");
-        let certified =
-            CertifiedMachineFunction::from_artifact(&artifact).expect("certified machine");
-        let accounting =
-            CertifiedSingleBlockAccounting::from_certified(&certified).expect("source accounting");
-        let report = accounting.audit();
-
-        assert!(accounting.expression_layer().entities().is_empty());
-        assert!(report.has_exact_source_accounting(), "{report:?}");
-        assert!(report.has_residuals());
-    }
-
-    #[test]
-    fn unsupported_value_chain_has_exact_residual_accounting() {
-        let loaded = Varnode::unique(0x10, 8);
-        let sum = Varnode::unique(0x18, 8);
-        let mut block = R2ILBlock::new(0x5150, 4);
-        block.push(R2ILOp::Load {
-            dst: loaded.clone(),
-            space: SpaceId::Ram,
-            addr: Varnode::register(0, 8),
-        });
-        block.push(R2ILOp::IntAdd {
-            dst: sum.clone(),
-            a: loaded,
-            b: Varnode::constant(1, 8),
-        });
-        block.push(R2ILOp::Store {
-            space: SpaceId::Ram,
-            addr: Varnode::register(8, 8),
-            val: sum,
-        });
-        let artifact = SsaArtifact::raw(&[block], None).expect("unsupported value artifact");
-        let certified = CertifiedMachineProjection::from_artifact(&artifact)
-            .expect("certified partial projection");
-        let accounting = CertifiedSingleBlockAccounting::from_projection(&certified)
-            .expect("partial source accounting");
-        let report = accounting.audit();
-
-        assert!(report.has_exact_source_accounting(), "{report:?}");
-        assert!(report.has_residuals());
-        assert!(accounting.expression_layer().entities().is_empty());
-        assert_eq!(
-            accounting.mappings().len(),
-            artifact.obligations().obligations().len()
-        );
-        assert!(accounting.mappings().iter().any(|mapping| {
-            mapping.obligation.kind == SemanticObligationKind::LiveValueProducer
-                && matches!(
-                    mapping.disposition,
-                    RegionObligationDisposition::Residualized {
-                        reason: RegionResidualReason::UnsupportedSourceSemantics,
-                    }
-                )
-        }));
-        assert!(!certified.finish().authorizes_certified_c());
-    }
-
-    #[test]
-    fn empty_single_block_has_exact_empty_accounting() {
-        let block = R2ILBlock::new(0x5180, 4);
-        let artifact = SsaArtifact::raw(&[block], None).expect("empty block artifact");
-        let certified =
-            CertifiedMachineFunction::from_artifact(&artifact).expect("empty certified machine");
-        let accounting = CertifiedSingleBlockAccounting::from_certified(&certified)
-            .expect("empty source accounting");
-        let report = accounting.audit();
-
-        assert!(report.has_exact_source_accounting(), "{report:?}");
-        assert!(accounting.instructions().is_empty());
-        assert!(accounting.mappings().is_empty());
-        assert!(!report.has_residuals());
+        assert_hand_authored_return_refused(SourceFunctionReturn::Void);
     }
 
     #[test]
@@ -2610,252 +2425,5 @@ mod tests {
             Err(RegionBuildError::MultipleBlocks(blocks))
                 if blocks == BTreeSet::from([0x5200, 0x5210])
         ));
-    }
-
-    #[test]
-    fn selected_multi_block_accounting_derives_exact_local_subset() {
-        let entry_value = Varnode::unique(0x10, 8);
-        let exit_value = Varnode::unique(0x18, 8);
-        let mut entry = R2ILBlock::new(0x5250, 4);
-        entry.push(R2ILOp::Copy {
-            dst: entry_value.clone(),
-            src: Varnode::constant(1, 8),
-        });
-        entry.push(R2ILOp::Store {
-            space: SpaceId::Ram,
-            addr: Varnode::register(0, 8),
-            val: entry_value,
-        });
-        entry.push(R2ILOp::Branch {
-            target: Varnode::ram(0x5260, 8),
-        });
-        let mut exit = R2ILBlock::new(0x5260, 4);
-        exit.push(R2ILOp::Copy {
-            dst: exit_value.clone(),
-            src: Varnode::constant(2, 8),
-        });
-        exit.push(R2ILOp::Store {
-            space: SpaceId::Ram,
-            addr: Varnode::register(8, 8),
-            val: exit_value,
-        });
-        exit.push(R2ILOp::Return {
-            target: Varnode::constant(0, 8),
-        });
-        let artifact = SsaArtifact::raw(&[entry, exit], None).expect("two-block artifact");
-        let certified =
-            CertifiedMachineFunction::from_artifact(&artifact).expect("certified machine");
-
-        for block_addr in [0x5250, 0x5260] {
-            let accounting =
-                CertifiedSingleBlockAccounting::from_certified_block(&certified, block_addr)
-                    .expect("selected block accounting");
-            let report = accounting.audit();
-            let topology_block = certified
-                .topology()
-                .block(block_addr)
-                .expect("selected topology block");
-            let expected_obligations = topology_block
-                .instructions()
-                .iter()
-                .map(|id| {
-                    artifact
-                        .obligations()
-                        .instructions()
-                        .get(id)
-                        .expect("source instruction")
-                        .obligations
-                        .len()
-                })
-                .sum::<usize>();
-
-            assert!(report.has_exact_source_accounting(), "{report:?}");
-            assert_eq!(
-                accounting.instructions().len(),
-                topology_block.instructions().len()
-            );
-            assert_eq!(accounting.mappings().len(), expected_obligations);
-            assert!(
-                accounting
-                    .instructions()
-                    .iter()
-                    .all(|instruction| instruction.source().block_addr == block_addr)
-            );
-        }
-        assert!(matches!(
-            CertifiedSingleBlockAccounting::from_certified_block(&certified, 0xdead),
-            Err(RegionBuildError::MissingBlock(0xdead))
-        ));
-    }
-
-    #[test]
-    fn deleting_fnv_value_mapping_fails_region_audit() {
-        let artifact = straight_line_artifact();
-        let certified =
-            CertifiedMachineFunction::from_artifact(&artifact).expect("certified machine");
-        let mut region =
-            CertifiedSingleBlockAccounting::from_certified(&certified).expect("source accounting");
-        let removed = region
-            .mappings
-            .iter()
-            .position(|mapping| {
-                mapping.obligation.kind == SemanticObligationKind::LiveValueProducer
-            })
-            .expect("live value mapping");
-        let mut mappings = region.mappings.to_vec();
-        let removed = mappings.remove(removed).obligation;
-        region.mappings = mappings.into_boxed_slice();
-
-        let report = region.audit();
-        assert!(!report.has_exact_source_accounting());
-        assert!(report.missing_obligations().contains(&removed));
-    }
-
-    #[test]
-    fn duplicating_memory_write_mapping_fails_region_audit() {
-        let artifact = straight_line_artifact();
-        let certified =
-            CertifiedMachineFunction::from_artifact(&artifact).expect("certified machine");
-        let mut region =
-            CertifiedSingleBlockAccounting::from_certified(&certified).expect("source accounting");
-        let duplicate = region
-            .mappings
-            .iter()
-            .find(|mapping| {
-                mapping.obligation.kind == SemanticObligationKind::ObservableMemoryWrite
-            })
-            .expect("memory write mapping")
-            .clone();
-        let duplicated_id = duplicate.obligation;
-        let mut mappings = region.mappings.to_vec();
-        mappings.push(duplicate);
-        region.mappings = mappings.into_boxed_slice();
-
-        let report = region.audit();
-        assert!(!report.has_exact_source_accounting());
-        assert!(report.duplicate_obligations().contains(&duplicated_id));
-    }
-
-    #[test]
-    fn swapping_expression_producers_fails_region_audit() {
-        let artifact = straight_line_artifact();
-        let certified =
-            CertifiedMachineFunction::from_artifact(&artifact).expect("certified machine");
-        let mut region =
-            CertifiedSingleBlockAccounting::from_certified(&certified).expect("source accounting");
-        let expression_indices = region
-            .instructions
-            .iter()
-            .enumerate()
-            .filter_map(|(index, instruction)| {
-                instruction
-                    .expression_producer
-                    .map(|producer| (index, producer))
-            })
-            .collect::<Vec<_>>();
-        let [
-            (first_index, first_producer),
-            (second_index, second_producer),
-        ] = expression_indices[..]
-        else {
-            panic!("two expression producers expected");
-        };
-        region.instructions[first_index].expression_producer = Some(second_producer);
-        region.instructions[second_index].expression_producer = Some(first_producer);
-        for mapping in &mut region.mappings {
-            if let RegionObligationDisposition::AbsorbedIntoExpression { producer } =
-                &mut mapping.disposition
-            {
-                if *producer == first_producer {
-                    *producer = second_producer;
-                } else if *producer == second_producer {
-                    *producer = first_producer;
-                }
-            }
-        }
-
-        let report = region.audit();
-        assert!(!report.has_exact_source_accounting());
-        assert!(
-            report
-                .invalid()
-                .iter()
-                .any(|reason| reason.contains("not bound to its semantic entity"))
-        );
-    }
-
-    #[test]
-    fn wrong_residual_reason_fails_region_audit() {
-        let artifact = straight_line_artifact();
-        let certified =
-            CertifiedMachineFunction::from_artifact(&artifact).expect("certified machine");
-        let mut region =
-            CertifiedSingleBlockAccounting::from_certified(&certified).expect("source accounting");
-        let mapping = region
-            .mappings
-            .iter_mut()
-            .find(|mapping| {
-                mapping.obligation.kind == SemanticObligationKind::ObservableMemoryWrite
-            })
-            .expect("memory write mapping");
-        mapping.disposition = RegionObligationDisposition::Residualized {
-            reason: RegionResidualReason::ReturnRequiresCertifiedControl,
-        };
-
-        let report = region.audit();
-        assert!(!report.has_exact_source_accounting());
-        assert!(
-            report
-                .invalid()
-                .iter()
-                .any(|reason| reason.contains("wrong residual reason"))
-        );
-    }
-
-    #[test]
-    fn changing_region_block_address_fails_region_audit() {
-        let artifact = straight_line_artifact();
-        let certified =
-            CertifiedMachineFunction::from_artifact(&artifact).expect("certified machine");
-        let mut region =
-            CertifiedSingleBlockAccounting::from_certified(&certified).expect("source accounting");
-        region.block_addr = 0xdead;
-
-        let report = region.audit();
-        assert!(!report.has_exact_source_accounting());
-        assert!(
-            report
-                .invalid()
-                .iter()
-                .any(|reason| reason.contains("block address"))
-        );
-    }
-
-    #[test]
-    fn changing_instruction_state_or_source_order_fails_accounting() {
-        let artifact = straight_line_artifact();
-        let certified =
-            CertifiedMachineFunction::from_artifact(&artifact).expect("certified machine");
-        let mut wrong_state =
-            CertifiedSingleBlockAccounting::from_certified(&certified).expect("source accounting");
-        wrong_state.instructions[0].state =
-            if wrong_state.instructions[0].state == SemanticInstructionState::ProvenDead {
-                SemanticInstructionState::LiveObligation
-            } else {
-                SemanticInstructionState::ProvenDead
-            };
-        assert!(!wrong_state.audit().has_exact_source_accounting());
-
-        let mut wrong_order =
-            CertifiedSingleBlockAccounting::from_certified(&certified).expect("source accounting");
-        wrong_order.instructions.reverse();
-        let report = wrong_order.audit();
-        assert!(!report.has_exact_source_accounting());
-        assert!(
-            report
-                .invalid()
-                .iter()
-                .any(|reason| reason.contains("source topology"))
-        );
     }
 }

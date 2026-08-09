@@ -31,9 +31,7 @@ pub(crate) mod address;
 pub(crate) mod analysis;
 pub mod ast;
 pub mod certified_call;
-pub mod certified_conditional_funnel_return;
 pub mod certified_control;
-pub mod certified_counted_loop_return;
 pub mod certified_if_return;
 pub mod certified_loop;
 pub mod certified_loop_return;
@@ -43,7 +41,6 @@ pub mod certified_structure;
 pub mod certified_switch;
 pub mod certified_switch_return;
 pub(crate) mod codegen;
-pub(crate) mod consumer_fallback;
 #[cfg(test)]
 pub(crate) mod consumer_linear;
 pub(crate) mod consumer_structured;
@@ -58,19 +55,12 @@ pub(crate) mod post_rename;
 pub mod region;
 pub(crate) mod registers;
 pub mod semantic_aggregate_function;
-pub mod semantic_branchless_guard_function;
 pub mod semantic_c;
 pub mod semantic_call_return;
 pub mod semantic_differential;
-pub mod semantic_fnv_fold_function;
-pub mod semantic_fnv_fold_o0_function;
 pub mod semantic_function;
 pub mod semantic_memory_function;
-pub mod semantic_nested_wrap32_guard_o0_function;
-pub mod semantic_private_frame_function;
 pub mod semantic_stmt;
-pub mod semantic_struct_array_index_function;
-pub mod semantic_sum_array_function;
 pub mod structure;
 pub mod variable;
 
@@ -78,13 +68,6 @@ pub use ast::{BinaryOp, CExpr, CFunction, CStmt, CType, UnaryOp};
 pub use certified_call::{
     CERTIFIED_DIRECT_CALL_REGION_SCHEMA_VERSION, CertifiedDirectCallBlockRegion,
     DirectCallRegionAuditReport, DirectCallRegionError, DirectCallRegionScope,
-};
-pub use certified_conditional_funnel_return::{
-    CERTIFIED_CONDITIONAL_FUNNEL_RETURN_FUNCTION_SCHEMA_VERSION,
-    CertifiedConditionalFunnelReturnFunction, ConditionalFunnelCarrierKind,
-    ConditionalFunnelCarrierManifest, ConditionalFunnelPhase, ConditionalFunnelPhaseKind,
-    ConditionalFunnelReturnFunctionAuditReport, ConditionalFunnelReturnFunctionError,
-    ConditionalFunnelReturnFunctionScope,
 };
 pub use certified_control::{
     CERTIFIED_CONDITIONAL_TRANSFER_REGION_SCHEMA_VERSION,
@@ -95,13 +78,6 @@ pub use certified_control::{
     ConditionalTransferRegionScope, DirectTransferRegionAuditReport, DirectTransferRegionError,
     DirectTransferRegionScope, FallthroughTransferRegionAuditReport,
     FallthroughTransferRegionError, FallthroughTransferRegionScope,
-};
-pub use certified_counted_loop_return::{
-    CERTIFIED_COUNTED_LOOP_RETURN_FUNCTION_SCHEMA_VERSION, CertifiedCountedLoopReturnFunction,
-    CountedLoopDifferentialCase, CountedLoopDifferentialReport, CountedLoopExecutionOutcome,
-    CountedLoopPhase, CountedLoopPhaseKind, CountedLoopReturnFunctionAuditReport,
-    CountedLoopReturnFunctionError, CountedLoopReturnFunctionScope,
-    check_counted_loop_return_differential,
 };
 pub use certified_if_return::{
     CERTIFIED_CONDITIONAL_RETURN_FUNCTION_SCHEMA_VERSION, CertifiedConditionalReturnArm,
@@ -121,7 +97,7 @@ pub use certified_loop_return::{
 pub use certified_region::{
     CERTIFIED_REGION_SCHEMA_VERSION, CertifiedRegionInstruction, CertifiedSingleBlockAccounting,
     RegionAuditReport, RegionBuildError, RegionObligationDisposition, RegionObligationMapping,
-    RegionResidualReason, SingleBlockAccountingScope,
+    RegionResidualReason, RegionTypedOwner, SingleBlockAccountingScope,
 };
 pub use certified_return::{
     CERTIFIED_TERMINAL_RETURN_REGION_SCHEMA_VERSION, CertifiedTerminalReturnBlockRegion,
@@ -156,14 +132,6 @@ pub use semantic_aggregate_function::{
     CertifiedAggregateSemanticCParameterKind, CertifiedAggregateSemanticCReturn,
     CertifiedAggregateStructLayoutManifest, CertifiedAggregateStructMemberManifest,
 };
-pub use semantic_branchless_guard_function::{
-    BranchlessGuardAbiManifest, BranchlessGuardDifferentialCase, BranchlessGuardDifferentialInput,
-    BranchlessGuardDifferentialReport, BranchlessGuardRenderNames, BranchlessGuardRenderProgram,
-    BranchlessGuardSemanticCFunctionAuditReport, BranchlessGuardSemanticCFunctionError,
-    BranchlessGuardSemanticCFunctionScope,
-    CERTIFIED_BRANCHLESS_GUARD_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-    CertifiedBranchlessGuardSemanticCFunction, check_branchless_guard_differential,
-};
 pub use semantic_c::{
     SemanticCCallArgument, SemanticCCallArgumentValue, SemanticCDirectCall, SemanticCError,
     SemanticCExpressionLayer, SemanticCFunctionInterface, SemanticCFunctionReturn,
@@ -189,22 +157,6 @@ pub use semantic_differential::{
     check_direct_call_differential, check_memory_terminal_return_differential,
     check_terminal_return_differential,
 };
-pub use semantic_fnv_fold_function::{
-    CERTIFIED_FNV_FOLD_SEMANTIC_C_FUNCTION_SCHEMA_VERSION, CertifiedFnvFoldSemanticCFunction,
-    FnvFoldAbiManifest, FnvFoldDifferentialCase, FnvFoldDifferentialInput,
-    FnvFoldDifferentialReport, FnvFoldPhase, FnvFoldPhaseKind, FnvFoldRenderNames,
-    FnvFoldRenderProgram, FnvFoldSemanticCFunctionAuditReport, FnvFoldSemanticCFunctionError,
-    FnvFoldSemanticCFunctionScope, check_fnv_fold_differential,
-};
-pub use semantic_fnv_fold_o0_function::{
-    CERTIFIED_FNV_FOLD_O0_SEMANTIC_C_FUNCTION_SCHEMA_VERSION, CertifiedFnvFoldO0SemanticCFunction,
-    FnvFoldO0AbiManifest, FnvFoldO0AliasSeal, FnvFoldO0DifferentialCase,
-    FnvFoldO0DifferentialInput, FnvFoldO0DifferentialReport, FnvFoldO0ObservedRead,
-    FnvFoldO0ProducerDisposition, FnvFoldO0ProducerTarget, FnvFoldO0RenderNames,
-    FnvFoldO0RenderPhase, FnvFoldO0RenderPhaseKind, FnvFoldO0RenderProgram,
-    FnvFoldO0SemanticCFunctionAuditReport, FnvFoldO0SemanticCFunctionError,
-    FnvFoldO0SemanticCFunctionScope, check_fnv_fold_o0_differential,
-};
 pub use semantic_function::{
     CERTIFIED_SEMANTIC_C_FUNCTION_SCHEMA_VERSION, CertifiedSemanticCFunction,
     CertifiedSemanticCFunctionError, CertifiedSemanticCFunctionScope,
@@ -214,45 +166,9 @@ pub use semantic_memory_function::{
     CertifiedMemorySemanticCFunctionAuditReport, CertifiedMemorySemanticCFunctionError,
     CertifiedMemorySemanticCFunctionScope,
 };
-pub use semantic_nested_wrap32_guard_o0_function::{
-    CERTIFIED_NESTED_WRAP32_GUARD_O0_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-    CertifiedNestedWrap32GuardO0SemanticCFunction, NestedWrap32GuardO0AbiManifest,
-    NestedWrap32GuardO0DifferentialCase, NestedWrap32GuardO0DifferentialInput,
-    NestedWrap32GuardO0DifferentialReport, NestedWrap32GuardO0RenderNames,
-    NestedWrap32GuardO0SemanticCFunctionAuditReport, NestedWrap32GuardO0SemanticCFunctionError,
-    NestedWrap32GuardO0SemanticCFunctionScope, NestedWrap32GuardO0TypedBinding,
-    NestedWrap32GuardO0TypedExpr, NestedWrap32GuardO0TypedProgram,
-    NestedWrap32GuardO0TypedScalar, NestedWrap32GuardO0TypedStatement,
-    check_nested_wrap32_guard_o0_boundary_and_random_differential,
-    check_nested_wrap32_guard_o0_differential, nested_wrap32_guard_o0_boundary_and_random_cases,
-};
-pub use semantic_private_frame_function::{
-    CERTIFIED_PRIVATE_FRAME_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-    CertifiedPrivateFrameSemanticCFunction, PrivateFrameAbiManifest, PrivateFrameDifferentialCase,
-    PrivateFrameDifferentialReport, PrivateFramePhase, PrivateFramePhaseKind,
-    PrivateFramePredicate, PrivateFramePredicateOperand, PrivateFrameRenderNames,
-    PrivateFrameSemanticCFunctionAuditReport, PrivateFrameSemanticCFunctionError,
-    PrivateFrameSemanticCFunctionScope, check_private_frame_differential,
-};
 pub use semantic_stmt::{
     SemanticCBlockStepLayer, SemanticCEntityRef, SemanticCMemoryStatementRef, SemanticCSourceStep,
     SemanticCStatementError, SemanticCStatementScope, SemanticCStepAuditReport,
-};
-pub use semantic_struct_array_index_function::{
-    CERTIFIED_STRUCT_ARRAY_INDEX_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-    CertifiedStructArrayIndexSemanticCFunction, StructArrayIndexAbiManifest,
-    StructArrayIndexDifferentialCase, StructArrayIndexDifferentialInput,
-    StructArrayIndexDifferentialReport, StructArrayIndexObservedEvent, StructArrayIndexRenderNames,
-    StructArrayIndexRenderPhase, StructArrayIndexRenderPhaseKind, StructArrayIndexRenderProgram,
-    StructArrayIndexSemanticCFunctionAuditReport, StructArrayIndexSemanticCFunctionError,
-    StructArrayIndexSemanticCFunctionScope, check_struct_array_index_differential,
-};
-pub use semantic_sum_array_function::{
-    CERTIFIED_SUM_ARRAY_SEMANTIC_C_FUNCTION_SCHEMA_VERSION, CertifiedSumArraySemanticCFunction,
-    SumArrayAbiManifest, SumArrayDifferentialCase, SumArrayDifferentialInput,
-    SumArrayDifferentialReport, SumArrayObservedRead, SumArrayRenderNames, SumArrayRenderPhaseKind,
-    SumArrayRenderProgram, SumArraySemanticCFunctionAuditReport, SumArraySemanticCFunctionError,
-    SumArraySemanticCFunctionScope, check_sum_array_differential,
 };
 pub use structure::{
     ControlFlowStructurer, ControlRenderProof, ControlRenderProofKind, ControlTransferRenderProof,
@@ -262,19 +178,18 @@ pub use variable::VariableRecovery;
 
 use crate::codegen::CodeGenerator;
 use crate::fold::FoldingContext;
-use crate::fold::context::{EffectRenderProof, EffectRenderProofKind, FoldArchConfig, FoldInputs};
+use crate::fold::context::{FoldArchConfig, FoldInputs};
 use r2ssa::SSAFunction;
 use r2ssa::SSAOp;
 use r2ssa::cfg::BlockTerminator;
 use r2types::{
-    CTypeLike, DecompileRouteFacts, DecompileRouteKind, ExternalRegisterParamSpec,
-    ExternalStackSlotRole, FunctionFacts, FunctionSignatureSpec, FunctionTypeFacts,
-    ParamSlotResolver, StackSlotKey, TypeInference, TypeOracle, VisibleBinding, VisibleBindingKind,
+    CTypeLike, DecompileRouteFacts, DecompileRouteKind, ExternalRegisterParamSpec, FunctionFacts,
+    FunctionSignatureSpec, FunctionTypeFacts, ParamSlotResolver, StackSlotKey, TypeInference,
+    TypeOracle, VisibleBinding, VisibleBindingKind,
 };
 #[cfg(test)]
 use r2types::{ExternalTypeDb, FunctionType};
-use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -1450,17 +1365,6 @@ fn native_region_summary_detail(summary: &r2sym::NativeRegionSummary) -> String 
     )
 }
 
-pub fn semantic_fallback_comment(
-    func_name: &str,
-    semantic_artifact: Option<&r2sym::SemanticArtifact>,
-) -> Option<String> {
-    let function_facts = r2types::FunctionFacts::new(
-        r2types::FunctionTypeFacts::default(),
-        semantic_artifact.cloned(),
-    );
-    consumer_fallback::semantic_fallback_comment(func_name, &function_facts)
-}
-
 pub fn block_guard_fallback_comment(func_name: &str, blocks: usize, max_blocks: usize) -> String {
     planner::block_guard_fallback_comment(func_name, blocks, max_blocks)
 }
@@ -1648,14 +1552,6 @@ fn render_permission_residual_reason(
             "r2dec residual: engine render permission summary-only: {}",
             permission.reason
         )),
-        r2sym::RenderPermissionKind::CertifiedC => {
-            (permission.owner != r2sym::ProofOwner::R2engine).then(|| {
-                format!(
-                    "r2dec residual: CertifiedC render permission from non-engine proof owner {:?}: {}",
-                    permission.owner, permission.reason
-                )
-            })
-        }
     }
 }
 
@@ -1664,9 +1560,6 @@ fn summary_only_semantics_standard_render_residual_reason(
 ) -> Option<String> {
     let route = function_facts.decompile_route()?;
     if route.kind != r2types::DecompileRouteKind::Standard {
-        return None;
-    }
-    if route.render_permission.kind != r2sym::RenderPermissionKind::CertifiedC {
         return None;
     }
     let semantics = function_facts.semantic_artifact()?;
@@ -1680,744 +1573,6 @@ fn missing_decompile_route_residual_comment(func_name: &str) -> String {
         func_name,
         "missing FunctionFacts::decompile_route; executable C suppressed until r2engine supplies route/refusal evidence",
     )
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum AssignmentGuardLiteral {
-    Equality {
-        left: CExpr,
-        right: CExpr,
-        equal: bool,
-    },
-    Expression {
-        expr: CExpr,
-        truth: bool,
-    },
-}
-
-#[derive(Clone)]
-struct DefiniteAssignmentState<'a> {
-    unconditional: BTreeSet<String>,
-    guarded: BTreeMap<String, Vec<Vec<AssignmentGuardLiteral>>>,
-    assumptions: Vec<AssignmentGuardLiteral>,
-    control: Option<DecompileWorkControl<'a>>,
-    stop_reason: Cell<Option<DecompileExecutionStop>>,
-}
-
-impl<'a> DefiniteAssignmentState<'a> {
-    fn new(unconditional: BTreeSet<String>) -> Self {
-        Self {
-            unconditional,
-            guarded: BTreeMap::new(),
-            assumptions: Vec::new(),
-            control: None,
-            stop_reason: Cell::new(None),
-        }
-    }
-
-    fn new_with_control(
-        unconditional: BTreeSet<String>,
-        control: DecompileWorkControl<'a>,
-    ) -> Self {
-        let mut state = Self::new(unconditional);
-        state.control = Some(control);
-        state
-    }
-
-    fn poll(&self) -> bool {
-        if self.stop_reason.get().is_some() {
-            return false;
-        }
-        if let Some(control) = self.control
-            && let Err(reason) = control.poll()
-        {
-            self.stop_reason.set(Some(reason));
-            return false;
-        }
-        true
-    }
-
-    fn local_is_assigned(&self, name: &str) -> bool {
-        self.unconditional.contains(name)
-            || self.guarded.get(name).is_some_and(|clauses| {
-                clauses.iter().any(|clause| {
-                    clause.iter().all(|literal| {
-                        self.assumptions
-                            .iter()
-                            .any(|assumption| assignment_guard_literals_match(literal, assumption))
-                    })
-                })
-            })
-    }
-
-    fn record_assignment(&mut self, name: &str) {
-        if self.assumptions.is_empty() {
-            self.unconditional.insert(name.to_string());
-            self.guarded.remove(name);
-            return;
-        }
-        if self.unconditional.contains(name) {
-            return;
-        }
-        let clause = normalized_assignment_guard_clause(self.assumptions.clone());
-        self.guarded
-            .entry(name.to_string())
-            .or_default()
-            .push(clause);
-        self.simplify_guarded_name(name);
-    }
-
-    fn with_assumption(&self, expr: &CExpr, truth: bool) -> Option<Self> {
-        let literal = assignment_guard_literal(expr, truth);
-        if self
-            .assumptions
-            .iter()
-            .any(|assumption| assignment_guard_literals_complement(assumption, &literal))
-        {
-            return None;
-        }
-        let mut state = self.clone();
-        if !state
-            .assumptions
-            .iter()
-            .any(|assumption| assignment_guard_literals_match(assumption, &literal))
-        {
-            state.assumptions.push(literal);
-        }
-        Some(state)
-    }
-
-    fn simplify_guarded_name(&mut self, name: &str) {
-        let Some(mut clauses) = self.guarded.remove(name) else {
-            return;
-        };
-        simplify_assignment_guard_clauses_with_control(
-            &mut clauses,
-            self.control,
-            &self.stop_reason,
-        );
-        if self.stop_reason.get().is_some() {
-            return;
-        }
-        if clauses.iter().any(Vec::is_empty) {
-            self.unconditional.insert(name.to_string());
-        } else if !clauses.is_empty() {
-            self.guarded.insert(name.to_string(), clauses);
-        }
-    }
-}
-
-fn assignment_guard_literal(expr: &CExpr, truth: bool) -> AssignmentGuardLiteral {
-    match expr {
-        CExpr::Paren(inner) => assignment_guard_literal(inner, truth),
-        CExpr::Unary {
-            op: UnaryOp::Not,
-            operand,
-        } => assignment_guard_literal(operand, !truth),
-        CExpr::Binary {
-            op: BinaryOp::Eq | BinaryOp::Ne,
-            left,
-            right,
-        } => AssignmentGuardLiteral::Equality {
-            left: (**left).clone(),
-            right: (**right).clone(),
-            equal: if matches!(
-                expr,
-                CExpr::Binary {
-                    op: BinaryOp::Eq,
-                    ..
-                }
-            ) {
-                truth
-            } else {
-                !truth
-            },
-        },
-        _ => AssignmentGuardLiteral::Expression {
-            expr: expr.clone(),
-            truth,
-        },
-    }
-}
-
-fn assignment_guard_literals_same_atom(
-    left: &AssignmentGuardLiteral,
-    right: &AssignmentGuardLiteral,
-) -> bool {
-    match (left, right) {
-        (
-            AssignmentGuardLiteral::Equality {
-                left: left_a,
-                right: left_b,
-                ..
-            },
-            AssignmentGuardLiteral::Equality {
-                left: right_a,
-                right: right_b,
-                ..
-            },
-        ) => left_a == right_a && left_b == right_b || left_a == right_b && left_b == right_a,
-        (
-            AssignmentGuardLiteral::Expression { expr: left, .. },
-            AssignmentGuardLiteral::Expression { expr: right, .. },
-        ) => left == right,
-        _ => false,
-    }
-}
-
-fn assignment_guard_literal_truth(literal: &AssignmentGuardLiteral) -> bool {
-    match literal {
-        AssignmentGuardLiteral::Equality { equal, .. } => *equal,
-        AssignmentGuardLiteral::Expression { truth, .. } => *truth,
-    }
-}
-
-fn assignment_guard_literals_match(
-    left: &AssignmentGuardLiteral,
-    right: &AssignmentGuardLiteral,
-) -> bool {
-    assignment_guard_literals_same_atom(left, right)
-        && assignment_guard_literal_truth(left) == assignment_guard_literal_truth(right)
-}
-
-fn assignment_guard_literals_complement(
-    left: &AssignmentGuardLiteral,
-    right: &AssignmentGuardLiteral,
-) -> bool {
-    assignment_guard_literals_same_atom(left, right)
-        && assignment_guard_literal_truth(left) != assignment_guard_literal_truth(right)
-}
-
-fn normalized_assignment_guard_clause(
-    literals: Vec<AssignmentGuardLiteral>,
-) -> Vec<AssignmentGuardLiteral> {
-    let mut normalized = Vec::new();
-    for literal in literals {
-        if normalized
-            .iter()
-            .any(|existing| assignment_guard_literals_complement(existing, &literal))
-        {
-            return Vec::new();
-        }
-        if !normalized
-            .iter()
-            .any(|existing| assignment_guard_literals_match(existing, &literal))
-        {
-            normalized.push(literal);
-        }
-    }
-    normalized
-}
-
-fn assignment_guard_clause_implies(
-    stronger: &[AssignmentGuardLiteral],
-    weaker: &[AssignmentGuardLiteral],
-) -> bool {
-    weaker.iter().all(|expected| {
-        stronger
-            .iter()
-            .any(|actual| assignment_guard_literals_match(actual, expected))
-    })
-}
-
-fn assignment_guard_consensus(
-    left: &[AssignmentGuardLiteral],
-    right: &[AssignmentGuardLiteral],
-) -> Option<Vec<AssignmentGuardLiteral>> {
-    let mut left_only = left
-        .iter()
-        .filter(|literal| {
-            !right
-                .iter()
-                .any(|other| assignment_guard_literals_match(literal, other))
-        })
-        .collect::<Vec<_>>();
-    let mut right_only = right
-        .iter()
-        .filter(|literal| {
-            !left
-                .iter()
-                .any(|other| assignment_guard_literals_match(literal, other))
-        })
-        .collect::<Vec<_>>();
-    if left_only.len() != 1
-        || right_only.len() != 1
-        || !assignment_guard_literals_complement(left_only.remove(0), right_only.remove(0))
-    {
-        return None;
-    }
-    Some(
-        left.iter()
-            .filter(|literal| {
-                right
-                    .iter()
-                    .any(|other| assignment_guard_literals_match(literal, other))
-            })
-            .cloned()
-            .collect(),
-    )
-}
-
-#[allow(dead_code)]
-fn simplify_assignment_guard_clauses(clauses: &mut Vec<Vec<AssignmentGuardLiteral>>) {
-    let stop_reason = Cell::new(None);
-    simplify_assignment_guard_clauses_with_control(clauses, None, &stop_reason);
-}
-
-fn simplify_assignment_guard_clauses_with_control(
-    clauses: &mut Vec<Vec<AssignmentGuardLiteral>>,
-    control: Option<DecompileWorkControl<'_>>,
-    stop_reason: &Cell<Option<DecompileExecutionStop>>,
-) {
-    let poll = || {
-        if stop_reason.get().is_some() {
-            return false;
-        }
-        if let Some(control) = control
-            && let Err(reason) = control.poll()
-        {
-            stop_reason.set(Some(reason));
-            return false;
-        }
-        true
-    };
-    let mut changed = true;
-    while changed {
-        if !poll() {
-            return;
-        }
-        changed = false;
-        let mut unique = Vec::<Vec<AssignmentGuardLiteral>>::new();
-        for clause in clauses.drain(..) {
-            if !poll() {
-                return;
-            }
-            if !unique.iter().any(|existing| {
-                assignment_guard_clause_implies(&clause, existing)
-                    && assignment_guard_clause_implies(existing, &clause)
-            }) {
-                unique.push(clause);
-            }
-        }
-        unique = unique
-            .iter()
-            .enumerate()
-            .filter(|(candidate_index, candidate)| {
-                !unique.iter().enumerate().any(|(other_index, other)| {
-                    candidate_index != &other_index
-                        && assignment_guard_clause_implies(candidate, other)
-                })
-            })
-            .map(|(_, clause)| clause.clone())
-            .collect();
-        'consensus: for left in 0..unique.len() {
-            if !poll() {
-                return;
-            }
-            for right in left + 1..unique.len() {
-                if !poll() {
-                    return;
-                }
-                let Some(consensus) = assignment_guard_consensus(&unique[left], &unique[right])
-                else {
-                    continue;
-                };
-                if !unique.iter().any(|existing| {
-                    assignment_guard_clause_implies(&consensus, existing)
-                        && assignment_guard_clause_implies(existing, &consensus)
-                }) {
-                    unique.push(consensus);
-                    changed = true;
-                    break 'consensus;
-                }
-            }
-        }
-        *clauses = unique;
-    }
-}
-
-fn merge_definite_assignment_states<'a>(
-    base_assumptions: &[AssignmentGuardLiteral],
-    states: impl IntoIterator<Item = DefiniteAssignmentState<'a>>,
-) -> DefiniteAssignmentState<'a> {
-    let states = states.into_iter().collect::<Vec<_>>();
-    let control = states.first().and_then(|state| state.control);
-    let stop_reason = states.iter().find_map(|state| state.stop_reason.get());
-    let unconditional = states
-        .first()
-        .map(|first| {
-            states
-                .iter()
-                .skip(1)
-                .fold(first.unconditional.clone(), |current, state| {
-                    current
-                        .intersection(&state.unconditional)
-                        .cloned()
-                        .collect()
-                })
-        })
-        .unwrap_or_default();
-    let mut merged = DefiniteAssignmentState {
-        unconditional,
-        guarded: BTreeMap::new(),
-        assumptions: base_assumptions.to_vec(),
-        control,
-        stop_reason: Cell::new(stop_reason),
-    };
-    for state in states {
-        for (name, clauses) in state.guarded {
-            if !merged.unconditional.contains(&name) {
-                merged.guarded.entry(name).or_default().extend(clauses);
-            }
-        }
-    }
-    let names = merged.guarded.keys().cloned().collect::<Vec<_>>();
-    for name in names {
-        merged.simplify_guarded_name(&name);
-    }
-    merged
-}
-
-#[cfg(test)]
-fn definite_assignment_residual_reason(func: &CFunction) -> Option<String> {
-    let control = r2ssa::SsaExecutionControl::default();
-    let work = DecompileWorkControl::new(&control, DecompileWorkPhase::Rendering);
-    definite_assignment_residual_reason_with_control(func, work)
-        .expect("default decompiler control never stops")
-}
-
-fn definite_assignment_residual_reason_with_control(
-    func: &CFunction,
-    control: DecompileWorkControl<'_>,
-) -> Result<Option<String>, DecompileExecutionStop> {
-    control.poll()?;
-    let mut local_names = func
-        .locals
-        .iter()
-        .map(|local| local.name.clone())
-        .collect::<BTreeSet<_>>();
-    for stmt in &func.body {
-        control.poll()?;
-        collect_declared_local_names(stmt, &mut local_names);
-    }
-    let assigned = func
-        .params
-        .iter()
-        .map(|param| param.name.clone())
-        .collect::<BTreeSet<_>>();
-    let mut state = DefiniteAssignmentState::new_with_control(assigned, control);
-    for (index, stmt) in func.body.iter().enumerate() {
-        control.poll()?;
-        if let Err(reason) = analyze_definite_assignment_stmt(stmt, &local_names, &mut state) {
-            return Ok(Some(format!(
-                "definite-assignment proof failed at statement {index}: {reason}"
-            )));
-        }
-        if let Some(reason) = state.stop_reason.get() {
-            return Err(reason);
-        }
-    }
-    control.poll()?;
-    Ok(None)
-}
-
-fn collect_declared_local_names(stmt: &CStmt, names: &mut BTreeSet<String>) {
-    match stmt {
-        CStmt::Decl { name, .. } => {
-            names.insert(name.clone());
-        }
-        CStmt::Block(stmts) => {
-            for stmt in stmts {
-                collect_declared_local_names(stmt, names);
-            }
-        }
-        CStmt::If {
-            then_body,
-            else_body,
-            ..
-        } => {
-            collect_declared_local_names(then_body, names);
-            if let Some(else_body) = else_body {
-                collect_declared_local_names(else_body, names);
-            }
-        }
-        CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
-            collect_declared_local_names(body, names);
-        }
-        CStmt::For { init, body, .. } => {
-            if let Some(init) = init {
-                collect_declared_local_names(init, names);
-            }
-            collect_declared_local_names(body, names);
-        }
-        CStmt::Switch { cases, default, .. } => {
-            for stmt in cases.iter().flat_map(|case| &case.body) {
-                collect_declared_local_names(stmt, names);
-            }
-            for stmt in default.iter().flatten() {
-                collect_declared_local_names(stmt, names);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn analyze_definite_assignment_stmt(
-    stmt: &CStmt,
-    local_names: &BTreeSet<String>,
-    state: &mut DefiniteAssignmentState<'_>,
-) -> Result<(), String> {
-    if !state.poll() {
-        return Ok(());
-    }
-    match stmt {
-        CStmt::Empty
-        | CStmt::Break
-        | CStmt::Continue
-        | CStmt::Goto(_)
-        | CStmt::Label(_)
-        | CStmt::Comment(_) => {}
-        CStmt::Expr(expr) => {
-            analyze_definite_assignment_expr(expr, local_names, state)?;
-        }
-        CStmt::Decl { name, init, .. } => {
-            if let Some(init) = init {
-                analyze_definite_assignment_expr(init, local_names, state)?;
-                state.record_assignment(name);
-            }
-        }
-        CStmt::Block(stmts) => {
-            for stmt in stmts {
-                analyze_definite_assignment_stmt(stmt, local_names, state)?;
-            }
-        }
-        CStmt::If {
-            cond,
-            then_body,
-            else_body,
-        } => {
-            analyze_definite_assignment_expr(cond, local_names, state)?;
-            let base_assumptions = state.assumptions.clone();
-            let mut exits = Vec::new();
-            if let Some(mut then_state) = state.with_assumption(cond, true) {
-                analyze_definite_assignment_stmt(then_body, local_names, &mut then_state)?;
-                exits.push(then_state);
-            }
-            if let Some(mut else_state) = state.with_assumption(cond, false) {
-                if let Some(else_body) = else_body {
-                    analyze_definite_assignment_stmt(else_body, local_names, &mut else_state)?;
-                }
-                exits.push(else_state);
-            }
-            *state = merge_definite_assignment_states(&base_assumptions, exits);
-        }
-        CStmt::While { cond, body } => {
-            analyze_definite_assignment_expr(cond, local_names, state)?;
-            if let Some(mut body_state) = state.with_assumption(cond, true) {
-                analyze_definite_assignment_stmt(body, local_names, &mut body_state)?;
-            }
-        }
-        CStmt::DoWhile { body, cond } => {
-            analyze_definite_assignment_stmt(body, local_names, state)?;
-            analyze_definite_assignment_expr(cond, local_names, state)?;
-        }
-        CStmt::For {
-            init,
-            cond,
-            update,
-            body,
-        } => {
-            if let Some(init) = init {
-                analyze_definite_assignment_stmt(init, local_names, state)?;
-            }
-            if let Some(cond) = cond {
-                analyze_definite_assignment_expr(cond, local_names, state)?;
-            }
-            let mut body_state = cond
-                .as_ref()
-                .and_then(|cond| state.with_assumption(cond, true))
-                .unwrap_or_else(|| state.clone());
-            analyze_definite_assignment_stmt(body, local_names, &mut body_state)?;
-            if let Some(update) = update {
-                analyze_definite_assignment_expr(update, local_names, &mut body_state)?;
-            }
-        }
-        CStmt::Switch {
-            expr,
-            cases,
-            default,
-        } => {
-            analyze_definite_assignment_expr(expr, local_names, state)?;
-            let base_assumptions = state.assumptions.clone();
-            let mut exits = Vec::new();
-            let case_guards = cases
-                .iter()
-                .map(|case| CExpr::binary(BinaryOp::Eq, expr.clone(), case.value.clone()))
-                .collect::<Vec<_>>();
-            for case in cases {
-                let case_guard = CExpr::binary(BinaryOp::Eq, expr.clone(), case.value.clone());
-                if let Some(mut case_state) = state.with_assumption(&case_guard, true) {
-                    for stmt in &case.body {
-                        analyze_definite_assignment_stmt(stmt, local_names, &mut case_state)?;
-                    }
-                    exits.push(case_state);
-                }
-            }
-            if let Some(default) = default {
-                let any_case = case_guards
-                    .iter()
-                    .cloned()
-                    .reduce(|left, right| CExpr::binary(BinaryOp::Or, left, right));
-                let mut default_state = any_case
-                    .as_ref()
-                    .and_then(|guard| state.with_assumption(guard, false))
-                    .unwrap_or_else(|| state.clone());
-                for stmt in default {
-                    analyze_definite_assignment_stmt(stmt, local_names, &mut default_state)?;
-                }
-                exits.push(default_state);
-            } else {
-                exits.push(state.clone());
-            }
-            *state = merge_definite_assignment_states(&base_assumptions, exits);
-        }
-        CStmt::Return(value) => {
-            if let Some(value) = value {
-                analyze_definite_assignment_expr(value, local_names, state)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn analyze_definite_assignment_expr(
-    expr: &CExpr,
-    local_names: &BTreeSet<String>,
-    state: &mut DefiniteAssignmentState<'_>,
-) -> Result<(), String> {
-    if !state.poll() {
-        return Ok(());
-    }
-    match expr {
-        CExpr::Var(name) => {
-            if local_names.contains(name) && !state.local_is_assigned(name) {
-                return Err(format!("local {name} may be read before assignment"));
-            }
-        }
-        CExpr::Binary {
-            op: BinaryOp::Assign,
-            left,
-            right,
-        } => {
-            analyze_definite_assignment_expr(right, local_names, state)?;
-            if !matches!(left.as_ref(), CExpr::Var(_)) {
-                analyze_definite_assignment_expr(left, local_names, state)?;
-            }
-            if let CExpr::Var(name) = left.as_ref()
-                && local_names.contains(name)
-            {
-                state.record_assignment(name);
-            }
-        }
-        CExpr::Binary {
-            op: BinaryOp::And,
-            left,
-            right,
-        } => {
-            analyze_definite_assignment_expr(left, local_names, state)?;
-            if let Some(mut right_state) = state.with_assumption(left, true) {
-                analyze_definite_assignment_expr(right, local_names, &mut right_state)?;
-                *state = merge_definite_assignment_states(
-                    &state.assumptions,
-                    [state.clone(), right_state],
-                );
-            }
-        }
-        CExpr::Binary {
-            op: BinaryOp::Or,
-            left,
-            right,
-        } => {
-            analyze_definite_assignment_expr(left, local_names, state)?;
-            if let Some(mut right_state) = state.with_assumption(left, false) {
-                analyze_definite_assignment_expr(right, local_names, &mut right_state)?;
-                *state = merge_definite_assignment_states(
-                    &state.assumptions,
-                    [state.clone(), right_state],
-                );
-            }
-        }
-        CExpr::Binary { left, right, .. } => {
-            analyze_definite_assignment_expr(left, local_names, state)?;
-            analyze_definite_assignment_expr(right, local_names, state)?;
-        }
-        CExpr::Comma(items) => {
-            for item in items {
-                analyze_definite_assignment_expr(item, local_names, state)?;
-            }
-        }
-        CExpr::Ternary {
-            cond,
-            then_expr,
-            else_expr,
-        } => {
-            analyze_definite_assignment_expr(cond, local_names, state)?;
-            let base_assumptions = state.assumptions.clone();
-            let mut exits = Vec::new();
-            if let Some(mut then_state) = state.with_assumption(cond, true) {
-                analyze_definite_assignment_expr(then_expr, local_names, &mut then_state)?;
-                exits.push(then_state);
-            }
-            if let Some(mut else_state) = state.with_assumption(cond, false) {
-                analyze_definite_assignment_expr(else_expr, local_names, &mut else_state)?;
-                exits.push(else_state);
-            }
-            *state = merge_definite_assignment_states(&base_assumptions, exits);
-        }
-        CExpr::Unary {
-            op: UnaryOp::PreInc | UnaryOp::PreDec | UnaryOp::PostInc | UnaryOp::PostDec,
-            operand,
-        } => {
-            analyze_definite_assignment_expr(operand, local_names, state)?;
-            if let CExpr::Var(name) = operand.as_ref()
-                && local_names.contains(name)
-            {
-                state.record_assignment(name);
-            }
-        }
-        CExpr::Unary { operand, .. }
-        | CExpr::Cast { expr: operand, .. }
-        | CExpr::Deref(operand)
-        | CExpr::Paren(operand) => {
-            analyze_definite_assignment_expr(operand, local_names, state)?;
-        }
-        CExpr::AddrOf(operand) => {
-            if !matches!(operand.as_ref(), CExpr::Var(_)) {
-                analyze_definite_assignment_expr(operand, local_names, state)?;
-            }
-        }
-        CExpr::Call { func, args } => {
-            analyze_definite_assignment_expr(func, local_names, state)?;
-            for arg in args {
-                analyze_definite_assignment_expr(arg, local_names, state)?;
-            }
-        }
-        CExpr::Subscript { base, index } => {
-            analyze_definite_assignment_expr(base, local_names, state)?;
-            analyze_definite_assignment_expr(index, local_names, state)?;
-        }
-        CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
-            analyze_definite_assignment_expr(base, local_names, state)?;
-        }
-        CExpr::Sizeof(_)
-        | CExpr::SizeofType(_)
-        | CExpr::IntLit(_)
-        | CExpr::UIntLit(_)
-        | CExpr::FloatLit(_)
-        | CExpr::StringLit(_)
-        | CExpr::CharLit(_) => {}
-    }
-    Ok(())
 }
 
 fn summary_non_void_return_type(
@@ -2604,159 +1759,6 @@ fn merge_params_with_external_signature(
             param
         })
         .collect()
-}
-
-fn params_from_authorized_signature(signature: &FunctionSignatureSpec) -> Vec<ast::CParam> {
-    signature
-        .params
-        .iter()
-        .enumerate()
-        .map(|(idx, param)| ast::CParam {
-            ty: param
-                .ty
-                .as_ref()
-                .map(type_like_to_ctype)
-                .expect("render-authorized signature parameter types checked before rendering"),
-            name: if param.name.trim().is_empty() || is_generic_arg_name(&param.name) {
-                format!("arg{idx}")
-            } else {
-                param.name.clone()
-            },
-        })
-        .collect()
-}
-
-fn signature_has_complete_render_param_types(signature: &FunctionSignatureSpec) -> bool {
-    signature.params.iter().all(|param| {
-        param
-            .ty
-            .as_ref()
-            .is_some_and(|ty| !matches!(type_like_to_ctype(ty), CType::Unknown))
-    })
-}
-
-fn certified_signature_entity_residual_reason(
-    signature: &FunctionSignatureSpec,
-    render: &r2types::FunctionRenderFacts,
-    ptr_bits: u32,
-) -> Option<String> {
-    let params = params_from_authorized_signature(signature);
-    let mut entities = BTreeMap::<u32, u32>::new();
-    for entity in render.certified_entities.values() {
-        if let r2types::CertifiedEntity::Parameter {
-            slot,
-            carrier_width,
-            ..
-        } = entity
-        {
-            entities.insert(*slot, *carrier_width);
-        }
-    }
-    if entities.len() != params.len()
-        || entities
-            .keys()
-            .copied()
-            .ne((0..params.len()).map(|slot| slot as u32))
-    {
-        return Some(format!(
-            "certified ABI parameter slots {:?} disagree with rendered signature arity {}",
-            entities.keys().collect::<Vec<_>>(),
-            params.len()
-        ));
-    }
-    for (slot, param) in params.iter().enumerate() {
-        let source_type = signature.params[slot]
-            .ty
-            .as_ref()
-            .expect("render-authorized parameter type checked before ABI certification");
-        let Some(type_bits) = certified_type_width(source_type, ptr_bits) else {
-            return Some(format!(
-                "parameter {slot} type {} has no certified width",
-                param.ty
-            ));
-        };
-        let carrier_bits = entities
-            .get(&(slot as u32))
-            .copied()
-            .unwrap_or(0)
-            .saturating_mul(8);
-        let width_matches = if certified_type_is_pointer(source_type) {
-            type_bits == carrier_bits
-        } else {
-            type_bits > 0 && type_bits <= carrier_bits
-        };
-        if !width_matches {
-            return Some(format!(
-                "parameter {slot} type width {type_bits} disagrees with ABI carrier width {carrier_bits}"
-            ));
-        }
-    }
-
-    let source_ret_type = signature.ret_type.as_ref()?;
-    let ret_type = type_like_to_ctype(source_ret_type);
-    let return_widths = render
-        .certified_effects
-        .values()
-        .filter_map(|effect| effect.return_fact().map(|fact| fact.width))
-        .collect::<BTreeSet<_>>();
-    if matches!(ret_type, CType::Void) {
-        if !return_widths.is_empty() {
-            return Some(format!(
-                "void signature has certified value-return widths {:?}",
-                return_widths
-            ));
-        }
-        return None;
-    }
-    let Some(ret_bits) = certified_type_width(source_ret_type, ptr_bits) else {
-        return Some(format!("return type {ret_type} has no certified width"));
-    };
-    let return_width_matches = !return_widths.is_empty()
-        && return_widths.iter().all(|width| {
-            let carrier_bits = width.saturating_mul(8);
-            if certified_type_is_pointer(source_ret_type) {
-                ret_bits == carrier_bits
-            } else {
-                ret_bits > 0 && ret_bits <= carrier_bits
-            }
-        });
-    if !return_width_matches {
-        return Some(format!(
-            "signature return width {} bit(s) disagrees with certified carrier widths {:?}",
-            ret_bits,
-            render
-                .certified_effects
-                .values()
-                .filter_map(|effect| effect.return_fact().map(|fact| fact.width))
-                .collect::<BTreeSet<_>>()
-        ));
-    }
-    None
-}
-
-fn certified_type_width(ty: &r2types::CTypeLike, ptr_bits: u32) -> Option<u32> {
-    match ty {
-        r2types::CTypeLike::Bool => Some(1),
-        r2types::CTypeLike::Int { bits, .. } | r2types::CTypeLike::Float(bits) => Some(*bits),
-        r2types::CTypeLike::Pointer(_) => Some(ptr_bits),
-        r2types::CTypeLike::Typedef(name) if r2types::semantic_typedef_is_pointer(name) => {
-            Some(ptr_bits)
-        }
-        r2types::CTypeLike::Typedef(name) => {
-            let resolved = r2types::parse_external_type_like_spec(name, ptr_bits)?;
-            if &resolved == ty {
-                None
-            } else {
-                certified_type_width(&resolved, ptr_bits)
-            }
-        }
-        _ => None,
-    }
-}
-
-fn certified_type_is_pointer(ty: &r2types::CTypeLike) -> bool {
-    matches!(ty, r2types::CTypeLike::Pointer(_))
-        || matches!(ty, r2types::CTypeLike::Typedef(name) if r2types::semantic_typedef_is_pointer(name))
 }
 
 fn register_alias_names(reg_name: &str) -> Vec<String> {
@@ -3430,14 +2432,6 @@ impl Decompiler {
         )
     }
 
-    pub(crate) fn stmt_has_content(stmt: &CStmt) -> bool {
-        match stmt {
-            CStmt::Empty => false,
-            CStmt::Block(stmts) => !stmts.is_empty(),
-            _ => true,
-        }
-    }
-
     pub(crate) fn prepend_comment(stmt: CStmt, text: String) -> CStmt {
         let comment = CStmt::comment(text);
         match stmt {
@@ -3827,7 +2821,7 @@ impl Decompiler {
             let reason =
                 render_permission_residual_reason(self.context.effective_render_permission())
                     .unwrap_or_else(|| {
-                        "r2dec residual: legacy CertifiedC claims cannot authorize production output; r2cert typed-region authorization is required".to_string()
+                        "r2dec residual: Standard executable rendering is unavailable; r2cert typed-region authorization is required".to_string()
                     });
             return Ok(residual_function_for_render_boundary(&func_name, &reason));
         }
@@ -4079,13 +3073,12 @@ impl Decompiler {
         );
 
         // Collect locals -- on fallback keep locals conservatively.
-        let mut locals: Vec<ast::CLocal> = if use_conservative_locals {
+        let locals: Vec<ast::CLocal> = if use_conservative_locals {
             var_recovery
                 .locals()
                 .iter()
                 .filter(|v| {
-                    !v
-                        .stack_offset
+                    !v.stack_offset
                         .is_some_and(|offset| param_home_offsets.contains(&offset))
                 })
                 .map(|v| ast::CLocal {
@@ -4644,24 +3637,6 @@ fn prune_dead_temp_assignments_in_function_body(
         CStmt::Empty => Vec::new(),
         stmt => vec![stmt],
     };
-}
-
-fn normalize_certified_appended_return_expr(
-    expr: CExpr,
-    ret_type: &CType,
-    locals: &[ast::CLocal],
-) -> CExpr {
-    let CExpr::Cast { ty, expr: inner } = expr else {
-        return expr;
-    };
-    if let CExpr::Var(name) = inner.as_ref()
-        && locals
-            .iter()
-            .any(|local| local.name.eq_ignore_ascii_case(name) && local.ty == *ret_type)
-    {
-        return *inner;
-    }
-    CExpr::Cast { ty, expr: inner }
 }
 
 fn normalize_redundant_return_carrier_casts(func: &mut CFunction) {
@@ -5408,61 +4383,11 @@ mod tests {
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
     use r2ssa::SSAFunction;
     use r2types::{
-        ExternalField, ExternalRegisterParamSpec, ExternalStackSlotRole, ExternalStackSlotSpec,
-        ExternalStruct, ExternalTypeDb, FunctionFacts, FunctionParamSpec, FunctionRenderFacts,
-        FunctionSignatureSpec, FunctionTypeFacts, ParamSlotResolver, SignatureCertificate,
-        SignatureCertificateSource, Signedness,
+        ExternalField, ExternalRegisterParamSpec, ExternalStruct, ExternalTypeDb, FunctionFacts,
+        FunctionParamSpec, FunctionSignatureSpec, FunctionTypeFacts, SignatureCertificate,
+        SignatureCertificateSource,
     };
     use std::collections::{BTreeMap, BTreeSet, HashMap};
-
-    struct StopAtPoll {
-        polls: Cell<usize>,
-        stop_at: usize,
-        reason: r2ssa::SsaExecutionStopReason,
-    }
-
-    impl StopAtPoll {
-        fn new(stop_at: usize, reason: r2ssa::SsaExecutionStopReason) -> Self {
-            Self {
-                polls: Cell::new(0),
-                stop_at,
-                reason,
-            }
-        }
-    }
-
-    impl r2ssa::SsaWorkControl for StopAtPoll {
-        fn poll(&self) -> Result<(), r2ssa::SsaExecutionStopReason> {
-            let polls = self.polls.get().saturating_add(1);
-            self.polls.set(polls);
-            if polls >= self.stop_at {
-                Err(self.reason)
-            } else {
-                Ok(())
-            }
-        }
-    }
-
-    fn test_stack_render_facts(
-        object: r2ssa::ObjectId,
-        base: r2ssa::StackAddressBase,
-        offset: i64,
-    ) -> FunctionRenderFacts {
-        let id = r2ssa::SemanticId::stack_slot(object);
-        FunctionRenderFacts {
-            certified_entities: BTreeMap::from([(
-                id,
-                r2types::CertifiedEntity::StackSlot {
-                    id,
-                    object,
-                    base,
-                    offset,
-                    size: None,
-                },
-            )]),
-            ..FunctionRenderFacts::default()
-        }
-    }
 
     #[test]
     fn semantic_memory_address_format_preserves_identity_kind() {
@@ -5489,164 +4414,6 @@ mod tests {
             ),
             "affine(v7*40; offset=4)"
         );
-    }
-
-    #[test]
-    fn definite_assignment_rejects_partial_branch_initialization() {
-        let mut function = CFunction::new("unlock", CType::i32());
-        function.locals.push(crate::ast::CLocal {
-            ty: CType::i32(),
-            name: "result".to_string(),
-            stack_offset: Some(-4),
-        });
-        function.body = vec![
-            CStmt::If {
-                cond: CExpr::Var("condition".to_string()),
-                then_body: Box::new(CStmt::Expr(CExpr::assign(
-                    CExpr::Var("result".to_string()),
-                    CExpr::IntLit(1),
-                ))),
-                else_body: None,
-            },
-            CStmt::Return(Some(CExpr::Var("result".to_string()))),
-        ];
-
-        assert!(
-            definite_assignment_residual_reason(&function)
-                .is_some_and(|reason| reason.contains("result may be read before assignment"))
-        );
-    }
-
-    #[test]
-    fn definite_assignment_accepts_complete_branch_initialization() {
-        let mut function = CFunction::new("unlock", CType::i32());
-        function.locals.push(crate::ast::CLocal {
-            ty: CType::i32(),
-            name: "result".to_string(),
-            stack_offset: Some(-4),
-        });
-        let assignment = |value| {
-            CStmt::Expr(CExpr::assign(
-                CExpr::Var("result".to_string()),
-                CExpr::IntLit(value),
-            ))
-        };
-        function.body = vec![
-            CStmt::If {
-                cond: CExpr::Var("condition".to_string()),
-                then_body: Box::new(assignment(1)),
-                else_body: Some(Box::new(assignment(0))),
-            },
-            CStmt::Return(Some(CExpr::Var("result".to_string()))),
-        ];
-
-        assert_eq!(definite_assignment_residual_reason(&function), None);
-    }
-
-    #[test]
-    fn definite_assignment_uses_complementary_ternary_guard() {
-        let mut function = CFunction::new("guarded_return", CType::i32());
-        function.params.push(crate::ast::CParam {
-            ty: CType::Pointer(Box::new(CType::Void)),
-            name: "arg0".to_string(),
-        });
-        function.locals.push(crate::ast::CLocal {
-            ty: CType::i32(),
-            name: "result".to_string(),
-            stack_offset: None,
-        });
-        let is_null = CExpr::binary(
-            BinaryOp::Eq,
-            CExpr::Var("arg0".to_string()),
-            CExpr::IntLit(0),
-        );
-        function.body = vec![
-            CStmt::If {
-                cond: CExpr::binary(
-                    BinaryOp::Ne,
-                    CExpr::Var("arg0".to_string()),
-                    CExpr::IntLit(0),
-                ),
-                then_body: Box::new(CStmt::Expr(CExpr::assign(
-                    CExpr::Var("result".to_string()),
-                    CExpr::IntLit(1),
-                ))),
-                else_body: None,
-            },
-            CStmt::Return(Some(CExpr::Ternary {
-                cond: Box::new(is_null),
-                then_expr: Box::new(CExpr::IntLit(0)),
-                else_expr: Box::new(CExpr::Var("result".to_string())),
-            })),
-        ];
-
-        assert_eq!(definite_assignment_residual_reason(&function), None);
-    }
-
-    #[test]
-    fn definite_assignment_rejects_wrong_ternary_guard_arm() {
-        let mut function = CFunction::new("unguarded_return", CType::i32());
-        function.params.push(crate::ast::CParam {
-            ty: CType::Pointer(Box::new(CType::Void)),
-            name: "arg0".to_string(),
-        });
-        function.locals.push(crate::ast::CLocal {
-            ty: CType::i32(),
-            name: "result".to_string(),
-            stack_offset: None,
-        });
-        let is_null = CExpr::binary(
-            BinaryOp::Eq,
-            CExpr::Var("arg0".to_string()),
-            CExpr::IntLit(0),
-        );
-        function.body = vec![
-            CStmt::If {
-                cond: CExpr::binary(
-                    BinaryOp::Ne,
-                    CExpr::Var("arg0".to_string()),
-                    CExpr::IntLit(0),
-                ),
-                then_body: Box::new(CStmt::Expr(CExpr::assign(
-                    CExpr::Var("result".to_string()),
-                    CExpr::IntLit(1),
-                ))),
-                else_body: None,
-            },
-            CStmt::Return(Some(CExpr::Ternary {
-                cond: Box::new(is_null),
-                then_expr: Box::new(CExpr::Var("result".to_string())),
-                else_expr: Box::new(CExpr::IntLit(0)),
-            })),
-        ];
-
-        assert!(
-            definite_assignment_residual_reason(&function)
-                .is_some_and(|reason| reason.contains("result may be read before assignment"))
-        );
-    }
-
-    #[test]
-    fn definite_assignment_accepts_sequential_loop_condition_assignment() {
-        let mut function = CFunction::new("scan", CType::i32());
-        function.locals.push(crate::ast::CLocal {
-            ty: CType::i32(),
-            name: "byte".to_string(),
-            stack_offset: None,
-        });
-        function.body = vec![CStmt::While {
-            cond: CExpr::Comma(vec![
-                CExpr::assign(CExpr::Var("byte".to_string()), CExpr::IntLit(1)),
-                CExpr::binary(
-                    BinaryOp::Ne,
-                    CExpr::Var("byte".to_string()),
-                    CExpr::IntLit(0),
-                ),
-            ]),
-            body: Box::new(CStmt::Empty),
-        }];
-
-        assert_eq!(definite_assignment_residual_reason(&function), None);
     }
 
     fn empty_fold_context_for_linearization<'a>() -> FoldingContext<'a> {
@@ -5745,7 +4512,7 @@ mod tests {
                 r2types::DecompileRouteKind::Standard,
                 "certified source alias normalization",
                 None,
-                r2sym::RenderPermission::certified(
+                r2sym::RenderPermission::residual(
                     r2sym::ProofOwner::R2engine,
                     "certified source alias normalization",
                 ),
@@ -5863,46 +4630,6 @@ mod tests {
     }
 
     #[test]
-    fn standard_certified_c_requires_r2engine_proof_owner() {
-        let arch = test_arch_for_decompile();
-        let ops = vec![
-            R2ILOp::Copy {
-                dst: Varnode::register(0x00, 8),
-                src: Varnode::constant(7, 8),
-            },
-            R2ILOp::Return {
-                target: Varnode::register(0x00, 8),
-            },
-        ];
-        let prepared = prepared_from_ops(ops, &arch);
-        let route = test_decompile_route(
-            r2types::DecompileRouteKind::Standard,
-            "non-engine certified fixture",
-            None,
-            r2sym::RenderPermission::certified(
-                r2sym::ProofOwner::R2sym,
-                "non-engine certified fixture",
-            ),
-        );
-        let function_facts =
-            FunctionFacts::new(FunctionTypeFacts::default(), None).with_decompile_route(route);
-        let input = DecompilerInput::new(
-            prepared,
-            DecompilerContext::default().with_function_facts(function_facts),
-        );
-        let output = Decompiler::new(DecompilerConfig::x86_64()).decompile_input(&input);
-
-        assert!(
-            output.contains("CertifiedC render permission from non-engine proof owner R2sym"),
-            "wrong-owner CertifiedC must residualize before executable Standard rendering, got:\n{output}"
-        );
-        assert!(
-            !output.contains("return 7;"),
-            "wrong-owner CertifiedC must not emit executable C, got:\n{output}"
-        );
-    }
-
-    #[test]
     fn linearized_conditional_branch_without_predicate_is_residual_comment() {
         let blocks = vec![
             R2ILBlock {
@@ -6004,35 +4731,6 @@ mod tests {
             .with_name("stable_demo")
     }
 
-    #[test]
-    fn assignment_guard_consensus_polls_inside_pair_search() {
-        let stop = StopAtPoll::new(5, r2ssa::SsaExecutionStopReason::DeadlineExceeded);
-        let work = DecompileWorkControl::new(&stop, DecompileWorkPhase::Rendering);
-        let stop_reason = Cell::new(None);
-        let atom = CExpr::var("guard");
-        let mut clauses = vec![
-            vec![AssignmentGuardLiteral::Expression {
-                expr: atom.clone(),
-                truth: true,
-            }],
-            vec![AssignmentGuardLiteral::Expression {
-                expr: atom,
-                truth: false,
-            }],
-        ];
-
-        simplify_assignment_guard_clauses_with_control(&mut clauses, Some(work), &stop_reason);
-
-        assert_eq!(stop.polls.get(), 5);
-        assert_eq!(
-            stop_reason.get(),
-            Some(DecompileExecutionStop::new(
-                DecompileWorkPhase::Rendering,
-                r2ssa::SsaExecutionStopReason::DeadlineExceeded,
-            ))
-        );
-    }
-
     fn test_arch_for_decompile() -> ArchSpec {
         let mut arch = ArchSpec::new("x86-64");
         arch.add_register(RegisterDef::new("RAX", 0x00, 8));
@@ -6105,49 +4803,6 @@ mod tests {
             signature,
             [r2types::SignatureCertificateSource::ExternalContext],
         )
-    }
-
-    fn arg_memory_term(
-        offset: i64,
-        size: u32,
-        evidence: r2sym::SemanticEvidence,
-        value_expr: Option<&str>,
-        exact_value: bool,
-    ) -> r2sym::BackwardMemoryCondition {
-        r2sym::BackwardMemoryCondition {
-            region: r2sym::BackwardMemoryRegion::Argument { index: 0 },
-            address: r2sym::SemanticMemoryAddress::exact(offset),
-            size,
-            evidence,
-            binding: None,
-            expr: if offset == 0 {
-                "*arg0".to_string()
-            } else {
-                format!("*(arg0 + {offset})")
-            },
-            value_expr: value_expr.map(str::to_string),
-            exact_value,
-        }
-    }
-
-    fn compiled_summary(
-        simplified: &str,
-        precision: r2sym::BackwardConditionPrecision,
-        supported_paths: usize,
-        total_paths: usize,
-        memory_terms: Vec<r2sym::BackwardMemoryCondition>,
-    ) -> r2sym::BackwardConditionSummary {
-        r2sym::BackwardConditionSummary {
-            simplified: simplified.to_string(),
-            terms: vec![simplified.to_string()],
-            memory_terms,
-            backward_memory_substitutions: 0,
-            backward_memory_candidate_enumerations: 0,
-            backward_memory_residual_fallbacks: 0,
-            precision,
-            supported_paths,
-            total_paths,
-        }
     }
 
     fn large_cfg_worker_artifact(
@@ -6365,21 +5020,6 @@ mod tests {
         assert_eq!(params.len(), 2);
         assert_eq!(params[0].name, "buf");
         assert_eq!(params[1].name, "count");
-    }
-
-    #[test]
-    fn authorized_signature_canonicalizes_generic_names_by_abi_slot() {
-        let signature = signature_spec(
-            Some(CType::Int(32)),
-            vec![
-                ("arg1", Some(CType::Int(32))),
-                ("arg2", Some(CType::Int(32))),
-            ],
-        );
-        let params = params_from_authorized_signature(&signature);
-
-        assert_eq!(params[0].name, "arg0");
-        assert_eq!(params[1].name, "arg1");
     }
 
     #[test]
@@ -6646,14 +5286,14 @@ mod tests {
             "summary rendering must not infer route permission from semantics alone"
         );
 
-        let certified_route_facts =
+        let non_summary_route_facts =
             function_facts
                 .clone()
                 .with_decompile_route(test_decompile_route(
                     r2types::DecompileRouteKind::LinearWorker,
                     "wrong permission for summary route",
                     None,
-                    r2sym::RenderPermission::certified(
+                    r2sym::RenderPermission::residual(
                         r2sym::ProofOwner::R2engine,
                         "wrong permission for summary route",
                     ),
@@ -6661,7 +5301,7 @@ mod tests {
         assert!(
             super::render_semantic_worker_summary(
                 "sym.worker",
-                &certified_route_facts,
+                &non_summary_route_facts,
                 DecompilerConfig::default(),
             )
             .is_none(),
@@ -6908,7 +5548,7 @@ mod tests {
     }
 
     #[test]
-    fn decompile_input_standard_certified_summary_only_semantics_residualizes() {
+    fn decompile_input_standard_summary_only_semantics_residualizes() {
         let arch = test_arch_for_decompile();
         let prepared = prepared_from_ops(
             vec![R2ILOp::Return {
@@ -6930,7 +5570,7 @@ mod tests {
                     r2types::DecompileRouteKind::Standard,
                     "bad standard route over summary-only semantics",
                     None,
-                    r2sym::RenderPermission::certified(
+                    r2sym::RenderPermission::residual(
                         r2sym::ProofOwner::R2engine,
                         "bad standard route over summary-only semantics",
                     ),
@@ -6947,7 +5587,7 @@ mod tests {
         assert!(
             output
                 .contains("summary-only semantic artifact cannot authorize Standard executable C"),
-            "summary-only semantics must reject certified Standard output, got:\n{output}"
+            "summary-only semantics must reject Standard output, got:\n{output}"
         );
         assert!(
             !output.contains("return 0;"),
@@ -7837,8 +6477,7 @@ mod tests {
     }
 
     #[test]
-    fn decompiler_pipeline_keeps_observed_x86_struct_array_load_exprs_semantic_before_return_join()
-    {
+    fn hand_authored_struct_array_fixture_refuses_typed_rendering() {
         use std::collections::HashMap;
 
         let block = r2ssa::SSABlock {
@@ -8047,7 +6686,7 @@ mod tests {
             r2types::DecompileRouteKind::Standard,
             "x86 struct-array pipeline test route",
             None,
-            r2sym::RenderPermission::certified(
+            r2sym::RenderPermission::residual(
                 r2sym::ProofOwner::R2engine,
                 "x86 struct-array pipeline test route",
             ),
@@ -8167,7 +6806,7 @@ mod tests {
             strings: &decompiler.context.strings,
             symbols: &decompiler.context.symbols,
             function_facts: &decompiler.context.function_facts,
-            certified_rendering_required: false,
+            certified_rendering_required: true,
             stack_slots: &decompiler.context.type_facts().stack_slots,
             field_access_certificates: &decompiler.context.type_facts().field_access_certificates,
             #[cfg(test)]
@@ -8195,12 +6834,11 @@ mod tests {
         let stmts = fold_ctx.fold_block(&fold_blocks[0], fold_blocks[0].addr);
         let mut structurer = ControlFlowStructurer::new(func, &fold_ctx);
         let body_stmt = structurer.structure();
-        let normalized_body_stmt = fold_ctx.normalize_final_stmt_calls(body_stmt.clone());
 
         assert!(
             !matches!(eax2, CExpr::Member { .. } | CExpr::PtrMember { .. })
                 && !matches!(ecx1, CExpr::Member { .. } | CExpr::PtrMember { .. }),
-            "uncertified internal pipeline must not invent member loads without render certificates, eax2={eax2:?}, ecx1={ecx1:?}; params={params:?}; param_aliases={param_register_aliases:?}; type_hints={type_hints:?}"
+            "typed rendering must not invent member loads without exact owners, eax2={eax2:?}, ecx1={ecx1:?}; params={params:?}; param_aliases={param_register_aliases:?}; type_hints={type_hints:?}"
         );
         assert!(
             stmts.iter().all(|stmt| !matches!(stmt, CStmt::Return(_)))
@@ -8209,11 +6847,8 @@ mod tests {
             "incomplete FunctionFacts must residualize this block instead of fabricating a return, got {stmts:?}"
         );
         assert!(
-            !format!("{body_stmt:?}").contains("f_34")
-                && !format!("{body_stmt:?}").contains("f_8")
-                && !format!("{normalized_body_stmt:?}").contains("f_34")
-                && !format!("{normalized_body_stmt:?}").contains("f_8"),
-            "uncertified structuring must not preserve fake member loads, body={body_stmt:?}; normalized={normalized_body_stmt:?}"
+            !format!("{body_stmt:?}").contains("f_34") && !format!("{body_stmt:?}").contains("f_8"),
+            "uncertified structuring must not preserve fake member loads, body={body_stmt:?}"
         );
     }
 
@@ -10316,7 +8951,7 @@ mod tests {
         };
         let function_facts = FunctionFacts::new(type_facts, Some(semantic_artifact));
         let output = render_semantic_worker_summary(
-            "fnv_fold",
+            "byte_hash_worker",
             &function_facts,
             &test_summary_decompile_route(
                 r2types::DecompileRouteKind::SummaryIslands,
@@ -10913,90 +9548,5 @@ mod tests {
         assert!(is_autogenerated_function_name("_140010138"));
         assert!(is_autogenerated_function_name("_401000"));
         assert!(!is_autogenerated_function_name("_named_worker"));
-    }
-
-    #[test]
-    fn semantic_fallback_comment_reports_actionable_control_islands() {
-        let exact = r2sym::SemanticEvidence::exact();
-        let memory_term = arg_memory_term(8, 4, exact.clone(), None, false);
-        let region = test_semantic_region(
-            0x401000,
-            BTreeSet::from([0x401010, 0x401020]),
-            vec![test_control_fact(
-                0x401010,
-                r2sym::SymbolicReachabilityStatus::Reachable,
-                Some(true),
-                Some("x == 0"),
-                Some(compiled_summary(
-                    "x == 0",
-                    r2sym::BackwardConditionPrecision::Exact,
-                    1,
-                    1,
-                    vec![memory_term.clone()],
-                )),
-                exact.clone(),
-            )],
-            vec![test_memory_fact(memory_term, exact.clone())],
-        );
-        let semantic_artifact = large_cfg_worker_artifact(
-            r2sym::RefinementStage::Residual,
-            vec![r2sym::ResidualReason::LargeCfg],
-            vec![region],
-        );
-        let output = semantic_fallback_comment("_401000", Some(&semantic_artifact))
-            .expect("typed semantic fallback comment");
-        assert!(output.contains("semantic fallback: worker slice in residual mode"));
-        assert!(output.contains("regions=1"));
-        assert!(output.contains("actionable_conditions=1"));
-        assert!(output.contains("exact_conditions=1"));
-        assert!(output.contains("actionable_preview=[0x401000: x == 0]"));
-    }
-
-    #[test]
-    fn semantic_fallback_comment_reports_assumption_conflicts() {
-        let semantic_artifact = large_cfg_worker_artifact(
-            r2sym::RefinementStage::Residual,
-            vec![r2sym::ResidualReason::LargeCfg],
-            Vec::new(),
-        );
-        let mut assumption_usage = r2ssa::AssumptionUsageReport::default();
-        assumption_usage.mark_conflict(
-            &r2ssa::AnalysisAssumption {
-                id: Some("assumption_c".to_string()),
-                subject: r2ssa::AssumptionSubject::Parameter { index: 0 },
-                value: r2ssa::AssumptionValue::TypeHint {
-                    ty: "int32_t".to_string(),
-                },
-                scope: r2ssa::AssumptionScope::Function,
-                provenance: r2ssa::AssumptionProvenance::User,
-            },
-            "parameter type conflict",
-        );
-        assumption_usage.mark_conflict(
-            &r2ssa::AnalysisAssumption {
-                id: Some("assumption_d".to_string()),
-                subject: r2ssa::AssumptionSubject::Register {
-                    name: "rdi".to_string(),
-                },
-                value: r2ssa::AssumptionValue::TypeHint {
-                    ty: "int64_t".to_string(),
-                },
-                scope: r2ssa::AssumptionScope::Function,
-                provenance: r2ssa::AssumptionProvenance::User,
-            },
-            "register type conflict",
-        );
-        let function_facts = r2types::FunctionFacts::new(
-            r2types::FunctionTypeFacts::default(),
-            Some(semantic_artifact),
-        )
-        .with_assumption_usage(assumption_usage);
-        let output =
-            crate::consumer_fallback::semantic_fallback_comment("_401000", &function_facts)
-                .expect("typed semantic fallback comment");
-        assert!(
-            output.contains("assumption_conflicts=2"),
-            "expected fallback comment to report the assumption conflict count, got:\n{output}"
-        );
     }
 }

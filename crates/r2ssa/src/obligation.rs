@@ -15,7 +15,7 @@ use crate::graph::{InstId, InstPayload, SsaGraph, ValueId};
 use crate::op::SSAOp;
 use crate::semantic::{SourceBoundaryFacts, StructuredDataflowFacts};
 
-pub const SEMANTIC_OBLIGATION_SCHEMA_VERSION: u32 = 3;
+pub const SEMANTIC_OBLIGATION_SCHEMA_VERSION: u32 = 4;
 
 /// Stable location of one canonical SSA instruction.
 ///
@@ -288,24 +288,6 @@ impl SemanticObligationInventory {
         let mut unsupported = BTreeSet::<InstId>::new();
         let mut duplicate_seeds =
             BTreeSet::<(InstId, SemanticObligationKind, SemanticObligationComponent)>::new();
-        let o0_frame_structural_instructions = structured
-            .canonical_fnv_fold_o0
-            .values()
-            .flat_map(|fact| {
-                [
-                    fact.frame.allocate_inst,
-                    fact.frame.allocate_arithmetic_inst,
-                    fact.frame.restore_inst,
-                    fact.frame.restore_arithmetic_inst,
-                ]
-                .into_iter()
-                .chain(fact.frame.allocate_support_insts.iter().copied())
-                .chain(fact.frame.restore_support_insts.iter().copied())
-                .chain(fact.frame.address_support_insts.iter().copied())
-                .chain(fact.frame.return_target_support_insts.iter().copied())
-            })
-            .collect::<BTreeSet<_>>();
-
         for block_addr in &structured.unstructured_cycle_blocks {
             if let Some(block) = graph
                 .block_id_for_addr(*block_addr)
@@ -428,6 +410,26 @@ impl SemanticObligationInventory {
                         &mut required,
                     );
                 }
+            }
+            if let Some(return_address) = boundary.return_address {
+                seed_value_definition(
+                    graph,
+                    return_address.value,
+                    SemanticObligationKind::LiveValueProducer,
+                    &mut required,
+                );
+            }
+            if let Some(crate::semantic::SourceReturnStackPointerFact::ReachingValue {
+                value,
+                ..
+            }) = boundary.exit_stack_pointer
+            {
+                seed_value_definition(
+                    graph,
+                    value,
+                    SemanticObligationKind::LiveValueProducer,
+                    &mut required,
+                );
             }
             if !boundary.complete {
                 unsupported.insert(boundary.at);
@@ -583,9 +585,7 @@ impl SemanticObligationInventory {
                 SemanticInstructionState::UnsupportedUnknown
             } else if !kinds.is_empty() {
                 SemanticInstructionState::LiveObligation
-            } else if instruction_is_structural(&inst.payload)
-                || o0_frame_structural_instructions.contains(&inst.id)
-            {
+            } else if instruction_is_structural(&inst.payload) {
                 SemanticInstructionState::StructuralControlOnly
             } else {
                 SemanticInstructionState::ProvenDead
@@ -1255,76 +1255,6 @@ mod tests {
         vec![entry, header, exit, latch]
     }
 
-    fn fnv_obligation_fixture() -> Vec<R2ILBlock> {
-        let accumulator = Varnode::register(0, 8);
-        let index = Varnode::register(8, 8);
-        let buffer = Varnode::register(16, 8);
-        let length = Varnode::register(24, 8);
-        let address = Varnode::unique(0x10, 8);
-        let byte = Varnode::unique(0x20, 1);
-        let condition = Varnode::unique(0x30, 1);
-
-        let mut entry = R2ILBlock::new(0x7000, 4);
-        entry.push(R2ILOp::Copy {
-            dst: accumulator.clone(),
-            src: Varnode::constant(1_469_598_103_934_665_603, 8),
-        });
-        entry.push(R2ILOp::Copy {
-            dst: index.clone(),
-            src: Varnode::constant(0, 8),
-        });
-        entry.push(R2ILOp::Branch {
-            target: Varnode::ram(0x7010, 8),
-        });
-
-        let mut header = R2ILBlock::new(0x7010, 4);
-        header.push(R2ILOp::IntLess {
-            dst: condition.clone(),
-            a: index.clone(),
-            b: length,
-        });
-        header.push(R2ILOp::CBranch {
-            target: Varnode::ram(0x7020, 8),
-            cond: condition,
-        });
-
-        let mut exit = R2ILBlock::new(0x7014, 4);
-        exit.push(R2ILOp::Return {
-            target: Varnode::register(32, 8),
-        });
-
-        let mut latch = R2ILBlock::new(0x7020, 4);
-        latch.push(R2ILOp::IntAdd {
-            dst: address.clone(),
-            a: buffer,
-            b: index.clone(),
-        });
-        latch.push(R2ILOp::Load {
-            dst: byte.clone(),
-            space: SpaceId::Ram,
-            addr: address,
-        });
-        latch.push(R2ILOp::IntXor {
-            dst: accumulator.clone(),
-            a: accumulator.clone(),
-            b: byte,
-        });
-        latch.push(R2ILOp::IntMult {
-            dst: accumulator.clone(),
-            a: accumulator,
-            b: Varnode::constant(1_099_511_628_211, 8),
-        });
-        latch.push(R2ILOp::IntAdd {
-            dst: index.clone(),
-            a: index,
-            b: Varnode::constant(1, 8),
-        });
-        latch.push(R2ILOp::Branch {
-            target: Varnode::ram(0x7010, 8),
-        });
-        vec![entry, header, exit, latch]
-    }
-
     fn irreducible_cycle_fixture() -> Vec<R2ILBlock> {
         let mut entry = R2ILBlock::new(0x8000, 4);
         entry.push(R2ILOp::CBranch {
@@ -1926,7 +1856,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_function_interface_preserves_parameter_and_return_value() {
+    fn synthetic_interface_without_typed_machine_roles_is_refused() {
         let mut block = R2ILBlock::new(0x3140, 4);
         block.push(R2ILOp::Copy {
             dst: Varnode::unique(0x10, 8),
@@ -1963,15 +1893,6 @@ mod tests {
             SsaArtifact::raw_with_interface(&[block], Some(&x86_64_call_arch()), interface)
                 .expect("return artifact");
 
-        let parameter = artifact
-            .facts()
-            .boundaries
-            .parameters
-            .get(&0)
-            .expect("parameter fact");
-        assert_eq!(parameter.index, 0);
-        assert_eq!(parameter.storage, parameter_storage);
-        assert!(artifact.graph().def_inst(parameter.value).is_none());
         let returned = artifact
             .facts()
             .boundaries
@@ -1979,33 +1900,21 @@ mod tests {
             .values()
             .next()
             .expect("return boundary");
-        assert!(returned.complete);
-        assert_eq!(returned.values.len(), 1);
-        assert_eq!(
-            returned.values[0].slot,
-            CallBoundarySlot::Register {
-                index: 0,
-                storage: return_storage,
-            }
-        );
-        assert_eq!(
-            returned.values[0].value,
-            artifact.graph().insts[1].output.expect("return producer")
-        );
-        let return_instruction = artifact
+        assert!(artifact.facts().boundaries.parameters.is_empty());
+        assert!(!returned.complete);
+        assert!(returned.values.is_empty());
+        let producer = artifact
             .obligations()
             .instructions()
             .get(&CanonicalInstructionId {
                 block_addr: 0x3140,
-                site: CanonicalInstructionSite::Op(2),
+                site: CanonicalInstructionSite::Op(1),
             })
-            .expect("return instruction");
-        assert!(
-            return_instruction
-                .obligations
-                .iter()
-                .any(|obligation| obligation.kind == SemanticObligationKind::ReturnValue)
-        );
+            .expect("untrusted return producer");
+        assert_eq!(producer.state, SemanticInstructionState::UnsupportedUnknown);
+        assert!(producer.obligations.iter().any(|obligation| {
+            obligation.kind == SemanticObligationKind::VolatileOrUnknownEffect
+        }));
     }
 
     #[test]
@@ -2402,41 +2311,6 @@ mod tests {
             .filter(|id| *id != latch)
             .collect::<Vec<_>>();
         let report = inventory.audit_coverage(without_latch);
-        assert_eq!(report.missing, vec![latch]);
-        assert!(!report.is_closed());
-    }
-
-    #[test]
-    fn removing_fnv_accumulator_latch_fails_before_rendering() {
-        let artifact =
-            SsaArtifact::raw(&fnv_obligation_fixture(), None).expect("FNV loop artifact");
-        let inventory = artifact.obligations();
-        let latch = inventory
-            .obligations
-            .keys()
-            .copied()
-            .find(|id| {
-                id.kind == SemanticObligationKind::LiveStateTransition
-                    && matches!(
-                        id.component,
-                        SemanticObligationComponent::LoopTransition {
-                            carrier: CanonicalStorageId {
-                                space: crate::CanonicalStorageSpace::Register,
-                                offset: 0,
-                                size: 8,
-                            },
-                            predecessor: 0x7020,
-                        }
-                    )
-            })
-            .expect("FNV accumulator latch obligation");
-        let rendered_without_latch = inventory
-            .obligations
-            .keys()
-            .copied()
-            .filter(|id| *id != latch)
-            .collect::<Vec<_>>();
-        let report = inventory.audit_coverage(rendered_without_latch);
         assert_eq!(report.missing, vec![latch]);
         assert!(!report.is_closed());
     }

@@ -2673,16 +2673,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         Ok(stmt)
     }
 
-    pub(crate) fn cleanup_preserving_render_proof_identity_with_control(
-        stmt: CStmt,
-        control: DecompileWorkControl<'_>,
-    ) -> Result<CStmt, DecompileExecutionStop> {
-        Self::poll_stmt_tree(&stmt, control)?;
-        let stmt = Self::cleanup_preserving_render_proof_identity(stmt);
-        Self::poll_stmt_tree(&stmt, control)?;
-        Ok(stmt)
-    }
-
     fn poll_stmt_tree(
         stmt: &CStmt,
         control: DecompileWorkControl<'_>,
@@ -2728,88 +2718,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             _ => {}
         }
         Ok(())
-    }
-
-    /// Normalize a certified statement tree without changing its control or
-    /// effect inventory.  The only loop rewrite is the canonical equivalence
-    /// `init; while (cond) { body; update; }` -> `for (init; cond; update)`;
-    /// branch inversion, guard factoring, and tail truncation are deliberately
-    /// excluded because they require their own proof transformations.
-    pub(crate) fn cleanup_preserving_render_proof_identity(stmt: CStmt) -> CStmt {
-        let stmt = match stmt {
-            CStmt::Block(stmts) => {
-                let cleaned = stmts
-                    .into_iter()
-                    .map(Self::cleanup_preserving_render_proof_identity)
-                    .filter(|stmt| !matches!(stmt, CStmt::Empty))
-                    .collect();
-                let rewritten = Self::rewrite_block_loops_to_for(cleaned);
-                Self::stmt_from_vec(rewritten)
-            }
-            CStmt::If {
-                cond,
-                then_body,
-                else_body,
-            } => CStmt::If {
-                cond,
-                then_body: Box::new(Self::cleanup_preserving_render_proof_identity(*then_body)),
-                else_body: else_body
-                    .map(|body| Box::new(Self::cleanup_preserving_render_proof_identity(*body))),
-            },
-            CStmt::While { cond, body } => CStmt::While {
-                cond,
-                body: Box::new(Self::strip_trailing_continue(
-                    Self::cleanup_preserving_render_proof_identity(*body),
-                )),
-            },
-            CStmt::DoWhile { body, cond } => CStmt::DoWhile {
-                body: Box::new(Self::strip_trailing_continue(
-                    Self::cleanup_preserving_render_proof_identity(*body),
-                )),
-                cond,
-            },
-            CStmt::For {
-                init,
-                cond,
-                update,
-                body,
-            } => CStmt::For {
-                init: init
-                    .map(|stmt| Box::new(Self::cleanup_preserving_render_proof_identity(*stmt))),
-                cond,
-                update,
-                body: Box::new(Self::strip_trailing_continue(
-                    Self::cleanup_preserving_render_proof_identity(*body),
-                )),
-            },
-            CStmt::Switch {
-                expr,
-                cases,
-                default,
-            } => CStmt::Switch {
-                expr,
-                cases: cases
-                    .into_iter()
-                    .map(|case| crate::ast::SwitchCase {
-                        value: case.value,
-                        body: case
-                            .body
-                            .into_iter()
-                            .map(Self::cleanup_preserving_render_proof_identity)
-                            .filter(|stmt| !matches!(stmt, CStmt::Empty))
-                            .collect(),
-                    })
-                    .collect(),
-                default: default.map(|body| {
-                    body.into_iter()
-                        .map(Self::cleanup_preserving_render_proof_identity)
-                        .filter(|stmt| !matches!(stmt, CStmt::Empty))
-                        .collect()
-                }),
-            },
-            other => other,
-        };
-        Self::flatten(stmt)
     }
 
     /// Recursively clean up children first, then apply local simplifications.
@@ -5558,7 +5466,7 @@ mod tests {
         }
     }
 
-    fn certified_standard_route_for_test(reason: &str) -> r2types::DecompileRouteFacts {
+    fn standard_route_for_test(reason: &str) -> r2types::DecompileRouteFacts {
         r2types::DecompileRouteFacts {
             kind: r2types::DecompileRouteKind::Standard,
             reason: Some(reason.to_string()),
@@ -5566,7 +5474,7 @@ mod tests {
             skip_runtime_type_inference: true,
             use_prepared_semantic_view: true,
             proof_coverage: r2sym::ProofCoverage::default(),
-            render_permission: r2sym::RenderPermission::certified(
+            render_permission: r2sym::RenderPermission::residual(
                 r2sym::ProofOwner::R2engine,
                 reason,
             ),
@@ -5578,10 +5486,17 @@ mod tests {
         ctx.inputs.certified_rendering_required = false;
     }
 
+    fn install_typed_function_facts(ctx: &mut FoldingContext<'_>, facts: r2types::FunctionFacts) {
+        install_function_facts(ctx, facts);
+        ctx.inputs.certified_rendering_required = true;
+    }
+
     fn install_semantic_artifact(ctx: &mut FoldingContext<'_>, artifact: r2sym::SemanticArtifact) {
+        let certified_rendering_required = ctx.inputs.certified_rendering_required;
         let mut function_facts = ctx.inputs.function_facts.clone();
         function_facts.set_semantics(Some(artifact));
         install_function_facts(ctx, function_facts);
+        ctx.inputs.certified_rendering_required = certified_rendering_required;
     }
 
     fn certified_function_facts(
@@ -5591,7 +5506,7 @@ mod tests {
         let mut facts = r2types::FunctionFacts::default()
             .with_control(control)
             .with_render(render)
-            .with_decompile_route(certified_standard_route_for_test("test certified Standard"));
+            .with_decompile_route(standard_route_for_test("test typed render facts"));
         add_test_x86_64_signature(&mut facts);
         facts
     }
@@ -6282,10 +6197,9 @@ mod tests {
         certified_ctx.inputs.prepared_ssa = Some(&prepared);
         function_facts.set_render(render_facts_for_prepared(&prepared));
         add_test_x86_64_signature(&mut function_facts);
-        install_function_facts(
+        install_typed_function_facts(
             &mut certified_ctx,
-            function_facts
-                .with_decompile_route(certified_standard_route_for_test("test certified branch")),
+            function_facts.with_decompile_route(standard_route_for_test("test typed branch")),
         );
         let mut certified_structurer =
             ControlFlowStructurer::new(prepared.function(), &certified_ctx);
@@ -6297,13 +6211,11 @@ mod tests {
 
         let mut missing_control_ctx = FoldingContext::new(64);
         missing_control_ctx.inputs.prepared_ssa = Some(&prepared);
-        install_function_facts(
+        install_typed_function_facts(
             &mut missing_control_ctx,
             r2types::FunctionFacts::default()
                 .with_render(render_facts_for_prepared(&prepared))
-                .with_decompile_route(certified_standard_route_for_test(
-                    "test certified missing branch proof",
-                )),
+                .with_decompile_route(standard_route_for_test("test typed missing branch proof")),
         );
         let mut missing_control_structurer =
             ControlFlowStructurer::new(prepared.function(), &missing_control_ctx);
@@ -6330,7 +6242,7 @@ mod tests {
         let certified_control = control_facts_for_guarded_while_loop(&prepared, true);
         let mut certified_ctx = FoldingContext::new(64);
         certified_ctx.inputs.prepared_ssa = Some(&prepared);
-        install_function_facts(
+        install_typed_function_facts(
             &mut certified_ctx,
             certified_function_facts(certified_control, render_facts_for_prepared(&prepared)),
         );
@@ -6358,7 +6270,7 @@ mod tests {
         let missing_loop_control = control_facts_for_guarded_while_loop(&prepared, false);
         let mut missing_loop_ctx = FoldingContext::new(64);
         missing_loop_ctx.inputs.prepared_ssa = Some(&prepared);
-        install_function_facts(
+        install_typed_function_facts(
             &mut missing_loop_ctx,
             certified_function_facts(missing_loop_control, render_facts_for_prepared(&prepared)),
         );
@@ -6386,7 +6298,7 @@ mod tests {
         let certified_control = control_facts_for_switch(&prepared, true);
         let mut certified_ctx = FoldingContext::new(64);
         certified_ctx.inputs.prepared_ssa = Some(&prepared);
-        install_function_facts(
+        install_typed_function_facts(
             &mut certified_ctx,
             certified_function_facts(certified_control, render_facts_for_prepared(&prepared)),
         );
@@ -6406,7 +6318,7 @@ mod tests {
         let selector_only_control = control_facts_for_switch(&prepared, false);
         let mut selector_only_ctx = FoldingContext::new(64);
         selector_only_ctx.inputs.prepared_ssa = Some(&prepared);
-        install_function_facts(
+        install_typed_function_facts(
             &mut selector_only_ctx,
             certified_function_facts(selector_only_control, render_facts_for_prepared(&prepared)),
         );
@@ -7763,11 +7675,10 @@ mod tests {
     fn certified_structuring_refuses_symbolic_exact_target_branch_elision() {
         let func = function_with_conditional_return_blocks(0x2000, 0x2004, 0x2008);
         let mut ctx = FoldingContext::new(64);
-        install_function_facts(
+        install_typed_function_facts(
             &mut ctx,
-            r2types::FunctionFacts::default().with_decompile_route(
-                certified_standard_route_for_test("test certified exact target refusal"),
-            ),
+            r2types::FunctionFacts::default()
+                .with_decompile_route(standard_route_for_test("test typed exact target refusal")),
         );
         let region = crate::test_semantic_region(
             0x2000,

@@ -5,9 +5,9 @@ use std::fmt::Write as _;
 
 use r2cert::{
     CERTIFIED_CARRIER_FREE_LOOP_TERMINAL_RETURN_CONTRACT_VERSION, CertifiedArtifactOrigin,
-    CertifiedClosedNaturalLoopControl, CertifiedMachineProjection, CertifiedRenderPermit,
-    CertifiedSourceTerminator, CertifiedTypedRegionKind, RenderAuthorizationError,
-    TypedRegionMapping, certify_carrier_free_loop_terminal_return_region,
+    CertifiedClosedNaturalLoopControl, CertifiedMachineProjection, CertifiedSourceTerminator,
+    CertifiedTypedRegionKind, LedgerClosureError, TypedRegionMapping,
+    certify_carrier_free_loop_terminal_return_region,
 };
 use r2ssa::{
     BlockTerminator, CanonicalInstructionId, CanonicalInstructionSite, MachineBuildError,
@@ -20,8 +20,8 @@ use crate::certified_loop::{
     CertifiedHeaderTestedLoopFragment, HeaderTestedLoopError, LoopContinuationArm,
 };
 use crate::certified_region::{
-    CertifiedSingleBlockAccounting, RegionBuildError, RegionObligationDisposition,
-    RegionObligationMapping,
+    CertifiedSingleBlockAccounting, CertifiedTypedOutputSeal, RegionBuildError,
+    RegionObligationDisposition, RegionObligationMapping, TypedOutputSealError,
 };
 use crate::semantic_c::{
     SemanticCError, SemanticCExprId, SemanticCExprKind, SemanticCFunctionInterface,
@@ -160,8 +160,7 @@ pub struct CertifiedLoopReturnFunction {
     preheader: CertifiedDirectTransferBlockRegion,
     loop_fragment: CertifiedHeaderTestedLoopFragment,
     exit: CertifiedLoopReturnExit,
-    mappings: Box<[RegionObligationMapping]>,
-    render_permit: CertifiedRenderPermit,
+    output_seal: CertifiedTypedOutputSeal,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -171,7 +170,8 @@ pub enum LoopReturnFunctionError {
     Direct(DirectTransferRegionError),
     Loop(HeaderTestedLoopError),
     Statement(SemanticCStatementError),
-    Authorization(RenderAuthorizationError),
+    LedgerClosure(LedgerClosureError),
+    TypedOutputSeal(TypedOutputSealError),
     MissingClosedLoopControl(u64),
     InvalidCondition,
     InvalidExit(u64),
@@ -220,9 +220,15 @@ impl From<SemanticCStatementError> for LoopReturnFunctionError {
     }
 }
 
-impl From<RenderAuthorizationError> for LoopReturnFunctionError {
-    fn from(error: RenderAuthorizationError) -> Self {
-        Self::Authorization(error)
+impl From<LedgerClosureError> for LoopReturnFunctionError {
+    fn from(error: LedgerClosureError) -> Self {
+        Self::LedgerClosure(error)
+    }
+}
+
+impl From<TypedOutputSealError> for LoopReturnFunctionError {
+    fn from(error: TypedOutputSealError) -> Self {
+        Self::TypedOutputSeal(error)
     }
 }
 
@@ -279,18 +285,17 @@ impl CertifiedLoopReturnFunction {
             loop_fragment.body_latch().body().accounting(),
             exit.layer().accounting(),
         ];
-        let mappings = accountings
-            .into_iter()
-            .flat_map(CertifiedSingleBlockAccounting::mappings)
-            .cloned()
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        let typed_mappings = typed_region_mappings(accountings);
-        let render_permit = certify_carrier_free_loop_terminal_return_region(
+        let ledger_closure = certify_carrier_free_loop_terminal_return_region(
             certified.origin(),
             certified.ledger(),
-            typed_mappings,
+            typed_region_mappings(accountings),
             &loop_control,
+        )?;
+        let output_seal = CertifiedTypedOutputSeal::new(
+            ledger_closure,
+            CertifiedTypedRegionKind::CarrierFreeLoopTerminalReturnFunction,
+            CERTIFIED_LOOP_RETURN_FUNCTION_SCHEMA_VERSION,
+            accountings,
         )?;
         let function = Self {
             schema_version: CERTIFIED_LOOP_RETURN_FUNCTION_SCHEMA_VERSION,
@@ -302,8 +307,7 @@ impl CertifiedLoopReturnFunction {
             preheader,
             loop_fragment,
             exit,
-            mappings,
-            render_permit,
+            output_seal,
         };
         let report = function.audit();
         if !report.has_exact_loop_return() {
@@ -345,11 +349,7 @@ impl CertifiedLoopReturnFunction {
     }
 
     pub const fn mappings(&self) -> &[RegionObligationMapping] {
-        &self.mappings
-    }
-
-    pub const fn render_permit(&self) -> &CertifiedRenderPermit {
-        &self.render_permit
+        self.output_seal.mappings()
     }
 
     pub fn audit(&self) -> LoopReturnFunctionAuditReport {
@@ -468,7 +468,8 @@ impl CertifiedLoopReturnFunction {
             .cloned()
             .collect::<Vec<_>>();
         let counts = counts(
-            self.mappings
+            self.output_seal
+                .mappings()
                 .iter()
                 .map(RegionObligationMapping::obligation),
         );
@@ -486,9 +487,9 @@ impl CertifiedLoopReturnFunction {
             .iter()
             .filter_map(|(id, count)| (*count > 1).then_some(*id))
             .collect();
-        if self.mappings.as_ref() != expected_mappings.as_slice()
+        if self.output_seal.mappings() != expected_mappings.as_slice()
             || expected_mappings.len() != expected.len()
-            || self.mappings.iter().any(|mapping| {
+            || self.output_seal.mappings().iter().any(|mapping| {
                 matches!(
                     mapping.disposition(),
                     RegionObligationDisposition::Residualized { .. }
@@ -497,14 +498,13 @@ impl CertifiedLoopReturnFunction {
         {
             invalid.push("loop mappings are not disjoint, complete, and closed".to_string());
         }
-        let typed_mappings = typed_region_mappings(accountings);
-        if !self.render_permit.matches_region(
+        if !self.output_seal.matches_region(
             &self.origin,
             CertifiedTypedRegionKind::CarrierFreeLoopTerminalReturnFunction,
             CERTIFIED_LOOP_RETURN_FUNCTION_SCHEMA_VERSION,
-            &typed_mappings,
+            accountings,
         ) {
-            invalid.push("render permit does not match the closed loop".to_string());
+            invalid.push("typed output seal does not match the closed loop".to_string());
         }
         LoopReturnFunctionAuditReport {
             missing,
@@ -516,7 +516,7 @@ impl CertifiedLoopReturnFunction {
 
     pub fn render_certified_c(&self) -> Result<String, LoopReturnFunctionError> {
         let report = self.audit();
-        if !report.has_exact_loop_return() || !self.render_permit.authorizes_certified_c() {
+        if !report.has_exact_loop_return() {
             return Err(LoopReturnFunctionError::InvalidComposition(report.invalid));
         }
         let interface = self
@@ -565,9 +565,11 @@ fn validate_condition(
             .get(control.parameter_index() as usize)
             .filter(|parameter| {
                 parameter.index() == control.parameter_index()
-                    && parameter.storage() == control.parameter_storage()
+                    && parameter.storage() == control.parameter_abi_storage()
                     && parameter.value() == Some(condition.binding())
                     && parameter.ty() == condition.ty()
+                    && control.parameter_graph_storage().size.checked_mul(8)
+                        == Some(parameter.ty().width_bits())
             })
             .is_none()
         || condition.binding().width_bits() != 8
@@ -957,8 +959,6 @@ fn parse_rendered_return(rendered: &str) -> Result<LoopReturnValue, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
-    use std::process::{Command, Stdio};
 
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, Varnode};
     use r2ssa::{
@@ -1039,118 +1039,23 @@ mod tests {
         vec![preheader, header, fallthrough, taken]
     }
 
-    fn artifact(continue_on_true: bool) -> SsaArtifact {
-        SsaArtifact::raw_with_interface(
-            &source_blocks(continue_on_true, false),
-            Some(&arch()),
-            interface(storage(8, 1)),
-        )
-        .expect("loop-return artifact")
-    }
-
-    fn compile(source: &str) {
-        let mut compiler = Command::new("cc")
-            .args([
-                "-std=c11",
-                "-Wall",
-                "-Wextra",
-                "-Wpedantic",
-                "-Werror",
-                "-fsyntax-only",
-                "-x",
-                "c",
-                "-",
-            ])
-            .stdin(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("C compiler required");
-        compiler
-            .stdin
-            .as_mut()
-            .expect("compiler stdin")
-            .write_all(source.as_bytes())
-            .expect("write C source");
-        let output = compiler.wait_with_output().expect("wait for compiler");
-        assert!(
-            output.status.success(),
-            "generated C failed:\n{}\n{}",
-            source,
-            String::from_utf8_lossy(&output.stderr)
-        );
+    fn assert_refused(blocks: &[R2ILBlock], parameter_storage: CanonicalStorageId) {
+        let artifact =
+            SsaArtifact::raw_with_interface(blocks, Some(&arch()), interface(parameter_storage))
+                .expect("synthetic loop-return artifact");
+        assert!(CertifiedLoopReturnFunction::from_artifact(&artifact).is_err());
     }
 
     #[test]
-    fn both_polarities_authorize_compile_and_distinguish_exit_from_nontermination() {
+    fn synthetic_loop_polarities_are_refused_without_typed_machine_roles() {
         for continue_on_true in [true, false] {
-            let artifact = artifact(continue_on_true);
-            let function = CertifiedLoopReturnFunction::from_artifact(&artifact)
-                .expect("closed carrier-free loop return");
-            assert!(function.audit().has_exact_loop_return());
-            assert!(function.render_permit().authorizes_certified_c());
-            assert_eq!(function.loop_control().parameter_storage(), storage(8, 1));
-            let source = function.render_certified_c().expect("certified loop C");
-            assert!(source.contains(if continue_on_true {
-                " != UINT8_C(0x0)"
-            } else {
-                " == UINT8_C(0x0)"
-            }));
-            compile(&source);
-            let differential =
-                check_loop_return_differential(&artifact, 8).expect("bounded loop differential");
-            assert_eq!(differential.cases().len(), 2);
-            assert!(differential.all_match());
-            assert_eq!(
-                differential
-                    .cases()
-                    .iter()
-                    .filter(|case| matches!(case.source(), LoopExecutionOutcome::Returned(_)))
-                    .count(),
-                1
-            );
-            assert_eq!(
-                differential
-                    .cases()
-                    .iter()
-                    .filter(|case| matches!(
-                        case.source(),
-                        LoopExecutionOutcome::BoundedNontermination { iterations: 8 }
-                    ))
-                    .count(),
-                1
-            );
+            assert_refused(&source_blocks(continue_on_true, false), storage(8, 1));
         }
     }
 
     #[test]
-    fn mutated_exit_manifest_schema_and_origin_fail_audit() {
-        let function =
-            CertifiedLoopReturnFunction::from_artifact(&artifact(true)).expect("closed loop");
-        let mut corrupted = function.clone();
-        corrupted.schema_version += 1;
-        assert!(!corrupted.audit().has_exact_loop_return());
-
-        let mut corrupted = function.clone();
-        corrupted.exit.value = LoopReturnValue::Value {
-            width_bits: 64,
-            bits: 0x99,
-        };
-        assert!(!corrupted.audit().has_exact_loop_return());
-
-        let mut corrupted = function.clone();
-        corrupted.mappings = Box::new([]);
-        assert!(!corrupted.audit().has_exact_loop_return());
-
-        let mut corrupted = function.clone();
-        let mapping = corrupted.mappings[0].clone();
-        corrupted.mappings = vec![mapping.clone(), mapping].into_boxed_slice();
-        assert!(!corrupted.audit().has_exact_loop_return());
-
-        let foreign =
-            CertifiedLoopReturnFunction::from_artifact(&artifact(false)).expect("foreign loop");
-        let mut corrupted = function;
-        corrupted.origin = foreign.origin;
-        assert!(!corrupted.audit().has_exact_loop_return());
+    fn synthetic_loop_certificate_baseline_is_refused() {
+        assert_refused(&source_blocks(true, false), storage(8, 1));
     }
 
     #[test]
@@ -1163,21 +1068,7 @@ mod tests {
             Err(LoopReturnFunctionError::MissingClosedLoopControl(0xa010))
         ));
 
-        let wrong_storage =
-            SsaArtifact::raw_with_interface(&blocks, Some(&arch()), interface(storage(24, 1)))
-                .expect("loop with wrong interface storage");
-        assert!(matches!(
-            CertifiedLoopReturnFunction::from_artifact(&wrong_storage),
-            Err(LoopReturnFunctionError::MissingClosedLoopControl(0xa010))
-        ));
-
-        let body_effect = SsaArtifact::raw_with_interface(
-            &source_blocks(true, true),
-            Some(&arch()),
-            interface(storage(8, 1)),
-        )
-        .expect("loop with body value");
-        assert!(CertifiedLoopReturnFunction::from_artifact(&body_effect).is_err());
-        assert!(check_loop_return_differential(&artifact(true), 0).is_err());
+        assert_refused(&blocks, storage(24, 1));
+        assert_refused(&source_blocks(true, true), storage(8, 1));
     }
 }

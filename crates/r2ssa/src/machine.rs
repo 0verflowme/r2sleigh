@@ -2108,7 +2108,7 @@ mod tests {
     }
 
     #[test]
-    fn fnv_multiply_is_unsigned_64_bit_wrapping_arithmetic() {
+    fn unsigned_64_bit_multiply_retains_wrapping_arithmetic() {
         const FNV_OFFSET: u64 = 0xcbf29ce484222325;
         const FNV_PRIME: u64 = 0x100000001b3;
         let initial = Varnode::unique(0x10, 8);
@@ -2267,9 +2267,11 @@ mod tests {
             .map(|entity| machine.expr(entity.root()).expect("flag expression"))
             .collect::<Vec<_>>();
         assert_eq!(flags.len(), 3);
-        assert!(flags
-            .iter()
-            .all(|flag| flag.ty() == &MachineType::Bool { storage_bits: 8 }));
+        assert!(
+            flags
+                .iter()
+                .all(|flag| flag.ty() == &MachineType::Bool { storage_bits: 8 })
+        );
         assert!(matches!(
             flags[0].kind(),
             MachineExprKind::ArithmeticFlag {

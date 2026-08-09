@@ -380,7 +380,6 @@ mod ffi {
         let first_defuse = normalize_json_output(&first.defuse_json);
         let second_defuse = normalize_json_output(&second.defuse_json);
         assert_eq!(first_defuse, second_defuse, "defuse mismatch for {}", arch);
-
     }
 
     fn contains_unsigned_int_meta(value: &Value) -> bool {
@@ -939,187 +938,6 @@ mod ffi {
     }
 
     #[test]
-    fn recover_vars_uses_pointer_metadata_for_arg_type() {
-        if !require_plugin() {
-            eprintln!("Skipping: plugin not built");
-            return;
-        }
-
-        unsafe {
-            let lib = libloading::Library::new(PLUGIN_PATH).expect("load plugin");
-
-            let r2il_arch_init: libloading::Symbol<
-                unsafe extern "C" fn(*const c_char) -> *mut std::ffi::c_void,
-            > = lib.get(b"r2il_arch_init").unwrap();
-            let r2il_lift: libloading::Symbol<
-                unsafe extern "C" fn(
-                    *mut std::ffi::c_void,
-                    *const u8,
-                    usize,
-                    u64,
-                ) -> *mut std::ffi::c_void,
-            > = lib.get(b"r2il_lift").unwrap();
-            let r2sleigh_recover_vars: libloading::Symbol<
-                unsafe extern "C" fn(
-                    *const std::ffi::c_void,
-                    *const *const std::ffi::c_void,
-                    usize,
-                    u64,
-                ) -> *mut c_char,
-            > = lib.get(b"r2sleigh_recover_vars").unwrap();
-            let r2il_free: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
-                lib.get(b"r2il_free").unwrap();
-            let r2il_block_free: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
-                lib.get(b"r2il_block_free").unwrap();
-            let r2il_string_free: libloading::Symbol<unsafe extern "C" fn(*mut c_char)> =
-                lib.get(b"r2il_string_free").unwrap();
-
-            let arch = CString::new("x86-64").unwrap();
-            let ctx = r2il_arch_init(arch.as_ptr());
-            assert!(!ctx.is_null(), "Failed to initialize x86-64 context");
-
-            // mov rax, rdi
-            let mut bytes = vec![0x48u8, 0x89, 0xF8];
-            bytes.resize(16, 0x90);
-            let block = r2il_lift(ctx, bytes.as_ptr(), bytes.len(), 0x1000);
-            assert!(!block.is_null(), "Failed to lift baseline instruction");
-
-            let block_ref = &mut *(block as *mut r2il::R2ILBlock);
-            let mut tagged = false;
-            for op in &mut block_ref.ops {
-                if let R2ILOp::Copy { src, .. } = op
-                    && src.space == r2il::SpaceId::Register
-                {
-                    let mut meta = r2il::VarnodeMetadata::default();
-                    meta.pointer_hint = Some(r2il::PointerHint::PointerLike);
-                    src.set_meta(meta);
-                    tagged = true;
-                    break;
-                }
-            }
-            assert!(tagged, "Expected to tag a register source with metadata");
-
-            let block_ptrs = [block as *const std::ffi::c_void];
-            let json_ptr =
-                r2sleigh_recover_vars(ctx, block_ptrs.as_ptr(), block_ptrs.len(), 0x1000);
-            assert!(!json_ptr.is_null(), "Expected recovered vars JSON");
-            let json_str = CStr::from_ptr(json_ptr).to_string_lossy().to_string();
-            r2il_string_free(json_ptr);
-
-            let parsed: Value = serde_json::from_str(&json_str).expect("valid recover vars json");
-            let vars = parsed.as_array().expect("recover vars array");
-            let has_pointer_arg = vars.iter().any(|entry| {
-                entry.get("reg").and_then(Value::as_str) == Some("rdi")
-                    && entry.get("type").and_then(Value::as_str) == Some("void *")
-            });
-            assert!(
-                has_pointer_arg,
-                "Recovered vars should include pointer-typed rdi arg from metadata: {}",
-                json_str
-            );
-
-            r2il_block_free(block);
-            r2il_free(ctx);
-        }
-    }
-
-    #[test]
-    fn analyze_fcn_annotations_include_semantic_metadata() {
-        if !require_plugin() {
-            eprintln!("Skipping: plugin not built");
-            return;
-        }
-
-        unsafe {
-            let lib = libloading::Library::new(PLUGIN_PATH).expect("load plugin");
-
-            let r2il_arch_init: libloading::Symbol<
-                unsafe extern "C" fn(*const c_char) -> *mut std::ffi::c_void,
-            > = lib.get(b"r2il_arch_init").unwrap();
-            let r2il_lift: libloading::Symbol<
-                unsafe extern "C" fn(
-                    *mut std::ffi::c_void,
-                    *const u8,
-                    usize,
-                    u64,
-                ) -> *mut std::ffi::c_void,
-            > = lib.get(b"r2il_lift").unwrap();
-            let r2sleigh_analyze_fcn_annotations: libloading::Symbol<
-                unsafe extern "C" fn(
-                    *const std::ffi::c_void,
-                    *const *const std::ffi::c_void,
-                    usize,
-                    u64,
-                ) -> *mut c_char,
-            > = lib.get(b"r2sleigh_analyze_fcn_annotations").unwrap();
-            let r2il_free: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
-                lib.get(b"r2il_free").unwrap();
-            let r2il_block_free: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
-                lib.get(b"r2il_block_free").unwrap();
-            let r2il_string_free: libloading::Symbol<unsafe extern "C" fn(*mut c_char)> =
-                lib.get(b"r2il_string_free").unwrap();
-
-            let arch = CString::new("x86-64").unwrap();
-            let ctx = r2il_arch_init(arch.as_ptr());
-            assert!(!ctx.is_null(), "Failed to initialize x86-64 context");
-
-            let mut bytes = vec![0x31u8, 0xC0]; // xor eax, eax
-            bytes.resize(16, 0x90);
-            let block = r2il_lift(ctx, bytes.as_ptr(), bytes.len(), 0x1000);
-            assert!(!block.is_null(), "Failed to lift baseline instruction");
-
-            let block_ref = &mut *(block as *mut r2il::R2ILBlock);
-            let mut tagged = false;
-            for op in &mut block_ref.ops {
-                if let R2ILOp::Copy { dst, .. } = op {
-                    let mut meta = r2il::VarnodeMetadata::default();
-                    meta.storage_class = Some(r2il::StorageClass::ThreadLocal);
-                    dst.set_meta(meta);
-                    tagged = true;
-                    break;
-                }
-            }
-            assert!(tagged, "Expected to tag at least one varnode with metadata");
-            block_ref.set_op_metadata(
-                0,
-                r2il::OpMetadata {
-                    memory_class: Some(r2il::MemoryClass::ThreadLocal),
-                    ..Default::default()
-                },
-            );
-
-            let block_ptrs = [block as *const std::ffi::c_void];
-            let json_ptr = r2sleigh_analyze_fcn_annotations(
-                ctx,
-                block_ptrs.as_ptr(),
-                block_ptrs.len(),
-                0x1000,
-            );
-            assert!(!json_ptr.is_null(), "Expected function annotations JSON");
-            let json_str = CStr::from_ptr(json_ptr).to_string_lossy().to_string();
-            r2il_string_free(json_ptr);
-
-            let parsed: Value = serde_json::from_str(&json_str).expect("valid annotations json");
-            let anns = parsed.as_array().expect("annotations array");
-            let has_meta_comment = anns.iter().any(|entry| {
-                entry
-                    .get("comment")
-                    .and_then(Value::as_str)
-                    .map(|s| s.contains("meta ") && s.contains("thread_local"))
-                    .unwrap_or(false)
-            });
-            assert!(
-                has_meta_comment,
-                "Function annotations should include semantic metadata summary: {}",
-                json_str
-            );
-
-            r2il_block_free(block);
-            r2il_free(ctx);
-        }
-    }
-
-    #[test]
     fn block_validate_rejects_invalid_guarded_memory_op() {
         if !require_plugin() {
             eprintln!("Skipping: plugin not built");
@@ -1548,7 +1366,6 @@ mod ffi {
         }
         assert_ffi_deterministic_for_arch("riscv32", RISCV_BYTES_BASE, RISCV_BYTES_BASE);
     }
-
 }
 
 #[cfg(target_os = "macos")]

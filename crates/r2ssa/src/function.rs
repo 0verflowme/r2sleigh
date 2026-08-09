@@ -30,7 +30,6 @@ use crate::machine_context::{
 use crate::naming::{ARCH_DERIVED_CACHE_MAX_ENTRIES, ArchCacheTag, cached_register_name_map};
 use crate::op::SSAOp;
 use crate::phi::{PhiPlacement, collect_defs_from_cfg_with_names_storage_and_control};
-use crate::private_frame::{PrivateFrameFact, collect_private_frame_fact};
 use crate::rename::{
     CallBoundaryConfig, CallBoundaryDef, rename_function_with_names_and_call_boundaries_and_control,
 };
@@ -91,16 +90,45 @@ pub enum FunctionPrepareMode {
     Symbolic,
 }
 
+/// Unforgeable run-local identity for one immutable SSA artifact.
+///
+/// Cloning an artifact retains this identity. Rebuilding identical source
+/// bytes creates a distinct identity, so downstream proof owners can reject
+/// artifact-local handles from an independently reconstructed graph without
+/// relying on names, addresses, or a probabilistic hash.
+#[derive(Clone)]
+pub struct SsaArtifactAuthority(Arc<()>);
+
+impl SsaArtifactAuthority {
+    fn new() -> Self {
+        Self(Arc::new(()))
+    }
+}
+
+impl std::fmt::Debug for SsaArtifactAuthority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SsaArtifactAuthority(..)")
+    }
+}
+
+impl PartialEq for SsaArtifactAuthority {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for SsaArtifactAuthority {}
+
 /// Canonical SSA artifact consumed by downstream analysis layers.
 #[derive(Debug, Clone)]
 pub struct SsaArtifact {
+    authority: SsaArtifactAuthority,
     function: SSAFunction,
     graph: SsaGraph,
     mode: FunctionPrepareMode,
     facts: PreparedFunctionFacts,
     machine_context: SourceMachineContext,
     aggregate_accesses: AggregateAccessProjectionFacts,
-    private_frame: Option<PrivateFrameFact>,
 }
 
 impl SsaArtifact {
@@ -145,26 +173,22 @@ impl SsaArtifact {
             &facts.structured.memory_accesses,
             &machine_context,
         );
-        let private_frame = machine_context.function_interface().and_then(|interface| {
-            collect_private_frame_fact(
-                mode,
-                &function,
-                &graph,
-                &facts,
-                &machine_context,
-                interface.revision_identity(),
-            )
-        });
         control.poll()?;
         Ok(Self {
+            authority: SsaArtifactAuthority::new(),
             function,
             graph,
             mode,
             facts,
             machine_context,
             aggregate_accesses,
-            private_frame,
         })
+    }
+
+    /// Run-local identity shared by every clone and downstream proof derived
+    /// from this exact artifact instance.
+    pub const fn authority(&self) -> &SsaArtifactAuthority {
+        &self.authority
     }
 
     pub fn from_blocks(blocks: &[R2ILBlock], arch: Option<&ArchSpec>) -> Option<Self> {
@@ -367,10 +391,6 @@ impl SsaArtifact {
         &self.aggregate_accesses
     }
 
-    pub const fn private_frame(&self) -> Option<&PrivateFrameFact> {
-        self.private_frame.as_ref()
-    }
-
     pub fn with_assumptions(&self, assumptions: &AssumptionSet) -> Self {
         let facts = PreparedFunctionFacts::collect_with_context(
             &self.function,
@@ -384,27 +404,14 @@ impl SsaArtifact {
             &facts.structured.memory_accesses,
             &self.machine_context,
         );
-        let private_frame = self
-            .machine_context
-            .function_interface()
-            .and_then(|interface| {
-                collect_private_frame_fact(
-                    self.mode,
-                    &self.function,
-                    &self.graph,
-                    &facts,
-                    &self.machine_context,
-                    interface.revision_identity(),
-                )
-            });
         Self {
+            authority: SsaArtifactAuthority::new(),
             function: self.function.clone(),
             graph: self.graph.clone(),
             mode: self.mode,
             facts,
             machine_context: self.machine_context.clone(),
             aggregate_accesses,
-            private_frame,
         }
     }
 
@@ -1492,10 +1499,7 @@ impl SSAFunction {
 
     /// Return name-independent storage provenance retained from the lifted
     /// varnode that produced or supplied this SSA value.
-    pub(crate) fn canonical_storage_for_var(
-        &self,
-        var: &SSAVar,
-    ) -> Option<CanonicalStorageId> {
+    pub(crate) fn canonical_storage_for_var(&self, var: &SSAVar) -> Option<CanonicalStorageId> {
         self.canonical_storage_by_var.get(var).copied()
     }
 

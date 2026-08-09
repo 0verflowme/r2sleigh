@@ -64,6 +64,11 @@ int main(void) {
 			.offset = 0x30,
 			.size = 8,
 		},
+		.stack_pointer_storage = {
+			.space = R2SLEIGH_SOURCE_STORAGE_REGISTER_V2,
+			.offset = 0x38,
+			.size = 8,
+		},
 	};
 	R2SleighSourceCallSiteInterfaceV2 call_site = {
 		.schema_version = R2SLEIGH_SOURCE_CALL_SITE_SCHEMA_V2,
@@ -74,9 +79,9 @@ int main(void) {
 		},
 	};
 	const R2SleighApiV2 *api = r2sleigh_api_v2 ();
-	if (R2SLEIGH_RADARE_ABI_V2 != 136
-		|| R2SLEIGH_SOURCE_INTERFACE_SCHEMA_V2 != 6
-		|| source_interface.schema_version != 6
+	if (R2SLEIGH_RADARE_ABI_V2 != 137
+		|| R2SLEIGH_SOURCE_INTERFACE_SCHEMA_V2 != 7
+		|| source_interface.schema_version != 7
 		|| function_context.schema_version != 3
 		|| interproc_scope.schema_version != 1
 		|| R2SLEIGH_RESPONSE_INFO_SCHEMA_V2 != 2
@@ -91,6 +96,9 @@ int main(void) {
 		|| source_interface.return_address_storage.space != R2SLEIGH_SOURCE_STORAGE_REGISTER_V2
 		|| source_interface.return_address_storage.offset != 0x30
 		|| source_interface.return_address_storage.size != 8
+		|| source_interface.stack_pointer_storage.space != R2SLEIGH_SOURCE_STORAGE_REGISTER_V2
+		|| source_interface.stack_pointer_storage.offset != 0x38
+		|| source_interface.stack_pointer_storage.size != 8
 		|| R2SLEIGH_MAX_FUNCTION_BLOCKS_V2 != 200
 		|| R2SLEIGH_MAX_FUNCTION_OPS_V2 != 512
 		|| R2SLEIGH_MAX_FUNCTION_INPUT_BYTES_V2 != (16U << 20)

@@ -18,14 +18,17 @@
 #include <string.h>
 #include "r2sleigh_api_v2.h"
 
-#if R2_ABIVERSION != R2SLEIGH_RADARE_ABI_V2
-#error "r2sleigh schema-6 source transport requires exactly radare2 ABI 136"
+#if R2_ABIVERSION != 137
+#error "r2sleigh schema-7 source transport requires exactly radare2 ABI 137"
 #endif
-#if R_ANAL_FUNCTION_SNAPSHOT_SCHEMA_VERSION != 5
-#error "r2sleigh schema-6 source transport requires function snapshot schema 5"
+#if R2SLEIGH_RADARE_ABI_V2 != 137
+#error "r2sleigh generated V2 header must target exactly radare2 ABI 137"
+#endif
+#if R_ANAL_FUNCTION_SNAPSHOT_SCHEMA_VERSION != 6
+#error "r2sleigh schema-7 source transport requires function snapshot schema 6"
 #endif
 #if R_ANAL_FUNCTION_SNAPSHOT_LIMITS_VERSION != 1
-#error "r2sleigh schema-6 source transport requires function snapshot limits API 1"
+#error "r2sleigh schema-7 source transport requires function snapshot limits API 1"
 #endif
 
 /* FFI declarations for r2sleigh Rust library */
@@ -962,7 +965,9 @@ static int sleigh_source_interface_v2_build(
 		|| !(typed->snapshot->capabilities
 			& R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_STACK_SLOT_ROLES)
 		|| !(typed->snapshot->capabilities
-			& R_ANAL_FUNCTION_SNAPSHOT_CAP_RETURN_ADDRESS_STORAGE)) {
+			& R_ANAL_FUNCTION_SNAPSHOT_CAP_RETURN_ADDRESS_STORAGE)
+		|| !(typed->snapshot->capabilities
+			& R_ANAL_FUNCTION_SNAPSHOT_CAP_STACK_POINTER_STORAGE)) {
 		return 0;
 	}
 	const RAnalFunctionInterfaceSnapshot *interface = &typed->snapshot->function_interface;
@@ -977,6 +982,10 @@ static int sleigh_source_interface_v2_build(
 		|| !interface->return_address_storage.size
 		|| interface->return_address_storage.offset
 			> UINT64_MAX - interface->return_address_storage.size
+		|| !interface->stack_pointer_storage.name
+		|| !interface->stack_pointer_storage.size
+		|| interface->stack_pointer_storage.offset
+			> UINT64_MAX - interface->stack_pointer_storage.size
 		|| (interface->num_parameters && !interface->parameters)
 		|| (interface->return_kind != R_ANAL_SNAPSHOT_RETURN_VOID
 			&& interface->return_kind != R_ANAL_SNAPSHOT_RETURN_REGISTER)) {
@@ -1110,6 +1119,9 @@ static int sleigh_source_interface_v2_build(
 	source->interface.return_address_storage.space = R2SLEIGH_SOURCE_STORAGE_REGISTER_V2;
 	source->interface.return_address_storage.offset = interface->return_address_storage.offset;
 	source->interface.return_address_storage.size = interface->return_address_storage.size;
+	source->interface.stack_pointer_storage.space = R2SLEIGH_SOURCE_STORAGE_REGISTER_V2;
+	source->interface.stack_pointer_storage.offset = interface->stack_pointer_storage.offset;
+	source->interface.stack_pointer_storage.size = interface->stack_pointer_storage.size;
 	if (!sleigh_source_type_graph_v2_build (typed->snapshot, source)) {
 		sleigh_source_interface_v2_clear (source);
 		return -1;

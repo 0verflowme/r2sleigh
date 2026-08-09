@@ -47,34 +47,6 @@ a:sym.runj {} | jq -Rs '. == ""'
 EOF_CMDS
 RUN
 
-NAME=dec_check_secret_current_function_public_surface
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s `afl~check_secret[0]` >/dev/null
-af
-a:sla.dec | jq -Rs 'contains("check_secret(int32_t arg0)") and contains("if (arg0 != 57005)") and contains("return 0;") and contains("return 1;") and (contains("var_4h")|not) and (contains("r2dec residual:")|not) and (contains("r2dec fallback:")|not)'
-EOF_CMDS
-RUN
-
-NAME=pdd_routes_to_sleigh_decompiler_when_plugin_loaded
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s `afl~check_secret[0]` >/dev/null
-af
-pdd | jq -Rs 'contains("check_secret") and contains("return") and (contains("r2pm -ci r2dec")|not)'
-EOF_CMDS
-RUN
-
 NAME=profilej_reports_deterministic_stage_timings
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
@@ -98,20 +70,6 @@ CMDS=<<EOF_CMDS
 a:sla >/dev/null
 aaa
 a:sla.debug.profilej | jq -c '.enabled==true and .max==20 and .count>0'
-EOF_CMDS
-RUN
-
-NAME=dec_check_secret_explicit_address_public_surface
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaa
-s `afl~check_secret[0]` >/dev/null
-af
-a:sla.dec $$ | jq -Rs 'contains("check_secret(int32_t arg0)") and contains("if (arg0 != 57005)") and contains("return 0;") and contains("return 1;") and (contains("var_4h")|not) and (contains("r2dec residual:")|not) and (contains("r2dec fallback:")|not)'
 EOF_CMDS
 RUN
 
@@ -143,11 +101,10 @@ a:sla.dec | jq -Rs 'contains("test_boolxor") and contains("r2dec residual: certi
 EOF_CMDS
 RUN
 
-NAME=dec_array_and_struct_index_render_without_fallback
+NAME=dec_array_index_render_without_fallback
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-true
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
@@ -155,9 +112,6 @@ aaaa
 s `afl~test_array_index[0]` >/dev/null
 af
 a:sla.dec | jq -Rs 'contains("test_array_index") and contains("return") and (contains("r2dec fallback:")|not)'
-s `afl~test_struct_array_index[0]` >/dev/null
-af
-a:sla.dec | jq -Rs 'contains("test_struct_array_index") and contains("struct sla_struct_") and contains("arg0[arg1].f_8 = arg2;") and contains("arg0[arg1].f_34") and contains("arg0[arg1].f_8") and (contains("r2dec residual:")|not) and (contains("r2sleigh residual:")|not) and (contains("r2dec fallback:")|not) and (contains("*(arg0 +")|not) and (contains("(int64_t)")|not)'
 EOF_CMDS
 RUN
 

@@ -263,10 +263,12 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn clear_effect_render_proofs(&self) {
         self.effect_render_proofs.borrow_mut().clear();
     }
 
+    #[cfg(test)]
     pub(crate) fn effect_render_proofs(&self) -> Vec<EffectRenderProof> {
         self.effect_render_proofs.borrow().clone()
     }

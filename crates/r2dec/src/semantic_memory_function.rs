@@ -6,9 +6,8 @@ use std::fmt::Write as _;
 use r2cert::{
     CERTIFIED_PLAIN_RAM_MEMORY_RETURN_CONTRACT_VERSION, CertifiedArtifactOrigin,
     CertifiedMachineProjection, CertifiedMemoryExecutionPolicy, CertifiedMemoryStatement,
-    CertifiedMemoryStatementKind, CertifiedRenderPermit, CertifiedSourceTerminator,
-    CertifiedTypedRegionKind, RenderAuthorizationError, TypedRegionMapping,
-    certify_plain_ram_memory_return_region,
+    CertifiedMemoryStatementKind, CertifiedSourceTerminator, CertifiedTypedRegionKind,
+    LedgerClosureError, TypedRegionMapping, certify_plain_ram_memory_return_region,
 };
 use r2ssa::{
     CanonicalInstructionId, MachineAddressSpace, MachineBuildError, MachineMemoryEndianness,
@@ -17,7 +16,8 @@ use r2ssa::{
 use serde::Serialize;
 
 use crate::certified_region::{
-    CertifiedSingleBlockAccounting, RegionBuildError, RegionObligationDisposition,
+    CertifiedSingleBlockAccounting, CertifiedTypedOutputSeal, RegionBuildError,
+    RegionObligationDisposition, TypedOutputSealError,
 };
 use crate::semantic_c::{
     SEMANTIC_C_HELPERS, SemanticCError, SemanticCExprId, SemanticCExprKind,
@@ -48,7 +48,7 @@ pub struct CertifiedMemorySemanticCFunction {
     memory_order: Box<[CanonicalInstructionId]>,
     return_producer: CanonicalInstructionId,
     returned_value: Option<MachineValueBinding>,
-    render_permit: CertifiedRenderPermit,
+    typed_output_seal: CertifiedTypedOutputSeal,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -56,7 +56,8 @@ pub enum CertifiedMemorySemanticCFunctionError {
     Machine(MachineBuildError),
     Region(RegionBuildError),
     Statement(SemanticCStatementError),
-    Authorization(RenderAuthorizationError),
+    LedgerClosure(LedgerClosureError),
+    TypedOutputSeal(TypedOutputSealError),
     MissingFunctionInterface,
     NotClosedTerminalReturn,
     MissingMemory,
@@ -94,9 +95,15 @@ impl From<SemanticCStatementError> for CertifiedMemorySemanticCFunctionError {
     }
 }
 
-impl From<RenderAuthorizationError> for CertifiedMemorySemanticCFunctionError {
-    fn from(error: RenderAuthorizationError) -> Self {
-        Self::Authorization(error)
+impl From<LedgerClosureError> for CertifiedMemorySemanticCFunctionError {
+    fn from(error: LedgerClosureError) -> Self {
+        Self::LedgerClosure(error)
+    }
+}
+
+impl From<TypedOutputSealError> for CertifiedMemorySemanticCFunctionError {
+    fn from(error: TypedOutputSealError) -> Self {
+        Self::TypedOutputSeal(error)
     }
 }
 
@@ -220,10 +227,16 @@ impl CertifiedMemorySemanticCFunction {
             return Err(CertifiedMemorySemanticCFunctionError::MissingMemory);
         }
         let mappings = typed_region_mappings(layer.accounting());
-        let render_permit = certify_plain_ram_memory_return_region(
+        let ledger_closure = certify_plain_ram_memory_return_region(
             layer.accounting().origin(),
             layer.accounting().ledger(),
             mappings,
+        )?;
+        let typed_output_seal = CertifiedTypedOutputSeal::new(
+            ledger_closure,
+            CertifiedTypedRegionKind::PlainRamMemoryTerminalReturnFunction,
+            CERTIFIED_MEMORY_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
+            [layer.accounting()],
         )?;
         let function = Self {
             schema_version: CERTIFIED_MEMORY_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
@@ -235,7 +248,7 @@ impl CertifiedMemorySemanticCFunction {
             memory_order: memory_order.into_boxed_slice(),
             return_producer,
             returned_value,
-            render_permit,
+            typed_output_seal,
         };
         let audit = function.audit();
         if !audit.has_exact_closed_memory_return() {
@@ -267,10 +280,6 @@ impl CertifiedMemorySemanticCFunction {
         &self.memory_order
     }
 
-    pub const fn render_permit(&self) -> &CertifiedRenderPermit {
-        &self.render_permit
-    }
-
     pub fn returned(&self) -> Option<&SemanticCReturn> {
         self.layer
             .accounting()
@@ -282,7 +291,6 @@ impl CertifiedMemorySemanticCFunction {
     pub fn audit(&self) -> CertifiedMemorySemanticCFunctionAuditReport {
         let mut invalid = Vec::new();
         let accounting = self.layer.accounting();
-        let mappings = typed_region_mappings(accounting);
         if self.schema_version != CERTIFIED_MEMORY_SEMANTIC_C_FUNCTION_SCHEMA_VERSION {
             invalid.push("memory function schema mismatch".to_string());
         }
@@ -294,13 +302,13 @@ impl CertifiedMemorySemanticCFunction {
         if self.origin != *accounting.origin() {
             invalid.push("memory function origin mismatch".to_string());
         }
-        if !self.render_permit.matches_region(
+        if !self.typed_output_seal.matches_region(
             &self.origin,
             CertifiedTypedRegionKind::PlainRamMemoryTerminalReturnFunction,
             CERTIFIED_MEMORY_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-            &mappings,
+            [accounting],
         ) {
-            invalid.push("memory function render permit mismatch".to_string());
+            invalid.push("memory function typed-output seal mismatch".to_string());
         }
         if !self.layer.audit().has_exact_source_order()
             || !accounting.audit().has_exact_source_accounting()
@@ -814,8 +822,6 @@ extern void r2s_ram_write_be_u64(uint64_t byte_address, uint64_t value);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
-    use std::process::{Command, Stdio};
 
     use r2il::{
         AddressSpace, ArchSpec, Endianness, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode,
@@ -823,39 +829,6 @@ mod tests {
     use r2ssa::{
         CanonicalStorageId, CanonicalStorageSpace, SourceFunctionInterface, SourceFunctionReturn,
     };
-
-    fn compile(source: &str) {
-        let mut compiler = Command::new("cc")
-            .args([
-                "-std=c11",
-                "-Wall",
-                "-Wextra",
-                "-Wpedantic",
-                "-Wno-unused-function",
-                "-Werror",
-                "-fsyntax-only",
-                "-x",
-                "c",
-                "-",
-            ])
-            .stdin(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("C compiler required");
-        compiler
-            .stdin
-            .as_mut()
-            .expect("compiler stdin")
-            .write_all(source.as_bytes())
-            .expect("write C source");
-        let output = compiler.wait_with_output().expect("wait for compiler");
-        assert!(
-            output.status.success(),
-            "generated C failed:\n{}\n{}",
-            source,
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
 
     fn interface(return_kind: SourceFunctionReturn) -> SourceFunctionInterface {
         SourceFunctionInterface::new(
@@ -933,39 +906,26 @@ mod tests {
         .expect("ordered alias artifact")
     }
 
+    fn assert_machine_context_refusal(artifact: &SsaArtifact) {
+        assert!(matches!(
+            CertifiedMemorySemanticCFunction::from_artifact(artifact),
+            Err(CertifiedMemorySemanticCFunctionError::Machine(
+                MachineBuildError::MachineContextMismatch
+            ))
+        ));
+    }
+
     #[test]
-    fn width_endian_helper_calls_are_declared_structured_and_compile_as_c11() {
+    fn hand_authored_width_endian_loads_cannot_authorize_memory_rendering() {
         for endianness in [Endianness::Little, Endianness::Big] {
             for width_bytes in [1, 2, 4, 8] {
-                let function = CertifiedMemorySemanticCFunction::from_artifact(&load_return(
-                    endianness,
-                    width_bytes,
-                ))
-                .unwrap_or_else(|error| {
-                    panic!("certified memory function {endianness:?}/{width_bytes}: {error:?}")
-                });
-                let source = function.render_certified_c().expect("strict helper C");
-                let endian = if endianness == Endianness::Little {
-                    "le"
-                } else {
-                    "be"
-                };
-                let width = width_bytes * 8;
-                let helper = format!("r2s_ram_read_{endian}_u{width}");
-                assert_eq!(source.matches(&format!("{helper}((uint64_t)(")).count(), 1);
-                assert!(source.contains(&format!(
-                    "extern uint{width}_t {helper}(uint64_t byte_address);"
-                )));
-                assert!(!source.contains("volatile"));
-                assert!(!source.contains("uint8_t *"));
-                assert!(source.contains("\treturn v_"));
-                compile(&source);
+                assert_machine_context_refusal(&load_return(endianness, width_bytes));
             }
         }
     }
 
     #[test]
-    fn store_void_uses_one_explicit_helper_and_exact_void_return() {
+    fn hand_authored_store_void_cannot_authorize_helper_or_return_rendering() {
         let mut block = R2ILBlock::new(0x8300, 4);
         block.push(R2ILOp::Store {
             space: SpaceId::Ram,
@@ -981,53 +941,16 @@ mod tests {
             interface(SourceFunctionReturn::Void),
         )
         .expect("store-void artifact");
-        let function =
-            CertifiedMemorySemanticCFunction::from_artifact(&artifact).expect("store function");
-        let source = function.render_certified_c().expect("store C");
-        assert_eq!(
-            source.matches("r2s_ram_write_be_u16((uint64_t)(").count(),
-            1
-        );
-        assert!(source.contains("void certified_mem_sub_8300(void)"));
-        assert!(source.contains("\treturn;"));
-        compile(&source);
+        assert_machine_context_refusal(&artifact);
     }
 
     #[test]
-    fn mutation_guards_reject_drop_duplicate_reorder_and_return_value_changes() {
-        let original = CertifiedMemorySemanticCFunction::from_artifact(&ordered_aliasing())
-            .expect("ordered function");
-        assert_eq!(original.memory_order.len(), 2);
-
-        let mut dropped = original.clone();
-        dropped.memory_order = dropped.memory_order[1..].to_vec().into_boxed_slice();
-        assert!(!dropped.audit().has_exact_closed_memory_return());
-        assert!(dropped.render_certified_c().is_err());
-
-        let mut duplicated = original.clone();
-        let mut order = duplicated.memory_order.to_vec();
-        order.push(order[0]);
-        duplicated.memory_order = order.into_boxed_slice();
-        assert!(!duplicated.audit().has_exact_closed_memory_return());
-        assert!(duplicated.render_certified_c().is_err());
-
-        let mut reordered = original.clone();
-        reordered.memory_order.reverse();
-        assert!(!reordered.audit().has_exact_closed_memory_return());
-        assert!(reordered.render_certified_c().is_err());
-
-        let mut wrong_return = original;
-        wrong_return.returned_value = Some(
-            wrong_return.layer.accounting().memory_statements()[0]
-                .address()
-                .binding(),
-        );
-        assert!(!wrong_return.audit().has_exact_closed_memory_return());
-        assert!(wrong_return.render_certified_c().is_err());
+    fn fabricated_memory_mutation_baseline_is_refused_at_public_constructor() {
+        assert_machine_context_refusal(&ordered_aliasing());
     }
 
     #[test]
-    fn missing_memory_and_word_addressing_are_refused() {
+    fn hand_authored_missing_and_word_addressed_memory_are_refused_by_typed_context() {
         let mut no_memory = R2ILBlock::new(0x8400, 4);
         no_memory.push(R2ILOp::Return {
             target: Varnode::register(16, 8),
@@ -1038,11 +961,7 @@ mod tests {
             interface(SourceFunctionReturn::Void),
         )
         .expect("memory-free artifact");
-        assert!(matches!(
-            CertifiedMemorySemanticCFunction::from_artifact(&no_memory),
-            Err(CertifiedMemorySemanticCFunctionError::MissingMemory)
-                | Err(CertifiedMemorySemanticCFunctionError::Authorization(_))
-        ));
+        assert_machine_context_refusal(&no_memory);
 
         let mut word_block = R2ILBlock::new(0x8404, 4);
         word_block.push(R2ILOp::Load {
@@ -1061,6 +980,6 @@ mod tests {
             }),
         )
         .expect("word-addressed artifact");
-        assert!(CertifiedMemorySemanticCFunction::from_artifact(&word_artifact).is_err());
+        assert_machine_context_refusal(&word_artifact);
     }
 }

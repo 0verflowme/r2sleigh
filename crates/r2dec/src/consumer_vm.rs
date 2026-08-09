@@ -291,21 +291,6 @@ pub(crate) fn render_vm_semantic_summary(
     Some(out)
 }
 
-pub(crate) fn render_vm_semantic_fallback_comment(
-    func_name: &str,
-    semantic_artifact: &r2sym::SemanticArtifact,
-) -> Option<String> {
-    let vm_body = semantic_artifact.vm_body()?;
-    let vm_step = vm_body
-        .step_summary
-        .as_ref()
-        .or(vm_body.transfer_summary.as_ref())?;
-    Some(format!(
-        "/* {} */",
-        vm_summary_stats_comment(func_name, vm_step)
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;

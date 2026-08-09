@@ -1,6 +1,6 @@
 {
-  "schema_version": 1,
-  "fixture_set": "r2sleigh-plain-o2-x86_64-macho-sleigh-lift-v1",
+  "schema_version": 2,
+  "fixture_set": "r2sleigh-plain-o2-x86_64-macho-sleigh-lift-v2",
   "origin_manifest": "tests/r2r/fixtures/plain_o2_v1/manifest.json",
   "origin_core_capture": "tests/r2r/fixtures/plain_o2_v1/core-functions.json",
   "arch": "x86-64",
@@ -31,8 +31,8 @@
       "file_offset": 1568,
       "bytes": "554889e585f67e0d89f183fe08730a31d231c0eb6b31c05dc389ca81e2f8ffff7f89c8c1e80325ffffff0f48c1e005660fefc031f6660fefc90f1f8000000000f30f6f1437660ffec2f30f6f543710660ffeca4883c6204839f075e4660ffec8660f70c1ee660ffec1660f70c855660ffec8660f7ec839ca7411660f1f44000003049748ffc24839d175f55dc3",
       "bytes_fnv1a64": "d093eafd65854e85",
-      "r2il_fnv1a64": "8af6ec5c96150544",
-      "ssa_fnv1a64": "8e378d39fbfd1bc9",
+      "r2il_fnv1a64": "a8608a0e07b42e74",
+      "ssa_fnv1a64": "5f157b6a42b65f40",
       "required_native_opcodes": ["movdqu", "paddd", "pshufd"],
       "source_abi": {
         "calling_convention": "sysv_amd64",
@@ -47,7 +47,7 @@
           "address": 4294968864,
           "bytes": "554889e585f67e0d",
           "op_count": 16,
-          "ops_fnv1a64": "30ebd61a8e9c8c93",
+          "ops_fnv1a64": "9307f4319d214d77",
           "op_kinds": "Copy,IntSub,Store,Copy,Copy,Copy,IntAnd,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,IntNotEqual,BoolOr,CBranch"
         },
         {
@@ -68,7 +68,7 @@
           "address": 4294968885,
           "bytes": "31c05dc3",
           "op_count": 17,
-          "ops_fnv1a64": "120e5d8aad423737",
+          "ops_fnv1a64": "bae72ec696bd116b",
           "op_kinds": "Copy,Copy,IntXor,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,Load,IntAdd,Copy,Load,IntAdd,Return"
         },
         {
@@ -82,7 +82,7 @@
           "address": 4294968928,
           "bytes": "f30f6f1437660ffec2f30f6f543710660ffeca4883c6204839f075e4",
           "op_count": 38,
-          "ops_fnv1a64": "1c71135b3a20e015",
+          "ops_fnv1a64": "63a4daad9c7ef72f",
           "op_kinds": "IntMult,IntAdd,Load,Copy,IntAdd,IntAdd,IntAdd,IntAdd,IntAdd,IntMult,IntAdd,Load,Copy,IntAdd,IntAdd,IntAdd,IntAdd,IntCarry,IntSCarry,IntAdd,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,IntLess,IntSBorrow,IntSub,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,BoolNot,CBranch"
         },
         {
@@ -103,14 +103,14 @@
           "address": 4294968992,
           "bytes": "03049748ffc24839d175f5",
           "op_count": 35,
-          "ops_fnv1a64": "b1cc25da5c378845",
+          "ops_fnv1a64": "de93043dc504658f",
           "op_kinds": "IntMult,IntAdd,Load,IntCarry,Load,IntSCarry,Load,IntAdd,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,IntSCarry,IntAdd,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,IntLess,IntSBorrow,IntSub,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,BoolNot,CBranch"
         },
         {
           "address": 4294969003,
           "bytes": "5dc3",
           "op_count": 7,
-          "ops_fnv1a64": "1d77f72b63af5f00",
+          "ops_fnv1a64": "f338ce2f352c813c",
           "op_kinds": "Copy,Load,IntAdd,Copy,Load,IntAdd,Return"
         }
       ],
@@ -118,12 +118,12 @@
         { "address": 4294968864, "size": 8, "phi_count": 0, "op_count": 16, "fnv1a64": "979eaa837ec6f118" },
         { "address": 4294968872, "size": 7, "phi_count": 0, "op_count": 14, "fnv1a64": "386adb16301cecab" },
         { "address": 4294968879, "size": 6, "phi_count": 0, "op_count": 21, "fnv1a64": "d16447e5a2736470" },
-        { "address": 4294968889, "size": 39, "phi_count": 0, "op_count": 111, "fnv1a64": "7b064122ca6b4369" },
-        { "address": 4294968928, "size": 28, "phi_count": 27, "op_count": 40, "fnv1a64": "bf5f0520d8dc5020" },
-        { "address": 4294968956, "size": 30, "phi_count": 0, "op_count": 153, "fnv1a64": "a4fa7a390060a502" },
-        { "address": 4294968986, "size": 6, "phi_count": 0, "op_count": 2, "fnv1a64": "2c3147b0ccc4d96b" },
-        { "address": 4294968992, "size": 11, "phi_count": 103, "op_count": 38, "fnv1a64": "5d7e51c4ce1ce243" },
-        { "address": 4294969003, "size": 2, "phi_count": 103, "op_count": 7, "fnv1a64": "5fa3011acce7e3b6" },
+        { "address": 4294968889, "size": 39, "phi_count": 0, "op_count": 119, "fnv1a64": "23935fe77881073c" },
+        { "address": 4294968928, "size": 28, "phi_count": 27, "op_count": 46, "fnv1a64": "6ed6bd58b0f13928" },
+        { "address": 4294968956, "size": 30, "phi_count": 0, "op_count": 154, "fnv1a64": "b53ee4110443575c" },
+        { "address": 4294968986, "size": 6, "phi_count": 0, "op_count": 3, "fnv1a64": "b702d081a3b1b02f" },
+        { "address": 4294968992, "size": 11, "phi_count": 103, "op_count": 42, "fnv1a64": "173c733327024636" },
+        { "address": 4294969003, "size": 2, "phi_count": 103, "op_count": 7, "fnv1a64": "79171c215ef00156" },
         { "address": 4294968885, "size": 4, "phi_count": 0, "op_count": 17, "fnv1a64": "de106f50738cec4d" }
       ]
     },
@@ -136,7 +136,7 @@
       "file_offset": 1616,
       "bytes": "554889e531c081ffadde00000f94c05dc3",
       "bytes_fnv1a64": "696bc30ad7592da1",
-      "r2il_fnv1a64": "8ce1280929a80437",
+      "r2il_fnv1a64": "af17f31870fc0925",
       "ssa_fnv1a64": "11fb796dcfd9dbf0",
       "source_abi": {
         "calling_convention": "sysv_amd64",
@@ -150,7 +150,7 @@
           "address": 4294968912,
           "bytes": "554889e531c081ffadde00000f94c05dc3",
           "op_count": 32,
-          "ops_fnv1a64": "df6c5bb6968c932b",
+          "ops_fnv1a64": "5854d32bdf4c9173",
           "op_kinds": "Copy,IntSub,Store,Copy,Copy,Copy,IntXor,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,IntLess,IntSBorrow,IntSub,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,Copy,Load,IntAdd,Copy,Load,IntAdd,Return"
         }
       ],
@@ -167,7 +167,7 @@
       "file_offset": 1936,
       "bytes": "554889e58d0c3e29f783f16483f71431c009cf0f94c05dc3",
       "bytes_fnv1a64": "bcde133ae05d0b35",
-      "r2il_fnv1a64": "d9045166796dee5f",
+      "r2il_fnv1a64": "f2a28d5783f8b5bd",
       "ssa_fnv1a64": "3348654a5dde0372",
       "source_abi": {
         "calling_convention": "sysv_amd64",
@@ -182,7 +182,7 @@
           "address": 4294969232,
           "bytes": "554889e58d0c3e29f783f16483f71431c009cf0f94c05dc3",
           "op_count": 66,
-          "ops_fnv1a64": "45183b0d43e80b5d",
+          "ops_fnv1a64": "ac5dcf68faffcd45",
           "op_kinds": "Copy,IntSub,Store,Copy,IntMult,IntAdd,Subpiece,IntZExt,IntLess,IntSBorrow,IntSub,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,Copy,IntXor,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,Copy,IntXor,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,Copy,IntXor,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,Copy,IntOr,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,Copy,Load,IntAdd,Copy,Load,IntAdd,Return"
         }
       ],
@@ -199,7 +199,7 @@
       "file_offset": 2736,
       "bytes": "554889e589d04863ce486bc93889540f0803440f345dc3",
       "bytes_fnv1a64": "274373379d942066",
-      "r2il_fnv1a64": "3a9fb313e4eab034",
+      "r2il_fnv1a64": "829839f01185598c",
       "ssa_fnv1a64": "3d17008bc9796e82",
       "source_abi": {
         "calling_convention": "sysv_amd64",
@@ -221,7 +221,7 @@
           "address": 4294970032,
           "bytes": "554889e589d04863ce486bc93889540f0803440f345dc3",
           "op_count": 43,
-          "ops_fnv1a64": "47cf39ae2eda485b",
+          "ops_fnv1a64": "f8758c24df8439fd",
           "op_kinds": "Copy,IntSub,Store,Copy,Copy,IntZExt,IntSExt,IntSExt,IntSExt,IntMult,IntMult,Subpiece,IntSExt,IntNotEqual,Copy,IntAdd,IntMult,IntAdd,Copy,Store,IntAdd,IntMult,IntAdd,Load,IntCarry,Load,IntSCarry,Load,IntAdd,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,Load,IntAdd,Copy,Load,IntAdd,Return"
         }
       ],

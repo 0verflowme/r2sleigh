@@ -5,15 +5,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use r2il::SpaceId;
 use serde::{Deserialize, Serialize};
 
 use crate::address::{AddressProvenanceFacts, collect_address_provenance};
 use crate::assumption::{AssumptionSet, AssumptionSubject, AssumptionUsageReport, AssumptionValue};
 use crate::cfg::BlockTerminator;
-use crate::conditional_return::{
-    ConditionalReturnFunnelFact, collect_conditional_return_funnel_facts,
-};
 use crate::function::{DecompilePrepFacts, SSAFunction, StackAddressBase, StackAddressRoot};
 use crate::graph::{InstId, InstPayload, SsaGraph, ValueId};
 use crate::machine_context::{
@@ -351,13 +347,54 @@ pub struct SourceCallBoundaryFact {
 pub struct SourceReturnBoundaryFact {
     pub at: InstId,
     pub values: Vec<CallBoundaryValueFact>,
+    /// Exact source-declared return-address carrier consumed by this return.
+    pub return_address: Option<SourceReturnAddressFact>,
     /// Exact register values that require ordered contained-slice writes to
     /// reconstruct. These are deliberately not also exposed through `values`:
     /// a single stale full-width definition is not the value at the boundary.
     pub register_compositions: Vec<SourceReturnRegisterCompositionFact>,
+    /// Exact full-width stack-pointer value reaching this return when the
+    /// source interface declares the typed stack-pointer carrier.
+    pub exit_stack_pointer: Option<SourceReturnStackPointerFact>,
     /// False when the current source facts cannot distinguish void from an
-    /// unresolved return carrier.
+    /// unresolved return carrier or cannot recover declared exit machine state.
     pub complete: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceReturnAddressFact {
+    pub storage: CanonicalStorageId,
+    pub value: ValueId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceReturnStackPointerFact {
+    /// The lifted function never defines or consumes this carrier, and every
+    /// predecessor path reaches the return without a call or overlapping
+    /// partial/full-width write. The architectural entry value is therefore
+    /// preserved without inventing an SSA value that does not exist.
+    PreservedEntry { storage: CanonicalStorageId },
+    /// A concrete graph value reaches the return. Its producer, when any, is
+    /// rooted by the semantic-obligation inventory.
+    ReachingValue {
+        storage: CanonicalStorageId,
+        value: ValueId,
+    },
+}
+
+impl SourceReturnStackPointerFact {
+    pub const fn storage(self) -> CanonicalStorageId {
+        match self {
+            Self::PreservedEntry { storage } | Self::ReachingValue { storage, .. } => storage,
+        }
+    }
+
+    pub const fn value(self) -> Option<ValueId> {
+        match self {
+            Self::PreservedEntry { .. } => None,
+            Self::ReachingValue { value, .. } => Some(value),
+        }
+    }
 }
 
 /// Schema for exact ABI return-register compositions.
@@ -411,11 +448,17 @@ impl SourceReturnRegisterCompositionFact {
     }
 }
 
-/// One exact full-width entry ABI carrier used by the canonical graph.
+/// One exact source-declared ABI parameter and its canonical graph carrier.
+///
+/// `abi_storage` is the source calling-convention carrier. `graph_storage`
+/// is the exact, source-declared logical projection used by SSA; it is never
+/// inferred from a register name or an overlapping storage range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceFormalParameterFact {
     pub index: u32,
-    pub storage: CanonicalStorageId,
+    pub abi_storage: CanonicalStorageId,
+    pub graph_storage: CanonicalStorageId,
+    pub logical_value: SourceLogicalValue,
     pub value: ValueId,
 }
 
@@ -562,192 +605,6 @@ pub struct StructuredLoopFact {
     pub induction_init: Option<ValueId>,
     pub induction_update: Option<ValueId>,
     pub bound: Option<ValueId>,
-}
-
-/// Exact SSA identity map for the first admitted stateful counted loop.
-///
-/// This is deliberately narrower than [`StructuredLoopFact`]. It recognizes
-/// only one closed four-block function whose sole mutable carrier is initialized
-/// to zero, compared unsigned against one bound, incremented by one on the sole
-/// latch, and returned on the unique exit. The fact is evidence about retained
-/// SSA identities; it is not final C-rendering permission.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CanonicalCountedLoopFact {
-    pub loop_id: LoopId,
-    pub preheader: u64,
-    pub header: u64,
-    pub latch: u64,
-    pub exit: u64,
-    pub predicate: PredicateId,
-    pub carrier_storage: CanonicalStorageId,
-    pub width: u32,
-    pub initializer: ValueId,
-    pub initializer_inst: InstId,
-    pub phi: ValueId,
-    pub phi_inst: InstId,
-    pub bound: ValueId,
-    pub condition: ValueId,
-    pub condition_inst: InstId,
-    pub update: ValueId,
-    pub update_inst: InstId,
-}
-
-pub const CANONICAL_FNV_FOLD_LOOP_FACT_SCHEMA_VERSION: u32 = 1;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CanonicalFnvFoldTopologyFact {
-    pub entry: u64,
-    pub setup: u64,
-    pub header_latch: u64,
-    pub exit: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CanonicalFnvFoldAbiFact {
-    pub revision_identity: Box<[u8]>,
-    pub pointer_parameter: SourceFormalParameterFact,
-    pub remaining_parameter: SourceFormalParameterFact,
-    pub return_storage: CanonicalStorageId,
-    pub pointer_logical: SourceLogicalValue,
-    pub remaining_logical: SourceLogicalValue,
-    pub return_logical: SourceLogicalValue,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CanonicalFnvFoldCarrierFact {
-    pub storage: CanonicalStorageId,
-    pub width: u32,
-    pub phi: ValueId,
-    pub phi_inst: InstId,
-    pub entry: ValueId,
-    pub update: ValueId,
-    pub update_inst: InstId,
-    /// Exact producer support consumed by the carrier transition in addition
-    /// to `update_inst` (identity copies and constructed constant operands).
-    pub update_support_insts: Box<[InstId]>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CanonicalFnvFoldPointerFact {
-    pub carrier: CanonicalFnvFoldCarrierFact,
-    pub entry_copy_inst: InstId,
-    pub load_address: ValueId,
-    pub load_address_copy_inst: InstId,
-    /// The object model may conservatively call an evolving phi unknown. This
-    /// exact parameter binding is proven from the carrier recurrence instead.
-    pub buffer_parameter_index: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CanonicalFnvFoldHashFact {
-    pub carrier: CanonicalFnvFoldCarrierFact,
-    pub offset_basis: u64,
-    pub initializer_inst: InstId,
-    pub initializer_witness_insts: Box<[InstId]>,
-    pub exit_phi: ValueId,
-    pub exit_phi_inst: InstId,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CanonicalFnvFoldByteLoadFact {
-    pub access: StructuredAccessId,
-    pub memory_space: SpaceId,
-    pub memory_object: ObjectId,
-    pub memory_version: MemoryVersion,
-    pub load_inst: InstId,
-    pub raw_byte: ValueId,
-    pub byte64: ValueId,
-    pub byte64_zext_inst: InstId,
-    pub byte32_for_range: ValueId,
-    pub byte32_for_lower: ValueId,
-    pub byte32_original: ValueId,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CanonicalFnvFoldUnsignedLessWitness {
-    Direct {
-        compare_inst: InstId,
-        condition_copies: Box<[InstId]>,
-    },
-    NegatedReverseLessEqual {
-        compare_inst: InstId,
-        comparison_copies: Box<[InstId]>,
-        not_inst: InstId,
-        condition_copies: Box<[InstId]>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CanonicalFnvFoldAsciiFact {
-    pub range: ValueId,
-    pub range_inst: InstId,
-    pub lowercase: ValueId,
-    pub lowercase_inst: InstId,
-    pub uppercase: ValueId,
-    pub predicate_witness: CanonicalFnvFoldUnsignedLessWitness,
-    pub selected: ValueId,
-    pub select_inst: InstId,
-    pub true_identity_insts: Box<[InstId]>,
-    pub false_identity_insts: Box<[InstId]>,
-    pub lowercase_on_true: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CanonicalFnvFoldRecurrenceFact {
-    pub selected64: ValueId,
-    pub selected64_zext_inst: InstId,
-    pub xor: ValueId,
-    pub xor_inst: InstId,
-    pub prime: ValueId,
-    pub prime_inst: InstId,
-    pub prime_witness_insts: Box<[InstId]>,
-    pub product: ValueId,
-    pub multiply_inst: InstId,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CanonicalFnvFoldGuardFact {
-    pub predicate: PredicateId,
-    pub condition: ValueId,
-    pub condition_inst: InstId,
-    pub branch_inst: InstId,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CanonicalFnvFoldReturnFact {
-    pub return_inst: InstId,
-    pub value: ValueId,
-}
-
-/// Exact, name-independent identities for the admitted four-block FNV fold.
-/// This remains source evidence only; downstream certification must still join
-/// every source obligation before it can authorize rendered C.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CanonicalFnvFoldLoopFact {
-    pub schema_version: u32,
-    pub loop_id: LoopId,
-    pub topology: CanonicalFnvFoldTopologyFact,
-    pub abi: CanonicalFnvFoldAbiFact,
-    pub pointer: CanonicalFnvFoldPointerFact,
-    pub remaining: CanonicalFnvFoldCarrierFact,
-    pub hash: CanonicalFnvFoldHashFact,
-    pub byte_load: CanonicalFnvFoldByteLoadFact,
-    pub ascii: CanonicalFnvFoldAsciiFact,
-    pub recurrence: CanonicalFnvFoldRecurrenceFact,
-    pub zero_guard: CanonicalFnvFoldGuardFact,
-    pub latch: CanonicalFnvFoldGuardFact,
-    pub returned: CanonicalFnvFoldReturnFact,
-}
-
-impl CanonicalFnvFoldLoopFact {
-    pub fn validate_against(&self, artifact: &crate::function::SsaArtifact) -> bool {
-        self.schema_version == CANONICAL_FNV_FOLD_LOOP_FACT_SCHEMA_VERSION
-            && artifact
-                .structured()
-                .canonical_fnv_fold_loops
-                .get(&self.topology.header_latch)
-                == Some(self)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -977,30 +834,10 @@ pub struct PreparedFunctionCertificates {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StructuredDataflowFacts {
     pub loops: BTreeMap<LoopId, StructuredLoopFact>,
-    /// Closed canonical unsigned counted loops keyed by their header address.
-    pub canonical_counted_loops: BTreeMap<u64, CanonicalCountedLoopFact>,
-    /// Closed four-block ASCII-folding FNV loops keyed by their self-loop block.
-    pub canonical_fnv_fold_loops: BTreeMap<u64, CanonicalFnvFoldLoopFact>,
-    /// Exact ARM64 O0 stack-backed FNV functions keyed by their loop header.
-    pub canonical_fnv_fold_o0: BTreeMap<u64, crate::CanonicalFnvFoldO0Fact>,
-    /// Exact one-block x86-64 branchless integer guards keyed by entry address.
-    pub branchless_guards: BTreeMap<u64, crate::BranchlessGuardFact>,
-    /// Exact one-block x86-64 struct-array updates keyed by entry address.
-    pub struct_array_indexes: BTreeMap<u64, crate::StructArrayIndexFact>,
-    /// Exact x86-64 stack-backed scalar array sums keyed by entry address.
-    pub sum_arrays: BTreeMap<u64, crate::SumArrayFact>,
-    /// Exact x86-64 vectorized array sums keyed by entry address.
-    pub sum_array_o2: BTreeMap<u64, crate::SumArrayO2Fact>,
-    /// Exact x86-64 O0 six-block nested wrap32 guards keyed by entry address.
-    pub nested_wrap32_guard_o0: BTreeMap<u64, crate::NestedWrap32GuardO0Fact>,
-    /// Fail-closed explanations for pinned shapes that lack source provenance.
-    pub sum_array_refusals: BTreeMap<u64, crate::SumArrayRefusalFact>,
     /// Cyclic CFG blocks not represented by a structured loop fact.
     pub unstructured_cycle_blocks: BTreeSet<u64>,
     pub memory_accesses: BTreeMap<StructuredAccessId, StructuredMemoryAccessFact>,
     pub recursive_calls: BTreeMap<CallSiteId, StructuredRecursiveCallFact>,
-    /// Exact whole-function two-arm funnels keyed by their branch predicate.
-    pub conditional_return_funnels: BTreeMap<PredicateId, ConditionalReturnFunnelFact>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1098,8 +935,6 @@ impl PreparedFunctionFacts {
                 memory: &memory,
                 predicates: &predicates,
                 call_sites: &call_sites,
-                boundaries: &boundaries,
-                machine_context,
             },
         );
         let control_domains = collect_control_domain_facts(function, &predicates, &structured);
@@ -1970,8 +1805,6 @@ struct StructuredCollectionInputs<'a> {
     memory: &'a MemorySSAFacts,
     predicates: &'a PredicateFacts,
     call_sites: &'a CallSiteFacts,
-    boundaries: &'a SourceBoundaryFacts,
-    machine_context: Option<&'a SourceMachineContext>,
 }
 
 fn collect_structured_dataflow_facts(
@@ -1980,125 +1813,17 @@ fn collect_structured_dataflow_facts(
     inputs: StructuredCollectionInputs<'_>,
 ) -> StructuredDataflowFacts {
     let loops = collect_structured_loop_facts(function, graph, inputs.predicates);
-    let canonical_counted_loops =
-        collect_canonical_counted_loop_facts(function, graph, inputs.predicates, &loops);
     let memory_accesses =
         collect_structured_memory_access_facts(function, graph, inputs.objects, inputs.memory);
-    let canonical_fnv_fold_loops = inputs
-        .machine_context
-        .map_or_else(BTreeMap::new, |context| {
-            collect_canonical_fnv_fold_loop_facts(
-                function,
-                graph,
-                inputs.memory,
-                inputs.predicates,
-                inputs.boundaries,
-                &loops,
-                &memory_accesses,
-                context,
-            )
-        });
-    let canonical_fnv_fold_o0 =
-        inputs
-            .machine_context
-            .map_or_else(BTreeMap::new, |machine_context| {
-                crate::canonical_fnv_o0::collect_canonical_fnv_fold_o0_facts(
-                    function,
-                    graph,
-                    inputs.objects,
-                    inputs.memory,
-                    inputs.predicates,
-                    inputs.boundaries,
-                    &loops,
-                    &memory_accesses,
-                    machine_context,
-                )
-            });
-    let branchless_guards = inputs
-        .machine_context
-        .map_or_else(BTreeMap::new, |machine_context| {
-            crate::branchless_guard::collect_branchless_guard_facts(
-                function,
-                graph,
-                inputs.boundaries,
-                machine_context,
-            )
-        });
-    let struct_array_indexes =
-        inputs
-            .machine_context
-            .map_or_else(BTreeMap::new, |machine_context| {
-                crate::struct_array_index::collect_struct_array_index_facts(
-                    function,
-                    graph,
-                    inputs.boundaries,
-                    machine_context,
-                )
-            });
-    let sum_arrays = inputs.machine_context.map_or_else(
-        || crate::sum_array::SumArrayCollection {
-            facts: BTreeMap::new(),
-            o2_facts: BTreeMap::new(),
-            refusals: BTreeMap::new(),
-        },
-        |machine_context| {
-            crate::sum_array::collect_sum_array_facts(
-                function,
-                graph,
-                inputs.boundaries,
-                machine_context,
-            )
-        },
-    );
-    let nested_wrap32_guard_o0 =
-        inputs
-            .machine_context
-            .map_or_else(BTreeMap::new, |machine_context| {
-                crate::nested_wrap32_guard_o0::collect_nested_wrap32_guard_o0_facts(
-                    function,
-                    graph,
-                    inputs.objects,
-                    inputs.memory,
-                    inputs.predicates,
-                    inputs.boundaries,
-                    &memory_accesses,
-                    machine_context,
-                )
-            });
-    let conditional_return_funnels =
-        inputs
-            .machine_context
-            .map_or_else(BTreeMap::new, |machine_context| {
-                collect_conditional_return_funnel_facts(
-                    function,
-                    graph,
-                    inputs.objects,
-                    inputs.memory,
-                    inputs.predicates,
-                    inputs.boundaries,
-                    &memory_accesses,
-                    machine_context,
-                )
-            });
     StructuredDataflowFacts {
         unstructured_cycle_blocks: collect_unstructured_cycle_blocks(graph, &loops),
         loops,
-        canonical_counted_loops,
-        canonical_fnv_fold_loops,
-        canonical_fnv_fold_o0,
-        branchless_guards,
-        struct_array_indexes,
-        sum_arrays: sum_arrays.facts,
-        sum_array_o2: sum_arrays.o2_facts,
-        nested_wrap32_guard_o0,
-        sum_array_refusals: sum_arrays.refusals,
         memory_accesses,
         recursive_calls: collect_structured_recursive_call_facts(
             function,
             graph,
             inputs.call_sites,
         ),
-        conditional_return_funnels,
     }
 }
 
@@ -2112,25 +1837,53 @@ fn collect_source_boundary_facts(
 
     if let Some(machine_context) = machine_context
         .filter(|context| context.abi_model().is_available() && context.abi_model().is_coherent())
+        && let Some(interface) = machine_context.function_interface()
+        && let Some(type_graph) = interface.type_graph()
+        && interface.schema_version() == SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION
+        && type_graph.schema_version() == SOURCE_TYPE_GRAPH_SCHEMA_VERSION
+        && interface.parameters().len() == interface.parameter_logical_values().len()
+        && machine_context.abi_model().argument_registers().len() == interface.parameters().len()
     {
-        for slot in machine_context.abi_model().argument_registers() {
+        for (parameter, logical_value) in interface
+            .parameters()
+            .iter()
+            .zip(interface.parameter_logical_values())
+        {
+            let abi_storage = parameter.storage();
+            if machine_context
+                .abi_model()
+                .argument_registers()
+                .iter()
+                .filter(|slot| slot.index() == parameter.index() && slot.storage() == abi_storage)
+                .count()
+                != 1
+            {
+                continue;
+            }
+            let Some(graph_storage) =
+                projected_formal_parameter_storage(abi_storage, *logical_value, type_graph)
+            else {
+                continue;
+            };
             let candidates = graph
                 .values
                 .iter()
                 .filter(|value| {
                     graph.def_inst(value.id).is_none()
                         && value.var.version == 0
-                        && value.var.size == slot.storage().size
-                        && value.canonical_storage == Some(slot.storage())
+                        && value.var.size == graph_storage.size
+                        && value.canonical_storage == Some(graph_storage)
                 })
                 .map(|value| value.id)
                 .collect::<Vec<_>>();
             if let [value] = candidates.as_slice() {
                 facts.parameters.insert(
-                    slot.index(),
+                    parameter.index(),
                     SourceFormalParameterFact {
-                        index: slot.index(),
-                        storage: slot.storage(),
+                        index: parameter.index(),
+                        abi_storage,
+                        graph_storage,
+                        logical_value: *logical_value,
                         value: *value,
                     },
                 );
@@ -2221,11 +1974,19 @@ fn collect_source_boundary_facts(
         if matches!(inst.payload, InstPayload::Op(SSAOp::Return { .. })) {
             let mut values = Vec::new();
             let mut register_compositions = Vec::new();
+            let mut return_address = None;
+            let mut exit_stack_pointer = None;
             let mut complete = false;
             if let Some(machine_context) = machine_context.filter(|context| {
                 context.abi_model().is_available() && context.abi_model().is_coherent()
             }) {
                 let return_slots = machine_context.abi_model().return_registers();
+                let stack_pointer_storage = machine_context
+                    .function_interface()
+                    .and_then(|interface| interface.stack_pointer_storage());
+                let return_address_storage = machine_context
+                    .function_interface()
+                    .and_then(|interface| interface.return_address_storage());
                 match machine_context
                     .function_interface()
                     .map(|interface| interface.return_kind())
@@ -2266,13 +2027,48 @@ fn collect_source_boundary_facts(
                     }
                     _ => {}
                 }
+                match stack_pointer_storage {
+                    Some(storage) => {
+                        exit_stack_pointer = graph
+                            .op_site_for_inst(inst.id)
+                            .and_then(|(block_addr, op_index)| {
+                                reaching_preserved_abi_value_in_block(
+                                    function,
+                                    graph,
+                                    machine_context,
+                                    block_addr,
+                                    op_index,
+                                    storage,
+                                )
+                            })
+                            .map(|state| match state {
+                                ReachingAbiState::PreservedEntry => {
+                                    SourceReturnStackPointerFact::PreservedEntry { storage }
+                                }
+                                ReachingAbiState::Value(value) => {
+                                    SourceReturnStackPointerFact::ReachingValue { storage, value }
+                                }
+                            });
+                        complete &= exit_stack_pointer.is_some();
+                    }
+                    None => {}
+                }
+                match return_address_storage {
+                    Some(storage) => {
+                        return_address = exact_return_address_fact(graph, inst, storage);
+                        complete &= return_address.is_some();
+                    }
+                    None => {}
+                }
             }
             facts.returns.insert(
                 inst.id,
                 SourceReturnBoundaryFact {
                     at: inst.id,
                     values,
+                    return_address,
                     register_compositions,
+                    exit_stack_pointer,
                     complete,
                 },
             );
@@ -2281,9 +2077,67 @@ fn collect_source_boundary_facts(
     facts
 }
 
+fn exact_return_address_fact(
+    graph: &SsaGraph,
+    return_inst: &crate::graph::GraphInst,
+    storage: CanonicalStorageId,
+) -> Option<SourceReturnAddressFact> {
+    let [value] = return_inst.inputs.as_slice() else {
+        return None;
+    };
+    let value = graph.value(*value)?;
+    (value.var.size == storage.size && value.canonical_storage == Some(storage)).then_some(
+        SourceReturnAddressFact {
+            storage,
+            value: value.id,
+        },
+    )
+}
+
+fn projected_formal_parameter_storage(
+    abi_storage: CanonicalStorageId,
+    logical_value: SourceLogicalValue,
+    type_graph: &crate::SourceTypeGraph,
+) -> Option<CanonicalStorageId> {
+    let source_type = type_graph.types().get(logical_value.type_id() as usize)?;
+    let carrier = logical_value.carrier();
+    let abi_bits = u64::from(abi_storage.size).checked_mul(8)?;
+    if abi_storage.space != CanonicalStorageSpace::Register
+        || carrier.offset_bits() != 0
+        || carrier.size_bits() == 0
+        || carrier.size_bits() != source_type.size_bits()
+        || carrier.size_bits() % 8 != 0
+    {
+        return None;
+    }
+    match carrier.kind() {
+        SourceCarrierKind::Full if carrier.size_bits() == abi_bits => Some(abi_storage),
+        SourceCarrierKind::LowBits
+            if carrier.size_bits() < abi_bits
+                && matches!(
+                    source_type.kind(),
+                    SourceTypeKind::SignedInteger | SourceTypeKind::UnsignedInteger
+                ) =>
+        {
+            Some(CanonicalStorageId {
+                space: abi_storage.space,
+                offset: abi_storage.offset,
+                size: u32::try_from(carrier.size_bits() / 8).ok()?,
+            })
+        }
+        _ => None,
+    }
+}
+
 enum ReachingAbiReturnRegister {
     Exact(ValueId),
     Composition(SourceReturnRegisterCompositionFact),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReachingAbiState {
+    PreservedEntry,
+    Value(ValueId),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2303,7 +2157,11 @@ fn reaching_abi_return_register_in_block(
     for (op_index, op) in block.ops.get(..boundary_op_index)?.iter().enumerate().rev() {
         if matches!(
             op,
-            SSAOp::Call { .. } | SSAOp::CallInd { .. } | SSAOp::Return { .. }
+            SSAOp::Call { .. }
+                | SSAOp::CallInd { .. }
+                | SSAOp::CallOther { .. }
+                | SSAOp::CallDefine { .. }
+                | SSAOp::Return { .. }
         ) {
             return None;
         }
@@ -2372,35 +2230,158 @@ fn reaching_abi_value_in_block(
     boundary_op_index: usize,
     storage: CanonicalStorageId,
 ) -> Option<ValueId> {
-    let mut visited = BTreeSet::new();
-    reaching_abi_value_before(
+    reaching_abi_value_in_block_with_policy(
         function,
         graph,
         machine_context,
         block_addr,
         boundary_op_index,
         storage,
-        &mut visited,
+        true,
     )
+    .and_then(|state| match state {
+        ReachingAbiState::PreservedEntry => None,
+        ReachingAbiState::Value(value) => Some(value),
+    })
 }
 
-fn reaching_abi_value_before(
+fn reaching_preserved_abi_value_in_block(
     function: &SSAFunction,
     graph: &SsaGraph,
     machine_context: &SourceMachineContext,
     block_addr: u64,
     boundary_op_index: usize,
     storage: CanonicalStorageId,
-    visited: &mut BTreeSet<u64>,
-) -> Option<ValueId> {
-    if !visited.insert(block_addr) {
+) -> Option<ReachingAbiState> {
+    reaching_abi_value_in_block_with_policy(
+        function,
+        graph,
+        machine_context,
+        block_addr,
+        boundary_op_index,
+        storage,
+        false,
+    )
+    .or_else(|| {
+        storage_is_untouched_on_all_predecessor_paths(
+            function,
+            graph,
+            block_addr,
+            boundary_op_index,
+            storage,
+        )
+        .then_some(ReachingAbiState::PreservedEntry)
+    })
+}
+
+fn storage_is_untouched_on_all_predecessor_paths(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    block_addr: u64,
+    boundary_op_index: usize,
+    storage: CanonicalStorageId,
+) -> bool {
+    let mut pending = vec![(block_addr, boundary_op_index)];
+    let mut visited = BTreeSet::new();
+    let mut reached_entry = false;
+    while let Some((candidate_addr, end_op_index)) = pending.pop() {
+        if !visited.insert(candidate_addr) {
+            continue;
+        }
+        let Some(block) = function.get_block(candidate_addr) else {
+            return false;
+        };
+        let Some(ops) = block.ops.get(..end_op_index) else {
+            return false;
+        };
+        for (op_index, op) in ops.iter().enumerate() {
+            if matches!(
+                op,
+                SSAOp::Call { .. }
+                    | SSAOp::CallInd { .. }
+                    | SSAOp::CallOther { .. }
+                    | SSAOp::CallDefine { .. }
+                    | SSAOp::Return { .. }
+            ) {
+                return false;
+            }
+            if op.dst().is_none() {
+                continue;
+            }
+            let Some(inst) = graph
+                .inst_id_for_op_site(candidate_addr, op_index)
+                .and_then(|inst| graph.inst(inst))
+            else {
+                return false;
+            };
+            if inst
+                .canonical_storage
+                .is_some_and(|written| register_storages_overlap(written, storage))
+            {
+                return false;
+            }
+        }
+        if candidate_addr == function.entry {
+            reached_entry = true;
+            continue;
+        }
+        let predecessors = function.predecessors(candidate_addr);
+        if predecessors.is_empty() {
+            return false;
+        }
+        pending.extend(predecessors.into_iter().filter_map(|predecessor| {
+            function
+                .get_block(predecessor)
+                .map(|block| (predecessor, block.ops.len()))
+        }));
+    }
+    reached_entry
+}
+
+fn reaching_abi_value_in_block_with_policy(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    _machine_context: &SourceMachineContext,
+    block_addr: u64,
+    boundary_op_index: usize,
+    storage: CanonicalStorageId,
+    allow_distinct_phi_inputs: bool,
+) -> Option<ReachingAbiState> {
+    let visited = BTreeSet::new();
+    reaching_abi_value_before(
+        function,
+        graph,
+        block_addr,
+        boundary_op_index,
+        storage,
+        &visited,
+        allow_distinct_phi_inputs,
+    )
+}
+
+fn reaching_abi_value_before(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    block_addr: u64,
+    boundary_op_index: usize,
+    storage: CanonicalStorageId,
+    visited: &BTreeSet<u64>,
+    allow_distinct_phi_inputs: bool,
+) -> Option<ReachingAbiState> {
+    if visited.contains(&block_addr) {
         return None;
     }
+    let mut path_visited = visited.clone();
+    path_visited.insert(block_addr);
     let block = function.get_block(block_addr)?;
     for (op_index, op) in block.ops.get(..boundary_op_index)?.iter().enumerate().rev() {
         if matches!(
             op,
-            SSAOp::Call { .. } | SSAOp::CallInd { .. } | SSAOp::Return { .. }
+            SSAOp::Call { .. }
+                | SSAOp::CallInd { .. }
+                | SSAOp::CallOther { .. }
+                | SSAOp::CallDefine { .. }
+                | SSAOp::Return { .. }
         ) {
             return None;
         }
@@ -2422,34 +2403,76 @@ fn reaching_abi_value_before(
             // no implicit register-merge semantics, so it must fail closed.
             return None;
         }
-        return graph.inst(producer).and_then(|inst| inst.output);
+        return graph
+            .inst(producer)
+            .and_then(|inst| inst.output)
+            .map(ReachingAbiState::Value);
     }
-    let phi_values = block
+    let phi_insts = block
         .phis
         .iter()
         .filter(|phi| phi.canonical_storage == Some(storage))
         .filter_map(|phi| graph.value_id_for_var(&phi.dst))
+        .filter_map(|value| graph.def_inst(value))
         .collect::<Vec<_>>();
-    if let [value] = phi_values.as_slice() {
-        return Some(*value);
+    if let [phi_inst] = phi_insts.as_slice() {
+        let phi = graph.inst(*phi_inst)?;
+        if allow_distinct_phi_inputs {
+            return phi.output.map(ReachingAbiState::Value);
+        }
+        let [first, rest @ ..] = phi.inputs.as_slice() else {
+            return None;
+        };
+        return rest
+            .iter()
+            .all(|input| input == first)
+            .then_some(ReachingAbiState::Value(*first));
     }
-    if !phi_values.is_empty() {
+    if !phi_insts.is_empty() {
         return None;
     }
     let predecessors = function.predecessors(block_addr);
-    let [predecessor] = predecessors.as_slice() else {
+    if predecessors.is_empty() {
+        let block_id = graph.block_by_addr.get(&block_addr)?;
+        if *block_id != graph.entry {
+            return None;
+        }
+        let candidates = graph
+            .values
+            .iter()
+            .filter(|value| {
+                graph.def_inst(value.id).is_none()
+                    && value.var.version == 0
+                    && value.var.size == storage.size
+                    && value.canonical_storage == Some(storage)
+            })
+            .map(|value| value.id)
+            .collect::<Vec<_>>();
+        return match candidates.as_slice() {
+            [value] => Some(ReachingAbiState::Value(*value)),
+            [] => Some(ReachingAbiState::PreservedEntry),
+            _ => None,
+        };
+    }
+    let values = predecessors
+        .iter()
+        .map(|predecessor| {
+            let predecessor_block = function.get_block(*predecessor)?;
+            reaching_abi_value_before(
+                function,
+                graph,
+                *predecessor,
+                predecessor_block.ops.len(),
+                storage,
+                &path_visited,
+                allow_distinct_phi_inputs,
+            )
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let [first, rest @ ..] = values.as_slice() else {
         return None;
     };
-    let predecessor_block = function.get_block(*predecessor)?;
-    reaching_abi_value_before(
-        function,
-        graph,
-        machine_context,
-        *predecessor,
-        predecessor_block.ops.len(),
-        storage,
-        visited,
-    )
+    rest.iter().all(|value| value == first).then_some(*first)
 }
 
 fn register_storages_overlap(left: CanonicalStorageId, right: CanonicalStorageId) -> bool {
@@ -4443,1152 +4466,6 @@ fn collect_structured_loop_facts(
     loops
 }
 
-fn collect_canonical_counted_loop_facts(
-    function: &SSAFunction,
-    graph: &SsaGraph,
-    predicates: &PredicateFacts,
-    loops: &BTreeMap<LoopId, StructuredLoopFact>,
-) -> BTreeMap<u64, CanonicalCountedLoopFact> {
-    let mut counted = BTreeMap::new();
-    for fact in loops.values() {
-        let (
-            [latch],
-            [exit],
-            [carrier],
-            Some(predicate_id),
-            Some(phi),
-            Some(initializer),
-            Some(update),
-            Some(bound),
-        ) = (
-            fact.latches.as_slice(),
-            fact.exits.as_slice(),
-            fact.carriers.as_slice(),
-            fact.condition,
-            fact.induction_phi,
-            fact.induction_init,
-            fact.induction_update,
-            fact.bound,
-        )
-        else {
-            continue;
-        };
-        let [entry] = carrier.entries.as_slice() else {
-            continue;
-        };
-        let [transition] = carrier.updates.as_slice() else {
-            continue;
-        };
-        let preheader = entry.predecessor;
-        let body = fact.body.iter().copied().collect::<BTreeSet<_>>();
-        if fact.kind != StructuredLoopKind::Natural
-            || function.entry != preheader
-            || function.num_blocks() != 4
-            || BTreeSet::from([preheader, fact.header, *latch, *exit]).len() != 4
-            || function
-                .block_addrs()
-                .iter()
-                .copied()
-                .collect::<BTreeSet<_>>()
-                != BTreeSet::from([preheader, fact.header, *latch, *exit])
-            || body != BTreeSet::from([fact.header, *latch])
-            || carrier.loop_id != fact.id
-            || carrier.header != fact.header
-            || carrier.phi != phi
-            || carrier.width == 0
-            || carrier.identity_values != BTreeSet::from([phi])
-            || entry.value != initializer
-            || transition.predecessor != *latch
-            || transition.value != update
-            || transition.identity_values != BTreeSet::from([update])
-            || !carrier.dominating_initializers.is_empty()
-        {
-            continue;
-        }
-
-        let (Some(preheader_block), Some(header_block), Some(latch_block), Some(exit_block)) = (
-            function.get_block(preheader),
-            function.get_block(fact.header),
-            function.get_block(*latch),
-            function.get_block(*exit),
-        ) else {
-            continue;
-        };
-        if !matches!(
-            preheader_block.ops.as_slice(),
-            [SSAOp::Copy { .. }, SSAOp::Branch { .. }]
-        ) || !preheader_block.phis.is_empty()
-            || !matches!(
-                header_block.ops.as_slice(),
-                [SSAOp::IntLess { .. }, SSAOp::CBranch { .. }]
-            )
-            || header_block.phis.iter().any(|header_phi| {
-                graph
-                    .value_id_for_var(&header_phi.dst)
-                    .is_none_or(|value| value != phi && !graph.use_sites(value).is_empty())
-            })
-            || !matches!(
-                latch_block.ops.as_slice(),
-                [SSAOp::IntAdd { .. }, SSAOp::Branch { .. }]
-            )
-            || !latch_block.phis.is_empty()
-            || !matches!(exit_block.ops.as_slice(), [SSAOp::Return { .. }])
-            || !exit_block.phis.is_empty()
-            || !matches!(
-                function.cfg().get_block(preheader).map(|block| &block.terminator),
-                Some(BlockTerminator::Branch { target }) if *target == fact.header
-            )
-            || !matches!(
-                function.cfg().get_block(fact.header).map(|block| &block.terminator),
-                Some(BlockTerminator::ConditionalBranch { true_target, false_target })
-                    if *true_target == *latch && *false_target == *exit
-            )
-            || !matches!(
-                function.cfg().get_block(*latch).map(|block| &block.terminator),
-                Some(BlockTerminator::Branch { target }) if *target == fact.header
-            )
-            || !matches!(
-                function
-                    .cfg()
-                    .get_block(*exit)
-                    .map(|block| &block.terminator),
-                Some(BlockTerminator::Return)
-            )
-        {
-            continue;
-        }
-
-        let Some(predicate) = predicates.predicates.get(&predicate_id) else {
-            continue;
-        };
-        let expected_comparison = CompareProvenance {
-            kind: CompareKind::Less,
-            lhs: phi,
-            rhs: bound,
-        };
-        if predicate.block_addr != fact.header
-            || predicate.condition == phi
-            || predicate.true_target != *latch
-            || predicate.false_target != *exit
-            || predicate.comparison.as_ref() != Some(&expected_comparison)
-            || predicate.evaluated_comparison.as_ref() != Some(&expected_comparison)
-            || graph.def_inst(bound).is_some()
-        {
-            continue;
-        }
-
-        let (Some(initializer_inst), Some(phi_inst), Some(condition_inst), Some(update_inst)) = (
-            graph.def_inst(initializer),
-            graph.def_inst(phi),
-            graph.def_inst(predicate.condition),
-            graph.def_inst(update),
-        ) else {
-            continue;
-        };
-        let (Some(initializer_def), Some(phi_def), Some(condition_def), Some(update_def)) = (
-            graph.inst(initializer_inst),
-            graph.inst(phi_inst),
-            graph.inst(condition_inst),
-            graph.inst(update_inst),
-        ) else {
-            continue;
-        };
-        let Some(phi_storage) = phi_def.canonical_storage else {
-            continue;
-        };
-        let phi_edges_match = match &phi_def.payload {
-            InstPayload::Phi { predecessors }
-                if predecessors.len() == 2 && phi_def.inputs.len() == 2 =>
-            {
-                predecessors
-                    .iter()
-                    .zip(&phi_def.inputs)
-                    .filter_map(|(predecessor, value)| {
-                        graph.block(*predecessor).map(|block| (block.addr, *value))
-                    })
-                    .collect::<BTreeSet<_>>()
-                    == BTreeSet::from([(preheader, initializer), (*latch, update)])
-            }
-            _ => false,
-        };
-        if !phi_edges_match
-            || phi_def.output != Some(phi)
-            || phi_storage.size != carrier.width
-            || !matches!(
-                &initializer_def.payload,
-                InstPayload::Op(SSAOp::Copy { .. })
-            )
-            || initializer_def.output != Some(initializer)
-            || initializer_def.inputs.len() != 1
-            || graph.value(initializer_def.inputs[0]).is_none_or(|value| {
-                value.var.size != carrier.width || value.var.constant_bits() != Some(0)
-            })
-            || !matches!(
-                &condition_def.payload,
-                InstPayload::Op(SSAOp::IntLess { .. })
-            )
-            || condition_def.output != Some(predicate.condition)
-            || condition_def.inputs != [phi, bound]
-            || graph
-                .value(predicate.condition)
-                .is_none_or(|value| value.var.size != 1)
-            || graph
-                .value(bound)
-                .is_none_or(|value| value.var.size != carrier.width || value.var.is_const())
-            || !matches!(&update_def.payload, InstPayload::Op(SSAOp::IntAdd { .. }))
-            || update_def.output != Some(update)
-            || update_def.inputs.len() != 2
-            || update_def.inputs[0] != phi
-            || graph.value(update_def.inputs[1]).is_none_or(|value| {
-                value.var.size != carrier.width || value.var.constant_bits() != Some(1)
-            })
-        {
-            continue;
-        }
-
-        counted.insert(
-            fact.header,
-            CanonicalCountedLoopFact {
-                loop_id: fact.id,
-                preheader,
-                header: fact.header,
-                latch: *latch,
-                exit: *exit,
-                predicate: predicate_id,
-                carrier_storage: phi_storage,
-                width: carrier.width,
-                initializer,
-                initializer_inst,
-                phi,
-                phi_inst,
-                bound,
-                condition: predicate.condition,
-                condition_inst,
-                update,
-                update_inst,
-            },
-        );
-    }
-    counted
-}
-
-#[allow(clippy::too_many_arguments)]
-fn collect_canonical_fnv_fold_loop_facts(
-    function: &SSAFunction,
-    graph: &SsaGraph,
-    memory: &MemorySSAFacts,
-    predicates: &PredicateFacts,
-    boundaries: &SourceBoundaryFacts,
-    loops: &BTreeMap<LoopId, StructuredLoopFact>,
-    memory_accesses: &BTreeMap<StructuredAccessId, StructuredMemoryAccessFact>,
-    machine_context: &SourceMachineContext,
-) -> BTreeMap<u64, CanonicalFnvFoldLoopFact> {
-    let mut facts = BTreeMap::new();
-    let Some(abi) = canonical_fnv_fold_abi_fact(machine_context, boundaries) else {
-        return facts;
-    };
-    if function.num_blocks() != 4
-        || !machine_context.abi_model().is_available()
-        || !machine_context.abi_model().is_coherent()
-        || !memory.defs_by_inst.is_empty()
-        || !memory.phis_by_block.is_empty()
-        || function.blocks().flat_map(|block| &block.ops).any(|op| {
-            matches!(
-                op,
-                SSAOp::Store { .. }
-                    | SSAOp::StoreGuarded { .. }
-                    | SSAOp::StoreConditional { .. }
-                    | SSAOp::AtomicCAS { .. }
-                    | SSAOp::Call { .. }
-                    | SSAOp::CallInd { .. }
-                    | SSAOp::CallOther { .. }
-            )
-        })
-    {
-        return facts;
-    }
-
-    for loop_fact in loops.values() {
-        if let Some(fact) = collect_one_canonical_fnv_fold_loop(
-            function,
-            graph,
-            memory,
-            predicates,
-            boundaries,
-            memory_accesses,
-            machine_context,
-            loop_fact,
-            abi.clone(),
-        ) {
-            facts.insert(fact.topology.header_latch, fact);
-        }
-    }
-    facts
-}
-
-#[allow(clippy::too_many_arguments)]
-fn collect_one_canonical_fnv_fold_loop(
-    function: &SSAFunction,
-    graph: &SsaGraph,
-    memory: &MemorySSAFacts,
-    predicates: &PredicateFacts,
-    boundaries: &SourceBoundaryFacts,
-    memory_accesses: &BTreeMap<StructuredAccessId, StructuredMemoryAccessFact>,
-    machine_context: &SourceMachineContext,
-    loop_fact: &StructuredLoopFact,
-    abi: CanonicalFnvFoldAbiFact,
-) -> Option<CanonicalFnvFoldLoopFact> {
-    let [latch] = loop_fact.latches.as_slice() else {
-        return None;
-    };
-    let [body] = loop_fact.body.as_slice() else {
-        return None;
-    };
-    let [exit] = loop_fact.exits.as_slice() else {
-        return None;
-    };
-    if loop_fact.kind != StructuredLoopKind::SelfLoop
-        || *latch != loop_fact.header
-        || *body != loop_fact.header
-        || loop_fact.carriers.len() != 3
-    {
-        return None;
-    }
-    let header = loop_fact.header;
-    let external_predecessors = function
-        .predecessors(header)
-        .into_iter()
-        .filter(|predecessor| *predecessor != header)
-        .collect::<Vec<_>>();
-    let [setup] = external_predecessors.as_slice() else {
-        return None;
-    };
-    let entry = function.entry;
-    if BTreeSet::from([entry, *setup, header, *exit]).len() != 4
-        || function
-            .block_addrs()
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>()
-            != BTreeSet::from([entry, *setup, header, *exit])
-        || function.predecessors(*setup) != [entry]
-        || function
-            .predecessors(*exit)
-            .into_iter()
-            .collect::<BTreeSet<_>>()
-            != BTreeSet::from([entry, header])
-        || function
-            .successors(entry)
-            .into_iter()
-            .collect::<BTreeSet<_>>()
-            != BTreeSet::from([*setup, *exit])
-        || function.successors(*setup) != [header]
-        || function
-            .successors(header)
-            .into_iter()
-            .collect::<BTreeSet<_>>()
-            != BTreeSet::from([header, *exit])
-        || !function.successors(*exit).is_empty()
-        || !matches!(
-            function.cfg().get_block(entry).map(|block| &block.terminator),
-            Some(BlockTerminator::ConditionalBranch { true_target, false_target })
-                if *true_target == *exit && *false_target == *setup
-        )
-        || !matches!(
-            function.cfg().get_block(*setup).map(|block| &block.terminator),
-            Some(BlockTerminator::Fallthrough { next }) if *next == header
-        )
-        || !matches!(
-            function.cfg().get_block(header).map(|block| &block.terminator),
-            Some(BlockTerminator::ConditionalBranch { true_target, false_target })
-                if *true_target == header && *false_target == *exit
-        )
-        || !matches!(
-            function
-                .cfg()
-                .get_block(*exit)
-                .map(|block| &block.terminator),
-            Some(BlockTerminator::Return)
-        )
-    {
-        return None;
-    }
-    let mut carriers = Vec::new();
-    for carrier in &loop_fact.carriers {
-        carriers.push(canonical_fnv_fold_carrier(graph, carrier, *setup, header)?);
-    }
-    let pointer_position = carriers.iter().position(|carrier| {
-        copy_root(graph, carrier.entry)
-            .is_some_and(|(value, _)| value == abi.pointer_parameter.value)
-            && carrier_update_unit_constant_witness(graph, carrier, true).is_some()
-    })?;
-    let mut pointer_carrier = carriers.remove(pointer_position);
-    let pointer_unit_witness = carrier_update_unit_constant_witness(graph, &pointer_carrier, true)?;
-    let mut pointer_support = pointer_carrier.update_support_insts.into_vec();
-    pointer_support.extend(pointer_unit_witness);
-    pointer_support.sort_unstable();
-    pointer_support.dedup();
-    pointer_carrier.update_support_insts = pointer_support.into_boxed_slice();
-    let remaining_position = carriers.iter().position(|carrier| {
-        carrier.entry == abi.remaining_parameter.value
-            && carrier_update_unit_constant_witness(graph, carrier, false).is_some()
-    })?;
-    let mut remaining = carriers.remove(remaining_position);
-    let remaining_unit_witness = carrier_update_unit_constant_witness(graph, &remaining, false)?;
-    let mut remaining_support = remaining.update_support_insts.into_vec();
-    remaining_support.extend(remaining_unit_witness);
-    remaining_support.sort_unstable();
-    remaining_support.dedup();
-    remaining.update_support_insts = remaining_support.into_boxed_slice();
-    let [hash_carrier] = carriers.as_slice() else {
-        return None;
-    };
-    if pointer_carrier.storage == remaining.storage
-        || pointer_carrier.storage == hash_carrier.storage
-        || remaining.storage == hash_carrier.storage
-        || hash_carrier.storage != abi.return_storage
-        || hash_carrier.storage != abi.pointer_parameter.storage
-        || remaining.storage != abi.remaining_parameter.storage
-    {
-        return None;
-    }
-
-    let (pointer_entry_root, pointer_entry_copies) = copy_root(graph, pointer_carrier.entry)?;
-    let [entry_copy_inst] = pointer_entry_copies.as_slice() else {
-        return None;
-    };
-    if pointer_entry_root != abi.pointer_parameter.value {
-        return None;
-    }
-
-    let (initializer_value, initializer_witness) =
-        evaluate_exact_constant(graph, hash_carrier.entry, 64)?;
-    if initializer_value != 0x14650fb0739d0383 {
-        return None;
-    }
-    let initializer_inst = graph.def_inst(hash_carrier.entry)?;
-    let (hash_update_root, _) = copy_root(graph, hash_carrier.update)?;
-    let hash_update_def = graph.inst(graph.def_inst(hash_update_root)?)?;
-    let InstPayload::Op(SSAOp::IntMult { .. }) = &hash_update_def.payload else {
-        return None;
-    };
-    let [multiply_left, multiply_right] = hash_update_def.inputs.as_slice() else {
-        return None;
-    };
-    let (xor, prime) = match (
-        value_is_int_xor(graph, *multiply_left),
-        value_is_int_xor(graph, *multiply_right),
-    ) {
-        (true, false) => (*multiply_left, *multiply_right),
-        (false, true) => (*multiply_right, *multiply_left),
-        _ => return None,
-    };
-    let (prime_value, prime_witness) = evaluate_exact_constant(graph, prime, 64)?;
-    if prime_value != 0x100000001b3 {
-        return None;
-    }
-    let prime_inst = graph.def_inst(prime)?;
-    let xor_def = graph.inst(graph.def_inst(xor)?)?;
-    let InstPayload::Op(SSAOp::IntXor { .. }) = &xor_def.payload else {
-        return None;
-    };
-    let [xor_left, xor_right] = xor_def.inputs.as_slice() else {
-        return None;
-    };
-    let selected64 = if *xor_left == hash_carrier.phi {
-        *xor_right
-    } else if *xor_right == hash_carrier.phi {
-        *xor_left
-    } else {
-        return None;
-    };
-    let selected64_def = graph.inst(graph.def_inst(selected64)?)?;
-    let InstPayload::Op(SSAOp::IntZExt { .. }) = &selected64_def.payload else {
-        return None;
-    };
-    let [selected] = selected64_def.inputs.as_slice() else {
-        return None;
-    };
-    if value_width(graph, selected64) != Some(64) || value_width(graph, *selected) != Some(32) {
-        return None;
-    }
-
-    let select_def = graph.inst(graph.def_inst(*selected)?)?;
-    let InstPayload::Op(SSAOp::Select { .. }) = &select_def.payload else {
-        return None;
-    };
-    let [uppercase, true_arm, false_arm] = select_def.inputs.as_slice() else {
-        return None;
-    };
-    let (true_root, true_copies) = copy_root(graph, *true_arm)?;
-    let (false_root, false_copies) = copy_root(graph, *false_arm)?;
-    let (lowercase, original, lowercase_on_true) = if value_is_or_32(graph, true_root, 0x20) {
-        (true_root, false_root, true)
-    } else if value_is_or_32(graph, false_root, 0x20) {
-        (false_root, true_root, false)
-    } else {
-        return None;
-    };
-    if !lowercase_on_true {
-        return None;
-    }
-    let lowercase_def = graph.inst(graph.def_inst(lowercase)?)?;
-    let [lower_left, lower_right] = lowercase_def.inputs.as_slice() else {
-        return None;
-    };
-    let byte32_for_lower = if constant_is(graph, *lower_left, 32, 0x20) {
-        *lower_right
-    } else if constant_is(graph, *lower_right, 32, 0x20) {
-        *lower_left
-    } else {
-        return None;
-    };
-    let byte64_from_lower = low_subpiece_source(graph, byte32_for_lower)?;
-    let byte64_from_original = low_subpiece_source(graph, original)?;
-    if byte64_from_lower != byte64_from_original {
-        return None;
-    }
-
-    let (range, predicate_witness) = canonical_unsigned_range_predicate(graph, *uppercase, 0x1a)?;
-    let range_def = graph.inst(graph.def_inst(range)?)?;
-    let InstPayload::Op(SSAOp::IntSub { .. }) = &range_def.payload else {
-        return None;
-    };
-    let [range_left, range_right] = range_def.inputs.as_slice() else {
-        return None;
-    };
-    if !constant_is(graph, *range_right, 32, 0x41) {
-        return None;
-    }
-    let byte32_for_range = *range_left;
-    let byte64 = low_subpiece_source(graph, byte32_for_range)?;
-    if byte64 != byte64_from_lower || value_width(graph, byte64) != Some(64) {
-        return None;
-    }
-    let byte64_def = graph.inst(graph.def_inst(byte64)?)?;
-    let InstPayload::Op(SSAOp::IntZExt { .. }) = &byte64_def.payload else {
-        return None;
-    };
-    let [raw_byte] = byte64_def.inputs.as_slice() else {
-        return None;
-    };
-    if value_width(graph, *raw_byte) != Some(8) {
-        return None;
-    }
-    let load_def = graph.inst(graph.def_inst(*raw_byte)?)?;
-    let InstPayload::Op(SSAOp::Load { .. }) = &load_def.payload else {
-        return None;
-    };
-    let [load_address] = load_def.inputs.as_slice() else {
-        return None;
-    };
-    let (load_address_root, load_address_copies) = copy_root(graph, *load_address)?;
-    let [load_address_copy_inst] = load_address_copies.as_slice() else {
-        return None;
-    };
-    if load_address_root != pointer_carrier.phi {
-        return None;
-    }
-    let all_memory_accesses = memory_accesses.values().collect::<Vec<_>>();
-    let [access] = all_memory_accesses.as_slice() else {
-        return None;
-    };
-    let [memory_use] = memory.uses_by_inst.get(&load_def.id)?.as_slice() else {
-        return None;
-    };
-    if access.id.inst != load_def.id
-        || access.id.ordinal != 0
-        || access.block_addr != header
-        || access.address != *load_address
-        || access.value != Some(*raw_byte)
-        || access.is_write
-        || access.width != 1
-        || !access.provenance_complete
-        || memory_use.location.object != access.object
-        || memory_use.location.size != 1
-        || memory_use.version.object != access.object
-    {
-        return None;
-    }
-    let memory_space = machine_context.memory_space_at(access.block_addr, access.op_index)?;
-    let memory_model = machine_context.memory_model();
-    if !memory_model.is_available()
-        || !memory_model.is_coherent()
-        || memory_model
-            .space(memory_space)
-            .is_none_or(|space| space.address_bits() != 64 || space.word_size_bytes() != 1)
-    {
-        return None;
-    }
-
-    let zero_guard = canonical_fnv_guard(
-        graph,
-        predicates,
-        entry,
-        abi.remaining_parameter.value,
-        true,
-        *exit,
-        *setup,
-    )?;
-    let latch = canonical_fnv_guard(
-        graph,
-        predicates,
-        header,
-        remaining.update,
-        false,
-        header,
-        *exit,
-    )?;
-    if loop_fact.condition != Some(latch.predicate) {
-        return None;
-    }
-
-    let (returned, exit_phi_inst) = canonical_fnv_return(
-        function,
-        graph,
-        boundaries,
-        entry,
-        header,
-        *exit,
-        abi.return_storage,
-        hash_carrier.entry,
-        hash_carrier.update,
-    )?;
-    let source_hash_carrier = loop_fact
-        .carriers
-        .iter()
-        .find(|carrier| carrier.phi == hash_carrier.phi)?;
-    if source_hash_carrier.identity_values != BTreeSet::from([hash_carrier.phi, returned.value])
-        || source_hash_carrier.dominating_initializers
-            != [LoopCarrierEdgeValue {
-                predecessor: entry,
-                value: hash_carrier.entry,
-            }]
-    {
-        return None;
-    }
-
-    Some(CanonicalFnvFoldLoopFact {
-        schema_version: CANONICAL_FNV_FOLD_LOOP_FACT_SCHEMA_VERSION,
-        loop_id: loop_fact.id,
-        topology: CanonicalFnvFoldTopologyFact {
-            entry,
-            setup: *setup,
-            header_latch: header,
-            exit: *exit,
-        },
-        abi,
-        pointer: CanonicalFnvFoldPointerFact {
-            carrier: pointer_carrier,
-            entry_copy_inst: *entry_copy_inst,
-            load_address: *load_address,
-            load_address_copy_inst: *load_address_copy_inst,
-            buffer_parameter_index: 0,
-        },
-        remaining,
-        hash: CanonicalFnvFoldHashFact {
-            carrier: hash_carrier.clone(),
-            offset_basis: initializer_value,
-            initializer_inst,
-            initializer_witness_insts: initializer_witness.into_boxed_slice(),
-            exit_phi: returned.value,
-            exit_phi_inst,
-        },
-        byte_load: CanonicalFnvFoldByteLoadFact {
-            access: access.id,
-            memory_space,
-            memory_object: access.object,
-            memory_version: memory_use.version,
-            load_inst: load_def.id,
-            raw_byte: *raw_byte,
-            byte64,
-            byte64_zext_inst: byte64_def.id,
-            byte32_for_range,
-            byte32_for_lower,
-            byte32_original: original,
-        },
-        ascii: CanonicalFnvFoldAsciiFact {
-            range,
-            range_inst: range_def.id,
-            lowercase,
-            lowercase_inst: lowercase_def.id,
-            uppercase: *uppercase,
-            predicate_witness,
-            selected: *selected,
-            select_inst: select_def.id,
-            true_identity_insts: true_copies.into_boxed_slice(),
-            false_identity_insts: false_copies.into_boxed_slice(),
-            lowercase_on_true,
-        },
-        recurrence: CanonicalFnvFoldRecurrenceFact {
-            selected64,
-            selected64_zext_inst: selected64_def.id,
-            xor,
-            xor_inst: xor_def.id,
-            prime,
-            prime_inst,
-            prime_witness_insts: prime_witness.into_boxed_slice(),
-            product: hash_carrier.update,
-            multiply_inst: hash_update_def.id,
-        },
-        zero_guard,
-        latch,
-        returned,
-    })
-}
-
-fn canonical_fnv_fold_abi_fact(
-    machine_context: &SourceMachineContext,
-    boundaries: &SourceBoundaryFacts,
-) -> Option<CanonicalFnvFoldAbiFact> {
-    let interface = machine_context.function_interface()?;
-    let [pointer_spec, remaining_spec] = interface.parameters() else {
-        return None;
-    };
-    let SourceFunctionReturn::Register {
-        storage: return_storage,
-    } = interface.return_kind()
-    else {
-        return None;
-    };
-    let [pointer_logical, remaining_logical] = interface.parameter_logical_values() else {
-        return None;
-    };
-    let return_logical = interface.return_logical_value()?;
-    let graph = interface.type_graph()?;
-    let pointer_type = graph.types().get(pointer_logical.type_id() as usize)?;
-    let SourceTypeKind::Pointer { target_type_id } = pointer_type.kind() else {
-        return None;
-    };
-    let pointee = graph.types().get(target_type_id as usize)?;
-    let remaining_type = graph.types().get(remaining_logical.type_id() as usize)?;
-    let return_type = graph.types().get(return_logical.type_id() as usize)?;
-    let full64 = |logical: SourceLogicalValue| {
-        logical.carrier().kind() == SourceCarrierKind::Full
-            && logical.carrier().offset_bits() == 0
-            && logical.carrier().size_bits() == 64
-    };
-    if interface.schema_version() != SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION
-        || graph.schema_version() != SOURCE_TYPE_GRAPH_SCHEMA_VERSION
-        || !interface
-            .calling_convention()
-            .eq_ignore_ascii_case("aapcs64")
-        || !interface.stack_slot_roles_complete()
-        || !interface.stack_slots().is_empty()
-        || pointer_spec.index() != 0
-        || remaining_spec.index() != 1
-        || pointer_spec.storage().size != 8
-        || remaining_spec.storage().size != 8
-        || return_storage.size != 8
-        || graph.types().len() != 3
-        || !graph.aggregates().is_empty()
-        || pointer_type.size_bits() != 64
-        || pointer_type.align_bits() != 64
-        || pointee.kind() != SourceTypeKind::UnsignedInteger
-        || pointee.size_bits() != 8
-        || pointee.align_bits() != 8
-        || remaining_type.kind() != SourceTypeKind::UnsignedInteger
-        || remaining_type.size_bits() != 64
-        || remaining_type.align_bits() != 64
-        || return_type != remaining_type
-        || !full64(*pointer_logical)
-        || !full64(*remaining_logical)
-        || !full64(return_logical)
-        || boundaries.parameters.len() != 2
-    {
-        return None;
-    }
-    let pointer_parameter = *boundaries.parameters.get(&0)?;
-    let remaining_parameter = *boundaries.parameters.get(&1)?;
-    if pointer_parameter.storage != pointer_spec.storage()
-        || remaining_parameter.storage != remaining_spec.storage()
-    {
-        return None;
-    }
-    Some(CanonicalFnvFoldAbiFact {
-        revision_identity: interface.revision_identity().to_vec().into_boxed_slice(),
-        pointer_parameter,
-        remaining_parameter,
-        return_storage,
-        pointer_logical: *pointer_logical,
-        remaining_logical: *remaining_logical,
-        return_logical,
-    })
-}
-
-fn canonical_fnv_fold_carrier(
-    graph: &SsaGraph,
-    carrier: &LoopCarrierFact,
-    setup: u64,
-    header: u64,
-) -> Option<CanonicalFnvFoldCarrierFact> {
-    let [entry] = carrier.entries.as_slice() else {
-        return None;
-    };
-    let [update] = carrier.updates.as_slice() else {
-        return None;
-    };
-    let phi_inst = graph.def_inst(carrier.phi)?;
-    let storage = graph.inst(phi_inst)?.canonical_storage?;
-    let (update_root, update_copies) = copy_root(graph, update.value)?;
-    let update_inst = graph.def_inst(update_root)?;
-    if carrier.width != 8
-        || storage.size != 8
-        || entry.predecessor != setup
-        || update.predecessor != header
-        || carrier.identity_values.is_empty()
-        || !carrier.identity_values.contains(&carrier.phi)
-        || update.identity_values != exact_copy_identity_values(graph, update.value)
-    {
-        return None;
-    }
-    Some(CanonicalFnvFoldCarrierFact {
-        storage,
-        width: carrier.width,
-        phi: carrier.phi,
-        phi_inst,
-        entry: entry.value,
-        update: update.value,
-        update_inst,
-        update_support_insts: update_copies.into_boxed_slice(),
-    })
-}
-
-fn carrier_update_unit_constant_witness(
-    graph: &SsaGraph,
-    carrier: &CanonicalFnvFoldCarrierFact,
-    increment: bool,
-) -> Option<Vec<InstId>> {
-    let Some((root, _)) = copy_root(graph, carrier.update) else {
-        return None;
-    };
-    let Some(inst) = graph.def_inst(root).and_then(|inst| graph.inst(inst)) else {
-        return None;
-    };
-    let op_matches = matches!(
-        (&inst.payload, increment),
-        (InstPayload::Op(SSAOp::IntAdd { .. }), true)
-            | (InstPayload::Op(SSAOp::IntSub { .. }), false)
-    );
-    if !op_matches || inst.inputs.as_slice().first() != Some(&carrier.phi) {
-        return None;
-    }
-    let (unit, witnesses) = evaluate_exact_constant(graph, *inst.inputs.get(1)?, 64)?;
-    (unit == 1).then_some(witnesses)
-}
-
-fn copy_root(graph: &SsaGraph, value: ValueId) -> Option<(ValueId, Vec<InstId>)> {
-    let mut value = value;
-    let mut copies = Vec::new();
-    let mut visited = BTreeSet::new();
-    while visited.insert(value) {
-        let Some(inst) = graph.def_inst(value).and_then(|inst| graph.inst(inst)) else {
-            return Some((value, copies));
-        };
-        let InstPayload::Op(SSAOp::Copy { .. }) = &inst.payload else {
-            return Some((value, copies));
-        };
-        let [source] = inst.inputs.as_slice() else {
-            return None;
-        };
-        if value_width(graph, value) != value_width(graph, *source) {
-            return None;
-        }
-        copies.push(inst.id);
-        value = *source;
-    }
-    None
-}
-
-fn evaluate_exact_constant(
-    graph: &SsaGraph,
-    value: ValueId,
-    width: u32,
-) -> Option<(u64, Vec<InstId>)> {
-    fn evaluate(
-        graph: &SsaGraph,
-        value: ValueId,
-        width: u32,
-        visiting: &mut BTreeSet<ValueId>,
-    ) -> Option<(u64, BTreeSet<InstId>)> {
-        if value_width(graph, value)? != width {
-            return None;
-        }
-        if let Some(bits) = graph.value(value)?.var.constant_bits() {
-            return Some((mask_to_width(bits, width)?, BTreeSet::new()));
-        }
-        if !visiting.insert(value) {
-            return None;
-        }
-        let inst = graph.inst(graph.def_inst(value)?)?;
-        let evaluated = match &inst.payload {
-            InstPayload::Op(SSAOp::Copy { .. }) => {
-                let [source] = inst.inputs.as_slice() else {
-                    return None;
-                };
-                evaluate(graph, *source, width, visiting)
-            }
-            InstPayload::Op(SSAOp::IntAnd { .. } | SSAOp::IntOr { .. }) => {
-                let [left, right] = inst.inputs.as_slice() else {
-                    return None;
-                };
-                let (left_value, mut left_witness) = evaluate(graph, *left, width, visiting)?;
-                let (right_value, right_witness) = evaluate(graph, *right, width, visiting)?;
-                left_witness.extend(right_witness);
-                let value = if matches!(&inst.payload, InstPayload::Op(SSAOp::IntAnd { .. })) {
-                    left_value & right_value
-                } else {
-                    left_value | right_value
-                };
-                Some((mask_to_width(value, width)?, left_witness))
-            }
-            _ => None,
-        };
-        visiting.remove(&value);
-        let (value, mut witness) = evaluated?;
-        witness.insert(inst.id);
-        Some((value, witness))
-    }
-
-    let (value, witness) = evaluate(graph, value, width, &mut BTreeSet::new())?;
-    Some((value, witness.into_iter().collect()))
-}
-
-fn mask_to_width(value: u64, width: u32) -> Option<u64> {
-    match width {
-        1..=63 => Some(value & ((1u64 << width) - 1)),
-        64 => Some(value),
-        _ => None,
-    }
-}
-
-fn value_width(graph: &SsaGraph, value: ValueId) -> Option<u32> {
-    graph.value(value)?.var.size.checked_mul(8)
-}
-
-fn constant_is(graph: &SsaGraph, value: ValueId, width: u32, expected: u64) -> bool {
-    value_width(graph, value) == Some(width)
-        && graph
-            .value(value)
-            .and_then(|value| value.var.constant_bits())
-            .and_then(|value| mask_to_width(value, width))
-            == Some(expected)
-}
-
-fn value_is_int_xor(graph: &SsaGraph, value: ValueId) -> bool {
-    graph
-        .def_inst(value)
-        .and_then(|inst| graph.inst(inst))
-        .is_some_and(|inst| matches!(&inst.payload, InstPayload::Op(SSAOp::IntXor { .. })))
-}
-
-fn value_is_or_32(graph: &SsaGraph, value: ValueId, constant: u64) -> bool {
-    let Some(inst) = graph.def_inst(value).and_then(|inst| graph.inst(inst)) else {
-        return false;
-    };
-    matches!(&inst.payload, InstPayload::Op(SSAOp::IntOr { .. }))
-        && value_width(graph, value) == Some(32)
-        && inst
-            .inputs
-            .iter()
-            .any(|input| constant_is(graph, *input, 32, constant))
-}
-
-fn low_subpiece_source(graph: &SsaGraph, value: ValueId) -> Option<ValueId> {
-    let inst = graph.inst(graph.def_inst(value)?)?;
-    let InstPayload::Op(SSAOp::Subpiece { offset: 0, .. }) = &inst.payload else {
-        return None;
-    };
-    let [source] = inst.inputs.as_slice() else {
-        return None;
-    };
-    (value_width(graph, value) == Some(32) && value_width(graph, *source) == Some(64))
-        .then_some(*source)
-}
-
-fn canonical_unsigned_range_predicate(
-    graph: &SsaGraph,
-    condition: ValueId,
-    upper_bound: u64,
-) -> Option<(ValueId, CanonicalFnvFoldUnsignedLessWitness)> {
-    let (condition_root, condition_copies) = copy_root(graph, condition)?;
-    let condition_inst = graph.inst(graph.def_inst(condition_root)?)?;
-    if matches!(
-        &condition_inst.payload,
-        InstPayload::Op(SSAOp::IntLess { .. })
-    ) {
-        let [range, bound] = condition_inst.inputs.as_slice() else {
-            return None;
-        };
-        if value_width(graph, *range) == Some(32) && constant_is(graph, *bound, 32, upper_bound) {
-            return Some((
-                *range,
-                CanonicalFnvFoldUnsignedLessWitness::Direct {
-                    compare_inst: condition_inst.id,
-                    condition_copies: condition_copies.into_boxed_slice(),
-                },
-            ));
-        }
-    }
-    let InstPayload::Op(SSAOp::BoolNot { .. }) = &condition_inst.payload else {
-        return None;
-    };
-    let [comparison] = condition_inst.inputs.as_slice() else {
-        return None;
-    };
-    let (comparison_root, comparison_copies) = copy_root(graph, *comparison)?;
-    let comparison_inst = graph.inst(graph.def_inst(comparison_root)?)?;
-    let InstPayload::Op(SSAOp::IntLessEqual { .. }) = &comparison_inst.payload else {
-        return None;
-    };
-    let [bound, range] = comparison_inst.inputs.as_slice() else {
-        return None;
-    };
-    if value_width(graph, *range) != Some(32) || !constant_is(graph, *bound, 32, upper_bound) {
-        return None;
-    }
-    Some((
-        *range,
-        CanonicalFnvFoldUnsignedLessWitness::NegatedReverseLessEqual {
-            compare_inst: comparison_inst.id,
-            comparison_copies: comparison_copies.into_boxed_slice(),
-            not_inst: condition_inst.id,
-            condition_copies: condition_copies.into_boxed_slice(),
-        },
-    ))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn canonical_fnv_guard(
-    graph: &SsaGraph,
-    predicates: &PredicateFacts,
-    block_addr: u64,
-    compared_value: ValueId,
-    equal: bool,
-    true_target: u64,
-    false_target: u64,
-) -> Option<CanonicalFnvFoldGuardFact> {
-    let block_predicates = predicates
-        .predicates
-        .values()
-        .filter(|predicate| predicate.block_addr == block_addr)
-        .collect::<Vec<_>>();
-    let [predicate] = block_predicates.as_slice() else {
-        return None;
-    };
-    let comparison = predicate.evaluated_comparison.as_ref()?;
-    let expected_kind = if equal {
-        CompareKind::Equal
-    } else {
-        CompareKind::NotEqual
-    };
-    let compared_root = copy_root(graph, compared_value)?.0;
-    let lhs_root = copy_root(graph, comparison.lhs)?.0;
-    let rhs_root = copy_root(graph, comparison.rhs)?.0;
-    let operands_match = (lhs_root == compared_root && constant_is(graph, comparison.rhs, 64, 0))
-        || (rhs_root == compared_root && constant_is(graph, comparison.lhs, 64, 0));
-    if comparison.kind != expected_kind
-        || !operands_match
-        || predicate.true_target != true_target
-        || predicate.false_target != false_target
-        || value_width(graph, predicate.condition) != Some(8)
-    {
-        return None;
-    }
-    let condition_inst = graph.def_inst(predicate.condition)?;
-    let block = graph.block(graph.block_id_for_addr(block_addr)?)?;
-    let branch_insts = block
-        .insts
-        .iter()
-        .filter_map(|inst| {
-            graph
-                .inst(*inst)
-                .filter(|inst| matches!(&inst.payload, InstPayload::Op(SSAOp::CBranch { .. })))
-                .map(|inst| inst.id)
-        })
-        .collect::<Vec<_>>();
-    let [branch_inst] = branch_insts.as_slice() else {
-        return None;
-    };
-    Some(CanonicalFnvFoldGuardFact {
-        predicate: predicate.id,
-        condition: predicate.condition,
-        condition_inst,
-        branch_inst: *branch_inst,
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn canonical_fnv_return(
-    function: &SSAFunction,
-    graph: &SsaGraph,
-    boundaries: &SourceBoundaryFacts,
-    entry: u64,
-    header: u64,
-    exit: u64,
-    return_storage: CanonicalStorageId,
-    initializer: ValueId,
-    update: ValueId,
-) -> Option<(CanonicalFnvFoldReturnFact, InstId)> {
-    let returns = function
-        .blocks()
-        .flat_map(|block| {
-            block
-                .ops
-                .iter()
-                .enumerate()
-                .map(move |(index, op)| (block, index, op))
-        })
-        .filter(|(_, _, op)| matches!(op, SSAOp::Return { .. }))
-        .collect::<Vec<_>>();
-    let [(block, op_index, _)] = returns.as_slice() else {
-        return None;
-    };
-    if block.addr != exit {
-        return None;
-    }
-    let return_inst = graph.inst_id_for_op_site(exit, *op_index)?;
-    let boundary = boundaries.returns.get(&return_inst)?;
-    let [returned] = boundary.values.as_slice() else {
-        return None;
-    };
-    if !boundary.complete
-        || returned.slot
-            != (CallBoundarySlot::Register {
-                index: 0,
-                storage: return_storage,
-            })
-    {
-        return None;
-    }
-    let exit_phi_inst = graph.def_inst(returned.value)?;
-    let exit_phi = graph.inst(exit_phi_inst)?;
-    let InstPayload::Phi { predecessors } = &exit_phi.payload else {
-        return None;
-    };
-    if exit_phi.canonical_storage != Some(return_storage)
-        || predecessors.len() != 2
-        || exit_phi.inputs.len() != 2
-        || predecessors
-            .iter()
-            .zip(&exit_phi.inputs)
-            .filter_map(|(predecessor, value)| {
-                graph.block(*predecessor).map(|block| (block.addr, *value))
-            })
-            .collect::<BTreeSet<_>>()
-            != BTreeSet::from([(entry, initializer), (header, update)])
-    {
-        return None;
-    }
-    Some((
-        CanonicalFnvFoldReturnFact {
-            return_inst,
-            value: returned.value,
-        },
-        exit_phi_inst,
-    ))
-}
-
 fn collect_unstructured_cycle_blocks(
     graph: &SsaGraph,
     loops: &BTreeMap<LoopId, StructuredLoopFact>,
@@ -7419,340 +6296,12 @@ fn stack_base_root_for_name(name: &str) -> Option<StackAddressRoot> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CallSiteId, CompareKind, CompareProvenance, ControlGuard, LoopId, ObjectId, PredicateId,
-        ProofNodeId, SemanticId, StructuredAccessId, collect_structured_memory_access_facts,
-        combine_compare_provenance_by, invert_compare_provenance,
-    };
+    use super::ControlGuard;
     use crate::{
-        CanonicalStorageId, CanonicalStorageSpace, InstId, SemanticObligationKind,
-        SourceAbiParameterSpec, SourceCarrierKind, SourceCarrierProjection,
-        SourceFunctionInterface, SourceFunctionReturn, SourceLogicalValue, SourceType,
-        SourceTypeGraph, SourceTypeKind, SsaArtifact, ValueId,
+        CanonicalStorageId, CanonicalStorageSpace, SemanticObligationKind, SourceAbiParameterSpec,
+        SourceFunctionInterface, SourceFunctionReturn, SsaArtifact,
     };
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
-    use r2sleigh_lift::{Disassembler, build_arch_spec};
-    use sha2::{Digest, Sha256};
-
-    #[test]
-    fn comparison_algebra_recovers_signed_le_and_complement() {
-        let lhs = ValueId(1);
-        let rhs = ValueId(2);
-        let signed_less = CompareProvenance {
-            kind: CompareKind::SignedLess,
-            lhs,
-            rhs,
-        };
-        let equal = CompareProvenance {
-            kind: CompareKind::Equal,
-            lhs: rhs,
-            rhs: lhs,
-        };
-        assert_eq!(
-            combine_compare_provenance_by(&equal, &signed_less, true, |lhs, rhs| lhs == rhs),
-            Some(CompareProvenance {
-                kind: CompareKind::SignedLessEqual,
-                lhs,
-                rhs,
-            })
-        );
-        assert_eq!(
-            invert_compare_provenance(&signed_less),
-            Some(CompareProvenance {
-                kind: CompareKind::SignedLessEqual,
-                lhs: rhs,
-                rhs: lhs,
-            })
-        );
-    }
-
-    #[test]
-    fn proof_node_ids_are_owner_qualified_and_stable() {
-        let loop_node = ProofNodeId::loop_certificate(0x401000, LoopId(7));
-        assert_eq!(loop_node.owner, "r2ssa");
-        assert_eq!(loop_node.kind, "loop");
-        assert_eq!(loop_node.anchor, 0x401000);
-        assert_eq!(loop_node.ordinal, 7);
-        assert_eq!(loop_node.to_string(), "r2ssa:loop:0x401000:7");
-
-        let switch_node = ProofNodeId::switch_certificate(0x401020);
-        assert_eq!(switch_node.owner, "r2ssa");
-        assert_eq!(switch_node.kind, "switch");
-        assert_eq!(switch_node.anchor, 0x401020);
-        assert_eq!(switch_node.ordinal, 0);
-        assert_eq!(switch_node.to_string(), "r2ssa:switch:0x401020:0");
-    }
-
-    #[test]
-    fn semantic_ids_are_typed_and_render_name_independent() {
-        let access = StructuredAccessId {
-            inst: InstId(9),
-            ordinal: 2,
-        };
-        let ids = [
-            SemanticId::expression(ValueId(4)),
-            SemanticId::parameter(1).expect("ABI parameter slot"),
-            SemanticId::stack_slot(ObjectId(3)),
-            SemanticId::memory_access(access),
-            SemanticId::return_value(InstId(12)),
-            SemanticId::call(CallSiteId(5)),
-            SemanticId::predicate(PredicateId(6)),
-            SemanticId::control_domain(super::ControlDomainId(7)),
-            SemanticId::effect(InstId(13)),
-        ];
-
-        assert_eq!(ids[0].to_string(), "expr:4");
-        assert_eq!(ids[1].to_string(), "param:1");
-        assert_eq!(ids[2].to_string(), "stack:3");
-        assert_eq!(ids[3].to_string(), "memory:9:2");
-        assert_eq!(ids[4].to_string(), "return:12");
-        assert_eq!(ids[5].to_string(), "call:5");
-        assert_eq!(ids[6].to_string(), "predicate:6");
-        assert_eq!(ids[7].to_string(), "domain:7");
-        assert_eq!(ids[8].to_string(), "effect:13");
-        assert_eq!(
-            ids,
-            [
-                SemanticId::Expression(ValueId(4)),
-                SemanticId::Parameter(1),
-                SemanticId::StackSlot(ObjectId(3)),
-                SemanticId::MemoryAccess(access),
-                SemanticId::Return(InstId(12)),
-                SemanticId::Call(CallSiteId(5)),
-                SemanticId::Predicate(PredicateId(6)),
-                SemanticId::ControlDomain(super::ControlDomainId(7)),
-                SemanticId::Effect(InstId(13)),
-            ]
-        );
-    }
-
-    #[test]
-    fn raw_atomic_subeffects_do_not_follow_memory_ssa_cardinality() {
-        let mut block = R2ILBlock::new(0x9000, 4);
-        block.push(R2ILOp::AtomicCAS {
-            dst: Varnode::unique(0x10, 8),
-            space: SpaceId::Ram,
-            addr: Varnode::register(0, 8),
-            expected: Varnode::constant(1, 8),
-            replacement: Varnode::constant(2, 8),
-            ordering: r2il::MemoryOrdering::SeqCst,
-        });
-        let artifact = SsaArtifact::raw(&[block], None).expect("atomic artifact");
-
-        let without_annotations = collect_structured_memory_access_facts(
-            artifact.function(),
-            artifact.graph(),
-            artifact.objects(),
-            &super::MemorySSAFacts::default(),
-        );
-        assert_eq!(without_annotations.len(), 2);
-        assert_eq!(
-            without_annotations
-                .keys()
-                .map(|id| id.ordinal)
-                .collect::<Vec<_>>(),
-            vec![0, 1]
-        );
-        assert!(
-            without_annotations
-                .values()
-                .all(|access| !access.provenance_complete)
-        );
-
-        let mut duplicate_annotations = artifact.memory().clone();
-        for facts in duplicate_annotations.uses_by_inst.values_mut() {
-            if let Some(first) = facts.first().cloned() {
-                facts.push(first);
-            }
-        }
-        for facts in duplicate_annotations.defs_by_inst.values_mut() {
-            if let Some(first) = facts.first().cloned() {
-                facts.push(first);
-            }
-        }
-        let with_duplicates = collect_structured_memory_access_facts(
-            artifact.function(),
-            artifact.graph(),
-            artifact.objects(),
-            &duplicate_annotations,
-        );
-        assert_eq!(with_duplicates.len(), 2);
-        assert!(
-            with_duplicates
-                .values()
-                .all(|access| !access.provenance_complete)
-        );
-    }
-
-    #[test]
-    fn predicate_comparison_survives_boolean_flag_copy_and_inversion() {
-        let mut entry = R2ILBlock::new(0x1000, 4);
-        let difference = Varnode::unique(0x10, 8);
-        let equal = Varnode::unique(0x20, 1);
-        let copied_flag = Varnode::unique(0x30, 1);
-        let condition = Varnode::unique(0x40, 1);
-        entry.push(R2ILOp::IntSub {
-            dst: difference.clone(),
-            a: test_reg(0),
-            b: test_const(0xdead),
-        });
-        entry.push(R2ILOp::IntEqual {
-            dst: equal.clone(),
-            a: difference,
-            b: test_const(0),
-        });
-        entry.push(R2ILOp::Copy {
-            dst: copied_flag.clone(),
-            src: equal,
-        });
-        entry.push(R2ILOp::BoolNot {
-            dst: condition.clone(),
-            src: copied_flag,
-        });
-        entry.push(R2ILOp::CBranch {
-            target: test_const(0x1008),
-            cond: condition,
-        });
-        let mut fallthrough = R2ILBlock::new(0x1004, 4);
-        fallthrough.push(R2ILOp::Return {
-            target: test_const(0),
-        });
-        let mut taken = R2ILBlock::new(0x1008, 4);
-        taken.push(R2ILOp::Return {
-            target: test_const(0),
-        });
-
-        let artifact =
-            SsaArtifact::for_decompile(&[entry, fallthrough, taken], None).expect("prepared SSA");
-        let predicate = artifact
-            .predicates()
-            .predicates
-            .values()
-            .next()
-            .expect("branch predicate");
-        let comparison = predicate.comparison.as_ref().expect("comparison proof");
-        assert_eq!(comparison.kind, CompareKind::NotEqual);
-        assert_eq!(
-            artifact
-                .graph()
-                .value(comparison.lhs)
-                .map(|value| value.var.name.as_str()),
-            Some("reg:0")
-        );
-        assert_eq!(
-            artifact
-                .graph()
-                .value(comparison.rhs)
-                .map(|value| value.var.name.as_str()),
-            Some("const:dead")
-        );
-    }
-
-    #[test]
-    fn predicate_comparison_recovers_aarch64_signed_less_equal_flags() {
-        let mut entry = R2ILBlock::new(0x1000, 4);
-        let wide_lhs = Varnode::new(SpaceId::Register, 0, 8);
-        let overflow_lhs = Varnode::unique(0x70, 4);
-        let sign_lhs = Varnode::unique(0x78, 4);
-        let rhs = Varnode::constant(2, 4);
-        let copied_rhs = Varnode::unique(0x08, 4);
-        let overflow = Varnode::unique(0x10, 1);
-        let difference = Varnode::unique(0x20, 4);
-        let negative = Varnode::unique(0x30, 1);
-        let zero = Varnode::unique(0x40, 1);
-        let signed_less = Varnode::unique(0x50, 1);
-        let condition = Varnode::unique(0x60, 1);
-        let copied_negative = Varnode::register(0x100, 1);
-        let copied_zero = Varnode::register(0x101, 1);
-        let copied_overflow = Varnode::register(0x102, 1);
-        entry.push(R2ILOp::Subpiece {
-            dst: overflow_lhs.clone(),
-            src: wide_lhs.clone(),
-            offset: 0,
-        });
-        entry.push(R2ILOp::Subpiece {
-            dst: sign_lhs.clone(),
-            src: wide_lhs,
-            offset: 0,
-        });
-        entry.push(R2ILOp::Copy {
-            dst: copied_rhs.clone(),
-            src: rhs.clone(),
-        });
-        entry.push(R2ILOp::IntSBorrow {
-            dst: overflow.clone(),
-            a: overflow_lhs.clone(),
-            b: rhs.clone(),
-        });
-        entry.push(R2ILOp::IntSub {
-            dst: difference.clone(),
-            a: sign_lhs,
-            b: copied_rhs,
-        });
-        entry.push(R2ILOp::IntSLess {
-            dst: negative.clone(),
-            a: difference.clone(),
-            b: Varnode::constant(0, 4),
-        });
-        entry.push(R2ILOp::IntEqual {
-            dst: zero.clone(),
-            a: difference,
-            b: Varnode::constant(0, 4),
-        });
-        entry.push(R2ILOp::Copy {
-            dst: copied_negative.clone(),
-            src: negative,
-        });
-        entry.push(R2ILOp::Copy {
-            dst: copied_zero.clone(),
-            src: zero,
-        });
-        entry.push(R2ILOp::Copy {
-            dst: copied_overflow.clone(),
-            src: overflow,
-        });
-        entry.push(R2ILOp::IntNotEqual {
-            dst: signed_less.clone(),
-            a: copied_negative,
-            b: copied_overflow,
-        });
-        entry.push(R2ILOp::BoolOr {
-            dst: condition.clone(),
-            a: copied_zero,
-            b: signed_less,
-        });
-        entry.push(R2ILOp::CBranch {
-            target: test_const(0x1008),
-            cond: condition,
-        });
-        let fallthrough = R2ILBlock::new(0x1004, 4);
-        let taken = R2ILBlock::new(0x1008, 4);
-
-        let artifact =
-            SsaArtifact::for_decompile(&[entry, fallthrough, taken], None).expect("prepared SSA");
-        let comparison = artifact
-            .predicates()
-            .predicates
-            .values()
-            .next()
-            .and_then(|predicate| predicate.comparison.as_ref())
-            .expect("signed less-equal comparison proof");
-        assert_eq!(comparison.kind, CompareKind::SignedLessEqual);
-        assert_eq!(
-            artifact
-                .graph()
-                .value(comparison.lhs)
-                .map(|value| value.var.name.as_str()),
-            Some("tmp:70")
-        );
-        assert_eq!(
-            artifact
-                .graph()
-                .value(comparison.rhs)
-                .map(|value| value.var.name.as_str()),
-            Some("const:2")
-        );
-    }
 
     fn test_reg(offset: u64) -> Varnode {
         Varnode::new(SpaceId::Register, offset, 8)
@@ -7785,53 +6334,15 @@ mod tests {
         block
     }
 
-    fn canonical_counted_loop_blocks() -> Vec<R2ILBlock> {
-        let counter = Varnode::register(0, 8);
-        let bound = Varnode::register(8, 8);
-        let mut preheader = R2ILBlock::new(0x2000, 4);
-        preheader.push(R2ILOp::Copy {
-            dst: counter.clone(),
-            src: Varnode::constant(0, 8),
-        });
-        preheader.push(R2ILOp::Branch {
-            target: Varnode::ram(0x2010, 8),
-        });
-
-        let condition = Varnode::unique(0x40, 1);
-        let mut header = R2ILBlock::new(0x2010, 4);
-        header.push(R2ILOp::IntLess {
-            dst: condition.clone(),
-            a: counter.clone(),
-            b: bound,
-        });
-        header.push(R2ILOp::CBranch {
-            target: Varnode::ram(0x2020, 8),
-            cond: condition,
-        });
-
-        let mut exit = R2ILBlock::new(0x2014, 4);
-        exit.push(R2ILOp::Return {
-            target: Varnode::register(16, 8),
-        });
-
-        let mut latch = R2ILBlock::new(0x2020, 4);
-        latch.push(R2ILOp::IntAdd {
-            dst: counter.clone(),
-            a: counter,
-            b: Varnode::constant(1, 8),
-        });
-        latch.push(R2ILOp::Branch {
-            target: Varnode::ram(0x2010, 8),
-        });
-        vec![preheader, header, exit, latch]
-    }
-
     fn return_boundary_arch() -> ArchSpec {
         let mut arch = ArchSpec::new("return-boundary-test");
+        arch.addr_size = 8;
         arch.add_register(RegisterDef::new("rax", 0, 8));
         arch.add_register(RegisterDef::new("rdi", 8, 8));
         arch.add_register(RegisterDef::new("rip", 16, 8));
         arch.add_register(RegisterDef::new("cond", 24, 1));
+        arch.add_register(RegisterDef::new("sp", 32, 8));
+        arch.add_register(RegisterDef::sub("sp_low", 32, 4, "sp"));
         arch
     }
 
@@ -7854,6 +6365,19 @@ mod tests {
             [],
         )
         .expect("return boundary interface")
+    }
+
+    fn preserved_stack_interface() -> SourceFunctionInterface {
+        SourceFunctionInterface::new_exact(
+            b"preserved-stack-revision-1".to_vec(),
+            "test-register-abi",
+            [],
+            SourceFunctionReturn::Void,
+            [],
+        )
+        .and_then(|interface| interface.with_return_address_storage(register_storage(16, 8)))
+        .and_then(|interface| interface.with_stack_pointer_storage(register_storage(32, 8)))
+        .expect("typed return-address and stack-pointer roles")
     }
 
     fn composed_return_arch(whole_name: &str, slice_name: &str, pc_name: &str) -> ArchSpec {
@@ -7912,66 +6436,12 @@ mod tests {
     }
 
     #[test]
-    fn return_boundary_predecessor_phi_recovery_is_exact_and_ambiguity_closed() {
-        let artifact = SsaArtifact::raw_with_interface(
-            &canonical_counted_loop_blocks(),
-            Some(&return_boundary_arch()),
-            return_boundary_interface(),
-        )
-        .expect("counted loop boundary artifact");
-        let recovered = super::reaching_abi_value_in_block(
-            artifact.function(),
-            artifact.graph(),
-            artifact.machine_context(),
-            0x2014,
-            0,
-            register_storage(0, 8),
-        );
-        let counted = artifact
-            .structured()
-            .canonical_counted_loops
-            .get(&0x2010)
-            .expect("canonical counted loop");
-        assert_eq!(recovered, Some(counted.phi));
-        assert_eq!(
-            super::reaching_abi_value_in_block(
-                artifact.function(),
-                artifact.graph(),
-                artifact.machine_context(),
-                0x2014,
-                0,
-                register_storage(0, 4),
-            ),
-            None
-        );
-
-        let mut ambiguous_function = artifact.function().clone();
-        let header = ambiguous_function
-            .get_block_mut(0x2010)
-            .expect("counted header");
-        let counter_phi = header
-            .phis
-            .iter()
-            .find(|phi| phi.canonical_storage == Some(register_storage(0, 8)))
-            .expect("counter phi")
-            .clone();
-        header.phis.push(counter_phi);
-        assert_eq!(
-            super::reaching_abi_value_in_block(
-                &ambiguous_function,
-                artifact.graph(),
-                artifact.machine_context(),
-                0x2014,
-                0,
-                register_storage(0, 8),
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn return_boundary_recovery_rejects_fanin_and_phi_free_cycles() {
+    fn return_boundary_recovery_accepts_identical_fanin_and_rejects_phi_free_cycles() {
         let mut entry = R2ILBlock::new(0x3000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(0x80, 8),
+            src: Varnode::register(0, 8),
+        });
         entry.push(R2ILOp::CBranch {
             target: Varnode::ram(0x3020, 8),
             cond: Varnode::register(24, 1),
@@ -7994,17 +6464,16 @@ mod tests {
             return_boundary_interface(),
         )
         .expect("fanin boundary artifact");
-        assert_eq!(
-            super::reaching_abi_value_in_block(
-                fanin.function(),
-                fanin.graph(),
-                fanin.machine_context(),
-                0x3030,
-                0,
-                register_storage(0, 8),
-            ),
-            None
-        );
+        let converged = super::reaching_abi_value_in_block(
+            fanin.function(),
+            fanin.graph(),
+            fanin.machine_context(),
+            0x3030,
+            0,
+            register_storage(0, 8),
+        )
+        .expect("both paths reach the same entry live-in");
+        assert!(fanin.graph().def_inst(converged).is_none());
 
         let mut header = R2ILBlock::new(0x4000, 4);
         header.push(R2ILOp::CBranch {
@@ -8035,7 +6504,400 @@ mod tests {
     }
 
     #[test]
-    fn return_boundary_composes_every_ordered_contained_slice_without_stale_generic_value() {
+    fn exit_stack_pointer_requires_preserved_entry_or_identical_path_value() {
+        let mut direct = R2ILBlock::new(0x6000, 4);
+        direct.push(R2ILOp::Copy {
+            dst: Varnode::unique(0x100, 8),
+            src: Varnode::register(32, 8),
+        });
+        direct.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+        let direct = SsaArtifact::raw_with_interface(
+            &[direct],
+            Some(&return_boundary_arch()),
+            preserved_stack_interface(),
+        )
+        .expect("entry-live-in stack artifact");
+        let direct_boundary = direct
+            .facts()
+            .boundaries
+            .returns
+            .values()
+            .next()
+            .expect("direct return boundary");
+        let entry_stack = direct_boundary
+            .exit_stack_pointer
+            .expect("entry stack pointer reaches return");
+        assert_eq!(entry_stack.storage(), register_storage(32, 8));
+        assert!(
+            direct
+                .graph()
+                .def_inst(entry_stack.value().expect("explicit entry SP value"))
+                .is_none()
+        );
+        assert!(direct_boundary.complete);
+
+        let mut frameless = R2ILBlock::new(0x6050, 4);
+        frameless.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+        let frameless = SsaArtifact::raw_with_interface(
+            &[frameless],
+            Some(&return_boundary_arch()),
+            preserved_stack_interface(),
+        )
+        .expect("frameless stack artifact");
+        let frameless_boundary = frameless
+            .facts()
+            .boundaries
+            .returns
+            .values()
+            .next()
+            .expect("frameless return boundary");
+        assert_eq!(
+            frameless_boundary.exit_stack_pointer,
+            Some(super::SourceReturnStackPointerFact::PreservedEntry {
+                storage: register_storage(32, 8),
+            })
+        );
+        assert!(frameless_boundary.complete);
+
+        let mut loop_entry = R2ILBlock::new(0x6060, 4);
+        loop_entry.push(R2ILOp::Branch {
+            target: Varnode::ram(0x6070, 8),
+        });
+        let mut loop_header = R2ILBlock::new(0x6070, 4);
+        loop_header.push(R2ILOp::CBranch {
+            target: Varnode::ram(0x6070, 8),
+            cond: Varnode::register(24, 1),
+        });
+        let mut loop_exit = R2ILBlock::new(0x6074, 4);
+        loop_exit.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+        let loop_preserved = SsaArtifact::raw_with_interface(
+            &[loop_entry, loop_header, loop_exit],
+            Some(&return_boundary_arch()),
+            preserved_stack_interface(),
+        )
+        .expect("loop-preserved stack artifact");
+        let loop_boundary = loop_preserved
+            .facts()
+            .boundaries
+            .returns
+            .values()
+            .next()
+            .expect("loop return boundary");
+        assert_eq!(
+            loop_boundary.exit_stack_pointer,
+            Some(super::SourceReturnStackPointerFact::PreservedEntry {
+                storage: register_storage(32, 8),
+            })
+        );
+        assert!(loop_boundary.complete);
+
+        let mut entry = R2ILBlock::new(0x6100, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(0x110, 8),
+            src: Varnode::register(32, 8),
+        });
+        entry.push(R2ILOp::CBranch {
+            target: Varnode::ram(0x6120, 8),
+            cond: Varnode::register(24, 1),
+        });
+        let mut right = R2ILBlock::new(0x6104, 4);
+        right.push(R2ILOp::Branch {
+            target: Varnode::ram(0x6130, 8),
+        });
+        let mut left = R2ILBlock::new(0x6120, 4);
+        left.push(R2ILOp::Branch {
+            target: Varnode::ram(0x6130, 8),
+        });
+        let mut joined = R2ILBlock::new(0x6130, 4);
+        joined.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+        let convergent = SsaArtifact::raw_with_interface(
+            &[entry, right, left, joined],
+            Some(&return_boundary_arch()),
+            preserved_stack_interface(),
+        )
+        .expect("convergent stack artifact");
+        let convergent_boundary = convergent
+            .facts()
+            .boundaries
+            .returns
+            .values()
+            .next()
+            .expect("convergent return boundary");
+        let converged_stack = convergent_boundary
+            .exit_stack_pointer
+            .expect("identical paths retain the entry stack pointer");
+        assert_eq!(converged_stack.storage(), register_storage(32, 8));
+        assert!(
+            convergent
+                .graph()
+                .def_inst(converged_stack.value().expect("converged entry SP value"))
+                .is_none()
+        );
+        assert!(convergent_boundary.complete);
+    }
+
+    #[test]
+    fn return_boundary_requires_declared_return_address_and_roots_it() {
+        let mut exact = R2ILBlock::new(0x6150, 4);
+        exact.push(R2ILOp::Copy {
+            dst: Varnode::register(16, 8),
+            src: Varnode::constant(0xfeed_face, 8),
+        });
+        exact.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+        let exact = SsaArtifact::raw_with_interface(
+            &[exact],
+            Some(&return_boundary_arch()),
+            preserved_stack_interface(),
+        )
+        .expect("exact return-address artifact");
+        let boundary = exact
+            .facts()
+            .boundaries
+            .returns
+            .values()
+            .next()
+            .expect("exact return boundary");
+        let return_address = boundary.return_address.expect("declared return address");
+        assert_eq!(return_address.storage, register_storage(16, 8));
+        let producer = exact
+            .graph()
+            .def_inst(return_address.value)
+            .expect("return-address producer");
+        assert!(
+            exact
+                .obligations()
+                .obligations_for_inst(producer)
+                .any(|obligation| {
+                    obligation.id.kind == SemanticObligationKind::LiveValueProducer
+                })
+        );
+        assert!(boundary.complete);
+
+        for target in [Varnode::register(0, 8), Varnode::constant(0, 8)] {
+            let mut corrupt = R2ILBlock::new(0x6160, 4);
+            corrupt.push(R2ILOp::Return { target });
+            let artifact = SsaArtifact::raw_with_interface(
+                &[corrupt],
+                Some(&return_boundary_arch()),
+                preserved_stack_interface(),
+            )
+            .expect("corrupt return-address artifact");
+            let boundary = artifact
+                .facts()
+                .boundaries
+                .returns
+                .values()
+                .next()
+                .expect("corrupt return boundary");
+            assert!(boundary.return_address.is_none());
+            assert!(!boundary.complete);
+        }
+    }
+
+    #[test]
+    fn exit_stack_pointer_refuses_divergence_calls_and_partial_writes() {
+        let divergent_blocks = || {
+            let mut entry = R2ILBlock::new(0x6200, 4);
+            entry.push(R2ILOp::Copy {
+                dst: Varnode::unique(0x120, 8),
+                src: Varnode::register(32, 8),
+            });
+            entry.push(R2ILOp::CBranch {
+                target: Varnode::ram(0x6220, 8),
+                cond: Varnode::register(24, 1),
+            });
+            let mut right = R2ILBlock::new(0x6204, 4);
+            right.push(R2ILOp::Copy {
+                dst: Varnode::register(32, 8),
+                src: Varnode::constant(0x1000, 8),
+            });
+            right.push(R2ILOp::Branch {
+                target: Varnode::ram(0x6230, 8),
+            });
+            let mut left = R2ILBlock::new(0x6220, 4);
+            left.push(R2ILOp::Copy {
+                dst: Varnode::register(32, 8),
+                src: Varnode::constant(0x2000, 8),
+            });
+            left.push(R2ILOp::Branch {
+                target: Varnode::ram(0x6230, 8),
+            });
+            let mut joined = R2ILBlock::new(0x6230, 4);
+            joined.push(R2ILOp::Return {
+                target: Varnode::register(16, 8),
+            });
+            vec![entry, right, left, joined]
+        };
+        let divergent = SsaArtifact::raw_with_interface(
+            &divergent_blocks(),
+            Some(&return_boundary_arch()),
+            preserved_stack_interface(),
+        )
+        .expect("divergent stack artifact");
+        let divergent_boundary = divergent
+            .facts()
+            .boundaries
+            .returns
+            .values()
+            .next()
+            .expect("divergent return boundary");
+        assert!(divergent_boundary.exit_stack_pointer.is_none());
+        assert!(!divergent_boundary.complete);
+
+        for (case_index, destructive_op) in [
+            R2ILOp::Call {
+                target: Varnode::ram(0x9000, 8),
+            },
+            R2ILOp::CallOther {
+                output: None,
+                userop: 7,
+                inputs: Vec::new(),
+            },
+            R2ILOp::Copy {
+                dst: Varnode::register(32, 4),
+                src: Varnode::constant(0, 4),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut block = R2ILBlock::new(0x6300, 4);
+            block.push(R2ILOp::Copy {
+                dst: Varnode::unique(0x130, 8),
+                src: Varnode::register(32, 8),
+            });
+            block.push(destructive_op);
+            block.push(R2ILOp::Return {
+                target: Varnode::register(16, 8),
+            });
+            let artifact = SsaArtifact::raw_with_interface(
+                &[block],
+                Some(&return_boundary_arch()),
+                preserved_stack_interface(),
+            )
+            .expect("closed stack artifact");
+            let boundary = artifact
+                .facts()
+                .boundaries
+                .returns
+                .values()
+                .next()
+                .expect("closed return boundary");
+            assert!(
+                boundary.exit_stack_pointer.is_none(),
+                "destructive SP case {case_index} retained a boundary: {boundary:?}"
+            );
+            assert!(!boundary.complete, "destructive SP case {case_index}");
+        }
+    }
+
+    #[test]
+    fn exit_stack_pointer_prunes_disconnected_returns_and_handles_reachable_cycles() {
+        let mut entry = R2ILBlock::new(0x6350, 4);
+        entry.push(R2ILOp::Branch {
+            target: Varnode::ram(0x6354, 8),
+        });
+        let mut dead = R2ILBlock::new(0x6354, 4);
+        dead.push(R2ILOp::Branch {
+            target: Varnode::ram(0x6354, 8),
+        });
+        let mut disconnected_return = R2ILBlock::new(0x6360, 4);
+        disconnected_return.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+        let disconnected = SsaArtifact::raw_with_interface(
+            &[entry, dead, disconnected_return],
+            Some(&return_boundary_arch()),
+            preserved_stack_interface(),
+        )
+        .expect("disconnected return artifact");
+        assert!(disconnected.facts().boundaries.returns.is_empty());
+
+        let mut entry = R2ILBlock::new(0x6370, 4);
+        entry.push(R2ILOp::Branch {
+            target: Varnode::ram(0x6374, 8),
+        });
+        let mut cycle = R2ILBlock::new(0x6374, 4);
+        cycle.push(R2ILOp::CBranch {
+            target: Varnode::ram(0x6374, 8),
+            cond: Varnode::register(24, 1),
+        });
+        let mut cycle_return = R2ILBlock::new(0x6378, 4);
+        cycle_return.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+        let cycle_only = SsaArtifact::raw_with_interface(
+            &[entry, cycle, cycle_return],
+            Some(&return_boundary_arch()),
+            preserved_stack_interface(),
+        )
+        .expect("reachable cycle return artifact");
+        let boundary = cycle_only
+            .facts()
+            .boundaries
+            .returns
+            .values()
+            .next()
+            .expect("reachable cycle return boundary");
+        assert!(boundary.exit_stack_pointer.is_some());
+        assert!(boundary.complete);
+    }
+
+    #[test]
+    fn exit_stack_pointer_is_collected_for_every_return() {
+        let mut entry = R2ILBlock::new(0x6400, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(0x140, 8),
+            src: Varnode::register(32, 8),
+        });
+        entry.push(R2ILOp::CBranch {
+            target: Varnode::ram(0x6420, 8),
+            cond: Varnode::register(24, 1),
+        });
+        let mut right = R2ILBlock::new(0x6404, 4);
+        right.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+        let mut left = R2ILBlock::new(0x6420, 4);
+        left.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+        let artifact = SsaArtifact::raw_with_interface(
+            &[entry, right, left],
+            Some(&return_boundary_arch()),
+            preserved_stack_interface(),
+        )
+        .expect("multi-return stack artifact");
+        assert_eq!(artifact.facts().boundaries.returns.len(), 2);
+        let values = artifact
+            .facts()
+            .boundaries
+            .returns
+            .values()
+            .map(|boundary| {
+                assert!(boundary.complete);
+                boundary
+                    .exit_stack_pointer
+                    .expect("typed stack pointer at every return")
+                    .value()
+                    .expect("multi-return graph carries entry SP")
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(values.len(), 1);
+    }
+
+    #[test]
+    fn return_boundary_refuses_composition_without_typed_machine_roles() {
         let artifact = composed_return_artifact(0x5000, "whole", "slice", "pc");
         let boundary = artifact
             .facts()
@@ -8044,69 +6906,13 @@ mod tests {
             .values()
             .next()
             .expect("return boundary");
-        assert!(boundary.complete);
+        assert!(!boundary.complete);
         assert!(
             boundary.values.is_empty(),
-            "generic return recovery must not select the stale full-width definition"
+            "an incomplete interface must not select a stale generic return value"
         );
-        let [composition] = boundary.register_compositions.as_slice() else {
-            panic!("one exact return composition expected");
-        };
-        assert_eq!(
-            composition.slot,
-            super::CallBoundarySlot::Register {
-                index: 0,
-                storage: register_storage(0, 4),
-            }
-        );
-        assert_eq!(composition.base.storage, register_storage(0, 4));
-        assert_eq!(composition.overlays.len(), 2);
-        assert!(
-            composition
-                .overlays
-                .iter()
-                .all(
-                    |overlay| overlay.definition.storage == register_storage(0, 1)
-                        && overlay.offset_bytes == 0
-                )
-        );
-        assert_eq!(
-            composition
-                .ordered_definitions()
-                .map(|definition| definition.producer)
-                .collect::<Vec<_>>(),
-            vec![InstId(0), InstId(1), InstId(2)]
-        );
-        assert!(composition.validate(
-            artifact.function(),
-            artifact.graph(),
-            artifact.machine_context(),
-            boundary.at,
-        ));
-        let return_value_obligations = artifact
-            .obligations()
-            .obligations_for_inst(boundary.at)
-            .filter(|obligation| obligation.id.kind == SemanticObligationKind::ReturnValue)
-            .collect::<Vec<_>>();
-        let [return_value] = return_value_obligations.as_slice() else {
-            panic!("one composed return-value obligation expected");
-        };
-        assert_eq!(
-            return_value.inputs,
-            composition
-                .ordered_definitions()
-                .map(|definition| definition.value)
-                .collect::<Vec<_>>()
-        );
-        for definition in composition.ordered_definitions() {
-            assert!(
-                artifact
-                    .obligations()
-                    .obligations_for_inst(definition.producer)
-                    .any(|obligation| obligation.id.kind
-                        == SemanticObligationKind::LiveValueProducer)
-            );
-        }
+        assert!(boundary.register_compositions.is_empty());
+        assert!(boundary.exit_stack_pointer.is_none());
         assert_eq!(
             super::reaching_abi_value_in_block(
                 artifact.function(),
@@ -8121,7 +6927,7 @@ mod tests {
     }
 
     #[test]
-    fn return_register_composition_validation_rejects_identity_and_order_mutations() {
+    fn return_register_composition_validation_is_unavailable_without_typed_machine_roles() {
         let artifact = composed_return_artifact(0x5100, "whole", "slice", "pc");
         let boundary = artifact
             .facts()
@@ -8130,49 +6936,10 @@ mod tests {
             .values()
             .next()
             .expect("return boundary");
-        let fact = boundary
-            .register_compositions
-            .first()
-            .expect("return composition");
-        let validates = |candidate: &super::SourceReturnRegisterCompositionFact| {
-            candidate.validate(
-                artifact.function(),
-                artifact.graph(),
-                artifact.machine_context(),
-                boundary.at,
-            )
-        };
-
-        let mut missing = fact.clone();
-        missing.overlays.remove(0);
-        assert!(!validates(&missing));
-
-        let mut reordered = fact.clone();
-        reordered.overlays.swap(0, 1);
-        assert!(!validates(&reordered));
-
-        let mut wrong_offset = fact.clone();
-        wrong_offset.overlays[0].offset_bytes = 1;
-        assert!(!validates(&wrong_offset));
-
-        let mut wrong_width = fact.clone();
-        wrong_width.overlays[0].definition.storage.size = 2;
-        assert!(!validates(&wrong_width));
-
-        let mut wrong_slot = fact.clone();
-        wrong_slot.slot = super::CallBoundarySlot::Register {
-            index: 1,
-            storage: register_storage(0, 4),
-        };
-        assert!(!validates(&wrong_slot));
-
-        let mut extra = fact.clone();
-        extra.overlays.push(fact.overlays[1]);
-        assert!(!validates(&extra));
-
-        let mut wrong_schema = fact.clone();
-        wrong_schema.schema_version = 0;
-        assert!(!validates(&wrong_schema));
+        assert!(!boundary.complete);
+        assert!(boundary.values.is_empty());
+        assert!(boundary.register_compositions.is_empty());
+        assert!(boundary.exit_stack_pointer.is_none());
     }
 
     #[test]
@@ -8210,400 +6977,33 @@ mod tests {
     }
 
     #[test]
-    fn return_register_composition_is_deterministic_name_and_address_independent() {
+    fn return_composition_refusal_is_deterministic_name_and_address_independent() {
         let first = composed_return_artifact(0x5200, "whole_a", "slice_a", "pc_a");
         let repeated = composed_return_artifact(0x5200, "whole_a", "slice_a", "pc_a");
         let renamed = composed_return_artifact(0x5200, "whole_b", "slice_b", "pc_b");
         let relocated = composed_return_artifact(0x9200, "whole_a", "slice_a", "pc_a");
-        let composition = |artifact: &SsaArtifact| {
+        let boundary = |artifact: &SsaArtifact| {
             artifact
                 .facts()
                 .boundaries
                 .returns
                 .values()
                 .next()
-                .and_then(|boundary| boundary.register_compositions.first())
                 .cloned()
-                .expect("return composition")
+                .expect("return boundary")
         };
-        assert_eq!(composition(&first), composition(&repeated));
-        assert_eq!(composition(&first), composition(&renamed));
-        assert_eq!(composition(&first), composition(&relocated));
-    }
-
-    #[test]
-    fn canonical_counted_loop_fact_retains_exact_carrier_transition_identities() {
-        let artifact =
-            SsaArtifact::raw(&canonical_counted_loop_blocks(), None).expect("counted loop SSA");
-        let facts = artifact
-            .structured()
-            .canonical_counted_loops
-            .values()
-            .collect::<Vec<_>>();
-        let [fact] = facts.as_slice() else {
-            panic!("one canonical counted loop fact");
-        };
-        assert_eq!(fact.preheader, 0x2000);
-        assert_eq!(fact.header, 0x2010);
-        assert_eq!(fact.exit, 0x2014);
-        assert_eq!(fact.latch, 0x2020);
-        assert_eq!(fact.width, 8);
-        assert_eq!(artifact.graph().def_inst(fact.phi), Some(fact.phi_inst));
-        assert_eq!(
-            artifact.graph().def_inst(fact.initializer),
-            Some(fact.initializer_inst)
-        );
-        assert_eq!(
-            artifact.graph().def_inst(fact.condition),
-            Some(fact.condition_inst)
-        );
-        assert_eq!(
-            artifact.graph().def_inst(fact.update),
-            Some(fact.update_inst)
-        );
-
-        let phi_obligations = artifact
-            .obligations()
-            .obligations_for_inst(fact.phi_inst)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            phi_obligations
-                .iter()
-                .filter(|obligation| {
-                    obligation.id.kind == SemanticObligationKind::LoopCarriedState
-                })
-                .count(),
-            1
-        );
-        let transitions = phi_obligations
-            .iter()
-            .filter(|obligation| obligation.id.kind == SemanticObligationKind::LiveStateTransition)
-            .collect::<Vec<_>>();
-        let [transition] = transitions.as_slice() else {
-            panic!("one edge-owned transition");
-        };
-        assert_eq!(transition.inputs, [fact.update]);
-    }
-
-    #[test]
-    fn canonical_counted_loop_fact_rejects_non_increment_transition() {
-        let mut blocks = canonical_counted_loop_blocks();
-        blocks[3].ops[0] = R2ILOp::IntSub {
-            dst: Varnode::register(0, 8),
-            a: Varnode::register(0, 8),
-            b: Varnode::constant(1, 8),
-        };
-        let artifact = SsaArtifact::raw(&blocks, None).expect("mutated loop SSA");
-        assert!(artifact.structured().canonical_counted_loops.is_empty());
-    }
-
-    const REAL_FNV_SOURCE_SHA256: &str =
-        "6524278ba4cd32a72dcf9cbcc385275999a50c3449d0e97035736891bcddff09";
-    const REAL_FNV_O2_FUNCTION_SHA256: &str =
-        "127862f7bb0f1efcdd2830dd5bec8eadd8ac9812a847f477909b95fec671b6ac";
-    const REAL_FNV_O2_BINARY_SHA256: &str =
-        "e15adf9d8916bdbc1a45a07741734279cc815b87a5b2762cfb24cd78d33503c1";
-    const REAL_FNV_O2_BINARY_PATH: &str = "tests/r2r/bins/r2sleigh_manual_limits_O2";
-    const REAL_FNV_O2_COMPILER_COMMAND: &str =
-        "cc -O2 -g -o tests/r2r/bins/r2sleigh_manual_limits_O2 tests/gold/manual_limits.c";
-    const REAL_FNV_O2_BASE: u64 = 0x1_0000_0594;
-    const REAL_FNV_O2_SETUP: u64 = 0x1_0000_05ac;
-    const REAL_FNV_O2_LOOP: u64 = 0x1_0000_05b4;
-    const REAL_FNV_O2_EXIT: u64 = 0x1_0000_05d8;
-    const REAL_FNV_O2_BLOCKS: &[&str] = &[
-        "e80300aa607080d2a073aef200f6c1f2a08ce2f2810100b4",
-        "693680d20920c0f2",
-        "0a1540384b0501514c011b327f6900718a318a1a0a000aca407d099b210400f101ffff54",
-        "c0035fd6",
-    ];
-
-    fn decode_hex(encoded: &str) -> Vec<u8> {
-        encoded
-            .as_bytes()
-            .chunks_exact(2)
-            .map(|pair| {
-                let high = (pair[0] as char).to_digit(16).expect("hex digit") as u8;
-                let low = (pair[1] as char).to_digit(16).expect("hex digit") as u8;
-                (high << 4) | low
-            })
-            .collect()
-    }
-
-    fn sha256_hex(bytes: &[u8]) -> String {
-        format!("{:x}", Sha256::digest(bytes))
-    }
-
-    fn real_fnv_fold_storage(arch: &ArchSpec, register: &str) -> CanonicalStorageId {
-        let register = arch
-            .get_register(register)
-            .expect("pinned AARCH64 register");
-        CanonicalStorageId {
-            space: CanonicalStorageSpace::Register,
-            offset: register.offset,
-            size: register.size,
+        let first = boundary(&first);
+        for refused in [
+            boundary(&repeated),
+            boundary(&renamed),
+            boundary(&relocated),
+        ] {
+            assert_eq!(refused, first);
+            assert!(!refused.complete);
+            assert!(refused.values.is_empty());
+            assert!(refused.register_compositions.is_empty());
+            assert!(refused.exit_stack_pointer.is_none());
         }
-    }
-
-    fn real_fnv_fold_interface_with(
-        arch: &ArchSpec,
-        revision: &[u8],
-        pointee_kind: SourceTypeKind,
-        return_storage: CanonicalStorageId,
-    ) -> SourceFunctionInterface {
-        let graph = SourceTypeGraph::new(
-            [
-                SourceType::new(0, pointee_kind, 8, 8),
-                SourceType::new(1, SourceTypeKind::Pointer { target_type_id: 0 }, 64, 64),
-                SourceType::new(2, SourceTypeKind::UnsignedInteger, 64, 64),
-            ],
-            [],
-        )
-        .expect("real FNV source graph");
-        let full64 = SourceCarrierProjection::new(SourceCarrierKind::Full, 0, 64);
-        SourceFunctionInterface::new_exact_with_logical_types(
-            revision.to_vec(),
-            "aapcs64",
-            [
-                SourceAbiParameterSpec::new(0, real_fnv_fold_storage(arch, "x0")),
-                SourceAbiParameterSpec::new(1, real_fnv_fold_storage(arch, "x1")),
-            ],
-            SourceFunctionReturn::Register {
-                storage: return_storage,
-            },
-            [],
-            [
-                SourceLogicalValue::new(1, full64),
-                SourceLogicalValue::new(2, full64),
-            ],
-            Some(SourceLogicalValue::new(2, full64)),
-            Some(graph),
-        )
-        .expect("real FNV source interface")
-    }
-
-    fn real_fnv_fold_fixture() -> (ArchSpec, Vec<R2ILBlock>) {
-        let provenance = format!(
-            "binary={REAL_FNV_O2_BINARY_PATH} binary_sha256={REAL_FNV_O2_BINARY_SHA256} command={REAL_FNV_O2_COMPILER_COMMAND}"
-        );
-        assert_eq!(
-            sha256_hex(include_bytes!("../../../tests/gold/manual_limits.c")),
-            REAL_FNV_SOURCE_SHA256,
-            "source provenance changed: {provenance}"
-        );
-        assert_eq!(
-            sha256_hex(include_bytes!(
-                "../../../tests/r2r/bins/r2sleigh_manual_limits_O2"
-            )),
-            REAL_FNV_O2_BINARY_SHA256,
-            "binary provenance changed: {provenance}"
-        );
-        let function_bytes = REAL_FNV_O2_BLOCKS
-            .iter()
-            .flat_map(|encoded| decode_hex(encoded))
-            .collect::<Vec<_>>();
-        assert_eq!(function_bytes.len(), 72, "{provenance}");
-        assert_eq!(
-            sha256_hex(&function_bytes),
-            REAL_FNV_O2_FUNCTION_SHA256,
-            "function-byte provenance changed: {provenance}"
-        );
-
-        let arch = build_arch_spec(
-            sleigh_config::processor_aarch64::SLA_AARCH64_APPLESILICON,
-            sleigh_config::processor_aarch64::PSPEC_AARCH64,
-            "aarch64",
-        )
-        .expect("AARCH64 architecture");
-        let disassembler = Disassembler::from_sla(
-            sleigh_config::processor_aarch64::SLA_AARCH64_APPLESILICON,
-            sleigh_config::processor_aarch64::PSPEC_AARCH64,
-            "aarch64",
-        )
-        .expect("AARCH64 disassembler");
-        let mut address = REAL_FNV_O2_BASE;
-        let blocks = REAL_FNV_O2_BLOCKS
-            .iter()
-            .map(|encoded| {
-                let bytes = decode_hex(encoded);
-                let block = disassembler
-                    .lift_block(&bytes, address, bytes.len())
-                    .expect("pinned real ARM64 O2 FNV block");
-                assert_eq!(
-                    block.size as usize,
-                    bytes.len(),
-                    "real block must be fully consumed"
-                );
-                address += bytes.len() as u64;
-                block
-            })
-            .collect::<Vec<_>>();
-        let memory_spaces = blocks
-            .iter()
-            .flat_map(|block| &block.ops)
-            .filter_map(|op| match op {
-                R2ILOp::Load { space, .. } | R2ILOp::Store { space, .. } => Some(*space),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            !memory_spaces.is_empty(),
-            "real FNV lift must access memory"
-        );
-        assert!(
-            memory_spaces.iter().all(|space| *space == SpaceId::Ram),
-            "real ARM64 FNV accesses must use Ram: {memory_spaces:?}"
-        );
-        (arch, blocks)
-    }
-
-    fn real_fnv_fold_artifact() -> SsaArtifact {
-        let (arch, blocks) = real_fnv_fold_fixture();
-        let interface = real_fnv_fold_interface_with(
-            &arch,
-            b"real-arm64-fnv-fold-o2-v1",
-            SourceTypeKind::UnsignedInteger,
-            real_fnv_fold_storage(&arch, "x0"),
-        );
-        SsaArtifact::for_decompile_with_interface(&blocks, Some(&arch), interface)
-            .expect("prepared real ARM64 O2 FNV artifact")
-    }
-
-    fn real_fnv_fold_artifact_with_contract(
-        revision: &[u8],
-        pointee_kind: SourceTypeKind,
-        return_register: &str,
-    ) -> SsaArtifact {
-        let (arch, blocks) = real_fnv_fold_fixture();
-        let interface = real_fnv_fold_interface_with(
-            &arch,
-            revision,
-            pointee_kind,
-            real_fnv_fold_storage(&arch, return_register),
-        );
-        SsaArtifact::for_decompile_with_interface(&blocks, Some(&arch), interface)
-            .expect("prepared real ARM64 O2 FNV contract variant")
-    }
-
-    #[test]
-    fn real_fnv_fold_fact_retains_exact_recurrence_and_return() {
-        let artifact = real_fnv_fold_artifact();
-        let fact = artifact
-            .structured()
-            .canonical_fnv_fold_loops
-            .get(&REAL_FNV_O2_LOOP)
-            .expect("real ARM64 O2 FNV fact");
-
-        assert_eq!(
-            fact.schema_version,
-            super::CANONICAL_FNV_FOLD_LOOP_FACT_SCHEMA_VERSION
-        );
-        assert_eq!(fact.topology.entry, REAL_FNV_O2_BASE);
-        assert_eq!(fact.topology.setup, REAL_FNV_O2_SETUP);
-        assert_eq!(fact.topology.exit, REAL_FNV_O2_EXIT);
-        assert_eq!(fact.hash.offset_basis, 0x1465_0fb0_739d_0383);
-        assert_eq!(fact.pointer.buffer_parameter_index, 0);
-        assert_eq!(fact.byte_load.access.ordinal, 0);
-        assert_eq!(
-            fact.byte_load.memory_version.object,
-            fact.byte_load.memory_object
-        );
-        assert!(fact.ascii.lowercase_on_true);
-        assert_eq!(fact.recurrence.product, fact.hash.carrier.update);
-        assert_eq!(fact.returned.value, fact.hash.exit_phi);
-        assert!(fact.validate_against(&artifact));
-    }
-
-    #[test]
-    fn real_fnv_fold_fact_rejects_hash_relation_mutation() {
-        let (arch, mut blocks) = real_fnv_fold_fixture();
-        let multiplication = blocks
-            .iter_mut()
-            .flat_map(|block| &mut block.ops)
-            .find(|op| matches!(op, R2ILOp::IntMult { .. }))
-            .expect("real FNV multiplication");
-        let R2ILOp::IntMult { dst, a, b } = multiplication.clone() else {
-            unreachable!("selected multiplication")
-        };
-        *multiplication = R2ILOp::IntAdd { dst, a, b };
-        let interface = real_fnv_fold_interface_with(
-            &arch,
-            b"real-arm64-fnv-fold-o2-v1",
-            SourceTypeKind::UnsignedInteger,
-            real_fnv_fold_storage(&arch, "x0"),
-        );
-        let artifact = SsaArtifact::for_decompile_with_interface(&blocks, Some(&arch), interface)
-            .expect("prepared real ARM64 O2 FNV mutation");
-        assert!(artifact.structured().canonical_fnv_fold_loops.is_empty());
-    }
-
-    #[test]
-    fn real_fnv_fold_fact_rejects_return_and_type_contract_mutations() {
-        let artifact = real_fnv_fold_artifact_with_contract(
-            b"real-arm64-fnv-fold-o2-v1",
-            SourceTypeKind::UnsignedInteger,
-            "x1",
-        );
-        assert!(artifact.structured().canonical_fnv_fold_loops.is_empty());
-
-        let artifact = real_fnv_fold_artifact_with_contract(
-            b"real-arm64-fnv-fold-o2-v1",
-            SourceTypeKind::SignedInteger,
-            "x0",
-        );
-        assert!(artifact.structured().canonical_fnv_fold_loops.is_empty());
-    }
-
-    #[test]
-    fn real_fnv_fold_fact_revision_identity_is_exact() {
-        let original = real_fnv_fold_artifact();
-        let original_fact = original
-            .structured()
-            .canonical_fnv_fold_loops
-            .get(&REAL_FNV_O2_LOOP)
-            .expect("original real FNV revision fact");
-        let revised = real_fnv_fold_artifact_with_contract(
-            b"real-arm64-fnv-fold-o2-v2",
-            SourceTypeKind::UnsignedInteger,
-            "x0",
-        );
-        let revised_fact = revised
-            .structured()
-            .canonical_fnv_fold_loops
-            .get(&REAL_FNV_O2_LOOP)
-            .expect("revised real FNV source fact");
-
-        assert_ne!(
-            original_fact.abi.revision_identity,
-            revised_fact.abi.revision_identity
-        );
-        assert!(!original_fact.validate_against(&revised));
-        assert!(!revised_fact.validate_against(&original));
-    }
-
-    #[test]
-    fn real_fnv_fold_fact_revalidator_rejects_corrupted_identity() {
-        let artifact = real_fnv_fold_artifact();
-        let fact = artifact
-            .structured()
-            .canonical_fnv_fold_loops
-            .get(&REAL_FNV_O2_LOOP)
-            .expect("real ARM64 O2 FNV fact");
-        let mut corrupted = fact.clone();
-        corrupted.schema_version = 0;
-        assert!(!corrupted.validate_against(&artifact));
-        let mut corrupted = fact.clone();
-        corrupted.abi.revision_identity = b"different-revision".to_vec().into_boxed_slice();
-        assert!(!corrupted.validate_against(&artifact));
-        let mut corrupted = fact.clone();
-        corrupted.pointer.load_address = fact.pointer.carrier.update;
-        assert!(!corrupted.validate_against(&artifact));
-        let mut corrupted = fact.clone();
-        corrupted.byte_load.memory_version.version =
-            corrupted.byte_load.memory_version.version.saturating_add(1);
-        assert!(!corrupted.validate_against(&artifact));
-        let mut corrupted = fact.clone();
-        corrupted.returned.value = fact.hash.carrier.phi;
-        assert!(!corrupted.validate_against(&artifact));
     }
 
     #[test]

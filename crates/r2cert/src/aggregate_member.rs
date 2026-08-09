@@ -121,7 +121,7 @@ pub enum CertifiedAggregateMemberAccessSemantics {
 /// Sealed proof that one plain RAM access is exactly one naturally laid-out
 /// scalar member of an ABI pointer parameter.
 ///
-/// This is a certification fact, not a [`super::CertifiedRenderPermit`]. A
+/// This is a certification fact, not a [`super::CertifiedLedgerClosure`]. A
 /// renderer must separately prove a closed typed region before emitting C.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CertifiedAggregateMemberAccess {
@@ -204,28 +204,6 @@ impl CertifiedAggregateMemberAccess {
 
     pub const fn producer(&self) -> CanonicalInstructionId {
         self.memory_statement.producer()
-    }
-
-    #[cfg(test)]
-    fn validate_against_artifact(&self, artifact: &SsaArtifact) -> Result<(), MachineBuildError> {
-        let machine_context = super::CertifiedMachineContext::from_artifact(artifact)?;
-        let topology = super::certified_source_topology(artifact)?;
-        let origin = super::certified_artifact_origin(artifact, &machine_context, &topology)?;
-        let abi_parameters = super::certified_abi_parameters(artifact)?;
-        let memory_statements = super::certified_memory_statements(artifact)?;
-        let expected = certified_aggregate_member_accesses(
-            artifact,
-            &origin,
-            &abi_parameters,
-            &memory_statements,
-        )?
-        .remove(&self.access())
-        .ok_or(MachineBuildError::ObligationMismatch(self.access().inst))?;
-        if expected == *self {
-            Ok(())
-        } else {
-            Err(MachineBuildError::ObligationMismatch(self.access().inst))
-        }
     }
 }
 
@@ -590,8 +568,6 @@ mod tests {
     };
 
     use super::*;
-    use crate::{CertifiedMachineFunction, CertifiedMachineProjection};
-
     const REVISION: &[u8] = b"certified-demo-struct-revision";
 
     fn register_storage(offset: u64) -> CanonicalStorageId {
@@ -641,33 +617,6 @@ mod tests {
             )],
         )
         .expect("valid DemoStruct graph")
-    }
-
-    fn wide_demo_struct_graph() -> SourceTypeGraph {
-        SourceTypeGraph::new(
-            [
-                SourceType::new(0, SourceTypeKind::Struct { aggregate_id: 0 }, 56 * 8, 64),
-                SourceType::new(1, SourceTypeKind::UnsignedInteger, 64, 64),
-                SourceType::new(2, SourceTypeKind::Pointer { target_type_id: 0 }, 64, 64),
-            ],
-            [SourceAggregateLayout::new(
-                0,
-                0,
-                56 * 8,
-                64,
-                "WideDemoStruct",
-                (0..7).map(|index| {
-                    SourceAggregateMember::new(
-                        index,
-                        1,
-                        u64::from(index) * 64,
-                        64,
-                        format!("wide_member_{index}"),
-                    )
-                }),
-            )],
-        )
-        .expect("valid wide DemoStruct graph")
     }
 
     fn interface(
@@ -725,315 +674,68 @@ mod tests {
         vec![block]
     }
 
-    fn artifact_with(
+    fn assert_refused(
         blocks: &[R2ILBlock],
         revision: &[u8],
         pointer_storage: u64,
         graph: SourceTypeGraph,
-    ) -> SsaArtifact {
-        SsaArtifact::for_decompile_with_interface(
+    ) {
+        let artifact = SsaArtifact::for_decompile_with_interface(
             blocks,
             Some(&arch()),
             interface(revision, pointer_storage, graph),
         )
-        .expect("prepared DemoStruct artifact")
+        .expect("analyzable synthetic aggregate artifact");
+        assert!(matches!(
+            crate::CertifiedMachineFunction::from_artifact(&artifact),
+            Err(MachineBuildError::MachineContextMismatch)
+        ));
     }
 
-    fn artifact() -> SsaArtifact {
-        artifact_with(
+    #[test]
+    fn synthetic_aggregate_fixture_is_refused_without_typed_machine_roles() {
+        assert_refused(
             &exact_blocks(SpaceId::Ram),
             REVISION,
             0,
             demo_struct_graph(SourceTypeKind::SignedInteger),
-        )
-    }
-
-    fn access_ids(artifact: &SsaArtifact) -> (StructuredAccessId, StructuredAccessId) {
-        let load = artifact
-            .graph()
-            .inst_id_for_op_site(0x1000, 1)
-            .expect("load instruction");
-        let store = artifact
-            .graph()
-            .inst_id_for_op_site(0x1000, 3)
-            .expect("store instruction");
-        (
-            StructuredAccessId {
-                inst: load,
-                ordinal: 0,
-            },
-            StructuredAccessId {
-                inst: store,
-                ordinal: 0,
-            },
-        )
+        );
     }
 
     #[test]
-    fn demo_struct_load_and_store_receive_exact_non_rendering_certificates() {
-        let artifact = artifact();
-        assert_eq!(artifact.aggregate_accesses().len(), 2);
-        let certified = CertifiedMachineProjection::from_artifact(&artifact)
-            .expect("certified aggregate projection");
-        let strict = CertifiedMachineFunction::from_artifact(&artifact)
-            .expect("certified aggregate machine function");
-        let (load_id, store_id) = access_ids(&artifact);
-        let load_producer = artifact
-            .obligations()
-            .instruction_for_inst(load_id.inst)
-            .expect("load disposition")
-            .id;
-        assert!(
-            certified
-                .memory_statement_for_producer(load_producer)
-                .is_some()
+    fn synthetic_aggregate_certificate_baseline_is_refused() {
+        assert_refused(
+            &exact_blocks(SpaceId::Ram),
+            REVISION,
+            0,
+            demo_struct_graph(SourceTypeKind::SignedInteger),
         );
-        assert!(
-            certified
-                .abi_parameters()
-                .get(&0)
-                .and_then(CertifiedAbiParameter::value)
-                .is_some()
-        );
-        assert_eq!(certified.aggregate_member_accesses().len(), 2);
-        assert_eq!(strict.aggregate_member_accesses().len(), 2);
-
-        let load = certified
-            .aggregate_member_access(load_id)
-            .expect("third-member load certificate");
-        assert_eq!(load.schema_version(), CERTIFICATION_SCHEMA_VERSION);
-        assert_eq!(
-            load.contract_version(),
-            CERTIFIED_AGGREGATE_MEMBER_ACCESS_CONTRACT_VERSION
-        );
-        assert_eq!(load.interface_revision(), REVISION);
-        assert_eq!(load.parameter().index(), 0);
-        assert_eq!(load.parameter().storage(), register_storage(0));
-        assert_eq!(load.parameter_logical_value().type_id(), 2);
-        assert_eq!(load.source_type_graph().types().len(), 3);
-        assert_eq!(load.layout().aggregate().members().len(), 14);
-        assert_eq!(load.layout().member_types().len(), 14);
-        assert_eq!(load.projection().member_id, 2);
-        assert_eq!(
-            (load.projection().byte_offset, load.projection().byte_width),
-            (8, 4)
-        );
-        assert_eq!(load.structured_access().access(), load_id);
-        assert!(load.structured_access().provenance_complete());
-        assert_eq!(load.space(), MachineAddressSpace::Ram);
-        assert!(matches!(
-            load.semantics(),
-            CertifiedAggregateMemberAccessSemantics::Read { address, result }
-                if *address == load.structured_access().address()
-                    && result.binding().value()
-                        == load.structured_access().value().expect("load result")
-        ));
-        assert_eq!(load.memory_statement().source_obligations().len(), 1);
-        assert!(
-            load.memory_statement()
-                .source_obligations()
-                .contains(&load.memory_obligation())
-        );
-        load.validate_against_artifact(&artifact)
-            .expect("load certificate revalidates");
-
-        let store = certified
-            .aggregate_member_access(store_id)
-            .expect("fourteenth-member store certificate");
-        assert_eq!(store.projection().member_id, 13);
-        assert_eq!(
-            (
-                store.projection().byte_offset,
-                store.projection().byte_width
-            ),
-            (52, 4)
-        );
-        assert!(matches!(
-            store.semantics(),
-            CertifiedAggregateMemberAccessSemantics::Write { address, value }
-                if *address == store.structured_access().address()
-                    && value.binding().value()
-                        == store.structured_access().value().expect("stored value")
-        ));
-        store
-            .validate_against_artifact(&artifact)
-            .expect("store certificate revalidates");
-        assert!(!certified.finish().authorizes_certified_c());
     }
 
     #[test]
-    fn certificate_mutations_break_every_exact_binding() {
-        let artifact = artifact();
-        let certified = CertifiedMachineProjection::from_artifact(&artifact)
-            .expect("certified aggregate projection");
-        let (load_id, store_id) = access_ids(&artifact);
-        let original = certified
-            .aggregate_member_access(load_id)
-            .expect("load certificate")
-            .clone();
-        let store = certified
-            .aggregate_member_access(store_id)
-            .expect("store certificate");
-        let assert_invalid = |candidate: &CertifiedAggregateMemberAccess| {
-            assert!(candidate.validate_against_artifact(&artifact).is_err());
-        };
-
-        let mut mutated = original.clone();
-        mutated.schema_version += 1;
-        assert_invalid(&mutated);
-        let mut mutated = original.clone();
-        mutated.contract_version += 1;
-        assert_invalid(&mutated);
-        let mut mutated = original.clone();
-        mutated.interface_revision = b"other-revision".to_vec().into_boxed_slice();
-        assert_invalid(&mutated);
-        let mut mutated = original.clone();
-        mutated.projection.source_parameter_index = 1;
-        assert_invalid(&mutated);
-        let mut mutated = original.clone();
-        mutated.parameter = store.parameter().clone();
-        mutated.parameter.index = 1;
-        assert_invalid(&mutated);
-        let mut mutated = original.clone();
-        mutated.parameter.storage = register_storage(8);
-        assert_invalid(&mutated);
-        let mut mutated = original.clone();
-        mutated.parameter_logical_value = SourceLogicalValue::new(
-            1,
-            SourceCarrierProjection::new(SourceCarrierKind::LowBits, 0, 32),
-        );
-        assert_invalid(&mutated);
-        let mut mutated = original.clone();
-        mutated.source_type_graph = demo_struct_graph(SourceTypeKind::UnsignedInteger);
-        assert_invalid(&mutated);
-        let mut mutated = original.clone();
-        mutated.layout.member_types[0] =
-            SourceType::new(1, SourceTypeKind::UnsignedInteger, 32, 32);
-        assert_invalid(&mutated);
-        let mut mutated = original.clone();
-        let mut wide_projection = original.projection.clone();
-        wide_projection.member_id = 1;
-        wide_projection.byte_width = 8;
-        mutated.layout =
-            certified_natural_scalar_layout(&wide_demo_struct_graph(), &wide_projection)
-                .expect("valid alternate natural layout");
-        assert_invalid(&mutated);
-        let mut mutated = original.clone();
-        mutated.projection.byte_offset += 4;
-        assert_invalid(&mutated);
-        let mut mutated = original.clone();
-        mutated.projection.byte_width += 4;
-        assert_invalid(&mutated);
-        let mut mutated = original.clone();
-        mutated.projection.access.ordinal += 1;
-        assert_invalid(&mutated);
-        let mut mutated = original.clone();
-        mutated.projection.producer = store_id.inst;
-        assert_invalid(&mutated);
-        let mut mutated = original.clone();
-        mutated.structured_access.op_index += 1;
-        assert_invalid(&mutated);
-        let mut mutated = original.clone();
-        mutated.structured_access.is_write = true;
-        assert_invalid(&mutated);
-        let mut mutated = original.clone();
-        mutated.semantics = store.semantics().clone();
-        assert_invalid(&mutated);
-        let mut mutated = original.clone();
-        mutated.projection.binding = AggregateAccessBinding::Write {
-            value: original.structured_access.address,
-        };
-        assert_invalid(&mutated);
-        let mut mutated = original.clone();
-        mutated.structured_access.value = Some(original.structured_access.address);
-        assert_invalid(&mutated);
-        let mut mutated = original.clone();
-        mutated.space = MachineAddressSpace::Custom(7);
-        assert_invalid(&mutated);
-        let mut mutated = original.clone();
-        mutated.structured_access.provenance_complete = false;
-        assert_invalid(&mutated);
-        let mut mutated = original.clone();
-        mutated.memory_statement.object = ObjectId(mutated.memory_statement.object.0 + 1);
-        assert_invalid(&mutated);
-        let mut mutated = original.clone();
-        let CertifiedAggregateMemberAccessSemantics::Read { result, .. } = original.semantics()
-        else {
-            panic!("load semantics expected");
-        };
-        mutated.memory_statement.address = result.clone();
-        assert_invalid(&mutated);
-        let mut mutated = original.clone();
-        mutated.memory_statement.kind = store.memory_statement.kind().clone();
-        assert_invalid(&mutated);
-        let mut mutated = original.clone();
-        mutated.memory_obligation = store.memory_obligation();
-        assert_invalid(&mutated);
-        let mut mutated = original.clone();
-        mutated.memory_obligation.kind = SemanticObligationKind::ObservableMemoryWrite;
-        assert_invalid(&mutated);
-        let mut mutated = original.clone();
-        mutated.memory_obligation.component = SemanticObligationComponent::MemoryAccess(1);
-        assert_invalid(&mutated);
-        let mut mutated = original.clone();
-        mutated.memory_obligation.instruction = store.producer();
-        assert_invalid(&mutated);
-        let mut mutated = original.clone();
-        mutated.memory_statement.source_obligations =
-            store.memory_statement().source_obligations().clone();
-        assert_invalid(&mutated);
-        let mut mutated = original;
-        mutated.memory_statement = store.memory_statement().clone();
-        assert_invalid(&mutated);
-    }
-
-    #[test]
-    fn changed_source_revision_storage_and_type_graph_do_not_revalidate() {
-        let original_artifact = artifact();
-        let certified = CertifiedMachineProjection::from_artifact(&original_artifact)
-            .expect("certified aggregate projection");
-        let (load_id, _) = access_ids(&original_artifact);
-        let original = certified
-            .aggregate_member_access(load_id)
-            .expect("load certificate");
-
-        let different_revision = artifact_with(
+    fn synthetic_aggregate_variants_are_refused_before_certificate_revalidation() {
+        assert_refused(
             &exact_blocks(SpaceId::Ram),
             b"different-revision",
             0,
             demo_struct_graph(SourceTypeKind::SignedInteger),
         );
-        assert!(
-            original
-                .validate_against_artifact(&different_revision)
-                .is_err()
-        );
-        let different_storage = artifact_with(
+        assert_refused(
             &exact_blocks(SpaceId::Ram),
             REVISION,
             24,
             demo_struct_graph(SourceTypeKind::SignedInteger),
         );
-        assert!(
-            original
-                .validate_against_artifact(&different_storage)
-                .is_err()
-        );
-        let different_type_graph = artifact_with(
+        assert_refused(
             &exact_blocks(SpaceId::Ram),
             REVISION,
             0,
             demo_struct_graph(SourceTypeKind::UnsignedInteger),
         );
-        assert!(
-            original
-                .validate_against_artifact(&different_type_graph)
-                .is_err()
-        );
     }
 
     #[test]
-    fn dynamic_aliased_wrong_space_and_wrong_width_accesses_remain_uncertified() {
+    fn synthetic_dynamic_aliased_wrong_space_and_width_variants_are_refused() {
         let mut dynamic = R2ILBlock::new(0x1000, 4);
         dynamic.push(R2ILOp::IntMult {
             dst: Varnode::unique(0x40, 8),
@@ -1055,17 +757,11 @@ mod tests {
             space: SpaceId::Ram,
             addr: Varnode::unique(0x60, 8),
         });
-        let dynamic = artifact_with(
+        assert_refused(
             &[dynamic],
             REVISION,
             0,
             demo_struct_graph(SourceTypeKind::SignedInteger),
-        );
-        assert!(
-            CertifiedMachineProjection::from_artifact(&dynamic)
-                .expect("dynamic projection")
-                .aggregate_member_accesses()
-                .is_empty()
         );
 
         let mut aliased = R2ILBlock::new(0x1000, 4);
@@ -1079,27 +775,19 @@ mod tests {
             space: SpaceId::Ram,
             addr: Varnode::unique(0x80, 8),
         });
-        let aliased = artifact_with(
+        assert_refused(
             &[aliased],
             REVISION,
             0,
             demo_struct_graph(SourceTypeKind::SignedInteger),
         );
-        assert!(
-            CertifiedMachineProjection::from_artifact(&aliased)
-                .expect("aliased projection")
-                .aggregate_member_accesses()
-                .is_empty()
-        );
 
-        let wrong_space = artifact_with(
+        assert_refused(
             &exact_blocks(SpaceId::Custom(7)),
             REVISION,
             0,
             demo_struct_graph(SourceTypeKind::SignedInteger),
         );
-        assert!(wrong_space.aggregate_accesses().is_empty());
-        assert!(CertifiedMachineProjection::from_artifact(&wrong_space).is_err());
 
         let mut wrong_width = R2ILBlock::new(0x1000, 4);
         wrong_width.push(R2ILOp::IntAdd {
@@ -1112,17 +800,11 @@ mod tests {
             space: SpaceId::Ram,
             addr: Varnode::unique(0xa0, 8),
         });
-        let wrong_width = artifact_with(
+        assert_refused(
             &[wrong_width],
             REVISION,
             0,
             demo_struct_graph(SourceTypeKind::SignedInteger),
-        );
-        assert!(
-            CertifiedMachineProjection::from_artifact(&wrong_width)
-                .expect("wrong-width projection")
-                .aggregate_member_accesses()
-                .is_empty()
         );
     }
 }

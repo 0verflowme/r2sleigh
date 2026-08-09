@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 use r2cert::{
     CertifiedAggregateMemberAccess, CertifiedAggregateMemberAccessSemantics,
     CertifiedArtifactOrigin, CertifiedMachineProjection, CertifiedMemoryStatement,
-    CertifiedMemoryStatementKind, CertifiedNaturalScalarAggregateLayout, CertifiedRenderPermit,
+    CertifiedMemoryStatementKind, CertifiedNaturalScalarAggregateLayout,
 };
 use r2ssa::{
     CanonicalInstructionId, CanonicalStorageId, InstPayload, MachineBuildError,
@@ -27,7 +27,7 @@ use crate::semantic_memory_function::{
     PLAIN_RAM_HELPER_DECLARATIONS, memory_helper_name, render_value_use,
 };
 
-pub const CERTIFIED_AGGREGATE_MEMBER_SEMANTIC_C_FUNCTION_SCHEMA_VERSION: u32 = 1;
+pub const CERTIFIED_AGGREGATE_MEMBER_SEMANTIC_C_FUNCTION_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum CertifiedAggregateMemberSemanticCFunctionScope {
@@ -235,14 +235,14 @@ impl CertifiedAggregateMemberRenderAccess {
 }
 
 /// A closed aggregate-member function layered on the existing plain-RAM
-/// terminal-return permit. This type carries no independent render authority.
+/// terminal-return typed-output seal. Aggregate spelling introduces no new
+/// source obligation and therefore carries no duplicate authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CertifiedAggregateMemberSemanticCFunction {
     schema_version: u32,
     scope: CertifiedAggregateMemberSemanticCFunctionScope,
     name: String,
     origin: CertifiedArtifactOrigin,
-    render_permit: CertifiedRenderPermit,
     interface_revision: Box<[u8]>,
     source_interface: SourceFunctionInterface,
     pointer_parameter_index: u32,
@@ -842,7 +842,6 @@ impl CertifiedAggregateMemberSemanticCFunction {
             scope: CertifiedAggregateMemberSemanticCFunctionScope::SingleTerminalReturnBlockWithExactAggregateMembers,
             name: format!("certified_aggregate_sub_{:x}", memory.layer().accounting().block_addr()),
             origin: memory_origin.clone(),
-            render_permit: memory.render_permit().clone(),
             interface_revision: revision.to_vec().into_boxed_slice(),
             source_interface,
             pointer_parameter_index,
@@ -878,10 +877,6 @@ impl CertifiedAggregateMemberSemanticCFunction {
 
     pub const fn origin(&self) -> &CertifiedArtifactOrigin {
         &self.origin
-    }
-
-    pub const fn render_permit(&self) -> &CertifiedRenderPermit {
-        &self.render_permit
     }
 
     pub const fn interface_revision(&self) -> &[u8] {
@@ -942,9 +937,6 @@ impl CertifiedAggregateMemberSemanticCFunction {
         }
         if self.origin != *self.memory.layer().accounting().origin() {
             invalid.push("aggregate function origin mismatch".to_string());
-        }
-        if self.render_permit != *self.memory.render_permit() {
-            invalid.push("aggregate function permit mismatch".to_string());
         }
         if self.interface_revision.as_ref() != self.source_interface.revision_identity() {
             invalid.push("aggregate interface revision mismatch".to_string());
@@ -1455,9 +1447,6 @@ static inline int64_t r2s_i64_from_bits(uint64_t bits) {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write as _;
-    use std::process::{Command, Stdio};
-
     use r2il::{
         AddressSpace, ArchSpec, Endianness, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode,
     };
@@ -1682,312 +1671,33 @@ mod tests {
         )
     }
 
-    fn compile_and_run(source: &str, harness: &str, suffix: &str) {
-        let executable =
-            std::env::temp_dir().join(format!("r2dec-aggregate-{}-{suffix}", std::process::id()));
-        let mut compiler = Command::new("cc")
-            .args([
-                "-std=c11",
-                "-Wall",
-                "-Wextra",
-                "-Wpedantic",
-                "-Wno-unused-function",
-                "-Werror",
-                "-x",
-                "c",
-                "-",
-                "-o",
-            ])
-            .arg(&executable)
-            .stdin(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("C11 compiler required");
-        let translation_unit = format!("{source}\n{harness}");
-        compiler
-            .stdin
-            .as_mut()
-            .expect("compiler stdin")
-            .write_all(translation_unit.as_bytes())
-            .expect("write generated translation unit");
-        let compilation = compiler.wait_with_output().expect("wait for C compiler");
-        assert!(
-            compilation.status.success(),
-            "generated C failed:\n{translation_unit}\n{}",
-            String::from_utf8_lossy(&compilation.stderr)
-        );
-        let execution = Command::new(&executable)
-            .output()
-            .expect("run generated C differential harness");
-        let _ = std::fs::remove_file(&executable);
-        assert!(
-            execution.status.success(),
-            "generated C differential failed: {}",
-            String::from_utf8_lossy(&execution.stderr)
-        );
-    }
-
-    const RAM_HELPERS: &str = r#"
-uint32_t r2s_ram_read_le_u32(uint64_t byte_address) {
-    const uint8_t *p = (const uint8_t *)(uintptr_t)byte_address;
-    return ((uint32_t)p[0]) | ((uint32_t)p[1] << 8U)
-        | ((uint32_t)p[2] << 16U) | ((uint32_t)p[3] << 24U);
-}
-
-void r2s_ram_write_le_u32(uint64_t byte_address, uint32_t value) {
-    uint8_t *p = (uint8_t *)(uintptr_t)byte_address;
-    p[0] = (uint8_t)value;
-    p[1] = (uint8_t)(value >> 8U);
-    p[2] = (uint8_t)(value >> 16U);
-    p[3] = (uint8_t)(value >> 24U);
-}
-"#;
-
-    #[test]
-    fn load_return_renders_exact_layout_address_and_bounded_behavior() {
-        let function =
-            CertifiedAggregateMemberSemanticCFunction::from_artifact(&load_return_artifact())
-                .expect("certified member-load return function");
-        assert!(function.audit().has_exact_closed_aggregate_memory_return());
-        assert_eq!(function.schema_version(), 1);
-        assert_eq!(function.accesses().len(), 1);
-        let source = function.render_certified_c().expect("aggregate member C");
-        assert!(source.contains("typedef struct r2s_struct_0"));
-        assert!(!source.contains("SourceNamesAreNotRenderAuthority"));
-        assert!(!source.contains("untrusted_member_name"));
-        let renamed = CertifiedAggregateMemberSemanticCFunction::from_artifact(
-            &load_return_artifact_with_graph(demo_struct_graph_with_names(
-                "CosmeticOnlyRename",
-                "also_cosmetic",
-            )),
-        )
-        .expect("renamed source graph remains certifiable")
-        .render_certified_c()
-        .expect("renamed aggregate member C");
-        assert_eq!(renamed, source);
-        assert!(source.contains("int32_t field_2;"));
-        assert!(source.contains("_Static_assert(sizeof(r2s_struct_0) == 56U"));
-        assert!(source.contains("_Static_assert(_Alignof(r2s_struct_0) == 4U"));
-        assert!(source.contains("offsetof(r2s_struct_0, field_13) == 52U"));
-        assert!(source.contains(
-            "r2s_ram_read_le_u32(((uint64_t)(uintptr_t)((const uint8_t *)&arg_0->field_2)))"
+    fn assert_machine_context_refused(artifact: &SsaArtifact) {
+        assert!(matches!(
+            CertifiedAggregateMemberSemanticCFunction::from_artifact(artifact),
+            Err(CertifiedAggregateMemberSemanticCFunctionError::Memory(
+                CertifiedMemorySemanticCFunctionError::Machine(
+                    MachineBuildError::MachineContextMismatch
+                )
+            ))
         ));
-        assert!(!source.contains("= arg_0->field_2"));
-        assert!(source.contains("int32_t certified_aggregate_sub_9000(r2s_struct_0 *arg_0)"));
-        let harness = format!(
-            r#"{RAM_HELPERS}
-int main(void) {{
-    r2s_struct_0 value = {{0}};
-    uint8_t *bytes = (uint8_t *)&value;
-    for (uint32_t i = 0; i < 256U; ++i) {{
-        uint32_t bits = i * 0x01010101U ^ 0x80000001U;
-        bytes[8] = (uint8_t)bits;
-        bytes[9] = (uint8_t)(bits >> 8U);
-        bytes[10] = (uint8_t)(bits >> 16U);
-        bytes[11] = (uint8_t)(bits >> 24U);
-        if ((uint32_t)certified_aggregate_sub_9000(&value) != bits) {{
-            return 1;
-        }}
-    }}
-    return 0;
-}}
-"#
-        );
-        compile_and_run(&source, &harness, "load-return");
     }
 
     #[test]
-    fn store_parameter_uses_exact_signed_abi_and_bounded_behavior() {
-        let function =
-            CertifiedAggregateMemberSemanticCFunction::from_artifact(&store_parameter_artifact())
-                .expect("certified member-store parameter function");
-        let source = function.render_certified_c().expect("aggregate member C");
-        assert!(
-            source
-                .contains("void certified_aggregate_sub_9010(r2s_struct_0 *arg_0, int32_t arg_1)")
-        );
-        assert!(source.contains("((uint32_t)arg_1)"));
-        assert!(
-            source.contains(
-                "r2s_ram_write_le_u32(((uint64_t)(uintptr_t)((uint8_t *)&arg_0->field_13))"
-            )
-        );
-        assert!(!source.contains("arg_0->field_13 ="));
-        let harness = format!(
-            r#"{RAM_HELPERS}
-int main(void) {{
-    r2s_struct_0 value = {{0}};
-    uint8_t *bytes = (uint8_t *)&value;
-    for (uint32_t i = 0; i < 256U; ++i) {{
-        uint32_t bits = i * 0x10203041U ^ 0xfedcba98U;
-        certified_aggregate_sub_9010(&value, r2s_i32_from_bits(bits));
-        if (bytes[52] != (uint8_t)bits
-            || bytes[53] != (uint8_t)(bits >> 8U)
-            || bytes[54] != (uint8_t)(bits >> 16U)
-            || bytes[55] != (uint8_t)(bits >> 24U)) {{
-            return 1;
-        }}
-    }}
-    return 0;
-}}
-"#
-        );
-        compile_and_run(&source, &harness, "store-parameter");
+    fn hand_authored_aggregate_fixtures_refuse_renderer_authority() {
+        assert_machine_context_refused(&load_return_artifact());
+        assert_machine_context_refused(&store_parameter_artifact());
+        assert_machine_context_refused(&read_write_artifact());
     }
 
     #[test]
-    fn read_then_write_preserves_source_order_and_bounded_behavior() {
-        let function =
-            CertifiedAggregateMemberSemanticCFunction::from_artifact(&read_write_artifact())
-                .expect("certified member read-write function");
-        let source = function.render_certified_c().expect("aggregate member C");
-        let read = source
-            .find("r2s_ram_read_le_u32(((uint64_t)(uintptr_t)((const uint8_t *)&arg_0->field_2)))")
-            .expect("member read helper");
-        let write = source
-            .find("r2s_ram_write_le_u32(((uint64_t)(uintptr_t)((uint8_t *)&arg_0->field_13))")
-            .expect("member write helper");
-        assert!(read < write);
-        assert!(source.contains("void certified_aggregate_sub_9020(r2s_struct_0 *arg_0)"));
-        assert!(source.contains("\treturn;"));
-        let harness = format!(
-            r#"{RAM_HELPERS}
-int main(void) {{
-    r2s_struct_0 value = {{0}};
-    uint8_t *bytes = (uint8_t *)&value;
-    for (uint32_t i = 0; i < 256U; ++i) {{
-        uint32_t bits = i * 0x11111111U ^ 0x89abcdefU;
-        bytes[8] = (uint8_t)bits;
-        bytes[9] = (uint8_t)(bits >> 8U);
-        bytes[10] = (uint8_t)(bits >> 16U);
-        bytes[11] = (uint8_t)(bits >> 24U);
-        certified_aggregate_sub_9020(&value);
-        if (bytes[52] != bytes[8] || bytes[53] != bytes[9]
-            || bytes[54] != bytes[10] || bytes[55] != bytes[11]) {{
-            return 1;
-        }}
-    }}
-    return 0;
-}}
-"#
-        );
-        compile_and_run(&source, &harness, "read-write");
-    }
-
-    fn assert_rejected(candidate: CertifiedAggregateMemberSemanticCFunction) {
-        assert!(!candidate.audit().has_exact_closed_aggregate_memory_return());
-        assert!(candidate.render_certified_c().is_err());
+    fn hand_authored_aggregate_name_variant_refuses_renderer_authority() {
+        assert_machine_context_refused(&load_return_artifact_with_graph(
+            demo_struct_graph_with_names("CosmeticOnlyRename", "also_cosmetic"),
+        ));
     }
 
     #[test]
-    fn manifest_mutations_reject_every_exact_join() {
-        let original =
-            CertifiedAggregateMemberSemanticCFunction::from_artifact(&read_write_artifact())
-                .expect("certified read-write function");
-        let foreign =
-            CertifiedAggregateMemberSemanticCFunction::from_artifact(&store_parameter_artifact())
-                .expect("foreign certified function");
-
-        let mut candidate = original.clone();
-        candidate.render_permit = foreign.render_permit.clone();
-        assert_rejected(candidate);
-        let mut candidate = original.clone();
-        candidate.origin = foreign.origin.clone();
-        assert_rejected(candidate);
-        let mut candidate = original.clone();
-        candidate.interface_revision[0] ^= 1;
-        assert_rejected(candidate);
-        let mut candidate = original.clone();
-        candidate.pointer_parameter_index += 1;
-        assert_rejected(candidate);
-        let mut candidate = original.clone();
-        candidate.parameters[0].index += 1;
-        assert_rejected(candidate);
-        let mut candidate = original.clone();
-        candidate.parameters[0].storage.offset += 8;
-        assert_rejected(candidate);
-
-        let mut candidate = original.clone();
-        candidate.layout.aggregate_id += 1;
-        assert_rejected(candidate);
-        let mut candidate = original.clone();
-        candidate.layout.size_bits += 32;
-        assert_rejected(candidate);
-        let mut candidate = original.clone();
-        candidate.layout.align_bits *= 2;
-        assert_rejected(candidate);
-        let mut candidate = original.clone();
-        candidate.layout.members[2].member_id += 1;
-        assert_rejected(candidate);
-        let mut candidate = original.clone();
-        candidate.layout.members[2].type_id += 1;
-        assert_rejected(candidate);
-        let mut candidate = original.clone();
-        candidate.layout.members[2].offset_bits += 32;
-        assert_rejected(candidate);
-        let mut candidate = original.clone();
-        candidate.layout.members[2].signedness = CertifiedAggregateScalarSignedness::Unsigned;
-        assert_rejected(candidate);
-
-        let mut candidate = original.clone();
-        candidate.accesses[0].producer = candidate.accesses[1].producer;
-        assert_rejected(candidate);
-        let mut candidate = original.clone();
-        candidate.accesses[0].access.ordinal += 1;
-        assert_rejected(candidate);
-        let mut candidate = original.clone();
-        candidate.accesses[0].member_id += 1;
-        assert_rejected(candidate);
-        let mut candidate = original.clone();
-        candidate.accesses[0].member_type_id += 1;
-        assert_rejected(candidate);
-        let mut candidate = original.clone();
-        candidate.accesses[0].byte_offset += 4;
-        assert_rejected(candidate);
-        let mut candidate = original.clone();
-        candidate.accesses[0].address = candidate.accesses[1].address;
-        assert_rejected(candidate);
-        let mut candidate = original.clone();
-        candidate.accesses[0].direction = candidate.accesses[1].direction;
-        assert_rejected(candidate);
-        let mut candidate = original.clone();
-        candidate.accesses[0].statement = candidate.accesses[1].statement.clone();
-        assert_rejected(candidate);
-        let mut candidate = original.clone();
-        candidate.memory_order.reverse();
-        assert_rejected(candidate);
-        let mut candidate = original.clone();
-        candidate.address_producers.remove(
-            &candidate.accesses[0]
-                .statement
-                .address()
-                .producer()
-                .expect("address producer"),
-        );
-        assert_rejected(candidate);
-
-        let load_return =
-            CertifiedAggregateMemberSemanticCFunction::from_artifact(&load_return_artifact())
-                .expect("certified load return");
-        let mut candidate = load_return.clone();
-        let CertifiedAggregateSemanticCReturn::Scalar { type_id, .. } = &mut candidate.return_kind
-        else {
-            panic!("scalar return expected");
-        };
-        *type_id += 1;
-        assert_rejected(candidate);
-        let mut candidate = load_return;
-        let CertifiedAggregateSemanticCReturn::Scalar { signedness, .. } =
-            &mut candidate.return_kind
-        else {
-            panic!("scalar return expected");
-        };
-        *signedness = CertifiedAggregateScalarSignedness::Unsigned;
-        assert_rejected(candidate);
-    }
-
-    #[test]
-    fn unprojected_memory_sibling_is_refused() {
+    fn hand_authored_unprojected_memory_sibling_refuses_renderer_authority() {
         let mut block = R2ILBlock::new(0x9030, 4);
         block.push(R2ILOp::IntAdd {
             dst: Varnode::unique(0x60, 8),
@@ -2014,6 +1724,6 @@ int main(void) {{
             SourceFunctionReturn::Void,
             None,
         );
-        assert!(CertifiedAggregateMemberSemanticCFunction::from_artifact(&artifact).is_err());
+        assert_machine_context_refused(&artifact);
     }
 }

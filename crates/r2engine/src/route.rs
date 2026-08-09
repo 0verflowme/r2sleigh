@@ -116,9 +116,9 @@ pub enum EnginePlan {
     RefuseWithEvidence,
 }
 
-/// The exact permit-bearing semantic-kernel region selected for production
-/// rendering. This is intentionally separate from the legacy `r2sym` render
-/// permission carried by route facts.
+/// The exact typed-output-sealed semantic-kernel region selected for
+/// production rendering. This is intentionally separate from the legacy
+/// `r2sym` render permission carried by route facts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EngineSemanticKernelRegion {
     TerminalReturnBlock,
@@ -126,22 +126,8 @@ pub enum EngineSemanticKernelRegion {
     PlainRamMemoryTerminalReturnFunction,
     DirectCallTerminalReturnFunction,
     ConditionalTerminalReturnFunction,
-    PrivateFrameConditionalReturnFunction,
-    CanonicalFnvFoldLoopFunction,
-    ConditionalFunnelSharedReturnFunction,
     SwitchTerminalReturnFunction,
     CarrierFreeLoopTerminalReturnFunction,
-    CountedLoopTerminalReturnFunction,
-    /// Kept at the end to preserve existing serialized enum discriminants.
-    CanonicalFnvFoldO0Function,
-    /// Kept at the end to preserve existing serialized enum discriminants.
-    BranchlessGuardFunction,
-    /// Kept at the end to preserve existing serialized enum discriminants.
-    StructArrayIndexFunction,
-    /// Kept at the end to preserve existing serialized enum discriminants.
-    NestedWrap32GuardO0Function,
-    /// Kept at the end to preserve existing serialized enum discriminants.
-    SumArrayFunction,
 }
 
 impl EngineSemanticKernelRegion {
@@ -162,38 +148,11 @@ impl EngineSemanticKernelRegion {
             Self::ConditionalTerminalReturnFunction => {
                 r2dec::CERTIFIED_CONDITIONAL_RETURN_FUNCTION_SCHEMA_VERSION
             }
-            Self::PrivateFrameConditionalReturnFunction => {
-                r2dec::CERTIFIED_PRIVATE_FRAME_SEMANTIC_C_FUNCTION_SCHEMA_VERSION
-            }
-            Self::CanonicalFnvFoldLoopFunction => {
-                r2dec::CERTIFIED_FNV_FOLD_SEMANTIC_C_FUNCTION_SCHEMA_VERSION
-            }
-            Self::CanonicalFnvFoldO0Function => {
-                r2dec::CERTIFIED_FNV_FOLD_O0_SEMANTIC_C_FUNCTION_SCHEMA_VERSION
-            }
-            Self::BranchlessGuardFunction => {
-                r2dec::CERTIFIED_BRANCHLESS_GUARD_SEMANTIC_C_FUNCTION_SCHEMA_VERSION
-            }
-            Self::StructArrayIndexFunction => {
-                r2dec::CERTIFIED_STRUCT_ARRAY_INDEX_SEMANTIC_C_FUNCTION_SCHEMA_VERSION
-            }
-            Self::NestedWrap32GuardO0Function => {
-                r2dec::CERTIFIED_NESTED_WRAP32_GUARD_O0_SEMANTIC_C_FUNCTION_SCHEMA_VERSION
-            }
-            Self::SumArrayFunction => {
-                r2dec::CERTIFIED_SUM_ARRAY_SEMANTIC_C_FUNCTION_SCHEMA_VERSION
-            }
-            Self::ConditionalFunnelSharedReturnFunction => {
-                r2dec::CERTIFIED_CONDITIONAL_FUNNEL_RETURN_FUNCTION_SCHEMA_VERSION
-            }
             Self::SwitchTerminalReturnFunction => {
                 r2dec::CERTIFIED_SWITCH_RETURN_FUNCTION_SCHEMA_VERSION
             }
             Self::CarrierFreeLoopTerminalReturnFunction => {
                 r2dec::CERTIFIED_LOOP_RETURN_FUNCTION_SCHEMA_VERSION
-            }
-            Self::CountedLoopTerminalReturnFunction => {
-                r2dec::CERTIFIED_COUNTED_LOOP_RETURN_FUNCTION_SCHEMA_VERSION
             }
         }
     }

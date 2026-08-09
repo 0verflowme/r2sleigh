@@ -13,7 +13,7 @@ use crate::semantic_c::{
     storage_type, value_name,
 };
 
-pub const CERTIFIED_SEMANTIC_C_FUNCTION_SCHEMA_VERSION: u32 = 1;
+pub const CERTIFIED_SEMANTIC_C_FUNCTION_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum CertifiedSemanticCFunctionScope {
@@ -34,7 +34,6 @@ pub enum CertifiedSemanticCFunctionError {
     Region(RegionBuildError),
     TerminalReturn(TerminalReturnRegionError),
     InvalidRegion(Vec<String>),
-    InvalidRenderPermit,
     MissingFunctionInterface,
     MemoryRequiresSemanticRenderer,
     StackAddressRequiresMemoryRenderer,
@@ -92,9 +91,6 @@ impl CertifiedSemanticCFunction {
             return Err(CertifiedSemanticCFunctionError::InvalidRegion(
                 report.invalid().to_vec(),
             ));
-        }
-        if !region.render_permit().authorizes_certified_c() {
-            return Err(CertifiedSemanticCFunctionError::InvalidRenderPermit);
         }
         let accounting = region.layer().accounting();
         if accounting.expression_layer().function_interface().is_none() {
@@ -169,7 +165,6 @@ impl CertifiedSemanticCFunction {
         if self.schema_version != CERTIFIED_SEMANTIC_C_FUNCTION_SCHEMA_VERSION
             || self.scope != CertifiedSemanticCFunctionScope::SingleTerminalReturnBlockWithoutMemory
             || !report.has_exact_terminal_return()
-            || !self.region.render_permit().authorizes_certified_c()
         {
             return Err(CertifiedSemanticCFunctionError::InvalidRegion(
                 report.invalid().to_vec(),
@@ -247,8 +242,6 @@ impl CertifiedSemanticCFunction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
-    use std::process::{Command, Stdio};
 
     use r2il::{ArchSpec, Endianness, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
     use r2ssa::{
@@ -291,15 +284,12 @@ mod tests {
 
     fn assert_public_constructor_refuses(artifact: &SsaArtifact) {
         if let Ok(function) = CertifiedSemanticCFunction::from_artifact(artifact) {
-            let authorized = function.region().render_permit().authorizes_certified_c();
             let rendered = function.render_certified_c();
-            panic!(
-                "excluded shape produced semantic function: authorized={authorized}, rendered={rendered:?}"
-            );
+            panic!("excluded shape produced semantic function: rendered={rendered:?}");
         }
     }
 
-    fn function(return_kind: SourceFunctionReturn) -> CertifiedSemanticCFunction {
+    fn hand_authored_function_artifact(return_kind: SourceFunctionReturn) -> SsaArtifact {
         let mut block = R2ILBlock::new(0x7200, 4);
         block.push(R2ILOp::IntAdd {
             dst: Varnode::unique(0x10, 8),
@@ -315,67 +305,35 @@ mod tests {
         });
         let arch = test_arch();
         let interface = source_interface(return_kind, []);
-        let artifact = SsaArtifact::raw_with_interface(&[block], Some(&arch), interface)
-            .expect("semantic function artifact");
-        CertifiedSemanticCFunction::from_artifact(&artifact).expect("semantic C function")
+        SsaArtifact::raw_with_interface(&[block], Some(&arch), interface)
+            .expect("semantic function artifact")
     }
 
-    fn compile(source: &str) {
-        let mut compiler = Command::new("cc")
-            .args([
-                "-std=c11",
-                "-Wall",
-                "-Wextra",
-                "-Wpedantic",
-                "-Wno-unused-function",
-                "-Werror",
-                "-fsyntax-only",
-                "-x",
-                "c",
-                "-",
-            ])
-            .stdin(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("C compiler required");
-        compiler
-            .stdin
-            .as_mut()
-            .expect("compiler stdin")
-            .write_all(source.as_bytes())
-            .expect("write C source");
-        let output = compiler.wait_with_output().expect("wait for compiler");
-        assert!(
-            output.status.success(),
-            "generated C failed:\n{}\n{}",
-            source,
-            String::from_utf8_lossy(&output.stderr)
-        );
+    fn assert_machine_context_refused(artifact: &SsaArtifact) {
+        assert!(matches!(
+            CertifiedSemanticCFunction::from_artifact(artifact),
+            Err(CertifiedSemanticCFunctionError::Machine(
+                MachineBuildError::MachineContextMismatch
+            ))
+        ));
     }
 
     #[test]
-    fn register_return_function_has_final_r2cert_permit_and_compiles_as_c11() {
-        let function = function(SourceFunctionReturn::Register {
+    fn hand_authored_register_return_refuses_public_constructor() {
+        let artifact = hand_authored_function_artifact(SourceFunctionReturn::Register {
             storage: CanonicalStorageId {
                 space: CanonicalStorageSpace::Register,
                 offset: 0,
                 size: 8,
             },
         });
-        assert!(function.region().render_permit().authorizes_certified_c());
-        let source = function.render_certified_c().expect("certified C");
-        assert!(source.contains("uint64_t certified_sub_7200(uint64_t v_"));
-        assert!(source.contains("return v_"));
-        compile(&source);
+        assert_machine_context_refused(&artifact);
     }
 
     #[test]
-    fn explicit_void_function_is_distinct_and_compiles() {
-        let function = function(SourceFunctionReturn::Void);
-        let source = function.render_certified_c().expect("certified void C");
-        assert!(source.contains("void certified_sub_7200(uint64_t v_"));
-        assert!(source.contains("\treturn;"));
-        compile(&source);
+    fn hand_authored_void_function_refuses_public_constructor() {
+        let artifact = hand_authored_function_artifact(SourceFunctionReturn::Void);
+        assert_machine_context_refused(&artifact);
     }
 
     #[test]
