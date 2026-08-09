@@ -459,9 +459,10 @@ impl<'a> RegionAnalyzer<'a> {
 
     /// Analyze the function and build a region tree.
     ///
-    /// Default path: iterative bottom-up loop collapsing (handles complex O2 CFGs).
-    /// Fallback: recursive analysis with depth guard.
-    /// `SLEIGH_DEC_LEGACY_ANALYZER=1`: force legacy recursive-only (A/B testing).
+    /// Iterative bottom-up loop collapsing is the sole production policy.
+    /// Acyclic subregions use the bounded recursive region builder internally;
+    /// failed loop collapse residualizes as irreducible instead of switching
+    /// to a competing structuring algorithm.
     pub fn analyze(&mut self) -> Region {
         if !self.poll() {
             return Region::Irreducible {
@@ -473,64 +474,13 @@ impl<'a> RegionAnalyzer<'a> {
         self.analysis_reason = None;
         self.recursion_depth = 0;
 
-        let force_legacy = std::env::var("SLEIGH_DEC_LEGACY_ANALYZER")
-            .ok()
-            .map(|v| {
-                let v = v.trim().to_ascii_lowercase();
-                v == "1" || v == "true" || v == "yes" || v == "on"
-            })
-            .unwrap_or(false);
-
-        let back_edge_count: usize = self.back_edges.values().map(Vec::len).sum();
-        let loop_count = self.loops.len();
-
-        // Legacy-only path: opt-in via env var.  Guard complex graphs since the
-        // recursive analyzer cannot handle deeply nested loop structures.
-        if force_legacy {
-            if loop_count > 8 || back_edge_count > 16 {
-                self.analysis_reason = Some(format!(
-                    "legacy region analyzer skipped for complex loop graph (loops={}, back_edges={})",
-                    loop_count, back_edge_count
-                ));
-                return Region::Irreducible {
-                    entry: self.func.entry,
-                    blocks: self.func.block_addrs().to_vec(),
-                };
-            }
-            return self.analyze_region_recursive(self.func.entry);
-        }
-
-        // Primary path: iterative analysis.  No complexity guard — the iterative
-        // algorithm has its own safety via max_collapse_iterations.
         if let Some(region) = self.analyze_iterative() {
             return region;
         }
-
-        // Iterative path failed to converge; fall back to recursive with depth guard.
-        self.analysis_reason = None;
-        self.processed.clear();
-        self.recursion_depth = 0;
-
-        // Guard the recursive fallback against complex graphs.
-        if loop_count > 8 || back_edge_count > 16 {
-            self.analysis_reason = Some(format!(
-                "recursive fallback skipped for complex loop graph (loops={}, back_edges={})",
-                loop_count, back_edge_count
-            ));
-            return Region::Irreducible {
-                entry: self.func.entry,
-                blocks: self.func.block_addrs().to_vec(),
-            };
+        Region::Irreducible {
+            entry: self.func.entry,
+            blocks: self.func.block_addrs().to_vec(),
         }
-
-        let region = self.analyze_region_recursive(self.func.entry);
-        if self.analysis_reason.is_some() {
-            return Region::Irreducible {
-                entry: self.func.entry,
-                blocks: self.func.block_addrs().to_vec(),
-            };
-        }
-        region
     }
 
     /// Analyze with a distinct cooperative-stop result.
@@ -3562,7 +3512,7 @@ mod tests {
                     cond_block: 0x1010
                 } if body.blocks() == vec![0x1010]
             ),
-            "recursive fallback must preserve the self-loop header body: {direct:?}"
+            "bounded acyclic-region builder must preserve the self-loop header body: {direct:?}"
         );
     }
 
