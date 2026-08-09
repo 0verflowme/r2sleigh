@@ -249,7 +249,7 @@ fn get_lattice_value(var: &SSAVar, lattice: &HashMap<VarKey, LatticeValue>) -> L
 }
 
 fn init_if_input(var: &SSAVar, lattice: &mut HashMap<VarKey, LatticeValue>) {
-    if var.version == 0 && !var.is_const() {
+    if var.version == 0 && var.constant_bits().is_none() {
         lattice
             .entry(VarKey::from_var(var))
             .or_insert(LatticeValue::Bottom);
@@ -500,20 +500,7 @@ fn sccp_with_control<C: SsaWorkControl + ?Sized>(
 }
 
 fn const_value(var: &SSAVar) -> Option<u64> {
-    if !var.is_const() {
-        return None;
-    }
-    let val_str = var.name.strip_prefix("const:")?;
-    if let Some(hex) = val_str
-        .strip_prefix("0x")
-        .or_else(|| val_str.strip_prefix("0X"))
-    {
-        return u64::from_str_radix(hex, 16).ok();
-    }
-    if let Ok(val) = u64::from_str_radix(val_str, 16) {
-        return Some(val);
-    }
-    val_str.parse::<u64>().ok()
+    var.constant_bits()
 }
 
 fn mask_for_bits(bits: u32) -> u64 {
@@ -2216,6 +2203,22 @@ mod sccp_tests {
             LatticeValue::Bottom.meet(LatticeValue::Const(9)),
             LatticeValue::Bottom
         );
+    }
+
+    #[test]
+    fn sccp_constant_identity_ignores_display_names() {
+        let spoofed = SSAVar::new("const:2a", 0, 8);
+        assert_eq!(const_value(&spoofed), None);
+        let mut lattice = HashMap::new();
+        init_if_input(&spoofed, &mut lattice);
+        assert_eq!(
+            lattice.get(&VarKey::from_var(&spoofed)),
+            Some(&LatticeValue::Bottom)
+        );
+
+        let mut renamed = SSAVar::constant(0x2a, 8);
+        renamed.name = "renamed-value".to_string();
+        assert_eq!(const_value(&renamed), Some(0x2a));
     }
 
     #[test]
