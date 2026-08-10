@@ -55,7 +55,7 @@ pub use stable_hash::{
 };
 
 pub const ENGINE_SCHEMA_VERSION: u32 = 10;
-pub const ENGINE_SOURCE_SNAPSHOT_SCHEMA_VERSION: u32 = 4;
+pub const ENGINE_SOURCE_SNAPSHOT_SCHEMA_VERSION: u32 = 5;
 pub const DEFAULT_ENGINE_CACHE_LIMIT: usize = 256;
 pub const SYMBOLIC_PATHS_LIMIT: usize = 32;
 pub const SYMBOLIC_PATHS_CALL_FREE_MAX_STATES: usize = 16;

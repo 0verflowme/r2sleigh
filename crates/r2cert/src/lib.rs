@@ -35,7 +35,7 @@ pub use aggregate_member::{
     CertifiedNaturalScalarAggregateLayout,
 };
 
-pub const CERTIFICATION_SCHEMA_VERSION: u32 = 23;
+pub const CERTIFICATION_SCHEMA_VERSION: u32 = 24;
 
 /// Unforgeable run-local identity for one proof authority domain.
 ///
@@ -6155,6 +6155,7 @@ impl CertifiedNormalizedStackRange {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CertifiedFrameRestore {
     return_control: CertifiedReturnControl,
+    return_address_read: Option<CertifiedMemoryStatement>,
     restore_read: CertifiedMemoryStatement,
     restore_copies: Box<[CertifiedFrameCopy]>,
     restore_assignment: CertifiedFrameRegisterAssignment,
@@ -6163,6 +6164,10 @@ pub struct CertifiedFrameRestore {
 impl CertifiedFrameRestore {
     pub const fn return_control(&self) -> &CertifiedReturnControl {
         &self.return_control
+    }
+
+    pub const fn return_address_read(&self) -> Option<&CertifiedMemoryStatement> {
+        self.return_address_read.as_ref()
     }
 
     pub const fn restore_read(&self) -> &CertifiedMemoryStatement {
@@ -6365,7 +6370,11 @@ struct FramePreservationEvidence {
     entry_save: CertifiedMemoryStatement,
     entry_save_copies: Vec<CertifiedExpr>,
     frame_relation: CertifiedExpr,
-    restores: Vec<(CertifiedReturnControl, FrameRestoreCandidate)>,
+    restores: Vec<(
+        CertifiedReturnControl,
+        FrameRestoreCandidate,
+        Option<CertifiedMemoryStatement>,
+    )>,
 }
 
 fn certified_register_storages_overlap(
@@ -6943,6 +6952,76 @@ fn frame_normalized_range(
     })
 }
 
+fn frame_stacked_return_read(
+    artifact: &SsaArtifact,
+    control: &CertifiedReturnControl,
+    return_inst: InstId,
+    memory_statements: &BTreeMap<CanonicalInstructionId, CertifiedMemoryStatement>,
+    entry_stack_pointer: ValueId,
+    stack_pointer_storage: CanonicalStorageId,
+    width_bits: u32,
+    exit_offset: i64,
+    affine: &mut BTreeMap<ValueId, Option<FrameAffine>>,
+) -> Option<CertifiedMemoryStatement> {
+    let interface = artifact.machine_context().function_interface()?;
+    let return_address_storage = interface.return_address_storage()?;
+    let mechanism = interface.return_mechanism()?;
+    let address_size = mechanism.address_size_bytes();
+    let address_bits = address_size.checked_mul(8)?;
+    if mechanism.stack_offset() != 0
+        || mechanism.slot_size_bytes() != address_size
+        || mechanism.stack_pointer_delta_bytes() != address_size
+        || exit_offset != i64::from(address_size)
+        || address_bits != width_bits
+        || return_address_storage.size != address_size
+        || stack_pointer_storage.size != address_size
+        || control.return_address().storage() != return_address_storage
+        || control.control_target().binding().width_bits() != address_bits
+    {
+        return None;
+    }
+    let memory_model = artifact.machine_context().memory_model();
+    let ram = memory_model.space(r2il::SpaceId::Ram)?;
+    if !memory_model.is_available()
+        || !memory_model.is_coherent()
+        || memory_model.default_address_bits() != address_bits
+        || ram.address_bits() != address_bits
+        || ram.word_size_bytes() != 1
+    {
+        return None;
+    }
+    let return_range = CertifiedNormalizedStackRange {
+        offset: mechanism.stack_offset(),
+        size_bytes: mechanism.slot_size_bytes(),
+    };
+    let reads = memory_statements
+        .values()
+        .filter(|statement| {
+            statement.space() == MachineAddressSpace::Ram
+                && statement.word_size_bytes() == 1
+                && statement.width_bits() == address_bits
+                && statement.endianness() == ram.endianness()
+                && frame_normalized_range(
+                    artifact,
+                    statement,
+                    entry_stack_pointer,
+                    width_bits,
+                    affine,
+                ) == Some(return_range)
+                && matches!(statement.kind(), CertifiedMemoryStatementKind::Read { result }
+                    if result == control.control_target()
+                        && result == control.return_address().value()
+                        && result.producer() == Some(statement.producer()))
+                && frame_instruction_dominates(artifact, statement.access().inst, return_inst)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let [return_read] = reads.as_slice() else {
+        return None;
+    };
+    Some(return_read.clone())
+}
+
 fn frame_evidence_from_certified_parts(
     artifact: &SsaArtifact,
     projection: &MachineProjection,
@@ -7390,24 +7469,45 @@ fn frame_evidence_from_certified_parts(
                 )
                 .is_some()
             });
-        let exit_is_entry = match control.exit_stack_pointer() {
+        let exit_offset = match control.exit_stack_pointer() {
             CertifiedExitStackPointer::PreservedEntry { storage } => {
-                *storage == stack_pointer_storage && !has_stack_pointer_def
+                (*storage == stack_pointer_storage && !has_stack_pointer_def).then_some(0)
             }
-            CertifiedExitStackPointer::ReachingValue { storage, value } => {
-                *storage == stack_pointer_storage
-                    && frame_affine_value(
+            CertifiedExitStackPointer::ReachingValue { storage, value } => (*storage
+                == stack_pointer_storage)
+                .then(|| {
+                    frame_affine_value(
                         artifact,
                         value.binding().value(),
                         entry_stack_pointer,
                         width_bits,
                         &mut affine,
                         &mut BTreeSet::new(),
-                    ) == Some(FrameAffine {
-                        offset_bits: 0,
-                        width_bits,
-                    })
-            }
+                    )?
+                    .signed_offset()
+                })
+                .flatten(),
+        };
+        let exit_offset = exit_offset?;
+        let declared_stacked_return = artifact
+            .machine_context()
+            .function_interface()?
+            .return_mechanism()
+            .is_some();
+        let return_address_read = match (declared_stacked_return, exit_offset) {
+            (false, 0) => None,
+            (false, _) => return None,
+            (true, _) => Some(frame_stacked_return_read(
+                artifact,
+                control,
+                return_inst,
+                memory_statements,
+                entry_stack_pointer,
+                stack_pointer_storage,
+                width_bits,
+                exit_offset,
+                &mut affine,
+            )?),
         };
         let effective = restore_candidates
             .iter()
@@ -7431,17 +7531,51 @@ fn frame_evidence_from_certified_parts(
                     && frame_instruction_can_reach(artifact, other.assignment_inst, return_inst)
             });
         if return_escapes_frame
-            || !exit_is_entry
             || later_frame_definition
             || !graph.use_sites(restore.restored_value).is_empty()
         {
             return None;
         }
         used_restores.insert(restore.assignment_inst);
-        restores.push((control.clone(), (*restore).clone()));
+        restores.push((control.clone(), (*restore).clone(), return_address_read));
     }
     if used_restores.len() != restore_candidates.len() {
         return None;
+    }
+    if let Some(mechanism) = interface.return_mechanism() {
+        let return_range = CertifiedNormalizedStackRange {
+            offset: mechanism.stack_offset(),
+            size_bytes: mechanism.slot_size_bytes(),
+        };
+        let sealed_return_reads = restores
+            .iter()
+            .map(|(_, _, read)| read.as_ref().map(CertifiedMemoryStatement::producer))
+            .collect::<Option<BTreeSet<_>>>()?;
+        for statement in memory_statements.values() {
+            if statement.space() != MachineAddressSpace::Ram {
+                continue;
+            }
+            let Some(range) = frame_normalized_range(
+                artifact,
+                statement,
+                entry_stack_pointer,
+                width_bits,
+                &mut affine,
+            ) else {
+                if matches!(
+                    artifact.objects().objects.get(&statement.object()),
+                    Some(object) if matches!(object.kind, ObjectKind::Global { .. })
+                ) {
+                    continue;
+                }
+                return None;
+            };
+            if frame_ranges_overlap(return_range, range, width_bits)
+                && !sealed_return_reads.contains(&statement.producer())
+            {
+                return None;
+            }
+        }
     }
     Some(FramePreservationEvidence {
         frame_pointer_storage,
@@ -7488,40 +7622,46 @@ fn certified_frame_preservation(
             .entry_save_copies
             .iter()
             .any(|copy| !frame_expression_is_ledgered(copy, ledger))
-        || evidence.restores.iter().any(|(control, restore)| {
-            !frame_return_is_ledgered(control, ledger)
-                || !frame_statement_is_ledgered(&restore.read, ledger)
-                || !frame_mechanical_producer_is_accounted(
-                    artifact,
-                    parts.projection,
-                    FrameMechanicalWitness {
-                        producer: restore.assignment.producer,
-                        root: restore.assignment.root,
-                        output: restore.assignment.output,
-                    },
-                    if restore.assignment.producer == restore.read.producer() {
-                        restore.read.source_obligations()
-                    } else {
-                        &no_obligations
-                    },
-                    parts.expressions,
-                    ledger,
-                )
-                || restore.copies.iter().any(|copy| {
-                    !frame_mechanical_producer_is_accounted(
+        || evidence
+            .restores
+            .iter()
+            .any(|(control, restore, return_address_read)| {
+                !frame_return_is_ledgered(control, ledger)
+                    || !frame_statement_is_ledgered(&restore.read, ledger)
+                    || return_address_read
+                        .as_ref()
+                        .is_some_and(|statement| !frame_statement_is_ledgered(statement, ledger))
+                    || !frame_mechanical_producer_is_accounted(
                         artifact,
                         parts.projection,
                         FrameMechanicalWitness {
-                            producer: copy.producer,
-                            root: copy.root,
-                            output: copy.output,
+                            producer: restore.assignment.producer,
+                            root: restore.assignment.root,
+                            output: restore.assignment.output,
                         },
-                        &no_obligations,
+                        if restore.assignment.producer == restore.read.producer() {
+                            restore.read.source_obligations()
+                        } else {
+                            &no_obligations
+                        },
                         parts.expressions,
                         ledger,
                     )
-                })
-        })
+                    || restore.copies.iter().any(|copy| {
+                        !frame_mechanical_producer_is_accounted(
+                            artifact,
+                            parts.projection,
+                            FrameMechanicalWitness {
+                                producer: copy.producer,
+                                root: copy.root,
+                                output: copy.output,
+                            },
+                            &no_obligations,
+                            parts.expressions,
+                            ledger,
+                        )
+                    })
+            })
     {
         return None;
     }
@@ -7537,12 +7677,15 @@ fn certified_frame_preservation(
         restores: evidence
             .restores
             .into_iter()
-            .map(|(return_control, restore)| CertifiedFrameRestore {
-                return_control,
-                restore_read: restore.read,
-                restore_copies: restore.copies.into_boxed_slice(),
-                restore_assignment: restore.assignment,
-            })
+            .map(
+                |(return_control, restore, return_address_read)| CertifiedFrameRestore {
+                    return_control,
+                    return_address_read,
+                    restore_read: restore.read,
+                    restore_copies: restore.copies.into_boxed_slice(),
+                    restore_assignment: restore.assignment,
+                },
+            )
             .collect::<Vec<_>>()
             .into_boxed_slice(),
     })
@@ -9249,9 +9392,48 @@ mod tests {
         EntrySelfLoop,
         UnbalancedStackPointer,
         PartialFramePointerWrite,
+        StackedReturn,
+        StackedNoContract,
+        StackedWrongOffset,
+        StackedWrongWidth,
+        StackedWrongSpace,
+        StackedWrongTarget,
+        StackedWrongDelta,
+        StackedZeroExit,
+        StackedDuplicateRead,
+        StackedUnledgeredRead,
+        StackedOverlappingStore,
+        StackedPartialOverlappingStore,
+        StackedUnknownPointerStore,
+        StackedAtomic,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum TwoReturnMutation {
+        None,
+        SharedRead,
+        CrossArmStore,
+        DuplicateDominatingRead,
     }
 
     fn preserved_frame_artifact(mutation: FrameMutation) -> SsaArtifact {
+        let stacked_return = matches!(
+            mutation,
+            FrameMutation::StackedReturn
+                | FrameMutation::StackedNoContract
+                | FrameMutation::StackedWrongOffset
+                | FrameMutation::StackedWrongWidth
+                | FrameMutation::StackedWrongSpace
+                | FrameMutation::StackedWrongTarget
+                | FrameMutation::StackedWrongDelta
+                | FrameMutation::StackedZeroExit
+                | FrameMutation::StackedDuplicateRead
+                | FrameMutation::StackedUnledgeredRead
+                | FrameMutation::StackedOverlappingStore
+                | FrameMutation::StackedPartialOverlappingStore
+                | FrameMutation::StackedUnknownPointerStore
+                | FrameMutation::StackedAtomic
+        );
         let fp = Varnode::register(0, 8);
         let sp = Varnode::register(8, 8);
         let ra = Varnode::register(16, 8);
@@ -9262,6 +9444,9 @@ mod tests {
         let restore_copy = Varnode::unique(0x120, 8);
         let stale_save_address = Varnode::unique(0x128, 8);
         let unrelated_load = Varnode::unique(0x130, 8);
+        let return_address = Varnode::unique(0x138, 8);
+        let duplicate_return_address = Varnode::unique(0x140, 8);
+        let adjusted_return_slot = Varnode::unique(0x148, 8);
         let mut block = R2ILBlock::new(0x3300, 4);
         if !matches!(mutation, FrameMutation::ZeroSaveRange) {
             if matches!(mutation, FrameMutation::PositiveSaveRange) {
@@ -9378,7 +9563,21 @@ mod tests {
             | FrameMutation::UnknownPointerLoad
             | FrameMutation::WrongAffineRoot
             | FrameMutation::EntrySelfLoop
-            | FrameMutation::UnbalancedStackPointer => {}
+            | FrameMutation::UnbalancedStackPointer
+            | FrameMutation::StackedReturn
+            | FrameMutation::StackedNoContract
+            | FrameMutation::StackedWrongOffset
+            | FrameMutation::StackedWrongWidth
+            | FrameMutation::StackedWrongSpace
+            | FrameMutation::StackedWrongTarget
+            | FrameMutation::StackedWrongDelta
+            | FrameMutation::StackedZeroExit
+            | FrameMutation::StackedDuplicateRead
+            | FrameMutation::StackedUnledgeredRead
+            | FrameMutation::StackedOverlappingStore
+            | FrameMutation::StackedPartialOverlappingStore
+            | FrameMutation::StackedUnknownPointerStore
+            | FrameMutation::StackedAtomic => {}
         }
         if matches!(mutation, FrameMutation::GlobalLoad) {
             block.push(R2ILOp::Load {
@@ -9465,12 +9664,108 @@ mod tests {
                 ),
             });
         }
+        let mut return_target = ra.clone();
+        if stacked_return {
+            if matches!(mutation, FrameMutation::StackedOverlappingStore) {
+                block.push(R2ILOp::Store {
+                    space: SpaceId::Ram,
+                    addr: sp.clone(),
+                    val: Varnode::constant(0, 8),
+                });
+            } else if matches!(mutation, FrameMutation::StackedPartialOverlappingStore) {
+                block.push(R2ILOp::Store {
+                    space: SpaceId::Ram,
+                    addr: sp.clone(),
+                    val: Varnode::constant(0, 4),
+                });
+            } else if matches!(mutation, FrameMutation::StackedUnknownPointerStore) {
+                block.push(R2ILOp::Store {
+                    space: SpaceId::Ram,
+                    addr: Varnode::register(24, 8),
+                    val: Varnode::constant(0, 8),
+                });
+            }
+            let return_slot = if matches!(mutation, FrameMutation::StackedWrongOffset) {
+                block.push(R2ILOp::IntAdd {
+                    dst: adjusted_return_slot.clone(),
+                    a: sp.clone(),
+                    b: Varnode::constant(8, 8),
+                });
+                adjusted_return_slot
+            } else {
+                sp.clone()
+            };
+            if matches!(mutation, FrameMutation::StackedDuplicateRead) {
+                block.push(R2ILOp::Load {
+                    dst: duplicate_return_address,
+                    space: SpaceId::Ram,
+                    addr: return_slot.clone(),
+                });
+            }
+            if matches!(mutation, FrameMutation::StackedUnledgeredRead) {
+                block.push(R2ILOp::LoadGuarded {
+                    dst: ra.clone(),
+                    space: SpaceId::Ram,
+                    addr: return_slot,
+                    guard: Varnode::constant(1, 1),
+                    ordering: MemoryOrdering::Relaxed,
+                });
+            } else if matches!(mutation, FrameMutation::StackedAtomic) {
+                block.push(R2ILOp::LoadLinked {
+                    dst: ra.clone(),
+                    space: SpaceId::Ram,
+                    addr: return_slot,
+                    ordering: MemoryOrdering::Relaxed,
+                });
+            } else {
+                let target = if matches!(mutation, FrameMutation::StackedWrongWidth) {
+                    Varnode::unique(0x150, 4)
+                } else {
+                    ra.clone()
+                };
+                block.push(R2ILOp::Load {
+                    dst: target.clone(),
+                    space: if matches!(mutation, FrameMutation::StackedWrongSpace) {
+                        SpaceId::Custom(1)
+                    } else {
+                        SpaceId::Ram
+                    },
+                    addr: return_slot,
+                });
+                return_target = target;
+            }
+            if !matches!(mutation, FrameMutation::StackedZeroExit) {
+                block.push(R2ILOp::IntAdd {
+                    dst: sp.clone(),
+                    a: sp.clone(),
+                    b: Varnode::constant(
+                        if matches!(mutation, FrameMutation::StackedWrongDelta) {
+                            4
+                        } else {
+                            8
+                        },
+                        8,
+                    ),
+                });
+            }
+            if matches!(
+                mutation,
+                FrameMutation::StackedUnledgeredRead | FrameMutation::StackedAtomic
+            ) {
+                return_target = ra.clone();
+            }
+            if matches!(mutation, FrameMutation::StackedWrongTarget) {
+                return_target = return_address;
+            }
+        }
         if matches!(mutation, FrameMutation::EntrySelfLoop) {
             block.push(R2ILOp::Branch {
                 target: Varnode::ram(0x3300, 8),
             });
         } else {
-            block.push(R2ILOp::Return { target: ra.clone() });
+            block.push(R2ILOp::Return {
+                target: return_target,
+            });
         }
 
         let mut arch = ArchSpec::new("preserved-frame-test");
@@ -9480,6 +9775,7 @@ mod tests {
         arch.add_register(RegisterDef::new("sp", 8, 8));
         arch.add_register(RegisterDef::new("ra", 16, 8));
         arch.add_register(RegisterDef::new("other", 24, 8));
+        arch.add_space(AddressSpace::ram(8));
         arch.add_space(AddressSpace::new(SpaceId::Custom(1), "other-memory", 8));
         let storage = |offset| CanonicalStorageId {
             space: CanonicalStorageSpace::Register,
@@ -9501,8 +9797,143 @@ mod tests {
         .and_then(|interface| interface.with_return_address_storage(storage(16)))
         .and_then(|interface| interface.with_stack_pointer_storage(storage(8)))
         .expect("exact preserved-frame interface");
+        let interface = if stacked_return && !matches!(mutation, FrameMutation::StackedNoContract) {
+            interface
+                .with_exact_stacked_return(0, 8, 8, 8)
+                .expect("exact stacked return contract")
+        } else {
+            interface
+        };
         SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface)
             .expect("preserved-frame artifact")
+    }
+
+    fn preserved_frame_two_return_artifact(mutation: TwoReturnMutation) -> SsaArtifact {
+        let fp = Varnode::register(0, 8);
+        let sp = Varnode::register(8, 8);
+        let ra = Varnode::register(16, 8);
+        let mut entry = R2ILBlock::new(0x3300, 4);
+        entry.push(R2ILOp::IntSub {
+            dst: sp.clone(),
+            a: sp.clone(),
+            b: Varnode::constant(8, 8),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(0x200, 8),
+            src: fp.clone(),
+        });
+        entry.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: sp.clone(),
+            val: Varnode::unique(0x200, 8),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: fp.clone(),
+            src: sp.clone(),
+        });
+        if matches!(
+            mutation,
+            TwoReturnMutation::SharedRead | TwoReturnMutation::DuplicateDominatingRead
+        ) {
+            entry.push(R2ILOp::IntAdd {
+                dst: Varnode::unique(0x208, 8),
+                a: sp.clone(),
+                b: Varnode::constant(8, 8),
+            });
+            entry.push(R2ILOp::Load {
+                dst: if matches!(mutation, TwoReturnMutation::SharedRead) {
+                    ra.clone()
+                } else {
+                    Varnode::unique(0x210, 8)
+                },
+                space: SpaceId::Ram,
+                addr: Varnode::unique(0x208, 8),
+            });
+        }
+        entry.push(R2ILOp::CBranch {
+            target: Varnode::ram(0x3320, 8),
+            cond: Varnode::constant(1, 1),
+        });
+
+        let build_return = |addr, loaded_offset, cross_arm_store| {
+            let loaded = Varnode::unique(loaded_offset, 8);
+            let mut block = R2ILBlock::new(addr, 4);
+            block.push(R2ILOp::Load {
+                dst: loaded.clone(),
+                space: SpaceId::Ram,
+                addr: fp.clone(),
+            });
+            block.push(R2ILOp::Copy {
+                dst: fp.clone(),
+                src: loaded,
+            });
+            block.push(R2ILOp::IntAdd {
+                dst: sp.clone(),
+                a: sp.clone(),
+                b: Varnode::constant(8, 8),
+            });
+            if cross_arm_store {
+                block.push(R2ILOp::Store {
+                    space: SpaceId::Ram,
+                    addr: sp.clone(),
+                    val: Varnode::constant(0, 8),
+                });
+            }
+            if !matches!(mutation, TwoReturnMutation::SharedRead) {
+                block.push(R2ILOp::Load {
+                    dst: ra.clone(),
+                    space: SpaceId::Ram,
+                    addr: sp.clone(),
+                });
+            }
+            block.push(R2ILOp::IntAdd {
+                dst: sp.clone(),
+                a: sp.clone(),
+                b: Varnode::constant(8, 8),
+            });
+            block.push(R2ILOp::Return { target: ra.clone() });
+            block
+        };
+        let fallthrough = build_return(
+            0x3304,
+            0x218,
+            matches!(mutation, TwoReturnMutation::CrossArmStore),
+        );
+        let taken = build_return(0x3320, 0x220, false);
+
+        let mut arch = ArchSpec::new("two-return-preserved-frame-test");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("fp", 0, 8));
+        arch.add_register(RegisterDef::new("sp", 8, 8));
+        arch.add_register(RegisterDef::new("ra", 16, 8));
+        arch.add_space(AddressSpace::ram(8));
+        let storage = |offset| CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let interface = SourceFunctionInterface::new_exact(
+            b"two-return-frame-revision-1".to_vec(),
+            "test-frame-abi",
+            [],
+            SourceFunctionReturn::Void,
+            [SourceStackSlotSpec::new_local(
+                StackAddressBase::FramePointer,
+                storage(0),
+                0,
+                8,
+            )],
+        )
+        .and_then(|interface| interface.with_return_address_storage(storage(16)))
+        .and_then(|interface| interface.with_stack_pointer_storage(storage(8)))
+        .and_then(|interface| interface.with_exact_stacked_return(0, 8, 8, 8))
+        .expect("exact two-return frame interface");
+        SsaArtifact::for_decompile_with_interface(
+            &[entry, fallthrough, taken],
+            Some(&arch),
+            interface,
+        )
+        .expect("two-return preserved-frame artifact")
     }
 
     fn preserved_frame_evidence(artifact: &SsaArtifact) -> Option<FramePreservationEvidence> {
@@ -9548,6 +9979,7 @@ mod tests {
         assert_eq!(evidence.restores.len(), 1);
         assert!(evidence.restores[0].1.copies.is_empty());
         assert_eq!(evidence.restores[0].1.range, evidence.saved_range);
+        assert!(evidence.restores[0].2.is_none());
 
         let affine =
             preserved_frame_evidence(&preserved_frame_artifact(FrameMutation::AffineRelation))
@@ -9568,6 +10000,41 @@ mod tests {
                 "supported exact shape: {mutation:?}"
             );
         }
+
+        let stacked_artifact = preserved_frame_artifact(FrameMutation::StackedReturn);
+        let stacked = preserved_frame_evidence(&stacked_artifact)
+            .expect("pinned x86 stacked return frame evidence");
+        let return_read = stacked.restores[0]
+            .2
+            .as_ref()
+            .expect("stacked return retains its exact RAM read");
+        assert_eq!(return_read.space(), MachineAddressSpace::Ram);
+        assert_eq!(return_read.word_size_bytes(), 1);
+        assert_eq!(return_read.width_bits(), 64);
+
+        let two_return = preserved_frame_evidence(&preserved_frame_two_return_artifact(
+            TwoReturnMutation::None,
+        ))
+        .expect("distinct stacked reads seal both return arms");
+        assert_eq!(two_return.restores.len(), 2);
+        let return_read_producers = two_return
+            .restores
+            .iter()
+            .map(|(_, _, read)| read.as_ref().expect("sealed return read").producer())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(return_read_producers.len(), 2);
+
+        let shared_return = preserved_frame_evidence(&preserved_frame_two_return_artifact(
+            TwoReturnMutation::SharedRead,
+        ))
+        .expect("one dominating stacked read may serve both return arms");
+        assert_eq!(shared_return.restores.len(), 2);
+        let shared_read_producers = shared_return
+            .restores
+            .iter()
+            .map(|(_, _, read)| read.as_ref().expect("sealed return read").producer())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(shared_read_producers.len(), 1);
     }
 
     #[test]
@@ -9591,10 +10058,32 @@ mod tests {
             FrameMutation::EntrySelfLoop,
             FrameMutation::UnbalancedStackPointer,
             FrameMutation::PartialFramePointerWrite,
+            FrameMutation::StackedNoContract,
+            FrameMutation::StackedWrongOffset,
+            FrameMutation::StackedWrongWidth,
+            FrameMutation::StackedWrongSpace,
+            FrameMutation::StackedWrongTarget,
+            FrameMutation::StackedWrongDelta,
+            FrameMutation::StackedZeroExit,
+            FrameMutation::StackedDuplicateRead,
+            FrameMutation::StackedUnledgeredRead,
+            FrameMutation::StackedOverlappingStore,
+            FrameMutation::StackedPartialOverlappingStore,
+            FrameMutation::StackedUnknownPointerStore,
+            FrameMutation::StackedAtomic,
         ] {
             assert!(
                 preserved_frame_evidence(&preserved_frame_artifact(mutation)).is_none(),
                 "mutation must refuse: {mutation:?}"
+            );
+        }
+        for mutation in [
+            TwoReturnMutation::CrossArmStore,
+            TwoReturnMutation::DuplicateDominatingRead,
+        ] {
+            assert!(
+                preserved_frame_evidence(&preserved_frame_two_return_artifact(mutation)).is_none(),
+                "two-return mutation must refuse: {mutation:?}"
             );
         }
     }
