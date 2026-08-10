@@ -144,14 +144,25 @@ endif
 
 $(RUST_LIB_LOCAL): FORCE $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)
 	mkdir -p $(RUST_RUNTIME_SUBDIR)
-	@if [ ! -f "$@" ] || ! cmp -s "$(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)" "$@"; then \
-		cp "$(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)" "$@"; \
-	fi
-ifeq ($(UNAME),Darwin)
-	@if ! codesign -v "$@" >/dev/null 2>&1; then \
-		codesign --force --sign - "$@" >/dev/null 2>&1; \
-	fi
-endif
+	@if [ "$(UNAME)" != Darwin ] && [ -f "$@" ] \
+		&& cmp -s "$(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)" "$@"; then \
+		exit 0; \
+	fi; \
+	rust_lib_tmp_dir="$$(mktemp -d "$(RUST_RUNTIME_SUBDIR)/.r2sleigh-runtime.XXXXXX")" || exit 1; \
+	rust_lib_tmp="$$rust_lib_tmp_dir/$(RUST_LIB).$(RUST_LIB_EXT)"; \
+	cleanup_rust_lib_tmp () { \
+		rm -f "$$rust_lib_tmp"; \
+		rmdir "$$rust_lib_tmp_dir" >/dev/null 2>&1 || true; \
+	}; \
+	trap cleanup_rust_lib_tmp EXIT; \
+	trap 'exit 1' HUP INT TERM; \
+	cp "$(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)" "$$rust_lib_tmp" || exit 1; \
+	if [ "$(UNAME)" = Darwin ]; then \
+		codesign --force --sign - "$$rust_lib_tmp" >/dev/null 2>&1 || exit 1; \
+	fi; \
+	mv -f "$$rust_lib_tmp" "$@" || exit 1; \
+	rmdir "$$rust_lib_tmp_dir" || exit 1; \
+	trap - EXIT HUP INT TERM
 
 FFI_V2_CONFORMANCE_BIN = $(RUST_BUILD_DIR)/ffi_v2_header_conformance
 
