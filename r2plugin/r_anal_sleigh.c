@@ -1292,13 +1292,14 @@ typedef struct {
 } SymStateCache;
 
 static SymStateCache sym_state_cache = {0};
-static RVecAnalRef *sleigh_get_data_refs(RAnal *anal, RAnalFunction *fcn);
-static int collect_data_refs_from_typed(
+static bool sleigh_get_data_refs(RAnal *anal, RAnalFunction *fcn, R_OUT RVecAnalRef **refs);
+static bool collect_data_refs_from_typed(
 	RAnal *anal,
 	RAnalFunction *fcn,
 	const R2SleighDataRef *items,
 	size_t count,
-	RVecAnalRef *refs);
+	RVecAnalRef *refs,
+	R_OUT size_t *discovered);
 
 typedef enum {
 	SLEIGH_MODE_FAST = 0,
@@ -4718,33 +4719,247 @@ typedef struct {
 } TaintSummaryMap;
 
 typedef struct {
-	ut64 from;
-	ut64 to;
-} EdgePair;
+	ut64 revision;
+	bool captured;
+} SleighArtifactRevision;
 
 typedef struct {
-	EdgePair *items;
-	size_t count;
-	size_t capacity;
-} EdgeSet;
+	RCore *core;
+	const char *domain_id;
+	ut64 scope_id;
+	ut64 function_epoch;
+	ut64 type_epoch;
+	ut64 snapshot_revision;
+	RCoreAnalArtifactComment *comments;
+	size_t comment_count;
+	size_t comment_capacity;
+	RCoreAnalArtifactFlag *flags;
+	size_t flag_count;
+	size_t flag_capacity;
+	RAnalRef *xrefs;
+	size_t xref_count;
+	size_t xref_capacity;
+	bool failed;
+} SleighArtifactPlan;
 
-static bool apply_typed_mutation(RAnal *anal, const RAnalMutation *mutation) {
-	RAnalMutationResult result = {0};
-	return anal && mutation
-		&& r_anal_apply_mutations (anal, mutation, 1, &result)
-		&& result.attempted == 1
-		&& result.applied == 1
-		&& result.failed == 0;
+static bool sleigh_artifact_revision_cb(const RAnalFunctionSnapshot *snapshot, void *user) {
+	SleighArtifactRevision *result = user;
+	RAnalFunctionSnapshotView view = {0};
+	if (!r_anal_function_snapshot_view (snapshot, &view)) {
+		return false;
+	}
+	result->revision = view.revision_identity;
+	result->captured = true;
+	return true;
 }
 
-static bool apply_typed_flag(RAnal *anal, const char *name, ut64 addr, ut64 size) {
-	RAnalMutation mutation = {
-		.kind = R_ANAL_MUTATION_FLAG,
-		.name = name,
+static bool sleigh_artifact_plan_init(SleighArtifactPlan *plan, RAnal *anal,
+		RAnalFunction *fcn, const char *domain_id) {
+	if (!plan || !anal || !fcn || !domain_id || !*domain_id) {
+		return false;
+	}
+	memset (plan, 0, sizeof (*plan));
+	RCore *core = anal->coreb.core;
+	if (!core) {
+		return false;
+	}
+	const ut64 function_epoch = r_anal_function_dirty_epoch (fcn);
+	const ut64 type_epoch = r_anal_types_dirty_epoch (anal);
+	SleighArtifactRevision revision = {0};
+	if (!r_core_function_snapshot_at (core, fcn->addr,
+			sleigh_artifact_revision_cb, &revision)
+			|| !revision.captured || !revision.revision
+			|| r_anal_function_dirty_epoch (fcn) != function_epoch
+			|| r_anal_types_dirty_epoch (anal) != type_epoch) {
+		return false;
+	}
+	plan->core = core;
+	plan->domain_id = domain_id;
+	plan->scope_id = fcn->addr;
+	plan->function_epoch = function_epoch;
+	plan->type_epoch = type_epoch;
+	plan->snapshot_revision = revision.revision;
+	return true;
+}
+
+static bool sleigh_artifact_plan_reserve(void **items, size_t *capacity,
+		size_t count, size_t item_size) {
+	if (!items || !capacity || !item_size) {
+		return false;
+	}
+	if (count < *capacity) {
+		return true;
+	}
+	size_t new_capacity = *capacity? *capacity * 2: 8;
+	if (new_capacity <= *capacity) {
+		return false;
+	}
+	size_t allocation_size;
+	if (r_mul_overflow (new_capacity, item_size, &allocation_size)) {
+		return false;
+	}
+	void *next = realloc (*items, allocation_size);
+	if (!next) {
+		return false;
+	}
+	*items = next;
+	*capacity = new_capacity;
+	return true;
+}
+
+static bool sleigh_artifact_plan_add_comment(SleighArtifactPlan *plan, ut64 addr,
+		const char *prefix, const char *text) {
+	if (!plan || plan->failed || !prefix || !*prefix || !text || !*text
+			|| strchr (prefix, '\n') || strchr (text, '\n')
+			|| !r_str_startswith (text, prefix)) {
+		if (plan) {
+			plan->failed = true;
+		}
+		return false;
+	}
+	size_t i;
+	for (i = 0; i < plan->comment_count; i++) {
+		RCoreAnalArtifactComment *comment = &plan->comments[i];
+		if (comment->addr == addr && !strcmp (comment->prefix, prefix)) {
+			char *replacement = strdup (text);
+			if (!replacement) {
+				plan->failed = true;
+				return false;
+			}
+			free ((char *)comment->text);
+			comment->text = replacement;
+			return true;
+		}
+	}
+	char *owned_prefix = strdup (prefix);
+	char *owned_text = strdup (text);
+	if (!owned_prefix || !owned_text
+			|| !sleigh_artifact_plan_reserve ((void **)&plan->comments,
+				&plan->comment_capacity, plan->comment_count, sizeof (*plan->comments))) {
+		free (owned_prefix);
+		free (owned_text);
+		plan->failed = true;
+		return false;
+	}
+	plan->comments[plan->comment_count++] = (RCoreAnalArtifactComment) {
+		.addr = addr,
+		.prefix = owned_prefix,
+		.text = owned_text,
+	};
+	return true;
+}
+
+static bool sleigh_artifact_plan_add_flag(SleighArtifactPlan *plan, const char *name,
+		ut64 addr, ut64 size) {
+	if (!plan || plan->failed || !name || !*name) {
+		if (plan) {
+			plan->failed = true;
+		}
+		return false;
+	}
+	size_t i;
+	for (i = 0; i < plan->flag_count; i++) {
+		RCoreAnalArtifactFlag *flag = &plan->flags[i];
+		if (!strcmp (flag->name, name)) {
+			if (flag->addr != addr || flag->size != size) {
+				plan->failed = true;
+				return false;
+			}
+			return true;
+		}
+	}
+	char *owned_name = strdup (name);
+	if (!owned_name
+			|| !sleigh_artifact_plan_reserve ((void **)&plan->flags,
+				&plan->flag_capacity, plan->flag_count, sizeof (*plan->flags))) {
+		free (owned_name);
+		plan->failed = true;
+		return false;
+	}
+	plan->flags[plan->flag_count++] = (RCoreAnalArtifactFlag) {
+		.name = owned_name,
 		.addr = addr,
 		.size = size,
 	};
-	return apply_typed_mutation (anal, &mutation);
+	return true;
+}
+
+static bool sleigh_artifact_plan_add_xref(SleighArtifactPlan *plan, ut64 from,
+		ut64 to, RAnalRefType type) {
+	if (!plan || plan->failed || from == UT64_MAX || to == UT64_MAX || from == to) {
+		if (plan) {
+			plan->failed = true;
+		}
+		return false;
+	}
+	size_t i;
+	for (i = 0; i < plan->xref_count; i++) {
+		RAnalRef *xref = &plan->xrefs[i];
+		if (xref->at == from && xref->addr == to) {
+			if (xref->type != type) {
+				plan->failed = true;
+				return false;
+			}
+			return true;
+		}
+	}
+	if (!sleigh_artifact_plan_reserve ((void **)&plan->xrefs,
+			&plan->xref_capacity, plan->xref_count, sizeof (*plan->xrefs))) {
+		plan->failed = true;
+		return false;
+	}
+	plan->xrefs[plan->xref_count++] = (RAnalRef) {
+		.at = from,
+		.addr = to,
+		.type = type,
+	};
+	return true;
+}
+
+static bool sleigh_artifact_plan_submit(SleighArtifactPlan *plan) {
+	if (!plan || plan->failed || !plan->core || !plan->domain_id) {
+		return false;
+	}
+	RCoreAnalArtifactReplacement replacement = {
+		.provider_id = "sla",
+		.domain_id = plan->domain_id,
+		.scope_id = plan->scope_id,
+		.expected_function_epoch = plan->function_epoch,
+		.expected_type_epoch = plan->type_epoch,
+		.expected_snapshot_revision = plan->snapshot_revision,
+		.comments = plan->comments,
+		.comment_count = plan->comment_count,
+		.flags = plan->flags,
+		.flag_count = plan->flag_count,
+		.xrefs = plan->xrefs,
+		.xref_count = plan->xref_count,
+	};
+	RCoreAnalArtifactReplaceResult result = r_core_anal_artifacts_replace (
+		plan->core, &replacement, 1);
+	if (result.status != R_CORE_ANAL_ARTIFACT_REPLACE_OK) {
+		R_LOG_WARN ("r2sleigh: cannot replace %s artifacts at 0x%08"PFMT64x": %u",
+			plan->domain_id, plan->scope_id, result.status);
+		return false;
+	}
+	return true;
+}
+
+static void sleigh_artifact_plan_fini(SleighArtifactPlan *plan) {
+	if (!plan) {
+		return;
+	}
+	size_t i;
+	for (i = 0; i < plan->comment_count; i++) {
+		free ((char *)plan->comments[i].prefix);
+		free ((char *)plan->comments[i].text);
+	}
+	for (i = 0; i < plan->flag_count; i++) {
+		free ((char *)plan->flags[i].name);
+	}
+	free (plan->comments);
+	free (plan->flags);
+	free (plan->xrefs);
+	memset (plan, 0, sizeof (*plan));
 }
 
 static bool append_unique_ut64(ut64 **items, size_t *count, size_t *capacity, ut64 value) {
@@ -5064,18 +5279,22 @@ static void trim_call_prefixes(char *name) {
 	}
 }
 
-static char *clean_call_name(const char *raw) {
+static bool clean_call_name(const char *raw, R_OUT char **result) {
 	char *name;
 	char *at;
 	size_t len;
 
+	if (!result) {
+		return false;
+	}
+	*result = NULL;
 	if (!raw || !*raw) {
-		return NULL;
+		return true;
 	}
 
 	name = strdup (raw);
 	if (!name) {
-		return NULL;
+		return false;
 	}
 
 	trim_call_prefixes (name);
@@ -5099,17 +5318,22 @@ static char *clean_call_name(const char *raw) {
 
 	if (!*name) {
 		free (name);
-		return NULL;
+		return true;
 	}
-	return name;
+	*result = name;
+	return true;
 }
 
-static char *resolve_call_target_name_from_addr(RCore *core, RAnal *anal, ut64 addr) {
+static bool resolve_call_target_name_from_addr(RCore *core, RAnal *anal, ut64 addr,
+		R_OUT char **result) {
 	const char *raw_name = NULL;
-	char *cleaned = NULL;
 
+	if (!result) {
+		return false;
+	}
+	*result = NULL;
 	if (!core || !anal) {
-		return NULL;
+		return false;
 	}
 
 	if (core->flags) {
@@ -5125,11 +5349,9 @@ static char *resolve_call_target_name_from_addr(RCore *core, RAnal *anal, ut64 a
 		}
 	}
 	if (!raw_name) {
-		return NULL;
+		return true;
 	}
-
-	cleaned = clean_call_name (raw_name);
-	return cleaned;
+	return clean_call_name (raw_name, result);
 }
 
 static bool is_dangerous_sink(const char *name) {
@@ -5167,64 +5389,6 @@ static TaintRiskLevel classify_taint_risk(bool meaningful, bool has_dangerous_ca
 		return TAINT_RISK_LOW;
 	}
 	return TAINT_RISK_LOW;
-}
-
-static void edge_set_init(EdgeSet *set) {
-	if (!set) {
-		return;
-	}
-	set->items = NULL;
-	set->count = 0;
-	set->capacity = 0;
-}
-
-static void edge_set_free(EdgeSet *set) {
-	if (!set) {
-		return;
-	}
-	free (set->items);
-	set->items = NULL;
-	set->count = 0;
-	set->capacity = 0;
-}
-
-static bool edge_set_has(const EdgeSet *set, ut64 from, ut64 to) {
-	size_t i;
-	if (!set) {
-		return false;
-	}
-	for (i = 0; i < set->count; i++) {
-		if (set->items[i].from == from && set->items[i].to == to) {
-			return true;
-		}
-	}
-	return false;
-}
-
-static bool edge_set_add(EdgeSet *set, ut64 from, ut64 to) {
-	EdgePair *next;
-
-	if (!set) {
-		return false;
-	}
-	if (edge_set_has (set, from, to)) {
-		return true;
-	}
-
-	if (set->count >= set->capacity) {
-		size_t new_capacity = set->capacity ? (set->capacity * 2) : 8;
-		next = realloc (set->items, new_capacity * sizeof (EdgePair));
-		if (!next) {
-			return false;
-		}
-		set->items = next;
-		set->capacity = new_capacity;
-	}
-
-	set->items[set->count].from = from;
-	set->items[set->count].to = to;
-	set->count++;
-	return true;
 }
 
 static bool is_noisy_taint_label(const char *label) {
@@ -5319,243 +5483,33 @@ static int cmp_labels_interesting(const void *a, const void *b) {
 	return strcmp (la ? la : "", lb ? lb : "");
 }
 
-static bool line_has_prefix(const char *line, size_t len, const char *prefix) {
-	size_t prefix_len;
-
-	if (!line || !prefix) {
-		return false;
-	}
-
-	prefix_len = strlen (prefix);
-	if (len < prefix_len) {
-		return false;
-	}
-	return !strncmp (line, prefix, prefix_len);
-}
-
-static bool is_sla_managed_line(const char *line, size_t len) {
-	if (!line) {
-		return false;
-	}
-	while (len > 0 && (*line == ' ' || *line == '\t')) {
-		line++;
-		len--;
-	}
-	return line_has_prefix (line, len, SLEIGH_COMMENT_PREFIX_TAINT)
-		|| line_has_prefix (line, len, SLEIGH_COMMENT_PREFIX_TAINT_RISK);
-}
-
-static bool is_sla_line_with_prefix(const char *line, size_t len, const char *prefix) {
-
-	if (!line) {
-		return false;
-	}
-	while (len > 0 && (*line == ' ' || *line == '\t')) {
-		line++;
-		len--;
-	}
-	return line_has_prefix (line, len, prefix);
-}
-
-static bool append_bytes(char **buf, size_t *len, size_t *cap, const char *src, size_t src_len) {
-	char *next;
-
-	if (!buf || !len || !cap || !src) {
-		return false;
-	}
-	if (*len + src_len + 1 > *cap) {
-		size_t new_cap = *cap ? *cap : 64;
-		while (*len + src_len + 1 > new_cap) {
-			new_cap *= 2;
-		}
-		next = realloc (*buf, new_cap);
-		if (!next) {
-			return false;
-		}
-		*buf = next;
-		*cap = new_cap;
-	}
-	memcpy (*buf + *len, src, src_len);
-	*len += src_len;
-	(*buf)[*len] = '\0';
-	return true;
-}
-
-static char *strip_sla_lines(const char *existing_comment, const char *prefix, bool all_managed) {
-	const char *cursor;
-	char *out = NULL;
-	size_t out_len = 0;
-	size_t out_cap = 0;
-	bool first = true;
-
-	if (!existing_comment || !*existing_comment) {
-		return strdup ("");
-	}
-
-	cursor = existing_comment;
-	while (*cursor) {
-		const char *line_start = cursor;
-		const char *line_end = strchr (cursor, '\n');
-		size_t line_len = line_end ? (size_t)(line_end - line_start) : strlen (line_start);
-		bool should_strip = all_managed
-			? is_sla_managed_line (line_start, line_len)
-			: is_sla_line_with_prefix (line_start, line_len, prefix);
-
-		if (!should_strip) {
-			if (!first) {
-				append_bytes (&out, &out_len, &out_cap, "\n", 1);
-			}
-			append_bytes (&out, &out_len, &out_cap, line_start, line_len);
-			first = false;
-		}
-
-		if (!line_end) {
-			break;
-		}
-			cursor = line_end + 1;
-	}
-
-	if (!out) {
-		return strdup ("");
-	}
-	return out;
-}
-
-static char *merge_sla_line(const char *existing_comment, const char *line_to_add, const char *prefix) {
-	char *cleaned;
-	char *merged;
-	size_t cleaned_len;
-	size_t line_len;
-
-	if (!line_to_add || !*line_to_add) {
-		return strip_sla_lines (existing_comment, prefix, false);
-	}
-
-	cleaned = strip_sla_lines (existing_comment, prefix, false);
-	if (!cleaned) {
-		return NULL;
-	}
-	if (!*cleaned) {
-		free (cleaned);
-		return strdup (line_to_add);
-	}
-
-	cleaned_len = strlen (cleaned);
-	line_len = strlen (line_to_add);
-	merged = malloc (cleaned_len + 1 + line_len + 1);
-	if (!merged) {
-		free (cleaned);
-		return NULL;
-	}
-	memcpy (merged, cleaned, cleaned_len);
-	merged[cleaned_len] = '\n';
-	memcpy (merged + cleaned_len + 1, line_to_add, line_len);
-	merged[cleaned_len + 1 + line_len] = '\0';
-	free (cleaned);
-	return merged;
-}
-
-static void set_sla_comment_line_with_prefix(RAnal *anal, ut64 addr, const char *line, const char *prefix) {
-	const char *existing;
-	char *updated;
-
-	if (!anal) {
-		return;
-	}
-
-	existing = r_meta_get_string (anal, R_META_TYPE_COMMENT, addr);
-	updated = line
-		? merge_sla_line (existing, line, prefix)
-		: strip_sla_lines (existing, prefix, false);
-	if (!updated) {
-		return;
-	}
-
-	if (*updated) {
-		RAnalMutation mutation = {
-			.kind = R_ANAL_MUTATION_COMMENT,
-			.addr = addr,
-			.text = updated,
-		};
-		apply_typed_mutation (anal, &mutation);
-	} else {
-		r_meta_del (anal, R_META_TYPE_COMMENT, addr, 1);
-	}
-	free (updated);
-}
-
-static void set_sla_taint_comment_line(RAnal *anal, ut64 addr, const char *taint_line) {
-	set_sla_comment_line_with_prefix (anal, addr, taint_line, SLEIGH_COMMENT_PREFIX_TAINT);
-}
-
-static void set_sla_taint_risk_comment_line(RAnal *anal, ut64 addr, const char *risk_line) {
-	set_sla_comment_line_with_prefix (anal, addr, risk_line, SLEIGH_COMMENT_PREFIX_TAINT_RISK);
-}
-
-static void clear_taint_function_artifacts(RAnal *anal, RCore *core, const RAnalFunction *fcn, const BlockArray *blocks) {
+static bool collect_semantic_comments_for_function(SleighArtifactPlan *plan,
+		const R2ILContext *ctx, const BlockArray *blocks, bool enabled) {
 	size_t i;
-	char glob[128];
-	char risk_glob[128];
-
-	if (!anal || !fcn || !blocks) {
-		return;
-	}
-
-	if (core && core->flags) {
-		snprintf (glob, sizeof (glob), "sla.taint.fcn_%"PFMT64x".*", fcn->addr);
-		r_flag_unset_glob (core->flags, glob);
-		snprintf (risk_glob, sizeof (risk_glob), "sla.taint.risk.*.fcn_%"PFMT64x, fcn->addr);
-		r_flag_unset_glob (core->flags, risk_glob);
-	}
-
-	for (i = 0; i < blocks->count; i++) {
-		ut64 block_addr = 0;
-		(void)sleigh_v2_block_addr (blocks->blocks[i], &block_addr);
-		set_sla_comment_line_with_prefix (anal, block_addr, NULL, SLEIGH_COMMENT_PREFIX_TAINT);
-		set_sla_comment_line_with_prefix (anal, block_addr, NULL, SLEIGH_COMMENT_PREFIX_TAINT_RISK);
-	}
-	set_sla_comment_line_with_prefix (anal, fcn->addr, NULL, SLEIGH_COMMENT_PREFIX_TAINT);
-	set_sla_comment_line_with_prefix (anal, fcn->addr, NULL, SLEIGH_COMMENT_PREFIX_TAINT_RISK);
-}
-
-static size_t write_semantic_comments_for_function(RAnal *anal, const R2ILContext *ctx,
-		const BlockArray *blocks, ut64 fcn_addr, bool enabled) {
-	size_t i;
-	size_t emitted = 0;
 	R2SleighAnalysisResultV2 *result = NULL;
 	R2SleighAnalysisResultViewV2 view = {0};
 	const R2SleighAnnotation *items = NULL;
 	size_t count = 0;
-	bool got_annotation_array = false;
-
-	if (!anal || !blocks) {
-		return 0;
+	bool success = false;
+	if (!plan || !ctx || !blocks) {
+		return false;
 	}
-
-	/* Always clear stale semantic lines first to keep writeback idempotent. */
-	set_sla_comment_line_with_prefix (anal, fcn_addr, NULL, SLEIGH_COMMENT_PREFIX_SEMANTIC);
-	for (i = 0; i < blocks->count; i++) {
-		ut64 block_addr = 0;
-		(void)sleigh_v2_block_addr (blocks->blocks[i], &block_addr);
-		set_sla_comment_line_with_prefix (anal, block_addr,
-			NULL, SLEIGH_COMMENT_PREFIX_SEMANTIC);
-	}
-
-	if (!enabled || !ctx || blocks->count == 0) {
-		return 0;
+	if (!enabled || blocks->count == 0) {
+		return true;
 	}
 
 	if (sleigh_v2_analysis_query (R2SLEIGH_QUERY_ANNOTATIONS_V2,
 		ctx, (const R2ILBlock *const *)blocks->blocks, blocks->count,
-		fcn_addr, NULL, NULL, 0, &result, &view) != R2SLEIGH_STATUS_OK_V2) {
-		R_LOG_DEBUG ("r2sleigh: semantic annotation generation returned empty payload for fcn=0x%"PFMT64x, fcn_addr);
+		plan->scope_id, NULL, NULL, 0, &result, &view) != R2SLEIGH_STATUS_OK_V2) {
+		R_LOG_DEBUG ("r2sleigh: semantic annotation generation failed for fcn=0x%"PFMT64x,
+			plan->scope_id);
 		goto cleanup;
 	}
 	items = (const R2SleighAnnotation *)view.primary;
 	count = view.primary_count;
-	got_annotation_array = true;
 	if (!items && count > 0) {
-		R_LOG_DEBUG ("r2sleigh: semantic annotation typed payload failure for fcn=0x%"PFMT64x, fcn_addr);
+		R_LOG_DEBUG ("r2sleigh: semantic annotation typed payload failure for fcn=0x%"PFMT64x,
+			plan->scope_id);
 		goto cleanup;
 	}
 
@@ -5564,73 +5518,14 @@ static size_t write_semantic_comments_for_function(RAnal *anal, const R2ILContex
 		if (!item->comment || !*item->comment) {
 			continue;
 		}
-		set_sla_comment_line_with_prefix (anal, (ut64)item->addr,
-			item->comment, SLEIGH_COMMENT_PREFIX_SEMANTIC);
-		emitted++;
+		if (!sleigh_artifact_plan_add_comment (plan, (ut64)item->addr,
+				SLEIGH_COMMENT_PREFIX_SEMANTIC, item->comment)) {
+			goto cleanup;
+		}
 	}
-
+	success = true;
 cleanup:
-	if (result) {
-		(void)sleigh_v2_analysis_result_release (&result);
-	}
-	if (enabled && got_annotation_array && emitted == 0) {
-		set_sla_comment_line_with_prefix (anal, fcn_addr, "sla: analyzed",
-			SLEIGH_COMMENT_PREFIX_SEMANTIC);
-		emitted = 1;
-	}
-	return emitted;
-}
-
-static bool has_xref(RAnal *anal, ut64 from, ut64 to, RAnalRefType type) {
-	RVecAnalRef *refs;
-	size_t i;
-	size_t len;
-
-	if (!anal) {
-		return false;
-	}
-	refs = r_anal_xrefs_get (anal, to);
-	if (!refs) {
-		return false;
-	}
-
-	len = RVecAnalRef_length (refs);
-	for (i = 0; i < len; i++) {
-		RAnalRef *ref = RVecAnalRef_at (refs, i);
-		if (ref && ref->at == from && ref->addr == to && ref->type == type) {
-			return true;
-		}
-	}
-
-	return false;
-}
-
-static bool maybe_add_taint_xref(RAnal *anal, EdgeSet *seen, ut64 from, ut64 to, RAnalRefType type, int *added_count) {
-	if (!anal || !seen || !from || !to) {
-		return false;
-	}
-	if (edge_set_has (seen, from, to)) {
-		return false;
-	}
-	if (!edge_set_add (seen, from, to)) {
-		return false;
-	}
-	if (has_xref (anal, from, to, type)) {
-		return false;
-	}
-	RAnalMutation mutation = {
-		.kind = R_ANAL_MUTATION_XREF,
-		.from = from,
-		.to = to,
-		.ref_type = type,
-	};
-	if (apply_typed_mutation (anal, &mutation)) {
-		if (added_count) {
-			(*added_count)++;
-		}
-		return true;
-	}
-	return false;
+	return sleigh_v2_analysis_result_release (&result) && success;
 }
 
 static char *format_taint_summary_comment(TaintBlockSummary *summary) {
@@ -7743,19 +7638,26 @@ static bool sleigh_analyze_fcn(RAnal *anal, RAnalFunction *fcn) {
 	if (!ctx) {
 		return false;
 	}
-
-	BlockArray blocks;
-	if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
+	SleighArtifactPlan plan;
+	if (!sleigh_artifact_plan_init (&plan, anal, fcn, "semantic")) {
 		return false;
 	}
 
-	size_t semantic_comments_emitted = write_semantic_comments_for_function (
-		anal, ctx, &blocks, fcn->addr, true);
+	BlockArray blocks;
+	if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
+		sleigh_artifact_plan_fini (&plan);
+		return false;
+	}
+
+	bool collected = collect_semantic_comments_for_function (&plan, ctx, &blocks, true);
+	bool committed = collected && sleigh_artifact_plan_submit (&plan);
+	size_t semantic_comments_emitted = committed? plan.comment_count: 0;
 	R_LOG_DEBUG ("r2sleigh: semantic comments fcn=0x%"PFMT64x" enabled=%d emitted=%zu",
-		fcn->addr, 1, semantic_comments_emitted);
+		plan.scope_id, 1, semantic_comments_emitted);
 
 	block_array_free (&blocks);
-	return true;
+	sleigh_artifact_plan_fini (&plan);
+	return committed;
 }
 
 /* Helper to free RAnalVarProt */
@@ -7915,93 +7817,117 @@ static RAnalRefType data_ref_type_from_kind(RAnal *anal, ut64 to_addr, char kind
 	return data_ref_type_from_json (anal, to_addr, kind? type_name: NULL);
 }
 
-static int collect_data_refs_from_typed(
+static bool collect_data_refs_from_typed(
 	RAnal *anal,
 	RAnalFunction *fcn,
 	const R2SleighDataRef *items,
 	size_t count,
-	RVecAnalRef *refs
+	RVecAnalRef *refs,
+	R_OUT size_t *discovered
 ) {
-	int discovered = 0;
+	if (!discovered) {
+		return false;
+	}
+	*discovered = 0;
 	size_t i;
 	if (!anal || !items || count == 0) {
-		return 0;
+		return false;
 	}
 	for (i = 0; i < count; i++) {
 		ut64 from_addr = (ut64)items[i].from;
 		ut64 to_addr = (ut64)items[i].to;
-		RAnalRefType ref_type;
 		if (fcn && to_addr >= fcn->addr && to_addr < fcn->addr + r_anal_function_linear_size (fcn)) {
 			continue;
 		}
-		ref_type = data_ref_type_from_kind (anal, to_addr, items[i].ref_kind);
 		if (refs) {
-			RAnalRef ref = {
+			RAnalRef *ref = RVecAnalRef_emplace_back (refs);
+			if (!ref) {
+				return false;
+			}
+			*ref = (RAnalRef) {
 				.at = from_addr,
 				.addr = to_addr,
-				.type = ref_type,
+				.type = data_ref_type_from_kind (anal, to_addr, items[i].ref_kind),
 			};
-			RVecAnalRef_push_back (refs, &ref);
 		}
-		discovered++;
+		(*discovered)++;
 	}
-	return discovered;
+	return true;
 }
 
 /* Called during reference analysis (aar) */
-static RVecAnalRef *sleigh_get_data_refs(RAnal *anal, RAnalFunction *fcn) {
+static bool sleigh_get_data_refs(RAnal *anal, RAnalFunction *fcn, R_OUT RVecAnalRef **refs) {
+	if (!refs) {
+		return false;
+	}
+	*refs = NULL;
 	if (!fcn || !anal) {
-		return NULL;
+		return false;
 	}
 	if (!auto_callback_allows_function (
 		anal,
 		fcn,
 		R2SLEIGH_AUTO_CALLBACK_DATA_REFS_V2,
 		"get_data_refs")) {
-		return NULL;
+		return false;
 	}
 
 	R2ILContext *ctx = get_context (anal);
 	if (!ctx) {
-		return NULL;
+		return false;
 	}
 
 	BlockArray blocks;
 	if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
-		return NULL;
+		return false;
 	}
 
+	bool success = false;
+	RVecAnalRef *result = NULL;
 	R2SleighAnalysisResultV2 *typed_refs = NULL;
-	R2SleighAnalysisResultViewV2 typed_view;
+	R2SleighAnalysisResultViewV2 typed_view = {0};
 	uint32_t typed_status = sleigh_v2_analysis_query (R2SLEIGH_QUERY_DATA_REFS_V2,
 		ctx, (const R2ILBlock *const *)blocks.blocks, blocks.count, fcn->addr,
 		NULL, NULL, 0, &typed_refs, &typed_view);
-	size_t typed_count = typed_status == R2SLEIGH_STATUS_OK_V2? typed_view.primary_count: 0;
-	const R2SleighDataRef *typed_items = typed_status == R2SLEIGH_STATUS_OK_V2
-		? (const R2SleighDataRef *)typed_view.primary: NULL;
-
-	if (!typed_items || typed_count == 0) {
-		(void)sleigh_v2_analysis_result_release (&typed_refs);
-		block_array_free (&blocks);
-		return NULL;
+	if (typed_status != R2SLEIGH_STATUS_OK_V2) {
+		goto beach;
 	}
-
-	RVecAnalRef *refs = RVecAnalRef_new ();
-	if (!refs) {
-		(void)sleigh_v2_analysis_result_release (&typed_refs);
-		block_array_free (&blocks);
-		return NULL;
+	size_t typed_count = typed_view.primary_count;
+	if (!typed_count) {
+		success = true;
+		goto beach;
 	}
-	collect_data_refs_from_typed (anal, fcn, typed_items, typed_count, refs);
+	const R2SleighDataRef *typed_items = (const R2SleighDataRef *)typed_view.primary;
+	if (!typed_items) {
+		goto beach;
+	}
+	size_t ref_count = 0;
+	if (!collect_data_refs_from_typed (
+			anal, fcn, typed_items, typed_count, NULL, &ref_count)) {
+		goto beach;
+	}
+	if (!ref_count) {
+		success = true;
+		goto beach;
+	}
+	result = RVecAnalRef_new ();
+	if (!result || !RVecAnalRef_reserve (result, ref_count)) {
+		goto beach;
+	}
+	size_t written = 0;
+	if (!collect_data_refs_from_typed (
+			anal, fcn, typed_items, typed_count, result, &written)
+			|| written != ref_count) {
+		goto beach;
+	}
+	*refs = result;
+	result = NULL;
+	success = true;
+beach:
+	RVecAnalRef_free (result);
 	(void)sleigh_v2_analysis_result_release (&typed_refs);
 	block_array_free (&blocks);
-
-	if (RVecAnalRef_empty (refs)) {
-		RVecAnalRef_free (refs);
-		return NULL;
-	}
-
-	return refs;
+	return success;
 }
 
 static char *resolve_interproc_seed_name(RCore *core, RAnal *anal, ut64 addr) {
@@ -8861,6 +8787,272 @@ static bool build_symbolic_function_scope(
 	return build_symbolic_function_scope_with_target (anal, root_fcn, ctx, scope, UT64_MAX);
 }
 
+typedef struct {
+	size_t sink_hits;
+	TaintRiskLevel risk_level;
+	int best_sink_rank;
+	ut64 best_sink_addr;
+	char *best_sink_label;
+} SleighTaintPlanStats;
+
+static void sleigh_taint_plan_stats_fini(SleighTaintPlanStats *stats) {
+	if (!stats) {
+		return;
+	}
+	free (stats->best_sink_label);
+	memset (stats, 0, sizeof (*stats));
+}
+
+static bool collect_taint_artifacts_for_function(SleighArtifactPlan *plan,
+		RAnal *anal, const R2ILContext *ctx, const BlockArray *blocks,
+		SleighTaintPlanStats *stats) {
+	R2SleighAnalysisResultV2 *result = NULL;
+	R2SleighAnalysisResultViewV2 view = {0};
+	TaintSourceMap source_map;
+	TaintSummaryMap summaries;
+	char **function_call_names = NULL;
+	size_t function_ncall_names = 0;
+	size_t function_call_name_cap = 0;
+	char **function_labels = NULL;
+	size_t function_nlabels = 0;
+	size_t function_label_cap = 0;
+	int function_call_hits = 0;
+	int function_store_hits = 0;
+	bool function_meaningful = false;
+	bool function_has_dangerous_call = false;
+	bool success = false;
+	size_t i;
+
+	if (!plan || !anal || !ctx || !blocks || !stats) {
+		return false;
+	}
+	memset (stats, 0, sizeof (*stats));
+	stats->best_sink_rank = 1000;
+	taint_source_map_init (&source_map);
+	taint_summary_map_init (&summaries);
+	uint32_t status = sleigh_v2_analysis_query (R2SLEIGH_QUERY_TAINT_SUMMARY_V2,
+		ctx, (const R2ILBlock *const *)blocks->blocks, blocks->count, 0,
+		NULL, NULL, 0, &result, &view);
+	if (status != R2SLEIGH_STATUS_OK_V2) {
+		goto cleanup;
+	}
+	const R2TaintSource *sources = (const R2TaintSource *)view.primary;
+	const R2TaintSinkHit *sink_hits = (const R2TaintSinkHit *)view.secondary;
+	if ((!sources && view.primary_count > 0)
+			|| (!sink_hits && view.secondary_count > 0)) {
+		goto cleanup;
+	}
+
+	for (i = 0; i < view.primary_count; i++) {
+		const R2TaintSource *source = &sources[i];
+		if (source->num_labels > 0 && !source->labels) {
+			goto cleanup;
+		}
+		size_t label_index;
+		for (label_index = 0; label_index < source->num_labels; label_index++) {
+			const char *label = source->labels? source->labels[label_index]: NULL;
+			if (label && *label
+					&& !taint_source_map_add (&source_map, label, (ut64)source->block)) {
+				goto cleanup;
+			}
+		}
+	}
+
+	for (i = 0; i < view.secondary_count; i++) {
+		const R2TaintSinkHit *hit = &sink_hits[i];
+		char **sink_labels = NULL;
+		size_t sink_label_count = 0;
+		size_t sink_label_cap = 0;
+		ut64 sink_block = (ut64)hit->block;
+		bool is_call_sink = hit->op_kind == R2TAINT_OP_CALL
+			|| hit->op_kind == R2TAINT_OP_CALL_IND;
+		bool had_primary_sources = false;
+		bool added_nonself = false;
+		size_t variable_index;
+		size_t label_index;
+		if (hit->num_tainted_vars > 0 && !hit->tainted_vars) {
+			goto cleanup;
+		}
+
+		for (variable_index = 0; variable_index < hit->num_tainted_vars; variable_index++) {
+			const R2TaintTaintedVar *variable = &hit->tainted_vars[variable_index];
+			if (variable->num_labels > 0 && !variable->labels) {
+				free_string_array (sink_labels, sink_label_count);
+				goto cleanup;
+			}
+			for (label_index = 0; label_index < variable->num_labels; label_index++) {
+				const char *label = variable->labels? variable->labels[label_index]: NULL;
+				if (label && *label && !is_noisy_taint_label (label)
+						&& !append_unique_string (&sink_labels, &sink_label_count,
+							&sink_label_cap, label)) {
+					free_string_array (sink_labels, sink_label_count);
+					goto cleanup;
+				}
+			}
+		}
+
+		TaintBlockSummary *summary = taint_summary_map_get_or_add (&summaries, sink_block);
+		if (!summary) {
+			free_string_array (sink_labels, sink_label_count);
+			goto cleanup;
+		}
+		stats->sink_hits++;
+		summary->hits++;
+		if (is_call_sink) {
+			summary->call_hits++;
+		}
+		if (hit->op_kind == R2TAINT_OP_STORE) {
+			summary->store_hits++;
+		}
+		if (is_call_sink && hit->has_target_addr) {
+			char *call_name = NULL;
+			if (!resolve_call_target_name_from_addr (
+					plan->core, anal, (ut64)hit->target_addr, &call_name)) {
+				free_string_array (sink_labels, sink_label_count);
+				goto cleanup;
+			}
+			if (call_name) {
+				bool added = taint_summary_add_call_name (summary, call_name);
+				free (call_name);
+				if (!added) {
+					free_string_array (sink_labels, sink_label_count);
+					goto cleanup;
+				}
+			}
+		}
+		for (label_index = 0; label_index < sink_label_count; label_index++) {
+			if (!taint_summary_add_label (summary, sink_labels[label_index])) {
+				free_string_array (sink_labels, sink_label_count);
+				goto cleanup;
+			}
+		}
+		for (label_index = 0; label_index < sink_label_count; label_index++) {
+			const TaintLabelSource *label_sources = taint_source_map_find (
+				&source_map, sink_labels[label_index]);
+			if (!label_sources || !label_sources->count) {
+				continue;
+			}
+			had_primary_sources = true;
+			size_t source_index;
+			for (source_index = 0; source_index < label_sources->count; source_index++) {
+				ut64 source_block = label_sources->blocks[source_index];
+				if (source_block == sink_block) {
+					continue;
+				}
+				if (!sleigh_artifact_plan_add_xref (plan, source_block,
+						sink_block, R_ANAL_REF_TYPE_DATA)) {
+					free_string_array (sink_labels, sink_label_count);
+					goto cleanup;
+				}
+				added_nonself = true;
+			}
+		}
+		if (had_primary_sources && !added_nonself && sink_block != plan->scope_id
+				&& !sleigh_artifact_plan_add_xref (plan, plan->scope_id,
+					sink_block, R_ANAL_REF_TYPE_DATA)) {
+			free_string_array (sink_labels, sink_label_count);
+			goto cleanup;
+		}
+		free_string_array (sink_labels, sink_label_count);
+	}
+
+	for (i = 0; i < summaries.count; i++) {
+		TaintBlockSummary *summary = &summaries.items[i];
+		size_t label_index;
+		if (summary->nlabels > 0
+				&& (summary->hits > 0 || summary->call_hits > 0 || summary->store_hits > 0)) {
+			function_meaningful = true;
+			function_call_hits += summary->call_hits;
+			function_store_hits += summary->store_hits;
+			for (label_index = 0; label_index < summary->ncall_names; label_index++) {
+				if (!append_unique_string (&function_call_names, &function_ncall_names,
+						&function_call_name_cap, summary->call_names[label_index])) {
+					goto cleanup;
+				}
+				if (is_dangerous_sink (summary->call_names[label_index])) {
+					function_has_dangerous_call = true;
+				}
+			}
+		}
+		for (label_index = 0; label_index < summary->nlabels; label_index++) {
+			if (!append_unique_string (&function_labels, &function_nlabels,
+					&function_label_cap, summary->labels[label_index])) {
+				goto cleanup;
+			}
+		}
+		if (summary->nlabels > 0) {
+			char *comment = format_taint_summary_comment (summary);
+			if (!comment) {
+				goto cleanup;
+			}
+			bool added = sleigh_artifact_plan_add_comment (plan, summary->addr,
+				SLEIGH_COMMENT_PREFIX_TAINT, comment);
+			free (comment);
+			if (!added) {
+				goto cleanup;
+			}
+			char flag_name[160];
+			snprintf (flag_name, sizeof (flag_name),
+				"sla.taint.fcn_%"PFMT64x".blk_%"PFMT64x,
+				plan->scope_id, summary->addr);
+			if (!sleigh_artifact_plan_add_flag (plan, flag_name, summary->addr, 1)) {
+				goto cleanup;
+			}
+			int rank = label_rank (summary->labels[0]);
+			if (rank < stats->best_sink_rank) {
+				char *label = strdup (summary->labels[0]);
+				if (!label) {
+					goto cleanup;
+				}
+				free (stats->best_sink_label);
+				stats->best_sink_label = label;
+				stats->best_sink_addr = summary->addr;
+				stats->best_sink_rank = rank;
+			}
+		}
+	}
+
+	stats->risk_level = classify_taint_risk (function_meaningful,
+		function_has_dangerous_call, function_call_hits, function_store_hits);
+	if (stats->risk_level != TAINT_RISK_NONE) {
+		char *risk_comment = format_taint_risk_comment (stats->risk_level,
+			function_call_names, function_ncall_names, function_call_hits,
+			function_store_hits, function_labels, function_nlabels);
+		if (!risk_comment) {
+			goto cleanup;
+		}
+		bool added = sleigh_artifact_plan_add_comment (plan, plan->scope_id,
+			SLEIGH_COMMENT_PREFIX_TAINT_RISK, risk_comment);
+		free (risk_comment);
+		if (!added) {
+			goto cleanup;
+		}
+		char flag_name[192];
+		snprintf (flag_name, sizeof (flag_name),
+			"sla.taint.risk.fcn_%"PFMT64x, plan->scope_id);
+		if (!sleigh_artifact_plan_add_flag (plan, flag_name, plan->scope_id, 1)) {
+			goto cleanup;
+		}
+		snprintf (flag_name, sizeof (flag_name),
+			"sla.taint.risk.%s.fcn_%"PFMT64x,
+			taint_risk_level_flag_name (stats->risk_level), plan->scope_id);
+		if (!sleigh_artifact_plan_add_flag (plan, flag_name, plan->scope_id, 1)) {
+			goto cleanup;
+		}
+	}
+	success = true;
+
+cleanup:
+	free_string_array (function_call_names, function_ncall_names);
+	free_string_array (function_labels, function_nlabels);
+	taint_summary_map_free (&summaries);
+	taint_source_map_free (&source_map);
+	if (!sleigh_v2_analysis_result_release (&result)) {
+		success = false;
+	}
+	return success;
+}
+
 /* Eligibility/priority callback: score > 0 = eligible with priority, < 0 = ineligible */
 static int sleigh_eligible(RAnal *anal) {
 	R2ILContext *ctx = get_context (anal);
@@ -8870,40 +9062,37 @@ static int sleigh_eligible(RAnal *anal) {
 /* Called at end of aaaa for global post-analysis passes */
 static bool sleigh_post_analysis(RAnal *anal) {
 	R2ILContext *ctx = get_context (anal);
-	RCore *core;
-	int xrefs_discovered = 0;
-	int xref_dirty_queued = 0;
-	int taint_comments = 0;
-	int taint_flags = 0;
-	int taint_xrefs = 0;
+	size_t taint_comments = 0;
+	size_t taint_flags = 0;
+	size_t taint_xrefs = 0;
 	int taint_parse_failures = 0;
 	int taint_fcns_eligible = 0;
 	int taint_fcns_skipped = 0;
-	int taint_sink_hits = 0;
+	size_t taint_sink_hits = 0;
 	int taint_risk_critical = 0;
 	int taint_risk_high = 0;
 	int taint_risk_medium = 0;
 	int taint_risk_low = 0;
-	size_t semantic_comments_total = 0;
 	int best_sink_rank = 1000;
 	ut64 best_sink_addr = 0;
 	ut64 focus_callee_addr = 0;
 	char *best_sink_label = NULL;
 	int num_fcns = anal && anal->fcns? r_list_length (anal->fcns): 0;
-	R2SleighPostAnalysisPlanV2 plan = sleigh_v2_query_post_analysis (
+	R2SleighPostAnalysisPlanV2 post_plan = sleigh_v2_query_post_analysis (
 		anal? (unsigned int)anal->plugin_analysis_depth: 0,
 		(size_t)num_fcns);
-	SleighMode post_mode = plan.mode <= (unsigned int)SLEIGH_MODE_FULL? (SleighMode)plan.mode: SLEIGH_MODE_BALANCED;
-		bool semantic_comments_enabled = plan.semantic_comments_enabled != 0;
-		bool taint_enabled = plan.taint_enabled != 0;
-	ut64 post_budget_us = plan.post_budget_us;
+	SleighMode post_mode = post_plan.mode <= (unsigned int)SLEIGH_MODE_FULL
+		? (SleighMode)post_plan.mode: SLEIGH_MODE_BALANCED;
+	bool taint_enabled = post_plan.taint_enabled != 0;
+	bool taint_focus_only = post_plan.taint_focus_only != 0;
+	ut64 post_budget_us = post_plan.post_budget_us;
 	SleighPostAnalysisBudget post_budget = sleigh_post_analysis_budget_new (post_budget_us);
 	bool post_budget_exhausted = false;
 
 	if (!ctx) {
 		return false;
 	}
-	core = anal->coreb.core;
+	RCore *core = anal->coreb.core;
 	if (core) {
 		RAnalFunction *focus_fcn = r_anal_get_fcn_in (anal, core->addr, 0);
 		if (focus_fcn) {
@@ -8911,8 +9100,6 @@ static bool sleigh_post_analysis(RAnal *anal) {
 		}
 	}
 
-		bool xref_enabled = plan.xref_enabled != 0;
-		bool taint_focus_only = plan.taint_focus_only != 0;
 	if (num_fcns == 0) {
 		return true;
 	}
@@ -8927,27 +9114,26 @@ static bool sleigh_post_analysis(RAnal *anal) {
 
 	RListIter *iter;
 	RAnalFunction *fcn;
-		r_list_foreach (anal->fcns, iter, fcn) {
-			if (!sleigh_post_analysis_budget_allows (&post_budget, "function sweep")) {
-				post_budget_exhausted = true;
-				break;
-			}
-			int bb_count = (fcn && fcn->bbs) ? r_list_length (fcn->bbs) : 0;
-			bool auto_callback_allowed = !taint_enabled || auto_callback_allows_function (
-				anal,
-				fcn,
-				R2SLEIGH_AUTO_CALLBACK_POST_ANALYSIS_TAINT_V2,
-				"post_analysis_taint");
-			bool taint_scope_eligible = !taint_focus_only
-				|| (focus_callee_addr && fcn && fcn->addr == focus_callee_addr);
-			bool taint_eligible = taint_enabled && taint_scope_eligible
-				&& bb_count <= SLEIGH_TAINT_MAX_BLOCKS && auto_callback_allowed;
-		bool semantic_for_fcn = false;
-		bool need_blocks = taint_eligible || semantic_for_fcn;
-		const char *fcn_name = (fcn && fcn->name) ? fcn->name : "unknown";
-		BlockArray blocks;
-		ut64 profile_start_us;
-
+	r_list_foreach (anal->fcns, iter, fcn) {
+		if (!sleigh_post_analysis_budget_allows (&post_budget, "function sweep")) {
+			post_budget_exhausted = true;
+			break;
+		}
+		if (!fcn) {
+			continue;
+		}
+		int bb_count = fcn->bbs? r_list_length (fcn->bbs): 0;
+		bool auto_callback_allowed = !taint_enabled || auto_callback_allows_function (
+			anal, fcn, R2SLEIGH_AUTO_CALLBACK_POST_ANALYSIS_TAINT_V2,
+			"post_analysis_taint");
+		bool taint_scope_eligible = !taint_focus_only
+			|| (focus_callee_addr && fcn->addr == focus_callee_addr);
+		bool taint_eligible = taint_enabled && taint_scope_eligible
+			&& bb_count <= SLEIGH_TAINT_MAX_BLOCKS && auto_callback_allowed;
+		SleighArtifactPlan taint_plan;
+		if (!sleigh_artifact_plan_init (&taint_plan, anal, fcn, "taint")) {
+			continue;
+		}
 		if (taint_enabled) {
 			if (taint_eligible) {
 				taint_fcns_eligible++;
@@ -8955,387 +9141,82 @@ static bool sleigh_post_analysis(RAnal *anal) {
 				taint_fcns_skipped++;
 			}
 		}
-		if (!fcn || !need_blocks) {
+		if (!taint_eligible) {
+			(void)sleigh_artifact_plan_submit (&taint_plan);
+			sleigh_artifact_plan_fini (&taint_plan);
 			continue;
 		}
 		if (!sleigh_post_analysis_budget_allows (&post_budget, "function lift")) {
 			post_budget_exhausted = true;
+			sleigh_artifact_plan_fini (&taint_plan);
 			break;
 		}
-		profile_start_us = r_time_now_mono ();
+		BlockArray blocks;
+		ut64 profile_start_us = r_time_now_mono ();
 		if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
+			sleigh_artifact_plan_fini (&taint_plan);
 			continue;
 		}
-		sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_LIFT, r_time_now_mono () - profile_start_us);
-		if (!sleigh_post_analysis_budget_allows (&post_budget, "function enrichment")) {
+		sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_LIFT,
+			r_time_now_mono () - profile_start_us);
+		if (!sleigh_post_analysis_budget_allows (&post_budget, "taint summary")) {
 			post_budget_exhausted = true;
 			block_array_free (&blocks);
+			sleigh_artifact_plan_fini (&taint_plan);
 			break;
 		}
-
-		if (semantic_for_fcn) {
-			semantic_comments_total += write_semantic_comments_for_function (
-				anal, ctx, &blocks, fcn->addr, semantic_for_fcn);
+		SleighTaintPlanStats stats;
+		bool collected = collect_taint_artifacts_for_function (
+			&taint_plan, anal, ctx, &blocks, &stats);
+		bool committed = collected && sleigh_artifact_plan_submit (&taint_plan);
+		if (!collected) {
+			taint_parse_failures++;
+			R_LOG_WARN ("r2sleigh: taint collection failed at 0x%08"PFMT64x,
+				taint_plan.scope_id);
 		}
-
-		/* Remove previous auto-generated taint artifacts only when taint sweep is active. */
-		if (taint_enabled) {
-			if (!sleigh_post_analysis_budget_allows (&post_budget, "taint cleanup")) {
-				post_budget_exhausted = true;
-				block_array_free (&blocks);
+		if (committed) {
+			taint_comments += taint_plan.comment_count;
+			taint_flags += taint_plan.flag_count;
+			taint_xrefs += taint_plan.xref_count;
+			taint_sink_hits += stats.sink_hits;
+			switch (stats.risk_level) {
+			case TAINT_RISK_CRITICAL:
+				taint_risk_critical++;
+				break;
+			case TAINT_RISK_HIGH:
+				taint_risk_high++;
+				break;
+			case TAINT_RISK_MEDIUM:
+				taint_risk_medium++;
+				break;
+			case TAINT_RISK_LOW:
+				taint_risk_low++;
+				break;
+			case TAINT_RISK_NONE:
+			default:
 				break;
 			}
-			profile_start_us = r_time_now_mono ();
-			clear_taint_function_artifacts (anal, core, fcn, &blocks);
+			if (stats.best_sink_label && stats.best_sink_rank < best_sink_rank) {
+				free (best_sink_label);
+				best_sink_label = stats.best_sink_label;
+				stats.best_sink_label = NULL;
+				best_sink_addr = stats.best_sink_addr;
+				best_sink_rank = stats.best_sink_rank;
 			}
-
-			if (taint_eligible) {
-				if (!sleigh_post_analysis_budget_allows (&post_budget, "taint summary")) {
-					post_budget_exhausted = true;
-					block_array_free (&blocks);
-					break;
-				}
-				R2SleighAnalysisResultV2 *taint_summary = NULL;
-				R2SleighAnalysisResultViewV2 taint_view;
-				uint32_t taint_status = sleigh_v2_analysis_query (R2SLEIGH_QUERY_TAINT_SUMMARY_V2,
-					ctx, (const R2ILBlock *const *)blocks.blocks, blocks.count, 0,
-					NULL, NULL, 0, &taint_summary, &taint_view);
-				if (taint_status != R2SLEIGH_STATUS_OK_V2) {
-					taint_summary = NULL;
-				}
-				if (taint_summary) {
-					size_t source_count = taint_view.primary_count;
-					size_t sink_hit_count = taint_view.secondary_count;
-					const R2TaintSource *taint_sources = (const R2TaintSource *)taint_view.primary;
-					const R2TaintSinkHit *sink_hits = (const R2TaintSinkHit *)taint_view.secondary;
-					if (!taint_sources && source_count > 0) {
-						taint_parse_failures++;
-						R_LOG_WARN ("r2sleigh: taint typed sources missing for %s @ 0x%"PFMT64x,
-							fcn_name, fcn->addr);
-					} else if (!sink_hits && sink_hit_count > 0) {
-						taint_parse_failures++;
-						R_LOG_WARN ("r2sleigh: taint typed sink hits missing for %s @ 0x%"PFMT64x,
-							fcn_name, fcn->addr);
-					} else {
-						TaintSourceMap source_map;
-						TaintSummaryMap summaries;
-						EdgeSet seen_edges;
-
-					taint_source_map_init (&source_map);
-						taint_summary_map_init (&summaries);
-						edge_set_init (&seen_edges);
-
-						for (size_t src_idx = 0; src_idx < source_count; src_idx++) {
-							const R2TaintSource *src_item = &taint_sources[src_idx];
-							for (size_t label_idx = 0; label_idx < src_item->num_labels; label_idx++) {
-								const char *label = src_item->labels? src_item->labels[label_idx]: NULL;
-								if (label && *label) {
-									taint_source_map_add (&source_map, label, (ut64)src_item->block);
-								}
-							}
-						}
-
-						for (size_t hit_idx = 0; hit_idx < sink_hit_count; hit_idx++) {
-							const R2TaintSinkHit *hit_item = &sink_hits[hit_idx];
-								char **sink_labels = NULL;
-								size_t sink_label_count = 0;
-								size_t sink_label_cap = 0;
-							size_t li;
-							ut64 sink_block;
-							bool is_call_sink = false;
-								bool had_primary_sources = false;
-								bool added_nonself = false;
-
-								sink_block = (ut64)hit_item->block;
-								is_call_sink = hit_item->op_kind == R2TAINT_OP_CALL || hit_item->op_kind == R2TAINT_OP_CALL_IND;
-
-								for (size_t tv_idx = 0; tv_idx < hit_item->num_tainted_vars; tv_idx++) {
-									const R2TaintTaintedVar *tv_item = hit_item->tainted_vars? &hit_item->tainted_vars[tv_idx]: NULL;
-									if (!tv_item) {
-										continue;
-									}
-									for (size_t label_idx = 0; label_idx < tv_item->num_labels; label_idx++) {
-										const char *label = tv_item->labels? tv_item->labels[label_idx]: NULL;
-										if (!label || !*label) {
-											continue;
-										}
-										if (is_noisy_taint_label (label)) {
-											continue;
-										}
-										append_unique_string (&sink_labels, &sink_label_count, &sink_label_cap, label);
-									}
-								}
-
-							taint_sink_hits++;
-							TaintBlockSummary *summary = taint_summary_map_get_or_add (&summaries, sink_block);
-							if (summary) {
-								summary->hits++;
-									if (is_call_sink) {
-										summary->call_hits++;
-									}
-									if (hit_item->op_kind == R2TAINT_OP_STORE) {
-										summary->store_hits++;
-									}
-									if (is_call_sink && hit_item->has_target_addr) {
-										char *call_name = resolve_call_target_name_from_addr (core, anal, (ut64)hit_item->target_addr);
-										if (call_name) {
-											taint_summary_add_call_name (summary, call_name);
-											free (call_name);
-									}
-								}
-							}
-
-							if (sink_label_count == 0) {
-								free_string_array (sink_labels, sink_label_count);
-								continue;
-							}
-
-							if (summary) {
-								for (li = 0; li < sink_label_count; li++) {
-									taint_summary_add_label (summary, sink_labels[li]);
-								}
-							}
-
-							for (li = 0; li < sink_label_count; li++) {
-								const TaintLabelSource *srcs = taint_source_map_find (&source_map, sink_labels[li]);
-								size_t si;
-								if (!srcs || srcs->count == 0) {
-									continue;
-								}
-								had_primary_sources = true;
-								for (si = 0; si < srcs->count; si++) {
-									ut64 src_block = srcs->blocks[si];
-									if (src_block == sink_block) {
-										continue;
-									}
-									if (maybe_add_taint_xref (anal, &seen_edges, src_block, sink_block, R_ANAL_REF_TYPE_DATA, &taint_xrefs)) {
-										added_nonself = true;
-									}
-								}
-							}
-
-							if (had_primary_sources && !added_nonself && sink_block != fcn->addr) {
-								maybe_add_taint_xref (anal, &seen_edges, fcn->addr, sink_block, R_ANAL_REF_TYPE_DATA, &taint_xrefs);
-							}
-
-								free_string_array (sink_labels, sink_label_count);
-							}
-
-						size_t si;
-						char **function_call_names = NULL;
-					size_t function_ncall_names = 0;
-					size_t function_call_name_cap = 0;
-					char **function_labels = NULL;
-					size_t function_nlabels = 0;
-					size_t function_label_cap = 0;
-					int function_call_hits = 0;
-					int function_store_hits = 0;
-					bool function_meaningful = false;
-					bool function_has_dangerous_call = false;
-					for (si = 0; si < summaries.count; si++) {
-						TaintBlockSummary *summary = &summaries.items[si];
-						char *comment = format_taint_summary_comment (summary);
-						size_t li;
-						if (summary->hits > 0 || summary->call_hits > 0 || summary->store_hits > 0) {
-							function_meaningful = true;
-							function_call_hits += summary->call_hits;
-							function_store_hits += summary->store_hits;
-							for (li = 0; li < summary->ncall_names; li++) {
-								append_unique_string (&function_call_names, &function_ncall_names, &function_call_name_cap, summary->call_names[li]);
-								if (is_dangerous_sink (summary->call_names[li])) {
-									function_has_dangerous_call = true;
-								}
-							}
-						}
-						if (comment && *comment) {
-							set_sla_taint_comment_line (anal, summary->addr, comment);
-							taint_comments++;
-
-							if (core) {
-								char flag_name[160];
-								snprintf (flag_name, sizeof (flag_name),
-									"sla.taint.fcn_%"PFMT64x".blk_%"PFMT64x, fcn->addr, summary->addr);
-								if (apply_typed_flag (anal, flag_name, summary->addr, 1)) {
-									taint_flags++;
-								}
-							}
-						}
-
-						if (summary->labels && summary->nlabels > 0) {
-							int rank = label_rank (summary->labels[0]);
-
-							for (li = 0; li < summary->nlabels; li++) {
-								append_unique_string (&function_labels, &function_nlabels, &function_label_cap, summary->labels[li]);
-							}
-
-							if (rank < best_sink_rank) {
-								free (best_sink_label);
-								best_sink_label = strdup (summary->labels[0]);
-								best_sink_addr = summary->addr;
-								best_sink_rank = rank;
-							}
-						}
-						free (comment);
-					}
-					{
-						TaintRiskLevel risk_level = classify_taint_risk (
-							function_meaningful,
-							function_has_dangerous_call,
-							function_call_hits,
-							function_store_hits
-						);
-						char *risk_comment = format_taint_risk_comment (
-							risk_level,
-							function_call_names,
-							function_ncall_names,
-							function_call_hits,
-							function_store_hits,
-							function_labels,
-							function_nlabels
-						);
-
-						switch (risk_level) {
-						case TAINT_RISK_CRITICAL:
-							taint_risk_critical++;
-							break;
-						case TAINT_RISK_HIGH:
-							taint_risk_high++;
-							break;
-						case TAINT_RISK_MEDIUM:
-							taint_risk_medium++;
-							break;
-						case TAINT_RISK_LOW:
-							taint_risk_low++;
-							break;
-						case TAINT_RISK_NONE:
-						default:
-							break;
-						}
-
-						if (risk_comment && *risk_comment) {
-							set_sla_taint_risk_comment_line (anal, fcn->addr, risk_comment);
-							taint_comments++;
-						}
-						free (risk_comment);
-
-						if (risk_level != TAINT_RISK_NONE && core) {
-							char generic_risk_flag[192];
-							char risk_flag[192];
-							snprintf (generic_risk_flag, sizeof (generic_risk_flag),
-								"sla.taint.risk.fcn_%"PFMT64x, fcn->addr);
-							if (apply_typed_flag (anal, generic_risk_flag, fcn->addr, 1)) {
-								taint_flags++;
-							}
-							snprintf (risk_flag, sizeof (risk_flag),
-								"sla.taint.risk.%s.fcn_%"PFMT64x,
-								taint_risk_level_flag_name (risk_level), fcn->addr);
-							if (apply_typed_flag (anal, risk_flag, fcn->addr, 1)) {
-								taint_flags++;
-							}
-						}
-					}
-					free_string_array (function_call_names, function_ncall_names);
-						free_string_array (function_labels, function_nlabels);
-
-						edge_set_free (&seen_edges);
-						taint_summary_map_free (&summaries);
-						taint_source_map_free (&source_map);
-					}
-					(void)sleigh_v2_analysis_result_release (&taint_summary);
-				}
-			}
-			sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_TAINT, r_time_now_mono () - profile_start_us);
-
+		}
+		sleigh_taint_plan_stats_fini (&stats);
 		block_array_free (&blocks);
-	}
-
-	if (xref_enabled && !post_budget_exhausted) {
-		ut64 *xref_queue = NULL;
-		size_t xref_queue_count = 0;
-		size_t xref_queue_cap = 0;
-		RListIter *xref_iter;
-		RAnalFunction *xref_fcn;
-
-		r_list_foreach (anal->fcns, xref_iter, xref_fcn) {
-			if (!xref_fcn) {
-				continue;
-			}
-			append_unique_ut64 (&xref_queue, &xref_queue_count, &xref_queue_cap, xref_fcn->addr);
-			xref_dirty_queued++;
-		}
-
-		while (xref_queue_count > 0) {
-			if (!sleigh_post_analysis_budget_allows (&post_budget, "xref sweep")) {
-				post_budget_exhausted = true;
-				break;
-			}
-			ut64 faddr = xref_queue[--xref_queue_count];
-			RAnalFunction *xref_fcn_cur = r_anal_get_fcn_in (anal, faddr, 0);
-			BlockArray xref_blocks;
-			R2SleighAnalysisResultV2 *typed_refs = NULL;
-			R2SleighAnalysisResultViewV2 typed_view;
-			const R2SleighDataRef *typed_items;
-			size_t typed_count = 0;
-			ut64 profile_start_us;
-			int ref_count;
-
-			if (!xref_fcn_cur) {
-				continue;
-			}
-			if (!auto_callback_allows_function (
-				anal,
-				xref_fcn_cur,
-				R2SLEIGH_AUTO_CALLBACK_POST_ANALYSIS_XREF_V2,
-				"post_analysis_xref")) {
-				continue;
-			}
-			if (!sleigh_post_analysis_budget_allows (&post_budget, "xref lift")) {
-				post_budget_exhausted = true;
-				break;
-			}
-			profile_start_us = r_time_now_mono ();
-			if (!lift_function_blocks (anal, xref_fcn_cur, ctx, &xref_blocks)) {
-				continue;
-			}
-			sleigh_profile_add (anal, xref_fcn_cur, SLEIGH_PROFILE_STAGE_LIFT, r_time_now_mono () - profile_start_us);
-			if (!sleigh_post_analysis_budget_allows (&post_budget, "xref extraction")) {
-				post_budget_exhausted = true;
-				block_array_free (&xref_blocks);
-				break;
-			}
-			profile_start_us = r_time_now_mono ();
-			uint32_t typed_status = sleigh_v2_analysis_query (R2SLEIGH_QUERY_DATA_REFS_V2,
-				ctx, (const R2ILBlock *const *)xref_blocks.blocks, xref_blocks.count,
-				xref_fcn_cur->addr, NULL, NULL, 0, &typed_refs, &typed_view);
-			typed_items = typed_status == R2SLEIGH_STATUS_OK_V2
-				? (const R2SleighDataRef *)typed_view.primary: NULL;
-			typed_count = typed_status == R2SLEIGH_STATUS_OK_V2? typed_view.primary_count: 0;
-			if (!typed_items || typed_count == 0) {
-				(void)sleigh_v2_analysis_result_release (&typed_refs);
-				block_array_free (&xref_blocks);
-				continue;
-			}
-
-			ref_count = collect_data_refs_from_typed (anal, xref_fcn_cur, typed_items, typed_count, NULL);
-			xrefs_discovered += ref_count;
-			sleigh_profile_add (anal, xref_fcn_cur, SLEIGH_PROFILE_STAGE_XREF, r_time_now_mono () - profile_start_us);
-			(void)sleigh_v2_analysis_result_release (&typed_refs);
-			block_array_free (&xref_blocks);
-		}
-		free (xref_queue);
+		sleigh_artifact_plan_fini (&taint_plan);
 	}
 
 	post_budget_exhausted = post_budget_exhausted || post_budget.exhausted;
-	R_LOG_INFO ("r2sleigh: post-analysis discovered %d data references; core owns durable xref writeback", xrefs_discovered);
-	R_LOG_INFO ("r2sleigh: post-analysis taint enabled=%d eligible=%d skipped=%d comments=%d flags=%d xrefs=%d sink_hits=%d parse_failures=%d",
+	R_LOG_INFO ("r2sleigh: post-analysis taint enabled=%d eligible=%d skipped=%d comments=%zu flags=%zu xrefs=%zu sink_hits=%zu parse_failures=%d",
 		taint_enabled? 1: 0, taint_fcns_eligible, taint_fcns_skipped, taint_comments, taint_flags, taint_xrefs,
 		taint_sink_hits, taint_parse_failures);
 	R_LOG_INFO ("r2sleigh: post-analysis risk summary: critical=%d high=%d medium=%d low=%d",
 		taint_risk_critical, taint_risk_high, taint_risk_medium, taint_risk_low);
-	R_LOG_INFO ("r2sleigh: post-analysis semantic comments enabled=%d emitted=%zu",
-		semantic_comments_enabled? 1: 0, semantic_comments_total);
-	R_LOG_INFO ("r2sleigh: post-analysis summary fcns=%d budget_exhausted=%d xref_dirty_queued=%d",
-		num_fcns, post_budget_exhausted? 1: 0, xref_dirty_queued);
+	R_LOG_INFO ("r2sleigh: post-analysis summary fcns=%d budget_exhausted=%d",
+		num_fcns, post_budget_exhausted? 1: 0);
 	if (best_sink_label) {
 		R_LOG_INFO ("r2sleigh: post-analysis most interesting sink 0x%"PFMT64x" label=%s",
 			best_sink_addr, best_sink_label);
