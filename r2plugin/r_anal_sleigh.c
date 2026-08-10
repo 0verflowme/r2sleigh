@@ -23,8 +23,14 @@
 #if R2SLEIGH_RADARE_ABI_V2 != 138
 #error "r2sleigh generated V2 header must target exactly radare2 ABI 138"
 #endif
-#if R_ANAL_FUNCTION_SNAPSHOT_SCHEMA_VERSION != 7
-#error "r2sleigh borrowed snapshot transport requires function snapshot schema 7"
+#if R_ANAL_FUNCTION_SNAPSHOT_SCHEMA_VERSION != 8
+#error "r2sleigh borrowed snapshot transport requires function snapshot schema 8"
+#endif
+#if R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 != 8
+#error "r2sleigh generated V2 header must target function snapshot schema 8"
+#endif
+#if R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2 != 2
+#error "r2sleigh generated V2 header must target snapshot accessor schema 2"
 #endif
 
 static bool sleigh_radare_storage_view(R2SleighRadareRegisterStorageViewV2 *destination, const RAnalSnapshotRegisterStorageView *source) {
@@ -527,6 +533,28 @@ static uint8_t sleigh_radare_external_exit(const void *opaque, size_t index, uin
 		&& r_anal_function_snapshot_external_exit (opaque, index, target)? 1: 0;
 }
 
+static uint8_t sleigh_radare_return_mechanism_view(const void *opaque, R2SleighRadareReturnMechanismViewV2 *destination) {
+	if (!opaque || !destination) {
+		return 0;
+	}
+	*destination = (R2SleighRadareReturnMechanismViewV2) {0};
+	RAnalSnapshotReturnMechanismView source = {0};
+	if (!r_anal_function_snapshot_interface_return_mechanism (opaque, &source)) {
+		return 0;
+	}
+	if (source.kind != R_ANAL_SNAPSHOT_RETURN_MECHANISM_STACK
+		|| source.exit_sp_delta < 0 || (ut64)source.exit_sp_delta > UT32_MAX) {
+		return 0;
+	}
+	*destination = (R2SleighRadareReturnMechanismViewV2) {
+		.kind = 1,
+		.stack_offset = source.entry_sp_offset,
+		.slot_size_bytes = source.slot_size,
+		.stack_pointer_delta_bytes = (uint32_t)source.exit_sp_delta,
+	};
+	return 1;
+}
+
 static const R2SleighRadareAccessorsV2 sleigh_radare_accessors = {
 	.struct_size = sizeof (sleigh_radare_accessors),
 	.abi_version = R2SLEIGH_RADARE_ABI_V2,
@@ -558,6 +586,7 @@ static const R2SleighRadareAccessorsV2 sleigh_radare_accessors = {
 	.block_bytes = sleigh_radare_block_bytes,
 	.successor_view = sleigh_radare_successor_view,
 	.external_exit = sleigh_radare_external_exit,
+	.return_mechanism_view = sleigh_radare_return_mechanism_view,
 };
 
 /* Remaining direct value declarations for the Rust library. */

@@ -12,7 +12,10 @@ use r2il::{
     R2ILOp, ScalarKind, SpaceId, StorageClass, Varnode, select_register_name,
 };
 use r2source::SourceEndianness;
-use r2source::{AdvisorySuccessorKind, MachineProfile, OwnedFunctionSnapshot};
+use r2source::{
+    AdvisorySuccessorKind, CanonicalStorageId, CanonicalStorageSpace, MachineProfile,
+    OwnedFunctionSnapshot, SourceFunctionInterface,
+};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -173,6 +176,68 @@ impl TrustedSleighProfile {
             ))),
         }
     }
+}
+
+fn is_exact_top_level_address_register(
+    arch: &r2il::ArchSpec,
+    storage: CanonicalStorageId,
+    address_size: u32,
+) -> bool {
+    storage.space == CanonicalStorageSpace::Register
+        && storage.size == address_size
+        && arch.registers.iter().any(|register| {
+            register.parent.is_none()
+                && register.offset == storage.offset
+                && register.size == storage.size
+        })
+        && !arch.registers.iter().any(|register| {
+            register.size > storage.size
+                && register.offset <= storage.offset
+                && register
+                    .offset
+                    .checked_add(u64::from(register.size))
+                    .zip(storage.offset.checked_add(u64::from(storage.size)))
+                    .is_some_and(|(register_end, storage_end)| register_end >= storage_end)
+        })
+}
+
+fn captured_return_mechanism_matches_arch(
+    interface: &SourceFunctionInterface,
+    arch: &r2il::ArchSpec,
+) -> bool {
+    let Some(mechanism) = interface.return_mechanism() else {
+        return true;
+    };
+    let address_size = mechanism.address_size_bytes();
+    let Some(address_bits) = address_size.checked_mul(8) else {
+        return false;
+    };
+    if address_size <= 1
+        || arch.addr_size != address_size
+        || mechanism.stack_offset() != 0
+        || mechanism.slot_size_bytes() != address_size
+        || mechanism.stack_pointer_delta_bytes() != address_size
+    {
+        return false;
+    }
+    let mut ram_spaces = arch.spaces.iter().filter(|space| space.id == SpaceId::Ram);
+    let Some(ram) = ram_spaces.next() else {
+        return false;
+    };
+    if ram_spaces.next().is_some()
+        || ram.word_size != 1
+        || ram.addr_size.checked_mul(8) != Some(address_bits)
+    {
+        return false;
+    }
+    let Some(return_address) = interface.return_address_storage() else {
+        return false;
+    };
+    let Some(stack_pointer) = interface.stack_pointer_storage() else {
+        return false;
+    };
+    is_exact_top_level_address_register(arch, return_address, address_size)
+        && is_exact_top_level_address_register(arch, stack_pointer, address_size)
 }
 
 /// Schema of the exact lift-origin manifest retained by genuine blocks.
@@ -1024,6 +1089,22 @@ impl Disassembler {
         {
             return Err(LiftError::Unsupported(
                 "owned function interface lacks exact stack/return machine roles".to_string(),
+            ));
+        }
+        let trusted_arch = disassembler
+            .genuine_authority
+            .as_ref()
+            .map(GenuineLiftAuthority::arch_spec)
+            .ok_or_else(|| {
+                LiftError::Unsupported(
+                    "trusted lift lost its exact architecture authority".to_string(),
+                )
+            })?;
+        if fields.has_return_mechanism() != interface.return_mechanism().is_some()
+            || !captured_return_mechanism_matches_arch(interface, trusted_arch)
+        {
+            return Err(LiftError::Unsupported(
+                "captured return mechanism conflicts with the exact lifted machine".to_string(),
             ));
         }
         let mut ranges = Vec::with_capacity(source.image().blocks().len());
@@ -3086,6 +3167,52 @@ mod tests {
             space_type,
             big_endian: false,
         }
+    }
+
+    #[test]
+    fn trusted_return_mechanism_validation_uses_only_exact_machine_facts() {
+        let stack_pointer = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 64,
+            size: 8,
+        };
+        let return_address = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 80,
+            size: 8,
+        };
+        let without_mechanism = SourceFunctionInterface::new_exact(
+            b"trusted-return-mechanism".to_vec(),
+            "test-abi",
+            [],
+            r2source::SourceFunctionReturn::Void,
+            [],
+        )
+        .and_then(|interface| interface.with_return_address_storage(return_address))
+        .and_then(|interface| interface.with_stack_pointer_storage(stack_pointer))
+        .expect("exact machine roles");
+        let exact = without_mechanism
+            .clone()
+            .with_exact_stacked_return(0, 8, 8, 8)
+            .expect("canonical stacked return");
+        let mut arch = r2il::ArchSpec::new("controlled-return-mechanism");
+        arch.addr_size = 8;
+        arch.add_register(r2il::RegisterDef::new("opaque-a", return_address.offset, 8));
+        arch.add_register(r2il::RegisterDef::new("opaque-b", stack_pointer.offset, 8));
+        arch.add_space(r2il::AddressSpace::ram(8));
+
+        assert!(captured_return_mechanism_matches_arch(&exact, &arch));
+        assert!(captured_return_mechanism_matches_arch(
+            &without_mechanism,
+            &arch
+        ));
+
+        arch.spaces[0].word_size = 2;
+        assert!(!captured_return_mechanism_matches_arch(&exact, &arch));
+        assert!(captured_return_mechanism_matches_arch(
+            &without_mechanism,
+            &arch
+        ));
     }
 
     #[test]

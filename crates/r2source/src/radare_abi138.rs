@@ -1,4 +1,4 @@
-//! Audited synchronous ingress for radare2 ABI 138 snapshot schema 7.
+//! Audited synchronous ingress for radare2 ABI 138 snapshot schema 8.
 //!
 //! The wire API contains only opaque handles, scalars, and caller-owned output
 //! buffers. It deliberately cannot expose radare2 internals or assemble source
@@ -13,8 +13,8 @@ use std::sync::Arc;
 use super::*;
 
 pub const RADARE_ABI_VERSION: u32 = 138;
-pub const RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION: u32 = 7;
-pub const RADARE_SNAPSHOT_ACCESSOR_SCHEMA_VERSION: u32 = 1;
+pub const RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION: u32 = 8;
+pub const RADARE_SNAPSHOT_ACCESSOR_SCHEMA_VERSION: u32 = 2;
 
 pub const RADARE_ENDIAN_LITTLE: u32 = 0x4321;
 pub const RADARE_ENDIAN_BIG: u32 = 0x1234;
@@ -34,8 +34,9 @@ pub const RADARE_CAP_EXACT_STACK_SLOT_ROLES: u64 = 1 << 11;
 pub const RADARE_CAP_RETURN_ADDRESS_STORAGE: u64 = 1 << 12;
 pub const RADARE_CAP_STACK_POINTER_STORAGE: u64 = 1 << 13;
 pub const RADARE_CAP_OWNED_BOUNDED_FUNCTION_IMAGE: u64 = 1 << 14;
+pub const RADARE_CAP_EXACT_RETURN_MECHANISM: u64 = 1 << 15;
 
-const KNOWN_CAPABILITIES: u64 = (1 << 15) - 1;
+const KNOWN_CAPABILITIES: u64 = (1 << 16) - 1;
 const INVALID_U64: u64 = u64::MAX;
 const INVALID_TYPE_ID: u32 = u32::MAX;
 
@@ -233,6 +234,15 @@ pub struct RadareAbi138StackSlotView {
     pub home_reg_size: u32,
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RadareAbi138ReturnMechanismView {
+    pub kind: i32,
+    pub stack_offset: i64,
+    pub slot_size_bytes: u32,
+    pub stack_pointer_delta_bytes: u32,
+}
+
 pub type RadareSnapshotViewFn =
     unsafe extern "C" fn(*const c_void, *mut RadareAbi138SnapshotView) -> u8;
 pub type RadareStringFn = unsafe extern "C" fn(*const c_void, *mut u8, usize) -> u8;
@@ -271,6 +281,8 @@ pub type RadareBlockBytesFn =
 pub type RadareSuccessorViewFn =
     unsafe extern "C" fn(*const c_void, usize, usize, *mut RadareAbi138SuccessorView) -> u8;
 pub type RadareExternalExitFn = unsafe extern "C" fn(*const c_void, usize, *mut u64) -> u8;
+pub type RadareReturnMechanismViewFn =
+    unsafe extern "C" fn(*const c_void, *mut RadareAbi138ReturnMechanismView) -> u8;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -305,6 +317,7 @@ pub struct RadareAbi138Accessors {
     pub block_bytes: Option<RadareBlockBytesFn>,
     pub successor_view: Option<RadareSuccessorViewFn>,
     pub external_exit: Option<RadareExternalExitFn>,
+    pub return_mechanism_view: Option<RadareReturnMechanismViewFn>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -597,11 +610,17 @@ fn validate_top(view: &RadareAbi138SnapshotView) -> Result<(), RadareAbi138Captu
     let exact_interface = view.capabilities & RADARE_CAP_EXACT_FUNCTION_INTERFACE != 0;
     let exact_types = view.capabilities & RADARE_CAP_EXACT_FUNCTION_TYPES != 0;
     let exact_slots = view.capabilities & RADARE_CAP_EXACT_STACK_SLOT_ROLES != 0;
+    let exact_return_mechanism = view.capabilities & RADARE_CAP_EXACT_RETURN_MECHANISM != 0;
     if (exact_types || exact_slots) && !exact_interface {
         return Err(RadareAbi138CaptureError::InvalidCapabilities);
     }
     if (exact_slots && view.capabilities & RADARE_CAP_STACK_SLOTS == 0)
         || (exact_types && view.capabilities & RADARE_CAP_TYPES == 0)
+        || (exact_return_mechanism
+            && (!exact_interface
+                || !exact_slots
+                || view.capabilities & RADARE_CAP_RETURN_ADDRESS_STORAGE == 0
+                || view.capabilities & RADARE_CAP_STACK_POINTER_STORAGE == 0))
     {
         return Err(RadareAbi138CaptureError::InvalidCapabilities);
     }
@@ -914,6 +933,45 @@ unsafe fn capture_stack_slots(
     Ok(slots)
 }
 
+unsafe fn capture_return_mechanism(
+    snapshot: *const c_void,
+    accessors: &RadareAbi138Accessors,
+    active: bool,
+    interface: SourceFunctionInterface,
+    address_size_bytes: u32,
+) -> Result<SourceFunctionInterface, RadareAbi138CaptureError> {
+    if !active {
+        return Ok(interface);
+    }
+    let view_fn = required(accessors.return_mechanism_view, "return_mechanism_view")?;
+    let mut first = RadareAbi138ReturnMechanismView::default();
+    // SAFETY: callback and snapshot validity are guaranteed by the caller.
+    callback_ok(
+        unsafe { view_fn(snapshot, &mut first) },
+        "return_mechanism_view",
+    )?;
+    let mut second = RadareAbi138ReturnMechanismView::default();
+    // SAFETY: callback and snapshot validity remain live for the second read.
+    callback_ok(
+        unsafe { view_fn(snapshot, &mut second) },
+        "return_mechanism_view",
+    )?;
+    if first != second {
+        return Err(RadareAbi138CaptureError::SnapshotChanged);
+    }
+    if first.kind != 1 {
+        return Err(RadareAbi138CaptureError::InvalidEnum);
+    }
+    interface
+        .with_exact_stacked_return(
+            first.stack_offset,
+            first.slot_size_bytes,
+            first.stack_pointer_delta_bytes,
+            address_size_bytes,
+        )
+        .map_err(|_| RadareAbi138CaptureError::InvalidInterface)
+}
+
 unsafe fn capture_interface(
     snapshot: *const c_void,
     accessors: &RadareAbi138Accessors,
@@ -1160,7 +1218,22 @@ unsafe fn capture_interface(
     } else if !absent_storage(view.stack_pointer_storage) {
         return Err(RadareAbi138CaptureError::InactivePayload);
     }
-    Ok(interface)
+    let address_size_bytes = u32::try_from(top.bits)
+        .ok()
+        .and_then(|bits| bits.checked_div(8))
+        .filter(|bytes| *bytes > 0)
+        .ok_or(RadareAbi138CaptureError::InvalidMachine)?;
+    // SAFETY: the optional scalar callback is copied from the validated table
+    // and read twice while the snapshot borrow remains live.
+    unsafe {
+        capture_return_mechanism(
+            snapshot,
+            accessors,
+            top.capabilities & RADARE_CAP_EXACT_RETURN_MECHANISM != 0,
+            interface,
+            address_size_bytes,
+        )
+    }
 }
 
 unsafe fn capture_image(
@@ -1556,7 +1629,8 @@ pub unsafe fn capture_radare_abi138(
             && first.capabilities & RADARE_CAP_RETURN_ADDRESS_STORAGE != 0,
         stack_pointer_storage: function_interface.is_some()
             && first.capabilities & RADARE_CAP_STACK_POINTER_STORAGE != 0,
-        return_mechanism: false,
+        return_mechanism: function_interface.is_some()
+            && first.capabilities & RADARE_CAP_EXACT_RETURN_MECHANISM != 0,
     };
     OwnedFunctionSnapshot::from_captured_parts(
         machine,
@@ -1578,7 +1652,89 @@ pub unsafe fn capture_radare_abi138(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    struct ReturnMechanismFixture {
+        first: RadareAbi138ReturnMechanismView,
+        second: RadareAbi138ReturnMechanismView,
+        calls: Cell<usize>,
+        status: u8,
+    }
+
+    unsafe extern "C" fn return_mechanism_view(
+        snapshot: *const c_void,
+        out: *mut RadareAbi138ReturnMechanismView,
+    ) -> u8 {
+        // SAFETY: tests pass exact pointers to live fixture/output values.
+        let fixture = unsafe { &*snapshot.cast::<ReturnMechanismFixture>() };
+        let call = fixture.calls.get();
+        fixture.calls.set(call.saturating_add(1));
+        let view = if call == 0 {
+            fixture.first
+        } else {
+            fixture.second
+        };
+        // SAFETY: the production reader supplies one valid output object.
+        unsafe { out.write(view) };
+        fixture.status
+    }
+
+    fn register(offset: u64) -> CanonicalStorageId {
+        CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        }
+    }
+
+    fn exact_return_interface() -> SourceFunctionInterface {
+        SourceFunctionInterface::new_exact(
+            b"return-mechanism-revision".to_vec(),
+            "test-abi",
+            [],
+            SourceFunctionReturn::Void,
+            [],
+        )
+        .and_then(|interface| interface.with_return_address_storage(register(16)))
+        .and_then(|interface| interface.with_stack_pointer_storage(register(24)))
+        .expect("exact return interface")
+    }
+
+    fn mechanism_accessors(callback: Option<RadareReturnMechanismViewFn>) -> RadareAbi138Accessors {
+        RadareAbi138Accessors {
+            return_mechanism_view: callback,
+            ..RadareAbi138Accessors::default()
+        }
+    }
+
+    fn stacked_view() -> RadareAbi138ReturnMechanismView {
+        RadareAbi138ReturnMechanismView {
+            kind: 1,
+            stack_offset: 0,
+            slot_size_bytes: 8,
+            stack_pointer_delta_bytes: 8,
+        }
+    }
+
+    fn valid_top(capabilities: u64) -> RadareAbi138SnapshotView {
+        RadareAbi138SnapshotView {
+            schema_version: RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION,
+            struct_size: u32::try_from(size_of::<RadareAbi138SnapshotView>())
+                .expect("ABI view size fits u32"),
+            capabilities,
+            function_size: 1,
+            bits: 64,
+            endian: RADARE_ENDIAN_LITTLE,
+            arch_id_length: 3,
+            cpu_id_length: 3,
+            revision_identity: 1,
+            num_blocks: 1,
+            total_source_bytes: 1,
+            ..RadareAbi138SnapshotView::default()
+        }
+    }
 
     fn null_input() -> RadareAbi138SnapshotInput {
         RadareAbi138SnapshotInput {
@@ -1603,7 +1759,15 @@ mod tests {
         );
 
         let mut input = null_input();
-        input.snapshot_schema_version = 6;
+        input.snapshot_schema_version = 7;
+        // SAFETY: malformed version is rejected before either null pointer is read.
+        assert_eq!(
+            unsafe { capture_radare_abi138(&input) },
+            Err(RadareAbi138CaptureError::UnsupportedVersion)
+        );
+
+        let mut input = null_input();
+        input.accessor_schema_version = 1;
         // SAFETY: malformed version is rejected before either null pointer is read.
         assert_eq!(
             unsafe { capture_radare_abi138(&input) },
@@ -1634,6 +1798,240 @@ mod tests {
             unsafe { capture_radare_abi138(&input) },
             Err(RadareAbi138CaptureError::InvalidAccessorSize)
         );
+    }
+
+    #[test]
+    fn return_mechanism_layout_is_append_only_and_defaults_inactive() {
+        let view = RadareAbi138ReturnMechanismView::default();
+        assert_eq!(view.kind, 0);
+        assert_eq!(view.stack_offset, 0);
+        assert_eq!(view.slot_size_bytes, 0);
+        assert_eq!(view.stack_pointer_delta_bytes, 0);
+        let accessors = RadareAbi138Accessors::default();
+        assert!(accessors.return_mechanism_view.is_none());
+        assert_eq!(
+            std::mem::offset_of!(RadareAbi138Accessors, return_mechanism_view),
+            std::mem::offset_of!(RadareAbi138Accessors, external_exit)
+                + size_of::<Option<RadareExternalExitFn>>()
+        );
+    }
+
+    #[test]
+    fn return_mechanism_capability_requires_all_exact_dependencies() {
+        let dependencies = RADARE_CAP_REVISION
+            | RADARE_CAP_OWNED_BOUNDED_FUNCTION_IMAGE
+            | RADARE_CAP_EXACT_FUNCTION_INTERFACE
+            | RADARE_CAP_STACK_SLOTS
+            | RADARE_CAP_EXACT_STACK_SLOT_ROLES
+            | RADARE_CAP_RETURN_ADDRESS_STORAGE
+            | RADARE_CAP_STACK_POINTER_STORAGE
+            | RADARE_CAP_EXACT_RETURN_MECHANISM;
+        assert_eq!(validate_top(&valid_top(dependencies)), Ok(()));
+        for dependency in [
+            RADARE_CAP_EXACT_FUNCTION_INTERFACE,
+            RADARE_CAP_STACK_SLOTS,
+            RADARE_CAP_EXACT_STACK_SLOT_ROLES,
+            RADARE_CAP_RETURN_ADDRESS_STORAGE,
+            RADARE_CAP_STACK_POINTER_STORAGE,
+        ] {
+            assert_eq!(
+                validate_top(&valid_top(dependencies & !dependency)),
+                Err(RadareAbi138CaptureError::InvalidCapabilities)
+            );
+        }
+        assert_eq!(
+            validate_top(&valid_top(dependencies | (1 << 16))),
+            Err(RadareAbi138CaptureError::InvalidCapabilities)
+        );
+    }
+
+    #[test]
+    fn exact_return_mechanism_is_read_twice_and_bound() {
+        let fixture = ReturnMechanismFixture {
+            first: stacked_view(),
+            second: stacked_view(),
+            calls: Cell::new(0),
+            status: 1,
+        };
+        let accessors = mechanism_accessors(Some(return_mechanism_view));
+        // SAFETY: callback receives a live fixture for both synchronous reads.
+        let interface = unsafe {
+            capture_return_mechanism(
+                (&fixture as *const ReturnMechanismFixture).cast(),
+                &accessors,
+                true,
+                exact_return_interface(),
+                8,
+            )
+        }
+        .expect("exact stacked return mechanism");
+        assert_eq!(fixture.calls.get(), 2);
+        assert_eq!(
+            interface.return_mechanism(),
+            Some(SourceReturnMechanism::Stacked {
+                stack_offset: 0,
+                slot_size_bytes: 8,
+                stack_pointer_delta_bytes: 8,
+                address_size_bytes: 8,
+            })
+        );
+    }
+
+    #[test]
+    fn inactive_return_mechanism_never_invokes_accessor() {
+        let fixture = ReturnMechanismFixture {
+            first: stacked_view(),
+            second: stacked_view(),
+            calls: Cell::new(0),
+            status: 0,
+        };
+        let accessors = mechanism_accessors(Some(return_mechanism_view));
+        // SAFETY: inactive ARM/LR-style contracts must not invoke the callback.
+        let interface = unsafe {
+            capture_return_mechanism(
+                (&fixture as *const ReturnMechanismFixture).cast(),
+                &accessors,
+                false,
+                exact_return_interface(),
+                8,
+            )
+        }
+        .expect("inactive register-return mechanism");
+        assert_eq!(fixture.calls.get(), 0);
+        assert_eq!(interface.return_mechanism(), None);
+    }
+
+    #[test]
+    fn return_mechanism_refuses_missing_unknown_and_failed_payloads() {
+        // SAFETY: no callback is invoked for an inactive absent mechanism.
+        assert_eq!(
+            unsafe {
+                capture_return_mechanism(
+                    std::ptr::NonNull::<u8>::dangling().as_ptr().cast(),
+                    &RadareAbi138Accessors::default(),
+                    false,
+                    exact_return_interface(),
+                    8,
+                )
+            }
+            .expect("inactive absent mechanism")
+            .return_mechanism(),
+            None
+        );
+        // SAFETY: active missing callback is rejected before snapshot access.
+        assert_eq!(
+            unsafe {
+                capture_return_mechanism(
+                    std::ptr::NonNull::<u8>::dangling().as_ptr().cast(),
+                    &RadareAbi138Accessors::default(),
+                    true,
+                    exact_return_interface(),
+                    8,
+                )
+            },
+            Err(RadareAbi138CaptureError::MissingAccessor(
+                "return_mechanism_view"
+            ))
+        );
+
+        for (view, status, expected) in [
+            (
+                RadareAbi138ReturnMechanismView {
+                    kind: 2,
+                    ..stacked_view()
+                },
+                1,
+                RadareAbi138CaptureError::InvalidEnum,
+            ),
+            (
+                stacked_view(),
+                0,
+                RadareAbi138CaptureError::AccessorFailed("return_mechanism_view"),
+            ),
+        ] {
+            let fixture = ReturnMechanismFixture {
+                first: view,
+                second: view,
+                calls: Cell::new(0),
+                status,
+            };
+            let accessors = mechanism_accessors(Some(return_mechanism_view));
+            // SAFETY: callback receives a live fixture for synchronous reads.
+            assert_eq!(
+                unsafe {
+                    capture_return_mechanism(
+                        (&fixture as *const ReturnMechanismFixture).cast(),
+                        &accessors,
+                        true,
+                        exact_return_interface(),
+                        8,
+                    )
+                },
+                Err(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn return_mechanism_refuses_mutation_and_malformed_geometry() {
+        let mutated = ReturnMechanismFixture {
+            first: stacked_view(),
+            second: RadareAbi138ReturnMechanismView {
+                stack_pointer_delta_bytes: 4,
+                ..stacked_view()
+            },
+            calls: Cell::new(0),
+            status: 1,
+        };
+        let accessors = mechanism_accessors(Some(return_mechanism_view));
+        // SAFETY: callback receives a live fixture for synchronous reads.
+        assert_eq!(
+            unsafe {
+                capture_return_mechanism(
+                    (&mutated as *const ReturnMechanismFixture).cast(),
+                    &accessors,
+                    true,
+                    exact_return_interface(),
+                    8,
+                )
+            },
+            Err(RadareAbi138CaptureError::SnapshotChanged)
+        );
+
+        for malformed in [
+            RadareAbi138ReturnMechanismView {
+                stack_offset: 1,
+                ..stacked_view()
+            },
+            RadareAbi138ReturnMechanismView {
+                slot_size_bytes: 4,
+                ..stacked_view()
+            },
+            RadareAbi138ReturnMechanismView {
+                stack_pointer_delta_bytes: 4,
+                ..stacked_view()
+            },
+        ] {
+            let fixture = ReturnMechanismFixture {
+                first: malformed,
+                second: malformed,
+                calls: Cell::new(0),
+                status: 1,
+            };
+            // SAFETY: callback receives a live fixture for synchronous reads.
+            assert_eq!(
+                unsafe {
+                    capture_return_mechanism(
+                        (&fixture as *const ReturnMechanismFixture).cast(),
+                        &accessors,
+                        true,
+                        exact_return_interface(),
+                        8,
+                    )
+                },
+                Err(RadareAbi138CaptureError::InvalidInterface)
+            );
+        }
     }
 
     #[test]

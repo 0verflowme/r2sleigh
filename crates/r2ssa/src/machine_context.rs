@@ -23,7 +23,7 @@ pub use r2source::{
     SourceTypeGraphError, SourceTypeKind, StackAddressBase,
 };
 
-pub const MACHINE_CONTEXT_SCHEMA_VERSION: u32 = 10;
+pub const MACHINE_CONTEXT_SCHEMA_VERSION: u32 = 11;
 /// One canonical register carrier in the immutable ABI snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct MachineAbiRegisterSlot {
@@ -273,6 +273,79 @@ impl MachineMemoryModel {
     }
 }
 
+fn is_exact_top_level_address_register(
+    arch: &ArchSpec,
+    storage: CanonicalStorageId,
+    address_size: u32,
+) -> bool {
+    storage.space == CanonicalStorageSpace::Register
+        && storage.size == address_size
+        && arch.registers.iter().any(|register| {
+            register.parent.is_none()
+                && register.offset == storage.offset
+                && register.size == storage.size
+        })
+        && !arch.registers.iter().any(|register| {
+            register.size > storage.size
+                && register.offset <= storage.offset
+                && register
+                    .offset
+                    .checked_add(u64::from(register.size))
+                    .zip(storage.offset.checked_add(u64::from(storage.size)))
+                    .is_some_and(|(register_end, storage_end)| register_end >= storage_end)
+        })
+}
+
+fn return_mechanism_matches_machine(
+    interface: &SourceFunctionInterface,
+    arch: Option<&ArchSpec>,
+    memory_model: &MachineMemoryModel,
+) -> bool {
+    let Some(mechanism) = interface.return_mechanism() else {
+        return true;
+    };
+    let Some(arch) = arch else {
+        return false;
+    };
+    let address_size = mechanism.address_size_bytes();
+    let Some(address_bits) = address_size.checked_mul(8) else {
+        return false;
+    };
+    if address_size <= 1
+        || arch.addr_size != address_size
+        || mechanism.stack_offset() != 0
+        || mechanism.slot_size_bytes() != address_size
+        || mechanism.stack_pointer_delta_bytes() != address_size
+        || memory_model.default_address_bits() != address_bits
+    {
+        return false;
+    }
+    let Some(ram) = memory_model.space(SpaceId::Ram) else {
+        return false;
+    };
+    if ram.word_size_bytes() != 1 || ram.address_bits() != address_bits {
+        return false;
+    }
+    let mut explicit_ram_spaces = arch.spaces.iter().filter(|space| space.id == SpaceId::Ram);
+    let Some(explicit_ram) = explicit_ram_spaces.next() else {
+        return false;
+    };
+    if explicit_ram_spaces.next().is_some()
+        || explicit_ram.word_size != 1
+        || explicit_ram.addr_size != address_size
+    {
+        return false;
+    }
+    let Some(return_address) = interface.return_address_storage() else {
+        return false;
+    };
+    let Some(stack_pointer) = interface.stack_pointer_storage() else {
+        return false;
+    };
+    is_exact_top_level_address_register(arch, return_address, address_size)
+        && is_exact_top_level_address_register(arch, stack_pointer, address_size)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SourceMachineContext {
     schema_version: u32,
@@ -311,6 +384,7 @@ impl SourceMachineContext {
                 )
             })
             .collect();
+        let memory_model = MachineMemoryModel::from_arch(arch);
         let mut abi_model = MachineAbiModel::from_interface(function_interface.as_ref());
         if let Some(interface) = function_interface.as_ref() {
             let has_frame_pointer_slots = interface
@@ -351,22 +425,11 @@ impl SourceMachineContext {
                 });
             let is_exact_address_register = |storage: CanonicalStorageId| {
                 arch.is_some_and(|arch| {
-                    storage.size == effective_arch_address_size(arch)
-                        && arch.registers.iter().any(|register| {
-                            register.parent.is_none()
-                                && register.offset == storage.offset
-                                && register.size == storage.size
-                        })
-                        && !arch.registers.iter().any(|register| {
-                            register.offset <= storage.offset
-                                && register
-                                    .offset
-                                    .checked_add(u64::from(register.size))
-                                    .is_some_and(|end| {
-                                        end >= storage.offset + u64::from(storage.size)
-                                    })
-                                && register.size > storage.size
-                        })
+                    is_exact_top_level_address_register(
+                        arch,
+                        storage,
+                        effective_arch_address_size(arch),
+                    )
                 })
             };
             let machine_carriers_are_exact_address_registers = interface
@@ -379,7 +442,8 @@ impl SourceMachineContext {
             abi_model.coherent &= exact_interface_roles_exist
                 && carrier_storages_are_disjoint
                 && declared_storages_exist
-                && machine_carriers_are_exact_address_registers;
+                && machine_carriers_are_exact_address_registers
+                && return_mechanism_matches_machine(interface, arch, &memory_model);
         }
         let raw_call_sites_by_id = collect_raw_call_site_identities(blocks);
         let raw_call_sites = raw_call_sites_by_id
@@ -439,7 +503,7 @@ impl SourceMachineContext {
             .collect();
         Self {
             schema_version: MACHINE_CONTEXT_SCHEMA_VERSION,
-            memory_model: MachineMemoryModel::from_arch(arch),
+            memory_model,
             function_interface,
             abi_model,
             register_storages_by_name,
@@ -464,6 +528,13 @@ impl SourceMachineContext {
 
     pub const fn function_interface(&self) -> Option<&SourceFunctionInterface> {
         self.function_interface.as_ref()
+    }
+
+    pub const fn return_mechanism(&self) -> Option<r2source::SourceReturnMechanism> {
+        match self.function_interface.as_ref() {
+            Some(interface) => interface.return_mechanism(),
+            None => None,
+        }
     }
 
     pub fn register_storage(&self, name: &str) -> Option<CanonicalStorageId> {
@@ -961,6 +1032,100 @@ mod tests {
             Vec::new(),
         );
         assert!(!subregister_ra.abi_model().is_coherent());
+    }
+
+    #[test]
+    fn exact_stacked_return_requires_matching_registers_and_byte_ram() {
+        let stack_pointer = register_storage(64, 8);
+        let return_address = register_storage(80, 8);
+        let make = || {
+            SourceFunctionInterface::new_exact(
+                b"exact-stacked-return".to_vec(),
+                "test-abi",
+                [],
+                SourceFunctionReturn::Void,
+                [],
+            )
+            .and_then(|interface| interface.with_return_address_storage(return_address))
+            .and_then(|interface| interface.with_stack_pointer_storage(stack_pointer))
+            .expect("exact machine roles")
+        };
+        let exact = make()
+            .with_exact_stacked_return(0, 8, 8, 8)
+            .expect("canonical stacked return");
+        let mut arch = ArchSpec::new("exact-stacked-return");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("source-ra", return_address.offset, 8));
+        arch.add_register(RegisterDef::new("source-sp", stack_pointer.offset, 8));
+        arch.add_space(AddressSpace::ram(8));
+
+        let coherent = SourceMachineContext::from_blocks_with_interfaces(
+            &[],
+            Some(&arch),
+            Some(exact.clone()),
+            Vec::new(),
+        );
+        assert!(coherent.abi_model().is_coherent());
+        assert_eq!(coherent.return_mechanism(), exact.return_mechanism());
+
+        let absent = SourceMachineContext::from_blocks_with_interfaces(
+            &[],
+            Some(&arch),
+            Some(make()),
+            Vec::new(),
+        );
+        assert!(absent.abi_model().is_coherent());
+        assert_eq!(absent.return_mechanism(), None);
+
+        let mut subregister = arch.clone();
+        subregister.registers.clear();
+        subregister.register_map.clear();
+        subregister.add_register(RegisterDef::sub(
+            "source-ra-alias",
+            return_address.offset,
+            8,
+            "untrusted-parent",
+        ));
+        subregister.add_register(RegisterDef::new("source-sp", stack_pointer.offset, 8));
+        let context = SourceMachineContext::from_blocks_with_interfaces(
+            &[],
+            Some(&subregister),
+            Some(exact.clone()),
+            Vec::new(),
+        );
+        assert!(!context.abi_model().is_coherent());
+
+        let mut wrong_machine_width = arch.clone();
+        wrong_machine_width.addr_size = 4;
+        wrong_machine_width.spaces.clear();
+        wrong_machine_width.add_space(AddressSpace::ram(4));
+        let context = SourceMachineContext::from_blocks_with_interfaces(
+            &[],
+            Some(&wrong_machine_width),
+            Some(exact.clone()),
+            Vec::new(),
+        );
+        assert!(!context.abi_model().is_coherent());
+
+        let mut word_addressed = arch.clone();
+        word_addressed.spaces[0].word_size = 2;
+        let context = SourceMachineContext::from_blocks_with_interfaces(
+            &[],
+            Some(&word_addressed),
+            Some(exact.clone()),
+            Vec::new(),
+        );
+        assert!(!context.abi_model().is_coherent());
+
+        let mut wrong_ram_width = arch;
+        wrong_ram_width.spaces[0].addr_size = 4;
+        let context = SourceMachineContext::from_blocks_with_interfaces(
+            &[],
+            Some(&wrong_ram_width),
+            Some(exact),
+            Vec::new(),
+        );
+        assert!(!context.abi_model().is_coherent());
     }
 
     #[test]

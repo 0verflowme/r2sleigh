@@ -42,9 +42,9 @@ typedef struct R2ILFunctionBlocks R2ILFunctionBlocks;
 
 #define R2SLEIGH_RADARE_ABI_V2 138
 
-#define R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 7
+#define R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 8
 
-#define R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2 1
+#define R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2 2
 
 #define R2SLEIGH_STATUS_OK_V2 0
 
@@ -1029,6 +1029,13 @@ typedef struct R2SleighRadareSuccessorViewV2 {
   uint8_t external;
 } R2SleighRadareSuccessorViewV2;
 
+typedef struct R2SleighRadareReturnMechanismViewV2 {
+  int32_t kind;
+  int64_t stack_offset;
+  uint32_t slot_size_bytes;
+  uint32_t stack_pointer_delta_bytes;
+} R2SleighRadareReturnMechanismViewV2;
+
 typedef struct R2SleighRadareAccessorsV2 {
   uint32_t struct_size;
   uint32_t abi_version;
@@ -1063,6 +1070,7 @@ typedef struct R2SleighRadareAccessorsV2 {
   uint8_t (*block_bytes)(const void*, size_t, size_t, uint8_t*, size_t);
   uint8_t (*successor_view)(const void*, size_t, size_t, struct R2SleighRadareSuccessorViewV2*);
   uint8_t (*external_exit)(const void*, size_t, uint64_t*);
+  uint8_t (*return_mechanism_view)(const void*, struct R2SleighRadareReturnMechanismViewV2*);
 } R2SleighRadareAccessorsV2;
 
 /**
