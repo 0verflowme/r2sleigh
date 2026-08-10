@@ -11,7 +11,6 @@ use r2il::{
     AtomicKind, MemoryClass, MemoryOrdering, MemoryPermissions, OpMetadata, PointerHint, R2ILBlock,
     R2ILOp, ScalarKind, SpaceId, StorageClass, Varnode, select_register_name,
 };
-#[cfg(feature = "x86")]
 use r2source::SourceEndianness;
 use r2source::{AdvisorySuccessorKind, MachineProfile, OwnedFunctionSnapshot};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -53,6 +52,8 @@ pub enum TrustedSleighProfile {
     #[cfg(feature = "arm")]
     ArmCortexLe,
     #[cfg(feature = "arm")]
+    Aarch64Le,
+    #[cfg(feature = "arm")]
     Aarch64AppleSilicon,
     #[cfg(feature = "mips")]
     Mips32Be,
@@ -88,6 +89,12 @@ impl TrustedSleighProfile {
                 sleigh_config::processor_arm::SLA_ARM8_LE,
                 sleigh_config::processor_arm::PSPEC_ARMCORTEX,
                 "ARM",
+            ),
+            #[cfg(feature = "arm")]
+            Self::Aarch64Le => (
+                sleigh_config::processor_aarch64::SLA_AARCH64,
+                sleigh_config::processor_aarch64::PSPEC_AARCH64,
+                "aarch64",
             ),
             #[cfg(feature = "arm")]
             Self::Aarch64AppleSilicon => (
@@ -139,22 +146,30 @@ impl TrustedSleighProfile {
     /// are admitted; aliases, empty CPU defaults, and inferred host values are
     /// deliberately unsupported.
     fn from_machine(machine: &MachineProfile) -> Result<Self> {
-        match (
+        Self::from_tuple(
             machine.arch_id(),
             machine.cpu_id(),
             machine.bits(),
             machine.endianness(),
-        ) {
+        )
+    }
+
+    fn from_tuple(
+        arch_id: &str,
+        cpu_id: &str,
+        bits: u32,
+        endianness: SourceEndianness,
+    ) -> Result<Self> {
+        match (arch_id, cpu_id, bits, endianness) {
             #[cfg(feature = "x86")]
             ("x86", "x86", 32, SourceEndianness::Little) => Ok(Self::X86),
             #[cfg(feature = "x86")]
             ("x86", "x86", 64, SourceEndianness::Little) => Ok(Self::X86_64),
+            #[cfg(feature = "arm")]
+            ("arm", "arm", 64, SourceEndianness::Little) => Ok(Self::Aarch64Le),
             _ => Err(LiftError::Unsupported(format!(
                 "no manually verified trusted Sleigh profile for source tuple {}/{}/{}/{:?}",
-                machine.arch_id(),
-                machine.cpu_id(),
-                machine.bits(),
-                machine.endianness()
+                arch_id, cpu_id, bits, endianness
             ))),
         }
     }
@@ -2762,6 +2777,65 @@ mod tests {
         assert_eq!(first_block.op_metadata, second_block.op_metadata);
         assert!(first_block.switch_info.is_none());
         assert!(second_block.switch_info.is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "arm")]
+    fn trusted_arm64_radare_tuple_selects_generic_aarch64() {
+        assert_eq!(
+            TrustedSleighProfile::from_tuple("arm", "arm", 64, SourceEndianness::Little)
+                .expect("verified radare ARM64 tuple"),
+            TrustedSleighProfile::Aarch64Le
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "arm")]
+    fn trusted_arm64_radare_tuple_refuses_unverified_neighbors() {
+        for (arch_id, cpu_id, bits, endianness) in [
+            ("arm", "arm", 32, SourceEndianness::Little),
+            ("arm", "arm", 64, SourceEndianness::Big),
+            ("aarch64", "arm", 64, SourceEndianness::Little),
+            ("arm", "arm64", 64, SourceEndianness::Little),
+            ("arm", "all", 64, SourceEndianness::Little),
+        ] {
+            assert!(matches!(
+                TrustedSleighProfile::from_tuple(arch_id, cpu_id, bits, endianness),
+                Err(LiftError::Unsupported(_))
+            ));
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "arm"))]
+    fn trusted_arm64_radare_tuple_requires_arm_feature() {
+        assert!(matches!(
+            TrustedSleighProfile::from_tuple("arm", "arm", 64, SourceEndianness::Little),
+            Err(LiftError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "arm")]
+    fn trusted_generic_aarch64_profile_lifts_pinned_real_bytes() {
+        let disassembler = Disassembler::from_trusted_profile(TrustedSleighProfile::Aarch64Le)
+            .expect("trusted generic AArch64 disassembler");
+        let block = disassembler
+            .lift_genuine_block(
+                PINNED_ARM64_O2_LOAD_BLOCK,
+                PINNED_ARM64_O2_LOAD_BLOCK_ADDR,
+                PINNED_ARM64_O2_LOAD_BLOCK.len(),
+            )
+            .expect("genuine lift of pinned real ARM64 bytes");
+
+        assert_eq!(block.source_bytes(), PINNED_ARM64_O2_LOAD_BLOCK);
+        assert_eq!(block.block().addr, PINNED_ARM64_O2_LOAD_BLOCK_ADDR);
+        assert_eq!(
+            block.block().size as usize,
+            PINNED_ARM64_O2_LOAD_BLOCK.len()
+        );
+        assert_eq!(block.authority().arch_name(), "aarch64");
+        assert!(!block.block().ops.is_empty());
     }
 
     #[test]
