@@ -296,6 +296,7 @@ pub struct CapturedSourceFields {
     exact_stack_slot_roles: bool,
     return_address_storage: bool,
     stack_pointer_storage: bool,
+    return_mechanism: bool,
 }
 
 impl CapturedSourceFields {
@@ -321,6 +322,10 @@ impl CapturedSourceFields {
 
     pub const fn has_stack_pointer_storage(self) -> bool {
         self.stack_pointer_storage
+    }
+
+    pub const fn has_return_mechanism(self) -> bool {
+        self.return_mechanism
     }
 }
 
@@ -426,6 +431,7 @@ impl OwnedFunctionSnapshot {
                     != interface.return_address_storage().is_some()
                 || captured_fields.stack_pointer_storage
                     != interface.stack_pointer_storage().is_some()
+                || captured_fields.return_mechanism != interface.return_mechanism().is_some()
             {
                 return Err(SnapshotValidationError::InvalidFunctionInterface);
             }
@@ -433,6 +439,7 @@ impl OwnedFunctionSnapshot {
             || captured_fields.exact_stack_slot_roles
             || captured_fields.return_address_storage
             || captured_fields.stack_pointer_storage
+            || captured_fields.return_mechanism
         {
             return Err(SnapshotValidationError::InvalidFunctionInterface);
         }
@@ -563,6 +570,7 @@ mod tests {
                 exact_stack_slot_roles: false,
                 return_address_storage: false,
                 stack_pointer_storage: false,
+                return_mechanism: false,
             },
             DiagnosticIdentity(7),
         )
@@ -589,6 +597,7 @@ mod tests {
         )
         .and_then(|interface| interface.with_return_address_storage(register(16)))
         .and_then(|interface| interface.with_stack_pointer_storage(register(24)))
+        .and_then(|interface| interface.with_exact_stacked_return(0, 8, 8, 8))
         .expect("exact interface")
     }
 
@@ -653,6 +662,7 @@ mod tests {
             exact_stack_slot_roles: true,
             return_address_storage: true,
             stack_pointer_storage: true,
+            return_mechanism: true,
         };
         let captured = OwnedFunctionSnapshot::from_captured_parts(
             valid.machine().clone(),
@@ -667,6 +677,41 @@ mod tests {
         )
         .expect("coherent interface capture");
         assert_eq!(captured.function_interface(), Some(&interface));
+        assert!(captured.captured_fields().has_return_mechanism());
+
+        let mut missing_return_mechanism = captured_fields;
+        missing_return_mechanism.return_mechanism = false;
+        assert_eq!(
+            OwnedFunctionSnapshot::from_captured_parts(
+                valid.machine().clone(),
+                *valid.function(),
+                valid.presentation().clone(),
+                valid.image().clone(),
+                Box::new([]),
+                Box::from([7]),
+                Some(interface.clone()),
+                missing_return_mechanism,
+                valid.diagnostic_identity(),
+            ),
+            Err(SnapshotValidationError::InvalidFunctionInterface)
+        );
+
+        let mut mechanism_without_interface = valid.captured_fields();
+        mechanism_without_interface.return_mechanism = true;
+        assert_eq!(
+            OwnedFunctionSnapshot::from_captured_parts(
+                valid.machine().clone(),
+                *valid.function(),
+                valid.presentation().clone(),
+                valid.image().clone(),
+                Box::new([]),
+                Box::from([7]),
+                None,
+                mechanism_without_interface,
+                valid.diagnostic_identity(),
+            ),
+            Err(SnapshotValidationError::InvalidFunctionInterface)
+        );
 
         let wrong_revision = SourceFunctionInterface::new_exact(
             [8],
@@ -679,6 +724,7 @@ mod tests {
         )
         .and_then(|interface| interface.with_return_address_storage(register(16)))
         .and_then(|interface| interface.with_stack_pointer_storage(register(24)))
+        .and_then(|interface| interface.with_exact_stacked_return(0, 8, 8, 8))
         .expect("structurally valid foreign interface");
         assert_eq!(
             OwnedFunctionSnapshot::from_captured_parts(

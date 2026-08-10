@@ -1556,6 +1556,7 @@ pub unsafe fn capture_radare_abi138(
             && first.capabilities & RADARE_CAP_RETURN_ADDRESS_STORAGE != 0,
         stack_pointer_storage: function_interface.is_some()
             && first.capabilities & RADARE_CAP_STACK_POINTER_STORAGE != 0,
+        return_mechanism: false,
     };
     OwnedFunctionSnapshot::from_captured_parts(
         machine,

@@ -63,7 +63,7 @@ pub enum StackAddressBase {
     StackPointer,
 }
 
-pub const SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION: u32 = 6;
+pub const SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION: u32 = 7;
 pub const SOURCE_CALL_SITE_INTERFACE_SCHEMA_VERSION: u32 = 1;
 pub const SOURCE_TYPE_GRAPH_SCHEMA_VERSION: u32 = 1;
 
@@ -525,6 +525,51 @@ pub enum SourceFunctionReturn {
     Register { storage: CanonicalStorageId },
 }
 
+/// Exact source-owned mechanism used to recover the return address and final
+/// stack-pointer delta. Absence remains unknown and grants no authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum SourceReturnMechanism {
+    Stacked {
+        stack_offset: i64,
+        slot_size_bytes: u32,
+        stack_pointer_delta_bytes: u32,
+        address_size_bytes: u32,
+    },
+}
+
+impl SourceReturnMechanism {
+    pub const fn stack_offset(self) -> i64 {
+        match self {
+            Self::Stacked { stack_offset, .. } => stack_offset,
+        }
+    }
+
+    pub const fn slot_size_bytes(self) -> u32 {
+        match self {
+            Self::Stacked {
+                slot_size_bytes, ..
+            } => slot_size_bytes,
+        }
+    }
+
+    pub const fn stack_pointer_delta_bytes(self) -> u32 {
+        match self {
+            Self::Stacked {
+                stack_pointer_delta_bytes,
+                ..
+            } => stack_pointer_delta_bytes,
+        }
+    }
+
+    pub const fn address_size_bytes(self) -> u32 {
+        match self {
+            Self::Stacked {
+                address_size_bytes, ..
+            } => address_size_bytes,
+        }
+    }
+}
+
 /// One exactly sized stack resource supplied by the immutable source snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum SourceStackSlotRole {
@@ -629,6 +674,7 @@ pub struct SourceFunctionInterface {
     return_kind: SourceFunctionReturn,
     return_address_storage: Option<CanonicalStorageId>,
     stack_pointer_storage: Option<CanonicalStorageId>,
+    return_mechanism: Option<SourceReturnMechanism>,
     stack_slots: Box<[SourceStackSlotSpec]>,
     parameter_logical_values: Box<[SourceLogicalValue]>,
     return_logical_value: Option<SourceLogicalValue>,
@@ -644,6 +690,7 @@ pub enum SourceFunctionInterfaceError {
     InvalidRegisterStorage,
     InvalidReturnAddressStorage,
     InvalidStackPointerStorage,
+    InvalidReturnMechanism,
     OverlappingRegisterStorages,
     InvalidStackSlot,
     InvalidStackSlotRole,
@@ -893,6 +940,7 @@ impl SourceFunctionInterface {
             return_kind,
             return_address_storage: None,
             stack_pointer_storage: None,
+            return_mechanism: None,
             stack_slots: stack_slots.into_boxed_slice(),
             parameter_logical_values: parameter_logical_values.into_boxed_slice(),
             return_logical_value,
@@ -980,6 +1028,12 @@ impl SourceFunctionInterface {
         mut self,
         storage: CanonicalStorageId,
     ) -> Result<Self, SourceFunctionInterfaceError> {
+        if self
+            .return_mechanism
+            .is_some_and(|_| self.return_address_storage != Some(storage))
+        {
+            return Err(SourceFunctionInterfaceError::InvalidReturnMechanism);
+        }
         if !self.return_address_storage_is_valid(storage) {
             return Err(SourceFunctionInterfaceError::InvalidReturnAddressStorage);
         }
@@ -997,6 +1051,12 @@ impl SourceFunctionInterface {
         mut self,
         storage: CanonicalStorageId,
     ) -> Result<Self, SourceFunctionInterfaceError> {
+        if self
+            .return_mechanism
+            .is_some_and(|_| self.stack_pointer_storage != Some(storage))
+        {
+            return Err(SourceFunctionInterfaceError::InvalidReturnMechanism);
+        }
         if !self.stack_pointer_storage_is_valid(storage) {
             return Err(SourceFunctionInterfaceError::InvalidStackPointerStorage);
         }
@@ -1006,6 +1066,58 @@ impl SourceFunctionInterface {
 
     pub const fn stack_pointer_storage(&self) -> Option<CanonicalStorageId> {
         self.stack_pointer_storage
+    }
+
+    /// Bind an exact stacked return-address contract. The return address is at
+    /// entry SP + 0, occupies one complete address-sized slot, and the return
+    /// advances SP by exactly that slot width.
+    pub fn with_exact_stacked_return(
+        mut self,
+        stack_offset: i64,
+        slot_size_bytes: u32,
+        stack_pointer_delta_bytes: u32,
+        address_size_bytes: u32,
+    ) -> Result<Self, SourceFunctionInterfaceError> {
+        let Some(return_address) = self.return_address_storage else {
+            return Err(SourceFunctionInterfaceError::InvalidReturnMechanism);
+        };
+        let Some(stack_pointer) = self.stack_pointer_storage else {
+            return Err(SourceFunctionInterfaceError::InvalidReturnMechanism);
+        };
+        let return_slot_end = i64::from(slot_size_bytes);
+        let overlaps_stack_slot = self.stack_slots.iter().any(|slot| {
+            if slot.base != StackAddressBase::StackPointer || slot.base_storage != stack_pointer {
+                return false;
+            }
+            let Some(slot_end) = slot.offset.checked_add(i64::from(slot.size_bytes)) else {
+                return true;
+            };
+            slot.offset < return_slot_end && 0 < slot_end
+        });
+        if stack_offset != 0
+            || slot_size_bytes == 0
+            || slot_size_bytes != stack_pointer_delta_bytes
+            || slot_size_bytes != address_size_bytes
+            || return_address.size != address_size_bytes
+            || stack_pointer.size != address_size_bytes
+            || !self.return_address_storage_is_valid(return_address)
+            || !self.stack_pointer_storage_is_valid(stack_pointer)
+            || register_storages_overlap(return_address, stack_pointer)
+            || overlaps_stack_slot
+        {
+            return Err(SourceFunctionInterfaceError::InvalidReturnMechanism);
+        }
+        self.return_mechanism = Some(SourceReturnMechanism::Stacked {
+            stack_offset,
+            slot_size_bytes,
+            stack_pointer_delta_bytes,
+            address_size_bytes,
+        });
+        Ok(self)
+    }
+
+    pub const fn return_mechanism(&self) -> Option<SourceReturnMechanism> {
+        self.return_mechanism
     }
 
     /// Return the unique full frame-pointer carrier from an exact stack-slot
@@ -1315,6 +1427,182 @@ mod tests {
             offset,
             size,
         }
+    }
+
+    fn exact_return_interface(
+        revision: &[u8],
+        calling_convention: &str,
+        stack_slots: impl IntoIterator<Item = SourceStackSlotSpec>,
+    ) -> SourceFunctionInterface {
+        SourceFunctionInterface::new_exact(
+            revision.to_vec(),
+            calling_convention,
+            [],
+            SourceFunctionReturn::Void,
+            stack_slots,
+        )
+        .and_then(|interface| interface.with_return_address_storage(register_storage(80, 8)))
+        .and_then(|interface| interface.with_stack_pointer_storage(register_storage(72, 8)))
+        .expect("exact return carriers")
+    }
+
+    #[test]
+    fn exact_stacked_return_is_revision_bound_and_name_independent() {
+        let stack_pointer = register_storage(72, 8);
+        let slots = [
+            SourceStackSlotSpec::new_local(StackAddressBase::StackPointer, stack_pointer, -8, 8),
+            SourceStackSlotSpec::new_local(StackAddressBase::StackPointer, stack_pointer, 8, 8),
+        ];
+        let exact = exact_return_interface(b"stacked-revision-a", "abi-display-a", slots)
+            .with_exact_stacked_return(0, 8, 8, 8)
+            .expect("exact stacked return");
+        assert_eq!(
+            exact.schema_version(),
+            SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION
+        );
+        assert_eq!(exact.revision_identity(), b"stacked-revision-a");
+        assert_eq!(
+            exact.return_mechanism(),
+            Some(SourceReturnMechanism::Stacked {
+                stack_offset: 0,
+                slot_size_bytes: 8,
+                stack_pointer_delta_bytes: 8,
+                address_size_bytes: 8,
+            })
+        );
+        let mechanism = exact.return_mechanism().expect("stacked mechanism");
+        assert_eq!(mechanism.stack_offset(), 0);
+        assert_eq!(mechanism.slot_size_bytes(), 8);
+        assert_eq!(mechanism.stack_pointer_delta_bytes(), 8);
+        assert_eq!(mechanism.address_size_bytes(), 8);
+
+        let renamed = exact_return_interface(b"stacked-revision-b", "abi-display-b", slots)
+            .with_exact_stacked_return(0, 8, 8, 8)
+            .expect("renamed exact stacked return");
+        assert_eq!(renamed.return_mechanism(), exact.return_mechanism());
+        assert_ne!(renamed.revision_identity(), exact.revision_identity());
+        assert_ne!(renamed.calling_convention(), exact.calling_convention());
+    }
+
+    #[test]
+    fn exact_stacked_return_rejects_missing_or_incoherent_carriers() {
+        let unbound = SourceFunctionInterface::new_exact(
+            b"stacked-unbound".to_vec(),
+            "test-abi",
+            [],
+            SourceFunctionReturn::Void,
+            [],
+        )
+        .expect("unbound exact interface");
+        assert_eq!(
+            unbound.clone().with_exact_stacked_return(0, 8, 8, 8),
+            Err(SourceFunctionInterfaceError::InvalidReturnMechanism)
+        );
+        assert_eq!(
+            unbound
+                .clone()
+                .with_return_address_storage(register_storage(80, 8))
+                .expect("return-address-only interface")
+                .with_exact_stacked_return(0, 8, 8, 8),
+            Err(SourceFunctionInterfaceError::InvalidReturnMechanism)
+        );
+        assert_eq!(
+            unbound
+                .with_stack_pointer_storage(register_storage(72, 8))
+                .expect("stack-pointer-only interface")
+                .with_exact_stacked_return(0, 8, 8, 8),
+            Err(SourceFunctionInterfaceError::InvalidReturnMechanism)
+        );
+
+        let exact = exact_return_interface(b"stacked-carriers", "test-abi", []);
+        let mut invalid_return_address = exact.clone();
+        invalid_return_address.return_address_storage = Some(CanonicalStorageId {
+            space: CanonicalStorageSpace::Ram,
+            offset: 80,
+            size: 8,
+        });
+        assert_eq!(
+            invalid_return_address.with_exact_stacked_return(0, 8, 8, 8),
+            Err(SourceFunctionInterfaceError::InvalidReturnMechanism)
+        );
+        let mut overlapping = exact.clone();
+        overlapping.return_address_storage = overlapping.stack_pointer_storage;
+        assert_eq!(
+            overlapping.with_exact_stacked_return(0, 8, 8, 8),
+            Err(SourceFunctionInterfaceError::InvalidReturnMechanism)
+        );
+        let mut narrow_stack_pointer = exact;
+        narrow_stack_pointer.stack_pointer_storage = Some(register_storage(72, 4));
+        assert_eq!(
+            narrow_stack_pointer.with_exact_stacked_return(0, 8, 8, 8),
+            Err(SourceFunctionInterfaceError::InvalidReturnMechanism)
+        );
+    }
+
+    #[test]
+    fn exact_stacked_return_rejects_inexact_geometry_and_stack_overlap() {
+        let exact = exact_return_interface(b"stacked-geometry", "test-abi", []);
+        for geometry in [(1, 8, 8, 8), (0, 0, 0, 0), (0, 8, 4, 8), (0, 8, 8, 4)] {
+            assert_eq!(
+                exact
+                    .clone()
+                    .with_exact_stacked_return(geometry.0, geometry.1, geometry.2, geometry.3,),
+                Err(SourceFunctionInterfaceError::InvalidReturnMechanism)
+            );
+        }
+
+        let stack_pointer = register_storage(72, 8);
+        for (offset, size) in [(0, 8), (-4, 8), (4, 8)] {
+            let overlapping = exact_return_interface(
+                b"stacked-overlap",
+                "test-abi",
+                [SourceStackSlotSpec::new_local(
+                    StackAddressBase::StackPointer,
+                    stack_pointer,
+                    offset,
+                    size,
+                )],
+            );
+            assert_eq!(
+                overlapping.with_exact_stacked_return(0, 8, 8, 8),
+                Err(SourceFunctionInterfaceError::InvalidReturnMechanism)
+            );
+        }
+    }
+
+    #[test]
+    fn exact_stacked_return_cannot_be_invalidated_by_carrier_rebinding() {
+        let exact = exact_return_interface(b"stacked-sealed", "test-abi", [])
+            .with_exact_stacked_return(0, 8, 8, 8)
+            .expect("exact stacked return");
+        assert!(
+            exact
+                .clone()
+                .with_return_address_storage(register_storage(88, 8))
+                .is_err()
+        );
+        assert!(
+            exact
+                .clone()
+                .with_stack_pointer_storage(register_storage(96, 8))
+                .is_err()
+        );
+        assert_eq!(
+            exact
+                .clone()
+                .with_return_address_storage(register_storage(80, 8))
+                .expect("idempotent return-address binding")
+                .return_mechanism(),
+            exact.return_mechanism()
+        );
+        assert_eq!(
+            exact
+                .clone()
+                .with_stack_pointer_storage(register_storage(72, 8))
+                .expect("idempotent stack-pointer binding")
+                .return_mechanism(),
+            exact.return_mechanism()
+        );
     }
 
     #[test]
