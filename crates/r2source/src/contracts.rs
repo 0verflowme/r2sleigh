@@ -1008,6 +1008,59 @@ impl SourceFunctionInterface {
         self.stack_pointer_storage
     }
 
+    /// Return the unique full frame-pointer carrier from an exact stack-slot
+    /// contract. This derives a storage identity only; it grants no frame
+    /// certification authority.
+    pub fn exact_frame_pointer_storage(&self) -> Option<CanonicalStorageId> {
+        if !self.stack_slot_roles_complete
+            || self
+                .stack_slots
+                .iter()
+                .any(|slot| slot.role == SourceStackSlotRole::UnclassifiedResource)
+        {
+            return None;
+        }
+        let mut frame_slots = self
+            .stack_slots
+            .iter()
+            .filter(|slot| slot.base == StackAddressBase::FramePointer);
+        let storage = frame_slots.next()?.base_storage;
+        if !valid_register_storage(storage) || frame_slots.any(|slot| slot.base_storage != storage)
+        {
+            return None;
+        }
+        let stack_pointer = self.stack_pointer_storage?;
+        let return_address = self.return_address_storage?;
+        if storage.size != stack_pointer.size
+            || !self.stack_pointer_storage_is_valid(stack_pointer)
+            || !self.return_address_storage_is_valid(return_address)
+        {
+            return None;
+        }
+        let overlaps_source_carrier = self
+            .parameters
+            .iter()
+            .map(SourceAbiParameterSpec::storage)
+            .chain(match self.return_kind {
+                SourceFunctionReturn::Void => None,
+                SourceFunctionReturn::Register { storage } => Some(storage),
+            })
+            .chain(Some(return_address))
+            .chain(Some(stack_pointer))
+            .chain(
+                self.stack_slots
+                    .iter()
+                    .filter(|slot| slot.base == StackAddressBase::StackPointer)
+                    .map(SourceStackSlotSpec::base_storage),
+            )
+            .chain(self.stack_slots.iter().filter_map(|slot| match slot.role {
+                SourceStackSlotRole::ParameterHome { home_storage, .. } => Some(home_storage),
+                SourceStackSlotRole::UnclassifiedResource | SourceStackSlotRole::Local => None,
+            }))
+            .any(|other| register_storages_overlap(storage, other));
+        (!overlaps_source_carrier).then_some(storage)
+    }
+
     pub const fn stack_slots(&self) -> &[SourceStackSlotSpec] {
         &self.stack_slots
     }
@@ -1250,4 +1303,185 @@ fn valid_call_target_storage(storage: CanonicalStorageId) -> bool {
             .offset
             .checked_add(u64::from(storage.size))
             .is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn register_storage(offset: u64, size: u32) -> CanonicalStorageId {
+        CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset,
+            size,
+        }
+    }
+
+    #[test]
+    fn exact_frame_pointer_storage_requires_one_disjoint_exact_base() {
+        let parameter = register_storage(0, 8);
+        let result = register_storage(8, 8);
+        let frame_pointer = register_storage(64, 8);
+        let stack_pointer = register_storage(72, 8);
+        let return_address = register_storage(80, 8);
+        let exact = SourceFunctionInterface::new_exact(
+            b"exact-frame-pointer".to_vec(),
+            "test-abi",
+            [SourceAbiParameterSpec::new(0, parameter)],
+            SourceFunctionReturn::Register { storage: result },
+            [
+                SourceStackSlotSpec::new_local(
+                    StackAddressBase::FramePointer,
+                    frame_pointer,
+                    -16,
+                    8,
+                ),
+                SourceStackSlotSpec::new_parameter_home(
+                    StackAddressBase::FramePointer,
+                    frame_pointer,
+                    -8,
+                    8,
+                    0,
+                    parameter,
+                ),
+                SourceStackSlotSpec::new_local(StackAddressBase::StackPointer, stack_pointer, 0, 8),
+            ],
+        )
+        .and_then(|interface| interface.with_return_address_storage(return_address))
+        .and_then(|interface| interface.with_stack_pointer_storage(stack_pointer))
+        .expect("coherent exact frame carriers");
+        assert_eq!(exact.exact_frame_pointer_storage(), Some(frame_pointer));
+
+        let unbound = SourceFunctionInterface::new_exact(
+            b"unbound-frame-pointer".to_vec(),
+            "test-abi",
+            [],
+            SourceFunctionReturn::Void,
+            [SourceStackSlotSpec::new_local(
+                StackAddressBase::FramePointer,
+                frame_pointer,
+                -8,
+                8,
+            )],
+        )
+        .expect("unbound exact stack roles");
+        assert_eq!(unbound.exact_frame_pointer_storage(), None);
+        assert_eq!(
+            unbound
+                .clone()
+                .with_return_address_storage(return_address)
+                .expect("return-address-only binding")
+                .exact_frame_pointer_storage(),
+            None
+        );
+        assert_eq!(
+            unbound
+                .with_stack_pointer_storage(stack_pointer)
+                .expect("stack-pointer-only binding")
+                .exact_frame_pointer_storage(),
+            None
+        );
+
+        let inexact = SourceFunctionInterface::new(
+            b"advisory-frame-pointer".to_vec(),
+            "test-abi",
+            [],
+            SourceFunctionReturn::Void,
+            [SourceStackSlotSpec::new(
+                StackAddressBase::FramePointer,
+                frame_pointer,
+                -8,
+                8,
+            )],
+        )
+        .expect("advisory frame resource");
+        assert_eq!(inexact.exact_frame_pointer_storage(), None);
+
+        let stack_only = SourceFunctionInterface::new_exact(
+            b"stack-only".to_vec(),
+            "test-abi",
+            [],
+            SourceFunctionReturn::Void,
+            [SourceStackSlotSpec::new_local(
+                StackAddressBase::StackPointer,
+                stack_pointer,
+                0,
+                8,
+            )],
+        )
+        .expect("exact stack-only resource");
+        assert_eq!(stack_only.exact_frame_pointer_storage(), None);
+
+        let parameter_overlap = SourceFunctionInterface::new_exact(
+            b"frame-parameter-overlap".to_vec(),
+            "test-abi",
+            [SourceAbiParameterSpec::new(0, frame_pointer)],
+            SourceFunctionReturn::Void,
+            [SourceStackSlotSpec::new_local(
+                StackAddressBase::FramePointer,
+                frame_pointer,
+                -8,
+                8,
+            )],
+        )
+        .and_then(|interface| interface.with_return_address_storage(return_address))
+        .and_then(|interface| interface.with_stack_pointer_storage(stack_pointer))
+        .expect("representable overlapping source carriers");
+        assert_eq!(parameter_overlap.exact_frame_pointer_storage(), None);
+
+        let result_overlap = SourceFunctionInterface::new_exact(
+            b"frame-result-overlap".to_vec(),
+            "test-abi",
+            [],
+            SourceFunctionReturn::Register {
+                storage: frame_pointer,
+            },
+            [SourceStackSlotSpec::new_local(
+                StackAddressBase::FramePointer,
+                frame_pointer,
+                -8,
+                8,
+            )],
+        )
+        .and_then(|interface| interface.with_return_address_storage(return_address))
+        .and_then(|interface| interface.with_stack_pointer_storage(stack_pointer))
+        .expect("representable overlapping result carrier");
+        assert_eq!(result_overlap.exact_frame_pointer_storage(), None);
+
+        let narrow_frame_pointer = register_storage(88, 4);
+        let width_mismatch = SourceFunctionInterface::new_exact(
+            b"frame-stack-width-mismatch".to_vec(),
+            "test-abi",
+            [],
+            SourceFunctionReturn::Void,
+            [SourceStackSlotSpec::new_local(
+                StackAddressBase::FramePointer,
+                narrow_frame_pointer,
+                -8,
+                8,
+            )],
+        )
+        .and_then(|interface| interface.with_return_address_storage(return_address))
+        .and_then(|interface| interface.with_stack_pointer_storage(stack_pointer))
+        .expect("representable frame/SP width mismatch");
+        assert_eq!(width_mismatch.exact_frame_pointer_storage(), None);
+
+        let stack_overlap = SourceFunctionInterface::new_exact(
+            b"frame-stack-overlap".to_vec(),
+            "test-abi",
+            [],
+            SourceFunctionReturn::Void,
+            [
+                SourceStackSlotSpec::new_local(
+                    StackAddressBase::FramePointer,
+                    frame_pointer,
+                    -8,
+                    8,
+                ),
+                SourceStackSlotSpec::new_local(StackAddressBase::StackPointer, frame_pointer, 0, 8),
+            ],
+        )
+        .expect("representable overlapping stack bases");
+        assert_eq!(stack_overlap.exact_frame_pointer_storage(), None);
+    }
 }

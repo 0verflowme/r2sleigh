@@ -1648,6 +1648,7 @@ fn dead_code_elim(
     changed
 }
 
+#[cfg(test)]
 fn canonical_register_storages_overlap(
     left: CanonicalStorageId,
     right: CanonicalStorageId,
@@ -1688,14 +1689,14 @@ fn canonical_register_storage_is_contained(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CoherentReturnProjection {
+struct TerminalStorageProjection {
     carrier: CanonicalStorageId,
     logical: CanonicalStorageId,
 }
 
 fn coherent_return_projection(
     function_interface: Option<&SourceFunctionInterface>,
-) -> Option<CoherentReturnProjection> {
+) -> Option<TerminalStorageProjection> {
     let interface = function_interface?;
     let SourceFunctionReturn::Register { storage } = interface.return_kind() else {
         return None;
@@ -1734,7 +1735,7 @@ fn coherent_return_projection(
         }
         _ => return None,
     };
-    Some(CoherentReturnProjection {
+    Some(TerminalStorageProjection {
         carrier: storage,
         logical,
     })
@@ -1766,70 +1767,157 @@ fn cover_uncovered_register_bytes(
     covered
 }
 
-fn return_chain_in_block(
+fn register_storage_overlaps_ranges(storage: CanonicalStorageId, ranges: &[(u64, u64)]) -> bool {
+    if storage.space != CanonicalStorageSpace::Register {
+        return false;
+    }
+    let Some(storage_end) = storage.offset.checked_add(u64::from(storage.size)) else {
+        return false;
+    };
+    ranges
+        .iter()
+        .any(|&(start, end)| storage.offset < end && start < storage_end)
+}
+
+fn merge_register_ranges(ranges: &mut Vec<(u64, u64)>, incoming: &[(u64, u64)]) -> bool {
+    let previous = ranges.clone();
+    ranges.extend_from_slice(incoming);
+    ranges.sort_unstable();
+    let mut merged = Vec::with_capacity(ranges.len());
+    for &(start, end) in ranges.iter() {
+        if let Some((_, previous_end)) = merged.last_mut()
+            && start <= *previous_end
+        {
+            *previous_end = (*previous_end).max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    *ranges = merged;
+    *ranges != previous
+}
+
+fn transfer_terminal_storage_liveness(
     func: &SSAFunction,
     block_addr: u64,
-    projection: CoherentReturnProjection,
-) -> Option<Vec<VarKey>> {
+    projection: TerminalStorageProjection,
+    live_out: &[(u64, u64)],
+) -> Option<(Vec<(u64, u64)>, HashSet<VarKey>)> {
     let block = func.get_block(block_addr)?;
-    let logical_end = projection
-        .logical
-        .offset
-        .checked_add(u64::from(projection.logical.size))?;
-    let mut uncovered = vec![(projection.logical.offset, logical_end)];
-    let mut reverse_chain = Vec::new();
+    let mut uncovered = live_out.to_vec();
+    let mut preserved = HashSet::new();
     for op in block.ops.iter().rev() {
+        if uncovered.is_empty() {
+            break;
+        }
         let Some(dst) = op.dst() else {
             continue;
         };
         let Some(storage) = func.canonical_storage_for_var(dst) else {
             continue;
         };
-        if !canonical_register_storages_overlap(storage, projection.logical) {
+        if !register_storage_overlaps_ranges(storage, &uncovered) {
             continue;
         }
         if !canonical_register_storage_is_contained(projection.carrier, storage) {
             return None;
         }
         if cover_uncovered_register_bytes(&mut uncovered, storage) {
-            reverse_chain.push(VarKey::from_var(dst));
-            if uncovered.is_empty() {
-                reverse_chain.reverse();
-                return Some(reverse_chain);
-            }
+            preserved.insert(VarKey::from_var(dst));
         }
     }
 
     for phi in block.phis.iter().rev() {
+        if uncovered.is_empty() {
+            break;
+        }
         let Some(storage) = phi.canonical_storage else {
             continue;
         };
-        if !canonical_register_storages_overlap(storage, projection.logical) {
+        if !register_storage_overlaps_ranges(storage, &uncovered) {
             continue;
         }
         if !canonical_register_storage_is_contained(projection.carrier, storage) {
             return None;
         }
         if cover_uncovered_register_bytes(&mut uncovered, storage) {
-            reverse_chain.push(VarKey::from_var(&phi.dst));
-            if uncovered.is_empty() {
-                reverse_chain.reverse();
-                return Some(reverse_chain);
+            preserved.insert(VarKey::from_var(&phi.dst));
+            for (_, source) in &phi.sources {
+                preserved.insert(VarKey::from_var(source));
             }
         }
     }
-    None
+    Some((uncovered, preserved))
 }
 
-fn collect_preserved_return_defs(
+fn collect_preserved_projection_defs(
     func: &SSAFunction,
-    function_interface: Option<&SourceFunctionInterface>,
+    projection: TerminalStorageProjection,
 ) -> HashSet<VarKey> {
     let mut preserved = HashSet::new();
-    let Some(projection) = coherent_return_projection(function_interface) else {
+    let Some(logical_end) = projection
+        .logical
+        .offset
+        .checked_add(u64::from(projection.logical.size))
+    else {
         return preserved;
     };
+    let seed = [(projection.logical.offset, logical_end)];
+    let mut live_out_by_block = HashMap::<u64, Vec<(u64, u64)>>::new();
+    let mut pending = VecDeque::new();
+    for block in func.blocks() {
+        let Some(cfg_block) = func.cfg().get_block(block.addr) else {
+            continue;
+        };
+        if cfg_block.is_return()
+            && merge_register_ranges(live_out_by_block.entry(block.addr).or_default(), &seed)
+        {
+            pending.push_back(block.addr);
+        }
+    }
 
+    while let Some(block_addr) = pending.pop_front() {
+        let Some(live_out) = live_out_by_block.get(&block_addr) else {
+            continue;
+        };
+        let Some((live_in, _)) =
+            transfer_terminal_storage_liveness(func, block_addr, projection, live_out)
+        else {
+            continue;
+        };
+        if live_in.is_empty() {
+            continue;
+        }
+        for predecessor in func.predecessors(block_addr) {
+            if merge_register_ranges(live_out_by_block.entry(predecessor).or_default(), &live_in) {
+                pending.push_back(predecessor);
+            }
+        }
+    }
+
+    for (block_addr, live_out) in live_out_by_block {
+        if let Some((_, block_preserved)) =
+            transfer_terminal_storage_liveness(func, block_addr, projection, &live_out)
+        {
+            preserved.extend(block_preserved);
+        }
+    }
+    preserved
+}
+
+fn collect_preserved_return_defs_in_terminal_blocks(
+    func: &SSAFunction,
+    projection: TerminalStorageProjection,
+) -> HashSet<VarKey> {
+    let mut preserved = HashSet::new();
+    let Some(logical_end) = projection
+        .logical
+        .offset
+        .checked_add(u64::from(projection.logical.size))
+    else {
+        return preserved;
+    };
+    let seed = [(projection.logical.offset, logical_end)];
     for block in func.blocks() {
         let Some(cfg_block) = func.cfg().get_block(block.addr) else {
             continue;
@@ -1837,10 +1925,38 @@ fn collect_preserved_return_defs(
         if !cfg_block.is_return() {
             continue;
         }
-
-        if let Some(chain) = return_chain_in_block(func, block.addr, projection) {
-            preserved.extend(chain);
+        let Some((uncovered, block_preserved)) =
+            transfer_terminal_storage_liveness(func, block.addr, projection, &seed)
+        else {
+            continue;
+        };
+        if uncovered.is_empty() {
+            preserved.extend(block_preserved);
         }
+    }
+    preserved
+}
+
+fn collect_preserved_terminal_defs(
+    func: &SSAFunction,
+    function_interface: Option<&SourceFunctionInterface>,
+) -> HashSet<VarKey> {
+    let mut preserved = HashSet::new();
+    if let Some(projection) = coherent_return_projection(function_interface) {
+        preserved.extend(collect_preserved_return_defs_in_terminal_blocks(
+            func, projection,
+        ));
+    }
+    if let Some(storage) =
+        function_interface.and_then(SourceFunctionInterface::exact_frame_pointer_storage)
+    {
+        preserved.extend(collect_preserved_projection_defs(
+            func,
+            TerminalStorageProjection {
+                carrier: storage,
+                logical: storage,
+            },
+        ));
     }
 
     preserved
@@ -1864,7 +1980,7 @@ fn collect_uses(
         }
     }
 
-    uses.extend(collect_preserved_return_defs(func, function_interface));
+    uses.extend(collect_preserved_terminal_defs(func, function_interface));
 
     uses
 }
@@ -2316,7 +2432,8 @@ mod sccp_tests {
     use super::*;
     use crate::{
         CanonicalStorageId, CanonicalStorageSpace, InstPayload, SourceCarrierProjection,
-        SourceLogicalValue, SourceType, SourceTypeGraph, SsaGraph,
+        SourceLogicalValue, SourceStackSlotSpec, SourceType, SourceTypeGraph, SsaGraph,
+        StackAddressBase,
     };
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
 
@@ -2342,6 +2459,15 @@ mod sccp_tests {
         Varnode {
             space: SpaceId::Ram,
             offset: addr,
+            size,
+            meta: None,
+        }
+    }
+
+    fn make_unique(offset: u64, size: u32) -> Varnode {
+        Varnode {
+            space: SpaceId::Unique,
+            offset,
             size,
             meta: None,
         }
@@ -2379,6 +2505,150 @@ mod sccp_tests {
             Some(graph),
         )
         .expect("exact logical return interface")
+    }
+
+    fn exact_frame_pointer_interface(storage: CanonicalStorageId) -> SourceFunctionInterface {
+        SourceFunctionInterface::new_exact(
+            b"frame-liveness-test-v1".to_vec(),
+            "test-cc",
+            [],
+            SourceFunctionReturn::Void,
+            [SourceStackSlotSpec::new_local(
+                StackAddressBase::FramePointer,
+                storage,
+                -16,
+                8,
+            )],
+        )
+        .expect("exact frame-pointer interface")
+        .with_return_address_storage(register_storage(0x80, 8))
+        .expect("return-address storage")
+        .with_stack_pointer_storage(register_storage(0x40, 8))
+        .expect("stack-pointer storage")
+    }
+
+    fn inexact_frame_pointer_interface(storage: CanonicalStorageId) -> SourceFunctionInterface {
+        SourceFunctionInterface::new(
+            b"frame-liveness-test-v1".to_vec(),
+            "test-cc",
+            [],
+            SourceFunctionReturn::Void,
+            [SourceStackSlotSpec::new(
+                StackAddressBase::FramePointer,
+                storage,
+                -16,
+                8,
+            )],
+        )
+        .expect("advisory frame-pointer interface")
+    }
+
+    fn exact_stack_pointer_only_interface(storage: CanonicalStorageId) -> SourceFunctionInterface {
+        SourceFunctionInterface::new_exact(
+            b"frame-liveness-test-v1".to_vec(),
+            "test-cc",
+            [],
+            SourceFunctionReturn::Void,
+            [SourceStackSlotSpec::new_local(
+                StackAddressBase::StackPointer,
+                storage,
+                0,
+                8,
+            )],
+        )
+        .expect("exact stack-pointer-only interface")
+    }
+
+    fn frame_pop_function(frame_name: &str, frame_offset: u64) -> SSAFunction {
+        let mut arch = ArchSpec::new("frame-pop-test");
+        arch.add_register(RegisterDef::new(frame_name, frame_offset, 8));
+        arch.add_register(RegisterDef::new("stack_base", 0x40, 8));
+        arch.add_register(RegisterDef::new("pc", 0x80, 8));
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push(R2ILOp::Load {
+            dst: make_unique(0x100, 8),
+            space: SpaceId::Ram,
+            addr: make_reg(0x40, 8),
+        });
+        block.push(R2ILOp::Copy {
+            dst: make_reg(frame_offset, 8),
+            src: make_unique(0x100, 8),
+        });
+        // A non-register destination may share the FP's numeric offset. It
+        // must not terminate register-storage liveness.
+        block.push(R2ILOp::Copy {
+            dst: make_unique(frame_offset, 8),
+            src: make_const(0x55, 8),
+        });
+        block.push(R2ILOp::IntAdd {
+            dst: make_reg(0x40, 8),
+            a: make_reg(0x40, 8),
+            b: make_const(16, 8),
+        });
+        block.push(R2ILOp::Return {
+            target: make_reg(0x80, 8),
+        });
+        SSAFunction::from_blocks_raw(&[block], Some(&arch)).expect("frame pop SSA")
+    }
+
+    fn predecessor_frame_restore_function(
+        frame_offset: u64,
+        split_after_restore: bool,
+    ) -> SSAFunction {
+        let mut arch = ArchSpec::new("predecessor-frame-restore-test");
+        arch.add_register(RegisterDef::new("frame_carrier", frame_offset, 8));
+        arch.add_register(RegisterDef::new("condition", 0x20, 1));
+        arch.add_register(RegisterDef::new("stack_base", 0x40, 8));
+        arch.add_register(RegisterDef::new("pc", 0x80, 8));
+        let mut restore = R2ILBlock::new(0x1000, 4);
+        restore.push(R2ILOp::Load {
+            dst: make_unique(0x100, 8),
+            space: SpaceId::Ram,
+            addr: make_reg(0x40, 8),
+        });
+        restore.push(R2ILOp::Copy {
+            dst: make_reg(frame_offset, 8),
+            src: make_unique(0x100, 8),
+        });
+        if split_after_restore {
+            restore.push(R2ILOp::CBranch {
+                target: make_const(0x1008, 8),
+                cond: make_reg(0x20, 1),
+            });
+        } else {
+            restore.push(R2ILOp::Branch {
+                target: make_const(0x1004, 8),
+            });
+        }
+        let mut first_return = R2ILBlock::new(0x1004, 4);
+        first_return.push(R2ILOp::Return {
+            target: make_reg(0x80, 8),
+        });
+        let mut blocks = vec![restore, first_return];
+        if split_after_restore {
+            let mut second_return = R2ILBlock::new(0x1008, 4);
+            second_return.push(R2ILOp::Return {
+                target: make_reg(0x80, 8),
+            });
+            blocks.push(second_return);
+        }
+        SSAFunction::from_blocks_raw(&blocks, Some(&arch)).expect("predecessor frame restore SSA")
+    }
+
+    fn frame_restore_chain_is_present(function: &SSAFunction, storage: CanonicalStorageId) -> bool {
+        let Some(block) = function.get_block(0x1000) else {
+            return false;
+        };
+        let load_dst = block.ops.iter().find_map(|op| match op {
+            SSAOp::Load { dst, .. } => Some(dst),
+            _ => None,
+        });
+        block.ops.iter().any(|op| match op {
+            SSAOp::Copy { dst, src } => {
+                function.canonical_storage_for_var(dst) == Some(storage) && load_dst == Some(src)
+            }
+            _ => false,
+        })
     }
 
     fn return_alias_function(whole_name: &str, low_name: &str) -> SSAFunction {
@@ -3014,6 +3284,197 @@ mod sccp_tests {
             ),
             "a return-like textual name has no authority without an exact interface"
         );
+    }
+
+    #[test]
+    fn typed_dce_retains_exact_frame_pointer_pop_chain() {
+        let frame_storage = register_storage(0, 8);
+        let mut func = frame_pop_function("callee_frame_carrier", 0);
+        let interface = exact_frame_pointer_interface(frame_storage);
+
+        optimize_with_interface(&mut func, &interface);
+
+        assert!(
+            frame_restore_chain_is_present(&func, frame_storage),
+            "the exact full-width frame restore and its feeding load must remain"
+        );
+    }
+
+    #[test]
+    fn frame_pointer_liveness_requires_exact_frame_slot_authority() {
+        let frame_storage = register_storage(0, 8);
+        let mut absent = frame_pop_function("frame_like", 0);
+        let mut inexact = absent.clone();
+        let mut stack_only = absent.clone();
+
+        optimize_function(&mut absent, &OptimizationConfig::default());
+        optimize_with_interface(
+            &mut inexact,
+            &inexact_frame_pointer_interface(frame_storage),
+        );
+        optimize_with_interface(
+            &mut stack_only,
+            &exact_stack_pointer_only_interface(frame_storage),
+        );
+
+        for function in [&absent, &inexact, &stack_only] {
+            assert!(
+                !frame_restore_chain_is_present(function, frame_storage),
+                "no interface, advisory roles, and SP-only slots must not preserve FP evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_frame_pointer_liveness_uses_canonical_storage_not_name() {
+        let frame_storage = register_storage(0, 8);
+        let interface = exact_frame_pointer_interface(frame_storage);
+        let mut first = frame_pop_function("ordinary_saved_base", 0);
+        let mut renamed = frame_pop_function("unrelated_display_name", 0);
+
+        optimize_with_interface(&mut first, &interface);
+        optimize_with_interface(&mut renamed, &interface);
+
+        assert!(frame_restore_chain_is_present(&first, frame_storage));
+        assert!(frame_restore_chain_is_present(&renamed, frame_storage));
+        assert_eq!(
+            first.get_block(0x1000).expect("return block").ops.len(),
+            renamed.get_block(0x1000).expect("return block").ops.len()
+        );
+    }
+
+    #[test]
+    fn typed_frame_pointer_liveness_does_not_preserve_wrong_storage() {
+        let exact_storage = register_storage(0, 8);
+        let wrong_storage = register_storage(0x20, 8);
+        let interface = exact_frame_pointer_interface(exact_storage);
+        let mut func = frame_pop_function("frame_pointer", wrong_storage.offset);
+
+        optimize_with_interface(&mut func, &interface);
+
+        assert!(
+            !frame_restore_chain_is_present(&func, wrong_storage),
+            "a frame-pointer-like name at the wrong storage has no liveness authority"
+        );
+        let block = func.get_block(0x1000).expect("return block");
+        assert!(!block.ops.iter().any(|op| {
+            op.dst()
+                .is_some_and(|dst| func.canonical_storage_for_var(dst) == Some(wrong_storage))
+        }));
+        assert!(!block.ops.iter().any(|op| matches!(op, SSAOp::Load { .. })));
+    }
+
+    #[test]
+    fn typed_dce_retains_frame_pointer_restore_on_each_return() {
+        let frame_storage = register_storage(0, 8);
+        let mut arch = ArchSpec::new("multi-return-frame-restore-test");
+        arch.add_register(RegisterDef::new("frame_carrier", 0, 8));
+        arch.add_register(RegisterDef::new("cond", 0x20, 1));
+        arch.add_register(RegisterDef::new("stack_base", 0x40, 8));
+        arch.add_register(RegisterDef::new("pc", 0x80, 8));
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::CBranch {
+            target: make_const(0x1008, 8),
+            cond: make_reg(0x20, 1),
+        });
+        let mut left = R2ILBlock::new(0x1004, 4);
+        left.push(R2ILOp::Load {
+            dst: make_unique(0x100, 8),
+            space: SpaceId::Ram,
+            addr: make_reg(0x40, 8),
+        });
+        left.push(R2ILOp::Copy {
+            dst: make_reg(0, 8),
+            src: make_unique(0x100, 8),
+        });
+        left.push(R2ILOp::Return {
+            target: make_reg(0x80, 8),
+        });
+        let mut right = R2ILBlock::new(0x1008, 4);
+        right.push(R2ILOp::Load {
+            dst: make_unique(0x200, 8),
+            space: SpaceId::Ram,
+            addr: make_reg(0x40, 8),
+        });
+        right.push(R2ILOp::Copy {
+            dst: make_reg(0, 8),
+            src: make_unique(0x200, 8),
+        });
+        right.push(R2ILOp::Return {
+            target: make_reg(0x80, 8),
+        });
+        let mut func = SSAFunction::from_blocks_raw(&[entry, left, right], Some(&arch))
+            .expect("multi-return frame restore SSA");
+
+        optimize_with_interface(&mut func, &exact_frame_pointer_interface(frame_storage));
+
+        for address in [0x1004, 0x1008] {
+            let block = func.get_block(address).expect("return block");
+            assert!(block.ops.iter().any(|op| {
+                matches!(op, SSAOp::Copy { dst, .. }
+                    if func.canonical_storage_for_var(dst) == Some(frame_storage))
+            }));
+            assert!(block.ops.iter().any(|op| matches!(op, SSAOp::Load { .. })));
+        }
+    }
+
+    #[test]
+    fn typed_dce_retains_frame_pointer_restore_in_return_predecessor() {
+        let frame_storage = register_storage(0, 8);
+        let mut function = predecessor_frame_restore_function(frame_storage.offset, false);
+
+        optimize_with_interface(&mut function, &exact_frame_pointer_interface(frame_storage));
+
+        assert!(frame_restore_chain_is_present(&function, frame_storage));
+        assert!(matches!(
+            function
+                .get_block(0x1004)
+                .expect("terminal return block")
+                .ops
+                .as_slice(),
+            [SSAOp::Return { .. }]
+        ));
+    }
+
+    #[test]
+    fn typed_dce_retains_one_shared_restore_for_multiple_returns() {
+        let frame_storage = register_storage(0, 8);
+        let mut function = predecessor_frame_restore_function(frame_storage.offset, true);
+
+        optimize_with_interface(&mut function, &exact_frame_pointer_interface(frame_storage));
+
+        assert!(frame_restore_chain_is_present(&function, frame_storage));
+        for address in [0x1004, 0x1008] {
+            assert!(matches!(
+                function
+                    .get_block(address)
+                    .expect("terminal return block")
+                    .ops
+                    .as_slice(),
+                [SSAOp::Return { .. }]
+            ));
+        }
+    }
+
+    #[test]
+    fn typed_dce_does_not_retain_wrong_predecessor_storage() {
+        let frame_storage = register_storage(0, 8);
+        let wrong_storage = register_storage(0x18, 8);
+        let mut function = predecessor_frame_restore_function(wrong_storage.offset, true);
+
+        optimize_with_interface(&mut function, &exact_frame_pointer_interface(frame_storage));
+
+        let restore = function.get_block(0x1000).expect("restore predecessor");
+        assert!(
+            !restore
+                .ops
+                .iter()
+                .any(|op| matches!(op, SSAOp::Load { .. }))
+        );
+        assert!(!restore.ops.iter().any(|op| {
+            op.dst()
+                .is_some_and(|dst| function.canonical_storage_for_var(dst) == Some(wrong_storage))
+        }));
     }
 
     #[test]

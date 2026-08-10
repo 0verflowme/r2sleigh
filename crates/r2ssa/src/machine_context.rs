@@ -23,7 +23,7 @@ pub use r2source::{
     SourceTypeGraphError, SourceTypeKind, StackAddressBase,
 };
 
-pub const MACHINE_CONTEXT_SCHEMA_VERSION: u32 = 9;
+pub const MACHINE_CONTEXT_SCHEMA_VERSION: u32 = 10;
 /// One canonical register carrier in the immutable ABI snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct MachineAbiRegisterSlot {
@@ -313,9 +313,15 @@ impl SourceMachineContext {
             .collect();
         let mut abi_model = MachineAbiModel::from_interface(function_interface.as_ref());
         if let Some(interface) = function_interface.as_ref() {
+            let has_frame_pointer_slots = interface
+                .stack_slots()
+                .iter()
+                .any(|slot| slot.base() == StackAddressBase::FramePointer);
+            let frame_pointer_storage = interface.exact_frame_pointer_storage();
             let exact_interface_roles_exist = interface.stack_slot_roles_complete()
                 && interface.return_address_storage().is_some()
-                && interface.stack_pointer_storage().is_some();
+                && interface.stack_pointer_storage().is_some()
+                && (!has_frame_pointer_slots || frame_pointer_storage.is_some());
             let carrier_storages_are_disjoint = interface
                 .return_address_storage()
                 .is_none_or(|storage| interface.return_address_storage_is_valid(storage))
@@ -368,7 +374,8 @@ impl SourceMachineContext {
                 .is_none_or(is_exact_address_register)
                 && interface
                     .stack_pointer_storage()
-                    .is_none_or(is_exact_address_register);
+                    .is_none_or(is_exact_address_register)
+                && frame_pointer_storage.is_none_or(is_exact_address_register);
             abi_model.coherent &= exact_interface_roles_exist
                 && carrier_storages_are_disjoint
                 && declared_storages_exist
@@ -954,6 +961,95 @@ mod tests {
             Vec::new(),
         );
         assert!(!subregister_ra.abi_model().is_coherent());
+    }
+
+    #[test]
+    fn exact_machine_interface_requires_top_level_address_width_frame_pointer() {
+        let stack_pointer = register_storage(64, 8);
+        let frame_pointer = register_storage(72, 8);
+        let return_address = register_storage(80, 8);
+        let make = |frame_pointer| {
+            SourceFunctionInterface::new_exact(
+                b"exact-machine-frame-pointer".to_vec(),
+                "test-abi",
+                [],
+                SourceFunctionReturn::Void,
+                [SourceStackSlotSpec::new_local(
+                    StackAddressBase::FramePointer,
+                    frame_pointer,
+                    -8,
+                    8,
+                )],
+            )
+            .and_then(|interface| interface.with_return_address_storage(return_address))
+            .and_then(|interface| interface.with_stack_pointer_storage(stack_pointer))
+            .expect("exact disjoint frame carriers")
+        };
+        let mut arch = ArchSpec::new("exact-machine-frame-pointer");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("sp", stack_pointer.offset, 8));
+        arch.add_register(RegisterDef::new("fp", frame_pointer.offset, 8));
+        arch.add_register(RegisterDef::new("lr", return_address.offset, 8));
+
+        let coherent = SourceMachineContext::from_blocks_with_interfaces(
+            &[],
+            Some(&arch),
+            Some(make(frame_pointer)),
+            Vec::new(),
+        );
+        assert!(coherent.abi_model().is_coherent());
+
+        let narrow_frame_pointer = register_storage(88, 4);
+        arch.add_register(RegisterDef::new(
+            "narrow_fp",
+            narrow_frame_pointer.offset,
+            narrow_frame_pointer.size,
+        ));
+        let narrow = SourceMachineContext::from_blocks_with_interfaces(
+            &[],
+            Some(&arch),
+            Some(make(narrow_frame_pointer)),
+            Vec::new(),
+        );
+        assert!(!narrow.abi_model().is_coherent());
+
+        let subregister_frame_pointer = register_storage(96, 8);
+        arch.add_register(RegisterDef::sub(
+            "fp_alias",
+            subregister_frame_pointer.offset,
+            subregister_frame_pointer.size,
+            "missing_fp_parent",
+        ));
+        let subregister = SourceMachineContext::from_blocks_with_interfaces(
+            &[],
+            Some(&arch),
+            Some(make(subregister_frame_pointer)),
+            Vec::new(),
+        );
+        assert!(!subregister.abi_model().is_coherent());
+
+        let overlapping = SourceFunctionInterface::new_exact(
+            b"overlapping-machine-frame-pointer".to_vec(),
+            "test-abi",
+            [SourceAbiParameterSpec::new(0, frame_pointer)],
+            SourceFunctionReturn::Void,
+            [SourceStackSlotSpec::new_local(
+                StackAddressBase::FramePointer,
+                frame_pointer,
+                -8,
+                8,
+            )],
+        )
+        .and_then(|interface| interface.with_return_address_storage(return_address))
+        .and_then(|interface| interface.with_stack_pointer_storage(stack_pointer))
+        .expect("representable overlapping source carrier");
+        let overlapping = SourceMachineContext::from_blocks_with_interfaces(
+            &[],
+            Some(&arch),
+            Some(overlapping),
+            Vec::new(),
+        );
+        assert!(!overlapping.abi_model().is_coherent());
     }
 
     #[test]
