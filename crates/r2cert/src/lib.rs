@@ -12,18 +12,18 @@ use std::{
 
 use r2ssa::{
     AssumptionSet, BlockTerminator, CallBoundarySlot, CallSiteId, CanonicalInstructionId,
-    CanonicalInstructionSite, CanonicalStorageId, FunctionPrepareMode,
-    GENUINE_LIFT_PROVENANCE_SCHEMA_VERSION, InstPayload, LoopId, MACHINE_CONTEXT_SCHEMA_VERSION,
-    MachineAddressSpace, MachineBitVector, MachineBuildError, MachineEntity, MachineExprId,
-    MachineExprKind, MachineMemoryEndianness, MachineMemoryModel, MachineProjection, MachineType,
-    MachineValueUse, ObjectId, ObjectKind, OwnedFunctionSnapshot, PredicateId,
-    RelativeMemoryAddress, SEMANTIC_OBLIGATION_SCHEMA_VERSION,
+    CanonicalInstructionSite, CanonicalStorageId, CanonicalStorageSpace, FunctionPrepareMode,
+    GENUINE_LIFT_PROVENANCE_SCHEMA_VERSION, InstId, InstPayload, LoopId,
+    MACHINE_CONTEXT_SCHEMA_VERSION, MachineAddressSpace, MachineBitVector, MachineBuildError,
+    MachineEntity, MachineExprId, MachineExprKind, MachineMemoryEndianness, MachineMemoryModel,
+    MachineProjection, MachineType, MachineValueUse, ObjectId, ObjectKind, OwnedFunctionSnapshot,
+    PredicateId, RelativeMemoryAddress, SEMANTIC_OBLIGATION_SCHEMA_VERSION,
     SOURCE_CALL_SITE_INTERFACE_SCHEMA_VERSION, SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION, SSAOp,
     SSAVar, SemanticInstructionState, SemanticObligationComponent, SemanticObligationId,
     SemanticObligationInventory, SemanticObligationKind, SourceCallResult, SourceCallSiteIdentity,
     SourceCarrierKind, SourceFunctionReturn, SourceLogicalValue, SourceMachineContext,
     SourceReturnStackPointerFact, SsaArtifact, SsaArtifactAuthority, StackAddressBase,
-    StackAddressRoot, StructuredAccessId, StructuredLoopKind, TrustedSsaArtifact,
+    StackAddressRoot, StructuredAccessId, StructuredLoopKind, TrustedSsaArtifact, ValueId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -35,7 +35,7 @@ pub use aggregate_member::{
     CertifiedNaturalScalarAggregateLayout,
 };
 
-pub const CERTIFICATION_SCHEMA_VERSION: u32 = 22;
+pub const CERTIFICATION_SCHEMA_VERSION: u32 = 23;
 
 /// Unforgeable run-local identity for one proof authority domain.
 ///
@@ -6132,6 +6132,1422 @@ fn certified_read_matches_machine_entity(
         && *width_bits == statement.width_bits()
 }
 
+/// One exact stack interval normalized to the architectural entry stack
+/// pointer. The signed offset is diagnostic; authority remains sealed in the
+/// containing frame certificate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct CertifiedNormalizedStackRange {
+    offset: i64,
+    size_bytes: u32,
+}
+
+impl CertifiedNormalizedStackRange {
+    pub const fn offset(&self) -> i64 {
+        self.offset
+    }
+
+    pub const fn size_bytes(&self) -> u32 {
+        self.size_bytes
+    }
+}
+
+/// Exact load-and-register-restore evidence effective at one terminal return.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CertifiedFrameRestore {
+    return_control: CertifiedReturnControl,
+    restore_read: CertifiedMemoryStatement,
+    restore_copies: Box<[CertifiedFrameCopy]>,
+    restore_assignment: CertifiedFrameRegisterAssignment,
+}
+
+impl CertifiedFrameRestore {
+    pub const fn return_control(&self) -> &CertifiedReturnControl {
+        &self.return_control
+    }
+
+    pub const fn restore_read(&self) -> &CertifiedMemoryStatement {
+        &self.restore_read
+    }
+
+    pub const fn restore_copies(&self) -> &[CertifiedFrameCopy] {
+        &self.restore_copies
+    }
+
+    pub const fn restore_assignment(&self) -> &CertifiedFrameRegisterAssignment {
+        &self.restore_assignment
+    }
+}
+
+/// Exact full-width, bit-preserving copy retained inside a frame-restore chain.
+/// It grants no independent semantic disposition.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CertifiedFrameCopy {
+    producer: CanonicalInstructionId,
+    root: MachineExprId,
+    input: MachineValueUse,
+    output: r2ssa::MachineValueBinding,
+}
+
+impl CertifiedFrameCopy {
+    pub const fn producer(&self) -> CanonicalInstructionId {
+        self.producer
+    }
+
+    pub const fn root(&self) -> MachineExprId {
+        self.root
+    }
+
+    pub const fn input(&self) -> &MachineValueUse {
+        &self.input
+    }
+
+    pub const fn output(&self) -> r2ssa::MachineValueBinding {
+        self.output
+    }
+}
+
+/// Exact full-width machine assignment into the source-declared frame pointer.
+/// Restore outputs are normally dead at the semantic ledger boundary, so this
+/// witness is sealed directly from the retained machine entity instead of
+/// inventing a live-value obligation.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CertifiedFrameRegisterAssignment {
+    producer: CanonicalInstructionId,
+    root: MachineExprId,
+    input: MachineValueUse,
+    output: r2ssa::MachineValueBinding,
+    storage: CanonicalStorageId,
+}
+
+impl CertifiedFrameRegisterAssignment {
+    pub const fn producer(&self) -> CanonicalInstructionId {
+        self.producer
+    }
+
+    pub const fn root(&self) -> MachineExprId {
+        self.root
+    }
+
+    pub const fn input(&self) -> &MachineValueUse {
+        &self.input
+    }
+
+    pub const fn output(&self) -> r2ssa::MachineValueBinding {
+        self.output
+    }
+
+    pub const fn storage(&self) -> CanonicalStorageId {
+        self.storage
+    }
+}
+
+/// Sealed proof that one exact source-declared frame-pointer carrier is saved
+/// to a private normalized stack interval and restored on every return.
+///
+/// This proof consumes no semantic obligation and grants no ledger
+/// disposition. It only retains already-certified expression, memory, return,
+/// topology, and source-interface evidence from the same artifact origin.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CertifiedFramePreservation {
+    origin: CertifiedArtifactOrigin,
+    frame_pointer_storage: CanonicalStorageId,
+    stack_pointer_storage: CanonicalStorageId,
+    saved_range: CertifiedNormalizedStackRange,
+    stack_allocation: CertifiedExpr,
+    entry_save: CertifiedMemoryStatement,
+    entry_save_copies: Box<[CertifiedExpr]>,
+    frame_relation: CertifiedExpr,
+    restores: Box<[CertifiedFrameRestore]>,
+}
+
+impl CertifiedFramePreservation {
+    pub const fn origin(&self) -> &CertifiedArtifactOrigin {
+        &self.origin
+    }
+
+    pub const fn frame_pointer_storage(&self) -> CanonicalStorageId {
+        self.frame_pointer_storage
+    }
+
+    pub const fn stack_pointer_storage(&self) -> CanonicalStorageId {
+        self.stack_pointer_storage
+    }
+
+    pub const fn saved_range(&self) -> CertifiedNormalizedStackRange {
+        self.saved_range
+    }
+
+    pub const fn stack_allocation(&self) -> &CertifiedExpr {
+        &self.stack_allocation
+    }
+
+    pub const fn entry_save(&self) -> &CertifiedMemoryStatement {
+        &self.entry_save
+    }
+
+    pub const fn entry_save_copies(&self) -> &[CertifiedExpr] {
+        &self.entry_save_copies
+    }
+
+    pub const fn frame_relation(&self) -> &CertifiedExpr {
+        &self.frame_relation
+    }
+
+    pub const fn restores(&self) -> &[CertifiedFrameRestore] {
+        &self.restores
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FrameAffine {
+    offset_bits: u64,
+    width_bits: u32,
+}
+
+impl FrameAffine {
+    fn mask(width_bits: u32) -> Option<u64> {
+        match width_bits {
+            1..=63 => Some((1_u64 << width_bits) - 1),
+            64 => Some(u64::MAX),
+            _ => None,
+        }
+    }
+
+    fn add(self, bits: u64) -> Option<Self> {
+        let mask = Self::mask(self.width_bits)?;
+        Some(Self {
+            offset_bits: self.offset_bits.wrapping_add(bits) & mask,
+            ..self
+        })
+    }
+
+    fn sub(self, bits: u64) -> Option<Self> {
+        let mask = Self::mask(self.width_bits)?;
+        Some(Self {
+            offset_bits: self.offset_bits.wrapping_sub(bits) & mask,
+            ..self
+        })
+    }
+
+    fn signed_offset(self) -> Option<i64> {
+        let mask = Self::mask(self.width_bits)?;
+        let bits = self.offset_bits & mask;
+        if self.width_bits == 64 {
+            Some(bits as i64)
+        } else {
+            let sign = 1_u64 << (self.width_bits - 1);
+            Some(if bits & sign == 0 {
+                bits as i64
+            } else {
+                (bits | !mask) as i64
+            })
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FrameRestoreCandidate {
+    read: CertifiedMemoryStatement,
+    copies: Vec<CertifiedFrameCopy>,
+    assignment: CertifiedFrameRegisterAssignment,
+    read_inst: InstId,
+    assignment_inst: InstId,
+    restored_value: ValueId,
+    range: CertifiedNormalizedStackRange,
+}
+
+#[derive(Debug, Clone)]
+struct FramePreservationEvidence {
+    frame_pointer_storage: CanonicalStorageId,
+    stack_pointer_storage: CanonicalStorageId,
+    saved_range: CertifiedNormalizedStackRange,
+    stack_allocation: CertifiedExpr,
+    entry_save: CertifiedMemoryStatement,
+    entry_save_copies: Vec<CertifiedExpr>,
+    frame_relation: CertifiedExpr,
+    restores: Vec<(CertifiedReturnControl, FrameRestoreCandidate)>,
+}
+
+fn certified_register_storages_overlap(
+    left: CanonicalStorageId,
+    right: CanonicalStorageId,
+) -> bool {
+    if left.space != CanonicalStorageSpace::Register
+        || right.space != CanonicalStorageSpace::Register
+    {
+        return false;
+    }
+    let (Some(left_end), Some(right_end)) = (
+        left.offset.checked_add(u64::from(left.size)),
+        right.offset.checked_add(u64::from(right.size)),
+    ) else {
+        return true;
+    };
+    left.offset < right_end && right.offset < left_end
+}
+
+fn frame_constant_bits(artifact: &SsaArtifact, value: ValueId, width_bits: u32) -> Option<u64> {
+    let graph_value = artifact.graph().value(value)?;
+    (graph_value.var.size.checked_mul(8) == Some(width_bits))
+        .then(|| graph_value.var.constant_bits())
+        .flatten()
+        .map(|bits| bits & FrameAffine::mask(width_bits).unwrap_or(u64::MAX))
+}
+
+fn frame_affine_value(
+    artifact: &SsaArtifact,
+    value: ValueId,
+    entry_stack_pointer: ValueId,
+    width_bits: u32,
+    memo: &mut BTreeMap<ValueId, Option<FrameAffine>>,
+    visiting: &mut BTreeSet<ValueId>,
+) -> Option<FrameAffine> {
+    if value == entry_stack_pointer {
+        return Some(FrameAffine {
+            offset_bits: 0,
+            width_bits,
+        });
+    }
+    if let Some(cached) = memo.get(&value) {
+        return *cached;
+    }
+    if !visiting.insert(value) {
+        return None;
+    }
+    let result = (|| {
+        let graph = artifact.graph();
+        let graph_value = graph.value(value)?;
+        if graph_value.var.size.checked_mul(8) != Some(width_bits) {
+            return None;
+        }
+        let inst = graph.inst(graph.def_inst(value)?)?;
+        match &inst.payload {
+            InstPayload::Op(SSAOp::Copy { .. }) if inst.inputs.len() == 1 => frame_affine_value(
+                artifact,
+                inst.inputs[0],
+                entry_stack_pointer,
+                width_bits,
+                memo,
+                visiting,
+            ),
+            InstPayload::Op(SSAOp::IntAdd { .. }) if inst.inputs.len() == 2 => {
+                let left = frame_affine_value(
+                    artifact,
+                    inst.inputs[0],
+                    entry_stack_pointer,
+                    width_bits,
+                    memo,
+                    visiting,
+                );
+                let right = frame_affine_value(
+                    artifact,
+                    inst.inputs[1],
+                    entry_stack_pointer,
+                    width_bits,
+                    memo,
+                    visiting,
+                );
+                match (left, right) {
+                    (Some(base), None) => frame_constant_bits(artifact, inst.inputs[1], width_bits)
+                        .and_then(|constant| base.add(constant)),
+                    (None, Some(base)) => frame_constant_bits(artifact, inst.inputs[0], width_bits)
+                        .and_then(|constant| base.add(constant)),
+                    _ => None,
+                }
+            }
+            InstPayload::Op(SSAOp::IntSub { .. }) if inst.inputs.len() == 2 => {
+                let base = frame_affine_value(
+                    artifact,
+                    inst.inputs[0],
+                    entry_stack_pointer,
+                    width_bits,
+                    memo,
+                    visiting,
+                )?;
+                frame_constant_bits(artifact, inst.inputs[1], width_bits)
+                    .and_then(|constant| base.sub(constant))
+            }
+            InstPayload::Phi { .. } if !inst.inputs.is_empty() => {
+                let mut inputs = inst.inputs.iter().copied();
+                let first = frame_affine_value(
+                    artifact,
+                    inputs.next()?,
+                    entry_stack_pointer,
+                    width_bits,
+                    memo,
+                    visiting,
+                )?;
+                inputs
+                    .all(|input| {
+                        frame_affine_value(
+                            artifact,
+                            input,
+                            entry_stack_pointer,
+                            width_bits,
+                            memo,
+                            visiting,
+                        ) == Some(first)
+                    })
+                    .then_some(first)
+            }
+            _ => None,
+        }
+    })();
+    visiting.remove(&value);
+    memo.insert(value, result);
+    result
+}
+
+fn frame_range_segments(
+    range: CertifiedNormalizedStackRange,
+    width_bits: u32,
+) -> Option<Vec<(u128, u128)>> {
+    let modulus = 1_u128.checked_shl(width_bits)?;
+    let mask = modulus - 1;
+    let start = u128::from(range.offset as u64) & mask;
+    let size = u128::from(range.size_bytes);
+    if size == 0 || size > modulus {
+        return None;
+    }
+    let end = start + size;
+    Some(if end <= modulus {
+        vec![(start, end)]
+    } else {
+        vec![(start, modulus), (0, end - modulus)]
+    })
+}
+
+fn frame_ranges_overlap(
+    left: CertifiedNormalizedStackRange,
+    right: CertifiedNormalizedStackRange,
+    width_bits: u32,
+) -> bool {
+    let (Some(left), Some(right)) = (
+        frame_range_segments(left, width_bits),
+        frame_range_segments(right, width_bits),
+    ) else {
+        return true;
+    };
+    left.iter().any(|left| {
+        right
+            .iter()
+            .any(|right| left.0 < right.1 && right.0 < left.1)
+    })
+}
+
+fn frame_instruction_dominates(artifact: &SsaArtifact, left: InstId, right: InstId) -> bool {
+    let graph = artifact.graph();
+    let (Some(left), Some(right)) = (graph.inst(left), graph.inst(right)) else {
+        return false;
+    };
+    let (Some(left_block), Some(right_block)) = (graph.block(left.block), graph.block(right.block))
+    else {
+        return false;
+    };
+    if left.block == right.block {
+        left.ordinal < right.ordinal
+    } else {
+        artifact
+            .function()
+            .dominates(left_block.addr, right_block.addr)
+    }
+}
+
+fn frame_instruction_can_reach(artifact: &SsaArtifact, left: InstId, right: InstId) -> bool {
+    let graph = artifact.graph();
+    let (Some(left), Some(right)) = (graph.inst(left), graph.inst(right)) else {
+        return false;
+    };
+    if left.block == right.block {
+        return left.ordinal < right.ordinal;
+    }
+    let mut seen = BTreeSet::new();
+    let mut work = graph
+        .block(left.block)
+        .map(|block| block.successors.clone())
+        .unwrap_or_default();
+    while let Some(block) = work.pop() {
+        if block == right.block {
+            return true;
+        }
+        if seen.insert(block)
+            && let Some(block) = graph.block(block)
+        {
+            work.extend(block.successors.iter().copied());
+        }
+    }
+    false
+}
+
+fn frame_value_descends_from(
+    artifact: &SsaArtifact,
+    value: ValueId,
+    ancestor: ValueId,
+    visited: &mut BTreeSet<ValueId>,
+) -> bool {
+    value == ancestor
+        || visited.insert(value)
+            && artifact
+                .graph()
+                .def_inst(value)
+                .and_then(|inst| artifact.graph().inst(inst))
+                .is_some_and(|inst| {
+                    inst.inputs
+                        .iter()
+                        .copied()
+                        .any(|input| frame_value_descends_from(artifact, input, ancestor, visited))
+                })
+}
+
+fn frame_expression_is_ledgered(expression: &CertifiedExpr, ledger: &ObligationLedger) -> bool {
+    expression
+        .entity()
+        .source_obligations()
+        .iter()
+        .all(|obligation| {
+            matches!(ledger.effects(*obligation), [effect]
+            if effect.expression_evidence() == Some(expression)
+                && matches!(effect.disposition(), EffectDisposition::AbsorbedIntoExpression {
+                    producer
+                } if *producer == expression.entity().producer()))
+        })
+}
+
+fn frame_statement_is_ledgered(
+    statement: &CertifiedMemoryStatement,
+    ledger: &ObligationLedger,
+) -> bool {
+    statement.source_obligations().iter().all(|obligation| {
+        matches!(ledger.effects(*obligation), [effect]
+            if effect.statement_evidence() == Some(statement)
+                && matches!(effect.disposition(), EffectDisposition::AbsorbedIntoStatement {
+                    producer
+                } if *producer == statement.producer()))
+    })
+}
+
+fn frame_return_is_ledgered(control: &CertifiedReturnControl, ledger: &ObligationLedger) -> bool {
+    control.source_obligations().into_iter().all(|obligation| {
+        matches!(ledger.effects(obligation), [effect]
+            if effect.return_control_evidence() == Some(control)
+                && matches!(effect.disposition(), EffectDisposition::AbsorbedIntoReturn {
+                    producer
+                } if *producer == control.producer()))
+    })
+}
+
+#[derive(Clone, Copy)]
+struct FrameMechanicalWitness {
+    producer: CanonicalInstructionId,
+    root: MachineExprId,
+    output: r2ssa::MachineValueBinding,
+}
+
+fn frame_mechanical_producer_is_accounted(
+    artifact: &SsaArtifact,
+    projection: &MachineProjection,
+    witness: FrameMechanicalWitness,
+    already_accounted: &BTreeSet<SemanticObligationId>,
+    expressions: &BTreeMap<CanonicalInstructionId, CertifiedExpr>,
+    ledger: &ObligationLedger,
+) -> bool {
+    let Some(instruction) = artifact.obligations().instructions().get(&witness.producer) else {
+        return false;
+    };
+    if !already_accounted.is_subset(&instruction.obligations) {
+        return false;
+    }
+    let remaining = instruction
+        .obligations
+        .difference(already_accounted)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if remaining.is_empty() {
+        return true;
+    }
+    let Some(machine_entity) = projection.entity_for_producer(witness.producer) else {
+        return false;
+    };
+    remaining
+        .iter()
+        .all(|obligation| obligation.kind == SemanticObligationKind::LiveValueProducer)
+        && expressions
+            .get(&witness.producer)
+            .is_some_and(|expression| {
+                expression.root() == witness.root
+                    && machine_entity.root() == witness.root
+                    && machine_entity.output() == witness.output
+                    && expression.entity().source_obligations() == &remaining
+                    && frame_expression_is_ledgered(expression, ledger)
+            })
+}
+
+fn frame_topology_is_balanced(topology: &CertifiedSourceTopology) -> bool {
+    let returns = topology
+        .blocks()
+        .iter()
+        .filter(|block| matches!(block.terminator(), CertifiedSourceTerminator::Return))
+        .map(CertifiedSourceBlock::addr)
+        .collect::<BTreeSet<_>>();
+    if returns.is_empty()
+        || topology.blocks().iter().any(|block| {
+            block.successors().is_empty()
+                && !matches!(block.terminator(), CertifiedSourceTerminator::Return)
+                || matches!(
+                    block.terminator(),
+                    CertifiedSourceTerminator::Call { .. }
+                        | CertifiedSourceTerminator::IndirectCall { .. }
+                )
+        })
+    {
+        return false;
+    }
+    let mut reachable = BTreeSet::from([topology.entry_addr()]);
+    let mut work = vec![topology.entry_addr()];
+    while let Some(addr) = work.pop() {
+        let Some(block) = topology.block(addr) else {
+            return false;
+        };
+        for successor in block.successors() {
+            if reachable.insert(*successor) {
+                work.push(*successor);
+            }
+        }
+    }
+    if reachable.len() != topology.blocks().len() {
+        return false;
+    }
+    let mut reaches_return = returns;
+    loop {
+        let mut changed = false;
+        for block in topology.blocks() {
+            if block
+                .successors()
+                .iter()
+                .any(|successor| reaches_return.contains(successor))
+            {
+                changed |= reaches_return.insert(block.addr());
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    reaches_return.len() == topology.blocks().len()
+}
+
+fn frame_producer_for_inst(artifact: &SsaArtifact, inst: InstId) -> Option<CanonicalInstructionId> {
+    artifact
+        .obligations()
+        .instruction_for_inst(inst)
+        .map(|instruction| instruction.id)
+}
+
+fn frame_expression_for_inst<'a>(
+    artifact: &SsaArtifact,
+    projection: &MachineProjection,
+    expressions: &'a BTreeMap<CanonicalInstructionId, CertifiedExpr>,
+    inst: InstId,
+) -> Option<&'a CertifiedExpr> {
+    let producer = frame_producer_for_inst(artifact, inst)?;
+    let expression = expressions.get(&producer)?;
+    let entity = projection.entity_for_producer(producer)?;
+    (expression.entity().producer() == producer
+        && expression.root() == entity.root()
+        && entity.output().value() == artifact.graph().inst(inst)?.output?)
+        .then_some(expression)
+}
+
+fn frame_statement_for_inst<'a>(
+    artifact: &SsaArtifact,
+    statements: &'a BTreeMap<CanonicalInstructionId, CertifiedMemoryStatement>,
+    inst: InstId,
+) -> Option<&'a CertifiedMemoryStatement> {
+    let producer = frame_producer_for_inst(artifact, inst)?;
+    statements
+        .get(&producer)
+        .filter(|statement| statement.access().inst == inst)
+}
+
+fn frame_register_assignment_for_inst(
+    artifact: &SsaArtifact,
+    projection: &MachineProjection,
+    inst: InstId,
+    input: ValueId,
+    storage: CanonicalStorageId,
+) -> Option<CertifiedFrameRegisterAssignment> {
+    let producer = frame_producer_for_inst(artifact, inst)?;
+    let entity = projection.entity_for_producer(producer)?;
+    let graph_inst = artifact.graph().inst(inst)?;
+    let output = graph_inst.output?;
+    (entity.output().value() == output
+        && entity.output().width_bits() == storage.size.checked_mul(8)?
+        && graph_inst.canonical_storage == Some(storage))
+    .then_some(CertifiedFrameRegisterAssignment {
+        producer,
+        root: entity.root(),
+        input: MachineValueUse::from_artifact(artifact, input).ok()?,
+        output: entity.output(),
+        storage,
+    })
+}
+
+fn frame_copy_for_inst(
+    artifact: &SsaArtifact,
+    projection: &MachineProjection,
+    inst: InstId,
+    input: ValueId,
+) -> Option<CertifiedFrameCopy> {
+    let producer = frame_producer_for_inst(artifact, inst)?;
+    let entity = projection.entity_for_producer(producer)?;
+    let graph_inst = artifact.graph().inst(inst)?;
+    let output = graph_inst.output?;
+    matches!(graph_inst.payload, InstPayload::Op(SSAOp::Copy { .. }))
+        .then_some(CertifiedFrameCopy {
+            producer,
+            root: entity.root(),
+            input: MachineValueUse::from_artifact(artifact, input).ok()?,
+            output: entity.output(),
+        })
+        .filter(|copy| copy.output.value() == output)
+}
+
+fn frame_entry_save_copy_chain(
+    artifact: &SsaArtifact,
+    projection: &MachineProjection,
+    expressions: &BTreeMap<CanonicalInstructionId, CertifiedExpr>,
+    entry_frame_pointer: ValueId,
+    saved_value: ValueId,
+    save_inst: InstId,
+    width_bits: u32,
+) -> Option<Vec<CertifiedExpr>> {
+    let graph = artifact.graph();
+    let mut current = saved_value;
+    let mut expected_use = r2ssa::UseSite {
+        inst: save_inst,
+        input_idx: 1,
+    };
+    let mut reversed = Vec::new();
+    let mut visited = BTreeSet::new();
+    while current != entry_frame_pointer {
+        if !visited.insert(current) || graph.use_sites(current) != [expected_use] {
+            return None;
+        }
+        let inst_id = graph.def_inst(current)?;
+        let inst = graph.inst(inst_id)?;
+        let InstPayload::Op(SSAOp::Copy { .. }) = &inst.payload else {
+            return None;
+        };
+        let [input] = inst.inputs.as_slice() else {
+            return None;
+        };
+        if graph.value(current)?.var.size.checked_mul(8) != Some(width_bits)
+            || graph.value(*input)?.var.size.checked_mul(8) != Some(width_bits)
+        {
+            return None;
+        }
+        if !frame_instruction_dominates(artifact, inst_id, expected_use.inst) {
+            return None;
+        }
+        let expression = frame_expression_for_inst(artifact, projection, expressions, inst_id)?;
+        reversed.push(expression.clone());
+        expected_use = r2ssa::UseSite {
+            inst: inst_id,
+            input_idx: 0,
+        };
+        current = *input;
+    }
+    if graph.use_sites(entry_frame_pointer) != [expected_use] {
+        return None;
+    }
+    reversed.reverse();
+    Some(reversed)
+}
+
+fn frame_restore_copy_chain(
+    artifact: &SsaArtifact,
+    projection: &MachineProjection,
+    memory_statements: &BTreeMap<CanonicalInstructionId, CertifiedMemoryStatement>,
+    restored_input: ValueId,
+    assignment_inst: InstId,
+    width_bits: u32,
+) -> Option<(CertifiedMemoryStatement, InstId, Vec<CertifiedFrameCopy>)> {
+    let graph = artifact.graph();
+    let mut current = restored_input;
+    let mut expected_use = r2ssa::UseSite {
+        inst: assignment_inst,
+        input_idx: 0,
+    };
+    let mut reversed = Vec::new();
+    let mut visited = BTreeSet::new();
+    loop {
+        if !visited.insert(current) || graph.use_sites(current) != [expected_use] {
+            return None;
+        }
+        let inst_id = graph.def_inst(current)?;
+        let inst = graph.inst(inst_id)?;
+        if let InstPayload::Op(SSAOp::Load { .. }) = &inst.payload {
+            let read = frame_statement_for_inst(artifact, memory_statements, inst_id)?.clone();
+            if !matches!(read.kind(), CertifiedMemoryStatementKind::Read { result }
+                if result.binding().value() == current
+                    && result.binding().width_bits() == width_bits)
+                || !frame_instruction_dominates(artifact, inst_id, expected_use.inst)
+            {
+                return None;
+            }
+            reversed.reverse();
+            return Some((read, inst_id, reversed));
+        }
+        let InstPayload::Op(SSAOp::Copy { .. }) = &inst.payload else {
+            return None;
+        };
+        let [input] = inst.inputs.as_slice() else {
+            return None;
+        };
+        if graph.value(current)?.var.size.checked_mul(8) != Some(width_bits)
+            || graph.value(*input)?.var.size.checked_mul(8) != Some(width_bits)
+            || !frame_instruction_dominates(artifact, inst_id, expected_use.inst)
+        {
+            return None;
+        }
+        reversed.push(frame_copy_for_inst(artifact, projection, inst_id, *input)?);
+        expected_use = r2ssa::UseSite {
+            inst: inst_id,
+            input_idx: 0,
+        };
+        current = *input;
+    }
+}
+
+fn frame_normalized_range(
+    artifact: &SsaArtifact,
+    statement: &CertifiedMemoryStatement,
+    entry_stack_pointer: ValueId,
+    width_bits: u32,
+    memo: &mut BTreeMap<ValueId, Option<FrameAffine>>,
+) -> Option<CertifiedNormalizedStackRange> {
+    if !statement.width_bits().is_multiple_of(8) {
+        return None;
+    }
+    let affine = frame_affine_value(
+        artifact,
+        statement.address().binding().value(),
+        entry_stack_pointer,
+        width_bits,
+        memo,
+        &mut BTreeSet::new(),
+    )?;
+    Some(CertifiedNormalizedStackRange {
+        offset: affine.signed_offset()?,
+        size_bytes: statement.width_bits().checked_div(8)?,
+    })
+}
+
+fn frame_evidence_from_certified_parts(
+    artifact: &SsaArtifact,
+    projection: &MachineProjection,
+    topology: &CertifiedSourceTopology,
+    expressions: &BTreeMap<CanonicalInstructionId, CertifiedExpr>,
+    memory_statements: &BTreeMap<CanonicalInstructionId, CertifiedMemoryStatement>,
+    return_controls: &BTreeMap<CanonicalInstructionId, CertifiedReturnControl>,
+) -> Option<FramePreservationEvidence> {
+    let interface = artifact.machine_context().function_interface()?;
+    let frame_pointer_storage = interface.exact_frame_pointer_storage()?;
+    let stack_pointer_storage = interface.stack_pointer_storage()?;
+    let width_bits = frame_pointer_storage.size.checked_mul(8)?;
+    if width_bits == 0
+        || width_bits > 64
+        || frame_pointer_storage.size != stack_pointer_storage.size
+        || !frame_topology_is_balanced(topology)
+    {
+        return None;
+    }
+    let graph = artifact.graph();
+    if !graph.block(graph.entry)?.predecessors.is_empty()
+        || artifact
+            .obligations()
+            .instructions()
+            .values()
+            .any(|instruction| instruction.state == SemanticInstructionState::UnsupportedUnknown)
+        || artifact
+            .obligations()
+            .obligations()
+            .values()
+            .any(|obligation| obligation.id.kind == SemanticObligationKind::VolatileOrUnknownEffect)
+        || graph.insts.iter().any(|inst| {
+            matches!(
+                inst.payload,
+                InstPayload::Op(SSAOp::Call { .. } | SSAOp::CallInd { .. })
+            )
+        })
+    {
+        return None;
+    }
+    let exact_entry_value = |storage| {
+        let values = graph
+            .values
+            .iter()
+            .filter(|value| {
+                value.canonical_storage == Some(storage) && graph.def_inst(value.id).is_none()
+            })
+            .map(|value| value.id)
+            .collect::<Vec<_>>();
+        match values.as_slice() {
+            [value] => Some(*value),
+            _ => None,
+        }
+    };
+    let entry_frame_pointer = exact_entry_value(frame_pointer_storage)?;
+    let entry_stack_pointer = exact_entry_value(stack_pointer_storage)?;
+    if graph.values.iter().any(|value| {
+        value.canonical_storage.is_some_and(|storage| {
+            (certified_register_storages_overlap(storage, frame_pointer_storage)
+                && storage != frame_pointer_storage)
+                || (certified_register_storages_overlap(storage, stack_pointer_storage)
+                    && storage != stack_pointer_storage)
+        })
+    }) {
+        return None;
+    }
+
+    let mut affine = BTreeMap::new();
+    let mut relation: Option<(CertifiedExpr, InstId, ValueId)> = None;
+    let mut restore_candidates = Vec::<FrameRestoreCandidate>::new();
+    for inst in &graph.insts {
+        if inst.canonical_storage != Some(frame_pointer_storage) {
+            continue;
+        }
+        let output = inst.output?;
+        if frame_affine_value(
+            artifact,
+            output,
+            entry_stack_pointer,
+            width_bits,
+            &mut affine,
+            &mut BTreeSet::new(),
+        )
+        .is_some()
+        {
+            let expression = frame_expression_for_inst(artifact, projection, expressions, inst.id)?;
+            if relation
+                .replace((expression.clone(), inst.id, output))
+                .is_some()
+            {
+                return None;
+            }
+            continue;
+        }
+        if matches!(inst.payload, InstPayload::Op(SSAOp::Load { .. })) {
+            let read = frame_statement_for_inst(artifact, memory_statements, inst.id)?.clone();
+            if !matches!(read.kind(), CertifiedMemoryStatementKind::Read { result }
+                if result.binding().value() == output
+                    && result.binding().width_bits() == width_bits)
+            {
+                return None;
+            }
+            let range = frame_normalized_range(
+                artifact,
+                &read,
+                entry_stack_pointer,
+                width_bits,
+                &mut affine,
+            )?;
+            restore_candidates.push(FrameRestoreCandidate {
+                read,
+                copies: Vec::new(),
+                assignment: frame_register_assignment_for_inst(
+                    artifact,
+                    projection,
+                    inst.id,
+                    output,
+                    frame_pointer_storage,
+                )?,
+                read_inst: inst.id,
+                assignment_inst: inst.id,
+                restored_value: output,
+                range,
+            });
+            continue;
+        }
+        let InstPayload::Op(SSAOp::Copy { .. }) = &inst.payload else {
+            return None;
+        };
+        let [input] = inst.inputs.as_slice() else {
+            return None;
+        };
+        let (read, read_inst, copies) = frame_restore_copy_chain(
+            artifact,
+            projection,
+            memory_statements,
+            *input,
+            inst.id,
+            width_bits,
+        )?;
+        let assignment = frame_register_assignment_for_inst(
+            artifact,
+            projection,
+            inst.id,
+            *input,
+            frame_pointer_storage,
+        )?;
+        let range = frame_normalized_range(
+            artifact,
+            &read,
+            entry_stack_pointer,
+            width_bits,
+            &mut affine,
+        )?;
+        restore_candidates.push(FrameRestoreCandidate {
+            read,
+            copies,
+            assignment,
+            read_inst,
+            assignment_inst: inst.id,
+            restored_value: output,
+            range,
+        });
+    }
+    let (frame_relation, relation_inst, relation_value) = relation?;
+    let relation_affine = frame_affine_value(
+        artifact,
+        relation_value,
+        entry_stack_pointer,
+        width_bits,
+        &mut affine,
+        &mut BTreeSet::new(),
+    )?;
+    if relation_affine.width_bits != width_bits {
+        return None;
+    }
+
+    for inst in &graph.insts {
+        if inst.canonical_storage == Some(stack_pointer_storage) {
+            let output = inst.output?;
+            frame_affine_value(
+                artifact,
+                output,
+                entry_stack_pointer,
+                width_bits,
+                &mut affine,
+                &mut BTreeSet::new(),
+            )?;
+        }
+    }
+
+    let saves = memory_statements
+        .values()
+        .filter_map(|statement| {
+            let CertifiedMemoryStatementKind::Write { value } = statement.kind() else {
+                return None;
+            };
+            if value.binding().width_bits() != width_bits {
+                return None;
+            }
+            let copies = frame_entry_save_copy_chain(
+                artifact,
+                projection,
+                expressions,
+                entry_frame_pointer,
+                value.binding().value(),
+                statement.access().inst,
+                width_bits,
+            )?;
+            Some((statement, copies))
+        })
+        .collect::<Vec<_>>();
+    let [(entry_save, entry_save_copies)] = saves.as_slice() else {
+        return None;
+    };
+    let entry_save = (*entry_save).clone();
+    let entry_save_copies = entry_save_copies.clone();
+    let save_inst = entry_save.access().inst;
+    let save_graph_inst = graph.inst(save_inst)?;
+    let relation_graph_inst = graph.inst(relation_inst)?;
+    let entry_block = graph.block(graph.entry)?;
+    if save_graph_inst.block != graph.entry
+        || relation_graph_inst.block != graph.entry
+        || save_graph_inst.ordinal >= relation_graph_inst.ordinal
+    {
+        return None;
+    }
+    let saved_range = frame_normalized_range(
+        artifact,
+        &entry_save,
+        entry_stack_pointer,
+        width_bits,
+        &mut affine,
+    )?;
+    if saved_range.size_bytes != frame_pointer_storage.size
+        || entry_save.space() != MachineAddressSpace::Ram
+        || entry_save.word_size_bytes() != 1
+        || entry_block.addr != topology.entry_addr()
+    {
+        return None;
+    }
+    let saved_end = saved_range
+        .offset
+        .checked_add(i64::from(saved_range.size_bytes))?;
+    let allocations = graph
+        .insts
+        .iter()
+        .filter_map(|inst| {
+            (inst.canonical_storage == Some(stack_pointer_storage)).then_some(())?;
+            let output = inst.output?;
+            let allocation = frame_affine_value(
+                artifact,
+                output,
+                entry_stack_pointer,
+                width_bits,
+                &mut affine,
+                &mut BTreeSet::new(),
+            )?
+            .signed_offset()?;
+            (allocation < 0 && frame_instruction_dominates(artifact, inst.id, save_inst)).then(
+                || {
+                    frame_expression_for_inst(artifact, projection, expressions, inst.id)
+                        .map(|expression| (inst.id, output, allocation, expression.clone()))
+                },
+            )?
+        })
+        .collect::<Vec<_>>();
+    let latest_allocations = allocations
+        .iter()
+        .filter(|(candidate, _, _, _)| {
+            allocations.iter().all(|(other, _, _, _)| {
+                candidate == other || frame_instruction_dominates(artifact, *other, *candidate)
+            })
+        })
+        .collect::<Vec<_>>();
+    let [(allocation_inst, allocation_value, allocation_offset, stack_allocation)] =
+        latest_allocations.as_slice()
+    else {
+        return None;
+    };
+    if saved_range.offset < *allocation_offset
+        || saved_end > 0
+        || !frame_value_descends_from(
+            artifact,
+            entry_save.address().binding().value(),
+            *allocation_value,
+            &mut BTreeSet::new(),
+        )
+        || !frame_value_descends_from(
+            artifact,
+            relation_value,
+            *allocation_value,
+            &mut BTreeSet::new(),
+        )
+        || !frame_instruction_dominates(artifact, *allocation_inst, relation_inst)
+        || restore_candidates.iter().any(|restore| {
+            !frame_instruction_dominates(artifact, *allocation_inst, restore.read_inst)
+                || (restore.assignment_inst != restore.read_inst
+                    && !frame_instruction_dominates(
+                        artifact,
+                        *allocation_inst,
+                        restore.assignment_inst,
+                    ))
+        })
+    {
+        return None;
+    }
+    let stack_allocation = stack_allocation.clone();
+
+    for inst in &graph.insts {
+        match &inst.payload {
+            InstPayload::Op(SSAOp::Load { .. } | SSAOp::Store { .. }) => {
+                frame_statement_for_inst(artifact, memory_statements, inst.id)?;
+            }
+            InstPayload::Op(
+                SSAOp::LoadLinked { .. }
+                | SSAOp::StoreConditional { .. }
+                | SSAOp::AtomicCAS { .. }
+                | SSAOp::LoadGuarded { .. }
+                | SSAOp::StoreGuarded { .. }
+                | SSAOp::Fence { .. },
+            ) => return None,
+            _ => {}
+        }
+    }
+    let restore_reads = restore_candidates
+        .iter()
+        .map(|restore| restore.read_inst)
+        .collect::<BTreeSet<_>>();
+    for statement in memory_statements.values() {
+        if statement.space() != entry_save.space() {
+            continue;
+        }
+        let Some(range) = frame_normalized_range(
+            artifact,
+            statement,
+            entry_stack_pointer,
+            width_bits,
+            &mut affine,
+        ) else {
+            if matches!(
+                artifact.objects().objects.get(&statement.object()),
+                Some(object) if matches!(object.kind, ObjectKind::Global { .. })
+            ) {
+                continue;
+            }
+            return None;
+        };
+        if !frame_ranges_overlap(saved_range, range, width_bits) {
+            continue;
+        }
+        let is_save = statement.access().inst == save_inst && *statement == entry_save;
+        let is_restore = restore_reads.contains(&statement.access().inst)
+            && restore_candidates
+                .iter()
+                .any(|restore| restore.read == *statement && restore.range == saved_range);
+        if !is_save && !is_restore {
+            return None;
+        }
+    }
+    if restore_candidates.is_empty()
+        || restore_candidates.iter().any(|restore| {
+            restore.range != saved_range
+                || restore.read.space() != entry_save.space()
+                || restore.read.word_size_bytes() != entry_save.word_size_bytes()
+                || restore.read.endianness() != entry_save.endianness()
+                || restore.read.width_bits() != entry_save.width_bits()
+                || !frame_instruction_dominates(artifact, relation_inst, restore.read_inst)
+        })
+    {
+        return None;
+    }
+
+    for value in &graph.values {
+        if frame_affine_value(
+            artifact,
+            value.id,
+            entry_stack_pointer,
+            width_bits,
+            &mut affine,
+            &mut BTreeSet::new(),
+        )
+        .is_none()
+        {
+            continue;
+        }
+        for use_site in graph.use_sites(value.id) {
+            let consumer = graph.inst(use_site.inst)?;
+            let allowed = match &consumer.payload {
+                InstPayload::Op(SSAOp::Load { .. } | SSAOp::Store { .. }) => {
+                    use_site.input_idx == 0
+                }
+                InstPayload::Op(
+                    SSAOp::Copy { .. } | SSAOp::IntAdd { .. } | SSAOp::IntSub { .. },
+                )
+                | InstPayload::Phi { .. } => consumer.output.is_some_and(|output| {
+                    frame_affine_value(
+                        artifact,
+                        output,
+                        entry_stack_pointer,
+                        width_bits,
+                        &mut affine,
+                        &mut BTreeSet::new(),
+                    )
+                    .is_some()
+                }),
+                _ => false,
+            };
+            if !allowed {
+                return None;
+            }
+        }
+    }
+
+    let return_blocks = topology
+        .blocks()
+        .iter()
+        .filter(|block| matches!(block.terminator(), CertifiedSourceTerminator::Return))
+        .count();
+    if return_controls.len() != return_blocks {
+        return None;
+    }
+    let has_stack_pointer_def = graph
+        .insts
+        .iter()
+        .any(|inst| inst.canonical_storage == Some(stack_pointer_storage));
+    let mut used_restores = BTreeSet::new();
+    let mut restores = Vec::new();
+    for control in return_controls.values() {
+        let return_inst = artifact
+            .obligations()
+            .instructions()
+            .get(&control.producer())?
+            .inst;
+        let return_escapes_frame = std::iter::once(control.control_target())
+            .chain(control.values().iter().map(CertifiedReturnValue::value))
+            .any(|value| {
+                frame_affine_value(
+                    artifact,
+                    value.binding().value(),
+                    entry_stack_pointer,
+                    width_bits,
+                    &mut affine,
+                    &mut BTreeSet::new(),
+                )
+                .is_some()
+            });
+        let exit_is_entry = match control.exit_stack_pointer() {
+            CertifiedExitStackPointer::PreservedEntry { storage } => {
+                *storage == stack_pointer_storage && !has_stack_pointer_def
+            }
+            CertifiedExitStackPointer::ReachingValue { storage, value } => {
+                *storage == stack_pointer_storage
+                    && frame_affine_value(
+                        artifact,
+                        value.binding().value(),
+                        entry_stack_pointer,
+                        width_bits,
+                        &mut affine,
+                        &mut BTreeSet::new(),
+                    ) == Some(FrameAffine {
+                        offset_bits: 0,
+                        width_bits,
+                    })
+            }
+        };
+        let effective = restore_candidates
+            .iter()
+            .filter(|restore| {
+                frame_instruction_dominates(artifact, restore.assignment_inst, return_inst)
+            })
+            .collect::<Vec<_>>();
+        let [restore] = effective.as_slice() else {
+            return None;
+        };
+        let later_frame_definition = (relation_inst != restore.assignment_inst
+            && frame_instruction_can_reach(artifact, restore.assignment_inst, relation_inst)
+            && frame_instruction_can_reach(artifact, relation_inst, return_inst))
+            || restore_candidates.iter().any(|other| {
+                other.assignment_inst != restore.assignment_inst
+                    && frame_instruction_can_reach(
+                        artifact,
+                        restore.assignment_inst,
+                        other.assignment_inst,
+                    )
+                    && frame_instruction_can_reach(artifact, other.assignment_inst, return_inst)
+            });
+        if return_escapes_frame
+            || !exit_is_entry
+            || later_frame_definition
+            || !graph.use_sites(restore.restored_value).is_empty()
+        {
+            return None;
+        }
+        used_restores.insert(restore.assignment_inst);
+        restores.push((control.clone(), (*restore).clone()));
+    }
+    if used_restores.len() != restore_candidates.len() {
+        return None;
+    }
+    Some(FramePreservationEvidence {
+        frame_pointer_storage,
+        stack_pointer_storage,
+        saved_range,
+        stack_allocation,
+        entry_save,
+        entry_save_copies,
+        frame_relation,
+        restores,
+    })
+}
+
+struct FrameCertifiedParts<'a> {
+    projection: &'a MachineProjection,
+    topology: &'a CertifiedSourceTopology,
+    expressions: &'a BTreeMap<CanonicalInstructionId, CertifiedExpr>,
+    memory_statements: &'a BTreeMap<CanonicalInstructionId, CertifiedMemoryStatement>,
+    return_controls: &'a BTreeMap<CanonicalInstructionId, CertifiedReturnControl>,
+}
+
+fn certified_frame_preservation(
+    artifact: &SsaArtifact,
+    origin: &CertifiedArtifactOrigin,
+    parts: FrameCertifiedParts<'_>,
+    ledger: &ObligationLedger,
+) -> Option<CertifiedFramePreservation> {
+    if !origin.is_valid() || !ledger.matches_origin(origin) {
+        return None;
+    }
+    let evidence = frame_evidence_from_certified_parts(
+        artifact,
+        parts.projection,
+        parts.topology,
+        parts.expressions,
+        parts.memory_statements,
+        parts.return_controls,
+    )?;
+    let no_obligations = BTreeSet::new();
+    if !frame_expression_is_ledgered(&evidence.stack_allocation, ledger)
+        || !frame_expression_is_ledgered(&evidence.frame_relation, ledger)
+        || !frame_statement_is_ledgered(&evidence.entry_save, ledger)
+        || evidence
+            .entry_save_copies
+            .iter()
+            .any(|copy| !frame_expression_is_ledgered(copy, ledger))
+        || evidence.restores.iter().any(|(control, restore)| {
+            !frame_return_is_ledgered(control, ledger)
+                || !frame_statement_is_ledgered(&restore.read, ledger)
+                || !frame_mechanical_producer_is_accounted(
+                    artifact,
+                    parts.projection,
+                    FrameMechanicalWitness {
+                        producer: restore.assignment.producer,
+                        root: restore.assignment.root,
+                        output: restore.assignment.output,
+                    },
+                    if restore.assignment.producer == restore.read.producer() {
+                        restore.read.source_obligations()
+                    } else {
+                        &no_obligations
+                    },
+                    parts.expressions,
+                    ledger,
+                )
+                || restore.copies.iter().any(|copy| {
+                    !frame_mechanical_producer_is_accounted(
+                        artifact,
+                        parts.projection,
+                        FrameMechanicalWitness {
+                            producer: copy.producer,
+                            root: copy.root,
+                            output: copy.output,
+                        },
+                        &no_obligations,
+                        parts.expressions,
+                        ledger,
+                    )
+                })
+        })
+    {
+        return None;
+    }
+    Some(CertifiedFramePreservation {
+        origin: origin.clone(),
+        frame_pointer_storage: evidence.frame_pointer_storage,
+        stack_pointer_storage: evidence.stack_pointer_storage,
+        saved_range: evidence.saved_range,
+        stack_allocation: evidence.stack_allocation,
+        entry_save: evidence.entry_save,
+        entry_save_copies: evidence.entry_save_copies.into_boxed_slice(),
+        frame_relation: evidence.frame_relation,
+        restores: evidence
+            .restores
+            .into_iter()
+            .map(|(return_control, restore)| CertifiedFrameRestore {
+                return_control,
+                restore_read: restore.read,
+                restore_copies: restore.copies.into_boxed_slice(),
+                restore_assignment: restore.assignment,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    })
+}
+
 /// Machine semantics and their source-bound certification ledger.
 ///
 /// Construction is intentionally artifact-only: callers cannot combine a
@@ -6158,6 +7574,7 @@ pub struct CertifiedMachineFunction {
     closed_natural_loop_controls: BTreeMap<u64, CertifiedClosedNaturalLoopControl>,
     switch_topologies: BTreeMap<u64, CertifiedSwitchTopology>,
     switch_controls: BTreeMap<u64, CertifiedSwitchControl>,
+    frame_preservation: Option<CertifiedFramePreservation>,
     topology: CertifiedSourceTopology,
 }
 
@@ -6427,6 +7844,18 @@ impl CertifiedMachineFunction {
             }
         }
 
+        let frame_preservation = certified_frame_preservation(
+            artifact,
+            &origin,
+            FrameCertifiedParts {
+                projection: &projection,
+                topology: &topology,
+                expressions: &expressions,
+                memory_statements: &memory_statements,
+                return_controls: &return_controls,
+            },
+            certification.ledger(),
+        );
         Ok(Self {
             origin,
             projection,
@@ -6445,6 +7874,7 @@ impl CertifiedMachineFunction {
             closed_natural_loop_controls,
             switch_topologies,
             switch_controls,
+            frame_preservation,
             topology,
         })
     }
@@ -6467,6 +7897,10 @@ impl CertifiedMachineFunction {
 
     pub const fn stack_slots(&self) -> &BTreeMap<StackAddressRoot, CertifiedStackSlot> {
         &self.stack_slots
+    }
+
+    pub const fn frame_preservation(&self) -> Option<&CertifiedFramePreservation> {
+        self.frame_preservation.as_ref()
     }
 
     pub fn source(&self) -> &SemanticObligationInventory {
@@ -6599,6 +8033,7 @@ pub struct CertifiedMachineProjection {
     closed_natural_loop_controls: BTreeMap<u64, CertifiedClosedNaturalLoopControl>,
     switch_topologies: BTreeMap<u64, CertifiedSwitchTopology>,
     switch_controls: BTreeMap<u64, CertifiedSwitchControl>,
+    frame_preservation: Option<CertifiedFramePreservation>,
     residual_producers: BTreeSet<CanonicalInstructionId>,
     topology: CertifiedSourceTopology,
 }
@@ -7091,6 +8526,18 @@ impl CertifiedMachineProjection {
             }
         }
 
+        let frame_preservation = certified_frame_preservation(
+            artifact,
+            &origin,
+            FrameCertifiedParts {
+                projection: &projection,
+                topology: &topology,
+                expressions: &expressions,
+                memory_statements: &memory_statements,
+                return_controls: &return_controls,
+            },
+            certification.ledger(),
+        );
         Ok(Self {
             origin,
             projection,
@@ -7109,6 +8556,7 @@ impl CertifiedMachineProjection {
             closed_natural_loop_controls,
             switch_topologies,
             switch_controls,
+            frame_preservation,
             residual_producers,
             topology,
         })
@@ -7132,6 +8580,10 @@ impl CertifiedMachineProjection {
 
     pub const fn stack_slots(&self) -> &BTreeMap<StackAddressRoot, CertifiedStackSlot> {
         &self.stack_slots
+    }
+
+    pub const fn frame_preservation(&self) -> Option<&CertifiedFramePreservation> {
+        self.frame_preservation.as_ref()
     }
 
     pub fn source(&self) -> &SemanticObligationInventory {
@@ -7534,7 +8986,8 @@ fn certified_expr_from_projection(
 mod tests {
     use super::*;
     use r2il::{
-        ArchSpec, Endianness, MemoryOrdering, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode,
+        AddressSpace, ArchSpec, Endianness, MemoryOrdering, R2ILBlock, R2ILOp, RegisterDef,
+        SpaceId, Varnode,
     };
     use r2ssa::{
         CanonicalStorageId, CanonicalStorageSpace, InstPayload, SSAOp, SourceAbiParameterSpec,
@@ -7769,6 +9222,383 @@ mod tests {
         SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface)
             .expect("explicit stack artifact")
     }
+
+    #[derive(Debug, Clone, Copy)]
+    enum FrameMutation {
+        None,
+        AffineRelation,
+        TransitiveRestore,
+        DirectLoadRestore,
+        SplitAllocation,
+        OverlappingWrite,
+        Call,
+        UnknownEffect,
+        Escape,
+        WrongRestoreRange,
+        MissingRestore,
+        WrongRestoreStorage,
+        RestoreBeforeRelation,
+        PositiveSaveRange,
+        ZeroSaveRange,
+        OtherRestoreSpace,
+        CustomSaveAndRestore,
+        StaleSplitAllocation,
+        GlobalLoad,
+        UnknownPointerLoad,
+        WrongAffineRoot,
+        EntrySelfLoop,
+        UnbalancedStackPointer,
+        PartialFramePointerWrite,
+    }
+
+    fn preserved_frame_artifact(mutation: FrameMutation) -> SsaArtifact {
+        let fp = Varnode::register(0, 8);
+        let sp = Varnode::register(8, 8);
+        let ra = Varnode::register(16, 8);
+        let loaded = Varnode::unique(0x100, 8);
+        let restore_address = Varnode::unique(0x108, 8);
+        let escape_address = Varnode::unique(0x110, 8);
+        let saved_frame_pointer = Varnode::unique(0x118, 8);
+        let restore_copy = Varnode::unique(0x120, 8);
+        let stale_save_address = Varnode::unique(0x128, 8);
+        let unrelated_load = Varnode::unique(0x130, 8);
+        let mut block = R2ILBlock::new(0x3300, 4);
+        if !matches!(mutation, FrameMutation::ZeroSaveRange) {
+            if matches!(mutation, FrameMutation::PositiveSaveRange) {
+                block.push(R2ILOp::IntAdd {
+                    dst: sp.clone(),
+                    a: sp.clone(),
+                    b: Varnode::constant(8, 8),
+                });
+            } else {
+                block.push(R2ILOp::IntSub {
+                    dst: sp.clone(),
+                    a: sp.clone(),
+                    b: Varnode::constant(8, 8),
+                });
+            }
+        }
+        if matches!(mutation, FrameMutation::StaleSplitAllocation) {
+            block.push(R2ILOp::Copy {
+                dst: stale_save_address.clone(),
+                src: sp.clone(),
+            });
+        }
+        if matches!(
+            mutation,
+            FrameMutation::SplitAllocation | FrameMutation::StaleSplitAllocation
+        ) {
+            block.push(R2ILOp::IntSub {
+                dst: sp.clone(),
+                a: sp.clone(),
+                b: Varnode::constant(8, 8),
+            });
+        }
+        block.push(R2ILOp::Copy {
+            dst: saved_frame_pointer.clone(),
+            src: fp.clone(),
+        });
+        block.push(R2ILOp::Store {
+            space: if matches!(mutation, FrameMutation::CustomSaveAndRestore) {
+                SpaceId::Custom(1)
+            } else {
+                SpaceId::Ram
+            },
+            addr: if matches!(mutation, FrameMutation::StaleSplitAllocation) {
+                stale_save_address
+            } else {
+                sp.clone()
+            },
+            val: saved_frame_pointer,
+        });
+        if !matches!(mutation, FrameMutation::RestoreBeforeRelation) {
+            if matches!(mutation, FrameMutation::WrongAffineRoot) {
+                block.push(R2ILOp::Copy {
+                    dst: fp.clone(),
+                    src: ra.clone(),
+                });
+            } else if matches!(mutation, FrameMutation::AffineRelation) {
+                block.push(R2ILOp::IntAdd {
+                    dst: fp.clone(),
+                    a: sp.clone(),
+                    b: Varnode::constant(0, 8),
+                });
+            } else {
+                block.push(R2ILOp::Copy {
+                    dst: fp.clone(),
+                    src: sp.clone(),
+                });
+            }
+        }
+        match mutation {
+            FrameMutation::OverlappingWrite => block.push(R2ILOp::Store {
+                space: SpaceId::Ram,
+                addr: fp.clone(),
+                val: Varnode::constant(0, 8),
+            }),
+            FrameMutation::Call => block.push(R2ILOp::Call {
+                target: Varnode::ram(0x4400, 8),
+            }),
+            FrameMutation::UnknownEffect => block.push(R2ILOp::CallOther {
+                output: None,
+                userop: 7,
+                inputs: vec![],
+            }),
+            FrameMutation::Escape => {
+                block.push(R2ILOp::IntAdd {
+                    dst: escape_address.clone(),
+                    a: fp.clone(),
+                    b: Varnode::constant(16, 8),
+                });
+                block.push(R2ILOp::Store {
+                    space: SpaceId::Ram,
+                    addr: escape_address,
+                    val: fp.clone(),
+                });
+            }
+            FrameMutation::PartialFramePointerWrite => block.push(R2ILOp::Copy {
+                dst: Varnode::register(0, 4),
+                src: Varnode::constant(0, 4),
+            }),
+            FrameMutation::None
+            | FrameMutation::AffineRelation
+            | FrameMutation::TransitiveRestore
+            | FrameMutation::DirectLoadRestore
+            | FrameMutation::SplitAllocation
+            | FrameMutation::WrongRestoreRange
+            | FrameMutation::MissingRestore
+            | FrameMutation::WrongRestoreStorage
+            | FrameMutation::RestoreBeforeRelation
+            | FrameMutation::PositiveSaveRange
+            | FrameMutation::ZeroSaveRange
+            | FrameMutation::OtherRestoreSpace
+            | FrameMutation::CustomSaveAndRestore
+            | FrameMutation::StaleSplitAllocation
+            | FrameMutation::GlobalLoad
+            | FrameMutation::UnknownPointerLoad
+            | FrameMutation::WrongAffineRoot
+            | FrameMutation::EntrySelfLoop
+            | FrameMutation::UnbalancedStackPointer => {}
+        }
+        if matches!(mutation, FrameMutation::GlobalLoad) {
+            block.push(R2ILOp::Load {
+                dst: unrelated_load.clone(),
+                space: SpaceId::Ram,
+                addr: Varnode::constant(0x8800, 8),
+            });
+        } else if matches!(mutation, FrameMutation::UnknownPointerLoad) {
+            block.push(R2ILOp::Load {
+                dst: unrelated_load.clone(),
+                space: SpaceId::Ram,
+                addr: Varnode::register(24, 8),
+            });
+        }
+        let restore_address = if matches!(mutation, FrameMutation::WrongRestoreRange) {
+            block.push(R2ILOp::IntAdd {
+                dst: restore_address.clone(),
+                a: fp.clone(),
+                b: Varnode::constant(8, 8),
+            });
+            restore_address
+        } else if matches!(mutation, FrameMutation::RestoreBeforeRelation) {
+            sp.clone()
+        } else {
+            fp.clone()
+        };
+        if !matches!(mutation, FrameMutation::MissingRestore) {
+            block.push(R2ILOp::Load {
+                dst: if matches!(mutation, FrameMutation::DirectLoadRestore) {
+                    fp.clone()
+                } else {
+                    loaded.clone()
+                },
+                space: if matches!(
+                    mutation,
+                    FrameMutation::OtherRestoreSpace | FrameMutation::CustomSaveAndRestore
+                ) {
+                    SpaceId::Custom(1)
+                } else {
+                    SpaceId::Ram
+                },
+                addr: restore_address,
+            });
+            if !matches!(mutation, FrameMutation::DirectLoadRestore) {
+                let restored = if matches!(mutation, FrameMutation::TransitiveRestore) {
+                    block.push(R2ILOp::Copy {
+                        dst: restore_copy.clone(),
+                        src: loaded,
+                    });
+                    restore_copy
+                } else {
+                    loaded
+                };
+                block.push(R2ILOp::Copy {
+                    dst: if matches!(mutation, FrameMutation::WrongRestoreStorage) {
+                        Varnode::register(24, 8)
+                    } else {
+                        fp.clone()
+                    },
+                    src: restored,
+                });
+            }
+        }
+        if matches!(mutation, FrameMutation::RestoreBeforeRelation) {
+            block.push(R2ILOp::Copy {
+                dst: fp.clone(),
+                src: sp.clone(),
+            });
+        }
+        if !matches!(mutation, FrameMutation::UnbalancedStackPointer) {
+            block.push(R2ILOp::IntAdd {
+                dst: sp.clone(),
+                a: sp.clone(),
+                b: Varnode::constant(
+                    if matches!(
+                        mutation,
+                        FrameMutation::SplitAllocation | FrameMutation::StaleSplitAllocation
+                    ) {
+                        16
+                    } else {
+                        8
+                    },
+                    8,
+                ),
+            });
+        }
+        if matches!(mutation, FrameMutation::EntrySelfLoop) {
+            block.push(R2ILOp::Branch {
+                target: Varnode::ram(0x3300, 8),
+            });
+        } else {
+            block.push(R2ILOp::Return { target: ra.clone() });
+        }
+
+        let mut arch = ArchSpec::new("preserved-frame-test");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("fp", 0, 8));
+        arch.add_register(RegisterDef::sub("fp_low", 0, 4, "fp"));
+        arch.add_register(RegisterDef::new("sp", 8, 8));
+        arch.add_register(RegisterDef::new("ra", 16, 8));
+        arch.add_register(RegisterDef::new("other", 24, 8));
+        arch.add_space(AddressSpace::new(SpaceId::Custom(1), "other-memory", 8));
+        let storage = |offset| CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let interface = SourceFunctionInterface::new_exact(
+            b"preserved-frame-revision-1".to_vec(),
+            "test-frame-abi",
+            [],
+            SourceFunctionReturn::Void,
+            [SourceStackSlotSpec::new_local(
+                StackAddressBase::FramePointer,
+                storage(0),
+                0,
+                8,
+            )],
+        )
+        .and_then(|interface| interface.with_return_address_storage(storage(16)))
+        .and_then(|interface| interface.with_stack_pointer_storage(storage(8)))
+        .expect("exact preserved-frame interface");
+        SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface)
+            .expect("preserved-frame artifact")
+    }
+
+    fn preserved_frame_evidence(artifact: &SsaArtifact) -> Option<FramePreservationEvidence> {
+        let projection = MachineProjection::from_artifact(artifact).ok()?;
+        let topology = certified_source_topology(artifact).ok()?;
+        let memory = certified_memory_statements(artifact).ok()?;
+        let returns = certified_return_controls(artifact, &topology).ok()?;
+        let mut expressions = BTreeMap::new();
+        for entity in projection.entities() {
+            let source_obligations = entity
+                .source_obligations()
+                .iter()
+                .copied()
+                .filter(|id| id.kind == SemanticObligationKind::LiveValueProducer)
+                .collect::<BTreeSet<_>>();
+            if source_obligations.is_empty() {
+                continue;
+            }
+            let expression =
+                certified_expr_from_projection(artifact, &projection, entity, source_obligations)
+                    .ok()?;
+            expressions.insert(entity.producer(), expression);
+        }
+        frame_evidence_from_certified_parts(
+            artifact,
+            &projection,
+            &topology,
+            &expressions,
+            &memory,
+            &returns,
+        )
+    }
+
+    #[test]
+    fn generic_preserved_frame_requires_sealed_save_relation_and_all_return_restore() {
+        let artifact = preserved_frame_artifact(FrameMutation::None);
+        let evidence = preserved_frame_evidence(&artifact).expect("preserved frame evidence");
+        assert_eq!(evidence.frame_pointer_storage.offset, 0);
+        assert_eq!(evidence.stack_pointer_storage.offset, 8);
+        assert_eq!(evidence.saved_range.offset(), -8);
+        assert_eq!(evidence.saved_range.size_bytes(), 8);
+        assert_eq!(evidence.entry_save_copies.len(), 1);
+        assert_eq!(evidence.restores.len(), 1);
+        assert!(evidence.restores[0].1.copies.is_empty());
+        assert_eq!(evidence.restores[0].1.range, evidence.saved_range);
+
+        let affine =
+            preserved_frame_evidence(&preserved_frame_artifact(FrameMutation::AffineRelation))
+                .expect("affine stack-derived relation");
+        assert_eq!(affine.saved_range, evidence.saved_range);
+
+        let transitive =
+            preserved_frame_evidence(&preserved_frame_artifact(FrameMutation::TransitiveRestore))
+                .expect("bounded restore copy chain");
+        assert_eq!(transitive.restores[0].1.copies.len(), 1);
+        for mutation in [
+            FrameMutation::DirectLoadRestore,
+            FrameMutation::SplitAllocation,
+            FrameMutation::GlobalLoad,
+        ] {
+            assert!(
+                preserved_frame_evidence(&preserved_frame_artifact(mutation)).is_some(),
+                "supported exact shape: {mutation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_preserved_frame_refuses_mutated_authority_inputs() {
+        for mutation in [
+            FrameMutation::OverlappingWrite,
+            FrameMutation::Call,
+            FrameMutation::UnknownEffect,
+            FrameMutation::Escape,
+            FrameMutation::WrongRestoreRange,
+            FrameMutation::MissingRestore,
+            FrameMutation::WrongRestoreStorage,
+            FrameMutation::RestoreBeforeRelation,
+            FrameMutation::PositiveSaveRange,
+            FrameMutation::ZeroSaveRange,
+            FrameMutation::OtherRestoreSpace,
+            FrameMutation::CustomSaveAndRestore,
+            FrameMutation::StaleSplitAllocation,
+            FrameMutation::UnknownPointerLoad,
+            FrameMutation::WrongAffineRoot,
+            FrameMutation::EntrySelfLoop,
+            FrameMutation::UnbalancedStackPointer,
+            FrameMutation::PartialFramePointerWrite,
+        ] {
+            assert!(
+                preserved_frame_evidence(&preserved_frame_artifact(mutation)).is_none(),
+                "mutation must refuse: {mutation:?}"
+            );
+        }
+    }
+
     fn obligation_ids(source: &SemanticObligationInventory) -> Vec<SemanticObligationId> {
         source.obligations().keys().copied().collect()
     }
