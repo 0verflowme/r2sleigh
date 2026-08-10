@@ -268,6 +268,16 @@ pub struct MachineBitVector {
 }
 
 impl MachineBitVector {
+    pub const fn zero(width_bits: u32) -> Option<Self> {
+        if width_bits == 0 || width_bits > 64 {
+            return None;
+        }
+        Some(Self {
+            width_bits,
+            bits: 0,
+        })
+    }
+
     pub const fn width_bits(self) -> u32 {
         self.width_bits
     }
@@ -2106,6 +2116,18 @@ mod tests {
             block.push(op);
         }
         SsaArtifact::raw(&[block], None).expect("test SSA artifact")
+    }
+
+    #[test]
+    fn zero_bitvector_is_checked_and_exact() {
+        for width_bits in [1, 8, 16, 32, 64] {
+            let zero = MachineBitVector::zero(width_bits).expect("supported zero bitvector");
+            assert_eq!(zero.width_bits(), width_bits);
+            assert_eq!(zero.bits(), 0);
+        }
+        assert_eq!(MachineBitVector::zero(0), None);
+        assert_eq!(MachineBitVector::zero(65), None);
+        assert_eq!(MachineBitVector::zero(u32::MAX), None);
     }
 
     #[test]

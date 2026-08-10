@@ -1446,7 +1446,10 @@ pub fn check_terminal_return_differential(
             );
         }
     };
-    let region = match CertifiedTerminalReturnBlockRegion::from_accounting(accounting) {
+    let region = match CertifiedTerminalReturnBlockRegion::from_accounting(
+        accounting,
+        certified.frame_preservation(),
+    ) {
         Ok(region) => region,
         Err(error) => {
             return candidate_not_admitted(

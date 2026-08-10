@@ -23,14 +23,14 @@
 #if R2SLEIGH_RADARE_ABI_V2 != 138
 #error "r2sleigh generated V2 header must target exactly radare2 ABI 138"
 #endif
-#if R_ANAL_FUNCTION_SNAPSHOT_SCHEMA_VERSION != 8
-#error "r2sleigh borrowed snapshot transport requires function snapshot schema 8"
+#if R_ANAL_FUNCTION_SNAPSHOT_SCHEMA_VERSION != 9
+#error "r2sleigh borrowed snapshot transport requires function snapshot schema 9"
 #endif
-#if R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 != 8
-#error "r2sleigh generated V2 header must target function snapshot schema 8"
+#if R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 != 9
+#error "r2sleigh generated V2 header must target function snapshot schema 9"
 #endif
-#if R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2 != 2
-#error "r2sleigh generated V2 header must target snapshot accessor schema 2"
+#if R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2 != 3
+#error "r2sleigh generated V2 header must target snapshot accessor schema 3"
 #endif
 
 static bool sleigh_radare_storage_view(R2SleighRadareRegisterStorageViewV2 *destination, const RAnalSnapshotRegisterStorageView *source) {
@@ -185,6 +185,9 @@ static uint8_t sleigh_radare_interface_storage_name(const void *opaque, int32_t 
 		break;
 	case 2:
 		source_kind = R_ANAL_SNAPSHOT_INTERFACE_STORAGE_STACK_POINTER;
+		break;
+	case 3:
+		source_kind = R_ANAL_SNAPSHOT_INTERFACE_STORAGE_FRAME_POINTER;
 		break;
 	default:
 		return 0;
@@ -555,6 +558,18 @@ static uint8_t sleigh_radare_return_mechanism_view(const void *opaque, R2SleighR
 	return 1;
 }
 
+static uint8_t sleigh_radare_frame_pointer_storage_view(const void *opaque, R2SleighRadareRegisterStorageViewV2 *destination) {
+	if (!opaque || !destination) {
+		return 0;
+	}
+	*destination = (R2SleighRadareRegisterStorageViewV2) {0};
+	RAnalSnapshotRegisterStorageView source = {0};
+	if (!r_anal_function_snapshot_interface_frame_pointer_storage (opaque, &source)) {
+		return 0;
+	}
+	return sleigh_radare_storage_view (destination, &source)? 1: 0;
+}
+
 static const R2SleighRadareAccessorsV2 sleigh_radare_accessors = {
 	.struct_size = sizeof (sleigh_radare_accessors),
 	.abi_version = R2SLEIGH_RADARE_ABI_V2,
@@ -587,6 +602,7 @@ static const R2SleighRadareAccessorsV2 sleigh_radare_accessors = {
 	.successor_view = sleigh_radare_successor_view,
 	.external_exit = sleigh_radare_external_exit,
 	.return_mechanism_view = sleigh_radare_return_mechanism_view,
+	.frame_pointer_storage_view = sleigh_radare_frame_pointer_storage_view,
 };
 
 /* Remaining direct value declarations for the Rust library. */
@@ -1274,6 +1290,7 @@ static uint32_t sleigh_v2_engine_cache_reset(void) {
  */
 static R2ILContext *sleigh_ctx = NULL;
 static char *sleigh_arch = NULL;
+static char *sleigh_reg_profile = NULL;
 static char *sleigh_arch_override = NULL;
 static R_TH_LOCAL R2SleighPlannerResultV2 *sleigh_pending_target_plan = NULL;
 
@@ -6169,6 +6186,48 @@ static void configure_context_runtime_options(RAnal *anal, R2ILContext *ctx) {
 	(void)sleigh_v2_context_set_semantic_metadata (ctx, !sleigh_mode_is_fast (anal));
 }
 
+static bool cache_context_reg_profile(R2ILContext *ctx) {
+	if (!ctx || ctx != sleigh_ctx) {
+		return false;
+	}
+	char *profile = NULL;
+	uint32_t status = sleigh_v2_context_reg_profile (ctx, &profile);
+	if (status != R2SLEIGH_STATUS_OK_V2 || R_STR_ISEMPTY (profile)) {
+		free (profile);
+		return false;
+	}
+	free (sleigh_reg_profile);
+	sleigh_reg_profile = profile;
+	return true;
+}
+
+static bool install_context_reg_profile(RAnal *anal, R2ILContext *ctx) {
+	if (!anal || !anal->reg || !ctx || ctx != sleigh_ctx
+			|| R_STR_ISEMPTY (sleigh_reg_profile)) {
+		return false;
+	}
+	if (anal->reg->reg_profile_str
+			&& !strcmp (anal->reg->reg_profile_str, sleigh_reg_profile)) {
+		return true;
+	}
+	return r_anal_set_reg_profile (anal, sleigh_reg_profile)
+		&& anal->reg->reg_profile_str
+		&& !strcmp (anal->reg->reg_profile_str, sleigh_reg_profile);
+}
+
+static bool release_sleigh_context(void) {
+	if (sleigh_ctx) {
+		uint32_t status = sleigh_v2_context_free (sleigh_ctx);
+		if (status != R2SLEIGH_STATUS_OK_V2) {
+			return false;
+		}
+		sleigh_ctx = NULL;
+	}
+	free (sleigh_reg_profile);
+	sleigh_reg_profile = NULL;
+	return true;
+}
+
 R2ILContext *get_context(RAnal *anal) {
 	if (!anal || !anal->config || !anal->config->arch[0]) {
 		return NULL;
@@ -6222,18 +6281,18 @@ R2ILContext *get_context(RAnal *anal) {
 
 	/* Check if we need to reinitialize */
 	if (sleigh_ctx && sleigh_arch && !strcmp (sleigh_arch, sleigh_arch_str)) {
+		if (!install_context_reg_profile (anal, sleigh_ctx)) {
+			R_LOG_DEBUG ("r2sleigh: cached register profile installation failed for %s", sleigh_arch_str);
+			return NULL;
+		}
 		configure_context_runtime_options (anal, sleigh_ctx);
 		return sleigh_ctx;
 	}
 
 	/* Free old context */
-	if (sleigh_ctx) {
-		uint32_t free_status = sleigh_v2_context_free (sleigh_ctx);
-		if (free_status != R2SLEIGH_STATUS_OK_V2) {
-			R_LOG_ERROR ("r2sleigh: refusing architecture reload because context free failed (%u)", free_status);
-			return NULL;
-		}
-		sleigh_ctx = NULL;
+	if (!release_sleigh_context ()) {
+		R_LOG_ERROR ("r2sleigh: refusing architecture reload because context free failed");
+		return NULL;
 	}
 	free (sleigh_arch);
 	sleigh_arch = NULL;
@@ -6245,6 +6304,9 @@ R2ILContext *get_context(RAnal *anal) {
 		/* Optional-arch builds are expected to miss some backends; stay silent
 		 * so unsupported architectures fall back to other anal plugins. */
 		R_LOG_DEBUG ("r2sleigh: backend unavailable for %s", sleigh_arch_str);
+		if (sleigh_ctx && !release_sleigh_context ()) {
+			R_LOG_ERROR ("r2sleigh: retaining failed context handle after create failure");
+		}
 		return NULL;
 	}
 
@@ -6256,24 +6318,24 @@ R2ILContext *get_context(RAnal *anal) {
 			R_LOG_DEBUG ("r2sleigh: %s", err);
 		}
 		free (err);
-		uint32_t free_status = sleigh_v2_context_free (sleigh_ctx);
-		if (free_status == R2SLEIGH_STATUS_OK_V2) {
-			sleigh_ctx = NULL;
-		} else {
-			R_LOG_ERROR ("r2sleigh: retaining failed context handle (%u)", free_status);
+		if (!release_sleigh_context ()) {
+			R_LOG_ERROR ("r2sleigh: retaining failed context handle");
 		}
 		return NULL;
 	}
 
-	sleigh_arch = strdup (sleigh_arch_str);
-
-	/* Set register profile from Sleigh definitions */
-	char *profile = NULL;
-	(void)sleigh_v2_context_reg_profile (sleigh_ctx, &profile);
-	if (profile) {
-		r_anal_set_reg_profile (anal, profile);
-		free (profile);
+	/* Establish the exact Sleigh register geometry before any typed consumer. */
+	char *loaded_arch = strdup (sleigh_arch_str);
+	if (!loaded_arch || !cache_context_reg_profile (sleigh_ctx)
+			|| !install_context_reg_profile (anal, sleigh_ctx)) {
+		R_LOG_DEBUG ("r2sleigh: failed to install register profile for %s", sleigh_arch_str);
+		free (loaded_arch);
+		if (!release_sleigh_context ()) {
+			R_LOG_ERROR ("r2sleigh: retaining context after register profile failure");
+		}
+		return NULL;
 	}
+	sleigh_arch = loaded_arch;
 
 	configure_context_runtime_options (anal, sleigh_ctx);
 	return sleigh_ctx;
@@ -6372,13 +6434,9 @@ static bool sleigh_fini(RAnal *anal) {
 	if (!sleigh_v2_planner_result_retry_pending ()) {
 		return false;
 	}
-	if (sleigh_ctx) {
-		uint32_t free_status = sleigh_v2_context_free (sleigh_ctx);
-		if (free_status != R2SLEIGH_STATUS_OK_V2) {
-			R_LOG_ERROR ("r2sleigh: retaining context after free failure (%u)", free_status);
-			return false;
-		}
-		sleigh_ctx = NULL;
+	if (!release_sleigh_context ()) {
+		R_LOG_ERROR ("r2sleigh: retaining context after free failure");
+		return false;
 	}
 	free (sleigh_arch);
 	sleigh_arch = NULL;
@@ -6981,13 +7039,9 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			arg++; // skip space
 			while (*arg == ' ') arg++;
 			if (*arg) {
-				if (sleigh_ctx) {
-					uint32_t free_status = sleigh_v2_context_free (sleigh_ctx);
-					if (free_status != R2SLEIGH_STATUS_OK_V2) {
-						R_LOG_ERROR ("r2sleigh: architecture unchanged because context free failed (%u)", free_status);
-						return strdup ("");
-					}
-					sleigh_ctx = NULL;
+				if (!release_sleigh_context ()) {
+					R_LOG_ERROR ("r2sleigh: architecture unchanged because context free failed");
+					return strdup ("");
 				}
 				/* Set override */
 				free (sleigh_arch_override);
@@ -9136,6 +9190,17 @@ static int sleigh_eligible(RAnal *anal) {
 	return ctx ? 10 : -1;
 }
 
+/* Reapply the cached context profile before variable/DWARF integration. The
+ * context is process-global while register state belongs to each RAnal. */
+static bool sleigh_pre_analysis(RAnal *anal) {
+	R2ILContext *ctx = get_context (anal);
+	if (!ctx || !install_context_reg_profile (anal, ctx)) {
+		R_LOG_DEBUG ("r2sleigh: pre-analysis register profile installation failed");
+		return false;
+	}
+	return true;
+}
+
 /* Called at end of aaaa for global post-analysis passes */
 static bool sleigh_post_analysis(RAnal *anal) {
 	R2ILContext *ctx = get_context (anal);
@@ -9315,6 +9380,7 @@ RAnalPlugin r_anal_plugin_sleigh = {
 	.op = sleigh_op,
 	.cmd = sleigh_cmd,
 	/* Deep integration callbacks */
+	.pre_analysis = sleigh_pre_analysis,
 	.analyze_fcn = sleigh_analyze_fcn,
 	.recover_vars = sleigh_recover_vars,
 	.get_data_refs = sleigh_get_data_refs,

@@ -13,8 +13,9 @@ use r2cert::{
     CertifiedConditionalControl, CertifiedControlTruthiness, CertifiedDirectCall,
     CertifiedDirectControl, CertifiedLedgerClosure, CertifiedMachineFunction,
     CertifiedMachineProjection, CertifiedMemoryStatement, CertifiedNormalizedStackRange,
-    CertifiedReturnControl, CertifiedSourceTopology, CertifiedSwitchControl,
-    CertifiedTypedRegionKind, EffectDisposition, ObligationLedger, TypedRegionMapping,
+    CertifiedReturnControl, CertifiedReturnRegisterDefinition, CertifiedSourceTopology,
+    CertifiedSwitchControl, CertifiedTypedRegionKind, EffectDisposition, ObligationLedger,
+    TypedRegionMapping,
 };
 use r2ssa::{
     CanonicalInstructionId, CanonicalStorageId, SemanticInstructionState,
@@ -27,11 +28,11 @@ use crate::semantic_c::{
     SEMANTIC_C_SCHEMA_VERSION, SemanticCCallArgumentValue, SemanticCDirectCall, SemanticCError,
     SemanticCExprId, SemanticCExpressionLayer, SemanticCFrameMechanicsAuthority,
     SemanticCFrameMechanicsOwner, SemanticCIdentityScope, SemanticCReturn,
-    SemanticCReturnMechanicsOwner, SemanticCScope, semantic_call_from_control,
-    semantic_return_from_control,
+    SemanticCReturnMechanicsOwner, SemanticCReturnRegisterDefinition, SemanticCScope,
+    semantic_call_from_control, semantic_return_from_control,
 };
 
-pub const CERTIFIED_REGION_SCHEMA_VERSION: u32 = 10;
+pub const CERTIFIED_REGION_SCHEMA_VERSION: u32 = 13;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum SingleBlockAccountingScope {
@@ -53,6 +54,7 @@ pub enum RegionResidualReason {
 pub enum RegionObligationDisposition {
     AbsorbedIntoExpression { producer: CanonicalInstructionId },
     AbsorbedIntoStatement { producer: CanonicalInstructionId },
+    AbsorbedIntoFrameMechanics { producer: CanonicalInstructionId },
     AbsorbedIntoCall { producer: CanonicalInstructionId },
     AbsorbedIntoControl { producer: CanonicalInstructionId },
     AbsorbedIntoReturn { producer: CanonicalInstructionId },
@@ -507,6 +509,72 @@ struct CertifiedBlockParts {
     return_controls: Vec<CertifiedReturnControl>,
 }
 
+fn semantic_return_definition_matches(
+    semantic: &SemanticCReturnRegisterDefinition,
+    certified: &CertifiedReturnRegisterDefinition,
+    layer: &SemanticCExpressionLayer,
+) -> bool {
+    certified.value().producer() == Some(certified.producer())
+        && semantic.storage() == certified.storage()
+        && semantic.binding() == certified.value().binding()
+        && semantic.producer() == certified.producer()
+        && layer
+            .entity_for_producer(certified.producer())
+            .is_some_and(|entity| {
+                entity.output() == semantic.binding()
+                    && entity.root() == semantic.expression()
+                    && layer.expr_type(entity.root()).ok() == Some(certified.value().ty())
+            })
+        && certified.storage().size.checked_mul(8) == Some(certified.value().binding().width_bits())
+}
+
+fn semantic_return_matches_control(
+    returned: &SemanticCReturn,
+    control: &CertifiedReturnControl,
+    layer: &SemanticCExpressionLayer,
+) -> bool {
+    returned.control_target() == control.control_target().binding()
+        && returned.source_obligations() == &control.source_obligations()
+        && returned.values().len() == control.values().len()
+        && returned
+            .values()
+            .iter()
+            .zip(control.values())
+            .all(|(semantic, certified)| {
+                let Some(producer) = certified.value().producer() else {
+                    return false;
+                };
+                semantic.slot() == certified.slot()
+                    && semantic.binding() == certified.value().binding()
+                    && semantic.producer() == producer
+                    && layer.entity_for_producer(producer).is_some_and(|entity| {
+                        entity.root() == semantic.expression()
+                            && entity.output() == semantic.binding()
+                            && layer.expr_type(entity.root()).ok() == Some(certified.value().ty())
+                    })
+            })
+        && returned.register_compositions().len() == control.register_compositions().len()
+        && returned
+            .register_compositions()
+            .iter()
+            .zip(control.register_compositions())
+            .all(|(semantic, certified)| {
+                semantic.slot() == certified.slot()
+                    && semantic_return_definition_matches(semantic.base(), certified.base(), layer)
+                    && semantic.overlays().len() == certified.overlays().len()
+                    && semantic.overlays().iter().zip(certified.overlays()).all(
+                        |(semantic_overlay, certified_overlay)| {
+                            semantic_overlay.offset_bytes() == certified_overlay.offset_bytes()
+                                && semantic_return_definition_matches(
+                                    semantic_overlay.definition(),
+                                    certified_overlay.definition(),
+                                    layer,
+                                )
+                        },
+                    )
+            })
+}
+
 impl CertifiedSingleBlockAccounting {
     pub fn from_certified(certified: &CertifiedMachineFunction) -> Result<Self, RegionBuildError> {
         let block_addr = only_source_block(certified.topology())?;
@@ -925,36 +993,34 @@ impl CertifiedSingleBlockAccounting {
                     let [effect] = ledger.effects(*obligation) else {
                         return Err(RegionBuildError::ExpressionObligationMismatch(*obligation));
                     };
-                    let disposition = match effect.disposition() {
-                        EffectDisposition::AbsorbedIntoExpression { producer }
-                            if producer == id
+                    let exact_ledger_owner = match obligation.kind {
+                        SemanticObligationKind::LiveValueProducer => {
+                            effect.disposition()
+                                == &(EffectDisposition::AbsorbedIntoExpression { producer: *id })
                                 && effect.expression_evidence().is_some_and(|expression| {
                                     expression.entity().producer() == *id
                                         && expression
                                             .entity()
                                             .source_obligations()
                                             .contains(obligation)
-                                }) =>
-                        {
-                            RegionObligationDisposition::AbsorbedIntoExpression { producer: *id }
+                                })
                         }
-                        EffectDisposition::AbsorbedIntoStatement { producer }
-                            if producer == id
+                        SemanticObligationKind::ObservableMemoryRead
+                        | SemanticObligationKind::ObservableMemoryWrite => {
+                            effect.disposition()
+                                == &(EffectDisposition::AbsorbedIntoStatement { producer: *id })
                                 && effect.statement_evidence().is_some_and(|statement| {
                                     statement.producer() == *id
                                         && statement.source_obligations().contains(obligation)
-                                }) =>
-                        {
-                            RegionObligationDisposition::AbsorbedIntoStatement { producer: *id }
+                                })
                         }
-                        _ => {
-                            return Err(RegionBuildError::ExpressionObligationMismatch(
-                                *obligation,
-                            ));
-                        }
+                        _ => false,
                     };
+                    if !exact_ledger_owner {
+                        return Err(RegionBuildError::ExpressionObligationMismatch(*obligation));
+                    }
                     (
-                        disposition,
+                        RegionObligationDisposition::AbsorbedIntoFrameMechanics { producer: *id },
                         Some(RegionTypedOwner::FrameMechanics {
                             source_producer: *id,
                             frame_pointer_storage: mechanics_owner.frame_pointer_storage(),
@@ -1647,8 +1713,7 @@ impl CertifiedSingleBlockAccounting {
                         && !return_producers.is_empty()
                 }),
                 (
-                    RegionObligationDisposition::AbsorbedIntoExpression { producer }
-                    | RegionObligationDisposition::AbsorbedIntoStatement { producer },
+                    RegionObligationDisposition::AbsorbedIntoFrameMechanics { producer },
                     Some(RegionTypedOwner::FrameMechanics {
                         source_producer,
                         frame_pointer_storage,
@@ -2156,21 +2221,7 @@ impl CertifiedSingleBlockAccounting {
             let semantic_matches = semantic_return_entities
                 .get(producer)
                 .is_some_and(|returned| {
-                    returned.control_target() == control.control_target().binding()
-                        && returned.source_obligations() == &control.source_obligations()
-                        && returned.values().len() == control.values().len()
-                        && returned.values().iter().zip(control.values()).all(
-                            |(semantic, certified)| {
-                                semantic.slot() == certified.slot()
-                                    && semantic.binding() == certified.value().binding()
-                                    && expression_entities
-                                        .get(&certified.value().producer().unwrap_or(*producer))
-                                        .is_some_and(|entity| {
-                                            entity.root() == semantic.expression()
-                                                && entity.output() == semantic.binding()
-                                        })
-                            },
-                        )
+                    semantic_return_matches_control(returned, control, &self.expression_layer)
                 });
             if !semantic_matches {
                 invalid.push(format!(
@@ -2385,45 +2436,6 @@ impl CertifiedSingleBlockAccounting {
         for mapping in &self.mappings {
             match mapping.disposition {
                 RegionObligationDisposition::AbsorbedIntoExpression { producer } => {
-                    if let Some(RegionTypedOwner::FrameMechanics {
-                        source_producer,
-                        frame_pointer_storage,
-                        saved_range,
-                        return_producers,
-                    }) = &mapping.owner
-                    {
-                        let owner_matches = producer == *source_producer
-                            && frame_entities.get(&producer).is_some_and(|owner| {
-                                owner.frame_pointer_storage() == *frame_pointer_storage
-                                    && owner.saved_range() == *saved_range
-                                    && owner.return_producers() == return_producers.as_ref()
-                                    && owner.source_obligations().contains(&mapping.obligation)
-                            });
-                        let ledger_matches = matches!(
-                            self.ledger.effects(mapping.obligation),
-                            [effect]
-                                if effect.disposition()
-                                    == &EffectDisposition::AbsorbedIntoExpression { producer }
-                                    && effect.expression_evidence().is_some_and(|expression| {
-                                        expression.entity().producer() == producer
-                                            && expression
-                                                .entity()
-                                                .source_obligations()
-                                                .contains(&mapping.obligation)
-                                    })
-                        );
-                        if mapping.obligation.kind != SemanticObligationKind::LiveValueProducer
-                            || producer != mapping.obligation.instruction
-                            || !owner_matches
-                            || !ledger_matches
-                        {
-                            invalid.push(format!(
-                                "invalid frame-mechanics expression mapping for {}",
-                                mapping.obligation
-                            ));
-                        }
-                        continue;
-                    }
                     let entity_matches = expression_entities.get(&producer).is_some_and(|entity| {
                         entity.source_obligations().contains(&mapping.obligation)
                     });
@@ -2442,45 +2454,6 @@ impl CertifiedSingleBlockAccounting {
                     }
                 }
                 RegionObligationDisposition::AbsorbedIntoStatement { producer } => {
-                    if let Some(RegionTypedOwner::FrameMechanics {
-                        source_producer,
-                        frame_pointer_storage,
-                        saved_range,
-                        return_producers,
-                    }) = &mapping.owner
-                    {
-                        let owner_matches = producer == *source_producer
-                            && frame_entities.get(&producer).is_some_and(|owner| {
-                                owner.frame_pointer_storage() == *frame_pointer_storage
-                                    && owner.saved_range() == *saved_range
-                                    && owner.return_producers() == return_producers.as_ref()
-                                    && owner.source_obligations().contains(&mapping.obligation)
-                            });
-                        let ledger_matches = matches!(
-                            self.ledger.effects(mapping.obligation),
-                            [effect]
-                                if effect.disposition()
-                                    == &EffectDisposition::AbsorbedIntoStatement { producer }
-                                    && effect.statement_evidence().is_some_and(|statement| {
-                                        statement.producer() == producer
-                                            && statement.source_obligations().contains(&mapping.obligation)
-                                    })
-                        );
-                        if !matches!(
-                            mapping.obligation.kind,
-                            SemanticObligationKind::ObservableMemoryRead
-                                | SemanticObligationKind::ObservableMemoryWrite
-                        ) || producer != mapping.obligation.instruction
-                            || !owner_matches
-                            || !ledger_matches
-                        {
-                            invalid.push(format!(
-                                "invalid frame-mechanics statement mapping for {}",
-                                mapping.obligation
-                            ));
-                        }
-                        continue;
-                    }
                     let statement_matches =
                         statement_entities.get(&producer).is_some_and(|statement| {
                             statement.source_obligations().contains(&mapping.obligation)
@@ -2508,6 +2481,66 @@ impl CertifiedSingleBlockAccounting {
                     {
                         invalid.push(format!(
                             "invalid memory-statement mapping for {}",
+                            mapping.obligation
+                        ));
+                    }
+                }
+                RegionObligationDisposition::AbsorbedIntoFrameMechanics { producer } => {
+                    let owner_matches = matches!(
+                        &mapping.owner,
+                        Some(RegionTypedOwner::FrameMechanics {
+                            source_producer,
+                            frame_pointer_storage,
+                            saved_range,
+                            return_producers,
+                        }) if producer == *source_producer
+                            && frame_entities.get(&producer).is_some_and(|owner| {
+                                owner.frame_pointer_storage() == *frame_pointer_storage
+                                    && owner.saved_range() == *saved_range
+                                    && owner.return_producers() == return_producers.as_ref()
+                                    && owner.source_obligations().contains(&mapping.obligation)
+                            })
+                    );
+                    let ledger_matches = matches!(
+                        self.ledger.effects(mapping.obligation),
+                        [effect]
+                            if match mapping.obligation.kind {
+                                SemanticObligationKind::LiveValueProducer => {
+                                    effect.disposition()
+                                        == &EffectDisposition::AbsorbedIntoExpression { producer }
+                                        && effect.expression_evidence().is_some_and(|expression| {
+                                            expression.entity().producer() == producer
+                                                && expression
+                                                    .entity()
+                                                    .source_obligations()
+                                                    .contains(&mapping.obligation)
+                                        })
+                                }
+                                SemanticObligationKind::ObservableMemoryRead
+                                | SemanticObligationKind::ObservableMemoryWrite => {
+                                    effect.disposition()
+                                        == &EffectDisposition::AbsorbedIntoStatement { producer }
+                                        && effect.statement_evidence().is_some_and(|statement| {
+                                            statement.producer() == producer
+                                                && statement
+                                                    .source_obligations()
+                                                    .contains(&mapping.obligation)
+                                        })
+                                }
+                                _ => false,
+                            }
+                    );
+                    if producer != mapping.obligation.instruction
+                        || !owner_matches
+                        || !ledger_matches
+                        || !self.instructions.iter().any(|instruction| {
+                            instruction.source == producer
+                                && instruction.expression_producer.is_none()
+                                && instruction.statement_producer.is_none()
+                        })
+                    {
+                        invalid.push(format!(
+                            "invalid frame-mechanics mapping for {}",
                             mapping.obligation
                         ));
                     }
@@ -2764,8 +2797,29 @@ impl CertifiedSingleBlockAccounting {
                                         )
                                     })
                                 });
+                                let compositions_are_grounded =
+                                    control.register_compositions().iter().all(|composition| {
+                                        std::iter::once(composition.base())
+                                            .chain(
+                                                composition
+                                                    .overlays()
+                                                    .iter()
+                                                    .map(|overlay| overlay.definition()),
+                                            )
+                                            .all(|definition| {
+                                                definition.value().producer()
+                                                    == Some(definition.producer())
+                                                    && expression_entities
+                                                        .get(&definition.producer())
+                                                        .is_some_and(|entity| {
+                                                            entity.output()
+                                                                == definition.value().binding()
+                                                        })
+                                            })
+                                    });
                                 control.source_obligations().contains(&mapping.obligation)
                                     && values_are_grounded
+                                    && compositions_are_grounded
                                     && self.source_block().is_some_and(|block| {
                                         matches!(
                                             block.terminator(),
@@ -2908,7 +2962,7 @@ fn ledger_mapping_for_typed_owner(
 ) -> Option<TypedRegionMapping> {
     if matches!(
         &mapping.owner,
-        Some(RegionTypedOwner::ReturnMechanics { .. })
+        Some(RegionTypedOwner::ReturnMechanics { .. } | RegionTypedOwner::FrameMechanics { .. })
     ) {
         let [effect] = ledger.effects(mapping.obligation) else {
             return None;
@@ -2925,6 +2979,7 @@ fn ledger_mapping_for_typed_owner(
         RegionObligationDisposition::AbsorbedIntoStatement { producer } => {
             EffectDisposition::AbsorbedIntoStatement { producer }
         }
+        RegionObligationDisposition::AbsorbedIntoFrameMechanics { .. } => return None,
         RegionObligationDisposition::AbsorbedIntoCall { producer } => {
             EffectDisposition::AbsorbedIntoCall { producer }
         }

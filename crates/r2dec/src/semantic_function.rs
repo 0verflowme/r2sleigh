@@ -13,7 +13,7 @@ use crate::semantic_c::{
     logical_return_type, render_logical_return_statement, storage_type, value_name,
 };
 
-pub const CERTIFIED_SEMANTIC_C_FUNCTION_SCHEMA_VERSION: u32 = 3;
+pub const CERTIFIED_SEMANTIC_C_FUNCTION_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum CertifiedSemanticCFunctionScope {
@@ -82,7 +82,10 @@ impl CertifiedSemanticCFunction {
     ) -> Result<Self, CertifiedSemanticCFunctionError> {
         let certified = CertifiedMachineProjection::from_artifact(trusted)?;
         let accounting = CertifiedSingleBlockAccounting::from_projection(&certified)?;
-        let region = CertifiedTerminalReturnBlockRegion::from_accounting(accounting)?;
+        let region = CertifiedTerminalReturnBlockRegion::from_accounting(
+            accounting,
+            certified.frame_preservation(),
+        )?;
         Self::from_terminal_region(region)
     }
 
@@ -117,35 +120,28 @@ impl CertifiedSemanticCFunction {
             .expression_layer()
             .function_interface()
             .ok_or(CertifiedSemanticCFunctionError::MissingFunctionInterface)?;
-        match (interface.return_kind(), interface.return_projection()) {
-            (SemanticCFunctionReturn::Void, None) => {}
-            (SemanticCFunctionReturn::Register { ty, .. }, Some(projection))
-                if projection.physical_ty() == ty => {}
-            _ => return Err(CertifiedSemanticCFunctionError::MissingReturnProjection),
-        }
-        if let [value] = returned.values() {
-            let return_position = region
-                .layer()
-                .steps()
-                .iter()
-                .position(|step| step.source() == region.return_producer())
-                .ok_or(CertifiedSemanticCFunctionError::MissingReturnedEntity)?;
-            let value_position = region
-                .layer()
-                .steps()
-                .iter()
-                .position(|step| {
-                    step.value().is_some_and(|reference| {
-                        region
-                            .layer()
-                            .resolve_value(reference)
-                            .is_some_and(|entity| entity.output() == value.binding())
-                    })
-                })
-                .ok_or(CertifiedSemanticCFunctionError::MissingReturnedEntity)?;
-            if value_position >= return_position {
-                return Err(CertifiedSemanticCFunctionError::MissingReturnedEntity);
+        let return_matches = match (interface.return_kind(), interface.return_projection()) {
+            (SemanticCFunctionReturn::Void, None) => {
+                returned.values().is_empty() && returned.register_compositions().is_empty()
             }
+            (SemanticCFunctionReturn::Register { storage, ty }, Some(projection))
+                if projection.physical_ty() == ty =>
+            {
+                returned.single_operand().is_some_and(|operand| {
+                    matches!(
+                        operand.slot(),
+                        r2ssa::CallBoundarySlot::Register {
+                            index: 0,
+                            storage: actual,
+                        } if actual == *storage
+                    ) && operand.physical_width_bits() == ty.width_bits()
+                        && region.operand_is_grounded_before_return(operand)
+                })
+            }
+            _ => false,
+        };
+        if !return_matches {
+            return Err(CertifiedSemanticCFunctionError::MissingReturnProjection);
         }
         Ok(Self {
             schema_version: CERTIFIED_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
@@ -238,21 +234,36 @@ impl CertifiedSemanticCFunction {
             .region
             .returned()
             .ok_or(CertifiedSemanticCFunctionError::MissingReturnedEntity)?;
-        match returned.values() {
-            [] => writeln!(
-                &mut output,
-                "\t{}",
-                render_logical_return_statement(interface, None)?
-            )
-            .expect("String writes cannot fail"),
-            [value] => writeln!(
-                &mut output,
-                "\t{}",
-                render_logical_return_statement(interface, Some(&value_name(value.binding())))?
-            )
-            .expect("String writes cannot fail"),
+        let return_value = match interface.return_kind() {
+            SemanticCFunctionReturn::Void
+                if returned.values().is_empty() && returned.register_compositions().is_empty() =>
+            {
+                None
+            }
+            SemanticCFunctionReturn::Register { storage, ty } => {
+                let operand = returned
+                    .single_operand()
+                    .filter(|operand| {
+                        matches!(
+                            operand.slot(),
+                            r2ssa::CallBoundarySlot::Register {
+                                index: 0,
+                                storage: actual,
+                            } if actual == *storage
+                        ) && operand.physical_width_bits() == ty.width_bits()
+                            && self.region.operand_is_grounded_before_return(*operand)
+                    })
+                    .ok_or(CertifiedSemanticCFunctionError::MissingReturnedEntity)?;
+                Some(expressions.render_return_operand(operand)?)
+            }
             _ => return Err(CertifiedSemanticCFunctionError::MissingReturnedEntity),
-        }
+        };
+        writeln!(
+            &mut output,
+            "\t{}",
+            render_logical_return_statement(interface, return_value.as_deref())?
+        )
+        .expect("String writes cannot fail");
         output.push_str("}\n");
         Ok(output)
     }

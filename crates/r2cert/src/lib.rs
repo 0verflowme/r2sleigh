@@ -21,9 +21,11 @@ use r2ssa::{
     SOURCE_CALL_SITE_INTERFACE_SCHEMA_VERSION, SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION, SSAOp,
     SSAVar, SemanticInstructionState, SemanticObligationComponent, SemanticObligationId,
     SemanticObligationInventory, SemanticObligationKind, SourceCallResult, SourceCallSiteIdentity,
-    SourceCarrierKind, SourceFunctionReturn, SourceLogicalValue, SourceMachineContext,
-    SourceReturnStackPointerFact, SsaArtifact, SsaArtifactAuthority, StackAddressBase,
-    StackAddressRoot, StructuredAccessId, StructuredLoopKind, TrustedSsaArtifact, ValueId,
+    SourceCarrierKind, SourceFunctionInterface, SourceFunctionReturn, SourceLogicalValue,
+    SourceMachineContext, SourceReturnBoundaryFact, SourceReturnRegisterCompositionFact,
+    SourceReturnRegisterDefinitionFact, SourceReturnStackPointerFact, SsaArtifact,
+    SsaArtifactAuthority, StackAddressBase, StackAddressRoot, StructuredAccessId,
+    StructuredLoopKind, TrustedSsaArtifact, ValueId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -35,7 +37,7 @@ pub use aggregate_member::{
     CertifiedNaturalScalarAggregateLayout,
 };
 
-pub const CERTIFICATION_SCHEMA_VERSION: u32 = 24;
+pub const CERTIFICATION_SCHEMA_VERSION: u32 = 27;
 
 /// Unforgeable run-local identity for one proof authority domain.
 ///
@@ -1348,6 +1350,81 @@ pub struct CertifiedReturnValue {
     source_obligation: SemanticObligationId,
 }
 
+/// One exact canonical register definition retained by a composed return.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CertifiedReturnRegisterDefinition {
+    storage: CanonicalStorageId,
+    value: MachineValueUse,
+    producer: CanonicalInstructionId,
+}
+
+impl CertifiedReturnRegisterDefinition {
+    pub const fn storage(&self) -> CanonicalStorageId {
+        self.storage
+    }
+
+    pub const fn value(&self) -> &MachineValueUse {
+        &self.value
+    }
+
+    pub const fn producer(&self) -> CanonicalInstructionId {
+        self.producer
+    }
+}
+
+/// One exact ordered contained-slice write over a composed return base.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CertifiedReturnRegisterOverlay {
+    definition: CertifiedReturnRegisterDefinition,
+    offset_bytes: u32,
+}
+
+impl CertifiedReturnRegisterOverlay {
+    pub const fn definition(&self) -> &CertifiedReturnRegisterDefinition {
+        &self.definition
+    }
+
+    pub const fn offset_bytes(&self) -> u32 {
+        self.offset_bytes
+    }
+}
+
+/// Sealed exact reconstruction of one full-width ABI return register.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CertifiedReturnRegisterComposition {
+    slot: CallBoundarySlot,
+    base: CertifiedReturnRegisterDefinition,
+    overlays: Box<[CertifiedReturnRegisterOverlay]>,
+    source_obligation: SemanticObligationId,
+}
+
+impl CertifiedReturnRegisterComposition {
+    pub const fn slot(&self) -> CallBoundarySlot {
+        self.slot
+    }
+
+    pub const fn base(&self) -> &CertifiedReturnRegisterDefinition {
+        &self.base
+    }
+
+    pub const fn overlays(&self) -> &[CertifiedReturnRegisterOverlay] {
+        &self.overlays
+    }
+
+    pub const fn source_obligation(&self) -> SemanticObligationId {
+        self.source_obligation
+    }
+
+    /// Exact base-then-overlay value order bound by the source obligation.
+    pub fn ordered_values(&self) -> impl Iterator<Item = &MachineValueUse> {
+        std::iter::once(self.base.value()).chain(
+            self.overlays
+                .iter()
+                .map(|overlay| overlay.definition.value()),
+        )
+    }
+}
+
 /// Exact typed return-address carrier consumed by one machine return.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CertifiedReturnAddress {
@@ -1416,6 +1493,7 @@ pub struct CertifiedReturnControl {
     return_address: CertifiedReturnAddress,
     exit_stack_pointer: CertifiedExitStackPointer,
     values: Box<[CertifiedReturnValue]>,
+    register_compositions: Box<[CertifiedReturnRegisterComposition]>,
     return_obligation: SemanticObligationId,
 }
 
@@ -1440,6 +1518,10 @@ impl CertifiedReturnControl {
         &self.values
     }
 
+    pub const fn register_compositions(&self) -> &[CertifiedReturnRegisterComposition] {
+        &self.register_compositions
+    }
+
     pub const fn return_obligation(&self) -> SemanticObligationId {
         self.return_obligation
     }
@@ -1447,6 +1529,11 @@ impl CertifiedReturnControl {
     pub fn source_obligations(&self) -> BTreeSet<SemanticObligationId> {
         std::iter::once(self.return_obligation)
             .chain(self.values.iter().map(|value| value.source_obligation))
+            .chain(
+                self.register_compositions
+                    .iter()
+                    .map(|composition| composition.source_obligation),
+            )
             .collect()
     }
 
@@ -1456,7 +1543,12 @@ impl CertifiedReturnControl {
         if self.return_obligation.instruction != self.producer
             || self.return_obligation.kind != SemanticObligationKind::Return
             || self.return_obligation.component != SemanticObligationComponent::Whole
-            || self.source_obligations().len() != self.values.len().saturating_add(1)
+            || self.source_obligations().len()
+                != self
+                    .values
+                    .len()
+                    .saturating_add(self.register_compositions.len())
+                    .saturating_add(1)
             || self.return_address.value != self.control_target
         {
             return Err(CertificationError::ObligationNotMapped(
@@ -1496,6 +1588,32 @@ impl CertifiedReturnControl {
                 ));
             }
         }
+        for composition in &self.register_compositions {
+            if composition.overlays.is_empty()
+                || composition.source_obligation.instruction != self.producer
+                || composition.source_obligation.kind != SemanticObligationKind::ReturnValue
+                || composition.source_obligation.component != return_component(composition.slot)
+            {
+                return Err(CertificationError::ObligationNotMapped(
+                    composition.source_obligation,
+                ));
+            }
+            let obligation = source
+                .obligations()
+                .get(&composition.source_obligation)
+                .ok_or(CertificationError::UnknownObligation(
+                    composition.source_obligation,
+                ))?;
+            let inputs = composition
+                .ordered_values()
+                .map(|value| value.binding().value())
+                .collect::<Vec<_>>();
+            if obligation.source_inst != self.source_inst || obligation.inputs != inputs {
+                return Err(CertificationError::ObligationNotMapped(
+                    composition.source_obligation,
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -1507,6 +1625,47 @@ fn return_component(slot: CallBoundarySlot) -> SemanticObligationComponent {
         }
         CallBoundarySlot::Stack(offset) => SemanticObligationComponent::StackOffset(offset),
     }
+}
+
+fn return_control_matches_interface(
+    control: &CertifiedReturnControl,
+    interface: &SourceFunctionInterface,
+) -> bool {
+    match interface.return_kind() {
+        SourceFunctionReturn::Void => {
+            control.values().is_empty() && control.register_compositions().is_empty()
+        }
+        SourceFunctionReturn::Register { storage } => {
+            let slot = CallBoundarySlot::Register { index: 0, storage };
+            (matches!(control.values(), [value] if value.slot() == slot)
+                && control.register_compositions().is_empty())
+                || (control.values().is_empty()
+                    && matches!(
+                        control.register_compositions(),
+                        [composition] if composition.slot() == slot
+                    ))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReturnClosureContract {
+    Terminal,
+    PlainRam,
+    DirectCall,
+    Conditional,
+    Switch,
+    Loop,
+}
+
+fn return_control_matches_closure(
+    control: &CertifiedReturnControl,
+    interface: &SourceFunctionInterface,
+    contract: ReturnClosureContract,
+) -> bool {
+    return_control_matches_interface(control, interface)
+        && (contract == ReturnClosureContract::Terminal
+            || control.register_compositions().is_empty())
 }
 
 /// Sealed topology-and-predicate witness for the first admitted natural loop.
@@ -2438,7 +2597,7 @@ pub enum CertifiedTypedRegionKind {
     CarrierFreeLoopTerminalReturnFunction,
 }
 
-pub const CERTIFIED_TERMINAL_RETURN_REGION_CONTRACT_VERSION: u32 = 3;
+pub const CERTIFIED_TERMINAL_RETURN_REGION_CONTRACT_VERSION: u32 = 5;
 pub const CERTIFIED_PLAIN_RAM_MEMORY_RETURN_CONTRACT_VERSION: u32 = 3;
 pub const CERTIFIED_DIRECT_CALL_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 3;
 pub const CERTIFIED_CONDITIONAL_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 3;
@@ -2638,6 +2797,23 @@ fn terminal_return_mechanics_producers(
     Some(candidates.difference(&semantic).copied().collect())
 }
 
+fn terminal_return_semantic_producers(
+    return_control: &CertifiedReturnControl,
+) -> BTreeSet<CanonicalInstructionId> {
+    return_control
+        .values()
+        .iter()
+        .map(CertifiedReturnValue::value)
+        .chain(
+            return_control
+                .register_compositions()
+                .iter()
+                .flat_map(CertifiedReturnRegisterComposition::ordered_values),
+        )
+        .filter_map(MachineValueUse::producer)
+        .collect()
+}
+
 fn exact_terminal_return_mechanical_reads(
     origin: &CertifiedArtifactOrigin,
     ledger: &ObligationLedger,
@@ -2684,10 +2860,7 @@ fn exact_terminal_return_mechanical_reads(
     ]
     .into_iter()
     .flatten();
-    let semantic_seeds = return_control
-        .values()
-        .iter()
-        .filter_map(|returned| returned.value().producer());
+    let semantic_seeds = terminal_return_semantic_producers(return_control);
     let mechanics = terminal_return_mechanics_producers(&dependencies, roots, semantic_seeds)?;
 
     let mut reads = BTreeSet::new();
@@ -2698,7 +2871,7 @@ fn exact_terminal_return_mechanical_reads(
         .filter(|obligation| obligation.id.kind == SemanticObligationKind::ObservableMemoryRead)
     {
         if !mechanics.contains(&obligation.id.instruction) {
-            return None;
+            continue;
         }
         let [effect] = ledger.effects(obligation.id) else {
             return None;
@@ -2729,9 +2902,85 @@ fn exact_terminal_return_mechanical_reads(
     Some(reads)
 }
 
+fn exact_terminal_frame_memory_obligations(
+    origin: &CertifiedArtifactOrigin,
+    ledger: &ObligationLedger,
+    mappings: &BTreeMap<SemanticObligationId, &TypedRegionMapping>,
+    return_control: &CertifiedReturnControl,
+    frame: &CertifiedFramePreservation,
+) -> Option<BTreeSet<SemanticObligationId>> {
+    if frame.origin() != origin {
+        return None;
+    }
+    let matching_restores = frame
+        .restores()
+        .iter()
+        .filter(|restore| restore.return_control() == return_control)
+        .collect::<Vec<_>>();
+    let [restore] = matching_restores.as_slice() else {
+        return None;
+    };
+    let mut statements = vec![(
+        frame.entry_save(),
+        SemanticObligationKind::ObservableMemoryWrite,
+    )];
+    statements.push((
+        restore.restore_read(),
+        SemanticObligationKind::ObservableMemoryRead,
+    ));
+    if let Some(return_address_read) = restore.return_address_read() {
+        statements.push((
+            return_address_read,
+            SemanticObligationKind::ObservableMemoryRead,
+        ));
+    }
+
+    let mut obligations = BTreeSet::new();
+    for (statement, expected_kind) in statements {
+        let kind_matches = matches!(
+            (expected_kind, statement.kind()),
+            (
+                SemanticObligationKind::ObservableMemoryRead,
+                CertifiedMemoryStatementKind::Read { .. }
+            ) | (
+                SemanticObligationKind::ObservableMemoryWrite,
+                CertifiedMemoryStatementKind::Write { .. }
+            )
+        );
+        if !kind_matches
+            || statement.execution()
+                != CertifiedMemoryExecutionPolicy::ExactlyOnceInSourceOrderViaHelper
+            || statement.source_obligations().is_empty()
+        {
+            return None;
+        }
+        for obligation in statement.source_obligations() {
+            let [effect] = ledger.effects(*obligation) else {
+                return None;
+            };
+            let mapping = mappings.get(obligation)?;
+            if obligation.instruction != statement.producer()
+                || obligation.kind != expected_kind
+                || !origin.source().obligations().contains_key(obligation)
+                || effect.disposition()
+                    != &(EffectDisposition::AbsorbedIntoStatement {
+                        producer: statement.producer(),
+                    })
+                || effect.statement_evidence() != Some(statement)
+                || mapping.source_disposition() != effect.disposition()
+                || !obligations.insert(*obligation)
+            {
+                return None;
+            }
+        }
+    }
+    Some(obligations)
+}
+
 fn terminal_return_obligation_is_admitted(
     obligation: SemanticObligationId,
     mechanical_reads: &BTreeSet<SemanticObligationId>,
+    frame_memory: &BTreeSet<SemanticObligationId>,
 ) -> bool {
     matches!(
         obligation.kind,
@@ -2740,12 +2989,26 @@ fn terminal_return_obligation_is_admitted(
             | SemanticObligationKind::ReturnValue
     ) || obligation.kind == SemanticObligationKind::ObservableMemoryRead
         && mechanical_reads.contains(&obligation)
+        || matches!(
+            obligation.kind,
+            SemanticObligationKind::ObservableMemoryRead
+                | SemanticObligationKind::ObservableMemoryWrite
+        ) && frame_memory.contains(&obligation)
 }
 
 pub fn certify_terminal_return_region(
     origin: &CertifiedArtifactOrigin,
     ledger: &ObligationLedger,
     mappings: impl IntoIterator<Item = TypedRegionMapping>,
+) -> Result<CertifiedLedgerClosure, LedgerClosureError> {
+    certify_terminal_return_region_with_frame(origin, ledger, mappings, None)
+}
+
+pub fn certify_terminal_return_region_with_frame(
+    origin: &CertifiedArtifactOrigin,
+    ledger: &ObligationLedger,
+    mappings: impl IntoIterator<Item = TypedRegionMapping>,
+    frame: Option<&CertifiedFramePreservation>,
 ) -> Result<CertifiedLedgerClosure, LedgerClosureError> {
     if !origin.is_valid()
         || !ledger.matches_origin(origin)
@@ -2818,33 +3081,39 @@ pub fn certify_terminal_return_region(
             != &(EffectDisposition::AbsorbedIntoReturn {
                 producer: return_control.producer(),
             })
-        || match origin
+        || origin
             .machine_context()
             .source()
             .function_interface()
-            .map(|interface| interface.return_kind())
-        {
-            Some(SourceFunctionReturn::Void) => !return_control.values().is_empty(),
-            Some(SourceFunctionReturn::Register { storage }) => !matches!(
-                return_control.values(),
-                [value]
-                    if value.slot()
-                        == CallBoundarySlot::Register { index: 0, storage }
-            ),
-            None => true,
-        }
+            .is_none_or(|interface| {
+                !return_control_matches_closure(
+                    return_control,
+                    interface,
+                    ReturnClosureContract::Terminal,
+                )
+            })
     {
         return Err(LedgerClosureError::InvalidRegionTopology);
     }
     let mechanical_reads =
         exact_terminal_return_mechanical_reads(origin, ledger, &by_obligation, return_control)
             .ok_or(LedgerClosureError::InvalidRegionTopology)?;
-    if origin
-        .source()
-        .obligations()
-        .values()
-        .any(|obligation| !terminal_return_obligation_is_admitted(obligation.id, &mechanical_reads))
-    {
+    let frame_memory = frame
+        .map(|frame| {
+            exact_terminal_frame_memory_obligations(
+                origin,
+                ledger,
+                &by_obligation,
+                return_control,
+                frame,
+            )
+            .ok_or(LedgerClosureError::InvalidRegionTopology)
+        })
+        .transpose()?
+        .unwrap_or_default();
+    if origin.source().obligations().values().any(|obligation| {
+        !terminal_return_obligation_is_admitted(obligation.id, &mechanical_reads, &frame_memory)
+    }) {
         return Err(LedgerClosureError::InvalidRegionTopology);
     }
     for obligation in origin.source().obligations().values() {
@@ -2864,8 +3133,9 @@ pub fn certify_terminal_return_region(
                             if *producer == return_control.producer()
                     )
             }
-            SemanticObligationKind::ObservableMemoryRead => {
-                mechanical_reads.contains(&obligation.id)
+            SemanticObligationKind::ObservableMemoryRead
+            | SemanticObligationKind::ObservableMemoryWrite => {
+                (mechanical_reads.contains(&obligation.id) || frame_memory.contains(&obligation.id))
                     && matches!(
                         effect.disposition(),
                         EffectDisposition::AbsorbedIntoStatement { producer }
@@ -2979,21 +3249,17 @@ pub fn certify_plain_ram_memory_return_region(
             != &(EffectDisposition::AbsorbedIntoReturn {
                 producer: return_control.producer(),
             })
-        || match origin
+        || origin
             .machine_context()
             .source()
             .function_interface()
-            .map(|interface| interface.return_kind())
-        {
-            Some(SourceFunctionReturn::Void) => !return_control.values().is_empty(),
-            Some(SourceFunctionReturn::Register { storage }) => !matches!(
-                return_control.values(),
-                [value]
-                    if value.slot()
-                        == CallBoundarySlot::Register { index: 0, storage }
-            ),
-            None => true,
-        }
+            .is_none_or(|interface| {
+                !return_control_matches_closure(
+                    return_control,
+                    interface,
+                    ReturnClosureContract::PlainRam,
+                )
+            })
     {
         return Err(LedgerClosureError::InvalidRegionTopology);
     }
@@ -3231,21 +3497,17 @@ pub fn certify_direct_call_terminal_return_region(
             == &(EffectDisposition::AbsorbedIntoReturn {
                 producer: return_control.producer(),
             })
-        && match origin
+        && origin
             .machine_context()
             .source()
             .function_interface()
-            .map(|interface| interface.return_kind())
-        {
-            Some(SourceFunctionReturn::Void) => return_control.values().is_empty(),
-            Some(SourceFunctionReturn::Register { storage }) => matches!(
-                return_control.values(),
-                [value]
-                    if value.slot()
-                        == CallBoundarySlot::Register { index: 0, storage }
-            ),
-            None => false,
-        };
+            .is_some_and(|interface| {
+                return_control_matches_closure(
+                    return_control,
+                    interface,
+                    ReturnClosureContract::DirectCall,
+                )
+            });
     if !return_matches {
         return Err(LedgerClosureError::InvalidRegionTopology);
     }
@@ -3501,15 +3763,11 @@ pub fn certify_conditional_terminal_return_region(
         };
         let return_matches = return_control.producer() == producer
             && return_effect.disposition() == &EffectDisposition::AbsorbedIntoReturn { producer }
-            && match interface.return_kind() {
-                SourceFunctionReturn::Void => return_control.values().is_empty(),
-                SourceFunctionReturn::Register { storage } => matches!(
-                    return_control.values(),
-                    [value]
-                        if value.slot()
-                            == CallBoundarySlot::Register { index: 0, storage }
-                ),
-            };
+            && return_control_matches_closure(
+                return_control,
+                interface,
+                ReturnClosureContract::Conditional,
+            );
         if !return_matches {
             return Err(LedgerClosureError::InvalidRegionDisposition(
                 return_obligation.id,
@@ -3753,14 +4011,8 @@ pub fn certify_switch_terminal_return_region(
                 return_obligation.id,
             ));
         };
-        let matches_interface = match interface.return_kind() {
-            SourceFunctionReturn::Void => control.values().is_empty(),
-            SourceFunctionReturn::Register { storage } => matches!(
-                control.values(),
-                [value]
-                    if value.slot() == CallBoundarySlot::Register { index: 0, storage }
-            ),
-        };
+        let matches_interface =
+            return_control_matches_closure(control, interface, ReturnClosureContract::Switch);
         if control.producer() != producer
             || effect.disposition() != &(EffectDisposition::AbsorbedIntoReturn { producer })
             || !matches_interface
@@ -4049,13 +4301,8 @@ pub fn certify_carrier_free_loop_terminal_return_region(
     let Some(return_control) = exit_return_effect.return_control_evidence() else {
         return Err(LedgerClosureError::InvalidRegionDisposition(exit_return.id));
     };
-    let return_matches = match interface.return_kind() {
-        SourceFunctionReturn::Void => return_control.values().is_empty(),
-        SourceFunctionReturn::Register { storage } => matches!(
-            return_control.values(),
-            [value] if value.slot() == CallBoundarySlot::Register { index: 0, storage }
-        ),
-    };
+    let return_matches =
+        return_control_matches_closure(return_control, interface, ReturnClosureContract::Loop);
     if return_control.producer() != exit_producer
         || exit_return_effect.disposition()
             != &(EffectDisposition::AbsorbedIntoReturn {
@@ -5238,8 +5485,7 @@ fn certified_return_controls(
         let Some(return_address_fact) = boundary.return_address else {
             continue;
         };
-        if !boundary.register_compositions.is_empty()
-            || return_address_fact.storage != return_address_storage
+        if return_address_fact.storage != return_address_storage
             || return_address_fact.value != inst.inputs[0]
         {
             continue;
@@ -5264,22 +5510,11 @@ fn certified_return_controls(
             }
             _ => continue,
         };
-        let values = boundary
-            .values
-            .iter()
-            .map(|value| {
-                let source_obligation = SemanticObligationId {
-                    instruction: producer,
-                    kind: SemanticObligationKind::ReturnValue,
-                    component: return_component(value.slot),
-                };
-                Ok(CertifiedReturnValue {
-                    slot: value.slot,
-                    value: MachineValueUse::from_artifact(artifact, value.value)?,
-                    source_obligation,
-                })
-            })
-            .collect::<Result<Vec<_>, MachineBuildError>>()?;
+        let Some((values, register_compositions)) =
+            certified_return_shapes(artifact, inst.id, producer, boundary)?
+        else {
+            continue;
+        };
         let return_obligation = SemanticObligationId {
             instruction: producer,
             kind: SemanticObligationKind::Return,
@@ -5287,6 +5522,11 @@ fn certified_return_controls(
         };
         let expected_obligations = std::iter::once(return_obligation)
             .chain(values.iter().map(|value| value.source_obligation))
+            .chain(
+                register_compositions
+                    .iter()
+                    .map(|composition| composition.source_obligation),
+            )
             .collect::<BTreeSet<_>>();
         if disposition.obligations != expected_obligations {
             continue;
@@ -5299,6 +5539,7 @@ fn certified_return_controls(
             return_address,
             exit_stack_pointer,
             values: values.into_boxed_slice(),
+            register_compositions: register_compositions.into_boxed_slice(),
             return_obligation,
         };
         control
@@ -5309,6 +5550,176 @@ fn certified_return_controls(
         }
     }
     Ok(returns)
+}
+
+fn certified_return_shapes(
+    artifact: &SsaArtifact,
+    boundary_at: InstId,
+    return_producer: CanonicalInstructionId,
+    boundary: &SourceReturnBoundaryFact,
+) -> Result<
+    Option<(
+        Vec<CertifiedReturnValue>,
+        Vec<CertifiedReturnRegisterComposition>,
+    )>,
+    MachineBuildError,
+> {
+    let machine_context = artifact.machine_context();
+    let expected_slots = machine_context
+        .abi_model()
+        .return_registers()
+        .iter()
+        .map(|slot| CallBoundarySlot::Register {
+            index: slot.index(),
+            storage: slot.storage(),
+        })
+        .collect::<BTreeSet<_>>();
+    let supplied_slots = boundary
+        .values
+        .iter()
+        .map(|value| value.slot)
+        .chain(
+            boundary
+                .register_compositions
+                .iter()
+                .map(|composition| composition.slot),
+        )
+        .collect::<BTreeSet<_>>();
+    let supplied_count = boundary
+        .values
+        .len()
+        .saturating_add(boundary.register_compositions.len());
+    if !boundary.complete
+        || boundary.at != boundary_at
+        || !machine_context.abi_model().is_available()
+        || !machine_context.abi_model().is_coherent()
+        || supplied_slots.len() != supplied_count
+        || supplied_slots != expected_slots
+    {
+        return Ok(None);
+    }
+
+    let mut values = Vec::with_capacity(boundary.values.len());
+    for fact in &boundary.values {
+        let CallBoundarySlot::Register { storage, .. } = fact.slot else {
+            return Ok(None);
+        };
+        let Some(graph_value) = artifact.graph().value(fact.value) else {
+            return Ok(None);
+        };
+        let value = MachineValueUse::from_artifact(artifact, fact.value)?;
+        if storage.space != CanonicalStorageSpace::Register
+            || storage.size == 0
+            || graph_value.canonical_storage != Some(storage)
+            || storage.size.checked_mul(8) != Some(value.binding().width_bits())
+        {
+            return Ok(None);
+        }
+        values.push(CertifiedReturnValue {
+            slot: fact.slot,
+            value,
+            source_obligation: SemanticObligationId {
+                instruction: return_producer,
+                kind: SemanticObligationKind::ReturnValue,
+                component: return_component(fact.slot),
+            },
+        });
+    }
+
+    let mut register_compositions = Vec::with_capacity(boundary.register_compositions.len());
+    for fact in &boundary.register_compositions {
+        let Some(composition) =
+            certified_return_register_composition(artifact, boundary_at, return_producer, fact)?
+        else {
+            return Ok(None);
+        };
+        register_compositions.push(composition);
+    }
+    Ok(Some((values, register_compositions)))
+}
+
+fn certified_return_register_definition(
+    artifact: &SsaArtifact,
+    fact: SourceReturnRegisterDefinitionFact,
+) -> Result<Option<CertifiedReturnRegisterDefinition>, MachineBuildError> {
+    let Some(inst) = artifact.graph().inst(fact.producer) else {
+        return Ok(None);
+    };
+    let Some(disposition) = artifact.obligations().instruction_for_inst(fact.producer) else {
+        return Ok(None);
+    };
+    let value = MachineValueUse::from_artifact(artifact, fact.value)?;
+    if fact.storage.space != CanonicalStorageSpace::Register
+        || fact.storage.size == 0
+        || inst.output != Some(fact.value)
+        || inst.canonical_storage != Some(fact.storage)
+        || fact.storage.size.checked_mul(8) != Some(value.binding().width_bits())
+        || value.producer() != Some(disposition.id)
+    {
+        return Ok(None);
+    }
+    Ok(Some(CertifiedReturnRegisterDefinition {
+        storage: fact.storage,
+        value,
+        producer: disposition.id,
+    }))
+}
+
+fn certified_return_register_composition(
+    artifact: &SsaArtifact,
+    boundary_at: InstId,
+    return_producer: CanonicalInstructionId,
+    fact: &SourceReturnRegisterCompositionFact,
+) -> Result<Option<CertifiedReturnRegisterComposition>, MachineBuildError> {
+    if !fact.validate(
+        artifact.function(),
+        artifact.graph(),
+        artifact.machine_context(),
+        boundary_at,
+    ) {
+        return Ok(None);
+    }
+    let CallBoundarySlot::Register { storage, .. } = fact.slot else {
+        return Ok(None);
+    };
+    let Some(base) = certified_return_register_definition(artifact, fact.base)? else {
+        return Ok(None);
+    };
+    if base.storage != storage
+        || storage.size.checked_mul(8) != Some(base.value.binding().width_bits())
+    {
+        return Ok(None);
+    }
+    let mut overlays = Vec::with_capacity(fact.overlays.len());
+    for overlay in &fact.overlays {
+        let Some(definition) = certified_return_register_definition(artifact, overlay.definition)?
+        else {
+            return Ok(None);
+        };
+        let Some(end) = overlay.offset_bytes.checked_add(definition.storage.size) else {
+            return Ok(None);
+        };
+        if storage.offset.checked_add(u64::from(overlay.offset_bytes))
+            != Some(definition.storage.offset)
+            || end > storage.size
+        {
+            return Ok(None);
+        }
+        overlays.push(CertifiedReturnRegisterOverlay {
+            definition,
+            offset_bytes: overlay.offset_bytes,
+        });
+    }
+    Ok(Some(CertifiedReturnRegisterComposition {
+        slot: fact.slot,
+        base,
+        overlays: overlays.into_boxed_slice(),
+        source_obligation: SemanticObligationId {
+            instruction: return_producer,
+            kind: SemanticObligationKind::ReturnValue,
+            component: return_component(fact.slot),
+        },
+    }))
 }
 
 fn has_earlier_terminal_control(
@@ -6023,6 +6434,12 @@ fn return_control_input_producers(
 ) -> BTreeSet<CanonicalInstructionId> {
     std::iter::once(control.control_target())
         .chain(control.values().iter().map(CertifiedReturnValue::value))
+        .chain(
+            control
+                .register_compositions()
+                .iter()
+                .flat_map(CertifiedReturnRegisterComposition::ordered_values),
+        )
         .chain(control.exit_stack_pointer().value())
         .filter_map(MachineValueUse::producer)
         .collect()
@@ -6222,6 +6639,7 @@ pub struct CertifiedFrameRegisterAssignment {
     input: MachineValueUse,
     output: r2ssa::MachineValueBinding,
     storage: CanonicalStorageId,
+    normalized_affine_relation: Option<CertifiedFrameAffineRelation>,
 }
 
 impl CertifiedFrameRegisterAssignment {
@@ -6244,6 +6662,34 @@ impl CertifiedFrameRegisterAssignment {
     pub const fn storage(&self) -> CanonicalStorageId {
         self.storage
     }
+
+    pub const fn normalized_affine_relation(&self) -> Option<CertifiedFrameAffineRelation> {
+        self.normalized_affine_relation
+    }
+}
+
+/// Exact address relation of a mechanical frame-register assignment, normalized
+/// to the source-declared entry stack pointer. It grants no semantic ledger
+/// disposition independently of its containing frame certificate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CertifiedFrameAffineRelation {
+    base_storage: CanonicalStorageId,
+    offset_bytes: i64,
+    width_bits: u32,
+}
+
+impl CertifiedFrameAffineRelation {
+    pub const fn base_storage(&self) -> CanonicalStorageId {
+        self.base_storage
+    }
+
+    pub const fn offset_bytes(&self) -> i64 {
+        self.offset_bytes
+    }
+
+    pub const fn width_bits(&self) -> u32 {
+        self.width_bits
+    }
 }
 
 /// Sealed proof that one exact source-declared frame-pointer carrier is saved
@@ -6261,7 +6707,7 @@ pub struct CertifiedFramePreservation {
     stack_allocation: CertifiedExpr,
     entry_save: CertifiedMemoryStatement,
     entry_save_copies: Box<[CertifiedExpr]>,
-    frame_relation: CertifiedExpr,
+    frame_relation: CertifiedFrameRegisterAssignment,
     restores: Box<[CertifiedFrameRestore]>,
 }
 
@@ -6294,7 +6740,7 @@ impl CertifiedFramePreservation {
         &self.entry_save_copies
     }
 
-    pub const fn frame_relation(&self) -> &CertifiedExpr {
+    pub const fn frame_relation(&self) -> &CertifiedFrameRegisterAssignment {
         &self.frame_relation
     }
 
@@ -6369,7 +6815,7 @@ struct FramePreservationEvidence {
     stack_allocation: CertifiedExpr,
     entry_save: CertifiedMemoryStatement,
     entry_save_copies: Vec<CertifiedExpr>,
-    frame_relation: CertifiedExpr,
+    frame_relation: CertifiedFrameRegisterAssignment,
     restores: Vec<(
         CertifiedReturnControl,
         FrameRestoreCandidate,
@@ -6671,12 +7117,15 @@ fn frame_mechanical_producer_is_accounted(
         .difference(already_accounted)
         .copied()
         .collect::<BTreeSet<_>>();
-    if remaining.is_empty() {
-        return true;
-    }
     let Some(machine_entity) = projection.entity_for_producer(witness.producer) else {
         return false;
     };
+    if machine_entity.root() != witness.root || machine_entity.output() != witness.output {
+        return false;
+    }
+    if remaining.is_empty() {
+        return true;
+    }
     remaining
         .iter()
         .all(|obligation| obligation.kind == SemanticObligationKind::LiveValueProducer)
@@ -6684,8 +7133,6 @@ fn frame_mechanical_producer_is_accounted(
             .get(&witness.producer)
             .is_some_and(|expression| {
                 expression.root() == witness.root
-                    && machine_entity.root() == witness.root
-                    && machine_entity.output() == witness.output
                     && expression.entity().source_obligations() == &remaining
                     && frame_expression_is_ledgered(expression, ledger)
             })
@@ -6798,7 +7245,148 @@ fn frame_register_assignment_for_inst(
         input: MachineValueUse::from_artifact(artifact, input).ok()?,
         output: entity.output(),
         storage,
+        normalized_affine_relation: None,
     })
+}
+
+fn frame_affine_assignment_input(
+    artifact: &SsaArtifact,
+    inst: InstId,
+    entry_stack_pointer: ValueId,
+    width_bits: u32,
+    affine: &mut BTreeMap<ValueId, Option<FrameAffine>>,
+) -> Option<ValueId> {
+    let graph_inst = artifact.graph().inst(inst)?;
+    match &graph_inst.payload {
+        InstPayload::Op(SSAOp::Copy { .. }) => {
+            let [input] = graph_inst.inputs.as_slice() else {
+                return None;
+            };
+            frame_affine_value(
+                artifact,
+                *input,
+                entry_stack_pointer,
+                width_bits,
+                affine,
+                &mut BTreeSet::new(),
+            )?;
+            Some(*input)
+        }
+        InstPayload::Op(SSAOp::IntAdd { .. }) => {
+            let [left, right] = graph_inst.inputs.as_slice() else {
+                return None;
+            };
+            let left_affine = frame_affine_value(
+                artifact,
+                *left,
+                entry_stack_pointer,
+                width_bits,
+                affine,
+                &mut BTreeSet::new(),
+            );
+            let right_affine = frame_affine_value(
+                artifact,
+                *right,
+                entry_stack_pointer,
+                width_bits,
+                affine,
+                &mut BTreeSet::new(),
+            );
+            match (left_affine, right_affine) {
+                (Some(_), None) if frame_constant_bits(artifact, *right, width_bits).is_some() => {
+                    Some(*left)
+                }
+                (None, Some(_)) if frame_constant_bits(artifact, *left, width_bits).is_some() => {
+                    Some(*right)
+                }
+                _ => None,
+            }
+        }
+        InstPayload::Op(SSAOp::IntSub { .. }) => {
+            let [base, offset] = graph_inst.inputs.as_slice() else {
+                return None;
+            };
+            frame_affine_value(
+                artifact,
+                *base,
+                entry_stack_pointer,
+                width_bits,
+                affine,
+                &mut BTreeSet::new(),
+            )?;
+            frame_constant_bits(artifact, *offset, width_bits)?;
+            Some(*base)
+        }
+        _ => None,
+    }
+}
+
+fn frame_affine_register_assignment_for_inst(
+    artifact: &SsaArtifact,
+    projection: &MachineProjection,
+    inst: InstId,
+    entry_stack_pointer: ValueId,
+    stack_pointer_storage: CanonicalStorageId,
+    frame_pointer_storage: CanonicalStorageId,
+    width_bits: u32,
+    affine: &mut BTreeMap<ValueId, Option<FrameAffine>>,
+) -> Option<CertifiedFrameRegisterAssignment> {
+    let graph_inst = artifact.graph().inst(inst)?;
+    let output = graph_inst.output?;
+    let input =
+        frame_affine_assignment_input(artifact, inst, entry_stack_pointer, width_bits, affine)?;
+    let relation = frame_affine_value(
+        artifact,
+        output,
+        entry_stack_pointer,
+        width_bits,
+        affine,
+        &mut BTreeSet::new(),
+    )?;
+    let mut assignment = frame_register_assignment_for_inst(
+        artifact,
+        projection,
+        inst,
+        input,
+        frame_pointer_storage,
+    )?;
+    assignment.normalized_affine_relation = Some(CertifiedFrameAffineRelation {
+        base_storage: stack_pointer_storage,
+        offset_bytes: relation.signed_offset()?,
+        width_bits: relation.width_bits,
+    });
+    Some(assignment)
+}
+
+fn frame_affine_register_assignment_matches(
+    artifact: &SsaArtifact,
+    projection: &MachineProjection,
+    assignment: &CertifiedFrameRegisterAssignment,
+    entry_stack_pointer: ValueId,
+    stack_pointer_storage: CanonicalStorageId,
+    frame_pointer_storage: CanonicalStorageId,
+    width_bits: u32,
+    affine: &mut BTreeMap<ValueId, Option<FrameAffine>>,
+) -> bool {
+    let Some(instruction) = artifact
+        .obligations()
+        .instructions()
+        .get(&assignment.producer)
+    else {
+        return false;
+    };
+    frame_affine_register_assignment_for_inst(
+        artifact,
+        projection,
+        instruction.inst,
+        entry_stack_pointer,
+        stack_pointer_storage,
+        frame_pointer_storage,
+        width_bits,
+        affine,
+    )
+    .as_ref()
+        == Some(assignment)
 }
 
 fn frame_copy_for_inst(
@@ -7090,7 +7678,7 @@ fn frame_evidence_from_certified_parts(
     }
 
     let mut affine = BTreeMap::new();
-    let mut relation: Option<(CertifiedExpr, InstId, ValueId)> = None;
+    let mut relation: Option<(CertifiedFrameRegisterAssignment, InstId, ValueId)> = None;
     let mut restore_candidates = Vec::<FrameRestoreCandidate>::new();
     for inst in &graph.insts {
         if inst.canonical_storage != Some(frame_pointer_storage) {
@@ -7107,11 +7695,17 @@ fn frame_evidence_from_certified_parts(
         )
         .is_some()
         {
-            let expression = frame_expression_for_inst(artifact, projection, expressions, inst.id)?;
-            if relation
-                .replace((expression.clone(), inst.id, output))
-                .is_some()
-            {
+            let assignment = frame_affine_register_assignment_for_inst(
+                artifact,
+                projection,
+                inst.id,
+                entry_stack_pointer,
+                stack_pointer_storage,
+                frame_pointer_storage,
+                width_bits,
+                &mut affine,
+            )?;
+            if relation.replace((assignment, inst.id, output)).is_some() {
                 return None;
             }
             continue;
@@ -7195,10 +7789,20 @@ fn frame_evidence_from_certified_parts(
         &mut affine,
         &mut BTreeSet::new(),
     )?;
-    if relation_affine.width_bits != width_bits {
+    if relation_affine.width_bits != width_bits
+        || !frame_affine_register_assignment_matches(
+            artifact,
+            projection,
+            &frame_relation,
+            entry_stack_pointer,
+            stack_pointer_storage,
+            frame_pointer_storage,
+            width_bits,
+            &mut affine,
+        )
+    {
         return None;
     }
-
     for inst in &graph.insts {
         if inst.canonical_storage == Some(stack_pointer_storage) {
             let output = inst.output?;
@@ -7212,7 +7816,6 @@ fn frame_evidence_from_certified_parts(
             )?;
         }
     }
-
     let saves = memory_statements
         .values()
         .filter_map(|statement| {
@@ -7435,7 +8038,6 @@ fn frame_evidence_from_certified_parts(
             }
         }
     }
-
     let return_blocks = topology
         .blocks()
         .iter()
@@ -7458,6 +8060,12 @@ fn frame_evidence_from_certified_parts(
             .inst;
         let return_escapes_frame = std::iter::once(control.control_target())
             .chain(control.values().iter().map(CertifiedReturnValue::value))
+            .chain(
+                control
+                    .register_compositions()
+                    .iter()
+                    .flat_map(CertifiedReturnRegisterComposition::ordered_values),
+            )
             .any(|value| {
                 frame_affine_value(
                     artifact,
@@ -7616,7 +8224,18 @@ fn certified_frame_preservation(
     )?;
     let no_obligations = BTreeSet::new();
     if !frame_expression_is_ledgered(&evidence.stack_allocation, ledger)
-        || !frame_expression_is_ledgered(&evidence.frame_relation, ledger)
+        || !frame_mechanical_producer_is_accounted(
+            artifact,
+            parts.projection,
+            FrameMechanicalWitness {
+                producer: evidence.frame_relation.producer,
+                root: evidence.frame_relation.root,
+                output: evidence.frame_relation.output,
+            },
+            &no_obligations,
+            parts.expressions,
+            ledger,
+        )
         || !frame_statement_is_ledgered(&evidence.entry_save, ledger)
         || evidence
             .entry_save_copies
@@ -9319,6 +9938,54 @@ mod tests {
         SsaArtifact::raw_with_interface(&[block], Some(&arch), interface)
             .expect("explicit return artifact")
     }
+
+    fn exact_rax_return_artifact(with_al_overlay: bool) -> SsaArtifact {
+        let rax = Varnode::register(0, 8);
+        let al = Varnode::register(0, 1);
+        let rip = Varnode::register(16, 8);
+        let mut block = R2ILBlock::new(0x30a0, 4);
+        block.push(R2ILOp::Copy {
+            dst: rax,
+            src: Varnode::constant(0x1122_3344_5566_7788, 8),
+        });
+        if with_al_overlay {
+            block.push(R2ILOp::Copy {
+                dst: al,
+                src: Varnode::constant(0xaa, 1),
+            });
+        }
+        block.push(R2ILOp::Return { target: rip });
+
+        let storage = |offset, size| CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset,
+            size,
+        };
+        let mut arch = ArchSpec::new("exact-return-test");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("rax", 0, 8));
+        arch.add_register(RegisterDef::sub("al", 0, 1, "rax"));
+        arch.add_register(RegisterDef::new("rip", 16, 8));
+        arch.add_register(RegisterDef::new("rsp", 24, 8));
+        let interface = SourceFunctionInterface::new_exact(
+            b"exact-return-revision-1".to_vec(),
+            "test-register-abi",
+            [],
+            SourceFunctionReturn::Register {
+                storage: storage(0, 8),
+            },
+            [],
+        )
+        .and_then(|interface| interface.with_return_address_storage(storage(16, 8)))
+        .and_then(|interface| interface.with_stack_pointer_storage(storage(24, 8)))
+        .expect("exact return interface");
+        SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface)
+            .expect("exact return artifact")
+    }
+
+    fn composed_rax_al_return_artifact() -> SsaArtifact {
+        exact_rax_return_artifact(true)
+    }
     fn explicit_stack_slot_artifact(slot_size_bytes: u32) -> SsaArtifact {
         let mut block = R2ILBlock::new(0x30c0, 4);
         block.push(R2ILOp::Store {
@@ -9369,7 +10036,11 @@ mod tests {
     #[derive(Debug, Clone, Copy)]
     enum FrameMutation {
         None,
+        ExplicitNoSlots,
+        ComposedReturn,
+        MissingExplicitNoSlots,
         AffineRelation,
+        ZeroObligationRelation,
         TransitiveRestore,
         DirectLoadRestore,
         SplitAllocation,
@@ -9546,7 +10217,11 @@ mod tests {
                 src: Varnode::constant(0, 4),
             }),
             FrameMutation::None
+            | FrameMutation::ExplicitNoSlots
+            | FrameMutation::ComposedReturn
+            | FrameMutation::MissingExplicitNoSlots
             | FrameMutation::AffineRelation
+            | FrameMutation::ZeroObligationRelation
             | FrameMutation::TransitiveRestore
             | FrameMutation::DirectLoadRestore
             | FrameMutation::SplitAllocation
@@ -9600,6 +10275,8 @@ mod tests {
             });
             restore_address
         } else if matches!(mutation, FrameMutation::RestoreBeforeRelation) {
+            sp.clone()
+        } else if matches!(mutation, FrameMutation::ZeroObligationRelation) {
             sp.clone()
         } else {
             fp.clone()
@@ -9763,6 +10440,16 @@ mod tests {
                 target: Varnode::ram(0x3300, 8),
             });
         } else {
+            if matches!(mutation, FrameMutation::ComposedReturn) {
+                block.push(R2ILOp::Copy {
+                    dst: Varnode::register(32, 8),
+                    src: Varnode::constant(0x1122_3344_5566_7788, 8),
+                });
+                block.push(R2ILOp::Copy {
+                    dst: Varnode::register(32, 1),
+                    src: Varnode::constant(0xaa, 1),
+                });
+            }
             block.push(R2ILOp::Return {
                 target: return_target,
             });
@@ -9775,6 +10462,8 @@ mod tests {
         arch.add_register(RegisterDef::new("sp", 8, 8));
         arch.add_register(RegisterDef::new("ra", 16, 8));
         arch.add_register(RegisterDef::new("other", 24, 8));
+        arch.add_register(RegisterDef::new("ret", 32, 8));
+        arch.add_register(RegisterDef::sub("ret_low", 32, 1, "ret"));
         arch.add_space(AddressSpace::ram(8));
         arch.add_space(AddressSpace::new(SpaceId::Custom(1), "other-memory", 8));
         let storage = |offset| CanonicalStorageId {
@@ -9782,21 +10471,42 @@ mod tests {
             offset,
             size: 8,
         };
-        let interface = SourceFunctionInterface::new_exact(
-            b"preserved-frame-revision-1".to_vec(),
-            "test-frame-abi",
-            [],
-            SourceFunctionReturn::Void,
-            [SourceStackSlotSpec::new_local(
+        let stack_slots = if matches!(
+            mutation,
+            FrameMutation::ExplicitNoSlots | FrameMutation::MissingExplicitNoSlots
+        ) {
+            Vec::new()
+        } else {
+            vec![SourceStackSlotSpec::new_local(
                 StackAddressBase::FramePointer,
                 storage(0),
                 0,
                 8,
-            )],
+            )]
+        };
+        let interface = SourceFunctionInterface::new_exact(
+            b"preserved-frame-revision-1".to_vec(),
+            "test-frame-abi",
+            [],
+            if matches!(mutation, FrameMutation::ComposedReturn) {
+                SourceFunctionReturn::Register {
+                    storage: storage(32),
+                }
+            } else {
+                SourceFunctionReturn::Void
+            },
+            stack_slots,
         )
         .and_then(|interface| interface.with_return_address_storage(storage(16)))
         .and_then(|interface| interface.with_stack_pointer_storage(storage(8)))
         .expect("exact preserved-frame interface");
+        let interface = if matches!(mutation, FrameMutation::ExplicitNoSlots) {
+            interface
+                .with_frame_pointer_storage(storage(0))
+                .expect("explicit frame-pointer storage")
+        } else {
+            interface
+        };
         let interface = if stacked_return && !matches!(mutation, FrameMutation::StackedNoContract) {
             interface
                 .with_exact_stacked_return(0, 8, 8, 8)
@@ -9967,6 +10677,123 @@ mod tests {
         )
     }
 
+    fn terminal_frame_fixture(
+        mutation: FrameMutation,
+    ) -> Option<(
+        CertifiedArtifactOrigin,
+        ObligationLedger,
+        CertifiedFramePreservation,
+        Vec<TypedRegionMapping>,
+    )> {
+        let artifact = preserved_frame_artifact(mutation);
+        let projection = MachineProjection::from_artifact(&artifact).ok()?;
+        let machine_context = CertifiedMachineContext::from_artifact(&artifact).ok()?;
+        let topology = certified_source_topology(&artifact).ok()?;
+        let memory = certified_memory_statements(&artifact).ok()?;
+        let returns = certified_return_controls(&artifact, &topology).ok()?;
+        let mut expressions = BTreeMap::new();
+        for entity in projection.entities() {
+            let source_obligations = entity
+                .source_obligations()
+                .iter()
+                .copied()
+                .filter(|id| id.kind == SemanticObligationKind::LiveValueProducer)
+                .collect::<BTreeSet<_>>();
+            if source_obligations.is_empty() {
+                continue;
+            }
+            let expression =
+                certified_expr_from_projection(&artifact, &projection, entity, source_obligations)
+                    .ok()?;
+            expressions.insert(entity.producer(), expression);
+        }
+        let origin = CertifiedArtifactOrigin {
+            schema_version: CERTIFICATION_SCHEMA_VERSION,
+            lift_provenance_schema_version: GENUINE_LIFT_PROVENANCE_SCHEMA_VERSION,
+            lift_manifest_hash: 1,
+            authority: CertifiedAuthoritySeal::new(),
+            graph_snapshot: vec![1].into_boxed_slice(),
+            prepare_mode: artifact.mode().into(),
+            decompile_preparation: None,
+            assumptions: artifact.facts().assumptions.clone(),
+            machine_context,
+            source: artifact.obligations().clone(),
+            topology: topology.clone(),
+        };
+        let mut certification = CertifiedFunction::bound(origin.source().clone(), &origin).ok()?;
+        for control in returns.values() {
+            certification.record_absorbed_return(control.clone()).ok()?;
+        }
+        for statement in memory.values() {
+            for obligation in statement.source_obligations() {
+                certification
+                    .record_absorbed_statement(*obligation, statement.clone())
+                    .ok()?;
+            }
+        }
+        for expression in expressions.values() {
+            for obligation in expression.entity().source_obligations() {
+                certification
+                    .record_absorbed_expression(*obligation, expression.clone())
+                    .ok()?;
+            }
+        }
+        let frame = certified_frame_preservation(
+            &artifact,
+            &origin,
+            FrameCertifiedParts {
+                projection: &projection,
+                topology: &topology,
+                expressions: &expressions,
+                memory_statements: &memory,
+                return_controls: &returns,
+            },
+            certification.ledger(),
+        )?;
+        let mappings = origin
+            .source()
+            .obligations()
+            .keys()
+            .map(|obligation| {
+                let [effect] = certification.ledger().effects(*obligation) else {
+                    return None;
+                };
+                Some(TypedRegionMapping::new(
+                    *obligation,
+                    effect.disposition().clone(),
+                ))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some((origin, certification.ledger().clone(), frame, mappings))
+    }
+
+    #[test]
+    fn terminal_return_frame_memory_requires_exact_preservation_manifest() {
+        let (origin, ledger, frame, mappings) =
+            terminal_frame_fixture(FrameMutation::StackedReturn)
+                .expect("stacked frame terminal fixture");
+        assert!(
+            certify_terminal_return_region_with_frame(
+                &origin,
+                &ledger,
+                mappings.clone(),
+                Some(&frame),
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            certify_terminal_return_region(&origin, &ledger, mappings),
+            Err(LedgerClosureError::InvalidRegionTopology),
+        );
+
+        let (origin, ledger, frame, mappings) = terminal_frame_fixture(FrameMutation::GlobalLoad)
+            .expect("frame with unrelated global read");
+        assert_eq!(
+            certify_terminal_return_region_with_frame(&origin, &ledger, mappings, Some(&frame),),
+            Err(LedgerClosureError::InvalidRegionTopology),
+        );
+    }
+
     #[test]
     fn generic_preserved_frame_requires_sealed_save_relation_and_all_return_restore() {
         let artifact = preserved_frame_artifact(FrameMutation::None);
@@ -9981,10 +10808,61 @@ mod tests {
         assert_eq!(evidence.restores[0].1.range, evidence.saved_range);
         assert!(evidence.restores[0].2.is_none());
 
+        let slot_derived_interface = artifact
+            .machine_context()
+            .function_interface()
+            .expect("slot-derived frame interface");
+        assert!(slot_derived_interface.frame_pointer_storage().is_none());
+        assert!(!slot_derived_interface.stack_slots().is_empty());
+
+        let explicit_artifact = preserved_frame_artifact(FrameMutation::ExplicitNoSlots);
+        let explicit_interface = explicit_artifact
+            .machine_context()
+            .function_interface()
+            .expect("explicit frame interface");
+        assert!(explicit_interface.stack_slots().is_empty());
+        assert_eq!(
+            explicit_interface.frame_pointer_storage(),
+            Some(evidence.frame_pointer_storage)
+        );
+        let explicit = preserved_frame_evidence(&explicit_artifact)
+            .expect("explicit no-slot frame preservation evidence");
+        assert_eq!(
+            explicit.frame_pointer_storage,
+            evidence.frame_pointer_storage
+        );
+        assert_eq!(explicit.saved_range, evidence.saved_range);
+
         let affine =
             preserved_frame_evidence(&preserved_frame_artifact(FrameMutation::AffineRelation))
                 .expect("affine stack-derived relation");
         assert_eq!(affine.saved_range, evidence.saved_range);
+        let affine_relation = affine
+            .frame_relation
+            .normalized_affine_relation()
+            .expect("sealed normalized affine assignment");
+        assert_eq!(affine_relation.base_storage(), affine.stack_pointer_storage);
+        assert_eq!(affine_relation.offset_bytes(), -8);
+        assert_eq!(affine_relation.width_bits(), 64);
+
+        let zero_obligation_artifact =
+            preserved_frame_artifact(FrameMutation::ZeroObligationRelation);
+        let zero_obligation = preserved_frame_evidence(&zero_obligation_artifact)
+            .expect("proven-dead frame relation remains mechanical evidence");
+        let relation_instruction = zero_obligation_artifact
+            .obligations()
+            .instructions()
+            .get(&zero_obligation.frame_relation.producer())
+            .expect("frame relation source instruction");
+        assert!(relation_instruction.obligations.is_empty());
+        assert_eq!(
+            relation_instruction.state,
+            SemanticInstructionState::ProvenDead
+        );
+        assert_eq!(
+            zero_obligation.frame_relation.normalized_affine_relation(),
+            evidence.frame_relation.normalized_affine_relation()
+        );
 
         let transitive =
             preserved_frame_evidence(&preserved_frame_artifact(FrameMutation::TransitiveRestore))
@@ -9994,6 +10872,7 @@ mod tests {
             FrameMutation::DirectLoadRestore,
             FrameMutation::SplitAllocation,
             FrameMutation::GlobalLoad,
+            FrameMutation::ComposedReturn,
         ] {
             assert!(
                 preserved_frame_evidence(&preserved_frame_artifact(mutation)).is_some(),
@@ -10038,7 +10917,188 @@ mod tests {
     }
 
     #[test]
+    fn frame_relation_witness_binds_machine_assignment_and_replays_live_obligations() {
+        let artifact = preserved_frame_artifact(FrameMutation::ZeroObligationRelation);
+        let projection = MachineProjection::from_artifact(&artifact).expect("machine projection");
+        let evidence = preserved_frame_evidence(&artifact).expect("zero-obligation frame evidence");
+        let relation = evidence.frame_relation.clone();
+        let entry_stack_pointer = artifact
+            .graph()
+            .values
+            .iter()
+            .find(|value| {
+                value.canonical_storage == Some(evidence.stack_pointer_storage)
+                    && artifact.graph().def_inst(value.id).is_none()
+            })
+            .expect("entry stack pointer")
+            .id;
+        let mut affine = BTreeMap::new();
+        assert!(frame_affine_register_assignment_matches(
+            &artifact,
+            &projection,
+            &relation,
+            entry_stack_pointer,
+            evidence.stack_pointer_storage,
+            evidence.frame_pointer_storage,
+            64,
+            &mut affine,
+        ));
+
+        let other_entity = projection
+            .entities()
+            .iter()
+            .find(|entity| entity.producer() != relation.producer)
+            .expect("independent machine entity");
+        let other_input = artifact
+            .graph()
+            .values
+            .iter()
+            .find(|value| value.id != relation.input.binding().value())
+            .and_then(|value| MachineValueUse::from_artifact(&artifact, value.id).ok())
+            .expect("independent machine input");
+        let assert_invalid = |assignment: &CertifiedFrameRegisterAssignment| {
+            assert!(!frame_affine_register_assignment_matches(
+                &artifact,
+                &projection,
+                assignment,
+                entry_stack_pointer,
+                evidence.stack_pointer_storage,
+                evidence.frame_pointer_storage,
+                64,
+                &mut BTreeMap::new(),
+            ));
+        };
+        let mut mutated = relation.clone();
+        mutated.producer = other_entity.producer();
+        assert_invalid(&mutated);
+        let mut mutated = relation.clone();
+        mutated.root = other_entity.root();
+        assert_invalid(&mutated);
+        let mut mutated = relation.clone();
+        mutated.input = other_input;
+        assert_invalid(&mutated);
+        let mut mutated = relation.clone();
+        mutated.output = other_entity.output();
+        assert_invalid(&mutated);
+        let mut mutated = relation.clone();
+        mutated.storage = evidence.stack_pointer_storage;
+        assert_invalid(&mutated);
+        let mut mutated = relation.clone();
+        mutated
+            .normalized_affine_relation
+            .as_mut()
+            .expect("normalized relation")
+            .offset_bytes += 1;
+        assert_invalid(&mutated);
+
+        let no_obligations = BTreeSet::new();
+        assert!(frame_mechanical_producer_is_accounted(
+            &artifact,
+            &projection,
+            FrameMechanicalWitness {
+                producer: relation.producer,
+                root: relation.root,
+                output: relation.output,
+            },
+            &no_obligations,
+            &BTreeMap::new(),
+            &ObligationLedger::new(),
+        ));
+
+        let live_artifact = preserved_frame_artifact(FrameMutation::None);
+        let live_projection =
+            MachineProjection::from_artifact(&live_artifact).expect("live machine projection");
+        let live_evidence = preserved_frame_evidence(&live_artifact).expect("live frame evidence");
+        let live_entity = live_projection
+            .entity_for_producer(live_evidence.frame_relation.producer)
+            .expect("live frame relation entity");
+        let live_obligations = live_entity
+            .source_obligations()
+            .iter()
+            .copied()
+            .filter(|id| id.kind == SemanticObligationKind::LiveValueProducer)
+            .collect::<BTreeSet<_>>();
+        assert!(!live_obligations.is_empty());
+        let live_expression = certified_expr_from_projection(
+            &live_artifact,
+            &live_projection,
+            live_entity,
+            live_obligations.clone(),
+        )
+        .expect("live frame relation expression");
+        let expressions = BTreeMap::from([(
+            live_evidence.frame_relation.producer,
+            live_expression.clone(),
+        )]);
+        let live_witness = FrameMechanicalWitness {
+            producer: live_evidence.frame_relation.producer,
+            root: live_evidence.frame_relation.root,
+            output: live_evidence.frame_relation.output,
+        };
+        assert!(!frame_mechanical_producer_is_accounted(
+            &live_artifact,
+            &live_projection,
+            live_witness,
+            &no_obligations,
+            &expressions,
+            &ObligationLedger::new(),
+        ));
+        let mut certification = CertifiedFunction::new(live_artifact.obligations().clone())
+            .expect("live relation ledger");
+        for obligation in live_obligations {
+            certification
+                .record_absorbed_expression(obligation, live_expression.clone())
+                .expect("ledger live relation expression");
+        }
+        assert!(frame_mechanical_producer_is_accounted(
+            &live_artifact,
+            &live_projection,
+            live_witness,
+            &no_obligations,
+            &expressions,
+            certification.ledger(),
+        ));
+    }
+
+    #[test]
     fn generic_preserved_frame_refuses_mutated_authority_inputs() {
+        assert!(
+            preserved_frame_evidence(&preserved_frame_artifact(
+                FrameMutation::MissingExplicitNoSlots
+            ))
+            .is_none(),
+            "a no-slot interface without explicit FP authority must refuse"
+        );
+
+        let storage = |offset, size| CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset,
+            size,
+        };
+        let explicit_base = SourceFunctionInterface::new_exact(
+            b"invalid-explicit-frame-revision".to_vec(),
+            "test-frame-abi",
+            [],
+            SourceFunctionReturn::Void,
+            [],
+        )
+        .and_then(|interface| interface.with_return_address_storage(storage(16, 8)))
+        .and_then(|interface| interface.with_stack_pointer_storage(storage(8, 8)))
+        .expect("coherent no-slot interface");
+        assert!(
+            explicit_base
+                .clone()
+                .with_frame_pointer_storage(storage(0, 4))
+                .is_err(),
+            "wrong-width explicit FP authority must not be constructible"
+        );
+        assert!(
+            explicit_base
+                .with_frame_pointer_storage(storage(8, 8))
+                .is_err(),
+            "overlapping explicit FP authority must not be constructible"
+        );
+
         for mutation in [
             FrameMutation::OverlappingWrite,
             FrameMutation::Call,
@@ -10448,6 +11508,242 @@ mod tests {
     }
 
     #[test]
+    fn exact_composed_rax_al_return_is_sealed_and_mutations_refuse() {
+        let artifact = composed_rax_al_return_artifact();
+        let topology = certified_source_topology(&artifact).expect("source topology");
+        let controls = certified_return_controls(&artifact, &topology).expect("return controls");
+        let mut controls = controls.values();
+        let control = controls.next().expect("one composed return control");
+        assert!(controls.next().is_none());
+        assert!(control.values().is_empty());
+        let [composition] = control.register_compositions() else {
+            panic!("one return-register composition");
+        };
+        assert_eq!(
+            composition.slot(),
+            CallBoundarySlot::Register {
+                index: 0,
+                storage: CanonicalStorageId {
+                    space: CanonicalStorageSpace::Register,
+                    offset: 0,
+                    size: 8,
+                },
+            }
+        );
+        assert_eq!(composition.base().storage().size, 8);
+        let [overlay] = composition.overlays() else {
+            panic!("one exact AL overlay");
+        };
+        assert_eq!(overlay.definition().storage().size, 1);
+        assert_eq!(overlay.offset_bytes(), 0);
+        let ordered = composition
+            .ordered_values()
+            .map(|value| value.binding().value())
+            .collect::<Vec<_>>();
+        let obligation = artifact
+            .obligations()
+            .obligations()
+            .get(&composition.source_obligation())
+            .expect("composed ReturnValue obligation");
+        assert_eq!(obligation.inputs, ordered);
+        assert_eq!(control.source_obligations().len(), 2);
+        assert_eq!(
+            return_control_input_producers(control),
+            [
+                composition.base().producer(),
+                overlay.definition().producer()
+            ]
+            .into_iter()
+            .collect()
+        );
+
+        let (&boundary_at, boundary) = artifact
+            .facts()
+            .boundaries
+            .returns
+            .first_key_value()
+            .expect("return boundary");
+        let return_producer = artifact
+            .obligations()
+            .instruction_for_inst(boundary_at)
+            .expect("return disposition")
+            .id;
+        let refuses = |boundary: &SourceReturnBoundaryFact| {
+            certified_return_shapes(&artifact, boundary_at, return_producer, boundary)
+                .expect("shape validation")
+                .is_none()
+        };
+
+        let mut mixed = boundary.clone();
+        mixed.values.push(r2ssa::CallBoundaryValueFact {
+            slot: mixed.register_compositions[0].slot,
+            value: mixed.register_compositions[0].base.value,
+        });
+        assert!(refuses(&mixed));
+
+        let mut missing = boundary.clone();
+        missing.register_compositions.clear();
+        assert!(refuses(&missing));
+
+        let mut wrong_base_storage = boundary.clone();
+        wrong_base_storage.register_compositions[0]
+            .base
+            .storage
+            .size = 4;
+        assert!(refuses(&wrong_base_storage));
+
+        let mut wrong_base_value = boundary.clone();
+        wrong_base_value.register_compositions[0].base.value =
+            wrong_base_value.register_compositions[0].overlays[0]
+                .definition
+                .value;
+        assert!(refuses(&wrong_base_value));
+
+        let mut wrong_base_producer = boundary.clone();
+        wrong_base_producer.register_compositions[0].base.producer =
+            wrong_base_producer.register_compositions[0].overlays[0]
+                .definition
+                .producer;
+        assert!(refuses(&wrong_base_producer));
+
+        let mut wrong_offset = boundary.clone();
+        wrong_offset.register_compositions[0].overlays[0].offset_bytes = 1;
+        assert!(refuses(&wrong_offset));
+
+        let mut missing_overlay = boundary.clone();
+        missing_overlay.register_compositions[0].overlays.clear();
+        assert!(refuses(&missing_overlay));
+
+        let mut reordered_obligation = (*control).clone();
+        let composition = &mut reordered_obligation.register_compositions[0];
+        std::mem::swap(
+            &mut composition.base.value,
+            &mut composition.overlays[0].definition.value,
+        );
+        assert!(
+            reordered_obligation
+                .validate(artifact.obligations())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn logical_return_shape_accepts_exact_direct_or_composed_exclusively() {
+        let one_control = |artifact: &SsaArtifact| {
+            let topology = certified_source_topology(artifact).expect("source topology");
+            let controls = certified_return_controls(artifact, &topology).expect("return controls");
+            let mut controls = controls.into_values();
+            let control = controls.next().expect("one return control");
+            assert!(controls.next().is_none());
+            control
+        };
+
+        let direct_artifact = exact_rax_return_artifact(false);
+        let direct = one_control(&direct_artifact);
+        let direct_interface = direct_artifact
+            .machine_context()
+            .function_interface()
+            .expect("direct interface");
+        assert_eq!(direct.values().len(), 1);
+        assert!(direct.register_compositions().is_empty());
+        assert!(return_control_matches_interface(&direct, direct_interface));
+
+        let composed_artifact = exact_rax_return_artifact(true);
+        let composed = one_control(&composed_artifact);
+        let composed_interface = composed_artifact
+            .machine_context()
+            .function_interface()
+            .expect("composed interface");
+        assert!(composed.values().is_empty());
+        assert_eq!(composed.register_compositions().len(), 1);
+        assert!(return_control_matches_interface(
+            &composed,
+            composed_interface
+        ));
+        assert!(return_control_matches_closure(
+            &composed,
+            composed_interface,
+            ReturnClosureContract::Terminal,
+        ));
+        for contract in [
+            ReturnClosureContract::PlainRam,
+            ReturnClosureContract::DirectCall,
+            ReturnClosureContract::Conditional,
+            ReturnClosureContract::Switch,
+            ReturnClosureContract::Loop,
+        ] {
+            assert!(
+                !return_control_matches_closure(&composed, composed_interface, contract),
+                "nonterminal route must refuse composed return: {contract:?}"
+            );
+            assert!(
+                return_control_matches_closure(&direct, direct_interface, contract),
+                "direct return remains admitted: {contract:?}"
+            );
+        }
+
+        let mut mixed = composed.clone();
+        let composition = &mixed.register_compositions[0];
+        mixed.values = vec![CertifiedReturnValue {
+            slot: composition.slot,
+            value: composition.base.value.clone(),
+            source_obligation: composition.source_obligation,
+        }]
+        .into_boxed_slice();
+        assert!(!return_control_matches_interface(
+            &mixed,
+            composed_interface
+        ));
+
+        let mut duplicate_direct = direct.clone();
+        duplicate_direct.values =
+            vec![direct.values[0].clone(), direct.values[0].clone()].into_boxed_slice();
+        assert!(!return_control_matches_interface(
+            &duplicate_direct,
+            direct_interface
+        ));
+
+        let mut duplicate_composed = composed.clone();
+        duplicate_composed.register_compositions = vec![
+            composed.register_compositions[0].clone(),
+            composed.register_compositions[0].clone(),
+        ]
+        .into_boxed_slice();
+        assert!(!return_control_matches_interface(
+            &duplicate_composed,
+            composed_interface
+        ));
+
+        let mut wrong_slot = composed.clone();
+        wrong_slot.register_compositions[0].slot = CallBoundarySlot::Register {
+            index: 1,
+            storage: wrong_slot.register_compositions[0].base.storage,
+        };
+        assert!(!return_control_matches_interface(
+            &wrong_slot,
+            composed_interface
+        ));
+
+        let void_interface = SourceFunctionInterface::new_exact(
+            b"void-return-shape".to_vec(),
+            "test-register-abi",
+            [],
+            SourceFunctionReturn::Void,
+            [],
+        )
+        .expect("void interface");
+        assert!(!return_control_matches_interface(&direct, &void_interface));
+        assert!(!return_control_matches_interface(
+            &composed,
+            &void_interface
+        ));
+        let mut empty = direct.clone();
+        empty.values = Box::new([]);
+        assert!(return_control_matches_interface(&empty, &void_interface));
+        assert!(!return_control_matches_interface(&empty, direct_interface));
+    }
+
+    #[test]
     fn synthetic_void_return_refuses_incomplete_machine_roles() {
         let artifact = explicit_return_artifact(SourceFunctionReturn::Void);
         assert!(matches!(
@@ -10691,6 +11987,44 @@ mod tests {
     }
 
     #[test]
+    fn composed_return_components_shared_with_terminal_mechanics_remain_semantic() {
+        let artifact = composed_rax_al_return_artifact();
+        let topology = certified_source_topology(&artifact).expect("source topology");
+        let controls = certified_return_controls(&artifact, &topology).expect("return controls");
+        let control = controls.values().next().expect("one return control");
+        let [composition] = control.register_compositions() else {
+            panic!("one return-register composition");
+        };
+        let component_producers = composition
+            .ordered_values()
+            .filter_map(MachineValueUse::producer)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(component_producers.len(), 2);
+        assert_eq!(
+            terminal_return_semantic_producers(control),
+            component_producers
+        );
+
+        let mechanical_root = CanonicalInstructionId {
+            block_addr: 0x30a0,
+            site: CanonicalInstructionSite::Op(99),
+        };
+        let mut dependencies = component_producers
+            .iter()
+            .copied()
+            .map(|producer| (producer, BTreeSet::new()))
+            .collect::<BTreeMap<_, _>>();
+        dependencies.insert(mechanical_root, component_producers);
+        let mechanics = terminal_return_mechanics_producers(
+            &dependencies,
+            [mechanical_root],
+            terminal_return_semantic_producers(control),
+        )
+        .expect("shared composed-return closure");
+        assert_eq!(mechanics, BTreeSet::from([mechanical_root]));
+    }
+
+    #[test]
     fn terminal_return_contract_admits_only_manifested_mechanical_reads() {
         let producer = CanonicalInstructionId {
             block_addr: 0x5100,
@@ -10714,17 +12048,21 @@ mod tests {
         assert!(terminal_return_obligation_is_admitted(
             read,
             &BTreeSet::from([read]),
+            &BTreeSet::new(),
         ));
         assert!(!terminal_return_obligation_is_admitted(
             read,
             &BTreeSet::new(),
+            &BTreeSet::new(),
         ));
-        assert!(!terminal_return_obligation_is_admitted(
+        assert!(terminal_return_obligation_is_admitted(
             write,
+            &BTreeSet::new(),
             &BTreeSet::from([write]),
         ));
         assert!(terminal_return_obligation_is_admitted(
             live,
+            &BTreeSet::new(),
             &BTreeSet::new(),
         ));
     }

@@ -43,8 +43,8 @@ pub const R2SLEIGH_CAPABILITIES_V2: u64 = R2SLEIGH_CAP_DECOMPILE_V2
     | R2SLEIGH_CAP_PLANNER_QUERY_V2
     | R2SLEIGH_CAP_OPAQUE_RADARE_SNAPSHOT_V2;
 pub const R2SLEIGH_RADARE_ABI_V2: u32 = 138;
-pub const R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2: u32 = 8;
-pub const R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2: u32 = 2;
+pub const R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2: u32 = 9;
+pub const R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2: u32 = 3;
 
 pub const R2SLEIGH_STATUS_OK_V2: u32 = 0;
 pub const R2SLEIGH_STATUS_INVALID_ARGUMENT_V2: u32 = 1;
@@ -502,6 +502,8 @@ pub struct R2SleighRadareAccessorsV2 {
     pub external_exit: Option<unsafe extern "C" fn(*const c_void, usize, *mut u64) -> u8>,
     pub return_mechanism_view:
         Option<unsafe extern "C" fn(*const c_void, *mut R2SleighRadareReturnMechanismViewV2) -> u8>,
+    pub frame_pointer_storage_view:
+        Option<unsafe extern "C" fn(*const c_void, *mut R2SleighRadareRegisterStorageViewV2) -> u8>,
 }
 
 macro_rules! assert_wire_layout {
@@ -9114,12 +9116,32 @@ mod tests {
     }
 
     #[test]
+    fn radare_frame_pointer_wire_layout_matches_source_append() {
+        assert_eq!(
+            std::mem::offset_of!(R2SleighRadareAccessorsV2, frame_pointer_storage_view),
+            std::mem::offset_of!(r2source::RadareAbi138Accessors, frame_pointer_storage_view)
+        );
+        assert_eq!(
+            std::mem::offset_of!(R2SleighRadareAccessorsV2, frame_pointer_storage_view),
+            std::mem::offset_of!(R2SleighRadareAccessorsV2, return_mechanism_view)
+                + size_of::<
+                    Option<
+                        unsafe extern "C" fn(
+                            *const c_void,
+                            *mut R2SleighRadareReturnMechanismViewV2,
+                        ) -> u8,
+                    >,
+                >()
+        );
+    }
+
+    #[test]
     fn api_table_reports_rust_layouts() {
         let api = unsafe { &*r2sleigh_api_v2() };
         assert_eq!(api.abi_version, R2SLEIGH_ABI_V2);
         assert_eq!(api.radare_abi_version, R2SLEIGH_RADARE_ABI_V2);
-        assert_eq!(R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2, 8);
-        assert_eq!(R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2, 2);
+        assert_eq!(R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2, 9);
+        assert_eq!(R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2, 3);
         assert_eq!(api.struct_size as usize, size_of::<R2SleighApiV2>());
         assert_eq!(api.request_size as usize, size_of::<R2SleighRequestV2>());
         assert_eq!(

@@ -296,6 +296,7 @@ pub struct CapturedSourceFields {
     exact_stack_slot_roles: bool,
     return_address_storage: bool,
     stack_pointer_storage: bool,
+    frame_pointer_storage: bool,
     return_mechanism: bool,
 }
 
@@ -322,6 +323,10 @@ impl CapturedSourceFields {
 
     pub const fn has_stack_pointer_storage(self) -> bool {
         self.stack_pointer_storage
+    }
+
+    pub const fn has_frame_pointer_storage(self) -> bool {
+        self.frame_pointer_storage
     }
 
     pub const fn has_return_mechanism(self) -> bool {
@@ -431,6 +436,11 @@ impl OwnedFunctionSnapshot {
                     != interface.return_address_storage().is_some()
                 || captured_fields.stack_pointer_storage
                     != interface.stack_pointer_storage().is_some()
+                || captured_fields.frame_pointer_storage
+                    != interface.frame_pointer_storage().is_some()
+                || interface
+                    .frame_pointer_storage()
+                    .is_some_and(|storage| storage.size != machine.bits / 8)
                 || captured_fields.return_mechanism != interface.return_mechanism().is_some()
             {
                 return Err(SnapshotValidationError::InvalidFunctionInterface);
@@ -439,6 +449,7 @@ impl OwnedFunctionSnapshot {
             || captured_fields.exact_stack_slot_roles
             || captured_fields.return_address_storage
             || captured_fields.stack_pointer_storage
+            || captured_fields.frame_pointer_storage
             || captured_fields.return_mechanism
         {
             return Err(SnapshotValidationError::InvalidFunctionInterface);
@@ -570,6 +581,7 @@ mod tests {
                 exact_stack_slot_roles: false,
                 return_address_storage: false,
                 stack_pointer_storage: false,
+                frame_pointer_storage: false,
                 return_mechanism: false,
             },
             DiagnosticIdentity(7),
@@ -597,6 +609,7 @@ mod tests {
         )
         .and_then(|interface| interface.with_return_address_storage(register(16)))
         .and_then(|interface| interface.with_stack_pointer_storage(register(24)))
+        .and_then(|interface| interface.with_frame_pointer_storage(register(32)))
         .and_then(|interface| interface.with_exact_stacked_return(0, 8, 8, 8))
         .expect("exact interface")
     }
@@ -662,6 +675,7 @@ mod tests {
             exact_stack_slot_roles: true,
             return_address_storage: true,
             stack_pointer_storage: true,
+            frame_pointer_storage: true,
             return_mechanism: true,
         };
         let captured = OwnedFunctionSnapshot::from_captured_parts(
@@ -678,6 +692,116 @@ mod tests {
         .expect("coherent interface capture");
         assert_eq!(captured.function_interface(), Some(&interface));
         assert!(captured.captured_fields().has_return_mechanism());
+        assert!(captured.captured_fields().has_frame_pointer_storage());
+
+        let narrow = |offset| CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset,
+            size: 4,
+        };
+        let wrong_machine_width =
+            SourceFunctionInterface::new_exact([7], "sysv", [], SourceFunctionReturn::Void, [])
+                .and_then(|interface| interface.with_stack_pointer_storage(narrow(24)))
+                .and_then(|interface| interface.with_frame_pointer_storage(narrow(32)))
+                .expect("internally width-coherent narrow interface");
+        let narrow_fields = CapturedSourceFields {
+            bounded_function_image: true,
+            function_interface: true,
+            exact_function_types: false,
+            exact_stack_slot_roles: true,
+            return_address_storage: false,
+            stack_pointer_storage: true,
+            frame_pointer_storage: true,
+            return_mechanism: false,
+        };
+        assert_eq!(
+            OwnedFunctionSnapshot::from_captured_parts(
+                valid.machine().clone(),
+                *valid.function(),
+                valid.presentation().clone(),
+                valid.image().clone(),
+                Box::new([]),
+                Box::from([7]),
+                Some(wrong_machine_width),
+                narrow_fields,
+                valid.diagnostic_identity(),
+            ),
+            Err(SnapshotValidationError::InvalidFunctionInterface)
+        );
+
+        let mut missing_frame_pointer = captured_fields;
+        missing_frame_pointer.frame_pointer_storage = false;
+        assert_eq!(
+            OwnedFunctionSnapshot::from_captured_parts(
+                valid.machine().clone(),
+                *valid.function(),
+                valid.presentation().clone(),
+                valid.image().clone(),
+                Box::new([]),
+                Box::from([7]),
+                Some(interface.clone()),
+                missing_frame_pointer,
+                valid.diagnostic_identity(),
+            ),
+            Err(SnapshotValidationError::InvalidFunctionInterface)
+        );
+
+        let interface_without_frame_pointer = SourceFunctionInterface::new_exact(
+            [7],
+            "sysv",
+            [SourceAbiParameterSpec::new(0, register(0))],
+            SourceFunctionReturn::Register {
+                storage: register(8),
+            },
+            [SourceStackSlotSpec::new_local(
+                StackAddressBase::FramePointer,
+                register(32),
+                -8,
+                8,
+            )],
+        )
+        .and_then(|interface| interface.with_return_address_storage(register(16)))
+        .and_then(|interface| interface.with_stack_pointer_storage(register(24)))
+        .and_then(|interface| interface.with_exact_stacked_return(0, 8, 8, 8))
+        .expect("interface without explicit frame fact");
+        assert_eq!(
+            interface_without_frame_pointer.exact_frame_pointer_storage(),
+            Some(register(32))
+        );
+        assert_eq!(
+            OwnedFunctionSnapshot::from_captured_parts(
+                valid.machine().clone(),
+                *valid.function(),
+                valid.presentation().clone(),
+                valid.image().clone(),
+                Box::new([]),
+                Box::from([7]),
+                Some(interface_without_frame_pointer.clone()),
+                captured_fields,
+                valid.diagnostic_identity(),
+            ),
+            Err(SnapshotValidationError::InvalidFunctionInterface)
+        );
+        let mut fields_without_frame_pointer = captured_fields;
+        fields_without_frame_pointer.frame_pointer_storage = false;
+        let captured_without_frame_pointer = OwnedFunctionSnapshot::from_captured_parts(
+            valid.machine().clone(),
+            *valid.function(),
+            valid.presentation().clone(),
+            valid.image().clone(),
+            Box::new([]),
+            Box::from([7]),
+            Some(interface_without_frame_pointer),
+            fields_without_frame_pointer,
+            valid.diagnostic_identity(),
+        )
+        .expect("absent frame bit means no explicit payload");
+        assert_eq!(
+            captured_without_frame_pointer
+                .function_interface()
+                .and_then(SourceFunctionInterface::frame_pointer_storage),
+            None
+        );
 
         let mut missing_return_mechanism = captured_fields;
         missing_return_mechanism.return_mechanism = false;
@@ -708,6 +832,23 @@ mod tests {
                 Box::from([7]),
                 None,
                 mechanism_without_interface,
+                valid.diagnostic_identity(),
+            ),
+            Err(SnapshotValidationError::InvalidFunctionInterface)
+        );
+
+        let mut frame_pointer_without_interface = valid.captured_fields();
+        frame_pointer_without_interface.frame_pointer_storage = true;
+        assert_eq!(
+            OwnedFunctionSnapshot::from_captured_parts(
+                valid.machine().clone(),
+                *valid.function(),
+                valid.presentation().clone(),
+                valid.image().clone(),
+                Box::new([]),
+                Box::from([7]),
+                None,
+                frame_pointer_without_interface,
                 valid.diagnostic_identity(),
             ),
             Err(SnapshotValidationError::InvalidFunctionInterface)

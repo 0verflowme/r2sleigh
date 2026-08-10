@@ -9,8 +9,9 @@ use r2cert::{
     CertifiedAbiParameter, CertifiedCallArgument, CertifiedCallArgumentOrigin, CertifiedDirectCall,
     CertifiedExpr, CertifiedFramePreservation, CertifiedMachineFunction,
     CertifiedMachineProjection, CertifiedMemoryStatement, CertifiedMemoryStatementKind,
-    CertifiedNormalizedStackRange, CertifiedReturnControl, CertifiedSourceTerminator,
-    CertifiedSourceTopology, CertifiedStackSlot, EffectDisposition, ObligationLedger,
+    CertifiedNormalizedStackRange, CertifiedReturnControl, CertifiedReturnRegisterDefinition,
+    CertifiedReturnRegisterOverlay, CertifiedSourceTerminator, CertifiedSourceTopology,
+    CertifiedStackSlot, EffectDisposition, ObligationLedger,
 };
 use r2ssa::{
     CallBoundarySlot, CallSiteId, CanonicalInstructionId, CanonicalStorageId,
@@ -26,7 +27,7 @@ use r2ssa::{
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const SEMANTIC_C_SCHEMA_VERSION: u32 = 11;
+pub const SEMANTIC_C_SCHEMA_VERSION: u32 = 14;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SemanticCParameter {
@@ -500,6 +501,7 @@ impl SemanticCDirectCall {
 pub struct SemanticCReturnValue {
     slot: CallBoundarySlot,
     binding: MachineValueBinding,
+    producer: CanonicalInstructionId,
     expression: SemanticCExprId,
 }
 
@@ -512,8 +514,122 @@ impl SemanticCReturnValue {
         self.binding
     }
 
+    pub const fn producer(&self) -> CanonicalInstructionId {
+        self.producer
+    }
+
     pub const fn expression(&self) -> SemanticCExprId {
         self.expression
+    }
+}
+
+/// One exact, real SSA definition participating in a composed ABI return.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SemanticCReturnRegisterDefinition {
+    storage: CanonicalStorageId,
+    binding: MachineValueBinding,
+    producer: CanonicalInstructionId,
+    expression: SemanticCExprId,
+}
+
+impl SemanticCReturnRegisterDefinition {
+    pub const fn storage(&self) -> CanonicalStorageId {
+        self.storage
+    }
+
+    pub const fn binding(&self) -> MachineValueBinding {
+        self.binding
+    }
+
+    pub const fn producer(&self) -> CanonicalInstructionId {
+        self.producer
+    }
+
+    pub const fn expression(&self) -> SemanticCExprId {
+        self.expression
+    }
+}
+
+/// One ordered contained-slice write over a composed ABI return base.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SemanticCReturnRegisterOverlay {
+    definition: SemanticCReturnRegisterDefinition,
+    offset_bytes: u32,
+}
+
+impl SemanticCReturnRegisterOverlay {
+    pub const fn definition(&self) -> &SemanticCReturnRegisterDefinition {
+        &self.definition
+    }
+
+    pub const fn offset_bytes(&self) -> u32 {
+        self.offset_bytes
+    }
+}
+
+/// Exact output-less reconstruction of one full-width ABI return register.
+///
+/// Every component names a real SSA binding and expression entity. The
+/// reconstructed value deliberately has no invented binding or entity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SemanticCReturnRegisterComposition {
+    slot: CallBoundarySlot,
+    base: SemanticCReturnRegisterDefinition,
+    overlays: Box<[SemanticCReturnRegisterOverlay]>,
+}
+
+impl SemanticCReturnRegisterComposition {
+    pub const fn slot(&self) -> CallBoundarySlot {
+        self.slot
+    }
+
+    pub const fn base(&self) -> &SemanticCReturnRegisterDefinition {
+        &self.base
+    }
+
+    pub const fn overlays(&self) -> &[SemanticCReturnRegisterOverlay] {
+        &self.overlays
+    }
+
+    pub const fn physical_width_bits(&self) -> u32 {
+        self.base.binding.width_bits()
+    }
+
+    pub fn source_producers(&self) -> impl Iterator<Item = CanonicalInstructionId> + '_ {
+        std::iter::once(self.base.producer).chain(
+            self.overlays
+                .iter()
+                .map(|overlay| overlay.definition.producer),
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticCReturnOperand<'a> {
+    Direct(&'a SemanticCReturnValue),
+    RegisterComposition(&'a SemanticCReturnRegisterComposition),
+}
+
+impl SemanticCReturnOperand<'_> {
+    pub const fn slot(self) -> CallBoundarySlot {
+        match self {
+            Self::Direct(value) => value.slot(),
+            Self::RegisterComposition(composition) => composition.slot(),
+        }
+    }
+
+    pub const fn physical_width_bits(self) -> u32 {
+        match self {
+            Self::Direct(value) => value.binding().width_bits(),
+            Self::RegisterComposition(composition) => composition.physical_width_bits(),
+        }
+    }
+
+    pub fn source_producers(self) -> BTreeSet<CanonicalInstructionId> {
+        match self {
+            Self::Direct(value) => BTreeSet::from([value.producer()]),
+            Self::RegisterComposition(composition) => composition.source_producers().collect(),
+        }
     }
 }
 
@@ -522,6 +638,7 @@ pub struct SemanticCReturn {
     producer: CanonicalInstructionId,
     control_target: MachineValueBinding,
     values: Box<[SemanticCReturnValue]>,
+    register_compositions: Box<[SemanticCReturnRegisterComposition]>,
     source_obligations: BTreeSet<SemanticObligationId>,
 }
 
@@ -536,6 +653,18 @@ impl SemanticCReturn {
 
     pub const fn values(&self) -> &[SemanticCReturnValue] {
         &self.values
+    }
+
+    pub const fn register_compositions(&self) -> &[SemanticCReturnRegisterComposition] {
+        &self.register_compositions
+    }
+
+    pub fn single_operand(&self) -> Option<SemanticCReturnOperand<'_>> {
+        match (self.values.as_ref(), self.register_compositions.as_ref()) {
+            ([value], []) => Some(SemanticCReturnOperand::Direct(value)),
+            ([], [composition]) => Some(SemanticCReturnOperand::RegisterComposition(composition)),
+            _ => None,
+        }
     }
 
     pub const fn source_obligations(&self) -> &BTreeSet<SemanticObligationId> {
@@ -735,6 +864,7 @@ pub enum SemanticCError {
     InvalidBooleanNotExpression(SemanticCExprId),
     InvalidBooleanExpression(SemanticCExprId),
     InvalidArithmeticFlagExpression(SemanticCExprId),
+    InvalidBitwiseExpression(MachineExprId),
     InvalidSelectExpression(SemanticCExprId),
     SelectRequiresValueArmExpression(SemanticCExprId),
     InvalidWidth(u32),
@@ -773,6 +903,10 @@ impl<'a> MachineView<'a> {
 
     fn expr(self, id: MachineExprId) -> Option<&'a MachineExpr> {
         self.0.expr(id)
+    }
+
+    fn entity_for_producer(self, producer: CanonicalInstructionId) -> Option<&'a MachineEntity> {
+        self.0.entity_for_producer(producer)
     }
 
     fn output_producers(self) -> BTreeMap<ValueId, CanonicalInstructionId> {
@@ -1480,6 +1614,32 @@ fn merge_frame_dependency_row(
         .extend(inputs.into_iter().filter(|input| *input != producer));
 }
 
+fn merge_exact_frame_relation_dependency(
+    dependencies: &mut BTreeMap<CanonicalInstructionId, BTreeSet<CanonicalInstructionId>>,
+    explicit_dependencies: &mut BTreeMap<CanonicalInstructionId, BTreeSet<CanonicalInstructionId>>,
+    producer: CanonicalInstructionId,
+    input: Option<CanonicalInstructionId>,
+) -> bool {
+    if input == Some(producer) {
+        return false;
+    }
+    let exact = input.into_iter().collect::<BTreeSet<_>>();
+    if dependencies
+        .get(&producer)
+        .is_some_and(|inputs| inputs != &exact)
+        || explicit_dependencies
+            .get(&producer)
+            .is_some_and(|inputs| inputs != &exact)
+    {
+        return false;
+    }
+    dependencies
+        .entry(producer)
+        .or_insert_with(|| exact.clone());
+    explicit_dependencies.entry(producer).or_insert(exact);
+    true
+}
+
 fn union_mechanics_services(
     return_services: &BTreeMap<CanonicalInstructionId, BTreeSet<CanonicalInstructionId>>,
     frame_services: &BTreeMap<CanonicalInstructionId, BTreeSet<CanonicalInstructionId>>,
@@ -1513,6 +1673,23 @@ fn semantic_mechanics_producers(
                 && candidate_set.contains(&producer)
             {
                 semantic.insert(producer);
+            }
+        }
+        for composition in control.register_compositions() {
+            for definition in std::iter::once(composition.base()).chain(
+                composition
+                    .overlays()
+                    .iter()
+                    .map(CertifiedReturnRegisterOverlay::definition),
+            ) {
+                if definition.value().producer() != Some(definition.producer()) {
+                    return Err(SemanticCError::InvalidReturnMechanics(
+                        definition.producer(),
+                    ));
+                }
+                if candidate_set.contains(&definition.producer()) {
+                    semantic.insert(definition.producer());
+                }
             }
         }
     }
@@ -1645,13 +1822,50 @@ fn derive_mechanics(
     let mut statements = BTreeMap::<CanonicalInstructionId, &CertifiedMemoryStatement>::new();
     let mut explicit_dependencies =
         BTreeMap::<CanonicalInstructionId, BTreeSet<CanonicalInstructionId>>::new();
-    let mut add_expression = |expression: &CertifiedExpr| {
-        common_roots.insert(expression.entity().producer());
+    common_roots.insert(frame.stack_allocation().entity().producer());
+    let relation = frame.frame_relation();
+    let relation_producer = relation.producer();
+    let relation_input = relation.input().binding();
+    let relation_input_producer = relation.input().producer();
+    let relation_width = frame
+        .frame_pointer_storage()
+        .size
+        .checked_mul(8)
+        .filter(|width| *width != 0)
+        .ok_or(SemanticCError::InvalidFrameMechanics(relation_producer))?;
+    let relation_entity = machine
+        .entity_for_producer(relation_producer)
+        .ok_or(SemanticCError::InvalidFrameMechanics(relation_producer))?;
+    let relation_affine = relation
+        .normalized_affine_relation()
+        .ok_or(SemanticCError::InvalidFrameMechanics(relation_producer))?;
+    let input_is_exact = match relation_input_producer {
+        Some(producer) => {
+            output_producers.get(&relation_input.value()) == Some(&producer)
+                && outputs.get(&producer) == Some(&relation_input)
+        }
+        None => !output_producers.contains_key(&relation_input.value()),
     };
-    add_expression(frame.stack_allocation());
-    add_expression(frame.frame_relation());
+    if relation.storage() != frame.frame_pointer_storage()
+        || relation_affine.base_storage() != frame.stack_pointer_storage()
+        || relation_affine.width_bits() != relation_width
+        || relation.input().binding().width_bits() != relation_width
+        || relation.output().width_bits() != relation_width
+        || relation_entity.root() != relation.root()
+        || relation_entity.output() != relation.output()
+        || !input_is_exact
+        || !merge_exact_frame_relation_dependency(
+            &mut dependencies,
+            &mut explicit_dependencies,
+            relation_producer,
+            relation_input_producer,
+        )
+    {
+        return Err(SemanticCError::InvalidFrameMechanics(relation_producer));
+    }
+    common_roots.insert(relation_producer);
     for copy in frame.entry_save_copies() {
-        add_expression(copy);
+        common_roots.insert(copy.entity().producer());
     }
     common_roots.insert(frame.entry_save().producer());
     statements.insert(frame.entry_save().producer(), frame.entry_save());
@@ -1674,6 +1888,20 @@ fn derive_mechanics(
     for restore in frame.restores() {
         let return_producer = restore.return_control().producer();
         let roots = restore_roots.entry(return_producer).or_default();
+        if let Some(return_address_read) = restore.return_address_read() {
+            roots.insert(return_address_read.producer());
+            statements.insert(return_address_read.producer(), return_address_read);
+            let mut return_address_read_inputs = BTreeSet::new();
+            if let Some(producer) = return_address_read.address().producer() {
+                roots.insert(producer);
+                return_address_read_inputs.insert(producer);
+            }
+            merge_frame_dependency_row(
+                &mut explicit_dependencies,
+                return_address_read.producer(),
+                return_address_read_inputs,
+            );
+        }
         roots.insert(restore.restore_read().producer());
         statements.insert(restore.restore_read().producer(), restore.restore_read());
         let mut restore_read_inputs = BTreeSet::new();
@@ -1887,10 +2115,20 @@ impl SemanticCExpressionLayer {
                     .map(|_| entity.producer())
             })
             .collect::<BTreeSet<_>>();
+        let mut root_outputs = BTreeMap::new();
+        for entity in machine.entities() {
+            if root_outputs
+                .insert(entity.root(), (entity.output(), entity.producer()))
+                .is_some()
+            {
+                return Err(SemanticCError::InvalidBitwiseExpression(entity.root()));
+            }
+        }
         let mut builder = SemanticCBuilder {
             machine,
             output_producers: &output_producers,
             certified_producers: &certified_producers,
+            root_outputs,
             translated: BTreeMap::new(),
             expressions: Vec::new(),
             inputs: BTreeMap::new(),
@@ -2090,6 +2328,41 @@ impl SemanticCExpressionLayer {
     pub(crate) fn render_expr(&self, id: SemanticCExprId) -> Result<String, SemanticCError> {
         self.render_expr_inner(id, None)
             .map(|rendered| rendered.source)
+    }
+
+    pub fn render_return_operand(
+        &self,
+        operand: SemanticCReturnOperand<'_>,
+    ) -> Result<String, SemanticCError> {
+        match operand {
+            SemanticCReturnOperand::Direct(value) => Ok(value_name(value.binding())),
+            SemanticCReturnOperand::RegisterComposition(composition) => {
+                let total_width = composition.physical_width_bits();
+                supported_width(total_width)?;
+                let ctype = storage_type(self.expr_type(composition.base.expression())?)?;
+                let mut rendered = value_name(composition.base.binding());
+                for overlay in composition.overlays() {
+                    let width = overlay.definition.binding().width_bits();
+                    let lsb_bits = overlay.offset_bytes.checked_mul(8).ok_or(
+                        SemanticCError::ReturnBindingMismatch(composition.base.producer()),
+                    )?;
+                    if width == 0
+                        || lsb_bits
+                            .checked_add(width)
+                            .is_none_or(|end| end > total_width)
+                    {
+                        return Err(SemanticCError::ReturnBindingMismatch(
+                            composition.base.producer(),
+                        ));
+                    }
+                    rendered = format!(
+                        "r2s_bit_insert((uint64_t)({rendered}), (uint64_t)({}), {lsb_bits}U, {width}U, {total_width}U)",
+                        value_name(overlay.definition.binding())
+                    );
+                }
+                Ok(format!("(({ctype})({rendered}))"))
+            }
+        }
     }
 
     fn render_expr_inner(
@@ -2514,15 +2787,27 @@ pub(crate) fn semantic_return_from_control(
     let interface = layer
         .function_interface()
         .ok_or(SemanticCError::InvalidCertifiedFunctionInterface)?;
-    match (interface.return_kind(), control.values()) {
-        (SemanticCFunctionReturn::Void, []) => {}
-        (SemanticCFunctionReturn::Register { storage, ty }, [returned])
+    match (
+        interface.return_kind(),
+        control.values(),
+        control.register_compositions(),
+    ) {
+        (SemanticCFunctionReturn::Void, [], []) => {}
+        (SemanticCFunctionReturn::Register { storage, ty }, [returned], [])
             if returned.slot()
                 == (CallBoundarySlot::Register {
                     index: 0,
                     storage: *storage,
                 })
                 && returned.value().ty() == ty => {}
+        (SemanticCFunctionReturn::Register { storage, ty }, [], [composition])
+            if composition.slot()
+                == (CallBoundarySlot::Register {
+                    index: 0,
+                    storage: *storage,
+                })
+                && composition.base().storage() == *storage
+                && composition.base().value().ty() == ty => {}
         _ => return Err(SemanticCError::ReturnBindingMismatch(control.producer())),
     }
     let mut values = Vec::with_capacity(control.values().len());
@@ -2541,14 +2826,81 @@ pub(crate) fn semantic_return_from_control(
         values.push(SemanticCReturnValue {
             slot: returned.slot(),
             binding: returned.value().binding(),
+            producer,
             expression: entity.root(),
+        });
+    }
+    let mut register_compositions = Vec::with_capacity(control.register_compositions().len());
+    for composition in control.register_compositions() {
+        let base = semantic_return_register_definition(composition.base(), layer)?;
+        let CallBoundarySlot::Register {
+            storage: slot_storage,
+            ..
+        } = composition.slot()
+        else {
+            return Err(SemanticCError::ReturnBindingMismatch(control.producer()));
+        };
+        if base.storage != slot_storage {
+            return Err(SemanticCError::ReturnBindingMismatch(control.producer()));
+        }
+        let mut overlays = Vec::with_capacity(composition.overlays().len());
+        for overlay in composition.overlays() {
+            let definition = semantic_return_register_definition(overlay.definition(), layer)?;
+            if definition.storage.space != base.storage.space
+                || definition.storage.offset.checked_sub(base.storage.offset)
+                    != Some(u64::from(overlay.offset_bytes()))
+                || u64::from(overlay.offset_bytes())
+                    .checked_add(u64::from(definition.storage.size))
+                    .is_none_or(|end| end > u64::from(base.storage.size))
+            {
+                return Err(SemanticCError::ReturnBindingMismatch(control.producer()));
+            }
+            overlays.push(SemanticCReturnRegisterOverlay {
+                definition,
+                offset_bytes: overlay.offset_bytes(),
+            });
+        }
+        if overlays.is_empty() {
+            return Err(SemanticCError::ReturnBindingMismatch(control.producer()));
+        }
+        register_compositions.push(SemanticCReturnRegisterComposition {
+            slot: composition.slot(),
+            base,
+            overlays: overlays.into_boxed_slice(),
         });
     }
     Ok(SemanticCReturn {
         producer: control.producer(),
         control_target: control.control_target().binding(),
         values: values.into_boxed_slice(),
+        register_compositions: register_compositions.into_boxed_slice(),
         source_obligations: control.source_obligations(),
+    })
+}
+
+fn semantic_return_register_definition(
+    definition: &CertifiedReturnRegisterDefinition,
+    layer: &SemanticCExpressionLayer,
+) -> Result<SemanticCReturnRegisterDefinition, SemanticCError> {
+    let producer = definition.producer();
+    if definition.value().producer() != Some(producer)
+        || definition.storage().size.checked_mul(8)
+            != Some(definition.value().binding().width_bits())
+    {
+        return Err(SemanticCError::ReturnBindingMismatch(producer));
+    }
+    let entity = layer
+        .entity_for_producer(producer)
+        .filter(|entity| entity.output() == definition.value().binding())
+        .ok_or(SemanticCError::MissingReturnExpression(producer))?;
+    if layer.expr(entity.root()).map(SemanticCExpr::ty) != Some(definition.value().ty()) {
+        return Err(SemanticCError::ReturnBindingMismatch(producer));
+    }
+    Ok(SemanticCReturnRegisterDefinition {
+        storage: definition.storage(),
+        binding: definition.value().binding(),
+        producer,
+        expression: entity.root(),
     })
 }
 
@@ -2556,12 +2908,136 @@ struct SemanticCBuilder<'a> {
     machine: MachineView<'a>,
     output_producers: &'a BTreeMap<ValueId, CanonicalInstructionId>,
     certified_producers: &'a BTreeSet<CanonicalInstructionId>,
+    root_outputs: BTreeMap<MachineExprId, (MachineValueBinding, CanonicalInstructionId)>,
     translated: BTreeMap<MachineExprId, SemanticCExprId>,
     expressions: Vec<SemanticCExpr>,
     inputs: BTreeMap<MachineValueBinding, MachineType>,
 }
 
+fn exact_self_xor_zero_value(
+    machine_id: MachineExprId,
+    output_ty: &MachineType,
+    input_ty: &MachineType,
+    binding_width_bits: u32,
+) -> Result<MachineBitVector, SemanticCError> {
+    if !matches!(output_ty, MachineType::Integer { .. })
+        || input_ty != output_ty
+        || binding_width_bits != output_ty.width_bits()
+    {
+        return Err(SemanticCError::InvalidBitwiseExpression(machine_id));
+    }
+    MachineBitVector::zero(binding_width_bits)
+        .ok_or(SemanticCError::InvalidBitwiseExpression(machine_id))
+}
+
 impl SemanticCBuilder<'_> {
+    fn exact_self_xor_zero(
+        &self,
+        machine_id: MachineExprId,
+        machine_expr: &MachineExpr,
+    ) -> Result<Option<(MachineExprId, MachineValueBinding, MachineBitVector)>, SemanticCError>
+    {
+        let MachineExprKind::Bitwise {
+            op: MachineBitwiseOp::Xor,
+            left,
+            right,
+        } = machine_expr.kind()
+        else {
+            return Ok(None);
+        };
+        if left != right {
+            return Ok(None);
+        }
+        let child = self
+            .machine
+            .expr(*left)
+            .ok_or(SemanticCError::MissingMachineExpression(*left))?;
+        let (binding, producer) = self
+            .root_outputs
+            .get(&machine_id)
+            .copied()
+            .ok_or(SemanticCError::InvalidBitwiseExpression(machine_id))?;
+        if machine_expr.origin() != Some(producer) {
+            return Err(SemanticCError::InvalidBitwiseExpression(machine_id));
+        }
+        let value = exact_self_xor_zero_value(
+            machine_id,
+            machine_expr.ty(),
+            child.ty(),
+            binding.width_bits(),
+        )?;
+        Ok(Some((*left, binding, value)))
+    }
+
+    fn collect_sources_without_translation(
+        &self,
+        root: MachineExprId,
+        source_instructions: &mut BTreeSet<CanonicalInstructionId>,
+    ) -> Result<(), SemanticCError> {
+        let mut pending = vec![root];
+        let mut visited = BTreeSet::new();
+        while let Some(machine_id) = pending.pop() {
+            if !visited.insert(machine_id) {
+                continue;
+            }
+            let expression = self
+                .machine
+                .expr(machine_id)
+                .ok_or(SemanticCError::MissingMachineExpression(machine_id))?;
+            supported_width(expression.ty().width_bits())?;
+            if let Some(origin) = expression.origin() {
+                source_instructions.insert(origin);
+            }
+            match expression.kind() {
+                MachineExprKind::Source { binding } => {
+                    if let Some(dependency) = self.output_producers.get(&binding.value()).copied() {
+                        if !self.certified_producers.contains(&dependency) {
+                            return Err(SemanticCError::UncertifiedDependency {
+                                producer: expression.origin().unwrap_or(dependency),
+                                dependency,
+                            });
+                        }
+                        source_instructions.insert(dependency);
+                    }
+                }
+                MachineExprKind::Constant { .. } => {}
+                MachineExprKind::MemoryRead { address, .. } => pending.push(*address),
+                MachineExprKind::Copy { input }
+                | MachineExprKind::BitwiseNot { input }
+                | MachineExprKind::BooleanNot { input }
+                | MachineExprKind::Cast { input, .. }
+                | MachineExprKind::Extract { input, .. } => pending.push(*input),
+                MachineExprKind::Arithmetic { left, right, .. }
+                | MachineExprKind::ArithmeticFlag { left, right, .. }
+                | MachineExprKind::Bitwise { left, right, .. }
+                | MachineExprKind::Boolean { left, right, .. }
+                | MachineExprKind::Compare { left, right, .. } => {
+                    pending.push(*left);
+                    pending.push(*right);
+                }
+                MachineExprKind::Shift { value, count, .. } => {
+                    pending.push(*value);
+                    pending.push(*count);
+                }
+                MachineExprKind::Select {
+                    condition,
+                    if_true,
+                    if_false,
+                } => {
+                    pending.push(*condition);
+                    pending.push(*if_true);
+                    pending.push(*if_false);
+                }
+                MachineExprKind::Phi { .. } => {
+                    return Err(SemanticCError::PhiRequiresCertifiedStructuring(
+                        expression.origin(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn translate(&mut self, machine_id: MachineExprId) -> Result<SemanticCExprId, SemanticCError> {
         if let Some(id) = self.translated.get(&machine_id).copied() {
             return Ok(id);
@@ -2647,11 +3123,20 @@ impl SemanticCBuilder<'_> {
                     right: self.translate_child(*right, &mut source_instructions)?,
                 }
             }
-            MachineExprKind::Bitwise { op, left, right } => SemanticCExprKind::Bitwise {
-                op: *op,
-                left: self.translate_child(*left, &mut source_instructions)?,
-                right: self.translate_child(*right, &mut source_instructions)?,
-            },
+            MachineExprKind::Bitwise { op, left, right } => {
+                if let Some((input, binding, value)) =
+                    self.exact_self_xor_zero(machine_id, machine_expr)?
+                {
+                    self.collect_sources_without_translation(input, &mut source_instructions)?;
+                    SemanticCExprKind::Constant { binding, value }
+                } else {
+                    SemanticCExprKind::Bitwise {
+                        op: *op,
+                        left: self.translate_child(*left, &mut source_instructions)?,
+                        right: self.translate_child(*right, &mut source_instructions)?,
+                    }
+                }
+            }
             MachineExprKind::BitwiseNot { input } => SemanticCExprKind::BitwiseNot {
                 input: self.translate_child(*input, &mut source_instructions)?,
             },
@@ -2881,6 +3366,12 @@ pub(crate) const SEMANTIC_C_HELPERS: &str = r#"static inline uint64_t r2s_mask(u
 	return width >= 64U ? UINT64_MAX : ((UINT64_C(1) << width) - UINT64_C(1));
 }
 
+static inline uint64_t r2s_bit_insert(uint64_t base, uint64_t value, unsigned lsb, unsigned width, unsigned total_width) {
+	uint64_t value_mask = r2s_mask(width);
+	uint64_t field_mask = value_mask << lsb;
+	return ((base & ~field_mask) | ((value & value_mask) << lsb)) & r2s_mask(total_width);
+}
+
 static inline int8_t r2s_i8_from_bits(uint8_t bits) {
 	return bits <= INT8_MAX ? (int8_t)bits : (int8_t)(-INT8_C(1) - (int16_t)(UINT8_MAX - bits));
 }
@@ -3023,9 +3514,10 @@ static inline uint64_t r2s_sext(uint64_t value, unsigned from_width, unsigned to
 #[cfg(test)]
 mod return_mechanics_tests {
     use super::*;
+    use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, Varnode};
     use r2ssa::{
         CanonicalInstructionSite, CanonicalStorageSpace, SourceLogicalValue, SourceType,
-        SourceTypeGraph,
+        SourceTypeGraph, SsaArtifact,
     };
 
     fn id(ordinal: u64) -> CanonicalInstructionId {
@@ -3040,6 +3532,170 @@ mod return_mechanics_tests {
             block_addr,
             site: CanonicalInstructionSite::Op(ordinal),
         }
+    }
+
+    fn translate_projection_root(
+        projection: &MachineProjection,
+        producer: CanonicalInstructionId,
+    ) -> (SemanticCExpr, BTreeMap<MachineValueBinding, MachineType>) {
+        let output_producers = MachineView(projection).output_producers();
+        let certified_producers = projection
+            .entities()
+            .iter()
+            .map(MachineEntity::producer)
+            .collect::<BTreeSet<_>>();
+        let root_outputs = projection
+            .entities()
+            .iter()
+            .map(|entity| (entity.root(), (entity.output(), entity.producer())))
+            .collect();
+        let root = projection
+            .entity_for_producer(producer)
+            .expect("translated producer")
+            .root();
+        let mut builder = SemanticCBuilder {
+            machine: MachineView(projection),
+            output_producers: &output_producers,
+            certified_producers: &certified_producers,
+            root_outputs,
+            translated: BTreeMap::new(),
+            expressions: Vec::new(),
+            inputs: BTreeMap::new(),
+        };
+        let translated = builder.translate(root).expect("semantic translation");
+        (
+            builder.expressions[translated.index()].clone(),
+            builder.inputs,
+        )
+    }
+
+    fn xor_projection(
+        width_bytes: u32,
+        left: Varnode,
+        right: Varnode,
+    ) -> (MachineProjection, CanonicalInstructionId) {
+        let block_addr = 0x4200 + u64::from(width_bytes);
+        let mut block = R2ILBlock::new(block_addr, 4);
+        block.push(R2ILOp::IntXor {
+            dst: Varnode::unique(0x100, width_bytes),
+            a: left,
+            b: right,
+        });
+        let artifact = SsaArtifact::raw(&[block], None).expect("self-XOR SSA artifact");
+        (
+            MachineProjection::from_artifact(&artifact).expect("self-XOR machine projection"),
+            block_id(block_addr, 0),
+        )
+    }
+
+    #[test]
+    fn exact_self_xor_becomes_bound_zero_without_source_input() {
+        for width_bytes in [1, 2, 4, 8] {
+            let source = Varnode::register(0, width_bytes);
+            let (projection, producer) = xor_projection(width_bytes, source.clone(), source);
+            let expected_binding = projection
+                .entity_for_producer(producer)
+                .expect("self-XOR entity")
+                .output();
+            let (expression, inputs) = translate_projection_root(&projection, producer);
+
+            assert_eq!(
+                expression.source_instructions(),
+                &BTreeSet::from([producer])
+            );
+            assert!(inputs.is_empty());
+            assert!(matches!(
+                expression.kind(),
+                SemanticCExprKind::Constant { binding, value }
+                    if *binding == expected_binding
+                        && value.width_bits() == width_bytes * 8
+                        && value.bits() == 0
+            ));
+        }
+    }
+
+    #[test]
+    fn self_xor_retains_exact_child_and_result_producers() {
+        let block_addr = 0x4210;
+        let copied = Varnode::unique(0x80, 4);
+        let mut block = R2ILBlock::new(block_addr, 4);
+        block.push(R2ILOp::Copy {
+            dst: copied.clone(),
+            src: Varnode::register(0, 4),
+        });
+        block.push(R2ILOp::IntXor {
+            dst: Varnode::unique(0x100, 4),
+            a: copied.clone(),
+            b: copied,
+        });
+        let artifact = SsaArtifact::raw(&[block], None).expect("dependent self-XOR artifact");
+        let projection =
+            MachineProjection::from_artifact(&artifact).expect("dependent self-XOR projection");
+        let producer = block_id(block_addr, 1);
+        let (expression, inputs) = translate_projection_root(&projection, producer);
+
+        assert_eq!(
+            expression.source_instructions(),
+            &BTreeSet::from([block_id(block_addr, 0), producer])
+        );
+        assert!(inputs.is_empty());
+        assert!(matches!(
+            expression.kind(),
+            SemanticCExprKind::Constant { value, .. } if value.bits() == 0
+        ));
+    }
+
+    #[test]
+    fn distinct_xor_inputs_are_not_annihilated() {
+        let (projection, producer) =
+            xor_projection(4, Varnode::register(0, 4), Varnode::register(8, 4));
+        let (expression, inputs) = translate_projection_root(&projection, producer);
+
+        assert!(matches!(
+            expression.kind(),
+            SemanticCExprKind::Bitwise {
+                op: MachineBitwiseOp::Xor,
+                left,
+                right,
+            } if left != right
+        ));
+        assert_eq!(inputs.len(), 2);
+    }
+
+    #[test]
+    fn self_xor_type_and_width_mutations_refuse() {
+        let source = Varnode::register(0, 4);
+        let (projection, producer) = xor_projection(4, source.clone(), source);
+        let expression = projection
+            .entity_for_producer(producer)
+            .expect("self-XOR entity")
+            .root();
+        let unsigned32 = MachineType::Integer {
+            width_bits: 32,
+            signedness: MachineSignedness::Unsigned,
+        };
+        let unsigned64 = MachineType::Integer {
+            width_bits: 64,
+            signedness: MachineSignedness::Unsigned,
+        };
+        let address32 = MachineType::Address {
+            width_bits: 32,
+            space: r2ssa::MachineAddressSpace::Ram,
+            provenance: MachineAddressProvenance::Unknown,
+        };
+
+        assert!(matches!(
+            exact_self_xor_zero_value(expression, &unsigned32, &unsigned64, 32),
+            Err(SemanticCError::InvalidBitwiseExpression(id)) if id == expression
+        ));
+        assert!(matches!(
+            exact_self_xor_zero_value(expression, &unsigned32, &unsigned32, 64),
+            Err(SemanticCError::InvalidBitwiseExpression(id)) if id == expression
+        ));
+        assert!(matches!(
+            exact_self_xor_zero_value(expression, &address32, &address32, 32),
+            Err(SemanticCError::InvalidBitwiseExpression(id)) if id == expression
+        ));
     }
 
     fn logical_return_interface(
@@ -3302,13 +3958,15 @@ mod return_mechanics_tests {
     fn shared_return_value_producers_and_ancestors_remain_semantic() {
         let leaf = id(0);
         let shared = id(1);
-        let return_address = id(2);
-        let exit_stack_pointer = id(3);
-        let return_producer = id(4);
+        let overlay = id(2);
+        let return_address = id(3);
+        let exit_stack_pointer = id(4);
+        let return_producer = id(5);
         let dependencies = BTreeMap::from([
             (leaf, BTreeSet::new()),
             (shared, BTreeSet::from([leaf])),
-            (return_address, BTreeSet::from([shared])),
+            (overlay, BTreeSet::from([shared])),
+            (return_address, BTreeSet::from([overlay])),
             (exit_stack_pointer, BTreeSet::from([shared])),
         ]);
         let mut candidates = BTreeMap::new();
@@ -3327,10 +3985,13 @@ mod return_mechanics_tests {
         )
         .expect("exit-stack-pointer closure");
 
-        let semantic =
-            backward_close_semantic_producers(&candidates, &dependencies, BTreeSet::from([shared]))
-                .expect("shared semantic closure");
-        assert_eq!(semantic, BTreeSet::from([leaf, shared]));
+        let semantic = backward_close_semantic_producers(
+            &candidates,
+            &dependencies,
+            BTreeSet::from([shared, overlay]),
+        )
+        .expect("composed return components close over their dependencies");
+        assert_eq!(semantic, BTreeSet::from([leaf, shared, overlay]));
         assert_eq!(
             candidates
                 .keys()
@@ -3339,6 +4000,216 @@ mod return_mechanics_tests {
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from([return_address, exit_stack_pointer])
         );
+    }
+
+    fn composed_operand_fixture() -> (
+        SemanticCExpressionLayer,
+        SemanticCReturnRegisterComposition,
+        SemanticCReturnValue,
+    ) {
+        let mut block = R2ILBlock::new(0x4100, 4);
+        block.push(R2ILOp::Copy {
+            dst: Varnode::register(0, 8),
+            src: Varnode::constant(0, 8),
+        });
+        block.push(R2ILOp::Copy {
+            dst: Varnode::register(0, 1),
+            src: Varnode::constant(1, 1),
+        });
+        let mut arch = ArchSpec::new("semantic-composed-return-test");
+        arch.add_register(RegisterDef::new("rax", 0, 8));
+        arch.add_register(RegisterDef::sub("al", 0, 1, "rax"));
+        let artifact = SsaArtifact::for_decompile(&[block], Some(&arch))
+            .expect("prepared composed-return component artifact");
+        let projection = MachineProjection::from_artifact(&artifact)
+            .expect("machine projection for composed-return components");
+        let base_producer = block_id(0x4100, 0);
+        let overlay_producer = block_id(0x4100, 1);
+        let base_binding = projection
+            .entity_for_producer(base_producer)
+            .expect("base entity")
+            .output();
+        let overlay_binding = projection
+            .entity_for_producer(overlay_producer)
+            .expect("overlay entity")
+            .output();
+        let base_ty = MachineType::Integer {
+            width_bits: 64,
+            signedness: MachineSignedness::Unsigned,
+        };
+        let overlay_ty = MachineType::Integer {
+            width_bits: 8,
+            signedness: MachineSignedness::Unsigned,
+        };
+        let expressions = vec![
+            SemanticCExpr {
+                ty: base_ty.clone(),
+                source_instructions: BTreeSet::from([base_producer]),
+                kind: SemanticCExprKind::Input {
+                    binding: base_binding,
+                },
+            },
+            SemanticCExpr {
+                ty: overlay_ty.clone(),
+                source_instructions: BTreeSet::from([overlay_producer]),
+                kind: SemanticCExprKind::Input {
+                    binding: overlay_binding,
+                },
+            },
+        ];
+        let entities = vec![
+            SemanticCEntity {
+                output: base_binding,
+                root: SemanticCExprId(0),
+                producer: base_producer,
+                source_obligations: BTreeSet::new(),
+            },
+            SemanticCEntity {
+                output: overlay_binding,
+                root: SemanticCExprId(1),
+                producer: overlay_producer,
+                source_obligations: BTreeSet::new(),
+            },
+        ];
+        let layer = SemanticCExpressionLayer {
+            schema_version: SEMANTIC_C_SCHEMA_VERSION,
+            scope: SemanticCScope::LiveValueExpressionsOnly,
+            identity_scope: SemanticCIdentityScope::ArtifactLocalHandles,
+            expressions: expressions.into_boxed_slice(),
+            entities: entities.into_boxed_slice(),
+            function_interface: None,
+            inputs: BTreeMap::from([(base_binding, base_ty), (overlay_binding, overlay_ty)]),
+            input_origins: BTreeMap::new(),
+            return_mechanics: SemanticCReturnMechanicsOwnership::default(),
+            frame_mechanics: SemanticCFrameMechanicsOwnership::default(),
+            open_obligations: BTreeSet::new(),
+        };
+        let base_storage = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 0,
+            size: 8,
+        };
+        let composition = SemanticCReturnRegisterComposition {
+            slot: CallBoundarySlot::Register {
+                index: 0,
+                storage: base_storage,
+            },
+            base: SemanticCReturnRegisterDefinition {
+                storage: base_storage,
+                binding: base_binding,
+                producer: base_producer,
+                expression: SemanticCExprId(0),
+            },
+            overlays: vec![SemanticCReturnRegisterOverlay {
+                definition: SemanticCReturnRegisterDefinition {
+                    storage: CanonicalStorageId {
+                        space: CanonicalStorageSpace::Register,
+                        offset: 0,
+                        size: 1,
+                    },
+                    binding: overlay_binding,
+                    producer: overlay_producer,
+                    expression: SemanticCExprId(1),
+                },
+                offset_bytes: 0,
+            }]
+            .into_boxed_slice(),
+        };
+        let direct = SemanticCReturnValue {
+            slot: composition.slot,
+            binding: base_binding,
+            producer: base_producer,
+            expression: SemanticCExprId(0),
+        };
+        (layer, composition, direct)
+    }
+
+    #[test]
+    fn composed_return_operand_has_no_fake_binding_and_renders_ordered_insert() {
+        let (layer, composition, direct) = composed_operand_fixture();
+        let base_name = value_name(composition.base().binding());
+        let overlay_name = value_name(composition.overlays()[0].definition().binding());
+        assert_eq!(
+            composition.source_producers().collect::<Vec<_>>(),
+            vec![
+                composition.base().producer(),
+                composition.overlays()[0].definition().producer()
+            ]
+        );
+        assert_eq!(composition.physical_width_bits(), 64);
+        assert_eq!(
+            layer
+                .render_return_operand(SemanticCReturnOperand::RegisterComposition(&composition))
+                .expect("exact composed return rendering"),
+            format!(
+                "((uint64_t)(r2s_bit_insert((uint64_t)({base_name}), (uint64_t)({overlay_name}), 0U, 8U, 64U)))"
+            )
+        );
+        assert_eq!(
+            layer
+                .render_return_operand(SemanticCReturnOperand::Direct(&direct))
+                .expect("direct return stays unchanged"),
+            value_name(direct.binding())
+        );
+        assert!(SEMANTIC_C_HELPERS.contains("static inline uint64_t r2s_bit_insert"));
+    }
+
+    #[test]
+    fn composed_return_operand_uses_real_binding_for_bound_zero_base() {
+        let (mut layer, composition, _) = composed_operand_fixture();
+        let base = composition.base();
+        layer.expressions[base.expression().index()].kind = SemanticCExprKind::Constant {
+            binding: base.binding(),
+            value: MachineBitVector::zero(base.binding().width_bits())
+                .expect("valid composed base width"),
+        };
+        layer.inputs.remove(&base.binding());
+
+        let overlay_name = value_name(composition.overlays()[0].definition().binding());
+        assert_eq!(
+            layer
+                .render_expr(base.expression())
+                .expect("bound zero expression"),
+            "((uint64_t)UINT64_C(0x0))"
+        );
+        let rendered = layer
+            .render_return_operand(SemanticCReturnOperand::RegisterComposition(&composition))
+            .expect("composed return with exact zero base");
+        assert_eq!(
+            rendered,
+            format!(
+                "((uint64_t)(r2s_bit_insert((uint64_t)({}), (uint64_t)({overlay_name}), 0U, 8U, 64U)))",
+                value_name(base.binding())
+            )
+        );
+        assert!(!layer.inputs.contains_key(&base.binding()));
+    }
+
+    #[test]
+    fn composed_return_operand_refuses_out_of_bounds_overlay_and_shape_collisions() {
+        let (layer, mut composition, direct) = composed_operand_fixture();
+        composition.overlays[0].offset_bytes = 8;
+        assert!(matches!(
+            layer.render_return_operand(SemanticCReturnOperand::RegisterComposition(&composition)),
+            Err(SemanticCError::ReturnBindingMismatch(_))
+        ));
+
+        let composed = SemanticCReturn {
+            producer: id(9),
+            control_target: direct.binding(),
+            values: Box::new([]),
+            register_compositions: vec![composition.clone()].into_boxed_slice(),
+            source_obligations: BTreeSet::new(),
+        };
+        assert!(matches!(
+            composed.single_operand(),
+            Some(SemanticCReturnOperand::RegisterComposition(_))
+        ));
+        let collided = SemanticCReturn {
+            values: vec![direct].into_boxed_slice(),
+            ..composed
+        };
+        assert!(collided.single_operand().is_none());
     }
 
     #[test]
@@ -3531,5 +4402,82 @@ mod return_mechanics_tests {
             explicit.get(&unknown),
             Some(&BTreeSet::from([address, input]))
         );
+    }
+
+    #[test]
+    fn exact_frame_relation_dependency_preserves_sealed_empty_and_input_rows() {
+        let relation = id(20);
+        let input = id(21);
+        let wrong = id(22);
+
+        let mut dependencies = BTreeMap::new();
+        let mut explicit = BTreeMap::new();
+        assert!(merge_exact_frame_relation_dependency(
+            &mut dependencies,
+            &mut explicit,
+            relation,
+            None,
+        ));
+        assert_eq!(dependencies.get(&relation), Some(&BTreeSet::new()));
+        assert_eq!(explicit.get(&relation), Some(&BTreeSet::new()));
+        let return_producer = id(23);
+        let mut candidates = BTreeMap::new();
+        add_frame_mechanics_closure(
+            relation,
+            return_producer,
+            &dependencies,
+            &mut candidates,
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+        )
+        .expect("the sealed empty relation row is an intentional mechanical leaf");
+        assert_eq!(
+            candidates.get(&relation),
+            Some(&BTreeSet::from([return_producer]))
+        );
+        assert!(matches!(
+            add_frame_mechanics_closure(
+                relation,
+                return_producer,
+                &BTreeMap::new(),
+                &mut BTreeMap::new(),
+                &mut BTreeSet::new(),
+                &mut BTreeSet::new(),
+            ),
+            Err(SemanticCError::InvalidFrameMechanics(producer)) if producer == relation
+        ));
+
+        let mut dependencies = BTreeMap::from([(relation, BTreeSet::from([input]))]);
+        let mut explicit = BTreeMap::new();
+        assert!(merge_exact_frame_relation_dependency(
+            &mut dependencies,
+            &mut explicit,
+            relation,
+            Some(input),
+        ));
+        assert_eq!(explicit.get(&relation), Some(&BTreeSet::from([input])));
+
+        let original_dependencies = BTreeMap::from([(relation, BTreeSet::from([wrong]))]);
+        let mut dependencies = original_dependencies.clone();
+        let mut explicit = BTreeMap::new();
+        assert!(!merge_exact_frame_relation_dependency(
+            &mut dependencies,
+            &mut explicit,
+            relation,
+            Some(input),
+        ));
+        assert_eq!(dependencies, original_dependencies);
+        assert!(explicit.is_empty());
+
+        let mut dependencies = BTreeMap::new();
+        let mut explicit = BTreeMap::new();
+        assert!(!merge_exact_frame_relation_dependency(
+            &mut dependencies,
+            &mut explicit,
+            relation,
+            Some(relation),
+        ));
+        assert!(dependencies.is_empty());
+        assert!(explicit.is_empty());
     }
 }

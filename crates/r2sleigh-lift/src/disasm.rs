@@ -201,6 +201,44 @@ fn is_exact_top_level_address_register(
         })
 }
 
+fn register_storages_are_disjoint(first: CanonicalStorageId, second: CanonicalStorageId) -> bool {
+    if first.space != second.space {
+        return true;
+    }
+    first
+        .offset
+        .checked_add(u64::from(first.size))
+        .zip(second.offset.checked_add(u64::from(second.size)))
+        .is_some_and(|(first_end, second_end)| {
+            first_end <= second.offset || second_end <= first.offset
+        })
+}
+
+fn captured_frame_pointer_storage_matches_arch(
+    interface: &SourceFunctionInterface,
+    arch: &r2il::ArchSpec,
+) -> bool {
+    let Some(frame_pointer) = interface.frame_pointer_storage() else {
+        return true;
+    };
+    let Some(return_address) = interface.return_address_storage() else {
+        return false;
+    };
+    let Some(stack_pointer) = interface.stack_pointer_storage() else {
+        return false;
+    };
+    let address_size = r2il::effective_arch_address_size(arch);
+    interface.frame_pointer_storage_is_valid(frame_pointer)
+        && interface.return_address_storage_is_valid(return_address)
+        && interface.stack_pointer_storage_is_valid(stack_pointer)
+        && is_exact_top_level_address_register(arch, frame_pointer, address_size)
+        && is_exact_top_level_address_register(arch, return_address, address_size)
+        && is_exact_top_level_address_register(arch, stack_pointer, address_size)
+        && register_storages_are_disjoint(frame_pointer, return_address)
+        && register_storages_are_disjoint(frame_pointer, stack_pointer)
+        && register_storages_are_disjoint(return_address, stack_pointer)
+}
+
 fn captured_return_mechanism_matches_arch(
     interface: &SourceFunctionInterface,
     arch: &r2il::ArchSpec,
@@ -1100,11 +1138,14 @@ impl Disassembler {
                     "trusted lift lost its exact architecture authority".to_string(),
                 )
             })?;
-        if fields.has_return_mechanism() != interface.return_mechanism().is_some()
+        if fields.has_frame_pointer_storage() != interface.frame_pointer_storage().is_some()
+            || !captured_frame_pointer_storage_matches_arch(interface, trusted_arch)
+            || fields.has_return_mechanism() != interface.return_mechanism().is_some()
             || !captured_return_mechanism_matches_arch(interface, trusted_arch)
         {
             return Err(LiftError::Unsupported(
-                "captured return mechanism conflicts with the exact lifted machine".to_string(),
+                "captured frame/return mechanism conflicts with the exact lifted machine"
+                    .to_string(),
             ));
         }
         let mut ranges = Vec::with_capacity(source.image().blocks().len());
@@ -3213,6 +3254,63 @@ mod tests {
             &without_mechanism,
             &arch
         ));
+    }
+
+    #[test]
+    fn trusted_frame_pointer_validation_uses_only_exact_machine_facts() {
+        let stack_pointer = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 64,
+            size: 8,
+        };
+        let frame_pointer = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 72,
+            size: 8,
+        };
+        let return_address = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 80,
+            size: 8,
+        };
+        let absent = SourceFunctionInterface::new_exact(
+            b"trusted-frame-pointer".to_vec(),
+            "test-abi",
+            [],
+            r2source::SourceFunctionReturn::Void,
+            [],
+        )
+        .and_then(|interface| interface.with_return_address_storage(return_address))
+        .and_then(|interface| interface.with_stack_pointer_storage(stack_pointer))
+        .expect("exact machine roles");
+        let exact = absent
+            .clone()
+            .with_frame_pointer_storage(frame_pointer)
+            .expect("explicit frame-pointer role");
+        let mut arch = r2il::ArchSpec::new("controlled-frame-pointer");
+        arch.addr_size = 8;
+        arch.add_register(r2il::RegisterDef::new("opaque-a", return_address.offset, 8));
+        arch.add_register(r2il::RegisterDef::new("opaque-b", stack_pointer.offset, 8));
+        arch.add_register(r2il::RegisterDef::new("opaque-c", frame_pointer.offset, 8));
+
+        assert!(captured_frame_pointer_storage_matches_arch(&exact, &arch));
+        assert!(captured_frame_pointer_storage_matches_arch(&absent, &arch));
+        assert!(!is_exact_top_level_address_register(
+            &arch,
+            CanonicalStorageId {
+                space: CanonicalStorageSpace::Ram,
+                ..frame_pointer
+            },
+            8,
+        ));
+
+        arch.registers[2].parent = Some("missing-parent".to_string());
+        assert!(!captured_frame_pointer_storage_matches_arch(&exact, &arch));
+        assert!(captured_frame_pointer_storage_matches_arch(&absent, &arch));
+        arch.registers[2].parent = None;
+        arch.addr_size = 4;
+        assert!(!captured_frame_pointer_storage_matches_arch(&exact, &arch));
+        assert!(captured_frame_pointer_storage_matches_arch(&absent, &arch));
     }
 
     #[test]

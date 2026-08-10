@@ -1,4 +1,4 @@
-//! Audited synchronous ingress for radare2 ABI 138 snapshot schema 8.
+//! Audited synchronous ingress for radare2 ABI 138 snapshot schema 9.
 //!
 //! The wire API contains only opaque handles, scalars, and caller-owned output
 //! buffers. It deliberately cannot expose radare2 internals or assemble source
@@ -13,8 +13,8 @@ use std::sync::Arc;
 use super::*;
 
 pub const RADARE_ABI_VERSION: u32 = 138;
-pub const RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION: u32 = 8;
-pub const RADARE_SNAPSHOT_ACCESSOR_SCHEMA_VERSION: u32 = 2;
+pub const RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION: u32 = 9;
+pub const RADARE_SNAPSHOT_ACCESSOR_SCHEMA_VERSION: u32 = 3;
 
 pub const RADARE_ENDIAN_LITTLE: u32 = 0x4321;
 pub const RADARE_ENDIAN_BIG: u32 = 0x1234;
@@ -35,8 +35,9 @@ pub const RADARE_CAP_RETURN_ADDRESS_STORAGE: u64 = 1 << 12;
 pub const RADARE_CAP_STACK_POINTER_STORAGE: u64 = 1 << 13;
 pub const RADARE_CAP_OWNED_BOUNDED_FUNCTION_IMAGE: u64 = 1 << 14;
 pub const RADARE_CAP_EXACT_RETURN_MECHANISM: u64 = 1 << 15;
+pub const RADARE_CAP_EXACT_FRAME_POINTER_STORAGE: u64 = 1 << 16;
 
-const KNOWN_CAPABILITIES: u64 = (1 << 16) - 1;
+const KNOWN_CAPABILITIES: u64 = (1 << 17) - 1;
 const INVALID_U64: u64 = u64::MAX;
 const INVALID_TYPE_ID: u32 = u32::MAX;
 
@@ -114,7 +115,7 @@ pub struct RadareAbi138SuccessorView {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RadareAbi138RegisterStorageView {
     pub name_length: usize,
     pub offset: u64,
@@ -283,6 +284,8 @@ pub type RadareSuccessorViewFn =
 pub type RadareExternalExitFn = unsafe extern "C" fn(*const c_void, usize, *mut u64) -> u8;
 pub type RadareReturnMechanismViewFn =
     unsafe extern "C" fn(*const c_void, *mut RadareAbi138ReturnMechanismView) -> u8;
+pub type RadareFramePointerStorageViewFn =
+    unsafe extern "C" fn(*const c_void, *mut RadareAbi138RegisterStorageView) -> u8;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -318,6 +321,7 @@ pub struct RadareAbi138Accessors {
     pub successor_view: Option<RadareSuccessorViewFn>,
     pub external_exit: Option<RadareExternalExitFn>,
     pub return_mechanism_view: Option<RadareReturnMechanismViewFn>,
+    pub frame_pointer_storage_view: Option<RadareFramePointerStorageViewFn>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -611,6 +615,7 @@ fn validate_top(view: &RadareAbi138SnapshotView) -> Result<(), RadareAbi138Captu
     let exact_types = view.capabilities & RADARE_CAP_EXACT_FUNCTION_TYPES != 0;
     let exact_slots = view.capabilities & RADARE_CAP_EXACT_STACK_SLOT_ROLES != 0;
     let exact_return_mechanism = view.capabilities & RADARE_CAP_EXACT_RETURN_MECHANISM != 0;
+    let exact_frame_pointer = view.capabilities & RADARE_CAP_EXACT_FRAME_POINTER_STORAGE != 0;
     if (exact_types || exact_slots) && !exact_interface {
         return Err(RadareAbi138CaptureError::InvalidCapabilities);
     }
@@ -619,6 +624,10 @@ fn validate_top(view: &RadareAbi138SnapshotView) -> Result<(), RadareAbi138Captu
         || (exact_return_mechanism
             && (!exact_interface
                 || !exact_slots
+                || view.capabilities & RADARE_CAP_RETURN_ADDRESS_STORAGE == 0
+                || view.capabilities & RADARE_CAP_STACK_POINTER_STORAGE == 0))
+        || (exact_frame_pointer
+            && (!exact_interface
                 || view.capabilities & RADARE_CAP_RETURN_ADDRESS_STORAGE == 0
                 || view.capabilities & RADARE_CAP_STACK_POINTER_STORAGE == 0))
     {
@@ -865,7 +874,7 @@ unsafe fn capture_stack_slots(
             (3, view.arg_name_length),
             (4, view.home_reg_length),
         ] {
-            // SAFETY: string kind is from the closed schema-7 vocabulary.
+            // SAFETY: string kind is from the closed schema-9 vocabulary.
             let _ = unsafe {
                 copy_stack_slot_string(snapshot, string_fn, index, kind, length, budget)
             }?;
@@ -969,6 +978,50 @@ unsafe fn capture_return_mechanism(
             first.stack_pointer_delta_bytes,
             address_size_bytes,
         )
+        .map_err(|_| RadareAbi138CaptureError::InvalidInterface)
+}
+
+unsafe fn capture_frame_pointer_storage(
+    snapshot: *const c_void,
+    accessors: &RadareAbi138Accessors,
+    active: bool,
+    interface: SourceFunctionInterface,
+    budget: &mut CaptureBudget,
+) -> Result<SourceFunctionInterface, RadareAbi138CaptureError> {
+    if !active {
+        return Ok(interface);
+    }
+    let view_fn = required(
+        accessors.frame_pointer_storage_view,
+        "frame_pointer_storage_view",
+    )?;
+    let name_fn = required(accessors.interface_storage_name, "interface_storage_name")?;
+    let mut first = RadareAbi138RegisterStorageView::default();
+    // SAFETY: callback and snapshot validity are guaranteed by the caller.
+    callback_ok(
+        unsafe { view_fn(snapshot, &mut first) },
+        "frame_pointer_storage_view",
+    )?;
+    // SAFETY: callback writes one owned string of the advertised size.
+    let first_name =
+        unsafe { copy_interface_storage_name(snapshot, name_fn, 3, first.name_length, budget) }?;
+    let mut second = RadareAbi138RegisterStorageView::default();
+    // SAFETY: callback and snapshot validity remain live for the second read.
+    callback_ok(
+        unsafe { view_fn(snapshot, &mut second) },
+        "frame_pointer_storage_view",
+    )?;
+    // SAFETY: the second stable view advertises this owned string length.
+    let second_name =
+        unsafe { copy_interface_storage_name(snapshot, name_fn, 3, second.name_length, budget) }?;
+    if first != second || first_name != second_name {
+        return Err(RadareAbi138CaptureError::SnapshotChanged);
+    }
+    if first_name.is_empty() {
+        return Err(RadareAbi138CaptureError::InvalidInterface);
+    }
+    interface
+        .with_frame_pointer_storage(storage(first)?)
         .map_err(|_| RadareAbi138CaptureError::InvalidInterface)
 }
 
@@ -1225,13 +1278,24 @@ unsafe fn capture_interface(
         .ok_or(RadareAbi138CaptureError::InvalidMachine)?;
     // SAFETY: the optional scalar callback is copied from the validated table
     // and read twice while the snapshot borrow remains live.
-    unsafe {
+    let interface = unsafe {
         capture_return_mechanism(
             snapshot,
             accessors,
             top.capabilities & RADARE_CAP_EXACT_RETURN_MECHANISM != 0,
             interface,
             address_size_bytes,
+        )
+    }?;
+    // SAFETY: both callbacks are copied from the validated table and all
+    // returned bytes are deep-copied while the snapshot borrow remains live.
+    unsafe {
+        capture_frame_pointer_storage(
+            snapshot,
+            accessors,
+            top.capabilities & RADARE_CAP_EXACT_FRAME_POINTER_STORAGE != 0,
+            interface,
+            budget,
         )
     }
 }
@@ -1504,7 +1568,7 @@ unsafe fn capture_advisory_calls(
     Ok(calls.into_boxed_slice())
 }
 
-/// Deep-copy one borrowed radare2 ABI 138/schema-7 snapshot synchronously.
+/// Deep-copy one borrowed radare2 ABI 138/schema-9 snapshot synchronously.
 ///
 /// This is the only public source-authority mint. It performs no symbol lookup
 /// and retains no foreign pointers.
@@ -1631,6 +1695,8 @@ pub unsafe fn capture_radare_abi138(
             && first.capabilities & RADARE_CAP_STACK_POINTER_STORAGE != 0,
         return_mechanism: function_interface.is_some()
             && first.capabilities & RADARE_CAP_EXACT_RETURN_MECHANISM != 0,
+        frame_pointer_storage: function_interface.is_some()
+            && first.capabilities & RADARE_CAP_EXACT_FRAME_POINTER_STORAGE != 0,
     };
     OwnedFunctionSnapshot::from_captured_parts(
         machine,
@@ -1663,6 +1729,16 @@ mod tests {
         status: u8,
     }
 
+    struct FramePointerFixture {
+        first: RadareAbi138RegisterStorageView,
+        second: RadareAbi138RegisterStorageView,
+        first_name: &'static [u8],
+        second_name: &'static [u8],
+        view_calls: Cell<usize>,
+        name_calls: Cell<usize>,
+        status: u8,
+    }
+
     unsafe extern "C" fn return_mechanism_view(
         snapshot: *const c_void,
         out: *mut RadareAbi138ReturnMechanismView,
@@ -1678,6 +1754,54 @@ mod tests {
         };
         // SAFETY: the production reader supplies one valid output object.
         unsafe { out.write(view) };
+        fixture.status
+    }
+
+    unsafe extern "C" fn frame_pointer_storage_view(
+        snapshot: *const c_void,
+        out: *mut RadareAbi138RegisterStorageView,
+    ) -> u8 {
+        // SAFETY: tests pass exact pointers to live fixture/output values.
+        let fixture = unsafe { &*snapshot.cast::<FramePointerFixture>() };
+        let call = fixture.view_calls.get();
+        fixture.view_calls.set(call.saturating_add(1));
+        let view = if call == 0 {
+            fixture.first
+        } else {
+            fixture.second
+        };
+        // SAFETY: the production reader supplies one valid output object.
+        unsafe { out.write(view) };
+        fixture.status
+    }
+
+    unsafe extern "C" fn frame_pointer_storage_name(
+        snapshot: *const c_void,
+        kind: i32,
+        out: *mut u8,
+        capacity: usize,
+    ) -> u8 {
+        // SAFETY: tests pass an exact pointer to a live fixture.
+        let fixture = unsafe { &*snapshot.cast::<FramePointerFixture>() };
+        if kind != 3 {
+            return 0;
+        }
+        let call = fixture.name_calls.get();
+        fixture.name_calls.set(call.saturating_add(1));
+        let name = if call == 0 {
+            fixture.first_name
+        } else {
+            fixture.second_name
+        };
+        if capacity != name.len().saturating_add(1) {
+            return 0;
+        }
+        // SAFETY: the production reader supplies exactly `name.len() + 1`
+        // writable bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(name.as_ptr(), out, name.len());
+            out.add(name.len()).write(0);
+        }
         fixture.status
     }
 
@@ -1706,6 +1830,24 @@ mod tests {
         RadareAbi138Accessors {
             return_mechanism_view: callback,
             ..RadareAbi138Accessors::default()
+        }
+    }
+
+    fn frame_pointer_accessors(
+        callback: Option<RadareFramePointerStorageViewFn>,
+    ) -> RadareAbi138Accessors {
+        RadareAbi138Accessors {
+            interface_storage_name: Some(frame_pointer_storage_name),
+            frame_pointer_storage_view: callback,
+            ..RadareAbi138Accessors::default()
+        }
+    }
+
+    fn frame_pointer_view(offset: u64) -> RadareAbi138RegisterStorageView {
+        RadareAbi138RegisterStorageView {
+            name_length: 3,
+            offset,
+            size: 8,
         }
     }
 
@@ -1817,6 +1959,184 @@ mod tests {
     }
 
     #[test]
+    fn frame_pointer_layout_is_append_only_and_defaults_inactive() {
+        let accessors = RadareAbi138Accessors::default();
+        assert!(accessors.frame_pointer_storage_view.is_none());
+        assert_eq!(
+            std::mem::offset_of!(RadareAbi138Accessors, frame_pointer_storage_view),
+            std::mem::offset_of!(RadareAbi138Accessors, return_mechanism_view)
+                + size_of::<Option<RadareReturnMechanismViewFn>>()
+        );
+    }
+
+    #[test]
+    fn frame_pointer_capability_requires_exact_interface_and_return_storages() {
+        let dependencies = RADARE_CAP_REVISION
+            | RADARE_CAP_OWNED_BOUNDED_FUNCTION_IMAGE
+            | RADARE_CAP_EXACT_FUNCTION_INTERFACE
+            | RADARE_CAP_RETURN_ADDRESS_STORAGE
+            | RADARE_CAP_STACK_POINTER_STORAGE
+            | RADARE_CAP_EXACT_FRAME_POINTER_STORAGE;
+        assert_eq!(validate_top(&valid_top(dependencies)), Ok(()));
+        for dependency in [
+            RADARE_CAP_EXACT_FUNCTION_INTERFACE,
+            RADARE_CAP_RETURN_ADDRESS_STORAGE,
+            RADARE_CAP_STACK_POINTER_STORAGE,
+        ] {
+            assert_eq!(
+                validate_top(&valid_top(dependencies & !dependency)),
+                Err(RadareAbi138CaptureError::InvalidCapabilities)
+            );
+        }
+        assert_eq!(dependencies & RADARE_CAP_STACK_SLOTS, 0);
+        assert_eq!(dependencies & RADARE_CAP_EXACT_STACK_SLOT_ROLES, 0);
+    }
+
+    #[test]
+    fn exact_frame_pointer_is_read_twice_and_bound_without_stack_slots() {
+        let fixture = FramePointerFixture {
+            first: frame_pointer_view(32),
+            second: frame_pointer_view(32),
+            first_name: b"rbp",
+            second_name: b"rbp",
+            view_calls: Cell::new(0),
+            name_calls: Cell::new(0),
+            status: 1,
+        };
+        let accessors = frame_pointer_accessors(Some(frame_pointer_storage_view));
+        let mut budget = CaptureBudget::default();
+        // SAFETY: fixture and callbacks remain live for both synchronous reads.
+        let interface = unsafe {
+            capture_frame_pointer_storage(
+                (&fixture as *const FramePointerFixture).cast(),
+                &accessors,
+                true,
+                exact_return_interface(),
+                &mut budget,
+            )
+        }
+        .expect("exact frame pointer");
+        assert_eq!(interface.exact_frame_pointer_storage(), Some(register(32)));
+        assert_eq!(fixture.view_calls.get(), 2);
+        assert_eq!(fixture.name_calls.get(), 2);
+    }
+
+    #[test]
+    fn inactive_frame_pointer_never_invokes_accessors() {
+        let fixture = FramePointerFixture {
+            first: frame_pointer_view(32),
+            second: frame_pointer_view(32),
+            first_name: b"rbp",
+            second_name: b"rbp",
+            view_calls: Cell::new(0),
+            name_calls: Cell::new(0),
+            status: 1,
+        };
+        let accessors = frame_pointer_accessors(Some(frame_pointer_storage_view));
+        let mut budget = CaptureBudget::default();
+        // SAFETY: inactive capture never invokes either foreign callback.
+        let interface = unsafe {
+            capture_frame_pointer_storage(
+                (&fixture as *const FramePointerFixture).cast(),
+                &accessors,
+                false,
+                exact_return_interface(),
+                &mut budget,
+            )
+        }
+        .expect("inactive frame pointer");
+        assert_eq!(interface.exact_frame_pointer_storage(), None);
+        assert_eq!(fixture.view_calls.get(), 0);
+        assert_eq!(fixture.name_calls.get(), 0);
+    }
+
+    #[test]
+    fn frame_pointer_refuses_view_or_name_mutation() {
+        for fixture in [
+            FramePointerFixture {
+                first: frame_pointer_view(32),
+                second: frame_pointer_view(40),
+                first_name: b"rbp",
+                second_name: b"rbp",
+                view_calls: Cell::new(0),
+                name_calls: Cell::new(0),
+                status: 1,
+            },
+            FramePointerFixture {
+                first: frame_pointer_view(32),
+                second: frame_pointer_view(32),
+                first_name: b"rbp",
+                second_name: b"ebp",
+                view_calls: Cell::new(0),
+                name_calls: Cell::new(0),
+                status: 1,
+            },
+        ] {
+            let accessors = frame_pointer_accessors(Some(frame_pointer_storage_view));
+            let mut budget = CaptureBudget::default();
+            // SAFETY: fixture and callbacks remain live for both synchronous reads.
+            assert_eq!(
+                unsafe {
+                    capture_frame_pointer_storage(
+                        (&fixture as *const FramePointerFixture).cast(),
+                        &accessors,
+                        true,
+                        exact_return_interface(),
+                        &mut budget,
+                    )
+                },
+                Err(RadareAbi138CaptureError::SnapshotChanged)
+            );
+        }
+    }
+
+    #[test]
+    fn active_frame_pointer_requires_callback_and_checked_geometry() {
+        let mut budget = CaptureBudget::default();
+        // SAFETY: active capture rejects the absent callback before using the
+        // dangling snapshot value.
+        assert_eq!(
+            unsafe {
+                capture_frame_pointer_storage(
+                    std::ptr::NonNull::<u8>::dangling().as_ptr().cast(),
+                    &frame_pointer_accessors(None),
+                    true,
+                    exact_return_interface(),
+                    &mut budget,
+                )
+            },
+            Err(RadareAbi138CaptureError::MissingAccessor(
+                "frame_pointer_storage_view"
+            ))
+        );
+
+        let fixture = FramePointerFixture {
+            first: frame_pointer_view(16),
+            second: frame_pointer_view(16),
+            first_name: b"rip",
+            second_name: b"rip",
+            view_calls: Cell::new(0),
+            name_calls: Cell::new(0),
+            status: 1,
+        };
+        let accessors = frame_pointer_accessors(Some(frame_pointer_storage_view));
+        let mut budget = CaptureBudget::default();
+        // SAFETY: fixture and callbacks remain live for both synchronous reads.
+        assert_eq!(
+            unsafe {
+                capture_frame_pointer_storage(
+                    (&fixture as *const FramePointerFixture).cast(),
+                    &accessors,
+                    true,
+                    exact_return_interface(),
+                    &mut budget,
+                )
+            },
+            Err(RadareAbi138CaptureError::InvalidInterface)
+        );
+    }
+
+    #[test]
     fn return_mechanism_capability_requires_all_exact_dependencies() {
         let dependencies = RADARE_CAP_REVISION
             | RADARE_CAP_OWNED_BOUNDED_FUNCTION_IMAGE
@@ -1840,7 +2160,7 @@ mod tests {
             );
         }
         assert_eq!(
-            validate_top(&valid_top(dependencies | (1 << 16))),
+            validate_top(&valid_top(dependencies | (1 << 17))),
             Err(RadareAbi138CaptureError::InvalidCapabilities)
         );
     }

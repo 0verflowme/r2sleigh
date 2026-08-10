@@ -63,7 +63,7 @@ pub enum StackAddressBase {
     StackPointer,
 }
 
-pub const SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION: u32 = 7;
+pub const SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION: u32 = 8;
 pub const SOURCE_CALL_SITE_INTERFACE_SCHEMA_VERSION: u32 = 1;
 pub const SOURCE_TYPE_GRAPH_SCHEMA_VERSION: u32 = 1;
 
@@ -674,6 +674,7 @@ pub struct SourceFunctionInterface {
     return_kind: SourceFunctionReturn,
     return_address_storage: Option<CanonicalStorageId>,
     stack_pointer_storage: Option<CanonicalStorageId>,
+    frame_pointer_storage: Option<CanonicalStorageId>,
     return_mechanism: Option<SourceReturnMechanism>,
     stack_slots: Box<[SourceStackSlotSpec]>,
     parameter_logical_values: Box<[SourceLogicalValue]>,
@@ -690,6 +691,7 @@ pub enum SourceFunctionInterfaceError {
     InvalidRegisterStorage,
     InvalidReturnAddressStorage,
     InvalidStackPointerStorage,
+    InvalidFramePointerStorage,
     InvalidReturnMechanism,
     OverlappingRegisterStorages,
     InvalidStackSlot,
@@ -940,6 +942,7 @@ impl SourceFunctionInterface {
             return_kind,
             return_address_storage: None,
             stack_pointer_storage: None,
+            frame_pointer_storage: None,
             return_mechanism: None,
             stack_slots: stack_slots.into_boxed_slice(),
             parameter_logical_values: parameter_logical_values.into_boxed_slice(),
@@ -980,6 +983,7 @@ impl SourceFunctionInterface {
                     SourceFunctionReturn::Register { storage } => Some(storage),
                 })
                 .chain(self.stack_pointer_storage)
+                .chain(self.frame_pointer_storage)
                 .chain(
                     self.stack_slots
                         .iter()
@@ -1002,6 +1006,7 @@ impl SourceFunctionInterface {
                 SourceFunctionReturn::Register { storage } => Some(storage),
             })
             .chain(self.return_address_storage)
+            .chain(self.frame_pointer_storage)
             .chain(self.stack_slots.iter().filter_map(|slot| match slot.role {
                 SourceStackSlotRole::ParameterHome { home_storage, .. } => Some(home_storage),
                 SourceStackSlotRole::UnclassifiedResource | SourceStackSlotRole::Local => None,
@@ -1018,7 +1023,50 @@ impl SourceFunctionInterface {
             .iter()
             .filter(|slot| slot.base == StackAddressBase::StackPointer)
             .any(|slot| slot.base_storage != storage);
-        valid_register_storage(storage) && !overlaps_non_stack_role && !mismatched_stack_base
+        let mismatched_frame_width = self
+            .frame_pointer_storage
+            .is_some_and(|frame_pointer| frame_pointer.size != storage.size);
+        valid_register_storage(storage)
+            && !overlaps_non_stack_role
+            && !mismatched_stack_base
+            && !mismatched_frame_width
+    }
+
+    pub fn frame_pointer_storage_is_valid(&self, storage: CanonicalStorageId) -> bool {
+        let overlaps_non_frame_role = self
+            .parameters
+            .iter()
+            .map(SourceAbiParameterSpec::storage)
+            .chain(match self.return_kind {
+                SourceFunctionReturn::Void => None,
+                SourceFunctionReturn::Register { storage } => Some(storage),
+            })
+            .chain(self.return_address_storage)
+            .chain(self.stack_pointer_storage)
+            .chain(self.stack_slots.iter().filter_map(|slot| match slot.role {
+                SourceStackSlotRole::ParameterHome { home_storage, .. } => Some(home_storage),
+                SourceStackSlotRole::UnclassifiedResource | SourceStackSlotRole::Local => None,
+            }))
+            .chain(
+                self.stack_slots
+                    .iter()
+                    .filter(|slot| slot.base == StackAddressBase::StackPointer)
+                    .map(SourceStackSlotSpec::base_storage),
+            )
+            .any(|other| register_storages_overlap(storage, other));
+        let mismatched_frame_base = self
+            .stack_slots
+            .iter()
+            .filter(|slot| slot.base == StackAddressBase::FramePointer)
+            .any(|slot| slot.base_storage != storage);
+        let Some(stack_pointer) = self.stack_pointer_storage else {
+            return false;
+        };
+        let mismatched_stack_width = stack_pointer.size != storage.size;
+        valid_register_storage(storage)
+            && !overlaps_non_frame_role
+            && !mismatched_frame_base
+            && !mismatched_stack_width
     }
 
     /// Bind the machine return-address carrier supplied by the immutable
@@ -1066,6 +1114,27 @@ impl SourceFunctionInterface {
 
     pub const fn stack_pointer_storage(&self) -> Option<CanonicalStorageId> {
         self.stack_pointer_storage
+    }
+
+    /// Bind the source-owned full-width frame-pointer carrier. This explicit
+    /// fact remains available when the source has no frame-based stack slots.
+    pub fn with_frame_pointer_storage(
+        mut self,
+        storage: CanonicalStorageId,
+    ) -> Result<Self, SourceFunctionInterfaceError> {
+        if self
+            .frame_pointer_storage
+            .is_some_and(|bound| bound != storage)
+            || !self.frame_pointer_storage_is_valid(storage)
+        {
+            return Err(SourceFunctionInterfaceError::InvalidFramePointerStorage);
+        }
+        self.frame_pointer_storage = Some(storage);
+        Ok(self)
+    }
+
+    pub const fn frame_pointer_storage(&self) -> Option<CanonicalStorageId> {
+        self.frame_pointer_storage
     }
 
     /// Bind an exact stacked return-address contract. The return address is at
@@ -1124,6 +1193,11 @@ impl SourceFunctionInterface {
     /// contract. This derives a storage identity only; it grants no frame
     /// certification authority.
     pub fn exact_frame_pointer_storage(&self) -> Option<CanonicalStorageId> {
+        if let Some(storage) = self.frame_pointer_storage {
+            return self
+                .frame_pointer_storage_is_valid(storage)
+                .then_some(storage);
+        }
         if !self.stack_slot_roles_complete
             || self
                 .stack_slots
@@ -1771,5 +1845,141 @@ mod tests {
         )
         .expect("representable overlapping stack bases");
         assert_eq!(stack_overlap.exact_frame_pointer_storage(), None);
+    }
+
+    #[test]
+    fn explicit_frame_pointer_storage_is_exact_without_stack_slots_and_name_independent() {
+        let frame_pointer = register_storage(64, 8);
+        let stack_pointer = register_storage(72, 8);
+        let return_address = register_storage(80, 8);
+        let build = |revision: &[u8], calling_convention: &str| {
+            SourceFunctionInterface::new_exact(
+                revision.to_vec(),
+                calling_convention,
+                [],
+                SourceFunctionReturn::Void,
+                [],
+            )
+            .and_then(|interface| interface.with_return_address_storage(return_address))
+            .and_then(|interface| interface.with_stack_pointer_storage(stack_pointer))
+            .and_then(|interface| interface.with_frame_pointer_storage(frame_pointer))
+        };
+        let explicit = build(b"explicit-frame-a", "abi-display-a").expect("explicit frame fact");
+        assert_eq!(explicit.frame_pointer_storage(), Some(frame_pointer));
+        assert_eq!(explicit.exact_frame_pointer_storage(), Some(frame_pointer));
+
+        let renamed = build(b"explicit-frame-b", "abi-display-b").expect("renamed frame fact");
+        assert_eq!(
+            renamed.frame_pointer_storage(),
+            explicit.frame_pointer_storage()
+        );
+        assert_eq!(
+            renamed.exact_frame_pointer_storage(),
+            explicit.exact_frame_pointer_storage()
+        );
+        assert_ne!(renamed.revision_identity(), explicit.revision_identity());
+        assert_ne!(renamed.calling_convention(), explicit.calling_convention());
+    }
+
+    #[test]
+    fn explicit_frame_pointer_storage_rejects_incoherent_carriers() {
+        let parameter = register_storage(0, 8);
+        let result = register_storage(8, 8);
+        let frame_pointer = register_storage(64, 8);
+        let stack_pointer = register_storage(72, 8);
+        let return_address = register_storage(80, 8);
+        let no_stack_pointer = SourceFunctionInterface::new_exact(
+            b"explicit-frame-no-sp".to_vec(),
+            "test-abi",
+            [],
+            SourceFunctionReturn::Void,
+            [],
+        )
+        .expect("slotless interface");
+        assert_eq!(
+            no_stack_pointer.with_frame_pointer_storage(frame_pointer),
+            Err(SourceFunctionInterfaceError::InvalidFramePointerStorage)
+        );
+        let base = SourceFunctionInterface::new_exact(
+            b"explicit-frame-validation".to_vec(),
+            "test-abi",
+            [SourceAbiParameterSpec::new(0, parameter)],
+            SourceFunctionReturn::Register { storage: result },
+            [],
+        )
+        .and_then(|interface| interface.with_return_address_storage(return_address))
+        .and_then(|interface| interface.with_stack_pointer_storage(stack_pointer))
+        .expect("bound source carriers");
+
+        for overlapping in [parameter, result, stack_pointer, return_address] {
+            assert_eq!(
+                base.clone().with_frame_pointer_storage(overlapping),
+                Err(SourceFunctionInterfaceError::InvalidFramePointerStorage)
+            );
+        }
+        assert_eq!(
+            base.clone()
+                .with_frame_pointer_storage(register_storage(64, 4)),
+            Err(SourceFunctionInterfaceError::InvalidFramePointerStorage)
+        );
+        assert_eq!(
+            base.clone().with_frame_pointer_storage(CanonicalStorageId {
+                space: CanonicalStorageSpace::Ram,
+                offset: 64,
+                size: 8,
+            }),
+            Err(SourceFunctionInterfaceError::InvalidFramePointerStorage)
+        );
+
+        let explicit = base
+            .with_frame_pointer_storage(frame_pointer)
+            .expect("valid frame pointer");
+        assert_eq!(
+            explicit
+                .clone()
+                .with_frame_pointer_storage(register_storage(88, 8)),
+            Err(SourceFunctionInterfaceError::InvalidFramePointerStorage)
+        );
+        assert_eq!(
+            explicit.clone().with_return_address_storage(frame_pointer),
+            Err(SourceFunctionInterfaceError::InvalidReturnAddressStorage)
+        );
+        assert_eq!(
+            explicit.with_stack_pointer_storage(register_storage(96, 4)),
+            Err(SourceFunctionInterfaceError::InvalidStackPointerStorage)
+        );
+    }
+
+    #[test]
+    fn explicit_frame_pointer_storage_must_match_every_frame_slot_base() {
+        let frame_pointer = register_storage(64, 8);
+        let other_frame_pointer = register_storage(88, 8);
+        let interface = SourceFunctionInterface::new_exact(
+            b"explicit-frame-slots".to_vec(),
+            "test-abi",
+            [],
+            SourceFunctionReturn::Void,
+            [SourceStackSlotSpec::new_local(
+                StackAddressBase::FramePointer,
+                frame_pointer,
+                -8,
+                8,
+            )],
+        )
+        .and_then(|interface| interface.with_stack_pointer_storage(register_storage(72, 8)))
+        .expect("exact frame slot with stack pointer");
+        assert_eq!(
+            interface
+                .clone()
+                .with_frame_pointer_storage(other_frame_pointer),
+            Err(SourceFunctionInterfaceError::InvalidFramePointerStorage)
+        );
+        assert_eq!(
+            interface
+                .with_frame_pointer_storage(frame_pointer)
+                .expect("matching explicit frame base")
+                .exact_frame_pointer_storage(),
+            Some(frame_pointer)
+        );
     }
 }
