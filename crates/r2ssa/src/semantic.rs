@@ -5005,25 +5005,25 @@ fn insert_raw_memory_subeffect(
             .get(&inst)
             .into_iter()
             .flatten()
-            .map(|fact| (fact.location.object, fact.location.size))
-            .collect::<Vec<_>>()
+            .map(|fact| &fact.location)
+            .collect::<BTreeSet<_>>()
     } else {
         memory
             .uses_by_inst
             .get(&inst)
             .into_iter()
             .flatten()
-            .map(|fact| (fact.location.object, fact.location.size))
-            .collect::<Vec<_>>()
+            .map(|fact| &fact.location)
+            .collect::<BTreeSet<_>>()
     };
     let matching = annotations
         .iter()
-        .filter(|(_, size)| *size == width)
+        .filter(|location| location.size == width)
         .collect::<Vec<_>>();
     let provenance_complete = annotations.len() == 1 && matching.len() == 1;
     let object = matching
         .first()
-        .map(|(object, _)| *object)
+        .map(|location| location.object)
         .or_else(|| objects.escaped_unknown_object())
         .unwrap_or(ObjectId(0));
     insert_structured_memory_access(
@@ -6304,10 +6304,16 @@ fn const_value(var: &SSAVar) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::ControlGuard;
+    use std::collections::BTreeMap;
+
+    use super::{
+        ControlGuard, MemoryDefFact, MemoryLocation, MemorySSAFacts, MemoryUseFact, MemoryVersion,
+        ObjectId, ObjectModel, RelativeMemoryAddress, StructuredAccessId,
+    };
     use crate::{
-        CanonicalStorageId, CanonicalStorageSpace, SSAVar, SemanticObligationKind,
+        CanonicalStorageId, CanonicalStorageSpace, InstId, SSAVar, SemanticObligationKind,
         SourceAbiParameterSpec, SourceFunctionInterface, SourceFunctionReturn, SsaArtifact,
+        ValueId,
     };
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
 
@@ -6317,6 +6323,112 @@ mod tests {
 
     fn test_const(value: u64) -> Varnode {
         Varnode::constant(value, 8)
+    }
+
+    fn raw_memory_access(
+        locations: Vec<MemoryLocation>,
+        is_write: bool,
+        width: u32,
+    ) -> super::StructuredMemoryAccessFact {
+        let inst = InstId(0);
+        let mut memory = MemorySSAFacts::default();
+        if is_write {
+            memory.defs_by_inst.insert(
+                inst,
+                locations
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, location)| MemoryDefFact {
+                        location,
+                        previous_version: MemoryVersion {
+                            object: ObjectId(index as u32 + 100),
+                            version: 1,
+                        },
+                        next_version: MemoryVersion {
+                            object: ObjectId(index as u32 + 100),
+                            version: 2,
+                        },
+                    })
+                    .collect(),
+            );
+        } else {
+            memory.uses_by_inst.insert(
+                inst,
+                locations
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, location)| MemoryUseFact {
+                        location,
+                        version: MemoryVersion {
+                            object: ObjectId(index as u32 + 100),
+                            version: 1,
+                        },
+                    })
+                    .collect(),
+            );
+        }
+        let mut accesses = BTreeMap::new();
+        let mut ordinal = 0;
+        super::insert_raw_memory_subeffect(
+            &mut accesses,
+            &memory,
+            &ObjectModel::default(),
+            inst,
+            &mut ordinal,
+            0x1000,
+            0,
+            ValueId(0),
+            Some(ValueId(1)),
+            is_write,
+            width,
+        );
+        accesses
+            .remove(&StructuredAccessId { inst, ordinal: 0 })
+            .expect("raw memory access")
+    }
+
+    #[test]
+    fn memory_access_provenance_ignores_duplicate_reaching_versions() {
+        let location = MemoryLocation {
+            object: ObjectId(7),
+            address: RelativeMemoryAddress::Exact(-8),
+            size: 8,
+        };
+        for is_write in [false, true] {
+            let access = raw_memory_access(vec![location.clone(), location.clone()], is_write, 8);
+            assert!(access.provenance_complete);
+            assert_eq!(access.object, location.object);
+        }
+    }
+
+    #[test]
+    fn memory_access_provenance_rejects_distinct_location_ambiguity() {
+        let location = MemoryLocation {
+            object: ObjectId(7),
+            address: RelativeMemoryAddress::Exact(-8),
+            size: 8,
+        };
+        let mutations = [
+            MemoryLocation {
+                object: ObjectId(8),
+                ..location.clone()
+            },
+            MemoryLocation {
+                address: RelativeMemoryAddress::Exact(-16),
+                ..location.clone()
+            },
+            MemoryLocation {
+                size: 4,
+                ..location.clone()
+            },
+        ];
+        for mutation in mutations {
+            for is_write in [false, true] {
+                let access =
+                    raw_memory_access(vec![location.clone(), mutation.clone()], is_write, 8);
+                assert!(!access.provenance_complete);
+            }
+        }
     }
 
     #[test]
