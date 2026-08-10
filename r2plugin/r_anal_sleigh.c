@@ -1590,6 +1590,51 @@ static bool sleigh_json_is_single_object(const char *text, size_t len) {
 	return false;
 }
 
+#define SLEIGH_SEMANTIC_KERNEL_WARNING_PREFIX "semantic-kernel:"
+#define SLEIGH_SEMANTIC_KERNEL_WARNING_LIMIT 7
+#define SLEIGH_SEMANTIC_KERNEL_WARNING_BYTES 4096
+#define SLEIGH_ENGINE_DIAGNOSTICS_BYTES (1024 * 1024)
+
+static void sleigh_engine_v2_log_semantic_kernel_warnings(R2SleighByteViewV2 view) {
+	if (!view.data || !view.len || view.len > SLEIGH_ENGINE_DIAGNOSTICS_BYTES
+		|| !sleigh_json_is_single_object ((const char *)view.data, view.len)) {
+		return;
+	}
+	char *text = sleigh_byte_view_v2_copy (view);
+	if (!text) {
+		return;
+	}
+	RJson *diagnostics = r_json_parse (text);
+	if (!diagnostics || diagnostics->type != R_JSON_OBJECT) {
+		r_json_free (diagnostics);
+		free (text);
+		return;
+	}
+	const RJson *warnings = r_json_get (diagnostics, "warnings");
+	if (warnings && warnings->type == R_JSON_ARRAY) {
+		const RJson *warning;
+		size_t count = 0;
+		for (warning = warnings->children.first; warning
+				&& count < SLEIGH_SEMANTIC_KERNEL_WARNING_LIMIT;
+			warning = warning->next) {
+			if (warning->type != R_JSON_STRING || !warning->str_value
+				|| !r_str_startswith (warning->str_value,
+					SLEIGH_SEMANTIC_KERNEL_WARNING_PREFIX)) {
+				continue;
+			}
+			const size_t length = r_str_nlen (warning->str_value,
+				SLEIGH_SEMANTIC_KERNEL_WARNING_BYTES + 1);
+			if (!length || length > SLEIGH_SEMANTIC_KERNEL_WARNING_BYTES) {
+				continue;
+			}
+			R_LOG_DEBUG ("r2sleigh: %s", warning->str_value);
+			count++;
+		}
+	}
+	r_json_free (diagnostics);
+	free (text);
+}
+
 static char *sleigh_engine_v2_response_json(const R2SleighResponseInfoV2 *info, R2SleighByteViewV2 bytes) {
 	if (!info || !info->diagnostics_json.data || !info->diagnostics_json.len) {
 		return NULL;
@@ -1812,6 +1857,9 @@ static char *sleigh_engine_execute_v2_project(uint32_t kind, uint64_t required_c
 		result = sleigh_engine_v2_error_json ("response_projection",
 			R2SLEIGH_STATUS_ENGINE_ERROR_V2,
 			"invalid output or diagnostics in V2 response");
+	}
+	if (!json_projection) {
+		sleigh_engine_v2_log_semantic_kernel_warnings (info.diagnostics_json);
 	}
 	api->response_free (response);
 	api->session_free (session);

@@ -5566,6 +5566,9 @@ impl EngineSession {
             EnginePhaseStatus::Executed,
             render_time,
         );
+        diagnostics
+            .warnings
+            .extend(rendered.semantic_kernel_warnings);
         metrics.planning_time += planning_time;
         metrics.render_time = render_time;
         if let Err(refusal) =
@@ -6173,7 +6176,101 @@ fn engine_plan_from_decompile_route_kind(kind: r2types::DecompileRouteKind) -> E
 struct EngineRenderedDecompile {
     output: String,
     semantic_kernel_render: Option<EngineSemanticKernelRender>,
+    semantic_kernel_warnings: Vec<String>,
     structuring_executed: bool,
+}
+
+const ENGINE_SEMANTIC_KERNEL_TRACE_LIMIT: usize = 7;
+const ENGINE_SEMANTIC_KERNEL_REASON_CHAR_LIMIT: usize = 512;
+const ENGINE_SEMANTIC_KERNEL_WARNING_TAG: &str = "semantic-kernel:";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EngineSemanticKernelProbe {
+    Aggregate,
+    Memory,
+    DirectCall,
+    Conditional,
+    Switch,
+    Loop,
+    Terminal,
+}
+
+impl EngineSemanticKernelProbe {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Aggregate => "aggregate",
+            Self::Memory => "memory",
+            Self::DirectCall => "direct-call",
+            Self::Conditional => "conditional",
+            Self::Switch => "switch",
+            Self::Loop => "loop",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EngineSemanticKernelProbeOutcome {
+    NotApplicable,
+    Refused,
+}
+
+impl EngineSemanticKernelProbeOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NotApplicable => "not_applicable",
+            Self::Refused => "refused",
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct EngineSemanticKernelTrace {
+    warnings: Vec<String>,
+}
+
+impl EngineSemanticKernelTrace {
+    fn record(
+        &mut self,
+        probe: EngineSemanticKernelProbe,
+        outcome: EngineSemanticKernelProbeOutcome,
+        reason: &str,
+    ) {
+        if self.warnings.len() >= ENGINE_SEMANTIC_KERNEL_TRACE_LIMIT {
+            return;
+        }
+        let reason: String = reason
+            .chars()
+            .take(ENGINE_SEMANTIC_KERNEL_REASON_CHAR_LIMIT)
+            .map(|ch| if ch.is_control() { ' ' } else { ch })
+            .collect();
+        let reason = if reason.is_empty() {
+            "unspecified"
+        } else {
+            reason.as_str()
+        };
+        self.warnings.push(format!(
+            "{ENGINE_SEMANTIC_KERNEL_WARNING_TAG}{}:{}:{reason}",
+            probe.as_str(),
+            outcome.as_str(),
+        ));
+    }
+
+    fn not_applicable(&mut self, probe: EngineSemanticKernelProbe, reason: &str) {
+        self.record(
+            probe,
+            EngineSemanticKernelProbeOutcome::NotApplicable,
+            reason,
+        );
+    }
+
+    fn refused(&mut self, probe: EngineSemanticKernelProbe, reason: &str) {
+        self.record(probe, EngineSemanticKernelProbeOutcome::Refused, reason);
+    }
+
+    fn into_warnings(self) -> Vec<String> {
+        self.warnings
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6297,7 +6394,7 @@ fn prepared_artifact_has_source_aggregate_pointer(artifact: &SsaArtifact) -> boo
 
 #[derive(Debug)]
 enum EngineSemanticKernelAttempt {
-    NotApplicable,
+    NotApplicable(Vec<String>),
     Rendered(EngineRenderedDecompile),
 }
 
@@ -6314,7 +6411,7 @@ fn complete_engine_semantic_kernel_attempt<C: r2ssa::SsaWorkControl + ?Sized>(
                 rendered.structuring_executed,
             )?;
         }
-        EngineSemanticKernelAttempt::NotApplicable => {
+        EngineSemanticKernelAttempt::NotApplicable(_) => {
             poll_engine_render_control(control, EnginePhase::Rendering)?;
         }
     }
@@ -6323,10 +6420,10 @@ fn complete_engine_semantic_kernel_attempt<C: r2ssa::SsaWorkControl + ?Sized>(
 
 fn resolve_engine_semantic_kernel_attempt(
     attempt: EngineSemanticKernelAttempt,
-) -> Result<Option<EngineRenderedDecompile>, EngineRenderExecutionStop> {
+) -> Result<(Option<EngineRenderedDecompile>, Vec<String>), EngineRenderExecutionStop> {
     match attempt {
-        EngineSemanticKernelAttempt::NotApplicable => Ok(None),
-        EngineSemanticKernelAttempt::Rendered(rendered) => Ok(Some(rendered)),
+        EngineSemanticKernelAttempt::NotApplicable(warnings) => Ok((None, warnings)),
+        EngineSemanticKernelAttempt::Rendered(rendered) => Ok((Some(rendered), Vec::new())),
     }
 }
 
@@ -6338,129 +6435,185 @@ fn render_semantic_kernel_function<C: r2ssa::SsaWorkControl + ?Sized>(
     let Some(trusted) = request.trusted_ssa.as_deref() else {
         return complete_engine_semantic_kernel_attempt(
             control,
-            EngineSemanticKernelAttempt::NotApplicable,
+            EngineSemanticKernelAttempt::NotApplicable(Vec::new()),
         );
     };
-    if let Ok(function) = r2dec::CertifiedAggregateMemberSemanticCFunction::from_artifact(trusted)
-        && let Ok(output) = function.render_certified_c()
-    {
-        return complete_engine_semantic_kernel_attempt(
-            control,
-            EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
-                output,
-                structuring_executed: true,
-                semantic_kernel_render: Some(EngineSemanticKernelRender {
-                    region: EngineSemanticKernelRegion::AggregateMemberTerminalReturnFunction,
-                    region_schema_version: function.schema_version(),
-                    exact_obligation_closure: true,
-                }),
-            }),
-        );
+    let mut trace = EngineSemanticKernelTrace::default();
+    match r2dec::CertifiedAggregateMemberSemanticCFunction::from_artifact(trusted) {
+        Ok(function) => match function.render_certified_c() {
+            Ok(output) => {
+                return complete_engine_semantic_kernel_attempt(
+                    control,
+                    EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
+                        output,
+                        structuring_executed: true,
+                        semantic_kernel_render: Some(EngineSemanticKernelRender {
+                            region:
+                                EngineSemanticKernelRegion::AggregateMemberTerminalReturnFunction,
+                            region_schema_version: function.schema_version(),
+                            exact_obligation_closure: true,
+                        }),
+                        semantic_kernel_warnings: trace.into_warnings(),
+                    }),
+                );
+            }
+            Err(error) => trace.refused(EngineSemanticKernelProbe::Aggregate, &error.to_string()),
+        },
+        Err(error) => {
+            trace.not_applicable(EngineSemanticKernelProbe::Aggregate, &error.to_string())
+        }
     }
     poll_engine_render_control(control, EnginePhase::Rendering)?;
-    if !prepared_artifact_has_source_aggregate_pointer(trusted.artifact())
-        && let Ok(function) = r2dec::CertifiedMemorySemanticCFunction::from_artifact(trusted)
-        && let Ok(output) = function.render_certified_c()
-    {
-        return complete_engine_semantic_kernel_attempt(
-            control,
-            EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
-                output,
-                structuring_executed: true,
-                semantic_kernel_render: Some(EngineSemanticKernelRender {
-                    region: EngineSemanticKernelRegion::PlainRamMemoryTerminalReturnFunction,
-                    region_schema_version: function.schema_version(),
-                    exact_obligation_closure: true,
-                }),
-            }),
+    if prepared_artifact_has_source_aggregate_pointer(trusted.artifact()) {
+        trace.not_applicable(
+            EngineSemanticKernelProbe::Memory,
+            "source aggregate pointer requires aggregate-member renderer",
         );
+    } else {
+        match r2dec::CertifiedMemorySemanticCFunction::from_artifact(trusted) {
+            Ok(function) => match function.render_certified_c() {
+                Ok(output) => {
+                    return complete_engine_semantic_kernel_attempt(
+                        control,
+                        EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
+                            output,
+                            structuring_executed: true,
+                            semantic_kernel_render: Some(EngineSemanticKernelRender {
+                                region:
+                                    EngineSemanticKernelRegion::PlainRamMemoryTerminalReturnFunction,
+                                region_schema_version: function.schema_version(),
+                                exact_obligation_closure: true,
+                            }),
+                            semantic_kernel_warnings: trace.into_warnings(),
+                        }),
+                    );
+                }
+                Err(error) => trace.refused(EngineSemanticKernelProbe::Memory, &error.to_string()),
+            },
+            Err(error) => {
+                trace.not_applicable(EngineSemanticKernelProbe::Memory, &error.to_string())
+            }
+        }
     }
     poll_engine_render_control(control, EnginePhase::Rendering)?;
-    if let Ok(function) = r2dec::CertifiedDirectCallReturnFunction::from_artifact(trusted)
-        && let Ok(output) = function.render_certified_c()
-    {
-        return complete_engine_semantic_kernel_attempt(
-            control,
-            EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
-                output,
-                structuring_executed: true,
-                semantic_kernel_render: Some(EngineSemanticKernelRender {
-                    region: EngineSemanticKernelRegion::DirectCallTerminalReturnFunction,
-                    region_schema_version: function.schema_version(),
-                    exact_obligation_closure: true,
-                }),
-            }),
-        );
+    match r2dec::CertifiedDirectCallReturnFunction::from_artifact(trusted) {
+        Ok(function) => match function.render_certified_c() {
+            Ok(output) => {
+                return complete_engine_semantic_kernel_attempt(
+                    control,
+                    EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
+                        output,
+                        structuring_executed: true,
+                        semantic_kernel_render: Some(EngineSemanticKernelRender {
+                            region: EngineSemanticKernelRegion::DirectCallTerminalReturnFunction,
+                            region_schema_version: function.schema_version(),
+                            exact_obligation_closure: true,
+                        }),
+                        semantic_kernel_warnings: trace.into_warnings(),
+                    }),
+                );
+            }
+            Err(error) => trace.refused(EngineSemanticKernelProbe::DirectCall, &error.to_string()),
+        },
+        Err(error) => {
+            trace.not_applicable(EngineSemanticKernelProbe::DirectCall, &error.to_string())
+        }
     }
     poll_engine_render_control(control, EnginePhase::Rendering)?;
-    if let Ok(function) = r2dec::CertifiedConditionalReturnFunction::from_artifact(trusted)
-        && let Ok(output) = function.render_certified_c()
-    {
-        return complete_engine_semantic_kernel_attempt(
-            control,
-            EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
-                output,
-                structuring_executed: true,
-                semantic_kernel_render: Some(EngineSemanticKernelRender {
-                    region: EngineSemanticKernelRegion::ConditionalTerminalReturnFunction,
-                    region_schema_version: function.schema_version(),
-                    exact_obligation_closure: true,
-                }),
-            }),
-        );
+    match r2dec::CertifiedConditionalReturnFunction::from_artifact(trusted) {
+        Ok(function) => match function.render_certified_c() {
+            Ok(output) => {
+                return complete_engine_semantic_kernel_attempt(
+                    control,
+                    EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
+                        output,
+                        structuring_executed: true,
+                        semantic_kernel_render: Some(EngineSemanticKernelRender {
+                            region: EngineSemanticKernelRegion::ConditionalTerminalReturnFunction,
+                            region_schema_version: function.schema_version(),
+                            exact_obligation_closure: true,
+                        }),
+                        semantic_kernel_warnings: trace.into_warnings(),
+                    }),
+                );
+            }
+            Err(error) => trace.refused(EngineSemanticKernelProbe::Conditional, &error.to_string()),
+        },
+        Err(error) => {
+            trace.not_applicable(EngineSemanticKernelProbe::Conditional, &error.to_string())
+        }
     }
     poll_engine_render_control(control, EnginePhase::Rendering)?;
-    if let Ok(function) = r2dec::CertifiedSwitchReturnFunction::from_artifact(trusted)
-        && let Ok(output) = function.render_certified_c()
-    {
-        return complete_engine_semantic_kernel_attempt(
-            control,
-            EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
-                output,
-                structuring_executed: true,
-                semantic_kernel_render: Some(EngineSemanticKernelRender {
-                    region: EngineSemanticKernelRegion::SwitchTerminalReturnFunction,
-                    region_schema_version: function.schema_version(),
-                    exact_obligation_closure: true,
-                }),
-            }),
-        );
+    match r2dec::CertifiedSwitchReturnFunction::from_artifact(trusted) {
+        Ok(function) => match function.render_certified_c() {
+            Ok(output) => {
+                return complete_engine_semantic_kernel_attempt(
+                    control,
+                    EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
+                        output,
+                        structuring_executed: true,
+                        semantic_kernel_render: Some(EngineSemanticKernelRender {
+                            region: EngineSemanticKernelRegion::SwitchTerminalReturnFunction,
+                            region_schema_version: function.schema_version(),
+                            exact_obligation_closure: true,
+                        }),
+                        semantic_kernel_warnings: trace.into_warnings(),
+                    }),
+                );
+            }
+            Err(error) => trace.refused(EngineSemanticKernelProbe::Switch, &error.to_string()),
+        },
+        Err(error) => trace.not_applicable(EngineSemanticKernelProbe::Switch, &error.to_string()),
     }
     poll_engine_render_control(control, EnginePhase::Rendering)?;
-    if let Ok(function) = r2dec::CertifiedLoopReturnFunction::from_artifact(trusted)
-        && let Ok(output) = function.render_certified_c()
-    {
-        return complete_engine_semantic_kernel_attempt(
-            control,
-            EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
-                output,
-                structuring_executed: true,
-                semantic_kernel_render: Some(EngineSemanticKernelRender {
-                    region: EngineSemanticKernelRegion::CarrierFreeLoopTerminalReturnFunction,
-                    region_schema_version: function.schema_version(),
-                    exact_obligation_closure: true,
-                }),
-            }),
-        );
+    match r2dec::CertifiedLoopReturnFunction::from_artifact(trusted) {
+        Ok(function) => match function.render_certified_c() {
+            Ok(output) => {
+                return complete_engine_semantic_kernel_attempt(
+                    control,
+                    EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
+                        output,
+                        structuring_executed: true,
+                        semantic_kernel_render: Some(EngineSemanticKernelRender {
+                            region:
+                                EngineSemanticKernelRegion::CarrierFreeLoopTerminalReturnFunction,
+                            region_schema_version: function.schema_version(),
+                            exact_obligation_closure: true,
+                        }),
+                        semantic_kernel_warnings: trace.into_warnings(),
+                    }),
+                );
+            }
+            Err(error) => trace.refused(EngineSemanticKernelProbe::Loop, &error.to_string()),
+        },
+        Err(error) => trace.not_applicable(EngineSemanticKernelProbe::Loop, &error.to_string()),
     }
     poll_engine_render_control(control, EnginePhase::Rendering)?;
-    if let Ok(function) = r2dec::CertifiedSemanticCFunction::from_artifact(trusted)
-        && let Ok(output) = function.render_certified_c()
-    {
-        return complete_engine_semantic_kernel_attempt(
-            control,
-            EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
-                output,
-                structuring_executed: true,
-                semantic_kernel_render: Some(EngineSemanticKernelRender {
-                    region: EngineSemanticKernelRegion::TerminalReturnBlock,
-                    region_schema_version: function.schema_version(),
-                    exact_obligation_closure: true,
-                }),
-            }),
-        );
+    match r2dec::CertifiedSemanticCFunction::from_artifact(trusted) {
+        Ok(function) => match function.render_certified_c() {
+            Ok(output) => {
+                return complete_engine_semantic_kernel_attempt(
+                    control,
+                    EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
+                        output,
+                        structuring_executed: true,
+                        semantic_kernel_render: Some(EngineSemanticKernelRender {
+                            region: EngineSemanticKernelRegion::TerminalReturnBlock,
+                            region_schema_version: function.schema_version(),
+                            exact_obligation_closure: true,
+                        }),
+                        semantic_kernel_warnings: trace.into_warnings(),
+                    }),
+                );
+            }
+            Err(error) => trace.refused(EngineSemanticKernelProbe::Terminal, &error.to_string()),
+        },
+        Err(error) => trace.not_applicable(EngineSemanticKernelProbe::Terminal, &error.to_string()),
     }
-    complete_engine_semantic_kernel_attempt(control, EngineSemanticKernelAttempt::NotApplicable)
+    complete_engine_semantic_kernel_attempt(
+        control,
+        EngineSemanticKernelAttempt::NotApplicable(trace.into_warnings()),
+    )
 }
 
 fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
@@ -6468,15 +6621,18 @@ fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
     control: &C,
     try_semantic_kernel: bool,
 ) -> Result<EngineRenderedDecompile, EngineRenderExecutionStop> {
-    if try_semantic_kernel {
-        if let Some(rendered) = resolve_engine_semantic_kernel_attempt(
+    let semantic_kernel_warnings = if try_semantic_kernel {
+        let (rendered, warnings) = resolve_engine_semantic_kernel_attempt(
             render_semantic_kernel_function(request, control)?,
-        )? {
+        )?;
+        if let Some(rendered) = rendered {
             return Ok(rendered);
         }
+        warnings
     } else {
         poll_engine_render_control(control, EnginePhase::Rendering)?;
-    }
+        Vec::new()
+    };
     poll_engine_render_control(control, EnginePhase::Rendering)?;
     if let Some(output) = render_semantic_route(
         &request.function_name,
@@ -6487,6 +6643,7 @@ fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
         return Ok(EngineRenderedDecompile {
             output,
             semantic_kernel_render: None,
+            semantic_kernel_warnings,
             structuring_executed: false,
         });
     }
@@ -6499,6 +6656,7 @@ fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
         return Ok(EngineRenderedDecompile {
             output,
             semantic_kernel_render: None,
+            semantic_kernel_warnings,
             structuring_executed: true,
         });
     }
@@ -6510,6 +6668,7 @@ fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
         )
         .unwrap_or_default(),
         semantic_kernel_render: None,
+        semantic_kernel_warnings,
         structuring_executed: false,
     })
 }
@@ -13337,42 +13496,98 @@ mod tests {
     }
 
     #[test]
+    fn semantic_kernel_trace_preserves_order_and_classification_before_later_success() {
+        let mut trace = EngineSemanticKernelTrace::default();
+        trace.not_applicable(
+            EngineSemanticKernelProbe::Aggregate,
+            "aggregate constructor mismatch",
+        );
+        trace.refused(EngineSemanticKernelProbe::Memory, "memory renderer refusal");
+
+        let warnings = trace.into_warnings();
+        assert_eq!(
+            warnings,
+            vec![
+                "semantic-kernel:aggregate:not_applicable:aggregate constructor mismatch",
+                "semantic-kernel:memory:refused:memory renderer refusal",
+            ],
+            "an earlier probe trace must survive a later successful probe"
+        );
+    }
+
+    #[test]
+    fn semantic_kernel_trace_bounds_entries_and_reason_characters() {
+        let probes = [
+            EngineSemanticKernelProbe::Aggregate,
+            EngineSemanticKernelProbe::Memory,
+            EngineSemanticKernelProbe::DirectCall,
+            EngineSemanticKernelProbe::Conditional,
+            EngineSemanticKernelProbe::Switch,
+            EngineSemanticKernelProbe::Loop,
+            EngineSemanticKernelProbe::Terminal,
+        ];
+        let mut trace = EngineSemanticKernelTrace::default();
+        let long_reason = format!("{}\nignored", "x".repeat(600));
+        for probe in probes {
+            trace.not_applicable(probe, &long_reason);
+        }
+        trace.refused(EngineSemanticKernelProbe::Terminal, "eighth entry");
+
+        let warnings = trace.into_warnings();
+        assert_eq!(warnings.len(), ENGINE_SEMANTIC_KERNEL_TRACE_LIMIT);
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| warning.starts_with(ENGINE_SEMANTIC_KERNEL_WARNING_TAG))
+        );
+        assert!(warnings.iter().all(|warning| !warning.contains('\n')));
+        let reason = warnings[0]
+            .rsplit_once(':')
+            .map(|(_, reason)| reason)
+            .expect("tagged reason");
+        assert_eq!(
+            reason.chars().count(),
+            ENGINE_SEMANTIC_KERNEL_REASON_CHAR_LIMIT
+        );
+    }
+
+    #[test]
     fn semantic_kernel_region_schema_table_tracks_exact_r2dec_contracts() {
         for (region, contract, expected_wire) in [
             (
                 EngineSemanticKernelRegion::TerminalReturnBlock,
                 r2dec::CERTIFIED_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-                2,
+                3,
             ),
             (
                 EngineSemanticKernelRegion::AggregateMemberTerminalReturnFunction,
                 r2dec::CERTIFIED_AGGREGATE_MEMBER_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-                2,
+                3,
             ),
             (
                 EngineSemanticKernelRegion::PlainRamMemoryTerminalReturnFunction,
                 r2dec::CERTIFIED_MEMORY_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-                2,
+                3,
             ),
             (
                 EngineSemanticKernelRegion::DirectCallTerminalReturnFunction,
                 r2dec::CERTIFIED_DIRECT_CALL_RETURN_FUNCTION_SCHEMA_VERSION,
-                2,
+                3,
             ),
             (
                 EngineSemanticKernelRegion::ConditionalTerminalReturnFunction,
                 r2dec::CERTIFIED_CONDITIONAL_RETURN_FUNCTION_SCHEMA_VERSION,
-                2,
+                3,
             ),
             (
                 EngineSemanticKernelRegion::SwitchTerminalReturnFunction,
                 r2dec::CERTIFIED_SWITCH_RETURN_FUNCTION_SCHEMA_VERSION,
-                2,
+                3,
             ),
             (
                 EngineSemanticKernelRegion::CarrierFreeLoopTerminalReturnFunction,
                 r2dec::CERTIFIED_LOOP_RETURN_FUNCTION_SCHEMA_VERSION,
-                2,
+                3,
             ),
         ] {
             assert_eq!(contract, expected_wire);
