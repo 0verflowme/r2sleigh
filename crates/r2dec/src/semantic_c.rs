@@ -7,8 +7,9 @@
 
 use r2cert::{
     CertifiedAbiParameter, CertifiedCallArgument, CertifiedCallArgumentOrigin, CertifiedDirectCall,
-    CertifiedExpr, CertifiedMachineFunction, CertifiedMachineProjection, CertifiedMemoryStatement,
-    CertifiedMemoryStatementKind, CertifiedReturnControl, CertifiedSourceTerminator,
+    CertifiedExpr, CertifiedFramePreservation, CertifiedMachineFunction,
+    CertifiedMachineProjection, CertifiedMemoryStatement, CertifiedMemoryStatementKind,
+    CertifiedNormalizedStackRange, CertifiedReturnControl, CertifiedSourceTerminator,
     CertifiedSourceTopology, CertifiedStackSlot, EffectDisposition, ObligationLedger,
 };
 use r2ssa::{
@@ -25,7 +26,7 @@ use r2ssa::{
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const SEMANTIC_C_SCHEMA_VERSION: u32 = 10;
+pub const SEMANTIC_C_SCHEMA_VERSION: u32 = 11;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SemanticCParameter {
@@ -569,6 +570,7 @@ pub struct SemanticCExpressionLayer {
     inputs: BTreeMap<MachineValueBinding, MachineType>,
     input_origins: BTreeMap<MachineValueBinding, SemanticCInputOrigin>,
     return_mechanics: SemanticCReturnMechanicsOwnership,
+    frame_mechanics: SemanticCFrameMechanicsOwnership,
     open_obligations: BTreeSet<SemanticObligationId>,
 }
 
@@ -614,6 +616,107 @@ impl SemanticCReturnMechanicsOwnership {
     }
 }
 
+/// Exact source producers erased only because the artifact's frame certificate
+/// proves that they implement one private save/restore protocol. A producer
+/// shared with terminal SP mechanics is represented here once and retains the
+/// exact returns it also serves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct SemanticCFrameMechanicsOwner {
+    pub(crate) source_producer: CanonicalInstructionId,
+    pub(crate) frame_pointer_storage: CanonicalStorageId,
+    pub(crate) saved_range: CertifiedNormalizedStackRange,
+    pub(crate) return_producers: Box<[CanonicalInstructionId]>,
+    pub(crate) source_obligations: Box<[SemanticObligationId]>,
+}
+
+impl SemanticCFrameMechanicsOwner {
+    pub(crate) const fn source_producer(&self) -> CanonicalInstructionId {
+        self.source_producer
+    }
+
+    pub(crate) const fn frame_pointer_storage(&self) -> CanonicalStorageId {
+        self.frame_pointer_storage
+    }
+
+    pub(crate) const fn saved_range(&self) -> CertifiedNormalizedStackRange {
+        self.saved_range
+    }
+
+    pub(crate) const fn return_producers(&self) -> &[CanonicalInstructionId] {
+        &self.return_producers
+    }
+
+    pub(crate) const fn source_obligations(&self) -> &[SemanticObligationId] {
+        &self.source_obligations
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct SemanticCFrameMechanicsOwnership {
+    owners: Box<[SemanticCFrameMechanicsOwner]>,
+    authority: Option<SemanticCFrameMechanicsAuthority>,
+}
+
+impl SemanticCFrameMechanicsOwnership {
+    pub(crate) const fn owners(&self) -> &[SemanticCFrameMechanicsOwner] {
+        &self.owners
+    }
+
+    pub(crate) const fn authority(&self) -> Option<&SemanticCFrameMechanicsAuthority> {
+        self.authority.as_ref()
+    }
+
+    fn source_obligations(&self) -> BTreeSet<SemanticObligationId> {
+        self.owners
+            .iter()
+            .flat_map(|owner| owner.source_obligations.iter().copied())
+            .collect()
+    }
+}
+
+/// Sealed frame-certificate anchors retained separately from derived owners so
+/// region accounting can replay exact closure rather than trusting the owner
+/// manifest it is auditing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct SemanticCFrameMechanicsAuthority {
+    frame_pointer_storage: CanonicalStorageId,
+    saved_range: CertifiedNormalizedStackRange,
+    common_roots: BTreeSet<CanonicalInstructionId>,
+    return_order: Box<[CanonicalInstructionId]>,
+    restore_roots: BTreeMap<CanonicalInstructionId, BTreeSet<CanonicalInstructionId>>,
+    explicit_dependencies: BTreeMap<CanonicalInstructionId, BTreeSet<CanonicalInstructionId>>,
+}
+
+impl SemanticCFrameMechanicsAuthority {
+    pub(crate) const fn frame_pointer_storage(&self) -> CanonicalStorageId {
+        self.frame_pointer_storage
+    }
+
+    pub(crate) const fn saved_range(&self) -> CertifiedNormalizedStackRange {
+        self.saved_range
+    }
+
+    pub(crate) const fn common_roots(&self) -> &BTreeSet<CanonicalInstructionId> {
+        &self.common_roots
+    }
+
+    pub(crate) const fn return_order(&self) -> &[CanonicalInstructionId] {
+        &self.return_order
+    }
+
+    pub(crate) const fn restore_roots(
+        &self,
+    ) -> &BTreeMap<CanonicalInstructionId, BTreeSet<CanonicalInstructionId>> {
+        &self.restore_roots
+    }
+
+    pub(crate) const fn explicit_dependencies(
+        &self,
+    ) -> &BTreeMap<CanonicalInstructionId, BTreeSet<CanonicalInstructionId>> {
+        &self.explicit_dependencies
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SemanticCError {
     MissingMachineExpression(MachineExprId),
@@ -648,6 +751,8 @@ pub enum SemanticCError {
     MemoryReadRequiresCertifiedStatement(SemanticCExprId),
     InvalidReturnMechanics(CanonicalInstructionId),
     CyclicReturnMechanics(CanonicalInstructionId),
+    InvalidFrameMechanics(CanonicalInstructionId),
+    CyclicFrameMechanics(CanonicalInstructionId),
 }
 
 impl std::fmt::Display for SemanticCError {
@@ -687,6 +792,7 @@ impl<'a> MachineView<'a> {
 }
 
 trait CertifiedSemanticSource {
+    fn origin(&self) -> &r2cert::CertifiedArtifactOrigin;
     fn machine_view(&self) -> MachineView<'_>;
     fn source(&self) -> &SemanticObligationInventory;
     fn ledger(&self) -> &ObligationLedger;
@@ -695,6 +801,7 @@ trait CertifiedSemanticSource {
     fn abi_parameters(&self) -> &BTreeMap<u32, CertifiedAbiParameter>;
     fn stack_slots(&self) -> &BTreeMap<StackAddressRoot, CertifiedStackSlot>;
     fn topology(&self) -> &CertifiedSourceTopology;
+    fn frame_preservation(&self) -> Option<&CertifiedFramePreservation>;
     fn return_control_for_producer(
         &self,
         producer: CanonicalInstructionId,
@@ -706,6 +813,10 @@ trait CertifiedSemanticSource {
 }
 
 impl CertifiedSemanticSource for CertifiedMachineFunction {
+    fn origin(&self) -> &r2cert::CertifiedArtifactOrigin {
+        CertifiedMachineFunction::origin(self)
+    }
+
     fn machine_view(&self) -> MachineView<'_> {
         MachineView(self.projection())
     }
@@ -738,6 +849,10 @@ impl CertifiedSemanticSource for CertifiedMachineFunction {
         CertifiedMachineFunction::topology(self)
     }
 
+    fn frame_preservation(&self) -> Option<&CertifiedFramePreservation> {
+        CertifiedMachineFunction::frame_preservation(self)
+    }
+
     fn return_control_for_producer(
         &self,
         producer: CanonicalInstructionId,
@@ -754,6 +869,10 @@ impl CertifiedSemanticSource for CertifiedMachineFunction {
 }
 
 impl CertifiedSemanticSource for CertifiedMachineProjection {
+    fn origin(&self) -> &r2cert::CertifiedArtifactOrigin {
+        CertifiedMachineProjection::origin(self)
+    }
+
     fn machine_view(&self) -> MachineView<'_> {
         MachineView(self.projection())
     }
@@ -784,6 +903,10 @@ impl CertifiedSemanticSource for CertifiedMachineProjection {
 
     fn topology(&self) -> &CertifiedSourceTopology {
         CertifiedMachineProjection::topology(self)
+    }
+
+    fn frame_preservation(&self) -> Option<&CertifiedFramePreservation> {
+        CertifiedMachineProjection::frame_preservation(self)
     }
 
     fn return_control_for_producer(
@@ -1121,6 +1244,11 @@ fn is_exact_mechanical_read(
     })
 }
 
+struct ReturnMechanicsPlan {
+    candidates: BTreeMap<CanonicalInstructionId, BTreeSet<CanonicalInstructionId>>,
+    return_order: Vec<CanonicalInstructionId>,
+}
+
 fn backward_close_semantic_producers(
     candidates: &BTreeMap<CanonicalInstructionId, BTreeSet<CanonicalInstructionId>>,
     dependencies: &BTreeMap<CanonicalInstructionId, BTreeSet<CanonicalInstructionId>>,
@@ -1140,12 +1268,11 @@ fn backward_close_semantic_producers(
     Ok(semantic)
 }
 
-fn derive_return_mechanics(
+fn derive_return_mechanics_plan(
     certified: &impl CertifiedSemanticSource,
-) -> Result<SemanticCReturnMechanicsOwnership, SemanticCError> {
+) -> Result<ReturnMechanicsPlan, SemanticCError> {
     let machine = certified.machine_view();
-    let (dependencies, output_producers, outputs) =
-        exact_expression_dependencies(certified, machine)?;
+    let (dependencies, _, _) = exact_expression_dependencies(certified, machine)?;
     let interface = certified.machine_context().function_interface();
     let mut controls = Vec::new();
     for block in certified.topology().blocks() {
@@ -1180,7 +1307,10 @@ fn derive_return_mechanics(
         controls.push(control);
     }
     if controls.is_empty() {
-        return Ok(SemanticCReturnMechanicsOwnership::default());
+        return Ok(ReturnMechanicsPlan {
+            candidates: BTreeMap::new(),
+            return_order: Vec::new(),
+        });
     }
 
     let return_order = controls
@@ -1203,81 +1333,18 @@ fn derive_return_mechanics(
             add_return_mechanics_closure(root, control.producer(), &dependencies, &mut candidates)?;
         }
     }
-    if candidates.is_empty() {
-        return Ok(SemanticCReturnMechanicsOwnership::default());
-    }
+    Ok(ReturnMechanicsPlan {
+        candidates,
+        return_order,
+    })
+}
 
-    let mut semantic = BTreeSet::new();
-    for control in &controls {
-        for returned in control.values() {
-            if let Some(producer) = returned.value().producer()
-                && candidates.contains_key(&producer)
-            {
-                semantic.insert(producer);
-            }
-        }
-    }
-    for (producer, inputs) in &dependencies {
-        if candidates.contains_key(producer) {
-            continue;
-        }
-        semantic.extend(
-            inputs
-                .iter()
-                .copied()
-                .filter(|input| candidates.contains_key(input)),
-        );
-    }
-    let return_controls = controls
-        .iter()
-        .map(|control| (control.producer(), *control))
-        .collect::<BTreeMap<_, _>>();
-    for obligation in certified.source().obligations().values() {
-        if obligation.id.kind == SemanticObligationKind::LiveValueProducer {
-            continue;
-        }
-        let exact_return_target = obligation.id.kind == SemanticObligationKind::Return
-            && return_controls
-                .get(&obligation.id.instruction)
-                .is_some_and(|control| {
-                    control.return_obligation() == obligation.id
-                        && obligation.inputs == [control.control_target().binding().value()]
-                });
-        if exact_return_target {
-            continue;
-        }
-        let exact_mechanical_read = obligation.id.kind
-            == SemanticObligationKind::ObservableMemoryRead
-            && candidates.contains_key(&obligation.id.instruction)
-            && is_exact_mechanical_read(
-                certified,
-                obligation.id.instruction,
-                outputs.get(&obligation.id.instruction).copied(),
-            );
-        if exact_mechanical_read {
-            continue;
-        }
-        if candidates.contains_key(&obligation.id.instruction) {
-            semantic.insert(obligation.id.instruction);
-        }
-        semantic.extend(obligation.inputs.iter().filter_map(|input| {
-            output_producers
-                .get(input)
-                .copied()
-                .filter(|producer| candidates.contains_key(producer))
-        }));
-    }
-
-    let semantic = backward_close_semantic_producers(&candidates, &dependencies, semantic)?;
-    let mechanics = candidates
-        .keys()
-        .copied()
-        .filter(|producer| !semantic.contains(producer))
-        .collect::<BTreeSet<_>>();
-    if mechanics.is_empty() {
-        return Ok(SemanticCReturnMechanicsOwnership::default());
-    }
-
+fn materialize_return_mechanics(
+    certified: &impl CertifiedSemanticSource,
+    plan: &ReturnMechanicsPlan,
+    mechanics: &BTreeSet<CanonicalInstructionId>,
+    outputs: &BTreeMap<CanonicalInstructionId, MachineValueBinding>,
+) -> Result<SemanticCReturnMechanicsOwnership, SemanticCError> {
     let mut owners = Vec::with_capacity(mechanics.len());
     for producer in certified
         .topology()
@@ -1312,10 +1379,12 @@ fn derive_return_mechanics(
                 return Err(SemanticCError::InvalidReturnMechanics(producer));
             }
         }
-        let served = candidates
+        let served = plan
+            .candidates
             .get(&producer)
             .ok_or(SemanticCError::InvalidReturnMechanics(producer))?;
-        let return_producers = return_order
+        let return_producers = plan
+            .return_order
             .iter()
             .copied()
             .filter(|return_producer| served.contains(return_producer))
@@ -1343,12 +1412,435 @@ fn derive_return_mechanics(
                     .iter()
                     .any(|owner| owner.source_producer == *producer)
             })
-            .unwrap_or(return_order[0]);
+            .unwrap_or(plan.return_order[0]);
         return Err(SemanticCError::InvalidReturnMechanics(producer));
     }
     Ok(SemanticCReturnMechanicsOwnership {
         owners: owners.into_boxed_slice(),
     })
+}
+
+fn add_frame_mechanics_closure(
+    root: CanonicalInstructionId,
+    return_producer: CanonicalInstructionId,
+    dependencies: &BTreeMap<CanonicalInstructionId, BTreeSet<CanonicalInstructionId>>,
+    candidates: &mut BTreeMap<CanonicalInstructionId, BTreeSet<CanonicalInstructionId>>,
+    active: &mut BTreeSet<CanonicalInstructionId>,
+    complete: &mut BTreeSet<CanonicalInstructionId>,
+) -> Result<(), SemanticCError> {
+    let mut stack = vec![(root, false)];
+    while let Some((producer, leaving)) = stack.pop() {
+        candidates
+            .entry(producer)
+            .or_default()
+            .insert(return_producer);
+        if leaving {
+            active.remove(&producer);
+            complete.insert(producer);
+            continue;
+        }
+        if active.contains(&producer) {
+            return Err(SemanticCError::CyclicFrameMechanics(producer));
+        }
+        if complete.contains(&producer) {
+            continue;
+        }
+        active.insert(producer);
+        stack.push((producer, true));
+        let Some(inputs) = dependencies.get(&producer) else {
+            return Err(SemanticCError::InvalidFrameMechanics(producer));
+        };
+        stack.extend(inputs.iter().rev().map(|input| (*input, false)));
+    }
+    Ok(())
+}
+
+fn frame_statement_has_exact_ledger_owner(
+    certified: &impl CertifiedSemanticSource,
+    statement: &CertifiedMemoryStatement,
+    obligation: SemanticObligationId,
+) -> bool {
+    statement.source_obligations().contains(&obligation)
+        && matches!(certified.ledger().effects(obligation), [effect]
+            if effect.disposition()
+                == &EffectDisposition::AbsorbedIntoStatement {
+                    producer: statement.producer(),
+                }
+                && effect.statement_evidence() == Some(statement))
+}
+
+fn merge_frame_dependency_row(
+    dependencies: &mut BTreeMap<CanonicalInstructionId, BTreeSet<CanonicalInstructionId>>,
+    producer: CanonicalInstructionId,
+    inputs: impl IntoIterator<Item = CanonicalInstructionId>,
+) {
+    dependencies
+        .entry(producer)
+        .or_default()
+        .extend(inputs.into_iter().filter(|input| *input != producer));
+}
+
+fn union_mechanics_services(
+    return_services: &BTreeMap<CanonicalInstructionId, BTreeSet<CanonicalInstructionId>>,
+    frame_services: &BTreeMap<CanonicalInstructionId, BTreeSet<CanonicalInstructionId>>,
+) -> BTreeMap<CanonicalInstructionId, BTreeSet<CanonicalInstructionId>> {
+    let mut combined = return_services.clone();
+    for (producer, returns) in frame_services {
+        combined.entry(*producer).or_default().extend(returns);
+    }
+    combined
+}
+
+fn semantic_mechanics_producers(
+    certified: &impl CertifiedSemanticSource,
+    candidates: &BTreeMap<CanonicalInstructionId, BTreeSet<CanonicalInstructionId>>,
+    dependencies: &BTreeMap<CanonicalInstructionId, BTreeSet<CanonicalInstructionId>>,
+    output_producers: &BTreeMap<ValueId, CanonicalInstructionId>,
+    outputs: &BTreeMap<CanonicalInstructionId, MachineValueBinding>,
+    frame_statements: &BTreeMap<CanonicalInstructionId, &CertifiedMemoryStatement>,
+    return_candidates: &BTreeMap<CanonicalInstructionId, BTreeSet<CanonicalInstructionId>>,
+) -> Result<BTreeSet<CanonicalInstructionId>, SemanticCError> {
+    let candidate_set = candidates.keys().copied().collect::<BTreeSet<_>>();
+    let mut semantic = BTreeSet::new();
+    for control in certified.topology().blocks().iter().filter_map(|block| {
+        block
+            .instructions()
+            .last()
+            .and_then(|producer| certified.return_control_for_producer(*producer))
+    }) {
+        for returned in control.values() {
+            if let Some(producer) = returned.value().producer()
+                && candidate_set.contains(&producer)
+            {
+                semantic.insert(producer);
+            }
+        }
+    }
+    for (producer, inputs) in dependencies {
+        if candidate_set.contains(producer) {
+            continue;
+        }
+        semantic.extend(
+            inputs
+                .iter()
+                .copied()
+                .filter(|input| candidate_set.contains(input)),
+        );
+    }
+    let return_controls = certified
+        .topology()
+        .blocks()
+        .iter()
+        .filter_map(|block| {
+            block
+                .instructions()
+                .last()
+                .and_then(|producer| certified.return_control_for_producer(*producer))
+        })
+        .map(|control| (control.producer(), control))
+        .collect::<BTreeMap<_, _>>();
+    for obligation in certified.source().obligations().values() {
+        if obligation.id.kind == SemanticObligationKind::LiveValueProducer {
+            continue;
+        }
+        let exact_frame_statement = frame_statements
+            .get(&obligation.id.instruction)
+            .is_some_and(|statement| {
+                frame_statement_has_exact_ledger_owner(certified, statement, obligation.id)
+            });
+        let exact_return_target = obligation.id.kind == SemanticObligationKind::Return
+            && return_controls
+                .get(&obligation.id.instruction)
+                .is_some_and(|control| {
+                    control.return_obligation() == obligation.id
+                        && obligation.inputs == [control.control_target().binding().value()]
+                });
+        let exact_return_read = obligation.id.kind == SemanticObligationKind::ObservableMemoryRead
+            && return_candidates.contains_key(&obligation.id.instruction)
+            && is_exact_mechanical_read(
+                certified,
+                obligation.id.instruction,
+                outputs.get(&obligation.id.instruction).copied(),
+            );
+        if exact_frame_statement || exact_return_target || exact_return_read {
+            continue;
+        }
+        if candidate_set.contains(&obligation.id.instruction) {
+            semantic.insert(obligation.id.instruction);
+        }
+        semantic.extend(obligation.inputs.iter().filter_map(|input| {
+            output_producers
+                .get(input)
+                .copied()
+                .filter(|producer| candidate_set.contains(producer))
+        }));
+    }
+    backward_close_semantic_producers(candidates, dependencies, semantic)
+}
+
+fn derive_mechanics(
+    certified: &impl CertifiedSemanticSource,
+    return_plan: &ReturnMechanicsPlan,
+) -> Result<
+    (
+        SemanticCReturnMechanicsOwnership,
+        SemanticCFrameMechanicsOwnership,
+    ),
+    SemanticCError,
+> {
+    let machine = certified.machine_view();
+    let (mut dependencies, output_producers, outputs) =
+        exact_expression_dependencies(certified, machine)?;
+    let Some(frame) = certified.frame_preservation() else {
+        let all_candidates = return_plan
+            .candidates
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let semantic = semantic_mechanics_producers(
+            certified,
+            &return_plan.candidates,
+            &dependencies,
+            &output_producers,
+            &outputs,
+            &BTreeMap::new(),
+            &return_plan.candidates,
+        )?;
+        let mechanics = all_candidates
+            .difference(&semantic)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        return Ok((
+            materialize_return_mechanics(certified, return_plan, &mechanics, &outputs)?,
+            SemanticCFrameMechanicsOwnership::default(),
+        ));
+    };
+    let fallback = frame.stack_allocation().entity().producer();
+    if frame.origin() != certified.origin() {
+        return Err(SemanticCError::InvalidFrameMechanics(fallback));
+    }
+    let restore_return_set = frame
+        .restores()
+        .iter()
+        .map(|restore| restore.return_control().producer())
+        .collect::<BTreeSet<_>>();
+    let frame_return_order = certified
+        .topology()
+        .blocks()
+        .iter()
+        .filter(|block| matches!(block.terminator(), CertifiedSourceTerminator::Return))
+        .filter_map(|block| block.instructions().last().copied())
+        .filter(|producer| restore_return_set.contains(producer))
+        .collect::<Vec<_>>();
+    if frame_return_order.is_empty()
+        || frame_return_order.len() != frame.restores().len()
+        || frame_return_order.len() != restore_return_set.len()
+        || frame_return_order != return_plan.return_order
+    {
+        return Err(SemanticCError::InvalidFrameMechanics(fallback));
+    }
+    let mut common_roots = BTreeSet::new();
+    let mut restore_roots =
+        BTreeMap::<CanonicalInstructionId, BTreeSet<CanonicalInstructionId>>::new();
+    let mut statements = BTreeMap::<CanonicalInstructionId, &CertifiedMemoryStatement>::new();
+    let mut explicit_dependencies =
+        BTreeMap::<CanonicalInstructionId, BTreeSet<CanonicalInstructionId>>::new();
+    let mut add_expression = |expression: &CertifiedExpr| {
+        common_roots.insert(expression.entity().producer());
+    };
+    add_expression(frame.stack_allocation());
+    add_expression(frame.frame_relation());
+    for copy in frame.entry_save_copies() {
+        add_expression(copy);
+    }
+    common_roots.insert(frame.entry_save().producer());
+    statements.insert(frame.entry_save().producer(), frame.entry_save());
+    let mut entry_save_inputs = BTreeSet::new();
+    if let Some(producer) = frame.entry_save().address().producer() {
+        common_roots.insert(producer);
+        entry_save_inputs.insert(producer);
+    }
+    if let CertifiedMemoryStatementKind::Write { value } = frame.entry_save().kind()
+        && let Some(producer) = value.producer()
+    {
+        common_roots.insert(producer);
+        entry_save_inputs.insert(producer);
+    }
+    merge_frame_dependency_row(
+        &mut explicit_dependencies,
+        frame.entry_save().producer(),
+        entry_save_inputs,
+    );
+    for restore in frame.restores() {
+        let return_producer = restore.return_control().producer();
+        let roots = restore_roots.entry(return_producer).or_default();
+        roots.insert(restore.restore_read().producer());
+        statements.insert(restore.restore_read().producer(), restore.restore_read());
+        let mut restore_read_inputs = BTreeSet::new();
+        if let Some(producer) = restore.restore_read().address().producer() {
+            roots.insert(producer);
+            restore_read_inputs.insert(producer);
+        }
+        merge_frame_dependency_row(
+            &mut explicit_dependencies,
+            restore.restore_read().producer(),
+            restore_read_inputs,
+        );
+        for copy in restore.restore_copies() {
+            roots.insert(copy.producer());
+            let mut copy_inputs = BTreeSet::new();
+            if let Some(producer) = copy.input().producer() {
+                roots.insert(producer);
+                copy_inputs.insert(producer);
+            }
+            merge_frame_dependency_row(&mut explicit_dependencies, copy.producer(), copy_inputs);
+        }
+        roots.insert(restore.restore_assignment().producer());
+        let mut assignment_inputs = BTreeSet::new();
+        if let Some(producer) = restore.restore_assignment().input().producer() {
+            roots.insert(producer);
+            assignment_inputs.insert(producer);
+        }
+        merge_frame_dependency_row(
+            &mut explicit_dependencies,
+            restore.restore_assignment().producer(),
+            assignment_inputs,
+        );
+    }
+    for (producer, inputs) in &explicit_dependencies {
+        merge_frame_dependency_row(&mut dependencies, *producer, inputs.iter().copied());
+    }
+    let mut candidates = BTreeMap::new();
+    for return_producer in &frame_return_order {
+        let mut complete = BTreeSet::new();
+        for root in &common_roots {
+            add_frame_mechanics_closure(
+                *root,
+                *return_producer,
+                &dependencies,
+                &mut candidates,
+                &mut BTreeSet::new(),
+                &mut complete,
+            )?;
+        }
+        for root in restore_roots.get(return_producer).into_iter().flatten() {
+            add_frame_mechanics_closure(
+                *root,
+                *return_producer,
+                &dependencies,
+                &mut candidates,
+                &mut BTreeSet::new(),
+                &mut complete,
+            )?;
+        }
+    }
+    if candidates.is_empty() {
+        return Err(SemanticCError::InvalidFrameMechanics(fallback));
+    }
+    let all_candidate_services = union_mechanics_services(&return_plan.candidates, &candidates);
+    let semantic = semantic_mechanics_producers(
+        certified,
+        &all_candidate_services,
+        &dependencies,
+        &output_producers,
+        &outputs,
+        &statements,
+        &return_plan.candidates,
+    )?;
+    let mechanics = candidates
+        .keys()
+        .filter(|producer| !semantic.contains(producer))
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut owners = Vec::with_capacity(mechanics.len());
+    for producer in certified
+        .topology()
+        .blocks()
+        .iter()
+        .flat_map(|block| block.instructions().iter().copied())
+        .filter(|producer| mechanics.contains(producer))
+    {
+        let instruction = certified
+            .source()
+            .instructions()
+            .get(&producer)
+            .ok_or(SemanticCError::InvalidFrameMechanics(producer))?;
+        for obligation in &instruction.obligations {
+            let valid = match obligation.kind {
+                SemanticObligationKind::LiveValueProducer => matches!(
+                    certified.ledger().effects(*obligation),
+                    [effect]
+                        if effect.disposition()
+                            == &EffectDisposition::AbsorbedIntoExpression { producer }
+                            && effect.expression_evidence().is_some_and(|expression| {
+                                expression.entity().producer() == producer
+                                    && expression.entity().source_obligations().contains(obligation)
+                            })
+                ),
+                SemanticObligationKind::ObservableMemoryRead
+                | SemanticObligationKind::ObservableMemoryWrite => {
+                    statements.get(&producer).is_some_and(|statement| {
+                        frame_statement_has_exact_ledger_owner(certified, statement, *obligation)
+                    }) || (obligation.kind == SemanticObligationKind::ObservableMemoryRead
+                        && return_plan.candidates.contains_key(&producer)
+                        && is_exact_mechanical_read(
+                            certified,
+                            producer,
+                            outputs.get(&producer).copied(),
+                        ))
+                }
+                _ => false,
+            };
+            if !valid {
+                return Err(SemanticCError::InvalidFrameMechanics(producer));
+            }
+        }
+        owners.push(SemanticCFrameMechanicsOwner {
+            source_producer: producer,
+            frame_pointer_storage: frame.frame_pointer_storage(),
+            saved_range: frame.saved_range(),
+            return_producers: return_plan
+                .return_order
+                .iter()
+                .copied()
+                .filter(|return_producer| {
+                    all_candidate_services
+                        .get(&producer)
+                        .is_some_and(|served| served.contains(return_producer))
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            source_obligations: instruction
+                .obligations
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        });
+    }
+    if owners.len() != mechanics.len() {
+        return Err(SemanticCError::InvalidFrameMechanics(fallback));
+    }
+    let return_mechanics = return_plan
+        .candidates
+        .keys()
+        .copied()
+        .filter(|producer| !semantic.contains(producer) && !mechanics.contains(producer))
+        .collect::<BTreeSet<_>>();
+    Ok((
+        materialize_return_mechanics(certified, return_plan, &return_mechanics, &outputs)?,
+        SemanticCFrameMechanicsOwnership {
+            owners: owners.into_boxed_slice(),
+            authority: Some(SemanticCFrameMechanicsAuthority {
+                frame_pointer_storage: frame.frame_pointer_storage(),
+                saved_range: frame.saved_range(),
+                common_roots,
+                return_order: frame_return_order.into_boxed_slice(),
+                restore_roots,
+                explicit_dependencies,
+            }),
+        },
+    ))
 }
 
 impl SemanticCExpressionLayer {
@@ -1371,11 +1863,18 @@ impl SemanticCExpressionLayer {
     fn from_source(certified: &impl CertifiedSemanticSource) -> Result<Self, SemanticCError> {
         let function_interface = semantic_function_interface(certified)?;
         let machine = certified.machine_view();
-        let return_mechanics = derive_return_mechanics(certified)?;
+        let return_plan = derive_return_mechanics_plan(certified)?;
+        let (return_mechanics, frame_mechanics) = derive_mechanics(certified, &return_plan)?;
         let mechanical_producers = return_mechanics
             .owners()
             .iter()
             .map(SemanticCReturnMechanicsOwner::source_producer)
+            .chain(
+                frame_mechanics
+                    .owners()
+                    .iter()
+                    .map(SemanticCFrameMechanicsOwner::source_producer),
+            )
             .collect::<BTreeSet<_>>();
         let output_producers = machine.output_producers();
         let certified_producers = machine
@@ -1477,7 +1976,8 @@ impl SemanticCExpressionLayer {
             .iter()
             .flat_map(|entity| entity.source_obligations.iter().copied())
             .collect::<BTreeSet<_>>();
-        let mechanical_obligations = return_mechanics.source_obligations();
+        let mut mechanical_obligations = return_mechanics.source_obligations();
+        mechanical_obligations.extend(frame_mechanics.source_obligations());
         let open_obligations = certified
             .source()
             .obligations()
@@ -1523,6 +2023,7 @@ impl SemanticCExpressionLayer {
             inputs: builder.inputs,
             input_origins,
             return_mechanics,
+            frame_mechanics,
             open_obligations,
         })
     }
@@ -1570,6 +2071,10 @@ impl SemanticCExpressionLayer {
 
     pub(crate) const fn return_mechanics(&self) -> &SemanticCReturnMechanicsOwnership {
         &self.return_mechanics
+    }
+
+    pub(crate) const fn frame_mechanics(&self) -> &SemanticCFrameMechanicsOwnership {
+        &self.frame_mechanics
     }
 
     pub const fn open_obligations(&self) -> &BTreeSet<SemanticObligationId> {
@@ -2530,6 +3035,13 @@ mod return_mechanics_tests {
         }
     }
 
+    fn block_id(block_addr: u64, ordinal: u64) -> CanonicalInstructionId {
+        CanonicalInstructionId {
+            block_addr,
+            site: CanonicalInstructionSite::Op(ordinal),
+        }
+    }
+
     fn logical_return_interface(
         kind: SourceTypeKind,
         carrier_kind: SourceCarrierKind,
@@ -2864,5 +3376,160 @@ mod return_mechanics_tests {
         };
         assert_ne!(canonical, reordered);
         assert_ne!(canonical, duplicated);
+    }
+
+    #[test]
+    fn frame_closure_tracks_shared_and_arm_local_return_service_exactly() {
+        let common_leaf = block_id(0x1000, 0);
+        let common_save = block_id(0x1000, 1);
+        let shared_restore_input = block_id(0x2000, 0);
+        let left_restore = block_id(0x2000, 1);
+        let right_restore = block_id(0x3000, 0);
+        let left_return = block_id(0x2000, 2);
+        let right_return = block_id(0x3000, 1);
+        let dependencies = BTreeMap::from([
+            (common_leaf, BTreeSet::new()),
+            (common_save, BTreeSet::from([common_leaf])),
+            (shared_restore_input, BTreeSet::from([common_leaf])),
+            (left_restore, BTreeSet::from([shared_restore_input])),
+            (right_restore, BTreeSet::from([shared_restore_input])),
+        ]);
+        let mut candidates = BTreeMap::new();
+        for return_producer in [left_return, right_return] {
+            let mut complete = BTreeSet::new();
+            add_frame_mechanics_closure(
+                common_save,
+                return_producer,
+                &dependencies,
+                &mut candidates,
+                &mut BTreeSet::new(),
+                &mut complete,
+            )
+            .expect("common frame closure");
+            add_frame_mechanics_closure(
+                if return_producer == left_return {
+                    left_restore
+                } else {
+                    right_restore
+                },
+                return_producer,
+                &dependencies,
+                &mut candidates,
+                &mut BTreeSet::new(),
+                &mut complete,
+            )
+            .expect("arm-local restore closure");
+        }
+
+        assert_eq!(
+            candidates.get(&common_save),
+            Some(&BTreeSet::from([left_return, right_return]))
+        );
+        assert_eq!(
+            candidates.get(&shared_restore_input),
+            Some(&BTreeSet::from([left_return, right_return]))
+        );
+        assert_eq!(
+            candidates.get(&left_restore),
+            Some(&BTreeSet::from([left_return]))
+        );
+        assert_eq!(
+            candidates.get(&right_restore),
+            Some(&BTreeSet::from([right_return]))
+        );
+
+        let return_only = block_id(0x1000, 9);
+        let combined = union_mechanics_services(
+            &BTreeMap::from([
+                (shared_restore_input, BTreeSet::from([left_return])),
+                (return_only, BTreeSet::from([right_return])),
+            ]),
+            &candidates,
+        );
+        assert_eq!(
+            combined.get(&shared_restore_input),
+            Some(&BTreeSet::from([left_return, right_return]))
+        );
+        assert_eq!(
+            combined.get(&return_only),
+            Some(&BTreeSet::from([right_return]))
+        );
+    }
+
+    #[test]
+    fn frame_closure_cycles_and_semantic_outside_uses_cannot_be_erased() {
+        let leaf = id(10);
+        let shared = id(11);
+        let restore = id(12);
+        let return_producer = id(13);
+        let dependencies = BTreeMap::from([
+            (leaf, BTreeSet::new()),
+            (shared, BTreeSet::from([leaf])),
+            (restore, BTreeSet::from([shared])),
+        ]);
+        let mut candidates = BTreeMap::new();
+        add_frame_mechanics_closure(
+            restore,
+            return_producer,
+            &dependencies,
+            &mut candidates,
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+        )
+        .expect("acyclic frame closure");
+        let semantic =
+            backward_close_semantic_producers(&candidates, &dependencies, BTreeSet::from([shared]))
+                .expect("outside use closes over its dependencies");
+        assert_eq!(semantic, BTreeSet::from([leaf, shared]));
+        assert!(!semantic.contains(&restore));
+
+        let cycle_dependencies = BTreeMap::from([
+            (leaf, BTreeSet::from([shared])),
+            (shared, BTreeSet::from([leaf])),
+        ]);
+        assert!(matches!(
+            add_frame_mechanics_closure(
+                leaf,
+                return_producer,
+                &cycle_dependencies,
+                &mut BTreeMap::new(),
+                &mut BTreeSet::new(),
+                &mut BTreeSet::new(),
+            ),
+            Err(SemanticCError::CyclicFrameMechanics(_))
+        ));
+
+        let unknown = id(14);
+        assert!(matches!(
+            add_frame_mechanics_closure(
+                unknown,
+                return_producer,
+                &dependencies,
+                &mut BTreeMap::new(),
+                &mut BTreeSet::new(),
+                &mut BTreeSet::new(),
+            ),
+            Err(SemanticCError::InvalidFrameMechanics(producer)) if producer == unknown
+        ));
+        let explicit_leaf_dependencies = BTreeMap::from([(unknown, BTreeSet::new())]);
+        add_frame_mechanics_closure(
+            unknown,
+            return_producer,
+            &explicit_leaf_dependencies,
+            &mut BTreeMap::new(),
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+        )
+        .expect("only an explicit sealed dependency row may terminate the closure");
+
+        let address = id(15);
+        let input = id(16);
+        let mut explicit = BTreeMap::new();
+        merge_frame_dependency_row(&mut explicit, unknown, [unknown, address]);
+        merge_frame_dependency_row(&mut explicit, unknown, [unknown, input]);
+        assert_eq!(
+            explicit.get(&unknown),
+            Some(&BTreeSet::from([address, input]))
+        );
     }
 }
