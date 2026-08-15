@@ -23,9 +23,9 @@ use crate::certified_region::{
     RegionObligationMapping, TypedOutputSealError,
 };
 use crate::semantic_c::{
-    SEMANTIC_C_HELPERS, SemanticCError, SemanticCFunctionInterface, SemanticCFunctionReturn,
-    SemanticCInputOrigin, SemanticCReturn, logical_return_type, render_logical_return_statement,
-    storage_type, value_name,
+    SemanticCError, SemanticCFunctionInterface, SemanticCFunctionReturn, SemanticCHelperSet,
+    SemanticCInputOrigin, SemanticCReturn, insert_semantic_c_helpers, logical_return_type,
+    render_logical_return_statement, storage_type, value_name,
 };
 use crate::semantic_stmt::{SemanticCBlockStepLayer, SemanticCStatementError};
 
@@ -543,8 +543,9 @@ impl CertifiedConditionalReturnFunction {
             .function_interface()
             .ok_or(ConditionalReturnFunctionError::MissingFunctionInterface)?;
         let mut output = String::new();
+        let mut helpers = SemanticCHelperSet::default();
         output.push_str("#include <stdint.h>\n\n");
-        output.push_str(SEMANTIC_C_HELPERS);
+        let helper_insertion = output.len();
         write!(&mut output, "\n{} {}(", return_type(interface)?, self.name)
             .expect("String writes cannot fail");
         render_parameters(&mut output, interface)?;
@@ -556,17 +557,24 @@ impl CertifiedConditionalReturnFunction {
                 .unwrap_or_else(|| format!("arg_{}", parameter.index()));
             writeln!(&mut output, "\t(void){name};").expect("String writes cannot fail");
         }
-        render_value_steps(&mut output, self.header.body(), "\t")?;
+        render_value_steps(&mut output, self.header.body(), "\t", &mut helpers)?;
         let condition = render_condition(self)?;
         writeln!(
             &mut output,
             "\tif ((uint8_t)({condition}) != UINT8_C(0)) {{"
         )
         .expect("String writes cannot fail");
-        render_return_arm(&mut output, &self.true_arm, "\t\t", interface)?;
+        render_return_arm(&mut output, &self.true_arm, "\t\t", interface, &mut helpers)?;
         output.push_str("\t} else {\n");
-        render_return_arm(&mut output, &self.false_arm, "\t\t", interface)?;
+        render_return_arm(
+            &mut output,
+            &self.false_arm,
+            "\t\t",
+            interface,
+            &mut helpers,
+        )?;
         output.push_str("\t}\n}\n");
+        insert_semantic_c_helpers(&mut output, helper_insertion, &helpers);
         Ok(output)
     }
 }
@@ -603,6 +611,7 @@ fn render_value_steps(
     output: &mut String,
     layer: &SemanticCBlockStepLayer,
     indent: &str,
+    helpers: &mut SemanticCHelperSet,
 ) -> Result<(), ConditionalReturnFunctionError> {
     let expressions = layer.accounting().expression_layer();
     for step in layer.steps() {
@@ -617,7 +626,7 @@ fn render_value_steps(
             "{indent}{} {} = {};",
             storage_type(expressions.expr_type(entity.root())?)?,
             value_name(entity.output()),
-            expressions.render_expr(entity.root())?
+            expressions.render_expr(entity.root(), helpers)?
         )
         .expect("String writes cannot fail");
         writeln!(output, "{indent}(void){};", value_name(entity.output()))
@@ -660,8 +669,9 @@ fn render_return_arm(
     arm: &CertifiedConditionalReturnArm,
     indent: &str,
     interface: &SemanticCFunctionInterface,
+    helpers: &mut SemanticCHelperSet,
 ) -> Result<(), ConditionalReturnFunctionError> {
-    render_value_steps(output, arm.layer(), indent)?;
+    render_value_steps(output, arm.layer(), indent, helpers)?;
     let returned = arm
         .returned()
         .ok_or(ConditionalReturnFunctionError::MissingReturnedEntity)?;
@@ -669,13 +679,17 @@ fn render_return_arm(
         [] => writeln!(
             output,
             "{indent}{}",
-            render_logical_return_statement(interface, None)?
+            render_logical_return_statement(interface, None, helpers)?
         )
         .expect("String writes cannot fail"),
         [value] => writeln!(
             output,
             "{indent}{}",
-            render_logical_return_statement(interface, Some(&value_name(value.binding())))?
+            render_logical_return_statement(
+                interface,
+                Some(&value_name(value.binding())),
+                helpers,
+            )?
         )
         .expect("String writes cannot fail"),
         _ => return Err(ConditionalReturnFunctionError::MissingReturnedEntity),

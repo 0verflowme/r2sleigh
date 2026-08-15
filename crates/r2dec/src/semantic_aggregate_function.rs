@@ -19,8 +19,8 @@ use r2ssa::{
 use serde::Serialize;
 
 use crate::semantic_c::{
-    SEMANTIC_C_HELPERS, SemanticCError, SemanticCFunctionReturn, SemanticCInputOrigin,
-    SemanticCParameter, storage_type, value_name,
+    SemanticCError, SemanticCFunctionReturn, SemanticCHelper, SemanticCHelperSet,
+    SemanticCInputOrigin, SemanticCParameter, insert_semantic_c_helpers, storage_type, value_name,
 };
 use crate::semantic_memory_function::{
     CertifiedMemorySemanticCFunction, CertifiedMemorySemanticCFunctionError,
@@ -1132,7 +1132,7 @@ impl CertifiedAggregateMemberSemanticCFunction {
                     .layer()
                     .accounting()
                     .expression_layer()
-                    .render_expr(entity.root())?;
+                    .render_expr(entity.root(), &mut SemanticCHelperSet::default())?;
             }
         }
         if observed.as_slice() != self.memory_order.as_ref() {
@@ -1149,10 +1149,9 @@ impl CertifiedAggregateMemberSemanticCFunction {
         self.validate_render_sequence()?;
         let expressions = self.memory.layer().accounting().expression_layer();
         let mut output = String::new();
-        output.push_str("#include <stddef.h>\n#include <stdint.h>\n#include <string.h>\n\n");
-        output.push_str(SEMANTIC_C_HELPERS);
-        output.push('\n');
-        output.push_str(SIGNED_BITCAST_HELPERS);
+        let mut helpers = SemanticCHelperSet::default();
+        output.push_str("#include <stddef.h>\n#include <stdint.h>\n\n");
+        let helper_insertion = output.len();
         output.push('\n');
         output.push_str(PLAIN_RAM_HELPER_DECLARATIONS);
         output.push('\n');
@@ -1272,7 +1271,7 @@ impl CertifiedAggregateMemberSemanticCFunction {
                         .ty()
                 )?,
                 value_name(entity.output()),
-                expressions.render_expr(entity.root())?
+                expressions.render_expr(entity.root(), &mut helpers)?
             )
             .expect("String writes cannot fail");
         }
@@ -1290,15 +1289,31 @@ impl CertifiedAggregateMemberSemanticCFunction {
                         writeln!(&mut output, "\treturn (uint{width_bits}_t)({value});")
                             .expect("String writes cannot fail")
                     }
-                    CertifiedAggregateScalarSignedness::Signed => writeln!(
-                        &mut output,
-                        "\treturn r2s_i{width_bits}_from_bits((uint{width_bits}_t)({value}));"
-                    )
-                    .expect("String writes cannot fail"),
+                    CertifiedAggregateScalarSignedness::Signed => {
+                        let helper = match width_bits {
+                            8 => SemanticCHelper::I8FromBits,
+                            16 => SemanticCHelper::I16FromBits,
+                            32 => SemanticCHelper::I32FromBits,
+                            64 => SemanticCHelper::I64FromBits,
+                            _ => {
+                                return Err(
+                                    CertifiedAggregateMemberSemanticCFunctionError::InvalidReturn,
+                                );
+                            }
+                        };
+                        helpers.insert(helper);
+                        writeln!(
+                            &mut output,
+                            "\treturn {}((uint{width_bits}_t)({value}));",
+                            helper.call_name()
+                        )
+                        .expect("String writes cannot fail")
+                    }
                 }
             }
         }
         output.push_str("}\n");
+        insert_semantic_c_helpers(&mut output, helper_insertion, &helpers);
         Ok(output)
     }
 
@@ -1420,31 +1435,6 @@ fn scalar_c_type(
         ),
     }
 }
-
-const SIGNED_BITCAST_HELPERS: &str = r#"static inline int8_t r2s_i8_from_bits(uint8_t bits) {
-    int8_t value;
-    memcpy(&value, &bits, sizeof(value));
-    return value;
-}
-
-static inline int16_t r2s_i16_from_bits(uint16_t bits) {
-    int16_t value;
-    memcpy(&value, &bits, sizeof(value));
-    return value;
-}
-
-static inline int32_t r2s_i32_from_bits(uint32_t bits) {
-    int32_t value;
-    memcpy(&value, &bits, sizeof(value));
-    return value;
-}
-
-static inline int64_t r2s_i64_from_bits(uint64_t bits) {
-    int64_t value;
-    memcpy(&value, &bits, sizeof(value));
-    return value;
-}
-"#;
 
 #[cfg(test)]
 mod tests {

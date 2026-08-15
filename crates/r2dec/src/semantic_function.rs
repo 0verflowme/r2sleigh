@@ -9,8 +9,9 @@ use serde::Serialize;
 use crate::certified_region::{CertifiedSingleBlockAccounting, RegionBuildError};
 use crate::certified_return::{CertifiedTerminalReturnBlockRegion, TerminalReturnRegionError};
 use crate::semantic_c::{
-    SEMANTIC_C_HELPERS, SemanticCError, SemanticCFunctionReturn, SemanticCInputOrigin,
-    logical_return_type, render_logical_return_statement, storage_type, value_name,
+    SemanticCError, SemanticCFunctionReturn, SemanticCHelperSet, SemanticCInputOrigin,
+    insert_semantic_c_helpers, logical_return_type, render_logical_return_statement, storage_type,
+    value_name,
 };
 
 pub const CERTIFIED_SEMANTIC_C_FUNCTION_SCHEMA_VERSION: u32 = 4;
@@ -186,8 +187,9 @@ impl CertifiedSemanticCFunction {
             .ok_or(CertifiedSemanticCFunctionError::MissingFunctionInterface)?;
         let return_type = logical_return_type(interface)?;
         let mut output = String::new();
+        let mut helpers = SemanticCHelperSet::default();
         output.push_str("#include <stdint.h>\n\n");
-        output.push_str(SEMANTIC_C_HELPERS);
+        let helper_insertion = output.len();
         write!(&mut output, "\n{return_type} {}(", self.name).expect("String writes cannot fail");
         if interface.parameters().is_empty() {
             output.push_str("void");
@@ -221,7 +223,7 @@ impl CertifiedSemanticCFunction {
                 .layer()
                 .resolve_value(reference)
                 .ok_or(CertifiedSemanticCFunctionError::MissingReturnedEntity)?;
-            let expression = expressions.render_expr(entity.root())?;
+            let expression = expressions.render_expr(entity.root(), &mut helpers)?;
             writeln!(
                 &mut output,
                 "\t{} {} = {expression};",
@@ -254,17 +256,18 @@ impl CertifiedSemanticCFunction {
                             && self.region.operand_is_grounded_before_return(*operand)
                     })
                     .ok_or(CertifiedSemanticCFunctionError::MissingReturnedEntity)?;
-                Some(expressions.render_return_operand(operand)?)
+                Some(expressions.render_return_operand_with_helpers(operand, &mut helpers)?)
             }
             _ => return Err(CertifiedSemanticCFunctionError::MissingReturnedEntity),
         };
         writeln!(
             &mut output,
             "\t{}",
-            render_logical_return_statement(interface, return_value.as_deref())?
+            render_logical_return_statement(interface, return_value.as_deref(), &mut helpers)?
         )
         .expect("String writes cannot fail");
         output.push_str("}\n");
+        insert_semantic_c_helpers(&mut output, helper_insertion, &helpers);
         Ok(output)
     }
 }

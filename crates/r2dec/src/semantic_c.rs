@@ -29,6 +29,137 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const SEMANTIC_C_SCHEMA_VERSION: u32 = 14;
 
+/// Closed renderer-owned helper vocabulary. Membership is derived only while
+/// rendering audited typed semantics and never grants certification authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum SemanticCHelper {
+    Mask,
+    BitInsert,
+    I8FromBits,
+    I16FromBits,
+    I32FromBits,
+    I64FromBits,
+    WrapAdd,
+    WrapSub,
+    WrapMul,
+    UnsignedCarry,
+    SignedCarry,
+    SignedBorrow,
+    ShiftLeft,
+    LogicalShiftRight,
+    ArithmeticShiftRight,
+    SignedKey,
+    SignExtend,
+}
+
+impl SemanticCHelper {
+    const ORDERED: [Self; 17] = [
+        Self::Mask,
+        Self::BitInsert,
+        Self::I8FromBits,
+        Self::I16FromBits,
+        Self::I32FromBits,
+        Self::I64FromBits,
+        Self::WrapAdd,
+        Self::WrapSub,
+        Self::WrapMul,
+        Self::UnsignedCarry,
+        Self::SignedCarry,
+        Self::SignedBorrow,
+        Self::ShiftLeft,
+        Self::LogicalShiftRight,
+        Self::ArithmeticShiftRight,
+        Self::SignedKey,
+        Self::SignExtend,
+    ];
+
+    const fn depends_on_mask(self) -> bool {
+        matches!(
+            self,
+            Self::BitInsert
+                | Self::WrapAdd
+                | Self::WrapSub
+                | Self::WrapMul
+                | Self::UnsignedCarry
+                | Self::SignedCarry
+                | Self::SignedBorrow
+                | Self::ShiftLeft
+                | Self::LogicalShiftRight
+                | Self::ArithmeticShiftRight
+                | Self::SignedKey
+                | Self::SignExtend
+        )
+    }
+
+    const fn definition(self) -> &'static str {
+        match self {
+            Self::Mask => SEMANTIC_C_MASK_HELPER,
+            Self::BitInsert => SEMANTIC_C_BIT_INSERT_HELPER,
+            Self::I8FromBits => SEMANTIC_C_I8_FROM_BITS_HELPER,
+            Self::I16FromBits => SEMANTIC_C_I16_FROM_BITS_HELPER,
+            Self::I32FromBits => SEMANTIC_C_I32_FROM_BITS_HELPER,
+            Self::I64FromBits => SEMANTIC_C_I64_FROM_BITS_HELPER,
+            Self::WrapAdd => SEMANTIC_C_WRAP_ADD_HELPER,
+            Self::WrapSub => SEMANTIC_C_WRAP_SUB_HELPER,
+            Self::WrapMul => SEMANTIC_C_WRAP_MUL_HELPER,
+            Self::UnsignedCarry => SEMANTIC_C_UCARRY_HELPER,
+            Self::SignedCarry => SEMANTIC_C_SCARRY_HELPER,
+            Self::SignedBorrow => SEMANTIC_C_SBORROW_HELPER,
+            Self::ShiftLeft => SEMANTIC_C_SHL_HELPER,
+            Self::LogicalShiftRight => SEMANTIC_C_LSHR_HELPER,
+            Self::ArithmeticShiftRight => SEMANTIC_C_ASHR_HELPER,
+            Self::SignedKey => SEMANTIC_C_SIGNED_KEY_HELPER,
+            Self::SignExtend => SEMANTIC_C_SEXT_HELPER,
+        }
+    }
+
+    pub(crate) const fn call_name(self) -> &'static str {
+        match self {
+            Self::Mask => "r2s_mask",
+            Self::BitInsert => "r2s_bit_insert",
+            Self::I8FromBits => "r2s_i8_from_bits",
+            Self::I16FromBits => "r2s_i16_from_bits",
+            Self::I32FromBits => "r2s_i32_from_bits",
+            Self::I64FromBits => "r2s_i64_from_bits",
+            Self::WrapAdd => "r2s_wrap_add",
+            Self::WrapSub => "r2s_wrap_sub",
+            Self::WrapMul => "r2s_wrap_mul",
+            Self::UnsignedCarry => "r2s_ucarry",
+            Self::SignedCarry => "r2s_scarry",
+            Self::SignedBorrow => "r2s_sborrow",
+            Self::ShiftLeft => "r2s_shl",
+            Self::LogicalShiftRight => "r2s_lshr",
+            Self::ArithmeticShiftRight => "r2s_ashr",
+            Self::SignedKey => "r2s_signed_key",
+            Self::SignExtend => "r2s_sext",
+        }
+    }
+}
+
+/// Deterministic helper dependency inventory for one generated translation unit.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SemanticCHelperSet(BTreeSet<SemanticCHelper>);
+
+impl SemanticCHelperSet {
+    pub(crate) fn insert(&mut self, helper: SemanticCHelper) {
+        if helper.depends_on_mask() {
+            self.0.insert(SemanticCHelper::Mask);
+        }
+        self.0.insert(helper);
+    }
+
+    fn definitions(&self) -> String {
+        let mut output = String::new();
+        for helper in SemanticCHelper::ORDERED {
+            if self.0.contains(&helper) {
+                output.push_str(helper.definition());
+                output.push('\n');
+            }
+        }
+        output
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SemanticCParameter {
     index: u32,
@@ -208,6 +339,7 @@ pub(crate) fn logical_return_type(
 fn render_logical_return_value(
     logical_ty: &MachineType,
     value: &str,
+    helpers: &mut SemanticCHelperSet,
 ) -> Result<String, SemanticCError> {
     let width = logical_ty.width_bits();
     match logical_ty {
@@ -219,7 +351,9 @@ fn render_logical_return_value(
             signedness: MachineSignedness::Signed,
             ..
         } if matches!(width, 8 | 16 | 32 | 64) => {
-            Ok(format!("r2s_i{width}_from_bits((uint{width}_t)({value}))"))
+            let helper = signed_from_bits_helper(width)?;
+            helpers.insert(helper);
+            Ok(format!("{}((uint{width}_t)({value}))", helper.call_name()))
         }
         _ => Err(SemanticCError::InvalidReturnProjection),
     }
@@ -228,6 +362,7 @@ fn render_logical_return_value(
 pub(crate) fn render_logical_return_statement(
     interface: &SemanticCFunctionInterface,
     value: Option<&str>,
+    helpers: &mut SemanticCHelperSet,
 ) -> Result<String, SemanticCError> {
     match (
         interface.return_kind(),
@@ -240,9 +375,19 @@ pub(crate) fn render_logical_return_statement(
         {
             Ok(format!(
                 "return {};",
-                render_logical_return_value(projection.logical_ty(), value)?
+                render_logical_return_value(projection.logical_ty(), value, helpers)?
             ))
         }
+        _ => Err(SemanticCError::InvalidReturnProjection),
+    }
+}
+
+fn signed_from_bits_helper(width: u32) -> Result<SemanticCHelper, SemanticCError> {
+    match width {
+        8 => Ok(SemanticCHelper::I8FromBits),
+        16 => Ok(SemanticCHelper::I16FromBits),
+        32 => Ok(SemanticCHelper::I32FromBits),
+        64 => Ok(SemanticCHelper::I64FromBits),
         _ => Err(SemanticCError::InvalidReturnProjection),
     }
 }
@@ -2325,14 +2470,19 @@ impl SemanticCExpressionLayer {
             .ok_or(SemanticCError::MissingSemanticExpression(id))
     }
 
-    pub(crate) fn render_expr(&self, id: SemanticCExprId) -> Result<String, SemanticCError> {
-        self.render_expr_inner(id, None)
-            .map(|rendered| rendered.source)
+    pub(crate) fn render_expr(
+        &self,
+        id: SemanticCExprId,
+        helpers: &mut SemanticCHelperSet,
+    ) -> Result<String, SemanticCError> {
+        let rendered = self.render_expr_inner(id, None, helpers)?;
+        Ok(rendered.source)
     }
 
-    pub fn render_return_operand(
+    pub(crate) fn render_return_operand_with_helpers(
         &self,
         operand: SemanticCReturnOperand<'_>,
+        helpers: &mut SemanticCHelperSet,
     ) -> Result<String, SemanticCError> {
         match operand {
             SemanticCReturnOperand::Direct(value) => Ok(value_name(value.binding())),
@@ -2355,8 +2505,11 @@ impl SemanticCExpressionLayer {
                             composition.base.producer(),
                         ));
                     }
+                    let helper = SemanticCHelper::BitInsert;
+                    helpers.insert(helper);
                     rendered = format!(
-                        "r2s_bit_insert((uint64_t)({rendered}), (uint64_t)({}), {lsb_bits}U, {width}U, {total_width}U)",
+                        "{}((uint64_t)({rendered}), (uint64_t)({}), {lsb_bits}U, {width}U, {total_width}U)",
+                        helper.call_name(),
                         value_name(overlay.definition.binding())
                     );
                 }
@@ -2369,13 +2522,14 @@ impl SemanticCExpressionLayer {
         &self,
         id: SemanticCExprId,
         substitution: Option<(MachineValueBinding, &str)>,
+        helpers: &mut SemanticCHelperSet,
     ) -> Result<RenderedSemanticExpr, SemanticCError> {
         let expr = self
             .expr(id)
             .ok_or(SemanticCError::MissingSemanticExpression(id))?;
         let width = expr.ty.width_bits();
         let ctype = storage_type(&expr.ty)?;
-        let child = |child| self.render_expr_inner(child, substitution);
+        let mut child = |child| self.render_expr_inner(child, substitution, helpers);
         let rendered = match &expr.kind {
             SemanticCExprKind::Input { binding } => {
                 if let Some((expected, replacement)) = substitution
@@ -2413,12 +2567,14 @@ impl SemanticCExpressionLayer {
                 right,
             } => {
                 let helper = match op {
-                    MachineArithmeticOp::Add => "r2s_wrap_add",
-                    MachineArithmeticOp::Subtract => "r2s_wrap_sub",
-                    MachineArithmeticOp::Multiply => "r2s_wrap_mul",
+                    MachineArithmeticOp::Add => SemanticCHelper::WrapAdd,
+                    MachineArithmeticOp::Subtract => SemanticCHelper::WrapSub,
+                    MachineArithmeticOp::Multiply => SemanticCHelper::WrapMul,
                 };
                 let left = child(*left)?;
                 let right = child(*right)?;
+                helpers.insert(helper);
+                let helper = helper.call_name();
                 RenderedSemanticExpr {
                     source: format!(
                         "(({ctype}){helper}((uint64_t)({}), (uint64_t)({}), {width}U))",
@@ -2440,12 +2596,14 @@ impl SemanticCExpressionLayer {
                     return Err(SemanticCError::InvalidArithmeticFlagExpression(id));
                 }
                 let helper = match op {
-                    MachineArithmeticFlagOp::UnsignedCarry => "r2s_ucarry",
-                    MachineArithmeticFlagOp::SignedCarry => "r2s_scarry",
-                    MachineArithmeticFlagOp::SignedBorrow => "r2s_sborrow",
+                    MachineArithmeticFlagOp::UnsignedCarry => SemanticCHelper::UnsignedCarry,
+                    MachineArithmeticFlagOp::SignedCarry => SemanticCHelper::SignedCarry,
+                    MachineArithmeticFlagOp::SignedBorrow => SemanticCHelper::SignedBorrow,
                 };
                 let left = child(*left)?;
                 let right = child(*right)?;
+                helpers.insert(helper);
+                let helper = helper.call_name();
                 RenderedSemanticExpr {
                     source: format!(
                         "(({ctype}){helper}((uint64_t)({}), (uint64_t)({}), {input_width}U))",
@@ -2527,15 +2685,21 @@ impl SemanticCExpressionLayer {
                 count,
             } => {
                 let helper = match (kind, overshift) {
-                    (MachineShiftKind::Left, MachineOvershiftBehavior::Zero) => "r2s_shl",
-                    (MachineShiftKind::LogicalRight, MachineOvershiftBehavior::Zero) => "r2s_lshr",
+                    (MachineShiftKind::Left, MachineOvershiftBehavior::Zero) => {
+                        SemanticCHelper::ShiftLeft
+                    }
+                    (MachineShiftKind::LogicalRight, MachineOvershiftBehavior::Zero) => {
+                        SemanticCHelper::LogicalShiftRight
+                    }
                     (MachineShiftKind::ArithmeticRight, MachineOvershiftBehavior::SignFill) => {
-                        "r2s_ashr"
+                        SemanticCHelper::ArithmeticShiftRight
                     }
                     _ => return Err(SemanticCError::UnsupportedShiftPolicy(id)),
                 };
                 let value = child(*value)?;
                 let count = child(*count)?;
+                helpers.insert(helper);
+                let helper = helper.call_name();
                 RenderedSemanticExpr {
                     source: format!(
                         "(({ctype}){helper}((uint64_t)({}), (uint64_t)({}), {width}U))",
@@ -2553,6 +2717,15 @@ impl SemanticCExpressionLayer {
                 let comparison_width = self.expr_type(*left)?.width_bits();
                 let left = child(*left)?;
                 let right = child(*right)?;
+                if *interpretation == MachineSignedness::Signed
+                    && matches!(
+                        op,
+                        MachineComparisonOp::LessThan | MachineComparisonOp::LessThanOrEqual
+                    )
+                {
+                    helpers.insert(SemanticCHelper::SignedKey);
+                }
+                let signed_key = SemanticCHelper::SignedKey.call_name();
                 let condition = match (op, interpretation) {
                     (MachineComparisonOp::Equal, _) => {
                         format!(
@@ -2579,11 +2752,11 @@ impl SemanticCExpressionLayer {
                         )
                     }
                     (MachineComparisonOp::LessThan, MachineSignedness::Signed) => format!(
-                        "(r2s_signed_key((uint64_t)({}), {comparison_width}U) < r2s_signed_key((uint64_t)({}), {comparison_width}U))",
+                        "({signed_key}((uint64_t)({}), {comparison_width}U) < {signed_key}((uint64_t)({}), {comparison_width}U))",
                         left.source, right.source
                     ),
                     (MachineComparisonOp::LessThanOrEqual, MachineSignedness::Signed) => format!(
-                        "(r2s_signed_key((uint64_t)({}), {comparison_width}U) <= r2s_signed_key((uint64_t)({}), {comparison_width}U))",
+                        "({signed_key}((uint64_t)({}), {comparison_width}U) <= {signed_key}((uint64_t)({}), {comparison_width}U))",
                         left.source, right.source
                     ),
                 };
@@ -2596,10 +2769,15 @@ impl SemanticCExpressionLayer {
                 let input_expr = child(*input)?;
                 let input_width = self.expr_type(*input)?.width_bits();
                 let source = match kind {
-                    MachineCastKind::SignExtend => format!(
-                        "(({ctype})r2s_sext((uint64_t)({}), {input_width}U, {width}U))",
-                        input_expr.source
-                    ),
+                    MachineCastKind::SignExtend => {
+                        let helper = SemanticCHelper::SignExtend;
+                        helpers.insert(helper);
+                        format!(
+                            "(({ctype}){}((uint64_t)({}), {input_width}U, {width}U))",
+                            helper.call_name(),
+                            input_expr.source
+                        )
+                    }
                     MachineCastKind::ZeroExtend
                     | MachineCastKind::Truncate
                     | MachineCastKind::BitReinterpret
@@ -3359,55 +3537,65 @@ pub(crate) fn value_name(binding: MachineValueBinding) -> String {
     format!("v_{}", binding.value().0)
 }
 
-pub(crate) const SEMANTIC_C_HELPERS: &str = r#"static inline uint64_t r2s_mask(unsigned width) {
+const SEMANTIC_C_MASK_HELPER: &str = r#"static inline uint64_t r2s_mask(unsigned width) {
 	if (width == 0U) {
 		return UINT64_C(0);
 	}
 	return width >= 64U ? UINT64_MAX : ((UINT64_C(1) << width) - UINT64_C(1));
 }
+"#;
 
-static inline uint64_t r2s_bit_insert(uint64_t base, uint64_t value, unsigned lsb, unsigned width, unsigned total_width) {
+const SEMANTIC_C_BIT_INSERT_HELPER: &str = r#"static inline uint64_t r2s_bit_insert(uint64_t base, uint64_t value, unsigned lsb, unsigned width, unsigned total_width) {
 	uint64_t value_mask = r2s_mask(width);
 	uint64_t field_mask = value_mask << lsb;
 	return ((base & ~field_mask) | ((value & value_mask) << lsb)) & r2s_mask(total_width);
 }
+"#;
 
-static inline int8_t r2s_i8_from_bits(uint8_t bits) {
+const SEMANTIC_C_I8_FROM_BITS_HELPER: &str = r#"static inline int8_t r2s_i8_from_bits(uint8_t bits) {
 	return bits <= INT8_MAX ? (int8_t)bits : (int8_t)(-INT8_C(1) - (int16_t)(UINT8_MAX - bits));
 }
+"#;
 
-static inline int16_t r2s_i16_from_bits(uint16_t bits) {
+const SEMANTIC_C_I16_FROM_BITS_HELPER: &str = r#"static inline int16_t r2s_i16_from_bits(uint16_t bits) {
 	return bits <= INT16_MAX ? (int16_t)bits : (int16_t)(-INT16_C(1) - (int32_t)(UINT16_MAX - bits));
 }
+"#;
 
-static inline int32_t r2s_i32_from_bits(uint32_t bits) {
+const SEMANTIC_C_I32_FROM_BITS_HELPER: &str = r#"static inline int32_t r2s_i32_from_bits(uint32_t bits) {
 	return bits <= INT32_MAX ? (int32_t)bits : (int32_t)(-INT32_C(1) - (int64_t)(UINT32_MAX - bits));
 }
+"#;
 
-static inline int64_t r2s_i64_from_bits(uint64_t bits) {
+const SEMANTIC_C_I64_FROM_BITS_HELPER: &str = r#"static inline int64_t r2s_i64_from_bits(uint64_t bits) {
 	return bits <= INT64_MAX ? (int64_t)bits : -INT64_C(1) - (int64_t)(UINT64_MAX - bits);
 }
+"#;
 
-static inline uint64_t r2s_wrap_add(uint64_t left, uint64_t right, unsigned width) {
+const SEMANTIC_C_WRAP_ADD_HELPER: &str = r#"static inline uint64_t r2s_wrap_add(uint64_t left, uint64_t right, unsigned width) {
 	return (left + right) & r2s_mask(width);
 }
+"#;
 
-static inline uint64_t r2s_wrap_sub(uint64_t left, uint64_t right, unsigned width) {
+const SEMANTIC_C_WRAP_SUB_HELPER: &str = r#"static inline uint64_t r2s_wrap_sub(uint64_t left, uint64_t right, unsigned width) {
 	return (left - right) & r2s_mask(width);
 }
+"#;
 
-static inline uint64_t r2s_wrap_mul(uint64_t left, uint64_t right, unsigned width) {
+const SEMANTIC_C_WRAP_MUL_HELPER: &str = r#"static inline uint64_t r2s_wrap_mul(uint64_t left, uint64_t right, unsigned width) {
 	return (left * right) & r2s_mask(width);
 }
+"#;
 
-static inline uint64_t r2s_ucarry(uint64_t left, uint64_t right, unsigned width) {
+const SEMANTIC_C_UCARRY_HELPER: &str = r#"static inline uint64_t r2s_ucarry(uint64_t left, uint64_t right, unsigned width) {
 	uint64_t mask = r2s_mask(width);
 	left &= mask;
 	right &= mask;
 	return left > (mask - right) ? UINT64_C(1) : UINT64_C(0);
 }
+"#;
 
-static inline uint64_t r2s_scarry(uint64_t left, uint64_t right, unsigned width) {
+const SEMANTIC_C_SCARRY_HELPER: &str = r#"static inline uint64_t r2s_scarry(uint64_t left, uint64_t right, unsigned width) {
 	if (width == 0U) {
 		return UINT64_C(0);
 	}
@@ -3421,8 +3609,9 @@ static inline uint64_t r2s_scarry(uint64_t left, uint64_t right, unsigned width)
 	uint64_t result = (left + right) & mask;
 	return ((~(left ^ right) & (left ^ result) & sign) != 0U) ? UINT64_C(1) : UINT64_C(0);
 }
+"#;
 
-static inline uint64_t r2s_sborrow(uint64_t left, uint64_t right, unsigned width) {
+const SEMANTIC_C_SBORROW_HELPER: &str = r#"static inline uint64_t r2s_sborrow(uint64_t left, uint64_t right, unsigned width) {
 	if (width == 0U) {
 		return UINT64_C(0);
 	}
@@ -3436,8 +3625,9 @@ static inline uint64_t r2s_sborrow(uint64_t left, uint64_t right, unsigned width
 	uint64_t result = (left - right) & mask;
 	return (((left ^ right) & (left ^ result) & sign) != 0U) ? UINT64_C(1) : UINT64_C(0);
 }
+"#;
 
-static inline uint64_t r2s_shl(uint64_t value, uint64_t count, unsigned width) {
+const SEMANTIC_C_SHL_HELPER: &str = r#"static inline uint64_t r2s_shl(uint64_t value, uint64_t count, unsigned width) {
 	if (width == 0U) {
 		return UINT64_C(0);
 	}
@@ -3446,8 +3636,9 @@ static inline uint64_t r2s_shl(uint64_t value, uint64_t count, unsigned width) {
 	}
 	return count >= width ? UINT64_C(0) : ((value << count) & r2s_mask(width));
 }
+"#;
 
-static inline uint64_t r2s_lshr(uint64_t value, uint64_t count, unsigned width) {
+const SEMANTIC_C_LSHR_HELPER: &str = r#"static inline uint64_t r2s_lshr(uint64_t value, uint64_t count, unsigned width) {
 	if (width == 0U) {
 		return UINT64_C(0);
 	}
@@ -3456,8 +3647,9 @@ static inline uint64_t r2s_lshr(uint64_t value, uint64_t count, unsigned width) 
 	}
 	return count >= width ? UINT64_C(0) : ((value & r2s_mask(width)) >> count);
 }
+"#;
 
-static inline uint64_t r2s_ashr(uint64_t value, uint64_t count, unsigned width) {
+const SEMANTIC_C_ASHR_HELPER: &str = r#"static inline uint64_t r2s_ashr(uint64_t value, uint64_t count, unsigned width) {
 	if (width == 0U) {
 		return UINT64_C(0);
 	}
@@ -3479,8 +3671,9 @@ static inline uint64_t r2s_ashr(uint64_t value, uint64_t count, unsigned width) 
 	}
 	return result & mask;
 }
+"#;
 
-static inline uint64_t r2s_signed_key(uint64_t value, unsigned width) {
+const SEMANTIC_C_SIGNED_KEY_HELPER: &str = r#"static inline uint64_t r2s_signed_key(uint64_t value, unsigned width) {
 	if (width == 0U) {
 		return UINT64_C(0);
 	}
@@ -3489,8 +3682,9 @@ static inline uint64_t r2s_signed_key(uint64_t value, unsigned width) {
 	}
 	return (value & r2s_mask(width)) ^ (UINT64_C(1) << (width - 1U));
 }
+"#;
 
-static inline uint64_t r2s_sext(uint64_t value, unsigned from_width, unsigned to_width) {
+const SEMANTIC_C_SEXT_HELPER: &str = r#"static inline uint64_t r2s_sext(uint64_t value, unsigned from_width, unsigned to_width) {
 	if (from_width == 0U || to_width == 0U) {
 		return UINT64_C(0);
 	}
@@ -3510,6 +3704,15 @@ static inline uint64_t r2s_sext(uint64_t value, unsigned from_width, unsigned to
 	return ((value & sign) != 0U ? (value | (to_mask ^ from_mask)) : value) & to_mask;
 }
 "#;
+
+pub(crate) fn insert_semantic_c_helpers(
+    output: &mut String,
+    insertion: usize,
+    helpers: &SemanticCHelperSet,
+) {
+    debug_assert!(insertion <= output.len() && output.is_char_boundary(insertion));
+    output.insert_str(insertion, &helpers.definitions());
+}
 
 #[cfg(test)]
 mod return_mechanics_tests {
@@ -3806,6 +4009,7 @@ mod return_mechanics_tests {
 
     #[test]
     fn shared_logical_return_renderer_is_exact_for_every_certified_route() {
+        let mut helpers = SemanticCHelperSet::default();
         let unsigned = semantic_return_interface(
             SourceTypeKind::UnsignedInteger,
             SourceCarrierKind::LowBits,
@@ -3813,9 +4017,10 @@ mod return_mechanics_tests {
         );
         assert_eq!(logical_return_type(&unsigned), Ok("uint32_t"));
         assert_eq!(
-            render_logical_return_statement(&unsigned, Some("v_7")),
+            render_logical_return_statement(&unsigned, Some("v_7"), &mut helpers),
             Ok("return (uint32_t)(v_7);".to_string())
         );
+        assert!(helpers.definitions().is_empty());
 
         let signed = semantic_return_interface(
             SourceTypeKind::SignedInteger,
@@ -3824,8 +4029,13 @@ mod return_mechanics_tests {
         );
         assert_eq!(logical_return_type(&signed), Ok("int32_t"));
         assert_eq!(
-            render_logical_return_statement(&signed, Some("v_7")),
+            render_logical_return_statement(&signed, Some("v_7"), &mut helpers),
             Ok("return r2s_i32_from_bits((uint32_t)(v_7));".to_string())
+        );
+        assert!(
+            helpers
+                .definitions()
+                .contains("static inline int32_t r2s_i32_from_bits")
         );
 
         let void = SemanticCFunctionInterface {
@@ -3838,11 +4048,11 @@ mod return_mechanics_tests {
         };
         assert_eq!(logical_return_type(&void), Ok("void"));
         assert_eq!(
-            render_logical_return_statement(&void, None),
+            render_logical_return_statement(&void, None, &mut helpers),
             Ok("return;".to_string())
         );
         assert_eq!(
-            render_logical_return_statement(&void, Some("v_1")),
+            render_logical_return_statement(&void, Some("v_1"), &mut helpers),
             Err(SemanticCError::InvalidReturnProjection)
         );
 
@@ -3853,9 +4063,47 @@ mod return_mechanics_tests {
             Err(SemanticCError::InvalidReturnProjection)
         );
         assert_eq!(
-            render_logical_return_statement(&missing, Some("v_7")),
+            render_logical_return_statement(&missing, Some("v_7"), &mut helpers),
             Err(SemanticCError::InvalidReturnProjection)
         );
+    }
+
+    #[test]
+    fn typed_helper_inventory_emits_zero_helpers_for_empty_set() {
+        assert!(SemanticCHelperSet::default().definitions().is_empty());
+    }
+
+    #[test]
+    fn typed_helper_inventory_does_not_infer_dependencies_from_c_text() {
+        let mut output = "/* r2s_wrap_add( is not authority */\nvoid f(void) {}\n".to_string();
+        let expected = output.clone();
+        insert_semantic_c_helpers(&mut output, 0, &SemanticCHelperSet::default());
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn typed_helper_inventory_emits_only_selected_signed_families_in_order() {
+        let mut helpers = SemanticCHelperSet::default();
+        helpers.insert(SemanticCHelper::I64FromBits);
+        helpers.insert(SemanticCHelper::I8FromBits);
+        let definitions = helpers.definitions();
+        let i8 = definitions.find("r2s_i8_from_bits").expect("i8 helper");
+        let i64 = definitions.find("r2s_i64_from_bits").expect("i64 helper");
+        assert!(i8 < i64);
+        assert!(!definitions.contains("r2s_i16_from_bits"));
+        assert!(!definitions.contains("r2s_i32_from_bits"));
+        assert!(!definitions.contains("r2s_mask"));
+    }
+
+    #[test]
+    fn typed_helper_inventory_closes_mask_dependency_before_dependent() {
+        let mut helpers = SemanticCHelperSet::default();
+        helpers.insert(SemanticCHelper::WrapAdd);
+        let definitions = helpers.definitions();
+        let mask = definitions.find("r2s_mask").expect("mask dependency");
+        let wrap = definitions.find("r2s_wrap_add").expect("selected helper");
+        assert!(mask < wrap);
+        assert!(!definitions.contains("r2s_wrap_sub"));
     }
 
     #[test]
@@ -4139,7 +4387,10 @@ mod return_mechanics_tests {
         assert_eq!(composition.physical_width_bits(), 64);
         assert_eq!(
             layer
-                .render_return_operand(SemanticCReturnOperand::RegisterComposition(&composition))
+                .render_return_operand_with_helpers(
+                    SemanticCReturnOperand::RegisterComposition(&composition),
+                    &mut SemanticCHelperSet::default(),
+                )
                 .expect("exact composed return rendering"),
             format!(
                 "((uint64_t)(r2s_bit_insert((uint64_t)({base_name}), (uint64_t)({overlay_name}), 0U, 8U, 64U)))"
@@ -4147,11 +4398,24 @@ mod return_mechanics_tests {
         );
         assert_eq!(
             layer
-                .render_return_operand(SemanticCReturnOperand::Direct(&direct))
+                .render_return_operand_with_helpers(
+                    SemanticCReturnOperand::Direct(&direct),
+                    &mut SemanticCHelperSet::default(),
+                )
                 .expect("direct return stays unchanged"),
             value_name(direct.binding())
         );
-        assert!(SEMANTIC_C_HELPERS.contains("static inline uint64_t r2s_bit_insert"));
+        let mut helpers = SemanticCHelperSet::default();
+        layer
+            .render_return_operand_with_helpers(
+                SemanticCReturnOperand::RegisterComposition(&composition),
+                &mut helpers,
+            )
+            .expect("typed helper inventory");
+        let definitions = helpers.definitions();
+        assert!(definitions.contains("static inline uint64_t r2s_mask"));
+        assert!(definitions.contains("static inline uint64_t r2s_bit_insert"));
+        assert!(!definitions.contains("r2s_wrap_add"));
     }
 
     #[test]
@@ -4168,12 +4432,15 @@ mod return_mechanics_tests {
         let overlay_name = value_name(composition.overlays()[0].definition().binding());
         assert_eq!(
             layer
-                .render_expr(base.expression())
+                .render_expr(base.expression(), &mut SemanticCHelperSet::default())
                 .expect("bound zero expression"),
             "((uint64_t)UINT64_C(0x0))"
         );
         let rendered = layer
-            .render_return_operand(SemanticCReturnOperand::RegisterComposition(&composition))
+            .render_return_operand_with_helpers(
+                SemanticCReturnOperand::RegisterComposition(&composition),
+                &mut SemanticCHelperSet::default(),
+            )
             .expect("composed return with exact zero base");
         assert_eq!(
             rendered,
@@ -4190,7 +4457,10 @@ mod return_mechanics_tests {
         let (layer, mut composition, direct) = composed_operand_fixture();
         composition.overlays[0].offset_bytes = 8;
         assert!(matches!(
-            layer.render_return_operand(SemanticCReturnOperand::RegisterComposition(&composition)),
+            layer.render_return_operand_with_helpers(
+                SemanticCReturnOperand::RegisterComposition(&composition),
+                &mut SemanticCHelperSet::default(),
+            ),
             Err(SemanticCError::ReturnBindingMismatch(_))
         ));
 

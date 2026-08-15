@@ -24,9 +24,10 @@ use crate::certified_region::{
     RegionObligationDisposition, RegionObligationMapping, TypedOutputSealError,
 };
 use crate::semantic_c::{
-    SEMANTIC_C_HELPERS, SemanticCError, SemanticCExprId, SemanticCExprKind,
-    SemanticCFunctionInterface, SemanticCFunctionReturn, SemanticCInputOrigin, SemanticCReturn,
-    logical_return_type, render_logical_return_statement, storage_type, value_name,
+    SemanticCError, SemanticCExprId, SemanticCExprKind, SemanticCFunctionInterface,
+    SemanticCFunctionReturn, SemanticCHelperSet, SemanticCInputOrigin, SemanticCReturn,
+    insert_semantic_c_helpers, logical_return_type, render_logical_return_statement, storage_type,
+    value_name,
 };
 use crate::semantic_stmt::{SemanticCBlockStepLayer, SemanticCStatementError};
 
@@ -533,8 +534,9 @@ impl CertifiedLoopReturnFunction {
             LoopContinuationArm::False => "==",
         };
         let mut output = String::new();
+        let mut helpers = SemanticCHelperSet::default();
         output.push_str("#include <stdint.h>\n\n");
-        output.push_str(SEMANTIC_C_HELPERS);
+        let helper_insertion = output.len();
         output.push('\n');
         write!(&mut output, "{} {}(", return_type(interface)?, self.name)
             .expect("String writes cannot fail");
@@ -547,8 +549,15 @@ impl CertifiedLoopReturnFunction {
         )
         .expect("String writes cannot fail");
         output.push_str("\t}\n");
-        render_return(&mut output, self.exit.value(), "\t", interface)?;
+        render_return(
+            &mut output,
+            self.exit.value(),
+            "\t",
+            interface,
+            &mut helpers,
+        )?;
         output.push_str("}\n");
+        insert_semantic_c_helpers(&mut output, helper_insertion, &helpers);
         Ok(output)
     }
 }
@@ -670,13 +679,14 @@ fn render_return(
     value: LoopReturnValue,
     indent: &str,
     interface: &SemanticCFunctionInterface,
+    helpers: &mut SemanticCHelperSet,
 ) -> Result<(), LoopReturnFunctionError> {
     match (interface.return_kind(), value) {
         (SemanticCFunctionReturn::Void, LoopReturnValue::Void) => {
             writeln!(
                 output,
                 "{indent}{}",
-                render_logical_return_statement(interface, None)?
+                render_logical_return_statement(interface, None, helpers)?
             )
             .expect("String writes cannot fail");
         }
@@ -688,7 +698,7 @@ fn render_return(
             writeln!(
                 output,
                 "{indent}{}",
-                render_logical_return_statement(interface, Some(&carrier))?
+                render_logical_return_statement(interface, Some(&carrier), helpers)?
             )
             .expect("String writes cannot fail");
         }
@@ -917,7 +927,8 @@ fn source_return_value(artifact: &SsaArtifact, block_addr: u64) -> Result<LoopRe
 }
 
 fn parse_rendered_polarity(rendered: &str) -> Result<bool, String> {
-    let lines = rendered
+    let body = rendered_function_body(rendered)?;
+    let lines = body
         .lines()
         .filter(|line| line.starts_with("\twhile ("))
         .collect::<Vec<_>>();
@@ -934,7 +945,8 @@ fn parse_rendered_polarity(rendered: &str) -> Result<bool, String> {
 }
 
 fn parse_rendered_return(rendered: &str) -> Result<LoopReturnValue, String> {
-    let returns = rendered
+    let body = rendered_function_body(rendered)?;
+    let returns = body
         .lines()
         .filter(|line| line.starts_with("\treturn"))
         .collect::<Vec<_>>();
@@ -961,4 +973,71 @@ fn parse_rendered_return(rendered: &str) -> Result<LoopReturnValue, String> {
         bits: u64::from_str_radix(bits, 16)
             .map_err(|_| "rendered loop return constant is malformed".to_string())?,
     })
+}
+
+fn rendered_function_body(rendered: &str) -> Result<&str, String> {
+    let mut depth = 0_u32;
+    let mut start = None;
+    let mut last_body = None;
+    for (index, byte) in rendered.bytes().enumerate() {
+        match byte {
+            b'{' => {
+                if depth == 0 {
+                    start = Some(index + 1);
+                }
+                depth = depth
+                    .checked_add(1)
+                    .ok_or_else(|| "rendered C brace nesting overflowed".to_string())?;
+            }
+            b'}' => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| "rendered C braces are unbalanced".to_string())?;
+                if depth == 0 {
+                    last_body = Some(
+                        start
+                            .take()
+                            .ok_or_else(|| "rendered C function body is malformed".to_string())?
+                            ..index,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return Err("rendered C braces are unbalanced".to_string());
+    }
+    last_body
+        .map(|range| &rendered[range])
+        .ok_or_else(|| "rendered C function body is missing".to_string())
+}
+
+#[cfg(test)]
+mod rendered_loop_parser_tests {
+    use super::*;
+
+    #[test]
+    fn whole_translation_unit_parser_ignores_helper_returns() {
+        let rendered = r#"#include <stdint.h>
+
+static inline uint64_t r2s_mask(unsigned width) {
+	return width;
+}
+
+uint32_t certified_loop(uint8_t v_1) {
+	while ((uint8_t)v_1 != UINT8_C(0x0)) {
+	}
+	return ((uint32_t)UINT64_C(0x2a));
+}
+"#;
+        assert_eq!(parse_rendered_polarity(rendered), Ok(true));
+        assert_eq!(
+            parse_rendered_return(rendered),
+            Ok(LoopReturnValue::Value {
+                width_bits: 32,
+                bits: 0x2a,
+            })
+        );
+    }
 }

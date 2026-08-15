@@ -21,9 +21,9 @@ use crate::certified_region::{
     RegionObligationDisposition, TypedOutputSealError,
 };
 use crate::semantic_c::{
-    SEMANTIC_C_HELPERS, SemanticCError, SemanticCExprId, SemanticCExprKind,
-    SemanticCFunctionReturn, SemanticCInputOrigin, SemanticCReturn, logical_return_type,
-    render_logical_return_statement, storage_type, value_name,
+    SemanticCError, SemanticCExprId, SemanticCExprKind, SemanticCFunctionReturn,
+    SemanticCHelperSet, SemanticCInputOrigin, SemanticCReturn, insert_semantic_c_helpers,
+    logical_return_type, render_logical_return_statement, storage_type, value_name,
 };
 use crate::semantic_stmt::{SemanticCBlockStepLayer, SemanticCStatementError};
 
@@ -403,8 +403,9 @@ impl CertifiedMemorySemanticCFunction {
             .ok_or(CertifiedMemorySemanticCFunctionError::MissingFunctionInterface)?;
         let return_type = logical_return_type(interface)?;
         let mut output = String::new();
+        let mut helpers = SemanticCHelperSet::default();
         output.push_str("#include <stdint.h>\n\n");
-        output.push_str(SEMANTIC_C_HELPERS);
+        let helper_insertion = output.len();
         output.push('\n');
         output.push_str(PLAIN_RAM_HELPER_DECLARATIONS);
         write!(&mut output, "\n{return_type} {}(", self.name).expect("String writes cannot fail");
@@ -471,7 +472,7 @@ impl CertifiedMemorySemanticCFunction {
                 "\t{} {} = {};",
                 storage_type(expressions.expr_type(entity.root())?)?,
                 value_name(entity.output()),
-                expressions.render_expr(entity.root())?
+                expressions.render_expr(entity.root(), &mut helpers)?
             )
             .expect("String writes cannot fail");
         }
@@ -479,10 +480,11 @@ impl CertifiedMemorySemanticCFunction {
         writeln!(
             &mut output,
             "\t{}",
-            render_logical_return_statement(interface, returned_name.as_deref())?
+            render_logical_return_statement(interface, returned_name.as_deref(), &mut helpers)?
         )
         .expect("String writes cannot fail");
         output.push_str("}\n");
+        insert_semantic_c_helpers(&mut output, helper_insertion, &helpers);
         Ok(output)
     }
 
@@ -577,7 +579,7 @@ impl CertifiedMemorySemanticCFunction {
                         *undefined,
                     ));
                 }
-                expressions.render_expr(entity.root())?;
+                expressions.render_expr(entity.root(), &mut SemanticCHelperSet::default())?;
                 defined.insert(entity.output());
             }
         }

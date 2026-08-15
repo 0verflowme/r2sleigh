@@ -20,9 +20,10 @@ use crate::certified_region::{
     RegionObligationMapping, TypedOutputSealError,
 };
 use crate::semantic_c::{
-    SEMANTIC_C_HELPERS, SemanticCError, SemanticCExprId, SemanticCExprKind,
-    SemanticCFunctionInterface, SemanticCFunctionReturn, SemanticCInputOrigin, SemanticCReturn,
-    logical_return_type, render_logical_return_statement, storage_type, value_name,
+    SemanticCError, SemanticCExprId, SemanticCExprKind, SemanticCFunctionInterface,
+    SemanticCFunctionReturn, SemanticCHelperSet, SemanticCInputOrigin, SemanticCReturn,
+    insert_semantic_c_helpers, logical_return_type, render_logical_return_statement, storage_type,
+    value_name,
 };
 use crate::semantic_stmt::{SemanticCBlockStepLayer, SemanticCStatementError};
 
@@ -556,8 +557,9 @@ impl CertifiedSwitchReturnFunction {
             .ok_or(SwitchReturnFunctionError::MissingFunctionInterface)?;
         let selector = self.switch_control.selector().binding();
         let mut output = String::new();
+        let mut helpers = SemanticCHelperSet::default();
         output.push_str("#include <stdint.h>\n\n");
-        output.push_str(SEMANTIC_C_HELPERS);
+        let helper_insertion = output.len();
         output.push('\n');
         write!(&mut output, "{} {}(", return_type(interface)?, self.name)
             .expect("String writes cannot fail");
@@ -572,11 +574,24 @@ impl CertifiedSwitchReturnFunction {
         for case in &self.cases {
             writeln!(&mut output, "\tcase UINT64_C(0x{:x}):", case.value)
                 .expect("String writes cannot fail");
-            render_return(&mut output, case.arm.outcome(), "\t\t", interface)?;
+            render_return(
+                &mut output,
+                case.arm.outcome(),
+                "\t\t",
+                interface,
+                &mut helpers,
+            )?;
         }
         output.push_str("\tdefault:\n");
-        render_return(&mut output, self.default_arm.outcome(), "\t\t", interface)?;
+        render_return(
+            &mut output,
+            self.default_arm.outcome(),
+            "\t\t",
+            interface,
+            &mut helpers,
+        )?;
         output.push_str("\t}\n}\n");
+        insert_semantic_c_helpers(&mut output, helper_insertion, &helpers);
         Ok(output)
     }
 }
@@ -707,13 +722,14 @@ fn render_return(
     outcome: SwitchReturnOutcome,
     indent: &str,
     interface: &SemanticCFunctionInterface,
+    helpers: &mut SemanticCHelperSet,
 ) -> Result<(), SwitchReturnFunctionError> {
     match (interface.return_kind(), outcome) {
         (SemanticCFunctionReturn::Void, SwitchReturnOutcome::Void) => {
             writeln!(
                 output,
                 "{indent}{}",
-                render_logical_return_statement(interface, None)?
+                render_logical_return_statement(interface, None, helpers)?
             )
             .expect("String writes cannot fail");
         }
@@ -725,7 +741,7 @@ fn render_return(
             writeln!(
                 output,
                 "{indent}{}",
-                render_logical_return_statement(interface, Some(&carrier))?
+                render_logical_return_statement(interface, Some(&carrier), helpers)?
             )
             .expect("String writes cannot fail");
         }

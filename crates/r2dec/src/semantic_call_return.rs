@@ -26,9 +26,10 @@ use crate::certified_region::{
     RegionObligationMapping, TypedOutputSealError,
 };
 use crate::semantic_c::{
-    SEMANTIC_C_HELPERS, SemanticCCallArgumentValue, SemanticCError, SemanticCExprKind,
-    SemanticCFunctionInterface, SemanticCFunctionReturn, SemanticCInputOrigin, SemanticCReturn,
-    logical_return_type, render_logical_return_statement, storage_type, value_name,
+    SemanticCCallArgumentValue, SemanticCError, SemanticCExprKind, SemanticCFunctionInterface,
+    SemanticCFunctionReturn, SemanticCHelperSet, SemanticCInputOrigin, SemanticCReturn,
+    insert_semantic_c_helpers, logical_return_type, render_logical_return_statement, storage_type,
+    value_name,
 };
 use crate::semantic_stmt::{SemanticCBlockStepLayer, SemanticCStatementError};
 
@@ -619,8 +620,9 @@ impl CertifiedDirectCallReturnFunction {
             .function_interface()
             .ok_or(DirectCallReturnFunctionError::MissingFunctionInterface)?;
         let mut output = String::new();
+        let mut helpers = SemanticCHelperSet::default();
         output.push_str("#include <stdint.h>\n\n");
-        output.push_str(SEMANTIC_C_HELPERS);
+        let helper_insertion = output.len();
         write!(&mut output, "\nextern void {}(", self.call_adapter_name())
             .expect("String writes cannot fail");
         render_call_parameter_types(&mut output, self.call_block.call())?;
@@ -636,7 +638,7 @@ impl CertifiedDirectCallReturnFunction {
                 .unwrap_or_else(|| format!("arg_{}", parameter.index()));
             writeln!(&mut output, "\t(void){name};").expect("String writes cannot fail");
         }
-        render_value_steps(&mut output, self.call_block.body())?;
+        render_value_steps(&mut output, self.call_block.body(), &mut helpers)?;
         write!(&mut output, "\t{}(", self.call_adapter_name()).expect("String writes cannot fail");
         for (position, argument) in self.call_block.call().arguments().iter().enumerate() {
             if position > 0 {
@@ -645,7 +647,7 @@ impl CertifiedDirectCallReturnFunction {
             output.push_str(&render_call_argument(argument)?);
         }
         output.push_str(");\n");
-        render_value_steps(&mut output, self.return_block.layer())?;
+        render_value_steps(&mut output, self.return_block.layer(), &mut helpers)?;
         let returned =
             self.return_block
                 .returned()
@@ -656,13 +658,17 @@ impl CertifiedDirectCallReturnFunction {
             [] => writeln!(
                 &mut output,
                 "\t{}",
-                render_logical_return_statement(interface, None)?
+                render_logical_return_statement(interface, None, &mut helpers)?
             )
             .expect("String writes cannot fail"),
             [value] => writeln!(
                 &mut output,
                 "\t{}",
-                render_logical_return_statement(interface, Some(&value_name(value.binding())))?
+                render_logical_return_statement(
+                    interface,
+                    Some(&value_name(value.binding())),
+                    &mut helpers,
+                )?
             )
             .expect("String writes cannot fail"),
             _ => {
@@ -672,6 +678,7 @@ impl CertifiedDirectCallReturnFunction {
             }
         }
         output.push_str("}\n");
+        insert_semantic_c_helpers(&mut output, helper_insertion, &helpers);
         Ok(output)
     }
 }
@@ -805,6 +812,7 @@ fn render_call_parameter_types(
 fn render_value_steps(
     output: &mut String,
     layer: &SemanticCBlockStepLayer,
+    helpers: &mut SemanticCHelperSet,
 ) -> Result<(), DirectCallReturnFunctionError> {
     let expressions = layer.accounting().expression_layer();
     for step in layer.steps() {
@@ -819,7 +827,7 @@ fn render_value_steps(
             "\t{} {} = {};",
             storage_type(expressions.expr_type(entity.root())?)?,
             value_name(entity.output()),
-            expressions.render_expr(entity.root())?
+            expressions.render_expr(entity.root(), helpers)?
         )
         .expect("String writes cannot fail");
         writeln!(output, "\t(void){};", value_name(entity.output()))
