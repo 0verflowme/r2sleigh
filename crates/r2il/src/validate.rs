@@ -4,7 +4,7 @@
 //! specifications and lifted blocks. The checks are intentionally conservative
 //! and avoid deep semantic/type reasoning.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt;
 
 use crate::opcode::{R2ILBlock, R2ILOp};
@@ -157,7 +157,6 @@ pub fn validate_archspec(arch: &ArchSpec) -> Result<(), ValidationError> {
     }
 
     let mut seen_reg_names = HashSet::new();
-    let mut reg_by_name = HashMap::new();
     for (i, reg) in arch.registers.iter().enumerate() {
         if reg.size == 0 {
             issues.push(ValidationIssue::new(
@@ -171,56 +170,6 @@ pub fn validate_archspec(arch: &ArchSpec) -> Result<(), ValidationError> {
                 "arch.registers.duplicate_name",
                 format!("arch.registers[{i}].name"),
                 format!("duplicate register name '{}'", reg.name),
-            ));
-        }
-        reg_by_name.insert(reg.name.as_str(), reg.offset);
-    }
-
-    for (name, offset) in &arch.register_map {
-        match reg_by_name.get(name.as_str()) {
-            None => issues.push(ValidationIssue::new(
-                "arch.register_map.unknown_register",
-                format!("arch.register_map[{name}]"),
-                format!("register_map entry references unknown register '{}'", name),
-            )),
-            Some(reg_offset) if reg_offset != offset => issues.push(ValidationIssue::new(
-                "arch.register_map.offset_mismatch",
-                format!("arch.register_map[{name}]"),
-                format!(
-                    "register_map offset {} does not match register offset {}",
-                    offset, reg_offset
-                ),
-            )),
-            Some(_) => {}
-        }
-    }
-
-    for (i, reg) in arch.registers.iter().enumerate() {
-        match arch.register_map.get(&reg.name) {
-            None => issues.push(ValidationIssue::new(
-                "arch.register_map.missing_entry",
-                format!("arch.registers[{i}]"),
-                format!("missing register_map entry for '{}'", reg.name),
-            )),
-            Some(offset) if *offset != reg.offset => issues.push(ValidationIssue::new(
-                "arch.register_map.offset_mismatch",
-                format!("arch.registers[{i}]"),
-                format!(
-                    "register '{}' offset {} mismatches register_map offset {}",
-                    reg.name, reg.offset, offset
-                ),
-            )),
-            Some(_) => {}
-        }
-    }
-
-    let mut seen_userops = HashSet::new();
-    for (i, op) in arch.userops.iter().enumerate() {
-        if !seen_userops.insert(op.index) {
-            issues.push(ValidationIssue::new(
-                "arch.userops.duplicate_index",
-                format!("arch.userops[{i}].index"),
-                format!("duplicate userop index {}", op.index),
             ));
         }
     }
@@ -1414,7 +1363,7 @@ fn check_size_addr_width(
 mod tests {
     use super::*;
     use crate::opcode::{SwitchCase, SwitchInfo};
-    use crate::serialize::{RegisterDef, UserOpDef};
+    use crate::serialize::RegisterDef;
     use crate::{AddressSpace, R2ILOp};
 
     fn valid_archspec() -> ArchSpec {
@@ -1424,10 +1373,6 @@ mod tests {
         arch.add_space(AddressSpace::ram(8));
         arch.add_space(AddressSpace::register());
         arch.add_register(RegisterDef::new("RAX", 0, 8));
-        arch.userops.push(UserOpDef {
-            index: 0,
-            name: "u0".to_string(),
-        });
         arch
     }
 
@@ -1601,7 +1546,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_archspec_duplicate_default_and_register_map_mismatch_fails() {
+    fn invalid_archspec_duplicate_default_and_register_name_fails() {
         let mut arch = valid_archspec();
 
         arch.spaces.push(AddressSpace::new(SpaceId::Ram, "ram2", 8));
@@ -1610,13 +1555,6 @@ mod tests {
         }
 
         arch.registers.push(RegisterDef::new("RAX", 8, 8));
-        arch.register_map.insert("RAX".to_string(), 0xdeadbeef);
-        arch.register_map.insert("MISSING".to_string(), 0x10);
-        arch.userops.push(UserOpDef {
-            index: 0,
-            name: "u0_duplicate".to_string(),
-        });
-
         let err = validate_archspec(&arch).expect_err("arch should fail");
         assert!(
             err.issues
@@ -1627,21 +1565,6 @@ mod tests {
             err.issues
                 .iter()
                 .any(|i| i.code == "arch.registers.duplicate_name")
-        );
-        assert!(
-            err.issues
-                .iter()
-                .any(|i| i.code == "arch.register_map.offset_mismatch")
-        );
-        assert!(
-            err.issues
-                .iter()
-                .any(|i| i.code == "arch.register_map.unknown_register")
-        );
-        assert!(
-            err.issues
-                .iter()
-                .any(|i| i.code == "arch.userops.duplicate_index")
         );
     }
 

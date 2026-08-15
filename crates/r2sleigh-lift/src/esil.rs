@@ -275,14 +275,10 @@ pub fn format_op(disasm: &Disassembler, op: &R2ILOp) -> String {
                 .map(&vn)
                 .unwrap_or_else(|| "none".to_string());
             let in_str: Vec<String> = inputs.iter().map(&vn).collect();
-            let userop_str = match disasm.userop_name(*userop) {
-                Some(name) => format!("{} ({})", userop, name),
-                None => userop.to_string(),
-            };
             format!(
                 "CallOther {{ output: {}, userop: {}, inputs: [{}] }}",
                 out_str,
-                userop_str,
+                userop,
                 in_str.join(", ")
             )
         }
@@ -663,7 +659,7 @@ pub fn op_to_esil(disasm: &Disassembler, op: &R2ILOp) -> String {
             output,
             userop,
             inputs,
-        } => format_callother_esil(disasm, output, *userop, inputs, false),
+        } => format_callother_esil(disasm, output, *userop, inputs),
 
         Nop => String::new(),
         Unimplemented => "UNIMPL".to_string(),
@@ -783,45 +779,26 @@ fn format_return_esil(sp_reg: &str, ptr_size: u32) -> String {
     format!("{sp_reg},[{ptr_size}],pc,=,{ptr_size},{sp_reg},+=")
 }
 
-/// Convert an R2ILOp into an ESIL string with userop names (best-effort).
-pub fn op_to_esil_named(disasm: &Disassembler, op: &R2ILOp) -> String {
-    match op {
-        R2ILOp::CallOther {
-            output,
-            userop,
-            inputs,
-        } => format_callother_esil(disasm, output, *userop, inputs, true),
-        _ => op_to_esil(disasm, op),
-    }
-}
-
-fn callother_userop_label(disasm: &Disassembler, userop: u32, include_name: bool) -> String {
-    if include_name && let Some(name) = disasm.userop_name(userop) {
-        return format!("{}:{}", userop, name);
-    }
-    userop.to_string()
-}
-
 fn format_callother_esil(
     disasm: &Disassembler,
     output: &Option<r2il::Varnode>,
     userop: u32,
     inputs: &[r2il::Varnode],
-    include_name: bool,
 ) -> String {
     let vn = |v: &r2il::Varnode| disasm.format_varnode(v).to_lowercase();
     let args: Vec<String> = inputs.iter().map(&vn).collect();
     let args_str = args.join(",");
-    let userop_str = callother_userop_label(disasm, userop, include_name);
     match output {
-        Some(dst) => format!("{},CALLOTHER({}),{},=", args_str, userop_str, vn(dst)),
-        None => format!("{},CALLOTHER({})", args_str, userop_str),
+        Some(dst) => format!("{},CALLOTHER({}),{},=", args_str, userop, vn(dst)),
+        None => format!("{},CALLOTHER({})", args_str, userop),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{format_call_esil, format_return_esil};
+    use super::{format_call_esil, format_op, format_return_esil, op_to_esil};
+    use crate::Disassembler;
+    use r2il::{R2ILOp, Varnode};
 
     #[test]
     fn call_esil_uses_x86_64_stack_and_width() {
@@ -839,5 +816,26 @@ mod tests {
     fn return_esil_supports_32bit_pointer_width() {
         let esil = format_return_esil("esp", 4);
         assert_eq!(esil, "esp,[4],pc,=,4,esp,+=");
+    }
+
+    #[test]
+    fn callother_rendering_is_numeric_and_ambient_independent() {
+        let disassembler = Disassembler::from_sla(
+            sleigh_config::processor_aarch64::SLA_AARCH64_APPLESILICON,
+            sleigh_config::processor_aarch64::PSPEC_AARCH64,
+            "aarch64",
+        )
+        .expect("AArch64 disassembler");
+        let op = R2ILOp::CallOther {
+            output: None,
+            userop: u32::MAX,
+            inputs: vec![Varnode::constant(1, 8)],
+        };
+
+        assert_eq!(
+            format_op(&disassembler, &op),
+            "CallOther { output: none, userop: 4294967295, inputs: [0x1] }"
+        );
+        assert_eq!(op_to_esil(&disassembler, &op), "0x1,CALLOTHER(4294967295)");
     }
 }

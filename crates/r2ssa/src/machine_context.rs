@@ -1136,7 +1136,6 @@ mod tests {
 
         let mut subregister = arch.clone();
         subregister.registers.clear();
-        subregister.register_map.clear();
         subregister.add_register(RegisterDef::sub(
             "source-ra-alias",
             return_address.offset,

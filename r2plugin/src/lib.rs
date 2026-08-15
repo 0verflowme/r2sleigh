@@ -29,12 +29,11 @@ use ffi_v2::{R2SleighContextParam, R2SleighInterprocSeed, R2SleighInterprocSessi
 
 #[cfg(test)]
 use analysis::ssa::{r2il_block_defuse_json, r2il_block_to_ssa_json};
-use r2il::serialize::UserOpDef;
 use r2il::{ArchSpec, R2ILBlock, R2ILOp, SwitchCase, SwitchInfo, Varnode, validate_block_full};
 use r2sleigh_export::{
     ExportFormat, InstructionAction, InstructionExportInput, export_instruction, op_json_named,
 };
-use r2sleigh_lift::{Disassembler, SemanticMetadataOptions, build_arch_spec, userop_map_for_arch};
+use r2sleigh_lift::{Disassembler, SemanticMetadataOptions, build_arch_spec};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::ptr;
@@ -2073,7 +2072,6 @@ fn create_disassembler_for_arch(arch: &str) -> Result<(ArchSpec, Disassembler), 
                 "x86-64",
             )
             .map_err(|e| e.to_string())?;
-            let (spec, dis) = apply_userop_map(spec, dis, "x86-64");
             Ok((spec, dis))
         }
         #[cfg(feature = "x86")]
@@ -2090,7 +2088,6 @@ fn create_disassembler_for_arch(arch: &str) -> Result<(ArchSpec, Disassembler), 
                 "x86",
             )
             .map_err(|e| e.to_string())?;
-            let (spec, dis) = apply_userop_map(spec, dis, "x86");
             Ok((spec, dis))
         }
         #[cfg(feature = "arm")]
@@ -2109,7 +2106,6 @@ fn create_disassembler_for_arch(arch: &str) -> Result<(ArchSpec, Disassembler), 
                 "ARM",
             )
             .map_err(|e| e.to_string())?;
-            let (spec, dis) = apply_userop_map(spec, dis, "arm");
             Ok((spec, dis))
         }
         #[cfg(feature = "arm")]
@@ -2126,7 +2122,6 @@ fn create_disassembler_for_arch(arch: &str) -> Result<(ArchSpec, Disassembler), 
                 "aarch64",
             )
             .map_err(|e| e.to_string())?;
-            let (spec, dis) = apply_userop_map(spec, dis, "arm64");
             Ok((spec, dis))
         }
         #[cfg(feature = "mips")]
@@ -2143,7 +2138,6 @@ fn create_disassembler_for_arch(arch: &str) -> Result<(ArchSpec, Disassembler), 
                 "mips32be",
             )
             .map_err(|e| e.to_string())?;
-            let (spec, dis) = apply_userop_map(spec, dis, "mips32be");
             Ok((spec, dis))
         }
         #[cfg(feature = "mips")]
@@ -2160,7 +2154,6 @@ fn create_disassembler_for_arch(arch: &str) -> Result<(ArchSpec, Disassembler), 
                 "mips32le",
             )
             .map_err(|e| e.to_string())?;
-            let (spec, dis) = apply_userop_map(spec, dis, "mips32le");
             Ok((spec, dis))
         }
         #[cfg(feature = "mips")]
@@ -2177,7 +2170,6 @@ fn create_disassembler_for_arch(arch: &str) -> Result<(ArchSpec, Disassembler), 
                 "mips64be",
             )
             .map_err(|e| e.to_string())?;
-            let (spec, dis) = apply_userop_map(spec, dis, "mips64be");
             Ok((spec, dis))
         }
         #[cfg(feature = "mips")]
@@ -2194,7 +2186,6 @@ fn create_disassembler_for_arch(arch: &str) -> Result<(ArchSpec, Disassembler), 
                 "mips64le",
             )
             .map_err(|e| e.to_string())?;
-            let (spec, dis) = apply_userop_map(spec, dis, "mips64le");
             Ok((spec, dis))
         }
         #[cfg(feature = "riscv")]
@@ -2211,7 +2202,6 @@ fn create_disassembler_for_arch(arch: &str) -> Result<(ArchSpec, Disassembler), 
                 "riscv64",
             )
             .map_err(|e| e.to_string())?;
-            let (spec, dis) = apply_userop_map(spec, dis, "riscv64");
             Ok((spec, dis))
         }
         #[cfg(feature = "riscv")]
@@ -2228,7 +2218,6 @@ fn create_disassembler_for_arch(arch: &str) -> Result<(ArchSpec, Disassembler), 
                 "riscv32",
             )
             .map_err(|e| e.to_string())?;
-            let (spec, dis) = apply_userop_map(spec, dis, "riscv32");
             Ok((spec, dis))
         }
         _ => {
@@ -2256,26 +2245,6 @@ fn create_disassembler_for_arch(arch: &str) -> Result<(ArchSpec, Disassembler), 
             }
         }
     }
-}
-
-fn apply_userop_map(
-    mut spec: ArchSpec,
-    mut disasm: Disassembler,
-    arch: &str,
-) -> (ArchSpec, Disassembler) {
-    let userop_map = userop_map_for_arch(arch);
-    disasm.set_userop_map(userop_map.clone());
-
-    if !userop_map.is_empty() {
-        let mut defs: Vec<UserOpDef> = userop_map
-            .into_iter()
-            .map(|(index, name)| UserOpDef { index, name })
-            .collect();
-        defs.sort_by_key(|def| def.index);
-        spec.userops = defs;
-    }
-
-    (spec, disasm)
 }
 
 // Symbolic execution and CFG surfaces are implemented under r2plugin/src/analysis/.
@@ -8464,27 +8433,62 @@ mod integration_tests {
     #[test]
     #[cfg(feature = "arm")]
     fn create_disassembler_for_arch_arm64() {
-        let (spec, disasm) = create_disassembler_for_arch("arm64").expect("arm64 disassembler");
+        let (spec, _disasm) = create_disassembler_for_arch("arm64").expect("arm64 disassembler");
         assert_eq!(spec.name, "aarch64");
         assert_eq!(spec.addr_size, 8);
+    }
+
+    #[test]
+    #[cfg(feature = "arm")]
+    fn arm64_callother_stays_numeric_and_construction_stable() {
+        const DMB_ISH: &[u8] = &[0xbf, 0x3b, 0x03, 0xd5];
+        const ADDR: u64 = 0x410000;
+
+        let mut decode_window = DMB_ISH.to_vec();
+        decode_window.resize(16, 0);
+        let (_, first) = create_disassembler_for_arch("arm64").expect("first arm64 disassembler");
+        let (_, second) = create_disassembler_for_arch("arm64").expect("second arm64 disassembler");
+        let first_block = first.lift(&decode_window, ADDR).expect("first DMB lift");
+        let second_block = second.lift(&decode_window, ADDR).expect("second DMB lift");
+
+        assert_eq!(first_block.ops, second_block.ops);
+        let numeric_userops = first_block
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                R2ILOp::CallOther { userop, .. } => Some(*userop),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!numeric_userops.is_empty());
         assert_eq!(
-            disasm.userop_name(0),
-            userop_map_for_arch("arm64").get(&0).map(String::as_str)
+            numeric_userops,
+            second_block
+                .ops
+                .iter()
+                .filter_map(|op| match op {
+                    R2ILOp::CallOther { userop, .. } => Some(*userop),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            first
+                .lift_genuine_block(&decode_window, ADDR, DMB_ISH.len())
+                .is_err(),
+            "plugin-created analysis disassemblers must not mint genuine authority"
         );
     }
 
     #[test]
     #[cfg(feature = "riscv")]
     fn create_disassembler_for_arch_riscv64() {
-        let (spec, disasm) = create_disassembler_for_arch("riscv64").expect("riscv64 disassembler");
+        let (spec, _disasm) =
+            create_disassembler_for_arch("riscv64").expect("riscv64 disassembler");
         assert_eq!(spec.name, "riscv64");
         assert!(spec.addr_size > 0);
         assert_eq!(spec.instruction_endianness, r2il::Endianness::Little);
         assert_eq!(spec.memory_endianness, r2il::Endianness::Little);
-        assert_eq!(
-            disasm.userop_name(0),
-            userop_map_for_arch("riscv64").get(&0).map(String::as_str)
-        );
     }
 
     #[test]
@@ -8626,15 +8630,12 @@ mod integration_tests {
     #[test]
     #[cfg(feature = "riscv")]
     fn create_disassembler_for_arch_riscv32() {
-        let (spec, disasm) = create_disassembler_for_arch("riscv32").expect("riscv32 disassembler");
+        let (spec, _disasm) =
+            create_disassembler_for_arch("riscv32").expect("riscv32 disassembler");
         assert_eq!(spec.name, "riscv32");
         assert!(spec.addr_size > 0);
         assert_eq!(spec.instruction_endianness, r2il::Endianness::Little);
         assert_eq!(spec.memory_endianness, r2il::Endianness::Little);
-        assert_eq!(
-            disasm.userop_name(0),
-            userop_map_for_arch("riscv32").get(&0).map(String::as_str)
-        );
     }
 
     #[test]
@@ -8668,16 +8669,12 @@ mod integration_tests {
     #[test]
     #[cfg(feature = "mips")]
     fn create_disassembler_for_arch_mips32be() {
-        let (spec, disasm) =
+        let (spec, _disasm) =
             create_disassembler_for_arch("mips32be").expect("mips32be disassembler");
         assert_eq!(spec.name, "mips32be");
         assert_eq!(spec.addr_size, 4);
         assert_eq!(spec.instruction_endianness, r2il::Endianness::Big);
         assert_eq!(spec.memory_endianness, r2il::Endianness::Big);
-        assert_eq!(
-            disasm.userop_name(0),
-            userop_map_for_arch("mips32be").get(&0).map(String::as_str)
-        );
     }
 
     #[test]

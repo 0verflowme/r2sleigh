@@ -191,19 +191,6 @@ impl LiftContext {
         self.arch.add_register(reg);
     }
 
-    /// Add a user-defined operation (CALLOTHER).
-    pub fn add_userop(&mut self, index: u32, name: &str) {
-        self.arch.userops.push(r2il::serialize::UserOpDef {
-            index,
-            name: name.into(),
-        });
-    }
-
-    /// Add a source file path.
-    pub fn add_source_file(&mut self, path: &str) {
-        self.arch.source_files.push(path.into());
-    }
-
     /// Allocate a unique temporary offset.
     pub fn alloc_unique(&mut self, size: u32) -> u64 {
         let offset = self.next_unique_offset;
@@ -251,7 +238,7 @@ mod tests {
 
         let arch = ctx.finish();
         assert_eq!(arch.registers.len(), 2);
-        assert_eq!(arch.get_register_offset("RAX"), Some(0));
-        assert_eq!(arch.get_register_offset("EAX"), Some(0));
+        assert_eq!(arch.get_register("RAX").map(|reg| reg.offset), Some(0));
+        assert_eq!(arch.get_register("EAX").map(|reg| reg.offset), Some(0));
     }
 }

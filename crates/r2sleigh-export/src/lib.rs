@@ -1,7 +1,7 @@
 //! Unified instruction export pipeline for r2sleigh.
 
 use r2il::{ArchSpec, R2ILBlock, R2ILOp, SpaceId, Varnode, validate_block_full};
-use r2sleigh_lift::{Disassembler, format_op, op_to_esil_named};
+use r2sleigh_lift::{Disassembler, format_op, op_to_esil};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -108,7 +108,6 @@ pub fn op_json_named(disasm: &Disassembler, op: &R2ILOp) -> Result<String, Expor
     let mut value =
         serde_json::to_value(op).map_err(|e| ExportError::SerializeError(e.to_string()))?;
     annotate_register_names(&mut value, disasm);
-    annotate_userop_names(&mut value, disasm);
     serde_json::to_string(&value).map_err(|e| ExportError::SerializeError(e.to_string()))
 }
 
@@ -176,7 +175,7 @@ fn export_lift(
                 .block
                 .ops
                 .iter()
-                .map(|op| op_to_esil_named(input.disasm, op))
+                .map(|op| op_to_esil(input.disasm, op))
                 .collect::<Vec<_>>();
             Ok(lines.join("\n"))
         }
@@ -201,7 +200,7 @@ fn export_lift(
                     );
                 }
                 out.push(format!("# {}", Value::Object(sidecar)));
-                out.push(format!("ae {}", op_to_esil_named(input.disasm, op)));
+                out.push(format!("ae {}", op_to_esil(input.disasm, op)));
             }
             Ok(out.join("\n"))
         }
@@ -399,33 +398,6 @@ fn annotate_register_names(value: &mut Value, disasm: &Disassembler) {
     }
 }
 
-fn annotate_userop_names(value: &mut Value, disasm: &Disassembler) {
-    match value {
-        Value::Object(map) => {
-            if let Some(callother) = map.get_mut("CallOther")
-                && let Value::Object(call_map) = callother
-            {
-                let userop = call_map.get("userop").and_then(Value::as_u64);
-                if let Some(userop) = userop
-                    && let Some(name) = disasm.userop_name(userop as u32)
-                {
-                    call_map.insert("userop_name".to_string(), Value::String(name.to_string()));
-                }
-            }
-
-            for value in map.values_mut() {
-                annotate_userop_names(value, disasm);
-            }
-        }
-        Value::Array(items) => {
-            for item in items.iter_mut() {
-                annotate_userop_names(item, disasm);
-            }
-        }
-        _ => {}
-    }
-}
-
 fn op_name_from_value(value: &Value) -> Option<String> {
     let map = value.as_object()?;
     map.keys().next().cloned()
@@ -471,7 +443,7 @@ struct DecResidualJson {
 mod tests {
     use super::*;
     use r2il::{MemoryClass, OpMetadata, ScalarKind, VarnodeMetadata};
-    use r2sleigh_lift::{build_arch_spec, userop_map_for_arch};
+    use r2sleigh_lift::build_arch_spec;
     use std::collections::BTreeMap;
 
     const X86_BYTES_MINIMAL: &str = "4889c000000000000000000000000000";
@@ -485,13 +457,12 @@ mod tests {
             "x86-64",
         )
         .expect("arch spec");
-        let mut disasm = Disassembler::from_sla(
+        let disasm = Disassembler::from_sla(
             sleigh_config::processor_x86::SLA_X86_64,
             sleigh_config::processor_x86::PSPEC_X86_64,
             "x86-64",
         )
         .expect("disasm");
-        disasm.set_userop_map(userop_map_for_arch("x86-64"));
         (disasm, spec)
     }
 
@@ -948,7 +919,7 @@ mod tests {
         );
         assert_eq!(
             lift_r2cmd,
-            "# {\"op\":\"Copy\",\"op_index\":0,\"op_json\":{\"Copy\":{\"dst\":{\"meta\":{\"storage_class\":\"register\"},\"name\":\"RAX\",\"offset\":0,\"size\":8,\"space\":\"Register\"},\"src\":{\"meta\":{\"storage_class\":\"register\"},\"name\":\"RAX\",\"offset\":0,\"size\":8,\"space\":\"Register\"}}}}\nae rax,rax,="
+            "# {\"op\":\"Copy\",\"op_index\":0,\"op_json\":{\"Copy\":{\"dst\":{\"name\":\"RAX\",\"offset\":0,\"size\":8,\"space\":\"Register\"},\"src\":{\"name\":\"RAX\",\"offset\":0,\"size\":8,\"space\":\"Register\"}}}}\nae rax,rax,="
         );
 
         let ssa_text = assert_export_deterministic(
@@ -985,5 +956,36 @@ mod tests {
                 "dec json must be explicit residual-only output: {dec_json}"
             );
         }
+    }
+
+    #[test]
+    fn callother_exports_exact_numeric_id_and_operands() {
+        let (disasm, arch) = x86_disasm_and_spec();
+        let mut block = R2ILBlock::new(0x1000, 1);
+        block.push(R2ILOp::CallOther {
+            output: Some(Varnode::register(0, 8)),
+            userop: 73,
+            inputs: vec![Varnode::constant(1, 8), Varnode::constant(2, 8)],
+        });
+
+        let input = InstructionExportInput {
+            disasm: &disasm,
+            arch: &arch,
+            block: &block,
+            addr: 0x1000,
+            mnemonic: "callother",
+            native_size: 1,
+        };
+        let json_output = export_instruction(&input, InstructionAction::Lift, ExportFormat::Json)
+            .expect("CallOther JSON");
+        let json: Value = serde_json::from_str(&json_output).expect("JSON value");
+        let callother = &json["ops"][0]["CallOther"];
+        assert_eq!(callother["userop"], 73);
+        assert_eq!(callother["inputs"].as_array().map(Vec::len), Some(2));
+        assert!(callother.get("userop_name").is_none());
+
+        let esil = export_instruction(&input, InstructionAction::Lift, ExportFormat::Esil)
+            .expect("CallOther ESIL");
+        assert_eq!(esil, "0x1,0x2,CALLOTHER(73),rax,=");
     }
 }

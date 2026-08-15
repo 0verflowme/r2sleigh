@@ -20,7 +20,7 @@ use r2sleigh_export::{
     ExportFormat, InstructionAction, InstructionExportInput, export_instruction,
 };
 #[cfg(feature = "sleigh-config")]
-use r2sleigh_lift::{Disassembler, build_arch_spec, userop_map_for_arch};
+use r2sleigh_lift::{Disassembler, build_arch_spec};
 
 /// r2sleigh - Sleigh to r2il compiler for radare2
 #[derive(Parser)]
@@ -297,8 +297,6 @@ fn cmd_info(input: &Path, show_registers: bool, show_spaces: bool) -> Result<(),
     println!("Alignment: {}", spec.alignment);
     println!("Registers: {}", spec.registers.len());
     println!("Address spaces: {}", spec.spaces.len());
-    println!("User operations: {}", spec.userops.len());
-    println!("Source files: {}", spec.source_files.len());
 
     if show_spaces || !show_registers {
         println!("\nAddress Spaces:");
@@ -325,20 +323,6 @@ fn cmd_info(input: &Path, show_registers: bool, show_spaces: bool) -> Result<(),
                 "  {:12} offset=0x{:04x} size={}{}",
                 reg.name, reg.offset, reg.size, parent_str
             );
-        }
-    }
-
-    if !spec.userops.is_empty() {
-        println!("\nUser Operations:");
-        for userop in &spec.userops {
-            println!("  {}: {}", userop.index, userop.name);
-        }
-    }
-
-    if !spec.source_files.is_empty() {
-        println!("\nSource Files:");
-        for file in &spec.source_files {
-            println!("  {}", file);
         }
     }
 
@@ -645,13 +629,12 @@ fn get_disassembler_with_spec(arch: &str) -> Result<(Disassembler, r2il::ArchSpe
                 "x86-64",
             )
             .map_err(|e| e.to_string())?;
-            let mut disasm = Disassembler::from_sla(
+            let disasm = Disassembler::from_sla(
                 sleigh_config::processor_x86::SLA_X86_64,
                 sleigh_config::processor_x86::PSPEC_X86_64,
                 "x86-64",
             )
             .map_err(|e| e.to_string())?;
-            disasm.set_userop_map(userop_map_for_arch("x86-64"));
             Ok((disasm, spec))
         }
         #[cfg(feature = "x86")]
@@ -662,13 +645,12 @@ fn get_disassembler_with_spec(arch: &str) -> Result<(Disassembler, r2il::ArchSpe
                 "x86",
             )
             .map_err(|e| e.to_string())?;
-            let mut disasm = Disassembler::from_sla(
+            let disasm = Disassembler::from_sla(
                 sleigh_config::processor_x86::SLA_X86,
                 sleigh_config::processor_x86::PSPEC_X86,
                 "x86",
             )
             .map_err(|e| e.to_string())?;
-            disasm.set_userop_map(userop_map_for_arch("x86"));
             Ok((disasm, spec))
         }
         #[cfg(feature = "arm")]
@@ -679,37 +661,29 @@ fn get_disassembler_with_spec(arch: &str) -> Result<(Disassembler, r2il::ArchSpe
                 "arm",
             )
             .map_err(|e| e.to_string())?;
-            let mut disasm = Disassembler::from_sla(
+            let disasm = Disassembler::from_sla(
                 sleigh_config::processor_arm::SLA_ARM8_LE,
                 // sleigh-config 1.x does not ship an ARM8 pspec; use a Cortex pspec instead.
                 sleigh_config::processor_arm::PSPEC_ARMCORTEX,
                 "ARM",
             )
             .map_err(|e| e.to_string())?;
-            disasm.set_userop_map(userop_map_for_arch("arm"));
             Ok((disasm, spec))
         }
         #[cfg(feature = "arm")]
         "arm64" | "arm64e" | "aarch64" => {
-            let mut spec = build_arch_spec(
+            let spec = build_arch_spec(
                 sleigh_config::processor_aarch64::SLA_AARCH64_APPLESILICON,
                 sleigh_config::processor_aarch64::PSPEC_AARCH64,
                 "aarch64",
             )
             .map_err(|e| e.to_string())?;
-            let mut disasm = Disassembler::from_sla(
+            let disasm = Disassembler::from_sla(
                 sleigh_config::processor_aarch64::SLA_AARCH64_APPLESILICON,
                 sleigh_config::processor_aarch64::PSPEC_AARCH64,
                 "aarch64",
             )
             .map_err(|e| e.to_string())?;
-            let userops = userop_map_for_arch("arm64");
-            disasm.set_userop_map(userops.clone());
-            spec.userops = userops
-                .into_iter()
-                .map(|(index, name)| r2il::serialize::UserOpDef { index, name })
-                .collect();
-            spec.userops.sort_by_key(|def| def.index);
             Ok((disasm, spec))
         }
         #[cfg(feature = "mips")]
@@ -720,13 +694,12 @@ fn get_disassembler_with_spec(arch: &str) -> Result<(Disassembler, r2il::ArchSpe
                 "mips32be",
             )
             .map_err(|e| e.to_string())?;
-            let mut disasm = Disassembler::from_sla(
+            let disasm = Disassembler::from_sla(
                 sleigh_config::processor_mips::SLA_MIPS32BE,
                 sleigh_config::processor_mips::PSPEC_MIPS32,
                 "mips32be",
             )
             .map_err(|e| e.to_string())?;
-            disasm.set_userop_map(userop_map_for_arch("mips32be"));
             Ok((disasm, spec))
         }
         #[cfg(feature = "mips")]
@@ -737,13 +710,12 @@ fn get_disassembler_with_spec(arch: &str) -> Result<(Disassembler, r2il::ArchSpe
                 "mips32le",
             )
             .map_err(|e| e.to_string())?;
-            let mut disasm = Disassembler::from_sla(
+            let disasm = Disassembler::from_sla(
                 sleigh_config::processor_mips::SLA_MIPS32LE,
                 sleigh_config::processor_mips::PSPEC_MIPS32,
                 "mips32le",
             )
             .map_err(|e| e.to_string())?;
-            disasm.set_userop_map(userop_map_for_arch("mips32le"));
             Ok((disasm, spec))
         }
         #[cfg(feature = "mips")]
@@ -754,13 +726,12 @@ fn get_disassembler_with_spec(arch: &str) -> Result<(Disassembler, r2il::ArchSpe
                 "mips64be",
             )
             .map_err(|e| e.to_string())?;
-            let mut disasm = Disassembler::from_sla(
+            let disasm = Disassembler::from_sla(
                 sleigh_config::processor_mips::SLA_MIPS64BE,
                 sleigh_config::processor_mips::PSPEC_MIPS64,
                 "mips64be",
             )
             .map_err(|e| e.to_string())?;
-            disasm.set_userop_map(userop_map_for_arch("mips64be"));
             Ok((disasm, spec))
         }
         #[cfg(feature = "mips")]
@@ -771,13 +742,12 @@ fn get_disassembler_with_spec(arch: &str) -> Result<(Disassembler, r2il::ArchSpe
                 "mips64le",
             )
             .map_err(|e| e.to_string())?;
-            let mut disasm = Disassembler::from_sla(
+            let disasm = Disassembler::from_sla(
                 sleigh_config::processor_mips::SLA_MIPS64LE,
                 sleigh_config::processor_mips::PSPEC_MIPS64,
                 "mips64le",
             )
             .map_err(|e| e.to_string())?;
-            disasm.set_userop_map(userop_map_for_arch("mips64le"));
             Ok((disasm, spec))
         }
         #[cfg(feature = "riscv")]
@@ -788,13 +758,12 @@ fn get_disassembler_with_spec(arch: &str) -> Result<(Disassembler, r2il::ArchSpe
                 "riscv64",
             )
             .map_err(|e| e.to_string())?;
-            let mut disasm = Disassembler::from_sla(
+            let disasm = Disassembler::from_sla(
                 sleigh_config::processor_riscv::SLA_RISCV_LP64D,
                 sleigh_config::processor_riscv::PSPEC_RV64GC,
                 "riscv64",
             )
             .map_err(|e| e.to_string())?;
-            disasm.set_userop_map(userop_map_for_arch("riscv64"));
             Ok((disasm, spec))
         }
         #[cfg(feature = "riscv")]
@@ -805,13 +774,12 @@ fn get_disassembler_with_spec(arch: &str) -> Result<(Disassembler, r2il::ArchSpe
                 "riscv32",
             )
             .map_err(|e| e.to_string())?;
-            let mut disasm = Disassembler::from_sla(
+            let disasm = Disassembler::from_sla(
                 sleigh_config::processor_riscv::SLA_RISCV_ILP32D,
                 sleigh_config::processor_riscv::PSPEC_RV32GC,
                 "riscv32",
             )
             .map_err(|e| e.to_string())?;
-            disasm.set_userop_map(userop_map_for_arch("riscv32"));
             Ok((disasm, spec))
         }
         _ => {
@@ -1165,16 +1133,88 @@ mod tests {
     }
 
     #[test]
-    fn disasm_esil_includes_userop_name_across_instructions() {
+    fn disasm_esil_keeps_numeric_callother_across_instructions() {
         let (disasm, arch_spec) = get_disassembler_with_spec("x86-64").expect("disassembler");
         let bytes = hex::decode("31c00fa2c3ffffffffffffffffffffffff").expect("bytes");
         let lines = render_esil_lines(&disasm, &arch_spec, &bytes, 0x1000).expect("render esil");
+        let callothers = lines
+            .iter()
+            .filter_map(|line| line.split_once("CALLOTHER(").map(|(_, rest)| rest))
+            .map(|rest| rest.split_once(')').expect("closed CALLOTHER").0)
+            .collect::<Vec<_>>();
         assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("CALLOTHER(") && line.contains("cpuid")),
-            "ESIL should include named CallOther ops across multiple instructions"
+            !callothers.is_empty(),
+            "CPUID must retain CallOther evidence"
         );
+        assert!(
+            callothers
+                .iter()
+                .all(|userop| userop.parse::<u32>().is_ok()),
+            "CallOther labels must remain numeric: {callothers:?}"
+        );
+        let repeated =
+            render_esil_lines(&disasm, &arch_spec, &bytes, 0x1000).expect("repeat render esil");
+        assert_eq!(lines, repeated, "numeric ESIL output must be deterministic");
+    }
+
+    #[test]
+    fn ambient_userop_fixture_child() {
+        if std::env::var_os("R2SLEIGH_AMBIENT_CHILD").is_none() {
+            return;
+        }
+        let output = run_action_output(
+            "x86-64",
+            "0fa2c3ffffffffffffffffffffffffffff",
+            "0x1000",
+            InstructionAction::Lift,
+            ExportFormat::Esil,
+        )
+        .expect("ambient-independent output");
+        println!("R2SLEIGH_AMBIENT_OUTPUT={output:?}");
+    }
+
+    #[test]
+    fn disasm_output_ignores_filesystem_and_environment_userop_names() {
+        fn run_with_fixture(label: &str, userop_name: &str) -> String {
+            let root = std::env::temp_dir().join(format!(
+                "r2sleigh-userop-invariance-{}-{label}",
+                std::process::id()
+            ));
+            let language_dir = root.join("ghidra/Ghidra/Processors/x86/data/languages");
+            std::fs::create_dir_all(&language_dir).expect("fixture directory");
+            std::fs::write(
+                language_dir.join("x86-64.slaspec"),
+                format!("define pcodeop {userop_name};\n"),
+            )
+            .expect("fixture spec");
+
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .arg("--exact")
+                .arg("tests::ambient_userop_fixture_child")
+                .arg("--nocapture")
+                .current_dir(&root)
+                .env("R2SLEIGH_AMBIENT_CHILD", "1")
+                .env("SLEIGH_CONFIG_ROOT", &root)
+                .output()
+                .expect("child test");
+            std::fs::remove_dir_all(&root).expect("remove fixture");
+            assert!(
+                output.status.success(),
+                "child failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout)
+                .expect("UTF-8 output")
+                .lines()
+                .find_map(|line| line.strip_prefix("R2SLEIGH_AMBIENT_OUTPUT="))
+                .expect("output marker")
+                .to_string()
+        }
+
+        let first = run_with_fixture("first", "ambient_first_name");
+        let second = run_with_fixture("second", "ambient_second_name");
+        assert_eq!(first, second);
+        assert!(first.contains("CALLOTHER(") && !first.contains("ambient_"));
     }
 
     #[test]

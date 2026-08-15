@@ -33,8 +33,6 @@ pub struct Disassembler {
     reg_name_map: HashMap<(u64, u32), String>,
     /// Exact mapping extracted with the architecture metadata for this session.
     space_map: HashMap<AddressSpaceId, SpaceId>,
-    /// User-defined operations by index
-    userop_map: HashMap<u32, String>,
     /// Opaque authority present only for an embedded trusted Sleigh profile.
     genuine_authority: Option<GenuineLiftAuthority>,
     trusted_profile: Option<TrustedSleighProfile>,
@@ -1108,10 +1106,6 @@ impl Disassembler {
         let reg_name_map = build_register_name_map(&sleigh);
         let extracted = crate::sleigh::extract_architecture(&sleigh, arch_name)?;
         let arch = Arc::new(extracted.arch);
-        // User-op names are presentation/enrichment data. They are never
-        // imported into a certifying session implicitly; an explicit override
-        // remains available but permanently demotes the session to analysis.
-        let userop_map = HashMap::new();
         let genuine_authority = trusted_profile.map(|_| {
             GenuineLiftAuthority::new(
                 Arc::from(sla_bytes),
@@ -1126,7 +1120,6 @@ impl Disassembler {
             arch_name: arch_name.to_string(),
             reg_name_map,
             space_map: extracted.space_map,
-            userop_map,
             genuine_authority,
             trusted_profile,
         })
@@ -1242,18 +1235,6 @@ impl Disassembler {
     /// Get the architecture name.
     pub fn arch_name(&self) -> &str {
         &self.arch_name
-    }
-
-    /// Set user-defined operation names for CallOther resolution.
-    pub fn set_userop_map(&mut self, map: HashMap<u32, String>) {
-        self.userop_map = map;
-        self.genuine_authority = None;
-        self.trusted_profile = None;
-    }
-
-    /// Get the user-defined operation name for a CallOther index.
-    pub fn userop_name(&self, index: u32) -> Option<&str> {
-        self.userop_map.get(&index).map(String::as_str)
     }
 
     /// Get the default code address space.
@@ -2943,7 +2924,7 @@ mod tests {
         const DMB_ISH: &[u8] = &[0xbf, 0x3b, 0x03, 0xd5];
         const ADDR: u64 = 0x410000;
 
-        let mut disassembler =
+        let disassembler =
             Disassembler::from_trusted_profile(TrustedSleighProfile::Aarch64AppleSilicon)
                 .expect("trusted Apple AArch64 disassembler");
         assert_native_instruction(&disassembler, PACIBSP, ADDR, "pacibsp");
@@ -2980,7 +2961,7 @@ mod tests {
             DMB_ISH,
             ADDR + PACIBSP.len() as u64,
         );
-        let genuine_userops = barrier
+        let numeric_userops = barrier
             .ops
             .iter()
             .filter_map(|op| match op {
@@ -2989,7 +2970,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(
-            !genuine_userops.is_empty(),
+            !numeric_userops.is_empty(),
             "DMB must retain the translator's numeric CallOther evidence"
         );
         assert!(
@@ -2999,13 +2980,15 @@ mod tests {
                 .any(|op| matches!(op, R2ILOp::Fence { .. }))
         );
 
-        disassembler.set_userop_map(HashMap::from([(genuine_userops[0], "fence".to_string())]));
-        let overridden = assert_public_lifts_preserve_canonical_ops(
-            &disassembler,
+        let independent =
+            Disassembler::from_trusted_profile(TrustedSleighProfile::Aarch64AppleSilicon)
+                .expect("independent trusted Apple AArch64 disassembler");
+        let repeated = assert_public_lifts_preserve_canonical_ops(
+            &independent,
             DMB_ISH,
             ADDR + PACIBSP.len() as u64,
         );
-        assert_eq!(overridden.ops, barrier.ops);
+        assert_eq!(repeated.ops, barrier.ops);
     }
 
     #[cfg(feature = "riscv")]
@@ -3089,7 +3072,7 @@ mod tests {
     }
 
     #[test]
-    fn arbitrary_specs_and_userop_overrides_cannot_mint_genuine_lifts() {
+    fn arbitrary_specs_cannot_mint_genuine_lifts() {
         let arbitrary = Disassembler::from_sla(
             sleigh_config::processor_x86::SLA_X86_64,
             sleigh_config::processor_x86::PSPEC_X86_64,
@@ -3106,19 +3089,45 @@ mod tests {
                 .is_err(),
             "even byte-identical caller-supplied specs remain analysis-only"
         );
+    }
 
-        let mut overridden = Disassembler::from_trusted_profile(TrustedSleighProfile::X86_64)
+    #[test]
+    fn callother_translation_preserves_numeric_id_and_operands() {
+        let disassembler = Disassembler::from_trusted_profile(TrustedSleighProfile::X86_64)
             .expect("trusted x86-64 disassembler");
-        overridden.set_userop_map(HashMap::new());
-        assert!(
-            overridden
-                .lift_genuine_block(
-                    PINNED_X86_CONDITIONAL_RETURN_BYTES,
-                    PINNED_X86_CONDITIONAL_RETURN_ADDR,
-                    PINNED_X86_CONDITIONAL_RETURN_BYTES.len(),
-                )
-                .is_err(),
-            "caller-controlled userop policy must demote certification authority"
+        let address_spaces = disassembler.address_spaces();
+        let constant_space = address_spaces
+            .iter()
+            .find(|space| space.space_type == libsla::AddressSpaceType::Constant)
+            .expect("constant space")
+            .clone();
+        let register_space = address_spaces
+            .iter()
+            .find(|space| space.name == "register")
+            .expect("register space")
+            .clone();
+        let instruction = PcodeInstruction {
+            address: Address::new(
+                disassembler.default_code_space(),
+                PINNED_X86_CONDITIONAL_RETURN_ADDR,
+            ),
+            op_code: OpCode::Pseudo(PseudoOp::CallOther),
+            inputs: vec![
+                VarnodeData::new(Address::new(constant_space.clone(), u32::MAX.into()), 4),
+                VarnodeData::new(Address::new(constant_space, 0xfeed_face), 8),
+            ],
+            output: Some(VarnodeData::new(Address::new(register_space, 0), 8)),
+        };
+
+        assert_eq!(
+            disassembler
+                .translate_pcode_op(&instruction)
+                .expect("CallOther translation"),
+            Some(R2ILOp::CallOther {
+                userop: u32::MAX,
+                output: Some(Varnode::register(0, 8)),
+                inputs: vec![Varnode::constant(0xfeed_face, 8)],
+            })
         );
     }
 

@@ -54,8 +54,9 @@ R2ILOp to ESIL Translation Table
 | Call | `target,pc,=` | |
 | Return | `target,pc,=` | |
 
-CallOther operations map to ESIL userops with names resolved from the Sleigh
-specification via `Disassembler::userop_name()`.
+CallOther operations map to `CALLOTHER(<numeric-id>)`. The identifier comes
+directly from the loaded Sleigh translator. Ambient specification files and
+presentation labels do not alter ESIL or lifted semantics.
 
 ESIL Pitfalls
 -------------

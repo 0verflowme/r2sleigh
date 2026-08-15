@@ -4,7 +4,6 @@
 //! storage and loading of architecture specifications.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::mem::size_of;
 use std::path::Path;
 use thiserror::Error;
@@ -25,7 +24,7 @@ pub enum SerializeError {
     #[error("Invalid architecture specification: {0}")]
     Validation(#[from] crate::ValidationError),
 
-    #[error("Invalid format discriminator: expected R2PSTC05")]
+    #[error("Invalid format discriminator: expected R2PSTC06")]
     InvalidMagic,
 
     #[error("Truncated r2il representation")]
@@ -76,15 +75,6 @@ impl RegisterDef {
     }
 }
 
-/// User-defined operation (CALLOTHER) definition.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UserOpDef {
-    /// Operation index
-    pub index: u32,
-    /// Operation name
-    pub name: String,
-}
-
 /// Instruction pattern and its semantic definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstructionDef {
@@ -122,15 +112,6 @@ pub struct ArchSpec {
 
     /// Register definitions
     pub registers: Vec<RegisterDef>,
-
-    /// Register name to offset mapping for quick lookup
-    pub register_map: HashMap<String, u64>,
-
-    /// User-defined operations (CALLOTHER)
-    pub userops: Vec<UserOpDef>,
-
-    /// Sleigh source file paths (for debugging)
-    pub source_files: Vec<String>,
 }
 
 impl ArchSpec {
@@ -145,9 +126,6 @@ impl ArchSpec {
             alignment: 1,
             spaces: Vec::new(),
             registers: Vec::new(),
-            register_map: HashMap::new(),
-            userops: Vec::new(),
-            source_files: Vec::new(),
         }
     }
 
@@ -163,7 +141,6 @@ impl ArchSpec {
 
     /// Add a register definition.
     pub fn add_register(&mut self, reg: RegisterDef) {
-        self.register_map.insert(reg.name.clone(), reg.offset);
         self.registers.push(reg);
     }
 
@@ -175,11 +152,6 @@ impl ArchSpec {
     /// Look up a register by name.
     pub fn get_register(&self, name: &str) -> Option<&RegisterDef> {
         self.registers.iter().find(|r| r.name == name)
-    }
-
-    /// Look up a register offset by name.
-    pub fn get_register_offset(&self, name: &str) -> Option<u64> {
-        self.register_map.get(name).copied()
     }
 }
 
@@ -316,6 +288,16 @@ mod tests {
         let bytes = b"NOTR2IL!";
         let result = from_bytes(bytes);
         assert!(matches!(result, Err(SerializeError::InvalidMagic)));
+    }
+
+    #[test]
+    fn previous_format_discriminator_is_rejected() {
+        let mut bytes = to_bytes(&valid_arch("previous-format")).expect("serialize fixture");
+        bytes[..MAGIC.len()].copy_from_slice(b"R2PSTC05");
+        assert!(matches!(
+            from_bytes(&bytes),
+            Err(SerializeError::InvalidMagic)
+        ));
     }
 
     #[test]

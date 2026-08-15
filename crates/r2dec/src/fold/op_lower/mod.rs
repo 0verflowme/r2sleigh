@@ -2218,11 +2218,6 @@ impl<'a> FoldingContext<'a> {
         names
     }
 
-    /// Set CallOther userop name mappings.
-    pub fn set_userop_names(&mut self, names: HashMap<u32, String>) {
-        self.userop_names = names;
-    }
-
     /// Analyze function structure to detect return patterns.
     /// This finds the exit block and blocks that branch to it.
     pub fn analyze_function_structure(&mut self, func: &SSAFunction) {
@@ -2847,14 +2842,6 @@ impl<'a> FoldingContext<'a> {
             return self.state.return_blocks.contains(&addr);
         }
         false
-    }
-
-    /// Look up a userop name for CallOther.
-    fn lookup_userop_name(&self, userop: u32) -> String {
-        self.userop_names
-            .get(&userop)
-            .cloned()
-            .unwrap_or_else(|| format!("userop_{}", userop))
     }
 
     /// Analyze a block to collect use counts and definitions.
@@ -14444,7 +14431,7 @@ impl<'a> FoldingContext<'a> {
                 inputs,
             } => {
                 let mut args = Vec::with_capacity(inputs.len() + 1);
-                args.push(CExpr::StringLit(self.lookup_userop_name(*userop)));
+                args.push(CExpr::StringLit(format!("userop_{}", userop)));
                 for input in inputs {
                     args.push(self.get_expr(input));
                 }

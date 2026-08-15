@@ -55,4 +55,4 @@ pub use validate::{
 pub use varnode::Varnode;
 
 /// Exact discriminator for the sole supported postcard representation.
-pub const MAGIC: &[u8; 8] = b"R2PSTC05";
+pub const MAGIC: &[u8; 8] = b"R2PSTC06";

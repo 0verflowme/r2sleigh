@@ -275,8 +275,6 @@ Structural checks include:
    - at least one address space and exactly one default space
    - unique space IDs and names
    - registers have non-zero size and unique names
-   - `register_map` entries match register definitions
-   - unique userop indices
 
 Validation is aggregated: all discovered issues are returned in one
 `ValidationError` instead of failing at the first problem.
@@ -434,8 +432,8 @@ Optional overrides:
 Behavior notes:
 
 1. `mixed` and `custom` are metadata-level only for now; deep execution semantics are deferred.
-2. The sole `.r2il` representation is identified by `R2PSTC05`:
-   - the wire layout is `R2PSTC05 || payload_length_u64_le || postcard(ArchSpec)`
+2. The sole `.r2il` representation is identified by `R2PSTC06`:
+   - the wire layout is `R2PSTC06 || payload_length_u64_le || postcard(ArchSpec)`
    - the loader requires an exact payload length and no trailing bytes
    - no independent version field or compatibility decoder exists
    - older versions and alternate encodings are rejected
@@ -469,11 +467,14 @@ Address-space topology fields (canonical, optional):
 4. `bank_id`
 5. `segment_id`
 
-Heuristic population baseline:
+Semantic source rule:
 
-1. `CALLOTHER` userops named like `fence` / `fence.i` / `sfence.*` / ARM barrier userops rewrite to `Fence`.
-2. RISC-V/ARM mnemonic patterns (`lr.*`/`ldrex*`, `sc.*`/`strex*`) rewrite matching RAM `Load`/`Store` to linked/conditional variants.
-3. RISC-V `amo*` mnemonics keep original load/store ops and attach `op_metadata.atomic_kind=read_modify_write` plus ordering.
+1. These operations are emitted only when the loaded Sleigh translator emits
+   the corresponding P-code semantics.
+2. Mnemonics and userop presentation names never rewrite canonical operations
+   or add memory-ordering metadata.
+3. A native instruction with no emitted P-code remains an exact native span and
+   residualizes as unsupported; it is never replaced with fabricated semantics.
 
 End-to-End Example
 ------------------
@@ -519,7 +520,7 @@ r2il types derive `serde::Serialize` and `serde::Deserialize`. The standard
 serialization formats are:
 
 - **JSON** (`serde_json`) -- for plugin output and debugging
-- **postcard** -- for the sole compact `R2PSTC05` binary storage representation
+- **postcard** -- for the sole compact `R2PSTC06` binary storage representation
 
 The plugin command `a:sla.json` outputs the R2ILBlock for the current
 instruction as JSON.
@@ -527,7 +528,7 @@ instruction as JSON.
 Compatibility Guarantees
 ------------------------
 
-1. The reader accepts exactly the `R2PSTC05` postcard representation.
+1. The reader accepts exactly the `R2PSTC06` postcard representation.
 2. The writer always emits that representation; older artifacts must be regenerated from their source authority.
 3. Instruction exporter action/format compatibility is strict:
    - `lift`: `json`, `text`, `esil`, `r2cmd`
@@ -538,5 +539,5 @@ Compatibility Guarantees
 
 Versioning policy:
 
-1. The sole binary identity is `R2PSTC05` with a checked payload length.
+1. The sole binary identity is `R2PSTC06` with a checked payload length.
 2. Any other discriminator or encoding is rejected.

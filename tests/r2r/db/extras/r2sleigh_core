@@ -67,7 +67,7 @@ jq -n -c --slurpfile regs /tmp/r2sleigh_core_regs.json --slurpfile mem /tmp/r2sl
 EOF_CMDS
 RUN
 
-NAME=sla_lift_cpuid_keeps_userop_name
+NAME=sla_lift_cpuid_keeps_numeric_userop
 FILE=malloc://64
 ARGS=-a x86 -b 64 -e scr.color=false -e log.level=0
 EXPECT=<<EOF_EXPECT
@@ -76,6 +76,6 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 wx 0fa20000000000000000000000000000
 s 0 >/dev/null
-a:sla.debug.json | jq -c '([.[] | .CallOther?.userop_name? | strings | select(startswith("cpuid"))] | length) > 0'
+a:sla.debug.json | jq -c '([.[] | .CallOther? | select((.userop | numbers) and (.inputs | arrays))] | length) > 0 and ([.[] | .CallOther? | select(has("userop_name"))] | length) == 0'
 EOF_CMDS
 RUN

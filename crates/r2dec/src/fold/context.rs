@@ -162,7 +162,6 @@ pub struct FoldingContext<'a> {
     pub(crate) current_block_addr: Cell<Option<u64>>,
     pub(crate) current_op_idx: Cell<Option<usize>>,
     pub(crate) hide_stack_frame: bool,
-    pub(crate) userop_names: HashMap<u32, String>,
     pub(crate) signature_registry: SignatureRegistry,
     pub(crate) rendered_alias_lookup_cache: std::cell::RefCell<HashMap<String, Option<String>>>,
     pub(crate) preferred_entry_arg_lookup_cache:
@@ -244,7 +243,6 @@ impl<'a> FoldingContext<'a> {
             current_block_addr: Cell::new(None),
             current_op_idx: Cell::new(None),
             hide_stack_frame: true,
-            userop_names: HashMap::new(),
             signature_registry: SignatureRegistry::from_embedded_json(),
             rendered_alias_lookup_cache: std::cell::RefCell::new(HashMap::new()),
             preferred_entry_arg_lookup_cache: std::cell::RefCell::new(HashMap::new()),

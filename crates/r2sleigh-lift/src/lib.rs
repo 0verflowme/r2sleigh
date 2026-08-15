@@ -30,7 +30,6 @@ mod internal_control;
 pub mod pcode;
 pub mod sleigh;
 pub mod translate;
-pub mod userops;
 
 use thiserror::Error;
 
@@ -41,12 +40,11 @@ pub use disasm::{
     GenuineLiftedFunctionAuthority, SemanticMetadataOptions, SemanticMetadataPrecision,
     TrustedLiftedFunction, TrustedSleighProfile,
 };
-pub use esil::{format_op, op_to_esil, op_to_esil_named};
+pub use esil::{format_op, op_to_esil};
 pub use pcode::{PcodeTranslator, RawPcodeOp, RawVarnode};
 use r2il::ArchSpec;
 use r2il::Endianness;
 pub use sleigh::{SleighInfo, build_arch_spec, extract_arch_spec, get_sleigh_info};
-pub use userops::userop_map_for_arch;
 
 /// Errors that can occur during lifting.
 #[derive(Debug, Error)]
