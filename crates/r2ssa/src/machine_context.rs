@@ -19,11 +19,12 @@ pub use r2source::{
     SourceCallResult, SourceCallSiteIdentity, SourceCallSiteInterface,
     SourceCallSiteInterfaceError, SourceCarrierKind, SourceCarrierProjection,
     SourceFunctionInterface, SourceFunctionInterfaceError, SourceFunctionReturn,
-    SourceLogicalValue, SourceStackSlotRole, SourceStackSlotSpec, SourceType, SourceTypeGraph,
-    SourceTypeGraphError, SourceTypeKind, StackAddressBase,
+    SourceLogicalValue, SourceStackAllocationContract, SourceStackGrowth, SourceStackSlotRole,
+    SourceStackSlotSpec, SourceType, SourceTypeGraph, SourceTypeGraphError, SourceTypeKind,
+    StackAddressBase,
 };
 
-pub const MACHINE_CONTEXT_SCHEMA_VERSION: u32 = 12;
+pub const MACHINE_CONTEXT_SCHEMA_VERSION: u32 = 13;
 /// One canonical register carrier in the immutable ABI snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct MachineAbiRegisterSlot {

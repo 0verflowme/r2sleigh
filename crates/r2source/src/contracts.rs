@@ -63,7 +63,7 @@ pub enum StackAddressBase {
     StackPointer,
 }
 
-pub const SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION: u32 = 8;
+pub const SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION: u32 = 9;
 pub const SOURCE_CALL_SITE_INTERFACE_SCHEMA_VERSION: u32 = 1;
 pub const SOURCE_TYPE_GRAPH_SCHEMA_VERSION: u32 = 1;
 
@@ -537,6 +537,47 @@ pub enum SourceReturnMechanism {
     },
 }
 
+/// Exact source-owned direction in which a callee acquires private stack
+/// storage by moving the architectural stack pointer away from its entry
+/// value. This is an ownership contract, not an inference from an architecture
+/// name, calling-convention string, or observed instruction spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum SourceStackGrowth {
+    LowerAddresses,
+    HigherAddresses,
+}
+
+/// Revision-bound stack-allocation authority supplied by the immutable source
+/// snapshot. While an exact SP move in `growth` remains live and unrestored,
+/// the half-open interval between the entry SP and that moved SP belongs to the
+/// callee. Absence grants no allocation or red-zone authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SourceStackAllocationContract {
+    growth: SourceStackGrowth,
+}
+
+impl SourceStackAllocationContract {
+    pub const fn new(growth: SourceStackGrowth) -> Self {
+        Self { growth }
+    }
+
+    pub const fn growth(self) -> SourceStackGrowth {
+        self.growth
+    }
+
+    pub fn owns_entry_relative_reservation(self, offset: i64, size_bytes: u32) -> bool {
+        if size_bytes == 0 {
+            return false;
+        }
+        match self.growth {
+            SourceStackGrowth::LowerAddresses => {
+                offset < 0 && offset.checked_add(i64::from(size_bytes)) == Some(0)
+            }
+            SourceStackGrowth::HigherAddresses => offset == 0,
+        }
+    }
+}
+
 impl SourceReturnMechanism {
     pub const fn stack_offset(self) -> i64 {
         match self {
@@ -676,6 +717,7 @@ pub struct SourceFunctionInterface {
     stack_pointer_storage: Option<CanonicalStorageId>,
     frame_pointer_storage: Option<CanonicalStorageId>,
     return_mechanism: Option<SourceReturnMechanism>,
+    stack_allocation_contract: Option<SourceStackAllocationContract>,
     stack_slots: Box<[SourceStackSlotSpec]>,
     parameter_logical_values: Box<[SourceLogicalValue]>,
     return_logical_value: Option<SourceLogicalValue>,
@@ -693,6 +735,7 @@ pub enum SourceFunctionInterfaceError {
     InvalidStackPointerStorage,
     InvalidFramePointerStorage,
     InvalidReturnMechanism,
+    InvalidStackAllocationContract,
     OverlappingRegisterStorages,
     InvalidStackSlot,
     InvalidStackSlotRole,
@@ -944,6 +987,7 @@ impl SourceFunctionInterface {
             stack_pointer_storage: None,
             frame_pointer_storage: None,
             return_mechanism: None,
+            stack_allocation_contract: None,
             stack_slots: stack_slots.into_boxed_slice(),
             parameter_logical_values: parameter_logical_values.into_boxed_slice(),
             return_logical_value,
@@ -1102,8 +1146,15 @@ impl SourceFunctionInterface {
         if self
             .return_mechanism
             .is_some_and(|_| self.stack_pointer_storage != Some(storage))
+            || self
+                .stack_allocation_contract
+                .is_some_and(|_| self.stack_pointer_storage != Some(storage))
         {
-            return Err(SourceFunctionInterfaceError::InvalidReturnMechanism);
+            return Err(if self.return_mechanism.is_some() {
+                SourceFunctionInterfaceError::InvalidReturnMechanism
+            } else {
+                SourceFunctionInterfaceError::InvalidStackAllocationContract
+            });
         }
         if !self.stack_pointer_storage_is_valid(storage) {
             return Err(SourceFunctionInterfaceError::InvalidStackPointerStorage);
@@ -1187,6 +1238,28 @@ impl SourceFunctionInterface {
 
     pub const fn return_mechanism(&self) -> Option<SourceReturnMechanism> {
         self.return_mechanism
+    }
+
+    /// Bind the source-owned stack growth/allocation convention. The stack
+    /// pointer identity must already be exact; callers cannot manufacture
+    /// allocation authority from a direction alone.
+    pub fn with_stack_allocation_contract(
+        mut self,
+        contract: SourceStackAllocationContract,
+    ) -> Result<Self, SourceFunctionInterfaceError> {
+        if self.stack_pointer_storage.is_none()
+            || self
+                .stack_allocation_contract
+                .is_some_and(|bound| bound != contract)
+        {
+            return Err(SourceFunctionInterfaceError::InvalidStackAllocationContract);
+        }
+        self.stack_allocation_contract = Some(contract);
+        Ok(self)
+    }
+
+    pub const fn stack_allocation_contract(&self) -> Option<SourceStackAllocationContract> {
+        self.stack_allocation_contract
     }
 
     /// Return the unique full frame-pointer carrier from an exact stack-slot
@@ -1980,6 +2053,44 @@ mod tests {
                 .expect("matching explicit frame base")
                 .exact_frame_pointer_storage(),
             Some(frame_pointer)
+        );
+    }
+
+    #[test]
+    fn stack_allocation_contract_requires_exact_sp_and_owns_only_its_growth_interval() {
+        let lower = SourceStackAllocationContract::new(SourceStackGrowth::LowerAddresses);
+        let higher = SourceStackAllocationContract::new(SourceStackGrowth::HigherAddresses);
+        let base = SourceFunctionInterface::new_exact(
+            b"stack-allocation-contract".to_vec(),
+            "test-abi",
+            [],
+            SourceFunctionReturn::Void,
+            [],
+        )
+        .expect("exact interface");
+        assert_eq!(
+            base.clone().with_stack_allocation_contract(lower),
+            Err(SourceFunctionInterfaceError::InvalidStackAllocationContract)
+        );
+
+        let exact = base
+            .with_stack_pointer_storage(register_storage(72, 8))
+            .and_then(|interface| interface.with_stack_allocation_contract(lower))
+            .expect("exact downward stack allocation contract");
+        assert_eq!(exact.stack_allocation_contract(), Some(lower));
+        assert!(lower.owns_entry_relative_reservation(-16, 16));
+        assert!(!lower.owns_entry_relative_reservation(0, 16));
+        assert!(higher.owns_entry_relative_reservation(0, 16));
+        assert!(!higher.owns_entry_relative_reservation(-16, 16));
+        assert_eq!(
+            exact
+                .clone()
+                .with_stack_pointer_storage(register_storage(80, 8)),
+            Err(SourceFunctionInterfaceError::InvalidStackAllocationContract)
+        );
+        assert_eq!(
+            exact.with_stack_allocation_contract(higher),
+            Err(SourceFunctionInterfaceError::InvalidStackAllocationContract)
         );
     }
 }

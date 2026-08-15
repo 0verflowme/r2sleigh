@@ -91,8 +91,8 @@ int main(void) {
 	request_payload.radare_snapshot = &radare_snapshot;
 	const R2SleighApiV2 *api = r2sleigh_api_v2 ();
 	if (R2SLEIGH_RADARE_ABI_V2 != 138
-		|| R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 != 9
-		|| R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2 != 3
+		|| R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 != 10
+		|| R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2 != 4
 		|| radare_snapshot.struct_size != sizeof (R2SleighRadareSnapshotInputV2)
 		|| radare_snapshot.accessors != &radare_accessors
 		|| radare_accessors.struct_size != sizeof (R2SleighRadareAccessorsV2)

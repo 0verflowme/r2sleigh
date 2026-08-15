@@ -22,14 +22,14 @@
 #if R2SLEIGH_RADARE_ABI_V2 != 138
 #error "r2sleigh generated V2 header must target exactly radare2 ABI 138"
 #endif
-#if R_ANAL_FUNCTION_SNAPSHOT_SCHEMA_VERSION != 9
-#error "r2sleigh borrowed snapshot transport requires function snapshot schema 9"
+#if R_ANAL_FUNCTION_SNAPSHOT_SCHEMA_VERSION != 10
+#error "r2sleigh borrowed snapshot transport requires function snapshot schema 10"
 #endif
-#if R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 != 9
-#error "r2sleigh generated V2 header must target function snapshot schema 9"
+#if R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 != 10
+#error "r2sleigh generated V2 header must target function snapshot schema 10"
 #endif
-#if R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2 != 3
-#error "r2sleigh generated V2 header must target snapshot accessor schema 3"
+#if R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2 != 4
+#error "r2sleigh generated V2 header must target snapshot accessor schema 4"
 #endif
 
 static bool sleigh_radare_storage_view(R2SleighRadareRegisterStorageViewV2 *destination, const RAnalSnapshotRegisterStorageView *source) {
@@ -569,6 +569,29 @@ static uint8_t sleigh_radare_frame_pointer_storage_view(const void *opaque, R2Sl
 	return sleigh_radare_storage_view (destination, &source)? 1: 0;
 }
 
+static uint8_t sleigh_radare_stack_allocation_contract_view(const void *opaque, R2SleighRadareStackAllocationContractViewV2 *destination) {
+	if (!opaque || !destination) {
+		return 0;
+	}
+	*destination = (R2SleighRadareStackAllocationContractViewV2) {0};
+	RAnalSnapshotStackAllocationContractView source = {0};
+	if (!r_anal_function_snapshot_interface_stack_allocation_contract (
+			opaque, &source)) {
+		return 0;
+	}
+	switch (source.growth) {
+	case R_ANAL_SNAPSHOT_STACK_GROWTH_LOWER:
+		destination->growth = 1;
+		return 1;
+	case R_ANAL_SNAPSHOT_STACK_GROWTH_HIGHER:
+		destination->growth = 2;
+		return 1;
+	case R_ANAL_SNAPSHOT_STACK_GROWTH_NONE:
+	default:
+		return 0;
+	}
+}
+
 static const R2SleighRadareAccessorsV2 sleigh_radare_accessors = {
 	.struct_size = sizeof (sleigh_radare_accessors),
 	.abi_version = R2SLEIGH_RADARE_ABI_V2,
@@ -602,6 +625,7 @@ static const R2SleighRadareAccessorsV2 sleigh_radare_accessors = {
 	.external_exit = sleigh_radare_external_exit,
 	.return_mechanism_view = sleigh_radare_return_mechanism_view,
 	.frame_pointer_storage_view = sleigh_radare_frame_pointer_storage_view,
+	.stack_allocation_contract_view = sleigh_radare_stack_allocation_contract_view,
 };
 
 /* Remaining direct value declarations for the Rust library. */

@@ -298,6 +298,7 @@ pub struct CapturedSourceFields {
     stack_pointer_storage: bool,
     frame_pointer_storage: bool,
     return_mechanism: bool,
+    stack_allocation_contract: bool,
 }
 
 impl CapturedSourceFields {
@@ -331,6 +332,10 @@ impl CapturedSourceFields {
 
     pub const fn has_return_mechanism(self) -> bool {
         self.return_mechanism
+    }
+
+    pub const fn has_stack_allocation_contract(self) -> bool {
+        self.stack_allocation_contract
     }
 }
 
@@ -442,6 +447,8 @@ impl OwnedFunctionSnapshot {
                     .frame_pointer_storage()
                     .is_some_and(|storage| storage.size != machine.bits / 8)
                 || captured_fields.return_mechanism != interface.return_mechanism().is_some()
+                || captured_fields.stack_allocation_contract
+                    != interface.stack_allocation_contract().is_some()
             {
                 return Err(SnapshotValidationError::InvalidFunctionInterface);
             }
@@ -451,6 +458,7 @@ impl OwnedFunctionSnapshot {
             || captured_fields.stack_pointer_storage
             || captured_fields.frame_pointer_storage
             || captured_fields.return_mechanism
+            || captured_fields.stack_allocation_contract
         {
             return Err(SnapshotValidationError::InvalidFunctionInterface);
         }
@@ -583,6 +591,7 @@ mod tests {
                 stack_pointer_storage: false,
                 frame_pointer_storage: false,
                 return_mechanism: false,
+                stack_allocation_contract: false,
             },
             DiagnosticIdentity(7),
         )
@@ -610,6 +619,11 @@ mod tests {
         .and_then(|interface| interface.with_return_address_storage(register(16)))
         .and_then(|interface| interface.with_stack_pointer_storage(register(24)))
         .and_then(|interface| interface.with_frame_pointer_storage(register(32)))
+        .and_then(|interface| {
+            interface.with_stack_allocation_contract(SourceStackAllocationContract::new(
+                SourceStackGrowth::LowerAddresses,
+            ))
+        })
         .and_then(|interface| interface.with_exact_stacked_return(0, 8, 8, 8))
         .expect("exact interface")
     }
@@ -677,6 +691,7 @@ mod tests {
             stack_pointer_storage: true,
             frame_pointer_storage: true,
             return_mechanism: true,
+            stack_allocation_contract: true,
         };
         let captured = OwnedFunctionSnapshot::from_captured_parts(
             valid.machine().clone(),
@@ -693,6 +708,7 @@ mod tests {
         assert_eq!(captured.function_interface(), Some(&interface));
         assert!(captured.captured_fields().has_return_mechanism());
         assert!(captured.captured_fields().has_frame_pointer_storage());
+        assert!(captured.captured_fields().has_stack_allocation_contract());
 
         let narrow = |offset| CanonicalStorageId {
             space: CanonicalStorageSpace::Register,
@@ -713,6 +729,7 @@ mod tests {
             stack_pointer_storage: true,
             frame_pointer_storage: true,
             return_mechanism: false,
+            stack_allocation_contract: false,
         };
         assert_eq!(
             OwnedFunctionSnapshot::from_captured_parts(
@@ -746,6 +763,23 @@ mod tests {
             Err(SnapshotValidationError::InvalidFunctionInterface)
         );
 
+        let mut missing_stack_allocation_contract = captured_fields;
+        missing_stack_allocation_contract.stack_allocation_contract = false;
+        assert_eq!(
+            OwnedFunctionSnapshot::from_captured_parts(
+                valid.machine().clone(),
+                *valid.function(),
+                valid.presentation().clone(),
+                valid.image().clone(),
+                Box::new([]),
+                Box::from([7]),
+                Some(interface.clone()),
+                missing_stack_allocation_contract,
+                valid.diagnostic_identity(),
+            ),
+            Err(SnapshotValidationError::InvalidFunctionInterface)
+        );
+
         let interface_without_frame_pointer = SourceFunctionInterface::new_exact(
             [7],
             "sysv",
@@ -762,6 +796,11 @@ mod tests {
         )
         .and_then(|interface| interface.with_return_address_storage(register(16)))
         .and_then(|interface| interface.with_stack_pointer_storage(register(24)))
+        .and_then(|interface| {
+            interface.with_stack_allocation_contract(SourceStackAllocationContract::new(
+                SourceStackGrowth::LowerAddresses,
+            ))
+        })
         .and_then(|interface| interface.with_exact_stacked_return(0, 8, 8, 8))
         .expect("interface without explicit frame fact");
         assert_eq!(

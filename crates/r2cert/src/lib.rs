@@ -24,10 +24,14 @@ use r2ssa::{
     SourceCallSiteIdentity, SourceCarrierKind, SourceFunctionInterface, SourceFunctionReturn,
     SourceLogicalValue, SourceMachineContext, SourceReturnBoundaryFact,
     SourceReturnRegisterCompositionFact, SourceReturnRegisterDefinitionFact,
-    SourceReturnStackPointerFact, SsaArtifact, SsaArtifactAuthority, StackAddressBase,
-    StackAddressRoot, StructuredAccessId, StructuredLoopKind, TrustedSsaArtifact, ValueId,
+    SourceReturnStackPointerFact, SourceStackGrowth, SsaArtifact, SsaArtifactAuthority,
+    StackAddressBase, StackAddressRoot, StructuredAccessId, StructuredLoopKind, TrustedSsaArtifact,
+    ValueId,
 };
 use serde::{Deserialize, Serialize};
+
+#[cfg(test)]
+use r2ssa::SourceStackAllocationContract;
 
 mod aggregate_member;
 
@@ -37,7 +41,7 @@ pub use aggregate_member::{
     CertifiedNaturalScalarAggregateLayout,
 };
 
-pub const CERTIFICATION_SCHEMA_VERSION: u32 = 28;
+pub const CERTIFICATION_SCHEMA_VERSION: u32 = 29;
 
 /// Unforgeable run-local identity for one proof authority domain.
 ///
@@ -6762,6 +6766,183 @@ impl CertifiedFrameAffineRelation {
     }
 }
 
+/// Exact full-width assignment to the source-declared stack pointer, bound to
+/// its machine entity and normalized to the unique entry stack-pointer value.
+/// It grants no semantic disposition independently of its containing stack
+/// discipline certificate.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CertifiedStackPointerAssignment {
+    producer: CanonicalInstructionId,
+    root: MachineExprId,
+    input: MachineValueUse,
+    output: r2ssa::MachineValueBinding,
+    storage: CanonicalStorageId,
+    normalized_affine_relation: CertifiedFrameAffineRelation,
+}
+
+impl CertifiedStackPointerAssignment {
+    pub const fn producer(&self) -> CanonicalInstructionId {
+        self.producer
+    }
+
+    pub const fn root(&self) -> MachineExprId {
+        self.root
+    }
+
+    pub const fn input(&self) -> &MachineValueUse {
+        &self.input
+    }
+
+    pub const fn output(&self) -> r2ssa::MachineValueBinding {
+        self.output
+    }
+
+    pub const fn storage(&self) -> CanonicalStorageId {
+        self.storage
+    }
+
+    pub const fn normalized_affine_relation(&self) -> CertifiedFrameAffineRelation {
+        self.normalized_affine_relation
+    }
+}
+
+/// One exact plain-memory access whose address is proven entry-stack-relative
+/// and contained in the certified private reservation. The statement retains
+/// ownership of its observable memory obligation; this witness owns only the
+/// address transport classification.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CertifiedPrivateStackAccess {
+    statement: CertifiedMemoryStatement,
+    range: CertifiedNormalizedStackRange,
+}
+
+impl CertifiedPrivateStackAccess {
+    pub const fn statement(&self) -> &CertifiedMemoryStatement {
+        &self.statement
+    }
+
+    pub const fn range(&self) -> CertifiedNormalizedStackRange {
+        self.range
+    }
+}
+
+/// Exact machine-derived private stack object and the complete set of its
+/// certified plain accesses. No source name, type, or declared slot is inferred
+/// from this manifest.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CertifiedPrivateStackRegion {
+    objects: Box<[ObjectId]>,
+    accessed_range: CertifiedNormalizedStackRange,
+    accesses: Box<[CertifiedPrivateStackAccess]>,
+}
+
+impl CertifiedPrivateStackRegion {
+    /// Exact object-model identities proven to name this one normalized stack
+    /// interval. Multiple identities are retained only when every access spans
+    /// the complete same interval; partial/hull-based aliasing is refused.
+    pub const fn objects(&self) -> &[ObjectId] {
+        &self.objects
+    }
+
+    pub const fn accessed_range(&self) -> CertifiedNormalizedStackRange {
+        self.accessed_range
+    }
+
+    pub const fn accesses(&self) -> &[CertifiedPrivateStackAccess] {
+        &self.accesses
+    }
+}
+
+/// Per-return proof that the private reservation has been restored before the
+/// source return. A stacked return may additionally advance the stack pointer
+/// by its exact source-declared return-mechanism delta.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CertifiedStackRelease {
+    return_control: CertifiedReturnControl,
+    restoration: CertifiedStackPointerAssignment,
+    post_restoration: Option<CertifiedStackPointerAssignment>,
+    return_address_read: Option<CertifiedMemoryStatement>,
+}
+
+impl CertifiedStackRelease {
+    pub const fn return_control(&self) -> &CertifiedReturnControl {
+        &self.return_control
+    }
+
+    pub const fn restoration(&self) -> &CertifiedStackPointerAssignment {
+        &self.restoration
+    }
+
+    pub const fn post_restoration(&self) -> Option<&CertifiedStackPointerAssignment> {
+        self.post_restoration.as_ref()
+    }
+
+    pub const fn exit_stack_pointer(&self) -> &CertifiedExitStackPointer {
+        self.return_control.exit_stack_pointer()
+    }
+
+    pub const fn return_address_read(&self) -> Option<&CertifiedMemoryStatement> {
+        self.return_address_read.as_ref()
+    }
+}
+
+/// Sealed proof of a source-bound private stack reservation, its exact
+/// machine-derived access/address manifest, and restoration on every return.
+///
+/// The certificate is architecture- and mnemonic-independent. It consumes no
+/// semantic obligation: memory statements, expression producers, and returns
+/// must already be owned exactly once by the same artifact ledger.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CertifiedStackDiscipline {
+    schema_version: u32,
+    origin: CertifiedArtifactOrigin,
+    stack_pointer_storage: CanonicalStorageId,
+    entry_stack_pointer: MachineValueUse,
+    reservation_range: CertifiedNormalizedStackRange,
+    reservation: CertifiedStackPointerAssignment,
+    assignments: Box<[CertifiedStackPointerAssignment]>,
+    private_regions: Box<[CertifiedPrivateStackRegion]>,
+    releases: Box<[CertifiedStackRelease]>,
+}
+
+impl CertifiedStackDiscipline {
+    pub const fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    pub const fn origin(&self) -> &CertifiedArtifactOrigin {
+        &self.origin
+    }
+
+    pub const fn stack_pointer_storage(&self) -> CanonicalStorageId {
+        self.stack_pointer_storage
+    }
+
+    pub const fn entry_stack_pointer(&self) -> &MachineValueUse {
+        &self.entry_stack_pointer
+    }
+
+    pub const fn reservation_range(&self) -> CertifiedNormalizedStackRange {
+        self.reservation_range
+    }
+
+    pub const fn reservation(&self) -> &CertifiedStackPointerAssignment {
+        &self.reservation
+    }
+
+    pub const fn assignments(&self) -> &[CertifiedStackPointerAssignment] {
+        &self.assignments
+    }
+
+    pub const fn private_regions(&self) -> &[CertifiedPrivateStackRegion] {
+        &self.private_regions
+    }
+
+    pub const fn releases(&self) -> &[CertifiedStackRelease] {
+        &self.releases
+    }
+}
+
 /// Sealed proof that one exact source-declared frame-pointer carrier is saved
 /// to a private normalized stack interval and restored on every return.
 ///
@@ -7058,6 +7239,19 @@ fn frame_ranges_overlap(
             .iter()
             .any(|right| left.0 < right.1 && right.0 < left.1)
     })
+}
+
+fn frame_range_contains(
+    outer: CertifiedNormalizedStackRange,
+    inner: CertifiedNormalizedStackRange,
+) -> bool {
+    let (Some(outer_end), Some(inner_end)) = (
+        outer.offset.checked_add(i64::from(outer.size_bytes)),
+        inner.offset.checked_add(i64::from(inner.size_bytes)),
+    ) else {
+        return false;
+    };
+    outer.offset <= inner.offset && inner_end <= outer_end
 }
 
 fn frame_instruction_dominates(artifact: &SsaArtifact, left: InstId, right: InstId) -> bool {
@@ -7461,6 +7655,35 @@ fn frame_affine_register_assignment_matches(
     })
 }
 
+fn stack_pointer_assignment_for_inst(
+    artifact: &SsaArtifact,
+    projection: &MachineProjection,
+    inst: InstId,
+    entry_stack_pointer: ValueId,
+    stack_pointer_storage: CanonicalStorageId,
+    width_bits: u32,
+    affine: &mut BTreeMap<ValueId, Option<FrameAffine>>,
+) -> Option<CertifiedStackPointerAssignment> {
+    let assignment = frame_affine_register_assignment_for_inst(
+        artifact,
+        projection,
+        inst,
+        entry_stack_pointer,
+        stack_pointer_storage,
+        stack_pointer_storage,
+        width_bits,
+        affine,
+    )?;
+    Some(CertifiedStackPointerAssignment {
+        producer: assignment.producer,
+        root: assignment.root,
+        input: assignment.input,
+        output: assignment.output,
+        storage: assignment.storage,
+        normalized_affine_relation: assignment.normalized_affine_relation?,
+    })
+}
+
 fn frame_copy_for_inst(
     artifact: &SsaArtifact,
     projection: &MachineProjection,
@@ -7693,6 +7916,10 @@ fn frame_evidence_from_certified_parts(
     let interface = artifact.machine_context().function_interface()?;
     let frame_pointer_storage = interface.exact_frame_pointer_storage()?;
     let stack_pointer_storage = interface.stack_pointer_storage()?;
+    let stack_allocation_contract = interface.stack_allocation_contract()?;
+    if stack_allocation_contract.growth() != SourceStackGrowth::LowerAddresses {
+        return None;
+    }
     let width_bits = frame_pointer_storage.size.checked_mul(8)?;
     if width_bits == 0
         || width_bits > 64
@@ -7977,7 +8204,10 @@ fn frame_evidence_from_certified_parts(
     else {
         return None;
     };
-    if saved_range.offset < *allocation_offset
+    let allocation_size = u32::try_from(allocation_offset.checked_neg()?).ok()?;
+    if !stack_allocation_contract
+        .owns_entry_relative_reservation(*allocation_offset, allocation_size)
+        || saved_range.offset < *allocation_offset
         || saved_end > 0
         || !frame_value_descends_from(
             artifact,
@@ -8270,12 +8500,524 @@ fn frame_evidence_from_certified_parts(
     })
 }
 
+#[derive(Debug, Clone)]
+struct StackAssignmentEvidence {
+    inst: InstId,
+    offset: i64,
+    assignment: CertifiedStackPointerAssignment,
+}
+
+#[derive(Debug, Clone)]
+struct StackDisciplineEvidence {
+    stack_pointer_storage: CanonicalStorageId,
+    entry_stack_pointer: MachineValueUse,
+    reservation_range: CertifiedNormalizedStackRange,
+    reservation: CertifiedStackPointerAssignment,
+    assignments: Vec<CertifiedStackPointerAssignment>,
+    private_regions: Vec<CertifiedPrivateStackRegion>,
+    releases: Vec<CertifiedStackRelease>,
+}
+
+fn stack_discipline_evidence_from_certified_parts(
+    artifact: &SsaArtifact,
+    projection: &MachineProjection,
+    topology: &CertifiedSourceTopology,
+    memory_statements: &BTreeMap<CanonicalInstructionId, CertifiedMemoryStatement>,
+    return_controls: &BTreeMap<CanonicalInstructionId, CertifiedReturnControl>,
+) -> Option<StackDisciplineEvidence> {
+    let interface = artifact.machine_context().function_interface()?;
+    let stack_pointer_storage = interface.stack_pointer_storage()?;
+    let stack_allocation_contract = interface.stack_allocation_contract()?;
+    let width_bits = stack_pointer_storage.size.checked_mul(8)?;
+    if width_bits == 0 || width_bits > 64 || !frame_topology_is_balanced(topology) {
+        return None;
+    }
+    let graph = artifact.graph();
+    if !graph.block(graph.entry)?.predecessors.is_empty()
+        || artifact
+            .obligations()
+            .instructions()
+            .values()
+            .any(|instruction| instruction.state == SemanticInstructionState::UnsupportedUnknown)
+        || artifact
+            .obligations()
+            .obligations()
+            .values()
+            .any(|obligation| obligation.id.kind == SemanticObligationKind::VolatileOrUnknownEffect)
+        || graph.insts.iter().any(|inst| {
+            matches!(
+                inst.payload,
+                InstPayload::Op(
+                    SSAOp::Call { .. }
+                        | SSAOp::CallInd { .. }
+                        | SSAOp::CallOther { .. }
+                        | SSAOp::LoadLinked { .. }
+                        | SSAOp::StoreConditional { .. }
+                        | SSAOp::AtomicCAS { .. }
+                        | SSAOp::LoadGuarded { .. }
+                        | SSAOp::StoreGuarded { .. }
+                        | SSAOp::Fence { .. }
+                )
+            )
+        })
+    {
+        return None;
+    }
+    let entry_values = graph
+        .values
+        .iter()
+        .filter(|value| {
+            value.canonical_storage == Some(stack_pointer_storage)
+                && graph.def_inst(value.id).is_none()
+        })
+        .map(|value| value.id)
+        .collect::<Vec<_>>();
+    let [entry_stack_pointer_value] = entry_values.as_slice() else {
+        return None;
+    };
+    let entry_stack_pointer_value = *entry_stack_pointer_value;
+    let entry_stack_pointer =
+        MachineValueUse::from_artifact(artifact, entry_stack_pointer_value).ok()?;
+    if graph.values.iter().any(|value| {
+        value.canonical_storage.is_some_and(|storage| {
+            certified_register_storages_overlap(storage, stack_pointer_storage)
+                && storage != stack_pointer_storage
+        })
+    }) {
+        return None;
+    }
+
+    let mut affine = BTreeMap::new();
+    let mut assignment_evidence = Vec::new();
+    for inst in &graph.insts {
+        if inst.canonical_storage != Some(stack_pointer_storage) {
+            continue;
+        }
+        let output = inst.output?;
+        let offset = frame_affine_value(
+            artifact,
+            output,
+            entry_stack_pointer_value,
+            width_bits,
+            &mut affine,
+            &mut BTreeSet::new(),
+        )?
+        .signed_offset()?;
+        assignment_evidence.push(StackAssignmentEvidence {
+            inst: inst.id,
+            offset,
+            assignment: stack_pointer_assignment_for_inst(
+                artifact,
+                projection,
+                inst.id,
+                entry_stack_pointer_value,
+                stack_pointer_storage,
+                width_bits,
+                &mut affine,
+            )?,
+        });
+    }
+    let reservations = assignment_evidence
+        .iter()
+        .filter(|assignment| match stack_allocation_contract.growth() {
+            SourceStackGrowth::LowerAddresses => assignment.offset < 0,
+            SourceStackGrowth::HigherAddresses => assignment.offset > 0,
+        })
+        .collect::<Vec<_>>();
+    let [reservation] = reservations.as_slice() else {
+        return None;
+    };
+    let (reservation_offset, reservation_size_i64) = match stack_allocation_contract.growth() {
+        SourceStackGrowth::LowerAddresses => {
+            (reservation.offset, reservation.offset.checked_neg()?)
+        }
+        SourceStackGrowth::HigherAddresses => (0, reservation.offset),
+    };
+    let reservation_size = u32::try_from(reservation_size_i64).ok()?;
+    let reservation_range = CertifiedNormalizedStackRange {
+        offset: reservation_offset,
+        size_bytes: reservation_size,
+    };
+    if !stack_allocation_contract
+        .owns_entry_relative_reservation(reservation_range.offset, reservation_range.size_bytes)
+    {
+        return None;
+    }
+
+    let return_blocks = topology
+        .blocks()
+        .iter()
+        .filter(|block| matches!(block.terminator(), CertifiedSourceTerminator::Return))
+        .count();
+    if return_controls.len() != return_blocks || return_controls.is_empty() {
+        return None;
+    }
+    let mechanism = interface.return_mechanism();
+    let expected_exit_offset = mechanism
+        .map(|mechanism| i64::from(mechanism.stack_pointer_delta_bytes()))
+        .unwrap_or(0);
+    let mut used_assignments = BTreeSet::from([reservation.inst]);
+    let mut release_evidence = Vec::new();
+    let mut sealed_return_reads = BTreeSet::new();
+    for control in return_controls.values() {
+        let return_inst = artifact
+            .obligations()
+            .instructions()
+            .get(&control.producer())?
+            .source
+            .graph_inst()?;
+        if std::iter::once(control.control_target())
+            .chain(control.values().iter().map(CertifiedReturnValue::value))
+            .chain(
+                control
+                    .register_compositions()
+                    .iter()
+                    .flat_map(CertifiedReturnRegisterComposition::ordered_values),
+            )
+            .any(|value| {
+                frame_affine_value(
+                    artifact,
+                    value.binding().value(),
+                    entry_stack_pointer_value,
+                    width_bits,
+                    &mut affine,
+                    &mut BTreeSet::new(),
+                )
+                .is_some()
+            })
+        {
+            return None;
+        }
+        let CertifiedExitStackPointer::ReachingValue { storage, value } =
+            control.exit_stack_pointer()
+        else {
+            return None;
+        };
+        if *storage != stack_pointer_storage {
+            return None;
+        }
+        let exit_assignments = assignment_evidence
+            .iter()
+            .filter(|assignment| {
+                assignment.assignment.output().value() == value.binding().value()
+                    && assignment.offset == expected_exit_offset
+                    && frame_instruction_dominates(artifact, assignment.inst, return_inst)
+            })
+            .collect::<Vec<_>>();
+        let [exit_assignment] = exit_assignments.as_slice() else {
+            return None;
+        };
+        let return_address_read = if mechanism.is_some() {
+            let read = frame_stacked_return_read(
+                artifact,
+                control,
+                return_inst,
+                memory_statements,
+                entry_stack_pointer_value,
+                stack_pointer_storage,
+                width_bits,
+                expected_exit_offset,
+                &mut affine,
+            )?;
+            sealed_return_reads.insert(read.producer());
+            Some(read)
+        } else {
+            None
+        };
+        let restorations = assignment_evidence
+            .iter()
+            .filter(|assignment| {
+                assignment.offset == 0
+                    && frame_instruction_dominates(artifact, reservation.inst, assignment.inst)
+                    && frame_instruction_dominates(artifact, assignment.inst, return_inst)
+                    && return_address_read.as_ref().is_none_or(|read| {
+                        frame_instruction_dominates(artifact, assignment.inst, read.access().inst)
+                            && frame_instruction_dominates(
+                                artifact,
+                                read.access().inst,
+                                exit_assignment.inst,
+                            )
+                    })
+            })
+            .collect::<Vec<_>>();
+        let [restoration] = restorations.as_slice() else {
+            return None;
+        };
+        used_assignments.insert(restoration.inst);
+        used_assignments.insert(exit_assignment.inst);
+        release_evidence.push((
+            return_inst,
+            restoration.inst,
+            CertifiedStackRelease {
+                return_control: control.clone(),
+                restoration: restoration.assignment.clone(),
+                post_restoration: (exit_assignment.inst != restoration.inst)
+                    .then(|| exit_assignment.assignment.clone()),
+                return_address_read,
+            },
+        ));
+    }
+    if used_assignments
+        != assignment_evidence
+            .iter()
+            .map(|assignment| assignment.inst)
+            .collect()
+    {
+        return None;
+    }
+
+    let graph_memory_instructions = graph
+        .insts
+        .iter()
+        .filter_map(|inst| {
+            matches!(
+                inst.payload,
+                InstPayload::Op(SSAOp::Load { .. } | SSAOp::Store { .. })
+            )
+            .then_some(inst.id)
+        })
+        .collect::<BTreeSet<_>>();
+    let certified_memory_instructions = memory_statements
+        .values()
+        .map(|statement| statement.access().inst)
+        .collect::<BTreeSet<_>>();
+    let source_memory_obligations = artifact
+        .obligations()
+        .obligations()
+        .values()
+        .filter(|obligation| {
+            matches!(
+                obligation.id.kind,
+                SemanticObligationKind::ObservableMemoryRead
+                    | SemanticObligationKind::ObservableMemoryWrite
+            )
+        })
+        .map(|obligation| obligation.id)
+        .collect::<BTreeSet<_>>();
+    let certified_memory_obligations = memory_statements
+        .values()
+        .flat_map(|statement| statement.source_obligations().iter().copied())
+        .collect::<BTreeSet<_>>();
+    if graph_memory_instructions != certified_memory_instructions
+        || source_memory_obligations != certified_memory_obligations
+        || memory_statements.len() != graph_memory_instructions.len()
+        || memory_statements.len() != source_memory_obligations.len()
+    {
+        return None;
+    }
+
+    let mut stack_regions = BTreeMap::<
+        CertifiedNormalizedStackRange,
+        (BTreeSet<ObjectId>, Vec<CertifiedPrivateStackAccess>),
+    >::new();
+    for statement in memory_statements.values() {
+        if sealed_return_reads.contains(&statement.producer()) {
+            continue;
+        }
+        let normalized = frame_normalized_range(
+            artifact,
+            statement,
+            entry_stack_pointer_value,
+            width_bits,
+            &mut affine,
+        );
+        let Some(range) = normalized else {
+            if matches!(
+                artifact.objects().objects.get(&statement.object()),
+                Some(object) if matches!(object.kind, ObjectKind::Global { .. })
+            ) {
+                continue;
+            }
+            return None;
+        };
+        if statement.space() != MachineAddressSpace::Ram
+            || statement.word_size_bytes() != 1
+            || !frame_range_contains(reservation_range, range)
+            || !frame_value_descends_from(
+                artifact,
+                statement.address().binding().value(),
+                reservation.assignment.output().value(),
+                &mut BTreeSet::new(),
+            )
+            || !frame_instruction_dominates(artifact, reservation.inst, statement.access().inst)
+            || !matches!(
+                artifact.objects().objects.get(&statement.object()),
+                Some(object) if matches!(
+                    object.kind,
+                    ObjectKind::StackSlot { space: r2il::SpaceId::Ram, .. }
+                        | ObjectKind::FrameObject { space: r2il::SpaceId::Ram, .. }
+                )
+            )
+        {
+            return None;
+        }
+        for (return_inst, restoration_inst, _) in &release_evidence {
+            if frame_instruction_can_reach(artifact, statement.access().inst, *return_inst)
+                && (!frame_instruction_can_reach(
+                    artifact,
+                    statement.access().inst,
+                    *restoration_inst,
+                ) || frame_instruction_can_reach(
+                    artifact,
+                    *restoration_inst,
+                    statement.access().inst,
+                ))
+            {
+                return None;
+            }
+        }
+        let region = stack_regions.entry(range).or_default();
+        region.0.insert(statement.object());
+        region.1.push(CertifiedPrivateStackAccess {
+            statement: statement.clone(),
+            range,
+        });
+    }
+    if stack_regions.is_empty() {
+        return None;
+    }
+    let ranges = stack_regions.keys().copied().collect::<Vec<_>>();
+    for (index, range) in ranges.iter().enumerate() {
+        if ranges[index + 1..]
+            .iter()
+            .any(|other| frame_ranges_overlap(*range, *other, width_bits))
+        {
+            return None;
+        }
+    }
+    let private_regions = stack_regions
+        .into_iter()
+        .map(
+            |(accessed_range, (objects, accesses))| CertifiedPrivateStackRegion {
+                objects: objects.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+                accessed_range,
+                accesses: accesses.into_boxed_slice(),
+            },
+        )
+        .collect();
+
+    for value in &graph.values {
+        if frame_affine_value(
+            artifact,
+            value.id,
+            entry_stack_pointer_value,
+            width_bits,
+            &mut affine,
+            &mut BTreeSet::new(),
+        )
+        .is_none()
+        {
+            continue;
+        }
+        for use_site in graph.use_sites(value.id) {
+            let consumer = graph.inst(use_site.inst)?;
+            let allowed = match &consumer.payload {
+                InstPayload::Op(SSAOp::Load { .. } | SSAOp::Store { .. }) => {
+                    use_site.input_idx == 0
+                }
+                InstPayload::Op(
+                    SSAOp::Copy { .. } | SSAOp::IntAdd { .. } | SSAOp::IntSub { .. },
+                )
+                | InstPayload::Phi { .. } => consumer.output.is_some_and(|output| {
+                    frame_affine_value(
+                        artifact,
+                        output,
+                        entry_stack_pointer_value,
+                        width_bits,
+                        &mut affine,
+                        &mut BTreeSet::new(),
+                    )
+                    .is_some()
+                }),
+                _ => false,
+            };
+            if !allowed {
+                return None;
+            }
+        }
+    }
+
+    Some(StackDisciplineEvidence {
+        stack_pointer_storage,
+        entry_stack_pointer,
+        reservation_range,
+        reservation: reservation.assignment.clone(),
+        assignments: assignment_evidence
+            .into_iter()
+            .map(|assignment| assignment.assignment)
+            .collect(),
+        private_regions,
+        releases: release_evidence
+            .into_iter()
+            .map(|(_, _, release)| release)
+            .collect(),
+    })
+}
+
+#[derive(Clone, Copy)]
 struct FrameCertifiedParts<'a> {
     projection: &'a MachineProjection,
     topology: &'a CertifiedSourceTopology,
     expressions: &'a BTreeMap<CanonicalInstructionId, CertifiedExpr>,
     memory_statements: &'a BTreeMap<CanonicalInstructionId, CertifiedMemoryStatement>,
     return_controls: &'a BTreeMap<CanonicalInstructionId, CertifiedReturnControl>,
+}
+
+fn certified_stack_discipline(
+    artifact: &SsaArtifact,
+    origin: &CertifiedArtifactOrigin,
+    parts: FrameCertifiedParts<'_>,
+    ledger: &ObligationLedger,
+) -> Option<CertifiedStackDiscipline> {
+    if !origin.is_valid() || !ledger.matches_origin(origin) {
+        return None;
+    }
+    let evidence = stack_discipline_evidence_from_certified_parts(
+        artifact,
+        parts.projection,
+        parts.topology,
+        parts.memory_statements,
+        parts.return_controls,
+    )?;
+    let no_obligations = BTreeSet::new();
+    if evidence.assignments.iter().any(|assignment| {
+        !frame_mechanical_producer_is_accounted(
+            artifact,
+            parts.projection,
+            FrameMechanicalWitness {
+                producer: assignment.producer,
+                root: assignment.root,
+                output: assignment.output,
+            },
+            &no_obligations,
+            parts.expressions,
+            ledger,
+        )
+    }) || evidence.private_regions.iter().any(|region| {
+        region
+            .accesses
+            .iter()
+            .any(|access| !frame_statement_is_ledgered(&access.statement, ledger))
+    }) || evidence.releases.iter().any(|release| {
+        !frame_return_is_ledgered(&release.return_control, ledger)
+            || release
+                .return_address_read
+                .as_ref()
+                .is_some_and(|statement| !frame_statement_is_ledgered(statement, ledger))
+    }) {
+        return None;
+    }
+    Some(CertifiedStackDiscipline {
+        schema_version: CERTIFICATION_SCHEMA_VERSION,
+        origin: origin.clone(),
+        stack_pointer_storage: evidence.stack_pointer_storage,
+        entry_stack_pointer: evidence.entry_stack_pointer,
+        reservation_range: evidence.reservation_range,
+        reservation: evidence.reservation,
+        assignments: evidence.assignments.into_boxed_slice(),
+        private_regions: evidence.private_regions.into_boxed_slice(),
+        releases: evidence.releases.into_boxed_slice(),
+    })
 }
 
 fn certified_frame_preservation(
@@ -8409,6 +9151,7 @@ pub struct CertifiedMachineFunction {
     closed_natural_loop_controls: BTreeMap<u64, CertifiedClosedNaturalLoopControl>,
     switch_topologies: BTreeMap<u64, CertifiedSwitchTopology>,
     switch_controls: BTreeMap<u64, CertifiedSwitchControl>,
+    stack_discipline: Option<CertifiedStackDiscipline>,
     frame_preservation: Option<CertifiedFramePreservation>,
     topology: CertifiedSourceTopology,
 }
@@ -8684,16 +9427,19 @@ impl CertifiedMachineFunction {
             }
         }
 
+        let certified_parts = FrameCertifiedParts {
+            projection: &projection,
+            topology: &topology,
+            expressions: &expressions,
+            memory_statements: &memory_statements,
+            return_controls: &return_controls,
+        };
+        let stack_discipline =
+            certified_stack_discipline(artifact, &origin, certified_parts, certification.ledger());
         let frame_preservation = certified_frame_preservation(
             artifact,
             &origin,
-            FrameCertifiedParts {
-                projection: &projection,
-                topology: &topology,
-                expressions: &expressions,
-                memory_statements: &memory_statements,
-                return_controls: &return_controls,
-            },
+            certified_parts,
             certification.ledger(),
         );
         Ok(Self {
@@ -8714,6 +9460,7 @@ impl CertifiedMachineFunction {
             closed_natural_loop_controls,
             switch_topologies,
             switch_controls,
+            stack_discipline,
             frame_preservation,
             topology,
         })
@@ -8741,6 +9488,10 @@ impl CertifiedMachineFunction {
 
     pub const fn frame_preservation(&self) -> Option<&CertifiedFramePreservation> {
         self.frame_preservation.as_ref()
+    }
+
+    pub const fn stack_discipline(&self) -> Option<&CertifiedStackDiscipline> {
+        self.stack_discipline.as_ref()
     }
 
     pub fn source(&self) -> &SemanticObligationInventory {
@@ -8873,6 +9624,7 @@ pub struct CertifiedMachineProjection {
     closed_natural_loop_controls: BTreeMap<u64, CertifiedClosedNaturalLoopControl>,
     switch_topologies: BTreeMap<u64, CertifiedSwitchTopology>,
     switch_controls: BTreeMap<u64, CertifiedSwitchControl>,
+    stack_discipline: Option<CertifiedStackDiscipline>,
     frame_preservation: Option<CertifiedFramePreservation>,
     residual_producers: BTreeSet<CanonicalInstructionId>,
     topology: CertifiedSourceTopology,
@@ -9378,16 +10130,19 @@ impl CertifiedMachineProjection {
             }
         }
 
+        let certified_parts = FrameCertifiedParts {
+            projection: &projection,
+            topology: &topology,
+            expressions: &expressions,
+            memory_statements: &memory_statements,
+            return_controls: &return_controls,
+        };
+        let stack_discipline =
+            certified_stack_discipline(artifact, &origin, certified_parts, certification.ledger());
         let frame_preservation = certified_frame_preservation(
             artifact,
             &origin,
-            FrameCertifiedParts {
-                projection: &projection,
-                topology: &topology,
-                expressions: &expressions,
-                memory_statements: &memory_statements,
-                return_controls: &return_controls,
-            },
+            certified_parts,
             certification.ledger(),
         );
         Ok(Self {
@@ -9408,6 +10163,7 @@ impl CertifiedMachineProjection {
             closed_natural_loop_controls,
             switch_topologies,
             switch_controls,
+            stack_discipline,
             frame_preservation,
             residual_producers,
             topology,
@@ -9436,6 +10192,10 @@ impl CertifiedMachineProjection {
 
     pub const fn frame_preservation(&self) -> Option<&CertifiedFramePreservation> {
         self.frame_preservation.as_ref()
+    }
+
+    pub const fn stack_discipline(&self) -> Option<&CertifiedStackDiscipline> {
+        self.stack_discipline.as_ref()
     }
 
     pub fn source(&self) -> &SemanticObligationInventory {
@@ -10153,6 +10913,8 @@ mod tests {
     #[derive(Debug, Clone, Copy)]
     enum FrameMutation {
         None,
+        MissingAllocationContract,
+        OppositeAllocationContract,
         ExplicitNoSlots,
         ComposedReturn,
         MissingExplicitNoSlots,
@@ -10194,6 +10956,255 @@ mod tests {
         StackedPartialOverlappingStore,
         StackedUnknownPointerStore,
         StackedAtomic,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum StackDisciplineMutation {
+        None,
+        HigherAddresses,
+        MissingAllocationContract,
+        OppositeAllocationContract,
+        MissingReservation,
+        WrongReservation,
+        MissingRestoration,
+        WrongRestoration,
+        PartialStackPointerWrite,
+        ExtraStackPointerWrite,
+        OutOfEnvelopeAccess,
+        StackPointerEscape,
+        Call,
+        UnknownEffect,
+        EntryReturnAddressOverlap,
+        AccessBeforeReservation,
+        AccessAfterRestoration,
+    }
+
+    fn frameless_stack_artifact(mutation: StackDisciplineMutation) -> SsaArtifact {
+        let upward = matches!(mutation, StackDisciplineMutation::HigherAddresses);
+        let sp = Varnode::register(0, 8);
+        let ra = Varnode::register(8, 8);
+        let first_address = Varnode::unique(0x100, 8);
+        let second_address = Varnode::unique(0x108, 8);
+        let loaded = Varnode::unique(0x110, 4);
+        let release = Varnode::unique(0x118, 8);
+        let mut block = R2ILBlock::new(0x3600, 4);
+        if matches!(mutation, StackDisciplineMutation::AccessBeforeReservation) {
+            block.push(R2ILOp::IntSub {
+                dst: Varnode::unique(0x130, 8),
+                a: sp.clone(),
+                b: Varnode::constant(8, 8),
+            });
+            block.push(R2ILOp::Store {
+                space: SpaceId::Ram,
+                addr: Varnode::unique(0x130, 8),
+                val: Varnode::constant(0, 4),
+            });
+        }
+        if !matches!(mutation, StackDisciplineMutation::MissingReservation) {
+            let amount = Varnode::constant(
+                if matches!(mutation, StackDisciplineMutation::WrongReservation) {
+                    8
+                } else {
+                    16
+                },
+                8,
+            );
+            block.push(if upward {
+                R2ILOp::IntAdd {
+                    dst: sp.clone(),
+                    a: sp.clone(),
+                    b: amount,
+                }
+            } else {
+                R2ILOp::IntSub {
+                    dst: sp.clone(),
+                    a: sp.clone(),
+                    b: amount,
+                }
+            });
+        }
+        let first_delta = Varnode::constant(
+            if matches!(mutation, StackDisciplineMutation::OutOfEnvelopeAccess) {
+                20
+            } else {
+                8
+            },
+            8,
+        );
+        block.push(if upward {
+            R2ILOp::IntSub {
+                dst: first_address.clone(),
+                a: sp.clone(),
+                b: first_delta,
+            }
+        } else {
+            R2ILOp::IntAdd {
+                dst: first_address.clone(),
+                a: sp.clone(),
+                b: first_delta,
+            }
+        });
+        block.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: first_address.clone(),
+            val: Varnode::constant(0x1122_3344, 4),
+        });
+        block.push(R2ILOp::Load {
+            dst: loaded.clone(),
+            space: SpaceId::Ram,
+            addr: first_address,
+        });
+        block.push(if upward {
+            R2ILOp::IntSub {
+                dst: second_address.clone(),
+                a: sp.clone(),
+                b: Varnode::constant(4, 8),
+            }
+        } else {
+            R2ILOp::IntAdd {
+                dst: second_address.clone(),
+                a: sp.clone(),
+                b: Varnode::constant(12, 8),
+            }
+        });
+        block.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: second_address.clone(),
+            val: loaded,
+        });
+        block.push(R2ILOp::Load {
+            dst: Varnode::unique(0x120, 4),
+            space: SpaceId::Ram,
+            addr: second_address,
+        });
+        match mutation {
+            StackDisciplineMutation::PartialStackPointerWrite => block.push(R2ILOp::Copy {
+                dst: Varnode::register(0, 4),
+                src: Varnode::constant(0, 4),
+            }),
+            StackDisciplineMutation::StackPointerEscape => block.push(R2ILOp::Store {
+                space: SpaceId::Ram,
+                addr: Varnode::constant(0x8800, 8),
+                val: sp.clone(),
+            }),
+            StackDisciplineMutation::Call => block.push(R2ILOp::Call {
+                target: Varnode::ram(0x4400, 8),
+            }),
+            StackDisciplineMutation::UnknownEffect => block.push(R2ILOp::CallOther {
+                output: None,
+                userop: 7,
+                inputs: vec![],
+            }),
+            StackDisciplineMutation::EntryReturnAddressOverlap => {
+                block.push(R2ILOp::IntAdd {
+                    dst: Varnode::unique(0x128, 8),
+                    a: sp.clone(),
+                    b: Varnode::constant(16, 8),
+                });
+                block.push(R2ILOp::Store {
+                    space: SpaceId::Ram,
+                    addr: Varnode::unique(0x128, 8),
+                    val: Varnode::constant(0, 8),
+                });
+            }
+            StackDisciplineMutation::None
+            | StackDisciplineMutation::HigherAddresses
+            | StackDisciplineMutation::MissingAllocationContract
+            | StackDisciplineMutation::OppositeAllocationContract
+            | StackDisciplineMutation::MissingReservation
+            | StackDisciplineMutation::WrongReservation
+            | StackDisciplineMutation::MissingRestoration
+            | StackDisciplineMutation::WrongRestoration
+            | StackDisciplineMutation::ExtraStackPointerWrite
+            | StackDisciplineMutation::OutOfEnvelopeAccess
+            | StackDisciplineMutation::AccessBeforeReservation
+            | StackDisciplineMutation::AccessAfterRestoration => {}
+        }
+        if !matches!(mutation, StackDisciplineMutation::MissingRestoration) {
+            let amount = Varnode::constant(
+                if matches!(mutation, StackDisciplineMutation::WrongRestoration) {
+                    8
+                } else {
+                    16
+                },
+                8,
+            );
+            block.push(if upward {
+                R2ILOp::IntSub {
+                    dst: release.clone(),
+                    a: sp.clone(),
+                    b: amount,
+                }
+            } else {
+                R2ILOp::IntAdd {
+                    dst: release.clone(),
+                    a: sp.clone(),
+                    b: amount,
+                }
+            });
+            block.push(R2ILOp::Copy {
+                dst: sp.clone(),
+                src: release,
+            });
+        }
+        if matches!(mutation, StackDisciplineMutation::AccessAfterRestoration) {
+            block.push(R2ILOp::IntSub {
+                dst: Varnode::unique(0x138, 8),
+                a: sp.clone(),
+                b: Varnode::constant(8, 8),
+            });
+            block.push(R2ILOp::Store {
+                space: SpaceId::Ram,
+                addr: Varnode::unique(0x138, 8),
+                val: Varnode::constant(0, 4),
+            });
+        }
+        if matches!(mutation, StackDisciplineMutation::ExtraStackPointerWrite) {
+            block.push(R2ILOp::Copy {
+                dst: sp.clone(),
+                src: sp.clone(),
+            });
+        }
+        block.push(R2ILOp::Return { target: ra.clone() });
+
+        let mut arch = ArchSpec::new("arm64-frameless-stack-test");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("sp", 0, 8));
+        arch.add_register(RegisterDef::new("x30", 8, 8));
+        arch.add_space(AddressSpace::ram(8));
+        let storage = |offset| CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let interface = SourceFunctionInterface::new_exact(
+            b"arm64-frameless-stack-revision-1".to_vec(),
+            "test-arm64-abi",
+            [],
+            SourceFunctionReturn::Void,
+            [],
+        )
+        .and_then(|interface| interface.with_return_address_storage(storage(8)))
+        .and_then(|interface| interface.with_stack_pointer_storage(storage(0)))
+        .expect("exact frameless stack interface");
+        let interface = if matches!(mutation, StackDisciplineMutation::MissingAllocationContract) {
+            interface
+        } else {
+            let growth = if upward
+                || matches!(
+                    mutation,
+                    StackDisciplineMutation::OppositeAllocationContract
+                ) {
+                SourceStackGrowth::HigherAddresses
+            } else {
+                SourceStackGrowth::LowerAddresses
+            };
+            interface
+                .with_stack_allocation_contract(SourceStackAllocationContract::new(growth))
+                .expect("exact frameless stack allocation contract")
+        };
+        SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface)
+            .expect("frameless stack artifact")
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -10334,6 +11345,8 @@ mod tests {
                 src: Varnode::constant(0, 4),
             }),
             FrameMutation::None
+            | FrameMutation::MissingAllocationContract
+            | FrameMutation::OppositeAllocationContract
             | FrameMutation::ExplicitNoSlots
             | FrameMutation::ComposedReturn
             | FrameMutation::MissingExplicitNoSlots
@@ -10617,6 +11630,19 @@ mod tests {
         .and_then(|interface| interface.with_return_address_storage(storage(16)))
         .and_then(|interface| interface.with_stack_pointer_storage(storage(8)))
         .expect("exact preserved-frame interface");
+        let interface = if matches!(mutation, FrameMutation::MissingAllocationContract) {
+            interface
+        } else {
+            interface
+                .with_stack_allocation_contract(SourceStackAllocationContract::new(
+                    if matches!(mutation, FrameMutation::OppositeAllocationContract) {
+                        SourceStackGrowth::HigherAddresses
+                    } else {
+                        SourceStackGrowth::LowerAddresses
+                    },
+                ))
+                .expect("exact preserved-frame stack allocation contract")
+        };
         let interface = if matches!(mutation, FrameMutation::ExplicitNoSlots) {
             interface
                 .with_frame_pointer_storage(storage(0))
@@ -10753,6 +11779,11 @@ mod tests {
         )
         .and_then(|interface| interface.with_return_address_storage(storage(16)))
         .and_then(|interface| interface.with_stack_pointer_storage(storage(8)))
+        .and_then(|interface| {
+            interface.with_stack_allocation_contract(SourceStackAllocationContract::new(
+                SourceStackGrowth::LowerAddresses,
+            ))
+        })
         .and_then(|interface| interface.with_exact_stacked_return(0, 8, 8, 8))
         .expect("exact two-return frame interface");
         SsaArtifact::for_decompile_with_interface(
@@ -10791,6 +11822,128 @@ mod tests {
             &expressions,
             &memory,
             &returns,
+        )
+    }
+
+    fn frameless_stack_evidence(artifact: &SsaArtifact) -> Option<StackDisciplineEvidence> {
+        let projection = MachineProjection::from_artifact(artifact).ok()?;
+        let topology = certified_source_topology(artifact).ok()?;
+        let memory = certified_memory_statements(artifact).ok()?;
+        let returns = certified_return_controls(artifact, &topology).ok()?;
+        stack_discipline_evidence_from_certified_parts(
+            artifact,
+            &projection,
+            &topology,
+            &memory,
+            &returns,
+        )
+    }
+
+    fn frameless_stack_evidence_with_missing_memory_statement(
+        artifact: &SsaArtifact,
+    ) -> Option<StackDisciplineEvidence> {
+        let projection = MachineProjection::from_artifact(artifact).ok()?;
+        let topology = certified_source_topology(artifact).ok()?;
+        let mut memory = certified_memory_statements(artifact).ok()?;
+        let first = *memory.keys().next()?;
+        memory.remove(&first);
+        let returns = certified_return_controls(artifact, &topology).ok()?;
+        stack_discipline_evidence_from_certified_parts(
+            artifact,
+            &projection,
+            &topology,
+            &memory,
+            &returns,
+        )
+    }
+
+    #[derive(Clone, Copy)]
+    enum StackAuthorityMutation {
+        None,
+        OriginSchema,
+        OriginAuthority,
+        LedgerAuthority,
+    }
+
+    fn certified_frameless_stack(
+        authority_mutation: StackAuthorityMutation,
+    ) -> Option<CertifiedStackDiscipline> {
+        let artifact = frameless_stack_artifact(StackDisciplineMutation::None);
+        let projection = MachineProjection::from_artifact(&artifact).ok()?;
+        let machine_context = CertifiedMachineContext::from_artifact(&artifact).ok()?;
+        let topology = certified_source_topology(&artifact).ok()?;
+        let memory = certified_memory_statements(&artifact).ok()?;
+        let returns = certified_return_controls(&artifact, &topology).ok()?;
+        let mut expressions = BTreeMap::new();
+        for entity in projection.entities() {
+            let source_obligations = entity
+                .source_obligations()
+                .iter()
+                .copied()
+                .filter(|id| id.kind == SemanticObligationKind::LiveValueProducer)
+                .collect::<BTreeSet<_>>();
+            if source_obligations.is_empty() {
+                continue;
+            }
+            let expression =
+                certified_expr_from_projection(&artifact, &projection, entity, source_obligations)
+                    .ok()?;
+            expressions.insert(entity.producer(), expression);
+        }
+        let mut origin = CertifiedArtifactOrigin {
+            schema_version: CERTIFICATION_SCHEMA_VERSION,
+            lift_provenance_schema_version: GENUINE_LIFT_PROVENANCE_SCHEMA_VERSION,
+            lift_manifest_hash: 1,
+            authority: CertifiedAuthoritySeal::new(),
+            graph_snapshot: vec![1].into_boxed_slice(),
+            prepare_mode: artifact.mode().into(),
+            decompile_preparation: None,
+            assumptions: artifact.facts().assumptions.clone(),
+            machine_context,
+            source: artifact.obligations().clone(),
+            topology: topology.clone(),
+        };
+        let mut certification = CertifiedFunction::bound(origin.source().clone(), &origin).ok()?;
+        for control in returns.values() {
+            certification.record_absorbed_return(control.clone()).ok()?;
+        }
+        for statement in memory.values() {
+            for obligation in statement.source_obligations() {
+                certification
+                    .record_absorbed_statement(*obligation, statement.clone())
+                    .ok()?;
+            }
+        }
+        for expression in expressions.values() {
+            for obligation in expression.entity().source_obligations() {
+                certification
+                    .record_absorbed_expression(*obligation, expression.clone())
+                    .ok()?;
+            }
+        }
+        match authority_mutation {
+            StackAuthorityMutation::None => {}
+            StackAuthorityMutation::OriginSchema => {
+                origin.schema_version += 1;
+            }
+            StackAuthorityMutation::OriginAuthority => {
+                origin.authority = CertifiedAuthoritySeal::new();
+            }
+            StackAuthorityMutation::LedgerAuthority => {
+                certification.ledger.authority = CertifiedAuthoritySeal::new();
+            }
+        }
+        certified_stack_discipline(
+            &artifact,
+            &origin,
+            FrameCertifiedParts {
+                projection: &projection,
+                topology: &topology,
+                expressions: &expressions,
+                memory_statements: &memory,
+                return_controls: &returns,
+            },
+            certification.ledger(),
         )
     }
 
@@ -10882,6 +12035,184 @@ mod tests {
             })
             .collect::<Option<Vec<_>>>()?;
         Some((origin, certification.ledger().clone(), frame, mappings))
+    }
+
+    #[test]
+    fn generic_frameless_stack_seals_exact_reservation_accesses_and_release() {
+        let artifact = frameless_stack_artifact(StackDisciplineMutation::None);
+        assert!(
+            artifact
+                .machine_context()
+                .function_interface()
+                .expect("frameless interface")
+                .stack_slots()
+                .is_empty(),
+            "private objects must not come from source-declared slots"
+        );
+        let evidence = frameless_stack_evidence(&artifact).expect("frameless stack evidence");
+        assert_eq!(evidence.stack_pointer_storage.offset, 0);
+        assert_eq!(evidence.reservation_range.offset(), -16);
+        assert_eq!(evidence.reservation_range.size_bytes(), 16);
+        assert_eq!(
+            evidence
+                .reservation
+                .normalized_affine_relation()
+                .offset_bytes(),
+            -16
+        );
+        assert_eq!(evidence.assignments.len(), 2);
+        assert_eq!(evidence.releases.len(), 1);
+        assert!(evidence.releases[0].post_restoration().is_none());
+        assert!(evidence.releases[0].return_address_read().is_none());
+        assert_eq!(
+            evidence.releases[0]
+                .restoration()
+                .normalized_affine_relation()
+                .offset_bytes(),
+            0
+        );
+        let access_ranges = evidence
+            .private_regions
+            .iter()
+            .flat_map(|object| object.accesses())
+            .map(CertifiedPrivateStackAccess::range)
+            .collect::<Vec<_>>();
+        assert_eq!(access_ranges.len(), 4);
+        assert!(
+            access_ranges
+                .iter()
+                .all(|range| { matches!(range.offset(), -8 | -4) && range.size_bytes() == 4 })
+        );
+
+        let upward = frameless_stack_evidence(&frameless_stack_artifact(
+            StackDisciplineMutation::HigherAddresses,
+        ))
+        .expect("the same proof supports an exact upward-growing source contract");
+        assert_eq!(upward.reservation_range.offset(), 0);
+        assert_eq!(upward.reservation_range.size_bytes(), 16);
+        assert_eq!(
+            upward
+                .private_regions
+                .iter()
+                .flat_map(|region| region.accesses())
+                .map(CertifiedPrivateStackAccess::range)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                CertifiedNormalizedStackRange {
+                    offset: 8,
+                    size_bytes: 4,
+                },
+                CertifiedNormalizedStackRange {
+                    offset: 12,
+                    size_bytes: 4,
+                },
+            ])
+        );
+
+        let certificate = certified_frameless_stack(StackAuthorityMutation::None)
+            .expect("same-origin ledger seals frameless stack discipline");
+        assert_eq!(certificate.schema_version(), CERTIFICATION_SCHEMA_VERSION);
+        let wire = serde_json::to_value((
+            certificate.schema_version,
+            certificate.stack_pointer_storage,
+            certificate.reservation_range,
+            &certificate.reservation,
+            &certificate.assignments,
+            &certificate.private_regions,
+            &certificate.releases,
+        ))
+        .expect("serialized stack certificate payload");
+        assert_eq!(
+            wire.get(0).and_then(serde_json::Value::as_u64),
+            Some(u64::from(CERTIFICATION_SCHEMA_VERSION))
+        );
+        assert_eq!(
+            wire.get(5)
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(2)
+        );
+
+        let stacked =
+            frameless_stack_evidence(&preserved_frame_artifact(FrameMutation::StackedReturn))
+                .expect("the same stack discipline seals the x86 O0 stacked-return shape");
+        assert_eq!(stacked.reservation_range.offset(), -8);
+        assert_eq!(stacked.releases.len(), 1);
+        assert!(stacked.releases[0].post_restoration().is_some());
+        assert!(stacked.releases[0].return_address_read().is_some());
+
+        let two_return = frameless_stack_evidence(&preserved_frame_two_return_artifact(
+            TwoReturnMutation::None,
+        ))
+        .expect("every return arm has an exact restoration and stacked return read");
+        assert_eq!(two_return.releases.len(), 2);
+    }
+
+    #[test]
+    fn generic_frameless_stack_refuses_mutations_and_foreign_authority() {
+        for mutation in [
+            StackDisciplineMutation::MissingAllocationContract,
+            StackDisciplineMutation::OppositeAllocationContract,
+            StackDisciplineMutation::MissingReservation,
+            StackDisciplineMutation::WrongReservation,
+            StackDisciplineMutation::MissingRestoration,
+            StackDisciplineMutation::WrongRestoration,
+            StackDisciplineMutation::PartialStackPointerWrite,
+            StackDisciplineMutation::ExtraStackPointerWrite,
+            StackDisciplineMutation::OutOfEnvelopeAccess,
+            StackDisciplineMutation::StackPointerEscape,
+            StackDisciplineMutation::Call,
+            StackDisciplineMutation::UnknownEffect,
+            StackDisciplineMutation::EntryReturnAddressOverlap,
+            StackDisciplineMutation::AccessBeforeReservation,
+            StackDisciplineMutation::AccessAfterRestoration,
+        ] {
+            assert!(
+                frameless_stack_evidence(&frameless_stack_artifact(mutation)).is_none(),
+                "stack mutation must refuse: {mutation:?}"
+            );
+        }
+        assert!(
+            frameless_stack_evidence_with_missing_memory_statement(&frameless_stack_artifact(
+                StackDisciplineMutation::None,
+            ))
+            .is_none(),
+            "omitting one canonical memory statement must refuse the certificate"
+        );
+        assert!(
+            frameless_stack_evidence(&preserved_frame_two_return_artifact(
+                TwoReturnMutation::CrossArmStore,
+            ))
+            .is_none(),
+            "an access after one arm restores SP must refuse"
+        );
+        for mutation in [
+            FrameMutation::StackedNoContract,
+            FrameMutation::StackedWrongOffset,
+            FrameMutation::StackedWrongWidth,
+            FrameMutation::StackedWrongSpace,
+            FrameMutation::StackedWrongTarget,
+            FrameMutation::StackedWrongDelta,
+            FrameMutation::StackedZeroExit,
+            FrameMutation::StackedDuplicateRead,
+            FrameMutation::StackedUnledgeredRead,
+            FrameMutation::StackedOverlappingStore,
+            FrameMutation::StackedPartialOverlappingStore,
+            FrameMutation::StackedUnknownPointerStore,
+            FrameMutation::StackedAtomic,
+        ] {
+            assert!(
+                frameless_stack_evidence(&preserved_frame_artifact(mutation)).is_none(),
+                "bad stacked-return stack discipline must refuse: {mutation:?}"
+            );
+        }
+        for mutation in [
+            StackAuthorityMutation::OriginSchema,
+            StackAuthorityMutation::OriginAuthority,
+            StackAuthorityMutation::LedgerAuthority,
+        ] {
+            assert!(certified_frameless_stack(mutation).is_none());
+        }
     }
 
     #[test]
@@ -11217,6 +12548,8 @@ mod tests {
         );
 
         for mutation in [
+            FrameMutation::MissingAllocationContract,
+            FrameMutation::OppositeAllocationContract,
             FrameMutation::OverlappingWrite,
             FrameMutation::Call,
             FrameMutation::UnknownEffect,

@@ -106,8 +106,9 @@ pub use machine_context::{
     SourceAggregateMember, SourceCallArgumentSpec, SourceCallResult, SourceCallSiteIdentity,
     SourceCallSiteInterface, SourceCallSiteInterfaceError, SourceCarrierKind,
     SourceCarrierProjection, SourceFunctionInterface, SourceFunctionInterfaceError,
-    SourceFunctionReturn, SourceLogicalValue, SourceMachineContext, SourceStackSlotRole,
-    SourceStackSlotSpec, SourceType, SourceTypeGraph, SourceTypeGraphError, SourceTypeKind,
+    SourceFunctionReturn, SourceLogicalValue, SourceMachineContext, SourceStackAllocationContract,
+    SourceStackGrowth, SourceStackSlotRole, SourceStackSlotSpec, SourceType, SourceTypeGraph,
+    SourceTypeGraphError, SourceTypeKind,
 };
 pub use obligation::{
     CanonicalInstructionId, CanonicalInstructionSite, ObligationCoverageReport,

@@ -31,9 +31,9 @@ typedef struct R2ILBlock R2ILBlock;
 
 #define R2SLEIGH_RADARE_ABI_V2 138
 
-#define R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 9
+#define R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 10
 
-#define R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2 3
+#define R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2 4
 
 #define R2SLEIGH_STATUS_OK_V2 0
 
@@ -651,6 +651,10 @@ typedef struct R2SleighRadareReturnMechanismViewV2 {
   uint32_t stack_pointer_delta_bytes;
 } R2SleighRadareReturnMechanismViewV2;
 
+typedef struct R2SleighRadareStackAllocationContractViewV2 {
+  int32_t growth;
+} R2SleighRadareStackAllocationContractViewV2;
+
 typedef struct R2SleighRadareAccessorsV2 {
   uint32_t struct_size;
   uint32_t abi_version;
@@ -687,6 +691,8 @@ typedef struct R2SleighRadareAccessorsV2 {
   uint8_t (*external_exit)(const void*, size_t, uint64_t*);
   uint8_t (*return_mechanism_view)(const void*, struct R2SleighRadareReturnMechanismViewV2*);
   uint8_t (*frame_pointer_storage_view)(const void*, struct R2SleighRadareRegisterStorageViewV2*);
+  uint8_t (*stack_allocation_contract_view)(const void*,
+                                            struct R2SleighRadareStackAllocationContractViewV2*);
 } R2SleighRadareAccessorsV2;
 
 /**

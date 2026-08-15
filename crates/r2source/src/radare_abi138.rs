@@ -1,4 +1,4 @@
-//! Audited synchronous ingress for radare2 ABI 138 snapshot schema 9.
+//! Audited synchronous ingress for radare2 ABI 138 snapshot schema 10.
 //!
 //! The wire API contains only opaque handles, scalars, and caller-owned output
 //! buffers. It deliberately cannot expose radare2 internals or assemble source
@@ -13,8 +13,8 @@ use std::sync::Arc;
 use super::*;
 
 pub const RADARE_ABI_VERSION: u32 = 138;
-pub const RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION: u32 = 9;
-pub const RADARE_SNAPSHOT_ACCESSOR_SCHEMA_VERSION: u32 = 3;
+pub const RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION: u32 = 10;
+pub const RADARE_SNAPSHOT_ACCESSOR_SCHEMA_VERSION: u32 = 4;
 
 pub const RADARE_ENDIAN_LITTLE: u32 = 0x4321;
 pub const RADARE_ENDIAN_BIG: u32 = 0x1234;
@@ -36,8 +36,9 @@ pub const RADARE_CAP_STACK_POINTER_STORAGE: u64 = 1 << 13;
 pub const RADARE_CAP_OWNED_BOUNDED_FUNCTION_IMAGE: u64 = 1 << 14;
 pub const RADARE_CAP_EXACT_RETURN_MECHANISM: u64 = 1 << 15;
 pub const RADARE_CAP_EXACT_FRAME_POINTER_STORAGE: u64 = 1 << 16;
+pub const RADARE_CAP_EXACT_STACK_ALLOCATION_CONTRACT: u64 = 1 << 17;
 
-const KNOWN_CAPABILITIES: u64 = (1 << 17) - 1;
+const KNOWN_CAPABILITIES: u64 = (1 << 18) - 1;
 const INVALID_U64: u64 = u64::MAX;
 const INVALID_TYPE_ID: u32 = u32::MAX;
 
@@ -244,6 +245,14 @@ pub struct RadareAbi138ReturnMechanismView {
     pub stack_pointer_delta_bytes: u32,
 }
 
+/// Source-owned callee stack-allocation direction. `growth` is 1 for lower
+/// addresses and 2 for higher addresses; zero is reserved for inactive data.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RadareAbi138StackAllocationContractView {
+    pub growth: i32,
+}
+
 pub type RadareSnapshotViewFn =
     unsafe extern "C" fn(*const c_void, *mut RadareAbi138SnapshotView) -> u8;
 pub type RadareStringFn = unsafe extern "C" fn(*const c_void, *mut u8, usize) -> u8;
@@ -286,6 +295,8 @@ pub type RadareReturnMechanismViewFn =
     unsafe extern "C" fn(*const c_void, *mut RadareAbi138ReturnMechanismView) -> u8;
 pub type RadareFramePointerStorageViewFn =
     unsafe extern "C" fn(*const c_void, *mut RadareAbi138RegisterStorageView) -> u8;
+pub type RadareStackAllocationContractViewFn =
+    unsafe extern "C" fn(*const c_void, *mut RadareAbi138StackAllocationContractView) -> u8;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -322,6 +333,7 @@ pub struct RadareAbi138Accessors {
     pub external_exit: Option<RadareExternalExitFn>,
     pub return_mechanism_view: Option<RadareReturnMechanismViewFn>,
     pub frame_pointer_storage_view: Option<RadareFramePointerStorageViewFn>,
+    pub stack_allocation_contract_view: Option<RadareStackAllocationContractViewFn>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -616,11 +628,15 @@ fn validate_top(view: &RadareAbi138SnapshotView) -> Result<(), RadareAbi138Captu
     let exact_slots = view.capabilities & RADARE_CAP_EXACT_STACK_SLOT_ROLES != 0;
     let exact_return_mechanism = view.capabilities & RADARE_CAP_EXACT_RETURN_MECHANISM != 0;
     let exact_frame_pointer = view.capabilities & RADARE_CAP_EXACT_FRAME_POINTER_STORAGE != 0;
+    let exact_stack_allocation =
+        view.capabilities & RADARE_CAP_EXACT_STACK_ALLOCATION_CONTRACT != 0;
     if (exact_types || exact_slots) && !exact_interface {
         return Err(RadareAbi138CaptureError::InvalidCapabilities);
     }
     if (exact_slots && view.capabilities & RADARE_CAP_STACK_SLOTS == 0)
         || (exact_types && view.capabilities & RADARE_CAP_TYPES == 0)
+        || (exact_stack_allocation
+            && (!exact_interface || view.capabilities & RADARE_CAP_STACK_POINTER_STORAGE == 0))
         || (exact_return_mechanism
             && (!exact_interface
                 || !exact_slots
@@ -874,7 +890,7 @@ unsafe fn capture_stack_slots(
             (3, view.arg_name_length),
             (4, view.home_reg_length),
         ] {
-            // SAFETY: string kind is from the closed schema-9 vocabulary.
+            // SAFETY: string kind is from the closed schema-10 vocabulary.
             let _ = unsafe {
                 copy_stack_slot_string(snapshot, string_fn, index, kind, length, budget)
             }?;
@@ -1022,6 +1038,44 @@ unsafe fn capture_frame_pointer_storage(
     }
     interface
         .with_frame_pointer_storage(storage(first)?)
+        .map_err(|_| RadareAbi138CaptureError::InvalidInterface)
+}
+
+unsafe fn capture_stack_allocation_contract(
+    snapshot: *const c_void,
+    accessors: &RadareAbi138Accessors,
+    active: bool,
+    interface: SourceFunctionInterface,
+) -> Result<SourceFunctionInterface, RadareAbi138CaptureError> {
+    if !active {
+        return Ok(interface);
+    }
+    let view_fn = required(
+        accessors.stack_allocation_contract_view,
+        "stack_allocation_contract_view",
+    )?;
+    let mut first = RadareAbi138StackAllocationContractView::default();
+    // SAFETY: callback and snapshot validity are guaranteed by the caller.
+    callback_ok(
+        unsafe { view_fn(snapshot, &mut first) },
+        "stack_allocation_contract_view",
+    )?;
+    let mut second = RadareAbi138StackAllocationContractView::default();
+    // SAFETY: callback and snapshot validity remain live for the second read.
+    callback_ok(
+        unsafe { view_fn(snapshot, &mut second) },
+        "stack_allocation_contract_view",
+    )?;
+    if first != second {
+        return Err(RadareAbi138CaptureError::SnapshotChanged);
+    }
+    let growth = match first.growth {
+        1 => SourceStackGrowth::LowerAddresses,
+        2 => SourceStackGrowth::HigherAddresses,
+        _ => return Err(RadareAbi138CaptureError::InvalidEnum),
+    };
+    interface
+        .with_stack_allocation_contract(SourceStackAllocationContract::new(growth))
         .map_err(|_| RadareAbi138CaptureError::InvalidInterface)
 }
 
@@ -1271,6 +1325,16 @@ unsafe fn capture_interface(
     } else if !absent_storage(view.stack_pointer_storage) {
         return Err(RadareAbi138CaptureError::InactivePayload);
     }
+    // SAFETY: the optional scalar callback is copied from the validated table
+    // and read twice while the snapshot borrow remains live.
+    let interface = unsafe {
+        capture_stack_allocation_contract(
+            snapshot,
+            accessors,
+            top.capabilities & RADARE_CAP_EXACT_STACK_ALLOCATION_CONTRACT != 0,
+            interface,
+        )
+    }?;
     let address_size_bytes = u32::try_from(top.bits)
         .ok()
         .and_then(|bits| bits.checked_div(8))
@@ -1568,7 +1632,7 @@ unsafe fn capture_advisory_calls(
     Ok(calls.into_boxed_slice())
 }
 
-/// Deep-copy one borrowed radare2 ABI 138/schema-9 snapshot synchronously.
+/// Deep-copy one borrowed radare2 ABI 138/schema-10 snapshot synchronously.
 ///
 /// This is the only public source-authority mint. It performs no symbol lookup
 /// and retains no foreign pointers.
@@ -1697,6 +1761,8 @@ pub unsafe fn capture_radare_abi138(
             && first.capabilities & RADARE_CAP_EXACT_RETURN_MECHANISM != 0,
         frame_pointer_storage: function_interface.is_some()
             && first.capabilities & RADARE_CAP_EXACT_FRAME_POINTER_STORAGE != 0,
+        stack_allocation_contract: function_interface.is_some()
+            && first.capabilities & RADARE_CAP_EXACT_STACK_ALLOCATION_CONTRACT != 0,
     };
     OwnedFunctionSnapshot::from_captured_parts(
         machine,
@@ -1736,6 +1802,13 @@ mod tests {
         second_name: &'static [u8],
         view_calls: Cell<usize>,
         name_calls: Cell<usize>,
+        status: u8,
+    }
+
+    struct StackAllocationFixture {
+        first: RadareAbi138StackAllocationContractView,
+        second: RadareAbi138StackAllocationContractView,
+        calls: Cell<usize>,
         status: u8,
     }
 
@@ -1805,6 +1878,24 @@ mod tests {
         fixture.status
     }
 
+    unsafe extern "C" fn stack_allocation_contract_view(
+        snapshot: *const c_void,
+        out: *mut RadareAbi138StackAllocationContractView,
+    ) -> u8 {
+        // SAFETY: tests pass exact pointers to live fixture/output values.
+        let fixture = unsafe { &*snapshot.cast::<StackAllocationFixture>() };
+        let call = fixture.calls.get();
+        fixture.calls.set(call.saturating_add(1));
+        let view = if call == 0 {
+            fixture.first
+        } else {
+            fixture.second
+        };
+        // SAFETY: the production reader supplies one valid output object.
+        unsafe { out.write(view) };
+        fixture.status
+    }
+
     fn register(offset: u64) -> CanonicalStorageId {
         CanonicalStorageId {
             space: CanonicalStorageSpace::Register,
@@ -1843,6 +1934,15 @@ mod tests {
         }
     }
 
+    fn stack_allocation_accessors(
+        callback: Option<RadareStackAllocationContractViewFn>,
+    ) -> RadareAbi138Accessors {
+        RadareAbi138Accessors {
+            stack_allocation_contract_view: callback,
+            ..RadareAbi138Accessors::default()
+        }
+    }
+
     fn frame_pointer_view(offset: u64) -> RadareAbi138RegisterStorageView {
         RadareAbi138RegisterStorageView {
             name_length: 3,
@@ -1858,6 +1958,10 @@ mod tests {
             slot_size_bytes: 8,
             stack_pointer_delta_bytes: 8,
         }
+    }
+
+    fn lower_stack_allocation_view() -> RadareAbi138StackAllocationContractView {
+        RadareAbi138StackAllocationContractView { growth: 1 }
     }
 
     fn valid_top(capabilities: u64) -> RadareAbi138SnapshotView {
@@ -1990,6 +2094,154 @@ mod tests {
         }
         assert_eq!(dependencies & RADARE_CAP_STACK_SLOTS, 0);
         assert_eq!(dependencies & RADARE_CAP_EXACT_STACK_SLOT_ROLES, 0);
+    }
+
+    #[test]
+    fn stack_allocation_contract_layout_is_append_only_and_defaults_inactive() {
+        let view = RadareAbi138StackAllocationContractView::default();
+        assert_eq!(view.growth, 0);
+        let accessors = RadareAbi138Accessors::default();
+        assert!(accessors.stack_allocation_contract_view.is_none());
+        assert_eq!(
+            std::mem::offset_of!(RadareAbi138Accessors, stack_allocation_contract_view),
+            std::mem::offset_of!(RadareAbi138Accessors, frame_pointer_storage_view)
+                + size_of::<Option<RadareFramePointerStorageViewFn>>()
+        );
+    }
+
+    #[test]
+    fn stack_allocation_contract_capability_requires_exact_interface_and_sp() {
+        let dependencies = RADARE_CAP_REVISION
+            | RADARE_CAP_OWNED_BOUNDED_FUNCTION_IMAGE
+            | RADARE_CAP_EXACT_FUNCTION_INTERFACE
+            | RADARE_CAP_STACK_POINTER_STORAGE
+            | RADARE_CAP_EXACT_STACK_ALLOCATION_CONTRACT;
+        assert_eq!(validate_top(&valid_top(dependencies)), Ok(()));
+        for dependency in [
+            RADARE_CAP_EXACT_FUNCTION_INTERFACE,
+            RADARE_CAP_STACK_POINTER_STORAGE,
+        ] {
+            assert_eq!(
+                validate_top(&valid_top(dependencies & !dependency)),
+                Err(RadareAbi138CaptureError::InvalidCapabilities)
+            );
+        }
+    }
+
+    #[test]
+    fn exact_stack_allocation_contract_is_read_twice_and_bound() {
+        let fixture = StackAllocationFixture {
+            first: lower_stack_allocation_view(),
+            second: lower_stack_allocation_view(),
+            calls: Cell::new(0),
+            status: 1,
+        };
+        let accessors = stack_allocation_accessors(Some(stack_allocation_contract_view));
+        // SAFETY: callback receives a live fixture for both synchronous reads.
+        let interface = unsafe {
+            capture_stack_allocation_contract(
+                (&fixture as *const StackAllocationFixture).cast(),
+                &accessors,
+                true,
+                exact_return_interface(),
+            )
+        }
+        .expect("exact stack allocation contract");
+        assert_eq!(fixture.calls.get(), 2);
+        assert_eq!(
+            interface.stack_allocation_contract(),
+            Some(SourceStackAllocationContract::new(
+                SourceStackGrowth::LowerAddresses
+            ))
+        );
+    }
+
+    #[test]
+    fn inactive_stack_allocation_contract_never_invokes_accessor() {
+        let fixture = StackAllocationFixture {
+            first: lower_stack_allocation_view(),
+            second: lower_stack_allocation_view(),
+            calls: Cell::new(0),
+            status: 0,
+        };
+        let accessors = stack_allocation_accessors(Some(stack_allocation_contract_view));
+        // SAFETY: inactive contracts must not invoke a foreign callback.
+        let interface = unsafe {
+            capture_stack_allocation_contract(
+                (&fixture as *const StackAllocationFixture).cast(),
+                &accessors,
+                false,
+                exact_return_interface(),
+            )
+        }
+        .expect("inactive stack allocation contract");
+        assert_eq!(fixture.calls.get(), 0);
+        assert_eq!(interface.stack_allocation_contract(), None);
+    }
+
+    #[test]
+    fn stack_allocation_contract_refuses_missing_unknown_failed_and_mutated_payloads() {
+        // SAFETY: active missing callback is rejected before snapshot access.
+        assert_eq!(
+            unsafe {
+                capture_stack_allocation_contract(
+                    std::ptr::NonNull::<u8>::dangling().as_ptr().cast(),
+                    &RadareAbi138Accessors::default(),
+                    true,
+                    exact_return_interface(),
+                )
+            },
+            Err(RadareAbi138CaptureError::MissingAccessor(
+                "stack_allocation_contract_view"
+            ))
+        );
+
+        for (first, second, status, expected) in [
+            (
+                RadareAbi138StackAllocationContractView { growth: 0 },
+                RadareAbi138StackAllocationContractView { growth: 0 },
+                1,
+                RadareAbi138CaptureError::InvalidEnum,
+            ),
+            (
+                RadareAbi138StackAllocationContractView { growth: 3 },
+                RadareAbi138StackAllocationContractView { growth: 3 },
+                1,
+                RadareAbi138CaptureError::InvalidEnum,
+            ),
+            (
+                lower_stack_allocation_view(),
+                lower_stack_allocation_view(),
+                0,
+                RadareAbi138CaptureError::AccessorFailed("stack_allocation_contract_view"),
+            ),
+            (
+                lower_stack_allocation_view(),
+                RadareAbi138StackAllocationContractView { growth: 2 },
+                1,
+                RadareAbi138CaptureError::SnapshotChanged,
+            ),
+        ] {
+            let fixture = StackAllocationFixture {
+                first,
+                second,
+                calls: Cell::new(0),
+                status,
+            };
+            let accessors = stack_allocation_accessors(Some(stack_allocation_contract_view));
+            // SAFETY: callback receives a live fixture for synchronous reads.
+            assert_eq!(
+                unsafe {
+                    capture_stack_allocation_contract(
+                        (&fixture as *const StackAllocationFixture).cast(),
+                        &accessors,
+                        true,
+                        exact_return_interface(),
+                    )
+                },
+                Err(expected)
+            );
+        }
     }
 
     #[test]
@@ -2160,7 +2412,7 @@ mod tests {
             );
         }
         assert_eq!(
-            validate_top(&valid_top(dependencies | (1 << 17))),
+            validate_top(&valid_top(dependencies | (1 << 18))),
             Err(RadareAbi138CaptureError::InvalidCapabilities)
         );
     }

@@ -60,7 +60,7 @@ Both a:sla and a:sleigh prefixes work.
 
 Direct `a:sla.dec` and `a:sla.decj` requests are intentionally unavailable:
 they do not run inside radare2's locked snapshot transaction and therefore
-cannot construct source authority. `pdd` receives one ABI-138/schema-9 borrowed
+cannot construct source authority. `pdd` receives one ABI-138/schema-10 borrowed
 snapshot, deep-copies it synchronously, and either completes from that immutable
 source or refuses. It never falls back to live blocks, names, or detached test
 metadata.

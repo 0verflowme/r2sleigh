@@ -32,8 +32,8 @@ pub const R2SLEIGH_CAPABILITIES_V2: u64 = R2SLEIGH_CAP_DECOMPILE_V2
     | R2SLEIGH_CAP_PLANNER_QUERY_V2
     | R2SLEIGH_CAP_OPAQUE_RADARE_SNAPSHOT_V2;
 pub const R2SLEIGH_RADARE_ABI_V2: u32 = 138;
-pub const R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2: u32 = 9;
-pub const R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2: u32 = 3;
+pub const R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2: u32 = 10;
+pub const R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2: u32 = 4;
 
 pub const R2SLEIGH_STATUS_OK_V2: u32 = 0;
 pub const R2SLEIGH_STATUS_INVALID_ARGUMENT_V2: u32 = 1;
@@ -360,6 +360,12 @@ pub struct R2SleighRadareReturnMechanismViewV2 {
 }
 
 #[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct R2SleighRadareStackAllocationContractViewV2 {
+    pub growth: i32,
+}
+
+#[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct R2SleighRadareAccessorsV2 {
     pub struct_size: u32,
@@ -429,6 +435,9 @@ pub struct R2SleighRadareAccessorsV2 {
         Option<unsafe extern "C" fn(*const c_void, *mut R2SleighRadareReturnMechanismViewV2) -> u8>,
     pub frame_pointer_storage_view:
         Option<unsafe extern "C" fn(*const c_void, *mut R2SleighRadareRegisterStorageViewV2) -> u8>,
+    pub stack_allocation_contract_view: Option<
+        unsafe extern "C" fn(*const c_void, *mut R2SleighRadareStackAllocationContractViewV2) -> u8,
+    >,
 }
 
 macro_rules! assert_wire_layout {
@@ -491,6 +500,10 @@ assert_wire_layout!(
 assert_wire_layout!(
     R2SleighRadareReturnMechanismViewV2,
     r2source::RadareAbi138ReturnMechanismView
+);
+assert_wire_layout!(
+    R2SleighRadareStackAllocationContractViewV2,
+    r2source::RadareAbi138StackAllocationContractView
 );
 assert_wire_layout!(R2SleighRadareAccessorsV2, r2source::RadareAbi138Accessors);
 const _: [(); R2SLEIGH_RADARE_ABI_V2 as usize] = [(); r2source::RADARE_ABI_VERSION as usize];
@@ -4316,12 +4329,43 @@ mod tests {
     }
 
     #[test]
+    fn radare_stack_allocation_contract_wire_layout_matches_source_append() {
+        assert_eq!(
+            size_of::<R2SleighRadareStackAllocationContractViewV2>(),
+            size_of::<r2source::RadareAbi138StackAllocationContractView>()
+        );
+        assert_eq!(
+            std::mem::offset_of!(R2SleighRadareStackAllocationContractViewV2, growth),
+            std::mem::offset_of!(r2source::RadareAbi138StackAllocationContractView, growth)
+        );
+        assert_eq!(
+            std::mem::offset_of!(R2SleighRadareAccessorsV2, stack_allocation_contract_view),
+            std::mem::offset_of!(
+                r2source::RadareAbi138Accessors,
+                stack_allocation_contract_view
+            )
+        );
+        assert_eq!(
+            std::mem::offset_of!(R2SleighRadareAccessorsV2, stack_allocation_contract_view),
+            std::mem::offset_of!(R2SleighRadareAccessorsV2, frame_pointer_storage_view)
+                + size_of::<
+                    Option<
+                        unsafe extern "C" fn(
+                            *const c_void,
+                            *mut R2SleighRadareRegisterStorageViewV2,
+                        ) -> u8,
+                    >,
+                >()
+        );
+    }
+
+    #[test]
     fn api_table_reports_rust_layouts() {
         let api = unsafe { &*r2sleigh_api_v2() };
         assert_eq!(api.abi_version, R2SLEIGH_ABI_V2);
         assert_eq!(api.radare_abi_version, R2SLEIGH_RADARE_ABI_V2);
-        assert_eq!(R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2, 9);
-        assert_eq!(R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2, 3);
+        assert_eq!(R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2, 10);
+        assert_eq!(R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2, 4);
         assert_eq!(api.struct_size as usize, size_of::<R2SleighApiV2>());
         assert_eq!(api.request_size as usize, size_of::<R2SleighRequestV2>());
         assert_eq!(
