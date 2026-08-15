@@ -124,12 +124,6 @@ impl Lifter {
         &self.ctx
     }
 
-    /// Set the endianness.
-    pub fn set_big_endian(&mut self, big_endian: bool) -> &mut Self {
-        self.ctx.set_big_endian(big_endian);
-        self
-    }
-
     /// Set instruction endianness.
     pub fn set_instruction_endianness(&mut self, endianness: Endianness) -> &mut Self {
         self.ctx.set_instruction_endianness(endianness);
@@ -165,7 +159,8 @@ impl Lifter {
 /// This provides a minimal x86-64 spec with common registers.
 pub fn create_x86_64_spec() -> ArchSpec {
     let mut ctx = LiftContext::new("x86-64");
-    ctx.set_big_endian(false);
+    ctx.set_instruction_endianness(Endianness::Little);
+    ctx.set_memory_endianness(Endianness::Little);
     ctx.set_addr_size(8);
 
     // Add standard address spaces
@@ -223,7 +218,8 @@ pub fn create_x86_64_spec() -> ArchSpec {
 /// Create a basic ARM architecture specification for testing.
 pub fn create_arm_spec() -> ArchSpec {
     let mut ctx = LiftContext::new("ARM");
-    ctx.set_big_endian(false);
+    ctx.set_instruction_endianness(Endianness::Little);
+    ctx.set_memory_endianness(Endianness::Little);
     ctx.set_addr_size(4);
 
     // Add standard address spaces
@@ -255,7 +251,8 @@ pub fn create_arm_spec() -> ArchSpec {
 
 fn create_riscv_spec(name: &str, addr_size: u32) -> ArchSpec {
     let mut ctx = LiftContext::new(name);
-    ctx.set_big_endian(false);
+    ctx.set_instruction_endianness(Endianness::Little);
+    ctx.set_memory_endianness(Endianness::Little);
     ctx.set_addr_size(addr_size);
 
     // Add standard address spaces
@@ -306,7 +303,6 @@ mod tests {
     fn test_x86_64_spec() {
         let spec = create_x86_64_spec();
         assert_eq!(spec.name, "x86-64");
-        assert!(!spec.big_endian);
         assert_eq!(spec.instruction_endianness, Endianness::Little);
         assert_eq!(spec.memory_endianness, Endianness::Little);
         assert_eq!(spec.addr_size, 8);
@@ -321,7 +317,6 @@ mod tests {
     fn test_arm_spec() {
         let spec = create_arm_spec();
         assert_eq!(spec.name, "ARM");
-        assert!(!spec.big_endian);
         assert_eq!(spec.instruction_endianness, Endianness::Little);
         assert_eq!(spec.memory_endianness, Endianness::Little);
         assert_eq!(spec.addr_size, 4);
@@ -336,7 +331,6 @@ mod tests {
     fn test_riscv64_spec() {
         let spec = create_riscv64_spec();
         assert_eq!(spec.name, "riscv64");
-        assert!(!spec.big_endian);
         assert_eq!(spec.instruction_endianness, Endianness::Little);
         assert_eq!(spec.memory_endianness, Endianness::Little);
         assert_eq!(spec.addr_size, 8);
@@ -349,7 +343,6 @@ mod tests {
     fn test_riscv32_spec() {
         let spec = create_riscv32_spec();
         assert_eq!(spec.name, "riscv32");
-        assert!(!spec.big_endian);
         assert_eq!(spec.instruction_endianness, Endianness::Little);
         assert_eq!(spec.memory_endianness, Endianness::Little);
         assert_eq!(spec.addr_size, 4);

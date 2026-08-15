@@ -55,11 +55,5 @@ pub use validate::{
 };
 pub use varnode::Varnode;
 
-/// Crate version for binary format compatibility checks.
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// Magic bytes for r2il binary files.
-pub const MAGIC: &[u8; 4] = b"R2IL";
-
-/// Current binary format version.
-pub const FORMAT_VERSION: u32 = 4;
+/// Exact discriminator for the sole supported postcard representation.
+pub const MAGIC: &[u8; 8] = b"R2PSTC05";

@@ -156,10 +156,9 @@ cargo clippy --all-targets --all-features -- -D warnings
 R2IL Format Compatibility
 -------------------------
 
-- Current writer format is `FORMAT_VERSION = 4`.
-- Default loader support is for v4 `.r2il` artifacts (postcard encoding).
-- Legacy v1/v2/v3 loading requires `r2il/legacy-bincode`.
-- Re-saving any loaded artifact writes v4.
+- The sole format identity is `R2PSTC05`; there is no separate format-version authority.
+- The loader accepts exactly `R2PSTC05 || payload_length_u64_le || postcard(ArchSpec)` and rejects truncation or trailing bytes.
+- Older versions and encodings are rejected instead of being migrated through a second semantic path.
 
 Troubleshooting
 ---------------

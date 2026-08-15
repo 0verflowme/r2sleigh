@@ -5,14 +5,13 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::mem::size_of;
 use std::path::Path;
 use thiserror::Error;
 
 use crate::opcode::R2ILOp;
-use crate::space::{AddressSpace, SpaceId};
-use crate::{Endianness, FORMAT_VERSION, MAGIC};
+use crate::space::AddressSpace;
+use crate::{Endianness, MAGIC};
 
 /// Errors that can occur during serialization/deserialization.
 #[derive(Debug, Error)]
@@ -23,15 +22,20 @@ pub enum SerializeError {
     #[error("Serialization error: {0}")]
     Postcard(#[from] postcard::Error),
 
-    #[cfg(feature = "legacy-bincode")]
-    #[error("Legacy bincode decode error: {0}")]
-    LegacyBincode(#[from] bincode::Error),
+    #[error("Invalid architecture specification: {0}")]
+    Validation(#[from] crate::ValidationError),
 
-    #[error("Invalid magic bytes: expected R2IL")]
+    #[error("Invalid format discriminator: expected R2PSTC05")]
     InvalidMagic,
 
-    #[error("Unsupported format version: {0} (expected {FORMAT_VERSION})")]
-    UnsupportedVersion(u32),
+    #[error("Truncated r2il representation")]
+    Truncated,
+
+    #[error("Trailing bytes after the r2il payload: {0}")]
+    TrailingBytes(usize),
+
+    #[error("R2IL payload is too large for this platform: {0} bytes")]
+    PayloadTooLarge(u64),
 }
 
 /// Result type for serialization operations.
@@ -101,17 +105,10 @@ pub struct ArchSpec {
     /// Processor variant (e.g., "default", "thumb")
     pub variant: String,
 
-    /// Legacy endianness shim for compatibility.
-    ///
-    /// Deprecated: prefer `instruction_endianness` / `memory_endianness`.
-    pub big_endian: bool,
-
     /// Endianness for instruction encoding/fetch semantics.
-    #[serde(default)]
     pub instruction_endianness: Endianness,
 
     /// Endianness for memory load/store semantics.
-    #[serde(default)]
     pub memory_endianness: Endianness,
 
     /// Address size in bytes (4 for 32-bit, 8 for 64-bit)
@@ -142,7 +139,6 @@ impl ArchSpec {
         Self {
             name: name.into(),
             variant: "default".into(),
-            big_endian: false,
             instruction_endianness: Endianness::Little,
             memory_endianness: Endianness::Little,
             addr_size: 8,
@@ -155,29 +151,14 @@ impl ArchSpec {
         }
     }
 
-    /// Set instruction endianness and update legacy shim fields.
+    /// Set instruction endianness.
     pub fn set_instruction_endianness(&mut self, endianness: Endianness) {
         self.instruction_endianness = endianness;
-        self.sync_legacy_big_endian();
     }
 
-    /// Set memory endianness and update legacy shim fields.
+    /// Set memory endianness.
     pub fn set_memory_endianness(&mut self, endianness: Endianness) {
         self.memory_endianness = endianness;
-        self.sync_legacy_big_endian();
-    }
-
-    /// Set legacy endianness and propagate it to v2 endianness fields.
-    pub fn set_legacy_big_endian(&mut self, big_endian: bool) {
-        self.big_endian = big_endian;
-        let v2 = Endianness::from_big_endian(big_endian);
-        self.instruction_endianness = v2;
-        self.memory_endianness = v2;
-    }
-
-    /// Synchronize legacy bool shim from v2 memory endianness.
-    pub fn sync_legacy_big_endian(&mut self) {
-        self.big_endian = self.memory_endianness.to_legacy_big_endian();
     }
 
     /// Add a register definition.
@@ -202,251 +183,43 @@ impl ArchSpec {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct AddressSpaceV1 {
-    id: SpaceId,
-    name: String,
-    addr_size: u32,
-    word_size: u32,
-    is_default: bool,
-}
-
-impl From<AddressSpaceV1> for AddressSpace {
-    fn from(value: AddressSpaceV1) -> Self {
-        Self {
-            id: value.id,
-            name: value.name,
-            addr_size: value.addr_size,
-            word_size: value.word_size,
-            is_default: value.is_default,
-            endianness: None,
-            memory_class: None,
-            permissions: None,
-            valid_ranges: Vec::new(),
-            bank_id: None,
-            segment_id: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct AddressSpaceV2 {
-    id: SpaceId,
-    name: String,
-    addr_size: u32,
-    word_size: u32,
-    is_default: bool,
-    endianness: Option<Endianness>,
-}
-
-impl From<AddressSpaceV2> for AddressSpace {
-    fn from(value: AddressSpaceV2) -> Self {
-        Self {
-            id: value.id,
-            name: value.name,
-            addr_size: value.addr_size,
-            word_size: value.word_size,
-            is_default: value.is_default,
-            endianness: value.endianness,
-            memory_class: None,
-            permissions: None,
-            valid_ranges: Vec::new(),
-            bank_id: None,
-            segment_id: None,
-        }
-    }
-}
-
-/// Legacy v1 architecture specification used only for deserialization.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ArchSpecV1 {
-    name: String,
-    variant: String,
-    big_endian: bool,
-    addr_size: u32,
-    alignment: u32,
-    spaces: Vec<AddressSpaceV1>,
-    registers: Vec<RegisterDef>,
-    register_map: HashMap<String, u64>,
-    userops: Vec<UserOpDef>,
-    source_files: Vec<String>,
-}
-
-impl From<ArchSpecV1> for ArchSpec {
-    fn from(value: ArchSpecV1) -> Self {
-        let endian = Endianness::from_big_endian(value.big_endian);
-        let mut arch = ArchSpec {
-            name: value.name,
-            variant: value.variant,
-            big_endian: value.big_endian,
-            instruction_endianness: endian,
-            memory_endianness: endian,
-            addr_size: value.addr_size,
-            alignment: value.alignment,
-            spaces: value.spaces.into_iter().map(Into::into).collect(),
-            registers: value.registers,
-            register_map: value.register_map,
-            userops: value.userops,
-            source_files: value.source_files,
-        };
-        arch.sync_legacy_big_endian();
-        arch
-    }
-}
-
-/// Legacy v2 architecture specification used only for deserialization.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ArchSpecV2 {
-    name: String,
-    variant: String,
-    big_endian: bool,
-    instruction_endianness: Endianness,
-    memory_endianness: Endianness,
-    addr_size: u32,
-    alignment: u32,
-    spaces: Vec<AddressSpaceV2>,
-    registers: Vec<RegisterDef>,
-    register_map: HashMap<String, u64>,
-    userops: Vec<UserOpDef>,
-    source_files: Vec<String>,
-}
-
-impl From<ArchSpecV2> for ArchSpec {
-    fn from(value: ArchSpecV2) -> Self {
-        let mut arch = ArchSpec {
-            name: value.name,
-            variant: value.variant,
-            big_endian: value.big_endian,
-            instruction_endianness: value.instruction_endianness,
-            memory_endianness: value.memory_endianness,
-            addr_size: value.addr_size,
-            alignment: value.alignment,
-            spaces: value.spaces.into_iter().map(Into::into).collect(),
-            registers: value.registers,
-            register_map: value.register_map,
-            userops: value.userops,
-            source_files: value.source_files,
-        };
-        arch.sync_legacy_big_endian();
-        arch
-    }
-}
-
-/// Header for r2il binary files.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct FileHeader {
-    /// Format version
-    version: u32,
-    /// Architecture name
-    arch_name: String,
-}
-
 fn encode_current<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     Ok(postcard::to_stdvec(value)?)
 }
 
 fn decode_current<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T> {
-    Ok(postcard::from_bytes(bytes)?)
-}
-
-#[cfg(feature = "legacy-bincode")]
-fn decode_legacy<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T> {
-    Ok(bincode::deserialize(bytes)?)
-}
-
-#[cfg(not(feature = "legacy-bincode"))]
-fn decode_legacy<T>(_bytes: &[u8], version: u32) -> Result<T> {
-    Err(SerializeError::UnsupportedVersion(version))
-}
-
-#[cfg(feature = "legacy-bincode")]
-fn decode_file_header(bytes: &[u8]) -> Result<FileHeader> {
-    match decode_current(bytes) {
-        Ok(header) => Ok(header),
-        Err(primary) => match decode_legacy(bytes) {
-            Ok(legacy_header) => Ok(legacy_header),
-            Err(_) => Err(primary),
-        },
+    let (value, remainder) = postcard::take_from_bytes(bytes)?;
+    if !remainder.is_empty() {
+        return Err(SerializeError::TrailingBytes(remainder.len()));
     }
-}
-
-#[cfg(not(feature = "legacy-bincode"))]
-fn decode_file_header(bytes: &[u8]) -> Result<FileHeader> {
-    decode_current(bytes)
+    Ok(value)
 }
 
 /// Save an architecture specification to a file.
 pub fn save(arch: &ArchSpec, path: &Path) -> Result<()> {
-    let file = File::create(path)?;
-    let mut writer = BufWriter::new(file);
-
-    // Write magic bytes
-    writer.write_all(MAGIC)?;
-
-    // Create and serialize header
-    let header = FileHeader {
-        version: FORMAT_VERSION,
-        arch_name: arch.name.clone(),
-    };
-    let header_bytes = encode_current(&header)?;
-    let header_len = header_bytes.len() as u32;
-    writer.write_all(&header_len.to_le_bytes())?;
-    writer.write_all(&header_bytes)?;
-
-    // Serialize the architecture spec
-    let arch_bytes = encode_current(arch)?;
-    writer.write_all(&arch_bytes)?;
-
-    writer.flush()?;
+    std::fs::write(path, to_bytes(arch)?)?;
     Ok(())
 }
 
 /// Load an architecture specification from a file.
 pub fn load(path: &Path) -> Result<ArchSpec> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
-
-    // Read and verify magic bytes
-    let mut magic = [0u8; 4];
-    reader.read_exact(&mut magic)?;
-    if &magic != MAGIC {
-        return Err(SerializeError::InvalidMagic);
-    }
-
-    // Read header
-    let mut header_len_bytes = [0u8; 4];
-    reader.read_exact(&mut header_len_bytes)?;
-    let header_len = u32::from_le_bytes(header_len_bytes) as usize;
-
-    let mut header_bytes = vec![0u8; header_len];
-    reader.read_exact(&mut header_bytes)?;
-    let header: FileHeader = decode_file_header(&header_bytes)?;
-
-    // Read the rest as architecture spec
-    let mut arch_bytes = Vec::new();
-    reader.read_to_end(&mut arch_bytes)?;
-    deserialize_archspec_bytes(header.version, &arch_bytes)
+    from_bytes(&std::fs::read(path)?)
 }
 
 /// Save to bytes (for testing or embedding).
 pub fn to_bytes(arch: &ArchSpec) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-
-    // Write magic bytes
-    bytes.extend_from_slice(MAGIC);
-
-    // Create and serialize header
-    let header = FileHeader {
-        version: FORMAT_VERSION,
-        arch_name: arch.name.clone(),
-    };
-    let header_bytes = encode_current(&header)?;
-    let header_len = header_bytes.len() as u32;
-    bytes.extend_from_slice(&header_len.to_le_bytes());
-    bytes.extend_from_slice(&header_bytes);
-
-    // Serialize the architecture spec
+    crate::validate_archspec(arch)?;
     let arch_bytes = encode_current(arch)?;
+    let payload_len =
+        u64::try_from(arch_bytes.len()).map_err(|_| SerializeError::PayloadTooLarge(u64::MAX))?;
+    let capacity = MAGIC
+        .len()
+        .checked_add(size_of::<u64>())
+        .and_then(|header| header.checked_add(arch_bytes.len()))
+        .ok_or(SerializeError::PayloadTooLarge(payload_len))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    bytes.extend_from_slice(MAGIC);
+    bytes.extend_from_slice(&payload_len.to_le_bytes());
     bytes.extend_from_slice(&arch_bytes);
 
     Ok(bytes)
@@ -454,136 +227,62 @@ pub fn to_bytes(arch: &ArchSpec) -> Result<Vec<u8>> {
 
 /// Load from bytes (for testing or embedded resources).
 pub fn from_bytes(bytes: &[u8]) -> Result<ArchSpec> {
-    if bytes.len() < 8 {
+    let header_len = MAGIC.len() + size_of::<u64>();
+    if bytes.len() < MAGIC.len() {
+        return Err(SerializeError::Truncated);
+    }
+    if &bytes[..MAGIC.len()] != MAGIC {
         return Err(SerializeError::InvalidMagic);
     }
-
-    // Verify magic bytes
-    if &bytes[0..4] != MAGIC {
-        return Err(SerializeError::InvalidMagic);
+    if bytes.len() < header_len {
+        return Err(SerializeError::Truncated);
     }
-
-    // Read header length
-    let header_len = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
-
-    if bytes.len() < 8 + header_len {
-        return Err(SerializeError::InvalidMagic);
+    let payload_len_u64 = u64::from_le_bytes(
+        bytes[MAGIC.len()..header_len]
+            .try_into()
+            .expect("checked fixed payload length"),
+    );
+    let payload_len = usize::try_from(payload_len_u64)
+        .map_err(|_| SerializeError::PayloadTooLarge(payload_len_u64))?;
+    let expected_len = header_len
+        .checked_add(payload_len)
+        .ok_or(SerializeError::PayloadTooLarge(payload_len_u64))?;
+    if bytes.len() < expected_len {
+        return Err(SerializeError::Truncated);
     }
-
-    // Deserialize header
-    let header: FileHeader = decode_file_header(&bytes[8..8 + header_len])?;
-
-    deserialize_archspec_bytes(header.version, &bytes[8 + header_len..])
+    if bytes.len() > expected_len {
+        return Err(SerializeError::TrailingBytes(bytes.len() - expected_len));
+    }
+    decode_archspec_bytes(&bytes[header_len..expected_len])
 }
 
-fn deserialize_archspec_bytes(version: u32, bytes: &[u8]) -> Result<ArchSpec> {
-    match version {
-        1 => {
-            #[cfg(feature = "legacy-bincode")]
-            let legacy: ArchSpecV1 = decode_legacy(bytes)?;
-            #[cfg(not(feature = "legacy-bincode"))]
-            let legacy: ArchSpecV1 = decode_legacy(bytes, version)?;
-            Ok(legacy.into())
-        }
-        2 => {
-            #[cfg(feature = "legacy-bincode")]
-            let legacy: ArchSpecV2 = decode_legacy(bytes)?;
-            #[cfg(not(feature = "legacy-bincode"))]
-            let legacy: ArchSpecV2 = decode_legacy(bytes, version)?;
-            Ok(legacy.into())
-        }
-        3 => {
-            #[cfg(feature = "legacy-bincode")]
-            let mut arch: ArchSpec = decode_legacy(bytes)?;
-            #[cfg(not(feature = "legacy-bincode"))]
-            let mut arch: ArchSpec = decode_legacy(bytes, version)?;
-            arch.sync_legacy_big_endian();
-            Ok(arch)
-        }
-        FORMAT_VERSION => {
-            let mut arch: ArchSpec = decode_current(bytes)?;
-            arch.sync_legacy_big_endian();
-            Ok(arch)
-        }
-        other => Err(SerializeError::UnsupportedVersion(other)),
-    }
+fn decode_archspec_bytes(bytes: &[u8]) -> Result<ArchSpec> {
+    let arch: ArchSpec = decode_current(bytes)?;
+    crate::validate_archspec(&arch)?;
+    Ok(arch)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[cfg(feature = "legacy-bincode")]
-    fn encode_v1_bytes(arch: &ArchSpecV1) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(MAGIC);
-
-        let header = FileHeader {
-            version: 1,
-            arch_name: arch.name.clone(),
-        };
-        let header_bytes = bincode::serialize(&header).expect("serialize header");
-        let header_len = header_bytes.len() as u32;
-        bytes.extend_from_slice(&header_len.to_le_bytes());
-        bytes.extend_from_slice(&header_bytes);
-
-        let arch_bytes = bincode::serialize(arch).expect("serialize arch v1");
-        bytes.extend_from_slice(&arch_bytes);
-        bytes
+    fn valid_arch(name: &str) -> ArchSpec {
+        let mut arch = ArchSpec::new(name);
+        arch.add_space(AddressSpace::ram(8));
+        arch.add_space(AddressSpace::register());
+        arch
     }
 
-    #[cfg(feature = "legacy-bincode")]
-    fn encode_v2_bytes(arch: &ArchSpecV2) -> Vec<u8> {
-        let mut bytes = Vec::new();
+    fn frame_payload(payload: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(MAGIC.len() + size_of::<u64>() + payload.len());
         bytes.extend_from_slice(MAGIC);
-
-        let header = FileHeader {
-            version: 2,
-            arch_name: arch.name.clone(),
-        };
-        let header_bytes = bincode::serialize(&header).expect("serialize header");
-        let header_len = header_bytes.len() as u32;
-        bytes.extend_from_slice(&header_len.to_le_bytes());
-        bytes.extend_from_slice(&header_bytes);
-
-        let arch_bytes = bincode::serialize(arch).expect("serialize arch v2");
-        bytes.extend_from_slice(&arch_bytes);
-        bytes
-    }
-
-    #[cfg(feature = "legacy-bincode")]
-    fn encode_v3_legacy_bytes(arch: &ArchSpec) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(MAGIC);
-
-        let header = FileHeader {
-            version: 3,
-            arch_name: arch.name.clone(),
-        };
-        let header_bytes = bincode::serialize(&header).expect("serialize header");
-        let header_len = header_bytes.len() as u32;
-        bytes.extend_from_slice(&header_len.to_le_bytes());
-        bytes.extend_from_slice(&header_bytes);
-
-        let arch_bytes = bincode::serialize(arch).expect("serialize arch v3");
-        bytes.extend_from_slice(&arch_bytes);
-        bytes
-    }
-
-    fn header_version_from_bytes(bytes: &[u8]) -> u32 {
-        assert!(
-            bytes.len() >= 8,
-            "serialized bytes must include magic + header length"
+        bytes.extend_from_slice(
+            &u64::try_from(payload.len())
+                .expect("test payload length fits u64")
+                .to_le_bytes(),
         );
-        assert_eq!(&bytes[..4], MAGIC, "magic mismatch");
-        let header_len = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
-        assert!(
-            bytes.len() >= 8 + header_len,
-            "serialized bytes too short for header"
-        );
-        let header: FileHeader =
-            decode_current(&bytes[8..8 + header_len]).expect("deserialize header");
-        header.version
+        bytes.extend_from_slice(payload);
+        bytes
     }
 
     #[test]
@@ -606,18 +305,39 @@ mod tests {
         assert_eq!(loaded.name, "test-arch");
         assert_eq!(loaded.instruction_endianness, Endianness::Little);
         assert_eq!(loaded.memory_endianness, Endianness::Little);
-        assert!(!loaded.big_endian);
         assert_eq!(loaded.addr_size, 8);
         assert_eq!(loaded.registers.len(), 2);
         assert_eq!(loaded.spaces.len(), 2);
-        assert_eq!(header_version_from_bytes(&bytes), FORMAT_VERSION);
+        assert_eq!(&bytes[..MAGIC.len()], MAGIC);
     }
 
     #[test]
     fn test_invalid_magic() {
-        let bytes = b"XXXX0000";
+        let bytes = b"NOTR2IL!";
         let result = from_bytes(bytes);
         assert!(matches!(result, Err(SerializeError::InvalidMagic)));
+    }
+
+    #[test]
+    fn every_truncated_discriminator_prefix_is_rejected_consistently() {
+        let encoded = to_bytes(&valid_arch("truncation")).expect("serialize fixture");
+        let path =
+            std::env::temp_dir().join(format!("r2il-truncation-{}.r2il", std::process::id()));
+        for length in 0..encoded.len() {
+            assert!(
+                matches!(
+                    from_bytes(&encoded[..length]),
+                    Err(SerializeError::Truncated)
+                ),
+                "prefix length {length} must be truncated"
+            );
+            std::fs::write(&path, &encoded[..length]).expect("write truncated fixture");
+            assert!(
+                matches!(load(&path), Err(SerializeError::Truncated)),
+                "file prefix length {length} must be truncated"
+            );
+        }
+        std::fs::remove_file(path).expect("remove truncated fixture");
     }
 
     #[test]
@@ -625,12 +345,11 @@ mod tests {
         let arch = ArchSpec::new("default");
         assert_eq!(arch.instruction_endianness, Endianness::Little);
         assert_eq!(arch.memory_endianness, Endianness::Little);
-        assert!(!arch.big_endian);
     }
 
     #[test]
     fn current_roundtrip_preserves_instruction_and_memory_endianness() {
-        let mut arch = ArchSpec::new("mixed-scope");
+        let mut arch = valid_arch("mixed-scope");
         arch.set_instruction_endianness(Endianness::Big);
         arch.set_memory_endianness(Endianness::Little);
 
@@ -638,8 +357,7 @@ mod tests {
         let loaded = from_bytes(&bytes).expect("deserialize");
         assert_eq!(loaded.instruction_endianness, Endianness::Big);
         assert_eq!(loaded.memory_endianness, Endianness::Little);
-        assert!(!loaded.big_endian);
-        assert_eq!(header_version_from_bytes(&bytes), FORMAT_VERSION);
+        assert_eq!(&bytes[..MAGIC.len()], MAGIC);
     }
 
     #[test]
@@ -664,7 +382,7 @@ mod tests {
 
         let bytes = to_bytes(&arch).expect("serialize");
         let loaded = from_bytes(&bytes).expect("deserialize");
-        assert_eq!(header_version_from_bytes(&bytes), FORMAT_VERSION);
+        assert_eq!(&bytes[..MAGIC.len()], MAGIC);
         assert_eq!(loaded.spaces.len(), 1);
         assert_eq!(loaded.spaces[0].memory_class, ram.memory_class);
         assert_eq!(loaded.spaces[0].permissions, ram.permissions);
@@ -674,185 +392,63 @@ mod tests {
     }
 
     #[test]
-    fn legacy_bool_syncs_from_new_fields() {
-        let mut arch = ArchSpec::new("shim");
-        arch.set_memory_endianness(Endianness::Big);
-        assert!(arch.big_endian);
-        arch.set_memory_endianness(Endianness::Custom);
-        assert!(!arch.big_endian);
-        arch.set_legacy_big_endian(true);
-        assert_eq!(arch.instruction_endianness, Endianness::Big);
-        assert_eq!(arch.memory_endianness, Endianness::Big);
-    }
-
-    #[test]
-    #[cfg(feature = "legacy-bincode")]
-    fn v1_file_loads_and_upgrades_to_current_fields() {
-        let legacy = ArchSpecV1 {
-            name: "legacy".to_string(),
-            variant: "default".to_string(),
-            big_endian: true,
-            addr_size: 8,
-            alignment: 1,
-            spaces: vec![
-                AddressSpaceV1 {
-                    id: SpaceId::Ram,
-                    name: "ram".to_string(),
-                    addr_size: 8,
-                    word_size: 1,
-                    is_default: true,
-                },
-                AddressSpaceV1 {
-                    id: SpaceId::Register,
-                    name: "register".to_string(),
-                    addr_size: 4,
-                    word_size: 1,
-                    is_default: false,
-                },
-            ],
-            registers: vec![RegisterDef::new("RAX", 0, 8)],
-            register_map: HashMap::from([(String::from("RAX"), 0)]),
-            userops: vec![UserOpDef {
-                index: 0,
-                name: "u0".to_string(),
-            }],
-            source_files: vec!["legacy.slaspec".to_string()],
-        };
-
-        let bytes = encode_v1_bytes(&legacy);
-        let loaded = from_bytes(&bytes).expect("load v1");
-        assert_eq!(loaded.name, "legacy");
-        assert_eq!(loaded.instruction_endianness, Endianness::Big);
-        assert_eq!(loaded.memory_endianness, Endianness::Big);
-        assert!(loaded.big_endian);
-        assert!(
-            loaded.spaces.iter().all(|space| space.endianness.is_none()),
-            "v1 upgrade should not synthesize per-space override"
-        );
-        assert!(
-            loaded
-                .spaces
-                .iter()
-                .all(|space| space.permissions.is_none())
-        );
-        assert!(
-            loaded
-                .spaces
-                .iter()
-                .all(|space| space.valid_ranges.is_empty())
-        );
-
-        let reserialized = to_bytes(&loaded).expect("reserialize upgraded v1");
-        assert_eq!(
-            header_version_from_bytes(&reserialized),
-            FORMAT_VERSION,
-            "upgraded v1 save must emit current format"
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "legacy-bincode")]
-    fn v2_file_loads_and_upgrades_to_current_fields() {
-        let legacy = ArchSpecV2 {
-            name: "legacy-v2".to_string(),
-            variant: "default".to_string(),
-            big_endian: false,
-            instruction_endianness: Endianness::Big,
-            memory_endianness: Endianness::Little,
-            addr_size: 8,
-            alignment: 1,
-            spaces: vec![AddressSpaceV2 {
-                id: SpaceId::Ram,
-                name: "ram".to_string(),
-                addr_size: 8,
-                word_size: 1,
-                is_default: true,
-                endianness: Some(Endianness::Big),
-            }],
-            registers: vec![RegisterDef::new("RAX", 0, 8)],
-            register_map: HashMap::from([(String::from("RAX"), 0)]),
-            userops: Vec::new(),
-            source_files: Vec::new(),
-        };
-
-        let bytes = encode_v2_bytes(&legacy);
-        let loaded = from_bytes(&bytes).expect("load v2");
-        assert_eq!(loaded.name, "legacy-v2");
-        assert_eq!(loaded.instruction_endianness, Endianness::Big);
-        assert_eq!(loaded.memory_endianness, Endianness::Little);
-        assert_eq!(loaded.spaces[0].endianness, Some(Endianness::Big));
-        assert_eq!(loaded.spaces[0].memory_class, None);
-        assert!(loaded.spaces[0].valid_ranges.is_empty());
-
-        let reserialized = to_bytes(&loaded).expect("reserialize upgraded v2");
-        assert_eq!(
-            header_version_from_bytes(&reserialized),
-            FORMAT_VERSION,
-            "upgraded v2 save must emit current format"
-        );
-    }
-
-    #[test]
-    fn save_writes_current_format_header_version() {
-        let arch = ArchSpec::new("header-version");
+    fn save_writes_only_the_current_format_discriminator() {
+        let arch = valid_arch("current-format");
         let bytes = to_bytes(&arch).expect("serialize");
-        assert_eq!(header_version_from_bytes(&bytes), FORMAT_VERSION);
+        assert_eq!(&bytes[..MAGIC.len()], MAGIC);
     }
 
     #[test]
-    #[cfg(feature = "legacy-bincode")]
-    fn v3_file_loads_with_legacy_feature_enabled() {
-        let mut arch = ArchSpec::new("legacy-v3");
-        arch.set_instruction_endianness(Endianness::Big);
-        arch.set_memory_endianness(Endianness::Little);
-        let bytes = encode_v3_legacy_bytes(&arch);
-        let loaded = from_bytes(&bytes).expect("load v3");
-        assert_eq!(loaded.name, "legacy-v3");
-        assert_eq!(loaded.instruction_endianness, Endianness::Big);
-        assert_eq!(loaded.memory_endianness, Endianness::Little);
+    fn old_v4_header_length_collision_cannot_enter_current_decoder() {
+        let mut old = Vec::from(b"R2IL".as_slice());
+        old.extend_from_slice(&5_u32.to_le_bytes());
+        old.extend_from_slice(&[4, 3, b'x', b'8', b'6']);
+        old.extend_from_slice(&encode_current(&valid_arch("x86")).expect("legacy-shaped payload"));
+        assert!(matches!(
+            from_bytes(&old),
+            Err(SerializeError::InvalidMagic)
+        ));
+
+        let mut adversarial = Vec::from(b"R2IL".as_slice());
+        adversarial.extend_from_slice(&u32::from_le_bytes(*b"PST5").to_le_bytes());
+        assert!(matches!(
+            from_bytes(&adversarial),
+            Err(SerializeError::InvalidMagic)
+        ));
     }
 
     #[test]
-    #[cfg(not(feature = "legacy-bincode"))]
-    fn legacy_v3_version_rejected_without_legacy_feature() {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(MAGIC);
-        let header = FileHeader {
-            version: 3,
-            arch_name: "legacy-v3".to_string(),
-        };
-        let header_bytes = encode_current(&header).expect("serialize header");
-        let header_len = header_bytes.len() as u32;
-        bytes.extend_from_slice(&header_len.to_le_bytes());
-        bytes.extend_from_slice(&header_bytes);
-        bytes.extend_from_slice(&[0x00]); // payload is ignored because version gate runs first.
-
-        let err = from_bytes(&bytes).expect_err("v3 should be rejected without legacy feature");
-        assert!(
-            matches!(err, SerializeError::UnsupportedVersion(3)),
-            "unexpected error: {err}"
-        );
+    fn trailing_payload_bytes_are_rejected() {
+        let arch = valid_arch("trailing");
+        let mut bytes = to_bytes(&arch).expect("serialize");
+        bytes.push(0);
+        assert!(matches!(
+            from_bytes(&bytes),
+            Err(SerializeError::TrailingBytes(1))
+        ));
     }
 
     #[test]
-    fn unsupported_future_version_rejected() {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(MAGIC);
-        let header = FileHeader {
-            version: FORMAT_VERSION + 1,
-            arch_name: "future".to_string(),
-        };
-        let header_bytes = encode_current(&header).expect("serialize header");
-        let header_len = header_bytes.len() as u32;
-        bytes.extend_from_slice(&header_len.to_le_bytes());
-        bytes.extend_from_slice(&header_bytes);
-        // No payload needed: version gate runs before payload decode.
+    fn exact_length_malformed_postcard_payload_is_rejected() {
+        let bytes = frame_payload(&[0xff]);
+        assert!(matches!(
+            from_bytes(&bytes),
+            Err(SerializeError::Postcard(_))
+        ));
+    }
 
-        let err = from_bytes(&bytes).expect_err("future version should be rejected");
-        assert!(
-            matches!(err, SerializeError::UnsupportedVersion(v) if v == FORMAT_VERSION + 1),
-            "unexpected error: {}",
-            err
-        );
+    #[test]
+    fn current_frame_cannot_bypass_architecture_validation() {
+        let invalid = ArchSpec::new("missing-spaces");
+        assert!(matches!(
+            to_bytes(&invalid),
+            Err(SerializeError::Validation(_))
+        ));
+
+        let payload = encode_current(&invalid).expect("encode deliberately invalid payload");
+        assert!(matches!(
+            from_bytes(&frame_payload(&payload)),
+            Err(SerializeError::Validation(_))
+        ));
     }
 }

@@ -85,11 +85,6 @@ impl LiftContext {
         self.space_map.insert("constant".into(), SpaceId::Const);
     }
 
-    /// Set the endianness.
-    pub fn set_big_endian(&mut self, big_endian: bool) {
-        self.arch.set_legacy_big_endian(big_endian);
-    }
-
     /// Set instruction endianness.
     pub fn set_instruction_endianness(&mut self, endianness: Endianness) {
         self.arch.set_instruction_endianness(endianness);
@@ -258,14 +253,5 @@ mod tests {
         assert_eq!(arch.registers.len(), 2);
         assert_eq!(arch.get_register_offset("RAX"), Some(0));
         assert_eq!(arch.get_register_offset("EAX"), Some(0));
-    }
-
-    #[test]
-    fn legacy_set_big_endian_sets_both_v2_fields() {
-        let mut ctx = LiftContext::new("test");
-        ctx.set_big_endian(true);
-        assert_eq!(ctx.arch.instruction_endianness, Endianness::Big);
-        assert_eq!(ctx.arch.memory_endianness, Endianness::Big);
-        assert!(ctx.arch.big_endian);
     }
 }

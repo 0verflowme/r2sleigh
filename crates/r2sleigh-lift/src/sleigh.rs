@@ -57,7 +57,11 @@ pub(crate) fn extract_address_space_map(
                 space.name, address_size, word_size
             )));
         }
-        let space_endianness = Endianness::from_big_endian(space.big_endian);
+        let space_endianness = if space.big_endian {
+            Endianness::Big
+        } else {
+            Endianness::Little
+        };
         let space_id = ctx.add_space_with_layout(
             &space.name,
             address_size,

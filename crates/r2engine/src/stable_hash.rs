@@ -61,7 +61,7 @@ pub fn stable_fnv1a_bytes(bytes: &[u8]) -> u64 {
 /// retained here in sorted form.
 pub fn stable_arch_hash(arch: Option<&ArchSpec>) -> u64 {
     let Some(arch) = arch else {
-        return stable_fnv1a_hash("r2engine-arch-identity-none-v1");
+        return stable_fnv1a_hash("r2engine-arch-identity-none-v2");
     };
     let endianness = |value: Endianness| match value {
         Endianness::Little => 0_u8,
@@ -78,7 +78,6 @@ pub fn stable_arch_hash(arch: Option<&ArchSpec>) -> u64 {
     let components = [
         stable_fnv1a_hash(arch.name.as_str()),
         stable_fnv1a_hash(arch.variant.as_str()),
-        stable_fnv1a_hash(&arch.big_endian),
         stable_fnv1a_hash(&endianness(arch.instruction_endianness)),
         stable_fnv1a_hash(&endianness(arch.memory_endianness)),
         stable_fnv1a_hash(&arch.addr_size),
@@ -89,7 +88,7 @@ pub fn stable_arch_hash(arch: Option<&ArchSpec>) -> u64 {
         stable_fnv1a_debug_hash(&arch.userops),
         stable_fnv1a_hash(&arch.source_files),
     ];
-    stable_fnv1a_hash(&("r2engine-arch-identity-v1", components))
+    stable_fnv1a_hash(&("r2engine-arch-identity-v2", components))
 }
 
 pub fn stable_blocks_hash(blocks: &[R2ILBlock]) -> u64 {

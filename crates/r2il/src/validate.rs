@@ -87,18 +87,6 @@ pub fn validate_archspec(arch: &ArchSpec) -> Result<(), ValidationError> {
         ));
     }
 
-    let expected_legacy = arch.memory_endianness.to_legacy_big_endian();
-    if arch.big_endian != expected_legacy {
-        issues.push(ValidationIssue::new(
-            "arch.endianness.legacy_mismatch",
-            "arch.big_endian",
-            format!(
-                "legacy big_endian ({}) does not match derived memory endianness ({})",
-                arch.big_endian, expected_legacy
-            ),
-        ));
-    }
-
     if arch.spaces.is_empty() {
         issues.push(ValidationIssue::new(
             "arch.spaces.empty",
@@ -1427,7 +1415,7 @@ mod tests {
     use super::*;
     use crate::opcode::{SwitchCase, SwitchInfo};
     use crate::serialize::{RegisterDef, UserOpDef};
-    use crate::{AddressSpace, Endianness, R2ILOp};
+    use crate::{AddressSpace, R2ILOp};
 
     fn valid_archspec() -> ArchSpec {
         let mut arch = ArchSpec::new("test-arch");
@@ -1654,19 +1642,6 @@ mod tests {
             err.issues
                 .iter()
                 .any(|i| i.code == "arch.userops.duplicate_index")
-        );
-    }
-
-    #[test]
-    fn validator_flags_legacy_mismatch_when_inconsistent() {
-        let mut arch = valid_archspec();
-        arch.memory_endianness = Endianness::Big;
-        arch.big_endian = false;
-        let err = validate_archspec(&arch).expect_err("arch should fail");
-        assert!(
-            err.issues
-                .iter()
-                .any(|i| i.code == "arch.endianness.legacy_mismatch")
         );
     }
 

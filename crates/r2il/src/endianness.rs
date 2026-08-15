@@ -25,18 +25,6 @@ impl Endianness {
     pub fn is_little(self) -> bool {
         matches!(self, Self::Little)
     }
-
-    /// Create endianness from legacy `big_endian` boolean.
-    pub fn from_big_endian(big_endian: bool) -> Self {
-        if big_endian { Self::Big } else { Self::Little }
-    }
-
-    /// Convert to legacy `big_endian` boolean.
-    ///
-    /// Only `Big` maps to `true`; all other variants map to `false`.
-    pub fn to_legacy_big_endian(self) -> bool {
-        self.is_big()
-    }
 }
 
 #[cfg(test)]
