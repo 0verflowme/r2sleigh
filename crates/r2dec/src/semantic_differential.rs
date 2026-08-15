@@ -5707,7 +5707,11 @@ mod tests {
     use std::ffi::c_void;
     use std::mem::size_of;
 
-    use r2cert::CertifiedMachineFunction;
+    use r2cert::{
+        CERTIFIED_PRIVATE_FRAME_CONDITIONAL_JOIN_CONTRACT_VERSION, CertifiedMachineFunction,
+        CertifiedTypedRegionKind, LedgerClosureError, TypedRegionMapping,
+        certify_private_frame_conditional_join_region,
+    };
 
     use r2source::{
         RADARE_ABI_VERSION, RADARE_CAP_EXACT_FUNCTION_INTERFACE, RADARE_CAP_EXACT_RETURN_MECHANISM,
@@ -6510,6 +6514,70 @@ mod tests {
         assert_eq!(certificate.true_arm().transparent().len(), 1);
         assert!(certificate.false_arm().transparent().is_empty());
         assert!(certificate.release().return_address_read().is_some());
+
+        let mappings = full
+            .source()
+            .obligations()
+            .keys()
+            .map(|obligation| {
+                let [effect] = full.ledger().effects(*obligation) else {
+                    panic!("one exact genuine ledger effect")
+                };
+                TypedRegionMapping::new(*obligation, effect.disposition().clone())
+            })
+            .collect::<Vec<_>>();
+        let closure = certify_private_frame_conditional_join_region(
+            trusted.artifact(),
+            full.origin(),
+            full.ledger(),
+            mappings.clone(),
+            certificate,
+        )
+        .expect("genuine private-frame conditional join ledger closure");
+        assert_eq!(
+            closure.region_kind(),
+            CertifiedTypedRegionKind::PrivateFrameConditionalJoinFunction
+        );
+        assert_eq!(
+            closure.region_schema_version(),
+            CERTIFIED_PRIVATE_FRAME_CONDITIONAL_JOIN_CONTRACT_VERSION
+        );
+        assert!(closure.matches_ledger(
+            full.origin(),
+            CertifiedTypedRegionKind::PrivateFrameConditionalJoinFunction,
+            CERTIFIED_PRIVATE_FRAME_CONDITIONAL_JOIN_CONTRACT_VERSION,
+            &mappings,
+        ));
+
+        let foreign_blocks = conditional_private_join_blocks(ADDR + 0x200, false);
+        let foreign_header = foreign_blocks[0].addr;
+        let (foreign_trusted, _, _) =
+            trusted_x86_blocks_fixture(foreign_blocks, ADDR + 0x200, true);
+        let foreign_full = CertifiedMachineFunction::from_artifact(&foreign_trusted)
+            .expect("foreign genuine conditional private-frame certificate");
+        let foreign_join = foreign_full
+            .private_frame_conditional_join(foreign_header)
+            .expect("foreign sealed conditional join");
+        assert_eq!(
+            certify_private_frame_conditional_join_region(
+                foreign_trusted.artifact(),
+                full.origin(),
+                full.ledger(),
+                mappings.clone(),
+                certificate,
+            ),
+            Err(LedgerClosureError::InvalidOrigin)
+        );
+        assert_eq!(
+            certify_private_frame_conditional_join_region(
+                trusted.artifact(),
+                full.origin(),
+                full.ledger(),
+                mappings,
+                foreign_join,
+            ),
+            Err(LedgerClosureError::InvalidRegionTopology)
+        );
 
         let source_blocks = conditional_private_join_blocks(ADDR + 0x100, true);
         let (trusted, lifted, spans) =

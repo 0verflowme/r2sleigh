@@ -45,6 +45,7 @@ pub use aggregate_member::{
 pub use private_frame_conditional_join::{
     CertifiedInertPrivateFrameJoinPhi, CertifiedPrivateFrameConditionalArm,
     CertifiedPrivateFrameConditionalJoin, CertifiedPrivateFrameTransparentBranch,
+    certify_private_frame_conditional_join_region,
 };
 pub use private_frame_value_flow::{
     CertifiedPrivateFrameLoad, CertifiedPrivateFramePhi, CertifiedPrivateFramePhiInput,
@@ -52,7 +53,7 @@ pub use private_frame_value_flow::{
     CertifiedPrivateFrameVersionDefinition,
 };
 
-pub const CERTIFICATION_SCHEMA_VERSION: u32 = 31;
+pub const CERTIFICATION_SCHEMA_VERSION: u32 = 32;
 
 /// Unforgeable run-local identity for one proof authority domain.
 ///
@@ -2641,6 +2642,7 @@ pub enum CertifiedTypedRegionKind {
     ConditionalTerminalReturnFunction,
     SwitchTerminalReturnFunction,
     CarrierFreeLoopTerminalReturnFunction,
+    PrivateFrameConditionalJoinFunction,
 }
 
 pub const CERTIFIED_TERMINAL_RETURN_REGION_CONTRACT_VERSION: u32 = 5;
@@ -2649,6 +2651,7 @@ pub const CERTIFIED_DIRECT_CALL_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 3;
 pub const CERTIFIED_CONDITIONAL_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 3;
 pub const CERTIFIED_SWITCH_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 3;
 pub const CERTIFIED_CARRIER_FREE_LOOP_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 3;
+pub const CERTIFIED_PRIVATE_FRAME_CONDITIONAL_JOIN_CONTRACT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TypedRegionMapping {
@@ -2728,6 +2731,10 @@ impl CertifiedLedgerClosure {
             CertifiedTypedRegionKind::CarrierFreeLoopTerminalReturnFunction => {
                 self.region_schema_version
                     == CERTIFIED_CARRIER_FREE_LOOP_TERMINAL_RETURN_CONTRACT_VERSION
+            }
+            CertifiedTypedRegionKind::PrivateFrameConditionalJoinFunction => {
+                self.region_schema_version
+                    == CERTIFIED_PRIVATE_FRAME_CONDITIONAL_JOIN_CONTRACT_VERSION
             }
         };
         let mapped_obligations = self
