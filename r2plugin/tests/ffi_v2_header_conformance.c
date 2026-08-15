@@ -2,6 +2,16 @@
 
 #include <stddef.h>
 
+#ifdef R2SLEIGH_QUERY_DIRECT_TARGETS_V2
+#error "detached direct-target query must not be public"
+#endif
+#ifdef R2SLEIGH_QUERY_SYMBOLIC_TARGETS_V2
+#error "detached symbolic-target query must not be public"
+#endif
+#ifdef R2SLEIGH_QUERY_RUNTIME_SOURCES_V2
+#error "mutable runtime-source query must not be public"
+#endif
+
 static int data_ref_contract_matches(const R2SleighApiV2 *api, uint32_t size, uint32_t schema_version) {
 	return api
 		&& api->data_ref_size == size
@@ -110,24 +120,6 @@ int main(void) {
 	R2SleighAnalysisRenderRequestV2 analysis_render = {
 		.kind = R2SLEIGH_ANALYSIS_BLOCK_ESIL_V2,
 	};
-	R2SleighScopeRenderRequestV2 scope_render = {
-		.kind = R2SLEIGH_SCOPE_FUNCTION_V2,
-	};
-	static const uint8_t scope_symbol_name[] = "sym.imp.memcpy";
-	R2SleighScopeSymbolV2 scope_symbol = {
-		.abi_version = R2SLEIGH_ABI_V2,
-		.struct_size = sizeof (scope_symbol),
-		.schema_version = R2SLEIGH_SCOPE_SYMBOL_SCHEMA_V2,
-		.addr = 0x5000,
-		.name = {
-			.data = scope_symbol_name,
-			.len = sizeof (scope_symbol_name) - 1,
-		},
-		.linkage = R2SLEIGH_INTERPROC_LINKAGE_IMPORTED_V2,
-	};
-	scope_render.symbols = &scope_symbol;
-	scope_render.num_symbols = 1;
-	scope_render.merge_states = 1;
 	R2SleighAnalysisQueryRequestV2 analysis_query = {
 		.kind = R2SLEIGH_QUERY_BLOCK_VALUES_V2,
 	};
@@ -139,25 +131,6 @@ int main(void) {
 		.kind = R2SLEIGH_PLANNER_ANALYSIS_POLICY_V2,
 	};
 	R2SleighPlannerQueryResponseV2 planner_response = {0};
-	static const uint8_t planner_target_name[] = "local_helper";
-	R2SleighPlannerTargetInputV2 planner_target = {
-		.abi_version = R2SLEIGH_ABI_V2,
-		.struct_size = sizeof (planner_target),
-		.schema_version = R2SLEIGH_PLANNER_TARGET_INPUT_SCHEMA_V2,
-		.direct_target = 0x4000,
-		.name = {
-			.data = planner_target_name,
-			.len = sizeof (planner_target_name) - 1,
-		},
-		.linkage = R2SLEIGH_INTERPROC_LINKAGE_INTERNAL_V2,
-		.resolved_target = 0x4010,
-		.has_resolved_target = 1,
-		.target_materialized = 1,
-		.has_target_metrics = 1,
-		.target_basic_block_count = 1,
-		.target_cost = 1,
-	};
-	R2SleighPlannerResultViewV2 planner_result_view = {0};
 	request_payload.radare_snapshot = &radare_snapshot;
 	const R2SleighApiV2 *api = r2sleigh_api_v2 ();
 	if (R2SLEIGH_RADARE_ABI_V2 != 138
@@ -180,12 +153,6 @@ int main(void) {
 		|| switch_case.target != 0x402000
 		|| call_identity.op_index != 3
 		|| analysis_render.kind != R2SLEIGH_ANALYSIS_BLOCK_ESIL_V2
-		|| scope_render.kind != R2SLEIGH_SCOPE_FUNCTION_V2
-		|| scope_render.symbols != &scope_symbol
-		|| scope_render.num_symbols != 1
-		|| scope_render.merge_states != 1
-		|| scope_symbol.schema_version != R2SLEIGH_SCOPE_SYMBOL_SCHEMA_V2
-		|| scope_symbol.linkage != R2SLEIGH_INTERPROC_LINKAGE_IMPORTED_V2
 		|| analysis_query.kind != R2SLEIGH_QUERY_BLOCK_VALUES_V2
 		|| analysis_view.kind != 0
 		|| request_payload.timeout_us != 10
@@ -204,8 +171,6 @@ int main(void) {
 		|| R2SLEIGH_MAX_AGGREGATE_BLOCKS_V2 != 1024
 		|| R2SLEIGH_MAX_AGGREGATE_OPS_V2 != 4096
 		|| R2SLEIGH_MAX_SCOPE_FUNCTIONS_V2 != 4096
-		|| R2SLEIGH_MAX_SCOPE_SYMBOLS_V2 != 4096
-		|| R2SLEIGH_MAX_PLANNER_TARGETS_V2 != 4096
 		|| R2SLEIGH_MAX_CONTEXT_ITEMS_V2 != 65536
 		|| R2SLEIGH_MAX_NESTED_ITEMS_V2 != 262144
 		|| R2SLEIGH_MAX_AGGREGATE_STRING_BYTES_V2 != (4U << 20)
@@ -246,16 +211,12 @@ int main(void) {
 		|| api->switch_case_size != sizeof (R2SleighSwitchCaseV2)
 		|| api->direct_call_identity_size != sizeof (R2SleighDirectCallIdentityV2)
 		|| api->analysis_render_request_size != sizeof (R2SleighAnalysisRenderRequestV2)
-		|| api->scope_render_request_size != sizeof (R2SleighScopeRenderRequestV2)
-		|| api->scope_symbol_size != sizeof (R2SleighScopeSymbolV2)
 		|| api->analysis_query_request_size != sizeof (R2SleighAnalysisQueryRequestV2)
 		|| api->analysis_result_view_size != sizeof (R2SleighAnalysisResultViewV2)
 		|| api->data_ref_size == 0
 		|| api->data_ref_schema_version != R2SLEIGH_DATA_REF_SCHEMA_V2
 		|| api->planner_query_request_size != sizeof (R2SleighPlannerQueryRequestV2)
 		|| api->planner_query_response_size != sizeof (R2SleighPlannerQueryResponseV2)
-		|| api->planner_target_input_size != sizeof (R2SleighPlannerTargetInputV2)
-		|| api->planner_result_view_size != sizeof (R2SleighPlannerResultViewV2)
 		|| api->radare_snapshot_input_size != sizeof (R2SleighRadareSnapshotInputV2)
 		|| api->radare_accessors_size != sizeof (R2SleighRadareAccessorsV2)
 		|| (api->capabilities & R2SLEIGH_CAPABILITIES_V2) != R2SLEIGH_CAPABILITIES_V2
@@ -284,11 +245,9 @@ int main(void) {
 		|| !api->lift_block_mnemonic || !api->lift_block_type
 		|| !api->lift_block_jump || !api->lift_block_fail
 		|| !api->owned_bytes_view || !api->owned_bytes_free
-		|| !api->analysis_render || !api->scope_render || !api->analysis_query
+		|| !api->analysis_render || !api->analysis_query
 		|| !api->analysis_result_view || !api->analysis_result_free
-		|| !api->engine_cache_reset || !api->planner_query
-		|| !api->planner_result_view || !api->planner_result_copy
-		|| !api->planner_result_free) {
+		|| !api->engine_cache_reset || !api->planner_query) {
 		return 1;
 	}
 	if (!data_ref_contract_matches (api, api->data_ref_size, R2SLEIGH_DATA_REF_SCHEMA_V2)
@@ -310,30 +269,6 @@ int main(void) {
 		return 9;
 	}
 	planner_query.callback_kind = 0;
-	planner_query.kind = R2SLEIGH_PLANNER_INTERPROC_TARGETS_V2;
-	planner_query.targets = &planner_target;
-	planner_query.num_targets = 1;
-	if (api->planner_query (&planner_query, &planner_response) != R2SLEIGH_STATUS_OK_V2
-		|| !planner_response.result
-		|| api->planner_result_view (planner_response.result, &planner_result_view) != R2SLEIGH_STATUS_OK_V2
-		|| planner_result_view.queued_target_count != 2) {
-		return 10;
-	}
-	uint64_t planner_targets[2] = {0};
-	size_t planner_target_count = 0;
-	if (api->planner_result_copy (
-		planner_response.result,
-		R2SLEIGH_PLANNER_RESULT_QUEUED_TARGETS_V2,
-		planner_targets,
-		2,
-		&planner_target_count) != R2SLEIGH_STATUS_OK_V2
-		|| planner_target_count != 2
-		|| planner_targets[0] != 0x4000 || planner_targets[1] != 0x4010
-		|| api->planner_result_free (planner_response.result) != R2SLEIGH_STATUS_OK_V2
-		|| api->planner_result_view (planner_response.result, &planner_result_view)
-			!= R2SLEIGH_STATUS_INVALID_ARGUMENT_V2) {
-		return 11;
-	}
 
 	static const uint8_t arch[] = "x86-64";
 	R2SleighStringViewV2 arch_view = {

@@ -192,33 +192,11 @@ typedef struct R2ILFunctionBlocks R2ILFunctionBlocks;
 
 #define R2SLEIGH_ANALYSIS_ENGINE_CACHE_STATS_V2 17
 
-#define R2SLEIGH_SCOPE_FUNCTION_V2 1
-
-#define R2SLEIGH_SCOPE_PATHS_V2 2
-
-#define R2SLEIGH_SCOPE_EXPLORE_V2 3
-
-#define R2SLEIGH_SCOPE_SOLVE_V2 4
-
-#define R2SLEIGH_SCOPE_EXPLORE_REPLAY_V2 5
-
-#define R2SLEIGH_SCOPE_SOLVE_REPLAY_V2 6
-
-#define R2SLEIGH_SCOPE_RUN_SPEC_V2 7
-
-#define R2SLEIGH_SCOPE_SYMBOL_SCHEMA_V2 1
-
 #define R2SLEIGH_QUERY_BLOCK_VALUES_V2 1
 
 #define R2SLEIGH_QUERY_TAINT_SUMMARY_V2 2
 
 #define R2SLEIGH_QUERY_ANNOTATIONS_V2 3
-
-#define R2SLEIGH_QUERY_DIRECT_TARGETS_V2 4
-
-#define R2SLEIGH_QUERY_SYMBOLIC_TARGETS_V2 5
-
-#define R2SLEIGH_QUERY_RUNTIME_SOURCES_V2 6
 
 #define R2SLEIGH_QUERY_RECOVERED_VARS_V2 7
 
@@ -235,30 +213,6 @@ typedef struct R2ILFunctionBlocks R2ILFunctionBlocks;
 #define R2SLEIGH_PLANNER_AUTO_CALLBACK_V2 3
 
 #define R2SLEIGH_PLANNER_INTERPROC_SESSION_V2 4
-
-#define R2SLEIGH_PLANNER_SYMBOLIC_SCOPE_V2 5
-
-#define R2SLEIGH_PLANNER_RUNTIME_SOURCE_V2 6
-
-#define R2SLEIGH_PLANNER_INTERPROC_TARGETS_V2 7
-
-#define R2SLEIGH_PLANNER_TARGET_INPUT_SCHEMA_V2 1
-
-#define R2SLEIGH_PLANNER_RESULT_SCHEMA_V2 1
-
-#define R2SLEIGH_MAX_PLANNER_TARGETS_V2 4096
-
-#define R2SLEIGH_INTERPROC_LINKAGE_UNKNOWN_V2 0
-
-#define R2SLEIGH_INTERPROC_LINKAGE_INTERNAL_V2 1
-
-#define R2SLEIGH_INTERPROC_LINKAGE_IMPORTED_V2 2
-
-#define R2SLEIGH_PLANNER_RESULT_QUEUED_TARGETS_V2 1
-
-#define R2SLEIGH_PLANNER_RESULT_REGISTRATION_TARGETS_V2 2
-
-#define R2SLEIGH_PLANNER_RESULT_RUNTIME_COPY_TARGETS_V2 3
 
 #define R2SLEIGH_MODE_FAST_V2 0
 
@@ -296,20 +250,6 @@ typedef struct R2ILFunctionBlocks R2ILFunctionBlocks;
 
 #define R2SLEIGH_AUTO_CALLBACK_REASON_TOO_COSTLY_V2 4
 
-#define R2SLEIGH_SYMBOLIC_SCOPE_REASON_ALLOWED_V2 0
-
-#define R2SLEIGH_SYMBOLIC_SCOPE_REASON_SCOPE_FULL_V2 1
-
-#define R2SLEIGH_SYMBOLIC_SCOPE_REASON_INTERPROC_DISABLED_V2 2
-
-#define R2SLEIGH_SYMBOLIC_SCOPE_REASON_TARGET_TERMINAL_V2 3
-
-#define R2SLEIGH_RUNTIME_SOURCE_REASON_ALLOWED_V2 0
-
-#define R2SLEIGH_RUNTIME_SOURCE_REASON_SCOPE_FULL_V2 1
-
-#define R2SLEIGH_RUNTIME_SOURCE_REASON_EMPTY_SOURCE_V2 2
-
 #define R2SLEIGH_MAX_FUNCTION_INPUT_BYTES_V2 (16 << 20)
 
 #define R2SLEIGH_MAX_AGGREGATE_BLOCKS_V2 1024
@@ -317,8 +257,6 @@ typedef struct R2ILFunctionBlocks R2ILFunctionBlocks;
 #define R2SLEIGH_MAX_AGGREGATE_OPS_V2 4096
 
 #define R2SLEIGH_MAX_SCOPE_FUNCTIONS_V2 4096
-
-#define R2SLEIGH_MAX_SCOPE_SYMBOLS_V2 4096
 
 #define R2SLEIGH_MAX_CONTEXT_ITEMS_V2 65536
 
@@ -342,12 +280,6 @@ typedef struct R2SleighAnalysisResultV2 R2SleighAnalysisResultV2;
  * `owned_bytes_free` is the only valid deallocator.
  */
 typedef struct R2SleighOwnedBytesV2 R2SleighOwnedBytesV2;
-
-/**
- * Opaque registry-owned planner result. `planner_result_free` is the only
- * valid deallocator.
- */
-typedef struct R2SleighPlannerResultV2 R2SleighPlannerResultV2;
 
 /**
  * Opaque registry-owned response handle. The caller owns the obligation to
@@ -461,36 +393,6 @@ typedef struct R2SleighAnalysisRenderRequestV2 {
 } R2SleighAnalysisRenderRequestV2;
 
 /**
- * One explicitly linked symbol in an immutable per-scope request snapshot.
- */
-typedef struct R2SleighScopeSymbolV2 {
-  uint32_t abi_version;
-  uint32_t struct_size;
-  uint32_t schema_version;
-  uint64_t addr;
-  struct R2SleighStringViewV2 name;
-  uint32_t linkage;
-} R2SleighScopeSymbolV2;
-
-/**
- * One bounded symbolic request over registry-owned scoped lift handles.
- */
-typedef struct R2SleighScopeRenderRequestV2 {
-  uint32_t kind;
-  const R2ILContext *context;
-  const R2ILFunctionBlocks *functions;
-  size_t num_functions;
-  uint64_t entry_addr;
-  uint64_t target_addr;
-  const void *replay_seed;
-  struct R2SleighStringViewV2 argument;
-  struct R2SleighStringViewV2 external_context;
-  const struct R2SleighScopeSymbolV2 *symbols;
-  size_t num_symbols;
-  uint32_t merge_states;
-} R2SleighScopeRenderRequestV2;
-
-/**
  * One bounded structured-analysis request over registry-owned lift handles.
  */
 typedef struct R2SleighAnalysisQueryRequestV2 {
@@ -499,9 +401,6 @@ typedef struct R2SleighAnalysisQueryRequestV2 {
   const R2ILBlock *const *blocks;
   size_t num_blocks;
   uint64_t function_addr;
-  struct R2SleighStringViewV2 function_name;
-  const uint64_t *input_values;
-  size_t num_input_values;
 } R2SleighAnalysisQueryRequestV2;
 
 /**
@@ -519,35 +418,9 @@ typedef struct R2SleighAnalysisResultViewV2 {
   size_t quaternary_count;
 } R2SleighAnalysisResultViewV2;
 
-typedef struct R2SleighInterprocSessionPlan {
-  int32_t include_type_interproc_scope;
-  int32_t include_root_symbolic_scope;
-  size_t interproc_iter;
-  size_t interproc_max_iters;
-  int32_t interproc_converged;
-} R2SleighInterprocSessionPlan;
-
 /**
- * One exact, independently versioned interprocedural target observation.
- */
-typedef struct R2SleighPlannerTargetInputV2 {
-  uint32_t abi_version;
-  uint32_t struct_size;
-  uint32_t schema_version;
-  uint64_t direct_target;
-  struct R2SleighStringViewV2 name;
-  uint32_t linkage;
-  uint64_t resolved_target;
-  uint32_t has_resolved_target;
-  uint32_t target_materialized;
-  uint32_t has_target_metrics;
-  uint32_t target_basic_block_count;
-  uint32_t target_cost;
-} R2SleighPlannerTargetInputV2;
-
-/**
- * Versioned planner query. The selected `kind` determines which input fields
- * are read; target arrays are copied and validated during the call.
+ * Versioned scalar planner query. The selected `kind` determines which input
+ * fields are read.
  */
 typedef struct R2SleighPlannerQueryRequestV2 {
   uint32_t abi_version;
@@ -557,18 +430,10 @@ typedef struct R2SleighPlannerQueryRequestV2 {
   uint32_t depth;
   uint32_t purpose;
   uint32_t callback_kind;
-  uint32_t root_function;
-  uint32_t target_hint_function;
-  size_t current_scope_count;
   size_t function_count;
   size_t basic_block_count;
   uint32_t cost;
   uint64_t linear_size;
-  uint64_t addr;
-  uint64_t size;
-  struct R2SleighInterprocSessionPlan interproc;
-  const struct R2SleighPlannerTargetInputV2 *targets;
-  size_t num_targets;
 } R2SleighPlannerQueryRequestV2;
 
 typedef struct R2SleighAnalysisPolicyV2 {
@@ -609,18 +474,13 @@ typedef struct R2SleighAutoCallbackPlanV2 {
   uint32_t reason;
 } R2SleighAutoCallbackPlanV2;
 
-typedef struct R2SleighSymbolicScopeFunctionPlanV2 {
-  int32_t append_function;
-  int32_t expand_targets;
-  uint32_t reason;
-} R2SleighSymbolicScopeFunctionPlanV2;
-
-typedef struct R2SleighRuntimeMaterializedSourcePlanV2 {
-  int32_t append_source;
-  uint64_t capped_size;
-  uint64_t slot_bytes;
-  uint32_t reason;
-} R2SleighRuntimeMaterializedSourcePlanV2;
+typedef struct R2SleighInterprocSessionPlan {
+  int32_t include_type_interproc_scope;
+  int32_t include_root_symbolic_scope;
+  size_t interproc_iter;
+  size_t interproc_max_iters;
+  int32_t interproc_converged;
+} R2SleighInterprocSessionPlan;
 
 /**
  * Versioned planner response. Only the member selected by `kind` is authoritative.
@@ -634,22 +494,7 @@ typedef struct R2SleighPlannerQueryResponseV2 {
   struct R2SleighPostAnalysisPlanV2 post_analysis;
   struct R2SleighAutoCallbackPlanV2 auto_callback;
   struct R2SleighInterprocSessionPlan interproc_session;
-  struct R2SleighSymbolicScopeFunctionPlanV2 symbolic_scope;
-  struct R2SleighRuntimeMaterializedSourcePlanV2 runtime_source;
-  struct R2SleighPlannerResultV2 *result;
 } R2SleighPlannerQueryResponseV2;
-
-/**
- * Pointer-free counts for one registry-owned planner result.
- */
-typedef struct R2SleighPlannerResultViewV2 {
-  uint32_t abi_version;
-  uint32_t struct_size;
-  uint32_t schema_version;
-  size_t queued_target_count;
-  size_t registration_target_count;
-  size_t runtime_copy_target_count;
-} R2SleighPlannerResultViewV2;
 
 /**
  * Stable V2 function table. Every callback contains its own unwind barrier.
@@ -692,16 +537,12 @@ typedef struct R2SleighApiV2 {
   uint32_t switch_case_size;
   uint32_t direct_call_identity_size;
   uint32_t analysis_render_request_size;
-  uint32_t scope_render_request_size;
-  uint32_t scope_symbol_size;
   uint32_t analysis_query_request_size;
   uint32_t analysis_result_view_size;
   uint32_t data_ref_size;
   uint32_t data_ref_schema_version;
   uint32_t planner_query_request_size;
   uint32_t planner_query_response_size;
-  uint32_t planner_target_input_size;
-  uint32_t planner_result_view_size;
   uint32_t radare_snapshot_input_size;
   uint32_t radare_accessors_size;
   uint32_t (*session_create)(const struct R2SleighSessionConfigV2*, struct R2SleighSessionV2**);
@@ -760,7 +601,6 @@ typedef struct R2SleighApiV2 {
   uint32_t (*owned_bytes_free)(struct R2SleighOwnedBytesV2*);
   uint32_t (*analysis_render)(const struct R2SleighAnalysisRenderRequestV2*,
                               struct R2SleighOwnedBytesV2**);
-  uint32_t (*scope_render)(const struct R2SleighScopeRenderRequestV2*, struct R2SleighOwnedBytesV2**);
   uint32_t (*analysis_query)(const struct R2SleighAnalysisQueryRequestV2*,
                              struct R2SleighAnalysisResultV2**);
   uint32_t (*analysis_result_view)(const struct R2SleighAnalysisResultV2*,
@@ -769,14 +609,6 @@ typedef struct R2SleighApiV2 {
   uint32_t (*engine_cache_reset)(void);
   uint32_t (*planner_query)(const struct R2SleighPlannerQueryRequestV2*,
                             struct R2SleighPlannerQueryResponseV2*);
-  uint32_t (*planner_result_view)(const struct R2SleighPlannerResultV2*,
-                                  struct R2SleighPlannerResultViewV2*);
-  uint32_t (*planner_result_copy)(const struct R2SleighPlannerResultV2*,
-                                  uint32_t,
-                                  uint64_t*,
-                                  size_t,
-                                  size_t*);
-  uint32_t (*planner_result_free)(struct R2SleighPlannerResultV2*);
 } R2SleighApiV2;
 
 /**

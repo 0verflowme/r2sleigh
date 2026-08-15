@@ -150,12 +150,13 @@ Memory Model
 Plugin Commands
 ---------------
 
-`a:sla.sym` -- symbolic execution summary for current function.
+Detached symbolic commands are unavailable. `a:sla.sym`, `a:sla.sym.paths`,
+`a:sym.runj`, the `a:sym.explore*` and `a:sym.solve*` families, and commands
+that build a detached symbolic scope cannot establish source authority from
+live plugin state.
 
-`a:sla.sym.paths` -- explore paths and return solutions as JSON.
-
-Example:
-
-```bash
-r2 -qc 'aaa; s main; a:sla.sym.paths' ./target
-```
+Symbolic execution requires a borrowed ABI-138/schema-9 function snapshot from
+radare2's locked snapshot transaction. The snapshot is deep-copied
+synchronously and then treated as immutable. Missing, stale, or incomplete
+source authority is refused; there is no detached fallback or replacement
+plugin API.

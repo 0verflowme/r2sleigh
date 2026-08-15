@@ -33,7 +33,7 @@ DEFAULT_TARGETS = (
     "_os_ref_release",
 )
 
-JSON_COMMANDS = frozenset({"profile", "types", "symex"})
+JSON_COMMANDS = frozenset({"profile", "types"})
 DECOMPILER_COMMANDS = frozenset({"decompile_sla", "decompile_pdd", "decompile_pdD"})
 DECOMPILER_FALLBACK_MARKERS = (
     "r2dec fallback:",
@@ -350,7 +350,6 @@ def collect_target(
         "decompile_pdD": "pdD",
         "types": "a:sla.debug.types",
         "profile": "a:sla.debug.profilej",
-        "symex": "a:sym.explore",
     }
     out: dict[str, Any] = dict(target)
     out["commands"] = {}

@@ -195,13 +195,13 @@ The plugin reads `anal.arch` and `anal.bits` from radare2. If auto-detection
 fails, set them explicitly:
 
 ```bash
-r2 -qc 'e anal.arch=x86; e anal.bits=64; aaa; s main; a:sla.dec' /bin/ls
+r2 -qc 'e anal.arch=x86; e anal.bits=64; aaa; s main; pdd' /bin/ls
 ```
 
 Or override with the plugin command:
 
 ```bash
-r2 -qc 'a:sla.arch x86-64; aaa; s main; a:sla.dec' /bin/ls
+r2 -qc 'a:sla.arch x86-64; aaa; s main; pdd' /bin/ls
 ```
 
 ### Build fails with linker errors

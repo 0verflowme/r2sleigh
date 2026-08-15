@@ -53,8 +53,6 @@ Function-Level:
 - a:sla.cfg -- ASCII CFG
 - a:sla.cfg.json -- CFG as JSON
 - a:sla.taint -- Taint analysis
-- a:sla.sym -- Symbolic execution summary
-- a:sla.sym.paths -- Path exploration
 - a:sla.slice [var] -- Backward slice
 - pdd -- Decompile through radare2's bounded borrowed-snapshot provider
 
@@ -62,10 +60,16 @@ Both a:sla and a:sleigh prefixes work.
 
 Direct `a:sla.dec` and `a:sla.decj` requests are intentionally unavailable:
 they do not run inside radare2's locked snapshot transaction and therefore
-cannot construct source authority. `pdd` receives one ABI-138/schema-7 borrowed
+cannot construct source authority. `pdd` receives one ABI-138/schema-9 borrowed
 snapshot, deep-copies it synchronously, and either completes from that immutable
 source or refuses. It never falls back to live blocks, names, or detached test
 metadata.
+
+Detached symbolic commands are unavailable for the same reason. This includes
+`a:sla.sym`, `a:sla.sym.paths`, `a:sym.runj`, the `a:sym.explore*` and
+`a:sym.solve*` families, and commands that construct a symbolic scope from live
+plugin state. Symbolic execution requires the same borrowed ABI-138 snapshot;
+the plugin does not expose a replacement command or API for detached inputs.
 
 Executable semantic C is authorized only through the generic source-obligation
 ledger and typed output-node ownership. Every live machine effect from the
@@ -172,13 +176,13 @@ R2SLEIGH_KERNELCACHE=/path/to/kernelcache \
 
 The harness is advisory and local-only: no kernel binaries or generated smoke
 reports are committed. It probes representative kernel helpers and records
-normalized decompile, type, profile, and symex output for regression triage.
+normalized decompile, type, and profile output for regression triage.
 By default the report keeps hashes, sizes, and line counts while redacting the
 local kernel path and stdout/stderr previews. Use `--include-sensitive` only for
 local triage when full paths and text previews are needed.
 
 Strict mode returns non-zero for missing requested targets, zero discovered
-functions, malformed profile/type/symex JSON, decompiler fallback comments, and
+functions, malformed profile/type JSON, decompiler fallback comments, and
 radare2 command return failures. The harness mirrors the r2r/e2e plugin
 isolation knobs where practical: `--plugin-dir` defaults to
 `R2SLEIGH_PLUGIN_DIR`, `R2R_PLUGIN_DIR`, or `R2_LIBR_PLUGINS`, and `--tmpdir`

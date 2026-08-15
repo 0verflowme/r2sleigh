@@ -11,6 +11,45 @@ use std::time::Duration;
 
 mod ffi_v2;
 
+#[test]
+fn detached_symbolic_command_families_require_a_borrowed_snapshot() {
+    for command in [
+        "a:sym.explore 0",
+        "a:sym.explore.replayj",
+        "a:sym.solve.state",
+        "a:sym.state",
+        "a:sym.debug.solve.replayj",
+        "a:sla.debug.sym.paths",
+    ] {
+        let result = r2_cmd(vuln_test_binary(), command);
+        result.assert_ok();
+        assert!(
+            result.contains("borrowed function snapshot provider")
+                && !result.contains("Unknown subcommand"),
+            "{command} must refuse before detached lifting:\n{}\n{}",
+            result.stdout,
+            result.stderr
+        );
+    }
+
+    let collision = r2_cmd(vuln_test_binary(), "a:sym.explorer");
+    collision.assert_ok();
+    assert!(
+        collision.contains("Unknown subcommand")
+            && !collision.contains("borrowed function snapshot provider"),
+        "a prefix collision must not enter the snapshot refusal route"
+    );
+
+    let profile = r2_cmd(vuln_test_binary(), "a:sla.debug.profilej");
+    profile.assert_ok();
+    let profile_json: Value = profile.parse_json().expect("profile command JSON");
+    assert!(
+        profile_json.get("enabled") == Some(&Value::Bool(true))
+            && !profile.contains("borrowed function snapshot provider"),
+        "the harmless profile command must remain outside the snapshot refusal route"
+    );
+}
+
 mod borrowed_snapshot_provider {
     use super::*;
 

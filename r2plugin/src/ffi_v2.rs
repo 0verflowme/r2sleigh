@@ -120,20 +120,9 @@ pub const R2SLEIGH_ANALYSIS_FUNCTION_TAINT_V2: u32 = 14;
 pub const R2SLEIGH_ANALYSIS_FUNCTION_CFG_ASCII_V2: u32 = 15;
 pub const R2SLEIGH_ANALYSIS_FUNCTION_CFG_JSON_V2: u32 = 16;
 pub const R2SLEIGH_ANALYSIS_ENGINE_CACHE_STATS_V2: u32 = 17;
-pub const R2SLEIGH_SCOPE_FUNCTION_V2: u32 = 1;
-pub const R2SLEIGH_SCOPE_PATHS_V2: u32 = 2;
-pub const R2SLEIGH_SCOPE_EXPLORE_V2: u32 = 3;
-pub const R2SLEIGH_SCOPE_SOLVE_V2: u32 = 4;
-pub const R2SLEIGH_SCOPE_EXPLORE_REPLAY_V2: u32 = 5;
-pub const R2SLEIGH_SCOPE_SOLVE_REPLAY_V2: u32 = 6;
-pub const R2SLEIGH_SCOPE_RUN_SPEC_V2: u32 = 7;
-pub const R2SLEIGH_SCOPE_SYMBOL_SCHEMA_V2: u32 = 1;
 pub const R2SLEIGH_QUERY_BLOCK_VALUES_V2: u32 = 1;
 pub const R2SLEIGH_QUERY_TAINT_SUMMARY_V2: u32 = 2;
 pub const R2SLEIGH_QUERY_ANNOTATIONS_V2: u32 = 3;
-pub const R2SLEIGH_QUERY_DIRECT_TARGETS_V2: u32 = 4;
-pub const R2SLEIGH_QUERY_SYMBOLIC_TARGETS_V2: u32 = 5;
-pub const R2SLEIGH_QUERY_RUNTIME_SOURCES_V2: u32 = 6;
 pub const R2SLEIGH_QUERY_RECOVERED_VARS_V2: u32 = 7;
 pub const R2SLEIGH_QUERY_DATA_REFS_V2: u32 = 8;
 pub const R2SLEIGH_DATA_REF_SCHEMA_V2: u32 = 1;
@@ -142,18 +131,6 @@ pub const R2SLEIGH_PLANNER_ANALYSIS_POLICY_V2: u32 = 1;
 pub const R2SLEIGH_PLANNER_POST_ANALYSIS_V2: u32 = 2;
 pub const R2SLEIGH_PLANNER_AUTO_CALLBACK_V2: u32 = 3;
 pub const R2SLEIGH_PLANNER_INTERPROC_SESSION_V2: u32 = 4;
-pub const R2SLEIGH_PLANNER_SYMBOLIC_SCOPE_V2: u32 = 5;
-pub const R2SLEIGH_PLANNER_RUNTIME_SOURCE_V2: u32 = 6;
-pub const R2SLEIGH_PLANNER_INTERPROC_TARGETS_V2: u32 = 7;
-pub const R2SLEIGH_PLANNER_TARGET_INPUT_SCHEMA_V2: u32 = 1;
-pub const R2SLEIGH_PLANNER_RESULT_SCHEMA_V2: u32 = 1;
-pub const R2SLEIGH_MAX_PLANNER_TARGETS_V2: usize = 4_096;
-pub const R2SLEIGH_INTERPROC_LINKAGE_UNKNOWN_V2: u32 = 0;
-pub const R2SLEIGH_INTERPROC_LINKAGE_INTERNAL_V2: u32 = 1;
-pub const R2SLEIGH_INTERPROC_LINKAGE_IMPORTED_V2: u32 = 2;
-pub const R2SLEIGH_PLANNER_RESULT_QUEUED_TARGETS_V2: u32 = 1;
-pub const R2SLEIGH_PLANNER_RESULT_REGISTRATION_TARGETS_V2: u32 = 2;
-pub const R2SLEIGH_PLANNER_RESULT_RUNTIME_COPY_TARGETS_V2: u32 = 3;
 pub const R2SLEIGH_MODE_FAST_V2: u32 = 0;
 pub const R2SLEIGH_MODE_BALANCED_V2: u32 = 1;
 pub const R2SLEIGH_MODE_FULL_V2: u32 = 2;
@@ -172,19 +149,11 @@ pub const R2SLEIGH_AUTO_CALLBACK_REASON_MODE_NOT_FULL_V2: u32 = 1;
 pub const R2SLEIGH_AUTO_CALLBACK_REASON_TOO_MANY_BLOCKS_V2: u32 = 2;
 pub const R2SLEIGH_AUTO_CALLBACK_REASON_TOO_LARGE_V2: u32 = 3;
 pub const R2SLEIGH_AUTO_CALLBACK_REASON_TOO_COSTLY_V2: u32 = 4;
-pub const R2SLEIGH_SYMBOLIC_SCOPE_REASON_ALLOWED_V2: u32 = 0;
-pub const R2SLEIGH_SYMBOLIC_SCOPE_REASON_SCOPE_FULL_V2: u32 = 1;
-pub const R2SLEIGH_SYMBOLIC_SCOPE_REASON_INTERPROC_DISABLED_V2: u32 = 2;
-pub const R2SLEIGH_SYMBOLIC_SCOPE_REASON_TARGET_TERMINAL_V2: u32 = 3;
-pub const R2SLEIGH_RUNTIME_SOURCE_REASON_ALLOWED_V2: u32 = 0;
-pub const R2SLEIGH_RUNTIME_SOURCE_REASON_SCOPE_FULL_V2: u32 = 1;
-pub const R2SLEIGH_RUNTIME_SOURCE_REASON_EMPTY_SOURCE_V2: u32 = 2;
 #[allow(dead_code)] // Exported for the C-side pre-lift byte budget.
 pub const R2SLEIGH_MAX_FUNCTION_INPUT_BYTES_V2: usize = 16 << 20;
 pub const R2SLEIGH_MAX_AGGREGATE_BLOCKS_V2: usize = 1_024;
 pub const R2SLEIGH_MAX_AGGREGATE_OPS_V2: usize = 4_096;
 pub const R2SLEIGH_MAX_SCOPE_FUNCTIONS_V2: usize = 4_096;
-pub const R2SLEIGH_MAX_SCOPE_SYMBOLS_V2: usize = 4_096;
 pub const R2SLEIGH_MAX_CONTEXT_ITEMS_V2: usize = 65_536;
 pub const R2SLEIGH_MAX_NESTED_ITEMS_V2: usize = 262_144;
 pub const R2SLEIGH_MAX_STRING_BYTES_V2: usize = 1 << 20;
@@ -740,63 +709,8 @@ pub struct R2SleighAutoCallbackPlanV2 {
     pub reason: u32,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct R2SleighSymbolicScopeFunctionPlanV2 {
-    pub append_function: i32,
-    pub expand_targets: i32,
-    pub reason: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct R2SleighRuntimeMaterializedSourcePlanV2 {
-    pub append_source: i32,
-    pub capped_size: u64,
-    pub slot_bytes: u64,
-    pub reason: u32,
-}
-
-/// One exact, independently versioned interprocedural target observation.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct R2SleighPlannerTargetInputV2 {
-    pub abi_version: u32,
-    pub struct_size: u32,
-    pub schema_version: u32,
-    pub direct_target: u64,
-    pub name: R2SleighStringViewV2,
-    pub linkage: u32,
-    pub resolved_target: u64,
-    pub has_resolved_target: u32,
-    pub target_materialized: u32,
-    pub has_target_metrics: u32,
-    pub target_basic_block_count: u32,
-    pub target_cost: u32,
-}
-
-/// Opaque registry-owned planner result. `planner_result_free` is the only
-/// valid deallocator.
-pub struct R2SleighPlannerResultV2 {
-    queued_targets: Vec<u64>,
-    registration_targets: Vec<u64>,
-    runtime_copy_targets: Vec<u64>,
-}
-
-/// Pointer-free counts for one registry-owned planner result.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct R2SleighPlannerResultViewV2 {
-    pub abi_version: u32,
-    pub struct_size: u32,
-    pub schema_version: u32,
-    pub queued_target_count: usize,
-    pub registration_target_count: usize,
-    pub runtime_copy_target_count: usize,
-}
-
-/// Versioned planner query. The selected `kind` determines which input fields
-/// are read; target arrays are copied and validated during the call.
+/// Versioned scalar planner query. The selected `kind` determines which input
+/// fields are read.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct R2SleighPlannerQueryRequestV2 {
@@ -807,18 +721,10 @@ pub struct R2SleighPlannerQueryRequestV2 {
     pub depth: u32,
     pub purpose: u32,
     pub callback_kind: u32,
-    pub root_function: u32,
-    pub target_hint_function: u32,
-    pub current_scope_count: usize,
     pub function_count: usize,
     pub basic_block_count: usize,
     pub cost: u32,
     pub linear_size: u64,
-    pub addr: u64,
-    pub size: u64,
-    pub interproc: R2SleighInterprocSessionPlan,
-    pub targets: *const R2SleighPlannerTargetInputV2,
-    pub num_targets: usize,
 }
 
 /// Versioned planner response. Only the member selected by `kind` is authoritative.
@@ -833,9 +739,6 @@ pub struct R2SleighPlannerQueryResponseV2 {
     pub post_analysis: R2SleighPostAnalysisPlanV2,
     pub auto_callback: R2SleighAutoCallbackPlanV2,
     pub interproc_session: R2SleighInterprocSessionPlan,
-    pub symbolic_scope: R2SleighSymbolicScopeFunctionPlanV2,
-    pub runtime_source: R2SleighRuntimeMaterializedSourcePlanV2,
-    pub result: *mut R2SleighPlannerResultV2,
 }
 
 #[repr(C)]
@@ -1117,7 +1020,6 @@ enum LiftHandleKind {
     Block,
     OwnedBytes,
     AnalysisResult,
-    PlannerResult,
 }
 
 struct LiftHandleEntry {
@@ -1196,36 +1098,6 @@ pub struct R2SleighAnalysisRenderRequestV2 {
     pub argument: R2SleighStringViewV2,
 }
 
-/// One explicitly linked symbol in an immutable per-scope request snapshot.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct R2SleighScopeSymbolV2 {
-    pub abi_version: u32,
-    pub struct_size: u32,
-    pub schema_version: u32,
-    pub addr: u64,
-    pub name: R2SleighStringViewV2,
-    pub linkage: u32,
-}
-
-/// One bounded symbolic request over registry-owned scoped lift handles.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct R2SleighScopeRenderRequestV2 {
-    pub kind: u32,
-    pub context: *const R2ILContext,
-    pub functions: *const R2ILFunctionBlocks,
-    pub num_functions: usize,
-    pub entry_addr: u64,
-    pub target_addr: u64,
-    pub replay_seed: *const c_void,
-    pub argument: R2SleighStringViewV2,
-    pub external_context: R2SleighStringViewV2,
-    pub symbols: *const R2SleighScopeSymbolV2,
-    pub num_symbols: usize,
-    pub merge_states: u32,
-}
-
 /// One bounded structured-analysis request over registry-owned lift handles.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1235,9 +1107,6 @@ pub struct R2SleighAnalysisQueryRequestV2 {
     pub blocks: *const *const R2ILBlock,
     pub num_blocks: usize,
     pub function_addr: u64,
-    pub function_name: R2SleighStringViewV2,
-    pub input_values: *const u64,
-    pub num_input_values: usize,
 }
 
 /// Borrowed arrays owned by one `R2SleighAnalysisResultV2`.
@@ -1295,16 +1164,12 @@ pub struct R2SleighApiV2 {
     pub switch_case_size: u32,
     pub direct_call_identity_size: u32,
     pub analysis_render_request_size: u32,
-    pub scope_render_request_size: u32,
-    pub scope_symbol_size: u32,
     pub analysis_query_request_size: u32,
     pub analysis_result_view_size: u32,
     pub data_ref_size: u32,
     pub data_ref_schema_version: u32,
     pub planner_query_request_size: u32,
     pub planner_query_response_size: u32,
-    pub planner_target_input_size: u32,
-    pub planner_result_view_size: u32,
     pub radare_snapshot_input_size: u32,
     pub radare_accessors_size: u32,
     pub session_create:
@@ -1376,8 +1241,6 @@ pub struct R2SleighApiV2 {
         *const R2SleighAnalysisRenderRequestV2,
         *mut *mut R2SleighOwnedBytesV2,
     ) -> u32,
-    pub scope_render:
-        extern "C" fn(*const R2SleighScopeRenderRequestV2, *mut *mut R2SleighOwnedBytesV2) -> u32,
     pub analysis_query: extern "C" fn(
         *const R2SleighAnalysisQueryRequestV2,
         *mut *mut R2SleighAnalysisResultV2,
@@ -1390,11 +1253,6 @@ pub struct R2SleighApiV2 {
         *const R2SleighPlannerQueryRequestV2,
         *mut R2SleighPlannerQueryResponseV2,
     ) -> u32,
-    pub planner_result_view:
-        extern "C" fn(*const R2SleighPlannerResultV2, *mut R2SleighPlannerResultViewV2) -> u32,
-    pub planner_result_copy:
-        extern "C" fn(*const R2SleighPlannerResultV2, u32, *mut u64, usize, *mut usize) -> u32,
-    pub planner_result_free: extern "C" fn(*mut R2SleighPlannerResultV2) -> u32,
 }
 
 #[derive(Debug)]
@@ -1523,7 +1381,6 @@ fn opaque_handle_stride() -> usize {
         .max(align_of::<R2ILBlock>())
         .max(align_of::<R2SleighOwnedBytesV2>())
         .max(align_of::<R2SleighAnalysisResultV2>())
-        .max(align_of::<R2SleighPlannerResultV2>())
         .max(2)
 }
 
@@ -1672,29 +1529,6 @@ impl LiftHandleRegistry {
         Ok(key as *mut R2SleighAnalysisResultV2)
     }
 
-    fn insert_planner_result(
-        &mut self,
-        result: R2SleighPlannerResultV2,
-    ) -> Result<*mut R2SleighPlannerResultV2, BoundaryError> {
-        let generation = self.allocate_generation()?;
-        let key = self.handle_key::<R2SleighPlannerResultV2>(generation)?;
-        if self.handles.contains_key(&key) {
-            return Err(BoundaryError::engine("planner-result handle collision"));
-        }
-        let payload = Box::into_raw(Box::new(result)) as usize;
-        self.handles.insert(
-            key,
-            LiftHandleEntry {
-                kind: LiftHandleKind::PlannerResult,
-                generation,
-                owner: 0,
-                payload,
-                creator_thread: thread::current().id(),
-            },
-        );
-        Ok(key as *mut R2SleighPlannerResultV2)
-    }
-
     fn entry(
         &self,
         key: usize,
@@ -1777,9 +1611,6 @@ impl LiftHandleRegistry {
                     drop(Box::from_raw(
                         entry.payload as *mut R2SleighAnalysisResultV2,
                     ));
-                }
-                LiftHandleKind::PlannerResult => {
-                    drop(Box::from_raw(entry.payload as *mut R2SleighPlannerResultV2));
                 }
             }
         }
@@ -1919,12 +1750,6 @@ unsafe fn free_analysis_result_payload(result: &R2SleighAnalysisResultV2) {
             super::analysis::taint::r2taint_function_summary_free(result.raw.cast())
         }
         R2SLEIGH_QUERY_ANNOTATIONS_V2 => super::r2sleigh_annotations_free(result.raw.cast()),
-        R2SLEIGH_QUERY_DIRECT_TARGETS_V2 | R2SLEIGH_QUERY_SYMBOLIC_TARGETS_V2 => {
-            super::r2sleigh_u64_array_free(result.raw.cast())
-        }
-        R2SLEIGH_QUERY_RUNTIME_SOURCES_V2 => {
-            super::r2sleigh_runtime_sources_free(result.raw.cast())
-        }
         R2SLEIGH_QUERY_RECOVERED_VARS_V2 => {
             super::types::r2sleigh_recovered_vars_free(result.raw.cast())
         }
@@ -5244,250 +5069,6 @@ extern "C" fn analysis_render(
     })
 }
 
-unsafe fn scope_request_snapshot(
-    request: &R2SleighScopeRenderRequestV2,
-) -> Result<super::analysis::sym::SymScopeRequestSnapshot, BoundaryError> {
-    let merge_states = match request.merge_states {
-        0 => false,
-        1 => true,
-        _ => {
-            return Err(BoundaryError::invalid(
-                "scope render merge_states is not boolean",
-            ));
-        }
-    };
-    if request.symbols.is_null() != (request.num_symbols == 0) {
-        return Err(BoundaryError::invalid(
-            "scope render symbols pointer/count are not canonical",
-        ));
-    }
-    let symbols = unsafe {
-        checked_slice(
-            request.symbols,
-            request.num_symbols,
-            R2SLEIGH_MAX_SCOPE_SYMBOLS_V2,
-            "scope render symbols",
-        )?
-    };
-    let mut budget = ValidationBudget::default();
-    let mut copied = Vec::with_capacity(symbols.len());
-    for (index, symbol) in symbols.iter().enumerate() {
-        let label = format!("scope render symbols[{index}]");
-        if symbol.abi_version != R2SLEIGH_ABI_V2
-            || symbol.struct_size != u32_size::<R2SleighScopeSymbolV2>()
-            || symbol.schema_version != R2SLEIGH_SCOPE_SYMBOL_SCHEMA_V2
-        {
-            return Err(BoundaryError::abi(format!(
-                "{label} has an incompatible envelope"
-            )));
-        }
-        let linkage = match symbol.linkage {
-            R2SLEIGH_INTERPROC_LINKAGE_UNKNOWN_V2 => r2ssa::FunctionSemanticLinkage::Unknown,
-            R2SLEIGH_INTERPROC_LINKAGE_INTERNAL_V2 => r2ssa::FunctionSemanticLinkage::Internal,
-            R2SLEIGH_INTERPROC_LINKAGE_IMPORTED_V2 => r2ssa::FunctionSemanticLinkage::Imported,
-            _ => {
-                return Err(BoundaryError::invalid(format!(
-                    "{label}.linkage is invalid"
-                )));
-            }
-        };
-        let name = unsafe {
-            string_view(
-                symbol.name,
-                R2SLEIGH_MAX_STRING_BYTES_V2,
-                &format!("{label}.name"),
-                &mut budget,
-            )?
-        };
-        if name.is_empty() {
-            return Err(BoundaryError::invalid(format!("{label}.name is empty")));
-        }
-        if name.as_bytes().contains(&0) {
-            return Err(BoundaryError::invalid(format!("{label}.name contains NUL")));
-        }
-        copied.push(r2sym::FunctionSymbol {
-            addr: symbol.addr,
-            name: name.to_string(),
-            linkage,
-        });
-    }
-    let symbols = r2sym::FunctionSymbolSnapshot::try_from_symbols(copied).map_err(|err| {
-        BoundaryError::invalid(format!("scope render symbol snapshot is invalid: {err:?}"))
-    })?;
-    Ok(super::analysis::sym::SymScopeRequestSnapshot::new(
-        symbols,
-        merge_states,
-    ))
-}
-
-extern "C" fn scope_render(
-    request: *const R2SleighScopeRenderRequestV2,
-    output: *mut *mut R2SleighOwnedBytesV2,
-) -> u32 {
-    lift_boundary(|| {
-        valid_output_ptr(output, "scope render output")?;
-        unsafe { *output = ptr::null_mut() };
-        valid_object_ptr(request, "scope render request")?;
-        let request = unsafe { &*request };
-        let functions = unsafe {
-            checked_slice(
-                request.functions,
-                request.num_functions,
-                R2SLEIGH_MAX_SCOPE_FUNCTIONS_V2,
-                "scope render functions",
-            )?
-        };
-        if functions.is_empty() {
-            return Err(BoundaryError::invalid("scope render functions are empty"));
-        }
-        let mut budget = ValidationBudget::default();
-        let argument = unsafe {
-            string_view(
-                request.argument,
-                R2SLEIGH_MAX_JSON_BYTES_V2,
-                "scope render argument",
-                &mut budget,
-            )?
-        };
-        let external_context = unsafe {
-            string_view(
-                request.external_context,
-                R2SLEIGH_MAX_JSON_BYTES_V2,
-                "scope render external context",
-                &mut budget,
-            )?
-        };
-        let argument = CString::new(argument)
-            .map_err(|_| BoundaryError::invalid("scope render argument contains NUL"))?;
-        let external_context = CString::new(external_context)
-            .map_err(|_| BoundaryError::invalid("scope render external context contains NUL"))?;
-        let request_snapshot = unsafe { scope_request_snapshot(request)? };
-        let argument_ptr = (!request.argument.data.is_null()).then_some(argument.as_ptr());
-        let external_ptr =
-            (!request.external_context.data.is_null()).then_some(external_context.as_ptr());
-
-        let context_key = lift_handle_key(request.context, "scope render context")?;
-        let mut registry = lock_lift_registry();
-        let context_entry =
-            registry.entry(context_key, LiftHandleKind::Context, "scope render context")?;
-        let owner = context_entry.generation;
-        let context = context_entry.payload as *const R2ILContext;
-        let mut scoped_blocks = Vec::with_capacity(functions.len());
-        for (function_index, function) in functions.iter().enumerate() {
-            let handles = unsafe {
-                checked_slice(
-                    function.blocks,
-                    function.num_blocks,
-                    R2SLEIGH_MAX_FUNCTION_BLOCKS_V2,
-                    &format!("scope render functions[{function_index}] blocks"),
-                )?
-            };
-            let mut resolved = Vec::with_capacity(handles.len());
-            for (block_index, handle) in handles.iter().enumerate() {
-                let label =
-                    format!("scope render functions[{function_index}] blocks[{block_index}]");
-                let key = lift_handle_key(*handle, &label)?;
-                let entry = registry.entry(key, LiftHandleKind::Block, &label)?;
-                if entry.owner != owner {
-                    return Err(BoundaryError::invalid(format!(
-                        "{label} belongs to a different lift context"
-                    )));
-                }
-                resolved.push(entry.payload as *const R2ILBlock);
-            }
-            scoped_blocks.push(resolved);
-        }
-        let mut resolved_functions = Vec::with_capacity(functions.len());
-        for (index, function) in functions.iter().enumerate() {
-            resolved_functions.push(R2ILFunctionBlocks {
-                entry_addr: function.entry_addr,
-                name: function.name,
-                blocks: scoped_blocks[index].as_ptr(),
-                num_blocks: scoped_blocks[index].len(),
-                provenance: function.provenance,
-            });
-        }
-        let functions_ptr = resolved_functions.as_ptr();
-        let functions_len = resolved_functions.len();
-        let external_ptr = external_ptr.unwrap_or(ptr::null());
-        let raw = match request.kind {
-            R2SLEIGH_SCOPE_FUNCTION_V2 => super::analysis::sym::r2sym_function_scope(
-                context,
-                functions_ptr,
-                functions_len,
-                request.entry_addr,
-                external_ptr,
-                &request_snapshot,
-            ),
-            R2SLEIGH_SCOPE_PATHS_V2 => super::analysis::sym::r2sym_paths_scope(
-                context,
-                functions_ptr,
-                functions_len,
-                request.entry_addr,
-                external_ptr,
-                &request_snapshot,
-            ),
-            R2SLEIGH_SCOPE_EXPLORE_V2 => super::analysis::sym::r2sym_explore_to_scope(
-                context,
-                functions_ptr,
-                functions_len,
-                request.entry_addr,
-                request.target_addr,
-                external_ptr,
-                &request_snapshot,
-            ),
-            R2SLEIGH_SCOPE_SOLVE_V2 => super::analysis::sym::r2sym_solve_to_scope(
-                context,
-                functions_ptr,
-                functions_len,
-                request.entry_addr,
-                request.target_addr,
-                external_ptr,
-                &request_snapshot,
-            ),
-            R2SLEIGH_SCOPE_EXPLORE_REPLAY_V2 => {
-                super::analysis::sym::r2sym_explore_to_replay_scope(
-                    context,
-                    functions_ptr,
-                    functions_len,
-                    request.entry_addr,
-                    request.target_addr,
-                    request.replay_seed.cast(),
-                    external_ptr,
-                    &request_snapshot,
-                )
-            }
-            R2SLEIGH_SCOPE_SOLVE_REPLAY_V2 => super::analysis::sym::r2sym_solve_to_replay_scope(
-                context,
-                functions_ptr,
-                functions_len,
-                request.entry_addr,
-                request.target_addr,
-                request.replay_seed.cast(),
-                external_ptr,
-                &request_snapshot,
-            ),
-            R2SLEIGH_SCOPE_RUN_SPEC_V2 => super::analysis::sym::r2sym_run_spec_json_scope(
-                context,
-                functions_ptr,
-                functions_len,
-                request.entry_addr,
-                argument_ptr.unwrap_or(ptr::null()),
-                external_ptr,
-                &request_snapshot,
-            ),
-            _ => return Err(BoundaryError::unsupported("unknown scope render kind")),
-        };
-        if raw.is_null() {
-            return Err(BoundaryError::engine("scope render failed"));
-        }
-        let bytes = unsafe { CString::from_raw(raw) };
-        let handle = registry.insert_owned_bytes(owner, R2SleighOwnedBytesV2 { bytes })?;
-        unsafe { *output = handle };
-        Ok(())
-    })
-}
-
 extern "C" fn analysis_query(
     request: *const R2SleighAnalysisQueryRequestV2,
     output: *mut *mut R2SleighAnalysisResultV2,
@@ -5508,25 +5089,6 @@ extern "C" fn analysis_query(
         if block_handles.is_empty() {
             return Err(BoundaryError::invalid("analysis query blocks are empty"));
         }
-        let input_values = unsafe {
-            checked_slice(
-                request.input_values,
-                request.num_input_values,
-                R2SLEIGH_MAX_NESTED_ITEMS_V2,
-                "analysis query input values",
-            )?
-        };
-        let mut budget = ValidationBudget::default();
-        let function_name = unsafe {
-            string_view(
-                request.function_name,
-                R2SLEIGH_MAX_STRING_BYTES_V2,
-                "analysis query function name",
-                &mut budget,
-            )?
-        };
-        let function_name = CString::new(function_name)
-            .map_err(|_| BoundaryError::invalid("analysis query function name contains NUL"))?;
         let context_key = lift_handle_key(request.context, "analysis query context")?;
         let mut registry = lock_lift_registry();
         let context_entry = registry.entry(
@@ -5572,36 +5134,6 @@ extern "C" fn analysis_query(
                 request.function_addr,
             )
             .cast(),
-            R2SLEIGH_QUERY_DIRECT_TARGETS_V2 => super::r2sleigh_get_direct_call_targets_typed(
-                context,
-                blocks.as_ptr(),
-                blocks.len(),
-                request.function_addr,
-                function_name.as_ptr(),
-            )
-            .cast(),
-            R2SLEIGH_QUERY_SYMBOLIC_TARGETS_V2 => super::r2sleigh_get_symbolic_scope_targets_typed(
-                context,
-                blocks.as_ptr(),
-                blocks.len(),
-                request.function_addr,
-                function_name.as_ptr(),
-                input_values.as_ptr(),
-                input_values.len(),
-            )
-            .cast(),
-            R2SLEIGH_QUERY_RUNTIME_SOURCES_V2 => {
-                super::r2sleigh_get_runtime_materialized_sources_typed(
-                    context,
-                    blocks.as_ptr(),
-                    blocks.len(),
-                    request.function_addr,
-                    function_name.as_ptr(),
-                    input_values.as_ptr(),
-                    input_values.len(),
-                )
-                .cast()
-            }
             R2SLEIGH_QUERY_RECOVERED_VARS_V2 => super::types::r2sleigh_recover_vars_typed(
                 context,
                 blocks.as_ptr(),
@@ -5687,18 +5219,6 @@ extern "C" fn analysis_result_view(
                 view.primary =
                     super::r2sleigh_annotations_items(result.raw.cast(), &mut view.primary_count)
                         .cast();
-            }
-            R2SLEIGH_QUERY_DIRECT_TARGETS_V2 | R2SLEIGH_QUERY_SYMBOLIC_TARGETS_V2 => {
-                view.primary =
-                    super::r2sleigh_u64_array_items(result.raw.cast(), &mut view.primary_count)
-                        .cast();
-            }
-            R2SLEIGH_QUERY_RUNTIME_SOURCES_V2 => {
-                view.primary = super::r2sleigh_runtime_sources_items(
-                    result.raw.cast(),
-                    &mut view.primary_count,
-                )
-                .cast();
             }
             R2SLEIGH_QUERY_RECOVERED_VARS_V2 => {
                 view.primary = super::types::r2sleigh_recovered_vars_items(
@@ -5884,283 +5404,38 @@ fn planner_interproc_plan(
     }
 }
 
-fn planner_input_bool(raw: i32) -> Option<bool> {
-    match raw {
-        0 => Some(false),
-        1 => Some(true),
-        _ => None,
-    }
-}
-
-fn planner_interproc_input(
-    plan: R2SleighInterprocSessionPlan,
-) -> Option<r2engine::EngineInterprocSessionPlan> {
-    Some(r2engine::EngineInterprocSessionPlan {
-        include_type_interproc_scope: planner_input_bool(plan.include_type_interproc_scope)?,
-        include_root_symbolic_scope: planner_input_bool(plan.include_root_symbolic_scope)?,
-        interproc_iter: plan.interproc_iter,
-        interproc_max_iters: plan.interproc_max_iters,
-        interproc_converged: planner_input_bool(plan.interproc_converged)?,
-    })
-}
-
-fn planner_symbolic_scope_reason(reason: r2engine::EngineSymbolicScopeFunctionReason) -> u32 {
-    match reason {
-        r2engine::EngineSymbolicScopeFunctionReason::Allowed => {
-            R2SLEIGH_SYMBOLIC_SCOPE_REASON_ALLOWED_V2
-        }
-        r2engine::EngineSymbolicScopeFunctionReason::ScopeFull => {
-            R2SLEIGH_SYMBOLIC_SCOPE_REASON_SCOPE_FULL_V2
-        }
-        r2engine::EngineSymbolicScopeFunctionReason::InterprocDisabled => {
-            R2SLEIGH_SYMBOLIC_SCOPE_REASON_INTERPROC_DISABLED_V2
-        }
-        r2engine::EngineSymbolicScopeFunctionReason::TargetTerminal => {
-            R2SLEIGH_SYMBOLIC_SCOPE_REASON_TARGET_TERMINAL_V2
-        }
-    }
-}
-
-fn planner_symbolic_scope(
-    plan: r2engine::EngineSymbolicScopeFunctionPlan,
-) -> R2SleighSymbolicScopeFunctionPlanV2 {
-    R2SleighSymbolicScopeFunctionPlanV2 {
-        append_function: planner_bool(plan.append_function),
-        expand_targets: planner_bool(plan.expand_targets),
-        reason: planner_symbolic_scope_reason(plan.reason),
-    }
-}
-
-fn planner_runtime_source_reason(reason: r2engine::EngineRuntimeMaterializedSourceReason) -> u32 {
-    match reason {
-        r2engine::EngineRuntimeMaterializedSourceReason::Allowed => {
-            R2SLEIGH_RUNTIME_SOURCE_REASON_ALLOWED_V2
-        }
-        r2engine::EngineRuntimeMaterializedSourceReason::ScopeFull => {
-            R2SLEIGH_RUNTIME_SOURCE_REASON_SCOPE_FULL_V2
-        }
-        r2engine::EngineRuntimeMaterializedSourceReason::EmptySource => {
-            R2SLEIGH_RUNTIME_SOURCE_REASON_EMPTY_SOURCE_V2
-        }
-    }
-}
-
-fn planner_runtime_source(
-    plan: r2engine::EngineRuntimeMaterializedSourcePlan,
-) -> R2SleighRuntimeMaterializedSourcePlanV2 {
-    R2SleighRuntimeMaterializedSourcePlanV2 {
-        append_source: planner_bool(plan.append_source),
-        capped_size: plan.capped_size,
-        slot_bytes: plan.slot_bytes,
-        reason: planner_runtime_source_reason(plan.reason),
-    }
-}
-
-fn planner_interproc_input_is_zero(plan: R2SleighInterprocSessionPlan) -> bool {
-    plan == R2SleighInterprocSessionPlan::default()
-}
-
 fn planner_query_inactive_fields_are_zero(request: &R2SleighPlannerQueryRequestV2) -> bool {
-    let no_depth = request.depth == 0;
     let no_purpose = request.purpose == 0;
     let no_callback = request.callback_kind == 0;
-    let no_scope_flags = request.root_function == 0 && request.target_hint_function == 0;
-    let no_scope_count = request.current_scope_count == 0;
     let no_function_count = request.function_count == 0;
     let no_metrics = request.basic_block_count == 0 && request.cost == 0;
     let no_linear_size = request.linear_size == 0;
-    let no_source = request.addr == 0 && request.size == 0;
-    let no_interproc = planner_interproc_input_is_zero(request.interproc);
-    let no_targets = request.targets.is_null() && request.num_targets == 0;
 
     match request.kind {
         R2SLEIGH_PLANNER_ANALYSIS_POLICY_V2 => {
-            no_purpose
-                && no_callback
-                && no_scope_flags
-                && no_scope_count
-                && no_function_count
-                && no_metrics
-                && no_linear_size
-                && no_source
-                && no_interproc
-                && no_targets
+            no_purpose && no_callback && no_function_count && no_metrics && no_linear_size
         }
         R2SLEIGH_PLANNER_POST_ANALYSIS_V2 => {
-            no_purpose
-                && no_callback
-                && no_scope_flags
-                && no_scope_count
-                && no_metrics
-                && no_linear_size
-                && no_source
-                && no_interproc
-                && no_targets
+            no_purpose && no_callback && no_metrics && no_linear_size
         }
-        R2SLEIGH_PLANNER_AUTO_CALLBACK_V2 => {
-            no_purpose
-                && no_scope_flags
-                && no_scope_count
-                && no_function_count
-                && no_source
-                && no_interproc
-                && no_targets
-        }
-        R2SLEIGH_PLANNER_INTERPROC_SESSION_V2 => {
-            no_callback
-                && no_scope_flags
-                && no_scope_count
-                && no_function_count
-                && no_linear_size
-                && no_source
-                && no_interproc
-                && no_targets
-        }
-        R2SLEIGH_PLANNER_SYMBOLIC_SCOPE_V2 => {
-            no_depth
-                && no_purpose
-                && no_callback
-                && no_function_count
-                && no_metrics
-                && no_linear_size
-                && no_source
-                && no_targets
-        }
-        R2SLEIGH_PLANNER_RUNTIME_SOURCE_V2 => {
-            no_depth
-                && no_purpose
-                && no_callback
-                && no_scope_flags
-                && no_function_count
-                && no_metrics
-                && no_linear_size
-                && no_interproc
-                && no_targets
-        }
-        R2SLEIGH_PLANNER_INTERPROC_TARGETS_V2 => {
-            no_depth
-                && no_purpose
-                && no_callback
-                && no_scope_flags
-                && no_scope_count
-                && no_function_count
-                && no_metrics
-                && no_linear_size
-                && no_source
-                && no_interproc
-        }
+        R2SLEIGH_PLANNER_AUTO_CALLBACK_V2 => no_purpose && no_function_count,
+        R2SLEIGH_PLANNER_INTERPROC_SESSION_V2 => no_callback && no_function_count && no_linear_size,
         _ => false,
     }
-}
-
-unsafe fn planner_target_inputs(
-    request: &R2SleighPlannerQueryRequestV2,
-) -> Result<Vec<r2engine::EngineInterprocTargetInput>, BoundaryError> {
-    let inputs = unsafe {
-        checked_slice(
-            request.targets,
-            request.num_targets,
-            R2SLEIGH_MAX_PLANNER_TARGETS_V2,
-            "planner targets",
-        )?
-    };
-    let mut budget = ValidationBudget::default();
-    let mut copied = Vec::with_capacity(inputs.len());
-    for (index, input) in inputs.iter().enumerate() {
-        let label = format!("planner targets[{index}]");
-        if input.abi_version != R2SLEIGH_ABI_V2
-            || input.struct_size != u32_size::<R2SleighPlannerTargetInputV2>()
-            || input.schema_version != R2SLEIGH_PLANNER_TARGET_INPUT_SCHEMA_V2
-        {
-            return Err(BoundaryError::abi(format!(
-                "{label} has an incompatible envelope"
-            )));
-        }
-        let linkage = match input.linkage {
-            R2SLEIGH_INTERPROC_LINKAGE_UNKNOWN_V2 => r2ssa::FunctionSemanticLinkage::Unknown,
-            R2SLEIGH_INTERPROC_LINKAGE_INTERNAL_V2 => r2ssa::FunctionSemanticLinkage::Internal,
-            R2SLEIGH_INTERPROC_LINKAGE_IMPORTED_V2 => r2ssa::FunctionSemanticLinkage::Imported,
-            _ => {
-                return Err(BoundaryError::invalid(format!(
-                    "{label}.linkage is invalid"
-                )));
-            }
-        };
-        let has_resolved_target = match input.has_resolved_target {
-            0 => false,
-            1 => true,
-            _ => {
-                return Err(BoundaryError::invalid(format!(
-                    "{label}.has_resolved_target is not boolean"
-                )));
-            }
-        };
-        let target_materialized = match input.target_materialized {
-            0 => false,
-            1 => true,
-            _ => {
-                return Err(BoundaryError::invalid(format!(
-                    "{label}.target_materialized is not boolean"
-                )));
-            }
-        };
-        let has_target_metrics = match input.has_target_metrics {
-            0 => false,
-            1 => true,
-            _ => {
-                return Err(BoundaryError::invalid(format!(
-                    "{label}.has_target_metrics is not boolean"
-                )));
-            }
-        };
-        if !has_resolved_target && input.resolved_target != 0 {
-            return Err(BoundaryError::invalid(format!(
-                "{label}.resolved_target must be zero when absent"
-            )));
-        }
-        if target_materialized && !has_resolved_target {
-            return Err(BoundaryError::invalid(format!(
-                "{label} cannot be materialized without a resolved target"
-            )));
-        }
-        if !has_target_metrics && (input.target_basic_block_count != 0 || input.target_cost != 0) {
-            return Err(BoundaryError::invalid(format!(
-                "{label} metrics must be zero when absent"
-            )));
-        }
-        if has_target_metrics && !target_materialized {
-            return Err(BoundaryError::invalid(format!(
-                "{label} cannot have metrics without a materialized target"
-            )));
-        }
-        let name = unsafe {
-            string_view(
-                input.name,
-                R2SLEIGH_MAX_STRING_BYTES_V2,
-                &format!("{label}.name"),
-                &mut budget,
-            )?
-        }
-        .trim();
-        copied.push(r2engine::EngineInterprocTargetInput {
-            direct_target: input.direct_target,
-            name: (!name.is_empty()).then(|| name.to_string()),
-            linkage,
-            semantic_summary: None,
-            resolved_target: has_resolved_target.then_some(input.resolved_target),
-            target_materialized,
-            target_metrics: has_target_metrics.then_some(r2engine::EngineInterprocTargetMetrics {
-                basic_block_count: input.target_basic_block_count,
-                cost: input.target_cost,
-            }),
-        });
-    }
-    Ok(copied)
 }
 
 fn planner_query_impl(
     request: &R2SleighPlannerQueryRequestV2,
 ) -> Result<R2SleighPlannerQueryResponseV2, BoundaryError> {
+    if !matches!(
+        request.kind,
+        R2SLEIGH_PLANNER_ANALYSIS_POLICY_V2
+            | R2SLEIGH_PLANNER_POST_ANALYSIS_V2
+            | R2SLEIGH_PLANNER_AUTO_CALLBACK_V2
+            | R2SLEIGH_PLANNER_INTERPROC_SESSION_V2
+    ) {
+        return Err(BoundaryError::invalid("planner query kind is invalid"));
+    }
     if !planner_query_inactive_fields_are_zero(request) {
         return Err(BoundaryError::invalid(
             "planner query contains nonzero inactive fields",
@@ -6212,52 +5487,7 @@ fn planner_query_impl(
                 }),
             ));
         }
-        R2SLEIGH_PLANNER_SYMBOLIC_SCOPE_V2 => {
-            let root_function = match request.root_function {
-                0 => false,
-                1 => true,
-                _ => return Err(BoundaryError::invalid("root_function is not boolean")),
-            };
-            let target_hint_function = match request.target_hint_function {
-                0 => false,
-                1 => true,
-                _ => {
-                    return Err(BoundaryError::invalid(
-                        "target_hint_function is not boolean",
-                    ));
-                }
-            };
-            let interproc = planner_interproc_input(request.interproc)
-                .ok_or_else(|| BoundaryError::invalid("interproc planner input is invalid"))?;
-            response.symbolic_scope =
-                planner_symbolic_scope(r2engine::symbolic_scope_function_plan(
-                    r2engine::EngineSymbolicScopeFunctionInput {
-                        current_scope_count: request.current_scope_count,
-                        root_function,
-                        target_hint_function,
-                        interproc,
-                    },
-                ));
-        }
-        R2SLEIGH_PLANNER_RUNTIME_SOURCE_V2 => {
-            response.runtime_source =
-                planner_runtime_source(r2engine::runtime_materialized_source_plan(
-                    request.current_scope_count,
-                    request.addr,
-                    request.size,
-                ));
-        }
-        R2SLEIGH_PLANNER_INTERPROC_TARGETS_V2 => {
-            let inputs = unsafe { planner_target_inputs(request)? };
-            let plan = r2engine::interproc_scope_target_plan(inputs);
-            response.result =
-                lock_lift_registry().insert_planner_result(R2SleighPlannerResultV2 {
-                    queued_targets: plan.queued_targets,
-                    registration_targets: plan.registration_targets,
-                    runtime_copy_targets: plan.runtime_copy_targets,
-                })?;
-        }
-        _ => return Err(BoundaryError::invalid("planner query kind is invalid")),
+        _ => unreachable!("planner query kind validated above"),
     }
     Ok(response)
 }
@@ -6282,79 +5512,6 @@ extern "C" fn planner_query(
         let response = planner_query_impl(request)?;
         unsafe { *output = response };
         Ok(())
-    })
-}
-
-extern "C" fn planner_result_view(
-    result: *const R2SleighPlannerResultV2,
-    output: *mut R2SleighPlannerResultViewV2,
-) -> u32 {
-    lift_boundary_for(result, || {
-        valid_output_ptr(output, "planner result view output")?;
-        unsafe { *output = R2SleighPlannerResultViewV2::default() };
-        let payload = lock_lift_registry().payload::<R2SleighPlannerResultV2>(
-            result as usize,
-            LiftHandleKind::PlannerResult,
-            "planner result",
-        )?;
-        let result = unsafe { &*payload };
-        unsafe {
-            *output = R2SleighPlannerResultViewV2 {
-                abi_version: R2SLEIGH_ABI_V2,
-                struct_size: u32_size::<R2SleighPlannerResultViewV2>(),
-                schema_version: R2SLEIGH_PLANNER_RESULT_SCHEMA_V2,
-                queued_target_count: result.queued_targets.len(),
-                registration_target_count: result.registration_targets.len(),
-                runtime_copy_target_count: result.runtime_copy_targets.len(),
-            };
-        }
-        Ok(())
-    })
-}
-
-extern "C" fn planner_result_copy(
-    result: *const R2SleighPlannerResultV2,
-    selector: u32,
-    output: *mut u64,
-    capacity: usize,
-    output_count: *mut usize,
-) -> u32 {
-    lift_boundary_for(result, || {
-        valid_output_ptr(output_count, "planner result copy count")?;
-        unsafe { *output_count = 0 };
-        let payload = lock_lift_registry().payload::<R2SleighPlannerResultV2>(
-            result as usize,
-            LiftHandleKind::PlannerResult,
-            "planner result",
-        )?;
-        let result = unsafe { &*payload };
-        let values = match selector {
-            R2SLEIGH_PLANNER_RESULT_QUEUED_TARGETS_V2 => &result.queued_targets,
-            R2SLEIGH_PLANNER_RESULT_REGISTRATION_TARGETS_V2 => &result.registration_targets,
-            R2SLEIGH_PLANNER_RESULT_RUNTIME_COPY_TARGETS_V2 => &result.runtime_copy_targets,
-            _ => return Err(BoundaryError::invalid("planner result selector is invalid")),
-        };
-        unsafe { *output_count = values.len() };
-        if capacity < values.len() {
-            return Err(BoundaryError::limit(
-                "planner result output capacity is too small",
-            ));
-        }
-        if !values.is_empty() {
-            valid_output_ptr(output, "planner result copy output")?;
-            unsafe { ptr::copy_nonoverlapping(values.as_ptr(), output, values.len()) };
-        }
-        Ok(())
-    })
-}
-
-extern "C" fn planner_result_free(result: *mut R2SleighPlannerResultV2) -> u32 {
-    lift_boundary_for(result, || {
-        lock_lift_registry().retire(
-            result as usize,
-            LiftHandleKind::PlannerResult,
-            "planner result",
-        )
     })
 }
 
@@ -6396,16 +5553,12 @@ static API_V2: R2SleighApiV2 = R2SleighApiV2 {
     switch_case_size: size_of::<R2SleighSwitchCaseV2>() as u32,
     direct_call_identity_size: size_of::<R2SleighDirectCallIdentityV2>() as u32,
     analysis_render_request_size: size_of::<R2SleighAnalysisRenderRequestV2>() as u32,
-    scope_render_request_size: size_of::<R2SleighScopeRenderRequestV2>() as u32,
-    scope_symbol_size: size_of::<R2SleighScopeSymbolV2>() as u32,
     analysis_query_request_size: size_of::<R2SleighAnalysisQueryRequestV2>() as u32,
     analysis_result_view_size: size_of::<R2SleighAnalysisResultViewV2>() as u32,
     data_ref_size: size_of::<super::types::R2SleighDataRef>() as u32,
     data_ref_schema_version: R2SLEIGH_DATA_REF_SCHEMA_V2,
     planner_query_request_size: size_of::<R2SleighPlannerQueryRequestV2>() as u32,
     planner_query_response_size: size_of::<R2SleighPlannerQueryResponseV2>() as u32,
-    planner_target_input_size: size_of::<R2SleighPlannerTargetInputV2>() as u32,
-    planner_result_view_size: size_of::<R2SleighPlannerResultViewV2>() as u32,
     radare_snapshot_input_size: size_of::<R2SleighRadareSnapshotInputV2>() as u32,
     radare_accessors_size: size_of::<R2SleighRadareAccessorsV2>() as u32,
     session_create,
@@ -6441,15 +5594,11 @@ static API_V2: R2SleighApiV2 = R2SleighApiV2 {
     owned_bytes_view,
     owned_bytes_free,
     analysis_render,
-    scope_render,
     analysis_query,
     analysis_result_view,
     analysis_result_free,
     engine_cache_reset,
     planner_query,
-    planner_result_view,
-    planner_result_copy,
-    planner_result_free,
 };
 
 /// Return the immutable V2 API table. The table and all callback addresses are
@@ -6487,186 +5636,6 @@ mod tests {
         let mut response = R2SleighPlannerQueryResponseV2::default();
         let status = (API_V2.planner_query)(request, &mut response);
         (status, response)
-    }
-
-    fn scope_symbol(addr: u64, name: &[u8], linkage: u32) -> R2SleighScopeSymbolV2 {
-        R2SleighScopeSymbolV2 {
-            abi_version: R2SLEIGH_ABI_V2,
-            struct_size: u32_size::<R2SleighScopeSymbolV2>(),
-            schema_version: R2SLEIGH_SCOPE_SYMBOL_SCHEMA_V2,
-            addr,
-            name: R2SleighStringViewV2 {
-                data: name.as_ptr(),
-                len: name.len(),
-            },
-            linkage,
-        }
-    }
-
-    fn scope_snapshot_request(
-        symbols: &[R2SleighScopeSymbolV2],
-        merge_states: u32,
-    ) -> R2SleighScopeRenderRequestV2 {
-        R2SleighScopeRenderRequestV2 {
-            kind: R2SLEIGH_SCOPE_FUNCTION_V2,
-            context: ptr::null(),
-            functions: ptr::null(),
-            num_functions: 0,
-            entry_addr: 0,
-            target_addr: 0,
-            replay_seed: ptr::null(),
-            argument: R2SleighStringViewV2::default(),
-            external_context: R2SleighStringViewV2::default(),
-            symbols: if symbols.is_empty() {
-                ptr::null()
-            } else {
-                symbols.as_ptr()
-            },
-            num_symbols: symbols.len(),
-            merge_states,
-        }
-    }
-
-    #[test]
-    fn scope_symbol_snapshot_is_owned_and_imported_linkage_is_the_only_name_authority() {
-        let mut internal_name = b"memcpy".to_vec();
-        let mut imported_name = b"malloc".to_vec();
-        let symbols = [
-            scope_symbol(
-                0x4000,
-                &internal_name,
-                R2SLEIGH_INTERPROC_LINKAGE_INTERNAL_V2,
-            ),
-            scope_symbol(
-                0x5000,
-                &imported_name,
-                R2SLEIGH_INTERPROC_LINKAGE_IMPORTED_V2,
-            ),
-        ];
-        let request = scope_snapshot_request(&symbols, 1);
-        let snapshot = unsafe { scope_request_snapshot(&request) }.expect("valid snapshot");
-        internal_name.fill(b'x');
-        imported_name.fill(b'y');
-
-        assert!(snapshot.merge_states());
-        assert_eq!(snapshot.symbols().len(), 2);
-        assert!(!snapshot.symbols().imported_names().contains_key(&0x4000));
-        assert_eq!(
-            snapshot
-                .symbols()
-                .imported_names()
-                .get(&0x5000)
-                .map(String::as_str),
-            Some("malloc")
-        );
-    }
-
-    #[test]
-    fn scope_symbol_snapshot_rejects_envelopes_names_linkage_and_conflicts() {
-        let valid = scope_symbol(0x4000, b"local", R2SLEIGH_INTERPROC_LINKAGE_INTERNAL_V2);
-        for symbol in [
-            R2SleighScopeSymbolV2 {
-                struct_size: valid.struct_size - 1,
-                ..valid
-            },
-            R2SleighScopeSymbolV2 {
-                linkage: u32::MAX,
-                ..valid
-            },
-            scope_symbol(0x4000, b"", R2SLEIGH_INTERPROC_LINKAGE_INTERNAL_V2),
-            scope_symbol(0x4000, b"bad\0name", R2SLEIGH_INTERPROC_LINKAGE_INTERNAL_V2),
-            scope_symbol(0x4000, &[0xff], R2SLEIGH_INTERPROC_LINKAGE_INTERNAL_V2),
-        ] {
-            assert!(
-                unsafe { scope_request_snapshot(&scope_snapshot_request(&[symbol], 0)) }.is_err()
-            );
-        }
-
-        let conflicting = [
-            valid,
-            R2SleighScopeSymbolV2 {
-                linkage: R2SLEIGH_INTERPROC_LINKAGE_IMPORTED_V2,
-                ..valid
-            },
-        ];
-        assert!(
-            unsafe { scope_request_snapshot(&scope_snapshot_request(&conflicting, 0)) }.is_err()
-        );
-        let duplicate = [valid, valid];
-        assert_eq!(
-            unsafe { scope_request_snapshot(&scope_snapshot_request(&duplicate, 0)) }
-                .unwrap()
-                .symbols()
-                .len(),
-            1
-        );
-        assert!(unsafe { scope_request_snapshot(&scope_snapshot_request(&[], 2)) }.is_err());
-
-        let mut null_nonzero = scope_snapshot_request(&[], 0);
-        null_nonzero.num_symbols = 1;
-        assert!(unsafe { scope_request_snapshot(&null_nonzero) }.is_err());
-        let mut nonnull_zero = scope_snapshot_request(&[], 0);
-        nonnull_zero.symbols = &valid;
-        assert!(unsafe { scope_request_snapshot(&nonnull_zero) }.is_err());
-        let mut over_cap = scope_snapshot_request(&[], 0);
-        over_cap.num_symbols = R2SLEIGH_MAX_SCOPE_SYMBOLS_V2 + 1;
-        assert!(unsafe { scope_request_snapshot(&over_cap) }.is_err());
-        let mut misaligned = scope_snapshot_request(&[], 0);
-        misaligned.symbols = 1usize as *const R2SleighScopeSymbolV2;
-        misaligned.num_symbols = 1;
-        assert!(unsafe { scope_request_snapshot(&misaligned) }.is_err());
-    }
-
-    #[test]
-    fn scope_symbol_snapshot_enforces_aggregate_budget_and_is_concurrent_request_local() {
-        let exact_cap = (0..R2SLEIGH_MAX_SCOPE_SYMBOLS_V2)
-            .map(|index| {
-                scope_symbol(
-                    0x1000 + index as u64,
-                    b"x",
-                    R2SLEIGH_INTERPROC_LINKAGE_INTERNAL_V2,
-                )
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            unsafe { scope_request_snapshot(&scope_snapshot_request(&exact_cap, 0)) }
-                .unwrap()
-                .symbols()
-                .len(),
-            R2SLEIGH_MAX_SCOPE_SYMBOLS_V2
-        );
-
-        let maximum_name = vec![b'x'; R2SLEIGH_MAX_STRING_BYTES_V2];
-        let symbols = (0..5)
-            .map(|index| {
-                scope_symbol(
-                    0x4000 + index,
-                    &maximum_name,
-                    R2SLEIGH_INTERPROC_LINKAGE_IMPORTED_V2,
-                )
-            })
-            .collect::<Vec<_>>();
-        assert!(unsafe { scope_request_snapshot(&scope_snapshot_request(&symbols, 0)) }.is_err());
-
-        let outcomes = [false, true].map(|merge_states| {
-            std::thread::spawn(move || {
-                let name = if merge_states { b"malloc" } else { b"memcpy" };
-                let symbol = scope_symbol(0x5000, name, R2SLEIGH_INTERPROC_LINKAGE_IMPORTED_V2);
-                let symbols = [symbol];
-                let request = scope_snapshot_request(&symbols, u32::from(merge_states));
-                let snapshot = unsafe { scope_request_snapshot(&request) }.unwrap();
-                (
-                    snapshot.merge_states(),
-                    snapshot.symbols().imported_names().get(&0x5000).cloned(),
-                )
-            })
-        });
-        let [merge_off, merge_on] = outcomes;
-        assert_eq!(
-            merge_off.join().unwrap(),
-            (false, Some("memcpy".to_string()))
-        );
-        assert_eq!(merge_on.join().unwrap(), (true, Some("malloc".to_string())));
     }
 
     #[test]
@@ -6722,394 +5691,6 @@ mod tests {
         assert_eq!(status, R2SLEIGH_STATUS_OK_V2);
         assert_eq!(response.interproc_session.include_type_interproc_scope, 1);
         assert_eq!(response.interproc_session.interproc_converged, 1);
-
-        request = planner_request(R2SLEIGH_PLANNER_SYMBOLIC_SCOPE_V2);
-        request.root_function = 1;
-        request.interproc.interproc_converged = 1;
-        let (status, response) = planner_query_for(&request);
-        assert_eq!(status, R2SLEIGH_STATUS_OK_V2);
-        assert_eq!(response.symbolic_scope.append_function, 1);
-        assert_eq!(response.symbolic_scope.expand_targets, 1);
-        assert_eq!(
-            response.symbolic_scope.reason,
-            R2SLEIGH_SYMBOLIC_SCOPE_REASON_ALLOWED_V2
-        );
-
-        request = planner_request(R2SLEIGH_PLANNER_RUNTIME_SOURCE_V2);
-        request.addr = 0x9000;
-        request.size = 0x20;
-        let (status, response) = planner_query_for(&request);
-        assert_eq!(status, R2SLEIGH_STATUS_OK_V2);
-        assert_eq!(response.runtime_source.append_source, 1);
-        assert_eq!(response.runtime_source.capped_size, 0x20);
-        assert_eq!(
-            response.runtime_source.reason,
-            R2SLEIGH_RUNTIME_SOURCE_REASON_ALLOWED_V2
-        );
-    }
-
-    fn planner_target(
-        direct_target: u64,
-        name: &'static [u8],
-        linkage: u32,
-        resolved_target: u64,
-    ) -> R2SleighPlannerTargetInputV2 {
-        R2SleighPlannerTargetInputV2 {
-            abi_version: R2SLEIGH_ABI_V2,
-            struct_size: u32_size::<R2SleighPlannerTargetInputV2>(),
-            schema_version: R2SLEIGH_PLANNER_TARGET_INPUT_SCHEMA_V2,
-            direct_target,
-            name: R2SleighStringViewV2 {
-                data: name.as_ptr(),
-                len: name.len(),
-            },
-            linkage,
-            resolved_target,
-            has_resolved_target: 1,
-            target_materialized: 1,
-            has_target_metrics: 1,
-            target_basic_block_count: 1,
-            target_cost: 1,
-        }
-    }
-
-    #[test]
-    fn planner_target_result_is_registry_owned_copied_and_thread_affine() {
-        let targets = [
-            planner_target(
-                0x3000,
-                b"sym.imp.AddVectoredExceptionHandler",
-                R2SLEIGH_INTERPROC_LINKAGE_IMPORTED_V2,
-                0x3000,
-            ),
-            planner_target(
-                0x4000,
-                b"sym.local_helper",
-                R2SLEIGH_INTERPROC_LINKAGE_INTERNAL_V2,
-                0x4010,
-            ),
-            planner_target(
-                0x5000,
-                b"sym.imp.memcpy",
-                R2SLEIGH_INTERPROC_LINKAGE_IMPORTED_V2,
-                0x5000,
-            ),
-        ];
-        let mut request = planner_request(R2SLEIGH_PLANNER_INTERPROC_TARGETS_V2);
-        request.targets = targets.as_ptr();
-        request.num_targets = targets.len();
-        let (status, response) = planner_query_for(&request);
-        assert_eq!(status, R2SLEIGH_STATUS_OK_V2);
-        assert!(!response.result.is_null());
-
-        let mut view = R2SleighPlannerResultViewV2::default();
-        assert_eq!(
-            (API_V2.planner_result_view)(response.result, &mut view),
-            R2SLEIGH_STATUS_OK_V2
-        );
-        assert_eq!(view.queued_target_count, 2);
-        assert_eq!(view.registration_target_count, 1);
-        assert_eq!(view.runtime_copy_target_count, 1);
-
-        let mut count = 0;
-        assert_eq!(
-            (API_V2.planner_result_copy)(
-                response.result,
-                R2SLEIGH_PLANNER_RESULT_QUEUED_TARGETS_V2,
-                ptr::null_mut(),
-                0,
-                &mut count,
-            ),
-            R2SLEIGH_STATUS_LIMIT_EXCEEDED_V2
-        );
-        assert_eq!(count, 2);
-
-        let mut queued = [0u64; 2];
-        assert_eq!(
-            (API_V2.planner_result_copy)(
-                response.result,
-                R2SLEIGH_PLANNER_RESULT_QUEUED_TARGETS_V2,
-                queued.as_mut_ptr(),
-                queued.len(),
-                &mut count,
-            ),
-            R2SLEIGH_STATUS_OK_V2
-        );
-        assert_eq!(count, 2);
-        assert_eq!(queued, [0x4000, 0x4010]);
-        assert_eq!(
-            (API_V2.planner_result_copy)(
-                response.result,
-                R2SLEIGH_PLANNER_RESULT_QUEUED_TARGETS_V2,
-                queued.as_mut_ptr(),
-                1,
-                &mut count,
-            ),
-            R2SLEIGH_STATUS_LIMIT_EXCEEDED_V2
-        );
-        assert_eq!(count, 2);
-
-        let handle = response.result as usize;
-        assert_eq!(
-            std::thread::spawn(move || {
-                let mut view = R2SleighPlannerResultViewV2::default();
-                (API_V2.planner_result_view)(handle as *const _, &mut view)
-            })
-            .join()
-            .expect("planner thread"),
-            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
-        );
-        assert_eq!(
-            std::thread::spawn(move || {
-                (API_V2.planner_result_free)(handle as *mut R2SleighPlannerResultV2)
-            })
-            .join()
-            .expect("planner free thread"),
-            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
-        );
-        assert_eq!(
-            (API_V2.planner_result_view)(response.result, &mut view),
-            R2SLEIGH_STATUS_OK_V2,
-            "wrong-thread free refusal must retain the owner"
-        );
-        assert_eq!(
-            (API_V2.planner_result_free)(response.result),
-            R2SLEIGH_STATUS_OK_V2
-        );
-        assert_eq!(
-            (API_V2.planner_result_view)(response.result, &mut view),
-            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
-        );
-        assert_eq!(
-            (API_V2.planner_result_free)(response.result),
-            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2,
-            "double free must remain stale"
-        );
-    }
-
-    #[test]
-    fn planner_result_copy_validates_selector_count_and_empty_output() {
-        let request = planner_request(R2SLEIGH_PLANNER_INTERPROC_TARGETS_V2);
-        let (status, empty) = planner_query_for(&request);
-        assert_eq!(status, R2SLEIGH_STATUS_OK_V2);
-        assert!(!empty.result.is_null());
-        let mut count = usize::MAX;
-        assert_eq!(
-            (API_V2.planner_result_copy)(
-                empty.result,
-                R2SLEIGH_PLANNER_RESULT_QUEUED_TARGETS_V2,
-                ptr::null_mut(),
-                0,
-                &mut count,
-            ),
-            R2SLEIGH_STATUS_OK_V2
-        );
-        assert_eq!(count, 0);
-        count = usize::MAX;
-        assert_eq!(
-            (API_V2.planner_result_copy)(empty.result, u32::MAX, ptr::null_mut(), 0, &mut count,),
-            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
-        );
-        assert_eq!(count, 0);
-        assert_eq!(
-            (API_V2.planner_result_copy)(
-                empty.result,
-                R2SLEIGH_PLANNER_RESULT_QUEUED_TARGETS_V2,
-                ptr::null_mut(),
-                0,
-                ptr::null_mut(),
-            ),
-            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
-        );
-
-        let wrong_kind = lock_lift_registry()
-            .insert_owned_bytes(
-                0,
-                R2SleighOwnedBytesV2 {
-                    bytes: CString::new("planner wrong kind").unwrap(),
-                },
-            )
-            .expect("registered wrong-kind handle");
-        let mut view = R2SleighPlannerResultViewV2::default();
-        let mut count = usize::MAX;
-        assert_eq!(
-            (API_V2.planner_result_view)(wrong_kind.cast(), &mut view),
-            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
-        );
-        assert_eq!(
-            (API_V2.planner_result_copy)(
-                wrong_kind.cast(),
-                R2SLEIGH_PLANNER_RESULT_QUEUED_TARGETS_V2,
-                ptr::null_mut(),
-                0,
-                &mut count,
-            ),
-            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
-        );
-        assert_eq!(count, 0);
-        assert_eq!(
-            (API_V2.planner_result_free)(wrong_kind.cast()),
-            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
-        );
-        assert_eq!(
-            (API_V2.owned_bytes_free)(wrong_kind),
-            R2SLEIGH_STATUS_OK_V2,
-            "wrong-kind refusal must retain the true owner"
-        );
-        assert_eq!(
-            (API_V2.planner_result_free)(empty.result),
-            R2SLEIGH_STATUS_OK_V2
-        );
-    }
-
-    #[test]
-    fn planner_target_ingress_rejects_bad_envelopes_utf8_and_exact_tags() {
-        fn query_target(target: &R2SleighPlannerTargetInputV2) -> u32 {
-            let mut request = planner_request(R2SLEIGH_PLANNER_INTERPROC_TARGETS_V2);
-            request.targets = target;
-            request.num_targets = 1;
-            planner_query_for(&request).0
-        }
-
-        let mut target = planner_target(
-            0x4000,
-            b"local",
-            R2SLEIGH_INTERPROC_LINKAGE_INTERNAL_V2,
-            0x4000,
-        );
-        for invalid in [2, u32::MAX] {
-            target.target_materialized = invalid;
-            assert_eq!(query_target(&target), R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
-        }
-        target.target_materialized = 1;
-        target.linkage = u32::MAX;
-        assert_eq!(query_target(&target), R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
-        target.linkage = R2SLEIGH_INTERPROC_LINKAGE_INTERNAL_V2;
-        target.struct_size -= 1;
-        assert_eq!(query_target(&target), R2SLEIGH_STATUS_ABI_MISMATCH_V2);
-        target.struct_size = u32_size::<R2SleighPlannerTargetInputV2>();
-        let invalid_utf8 = [0xff];
-        target.name = R2SleighStringViewV2 {
-            data: invalid_utf8.as_ptr(),
-            len: invalid_utf8.len(),
-        };
-        assert_eq!(query_target(&target), R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
-        let mut request = planner_request(R2SLEIGH_PLANNER_INTERPROC_TARGETS_V2);
-        request.targets = ptr::null();
-        request.num_targets = 1;
-        assert_eq!(
-            planner_query_for(&request).0,
-            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
-        );
-        request.num_targets = R2SLEIGH_MAX_PLANNER_TARGETS_V2 + 1;
-        assert_eq!(
-            planner_query_for(&request).0,
-            R2SLEIGH_STATUS_LIMIT_EXCEEDED_V2
-        );
-
-        let exact_cap_target =
-            planner_target(0x4000, b"", R2SLEIGH_INTERPROC_LINKAGE_INTERNAL_V2, 0x4000);
-        let exact_cap_targets = vec![exact_cap_target; R2SLEIGH_MAX_PLANNER_TARGETS_V2];
-        request.targets = exact_cap_targets.as_ptr();
-        request.num_targets = exact_cap_targets.len();
-        let (status, response) = planner_query_for(&request);
-        assert_eq!(status, R2SLEIGH_STATUS_OK_V2);
-        assert_eq!(
-            (API_V2.planner_result_free)(response.result),
-            R2SLEIGH_STATUS_OK_V2
-        );
-
-        let maximum_name = vec![b'x'; R2SLEIGH_MAX_STRING_BYTES_V2];
-        let mut aggregate_targets = vec![exact_cap_target; 5];
-        for target in &mut aggregate_targets {
-            target.name = R2SleighStringViewV2 {
-                data: maximum_name.as_ptr(),
-                len: maximum_name.len(),
-            };
-        }
-        request.targets = aggregate_targets.as_ptr();
-        request.num_targets = aggregate_targets.len();
-        assert_eq!(
-            planner_query_for(&request).0,
-            R2SLEIGH_STATUS_LIMIT_EXCEEDED_V2,
-            "aggregate target-name bytes must remain bounded"
-        );
-    }
-
-    #[test]
-    fn planner_target_ingress_rejects_invalid_boolean_and_dependency_matrix() {
-        fn query_target(target: &R2SleighPlannerTargetInputV2) -> u32 {
-            let mut request = planner_request(R2SLEIGH_PLANNER_INTERPROC_TARGETS_V2);
-            request.targets = target;
-            request.num_targets = 1;
-            planner_query_for(&request).0
-        }
-
-        let valid = planner_target(
-            0x4000,
-            b"local",
-            R2SLEIGH_INTERPROC_LINKAGE_INTERNAL_V2,
-            0x4010,
-        );
-        for invalid in [2, u32::MAX] {
-            for target in [
-                R2SleighPlannerTargetInputV2 {
-                    has_resolved_target: invalid,
-                    ..valid
-                },
-                R2SleighPlannerTargetInputV2 {
-                    target_materialized: invalid,
-                    ..valid
-                },
-                R2SleighPlannerTargetInputV2 {
-                    has_target_metrics: invalid,
-                    ..valid
-                },
-            ] {
-                assert_eq!(query_target(&target), R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
-            }
-        }
-
-        for target in [
-            R2SleighPlannerTargetInputV2 {
-                has_resolved_target: 0,
-                ..valid
-            },
-            R2SleighPlannerTargetInputV2 {
-                has_resolved_target: 0,
-                resolved_target: 0,
-                ..valid
-            },
-            R2SleighPlannerTargetInputV2 {
-                has_target_metrics: 0,
-                ..valid
-            },
-            R2SleighPlannerTargetInputV2 {
-                target_materialized: 0,
-                ..valid
-            },
-        ] {
-            assert_eq!(query_target(&target), R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
-        }
-
-        let absent = R2SleighPlannerTargetInputV2 {
-            resolved_target: 0,
-            has_resolved_target: 0,
-            target_materialized: 0,
-            has_target_metrics: 0,
-            target_basic_block_count: 0,
-            target_cost: 0,
-            ..valid
-        };
-        let mut request = planner_request(R2SLEIGH_PLANNER_INTERPROC_TARGETS_V2);
-        request.targets = &absent;
-        request.num_targets = 1;
-        let (status, response) = planner_query_for(&request);
-        assert_eq!(status, R2SLEIGH_STATUS_OK_V2);
-        assert_eq!(
-            (API_V2.planner_result_free)(response.result),
-            R2SLEIGH_STATUS_OK_V2
-        );
     }
 
     #[test]
@@ -7159,19 +5740,6 @@ mod tests {
                 purpose: u32::MAX,
                 ..request
             },
-            R2SleighPlannerQueryRequestV2 {
-                kind: R2SLEIGH_PLANNER_SYMBOLIC_SCOPE_V2,
-                root_function: 2,
-                ..request
-            },
-            R2SleighPlannerQueryRequestV2 {
-                kind: R2SLEIGH_PLANNER_SYMBOLIC_SCOPE_V2,
-                interproc: R2SleighInterprocSessionPlan {
-                    interproc_converged: 2,
-                    ..R2SleighInterprocSessionPlan::default()
-                },
-                ..request
-            },
         ];
         for request in invalid {
             let (status, response) = planner_query_for(&request);
@@ -7181,20 +5749,60 @@ mod tests {
     }
 
     #[test]
+    fn planner_query_rejects_deleted_raw_kinds_without_output() {
+        for kind in [5, 6, 7] {
+            let request = planner_request(kind);
+            let (status, response) = planner_query_for(&request);
+            assert_eq!(status, R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
+            assert_eq!(response, R2SleighPlannerQueryResponseV2::default());
+        }
+    }
+
+    #[test]
     fn planner_query_rejects_nonzero_inactive_fields_for_every_kind() {
-        let target = planner_target(
-            0x4000,
-            b"local",
-            R2SLEIGH_INTERPROC_LINKAGE_INTERNAL_V2,
-            0x4000,
-        );
         let invalid = [
             R2SleighPlannerQueryRequestV2 {
                 purpose: 1,
                 ..planner_request(R2SLEIGH_PLANNER_ANALYSIS_POLICY_V2)
             },
             R2SleighPlannerQueryRequestV2 {
-                targets: &target,
+                callback_kind: 1,
+                ..planner_request(R2SLEIGH_PLANNER_ANALYSIS_POLICY_V2)
+            },
+            R2SleighPlannerQueryRequestV2 {
+                function_count: 1,
+                ..planner_request(R2SLEIGH_PLANNER_ANALYSIS_POLICY_V2)
+            },
+            R2SleighPlannerQueryRequestV2 {
+                basic_block_count: 1,
+                ..planner_request(R2SLEIGH_PLANNER_ANALYSIS_POLICY_V2)
+            },
+            R2SleighPlannerQueryRequestV2 {
+                cost: 1,
+                ..planner_request(R2SLEIGH_PLANNER_ANALYSIS_POLICY_V2)
+            },
+            R2SleighPlannerQueryRequestV2 {
+                linear_size: 1,
+                ..planner_request(R2SLEIGH_PLANNER_ANALYSIS_POLICY_V2)
+            },
+            R2SleighPlannerQueryRequestV2 {
+                purpose: 1,
+                ..planner_request(R2SLEIGH_PLANNER_POST_ANALYSIS_V2)
+            },
+            R2SleighPlannerQueryRequestV2 {
+                callback_kind: 1,
+                ..planner_request(R2SLEIGH_PLANNER_POST_ANALYSIS_V2)
+            },
+            R2SleighPlannerQueryRequestV2 {
+                basic_block_count: 1,
+                ..planner_request(R2SLEIGH_PLANNER_POST_ANALYSIS_V2)
+            },
+            R2SleighPlannerQueryRequestV2 {
+                cost: 1,
+                ..planner_request(R2SLEIGH_PLANNER_POST_ANALYSIS_V2)
+            },
+            R2SleighPlannerQueryRequestV2 {
+                linear_size: 1,
                 ..planner_request(R2SLEIGH_PLANNER_POST_ANALYSIS_V2)
             },
             R2SleighPlannerQueryRequestV2 {
@@ -7203,24 +5811,22 @@ mod tests {
                 ..planner_request(R2SLEIGH_PLANNER_AUTO_CALLBACK_V2)
             },
             R2SleighPlannerQueryRequestV2 {
-                purpose: R2SLEIGH_INTERPROC_SESSION_TYPE_ANALYSIS_V2,
-                linear_size: 1,
+                purpose: 1,
+                callback_kind: R2SLEIGH_AUTO_CALLBACK_ANALYZE_FUNCTION_V2,
+                ..planner_request(R2SLEIGH_PLANNER_AUTO_CALLBACK_V2)
+            },
+            R2SleighPlannerQueryRequestV2 {
+                callback_kind: 1,
                 ..planner_request(R2SLEIGH_PLANNER_INTERPROC_SESSION_V2)
             },
             R2SleighPlannerQueryRequestV2 {
-                depth: 1,
-                ..planner_request(R2SLEIGH_PLANNER_SYMBOLIC_SCOPE_V2)
+                function_count: 1,
+                ..planner_request(R2SLEIGH_PLANNER_INTERPROC_SESSION_V2)
             },
             R2SleighPlannerQueryRequestV2 {
-                interproc: R2SleighInterprocSessionPlan {
-                    interproc_iter: 1,
-                    ..R2SleighInterprocSessionPlan::default()
-                },
-                ..planner_request(R2SLEIGH_PLANNER_RUNTIME_SOURCE_V2)
-            },
-            R2SleighPlannerQueryRequestV2 {
-                addr: 1,
-                ..planner_request(R2SLEIGH_PLANNER_INTERPROC_TARGETS_V2)
+                purpose: R2SLEIGH_INTERPROC_SESSION_TYPE_ANALYSIS_V2,
+                linear_size: 1,
+                ..planner_request(R2SLEIGH_PLANNER_INTERPROC_SESSION_V2)
             },
         ];
         for request in invalid {
@@ -7358,9 +5964,6 @@ mod tests {
             blocks: block_handles.as_ptr(),
             num_blocks: block_handles.len(),
             function_addr: 0,
-            function_name: R2SleighStringViewV2::default(),
-            input_values: ptr::null(),
-            num_input_values: 0,
         };
         let mut analysis_result = ptr::null_mut();
         assert_eq!(
@@ -7381,6 +5984,19 @@ mod tests {
             (api.analysis_result_view)(analysis_result, &mut analysis_view),
             R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
         );
+        for deleted_kind in [4, 5, 6] {
+            let deleted_request = R2SleighAnalysisQueryRequestV2 {
+                kind: deleted_kind,
+                ..query_request
+            };
+            let mut deleted_result = analysis_result;
+            assert_eq!(
+                (api.analysis_query)(&deleted_request, &mut deleted_result),
+                R2SLEIGH_STATUS_UNSUPPORTED_V2,
+                "deleted query ID {deleted_kind} must not alias another query"
+            );
+            assert!(deleted_result.is_null());
+        }
         assert_eq!((api.owned_bytes_free)(rendered), R2SLEIGH_STATUS_OK_V2);
 
         let mut mnemonic = ptr::null_mut();
@@ -9248,14 +7864,6 @@ mod tests {
         assert_eq!(
             api.analysis_render_request_size as usize,
             size_of::<R2SleighAnalysisRenderRequestV2>()
-        );
-        assert_eq!(
-            api.scope_render_request_size as usize,
-            size_of::<R2SleighScopeRenderRequestV2>()
-        );
-        assert_eq!(
-            api.scope_symbol_size as usize,
-            size_of::<R2SleighScopeSymbolV2>()
         );
         assert_eq!(
             api.analysis_query_request_size as usize,

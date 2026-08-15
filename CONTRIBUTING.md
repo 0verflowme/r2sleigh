@@ -17,7 +17,7 @@ When reporting a bug, include:
 For crashes, include a backtrace if possible:
 
 ```bash
-RUST_BACKTRACE=1 r2 -qc 'aaa; s main; a:sla.dec' /path/to/binary
+RUST_BACKTRACE=1 r2 -qc 'aaa; s main; pdd' /path/to/binary
 ```
 
 Getting Started
@@ -101,7 +101,7 @@ Testing Requirements
 | New plugin command | e2e test in `tests/e2e/integration_tests.rs` |
 | New optimization pass | Unit test in `r2ssa` + e2e test via `a:sla.ssa.func.opt` |
 | Bug fix | Regression test reproducing the bug |
-| Decompiler change | e2e test via `a:sla.dec` |
+| Decompiler change | e2e test via the `pdd` borrowed-snapshot decompiler path |
 
 ### Adding a test binary pattern
 
