@@ -21,15 +21,16 @@ use r2ssa::{
     MachineBitVector, MachineBitwiseOp, MachineBooleanOp, MachineCastKind, MachineComparisonOp,
     MachineEntity, MachineExpr, MachineExprId, MachineExprKind, MachineMemoryEndianness,
     MachineOvershiftBehavior, MachineProjection, MachineShiftKind, MachineSignedness,
-    MachineStackBase, MachineType, MachineValueBinding, ObjectId, SemanticObligationId,
-    SemanticObligationInventory, SemanticObligationKind, SourceCallSiteIdentity, SourceCarrierKind,
-    SourceCarrierProjection, SourceFunctionInterface, SourceFunctionReturn, SourceMachineContext,
-    SourceTypeKind, StackAddressBase, StackAddressRoot, StructuredAccessId, ValueId,
+    MachineStackBase, MachineType, MachineValueBinding, MachineValueUse, ObjectId,
+    SemanticObligationId, SemanticObligationInventory, SemanticObligationKind,
+    SourceCallSiteIdentity, SourceCarrierKind, SourceCarrierProjection, SourceFunctionInterface,
+    SourceFunctionReturn, SourceMachineContext, SourceTypeKind, StackAddressBase, StackAddressRoot,
+    StructuredAccessId, ValueId,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const SEMANTIC_C_SCHEMA_VERSION: u32 = 15;
+pub const SEMANTIC_C_SCHEMA_VERSION: u32 = 16;
 
 /// Closed renderer-owned helper vocabulary. Membership is derived only while
 /// rendering audited typed semantics and never grants certification authority.
@@ -854,6 +855,95 @@ pub struct SemanticCExpressionLayer {
     open_obligations: BTreeSet<SemanticObligationId>,
 }
 
+/// One sealed, typed leaf admitted by expanded expression rendering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SemanticCTypedLeaf {
+    kind: SemanticCTypedLeafKind,
+    ty: MachineType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SemanticCTypedLeafKind {
+    Root(SemanticCExprId),
+    Constant {
+        binding: MachineValueBinding,
+        value: MachineBitVector,
+    },
+    AbiInput {
+        binding: MachineValueBinding,
+    },
+}
+
+impl SemanticCTypedLeaf {
+    pub(crate) const fn ty(&self) -> &MachineType {
+        &self.ty
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SemanticCMemoryReadDescriptor {
+    root: SemanticCExprId,
+    access: StructuredAccessId,
+    object: ObjectId,
+    space: r2ssa::MachineAddressSpace,
+    endianness: MachineMemoryEndianness,
+    word_size_bytes: u32,
+    address: SemanticCExprId,
+    width_bits: u32,
+    ty: MachineType,
+}
+
+/// One sealed replacement for an exact semantic-C memory-read node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SemanticCMemoryRewrite {
+    read: SemanticCMemoryReadDescriptor,
+    kind: SemanticCMemoryRewriteKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SemanticCMemoryRewriteKind {
+    Direct {
+        value: SemanticCTypedLeaf,
+    },
+    NonZeroSelect {
+        condition: SemanticCTypedLeaf,
+        true_value: SemanticCTypedLeaf,
+        false_value: SemanticCTypedLeaf,
+    },
+}
+
+impl SemanticCMemoryRewrite {
+    pub(crate) const fn access(&self) -> StructuredAccessId {
+        self.read.access
+    }
+}
+
+/// Result of one exact-manifest expanded expression render.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SemanticCExpandedRender {
+    expression: String,
+    consumed_rewrites: Box<[StructuredAccessId]>,
+    helpers: SemanticCHelperSet,
+}
+
+impl SemanticCExpandedRender {
+    pub(crate) fn expression(&self) -> &str {
+        &self.expression
+    }
+
+    pub(crate) const fn consumed_rewrites(&self) -> &[StructuredAccessId] {
+        &self.consumed_rewrites
+    }
+
+    pub(crate) const fn helpers(&self) -> &SemanticCHelperSet {
+        &self.helpers
+    }
+
+    pub(crate) const fn helpers_mut(&mut self) -> &mut SemanticCHelperSet {
+        &mut self.helpers
+    }
+}
+
 /// Exact source producers whose only certified consumers are architectural
 /// return-address or exit-stack-pointer roots. These remain owned by the
 /// terminal return node and are deliberately absent from semantic C steps.
@@ -1031,6 +1121,15 @@ pub enum SemanticCError {
     CheckedArithmeticRequiresHelper(SemanticCExprId),
     UnsupportedShiftPolicy(SemanticCExprId),
     MemoryReadRequiresCertifiedStatement(SemanticCExprId),
+    InvalidExpandedLeaf(MachineValueBinding),
+    InvalidExpandedRoot(SemanticCExprId),
+    AmbiguousExpandedInput(MachineValueBinding),
+    CyclicExpandedExpression(SemanticCExprId),
+    MissingMemoryRewrite(StructuredAccessId),
+    DuplicateMemoryRewrite(StructuredAccessId),
+    InvalidMemoryRewrite(StructuredAccessId),
+    CyclicMemoryRewrite(StructuredAccessId),
+    IncompleteMemoryRewrite(StructuredAccessId),
     InvalidReturnMechanics(CanonicalInstructionId),
     CyclicReturnMechanics(CanonicalInstructionId),
     InvalidFrameMechanics(CanonicalInstructionId),
@@ -2571,12 +2670,204 @@ impl SemanticCExpressionLayer {
             .ok_or(SemanticCError::MissingSemanticExpression(id))
     }
 
+    pub(crate) fn expanded_root_leaf(
+        &self,
+        value: &MachineValueUse,
+        root: SemanticCExprId,
+        semantic_ty: &MachineType,
+    ) -> Result<SemanticCTypedLeaf, SemanticCError> {
+        let Some(producer) = value.producer() else {
+            return Err(SemanticCError::InvalidExpandedLeaf(value.binding()));
+        };
+        let mut entities = self.entities.iter().filter(|entity| {
+            entity.producer() == producer
+                && entity.output() == value.binding()
+                && entity.root() == root
+        });
+        if entities.next().is_none()
+            || entities.next().is_some()
+            || self.expr_type(root)? != semantic_ty
+            || semantic_ty.width_bits() != value.ty().width_bits()
+            || semantic_ty.width_bits() != value.binding().width_bits()
+        {
+            return Err(SemanticCError::InvalidExpandedLeaf(value.binding()));
+        }
+        Ok(SemanticCTypedLeaf {
+            kind: SemanticCTypedLeafKind::Root(root),
+            ty: semantic_ty.clone(),
+        })
+    }
+
+    pub(crate) fn expanded_constant_leaf(
+        &self,
+        value: &MachineValueUse,
+    ) -> Result<SemanticCTypedLeaf, SemanticCError> {
+        let Some(constant) = value.constant() else {
+            return Err(SemanticCError::InvalidExpandedLeaf(value.binding()));
+        };
+        if value.producer().is_some()
+            || value.memory_access().is_some()
+            || constant.width_bits() != value.binding().width_bits()
+            || value.ty().width_bits() != value.binding().width_bits()
+        {
+            return Err(SemanticCError::InvalidExpandedLeaf(value.binding()));
+        }
+        storage_type(value.ty())?;
+        Ok(SemanticCTypedLeaf {
+            kind: SemanticCTypedLeafKind::Constant {
+                binding: value.binding(),
+                value: constant,
+            },
+            ty: value.ty().clone(),
+        })
+    }
+
+    pub(crate) fn expanded_abi_input_leaf(
+        &self,
+        value: &MachineValueUse,
+    ) -> Result<SemanticCTypedLeaf, SemanticCError> {
+        if value.producer().is_some()
+            || value.constant().is_some()
+            || value.memory_access().is_some()
+            || !self.is_exact_abi_input(value.binding(), value.ty())
+        {
+            return Err(SemanticCError::InvalidExpandedLeaf(value.binding()));
+        }
+        Ok(SemanticCTypedLeaf {
+            kind: SemanticCTypedLeafKind::AbiInput {
+                binding: value.binding(),
+            },
+            ty: value.ty().clone(),
+        })
+    }
+
+    pub(crate) fn direct_memory_rewrite(
+        &self,
+        load_root: SemanticCExprId,
+        access: StructuredAccessId,
+        value: SemanticCTypedLeaf,
+    ) -> Result<SemanticCMemoryRewrite, SemanticCError> {
+        let read = self.memory_read_descriptor(load_root, access)?;
+        if value.ty() != &read.ty {
+            return Err(SemanticCError::InvalidMemoryRewrite(access));
+        }
+        Ok(SemanticCMemoryRewrite {
+            read,
+            kind: SemanticCMemoryRewriteKind::Direct { value },
+        })
+    }
+
+    pub(crate) fn nonzero_select_memory_rewrite(
+        &self,
+        load_root: SemanticCExprId,
+        access: StructuredAccessId,
+        condition: SemanticCTypedLeaf,
+        true_value: SemanticCTypedLeaf,
+        false_value: SemanticCTypedLeaf,
+    ) -> Result<SemanticCMemoryRewrite, SemanticCError> {
+        let read = self.memory_read_descriptor(load_root, access)?;
+        if !matches!(condition.ty(), MachineType::Bool { .. })
+            || true_value.ty() != &read.ty
+            || false_value.ty() != &read.ty
+        {
+            return Err(SemanticCError::InvalidMemoryRewrite(access));
+        }
+        Ok(SemanticCMemoryRewrite {
+            read,
+            kind: SemanticCMemoryRewriteKind::NonZeroSelect {
+                condition,
+                true_value,
+                false_value,
+            },
+        })
+    }
+
+    pub(crate) fn render_expanded_expr(
+        &self,
+        root: SemanticCExprId,
+        rewrites: &[SemanticCMemoryRewrite],
+    ) -> Result<SemanticCExpandedRender, SemanticCError> {
+        let mut context = SemanticCExpandedRenderContext::new(self, rewrites)?;
+        let mut helpers = SemanticCHelperSet::default();
+        let rendered = self.render_expr_inner(
+            root,
+            &mut SemanticCRenderMode::Expanded(&mut context),
+            &mut helpers,
+        )?;
+        context.finish()?;
+        Ok(SemanticCExpandedRender {
+            expression: rendered.source,
+            consumed_rewrites: context
+                .consumed
+                .into_iter()
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            helpers,
+        })
+    }
+
+    fn is_exact_abi_input(&self, binding: MachineValueBinding, ty: &MachineType) -> bool {
+        let Some(SemanticCInputOrigin::AbiParameter { index, storage }) =
+            self.input_origins.get(&binding)
+        else {
+            return false;
+        };
+        let mut parameters = self
+            .function_interface
+            .iter()
+            .flat_map(SemanticCFunctionInterface::parameters)
+            .filter(|parameter| {
+                parameter.index() == *index
+                    && parameter.storage() == *storage
+                    && parameter.value() == Some(binding)
+                    && parameter.ty() == ty
+            });
+        parameters.next().is_some() && parameters.next().is_none()
+    }
+
+    fn memory_read_descriptor(
+        &self,
+        root: SemanticCExprId,
+        expected_access: StructuredAccessId,
+    ) -> Result<SemanticCMemoryReadDescriptor, SemanticCError> {
+        let expression = self
+            .expr(root)
+            .ok_or(SemanticCError::MissingSemanticExpression(root))?;
+        let SemanticCExprKind::MemoryRead {
+            access,
+            object,
+            space,
+            endianness,
+            word_size_bytes,
+            address,
+            width_bits,
+        } = expression.kind()
+        else {
+            return Err(SemanticCError::InvalidMemoryRewrite(expected_access));
+        };
+        if *access != expected_access || *width_bits != expression.ty().width_bits() {
+            return Err(SemanticCError::InvalidMemoryRewrite(expected_access));
+        }
+        storage_type(expression.ty())?;
+        Ok(SemanticCMemoryReadDescriptor {
+            root,
+            access: *access,
+            object: *object,
+            space: *space,
+            endianness: *endianness,
+            word_size_bytes: *word_size_bytes,
+            address: *address,
+            width_bits: *width_bits,
+            ty: expression.ty().clone(),
+        })
+    }
+
     pub(crate) fn render_expr(
         &self,
         id: SemanticCExprId,
         helpers: &mut SemanticCHelperSet,
     ) -> Result<String, SemanticCError> {
-        let rendered = self.render_expr_inner(id, None, helpers)?;
+        let rendered = self.render_expr_inner(id, &mut SemanticCRenderMode::Ordinary, helpers)?;
         Ok(rendered.source)
     }
 
@@ -2622,7 +2913,25 @@ impl SemanticCExpressionLayer {
     fn render_expr_inner(
         &self,
         id: SemanticCExprId,
-        substitution: Option<(MachineValueBinding, &str)>,
+        mode: &mut SemanticCRenderMode<'_, '_>,
+        helpers: &mut SemanticCHelperSet,
+    ) -> Result<RenderedSemanticExpr, SemanticCError> {
+        if let SemanticCRenderMode::Expanded(context) = mode
+            && !context.active_expressions.insert(id)
+        {
+            return Err(SemanticCError::CyclicExpandedExpression(id));
+        }
+        let rendered = self.render_expr_entered(id, mode, helpers);
+        if let SemanticCRenderMode::Expanded(context) = mode {
+            context.active_expressions.remove(&id);
+        }
+        rendered
+    }
+
+    fn render_expr_entered(
+        &self,
+        id: SemanticCExprId,
+        mode: &mut SemanticCRenderMode<'_, '_>,
         helpers: &mut SemanticCHelperSet,
     ) -> Result<RenderedSemanticExpr, SemanticCError> {
         let expr = self
@@ -2630,30 +2939,47 @@ impl SemanticCExpressionLayer {
             .ok_or(SemanticCError::MissingSemanticExpression(id))?;
         let width = expr.ty.width_bits();
         let ctype = storage_type(&expr.ty)?;
-        let mut child = |child| self.render_expr_inner(child, substitution, helpers);
-        let rendered = match &expr.kind {
-            SemanticCExprKind::Input { binding } => {
-                if let Some((expected, replacement)) = substitution
-                    && expected == *binding
-                {
-                    RenderedSemanticExpr {
-                        source: replacement.to_string(),
-                        substitutions: 1,
+        if let SemanticCExprKind::Input { binding } = &expr.kind {
+            return match mode {
+                SemanticCRenderMode::Ordinary => Ok(RenderedSemanticExpr {
+                    source: value_name(*binding),
+                    substitutions: 0,
+                }),
+                SemanticCRenderMode::Expanded(context) => {
+                    if context.ambiguous_outputs.contains(binding) {
+                        return Err(SemanticCError::AmbiguousExpandedInput(*binding));
                     }
-                } else {
-                    RenderedSemanticExpr {
-                        source: value_name(*binding),
-                        substitutions: 0,
+                    if let Some(root) = context.unique_outputs.get(binding).copied() {
+                        self.render_expr_inner(root, mode, helpers)
+                    } else if self.is_exact_abi_input(*binding, expr.ty()) {
+                        Ok(RenderedSemanticExpr {
+                            source: value_name(*binding),
+                            substitutions: 0,
+                        })
+                    } else {
+                        Err(SemanticCError::InvalidExpandedLeaf(*binding))
                     }
                 }
-            }
+            };
+        }
+        if matches!(expr.kind(), SemanticCExprKind::MemoryRead { .. }) {
+            return match mode {
+                SemanticCRenderMode::Ordinary => {
+                    Err(SemanticCError::MemoryReadRequiresCertifiedStatement(id))
+                }
+                SemanticCRenderMode::Expanded(context) => {
+                    self.render_memory_rewrite(id, context, helpers)
+                }
+            };
+        }
+        let mut child = |child| self.render_expr_inner(child, mode, helpers);
+        let rendered = match &expr.kind {
+            SemanticCExprKind::Input { .. } => unreachable!("handled above"),
             SemanticCExprKind::Constant { value, .. } => RenderedSemanticExpr {
                 source: format!("(({ctype})UINT64_C(0x{:x}))", value.bits()),
                 substitutions: 0,
             },
-            SemanticCExprKind::MemoryRead { .. } => {
-                return Err(SemanticCError::MemoryReadRequiresCertifiedStatement(id));
-            }
+            SemanticCExprKind::MemoryRead { .. } => unreachable!("handled above"),
             SemanticCExprKind::Copy { input } => {
                 let input = child(*input)?;
                 RenderedSemanticExpr {
@@ -2936,11 +3262,180 @@ impl SemanticCExpressionLayer {
         };
         Ok(rendered)
     }
+
+    fn render_memory_rewrite(
+        &self,
+        id: SemanticCExprId,
+        context: &mut SemanticCExpandedRenderContext<'_>,
+        helpers: &mut SemanticCHelperSet,
+    ) -> Result<RenderedSemanticExpr, SemanticCError> {
+        let expression = self
+            .expr(id)
+            .ok_or(SemanticCError::MissingSemanticExpression(id))?;
+        let SemanticCExprKind::MemoryRead {
+            access,
+            object,
+            space,
+            endianness,
+            word_size_bytes,
+            address,
+            width_bits,
+        } = expression.kind()
+        else {
+            unreachable!("expanded memory renderer requires a memory-read node")
+        };
+        let rewrite = context
+            .rewrites
+            .get(access)
+            .copied()
+            .ok_or(SemanticCError::MissingMemoryRewrite(*access))?
+            .clone();
+        let read = &rewrite.read;
+        if read.root != id
+            || read.access != *access
+            || read.object != *object
+            || read.space != *space
+            || read.endianness != *endianness
+            || read.word_size_bytes != *word_size_bytes
+            || read.address != *address
+            || read.width_bits != *width_bits
+            || read.ty != *expression.ty()
+            || *width_bits != expression.ty().width_bits()
+        {
+            return Err(SemanticCError::InvalidMemoryRewrite(*access));
+        }
+        if !context.active_accesses.insert(*access) {
+            return Err(SemanticCError::CyclicMemoryRewrite(*access));
+        }
+        if !context.consumed.insert(*access) {
+            context.active_accesses.remove(access);
+            return Err(SemanticCError::DuplicateMemoryRewrite(*access));
+        }
+
+        let rendered = match &rewrite.kind {
+            SemanticCMemoryRewriteKind::Direct { value } => {
+                self.render_typed_leaf(value, context, helpers)
+            }
+            SemanticCMemoryRewriteKind::NonZeroSelect {
+                condition,
+                true_value,
+                false_value,
+            } => {
+                let condition = self.render_typed_leaf(condition, context, helpers)?;
+                let true_value = self.render_typed_leaf(true_value, context, helpers)?;
+                let false_value = self.render_typed_leaf(false_value, context, helpers)?;
+                let ctype = storage_type(expression.ty())?;
+                Ok(RenderedSemanticExpr {
+                    source: format!(
+                        "(({ctype})(((uint64_t)({}) != UINT64_C(0)) ? ({}) : ({})))",
+                        condition.source, true_value.source, false_value.source
+                    ),
+                    substitutions: 0,
+                })
+            }
+        };
+        context.active_accesses.remove(access);
+        rendered
+    }
+
+    fn render_typed_leaf(
+        &self,
+        leaf: &SemanticCTypedLeaf,
+        context: &mut SemanticCExpandedRenderContext<'_>,
+        helpers: &mut SemanticCHelperSet,
+    ) -> Result<RenderedSemanticExpr, SemanticCError> {
+        match &leaf.kind {
+            SemanticCTypedLeafKind::Root(root) => {
+                if self.expr_type(*root)? != leaf.ty() {
+                    return Err(SemanticCError::InvalidExpandedRoot(*root));
+                }
+                self.render_expr_inner(*root, &mut SemanticCRenderMode::Expanded(context), helpers)
+            }
+            SemanticCTypedLeafKind::Constant { binding, value } => {
+                if binding.width_bits() != leaf.ty.width_bits()
+                    || value.width_bits() != binding.width_bits()
+                {
+                    return Err(SemanticCError::InvalidExpandedLeaf(*binding));
+                }
+                let ctype = storage_type(&leaf.ty)?;
+                Ok(RenderedSemanticExpr {
+                    source: format!("(({ctype})UINT64_C(0x{:x}))", value.bits()),
+                    substitutions: 0,
+                })
+            }
+            SemanticCTypedLeafKind::AbiInput { binding } => {
+                if !self.is_exact_abi_input(*binding, &leaf.ty) {
+                    return Err(SemanticCError::InvalidExpandedLeaf(*binding));
+                }
+                Ok(RenderedSemanticExpr {
+                    source: value_name(*binding),
+                    substitutions: 0,
+                })
+            }
+        }
+    }
 }
 
 struct RenderedSemanticExpr {
     source: String,
     substitutions: usize,
+}
+
+enum SemanticCRenderMode<'a, 'rewrite> {
+    Ordinary,
+    Expanded(&'a mut SemanticCExpandedRenderContext<'rewrite>),
+}
+
+struct SemanticCExpandedRenderContext<'a> {
+    rewrites: BTreeMap<StructuredAccessId, &'a SemanticCMemoryRewrite>,
+    unique_outputs: BTreeMap<MachineValueBinding, SemanticCExprId>,
+    ambiguous_outputs: BTreeSet<MachineValueBinding>,
+    active_expressions: BTreeSet<SemanticCExprId>,
+    active_accesses: BTreeSet<StructuredAccessId>,
+    consumed: BTreeSet<StructuredAccessId>,
+}
+
+impl<'a> SemanticCExpandedRenderContext<'a> {
+    fn new(
+        layer: &SemanticCExpressionLayer,
+        rewrites: &'a [SemanticCMemoryRewrite],
+    ) -> Result<Self, SemanticCError> {
+        let mut rewrite_index = BTreeMap::new();
+        for rewrite in rewrites {
+            if rewrite_index.insert(rewrite.access(), rewrite).is_some() {
+                return Err(SemanticCError::DuplicateMemoryRewrite(rewrite.access()));
+            }
+        }
+        let mut unique_outputs = BTreeMap::new();
+        let mut ambiguous_outputs = BTreeSet::new();
+        for entity in layer.entities() {
+            if unique_outputs
+                .insert(entity.output(), entity.root())
+                .is_some()
+            {
+                ambiguous_outputs.insert(entity.output());
+            }
+        }
+        Ok(Self {
+            rewrites: rewrite_index,
+            unique_outputs,
+            ambiguous_outputs,
+            active_expressions: BTreeSet::new(),
+            active_accesses: BTreeSet::new(),
+            consumed: BTreeSet::new(),
+        })
+    }
+
+    fn finish(&self) -> Result<(), SemanticCError> {
+        if let Some(access) = self
+            .rewrites
+            .keys()
+            .find(|access| !self.consumed.contains(access))
+        {
+            return Err(SemanticCError::IncompleteMemoryRewrite(*access));
+        }
+        Ok(())
+    }
 }
 
 fn semantic_call_argument_leaf<'a>(
@@ -3818,7 +4313,7 @@ pub(crate) fn insert_semantic_c_helpers(
 #[cfg(test)]
 mod return_mechanics_tests {
     use super::*;
-    use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, Varnode};
+    use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
     use r2ssa::{
         CanonicalInstructionSite, CanonicalStorageSpace, SourceLogicalValue, SourceType,
         SourceTypeGraph, SsaArtifact,
@@ -3871,6 +4366,212 @@ mod return_mechanics_tests {
             builder.expressions[translated.index()].clone(),
             builder.inputs,
         )
+    }
+
+    type ExpandedMemoryNode = (SemanticCExprId, StructuredAccessId, MachineValueBinding);
+    type ExpandedMemoryFixture = (
+        SemanticCExpressionLayer,
+        ExpandedMemoryNode,
+        SemanticCExprId,
+        ExpandedMemoryNode,
+    );
+
+    fn expanded_memory_fixture() -> ExpandedMemoryFixture {
+        let block_addr = 0x4300;
+        let mut block = R2ILBlock::new(block_addr, 4);
+        block.push(R2ILOp::Load {
+            dst: Varnode::unique(0x100, 1),
+            space: SpaceId::Ram,
+            addr: Varnode::register(0, 8),
+        });
+        block.push(R2ILOp::IntEqual {
+            dst: Varnode::unique(0x110, 1),
+            a: Varnode::unique(0x100, 1),
+            b: Varnode::constant(0, 1),
+        });
+        block.push(R2ILOp::Load {
+            dst: Varnode::unique(0x120, 4),
+            space: SpaceId::Ram,
+            addr: Varnode::register(8, 8),
+        });
+        let mut arch = ArchSpec::new("expanded-memory-render-test");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("r0", 0, 8));
+        arch.add_register(RegisterDef::new("r1", 8, 8));
+        let artifact = SsaArtifact::for_decompile(&[block], Some(&arch))
+            .expect("expanded-render prepared artifact");
+        let projection =
+            MachineProjection::from_artifact(&artifact).expect("expanded-render projection");
+        let output_producers = MachineView(&projection).output_producers();
+        let certified_producers = projection
+            .entities()
+            .iter()
+            .map(MachineEntity::producer)
+            .collect::<BTreeSet<_>>();
+        let root_outputs = projection
+            .entities()
+            .iter()
+            .map(|entity| (entity.root(), (entity.output(), entity.producer())))
+            .collect();
+        let mut builder = SemanticCBuilder {
+            machine: MachineView(&projection),
+            output_producers: &output_producers,
+            certified_producers: &certified_producers,
+            root_outputs,
+            translated: BTreeMap::new(),
+            expressions: Vec::new(),
+            inputs: BTreeMap::new(),
+        };
+        let mut entities = Vec::new();
+        for entity in projection.entities() {
+            let root = builder
+                .translate(entity.root())
+                .expect("expanded-render semantic root");
+            entities.push(SemanticCEntity {
+                output: entity.output(),
+                root,
+                producer: entity.producer(),
+                source_obligations: BTreeSet::new(),
+            });
+        }
+        let locate = |producer| {
+            let entity = entities
+                .iter()
+                .find(|entity| entity.producer() == producer)
+                .expect("expanded-render entity");
+            let expression = &builder.expressions[entity.root().index()];
+            let SemanticCExprKind::MemoryRead { access, .. } = expression.kind() else {
+                panic!("expanded-render memory entity")
+            };
+            (entity.root(), *access, entity.output())
+        };
+        let auxiliary = locate(block_id(block_addr, 0));
+        let condition = entities
+            .iter()
+            .find(|entity| entity.producer() == block_id(block_addr, 1))
+            .expect("expanded-render condition")
+            .root();
+        let joined = locate(block_id(block_addr, 2));
+        let layer = SemanticCExpressionLayer {
+            schema_version: SEMANTIC_C_SCHEMA_VERSION,
+            scope: SemanticCScope::LiveValueExpressionsOnly,
+            identity_scope: SemanticCIdentityScope::ArtifactLocalHandles,
+            expressions: builder.expressions.into_boxed_slice(),
+            entities: entities.into_boxed_slice(),
+            function_interface: None,
+            inputs: builder.inputs,
+            input_origins: BTreeMap::new(),
+            return_mechanics: SemanticCReturnMechanicsOwnership::default(),
+            frame_mechanics: SemanticCFrameMechanicsOwnership::default(),
+            open_obligations: BTreeSet::new(),
+        };
+        (layer, auxiliary, condition, joined)
+    }
+
+    #[test]
+    fn expanded_renderer_consumes_exact_direct_and_nonzero_select_manifest() {
+        let (
+            layer,
+            (aux_root, aux_access, aux_binding),
+            condition_root,
+            (join_root, join_access, join_binding),
+        ) = expanded_memory_fixture();
+        let unsigned8 = MachineType::Integer {
+            width_bits: 8,
+            signedness: MachineSignedness::Unsigned,
+        };
+        let unsigned32 = MachineType::Integer {
+            width_bits: 32,
+            signedness: MachineSignedness::Unsigned,
+        };
+        let auxiliary = layer
+            .direct_memory_rewrite(
+                aux_root,
+                aux_access,
+                SemanticCTypedLeaf {
+                    kind: SemanticCTypedLeafKind::Constant {
+                        binding: aux_binding,
+                        value: MachineBitVector::zero(8).expect("eight-bit zero"),
+                    },
+                    ty: unsigned8,
+                },
+            )
+            .expect("exact auxiliary rewrite");
+        let joined = layer
+            .nonzero_select_memory_rewrite(
+                join_root,
+                join_access,
+                SemanticCTypedLeaf {
+                    kind: SemanticCTypedLeafKind::Root(condition_root),
+                    ty: MachineType::Bool { storage_bits: 8 },
+                },
+                SemanticCTypedLeaf {
+                    kind: SemanticCTypedLeafKind::Constant {
+                        binding: join_binding,
+                        value: MachineBitVector::zero(32).expect("32-bit zero"),
+                    },
+                    ty: unsigned32.clone(),
+                },
+                SemanticCTypedLeaf {
+                    kind: SemanticCTypedLeafKind::Constant {
+                        binding: join_binding,
+                        value: MachineBitVector::zero(32).expect("32-bit zero"),
+                    },
+                    ty: unsigned32,
+                },
+            )
+            .expect("exact joined select rewrite");
+        let rendered = layer
+            .render_expanded_expr(join_root, &[joined.clone(), auxiliary.clone()])
+            .expect("exact expanded manifest");
+        assert!(rendered.expression().contains(" != UINT64_C(0)) ?"));
+        assert_eq!(
+            rendered.consumed_rewrites(),
+            [aux_access, join_access]
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
+        assert!(rendered.helpers().definitions().is_empty());
+        assert_eq!(
+            layer.render_expr(join_root, &mut SemanticCHelperSet::default()),
+            Err(SemanticCError::MemoryReadRequiresCertifiedStatement(
+                join_root
+            ))
+        );
+
+        let mut mismatched = joined.clone();
+        mismatched.read.word_size_bytes = mismatched.read.word_size_bytes.saturating_add(1);
+        assert_eq!(
+            layer.render_expanded_expr(join_root, &[mismatched, auxiliary.clone()]),
+            Err(SemanticCError::InvalidMemoryRewrite(join_access))
+        );
+        assert_eq!(
+            layer.render_expanded_expr(join_root, &[joined.clone(), joined]),
+            Err(SemanticCError::DuplicateMemoryRewrite(join_access))
+        );
+
+        let direct_join = layer
+            .direct_memory_rewrite(
+                join_root,
+                join_access,
+                SemanticCTypedLeaf {
+                    kind: SemanticCTypedLeafKind::Constant {
+                        binding: join_binding,
+                        value: MachineBitVector::zero(32).expect("32-bit zero"),
+                    },
+                    ty: MachineType::Integer {
+                        width_bits: 32,
+                        signedness: MachineSignedness::Unsigned,
+                    },
+                },
+            )
+            .expect("exact joined direct rewrite");
+        assert_eq!(
+            layer.render_expanded_expr(join_root, &[direct_join, auxiliary]),
+            Err(SemanticCError::IncompleteMemoryRewrite(aux_access))
+        );
     }
 
     fn xor_projection(

@@ -96,16 +96,20 @@ pub use certified_loop_return::{
     LoopReturnFunctionScope, LoopReturnValue, check_loop_return_differential,
 };
 pub use certified_private_frame_join::{
+    CERTIFIED_PRIVATE_FRAME_CONDITIONAL_JOIN_FUNCTION_SCHEMA_VERSION,
     CERTIFIED_PRIVATE_FRAME_JOIN_REWRITE_SCHEMA_VERSION,
-    CertifiedPrivateFrameConditionalJoinRewrite, CertifiedPrivateFrameConditionalJoinRewriteScope,
-    CertifiedPrivateFrameDirectSubstitution, CertifiedPrivateFrameJoinValue,
-    CertifiedPrivateFrameJoinValueOrigin, CertifiedPrivateFrameJoinedSelect,
-    PrivateFrameConditionalJoinRewriteError,
+    CertifiedPrivateFrameConditionalJoinFunction,
+    CertifiedPrivateFrameConditionalJoinFunctionScope, CertifiedPrivateFrameConditionalJoinRewrite,
+    CertifiedPrivateFrameConditionalJoinRewriteScope, CertifiedPrivateFrameDirectSubstitution,
+    CertifiedPrivateFrameJoinValue, CertifiedPrivateFrameJoinValueOrigin,
+    CertifiedPrivateFrameJoinedSelect, PrivateFrameConditionalJoinFunctionAuditReport,
+    PrivateFrameConditionalJoinFunctionError, PrivateFrameConditionalJoinRewriteError,
 };
 pub use certified_region::{
     CERTIFIED_REGION_SCHEMA_VERSION, CertifiedRegionInstruction, CertifiedSingleBlockAccounting,
-    RegionAuditReport, RegionBuildError, RegionObligationDisposition, RegionObligationMapping,
-    RegionResidualReason, RegionTypedOwner, SingleBlockAccountingScope,
+    PrivateFrameConditionalJoinOwnerRole, RegionAuditReport, RegionBuildError,
+    RegionObligationDisposition, RegionObligationMapping, RegionResidualReason, RegionTypedOwner,
+    SingleBlockAccountingScope,
 };
 pub use certified_return::{
     CERTIFIED_TERMINAL_RETURN_REGION_SCHEMA_VERSION, CertifiedTerminalReturnBlockRegion,

@@ -9,18 +9,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use r2cert::{
-    CERTIFICATION_SCHEMA_VERSION, CertifiedArtifactOrigin, CertifiedCallArgumentOrigin,
-    CertifiedConditionalControl, CertifiedControlTruthiness, CertifiedDirectCall,
-    CertifiedDirectControl, CertifiedLedgerClosure, CertifiedMachineFunction,
-    CertifiedMachineProjection, CertifiedMemoryStatement, CertifiedNormalizedStackRange,
-    CertifiedReturnControl, CertifiedReturnRegisterDefinition, CertifiedSourceTopology,
-    CertifiedSwitchControl, CertifiedTypedRegionKind, EffectDisposition, ObligationLedger,
-    TypedRegionMapping,
+    CERTIFICATION_SCHEMA_VERSION, CERTIFIED_PRIVATE_FRAME_CONDITIONAL_JOIN_CONTRACT_VERSION,
+    CertifiedArtifactOrigin, CertifiedCallArgumentOrigin, CertifiedConditionalControl,
+    CertifiedControlTruthiness, CertifiedDirectCall, CertifiedDirectControl,
+    CertifiedLedgerClosure, CertifiedMachineFunction, CertifiedMachineProjection,
+    CertifiedMemoryStatement, CertifiedNormalizedStackRange, CertifiedReturnControl,
+    CertifiedReturnRegisterDefinition, CertifiedSourceTopology, CertifiedSwitchControl,
+    CertifiedTypedRegionKind, EffectDisposition, ObligationLedger, TypedRegionMapping,
 };
 use r2ssa::{
     CanonicalInstructionId, CanonicalInstructionSite, CanonicalStorageId, SemanticInstructionState,
     SemanticObligationComponent, SemanticObligationId, SemanticObligationInventory,
-    SemanticObligationKind,
+    SemanticObligationKind, StructuredAccessId,
 };
 use serde::Serialize;
 
@@ -31,8 +31,9 @@ use crate::semantic_c::{
     SemanticCReturnMechanicsOwner, SemanticCReturnRegisterDefinition, SemanticCScope,
     semantic_call_from_control, semantic_return_from_control,
 };
+use crate::{CertifiedPrivateFrameConditionalJoinRewrite, CertifiedPrivateFrameJoinValueOrigin};
 
-pub const CERTIFIED_REGION_SCHEMA_VERSION: u32 = 13;
+pub const CERTIFIED_REGION_SCHEMA_VERSION: u32 = 14;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum SingleBlockAccountingScope {
@@ -97,6 +98,71 @@ pub enum RegionTypedOwner {
         saved_range: CertifiedNormalizedStackRange,
         return_producers: Box<[CanonicalInstructionId]>,
     },
+    PrivateFrameConditionalJoin {
+        producer: CanonicalInstructionId,
+        role: PrivateFrameConditionalJoinOwnerRole,
+    },
+}
+
+/// Exact composite role by which the private-frame rewrite plan owns an
+/// already-ledgered source effect. These roles never replace or invent the
+/// underlying ledger disposition.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub enum PrivateFrameConditionalJoinOwnerRole {
+    AuxiliaryStoreMemory {
+        access: StructuredAccessId,
+    },
+    AuxiliaryLoadMemory {
+        access: StructuredAccessId,
+    },
+    AuxiliaryLoadValue {
+        access: StructuredAccessId,
+        root: SemanticCExprId,
+    },
+    JoinedTrueStoreMemory {
+        access: StructuredAccessId,
+    },
+    JoinedFalseStoreMemory {
+        access: StructuredAccessId,
+    },
+    JoinedLoadMemory {
+        access: StructuredAccessId,
+    },
+    JoinedLoadValue {
+        access: StructuredAccessId,
+        root: SemanticCExprId,
+    },
+    PrivateStackMechanics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct PrivateFrameConditionalJoinAccountingAuthority {
+    header: u64,
+    stack_pointer_storage: CanonicalStorageId,
+    reservation_range: CertifiedNormalizedStackRange,
+    roles: Box<[(SemanticObligationId, PrivateFrameConditionalJoinOwnerRole)]>,
+}
+
+fn private_role_manifest_is_canonical(
+    roles: &[(SemanticObligationId, PrivateFrameConditionalJoinOwnerRole)],
+) -> bool {
+    roles.windows(2).all(|pair| pair[0].0 < pair[1].0)
+        && roles.iter().all(|(obligation, role)| match role {
+            PrivateFrameConditionalJoinOwnerRole::AuxiliaryStoreMemory { .. }
+            | PrivateFrameConditionalJoinOwnerRole::JoinedTrueStoreMemory { .. }
+            | PrivateFrameConditionalJoinOwnerRole::JoinedFalseStoreMemory { .. } => {
+                obligation.kind == SemanticObligationKind::ObservableMemoryWrite
+            }
+            PrivateFrameConditionalJoinOwnerRole::AuxiliaryLoadMemory { .. }
+            | PrivateFrameConditionalJoinOwnerRole::JoinedLoadMemory { .. } => {
+                obligation.kind == SemanticObligationKind::ObservableMemoryRead
+            }
+            PrivateFrameConditionalJoinOwnerRole::AuxiliaryLoadValue { .. }
+            | PrivateFrameConditionalJoinOwnerRole::JoinedLoadValue { .. }
+            | PrivateFrameConditionalJoinOwnerRole::PrivateStackMechanics => {
+                obligation.kind == SemanticObligationKind::LiveValueProducer
+            }
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -221,6 +287,7 @@ pub struct CertifiedSingleBlockAccounting {
     semantic_returns: Box<[SemanticCReturn]>,
     instructions: Box<[CertifiedRegionInstruction]>,
     mappings: Box<[RegionObligationMapping]>,
+    private_frame_conditional_join: Option<PrivateFrameConditionalJoinAccountingAuthority>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,6 +305,8 @@ pub enum RegionBuildError {
     ReturnObligationMismatch(SemanticObligationId),
     AmbiguousControl(CanonicalInstructionId),
     ArtifactOriginMismatch,
+    PrivateFrameConditionalJoinMismatch,
+    UnsupportedPrivateFrameConditionalJoinObligation(SemanticObligationId),
 }
 
 impl std::fmt::Display for RegionBuildError {
@@ -538,6 +607,363 @@ struct CertifiedBlockParts {
     conditional_controls: Vec<CertifiedConditionalControl>,
     switch_controls: Vec<CertifiedSwitchControl>,
     return_controls: Vec<CertifiedReturnControl>,
+}
+
+fn projection_block_parts(
+    projection: &CertifiedMachineProjection,
+    block_addr: u64,
+    expression_layer: SemanticCExpressionLayer,
+) -> CertifiedBlockParts {
+    let producers = projection
+        .topology()
+        .block(block_addr)
+        .into_iter()
+        .flat_map(|block| block.instructions())
+        .copied()
+        .collect::<Vec<_>>();
+    CertifiedBlockParts {
+        expression_layer,
+        memory_statements: producers
+            .iter()
+            .filter_map(|producer| projection.memory_statement_for_producer(*producer).cloned())
+            .collect(),
+        direct_calls: producers
+            .iter()
+            .filter_map(|producer| projection.direct_call_for_producer(*producer).cloned())
+            .collect(),
+        direct_controls: producers
+            .iter()
+            .filter_map(|producer| projection.direct_control_for_producer(*producer).cloned())
+            .collect(),
+        conditional_controls: producers
+            .iter()
+            .filter_map(|producer| {
+                projection
+                    .conditional_control_for_producer(*producer)
+                    .cloned()
+            })
+            .collect(),
+        switch_controls: projection
+            .switch_control_for_block(block_addr)
+            .cloned()
+            .into_iter()
+            .collect(),
+        return_controls: producers
+            .iter()
+            .filter_map(|producer| projection.return_control_for_producer(*producer).cloned())
+            .collect(),
+    }
+}
+
+fn insert_private_role(
+    roles: &mut BTreeMap<SemanticObligationId, PrivateFrameConditionalJoinOwnerRole>,
+    obligation: SemanticObligationId,
+    role: PrivateFrameConditionalJoinOwnerRole,
+) -> Result<(), RegionBuildError> {
+    if roles.insert(obligation, role).is_some() {
+        return Err(RegionBuildError::PrivateFrameConditionalJoinMismatch);
+    }
+    Ok(())
+}
+
+fn insert_private_statement_role(
+    roles: &mut BTreeMap<SemanticObligationId, PrivateFrameConditionalJoinOwnerRole>,
+    statement: &CertifiedMemoryStatement,
+    role: PrivateFrameConditionalJoinOwnerRole,
+) -> Result<(), RegionBuildError> {
+    if statement.access()
+        != match &role {
+            PrivateFrameConditionalJoinOwnerRole::AuxiliaryStoreMemory { access }
+            | PrivateFrameConditionalJoinOwnerRole::AuxiliaryLoadMemory { access }
+            | PrivateFrameConditionalJoinOwnerRole::JoinedTrueStoreMemory { access }
+            | PrivateFrameConditionalJoinOwnerRole::JoinedFalseStoreMemory { access }
+            | PrivateFrameConditionalJoinOwnerRole::JoinedLoadMemory { access }
+            | PrivateFrameConditionalJoinOwnerRole::AuxiliaryLoadValue { access, .. }
+            | PrivateFrameConditionalJoinOwnerRole::JoinedLoadValue { access, .. } => *access,
+            PrivateFrameConditionalJoinOwnerRole::PrivateStackMechanics => {
+                return Err(RegionBuildError::PrivateFrameConditionalJoinMismatch);
+            }
+        }
+        || statement.source_obligations().is_empty()
+    {
+        return Err(RegionBuildError::PrivateFrameConditionalJoinMismatch);
+    }
+    for obligation in statement.source_obligations() {
+        insert_private_role(roles, *obligation, role.clone())?;
+    }
+    Ok(())
+}
+
+fn exact_ledger_is_closed_for_private_join(
+    projection: &CertifiedMachineProjection,
+    rewrite: &CertifiedPrivateFrameConditionalJoinRewrite,
+) -> bool {
+    if rewrite.origin() != projection.origin()
+        || rewrite.ledger_closure().origin() != projection.origin()
+        || projection
+            .source()
+            .instructions()
+            .values()
+            .any(|instruction| instruction.state == SemanticInstructionState::UnsupportedUnknown)
+    {
+        return false;
+    }
+    let mut mappings = Vec::with_capacity(projection.source().obligations().len());
+    for obligation in projection.source().obligations().keys() {
+        let [effect] = projection.ledger().effects(*obligation) else {
+            return false;
+        };
+        if matches!(
+            effect.disposition(),
+            EffectDisposition::Residualized { .. }
+                | EffectDisposition::Refused { .. }
+                | EffectDisposition::Rendered
+                | EffectDisposition::Rewritten { .. }
+                | EffectDisposition::Superseded { .. }
+                | EffectDisposition::ProvenDead
+        ) {
+            return false;
+        }
+        mappings.push(TypedRegionMapping::new(
+            *obligation,
+            effect.disposition().clone(),
+        ));
+    }
+    rewrite.ledger_closure().matches_ledger(
+        projection.origin(),
+        CertifiedTypedRegionKind::PrivateFrameConditionalJoinFunction,
+        CERTIFIED_PRIVATE_FRAME_CONDITIONAL_JOIN_CONTRACT_VERSION,
+        &mappings,
+    )
+}
+
+fn private_join_accounting_authority(
+    projection: &CertifiedMachineProjection,
+    rewrite: &CertifiedPrivateFrameConditionalJoinRewrite,
+) -> Result<PrivateFrameConditionalJoinAccountingAuthority, RegionBuildError> {
+    let join = rewrite.machine_join();
+    let stack = projection
+        .stack_discipline()
+        .ok_or(RegionBuildError::PrivateFrameConditionalJoinMismatch)?;
+    if join.origin() != projection.origin()
+        || rewrite.origin() != projection.origin()
+        || projection.private_frame_conditional_join(join.header()) != Some(join)
+        || join.header() != projection.topology().entry_addr()
+        || stack.origin() != projection.origin()
+        || rewrite.expression_layer().schema_version() != SEMANTIC_C_SCHEMA_VERSION
+        || !exact_ledger_is_closed_for_private_join(projection, rewrite)
+        || !projection.direct_calls().is_empty()
+    {
+        return Err(RegionBuildError::PrivateFrameConditionalJoinMismatch);
+    }
+
+    let layer = rewrite.expression_layer();
+    let mut roles = BTreeMap::new();
+    let auxiliary = join
+        .auxiliary_direct_flows()
+        .iter()
+        .map(|(access, flow)| (*access, flow))
+        .collect::<BTreeMap<_, _>>();
+    if auxiliary.len() != rewrite.direct_substitutions().len() {
+        return Err(RegionBuildError::PrivateFrameConditionalJoinMismatch);
+    }
+    let mut rewritten_load_producers = BTreeSet::new();
+    for substitution in rewrite.direct_substitutions() {
+        let access = substitution.load_access();
+        let flow = auxiliary
+            .get(&access)
+            .copied()
+            .ok_or(RegionBuildError::PrivateFrameConditionalJoinMismatch)?;
+        let mut stores = flow
+            .definitions()
+            .iter()
+            .filter_map(|definition| definition.store());
+        let store = stores
+            .next()
+            .filter(|_| stores.next().is_none())
+            .ok_or(RegionBuildError::PrivateFrameConditionalJoinMismatch)?;
+        insert_private_statement_role(
+            &mut roles,
+            store.statement(),
+            PrivateFrameConditionalJoinOwnerRole::AuxiliaryStoreMemory {
+                access: store.statement().access(),
+            },
+        )?;
+        let load = flow.load().statement();
+        if load.access() != access || substitution.load_result().producer() != Some(load.producer())
+        {
+            return Err(RegionBuildError::PrivateFrameConditionalJoinMismatch);
+        }
+        insert_private_statement_role(
+            &mut roles,
+            load,
+            PrivateFrameConditionalJoinOwnerRole::AuxiliaryLoadMemory { access },
+        )?;
+        let entity = layer
+            .entity_for_producer(load.producer())
+            .filter(|entity| entity.root() == substitution.load_root())
+            .ok_or(RegionBuildError::PrivateFrameConditionalJoinMismatch)?;
+        for obligation in entity.source_obligations() {
+            insert_private_role(
+                &mut roles,
+                *obligation,
+                PrivateFrameConditionalJoinOwnerRole::AuxiliaryLoadValue {
+                    access,
+                    root: entity.root(),
+                },
+            )?;
+        }
+        rewritten_load_producers.insert(load.producer());
+    }
+
+    let joined = rewrite.joined_select();
+    let joined_load = join.joined_flow().load().statement();
+    if joined.load_access() != joined_load.access()
+        || joined.load_result().producer() != Some(joined_load.producer())
+    {
+        return Err(RegionBuildError::PrivateFrameConditionalJoinMismatch);
+    }
+    for (statement, role) in [
+        (
+            join.true_arm().store().statement(),
+            PrivateFrameConditionalJoinOwnerRole::JoinedTrueStoreMemory {
+                access: join.true_arm().store().statement().access(),
+            },
+        ),
+        (
+            join.false_arm().store().statement(),
+            PrivateFrameConditionalJoinOwnerRole::JoinedFalseStoreMemory {
+                access: join.false_arm().store().statement().access(),
+            },
+        ),
+        (
+            joined_load,
+            PrivateFrameConditionalJoinOwnerRole::JoinedLoadMemory {
+                access: joined_load.access(),
+            },
+        ),
+    ] {
+        insert_private_statement_role(&mut roles, statement, role)?;
+    }
+    let joined_entity = layer
+        .entity_for_producer(joined_load.producer())
+        .filter(|entity| entity.root() == joined.load_root())
+        .ok_or(RegionBuildError::PrivateFrameConditionalJoinMismatch)?;
+    for obligation in joined_entity.source_obligations() {
+        insert_private_role(
+            &mut roles,
+            *obligation,
+            PrivateFrameConditionalJoinOwnerRole::JoinedLoadValue {
+                access: joined_load.access(),
+                root: joined_entity.root(),
+            },
+        )?;
+    }
+    rewritten_load_producers.insert(joined_load.producer());
+
+    let mut visible_roots = vec![joined.condition_root(), joined.return_root()];
+    for value in rewrite
+        .direct_substitutions()
+        .iter()
+        .map(|substitution| substitution.replacement())
+        .chain([joined.true_value(), joined.false_value()])
+    {
+        if let CertifiedPrivateFrameJoinValueOrigin::Produced { root, .. } = value.origin() {
+            visible_roots.push(*root);
+        }
+    }
+    let visible_producers = visible_roots
+        .into_iter()
+        .map(|root| {
+            layer
+                .expr(root)
+                .map(|expression| expression.source_instructions())
+                .ok_or(RegionBuildError::PrivateFrameConditionalJoinMismatch)
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .copied()
+        .collect::<BTreeSet<_>>();
+
+    let mut stack_roots = stack
+        .assignments()
+        .iter()
+        .map(|assignment| assignment.producer())
+        .collect::<BTreeSet<_>>();
+    stack_roots.insert(stack.reservation().producer());
+    for region in stack.private_regions() {
+        for access in region.accesses() {
+            if let Some(producer) = access.statement().address().producer() {
+                stack_roots.insert(producer);
+            }
+        }
+    }
+    for release in stack.releases() {
+        stack_roots.insert(release.restoration().producer());
+        if let Some(assignment) = release.post_restoration() {
+            stack_roots.insert(assignment.producer());
+        }
+        if let Some(statement) = release.return_address_read()
+            && let Some(producer) = statement.address().producer()
+        {
+            stack_roots.insert(producer);
+        }
+    }
+    let mut stack_producers = BTreeSet::new();
+    let mut frontier = stack_roots.into_iter().collect::<Vec<_>>();
+    while let Some(producer) = frontier.pop() {
+        if !stack_producers.insert(producer) {
+            continue;
+        }
+        if let Some(inputs) =
+            ledger_expression_inputs(projection.ledger(), projection.source(), producer)
+        {
+            frontier.extend(inputs);
+        }
+    }
+    let return_mechanics = layer
+        .return_mechanics()
+        .owners()
+        .iter()
+        .map(|owner| owner.source_producer())
+        .chain(
+            layer
+                .frame_mechanics()
+                .owners()
+                .iter()
+                .map(|owner| owner.source_producer()),
+        )
+        .collect::<BTreeSet<_>>();
+    for entity in layer.entities() {
+        if rewritten_load_producers.contains(&entity.producer())
+            || visible_producers.contains(&entity.producer())
+            || return_mechanics.contains(&entity.producer())
+        {
+            continue;
+        }
+        if !stack_producers.contains(&entity.producer()) {
+            return Err(RegionBuildError::PrivateFrameConditionalJoinMismatch);
+        }
+        for obligation in entity.source_obligations() {
+            insert_private_role(
+                &mut roles,
+                *obligation,
+                PrivateFrameConditionalJoinOwnerRole::PrivateStackMechanics,
+            )?;
+        }
+    }
+
+    let authority = PrivateFrameConditionalJoinAccountingAuthority {
+        header: join.header(),
+        stack_pointer_storage: stack.stack_pointer_storage(),
+        reservation_range: stack.reservation_range(),
+        roles: roles.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+    };
+    if !private_role_manifest_is_canonical(&authority.roles) {
+        return Err(RegionBuildError::PrivateFrameConditionalJoinMismatch);
+    }
+    Ok(authority)
 }
 
 fn semantic_return_definition_matches(
@@ -879,6 +1305,101 @@ impl CertifiedSingleBlockAccounting {
         )
     }
 
+    /// Build block-local typed-output accounting for one exact sealed
+    /// private-frame conditional-join rewrite plan.
+    pub(crate) fn from_private_frame_conditional_join_rewrite_block(
+        projection: &CertifiedMachineProjection,
+        rewrite: &CertifiedPrivateFrameConditionalJoinRewrite,
+        block_addr: u64,
+    ) -> Result<Self, RegionBuildError> {
+        require_source_block(projection.topology(), block_addr)?;
+        let authority = private_join_accounting_authority(projection, rewrite)?;
+        if projection.source().obligations().keys().any(|obligation| {
+            matches!(
+                obligation.kind,
+                SemanticObligationKind::Call
+                    | SemanticObligationKind::CallArgument
+                    | SemanticObligationKind::CallResult
+                    | SemanticObligationKind::Trap
+                    | SemanticObligationKind::Atomicity
+                    | SemanticObligationKind::MemoryOrdering
+                    | SemanticObligationKind::VolatileOrUnknownEffect
+                    | SemanticObligationKind::LoopCarriedState
+                    | SemanticObligationKind::LiveStateTransition
+            )
+        }) {
+            return Err(RegionBuildError::PrivateFrameConditionalJoinMismatch);
+        }
+        let roles = authority.roles.iter().cloned().collect::<BTreeMap<_, _>>();
+        let parts =
+            projection_block_parts(projection, block_addr, rewrite.expression_layer().clone());
+        let mut accounting = Self::from_parts_with_private_join(
+            projection.origin(),
+            projection.source(),
+            projection.topology(),
+            projection.ledger(),
+            block_addr,
+            parts,
+            None,
+        )?;
+        for mapping in &mut accounting.mappings {
+            if let Some(role) = roles.get(&mapping.obligation) {
+                let [effect] = projection.ledger().effects(mapping.obligation) else {
+                    return Err(
+                        RegionBuildError::UnsupportedPrivateFrameConditionalJoinObligation(
+                            mapping.obligation,
+                        ),
+                    );
+                };
+                let exact_disposition = match effect.disposition() {
+                    EffectDisposition::AbsorbedIntoExpression { producer } => {
+                        RegionObligationDisposition::AbsorbedIntoExpression {
+                            producer: *producer,
+                        }
+                    }
+                    EffectDisposition::AbsorbedIntoStatement { producer } => {
+                        RegionObligationDisposition::AbsorbedIntoStatement {
+                            producer: *producer,
+                        }
+                    }
+                    _ => {
+                        return Err(
+                            RegionBuildError::UnsupportedPrivateFrameConditionalJoinObligation(
+                                mapping.obligation,
+                            ),
+                        );
+                    }
+                };
+                if mapping.disposition != exact_disposition {
+                    return Err(
+                        RegionBuildError::UnsupportedPrivateFrameConditionalJoinObligation(
+                            mapping.obligation,
+                        ),
+                    );
+                }
+                mapping.owner = Some(RegionTypedOwner::PrivateFrameConditionalJoin {
+                    producer: mapping.obligation.instruction,
+                    role: role.clone(),
+                });
+            } else if matches!(
+                mapping.disposition,
+                RegionObligationDisposition::Residualized { .. }
+            ) || matches!(mapping.owner, Some(RegionTypedOwner::Call { .. }))
+            {
+                return Err(
+                    RegionBuildError::UnsupportedPrivateFrameConditionalJoinObligation(
+                        mapping.obligation,
+                    ),
+                );
+            }
+        }
+        accounting.private_frame_conditional_join = Some(authority);
+        if !accounting.audit().has_exact_source_accounting() {
+            return Err(RegionBuildError::PrivateFrameConditionalJoinMismatch);
+        }
+        Ok(accounting)
+    }
+
     fn from_parts(
         origin: &CertifiedArtifactOrigin,
         source: &SemanticObligationInventory,
@@ -886,6 +1407,20 @@ impl CertifiedSingleBlockAccounting {
         ledger: &ObligationLedger,
         block_addr: u64,
         parts: CertifiedBlockParts,
+    ) -> Result<Self, RegionBuildError> {
+        Self::from_parts_with_private_join(
+            origin, source, topology, ledger, block_addr, parts, None,
+        )
+    }
+
+    fn from_parts_with_private_join(
+        origin: &CertifiedArtifactOrigin,
+        source: &SemanticObligationInventory,
+        topology: &CertifiedSourceTopology,
+        ledger: &ObligationLedger,
+        block_addr: u64,
+        parts: CertifiedBlockParts,
+        private_frame_conditional_join: Option<PrivateFrameConditionalJoinAccountingAuthority>,
     ) -> Result<Self, RegionBuildError> {
         if !ledger.matches_origin(origin) {
             return Err(RegionBuildError::ArtifactOriginMismatch);
@@ -1265,6 +1800,7 @@ impl CertifiedSingleBlockAccounting {
             semantic_returns: semantic_returns.into_boxed_slice(),
             instructions: instructions.into_boxed_slice(),
             mappings: mappings.into_boxed_slice(),
+            private_frame_conditional_join,
         })
     }
 
@@ -1649,6 +2185,11 @@ impl CertifiedSingleBlockAccounting {
                 .then_some(mapping.obligation)
             })
             .collect::<BTreeSet<_>>();
+        let private_roles = self
+            .private_frame_conditional_join
+            .as_ref()
+            .map(|authority| authority.roles.iter().cloned().collect::<BTreeMap<_, _>>())
+            .unwrap_or_default();
 
         for mapping in &self.mappings {
             let owner_matches = match (&mapping.disposition, &mapping.owner) {
@@ -1759,6 +2300,82 @@ impl CertifiedSingleBlockAccounting {
                         && owner.source_obligations().contains(&mapping.obligation)
                         && !return_producers.is_empty()
                 }),
+                (
+                    RegionObligationDisposition::AbsorbedIntoExpression { producer },
+                    Some(RegionTypedOwner::PrivateFrameConditionalJoin {
+                        producer: owner,
+                        role,
+                    }),
+                ) => {
+                    producer == owner
+                        && private_roles.get(&mapping.obligation) == Some(role)
+                        && matches!(
+                            self.ledger.effects(mapping.obligation),
+                            [effect]
+                                if effect.disposition()
+                                    == &EffectDisposition::AbsorbedIntoExpression {
+                                        producer: *producer,
+                                    }
+                                    && effect.expression_evidence().is_some_and(|evidence| {
+                                        evidence.entity().producer() == *producer
+                                            && evidence
+                                                .entity()
+                                                .source_obligations()
+                                                .contains(&mapping.obligation)
+                                    })
+                        )
+                        && expression_entities.get(producer).is_some_and(|entity| {
+                            entity.source_obligations().contains(&mapping.obligation)
+                                && match role {
+                                    PrivateFrameConditionalJoinOwnerRole::AuxiliaryLoadValue {
+                                        root,
+                                        ..
+                                    }
+                                    | PrivateFrameConditionalJoinOwnerRole::JoinedLoadValue {
+                                        root,
+                                        ..
+                                    } => entity.root() == *root,
+                                    PrivateFrameConditionalJoinOwnerRole::PrivateStackMechanics => {
+                                        true
+                                    }
+                                    _ => false,
+                                }
+                        })
+                }
+                (
+                    RegionObligationDisposition::AbsorbedIntoStatement { producer },
+                    Some(RegionTypedOwner::PrivateFrameConditionalJoin {
+                        producer: owner,
+                        role,
+                    }),
+                ) => {
+                    let role_access = match role {
+                        PrivateFrameConditionalJoinOwnerRole::AuxiliaryStoreMemory { access }
+                        | PrivateFrameConditionalJoinOwnerRole::AuxiliaryLoadMemory { access }
+                        | PrivateFrameConditionalJoinOwnerRole::JoinedTrueStoreMemory { access }
+                        | PrivateFrameConditionalJoinOwnerRole::JoinedFalseStoreMemory { access }
+                        | PrivateFrameConditionalJoinOwnerRole::JoinedLoadMemory { access } => {
+                            Some(*access)
+                        }
+                        _ => None,
+                    };
+                    producer == owner
+                        && private_roles.get(&mapping.obligation) == Some(role)
+                        && matches!(
+                            self.ledger.effects(mapping.obligation),
+                            [effect]
+                                if effect.disposition()
+                                    == &EffectDisposition::AbsorbedIntoStatement {
+                                        producer: *producer,
+                                    }
+                                    && effect.statement_evidence()
+                                        == statement_entities.get(producer).copied()
+                        )
+                        && statement_entities.get(producer).is_some_and(|statement| {
+                            role_access == Some(statement.access())
+                                && statement.source_obligations().contains(&mapping.obligation)
+                        })
+                }
                 (RegionObligationDisposition::Residualized { .. }, None) => true,
                 _ => false,
             };
@@ -1772,6 +2389,36 @@ impl CertifiedSingleBlockAccounting {
 
         if self.schema_version != CERTIFIED_REGION_SCHEMA_VERSION {
             invalid.push("region schema version mismatch".to_string());
+        }
+        let mapped_private_roles = self
+            .mappings
+            .iter()
+            .filter_map(|mapping| match &mapping.owner {
+                Some(RegionTypedOwner::PrivateFrameConditionalJoin { role, .. }) => {
+                    Some((mapping.obligation, role.clone()))
+                }
+                _ => None,
+            })
+            .collect::<BTreeMap<_, _>>();
+        let expected_private_roles = private_roles
+            .iter()
+            .filter(|(obligation, _)| expected_obligations.contains(obligation))
+            .map(|(obligation, role)| (*obligation, role.clone()))
+            .collect::<BTreeMap<_, _>>();
+        if mapped_private_roles != expected_private_roles
+            || self
+                .private_frame_conditional_join
+                .as_ref()
+                .is_some_and(|authority| {
+                    authority.header != self.topology.entry_addr()
+                        || authority.stack_pointer_storage.size == 0
+                        || authority.reservation_range.size_bytes() == 0
+                        || authority.roles.len() != private_roles.len()
+                        || !private_role_manifest_is_canonical(&authority.roles)
+                })
+        {
+            invalid
+                .push("private-frame conditional-join ownership manifest is not exact".to_string());
         }
         if !self.source.is_complete() {
             invalid.push("retained source obligation inventory is incomplete".to_string());
@@ -2992,7 +3639,11 @@ fn ledger_mapping_for_typed_owner(
 ) -> Option<TypedRegionMapping> {
     if matches!(
         &mapping.owner,
-        Some(RegionTypedOwner::ReturnMechanics { .. } | RegionTypedOwner::FrameMechanics { .. })
+        Some(
+            RegionTypedOwner::ReturnMechanics { .. }
+                | RegionTypedOwner::FrameMechanics { .. }
+                | RegionTypedOwner::PrivateFrameConditionalJoin { .. }
+        )
     ) {
         let [effect] = ledger.effects(mapping.obligation) else {
             return None;
@@ -3260,7 +3911,7 @@ fn residual_reason(kind: SemanticObligationKind) -> RegionResidualReason {
 #[cfg(test)]
 mod return_mechanics_manifest_tests {
     use super::*;
-    use r2ssa::CanonicalInstructionSite;
+    use r2ssa::{CanonicalInstructionSite, InstId};
 
     fn id(ordinal: u64) -> CanonicalInstructionId {
         CanonicalInstructionId {
@@ -3288,6 +3939,57 @@ mod return_mechanics_manifest_tests {
                 .into_boxed_slice(),
             source_obligations: Vec::new().into_boxed_slice(),
         }
+    }
+
+    fn obligation(
+        producer: CanonicalInstructionId,
+        kind: SemanticObligationKind,
+    ) -> SemanticObligationId {
+        SemanticObligationId {
+            instruction: producer,
+            kind,
+            component: SemanticObligationComponent::Whole,
+        }
+    }
+
+    #[test]
+    fn private_join_role_manifest_refuses_reorder_duplicate_and_wrong_effect_class() {
+        let store = obligation(id(0), SemanticObligationKind::ObservableMemoryWrite);
+        let load = obligation(id(1), SemanticObligationKind::ObservableMemoryRead);
+        let mechanics = obligation(id(2), SemanticObligationKind::LiveValueProducer);
+        let store_role = PrivateFrameConditionalJoinOwnerRole::AuxiliaryStoreMemory {
+            access: StructuredAccessId {
+                inst: InstId(4),
+                ordinal: 0,
+            },
+        };
+        let load_role = PrivateFrameConditionalJoinOwnerRole::AuxiliaryLoadMemory {
+            access: StructuredAccessId {
+                inst: InstId(7),
+                ordinal: 0,
+            },
+        };
+        let canonical = [
+            (store, store_role.clone()),
+            (load, load_role.clone()),
+            (
+                mechanics,
+                PrivateFrameConditionalJoinOwnerRole::PrivateStackMechanics,
+            ),
+        ];
+        assert!(private_role_manifest_is_canonical(&canonical));
+        assert!(!private_role_manifest_is_canonical(&[
+            (load, load_role.clone()),
+            (store, store_role.clone()),
+        ]));
+        assert!(!private_role_manifest_is_canonical(&[
+            (store, store_role.clone()),
+            (store, store_role),
+        ]));
+        assert!(!private_role_manifest_is_canonical(&[(
+            store,
+            PrivateFrameConditionalJoinOwnerRole::PrivateStackMechanics,
+        )]));
     }
 
     #[test]

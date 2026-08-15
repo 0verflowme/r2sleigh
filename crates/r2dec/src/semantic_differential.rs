@@ -5717,7 +5717,10 @@ mod tests {
         certified_private_entry_stack_pointer_input,
     };
     use crate::{
+        CERTIFIED_PRIVATE_FRAME_CONDITIONAL_JOIN_FUNCTION_SCHEMA_VERSION,
         CERTIFIED_PRIVATE_FRAME_JOIN_REWRITE_SCHEMA_VERSION,
+        CertifiedPrivateFrameConditionalJoinFunction,
+        CertifiedPrivateFrameConditionalJoinFunctionScope,
         CertifiedPrivateFrameConditionalJoinRewrite,
         CertifiedPrivateFrameConditionalJoinRewriteScope, CertifiedPrivateFrameJoinValueOrigin,
         PrivateFrameConditionalJoinRewriteError,
@@ -6917,6 +6920,53 @@ mod tests {
         ));
         assert_eq!(rewrite.ledger_closure(), &closure);
 
+        let function = CertifiedPrivateFrameConditionalJoinFunction::from_artifact(&trusted)
+            .expect("genuine typed-output private-frame function");
+        assert_eq!(
+            function.schema_version(),
+            CERTIFIED_PRIVATE_FRAME_CONDITIONAL_JOIN_FUNCTION_SCHEMA_VERSION
+        );
+        assert_eq!(
+            function.scope(),
+            CertifiedPrivateFrameConditionalJoinFunctionScope::ClosedSourceAccountedPrivateFrameConditionalJoin
+        );
+        assert_eq!(function.origin(), projection.origin());
+        assert_eq!(function.rewrite(), &rewrite);
+        assert_eq!(function.accountings().len(), 5);
+        assert!(
+            function
+                .accountings()
+                .iter()
+                .all(|accounting| accounting.audit().has_exact_source_accounting())
+        );
+        let function_audit = function.audit();
+        assert!(
+            function_audit.has_exact_private_frame_conditional_join(),
+            "{:?}",
+            function_audit.invalid()
+        );
+        assert_eq!(function.mappings().len(), full.source().obligations().len());
+        assert!(
+            function
+                .mappings()
+                .iter()
+                .all(|mapping| mapping.owner().is_some())
+        );
+        let rendered = function
+            .render_certified_c()
+            .expect("strict typed private-frame conditional return C");
+        assert!(rendered.starts_with("#include <stdint.h>\n"));
+        assert!(rendered.contains("uint32_t certified_sub_404000(uint64_t"));
+        assert!(rendered.contains(" != UINT64_C(0)) ?"));
+        assert!(rendered.contains("UINT64_C(0x1)"));
+        assert!(rendered.contains("UINT64_C(0x0)"));
+        assert!(rendered.contains("return (uint32_t)("));
+        assert!(!rendered.contains("*"));
+        assert!(!rendered.contains("memory"));
+        assert!(!rendered.contains("stack"));
+        assert!(!rendered.contains("local"));
+        assert_eq!(rendered.matches("return ").count(), 1);
+
         let foreign_blocks = conditional_private_join_blocks(ADDR + 0x200, false);
         let foreign_header = foreign_blocks[0].addr;
         let (foreign_trusted, _, _) =
@@ -7030,6 +7080,7 @@ mod tests {
             Err(PrivateFrameConditionalJoinRewriteError::MissingExactJoin)
                 | Err(PrivateFrameConditionalJoinRewriteError::MissingStackDiscipline)
         ));
+        assert!(CertifiedPrivateFrameConditionalJoinFunction::from_artifact(&trusted).is_err());
     }
 
     #[test]

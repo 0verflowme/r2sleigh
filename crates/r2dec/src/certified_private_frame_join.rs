@@ -5,6 +5,7 @@
 //! obligations.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write;
 
 use r2cert::{
     CERTIFICATION_SCHEMA_VERSION, CERTIFIED_PRIVATE_FRAME_CONDITIONAL_JOIN_CONTRACT_VERSION,
@@ -22,12 +23,19 @@ use r2ssa::{
 };
 use serde::Serialize;
 
+use crate::certified_region::{
+    CertifiedSingleBlockAccounting, CertifiedTypedOutputSeal, RegionBuildError,
+    RegionObligationMapping, TypedOutputSealError,
+};
 use crate::semantic_c::{
     SEMANTIC_C_SCHEMA_VERSION, SemanticCEntity, SemanticCError, SemanticCExprId, SemanticCExprKind,
-    SemanticCExpressionLayer, SemanticCReturnOperand, semantic_return_from_control,
+    SemanticCExpressionLayer, SemanticCInputOrigin, SemanticCMemoryRewrite, SemanticCReturnOperand,
+    SemanticCTypedLeaf, insert_semantic_c_helpers, logical_return_type,
+    render_logical_return_statement, semantic_return_from_control, storage_type, value_name,
 };
 
 pub const CERTIFIED_PRIVATE_FRAME_JOIN_REWRITE_SCHEMA_VERSION: u32 = 1;
+pub const CERTIFIED_PRIVATE_FRAME_CONDITIONAL_JOIN_FUNCTION_SCHEMA_VERSION: u32 = 1;
 
 /// This certificate is an incomplete, non-rendering rewrite plan only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -310,6 +318,447 @@ impl CertifiedPrivateFrameConditionalJoinRewrite {
     }
 }
 
+/// Closed render authority for the exact private-frame conditional-join
+/// function. The nested rewrite remains non-rendering on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum CertifiedPrivateFrameConditionalJoinFunctionScope {
+    ClosedSourceAccountedPrivateFrameConditionalJoin,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CertifiedPrivateFrameConditionalJoinFunction {
+    schema_version: u32,
+    scope: CertifiedPrivateFrameConditionalJoinFunctionScope,
+    name: String,
+    origin: CertifiedArtifactOrigin,
+    rewrite: CertifiedPrivateFrameConditionalJoinRewrite,
+    accountings: Box<[CertifiedSingleBlockAccounting]>,
+    mappings: Box<[RegionObligationMapping]>,
+    typed_output_seal: CertifiedTypedOutputSeal,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PrivateFrameConditionalJoinFunctionError {
+    MachineProjection(MachineBuildError),
+    Rewrite(PrivateFrameConditionalJoinRewriteError),
+    Accounting(RegionBuildError),
+    TypedOutputSeal(TypedOutputSealError),
+    SemanticC(SemanticCError),
+    MissingExactJoin,
+    MissingStackDiscipline,
+    MissingFunctionInterface,
+    InvalidComposition(Vec<String>),
+}
+
+impl std::fmt::Display for PrivateFrameConditionalJoinFunctionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "private-frame conditional-join function failed: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for PrivateFrameConditionalJoinFunctionError {}
+
+impl From<PrivateFrameConditionalJoinRewriteError> for PrivateFrameConditionalJoinFunctionError {
+    fn from(error: PrivateFrameConditionalJoinRewriteError) -> Self {
+        Self::Rewrite(error)
+    }
+}
+
+impl From<RegionBuildError> for PrivateFrameConditionalJoinFunctionError {
+    fn from(error: RegionBuildError) -> Self {
+        Self::Accounting(error)
+    }
+}
+
+impl From<TypedOutputSealError> for PrivateFrameConditionalJoinFunctionError {
+    fn from(error: TypedOutputSealError) -> Self {
+        Self::TypedOutputSeal(error)
+    }
+}
+
+impl From<SemanticCError> for PrivateFrameConditionalJoinFunctionError {
+    fn from(error: SemanticCError) -> Self {
+        Self::SemanticC(error)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PrivateFrameConditionalJoinFunctionAuditReport {
+    missing: Vec<SemanticObligationId>,
+    duplicate: Vec<SemanticObligationId>,
+    unexpected: Vec<SemanticObligationId>,
+    invalid: Vec<String>,
+}
+
+impl PrivateFrameConditionalJoinFunctionAuditReport {
+    pub fn has_exact_private_frame_conditional_join(&self) -> bool {
+        self.missing.is_empty()
+            && self.duplicate.is_empty()
+            && self.unexpected.is_empty()
+            && self.invalid.is_empty()
+    }
+
+    pub fn missing(&self) -> &[SemanticObligationId] {
+        &self.missing
+    }
+
+    pub fn duplicate(&self) -> &[SemanticObligationId] {
+        &self.duplicate
+    }
+
+    pub fn unexpected(&self) -> &[SemanticObligationId] {
+        &self.unexpected
+    }
+
+    pub fn invalid(&self) -> &[String] {
+        &self.invalid
+    }
+}
+
+fn private_join_value_leaf(
+    layer: &SemanticCExpressionLayer,
+    value: &CertifiedPrivateFrameJoinValue,
+) -> Result<SemanticCTypedLeaf, PrivateFrameConditionalJoinFunctionError> {
+    match value.origin() {
+        CertifiedPrivateFrameJoinValueOrigin::Produced { producer, root }
+            if value.value().producer() == Some(*producer) =>
+        {
+            Ok(layer.expanded_root_leaf(value.value(), *root, value.value().ty())?)
+        }
+        CertifiedPrivateFrameJoinValueOrigin::Constant(bits)
+            if value.value().constant() == Some(*bits) =>
+        {
+            Ok(layer.expanded_constant_leaf(value.value())?)
+        }
+        CertifiedPrivateFrameJoinValueOrigin::AbiParameter { index, storage }
+            if layer.input_origins().get(&value.value().binding())
+                == Some(&SemanticCInputOrigin::AbiParameter {
+                    index: *index,
+                    storage: *storage,
+                }) =>
+        {
+            Ok(layer.expanded_abi_input_leaf(value.value())?)
+        }
+        _ => Err(
+            PrivateFrameConditionalJoinFunctionError::InvalidComposition(vec![
+                "rewrite value origin no longer matches the sealed expression layer".to_string(),
+            ]),
+        ),
+    }
+}
+
+fn private_join_memory_rewrites(
+    rewrite: &CertifiedPrivateFrameConditionalJoinRewrite,
+) -> Result<Vec<SemanticCMemoryRewrite>, PrivateFrameConditionalJoinFunctionError> {
+    let layer = rewrite.expression_layer();
+    let mut rewrites = Vec::with_capacity(rewrite.direct_substitutions().len() + 1);
+    for substitution in rewrite.direct_substitutions() {
+        rewrites.push(layer.direct_memory_rewrite(
+            substitution.load_root(),
+            substitution.load_access(),
+            private_join_value_leaf(layer, substitution.replacement())?,
+        )?);
+    }
+    let joined = rewrite.joined_select();
+    if joined.truthiness() != CertifiedControlTruthiness::NonZeroIsTrue {
+        return Err(
+            PrivateFrameConditionalJoinFunctionError::InvalidComposition(vec![
+                "joined select truthiness is not nonzero-is-true".to_string(),
+            ]),
+        );
+    }
+    let condition_ty = layer
+        .expr(joined.condition_root())
+        .ok_or(SemanticCError::MissingSemanticExpression(
+            joined.condition_root(),
+        ))?
+        .ty();
+    let condition =
+        layer.expanded_root_leaf(joined.condition(), joined.condition_root(), condition_ty)?;
+    rewrites.push(layer.nonzero_select_memory_rewrite(
+        joined.load_root(),
+        joined.load_access(),
+        condition,
+        private_join_value_leaf(layer, joined.true_value())?,
+        private_join_value_leaf(layer, joined.false_value())?,
+    )?);
+    Ok(rewrites)
+}
+
+fn exact_rendered_private_join_return(
+    rewrite: &CertifiedPrivateFrameConditionalJoinRewrite,
+) -> Result<crate::semantic_c::SemanticCExpandedRender, PrivateFrameConditionalJoinFunctionError> {
+    let rewrites = private_join_memory_rewrites(rewrite)?;
+    let rendered = rewrite
+        .expression_layer()
+        .render_expanded_expr(rewrite.joined_select().return_root(), &rewrites)?;
+    let expected = rewrite
+        .direct_substitutions()
+        .iter()
+        .map(CertifiedPrivateFrameDirectSubstitution::load_access)
+        .chain([rewrite.joined_select().load_access()])
+        .collect::<BTreeSet<_>>();
+    let consumed = rendered
+        .consumed_rewrites()
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if rendered.consumed_rewrites().len() != expected.len() || consumed != expected {
+        return Err(
+            PrivateFrameConditionalJoinFunctionError::InvalidComposition(vec![
+                "expanded return did not consume the exact private-load manifest".to_string(),
+            ]),
+        );
+    }
+    Ok(rendered)
+}
+
+impl CertifiedPrivateFrameConditionalJoinFunction {
+    pub fn from_artifact(
+        trusted: &TrustedSsaArtifact,
+    ) -> Result<Self, PrivateFrameConditionalJoinFunctionError> {
+        let projection = CertifiedMachineProjection::from_artifact(trusted)
+            .map_err(PrivateFrameConditionalJoinFunctionError::MachineProjection)?;
+        let header = projection.topology().entry_addr();
+        if projection.private_frame_conditional_joins().len() != 1 {
+            return Err(PrivateFrameConditionalJoinFunctionError::MissingExactJoin);
+        }
+        let join = projection
+            .private_frame_conditional_join(header)
+            .ok_or(PrivateFrameConditionalJoinFunctionError::MissingExactJoin)?;
+        let stack = projection
+            .stack_discipline()
+            .ok_or(PrivateFrameConditionalJoinFunctionError::MissingStackDiscipline)?;
+        let rewrite = CertifiedPrivateFrameConditionalJoinRewrite::from_certified_parts(
+            trusted,
+            &projection,
+            join,
+            stack,
+        )?;
+        let accountings = projection
+            .topology()
+            .blocks()
+            .iter()
+            .map(|block| {
+                CertifiedSingleBlockAccounting::from_private_frame_conditional_join_rewrite_block(
+                    &projection,
+                    &rewrite,
+                    block.addr(),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mappings = accountings
+            .iter()
+            .flat_map(CertifiedSingleBlockAccounting::mappings)
+            .cloned()
+            .collect::<Vec<_>>();
+        let typed_output_seal = CertifiedTypedOutputSeal::new(
+            rewrite.ledger_closure().clone(),
+            CertifiedTypedRegionKind::PrivateFrameConditionalJoinFunction,
+            CERTIFIED_PRIVATE_FRAME_CONDITIONAL_JOIN_CONTRACT_VERSION,
+            &accountings,
+        )?;
+        let function = Self {
+            schema_version: CERTIFIED_PRIVATE_FRAME_CONDITIONAL_JOIN_FUNCTION_SCHEMA_VERSION,
+            scope: CertifiedPrivateFrameConditionalJoinFunctionScope::ClosedSourceAccountedPrivateFrameConditionalJoin,
+            name: format!("certified_sub_{header:x}"),
+            origin: projection.origin().clone(),
+            rewrite,
+            accountings: accountings.into_boxed_slice(),
+            mappings: mappings.into_boxed_slice(),
+            typed_output_seal,
+        };
+        let report = function.audit();
+        if !report.has_exact_private_frame_conditional_join() {
+            return Err(
+                PrivateFrameConditionalJoinFunctionError::InvalidComposition(report.invalid),
+            );
+        }
+        Ok(function)
+    }
+
+    pub const fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    pub const fn scope(&self) -> CertifiedPrivateFrameConditionalJoinFunctionScope {
+        self.scope
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub const fn origin(&self) -> &CertifiedArtifactOrigin {
+        &self.origin
+    }
+
+    pub const fn rewrite(&self) -> &CertifiedPrivateFrameConditionalJoinRewrite {
+        &self.rewrite
+    }
+
+    pub const fn accountings(&self) -> &[CertifiedSingleBlockAccounting] {
+        &self.accountings
+    }
+
+    pub const fn mappings(&self) -> &[RegionObligationMapping] {
+        &self.mappings
+    }
+
+    pub fn audit(&self) -> PrivateFrameConditionalJoinFunctionAuditReport {
+        let mut invalid = Vec::new();
+        let topology = self.origin.topology();
+        let expected_blocks = topology
+            .blocks()
+            .iter()
+            .map(|block| block.addr())
+            .collect::<Vec<_>>();
+        let actual_blocks = self
+            .accountings
+            .iter()
+            .map(CertifiedSingleBlockAccounting::block_addr)
+            .collect::<Vec<_>>();
+        if self.schema_version != CERTIFIED_PRIVATE_FRAME_CONDITIONAL_JOIN_FUNCTION_SCHEMA_VERSION {
+            invalid.push("private-frame conditional-join function schema mismatch".to_string());
+        }
+        if self.scope
+            != CertifiedPrivateFrameConditionalJoinFunctionScope::ClosedSourceAccountedPrivateFrameConditionalJoin
+        {
+            invalid.push("private-frame conditional-join function scope mismatch".to_string());
+        }
+        if self.name != format!("certified_sub_{:x}", topology.entry_addr()) {
+            invalid.push("function name is not derived from the exact entry address".to_string());
+        }
+        if self.rewrite.origin() != &self.origin
+            || self.rewrite.schema_version() != CERTIFIED_PRIVATE_FRAME_JOIN_REWRITE_SCHEMA_VERSION
+            || self.rewrite.scope()
+                != CertifiedPrivateFrameConditionalJoinRewriteScope::ProofBoundRewritePlanOnly
+            || self.rewrite.machine_join().origin() != &self.origin
+            || self.rewrite.machine_join().header() != topology.entry_addr()
+            || self.rewrite.ledger_closure().origin() != &self.origin
+        {
+            invalid.push("rewrite does not match the retained function authority".to_string());
+        }
+        if actual_blocks != expected_blocks
+            || self.accountings.len() != topology.blocks().len()
+            || self.accountings.iter().any(|accounting| {
+                accounting.origin() != &self.origin
+                    || accounting.expression_layer() != self.rewrite.expression_layer()
+                    || !accounting.audit().has_exact_source_accounting()
+                    || accounting.audit().has_residuals()
+            })
+        {
+            invalid.push("source-ordered block accounting is not exact".to_string());
+        }
+
+        let expected_mappings = self
+            .accountings
+            .iter()
+            .flat_map(CertifiedSingleBlockAccounting::mappings)
+            .cloned()
+            .collect::<Vec<_>>();
+        let expected_obligations = self
+            .origin
+            .source()
+            .obligations()
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let mut counts = BTreeMap::<SemanticObligationId, usize>::new();
+        for mapping in &self.mappings {
+            *counts.entry(mapping.obligation()).or_default() += 1;
+        }
+        let actual_obligations = counts.keys().copied().collect::<BTreeSet<_>>();
+        let missing = expected_obligations
+            .difference(&actual_obligations)
+            .copied()
+            .collect();
+        let unexpected = actual_obligations
+            .difference(&expected_obligations)
+            .copied()
+            .collect();
+        let duplicate = counts
+            .iter()
+            .filter_map(|(obligation, count)| (*count != 1).then_some(*obligation))
+            .collect();
+        if self.mappings.as_ref() != expected_mappings.as_slice()
+            || self.mappings.len() != expected_obligations.len()
+            || self
+                .mappings
+                .iter()
+                .any(|mapping| mapping.owner().is_none())
+        {
+            invalid.push("combined typed-owner mapping union is not exact".to_string());
+        }
+        if !self.typed_output_seal.matches_region(
+            &self.origin,
+            CertifiedTypedRegionKind::PrivateFrameConditionalJoinFunction,
+            CERTIFIED_PRIVATE_FRAME_CONDITIONAL_JOIN_CONTRACT_VERSION,
+            self.accountings.iter(),
+        ) {
+            invalid.push("typed-output seal does not match the private join region".to_string());
+        }
+        if exact_rendered_private_join_return(&self.rewrite).is_err() {
+            invalid.push("private join expanded-return rewrite is not exact".to_string());
+        }
+        PrivateFrameConditionalJoinFunctionAuditReport {
+            missing,
+            duplicate,
+            unexpected,
+            invalid,
+        }
+    }
+
+    pub fn render_certified_c(&self) -> Result<String, PrivateFrameConditionalJoinFunctionError> {
+        let report = self.audit();
+        if !report.has_exact_private_frame_conditional_join() {
+            return Err(
+                PrivateFrameConditionalJoinFunctionError::InvalidComposition(report.invalid),
+            );
+        }
+        let interface = self
+            .rewrite
+            .expression_layer()
+            .function_interface()
+            .ok_or(PrivateFrameConditionalJoinFunctionError::MissingFunctionInterface)?;
+        let mut rendered = exact_rendered_private_join_return(&self.rewrite)?;
+        let expression = rendered.expression().to_string();
+        let returned =
+            render_logical_return_statement(interface, Some(&expression), rendered.helpers_mut())?;
+        let mut output = String::new();
+        output.push_str("#include <stdint.h>\n\n");
+        let helper_insertion = output.len();
+        write!(
+            &mut output,
+            "\n{} {}(",
+            logical_return_type(interface)?,
+            self.name
+        )
+        .expect("String writes cannot fail");
+        if interface.parameters().is_empty() {
+            output.push_str("void");
+        } else {
+            for (position, parameter) in interface.parameters().iter().enumerate() {
+                if position > 0 {
+                    output.push_str(", ");
+                }
+                let name = parameter
+                    .value()
+                    .map(value_name)
+                    .unwrap_or_else(|| format!("arg_{}", parameter.index()));
+                write!(&mut output, "{} {name}", storage_type(parameter.ty())?)
+                    .expect("String writes cannot fail");
+            }
+        }
+        writeln!(&mut output, ") {{\n\t{returned}\n}}").expect("String writes cannot fail");
+        insert_semantic_c_helpers(&mut output, helper_insertion, rendered.helpers());
+        Ok(output)
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn certified_private_frame_join_rewrite_from_parts_for_test(
     trusted: &TrustedSsaArtifact,
@@ -420,11 +869,11 @@ fn statement_store(statement: &CertifiedMemoryStatement) -> Option<&MachineValue
     }
 }
 
-fn exact_entity<'a>(
-    layer: &'a SemanticCExpressionLayer,
+fn exact_entity(
+    layer: &SemanticCExpressionLayer,
     binding: MachineValueBinding,
     producer: CanonicalInstructionId,
-) -> Result<&'a SemanticCEntity, PrivateFrameConditionalJoinRewriteError> {
+) -> Result<&SemanticCEntity, PrivateFrameConditionalJoinRewriteError> {
     let mut entities = layer
         .entities()
         .iter()
