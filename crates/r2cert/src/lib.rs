@@ -34,14 +34,20 @@ use serde::{Deserialize, Serialize};
 use r2ssa::SourceStackAllocationContract;
 
 mod aggregate_member;
+mod private_frame_value_flow;
 
 pub use aggregate_member::{
     CERTIFIED_AGGREGATE_MEMBER_ACCESS_CONTRACT_VERSION, CertifiedAggregateMemberAccess,
     CertifiedAggregateMemberAccessSemantics, CertifiedAggregateStructuredAccess,
     CertifiedNaturalScalarAggregateLayout,
 };
+pub use private_frame_value_flow::{
+    CertifiedPrivateFrameLoad, CertifiedPrivateFramePhi, CertifiedPrivateFramePhiInput,
+    CertifiedPrivateFrameStore, CertifiedPrivateFrameValueFlow,
+    CertifiedPrivateFrameVersionDefinition,
+};
 
-pub const CERTIFICATION_SCHEMA_VERSION: u32 = 29;
+pub const CERTIFICATION_SCHEMA_VERSION: u32 = 30;
 
 /// Unforgeable run-local identity for one proof authority domain.
 ///
@@ -9152,6 +9158,7 @@ pub struct CertifiedMachineFunction {
     switch_topologies: BTreeMap<u64, CertifiedSwitchTopology>,
     switch_controls: BTreeMap<u64, CertifiedSwitchControl>,
     stack_discipline: Option<CertifiedStackDiscipline>,
+    private_frame_value_flows: BTreeMap<StructuredAccessId, CertifiedPrivateFrameValueFlow>,
     frame_preservation: Option<CertifiedFramePreservation>,
     topology: CertifiedSourceTopology,
 }
@@ -9436,6 +9443,14 @@ impl CertifiedMachineFunction {
         };
         let stack_discipline =
             certified_stack_discipline(artifact, &origin, certified_parts, certification.ledger());
+        let private_frame_value_flows =
+            private_frame_value_flow::certified_private_frame_value_flows(
+                artifact,
+                &origin,
+                stack_discipline.as_ref(),
+                &memory_statements,
+                certification.ledger(),
+            );
         let frame_preservation = certified_frame_preservation(
             artifact,
             &origin,
@@ -9461,6 +9476,7 @@ impl CertifiedMachineFunction {
             switch_topologies,
             switch_controls,
             stack_discipline,
+            private_frame_value_flows,
             frame_preservation,
             topology,
         })
@@ -9492,6 +9508,19 @@ impl CertifiedMachineFunction {
 
     pub const fn stack_discipline(&self) -> Option<&CertifiedStackDiscipline> {
         self.stack_discipline.as_ref()
+    }
+
+    pub fn private_frame_value_flow(
+        &self,
+        load: StructuredAccessId,
+    ) -> Option<&CertifiedPrivateFrameValueFlow> {
+        self.private_frame_value_flows.get(&load)
+    }
+
+    pub const fn private_frame_value_flows(
+        &self,
+    ) -> &BTreeMap<StructuredAccessId, CertifiedPrivateFrameValueFlow> {
+        &self.private_frame_value_flows
     }
 
     pub fn source(&self) -> &SemanticObligationInventory {
@@ -9625,6 +9654,7 @@ pub struct CertifiedMachineProjection {
     switch_topologies: BTreeMap<u64, CertifiedSwitchTopology>,
     switch_controls: BTreeMap<u64, CertifiedSwitchControl>,
     stack_discipline: Option<CertifiedStackDiscipline>,
+    private_frame_value_flows: BTreeMap<StructuredAccessId, CertifiedPrivateFrameValueFlow>,
     frame_preservation: Option<CertifiedFramePreservation>,
     residual_producers: BTreeSet<CanonicalInstructionId>,
     topology: CertifiedSourceTopology,
@@ -10139,6 +10169,14 @@ impl CertifiedMachineProjection {
         };
         let stack_discipline =
             certified_stack_discipline(artifact, &origin, certified_parts, certification.ledger());
+        let private_frame_value_flows =
+            private_frame_value_flow::certified_private_frame_value_flows(
+                artifact,
+                &origin,
+                stack_discipline.as_ref(),
+                &memory_statements,
+                certification.ledger(),
+            );
         let frame_preservation = certified_frame_preservation(
             artifact,
             &origin,
@@ -10164,6 +10202,7 @@ impl CertifiedMachineProjection {
             switch_topologies,
             switch_controls,
             stack_discipline,
+            private_frame_value_flows,
             frame_preservation,
             residual_producers,
             topology,
@@ -10196,6 +10235,19 @@ impl CertifiedMachineProjection {
 
     pub const fn stack_discipline(&self) -> Option<&CertifiedStackDiscipline> {
         self.stack_discipline.as_ref()
+    }
+
+    pub fn private_frame_value_flow(
+        &self,
+        load: StructuredAccessId,
+    ) -> Option<&CertifiedPrivateFrameValueFlow> {
+        self.private_frame_value_flows.get(&load)
+    }
+
+    pub const fn private_frame_value_flows(
+        &self,
+    ) -> &BTreeMap<StructuredAccessId, CertifiedPrivateFrameValueFlow> {
+        &self.private_frame_value_flows
     }
 
     pub fn source(&self) -> &SemanticObligationInventory {

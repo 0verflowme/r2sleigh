@@ -5707,15 +5707,19 @@ mod tests {
     use std::ffi::c_void;
     use std::mem::size_of;
 
+    use r2cert::CertifiedMachineFunction;
+
     use r2source::{
-        RADARE_ABI_VERSION, RADARE_CAP_EXACT_FUNCTION_INTERFACE, RADARE_CAP_EXACT_STACK_SLOT_ROLES,
+        RADARE_ABI_VERSION, RADARE_CAP_EXACT_FUNCTION_INTERFACE, RADARE_CAP_EXACT_RETURN_MECHANISM,
+        RADARE_CAP_EXACT_STACK_ALLOCATION_CONTRACT, RADARE_CAP_EXACT_STACK_SLOT_ROLES,
         RADARE_CAP_OWNED_BOUNDED_FUNCTION_IMAGE, RADARE_CAP_RETURN_ADDRESS_STORAGE,
         RADARE_CAP_REVISION, RADARE_CAP_STACK_POINTER_STORAGE, RADARE_CAP_STACK_SLOTS,
         RADARE_ENDIAN_LITTLE, RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION,
         RADARE_SNAPSHOT_ACCESSOR_SCHEMA_VERSION, RadareAbi138Accessors, RadareAbi138BlockView,
         RadareAbi138FunctionInterfaceView, RadareAbi138ParameterView,
-        RadareAbi138RegisterStorageView, RadareAbi138SnapshotInput, RadareAbi138SnapshotView,
-        RadareAbi138SuccessorView,
+        RadareAbi138RegisterStorageView, RadareAbi138ReturnMechanismView,
+        RadareAbi138SnapshotInput, RadareAbi138SnapshotView,
+        RadareAbi138StackAllocationContractView, RadareAbi138SuccessorView,
     };
 
     #[test]
@@ -5744,6 +5748,8 @@ mod tests {
         stack_pointer: RadareAbi138RegisterStorageView,
         return_address_name: String,
         stack_pointer_name: String,
+        terminal_return: bool,
+        exact_private_stack: bool,
     }
 
     impl NativeSpanSnapshotFixture {
@@ -5758,7 +5764,13 @@ mod tests {
                     | RADARE_CAP_STACK_SLOTS
                     | RADARE_CAP_EXACT_STACK_SLOT_ROLES
                     | RADARE_CAP_RETURN_ADDRESS_STORAGE
-                    | RADARE_CAP_STACK_POINTER_STORAGE,
+                    | RADARE_CAP_STACK_POINTER_STORAGE
+                    | if self.exact_private_stack {
+                        RADARE_CAP_EXACT_RETURN_MECHANISM
+                            | RADARE_CAP_EXACT_STACK_ALLOCATION_CONTRACT
+                    } else {
+                        0
+                    },
                 function_addr: self.addr,
                 function_size: u64::try_from(self.bytes.len()).expect("fixture size fits u64"),
                 bits: 64,
@@ -5768,7 +5780,7 @@ mod tests {
                 function_name_length: 19,
                 revision_identity: self.addr,
                 num_blocks: 1,
-                num_external_exits: 1,
+                num_external_exits: usize::from(!self.terminal_return),
                 total_source_bytes: self.bytes.len(),
                 ..Default::default()
             }
@@ -5909,7 +5921,7 @@ mod tests {
             out.write(RadareAbi138BlockView {
                 addr: fixture.addr,
                 size: u64::try_from(fixture.bytes.len()).expect("fixture size fits u64"),
-                num_successors: 1,
+                num_successors: usize::from(!fixture.terminal_return),
                 switch_addr: u64::MAX,
             })
         };
@@ -5946,6 +5958,9 @@ mod tests {
         }
         // SAFETY: the callback receives the live fixture pointer.
         let fixture = unsafe { fixture(snapshot) };
+        if fixture.terminal_return {
+            return 0;
+        }
         // SAFETY: the capture owns one initialized output slot.
         unsafe {
             out.write(RadareAbi138SuccessorView {
@@ -5963,43 +5978,84 @@ mod tests {
             return 0;
         }
         // SAFETY: callback arguments are the live fixture and capture-owned output.
-        unsafe { out.write(fixture(snapshot).end()) };
+        let fixture = unsafe { fixture(snapshot) };
+        if fixture.terminal_return {
+            return 0;
+        }
+        unsafe { out.write(fixture.end()) };
         1
     }
 
-    fn trusted_native_span_fixture(
+    unsafe extern "C" fn return_mechanism_view(
+        snapshot: *const c_void,
+        out: *mut RadareAbi138ReturnMechanismView,
+    ) -> u8 {
+        // SAFETY: callback arguments are the live fixture and capture-owned output.
+        let fixture = unsafe { fixture(snapshot) };
+        if !fixture.exact_private_stack {
+            return 0;
+        }
+        unsafe {
+            out.write(RadareAbi138ReturnMechanismView {
+                kind: 1,
+                stack_offset: 0,
+                slot_size_bytes: 8,
+                stack_pointer_delta_bytes: 8,
+            })
+        };
+        1
+    }
+
+    unsafe extern "C" fn stack_allocation_contract_view(
+        snapshot: *const c_void,
+        out: *mut RadareAbi138StackAllocationContractView,
+    ) -> u8 {
+        // SAFETY: callback arguments are the live fixture and capture-owned output.
+        let fixture = unsafe { fixture(snapshot) };
+        if !fixture.exact_private_stack {
+            return 0;
+        }
+        unsafe { out.write(RadareAbi138StackAllocationContractView { growth: 1 }) };
+        1
+    }
+
+    fn trusted_x86_fixture(
         bytes: &[u8],
         addr: u64,
+        terminal_return: bool,
+        exact_private_stack: bool,
     ) -> (
         TrustedSsaArtifact,
         r2il::R2ILBlock,
         Vec<(u64, u32, u64, u64)>,
     ) {
-        let trusted_arch = r2sleigh_lift::create_x86_64_spec();
-        let register = |name: &str| {
-            trusted_arch
-                .registers
-                .iter()
-                .find(|register| register.name.eq_ignore_ascii_case(name))
-                .unwrap_or_else(|| panic!("missing trusted {name} register"))
-        };
-        let return_address = register("rip");
-        let stack_pointer = register("rsp");
+        let trusted_disassembler = r2sleigh_lift::Disassembler::from_trusted_profile(
+            r2sleigh_lift::TrustedSleighProfile::X86_64,
+        )
+        .expect("embedded x86-64 profile");
+        let return_address = trusted_disassembler
+            .register("RIP")
+            .expect("trusted RIP register");
+        let stack_pointer = trusted_disassembler
+            .register("RSP")
+            .expect("trusted RSP register");
         let fixture = NativeSpanSnapshotFixture {
             addr,
             bytes: bytes.to_vec(),
             return_address: RadareAbi138RegisterStorageView {
-                name_length: return_address.name.len(),
-                offset: return_address.offset,
-                size: return_address.size,
+                name_length: 3,
+                offset: return_address.address.offset,
+                size: u32::try_from(return_address.size).expect("RIP size fits u32"),
             },
             stack_pointer: RadareAbi138RegisterStorageView {
-                name_length: stack_pointer.name.len(),
-                offset: stack_pointer.offset,
-                size: stack_pointer.size,
+                name_length: 3,
+                offset: stack_pointer.address.offset,
+                size: u32::try_from(stack_pointer.size).expect("RSP size fits u32"),
             },
-            return_address_name: return_address.name.clone(),
-            stack_pointer_name: stack_pointer.name.clone(),
+            return_address_name: "RIP".to_string(),
+            stack_pointer_name: "RSP".to_string(),
+            terminal_return,
+            exact_private_stack,
         };
         let accessors = RadareAbi138Accessors {
             struct_size: u32::try_from(size_of::<RadareAbi138Accessors>())
@@ -6020,6 +6076,8 @@ mod tests {
             block_bytes: Some(block_bytes),
             successor_view: Some(successor_view),
             external_exit: Some(external_exit),
+            return_mechanism_view: Some(return_mechanism_view),
+            stack_allocation_contract_view: Some(stack_allocation_contract_view),
             ..Default::default()
         };
         let input = RadareAbi138SnapshotInput {
@@ -6055,6 +6113,17 @@ mod tests {
             block,
             spans,
         )
+    }
+
+    fn trusted_native_span_fixture(
+        bytes: &[u8],
+        addr: u64,
+    ) -> (
+        TrustedSsaArtifact,
+        r2il::R2ILBlock,
+        Vec<(u64, u32, u64, u64)>,
+    ) {
+        trusted_x86_fixture(bytes, addr, false, false)
     }
 
     fn assert_zero_op_native_spans_are_exactly_residual(
@@ -6177,6 +6246,48 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn genuine_private_frame_flow_is_wired_through_both_public_certificates() {
+        const ADDR: u64 = 0x403000;
+        const VALID: &[u8] = &[
+            0x48, 0x8d, 0x64, 0x24, 0xf0, // lea rsp, [rsp-16]
+            0xc7, 0x44, 0x24, 0x08, 0x01, 0x00, 0x00, 0x00, // mov dword [rsp+8], 1
+            0x8b, 0x44, 0x24, 0x08, // mov eax, dword [rsp+8]
+            0x48, 0x8d, 0x64, 0x24, 0x10, // lea rsp, [rsp+16]
+            0xc3, // ret
+        ];
+        const UNINITIALIZED_LOAD: &[u8] = &[
+            0x48, 0x8d, 0x64, 0x24, 0xf0, // lea rsp, [rsp-16]
+            0x8b, 0x44, 0x24, 0x08, // mov eax, dword [rsp+8]
+            0xc7, 0x44, 0x24, 0x08, 0x01, 0x00, 0x00, 0x00, // mov dword [rsp+8], 1
+            0x48, 0x8d, 0x64, 0x24, 0x10, // lea rsp, [rsp+16]
+            0xc3, // ret
+        ];
+
+        let (trusted, _, _) = trusted_x86_fixture(VALID, ADDR, true, true);
+        let full = CertifiedMachineFunction::from_artifact(&trusted)
+            .expect("full genuine private-frame certificate");
+        let projection = CertifiedMachineProjection::from_artifact(&trusted)
+            .expect("projected genuine private-frame certificate");
+        assert!(full.stack_discipline().is_some());
+        assert!(projection.stack_discipline().is_some());
+        assert_eq!(full.private_frame_value_flows().len(), 1);
+        assert_eq!(
+            full.private_frame_value_flows(),
+            projection.private_frame_value_flows()
+        );
+
+        let (trusted, _, _) = trusted_x86_fixture(UNINITIALIZED_LOAD, ADDR + 0x100, true, true);
+        let full = CertifiedMachineFunction::from_artifact(&trusted)
+            .expect("full genuine uninitialized-load certificate");
+        let projection = CertifiedMachineProjection::from_artifact(&trusted)
+            .expect("projected genuine uninitialized-load certificate");
+        assert!(full.stack_discipline().is_some());
+        assert!(projection.stack_discipline().is_some());
+        assert!(full.private_frame_value_flows().is_empty());
+        assert!(projection.private_frame_value_flows().is_empty());
     }
 
     #[test]
