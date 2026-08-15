@@ -4775,13 +4775,7 @@ fn evaluate_private_join_value(
             semantic_bitvector(constant.width_bits(), constant.bits())?
         }
         CertifiedPrivateFrameJoinValueOrigin::AbiParameter { index, storage } => {
-            if !matches!(
-                layer.input_origins().get(&binding),
-                Some(crate::semantic_c::SemanticCInputOrigin::AbiParameter {
-                    index: actual_index,
-                    storage: actual_storage,
-                }) if actual_index == index && actual_storage == storage
-            ) {
+            if !layer.is_exact_abi_parameter(binding, value.value().ty(), *index, *storage) {
                 return Err(RunFailure::Invalid(
                     "ABI rewrite value differs from its sealed input origin".to_string(),
                 ));
@@ -6955,7 +6949,7 @@ mod tests {
     };
     use crate::semantic_c::{
         SemanticCError, SemanticCExprKind, SemanticCInputOrigin,
-        certified_private_entry_stack_pointer_input,
+        certified_private_entry_stack_pointer_input, value_name,
     };
     use crate::{
         CERTIFIED_PRIVATE_FRAME_CONDITIONAL_JOIN_FUNCTION_SCHEMA_VERSION,
@@ -7056,6 +7050,9 @@ mod tests {
     struct NativeSpanSnapshotFixture {
         addr: u64,
         blocks: Vec<NativeSpanBlockFixture>,
+        arch_id: String,
+        cpu_id: String,
+        calling_convention: String,
         return_address: RadareAbi138RegisterStorageView,
         stack_pointer: RadareAbi138RegisterStorageView,
         scalar_return: Option<RadareAbi138RegisterStorageView>,
@@ -7065,6 +7062,10 @@ mod tests {
         parameter: Option<RadareAbi138ParameterView>,
         parameter_name: Option<String>,
         exact_private_stack: bool,
+        stacked_return: bool,
+        types: Vec<(i32, u64)>,
+        return_type_id: u32,
+        return_carrier: RadareAbi138CarrierProjection,
     }
 
     impl NativeSpanSnapshotFixture {
@@ -7086,8 +7087,12 @@ mod tests {
                         0
                     }
                     | if self.exact_private_stack {
+                        RADARE_CAP_EXACT_STACK_ALLOCATION_CONTRACT
+                    } else {
+                        0
+                    }
+                    | if self.stacked_return {
                         RADARE_CAP_EXACT_RETURN_MECHANISM
-                            | RADARE_CAP_EXACT_STACK_ALLOCATION_CONTRACT
                     } else {
                         0
                     },
@@ -7095,14 +7100,14 @@ mod tests {
                 function_size: self.end().checked_sub(self.addr).expect("fixture size"),
                 bits: 64,
                 endian: RADARE_ENDIAN_LITTLE,
-                arch_id_length: 3,
-                cpu_id_length: 3,
+                arch_id_length: self.arch_id.len(),
+                cpu_id_length: self.cpu_id.len(),
                 function_name_length: 19,
                 revision_identity: self.addr,
                 num_blocks: self.blocks.len(),
                 num_external_exits: self.external_exits().len(),
                 total_source_bytes: self.blocks.iter().map(|block| block.bytes.len()).sum(),
-                num_types: if self.parameter.is_some() { 2 } else { 0 },
+                num_types: self.types.len(),
                 ..Default::default()
             }
         }
@@ -7158,14 +7163,14 @@ mod tests {
         1
     }
 
-    unsafe extern "C" fn arch_id(_snapshot: *const c_void, out: *mut u8, capacity: usize) -> u8 {
+    unsafe extern "C" fn arch_id(snapshot: *const c_void, out: *mut u8, capacity: usize) -> u8 {
         // SAFETY: forwarded capture-owned output buffer.
-        unsafe { copy_fixture_string(b"x86", out, capacity) }
+        unsafe { copy_fixture_string(fixture(snapshot).arch_id.as_bytes(), out, capacity) }
     }
 
-    unsafe extern "C" fn cpu_id(_snapshot: *const c_void, out: *mut u8, capacity: usize) -> u8 {
+    unsafe extern "C" fn cpu_id(snapshot: *const c_void, out: *mut u8, capacity: usize) -> u8 {
         // SAFETY: forwarded capture-owned output buffer.
-        unsafe { copy_fixture_string(b"x86", out, capacity) }
+        unsafe { copy_fixture_string(fixture(snapshot).cpu_id.as_bytes(), out, capacity) }
     }
 
     unsafe extern "C" fn function_name(
@@ -7186,7 +7191,7 @@ mod tests {
         // SAFETY: the capture owns one initialized output slot.
         unsafe {
             out.write(RadareAbi138FunctionInterfaceView {
-                calling_convention_length: 4,
+                calling_convention_length: fixture.calling_convention.len(),
                 num_parameters: usize::from(fixture.parameter.is_some()),
                 return_kind: if fixture.parameter.is_some() { 2 } else { 1 },
                 return_storage: fixture.scalar_return.unwrap_or_default(),
@@ -7195,20 +7200,8 @@ mod tests {
                 stack_resources_complete: 1,
                 stack_slot_roles_complete: 1,
                 complete: 1,
-                return_type_id: if fixture.parameter.is_some() {
-                    1
-                } else {
-                    u32::MAX
-                },
-                return_carrier: if fixture.parameter.is_some() {
-                    RadareAbi138CarrierProjection {
-                        kind: 2,
-                        offset_bits: 0,
-                        size_bits: 32,
-                    }
-                } else {
-                    RadareAbi138CarrierProjection::default()
-                },
+                return_type_id: fixture.return_type_id,
+                return_carrier: fixture.return_carrier,
                 logical_types_complete: u8::from(fixture.parameter.is_some()),
                 ..Default::default()
             })
@@ -7217,12 +7210,18 @@ mod tests {
     }
 
     unsafe extern "C" fn interface_calling_convention(
-        _snapshot: *const c_void,
+        snapshot: *const c_void,
         out: *mut u8,
         capacity: usize,
     ) -> u8 {
         // SAFETY: forwarded capture-owned output buffer.
-        unsafe { copy_fixture_string(b"sysv", out, capacity) }
+        unsafe {
+            copy_fixture_string(
+                fixture(snapshot).calling_convention.as_bytes(),
+                out,
+                capacity,
+            )
+        }
     }
 
     unsafe extern "C" fn interface_storage_name(
@@ -7283,7 +7282,7 @@ mod tests {
         }
         unsafe {
             out.write(RadareAbi138TypeGraphView {
-                num_types: 2,
+                num_types: fixture.types.len(),
                 num_aggregates: 0,
                 complete: 1,
             })
@@ -7297,15 +7296,13 @@ mod tests {
         out: *mut RadareAbi138TypeView,
     ) -> u8 {
         let fixture = unsafe { fixture(snapshot) };
-        let size_bits = match (fixture.parameter.is_some(), index) {
-            (true, 0) => 64,
-            (true, 1) => 32,
-            _ => return 0,
+        let Some((kind, size_bits)) = fixture.types.get(index).copied() else {
+            return 0;
         };
         unsafe {
             out.write(RadareAbi138TypeView {
                 id: u32::try_from(index).expect("type index fits u32"),
-                kind: 2,
+                kind,
                 size_bits,
                 align_bits: size_bits,
                 target_type_id: u32::MAX,
@@ -7430,7 +7427,7 @@ mod tests {
     ) -> u8 {
         // SAFETY: callback arguments are the live fixture and capture-owned output.
         let fixture = unsafe { fixture(snapshot) };
-        if !fixture.exact_private_stack {
+        if !fixture.stacked_return {
             return 0;
         }
         unsafe {
@@ -7512,6 +7509,9 @@ mod tests {
         let fixture = NativeSpanSnapshotFixture {
             addr,
             blocks,
+            arch_id: "x86".into(),
+            cpu_id: "x86".into(),
+            calling_convention: "sysv".into(),
             return_address: RadareAbi138RegisterStorageView {
                 name_length: 3,
                 offset: return_address.address.offset,
@@ -7529,6 +7529,24 @@ mod tests {
             parameter,
             parameter_name: parameter_register.map(str::to_string),
             exact_private_stack,
+            stacked_return: exact_private_stack,
+            types: parameter_register
+                .map(|_| vec![(2, 64), (2, 32)])
+                .unwrap_or_default(),
+            return_type_id: if parameter_register.is_some() {
+                1
+            } else {
+                u32::MAX
+            },
+            return_carrier: if parameter_register.is_some() {
+                RadareAbi138CarrierProjection {
+                    kind: 2,
+                    offset_bits: 0,
+                    size_bits: 32,
+                }
+            } else {
+                RadareAbi138CarrierProjection::default()
+            },
         };
         let accessors = RadareAbi138Accessors {
             struct_size: u32::try_from(size_of::<RadareAbi138Accessors>())
@@ -7636,6 +7654,226 @@ mod tests {
         let [block] = blocks.try_into().expect("one lifted block");
         let [spans] = spans.try_into().expect("one lifted block span set");
         (trusted, block, spans)
+    }
+
+    fn try_trusted_aarch64_blocks_fixture(
+        blocks: Vec<NativeSpanBlockFixture>,
+    ) -> Result<
+        (
+            TrustedSsaArtifact,
+            Vec<r2il::R2ILBlock>,
+            Vec<LiftedBlockSpans>,
+        ),
+        String,
+    > {
+        let addr = blocks
+            .first()
+            .map(|block| block.addr)
+            .ok_or_else(|| "AArch64 fixture has no blocks".to_string())?;
+        let trusted_disassembler = r2sleigh_lift::Disassembler::from_trusted_profile(
+            r2sleigh_lift::TrustedSleighProfile::Aarch64Le,
+        )
+        .map_err(|error| format!("embedded AArch64 profile: {error}"))?;
+        let register = |name: &str| {
+            trusted_disassembler
+                .register(name)
+                .map_err(|error| format!("trusted AArch64 {name} register: {error}"))
+        };
+        let x0 = register("x0")?;
+        let w0 = register("w0")?;
+        let stack_pointer = register("sp")?;
+        let return_address = register("x30")?;
+        if x0.address.offset != w0.address.offset || x0.size != 8 || w0.size != 4 {
+            return Err("trusted AArch64 x0/w0 storage alias is not exact".to_string());
+        }
+        let fixture = NativeSpanSnapshotFixture {
+            addr,
+            blocks,
+            arch_id: "arm".into(),
+            cpu_id: "arm".into(),
+            calling_convention: "aapcs".into(),
+            return_address: RadareAbi138RegisterStorageView {
+                name_length: 3,
+                offset: return_address.address.offset,
+                size: u32::try_from(return_address.size).expect("x30 size fits u32"),
+            },
+            stack_pointer: RadareAbi138RegisterStorageView {
+                name_length: 2,
+                offset: stack_pointer.address.offset,
+                size: u32::try_from(stack_pointer.size).expect("sp size fits u32"),
+            },
+            scalar_return: Some(RadareAbi138RegisterStorageView {
+                name_length: 2,
+                offset: x0.address.offset,
+                size: u32::try_from(x0.size).expect("x0 size fits u32"),
+            }),
+            return_address_name: "x30".into(),
+            stack_pointer_name: "sp".into(),
+            scalar_return_name: Some("x0".into()),
+            parameter: Some(RadareAbi138ParameterView {
+                index: 0,
+                storage: RadareAbi138RegisterStorageView {
+                    name_length: 2,
+                    offset: x0.address.offset,
+                    size: u32::try_from(x0.size).expect("x0 size fits u32"),
+                },
+                logical_type_id: 0,
+                carrier: RadareAbi138CarrierProjection {
+                    kind: 2,
+                    offset_bits: 0,
+                    size_bits: 32,
+                },
+                ..Default::default()
+            }),
+            parameter_name: Some("x0".into()),
+            exact_private_stack: true,
+            stacked_return: false,
+            types: vec![(1, 32)],
+            return_type_id: 0,
+            return_carrier: RadareAbi138CarrierProjection {
+                kind: 2,
+                offset_bits: 0,
+                size_bits: 32,
+            },
+        };
+        let accessors = RadareAbi138Accessors {
+            struct_size: u32::try_from(size_of::<RadareAbi138Accessors>())
+                .expect("accessor size fits u32"),
+            abi_version: RADARE_ABI_VERSION,
+            snapshot_schema_version: RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION,
+            accessor_schema_version: RADARE_SNAPSHOT_ACCESSOR_SCHEMA_VERSION,
+            snapshot_view: Some(snapshot_view),
+            arch_id: Some(arch_id),
+            cpu_id: Some(cpu_id),
+            function_name: Some(function_name),
+            interface_view: Some(interface_view),
+            interface_calling_convention: Some(interface_calling_convention),
+            interface_storage_name: Some(interface_storage_name),
+            parameter_view: Some(parameter_view),
+            parameter_storage_name: Some(parameter_name),
+            type_graph_view: Some(type_graph_view),
+            type_view: Some(type_view),
+            aggregate_view: Some(unused_aggregate_view),
+            aggregate_name: Some(parameter_name),
+            aggregate_member_view: Some(unused_aggregate_member_view),
+            aggregate_member_name: Some(unused_aggregate_member_name),
+            block_view: Some(block_view),
+            block_bytes: Some(block_bytes),
+            successor_view: Some(successor_view),
+            external_exit: Some(external_exit),
+            return_mechanism_view: Some(return_mechanism_view),
+            stack_allocation_contract_view: Some(stack_allocation_contract_view),
+            ..Default::default()
+        };
+        let input = RadareAbi138SnapshotInput {
+            struct_size: u32::try_from(size_of::<RadareAbi138SnapshotInput>())
+                .expect("input size fits u32"),
+            abi_version: RADARE_ABI_VERSION,
+            snapshot_schema_version: RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION,
+            accessor_schema_version: RADARE_SNAPSHOT_ACCESSOR_SCHEMA_VERSION,
+            snapshot: (&fixture as *const NativeSpanSnapshotFixture).cast(),
+            accessors: &accessors,
+        };
+        // SAFETY: the fixture and immutable callback table remain live for the
+        // full synchronous capture and every callback obeys the exact ABI.
+        let source = unsafe { r2source::capture_radare_abi138(&input) }
+            .map_err(|error| format!("AArch64 source capture: {error}"))?;
+        let lifted = r2sleigh_lift::Disassembler::lift_owned_function(source)
+            .map_err(|error| format!("AArch64 trusted lift: {error}"))?;
+        let blocks = lifted
+            .lifted()
+            .blocks()
+            .iter()
+            .map(|block| block.block().clone())
+            .collect();
+        let spans = lifted
+            .lifted()
+            .blocks()
+            .iter()
+            .map(|block| {
+                block
+                    .instruction_spans()
+                    .iter()
+                    .map(|span| {
+                        (
+                            span.addr(),
+                            span.size(),
+                            span.first_canonical_op(),
+                            span.canonical_op_count(),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        let trusted = TrustedSsaArtifact::prepare(lifted)
+            .map_err(|error| format!("AArch64 trusted SSA: {error}"))?;
+        Ok((trusted, blocks, spans))
+    }
+
+    fn aarch64_private_join_blocks() -> Vec<NativeSpanBlockFixture> {
+        const BASE: u64 = 0x1_0000_0000;
+        const HEADER: u64 = BASE + 0x598;
+        const FORWARDER: u64 = BASE + 0x5b0;
+        const STORE_ONE: u64 = BASE + 0x5b4;
+        const STORE_ZERO: u64 = BASE + 0x5c0;
+        const JOIN: u64 = BASE + 0x5c8;
+        vec![
+            NativeSpanBlockFixture {
+                addr: HEADER,
+                bytes: vec![
+                    0xff, 0x43, 0x00, 0xd1, 0xe0, 0x0b, 0x00, 0xb9, 0xe8, 0x0b, 0x40, 0xb9, 0xa9,
+                    0xd5, 0x9b, 0x52, 0x08, 0x01, 0x09, 0x6b, 0xa1, 0x00, 0x00, 0x54,
+                ],
+                successors: vec![
+                    NativeSpanSuccessorFixture {
+                        kind: 0,
+                        target: STORE_ZERO,
+                        external: false,
+                    },
+                    NativeSpanSuccessorFixture {
+                        kind: 1,
+                        target: FORWARDER,
+                        external: false,
+                    },
+                ],
+            },
+            NativeSpanBlockFixture {
+                addr: FORWARDER,
+                bytes: vec![0x01, 0x00, 0x00, 0x14],
+                successors: vec![NativeSpanSuccessorFixture {
+                    kind: 0,
+                    target: STORE_ONE,
+                    external: false,
+                }],
+            },
+            NativeSpanBlockFixture {
+                addr: STORE_ONE,
+                bytes: vec![
+                    0x28, 0x00, 0x80, 0x52, 0xe8, 0x0f, 0x00, 0xb9, 0x03, 0x00, 0x00, 0x14,
+                ],
+                successors: vec![NativeSpanSuccessorFixture {
+                    kind: 0,
+                    target: JOIN,
+                    external: false,
+                }],
+            },
+            NativeSpanBlockFixture {
+                addr: STORE_ZERO,
+                bytes: vec![0xff, 0x0f, 0x00, 0xb9, 0x01, 0x00, 0x00, 0x14],
+                successors: vec![NativeSpanSuccessorFixture {
+                    kind: 0,
+                    target: JOIN,
+                    external: false,
+                }],
+            },
+            NativeSpanBlockFixture {
+                addr: JOIN,
+                bytes: vec![
+                    0xe0, 0x0f, 0x40, 0xb9, 0xff, 0x43, 0x00, 0x91, 0xc0, 0x03, 0x5f, 0xd6,
+                ],
+                successors: Vec::new(),
+            },
+        ]
     }
 
     fn trusted_native_span_fixture(
@@ -7937,6 +8175,369 @@ mod tests {
         assert!(projection.stack_discipline().is_some());
         assert!(full.private_frame_value_flows().is_empty());
         assert!(projection.private_frame_value_flows().is_empty());
+    }
+
+    #[test]
+    fn genuine_x86_generic_renderer_uses_logical_parameter_and_graph_binding() {
+        const ADDR: u64 = 0x403800;
+        let (trusted, lifted, spans) = trusted_x86_blocks_fixture(
+            vec![NativeSpanBlockFixture {
+                addr: ADDR,
+                bytes: vec![
+                    0x48, 0x89, 0xc8, // mov rax, rcx
+                    0xc3, // ret
+                ],
+                successors: Vec::new(),
+            }],
+            ADDR,
+            true,
+            Some("RCX"),
+        );
+        assert_eq!(lifted.len(), 1);
+        assert_eq!(spans.len(), 1);
+
+        let projection = CertifiedMachineProjection::from_artifact(&trusted)
+            .expect("genuine generic x86 projection");
+        assert!(projection.private_frame_conditional_joins().is_empty());
+        let function = CertifiedSemanticCFunction::from_artifact(&trusted)
+            .expect("genuine generic x86 semantic-C function");
+        let interface = function
+            .region()
+            .layer()
+            .accounting()
+            .expression_layer()
+            .function_interface()
+            .expect("genuine generic x86 function interface");
+        let [parameter] = interface.parameters() else {
+            panic!("one exact generic x86 parameter")
+        };
+        let binding = parameter
+            .value()
+            .expect("one exact generic x86 graph parameter binding");
+        assert_eq!(parameter.storage().size.checked_mul(8), Some(64));
+        assert_eq!(parameter.ty().width_bits(), 64);
+        assert_eq!(
+            parameter.projection().logical_ty(),
+            Some(&MachineType::Integer {
+                width_bits: 64,
+                signedness: MachineSignedness::Unsigned,
+            })
+        );
+
+        let rendered = function
+            .render_certified_c()
+            .expect("genuine generic x86 strict C rendering");
+        assert!(rendered.contains("uint32_t certified_sub_403800(uint64_t arg_0)"));
+        assert!(rendered.contains(&format!(
+            "uint64_t {} = (uint64_t)(arg_0);",
+            value_name(binding)
+        )));
+    }
+
+    #[test]
+    fn genuine_aarch64_private_frame_join_matches_machine_polarity() {
+        const BASE: u64 = 0x1_0000_0000;
+        const HEADER: u64 = BASE + 0x598;
+        const FORWARDER: u64 = BASE + 0x5b0;
+        const STORE_ONE: u64 = BASE + 0x5b4;
+        const STORE_ZERO: u64 = BASE + 0x5c0;
+        const JOIN: u64 = BASE + 0x5c8;
+
+        let source_blocks = aarch64_private_join_blocks();
+        let (trusted, lifted, spans) = try_trusted_aarch64_blocks_fixture(source_blocks.clone())
+            .unwrap_or_else(|error| {
+                panic!("genuine AArch64 fixture failed: {error}; blocks={source_blocks:#x?}")
+            });
+        assert_eq!(lifted.len(), 5);
+        assert_eq!(spans.len(), 5);
+        assert!(spans.iter().flatten().all(|span| span.3 != 0));
+
+        let full = CertifiedMachineFunction::from_artifact(&trusted)
+            .expect("full genuine AArch64 private-frame certificate");
+        let projection = CertifiedMachineProjection::from_artifact(&trusted)
+            .expect("projected genuine AArch64 private-frame certificate");
+        let stack = projection
+            .stack_discipline()
+            .expect("AArch64 lower private stack discipline");
+        assert_eq!(stack.reservation_range().offset(), -16);
+        assert_eq!(stack.reservation_range().size_bytes(), 16);
+        assert_eq!(stack.releases().len(), 1);
+        let restoration = stack.releases()[0].restoration();
+        assert_eq!(
+            restoration.normalized_affine_relation().base_storage(),
+            stack.stack_pointer_storage()
+        );
+        assert_eq!(restoration.normalized_affine_relation().offset_bytes(), 0);
+        assert_eq!(
+            restoration.normalized_affine_relation().width_bits(),
+            stack.entry_stack_pointer().binding().width_bits()
+        );
+        assert!(stack.releases()[0].post_restoration().is_none());
+        assert!(stack.releases()[0].return_address_read().is_none());
+        let mut private_ranges = stack
+            .private_regions()
+            .iter()
+            .map(|region| {
+                (
+                    region.accessed_range().offset(),
+                    region.accessed_range().size_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+        private_ranges.sort_unstable();
+        assert_eq!(stack.private_regions().len(), 2);
+        assert_eq!(private_ranges, vec![(-8, 4), (-4, 4)]);
+
+        assert_eq!(full.private_frame_value_flows().len(), 2);
+        assert_eq!(
+            full.private_frame_value_flows(),
+            projection.private_frame_value_flows()
+        );
+        let certificate = full
+            .private_frame_conditional_join(HEADER)
+            .expect("AArch64 header-keyed private-frame join");
+        assert_eq!(full.private_frame_conditional_joins().len(), 1);
+        assert_eq!(
+            full.private_frame_conditional_joins(),
+            projection.private_frame_conditional_joins()
+        );
+        assert_eq!(certificate.join_block(), JOIN);
+        assert_eq!(certificate.condition().true_target(), STORE_ZERO);
+        assert_eq!(certificate.condition().false_target(), FORWARDER);
+        assert_eq!(certificate.true_arm().entry_target(), STORE_ZERO);
+        assert!(certificate.true_arm().transparent().is_empty());
+        assert_eq!(certificate.true_arm().store_block(), STORE_ZERO);
+        assert_eq!(certificate.false_arm().entry_target(), FORWARDER);
+        let [false_forwarder] = certificate.false_arm().transparent() else {
+            panic!("one exact false-arm transparent branch")
+        };
+        assert_eq!(false_forwarder.block_addr(), FORWARDER);
+        assert_eq!(certificate.false_arm().store_block(), STORE_ONE);
+        assert_eq!(certificate.auxiliary_direct_flows().len(), 1);
+        assert!(certificate.release().return_address_read().is_none());
+
+        let rewrite = CertifiedPrivateFrameConditionalJoinRewrite::from_artifact(&trusted)
+            .expect("genuine AArch64 private-frame rewrite plan");
+        assert_eq!(rewrite.machine_join(), certificate);
+        assert_eq!(rewrite.direct_substitutions().len(), 1);
+        assert_eq!(rewrite.origin(), projection.origin());
+        let function = CertifiedPrivateFrameConditionalJoinFunction::from_artifact(&trusted)
+            .expect("genuine AArch64 typed private-frame function");
+        assert_eq!(function.rewrite(), &rewrite);
+        assert_eq!(function.accountings().len(), 5);
+        let audit = function.audit();
+        assert!(
+            audit.has_exact_private_frame_conditional_join(),
+            "{:?}",
+            audit.invalid()
+        );
+
+        let semantic_parameter = rewrite
+            .expression_layer()
+            .function_interface()
+            .and_then(|interface| interface.parameters().first())
+            .expect("exact AArch64 x0 parameter");
+        let parameter = semantic_parameter
+            .value()
+            .expect("exact AArch64 w0 parameter binding");
+        let source_interface = trusted
+            .artifact()
+            .machine_context()
+            .function_interface()
+            .expect("exact AArch64 source interface");
+        let source_parameter = source_interface
+            .parameters()
+            .first()
+            .expect("exact AArch64 source x0 parameter");
+        let source_logical = source_interface
+            .parameter_logical_values()
+            .first()
+            .expect("exact AArch64 source logical parameter");
+        let certified_parameter = projection
+            .abi_parameters()
+            .get(&0)
+            .expect("exact certified AArch64 ABI parameter");
+        assert_eq!(source_parameter.index(), 0);
+        assert_eq!(source_parameter.storage(), semantic_parameter.storage());
+        assert_eq!(certified_parameter.storage(), semantic_parameter.storage());
+        assert_eq!(semantic_parameter.storage().size.checked_mul(8), Some(64));
+        assert_eq!(
+            certified_parameter.graph_storage().size.checked_mul(8),
+            Some(32)
+        );
+        assert_eq!(
+            certified_parameter.value().map(|value| value.binding()),
+            Some(parameter)
+        );
+        assert_eq!(parameter.width_bits(), 32);
+        assert_eq!(
+            semantic_parameter.ty(),
+            &MachineType::Integer {
+                width_bits: 32,
+                signedness: MachineSignedness::Unsigned,
+            }
+        );
+        let logical_parameter_ty = semantic_parameter
+            .projection()
+            .logical_ty()
+            .expect("signed scalar AArch64 logical parameter");
+        assert_eq!(
+            semantic_parameter.projection().source_type_id(),
+            source_logical.type_id()
+        );
+        assert_eq!(logical_parameter_ty.width_bits(), 32);
+        assert_eq!(
+            logical_parameter_ty.signedness(),
+            Some(MachineSignedness::Signed)
+        );
+        assert_eq!(
+            semantic_parameter.projection().carrier().kind(),
+            SourceCarrierKind::LowBits
+        );
+        assert_eq!(semantic_parameter.projection().carrier().offset_bits(), 0);
+        assert_eq!(semantic_parameter.projection().carrier().size_bits(), 32);
+        let [direct] = rewrite.direct_substitutions() else {
+            panic!("one exact AArch64 auxiliary substitution")
+        };
+        assert_eq!(direct.replacement().value().binding(), parameter);
+        assert!(matches!(
+            direct.replacement().origin(),
+            CertifiedPrivateFrameJoinValueOrigin::AbiParameter { index: 0, storage }
+                if *storage == semantic_parameter.storage()
+        ));
+        let rendered = function
+            .render_certified_c()
+            .expect("genuine AArch64 strict C rendering");
+        assert!(rendered.contains("int32_t certified_sub_100000598(int32_t arg_0)"));
+        assert!(rendered.contains(&format!(
+            "uint32_t {} = (uint32_t)(arg_0);",
+            value_name(parameter)
+        )));
+        let entry_sp = stack.entry_stack_pointer().binding();
+        assert_eq!(entry_sp.width_bits(), 64);
+        let return_target = certificate.return_control().control_target().binding();
+        let return_carrier = trusted
+            .artifact()
+            .graph()
+            .def_inst(return_target.value())
+            .and_then(|producer| trusted.artifact().graph().inst(producer))
+            .and_then(|transport| match transport.inputs.as_slice() {
+                [carrier] => Some(*carrier),
+                _ => None,
+            })
+            .expect("one-hop exact x30 return carrier transport");
+        let x30_storage = source_interface
+            .return_address_storage()
+            .expect("exact source x30 return-address storage");
+        assert_eq!(x30_storage.size.checked_mul(8), Some(64));
+        assert_eq!(
+            trusted
+                .artifact()
+                .graph()
+                .value(return_carrier)
+                .and_then(|value| value.canonical_storage),
+            Some(x30_storage)
+        );
+        let route_steps = |arm: &CertifiedPrivateFrameConditionalArm| {
+            std::iter::once(certificate.header())
+                .chain(arm.transparent().iter().map(|branch| branch.block_addr()))
+                .chain([arm.store_block(), certificate.join_block()])
+                .map(|addr| {
+                    trusted
+                        .artifact()
+                        .graph()
+                        .block_id_for_addr(addr)
+                        .and_then(|id| trusted.artifact().graph().block(id))
+                        .map(|block| block.insts.len())
+                        .expect("sealed AArch64 route graph block")
+                })
+                .sum::<usize>()
+        };
+        let limits = DifferentialLimits {
+            max_source_steps: u32::try_from(
+                route_steps(certificate.true_arm()).max(route_steps(certificate.false_arm())),
+            )
+            .expect("AArch64 route steps fit u32"),
+            max_expression_nodes: 256,
+            max_memory_bytes: 32,
+        };
+        let seeded_state = |input: u64| {
+            let mut state = DifferentialState::for_artifact(&trusted).expect("AArch64 state");
+            assert!(
+                state
+                    .set_value(
+                        entry_sp.value(),
+                        DifferentialBitVector::new(entry_sp.width_bits(), 0x9000)
+                            .expect("entry sp"),
+                    )
+                    .is_none()
+            );
+            assert!(
+                state
+                    .set_value(
+                        parameter.value(),
+                        DifferentialBitVector::new(parameter.width_bits(), input)
+                            .expect("x0 input"),
+                    )
+                    .is_none()
+            );
+            assert!(
+                state
+                    .set_value(
+                        return_carrier,
+                        DifferentialBitVector::new(64, 0x1234_5678_9abc_def0)
+                            .expect("x30 return carrier"),
+                    )
+                    .is_none()
+            );
+            for byte_address in 0x8ff8..0x9000 {
+                assert!(
+                    state
+                        .set_memory_byte(
+                            DifferentialMemoryLocation {
+                                space: MachineAddressSpace::Ram,
+                                byte_address,
+                            },
+                            0xa5,
+                        )
+                        .is_none()
+                );
+            }
+            state
+        };
+        for (input, expected) in [(0xdead, 1), (0, 0), (0xdeac, 0), (0xffff_ffff, 0)] {
+            let report = check_private_frame_conditional_join_differential(
+                &trusted,
+                &seeded_state(input),
+                limits,
+            );
+            assert_eq!(
+                report.conclusion(),
+                DifferentialConclusion::NoMismatchObserved,
+                "input={input:#x}: {:?}",
+                report.disposition()
+            );
+            let DifferentialBoundaryOutcome::Returned { values } =
+                &report.source().expect("AArch64 source run").outcome
+            else {
+                panic!("AArch64 private join must return")
+            };
+            assert_eq!(
+                values.as_ref(),
+                [DifferentialBitVector::new(32, expected).unwrap()]
+            );
+            assert!(report.source().unwrap().memory_events.is_empty());
+            assert!(report.source().unwrap().final_memory.is_empty());
+        }
+
+        let mut wrong_successor_kind = aarch64_private_join_blocks();
+        assert_eq!(wrong_successor_kind[2].addr, STORE_ONE);
+        assert_eq!(wrong_successor_kind[2].successors[0].target, JOIN);
+        wrong_successor_kind[2].successors[0].kind = 1;
+        assert!(
+            try_trusted_aarch64_blocks_fixture(wrong_successor_kind).is_err(),
+            "a fallthrough advisory must not certify an encoded direct branch"
+        );
     }
 
     #[test]

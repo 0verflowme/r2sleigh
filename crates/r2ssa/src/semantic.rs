@@ -523,7 +523,11 @@ pub struct SourceReturnBoundaryFact {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceReturnAddressFact {
+    /// Exact source-declared return-address carrier transported to the return.
     pub storage: CanonicalStorageId,
+    /// Exact control-target value consumed by the return. This may either be
+    /// the carrier itself or the result of one immediately preceding,
+    /// full-width `Copy` from that carrier.
     pub value: ValueId,
 }
 
@@ -2296,16 +2300,42 @@ fn exact_return_address_fact(
     return_inst: &crate::graph::GraphInst,
     storage: CanonicalStorageId,
 ) -> Option<SourceReturnAddressFact> {
-    let [value] = return_inst.inputs.as_slice() else {
+    let [target_id] = return_inst.inputs.as_slice() else {
         return None;
     };
-    let value = graph.value(*value)?;
-    (value.var.size == storage.size && value.canonical_storage == Some(storage)).then_some(
-        SourceReturnAddressFact {
+    let target = graph.value(*target_id)?;
+    if target.var.size == storage.size && target.canonical_storage == Some(storage) {
+        return Some(SourceReturnAddressFact {
             storage,
-            value: value.id,
-        },
-    )
+            value: target.id,
+        });
+    }
+
+    // Some exact instruction semantics transport a declared return-address
+    // carrier into the architectural control target immediately before the
+    // return. Admit only that one-hop, full-width terminal transport. Broader
+    // copy chains, casts, phis, partial aliases, and cross-block/non-terminal
+    // definitions need distinct proofs.
+    let producer = graph.def_inst(target.id).and_then(|id| graph.inst(id))?;
+    let [source_id] = producer.inputs.as_slice() else {
+        return None;
+    };
+    let source = graph.value(*source_id)?;
+    let InstPayload::Op(SSAOp::Copy { dst, src }) = &producer.payload else {
+        return None;
+    };
+    (producer.block == return_inst.block
+        && producer.ordinal.checked_add(1) == Some(return_inst.ordinal)
+        && producer.output == Some(target.id)
+        && target.var == *dst
+        && source.var == *src
+        && target.var.size == storage.size
+        && source.var.size == storage.size
+        && source.canonical_storage == Some(storage))
+    .then_some(SourceReturnAddressFact {
+        storage,
+        value: target.id,
+    })
 }
 
 fn projected_formal_parameter_storage(
@@ -6664,8 +6694,8 @@ mod tests {
         RelativeMemoryAddress, StructuredAccessId, memory_locations_may_alias,
     };
     use crate::{
-        CanonicalStorageId, CanonicalStorageSpace, DecompilePrepFacts, InstId, SSAVar,
-        SemanticObligationKind, SourceAbiParameterSpec, SourceFunctionInterface,
+        CanonicalStorageId, CanonicalStorageSpace, DecompilePrepFacts, InstId, InstPayload, SSAOp,
+        SSAVar, SemanticObligationKind, SourceAbiParameterSpec, SourceFunctionInterface,
         SourceFunctionReturn, SsaArtifact, StackAddressBase, StackAddressRoot, ValueId,
     };
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
@@ -7307,6 +7337,7 @@ mod tests {
         arch.add_register(RegisterDef::new("cond", 24, 1));
         arch.add_register(RegisterDef::new("sp", 32, 8));
         arch.add_register(RegisterDef::sub("sp_low", 32, 4, "sp"));
+        arch.add_register(RegisterDef::new("return_transport", 40, 8));
         arch
     }
 
@@ -7647,8 +7678,117 @@ mod tests {
         );
         assert!(boundary.complete);
 
+        let mut transported = R2ILBlock::new(0x6154, 4);
+        transported.push(R2ILOp::Copy {
+            dst: Varnode::register(40, 8),
+            src: Varnode::register(16, 8),
+        });
+        transported.push(R2ILOp::Return {
+            target: Varnode::register(40, 8),
+        });
+        let transported = SsaArtifact::raw_with_interface(
+            &[transported],
+            Some(&return_boundary_arch()),
+            preserved_stack_interface(),
+        )
+        .expect("transported return-address artifact");
+        let transported_boundary = transported
+            .facts()
+            .boundaries
+            .returns
+            .values()
+            .next()
+            .expect("transported return boundary");
+        let transported_address = transported_boundary
+            .return_address
+            .expect("declared return address transported to control target");
+        assert_eq!(transported_address.storage, register_storage(16, 8));
+        assert_eq!(
+            transported
+                .graph()
+                .value(transported_address.value)
+                .and_then(|value| value.canonical_storage),
+            Some(register_storage(40, 8))
+        );
+        let transport = transported
+            .graph()
+            .def_inst(transported_address.value)
+            .and_then(|inst| transported.graph().inst(inst))
+            .expect("exact return-address transport");
+        assert!(matches!(
+            transport.payload,
+            InstPayload::Op(SSAOp::Copy { .. })
+        ));
+        assert!(
+            transported
+                .obligations()
+                .obligations_for_inst(transport.id)
+                .any(|obligation| obligation.id.kind == SemanticObligationKind::LiveValueProducer)
+        );
+        assert!(transported_boundary.complete);
+
+        let mut wrong_source = R2ILBlock::new(0x6158, 4);
+        wrong_source.push(R2ILOp::Copy {
+            dst: Varnode::register(40, 8),
+            src: Varnode::register(0, 8),
+        });
+        wrong_source.push(R2ILOp::Return {
+            target: Varnode::register(40, 8),
+        });
+
+        let mut non_copy = R2ILBlock::new(0x615c, 4);
+        non_copy.push(R2ILOp::IntAdd {
+            dst: Varnode::register(40, 8),
+            a: Varnode::register(16, 8),
+            b: Varnode::constant(0, 8),
+        });
+        non_copy.push(R2ILOp::Return {
+            target: Varnode::register(40, 8),
+        });
+
+        let mut non_terminal = R2ILBlock::new(0x6160, 4);
+        non_terminal.push(R2ILOp::Copy {
+            dst: Varnode::register(40, 8),
+            src: Varnode::register(16, 8),
+        });
+        non_terminal.push(R2ILOp::Nop);
+        non_terminal.push(R2ILOp::Return {
+            target: Varnode::register(40, 8),
+        });
+
+        let mut copy_chain = R2ILBlock::new(0x6164, 4);
+        copy_chain.push(R2ILOp::Copy {
+            dst: Varnode::register(0, 8),
+            src: Varnode::register(16, 8),
+        });
+        copy_chain.push(R2ILOp::Copy {
+            dst: Varnode::register(40, 8),
+            src: Varnode::register(0, 8),
+        });
+        copy_chain.push(R2ILOp::Return {
+            target: Varnode::register(40, 8),
+        });
+
+        for corrupt in [wrong_source, non_copy, non_terminal, copy_chain] {
+            let artifact = SsaArtifact::raw_with_interface(
+                &[corrupt],
+                Some(&return_boundary_arch()),
+                preserved_stack_interface(),
+            )
+            .expect("invalid transported return-address artifact");
+            let boundary = artifact
+                .facts()
+                .boundaries
+                .returns
+                .values()
+                .next()
+                .expect("invalid transported return boundary");
+            assert!(boundary.return_address.is_none());
+            assert!(!boundary.complete);
+        }
+
         for target in [Varnode::register(0, 8), Varnode::constant(0, 8)] {
-            let mut corrupt = R2ILBlock::new(0x6160, 4);
+            let mut corrupt = R2ILBlock::new(0x6168, 4);
             corrupt.push(R2ILOp::Return { target });
             let artifact = SsaArtifact::raw_with_interface(
                 &[corrupt],

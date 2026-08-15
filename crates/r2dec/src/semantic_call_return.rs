@@ -28,7 +28,8 @@ use crate::certified_region::{
 use crate::semantic_c::{
     SemanticCCallArgumentValue, SemanticCError, SemanticCExprKind, SemanticCFunctionInterface,
     SemanticCFunctionReturn, SemanticCHelperSet, SemanticCInputOrigin, SemanticCReturn,
-    insert_semantic_c_helpers, logical_return_type, render_logical_return_statement, storage_type,
+    insert_semantic_c_helpers, logical_return_type, render_logical_parameter_declarations,
+    render_logical_return_statement, render_parameter_graph_binding_prologue, storage_type,
     value_name,
 };
 use crate::semantic_stmt::{SemanticCBlockStepLayer, SemanticCStatementError};
@@ -629,15 +630,9 @@ impl CertifiedDirectCallReturnFunction {
         output.push_str(");\n\n");
         write!(&mut output, "{} {}(", return_type(interface)?, self.name)
             .expect("String writes cannot fail");
-        render_function_parameters(&mut output, interface)?;
+        output.push_str(&render_logical_parameter_declarations(interface)?);
         output.push_str(") {\n");
-        for parameter in interface.parameters() {
-            let name = parameter
-                .value()
-                .map(value_name)
-                .unwrap_or_else(|| format!("arg_{}", parameter.index()));
-            writeln!(&mut output, "\t(void){name};").expect("String writes cannot fail");
-        }
+        output.push_str(&render_parameter_graph_binding_prologue(interface)?);
         render_value_steps(&mut output, self.call_block.body(), &mut helpers)?;
         write!(&mut output, "\t{}(", self.call_adapter_name()).expect("String writes cannot fail");
         for (position, argument) in self.call_block.call().arguments().iter().enumerate() {
@@ -768,28 +763,6 @@ fn return_type(
     interface: &SemanticCFunctionInterface,
 ) -> Result<&'static str, DirectCallReturnFunctionError> {
     Ok(logical_return_type(interface)?)
-}
-
-fn render_function_parameters(
-    output: &mut String,
-    interface: &SemanticCFunctionInterface,
-) -> Result<(), DirectCallReturnFunctionError> {
-    if interface.parameters().is_empty() {
-        output.push_str("void");
-        return Ok(());
-    }
-    for (position, parameter) in interface.parameters().iter().enumerate() {
-        if position > 0 {
-            output.push_str(", ");
-        }
-        let name = parameter
-            .value()
-            .map(value_name)
-            .unwrap_or_else(|| format!("arg_{}", parameter.index()));
-        write!(output, "{} {name}", storage_type(parameter.ty())?)
-            .expect("String writes cannot fail");
-    }
-    Ok(())
 }
 
 fn render_call_parameter_types(

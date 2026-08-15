@@ -53,7 +53,7 @@ pub use private_frame_value_flow::{
     CertifiedPrivateFrameVersionDefinition,
 };
 
-pub const CERTIFICATION_SCHEMA_VERSION: u32 = 32;
+pub const CERTIFICATION_SCHEMA_VERSION: u32 = 33;
 
 /// Unforgeable run-local identity for one proof authority domain.
 ///
@@ -7111,11 +7111,55 @@ fn certified_register_storages_overlap(
 }
 
 fn frame_constant_bits(artifact: &SsaArtifact, value: ValueId, width_bits: u32) -> Option<u64> {
-    let graph_value = artifact.graph().value(value)?;
-    (graph_value.var.size.checked_mul(8) == Some(width_bits))
-        .then(|| graph_value.var.constant_bits())
-        .flatten()
-        .map(|bits| bits & FrameAffine::mask(width_bits).unwrap_or(u64::MAX))
+    frame_constant_bits_from_graph(artifact.graph(), value, width_bits)
+}
+
+fn frame_constant_bits_from_graph(
+    graph: &r2ssa::SsaGraph,
+    value: ValueId,
+    width_bits: u32,
+) -> Option<u64> {
+    let mask = FrameAffine::mask(width_bits)?;
+    let graph_value = graph.value(value)?;
+    if graph_value.var.size.checked_mul(8) != Some(width_bits) {
+        return None;
+    }
+    if let Some(bits) = graph_value.var.constant_bits() {
+        return Some(bits & mask);
+    }
+
+    let definition = graph.def_inst(value)?;
+    let inst = graph.inst(definition)?;
+    let InstPayload::Op(SSAOp::Copy { dst, src }) = &inst.payload else {
+        return None;
+    };
+    let [input] = inst.inputs.as_slice() else {
+        return None;
+    };
+    if inst.output != Some(value)
+        || inst.canonical_storage != graph_value.canonical_storage
+        || graph_value.var != *dst
+        || graph
+            .block(inst.block)
+            .is_none_or(|block| !block.insts.contains(&inst.id))
+        || graph.def_inst(*input).is_some()
+    {
+        return None;
+    }
+    let input_value = graph.value(*input)?;
+    let bits = input_value.var.constant_bits()?;
+    if input_value.var != *src
+        || input_value.var.size.checked_mul(8) != Some(width_bits)
+        || input_value.canonical_storage
+            != Some(CanonicalStorageId {
+                space: CanonicalStorageSpace::Constant,
+                offset: bits,
+                size: input_value.var.size,
+            })
+    {
+        return None;
+    }
+    Some(bits & mask)
 }
 
 fn frame_affine_value(
@@ -7220,6 +7264,36 @@ fn frame_affine_value(
     visiting.remove(&value);
     memo.insert(value, result);
     result
+}
+
+fn frame_affine_leaf_dead_consumer(
+    artifact: &SsaArtifact,
+    value: ValueId,
+    use_site: r2ssa::UseSite,
+) -> bool {
+    let graph = artifact.graph();
+    let source = artifact.obligations();
+    if !source.is_complete() {
+        return false;
+    }
+    let Some(consumer) = graph.inst(use_site.inst) else {
+        return false;
+    };
+    let Some(input) = consumer.inputs.get(use_site.input_idx) else {
+        return false;
+    };
+    let Some(output) = consumer.output else {
+        return false;
+    };
+    let Some(disposition) = source.instruction_for_inst(consumer.id) else {
+        return false;
+    };
+    *input == value
+        && disposition.source.graph_inst() == Some(consumer.id)
+        && disposition.state == SemanticInstructionState::ProvenDead
+        && disposition.obligations.is_empty()
+        && graph.def_inst(output) == Some(consumer.id)
+        && graph.use_sites(output).is_empty()
 }
 
 fn frame_range_segments(
@@ -8351,7 +8425,7 @@ fn frame_evidence_from_certified_parts(
                     )
                     .is_some()
                 }),
-                _ => false,
+                _ => frame_affine_leaf_dead_consumer(artifact, value.id, *use_site),
             };
             if !allowed {
                 return None;
@@ -8947,7 +9021,7 @@ fn stack_discipline_evidence_from_certified_parts(
                     )
                     .is_some()
                 }),
-                _ => false,
+                _ => frame_affine_leaf_dead_consumer(artifact, value.id, *use_site),
             };
             if !allowed {
                 return None;
@@ -10770,6 +10844,215 @@ mod tests {
         assert_ne!(ssa_memory_space(&load), Some(SpaceId::Custom(7)));
         assert_eq!(ssa_memory_space(&store), Some(SpaceId::Custom(7)));
         assert_ne!(ssa_memory_space(&store), Some(SpaceId::Ram));
+    }
+
+    fn copied_literal_graph() -> (r2ssa::SsaGraph, InstId, ValueId, ValueId) {
+        let mut block = R2ILBlock::new(0x1080, 4);
+        block.push(R2ILOp::Copy {
+            dst: Varnode::unique(0x100, 8),
+            src: Varnode::constant(0x10, 8),
+        });
+        let artifact = SsaArtifact::raw(&[block], None).expect("copied-literal artifact");
+        let graph = artifact.graph().clone();
+        let inst = graph.insts.first().expect("one copied-literal instruction");
+        let inst_id = inst.id;
+        let output = inst.output.expect("copied-literal output");
+        let [input] = inst.inputs.as_slice() else {
+            panic!("one copied-literal input")
+        };
+        let input = *input;
+        (graph, inst_id, output, input)
+    }
+
+    #[test]
+    fn frame_constant_accepts_only_exact_one_hop_copied_literal() {
+        let (graph, inst, output, input) = copied_literal_graph();
+        assert_eq!(
+            frame_constant_bits_from_graph(&graph, input, 64),
+            Some(0x10)
+        );
+        assert_eq!(
+            frame_constant_bits_from_graph(&graph, output, 64),
+            Some(0x10)
+        );
+        assert_eq!(frame_constant_bits_from_graph(&graph, output, 32), None);
+        assert_eq!(frame_constant_bits_from_graph(&graph, output, 0), None);
+
+        let assert_refused = |mutate: fn(&mut r2ssa::SsaGraph)| {
+            let (mut mutated, _, output, _) = copied_literal_graph();
+            mutate(&mut mutated);
+            assert_eq!(frame_constant_bits_from_graph(&mutated, output, 64), None);
+        };
+        assert_refused(|graph| graph.insts[0].output = None);
+        assert_refused(|graph| {
+            let output = graph.insts[0].output.expect("copied-literal output");
+            graph.def_of[output.0 as usize] = None;
+        });
+        assert_refused(|graph| graph.insts[0].inputs.clear());
+        assert_refused(|graph| {
+            let input = graph.insts[0].inputs[0];
+            graph.insts[0].inputs.push(input);
+        });
+        assert_refused(|graph| graph.insts[0].canonical_storage = None);
+        assert_refused(|graph| graph.blocks[0].insts.clear());
+        assert_refused(|graph| {
+            let input = graph.insts[0].inputs[0];
+            graph.def_of[input.0 as usize] = Some(graph.insts[0].id);
+        });
+        assert_refused(|graph| {
+            let input = graph.insts[0].inputs[0];
+            graph.values[input.0 as usize].canonical_storage = None;
+        });
+        assert_refused(|graph| {
+            let input = graph.insts[0].inputs[0];
+            graph.values[input.0 as usize]
+                .canonical_storage
+                .as_mut()
+                .expect("constant storage")
+                .offset += 1;
+        });
+        assert_refused(|graph| {
+            let InstPayload::Op(SSAOp::Copy { dst, src }) = &graph.insts[0].payload else {
+                unreachable!()
+            };
+            graph.insts[0].payload = InstPayload::Op(SSAOp::IntAdd {
+                dst: dst.clone(),
+                a: src.clone(),
+                b: src.clone(),
+            });
+        });
+        assert_refused(|graph| {
+            let InstPayload::Op(SSAOp::Copy { src, .. }) = &graph.insts[0].payload else {
+                unreachable!()
+            };
+            graph.insts[0].payload = InstPayload::Op(SSAOp::Copy {
+                dst: SSAVar::new("foreign", 0, 8),
+                src: src.clone(),
+            });
+        });
+        assert_refused(|graph| {
+            let InstPayload::Op(SSAOp::Copy { dst, .. }) = &graph.insts[0].payload else {
+                unreachable!()
+            };
+            graph.insts[0].payload = InstPayload::Op(SSAOp::Copy {
+                dst: dst.clone(),
+                src: SSAVar::new("foreign", 0, 8),
+            });
+        });
+
+        assert_eq!(graph.def_inst(output), Some(inst));
+    }
+
+    #[test]
+    fn frame_constant_rejects_nonliteral_and_two_hop_copy() {
+        let mut nonliteral = R2ILBlock::new(0x1090, 4);
+        nonliteral.push(R2ILOp::Copy {
+            dst: Varnode::unique(0x100, 8),
+            src: Varnode::register(0, 8),
+        });
+        let artifact = SsaArtifact::raw(&[nonliteral], None).expect("nonliteral copy artifact");
+        let output = artifact.graph().insts[0].output.expect("copy output");
+        assert_eq!(frame_constant_bits(&artifact, output, 64), None);
+
+        let first = Varnode::unique(0x100, 8);
+        let second = Varnode::unique(0x108, 8);
+        let mut two_hop = R2ILBlock::new(0x10a0, 4);
+        two_hop.push(R2ILOp::Copy {
+            dst: first.clone(),
+            src: Varnode::constant(0x10, 8),
+        });
+        two_hop.push(R2ILOp::Copy {
+            dst: second,
+            src: first,
+        });
+        let artifact = SsaArtifact::raw(&[two_hop], None).expect("two-hop copy artifact");
+        let first_output = artifact.graph().insts[0].output.expect("first copy output");
+        let second_output = artifact.graph().insts[1]
+            .output
+            .expect("second copy output");
+        assert_eq!(frame_constant_bits(&artifact, first_output, 64), Some(0x10));
+        assert_eq!(frame_constant_bits(&artifact, second_output, 64), None);
+    }
+
+    fn first_input_use(artifact: &SsaArtifact, inst_index: usize) -> (ValueId, r2ssa::UseSite) {
+        let inst = &artifact.graph().insts[inst_index];
+        let value = inst.inputs[0];
+        let use_site = artifact
+            .graph()
+            .use_sites(value)
+            .iter()
+            .copied()
+            .find(|use_site| use_site.inst == inst.id && use_site.input_idx == 0)
+            .expect("exact first-input use");
+        (value, use_site)
+    }
+
+    #[test]
+    fn frame_affine_use_accepts_only_exact_leaf_proven_dead_consumers() {
+        let left = Varnode::register(0, 8);
+        let right = Varnode::constant(0x10, 8);
+        for op in [
+            R2ILOp::IntCarry {
+                dst: Varnode::unique(0x100, 1),
+                a: left.clone(),
+                b: right.clone(),
+            },
+            R2ILOp::IntSCarry {
+                dst: Varnode::unique(0x108, 1),
+                a: left.clone(),
+                b: right.clone(),
+            },
+            R2ILOp::IntSLess {
+                dst: Varnode::unique(0x110, 1),
+                a: left.clone(),
+                b: right.clone(),
+            },
+            R2ILOp::IntEqual {
+                dst: Varnode::unique(0x118, 1),
+                a: left.clone(),
+                b: right.clone(),
+            },
+        ] {
+            let mut block = R2ILBlock::new(0x10b0, 4);
+            block.push(op);
+            let artifact = SsaArtifact::raw(&[block], None).expect("dead flag artifact");
+            let (value, use_site) = first_input_use(&artifact, 0);
+            let consumer = artifact.graph().inst(use_site.inst).expect("flag consumer");
+            let output = consumer.output.expect("flag output");
+            let disposition = artifact
+                .obligations()
+                .instruction_for_inst(consumer.id)
+                .expect("flag disposition");
+            assert_eq!(disposition.state, SemanticInstructionState::ProvenDead);
+            assert!(disposition.obligations.is_empty());
+            assert!(artifact.graph().use_sites(output).is_empty());
+            assert!(frame_affine_leaf_dead_consumer(&artifact, value, use_site));
+        }
+
+        let flag = Varnode::unique(0x120, 1);
+        let mut dead_chain = R2ILBlock::new(0x10c0, 4);
+        dead_chain.push(R2ILOp::IntCarry {
+            dst: flag.clone(),
+            a: left.clone(),
+            b: right.clone(),
+        });
+        dead_chain.push(R2ILOp::Copy {
+            dst: Varnode::unique(0x128, 1),
+            src: flag,
+        });
+        let artifact = SsaArtifact::raw(&[dead_chain], None).expect("dead flag chain artifact");
+        let (value, use_site) = first_input_use(&artifact, 0);
+        assert!(!frame_affine_leaf_dead_consumer(&artifact, value, use_site));
+
+        let mut trapping = R2ILBlock::new(0x10d0, 4);
+        trapping.push(R2ILOp::IntDiv {
+            dst: Varnode::unique(0x130, 8),
+            a: left,
+            b: right,
+        });
+        let artifact = SsaArtifact::raw(&[trapping], None).expect("trapping artifact");
+        let (value, use_site) = first_input_use(&artifact, 0);
+        assert!(!frame_affine_leaf_dead_consumer(&artifact, value, use_site));
     }
 
     #[test]

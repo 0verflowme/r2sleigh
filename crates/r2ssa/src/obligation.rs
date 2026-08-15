@@ -15,7 +15,7 @@ use crate::graph::{InstId, InstPayload, SsaGraph, ValueId};
 use crate::op::SSAOp;
 use crate::semantic::{SourceBoundaryFacts, StructuredDataflowFacts};
 
-pub const SEMANTIC_OBLIGATION_SCHEMA_VERSION: u32 = 5;
+pub const SEMANTIC_OBLIGATION_SCHEMA_VERSION: u32 = 6;
 
 /// Stable location of one canonical SSA instruction.
 ///

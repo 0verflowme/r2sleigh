@@ -738,6 +738,56 @@ fn inert_join_phis(
     Some(inert)
 }
 
+fn proven_dead_subgraph_is_closed(
+    artifact: &SsaArtifact,
+    producer: CanonicalInstructionId,
+    memo: &mut BTreeMap<CanonicalInstructionId, bool>,
+    visiting: &mut BTreeSet<CanonicalInstructionId>,
+) -> bool {
+    if let Some(closed) = memo.get(&producer) {
+        return *closed;
+    }
+    if !visiting.insert(producer) {
+        return false;
+    }
+    let closed = (|| {
+        let source = artifact.obligations();
+        let instruction = source.instructions().get(&producer)?;
+        if instruction.state != SemanticInstructionState::ProvenDead
+            || !instruction.obligations.is_empty()
+        {
+            return None;
+        }
+        let inst_id = instruction.source.graph_inst()?;
+        if source.instruction_for_inst(inst_id) != Some(instruction) {
+            return None;
+        }
+        let graph = artifact.graph();
+        let inst = graph.inst(inst_id)?;
+        let Some(output) = inst.output else {
+            return Some(true);
+        };
+        if graph.def_inst(output) != Some(inst_id) {
+            return None;
+        }
+        for use_site in graph.use_sites(output) {
+            let consumer = graph.inst(use_site.inst)?;
+            if consumer.inputs.get(use_site.input_idx) != Some(&output) {
+                return None;
+            }
+            let consumer_disposition = source.instruction_for_inst(consumer.id)?;
+            if !proven_dead_subgraph_is_closed(artifact, consumer_disposition.id, memo, visiting) {
+                return None;
+            }
+        }
+        Some(true)
+    })()
+    .unwrap_or(false);
+    visiting.remove(&producer);
+    memo.insert(producer, closed);
+    closed
+}
+
 fn expression_or_dead_instruction_is_closed(
     artifact: &SsaArtifact,
     producer: CanonicalInstructionId,
@@ -747,18 +797,12 @@ fn expression_or_dead_instruction_is_closed(
         return false;
     };
     match instruction.state {
-        SemanticInstructionState::ProvenDead => {
-            if !instruction.obligations.is_empty() {
-                return false;
-            }
-            instruction.source.graph_inst().is_some_and(|inst| {
-                artifact
-                    .graph()
-                    .inst(inst)
-                    .and_then(|instruction| instruction.output)
-                    .is_none_or(|output| artifact.graph().use_sites(output).is_empty())
-            })
-        }
+        SemanticInstructionState::ProvenDead => proven_dead_subgraph_is_closed(
+            artifact,
+            producer,
+            &mut BTreeMap::new(),
+            &mut BTreeSet::new(),
+        ),
         SemanticInstructionState::LiveObligation => {
             !instruction.obligations.is_empty()
                 && instruction.obligations.iter().all(|obligation| {
@@ -1082,6 +1126,57 @@ mod tests {
         GENUINE_LIFT_PROVENANCE_SCHEMA_VERSION, certified_conditional_controls,
         certified_direct_controls, certified_return_controls, certified_source_topology,
     };
+
+    fn instruction_id(artifact: &SsaArtifact, index: usize) -> CanonicalInstructionId {
+        let inst = artifact.graph().insts[index].id;
+        artifact
+            .obligations()
+            .instruction_for_inst(inst)
+            .expect("canonical instruction disposition")
+            .id
+    }
+
+    #[test]
+    fn proven_dead_closure_traverses_only_finite_all_dead_use_graphs() {
+        let first = Varnode::unique(0x100, 8);
+        let second = Varnode::unique(0x108, 8);
+        let mut dead_chain = R2ILBlock::new(0x1000, 4);
+        dead_chain.push(R2ILOp::Copy {
+            dst: first.clone(),
+            src: Varnode::constant(1, 8),
+        });
+        dead_chain.push(R2ILOp::Copy {
+            dst: second.clone(),
+            src: first.clone(),
+        });
+        let artifact = SsaArtifact::raw(&[dead_chain], None).expect("dead copy chain");
+        assert!(proven_dead_subgraph_is_closed(
+            &artifact,
+            instruction_id(&artifact, 0),
+            &mut BTreeMap::new(),
+            &mut BTreeSet::new(),
+        ));
+
+        let mut live_endpoint = R2ILBlock::new(0x1010, 4);
+        live_endpoint.push(R2ILOp::Copy {
+            dst: first.clone(),
+            src: Varnode::constant(1, 8),
+        });
+        live_endpoint.push(R2ILOp::Copy {
+            dst: second,
+            src: first,
+        });
+        live_endpoint.push(R2ILOp::Return {
+            target: Varnode::unique(0x108, 8),
+        });
+        let artifact = SsaArtifact::raw(&[live_endpoint], None).expect("live copy endpoint");
+        assert!(!proven_dead_subgraph_is_closed(
+            &artifact,
+            instruction_id(&artifact, 0),
+            &mut BTreeMap::new(),
+            &mut BTreeSet::new(),
+        ));
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum RouteMutation {

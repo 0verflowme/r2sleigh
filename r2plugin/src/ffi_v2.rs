@@ -3766,7 +3766,7 @@ mod tests {
         assert_semantic_kernel_render_diagnostics(
             r2engine::EngineSemanticKernelRegion::AggregateMemberTerminalReturnFunction,
             "aggregate_member_terminal_return_function",
-            3,
+            4,
         );
     }
 
@@ -3790,7 +3790,7 @@ mod tests {
             (
                 r2engine::EngineSemanticKernelRegion::AggregateMemberTerminalReturnFunction,
                 "aggregate_member_terminal_return_function",
-                3,
+                4,
             ),
             (
                 r2engine::EngineSemanticKernelRegion::PlainRamMemoryTerminalReturnFunction,

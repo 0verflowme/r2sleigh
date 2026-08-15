@@ -25,7 +25,8 @@ use crate::certified_region::{
 use crate::semantic_c::{
     SemanticCError, SemanticCFunctionInterface, SemanticCFunctionReturn, SemanticCHelperSet,
     SemanticCInputOrigin, SemanticCReturn, insert_semantic_c_helpers, logical_return_type,
-    render_logical_return_statement, storage_type, value_name,
+    render_logical_parameter_declarations, render_logical_return_statement,
+    render_parameter_graph_binding_prologue, storage_type, value_name,
 };
 use crate::semantic_stmt::{SemanticCBlockStepLayer, SemanticCStatementError};
 
@@ -548,15 +549,9 @@ impl CertifiedConditionalReturnFunction {
         let helper_insertion = output.len();
         write!(&mut output, "\n{} {}(", return_type(interface)?, self.name)
             .expect("String writes cannot fail");
-        render_parameters(&mut output, interface)?;
+        output.push_str(&render_logical_parameter_declarations(interface)?);
         output.push_str(") {\n");
-        for parameter in interface.parameters() {
-            let name = parameter
-                .value()
-                .map(value_name)
-                .unwrap_or_else(|| format!("arg_{}", parameter.index()));
-            writeln!(&mut output, "\t(void){name};").expect("String writes cannot fail");
-        }
+        output.push_str(&render_parameter_graph_binding_prologue(interface)?);
         render_value_steps(&mut output, self.header.body(), "\t", &mut helpers)?;
         let condition = render_condition(self)?;
         writeln!(
@@ -583,28 +578,6 @@ fn return_type(
     interface: &SemanticCFunctionInterface,
 ) -> Result<&'static str, ConditionalReturnFunctionError> {
     Ok(logical_return_type(interface)?)
-}
-
-fn render_parameters(
-    output: &mut String,
-    interface: &SemanticCFunctionInterface,
-) -> Result<(), ConditionalReturnFunctionError> {
-    if interface.parameters().is_empty() {
-        output.push_str("void");
-        return Ok(());
-    }
-    for (position, parameter) in interface.parameters().iter().enumerate() {
-        if position > 0 {
-            output.push_str(", ");
-        }
-        let name = parameter
-            .value()
-            .map(value_name)
-            .unwrap_or_else(|| format!("arg_{}", parameter.index()));
-        write!(output, "{} {name}", storage_type(parameter.ty())?)
-            .expect("String writes cannot fail");
-    }
-    Ok(())
 }
 
 fn render_value_steps(

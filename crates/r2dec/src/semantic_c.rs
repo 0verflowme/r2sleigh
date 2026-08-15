@@ -30,7 +30,7 @@ use r2ssa::{
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const SEMANTIC_C_SCHEMA_VERSION: u32 = 16;
+pub const SEMANTIC_C_SCHEMA_VERSION: u32 = 17;
 
 /// Closed renderer-owned helper vocabulary. Membership is derived only while
 /// rendering audited typed semantics and never grants certification authority.
@@ -164,11 +164,33 @@ impl SemanticCHelperSet {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SemanticCParameterProjection {
+    source_type_id: u32,
+    carrier: SourceCarrierProjection,
+    logical_ty: Option<MachineType>,
+}
+
+impl SemanticCParameterProjection {
+    pub const fn source_type_id(&self) -> u32 {
+        self.source_type_id
+    }
+
+    pub const fn carrier(&self) -> SourceCarrierProjection {
+        self.carrier
+    }
+
+    pub const fn logical_ty(&self) -> Option<&MachineType> {
+        self.logical_ty.as_ref()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SemanticCParameter {
     index: u32,
     storage: CanonicalStorageId,
     value: Option<MachineValueBinding>,
     ty: MachineType,
+    projection: SemanticCParameterProjection,
 }
 
 impl SemanticCParameter {
@@ -186,6 +208,10 @@ impl SemanticCParameter {
 
     pub const fn ty(&self) -> &MachineType {
         &self.ty
+    }
+
+    pub const fn projection(&self) -> &SemanticCParameterProjection {
+        &self.projection
     }
 }
 
@@ -1309,6 +1335,113 @@ impl CertifiedSemanticSource for CertifiedMachineProjection {
     }
 }
 
+fn exact_semantic_parameter_projection(
+    source: &SourceFunctionInterface,
+    physical_storage: CanonicalStorageId,
+    graph_storage: CanonicalStorageId,
+    logical: r2ssa::SourceLogicalValue,
+    graph_ty: &MachineType,
+) -> Result<SemanticCParameterProjection, SemanticCError> {
+    let graph = source
+        .type_graph()
+        .ok_or(SemanticCError::InvalidCertifiedFunctionInterface)?;
+    let source_type = usize::try_from(logical.type_id())
+        .ok()
+        .and_then(|index| graph.types().get(index))
+        .filter(|source_type| source_type.id() == logical.type_id())
+        .ok_or(SemanticCError::InvalidCertifiedFunctionInterface)?;
+    let logical_ty = match source_type.kind() {
+        SourceTypeKind::SignedInteger => Some(MachineType::Integer {
+            width_bits: u32::try_from(source_type.size_bits())
+                .map_err(|_| SemanticCError::InvalidCertifiedFunctionInterface)?,
+            signedness: MachineSignedness::Signed,
+        }),
+        SourceTypeKind::UnsignedInteger => Some(MachineType::Integer {
+            width_bits: u32::try_from(source_type.size_bits())
+                .map_err(|_| SemanticCError::InvalidCertifiedFunctionInterface)?,
+            signedness: MachineSignedness::Unsigned,
+        }),
+        SourceTypeKind::Pointer { .. } | SourceTypeKind::Struct { .. } => None,
+    };
+    let physical_width = physical_storage
+        .size
+        .checked_mul(8)
+        .filter(|width| *width > 0)
+        .ok_or(SemanticCError::InvalidCertifiedFunctionInterface)?;
+    let logical_width = u32::try_from(source_type.size_bits())
+        .ok()
+        .filter(|width| *width > 0 && *width % 8 == 0)
+        .ok_or(SemanticCError::InvalidCertifiedFunctionInterface)?;
+    let carrier = logical.carrier();
+    let expected_graph_storage = match carrier.kind() {
+        SourceCarrierKind::Full if logical_width == physical_width => physical_storage,
+        SourceCarrierKind::LowBits if logical_width < physical_width => CanonicalStorageId {
+            size: logical_width / 8,
+            ..physical_storage
+        },
+        SourceCarrierKind::Full | SourceCarrierKind::LowBits => {
+            return Err(SemanticCError::InvalidCertifiedFunctionInterface);
+        }
+    };
+    if carrier.offset_bits() != 0
+        || carrier.size_bits() != u64::from(logical_width)
+        || graph_storage != expected_graph_storage
+        || graph_ty.width_bits() != logical_width
+    {
+        return Err(SemanticCError::InvalidCertifiedFunctionInterface);
+    }
+    Ok(SemanticCParameterProjection {
+        source_type_id: logical.type_id(),
+        carrier,
+        logical_ty,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn validated_semantic_parameter_for_test(
+    source: &SourceFunctionInterface,
+    index: u32,
+    graph_storage: CanonicalStorageId,
+    value: Option<MachineValueBinding>,
+    ty: MachineType,
+) -> Result<SemanticCParameter, SemanticCError> {
+    let position =
+        usize::try_from(index).map_err(|_| SemanticCError::InvalidCertifiedFunctionInterface)?;
+    let declared = source
+        .parameters()
+        .get(position)
+        .filter(|parameter| parameter.index() == index)
+        .ok_or(SemanticCError::InvalidCertifiedFunctionInterface)?;
+    let logical = *source
+        .parameter_logical_values()
+        .get(position)
+        .ok_or(SemanticCError::InvalidCertifiedFunctionInterface)?;
+    let graph_width = graph_storage
+        .size
+        .checked_mul(8)
+        .filter(|width| *width > 0)
+        .ok_or(SemanticCError::InvalidCertifiedFunctionInterface)?;
+    if ty.width_bits() != graph_width
+        || value.is_some_and(|binding| binding.width_bits() != graph_width)
+    {
+        return Err(SemanticCError::InvalidCertifiedFunctionInterface);
+    }
+    let projection = exact_semantic_parameter_projection(
+        source,
+        declared.storage(),
+        graph_storage,
+        logical,
+        &ty,
+    )?;
+    Ok(SemanticCParameter {
+        index,
+        storage: declared.storage(),
+        value,
+        ty,
+        projection,
+    })
+}
+
 fn exact_semantic_return_projection(
     source: &SourceFunctionInterface,
     storage: CanonicalStorageId,
@@ -1371,6 +1504,7 @@ fn semantic_function_interface(
         return Ok(None);
     };
     if source.parameters().len() != certified.abi_parameters().len()
+        || source.parameters().len() != source.parameter_logical_values().len()
         || source.stack_slots().len() != certified.stack_slots().len()
     {
         return Err(SemanticCError::InvalidCertifiedFunctionInterface);
@@ -1405,11 +1539,19 @@ fn semantic_function_interface(
         if ty.width_bits() != width_bits {
             return Err(SemanticCError::InvalidCertifiedFunctionInterface);
         }
+        let projection = exact_semantic_parameter_projection(
+            source,
+            declared.storage(),
+            certified_parameter.graph_storage(),
+            *logical_value,
+            &ty,
+        )?;
         parameters.push(SemanticCParameter {
             index: declared.index(),
             storage: declared.storage(),
             value: certified_parameter.value().map(|value| value.binding()),
             ty,
+            projection,
         });
     }
     let (return_kind, return_projection) = match source.return_kind() {
@@ -2807,18 +2949,28 @@ impl SemanticCExpressionLayer {
     }
 
     fn is_exact_abi_input(&self, binding: MachineValueBinding, ty: &MachineType) -> bool {
-        let Some(SemanticCInputOrigin::AbiParameter { index, storage }) =
-            self.input_origins.get(&binding)
-        else {
-            return false;
-        };
+        let mut parameters = self
+            .function_interface
+            .iter()
+            .flat_map(SemanticCFunctionInterface::parameters)
+            .filter(|parameter| parameter.value() == Some(binding) && parameter.ty() == ty);
+        parameters.next().is_some() && parameters.next().is_none()
+    }
+
+    pub(crate) fn is_exact_abi_parameter(
+        &self,
+        binding: MachineValueBinding,
+        ty: &MachineType,
+        index: u32,
+        storage: CanonicalStorageId,
+    ) -> bool {
         let mut parameters = self
             .function_interface
             .iter()
             .flat_map(SemanticCFunctionInterface::parameters)
             .filter(|parameter| {
-                parameter.index() == *index
-                    && parameter.storage() == *storage
+                parameter.index() == index
+                    && parameter.storage() == storage
                     && parameter.value() == Some(binding)
                     && parameter.ty() == ty
             });
@@ -4129,6 +4281,84 @@ pub(crate) fn storage_type(ty: &MachineType) -> Result<&'static str, SemanticCEr
     }
 }
 
+fn semantic_parameter_projection_is_coherent(parameter: &SemanticCParameter) -> bool {
+    let physical_width = parameter.storage.size.checked_mul(8);
+    let graph_width = parameter.ty.width_bits();
+    let carrier = parameter.projection.carrier;
+    let carrier_width = u32::try_from(carrier.size_bits()).ok();
+    matches!(physical_width, Some(8 | 16 | 32 | 64))
+        && carrier_width == Some(graph_width)
+        && matches!(graph_width, 8 | 16 | 32 | 64)
+        && carrier.offset_bits() == 0
+        && match carrier.kind() {
+            SourceCarrierKind::Full => physical_width == Some(graph_width),
+            SourceCarrierKind::LowBits => physical_width.is_some_and(|width| graph_width < width),
+        }
+        && parameter
+            .value
+            .is_none_or(|binding| binding.width_bits() == graph_width)
+        && parameter.projection.logical_ty.as_ref().is_none_or(|ty| {
+            matches!(ty, MachineType::Integer { .. }) && ty.width_bits() == graph_width
+        })
+}
+
+pub(crate) fn render_logical_parameter_declarations(
+    interface: &SemanticCFunctionInterface,
+) -> Result<String, SemanticCError> {
+    if interface.parameters.is_empty() {
+        return Ok("void".to_string());
+    }
+    let mut indices = BTreeSet::new();
+    let mut declarations = Vec::with_capacity(interface.parameters.len());
+    for parameter in &interface.parameters {
+        if !semantic_parameter_projection_is_coherent(parameter) || !indices.insert(parameter.index)
+        {
+            return Err(SemanticCError::InvalidCertifiedFunctionInterface);
+        }
+        let logical_ty = parameter
+            .projection
+            .logical_ty()
+            .ok_or(SemanticCError::InvalidCertifiedFunctionInterface)?;
+        declarations.push(format!(
+            "{} arg_{}",
+            logical_scalar_type(logical_ty)?,
+            parameter.index
+        ));
+    }
+    Ok(declarations.join(", "))
+}
+
+pub(crate) fn render_parameter_graph_binding_prologue(
+    interface: &SemanticCFunctionInterface,
+) -> Result<String, SemanticCError> {
+    let mut indices = BTreeSet::new();
+    let mut bindings = BTreeSet::new();
+    let mut output = String::new();
+    for parameter in &interface.parameters {
+        if !semantic_parameter_projection_is_coherent(parameter) || !indices.insert(parameter.index)
+        {
+            return Err(SemanticCError::InvalidCertifiedFunctionInterface);
+        }
+        if parameter.projection.logical_ty().is_none() {
+            return Err(SemanticCError::InvalidCertifiedFunctionInterface);
+        }
+        let Some(binding) = parameter.value else {
+            output.push_str(&format!("\t(void)arg_{};\n", parameter.index));
+            continue;
+        };
+        if !bindings.insert(binding) {
+            return Err(SemanticCError::InvalidCertifiedFunctionInterface);
+        }
+        let graph_type = storage_type(&parameter.ty)?;
+        output.push_str(&format!(
+            "\t{graph_type} {} = ({graph_type})(arg_{});\n",
+            value_name(binding),
+            parameter.index
+        ));
+    }
+    Ok(output)
+}
+
 pub(crate) fn value_name(binding: MachineValueBinding) -> String {
     format!("v_{}", binding.value().0)
 }
@@ -4315,8 +4545,8 @@ mod return_mechanics_tests {
     use super::*;
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
     use r2ssa::{
-        CanonicalInstructionSite, CanonicalStorageSpace, SourceLogicalValue, SourceType,
-        SourceTypeGraph, SsaArtifact,
+        CanonicalInstructionSite, CanonicalStorageSpace, SourceAbiParameterSpec,
+        SourceLogicalValue, SourceType, SourceTypeGraph, SsaArtifact,
     };
 
     fn id(ordinal: u64) -> CanonicalInstructionId {
@@ -4665,6 +4895,383 @@ mod return_mechanics_tests {
             } if left != right
         ));
         assert_eq!(inputs.len(), 2);
+    }
+
+    fn logical_parameter_interface(
+        kind: SourceTypeKind,
+        carrier_kind: SourceCarrierKind,
+        logical_bits: u64,
+        physical_bytes: u32,
+    ) -> SourceFunctionInterface {
+        let storage = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 0,
+            size: physical_bytes,
+        };
+        SourceFunctionInterface::new_with_logical_types(
+            b"logical-parameter-projection:v1".to_vec(),
+            "test-abi",
+            [SourceAbiParameterSpec::new(0, storage)],
+            SourceFunctionReturn::Void,
+            [],
+            [SourceLogicalValue::new(
+                0,
+                SourceCarrierProjection::new(carrier_kind, 0, logical_bits),
+            )],
+            None,
+            Some(
+                SourceTypeGraph::new([SourceType::new(0, kind, logical_bits, logical_bits)], [])
+                    .expect("scalar source type"),
+            ),
+        )
+        .expect("coherent logical parameter interface")
+    }
+
+    #[test]
+    fn exact_parameter_projection_keeps_signed_low_bits_distinct_from_graph_bits() {
+        let source = logical_parameter_interface(
+            SourceTypeKind::SignedInteger,
+            SourceCarrierKind::LowBits,
+            32,
+            8,
+        );
+        let physical = source.parameters()[0].storage();
+        let graph_storage = CanonicalStorageId {
+            size: 4,
+            ..physical
+        };
+        let graph_ty = MachineType::Integer {
+            width_bits: 32,
+            signedness: MachineSignedness::Unsigned,
+        };
+        let projection = exact_semantic_parameter_projection(
+            &source,
+            physical,
+            graph_storage,
+            source.parameter_logical_values()[0],
+            &graph_ty,
+        )
+        .expect("signed low-bits parameter projection");
+        assert_eq!(projection.source_type_id(), 0);
+        assert_eq!(projection.carrier().kind(), SourceCarrierKind::LowBits);
+        assert_eq!(
+            projection.logical_ty(),
+            Some(&MachineType::Integer {
+                width_bits: 32,
+                signedness: MachineSignedness::Signed,
+            })
+        );
+
+        let (machine, producer) =
+            xor_projection(4, Varnode::register(0, 4), Varnode::constant(1, 4));
+        let (_, inputs) = translate_projection_root(&machine, producer);
+        let inputs = inputs.into_iter().collect::<Vec<_>>();
+        let [(binding, input_ty)] = inputs.as_slice() else {
+            panic!("one exact graph input")
+        };
+        assert_eq!(input_ty, &graph_ty);
+        let interface = SemanticCFunctionInterface {
+            revision_identity: source.revision_identity().into(),
+            calling_convention: source.calling_convention().to_string(),
+            parameters: vec![SemanticCParameter {
+                index: 0,
+                storage: physical,
+                value: Some(*binding),
+                ty: input_ty.clone(),
+                projection,
+            }]
+            .into_boxed_slice(),
+            return_kind: SemanticCFunctionReturn::Void,
+            return_projection: None,
+            stack_slots: Box::new([]),
+        };
+        assert_eq!(
+            render_logical_parameter_declarations(&interface),
+            Ok("int32_t arg_0".to_string())
+        );
+        assert_eq!(
+            render_parameter_graph_binding_prologue(&interface),
+            Ok(format!(
+                "\tuint32_t {} = (uint32_t)(arg_0);\n",
+                value_name(*binding)
+            ))
+        );
+    }
+
+    #[test]
+    fn parameter_render_helpers_refuse_mutated_projection_binding_and_identity() {
+        let source = logical_parameter_interface(
+            SourceTypeKind::SignedInteger,
+            SourceCarrierKind::LowBits,
+            32,
+            8,
+        );
+        let physical = source.parameters()[0].storage();
+        let graph_storage = CanonicalStorageId {
+            size: 4,
+            ..physical
+        };
+        let graph_ty = MachineType::Integer {
+            width_bits: 32,
+            signedness: MachineSignedness::Unsigned,
+        };
+        let projection = exact_semantic_parameter_projection(
+            &source,
+            physical,
+            graph_storage,
+            source.parameter_logical_values()[0],
+            &graph_ty,
+        )
+        .expect("signed low-bits parameter projection");
+        let (machine, producer) =
+            xor_projection(4, Varnode::register(0, 4), Varnode::constant(1, 4));
+        let (_, inputs) = translate_projection_root(&machine, producer);
+        let inputs = inputs.into_iter().collect::<Vec<_>>();
+        let [(binding, _)] = inputs.as_slice() else {
+            panic!("one exact projected input")
+        };
+        let parameter = SemanticCParameter {
+            index: 0,
+            storage: physical,
+            value: Some(*binding),
+            ty: graph_ty,
+            projection,
+        };
+        let interface = SemanticCFunctionInterface {
+            revision_identity: source.revision_identity().into(),
+            calling_convention: source.calling_convention().to_string(),
+            parameters: vec![parameter].into_boxed_slice(),
+            return_kind: SemanticCFunctionReturn::Void,
+            return_projection: None,
+            stack_slots: Box::new([]),
+        };
+
+        let refuses = |interface: &SemanticCFunctionInterface| {
+            assert_eq!(
+                render_logical_parameter_declarations(interface),
+                Err(SemanticCError::InvalidCertifiedFunctionInterface)
+            );
+            assert_eq!(
+                render_parameter_graph_binding_prologue(interface),
+                Err(SemanticCError::InvalidCertifiedFunctionInterface)
+            );
+        };
+
+        let mut wrong_logical_width = interface.clone();
+        wrong_logical_width.parameters[0].projection.logical_ty = Some(MachineType::Integer {
+            width_bits: 64,
+            signedness: MachineSignedness::Signed,
+        });
+        refuses(&wrong_logical_width);
+
+        let mut wrong_full_carrier = interface.clone();
+        wrong_full_carrier.parameters[0].projection.carrier =
+            SourceCarrierProjection::new(SourceCarrierKind::Full, 0, 32);
+        refuses(&wrong_full_carrier);
+
+        let mut wrong_binding_width = interface.clone();
+        let (wide_machine, wide_producer) =
+            xor_projection(8, Varnode::register(0, 8), Varnode::constant(1, 8));
+        let (_, wide_inputs) = translate_projection_root(&wide_machine, wide_producer);
+        let wide_inputs = wide_inputs.into_iter().collect::<Vec<_>>();
+        let [(wide_binding, _)] = wide_inputs.as_slice() else {
+            panic!("one exact wide input")
+        };
+        wrong_binding_width.parameters[0].value = Some(*wide_binding);
+        refuses(&wrong_binding_width);
+
+        let mut duplicate_index = interface.clone();
+        duplicate_index.parameters = vec![
+            duplicate_index.parameters[0].clone(),
+            duplicate_index.parameters[0].clone(),
+        ]
+        .into_boxed_slice();
+        refuses(&duplicate_index);
+
+        let mut duplicate_binding = interface.clone();
+        let mut second = duplicate_binding.parameters[0].clone();
+        second.index = 1;
+        duplicate_binding.parameters =
+            vec![duplicate_binding.parameters[0].clone(), second].into_boxed_slice();
+        assert!(render_logical_parameter_declarations(&duplicate_binding).is_ok());
+        assert_eq!(
+            render_parameter_graph_binding_prologue(&duplicate_binding),
+            Err(SemanticCError::InvalidCertifiedFunctionInterface)
+        );
+    }
+
+    #[test]
+    fn exact_parameter_projection_supports_full_width_and_producerless_inputs() {
+        let source = logical_parameter_interface(
+            SourceTypeKind::UnsignedInteger,
+            SourceCarrierKind::Full,
+            64,
+            8,
+        );
+        let storage = source.parameters()[0].storage();
+        let graph_ty = MachineType::Integer {
+            width_bits: 64,
+            signedness: MachineSignedness::Unsigned,
+        };
+        let projection = exact_semantic_parameter_projection(
+            &source,
+            storage,
+            storage,
+            source.parameter_logical_values()[0],
+            &graph_ty,
+        )
+        .expect("full-width parameter projection");
+        let interface = SemanticCFunctionInterface {
+            revision_identity: source.revision_identity().into(),
+            calling_convention: source.calling_convention().to_string(),
+            parameters: vec![SemanticCParameter {
+                index: 0,
+                storage,
+                value: None,
+                ty: graph_ty,
+                projection,
+            }]
+            .into_boxed_slice(),
+            return_kind: SemanticCFunctionReturn::Void,
+            return_projection: None,
+            stack_slots: Box::new([]),
+        };
+        assert_eq!(
+            render_logical_parameter_declarations(&interface),
+            Ok("uint64_t arg_0".to_string())
+        );
+        assert_eq!(
+            render_parameter_graph_binding_prologue(&interface),
+            Ok("\t(void)arg_0;\n".to_string())
+        );
+    }
+
+    #[test]
+    fn exact_parameter_projection_refuses_storage_carrier_and_graph_mutations() {
+        let source = logical_parameter_interface(
+            SourceTypeKind::SignedInteger,
+            SourceCarrierKind::LowBits,
+            32,
+            8,
+        );
+        let physical = source.parameters()[0].storage();
+        let graph_storage = CanonicalStorageId {
+            size: 4,
+            ..physical
+        };
+        let graph32 = MachineType::Integer {
+            width_bits: 32,
+            signedness: MachineSignedness::Unsigned,
+        };
+        let graph64 = MachineType::Integer {
+            width_bits: 64,
+            signedness: MachineSignedness::Unsigned,
+        };
+        assert_eq!(
+            exact_semantic_parameter_projection(
+                &source,
+                physical,
+                physical,
+                source.parameter_logical_values()[0],
+                &graph32,
+            ),
+            Err(SemanticCError::InvalidCertifiedFunctionInterface)
+        );
+        assert_eq!(
+            exact_semantic_parameter_projection(
+                &source,
+                physical,
+                graph_storage,
+                source.parameter_logical_values()[0],
+                &graph64,
+            ),
+            Err(SemanticCError::InvalidCertifiedFunctionInterface)
+        );
+        assert_eq!(
+            exact_semantic_parameter_projection(
+                &source,
+                physical,
+                graph_storage,
+                SourceLogicalValue::new(
+                    0,
+                    SourceCarrierProjection::new(SourceCarrierKind::LowBits, 8, 32),
+                ),
+                &graph32,
+            ),
+            Err(SemanticCError::InvalidCertifiedFunctionInterface)
+        );
+    }
+
+    #[test]
+    fn exact_parameter_projection_retains_non_scalar_source_kind() {
+        let physical = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 0,
+            size: 8,
+        };
+        let logical = SourceLogicalValue::new(
+            1,
+            SourceCarrierProjection::new(SourceCarrierKind::Full, 0, 64),
+        );
+        let source = SourceFunctionInterface::new_with_logical_types(
+            b"pointer-parameter-projection:v1".to_vec(),
+            "test-abi",
+            [SourceAbiParameterSpec::new(0, physical)],
+            SourceFunctionReturn::Void,
+            [],
+            [logical],
+            None,
+            Some(
+                SourceTypeGraph::new(
+                    [
+                        SourceType::new(0, SourceTypeKind::UnsignedInteger, 8, 8),
+                        SourceType::new(1, SourceTypeKind::Pointer { target_type_id: 0 }, 64, 64),
+                    ],
+                    [],
+                )
+                .expect("pointer source type"),
+            ),
+        )
+        .expect("coherent pointer parameter interface");
+        let projection = exact_semantic_parameter_projection(
+            &source,
+            physical,
+            physical,
+            logical,
+            &MachineType::Integer {
+                width_bits: 64,
+                signedness: MachineSignedness::Unsigned,
+            },
+        )
+        .expect("non-scalar projection is retained");
+        assert_eq!(projection.source_type_id(), 1);
+        assert_eq!(projection.logical_ty(), None);
+        let interface = SemanticCFunctionInterface {
+            revision_identity: source.revision_identity().into(),
+            calling_convention: source.calling_convention().to_string(),
+            parameters: vec![SemanticCParameter {
+                index: 0,
+                storage: physical,
+                value: None,
+                ty: MachineType::Integer {
+                    width_bits: 64,
+                    signedness: MachineSignedness::Unsigned,
+                },
+                projection,
+            }]
+            .into_boxed_slice(),
+            return_kind: SemanticCFunctionReturn::Void,
+            return_projection: None,
+            stack_slots: Box::new([]),
+        };
+        assert_eq!(
+            render_logical_parameter_declarations(&interface),
+            Err(SemanticCError::InvalidCertifiedFunctionInterface)
+        );
+        assert_eq!(
+            render_parameter_graph_binding_prologue(&interface),
+            Err(SemanticCError::InvalidCertifiedFunctionInterface)
+        );
     }
 
     #[test]

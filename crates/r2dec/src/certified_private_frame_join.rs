@@ -29,12 +29,13 @@ use crate::certified_region::{
 };
 use crate::semantic_c::{
     SEMANTIC_C_SCHEMA_VERSION, SemanticCEntity, SemanticCError, SemanticCExprId, SemanticCExprKind,
-    SemanticCExpressionLayer, SemanticCInputOrigin, SemanticCMemoryRewrite, SemanticCReturnOperand,
-    SemanticCTypedLeaf, insert_semantic_c_helpers, logical_return_type,
-    render_logical_return_statement, semantic_return_from_control, storage_type, value_name,
+    SemanticCExpressionLayer, SemanticCMemoryRewrite, SemanticCReturnOperand, SemanticCTypedLeaf,
+    insert_semantic_c_helpers, logical_return_type, render_logical_parameter_declarations,
+    render_logical_return_statement, render_parameter_graph_binding_prologue,
+    semantic_return_from_control,
 };
 
-pub const CERTIFIED_PRIVATE_FRAME_JOIN_REWRITE_SCHEMA_VERSION: u32 = 1;
+pub const CERTIFIED_PRIVATE_FRAME_JOIN_REWRITE_SCHEMA_VERSION: u32 = 2;
 pub const CERTIFIED_PRIVATE_FRAME_CONDITIONAL_JOIN_FUNCTION_SCHEMA_VERSION: u32 = 1;
 
 /// This certificate is an incomplete, non-rendering rewrite plan only.
@@ -434,11 +435,12 @@ fn private_join_value_leaf(
             Ok(layer.expanded_constant_leaf(value.value())?)
         }
         CertifiedPrivateFrameJoinValueOrigin::AbiParameter { index, storage }
-            if layer.input_origins().get(&value.value().binding())
-                == Some(&SemanticCInputOrigin::AbiParameter {
-                    index: *index,
-                    storage: *storage,
-                }) =>
+            if layer.is_exact_abi_parameter(
+                value.value().binding(),
+                value.value().ty(),
+                *index,
+                *storage,
+            ) =>
         {
             Ok(layer.expanded_abi_input_leaf(value.value())?)
         }
@@ -738,22 +740,10 @@ impl CertifiedPrivateFrameConditionalJoinFunction {
             self.name
         )
         .expect("String writes cannot fail");
-        if interface.parameters().is_empty() {
-            output.push_str("void");
-        } else {
-            for (position, parameter) in interface.parameters().iter().enumerate() {
-                if position > 0 {
-                    output.push_str(", ");
-                }
-                let name = parameter
-                    .value()
-                    .map(value_name)
-                    .unwrap_or_else(|| format!("arg_{}", parameter.index()));
-                write!(&mut output, "{} {name}", storage_type(parameter.ty())?)
-                    .expect("String writes cannot fail");
-            }
-        }
-        writeln!(&mut output, ") {{\n\t{returned}\n}}").expect("String writes cannot fail");
+        output.push_str(&render_logical_parameter_declarations(interface)?);
+        output.push_str(") {\n");
+        output.push_str(&render_parameter_graph_binding_prologue(interface)?);
+        writeln!(&mut output, "\t{returned}\n}}").expect("String writes cannot fail");
         insert_semantic_c_helpers(&mut output, helper_insertion, rendered.helpers());
         Ok(output)
     }
@@ -984,10 +974,7 @@ fn exact_join_value(
                 .into_iter()
                 .flat_map(|interface| interface.parameters())
                 .filter(|parameter| {
-                    parameter.value() == Some(value.binding())
-                        && parameter.ty() == value.ty()
-                        && parameter.storage().size.checked_mul(8)
-                            == Some(value.binding().width_bits())
+                    parameter.value() == Some(value.binding()) && parameter.ty() == value.ty()
                 });
             let parameter = parameters.next().ok_or(
                 PrivateFrameConditionalJoinRewriteError::InvalidValueOrigin(value.binding()),

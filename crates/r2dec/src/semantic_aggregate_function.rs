@@ -12,7 +12,7 @@ use r2cert::{
     CertifiedMemoryStatementKind, CertifiedNaturalScalarAggregateLayout,
 };
 use r2ssa::{
-    CanonicalInstructionId, CanonicalStorageId, InstPayload, MachineBuildError,
+    CanonicalInstructionId, CanonicalStorageId, InstPayload, MachineBuildError, MachineSignedness,
     MachineValueBinding, SSAOp, SourceCarrierKind, SourceFunctionInterface, SourceFunctionReturn,
     SourceTypeGraph, SourceTypeKind, SsaArtifact, StructuredAccessId, TrustedSsaArtifact,
 };
@@ -27,7 +27,7 @@ use crate::semantic_memory_function::{
     PLAIN_RAM_HELPER_DECLARATIONS, memory_helper_name, render_value_use,
 };
 
-pub const CERTIFIED_AGGREGATE_MEMBER_SEMANTIC_C_FUNCTION_SCHEMA_VERSION: u32 = 3;
+pub const CERTIFIED_AGGREGATE_MEMBER_SEMANTIC_C_FUNCTION_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum CertifiedAggregateMemberSemanticCFunctionScope {
@@ -430,9 +430,11 @@ fn parameter_manifests(
         .map(|(source_parameter, logical)| {
             let semantic_parameter =
                 semantic_parameter_by_index(semantic, source_parameter.index())?;
+            let projection = semantic_parameter.projection();
             if semantic_parameter.storage() != source_parameter.storage()
-                || semantic_parameter.ty().width_bits()
-                    != source_parameter.storage().size.checked_mul(8)?
+                || projection.source_type_id() != logical.type_id()
+                || projection.carrier() != logical.carrier()
+                || u64::from(semantic_parameter.ty().width_bits()) != logical.carrier().size_bits()
             {
                 return None;
             }
@@ -447,6 +449,7 @@ fn parameter_manifests(
                     || carrier.kind() != SourceCarrierKind::Full
                     || carrier.offset_bits() != 0
                     || carrier.size_bits() != source_type.size_bits()
+                    || projection.logical_ty().is_some()
                 {
                     return None;
                 }
@@ -456,9 +459,16 @@ fn parameter_manifests(
                 }
             } else {
                 let signedness = scalar_signedness(source_type.kind())?;
+                let logical_ty = projection.logical_ty()?;
+                let expected_signedness = match signedness {
+                    CertifiedAggregateScalarSignedness::Signed => MachineSignedness::Signed,
+                    CertifiedAggregateScalarSignedness::Unsigned => MachineSignedness::Unsigned,
+                };
                 if carrier.offset_bits() != 0
                     || carrier.size_bits() != source_type.size_bits()
                     || !matches!(source_type.size_bits(), 8 | 16 | 32 | 64)
+                    || logical_ty.width_bits() != u32::try_from(source_type.size_bits()).ok()?
+                    || logical_ty.signedness() != Some(expected_signedness)
                     || !matches!(
                         carrier.kind(),
                         SourceCarrierKind::Full | SourceCarrierKind::LowBits
@@ -1442,11 +1452,12 @@ mod tests {
         AddressSpace, ArchSpec, Endianness, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode,
     };
     use r2ssa::{
-        CanonicalStorageSpace, SourceAbiParameterSpec, SourceAggregateLayout,
+        CanonicalStorageSpace, MachineType, SourceAbiParameterSpec, SourceAggregateLayout,
         SourceAggregateMember, SourceCarrierProjection, SourceLogicalValue, SourceType,
     };
 
     use super::*;
+    use crate::semantic_c::validated_semantic_parameter_for_test;
 
     const REVISION: &[u8] = b"aggregate-semantic-c-revision-1";
 
@@ -1562,6 +1573,133 @@ mod tests {
         SourceAbiParameterSpec::new(0, register_storage(0, 8))
     }
 
+    fn parameter_manifest_graph(
+        parameter_type_id: u32,
+        parameter_kind: SourceTypeKind,
+        parameter_bits: u64,
+    ) -> SourceTypeGraph {
+        let member_type_id = if parameter_type_id == 1 { 3 } else { 1 };
+        let scalar = |id| {
+            if id == parameter_type_id {
+                SourceType::new(id, parameter_kind, parameter_bits, parameter_bits)
+            } else {
+                SourceType::new(id, SourceTypeKind::SignedInteger, 32, 32)
+            }
+        };
+        SourceTypeGraph::new(
+            [
+                SourceType::new(0, SourceTypeKind::Struct { aggregate_id: 0 }, 56 * 8, 32),
+                scalar(1),
+                SourceType::new(2, SourceTypeKind::Pointer { target_type_id: 0 }, 64, 64),
+                scalar(3),
+            ],
+            [SourceAggregateLayout::new(
+                0,
+                0,
+                56 * 8,
+                32,
+                "TestOnlyAggregate",
+                (0..14).map(|index| {
+                    SourceAggregateMember::new(
+                        index,
+                        member_type_id,
+                        u64::from(index) * 32,
+                        32,
+                        format!("member_{index}"),
+                    )
+                }),
+            )],
+        )
+        .expect("valid parameter-manifest source graph")
+    }
+
+    fn parameter_manifest_source(
+        parameter_type_id: u32,
+        parameter_kind: SourceTypeKind,
+        parameter_bits: u64,
+        carrier_kind: SourceCarrierKind,
+    ) -> SourceFunctionInterface {
+        SourceFunctionInterface::new_with_logical_types(
+            REVISION.to_vec(),
+            "aapcs64",
+            [
+                pointer_parameter(),
+                SourceAbiParameterSpec::new(1, register_storage(8, 8)),
+            ],
+            SourceFunctionReturn::Void,
+            [],
+            [
+                pointer_logical(),
+                SourceLogicalValue::new(
+                    parameter_type_id,
+                    SourceCarrierProjection::new(carrier_kind, 0, parameter_bits),
+                ),
+            ],
+            None,
+            Some(parameter_manifest_graph(
+                parameter_type_id,
+                parameter_kind,
+                parameter_bits,
+            )),
+        )
+        .expect("valid parameter-manifest source interface")
+    }
+
+    fn parameter_manifest_layout() -> CertifiedAggregateStructLayoutManifest {
+        CertifiedAggregateStructLayoutManifest {
+            pointer_type_id: 2,
+            struct_type_id: 0,
+            aggregate_id: 0,
+            size_bits: 56 * 8,
+            align_bits: 32,
+            members: (0..14)
+                .map(|member_id| CertifiedAggregateStructMemberManifest {
+                    member_id,
+                    type_id: 3,
+                    offset_bits: u64::from(member_id) * 32,
+                    size_bits: 32,
+                    align_bits: 32,
+                    signedness: CertifiedAggregateScalarSignedness::Signed,
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        }
+    }
+
+    fn validated_manifest_parameters(
+        source: &SourceFunctionInterface,
+    ) -> Result<Vec<SemanticCParameter>, SemanticCError> {
+        let unsigned = |width_bits| MachineType::Integer {
+            width_bits,
+            signedness: MachineSignedness::Unsigned,
+        };
+        Ok(vec![
+            validated_semantic_parameter_for_test(
+                source,
+                0,
+                register_storage(0, 8),
+                None,
+                unsigned(64),
+            )?,
+            validated_semantic_parameter_for_test(
+                source,
+                1,
+                CanonicalStorageId {
+                    size: u32::try_from(
+                        source.parameter_logical_values()[1].carrier().size_bits() / 8,
+                    )
+                    .map_err(|_| SemanticCError::InvalidCertifiedFunctionInterface)?,
+                    ..register_storage(8, 8)
+                },
+                None,
+                unsigned(
+                    u32::try_from(source.parameter_logical_values()[1].carrier().size_bits())
+                        .map_err(|_| SemanticCError::InvalidCertifiedFunctionInterface)?,
+                ),
+            )?,
+        ])
+    }
+
     fn load_return_artifact_with_graph(graph: SourceTypeGraph) -> SsaArtifact {
         let mut block = R2ILBlock::new(0x9000, 4);
         block.push(R2ILOp::IntAdd {
@@ -1666,6 +1804,128 @@ mod tests {
         assert_eq!(
             artifact.provenance_kind(),
             r2ssa::SsaArtifactProvenanceKind::Manual
+        );
+    }
+
+    #[test]
+    fn exact_parameter_manifest_accepts_pointer_and_signed_low_bits_scalar() {
+        let source = parameter_manifest_source(
+            1,
+            SourceTypeKind::SignedInteger,
+            32,
+            SourceCarrierKind::LowBits,
+        );
+        let semantic = validated_manifest_parameters(&source)
+            .expect("production-validated semantic parameters");
+        assert_eq!(semantic[0].projection().logical_ty(), None);
+        assert_eq!(semantic[0].storage(), register_storage(0, 8));
+        assert_eq!(semantic[0].ty().width_bits(), 64);
+        assert_eq!(semantic[1].storage(), register_storage(8, 8));
+        assert_eq!(semantic[1].ty().width_bits(), 32);
+        assert_eq!(
+            semantic[1].projection().logical_ty(),
+            Some(&MachineType::Integer {
+                width_bits: 32,
+                signedness: MachineSignedness::Signed,
+            })
+        );
+        let manifest = parameter_manifests(&source, &semantic, 0, &parameter_manifest_layout())
+            .expect("exact aggregate parameter manifest");
+        let [pointer, scalar] = manifest.as_slice() else {
+            panic!("exact pointer and scalar parameter manifests")
+        };
+        assert!(matches!(
+            pointer.kind(),
+            CertifiedAggregateSemanticCParameterKind::AggregatePointer {
+                pointer_type_id: 2,
+                struct_type_id: 0,
+            }
+        ));
+        assert!(matches!(
+            scalar.kind(),
+            CertifiedAggregateSemanticCParameterKind::Scalar {
+                type_id: 1,
+                width_bits: 32,
+                signedness: CertifiedAggregateScalarSignedness::Signed,
+                carrier_kind: SourceCarrierKind::LowBits,
+                carrier_width_bits: 64,
+            }
+        ));
+    }
+
+    #[test]
+    fn exact_parameter_manifest_refuses_graph_projection_and_source_mutations() {
+        let source = parameter_manifest_source(
+            1,
+            SourceTypeKind::SignedInteger,
+            32,
+            SourceCarrierKind::LowBits,
+        );
+        let semantic = validated_manifest_parameters(&source)
+            .expect("production-validated semantic parameters");
+        assert_eq!(
+            validated_semantic_parameter_for_test(
+                &source,
+                1,
+                register_storage(8, 8),
+                None,
+                MachineType::Integer {
+                    width_bits: 64,
+                    signedness: MachineSignedness::Unsigned,
+                },
+            ),
+            Err(SemanticCError::InvalidCertifiedFunctionInterface),
+            "a 32-bit LowBits carrier cannot acquire a 64-bit graph projection"
+        );
+
+        let type_id_mutation = parameter_manifest_source(
+            3,
+            SourceTypeKind::SignedInteger,
+            32,
+            SourceCarrierKind::LowBits,
+        );
+        assert_eq!(
+            parameter_manifests(
+                &type_id_mutation,
+                &semantic,
+                0,
+                &parameter_manifest_layout(),
+            ),
+            None,
+            "the sealed projection type ID must match the source logical value"
+        );
+
+        let full_width_source = parameter_manifest_source(
+            1,
+            SourceTypeKind::SignedInteger,
+            64,
+            SourceCarrierKind::Full,
+        );
+        let full_width_semantic = validated_manifest_parameters(&full_width_source)
+            .expect("valid alternate full-width projection");
+        assert_eq!(
+            parameter_manifests(
+                &source,
+                &full_width_semantic,
+                0,
+                &parameter_manifest_layout(),
+            ),
+            None,
+            "the sealed Full64 carrier cannot satisfy a LowBits32 source value"
+        );
+
+        let unsigned_source = parameter_manifest_source(
+            1,
+            SourceTypeKind::UnsignedInteger,
+            32,
+            SourceCarrierKind::LowBits,
+        );
+        let unsigned_semantic = validated_manifest_parameters(&unsigned_source)
+            .expect("valid alternate unsigned projection");
+        assert_eq!(
+            parameter_manifests(&source, &unsigned_semantic, 0, &parameter_manifest_layout(),),
+            None,
+            "the sealed unsigned logical type cannot satisfy signed source authority"
         );
     }
 

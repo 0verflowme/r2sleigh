@@ -147,8 +147,8 @@ pub use semantic_aggregate_function::{
 pub use semantic_c::{
     SemanticCCallArgument, SemanticCCallArgumentValue, SemanticCDirectCall, SemanticCError,
     SemanticCExpressionLayer, SemanticCFunctionInterface, SemanticCFunctionReturn,
-    SemanticCIdentityScope, SemanticCInputOrigin, SemanticCParameter, SemanticCReturn,
-    SemanticCReturnValue, SemanticCScope, SemanticCStackSlot,
+    SemanticCIdentityScope, SemanticCInputOrigin, SemanticCParameter, SemanticCParameterProjection,
+    SemanticCReturn, SemanticCReturnValue, SemanticCScope, SemanticCStackSlot,
 };
 pub use semantic_call_return::{
     CERTIFIED_DIRECT_CALL_RETURN_FUNCTION_SCHEMA_VERSION, CertifiedDirectCallReturnBlock,

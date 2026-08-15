@@ -23,7 +23,8 @@ use crate::certified_region::{
 use crate::semantic_c::{
     SemanticCError, SemanticCExprId, SemanticCExprKind, SemanticCFunctionReturn,
     SemanticCHelperSet, SemanticCInputOrigin, SemanticCReturn, insert_semantic_c_helpers,
-    logical_return_type, render_logical_return_statement, storage_type, value_name,
+    logical_return_type, render_logical_parameter_declarations, render_logical_return_statement,
+    render_parameter_graph_binding_prologue, storage_type, value_name,
 };
 use crate::semantic_stmt::{SemanticCBlockStepLayer, SemanticCStatementError};
 
@@ -409,29 +410,9 @@ impl CertifiedMemorySemanticCFunction {
         output.push('\n');
         output.push_str(PLAIN_RAM_HELPER_DECLARATIONS);
         write!(&mut output, "\n{return_type} {}(", self.name).expect("String writes cannot fail");
-        if interface.parameters().is_empty() {
-            output.push_str("void");
-        } else {
-            for (position, parameter) in interface.parameters().iter().enumerate() {
-                if position > 0 {
-                    output.push_str(", ");
-                }
-                let name = parameter
-                    .value()
-                    .map(value_name)
-                    .unwrap_or_else(|| format!("arg_{}", parameter.index()));
-                write!(&mut output, "{} {name}", storage_type(parameter.ty())?)
-                    .expect("String writes cannot fail");
-            }
-        }
+        output.push_str(&render_logical_parameter_declarations(interface)?);
         output.push_str(") {\n");
-        for parameter in interface.parameters() {
-            let name = parameter
-                .value()
-                .map(value_name)
-                .unwrap_or_else(|| format!("arg_{}", parameter.index()));
-            writeln!(&mut output, "\t(void){name};").expect("String writes cannot fail");
-        }
+        output.push_str(&render_parameter_graph_binding_prologue(interface)?);
         for step in self.layer.steps() {
             if let Some(reference) = step.memory() {
                 let statement = self.layer.resolve_memory_statement(reference).ok_or(

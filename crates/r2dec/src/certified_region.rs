@@ -33,7 +33,7 @@ use crate::semantic_c::{
 };
 use crate::{CertifiedPrivateFrameConditionalJoinRewrite, CertifiedPrivateFrameJoinValueOrigin};
 
-pub const CERTIFIED_REGION_SCHEMA_VERSION: u32 = 14;
+pub const CERTIFIED_REGION_SCHEMA_VERSION: u32 = 15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum SingleBlockAccountingScope {
@@ -402,6 +402,94 @@ fn ledger_expression_inputs(
             .source_obligations()
             .contains(obligation))
     .then(|| expression.inputs().clone())
+}
+
+fn exact_layer_expression_dependencies(
+    layer: &SemanticCExpressionLayer,
+    source: &SemanticObligationInventory,
+    ledger: &ObligationLedger,
+) -> Option<BTreeMap<CanonicalInstructionId, BTreeSet<CanonicalInstructionId>>> {
+    let mut dependencies = BTreeMap::new();
+    for entity in layer.entities() {
+        let producer = entity.producer();
+        let instruction = source.instructions().get(&producer)?;
+        let live = instruction
+            .obligations
+            .iter()
+            .copied()
+            .filter(|obligation| obligation.kind == SemanticObligationKind::LiveValueProducer)
+            .collect::<Vec<_>>();
+        let [obligation] = live.as_slice() else {
+            return None;
+        };
+        let [effect] = ledger.effects(*obligation) else {
+            return None;
+        };
+        let expression = effect.expression_evidence()?;
+        if instruction.state != SemanticInstructionState::LiveObligation
+            || effect.disposition() != &(EffectDisposition::AbsorbedIntoExpression { producer })
+            || expression.entity().producer() != producer
+            || expression.entity().source_obligations() != entity.source_obligations()
+            || entity.source_obligations() != &BTreeSet::from([*obligation])
+            || layer.expr(entity.root()).is_none()
+            || dependencies
+                .insert(producer, expression.inputs().clone())
+                .is_some()
+        {
+            return None;
+        }
+    }
+    Some(dependencies)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExactDependencyVisit {
+    Active,
+    Complete,
+}
+
+fn visit_exact_expression_dependency(
+    producer: CanonicalInstructionId,
+    boundaries: &BTreeSet<CanonicalInstructionId>,
+    dependencies: &BTreeMap<CanonicalInstructionId, BTreeSet<CanonicalInstructionId>>,
+    states: &mut BTreeMap<CanonicalInstructionId, ExactDependencyVisit>,
+    visible: &mut BTreeSet<CanonicalInstructionId>,
+) -> Option<()> {
+    if boundaries.contains(&producer) {
+        return Some(());
+    }
+    match states.get(&producer) {
+        Some(ExactDependencyVisit::Active) => return None,
+        Some(ExactDependencyVisit::Complete) => return Some(()),
+        None => {}
+    }
+    let inputs = dependencies.get(&producer)?;
+    states.insert(producer, ExactDependencyVisit::Active);
+    visible.insert(producer);
+    for input in inputs {
+        visit_exact_expression_dependency(*input, boundaries, dependencies, states, visible)?;
+    }
+    states.insert(producer, ExactDependencyVisit::Complete);
+    Some(())
+}
+
+fn exact_visible_expression_closure(
+    roots: impl IntoIterator<Item = CanonicalInstructionId>,
+    boundaries: &BTreeSet<CanonicalInstructionId>,
+    dependencies: &BTreeMap<CanonicalInstructionId, BTreeSet<CanonicalInstructionId>>,
+) -> Option<BTreeSet<CanonicalInstructionId>> {
+    let mut states = BTreeMap::new();
+    let mut visible = BTreeSet::new();
+    for producer in roots {
+        visit_exact_expression_dependency(
+            producer,
+            boundaries,
+            dependencies,
+            &mut states,
+            &mut visible,
+        )?;
+    }
+    Some(visible)
 }
 
 fn return_mechanics_reaches_producer(
@@ -872,20 +960,6 @@ fn private_join_accounting_authority(
             visible_roots.push(*root);
         }
     }
-    let visible_producers = visible_roots
-        .into_iter()
-        .map(|root| {
-            layer
-                .expr(root)
-                .map(|expression| expression.source_instructions())
-                .ok_or(RegionBuildError::PrivateFrameConditionalJoinMismatch)
-        })
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .flatten()
-        .copied()
-        .collect::<BTreeSet<_>>();
-
     let mut stack_roots = stack
         .assignments()
         .iter()
@@ -935,23 +1009,46 @@ fn private_join_accounting_authority(
                 .map(|owner| owner.source_producer()),
         )
         .collect::<BTreeSet<_>>();
+    let dependency_map =
+        exact_layer_expression_dependencies(layer, projection.source(), projection.ledger())
+            .ok_or(RegionBuildError::PrivateFrameConditionalJoinMismatch)?;
+    let visible_seeds = visible_roots
+        .into_iter()
+        .map(|root| {
+            layer
+                .expr(root)
+                .map(|expression| expression.source_instructions())
+                .ok_or(RegionBuildError::PrivateFrameConditionalJoinMismatch)
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let visible_producers =
+        exact_visible_expression_closure(visible_seeds, &rewritten_load_producers, &dependency_map)
+            .ok_or(RegionBuildError::PrivateFrameConditionalJoinMismatch)?;
     for entity in layer.entities() {
-        if rewritten_load_producers.contains(&entity.producer())
-            || visible_producers.contains(&entity.producer())
-            || return_mechanics.contains(&entity.producer())
-        {
+        if rewritten_load_producers.contains(&entity.producer()) {
             continue;
         }
-        if !stack_producers.contains(&entity.producer()) {
-            return Err(RegionBuildError::PrivateFrameConditionalJoinMismatch);
+        if visible_producers.contains(&entity.producer()) {
+            continue;
         }
-        for obligation in entity.source_obligations() {
-            insert_private_role(
-                &mut roles,
-                *obligation,
-                PrivateFrameConditionalJoinOwnerRole::PrivateStackMechanics,
-            )?;
+        if return_mechanics.contains(&entity.producer()) {
+            continue;
         }
+        if stack_producers.contains(&entity.producer()) {
+            for obligation in entity.source_obligations() {
+                insert_private_role(
+                    &mut roles,
+                    *obligation,
+                    PrivateFrameConditionalJoinOwnerRole::PrivateStackMechanics,
+                )?;
+            }
+            continue;
+        }
+        return Err(RegionBuildError::PrivateFrameConditionalJoinMismatch);
     }
 
     let authority = PrivateFrameConditionalJoinAccountingAuthority {
@@ -3990,6 +4087,91 @@ mod return_mechanics_manifest_tests {
             store,
             PrivateFrameConditionalJoinOwnerRole::PrivateStackMechanics,
         )]));
+    }
+
+    #[test]
+    fn visible_expression_closure_is_transitive_and_stops_at_composite_boundaries() {
+        let root = id(10);
+        let middle = id(11);
+        let leaf = id(12);
+        let dependencies = BTreeMap::from([
+            (root, BTreeSet::from([middle])),
+            (middle, BTreeSet::from([leaf])),
+            (leaf, BTreeSet::new()),
+        ]);
+        assert_eq!(
+            exact_visible_expression_closure([root], &BTreeSet::new(), &dependencies),
+            Some(BTreeSet::from([root, middle, leaf]))
+        );
+
+        let rewritten_load = id(20);
+        let private_address = id(21);
+        let bounded = BTreeMap::from([
+            (root, BTreeSet::from([rewritten_load])),
+            (rewritten_load, BTreeSet::from([private_address])),
+        ]);
+        assert_eq!(
+            exact_visible_expression_closure([root], &BTreeSet::from([rewritten_load]), &bounded,),
+            Some(BTreeSet::from([root]))
+        );
+        assert_eq!(
+            exact_visible_expression_closure(
+                [rewritten_load],
+                &BTreeSet::from([rewritten_load]),
+                &BTreeMap::new(),
+            ),
+            Some(BTreeSet::new())
+        );
+    }
+
+    #[test]
+    fn visible_expression_closure_keeps_shared_mechanics_dependencies_visible() {
+        let root = id(25);
+        let shared_mechanics = id(26);
+        let rewritten_load = id(27);
+        let private_address = id(28);
+        let dependencies = BTreeMap::from([
+            (root, BTreeSet::from([shared_mechanics, rewritten_load])),
+            (shared_mechanics, BTreeSet::new()),
+            (rewritten_load, BTreeSet::from([private_address])),
+        ]);
+        assert_eq!(
+            exact_visible_expression_closure(
+                [root],
+                &BTreeSet::from([rewritten_load]),
+                &dependencies,
+            ),
+            Some(BTreeSet::from([root, shared_mechanics]))
+        );
+    }
+
+    #[test]
+    fn visible_expression_closure_refuses_missing_and_cyclic_dependencies() {
+        let root = id(30);
+        let missing = id(31);
+        assert_eq!(
+            exact_visible_expression_closure(
+                [root],
+                &BTreeSet::new(),
+                &BTreeMap::from([(root, BTreeSet::from([missing]))]),
+            ),
+            None
+        );
+        assert_eq!(
+            exact_visible_expression_closure(
+                [root],
+                &BTreeSet::new(),
+                &BTreeMap::from([
+                    (root, BTreeSet::from([missing])),
+                    (missing, BTreeSet::from([root])),
+                ]),
+            ),
+            None
+        );
+        assert_eq!(
+            exact_visible_expression_closure([root], &BTreeSet::new(), &BTreeMap::new()),
+            None
+        );
     }
 
     #[test]

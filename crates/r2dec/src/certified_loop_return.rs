@@ -26,7 +26,8 @@ use crate::certified_region::{
 use crate::semantic_c::{
     SemanticCError, SemanticCExprId, SemanticCExprKind, SemanticCFunctionInterface,
     SemanticCFunctionReturn, SemanticCHelperSet, SemanticCInputOrigin, SemanticCReturn,
-    insert_semantic_c_helpers, logical_return_type, render_logical_return_statement, storage_type,
+    insert_semantic_c_helpers, logical_return_type, render_logical_parameter_declarations,
+    render_logical_return_statement, render_parameter_graph_binding_prologue, storage_type,
     value_name,
 };
 use crate::semantic_stmt::{SemanticCBlockStepLayer, SemanticCStatementError};
@@ -540,8 +541,9 @@ impl CertifiedLoopReturnFunction {
         output.push('\n');
         write!(&mut output, "{} {}(", return_type(interface)?, self.name)
             .expect("String writes cannot fail");
-        render_parameters(&mut output, interface)?;
+        output.push_str(&render_logical_parameter_declarations(interface)?);
         output.push_str(") {\n");
+        output.push_str(&render_parameter_graph_binding_prologue(interface)?);
         writeln!(
             &mut output,
             "\twhile ((uint8_t){} {operator} UINT8_C(0x0)) {{",
@@ -657,21 +659,6 @@ fn return_type(
     interface: &SemanticCFunctionInterface,
 ) -> Result<&'static str, LoopReturnFunctionError> {
     Ok(logical_return_type(interface)?)
-}
-
-fn render_parameters(
-    output: &mut String,
-    interface: &SemanticCFunctionInterface,
-) -> Result<(), LoopReturnFunctionError> {
-    let [parameter] = interface.parameters() else {
-        return Err(LoopReturnFunctionError::InvalidCondition);
-    };
-    let name = parameter
-        .value()
-        .map(value_name)
-        .ok_or(LoopReturnFunctionError::InvalidCondition)?;
-    write!(output, "{} {name}", storage_type(parameter.ty())?).expect("String writes cannot fail");
-    Ok(())
 }
 
 fn render_return(
