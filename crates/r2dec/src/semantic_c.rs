@@ -6,12 +6,14 @@
 //! names and rendered positions are never consulted as evidence.
 
 use r2cert::{
-    CertifiedAbiParameter, CertifiedCallArgument, CertifiedCallArgumentOrigin, CertifiedDirectCall,
-    CertifiedExpr, CertifiedFramePreservation, CertifiedMachineFunction,
-    CertifiedMachineProjection, CertifiedMemoryStatement, CertifiedMemoryStatementKind,
-    CertifiedNormalizedStackRange, CertifiedReturnControl, CertifiedReturnRegisterDefinition,
-    CertifiedReturnRegisterOverlay, CertifiedSourceTerminator, CertifiedSourceTopology,
-    CertifiedStackSlot, EffectDisposition, ObligationLedger,
+    CERTIFICATION_SCHEMA_VERSION, CertifiedAbiParameter, CertifiedCallArgument,
+    CertifiedCallArgumentOrigin, CertifiedDirectCall, CertifiedExpr, CertifiedFramePreservation,
+    CertifiedMachineFunction, CertifiedMachineProjection, CertifiedMemoryStatement,
+    CertifiedMemoryStatementKind, CertifiedNormalizedStackRange,
+    CertifiedPrivateFrameConditionalJoin, CertifiedReturnControl,
+    CertifiedReturnRegisterDefinition, CertifiedReturnRegisterOverlay, CertifiedSourceTerminator,
+    CertifiedSourceTopology, CertifiedStackDiscipline, CertifiedStackSlot, EffectDisposition,
+    ObligationLedger,
 };
 use r2ssa::{
     CallBoundarySlot, CallSiteId, CanonicalInstructionId, CanonicalStorageId,
@@ -27,7 +29,7 @@ use r2ssa::{
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const SEMANTIC_C_SCHEMA_VERSION: u32 = 14;
+pub const SEMANTIC_C_SCHEMA_VERSION: u32 = 15;
 
 /// Closed renderer-owned helper vocabulary. Membership is derived only while
 /// rendering audited typed semantics and never grants certification authority.
@@ -403,6 +405,10 @@ pub enum SemanticCInputOrigin {
         offset: i64,
         size_bytes: u32,
         object: Option<ObjectId>,
+    },
+    CertifiedPrivateEntryStackPointer {
+        storage: CanonicalStorageId,
+        header: u64,
     },
     UnclassifiedSource,
 }
@@ -1016,6 +1022,7 @@ pub enum SemanticCError {
     InconsistentInputType(ValueId),
     UnclassifiedSourceInput(ValueId),
     InvalidCertifiedFunctionInterface,
+    InvalidCertifiedPrivateFrameInput,
     InvalidReturnProjection,
     MissingReturnExpression(CanonicalInstructionId),
     ReturnBindingMismatch(CanonicalInstructionId),
@@ -1360,11 +1367,83 @@ fn semantic_function_interface(
     }))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CertifiedPrivateEntryStackPointerInput {
+    binding: MachineValueBinding,
+    ty: MachineType,
+    storage: CanonicalStorageId,
+    header: u64,
+}
+
+impl CertifiedPrivateEntryStackPointerInput {
+    pub(crate) fn classify(
+        &self,
+        binding: MachineValueBinding,
+        ty: &MachineType,
+    ) -> SemanticCInputOrigin {
+        if binding == self.binding && ty == &self.ty {
+            SemanticCInputOrigin::CertifiedPrivateEntryStackPointer {
+                storage: self.storage,
+                header: self.header,
+            }
+        } else {
+            SemanticCInputOrigin::UnclassifiedSource
+        }
+    }
+}
+
+pub(crate) fn certified_private_entry_stack_pointer_input(
+    certified: &CertifiedMachineProjection,
+    join: Option<&CertifiedPrivateFrameConditionalJoin>,
+    stack: Option<&CertifiedStackDiscipline>,
+) -> Result<CertifiedPrivateEntryStackPointerInput, SemanticCError> {
+    let (Some(join), Some(stack)) = (join, stack) else {
+        return Err(SemanticCError::InvalidCertifiedPrivateFrameInput);
+    };
+    let origin = certified.origin();
+    let entry = stack.entry_stack_pointer();
+    let width_bits = stack
+        .stack_pointer_storage()
+        .size
+        .checked_mul(8)
+        .ok_or(SemanticCError::InvalidCertifiedPrivateFrameInput)?;
+    if origin.schema_version() != CERTIFICATION_SCHEMA_VERSION
+        || join.schema_version() != CERTIFICATION_SCHEMA_VERSION
+        || stack.schema_version() != CERTIFICATION_SCHEMA_VERSION
+        || join.origin() != origin
+        || stack.origin() != origin
+        || join.header() != certified.topology().entry_addr()
+        || certified.private_frame_conditional_join(join.header()) != Some(join)
+        || certified.stack_discipline() != Some(stack)
+        || entry.binding().width_bits() != width_bits
+        || entry.producer().is_some()
+        || entry.memory_access().is_some()
+        || entry.ty().width_bits() != width_bits
+    {
+        return Err(SemanticCError::InvalidCertifiedPrivateFrameInput);
+    }
+    Ok(CertifiedPrivateEntryStackPointerInput {
+        binding: entry.binding(),
+        ty: entry.ty().clone(),
+        storage: stack.stack_pointer_storage(),
+        header: join.header(),
+    })
+}
+
 fn classify_input(
     binding: MachineValueBinding,
     ty: &MachineType,
     interface: Option<&SemanticCFunctionInterface>,
+    private_entry_stack_pointer: Option<&CertifiedPrivateEntryStackPointerInput>,
 ) -> SemanticCInputOrigin {
+    if let Some(origin) =
+        private_entry_stack_pointer.and_then(|input| match input.classify(binding, ty) {
+            origin @ SemanticCInputOrigin::CertifiedPrivateEntryStackPointer { .. } => Some(origin),
+            _ => None,
+        })
+    {
+        return origin;
+    }
     if let Some(parameter) = interface
         .into_iter()
         .flat_map(SemanticCFunctionInterface::parameters)
@@ -2233,7 +2312,24 @@ impl SemanticCExpressionLayer {
         Self::from_source(certified)
     }
 
+    pub(crate) fn from_private_frame_conditional_join(
+        certified: &CertifiedMachineProjection,
+        join: &CertifiedPrivateFrameConditionalJoin,
+        stack: &CertifiedStackDiscipline,
+    ) -> Result<Self, SemanticCError> {
+        let input =
+            certified_private_entry_stack_pointer_input(certified, Some(join), Some(stack))?;
+        Self::from_source_with_private_entry_stack_pointer(certified, Some(&input))
+    }
+
     fn from_source(certified: &impl CertifiedSemanticSource) -> Result<Self, SemanticCError> {
+        Self::from_source_with_private_entry_stack_pointer(certified, None)
+    }
+
+    fn from_source_with_private_entry_stack_pointer(
+        certified: &impl CertifiedSemanticSource,
+        private_entry_stack_pointer: Option<&CertifiedPrivateEntryStackPointerInput>,
+    ) -> Result<Self, SemanticCError> {
         let function_interface = semantic_function_interface(certified)?;
         let machine = certified.machine_view();
         let return_plan = derive_return_mechanics_plan(certified)?;
@@ -2374,7 +2470,12 @@ impl SemanticCExpressionLayer {
             .map(|(binding, ty)| {
                 (
                     *binding,
-                    classify_input(*binding, ty, function_interface.as_ref()),
+                    classify_input(
+                        *binding,
+                        ty,
+                        function_interface.as_ref(),
+                        private_entry_stack_pointer,
+                    ),
                 )
             })
             .collect::<BTreeMap<_, _>>();

@@ -35,6 +35,7 @@ pub mod certified_control;
 pub mod certified_if_return;
 pub mod certified_loop;
 pub mod certified_loop_return;
+pub mod certified_private_frame_join;
 pub mod certified_region;
 pub mod certified_return;
 pub mod certified_structure;
@@ -93,6 +94,13 @@ pub use certified_loop_return::{
     CertifiedLoopReturnFunction, LoopExecutionOutcome, LoopReturnDifferentialCase,
     LoopReturnDifferentialReport, LoopReturnFunctionAuditReport, LoopReturnFunctionError,
     LoopReturnFunctionScope, LoopReturnValue, check_loop_return_differential,
+};
+pub use certified_private_frame_join::{
+    CERTIFIED_PRIVATE_FRAME_JOIN_REWRITE_SCHEMA_VERSION,
+    CertifiedPrivateFrameConditionalJoinRewrite, CertifiedPrivateFrameConditionalJoinRewriteScope,
+    CertifiedPrivateFrameDirectSubstitution, CertifiedPrivateFrameJoinValue,
+    CertifiedPrivateFrameJoinValueOrigin, CertifiedPrivateFrameJoinedSelect,
+    PrivateFrameConditionalJoinRewriteError,
 };
 pub use certified_region::{
     CERTIFIED_REGION_SCHEMA_VERSION, CertifiedRegionInstruction, CertifiedSingleBlockAccounting,

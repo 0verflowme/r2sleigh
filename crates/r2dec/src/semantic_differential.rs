@@ -5707,23 +5707,41 @@ mod tests {
     use std::ffi::c_void;
     use std::mem::size_of;
 
+    use crate::certified_private_frame_join::{
+        canonical_private_frame_accesses_for_test,
+        certified_private_frame_join_rewrite_from_parts_for_test,
+        private_frame_condition_accesses_for_test,
+    };
+    use crate::semantic_c::{
+        SemanticCError, SemanticCExprKind, SemanticCInputOrigin,
+        certified_private_entry_stack_pointer_input,
+    };
+    use crate::{
+        CERTIFIED_PRIVATE_FRAME_JOIN_REWRITE_SCHEMA_VERSION,
+        CertifiedPrivateFrameConditionalJoinRewrite,
+        CertifiedPrivateFrameConditionalJoinRewriteScope, CertifiedPrivateFrameJoinValueOrigin,
+        PrivateFrameConditionalJoinRewriteError,
+    };
+
     use r2cert::{
         CERTIFIED_PRIVATE_FRAME_CONDITIONAL_JOIN_CONTRACT_VERSION, CertifiedMachineFunction,
-        CertifiedTypedRegionKind, LedgerClosureError, TypedRegionMapping,
-        certify_private_frame_conditional_join_region,
+        CertifiedMemoryStatementKind, CertifiedTypedRegionKind, LedgerClosureError,
+        TypedRegionMapping, certify_private_frame_conditional_join_region,
     };
 
     use r2source::{
-        RADARE_ABI_VERSION, RADARE_CAP_EXACT_FUNCTION_INTERFACE, RADARE_CAP_EXACT_RETURN_MECHANISM,
-        RADARE_CAP_EXACT_STACK_ALLOCATION_CONTRACT, RADARE_CAP_EXACT_STACK_SLOT_ROLES,
-        RADARE_CAP_OWNED_BOUNDED_FUNCTION_IMAGE, RADARE_CAP_RETURN_ADDRESS_STORAGE,
-        RADARE_CAP_REVISION, RADARE_CAP_STACK_POINTER_STORAGE, RADARE_CAP_STACK_SLOTS,
-        RADARE_ENDIAN_LITTLE, RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION,
-        RADARE_SNAPSHOT_ACCESSOR_SCHEMA_VERSION, RadareAbi138Accessors, RadareAbi138BlockView,
-        RadareAbi138FunctionInterfaceView, RadareAbi138ParameterView,
-        RadareAbi138RegisterStorageView, RadareAbi138ReturnMechanismView,
-        RadareAbi138SnapshotInput, RadareAbi138SnapshotView,
+        RADARE_ABI_VERSION, RADARE_CAP_EXACT_FUNCTION_INTERFACE, RADARE_CAP_EXACT_FUNCTION_TYPES,
+        RADARE_CAP_EXACT_RETURN_MECHANISM, RADARE_CAP_EXACT_STACK_ALLOCATION_CONTRACT,
+        RADARE_CAP_EXACT_STACK_SLOT_ROLES, RADARE_CAP_OWNED_BOUNDED_FUNCTION_IMAGE,
+        RADARE_CAP_RETURN_ADDRESS_STORAGE, RADARE_CAP_REVISION, RADARE_CAP_STACK_POINTER_STORAGE,
+        RADARE_CAP_STACK_SLOTS, RADARE_CAP_TYPES, RADARE_ENDIAN_LITTLE,
+        RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION, RADARE_SNAPSHOT_ACCESSOR_SCHEMA_VERSION,
+        RadareAbi138Accessors, RadareAbi138AggregateMemberView, RadareAbi138AggregateView,
+        RadareAbi138BlockView, RadareAbi138CarrierProjection, RadareAbi138FunctionInterfaceView,
+        RadareAbi138ParameterView, RadareAbi138RegisterStorageView,
+        RadareAbi138ReturnMechanismView, RadareAbi138SnapshotInput, RadareAbi138SnapshotView,
         RadareAbi138StackAllocationContractView, RadareAbi138SuccessorView,
+        RadareAbi138TypeGraphView, RadareAbi138TypeView,
     };
 
     #[test]
@@ -5764,8 +5782,12 @@ mod tests {
         blocks: Vec<NativeSpanBlockFixture>,
         return_address: RadareAbi138RegisterStorageView,
         stack_pointer: RadareAbi138RegisterStorageView,
+        scalar_return: Option<RadareAbi138RegisterStorageView>,
         return_address_name: String,
         stack_pointer_name: String,
+        scalar_return_name: Option<String>,
+        parameter: Option<RadareAbi138ParameterView>,
+        parameter_name: Option<String>,
         exact_private_stack: bool,
     }
 
@@ -5782,6 +5804,11 @@ mod tests {
                     | RADARE_CAP_EXACT_STACK_SLOT_ROLES
                     | RADARE_CAP_RETURN_ADDRESS_STORAGE
                     | RADARE_CAP_STACK_POINTER_STORAGE
+                    | if self.parameter.is_some() {
+                        RADARE_CAP_EXACT_FUNCTION_TYPES | RADARE_CAP_TYPES
+                    } else {
+                        0
+                    }
                     | if self.exact_private_stack {
                         RADARE_CAP_EXACT_RETURN_MECHANISM
                             | RADARE_CAP_EXACT_STACK_ALLOCATION_CONTRACT
@@ -5799,6 +5826,7 @@ mod tests {
                 num_blocks: self.blocks.len(),
                 num_external_exits: self.external_exits().len(),
                 total_source_bytes: self.blocks.iter().map(|block| block.bytes.len()).sum(),
+                num_types: if self.parameter.is_some() { 2 } else { 0 },
                 ..Default::default()
             }
         }
@@ -5883,13 +5911,29 @@ mod tests {
         unsafe {
             out.write(RadareAbi138FunctionInterfaceView {
                 calling_convention_length: 4,
-                return_kind: 1,
+                num_parameters: usize::from(fixture.parameter.is_some()),
+                return_kind: if fixture.parameter.is_some() { 2 } else { 1 },
+                return_storage: fixture.scalar_return.unwrap_or_default(),
                 return_address_storage: fixture.return_address,
                 stack_pointer_storage: fixture.stack_pointer,
                 stack_resources_complete: 1,
                 stack_slot_roles_complete: 1,
                 complete: 1,
-                return_type_id: u32::MAX,
+                return_type_id: if fixture.parameter.is_some() {
+                    1
+                } else {
+                    u32::MAX
+                },
+                return_carrier: if fixture.parameter.is_some() {
+                    RadareAbi138CarrierProjection {
+                        kind: 2,
+                        offset_bits: 0,
+                        size_bits: 32,
+                    }
+                } else {
+                    RadareAbi138CarrierProjection::default()
+                },
+                logical_types_complete: u8::from(fixture.parameter.is_some()),
                 ..Default::default()
             })
         };
@@ -5914,6 +5958,11 @@ mod tests {
         // SAFETY: the callback receives the live fixture pointer.
         let fixture = unsafe { fixture(snapshot) };
         let name = match kind {
+            0 => fixture
+                .scalar_return_name
+                .as_ref()
+                .map(String::as_bytes)
+                .unwrap_or_default(),
             1 => fixture.return_address_name.as_bytes(),
             2 => fixture.stack_pointer_name.as_bytes(),
             _ => return 0,
@@ -5922,17 +5971,95 @@ mod tests {
         unsafe { copy_fixture_string(name, out, capacity) }
     }
 
-    unsafe extern "C" fn unused_parameter_view(
+    unsafe extern "C" fn parameter_view(
+        snapshot: *const c_void,
+        index: usize,
+        out: *mut RadareAbi138ParameterView,
+    ) -> u8 {
+        let fixture = unsafe { fixture(snapshot) };
+        let Some(parameter) = fixture.parameter.filter(|_| index == 0) else {
+            return 0;
+        };
+        unsafe { out.write(parameter) };
+        1
+    }
+
+    unsafe extern "C" fn parameter_name(
+        snapshot: *const c_void,
+        index: usize,
+        out: *mut u8,
+        capacity: usize,
+    ) -> u8 {
+        let fixture = unsafe { fixture(snapshot) };
+        let Some(name) = fixture.parameter_name.as_ref().filter(|_| index == 0) else {
+            return 0;
+        };
+        unsafe { copy_fixture_string(name.as_bytes(), out, capacity) }
+    }
+
+    unsafe extern "C" fn type_graph_view(
+        snapshot: *const c_void,
+        out: *mut RadareAbi138TypeGraphView,
+    ) -> u8 {
+        let fixture = unsafe { fixture(snapshot) };
+        if fixture.parameter.is_none() {
+            return 0;
+        }
+        unsafe {
+            out.write(RadareAbi138TypeGraphView {
+                num_types: 2,
+                num_aggregates: 0,
+                complete: 1,
+            })
+        };
+        1
+    }
+
+    unsafe extern "C" fn type_view(
+        snapshot: *const c_void,
+        index: usize,
+        out: *mut RadareAbi138TypeView,
+    ) -> u8 {
+        let fixture = unsafe { fixture(snapshot) };
+        let size_bits = match (fixture.parameter.is_some(), index) {
+            (true, 0) => 64,
+            (true, 1) => 32,
+            _ => return 0,
+        };
+        unsafe {
+            out.write(RadareAbi138TypeView {
+                id: u32::try_from(index).expect("type index fits u32"),
+                kind: 2,
+                size_bits,
+                align_bits: size_bits,
+                target_type_id: u32::MAX,
+                aggregate_id: u32::MAX,
+            })
+        };
+        1
+    }
+
+    unsafe extern "C" fn unused_aggregate_view(
         _snapshot: *const c_void,
         _index: usize,
-        _out: *mut RadareAbi138ParameterView,
+        _out: *mut RadareAbi138AggregateView,
     ) -> u8 {
         0
     }
 
-    unsafe extern "C" fn unused_parameter_name(
+    unsafe extern "C" fn unused_aggregate_member_view(
         _snapshot: *const c_void,
-        _index: usize,
+        _aggregate: usize,
+        _member: usize,
+        _out: *mut RadareAbi138AggregateMemberView,
+    ) -> u8 {
+        0
+    }
+
+    unsafe extern "C" fn unused_aggregate_member_name(
+        _snapshot: *const c_void,
+        _aggregate: usize,
+        _member: usize,
         _out: *mut u8,
         _capacity: usize,
     ) -> u8 {
@@ -6060,6 +6187,7 @@ mod tests {
         blocks: Vec<NativeSpanBlockFixture>,
         addr: u64,
         exact_private_stack: bool,
+        parameter_register: Option<&str>,
     ) -> (
         TrustedSsaArtifact,
         Vec<r2il::R2ILBlock>,
@@ -6075,6 +6203,36 @@ mod tests {
         let stack_pointer = trusted_disassembler
             .register("RSP")
             .expect("trusted RSP register");
+        let parameter = parameter_register.map(|name| {
+            let register = trusted_disassembler
+                .register(name)
+                .expect("trusted parameter register");
+            RadareAbi138ParameterView {
+                index: 0,
+                storage: RadareAbi138RegisterStorageView {
+                    name_length: name.len(),
+                    offset: register.address.offset,
+                    size: u32::try_from(register.size).expect("parameter size fits u32"),
+                },
+                logical_type_id: 0,
+                carrier: RadareAbi138CarrierProjection {
+                    kind: 1,
+                    offset_bits: 0,
+                    size_bits: 64,
+                },
+                ..Default::default()
+            }
+        });
+        let scalar_return = parameter_register.map(|_| {
+            let register = trusted_disassembler
+                .register("RAX")
+                .expect("trusted RAX register");
+            RadareAbi138RegisterStorageView {
+                name_length: 3,
+                offset: register.address.offset,
+                size: u32::try_from(register.size).expect("RAX size fits u32"),
+            }
+        });
         let fixture = NativeSpanSnapshotFixture {
             addr,
             blocks,
@@ -6088,8 +6246,12 @@ mod tests {
                 offset: stack_pointer.address.offset,
                 size: u32::try_from(stack_pointer.size).expect("RSP size fits u32"),
             },
+            scalar_return,
             return_address_name: "RIP".to_string(),
             stack_pointer_name: "RSP".to_string(),
+            scalar_return_name: parameter_register.map(|_| "RAX".to_string()),
+            parameter,
+            parameter_name: parameter_register.map(str::to_string),
             exact_private_stack,
         };
         let accessors = RadareAbi138Accessors {
@@ -6105,8 +6267,14 @@ mod tests {
             interface_view: Some(interface_view),
             interface_calling_convention: Some(interface_calling_convention),
             interface_storage_name: Some(interface_storage_name),
-            parameter_view: Some(unused_parameter_view),
-            parameter_storage_name: Some(unused_parameter_name),
+            parameter_view: Some(parameter_view),
+            parameter_storage_name: Some(parameter_name),
+            type_graph_view: Some(type_graph_view),
+            type_view: Some(type_view),
+            aggregate_view: Some(unused_aggregate_view),
+            aggregate_name: Some(parameter_name),
+            aggregate_member_view: Some(unused_aggregate_member_view),
+            aggregate_member_name: Some(unused_aggregate_member_name),
             block_view: Some(block_view),
             block_bytes: Some(block_bytes),
             successor_view: Some(successor_view),
@@ -6187,6 +6355,7 @@ mod tests {
             }],
             addr,
             exact_private_stack,
+            None,
         );
         let [block] = blocks.try_into().expect("one lifted block");
         let [spans] = spans.try_into().expect("one lifted block span set");
@@ -6209,7 +6378,7 @@ mod tests {
         zero_op_forwarder: bool,
     ) -> Vec<NativeSpanBlockFixture> {
         let header_addr = addr;
-        let false_addr = header_addr + 7;
+        let false_addr = header_addr + 17;
         let false_size = 10_u64;
         let forwarder_addr = false_addr + false_size;
         let forwarder_size = if zero_op_forwarder { 3_u64 } else { 2_u64 };
@@ -6238,7 +6407,17 @@ mod tests {
                     0x8d,
                     0x64,
                     0x24,
-                    0xf0, // lea rsp, [rsp-16]
+                    0xe0, // lea rsp, [rsp-32]
+                    0x48,
+                    0x89,
+                    0x4c,
+                    0x24,
+                    0x08, // mov qword [rsp+8], rcx
+                    0x48,
+                    0x8b,
+                    0x4c,
+                    0x24,
+                    0x08, // mov rcx, qword [rsp+8]
                     0xe3,
                     rel8(false_addr, forwarder_addr), // jrcxz forwarder
                 ],
@@ -6261,11 +6440,11 @@ mod tests {
                     0xc7,
                     0x44,
                     0x24,
-                    0x08,
+                    0x18,
                     0x00,
                     0x00,
                     0x00,
-                    0x00, // mov dword [rsp+8], 0
+                    0x00, // mov dword [rsp+24], 0
                     0xeb,
                     rel8(forwarder_addr, join_addr), // jmp join
                 ],
@@ -6290,11 +6469,11 @@ mod tests {
                     0xc7,
                     0x44,
                     0x24,
-                    0x08,
+                    0x18,
                     0x01,
                     0x00,
                     0x00,
-                    0x00, // mov dword [rsp+8], 1
+                    0x00, // mov dword [rsp+24], 1
                     0xeb,
                     rel8(join_addr, join_addr), // jmp join
                 ],
@@ -6307,8 +6486,8 @@ mod tests {
             NativeSpanBlockFixture {
                 addr: join_addr,
                 bytes: vec![
-                    0x8b, 0x44, 0x24, 0x08, // mov eax, dword [rsp+8]
-                    0x48, 0x8d, 0x64, 0x24, 0x10, // lea rsp, [rsp+16]
+                    0x8b, 0x44, 0x24, 0x18, // mov eax, dword [rsp+24]
+                    0x48, 0x8d, 0x64, 0x24, 0x20, // lea rsp, [rsp+32]
                     0xc3, // ret
                 ],
                 successors: Vec::new(),
@@ -6468,6 +6647,10 @@ mod tests {
             full.private_frame_value_flows(),
             projection.private_frame_value_flows()
         );
+        assert_eq!(
+            CertifiedPrivateFrameConditionalJoinRewrite::from_artifact(&trusted),
+            Err(PrivateFrameConditionalJoinRewriteError::MissingExactJoin)
+        );
 
         let (trusted, _, _) = trusted_x86_fixture(UNINITIALIZED_LOAD, ADDR + 0x100, true, true);
         let full = CertifiedMachineFunction::from_artifact(&trusted)
@@ -6486,7 +6669,8 @@ mod tests {
         let source_blocks = conditional_private_join_blocks(ADDR, false);
         let header = source_blocks[0].addr;
         let join_addr = source_blocks[4].addr;
-        let (trusted, lifted, spans) = trusted_x86_blocks_fixture(source_blocks, ADDR, true);
+        let (trusted, lifted, spans) =
+            trusted_x86_blocks_fixture(source_blocks, ADDR, true, Some("RCX"));
         assert_eq!(lifted.len(), 5);
         assert_eq!(spans.len(), 5);
         assert!(spans.iter().flatten().all(|span| span.3 != 0));
@@ -6497,7 +6681,7 @@ mod tests {
             .expect("projected genuine conditional private-frame certificate");
         assert!(full.stack_discipline().is_some());
         assert!(projection.stack_discipline().is_some());
-        assert_eq!(full.private_frame_value_flows().len(), 1);
+        assert_eq!(full.private_frame_value_flows().len(), 2);
         assert_eq!(
             full.private_frame_value_flows(),
             projection.private_frame_value_flows()
@@ -6513,7 +6697,190 @@ mod tests {
         assert_eq!(certificate.join_block(), join_addr);
         assert_eq!(certificate.true_arm().transparent().len(), 1);
         assert!(certificate.false_arm().transparent().is_empty());
+        assert_eq!(certificate.auxiliary_direct_flows().len(), 1);
         assert!(certificate.release().return_address_read().is_some());
+        let rewrite = CertifiedPrivateFrameConditionalJoinRewrite::from_artifact(&trusted)
+            .expect("genuine private-frame conditional-join rewrite plan");
+        assert_eq!(
+            rewrite.schema_version(),
+            CERTIFIED_PRIVATE_FRAME_JOIN_REWRITE_SCHEMA_VERSION
+        );
+        assert_eq!(
+            rewrite.scope(),
+            CertifiedPrivateFrameConditionalJoinRewriteScope::ProofBoundRewritePlanOnly
+        );
+        assert_eq!(rewrite.origin(), projection.origin());
+        assert_eq!(rewrite.machine_join(), certificate);
+        let [direct] = rewrite.direct_substitutions() else {
+            panic!("one exact auxiliary direct substitution")
+        };
+        let [(auxiliary_access, auxiliary_flow)] = certificate.auxiliary_direct_flows() else {
+            panic!("one exact auxiliary direct flow")
+        };
+        assert_eq!(direct.load_access(), *auxiliary_access);
+        let auxiliary_load = match auxiliary_flow.load().statement().kind() {
+            CertifiedMemoryStatementKind::Read { result } => result,
+            CertifiedMemoryStatementKind::Write { .. } => panic!("auxiliary direct load"),
+        };
+        assert_eq!(direct.load_result(), auxiliary_load);
+        assert!(matches!(
+            rewrite.expression_layer().expr(direct.load_root()).map(|expression| expression.kind()),
+            Some(SemanticCExprKind::MemoryRead { access, .. }) if *access == direct.load_access()
+        ));
+        let auxiliary_store = auxiliary_flow
+            .definition(auxiliary_flow.root_version())
+            .and_then(|definition| definition.store())
+            .expect("auxiliary direct root store");
+        let auxiliary_store_value = match auxiliary_store.statement().kind() {
+            CertifiedMemoryStatementKind::Write { value } => value,
+            CertifiedMemoryStatementKind::Read { .. } => panic!("auxiliary direct store"),
+        };
+        assert_eq!(direct.replacement().value(), auxiliary_store_value);
+        assert!(matches!(
+            direct.replacement().origin(),
+            CertifiedPrivateFrameJoinValueOrigin::Produced { producer, root }
+                if Some(*producer) == direct.replacement().value().producer()
+                    && rewrite.expression_layer().expr(*root).is_some()
+        ));
+        let condition_accesses = private_frame_condition_accesses_for_test(&rewrite)
+            .expect("exact expanded condition accesses");
+        assert_eq!(condition_accesses, vec![direct.load_access()]);
+        assert_ne!(direct.load_access(), rewrite.joined_select().load_access());
+        assert!(!condition_accesses.contains(&rewrite.joined_select().load_access()));
+        let reversed = [rewrite.joined_select().load_access(), direct.load_access()];
+        let canonical = canonical_private_frame_accesses_for_test(reversed)
+            .expect("canonical exact access order");
+        let mut expected = reversed;
+        expected.sort();
+        assert_eq!(canonical, expected);
+        assert!(canonical.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(
+            canonical_private_frame_accesses_for_test(
+                [direct.load_access(), direct.load_access(),]
+            )
+            .is_err()
+        );
+        assert!(!rewrite.open_obligations().is_empty());
+        assert_eq!(
+            rewrite.joined_select().load_access(),
+            certificate.joined_flow().load().statement().access()
+        );
+        assert_eq!(
+            rewrite.joined_select().truthiness(),
+            certificate.condition().truthiness()
+        );
+        assert!(matches!(
+            rewrite.joined_select().true_value().origin(),
+            CertifiedPrivateFrameJoinValueOrigin::Produced { producer, .. }
+                if Some(*producer) == rewrite.joined_select().true_value().value().producer()
+        ));
+        assert!(matches!(
+            rewrite.joined_select().false_value().origin(),
+            CertifiedPrivateFrameJoinValueOrigin::Produced { producer, .. }
+                if Some(*producer) == rewrite.joined_select().false_value().value().producer()
+        ));
+        let true_store_value = match certificate.true_arm().store().statement().kind() {
+            CertifiedMemoryStatementKind::Write { value } => value,
+            CertifiedMemoryStatementKind::Read { .. } => panic!("conditional arm store"),
+        };
+        let false_store_value = match certificate.false_arm().store().statement().kind() {
+            CertifiedMemoryStatementKind::Write { value } => value,
+            CertifiedMemoryStatementKind::Read { .. } => panic!("conditional arm store"),
+        };
+        assert_eq!(
+            rewrite.joined_select().true_value().value(),
+            true_store_value
+        );
+        assert_eq!(
+            rewrite.joined_select().false_value().value(),
+            false_store_value
+        );
+        assert_eq!(
+            rewrite.joined_select().true_value().value().ty(),
+            rewrite.joined_select().load_result().ty()
+        );
+        assert_eq!(
+            rewrite.joined_select().false_value().value().ty(),
+            rewrite.joined_select().load_result().ty()
+        );
+        let interface = rewrite
+            .expression_layer()
+            .function_interface()
+            .expect("exact scalar fixture interface");
+        let return_projection = interface
+            .return_projection()
+            .expect("exact low-bits return projection");
+        assert_eq!(return_projection.physical_ty().width_bits(), 64);
+        assert_eq!(return_projection.logical_ty().width_bits(), 32);
+        assert_eq!(
+            rewrite
+                .expression_layer()
+                .expr(rewrite.joined_select().return_root())
+                .expect("exact return DAG root")
+                .ty()
+                .width_bits(),
+            64
+        );
+        assert_eq!(rewrite.joined_select().load_result().ty().width_bits(), 32);
+        assert_eq!(
+            rewrite.ledger_closure().region_kind(),
+            CertifiedTypedRegionKind::PrivateFrameConditionalJoinFunction
+        );
+        assert_eq!(
+            rewrite.ledger_closure().region_schema_version(),
+            CERTIFIED_PRIVATE_FRAME_CONDITIONAL_JOIN_CONTRACT_VERSION
+        );
+        assert_eq!(rewrite.ledger_closure().origin(), rewrite.origin());
+
+        let projected_join = projection
+            .private_frame_conditional_join(header)
+            .expect("projected header-keyed conditional join");
+        let stack = projection
+            .stack_discipline()
+            .expect("projected private stack discipline");
+        let private_stack_input = certified_private_entry_stack_pointer_input(
+            &projection,
+            Some(projected_join),
+            Some(stack),
+        )
+        .expect("exact certified private entry stack pointer");
+        assert_eq!(
+            private_stack_input.classify(
+                stack.entry_stack_pointer().binding(),
+                stack.entry_stack_pointer().ty(),
+            ),
+            SemanticCInputOrigin::CertifiedPrivateEntryStackPointer {
+                storage: stack.stack_pointer_storage(),
+                header,
+            }
+        );
+        assert_eq!(
+            private_stack_input.classify(
+                projected_join.condition().condition().binding(),
+                stack.entry_stack_pointer().ty(),
+            ),
+            SemanticCInputOrigin::UnclassifiedSource
+        );
+        assert_eq!(
+            certified_private_entry_stack_pointer_input(&projection, None, Some(stack),),
+            Err(SemanticCError::InvalidCertifiedPrivateFrameInput)
+        );
+        assert_eq!(
+            certified_private_entry_stack_pointer_input(&projection, Some(projected_join), None,),
+            Err(SemanticCError::InvalidCertifiedPrivateFrameInput)
+        );
+        assert!(SemanticCExpressionLayer::from_projection(&projection).is_err());
+        match SemanticCExpressionLayer::from_private_frame_conditional_join(
+            &projection,
+            projected_join,
+            stack,
+        ) {
+            Ok(_) => {}
+            Err(SemanticCError::UnclassifiedSourceInput(value)) => {
+                assert_ne!(value, stack.entry_stack_pointer().binding().value());
+            }
+            Err(error) => panic!("private entry-SP seam failed unexpectedly: {error}"),
+        }
 
         let mappings = full
             .source()
@@ -6548,16 +6915,64 @@ mod tests {
             CERTIFIED_PRIVATE_FRAME_CONDITIONAL_JOIN_CONTRACT_VERSION,
             &mappings,
         ));
+        assert_eq!(rewrite.ledger_closure(), &closure);
 
         let foreign_blocks = conditional_private_join_blocks(ADDR + 0x200, false);
         let foreign_header = foreign_blocks[0].addr;
         let (foreign_trusted, _, _) =
-            trusted_x86_blocks_fixture(foreign_blocks, ADDR + 0x200, true);
+            trusted_x86_blocks_fixture(foreign_blocks, ADDR + 0x200, true, Some("RCX"));
         let foreign_full = CertifiedMachineFunction::from_artifact(&foreign_trusted)
             .expect("foreign genuine conditional private-frame certificate");
+        let foreign_projection = CertifiedMachineProjection::from_artifact(&foreign_trusted)
+            .expect("foreign genuine conditional private-frame projection");
         let foreign_join = foreign_full
             .private_frame_conditional_join(foreign_header)
             .expect("foreign sealed conditional join");
+        let foreign_stack = foreign_projection
+            .stack_discipline()
+            .expect("foreign private stack discipline");
+        assert_eq!(
+            certified_private_entry_stack_pointer_input(
+                &projection,
+                Some(foreign_join),
+                Some(stack),
+            ),
+            Err(SemanticCError::InvalidCertifiedPrivateFrameInput)
+        );
+        assert_eq!(
+            certified_private_entry_stack_pointer_input(
+                &projection,
+                Some(projected_join),
+                Some(foreign_stack),
+            ),
+            Err(SemanticCError::InvalidCertifiedPrivateFrameInput)
+        );
+        assert!(
+            SemanticCExpressionLayer::from_private_frame_conditional_join(
+                &projection,
+                foreign_join,
+                stack,
+            )
+            .is_err()
+        );
+        assert!(
+            certified_private_frame_join_rewrite_from_parts_for_test(
+                &trusted,
+                &projection,
+                foreign_join,
+                stack,
+            )
+            .is_err()
+        );
+        assert!(
+            certified_private_frame_join_rewrite_from_parts_for_test(
+                &trusted,
+                &projection,
+                projected_join,
+                foreign_stack,
+            )
+            .is_err()
+        );
         assert_eq!(
             certify_private_frame_conditional_join_region(
                 foreign_trusted.artifact(),
@@ -6581,7 +6996,7 @@ mod tests {
 
         let source_blocks = conditional_private_join_blocks(ADDR + 0x100, true);
         let (trusted, lifted, spans) =
-            trusted_x86_blocks_fixture(source_blocks, ADDR + 0x100, true);
+            trusted_x86_blocks_fixture(source_blocks, ADDR + 0x100, true, Some("RCX"));
         assert_eq!(lifted.len(), 5);
         let zero_spans = spans
             .iter()
@@ -6610,6 +7025,11 @@ mod tests {
         assert!(full.private_frame_conditional_joins().is_empty());
         assert!(projection.private_frame_conditional_joins().is_empty());
         assert!(projection.residual_producers().contains(&unsupported[0]));
+        assert!(matches!(
+            CertifiedPrivateFrameConditionalJoinRewrite::from_artifact(&trusted),
+            Err(PrivateFrameConditionalJoinRewriteError::MissingExactJoin)
+                | Err(PrivateFrameConditionalJoinRewriteError::MissingStackDiscipline)
+        ));
     }
 
     #[test]
