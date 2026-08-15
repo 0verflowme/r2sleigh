@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 
-use r2il::userops::is_arm64_pauth_userop;
 use r2ssa::{SSAOp, SSAVar};
 use r2types::TypeOracle;
 
@@ -420,11 +419,6 @@ impl<'a> LowerCtx<'a> {
                 userop,
                 inputs,
             } => {
-                if is_arm64_pauth_userop(*userop)
-                    && let Some(input) = inputs.first()
-                {
-                    return self.get_expr(input);
-                }
                 let mut args = Vec::with_capacity(inputs.len() + 1);
                 args.push(CExpr::StringLit(format!("userop_{}", userop)));
                 for input in inputs {
@@ -1485,7 +1479,7 @@ mod tests {
     }
 
     #[test]
-    fn op_to_expr_treats_arm64_pauth_as_value_preserving() {
+    fn callother_ids_share_explicit_lowering() {
         let fn_map = HashMap::new();
         let str_map = HashMap::new();
         let sym_map = HashMap::new();
@@ -1511,13 +1505,26 @@ mod tests {
             &sym_map,
         );
 
-        let expr = ctx.op_to_expr(&SSAOp::CallOther {
-            output: Some(SSAVar::new("X30", 1, 8)),
-            userop: r2il::userops::ARM64_PAUTH_AUTH_USEROP,
-            inputs: vec![SSAVar::new("X30", 0, 8), SSAVar::new("SP", 0, 8)],
-        });
+        for userop in [7, 0xffff_0001, 0xffff_0002, 0xffff_0003] {
+            let expr = ctx.op_to_expr(&SSAOp::CallOther {
+                output: Some(SSAVar::new("X30", 1, 8)),
+                userop,
+                inputs: vec![SSAVar::new("X30", 0, 8), SSAVar::new("SP", 0, 8)],
+            });
 
-        assert_eq!(expr, CExpr::Var("x30".to_string()));
+            assert_eq!(
+                expr,
+                CExpr::call(
+                    CExpr::Var("callother".to_string()),
+                    vec![
+                        CExpr::StringLit(format!("userop_{userop}")),
+                        CExpr::Var("x30".to_string()),
+                        CExpr::Var("sp".to_string()),
+                    ],
+                ),
+                "numeric userop must remain an explicit CallOther"
+            );
+        }
     }
 
     #[test]

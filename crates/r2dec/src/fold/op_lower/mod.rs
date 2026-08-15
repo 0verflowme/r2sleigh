@@ -22,7 +22,6 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use r2il::userops::is_arm64_pauth_userop;
 use r2ssa::{
     DecompilePrepFacts, MemoryDefFact, MemoryLocation, ObjectKind, ObjectModel,
     PreparedFunctionFacts, SSAFunction, SSAOp, SSAVar, SSAVarNameKind, SsaArtifact, ValueId,
@@ -14444,9 +14443,6 @@ impl<'a> FoldingContext<'a> {
                 userop,
                 inputs,
             } => {
-                if is_arm64_pauth_userop(*userop) {
-                    return None;
-                }
                 let mut args = Vec::with_capacity(inputs.len() + 1);
                 args.push(CExpr::StringLit(self.lookup_userop_name(*userop)));
                 for input in inputs {
@@ -14962,6 +14958,53 @@ fn memory_ordering_name(ordering: &r2il::MemoryOrdering) -> &'static str {
         r2il::MemoryOrdering::SeqCst => "seq_cst",
         r2il::MemoryOrdering::Unknown => "unknown",
     }
+}
+
+#[cfg(test)]
+#[test]
+fn callother_ids_share_effect_and_result_lowering() {
+    let ctx = FoldingContext::new(64);
+    let input = SSAVar::new("X30", 0, 8);
+    let output = SSAVar::new("X30", 1, 8);
+
+    for userop in [7, 0xffff_0001, 0xffff_0002, 0xffff_0003] {
+        let stmt = ctx.op_to_stmt_impl(&SSAOp::CallOther {
+            output: Some(output.clone()),
+            userop,
+            inputs: vec![input.clone()],
+        });
+        assert_eq!(
+            stmt,
+            Some(CStmt::Expr(CExpr::assign(
+                CExpr::Var("x30_1".to_string()),
+                CExpr::call(
+                    CExpr::Var("callother".to_string()),
+                    vec![
+                        CExpr::StringLit(format!("userop_{userop}")),
+                        CExpr::Var("x30".to_string()),
+                    ],
+                ),
+            ))),
+            "numeric userop must retain its explicit result assignment"
+        );
+    }
+
+    let stmt = ctx.op_to_stmt_impl(&SSAOp::CallOther {
+        output: None,
+        userop: 0xffff_0001,
+        inputs: vec![input],
+    });
+    assert_eq!(
+        stmt,
+        Some(CStmt::Expr(CExpr::call(
+            CExpr::Var("callother".to_string()),
+            vec![
+                CExpr::StringLit("userop_4294901761".to_string()),
+                CExpr::Var("x30".to_string()),
+            ],
+        ))),
+        "outputless CallOther must retain its explicit effect"
+    );
 }
 
 #[cfg(test)]
