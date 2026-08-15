@@ -2300,9 +2300,9 @@ rustc_session::declare_lint!(
     /// ### Why is this bad?
     ///
     /// Typed radare2 context fallback merging, numeric role/linkage mapping,
-    /// and schema defaults are engine/type-contract policy. Plugin glue may
-    /// copy C ABI fields into an engine-owned input DTO, but must not become a
-    /// second owner for the canonical external context schema.
+    /// and schema defaults are engine/type-contract policy. Plugin glue must
+    /// consume the borrowed opaque snapshot instead of becoming a second owner
+    /// for the canonical external context schema.
     ///
     /// ### Example
     ///
@@ -2312,7 +2312,7 @@ rustc_session::declare_lint!(
     /// r2types::parse_external_context(raw, ptr_bits)
     /// ```
     ///
-    /// Use instead `r2engine::parse_typed_external_context(...)`.
+    /// Use the opaque snapshot capture and engine-owned context pipeline instead.
     pub R2PLUGIN_TYPED_EXTERNAL_CONTEXT_OWNERSHIP,
     Warn,
     "r2plugin must not construct typed external context schema directly"
@@ -3408,18 +3408,6 @@ impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
                 R2PLUGIN_ENGINE_POLICY_OWNERSHIP,
                 item.span,
                 "r2plugin must delegate cache/session/route policy to r2engine",
-            );
-        }
-
-        if is_r2plugin_span(cx, item.span)
-            && !item_is_test_only(cx, item)
-            && plugin_typed_external_context_ownership_item(cx, item)
-        {
-            span_lint(
-                cx,
-                R2PLUGIN_TYPED_EXTERNAL_CONTEXT_OWNERSHIP,
-                item.span,
-                "r2plugin must not return ParsedExternalContext from typed FFI context; build EngineExternalContextInput and call r2engine::parse_typed_external_context",
             );
         }
 
@@ -4766,7 +4754,7 @@ impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
                 cx,
                 R2PLUGIN_TYPED_EXTERNAL_CONTEXT_OWNERSHIP,
                 expr.span,
-                "r2plugin must pass typed FFI context through r2engine::parse_typed_external_context instead of constructing r2types external context schema",
+                "r2plugin must consume opaque snapshot context instead of constructing r2types external context schema",
             );
         }
 
@@ -5278,19 +5266,6 @@ fn plugin_typed_external_context_ownership_expr(cx: &LateContext<'_>, expr: &Exp
     ]
     .iter()
     .any(|needle| snippet.contains(needle))
-}
-
-fn plugin_typed_external_context_ownership_item(cx: &LateContext<'_>, item: &Item<'_>) -> bool {
-    if !matches!(item.kind, rustc_hir::ItemKind::Fn { .. }) {
-        return false;
-    }
-    let Ok(snippet) = cx.sess().source_map().span_to_snippet(item.span) else {
-        return false;
-    };
-    snippet.contains("fn typed_function_context_to_parsed")
-        || (snippet.contains("R2SleighFunctionContext")
-            && snippet.contains("ParsedExternalContext")
-            && snippet.contains("parse_typed_external_context"))
 }
 
 fn plugin_external_type_parser_renderer_type_ownership_item(
@@ -8471,7 +8446,7 @@ fn r2engine_decompile_does_not_replan_after_functionfacts_stamping() {
 }
 
 #[test]
-fn r2plugin_function_decompile_export_is_engine_only() {
+fn r2plugin_snapshot_decompile_path_is_engine_only() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../..")
         .join("r2plugin/src/lib.rs");
@@ -8493,21 +8468,24 @@ fn r2plugin_function_decompile_export_is_engine_only() {
         &rest[..end]
     };
     let engine_impl = extract(
-        "fn r2sleigh_engine_decompile_function_output",
-        "\n// ============================================================================\n// radare2 Deep Integration FFI - Variable Recovery and Data Refs",
+        "fn r2sleigh_engine_decompile_trusted_output",
+        "\nfn r2sleigh_engine_type_function_trusted_output",
     );
 
     assert!(
         engine_impl.contains("run_engine_decompile")
-            && engine_impl.contains("EngineFunctionDecompileRequestInput::single_function"),
-        "engine decompile wrapper must build an engine-owned decompile request and run it through EngineSession"
+            && engine_impl.contains("EngineFunctionDecompileRequestInput::single_function")
+            && engine_impl.contains(".with_trusted_ssa(trusted)"),
+        "snapshot decompile wrapper must pass trusted SSA through the engine-owned request"
     );
     assert!(
-        c_source.contains("r2sleigh_engine_decompile_function"),
-        "C plugin glue must call the typed engine decompile boundary"
+        c_source.contains("sleigh_engine_execute_v2 (")
+            && c_source.contains("R2SLEIGH_CAP_OPAQUE_RADARE_SNAPSHOT_V2"),
+        "C plugin glue must call the opaque-snapshot engine boundary"
     );
 
     for forbidden in [
+        "r2sleigh_engine_decompile_function",
         "r2dec_function_with_context",
         "r2dec_function_with_context_scope",
         "r2dec_function_with_context_impl",
@@ -9606,7 +9584,7 @@ fn r2plugin_sla_ssa_func_does_not_own_decompile_cfg_guard() {
 }
 
 #[test]
-fn r2plugin_sla_dec_does_not_build_interproc_scope_in_c() {
+fn r2plugin_sla_dec_uses_only_opaque_snapshot_ingress() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../..")
         .join("r2plugin/r_anal_sleigh.c");
@@ -9626,7 +9604,42 @@ fn r2plugin_sla_dec_does_not_build_interproc_scope_in_c() {
             && decompile_block.contains("R2SLEIGH_REQUEST_DECOMPILE_V2"),
         "decompiler provider must route decompile through the V2 engine boundary"
     );
+    for required in [
+        "api->radare_snapshot_input_size != sizeof (R2SleighRadareSnapshotInputV2)",
+        "api->radare_accessors_size != sizeof (R2SleighRadareAccessorsV2)",
+    ] {
+        assert!(
+            source.contains(required),
+            "engine boundary must reject nested snapshot layout drift before capture: {required:?}"
+        );
+    }
+    for required in [
+        "static RCodeMeta *sleigh_decompile(const RAnalFunctionSnapshot *snapshot)",
+        "R_RETURN_VAL_IF_FAIL (snapshot, NULL);",
+        "const R2SleighRadareSnapshotInputV2 source = {",
+        ".snapshot = snapshot",
+        ".accessors = &sleigh_radare_accessors",
+        ".radare_snapshot = &source",
+        "R2SLEIGH_CAP_OPAQUE_RADARE_SNAPSHOT_V2",
+    ] {
+        assert!(
+            decompile_block.contains(required),
+            "decompiler provider must preserve opaque snapshot ingress field {required:?}"
+        );
+    }
     for forbidden in [
+        "R2SleighEngineDecompileInput",
+        "R2SleighFunctionContext",
+        "R2SleighInterprocScope",
+        "R2SleighLiftQuality",
+        ".ctx =",
+        ".blocks =",
+        ".function_context =",
+        ".lift_quality =",
+        ".interproc_scope =",
+        ".interproc_plan =",
+        ".source_interface =",
+        "lift_function_blocks (",
         "build_type_interproc_scope",
         "build_symbolic_function_scope_with_target",
         "SymFunctionScope sym_scope",
@@ -9646,7 +9659,7 @@ fn r2plugin_sla_dec_does_not_build_interproc_scope_in_c() {
     ] {
         assert!(
             !decompile_block.contains(forbidden),
-            "sla.dec must not own interprocedural scope or session policy construction {forbidden:?}"
+            "decompiler provider must not reconstruct detached source authority {forbidden:?}"
         );
     }
 }
@@ -9679,12 +9692,9 @@ fn r2plugin_decompile_path_does_not_repair_cfg_or_invent_switches() {
 
     assert!(
         decompile_block.contains("sleigh_engine_execute_v2 (")
-            && decompile_block.contains("R2SLEIGH_REQUEST_DECOMPILE_V2"),
-        "decompiler provider must route decompile through the V2 engine boundary"
-    );
-    assert!(
-        decompile_block.contains("lift_function_blocks (anal, fcn, ctx, &blocks)"),
-        "sla.dec must use the strict function-block lifter before engine handoff"
+            && decompile_block.contains("R2SLEIGH_REQUEST_DECOMPILE_V2")
+            && decompile_block.contains(".radare_snapshot = &source"),
+        "decompiler provider must route the opaque snapshot through the V2 engine boundary"
     );
     for required in [
         "if (!block || !bb || !bb->switch_op || !bb->switch_op->cases)",
@@ -9736,141 +9746,11 @@ fn r2plugin_decompile_path_does_not_repair_cfg_or_invent_switches() {
 }
 
 #[test]
-fn r2plugin_sla_dec_preserves_lift_quality_for_engine() {
+fn r2engine_decompile_validates_internal_input_quality() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
-    let c_path = root.join("r2plugin/r_anal_sleigh.c");
-    let rust_path = root.join("r2plugin/src/lib.rs");
     let engine_path = root.join("crates/r2engine/src/lib.rs");
-    let c_source = std::fs::read_to_string(&c_path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", c_path.display()));
-    let rust_source = std::fs::read_to_string(&rust_path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", rust_path.display()));
     let engine_source = std::fs::read_to_string(&engine_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", engine_path.display()));
-
-    let decompile_start = c_source
-        .find("static RCodeMeta *sleigh_decompile(")
-        .unwrap_or_else(|| panic!("missing decompiler provider callback"));
-    let decompile_end = c_source[decompile_start..]
-        .find("static char *sleigh_cmd(")
-        .map(|offset| decompile_start + offset)
-        .unwrap_or_else(|| panic!("missing command callback after decompiler provider"));
-    let decompile_block = &c_source[decompile_start..decompile_end];
-    let lift_handoff_start = decompile_block
-        .find("bool lift_ok = lift_function_blocks")
-        .unwrap_or_else(|| panic!("sla.dec must keep lift success as an input fact"));
-    let lift_handoff_end = decompile_block[lift_handoff_start..]
-        .find("sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_LIFT")
-        .map(|offset| lift_handoff_start + offset)
-        .unwrap_or_else(|| panic!("missing lift profile marker after lift handoff"));
-    let lift_handoff = &decompile_block[lift_handoff_start..lift_handoff_end];
-    assert!(
-        !lift_handoff.contains("return strdup(\"\")"),
-        "sla.dec must not return empty output before r2engine sees lift-quality refusal"
-    );
-
-    let engine_input_start = decompile_block
-        .find("R2SleighEngineDecompileInput decompile_input = {")
-        .unwrap_or_else(|| panic!("missing engine decompile input"));
-    let engine_input_end = decompile_block[engine_input_start..]
-        .find("};")
-        .map(|offset| engine_input_start + offset)
-        .unwrap_or_else(|| panic!("missing engine decompile input end"));
-    let engine_input = &decompile_block[engine_input_start..engine_input_end];
-    for required in [
-        ".blocks = lift_ok ? (const R2ILBlock **)blocks.blocks : NULL",
-        ".num_blocks = lift_ok ? blocks.count : 0",
-        ".lift_quality = blocks.quality",
-    ] {
-        assert!(
-            engine_input.contains(required),
-            "sla.dec must pass lift-quality handoff field {required:?}"
-        );
-    }
-    assert!(
-        decompile_block.contains("sleigh_engine_execute_v2 (")
-            && decompile_block.contains("R2SLEIGH_REQUEST_DECOMPILE_V2"),
-        "decompiler provider must route incomplete lift input to r2engine through V2"
-    );
-    for forbidden in [
-        "R2SleighLiftQuality quality = {0}",
-        "memset (&decompile_input.lift_quality",
-        "incomplete lifted function input",
-        "empty lifted function input",
-    ] {
-        assert!(
-            !decompile_block.contains(forbidden),
-            "sla.dec must not own lift-quality refusal or synthesize quality locally: {forbidden:?}"
-        );
-    }
-
-    let ffi_start = rust_source
-        .find("fn r2sleigh_engine_decompile_function_output")
-        .unwrap_or_else(|| panic!("missing Rust engine decompile FFI wrapper"));
-    let ffi_end = rust_source[ffi_start..]
-        .find("// radare2 Deep Integration FFI - Variable Recovery and Data Refs")
-        .map(|offset| ffi_start + offset)
-        .unwrap_or_else(|| panic!("missing Rust engine decompile FFI wrapper end"));
-    let ffi_body = &rust_source[ffi_start..ffi_end];
-    for required in [
-        "engine_function_input_quality_from_ffi(input.lift_quality)",
-        "block_slice.is_none() && input_quality.refusal_reason().is_none()",
-        "blocks: block_slice",
-        "parse_typed_external_context_for_engine(",
-        "EngineFunctionDecompileRequestInput::single_function_from_engine_context(",
-        ".with_input_quality(input_quality)",
-        "run_engine_decompile(decompile_input)",
-        "quality.expected_blocks",
-        "quality.lifted_blocks",
-        "quality.read_failures",
-        "quality.invalid_blocks",
-        "quality.null_lift_failures",
-        "quality.truncated_blocks",
-    ] {
-        assert!(
-            ffi_body.contains(required),
-            "Rust decompile FFI must preserve lift-quality evidence: {required:?}"
-        );
-    }
-    for forbidden in [
-        "types::build_function_input(",
-        "types::hash_string_payload(&external_context)",
-        "EngineFunctionInputQuality::complete(input.num_blocks)",
-        "EngineFunctionDecompileRequest::full_semantics_for_function(",
-        ".decompile_function(",
-        "function_context.external_context_json",
-        "cstr_or_default(input.function_context.external_context_json",
-    ] {
-        assert!(
-            !ffi_body.contains(forbidden),
-            "Rust decompile FFI must not bypass typed engine evidence or input-quality refusal: {forbidden:?}"
-        );
-    }
-
-    let typed_parser_start = engine_source
-        .find("pub fn parse_typed_external_context(")
-        .unwrap_or_else(|| panic!("missing typed external context parser"));
-    let typed_parser_rest = &engine_source[typed_parser_start..];
-    let typed_parser_end = typed_parser_rest
-        .find("\npub fn parse_typed_external_context_for_engine(")
-        .unwrap_or_else(|| panic!("missing typed parser end marker"));
-    let typed_parser_body = &typed_parser_rest[..typed_parser_end];
-    for forbidden in [
-        "fallback_json",
-        "parse_external_context_json(fallback",
-        "serde_json::from_str::<r2types::ExternalContextJson>",
-        "known_signatures: fallback",
-        "fallback.assumptions",
-    ] {
-        assert!(
-            !typed_parser_body.contains(forbidden),
-            "typed external context parsing must not repair missing typed facts from raw JSON fallback: {forbidden:?}"
-        );
-    }
-    assert!(
-        !c_source.contains("fallback_external_context_json"),
-        "C typed context collector must not preserve raw external-context JSON fallback"
-    );
 
     let engine_check_start = engine_source
         .find("pub fn decompile_function_from_input(")
@@ -10531,46 +10411,13 @@ fn r2plugin_auto_callbacks_do_not_own_policy_in_c() {
 }
 
 #[test]
-fn r2plugin_symbolic_scope_caps_are_engine_owned() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
-    let path = root.join("r2plugin/r_anal_sleigh.c");
-    let source = std::fs::read_to_string(&path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
-
-    assert!(
-        source.contains(concat!("r2sleigh_", "symbolic_scope_function_plan")),
-        "C symbolic scope builder must ask r2engine-owned function admission policy through FFI"
-    );
-    assert!(
-        source.contains(concat!("r2sleigh_", "runtime_materialized_source_plan")),
-        "C runtime-materialized source lifting must ask r2engine-owned cap policy through FFI"
-    );
-
-    for forbidden in [
-        "#define SLEIGH_SYM_HELPER_MAX_FUNCTIONS",
-        "#define SLEIGH_RUNTIME_MATERIALIZED_MAX_BYTES",
-        "#define SLEIGH_RUNTIME_MATERIALIZED_SLOT_BYTES",
-        "scope->count < SLEIGH_SYM_HELPER_MAX_FUNCTIONS",
-        "scope_skip_budget",
-    ] {
-        assert!(
-            !source.contains(forbidden),
-            "plugin C must not own symbolic/interproc scope cap policy fragment {forbidden:?}"
-        );
-    }
-}
-
-#[test]
 fn r2plugin_standalone_signature_and_semantic_compile_abis_stay_deleted() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let rust_path = root.join("r2plugin/src/lib.rs");
-    let sym_path = root.join("r2plugin/src/analysis/sym.rs");
     let c_path = root.join("r2plugin/r_anal_sleigh.c");
     let e2e_path = root.join("tests/e2e/integration_tests.rs");
     let rust_source = std::fs::read_to_string(&rust_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", rust_path.display()));
-    let sym_source = std::fs::read_to_string(&sym_path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", sym_path.display()));
     let c_source = std::fs::read_to_string(&c_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", c_path.display()));
     let e2e_source = std::fs::read_to_string(&e2e_path)
@@ -10578,7 +10425,6 @@ fn r2plugin_standalone_signature_and_semantic_compile_abis_stay_deleted() {
 
     for (source_name, source) in [
         ("r2plugin/src/lib.rs", rust_source.as_str()),
-        ("r2plugin/src/analysis/sym.rs", sym_source.as_str()),
         ("r2plugin/r_anal_sleigh.c", c_source.as_str()),
         ("tests/e2e/integration_tests.rs", e2e_source.as_str()),
     ] {

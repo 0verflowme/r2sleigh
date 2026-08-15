@@ -1289,7 +1289,6 @@ typedef struct {
 	R2ILBlock **blocks;
 	size_t count;
 	size_t capacity;
-	R2SleighLiftQuality quality;
 } BlockArray;
 
 typedef struct {
@@ -1654,7 +1653,7 @@ static char *sleigh_engine_v2_cleanup_error(bool json_projection, uint32_t statu
 // Returns a malloc-owned NUL-terminated projection. Every borrowed response
 // view is consumed before response_free releases the opaque Rust owner.
 static char *sleigh_engine_execute_v2_project(uint32_t kind, uint64_t required_capability, const R2SleighEngineRequestPayloadV2 *payload, bool json_projection) {
-	required_capability |= R2SLEIGH_CAP_NATIVE_REQUEST_GRAPH_V2
+	required_capability |= R2SLEIGH_CAP_OPAQUE_RADARE_SNAPSHOT_V2
 		| R2SLEIGH_CAP_RESPONSE_INFO_V2
 		| R2SLEIGH_CAP_EXECUTION_CONTROL_V2;
 	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
@@ -1664,29 +1663,8 @@ static char *sleigh_engine_execute_v2_project(uint32_t kind, uint64_t required_c
 		|| api->session_config_size != sizeof (R2SleighSessionConfigV2)
 		|| api->request_size != sizeof (R2SleighRequestV2)
 		|| api->engine_request_payload_size != sizeof (R2SleighEngineRequestPayloadV2)
-		|| api->function_context_size != sizeof (R2SleighFunctionContext)
-		|| api->context_param_size != sizeof (R2SleighContextParam)
-		|| api->context_var_size != sizeof (R2SleighContextVar)
-		|| api->context_base_member_size != sizeof (R2SleighContextBaseMember)
-		|| api->context_enum_variant_size != sizeof (R2SleighContextEnumVariant)
-		|| api->context_base_type_size != sizeof (R2SleighContextBaseType)
-		|| api->context_callee_size != sizeof (R2SleighContextCallee)
-		|| api->lift_quality_size != sizeof (R2SleighLiftQuality)
-		|| api->interproc_seed_size != sizeof (R2SleighInterprocSeed)
-		|| api->interproc_scope_size != sizeof (R2SleighInterprocScope)
-		|| api->interproc_plan_size != sizeof (R2SleighInterprocSessionPlan)
-		|| api->source_function_interface_size != sizeof (R2SleighSourceFunctionInterfaceV2)
-		|| api->source_parameter_size != sizeof (R2SleighSourceParameterV2)
-		|| api->source_parameter_type_size != sizeof (R2SleighSourceParameterTypeV2)
-		|| api->source_carrier_projection_size != sizeof (R2SleighSourceCarrierProjectionV2)
-		|| api->source_type_size != sizeof (R2SleighSourceTypeV2)
-		|| api->source_aggregate_member_size != sizeof (R2SleighSourceAggregateMemberV2)
-		|| api->source_aggregate_layout_size != sizeof (R2SleighSourceAggregateLayoutV2)
-		|| api->source_register_size != sizeof (R2SleighSourceRegisterV2)
-		|| api->source_stack_slot_size != sizeof (R2SleighSourceStackSlotV2)
-		|| api->source_storage_size != sizeof (R2SleighSourceStorageV2)
-		|| api->source_call_argument_size != sizeof (R2SleighSourceCallArgumentV2)
-		|| api->source_call_site_interface_size != sizeof (R2SleighSourceCallSiteInterfaceV2)
+		|| api->radare_snapshot_input_size != sizeof (R2SleighRadareSnapshotInputV2)
+		|| api->radare_accessors_size != sizeof (R2SleighRadareAccessorsV2)
 		|| api->byte_view_size != sizeof (R2SleighByteViewV2)
 		|| api->phase_timing_size != sizeof (R2SleighPhaseTimingV2)
 		|| api->response_info_size != sizeof (R2SleighResponseInfoV2)
@@ -1851,7 +1829,6 @@ static void block_array_init(BlockArray *arr) {
 	arr->blocks = NULL;
 	arr->count = 0;
 	arr->capacity = 0;
-	memset (&arr->quality, 0, sizeof (arr->quality));
 }
 
 static bool block_array_push(BlockArray *arr, R2ILBlock *block) {
@@ -1890,7 +1867,6 @@ static bool block_array_free(BlockArray *arr) {
 	arr->blocks = NULL;
 	arr->count = 0;
 	arr->capacity = 0;
-	memset (&arr->quality, 0, sizeof (arr->quality));
 	return true;
 }
 
@@ -1921,8 +1897,7 @@ static bool read_block_bytes_for_lifting(
 	const RAnalBlock *bb,
 	ut8 **out_buf,
 	size_t *out_len,
-	size_t *out_lift_size,
-	size_t *out_logical_size
+	size_t *out_lift_size
 ) {
 	size_t logical_size;
 	size_t lift_size;
@@ -1930,7 +1905,7 @@ static bool read_block_bytes_for_lifting(
 	ut8 *buf;
 
 	R_RETURN_VAL_IF_FAIL (
-		anal && bb && out_buf && out_len && out_lift_size && out_logical_size,
+		anal && bb && out_buf && out_len && out_lift_size,
 		false
 	);
 
@@ -1963,7 +1938,6 @@ static bool read_block_bytes_for_lifting(
 	*out_buf = buf;
 	*out_len = read_len;
 	*out_lift_size = lift_size;
-	*out_logical_size = logical_size;
 	return true;
 }
 
@@ -3475,21 +3449,15 @@ static bool lift_function_blocks_with_limits(
 	size_t total_ops = 0;
 
 	block_array_init (out);
-	out->quality.expected_blocks = fcn->bbs? (size_t)r_list_length (fcn->bbs): 0;
 
 	r_list_foreach (fcn->bbs, iter, bb) {
 		ut8 *buf = NULL;
 		size_t lift_size = 0;
-		size_t logical_size = 0;
 		size_t to_read = 0;
 
-		if (!read_block_bytes_for_lifting (anal, bb, &buf, &to_read, &lift_size, &logical_size)) {
+		if (!read_block_bytes_for_lifting (anal, bb, &buf, &to_read, &lift_size)) {
 			R_LOG_ERROR ("r2sleigh: failed to read block at 0x%"PFMT64x, bb->addr);
-			out->quality.read_failures++;
 			continue;
-		}
-		if (lift_size < logical_size) {
-			out->quality.truncated_blocks++;
 		}
 
 		/* Lift entire basic block (multiple instructions) */
@@ -3508,14 +3476,12 @@ static bool lift_function_blocks_with_limits(
 				free (err);
 				(void)sleigh_v2_block_release (&block);
 				free (buf);
-				out->quality.invalid_blocks++;
 				continue;
 			}
 			size_t block_ops = 0;
 			if (sleigh_v2_block_op_count (block, &block_ops) != R2SLEIGH_STATUS_OK_V2) {
 				(void)sleigh_v2_block_release (&block);
 				free (buf);
-				out->quality.invalid_blocks++;
 				continue;
 			}
 			if ((max_blocks && out->count >= max_blocks)
@@ -3533,7 +3499,6 @@ static bool lift_function_blocks_with_limits(
 				R_LOG_ERROR ("r2sleigh: rejected switch metadata at 0x%"PFMT64x"%s%s",
 					bb->addr, err && *err? ": ": "", err && *err? err: "");
 				free (err);
-				out->quality.invalid_blocks++;
 				(void)sleigh_v2_block_release (&block);
 				free (buf);
 				continue;
@@ -3546,12 +3511,9 @@ static bool lift_function_blocks_with_limits(
 				return false;
 			}
 			total_ops += block_ops;
-		} else {
-			out->quality.null_lift_failures++;
 		}
 		free (buf);
 	}
-	out->quality.lifted_blocks = out->count;
 
 	return out->count > 0;
 }

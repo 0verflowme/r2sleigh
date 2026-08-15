@@ -18,8 +18,6 @@ pub(crate) struct FunctionInput<'a> {
 }
 
 pub(crate) type FunctionAnalysis = r2engine::EngineAnalysis;
-#[cfg(test)]
-pub(crate) type FunctionAnalysisArtifact = r2engine::EngineAnalysisArtifact;
 
 #[cfg(test)]
 type FunctionAnalysisCacheKey = r2engine::AnalysisCacheKey;
@@ -146,14 +144,6 @@ pub(crate) fn function_facts_store() -> &'static FunctionFactsStore {
 
 pub(crate) fn engine_session() -> &'static r2engine::EngineSession {
     &function_facts_store().engine_session
-}
-
-#[cfg(test)]
-fn rename_function_analysis_artifact(
-    artifact: FunctionAnalysisArtifact,
-    function_name: &str,
-) -> FunctionAnalysisArtifact {
-    r2engine::rename_engine_analysis_artifact(artifact, function_name)
 }
 
 fn cache_counters_json(counters: r2engine::CacheCounters) -> String {
@@ -415,132 +405,6 @@ fn signature_strength(signature: &r2types::FunctionSignatureSpec) -> u8 {
     }
 }
 
-#[allow(dead_code)]
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn build_detached_function_analysis_artifact(
-    blocks: &[R2ILBlock],
-    function_name: &str,
-    arch: Option<&ArchSpec>,
-    ptr_bits: u32,
-    semantic_metadata_enabled: bool,
-    reg_type_hints: &std::collections::HashMap<String, TypeHint>,
-    external_context_json: &str,
-    source_snapshot: std::sync::Arc<r2engine::EngineSourceSnapshot>,
-) -> Option<FunctionAnalysisArtifact> {
-    build_detached_function_analysis_artifact_with_scope_and_semantics(
-        blocks,
-        function_name,
-        arch,
-        ptr_bits,
-        semantic_metadata_enabled,
-        reg_type_hints,
-        external_context_json,
-        source_snapshot,
-        None,
-        None,
-    )
-}
-
-#[cfg(test)]
-#[allow(dead_code, clippy::too_many_arguments)]
-pub(crate) fn build_detached_function_analysis_artifact_with_scope(
-    blocks: &[R2ILBlock],
-    function_name: &str,
-    arch: Option<&ArchSpec>,
-    ptr_bits: u32,
-    semantic_metadata_enabled: bool,
-    reg_type_hints: &std::collections::HashMap<String, TypeHint>,
-    external_context_json: &str,
-    source_snapshot: std::sync::Arc<r2engine::EngineSourceSnapshot>,
-    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
-) -> Option<FunctionAnalysisArtifact> {
-    build_detached_function_analysis_artifact_with_scope_and_semantics(
-        blocks,
-        function_name,
-        arch,
-        ptr_bits,
-        semantic_metadata_enabled,
-        reg_type_hints,
-        external_context_json,
-        source_snapshot,
-        symbolic_scope,
-        None,
-    )
-}
-
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn build_detached_function_analysis_artifact_with_scope_and_semantics(
-    blocks: &[R2ILBlock],
-    function_name: &str,
-    arch: Option<&ArchSpec>,
-    ptr_bits: u32,
-    semantic_metadata_enabled: bool,
-    reg_type_hints: &std::collections::HashMap<String, TypeHint>,
-    external_context_json: &str,
-    source_snapshot: std::sync::Arc<r2engine::EngineSourceSnapshot>,
-    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
-    precomputed_semantic_artifact: Option<r2sym::SemanticArtifact>,
-) -> Option<FunctionAnalysisArtifact> {
-    build_detached_function_analysis_artifact_with_scope_and_optional_semantics(
-        blocks,
-        function_name,
-        arch,
-        ptr_bits,
-        semantic_metadata_enabled,
-        reg_type_hints,
-        external_context_json,
-        source_snapshot,
-        symbolic_scope,
-        precomputed_semantic_artifact,
-        true,
-    )
-}
-
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn build_detached_function_analysis_artifact_with_scope_and_optional_semantics(
-    blocks: &[R2ILBlock],
-    function_name: &str,
-    arch: Option<&ArchSpec>,
-    ptr_bits: u32,
-    semantic_metadata_enabled: bool,
-    reg_type_hints: &std::collections::HashMap<String, TypeHint>,
-    external_context_json: &str,
-    source_snapshot: std::sync::Arc<r2engine::EngineSourceSnapshot>,
-    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
-    precomputed_semantic_artifact: Option<r2sym::SemanticArtifact>,
-    compile_missing_semantics: bool,
-) -> Option<FunctionAnalysisArtifact> {
-    let parsed_context =
-        r2engine::parse_external_context_json_for_engine(external_context_json, ptr_bits);
-    let scope_facts = empty_interproc_scope_facts();
-    let request = r2engine::EngineAnalyzeRequest::from_input_with_compile_missing_semantics(
-        r2engine::EngineAnalyzeRequestInput {
-            function_name: function_name.to_string(),
-            function_addr: blocks.first().map(|block| block.addr).unwrap_or_default(),
-            blocks: blocks.to_vec(),
-            arch: arch.cloned(),
-            ptr_bits: Some(ptr_bits),
-            semantic_metadata_enabled,
-            source_snapshot: Some(source_snapshot),
-            reg_type_hints: reg_type_hints.clone(),
-            parsed_context: parsed_context.parsed_context,
-            external_context_fallback_hash: parsed_context.fallback_hash,
-            scope_facts,
-            interproc_max_iterations: 1,
-            symbolic_scope: symbolic_scope.cloned(),
-            precomputed_semantic_artifact,
-            include_interproc_summary_set: false,
-        },
-        compile_missing_semantics,
-    );
-    engine_session()
-        .analyze(request)
-        .map(|response| rename_function_analysis_artifact(response.artifact, function_name))
-}
-
 #[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct DataRef {
@@ -662,14 +526,6 @@ pub(crate) fn merge_type_hint(
     incoming: TypeHint,
 ) {
     r2types::merge_type_hint(hints, key, incoming);
-}
-
-#[cfg(test)]
-pub(crate) fn collect_register_type_hints(
-    r2il_blocks: &[R2ILBlock],
-    disasm: &crate::Disassembler,
-) -> std::collections::HashMap<String, TypeHint> {
-    r2engine::collect_register_type_hints_with_names(r2il_blocks, |vn| disasm.register_name(vn))
 }
 
 #[cfg(test)]
