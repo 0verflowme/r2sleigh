@@ -1513,7 +1513,7 @@ static bool sleigh_json_is_single_object(const char *text, size_t len) {
 }
 
 #define SLEIGH_SEMANTIC_KERNEL_WARNING_PREFIX "semantic-kernel:"
-#define SLEIGH_SEMANTIC_KERNEL_WARNING_LIMIT 7
+#define SLEIGH_SEMANTIC_KERNEL_WARNING_LIMIT 8
 #define SLEIGH_SEMANTIC_KERNEL_WARNING_BYTES 4096
 #define SLEIGH_ENGINE_DIAGNOSTICS_BYTES (1024 * 1024)
 

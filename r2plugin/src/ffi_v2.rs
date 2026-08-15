@@ -1747,6 +1747,9 @@ fn engine_semantic_kernel_region_name(
         r2engine::EngineSemanticKernelRegion::DirectCallTerminalReturnFunction => {
             "direct_call_terminal_return_function"
         }
+        r2engine::EngineSemanticKernelRegion::PrivateFrameConditionalJoinFunction => {
+            "private_frame_conditional_join_function"
+        }
         r2engine::EngineSemanticKernelRegion::ConditionalTerminalReturnFunction => {
             "conditional_terminal_return_function"
         }
@@ -3801,6 +3804,11 @@ mod tests {
                 r2engine::EngineSemanticKernelRegion::DirectCallTerminalReturnFunction,
                 "direct_call_terminal_return_function",
                 3,
+            ),
+            (
+                r2engine::EngineSemanticKernelRegion::PrivateFrameConditionalJoinFunction,
+                "private_frame_conditional_join_function",
+                1,
             ),
             (
                 r2engine::EngineSemanticKernelRegion::ConditionalTerminalReturnFunction,

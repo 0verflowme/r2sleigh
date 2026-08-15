@@ -54,7 +54,7 @@ pub use stable_hash::{
     stable_fnv1a_hash,
 };
 
-pub const ENGINE_SCHEMA_VERSION: u32 = 10;
+pub const ENGINE_SCHEMA_VERSION: u32 = 11;
 pub const ENGINE_SOURCE_SNAPSHOT_SCHEMA_VERSION: u32 = 5;
 pub const DEFAULT_ENGINE_CACHE_LIMIT: usize = 256;
 pub const SYMBOLIC_PATHS_LIMIT: usize = 32;
@@ -5600,6 +5600,10 @@ impl EngineSession {
                     EnginePlan::SemanticStructured,
                     "r2dec sealed exact direct-call terminal-return typed-output ownership",
                 ),
+                EngineSemanticKernelRegion::PrivateFrameConditionalJoinFunction => (
+                    EnginePlan::SemanticStructured,
+                    "r2dec sealed exact private-frame conditional-join typed-output ownership",
+                ),
                 EngineSemanticKernelRegion::ConditionalTerminalReturnFunction => (
                     EnginePlan::SemanticStructured,
                     "r2dec sealed exact conditional-return typed-output ownership",
@@ -6180,12 +6184,13 @@ struct EngineRenderedDecompile {
     structuring_executed: bool,
 }
 
-const ENGINE_SEMANTIC_KERNEL_TRACE_LIMIT: usize = 7;
+const ENGINE_SEMANTIC_KERNEL_TRACE_LIMIT: usize = 8;
 const ENGINE_SEMANTIC_KERNEL_REASON_CHAR_LIMIT: usize = 512;
 const ENGINE_SEMANTIC_KERNEL_WARNING_TAG: &str = "semantic-kernel:";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EngineSemanticKernelProbe {
+    PrivateFrame,
     Aggregate,
     Memory,
     DirectCall,
@@ -6195,9 +6200,27 @@ enum EngineSemanticKernelProbe {
     Terminal,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnginePrivateFrameProbeDisposition {
+    NotApplicable,
+    Refused,
+}
+
+fn classify_private_frame_probe_error(
+    error: &r2dec::PrivateFrameConditionalJoinFunctionError,
+) -> EnginePrivateFrameProbeDisposition {
+    match error {
+        r2dec::PrivateFrameConditionalJoinFunctionError::MissingExactJoin => {
+            EnginePrivateFrameProbeDisposition::NotApplicable
+        }
+        _ => EnginePrivateFrameProbeDisposition::Refused,
+    }
+}
+
 impl EngineSemanticKernelProbe {
     fn as_str(self) -> &'static str {
         match self {
+            Self::PrivateFrame => "private-frame",
             Self::Aggregate => "aggregate",
             Self::Memory => "memory",
             Self::DirectCall => "direct-call",
@@ -6368,6 +6391,21 @@ fn engine_render_stop_from_decompiler(
     mapped
 }
 
+fn engine_semantic_kernel_refusal(
+    reason: String,
+    phase: EnginePhase,
+    certification_completed: bool,
+    structuring_completed: bool,
+) -> EngineRenderExecutionStop {
+    EngineRenderExecutionStop {
+        reason,
+        phase,
+        certification_completed,
+        normalization_completed: false,
+        structuring_completed,
+    }
+}
+
 fn prepared_artifact_has_source_aggregate_pointer(artifact: &SsaArtifact) -> bool {
     let Some(interface) = artifact.machine_context().function_interface() else {
         return false;
@@ -6439,6 +6477,49 @@ fn render_semantic_kernel_function<C: r2ssa::SsaWorkControl + ?Sized>(
         );
     };
     let mut trace = EngineSemanticKernelTrace::default();
+    match r2dec::CertifiedPrivateFrameConditionalJoinFunction::from_artifact(trusted) {
+        Ok(function) => {
+            let output = function.render_certified_c().map_err(|error| {
+                engine_semantic_kernel_refusal(
+                    format!(
+                        "private-frame conditional-join rendering refused after exact certification: {error}"
+                    ),
+                    EnginePhase::Rendering,
+                    true,
+                    true,
+                )
+            })?;
+            return complete_engine_semantic_kernel_attempt(
+                control,
+                EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
+                    output,
+                    structuring_executed: true,
+                    semantic_kernel_render: Some(EngineSemanticKernelRender {
+                        region: EngineSemanticKernelRegion::PrivateFrameConditionalJoinFunction,
+                        region_schema_version: function.schema_version(),
+                        exact_obligation_closure: true,
+                    }),
+                    semantic_kernel_warnings: trace.into_warnings(),
+                }),
+            );
+        }
+        Err(error) => match classify_private_frame_probe_error(&error) {
+            EnginePrivateFrameProbeDisposition::NotApplicable => {
+                trace.not_applicable(EngineSemanticKernelProbe::PrivateFrame, &error.to_string())
+            }
+            EnginePrivateFrameProbeDisposition::Refused => {
+                return Err(engine_semantic_kernel_refusal(
+                    format!(
+                        "private-frame conditional-join certification refused without fallback: {error}"
+                    ),
+                    EnginePhase::Certification,
+                    false,
+                    false,
+                ));
+            }
+        },
+    }
+    poll_engine_render_control(control, EnginePhase::Rendering)?;
     match r2dec::CertifiedAggregateMemberSemanticCFunction::from_artifact(trusted) {
         Ok(function) => match function.render_certified_c() {
             Ok(output) => {
@@ -13499,6 +13580,10 @@ mod tests {
     fn semantic_kernel_trace_preserves_order_and_classification_before_later_success() {
         let mut trace = EngineSemanticKernelTrace::default();
         trace.not_applicable(
+            EngineSemanticKernelProbe::PrivateFrame,
+            "private-frame constructor mismatch",
+        );
+        trace.not_applicable(
             EngineSemanticKernelProbe::Aggregate,
             "aggregate constructor mismatch",
         );
@@ -13508,6 +13593,7 @@ mod tests {
         assert_eq!(
             warnings,
             vec![
+                "semantic-kernel:private-frame:not_applicable:private-frame constructor mismatch",
                 "semantic-kernel:aggregate:not_applicable:aggregate constructor mismatch",
                 "semantic-kernel:memory:refused:memory renderer refusal",
             ],
@@ -13516,8 +13602,30 @@ mod tests {
     }
 
     #[test]
+    fn private_frame_probe_continues_only_when_no_exact_join_exists() {
+        use r2dec::PrivateFrameConditionalJoinFunctionError as Error;
+
+        assert_eq!(
+            classify_private_frame_probe_error(&Error::MissingExactJoin),
+            EnginePrivateFrameProbeDisposition::NotApplicable
+        );
+        for error in [
+            Error::MachineProjection(r2ssa::MachineBuildError::UntrustedArtifactProvenance),
+            Error::MultipleExactJoins,
+            Error::NonEntryExactJoin,
+        ] {
+            assert_eq!(
+                classify_private_frame_probe_error(&error),
+                EnginePrivateFrameProbeDisposition::Refused,
+                "{error} must stop before any lower semantic or legacy route"
+            );
+        }
+    }
+
+    #[test]
     fn semantic_kernel_trace_bounds_entries_and_reason_characters() {
         let probes = [
+            EngineSemanticKernelProbe::PrivateFrame,
             EngineSemanticKernelProbe::Aggregate,
             EngineSemanticKernelProbe::Memory,
             EngineSemanticKernelProbe::DirectCall,
@@ -13531,7 +13639,7 @@ mod tests {
         for probe in probes {
             trace.not_applicable(probe, &long_reason);
         }
-        trace.refused(EngineSemanticKernelProbe::Terminal, "eighth entry");
+        trace.refused(EngineSemanticKernelProbe::Terminal, "ninth entry");
 
         let warnings = trace.into_warnings();
         assert_eq!(warnings.len(), ENGINE_SEMANTIC_KERNEL_TRACE_LIMIT);
@@ -13573,6 +13681,11 @@ mod tests {
                 EngineSemanticKernelRegion::DirectCallTerminalReturnFunction,
                 r2dec::CERTIFIED_DIRECT_CALL_RETURN_FUNCTION_SCHEMA_VERSION,
                 3,
+            ),
+            (
+                EngineSemanticKernelRegion::PrivateFrameConditionalJoinFunction,
+                r2dec::CERTIFIED_PRIVATE_FRAME_CONDITIONAL_JOIN_FUNCTION_SCHEMA_VERSION,
+                1,
             ),
             (
                 EngineSemanticKernelRegion::ConditionalTerminalReturnFunction,

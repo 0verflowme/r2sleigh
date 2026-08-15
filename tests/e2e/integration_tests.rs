@@ -300,6 +300,211 @@ int main(void) {
             "compare CertifiedC with independently compiled source",
         );
     }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn genuine_arm64_private_join_emits_and_executes_strict_certified_c() {
+        let source = repo_path("tests/e2e/vuln_test.c");
+        let scratch = ScratchDir::new();
+        let fixture_o = scratch.join("vuln_test_arm64.o");
+        let binary = scratch.join("vuln_test_arm64");
+        let dsym = scratch.join("vuln_test_arm64.dSYM");
+        run_checked(
+            Command::new("clang")
+                .args(["-arch", "arm64", "-O0", "-g", "-fno-stack-protector", "-c"])
+                .arg(&source)
+                .arg("-o")
+                .arg(&fixture_o),
+            "compile genuine ARM64 O0 fixture",
+        );
+        run_checked(
+            Command::new("clang")
+                .args(["-arch", "arm64", "-Wl,-no_pie"])
+                .arg(&fixture_o)
+                .arg("-o")
+                .arg(&binary),
+            "link genuine ARM64 O0 fixture",
+        );
+        run_checked(
+            Command::new("dsymutil")
+                .arg(&binary)
+                .arg("-o")
+                .arg(&dsym),
+            "build genuine ARM64 dSYM",
+        );
+        let result = r2_cmd_timeout(
+            binary.to_str().expect("UTF-8 ARM64 fixture path"),
+            "e bin.dbginfo=true; e bin.relocs.apply=true; oo; aaa; s sym._check_secret; pdd",
+            Duration::from_secs(120),
+        );
+        result.assert_ok();
+        assert_eq!(
+            result.exit_code,
+            Some(0),
+            "radare ARM64 command failed:\n{}\n{}",
+            result.stdout,
+            result.stderr
+        );
+        let declaration = result
+            .stdout
+            .lines()
+            .map(str::trim)
+            .find(|line| {
+                line.starts_with("int32_t certified_sub_") && line.ends_with("(int32_t arg_0) {")
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "genuine ARM64 capture did not expose the signed source signature:\n{}\n{}",
+                    result.stdout, result.stderr
+                )
+            });
+        let function_name = declaration
+            .strip_prefix("int32_t ")
+            .and_then(|line| line.split_once('(').map(|(name, _)| name))
+            .expect("parse certified ARM64 declaration");
+        let address_hex = function_name
+            .strip_prefix("certified_sub_")
+            .expect("address-derived certified ARM64 name");
+        assert!(
+            !address_hex.is_empty()
+                && address_hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && u64::from_str_radix(address_hex, 16).is_ok(),
+            "genuine ARM64 capture did not expose the signed source signature:\n{}\n{}",
+            result.stdout,
+            result.stderr
+        );
+        assert!(
+            result.stdout.lines().any(|line| {
+                let line = line.trim();
+                line.starts_with("uint32_t v_")
+                    && line.ends_with(" = (uint32_t)(arg_0);")
+            }),
+            "genuine ARM64 capture did not bind signed source input to unsigned graph bits:\n{}",
+            result.stdout
+        );
+        let diagnostic_text = format!("{}\n{}", result.stdout, result.stderr).to_ascii_lowercase();
+        assert!(
+            !diagnostic_text.contains("r2dec residual:")
+                && !diagnostic_text.contains("refus"),
+            "the certified ARM64 route must not residualize or refuse:\n{}\n{}",
+            result.stdout,
+            result.stderr
+        );
+
+        let generated_c = scratch.join("generated_arm64.c");
+        let generated_o = scratch.join("generated_arm64.o");
+        let oracle_o = scratch.join("oracle_arm64.o");
+        let driver_c = scratch.join("driver_arm64.c");
+        let executable = scratch.join("run_arm64_certified");
+        fs::write(&generated_c, &result.stdout).expect("write ARM64 generated semantic C");
+        fs::write(
+            &driver_c,
+            format!(
+                r#"#include <limits.h>
+#include <stdint.h>
+#include <stdio.h>
+
+int32_t {function_name}(int32_t value);
+int oracle_check_secret(int value);
+
+static int check_one(int32_t value, int32_t expected) {{
+	int32_t actual = {function_name}(value);
+	int32_t oracle = (int32_t)oracle_check_secret((int)value);
+	if (actual != expected || actual != oracle) {{
+		fprintf(stderr, "mismatch input=%d actual=%d expected=%d oracle=%d\n", value, actual, expected, oracle);
+		return 1;
+	}}
+	return 0;
+}}
+
+int main(void) {{
+	static const struct {{ int32_t input; int32_t expected; }} boundary[] = {{
+		{{ INT32_MIN, INT32_C(0) }},
+		{{ -INT32_C(1), INT32_C(0) }},
+		{{ INT32_C(0), INT32_C(0) }},
+		{{ INT32_C(0xdeac), INT32_C(0) }},
+		{{ INT32_C(0xdead), INT32_C(1) }},
+		{{ INT32_C(0xdeae), INT32_C(0) }},
+		{{ INT32_MAX, INT32_C(0) }},
+	}};
+	for (unsigned i = 0; i < sizeof(boundary) / sizeof(boundary[0]); i++) {{
+		if (check_one(boundary[i].input, boundary[i].expected)) {{
+			return 1;
+		}}
+	}}
+	uint32_t state = UINT32_C(0x6d2b79f5);
+	for (unsigned i = 0; i < 4096U; i++) {{
+		state ^= state << 13;
+		state ^= state >> 17;
+		state ^= state << 5;
+		int32_t expected = state == UINT32_C(0xdead) ? INT32_C(1) : INT32_C(0);
+		if (check_one((int32_t)state, expected)) {{
+			return 1;
+		}}
+	}}
+	if (check_one((int32_t)UINT32_C(0xffffffff), INT32_C(0))) {{
+		return 1;
+	}}
+	return 0;
+}}
+"#,
+            ),
+        )
+        .expect("write ARM64 execution driver");
+        run_checked(
+            Command::new("clang")
+                .args([
+                    "-std=c11",
+                    "-pedantic-errors",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-c",
+                ])
+                .arg(&generated_c)
+                .arg("-o")
+                .arg(&generated_o),
+            "strictly compile ARM64 generated semantic C",
+        );
+        run_checked(
+            Command::new("clang")
+                .args([
+                    "-arch",
+                    "arm64",
+                    "-O0",
+                    "-Wno-format-security",
+                    "-Dcheck_secret=oracle_check_secret",
+                    "-Dmain=fixture_main",
+                    "-c",
+                ])
+                .arg(&source)
+                .arg("-o")
+                .arg(&oracle_o),
+            "compile independent ARM64 source oracle",
+        );
+        run_checked(
+            Command::new("clang")
+                .args([
+                    "-arch",
+                    "arm64",
+                    "-std=c11",
+                    "-pedantic-errors",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                ])
+                .arg(&driver_c)
+                .arg(&generated_o)
+                .arg(&oracle_o)
+                .arg("-o")
+                .arg(&executable),
+            "link ARM64 source-versus-CertifiedC oracle",
+        );
+        run_checked(
+            &mut Command::new(&executable),
+            "execute ARM64 CertifiedC polarity cases",
+        );
+    }
 }
 
 // ============================================================================

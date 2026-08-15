@@ -179,12 +179,14 @@ impl CertifiedPrivateFrameConditionalJoinRewrite {
         let projection = CertifiedMachineProjection::from_artifact(trusted)
             .map_err(PrivateFrameConditionalJoinRewriteError::MachineProjection)?;
         let header = projection.topology().entry_addr();
-        if projection.private_frame_conditional_joins().len() != 1 {
-            return Err(PrivateFrameConditionalJoinRewriteError::MissingExactJoin);
+        match projection.private_frame_conditional_joins().len() {
+            0 => return Err(PrivateFrameConditionalJoinRewriteError::MissingExactJoin),
+            1 => {}
+            _ => return Err(PrivateFrameConditionalJoinRewriteError::MultipleExactJoins),
         }
         let join = projection
             .private_frame_conditional_join(header)
-            .ok_or(PrivateFrameConditionalJoinRewriteError::MissingExactJoin)?;
+            .ok_or(PrivateFrameConditionalJoinRewriteError::NonEntryExactJoin)?;
         let stack = projection
             .stack_discipline()
             .ok_or(PrivateFrameConditionalJoinRewriteError::MissingStackDiscipline)?;
@@ -346,6 +348,8 @@ pub enum PrivateFrameConditionalJoinFunctionError {
     TypedOutputSeal(TypedOutputSealError),
     SemanticC(SemanticCError),
     MissingExactJoin,
+    MultipleExactJoins,
+    NonEntryExactJoin,
     MissingStackDiscipline,
     MissingFunctionInterface,
     InvalidComposition(Vec<String>),
@@ -525,12 +529,14 @@ impl CertifiedPrivateFrameConditionalJoinFunction {
         let projection = CertifiedMachineProjection::from_artifact(trusted)
             .map_err(PrivateFrameConditionalJoinFunctionError::MachineProjection)?;
         let header = projection.topology().entry_addr();
-        if projection.private_frame_conditional_joins().len() != 1 {
-            return Err(PrivateFrameConditionalJoinFunctionError::MissingExactJoin);
+        match projection.private_frame_conditional_joins().len() {
+            0 => return Err(PrivateFrameConditionalJoinFunctionError::MissingExactJoin),
+            1 => {}
+            _ => return Err(PrivateFrameConditionalJoinFunctionError::MultipleExactJoins),
         }
         let join = projection
             .private_frame_conditional_join(header)
-            .ok_or(PrivateFrameConditionalJoinFunctionError::MissingExactJoin)?;
+            .ok_or(PrivateFrameConditionalJoinFunctionError::NonEntryExactJoin)?;
         let stack = projection
             .stack_discipline()
             .ok_or(PrivateFrameConditionalJoinFunctionError::MissingStackDiscipline)?;
@@ -786,6 +792,8 @@ pub(crate) fn private_frame_condition_accesses_for_test(
 pub enum PrivateFrameConditionalJoinRewriteError {
     MachineProjection(MachineBuildError),
     MissingExactJoin,
+    MultipleExactJoins,
+    NonEntryExactJoin,
     MissingStackDiscipline,
     InvalidAuthority,
     SemanticC(SemanticCError),
