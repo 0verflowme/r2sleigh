@@ -33,7 +33,6 @@ pub mod opcode;
 pub mod regname;
 pub mod serialize;
 pub mod space;
-pub mod userops;
 pub mod validate;
 pub mod varnode;
 

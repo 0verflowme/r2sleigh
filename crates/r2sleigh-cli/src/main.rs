@@ -1247,7 +1247,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "arm")]
-    fn arm64_alias_lifts_pointer_auth_userop() {
+    fn arm64_alias_preserves_zero_pcode_pacibsp() {
         let out = run_action_output(
             "arm64",
             ARM64_PACIBSP_BYTES,
@@ -1257,9 +1257,9 @@ mod tests {
         )
         .expect("run output");
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("json");
-        assert_eq!(
-            parsed["ops"][0]["CallOther"]["userop"].as_u64(),
-            Some(0xffff_0002)
+        assert!(
+            parsed["ops"].as_array().is_some_and(|ops| ops.is_empty()),
+            "zero-P-code PACIBSP must not acquire fabricated operations"
         );
     }
 

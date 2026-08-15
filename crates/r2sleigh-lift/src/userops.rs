@@ -4,10 +4,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-pub use r2il::userops::{
-    ARM64_PAUTH_AUTH_USEROP, ARM64_PAUTH_SIGN_USEROP, ARM64_PAUTH_STRIP_USEROP,
-};
-
 static USEROP_CACHE: OnceLock<Mutex<HashMap<String, HashMap<u32, String>>>> = OnceLock::new();
 
 fn arch_to_slaspec(arch: &str) -> Option<(&'static str, &'static str)> {
@@ -141,7 +137,6 @@ fn build_userop_map(arch: &str) -> HashMap<u32, String> {
     };
 
     let Some(root) = find_sleigh_config_root() else {
-        add_synthetic_userops(arch, &mut map);
         return map;
     };
 
@@ -154,7 +149,6 @@ fn build_userop_map(arch: &str) -> HashMap<u32, String> {
     let mut names = Vec::new();
     let mut seen = HashSet::new();
     if parse_userops_from_file(&slaspec_path, &mut seen, &mut names).is_err() {
-        add_synthetic_userops(arch, &mut map);
         return map;
     }
 
@@ -162,17 +156,7 @@ fn build_userop_map(arch: &str) -> HashMap<u32, String> {
         map.insert(index as u32, name);
     }
 
-    add_synthetic_userops(arch, &mut map);
-
     map
-}
-
-fn add_synthetic_userops(arch: &str, map: &mut HashMap<u32, String>) {
-    if matches!(arch, "aarch64" | "arm64" | "arm64e") {
-        map.insert(ARM64_PAUTH_AUTH_USEROP, "arm64_pauth_auth".to_string());
-        map.insert(ARM64_PAUTH_SIGN_USEROP, "arm64_pauth_sign".to_string());
-        map.insert(ARM64_PAUTH_STRIP_USEROP, "arm64_pauth_strip".to_string());
-    }
 }
 
 pub fn userop_map_for_arch(arch: &str) -> HashMap<u32, String> {

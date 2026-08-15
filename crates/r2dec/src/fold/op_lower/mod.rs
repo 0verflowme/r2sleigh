@@ -14967,7 +14967,7 @@ fn callother_ids_share_effect_and_result_lowering() {
     let input = SSAVar::new("X30", 0, 8);
     let output = SSAVar::new("X30", 1, 8);
 
-    for userop in [7, 0xffff_0001, 0xffff_0002, 0xffff_0003] {
+    for userop in [7, 0x7fff_ffff, 0x8000_0000, u32::MAX] {
         let stmt = ctx.op_to_stmt_impl(&SSAOp::CallOther {
             output: Some(output.clone()),
             userop,
@@ -14989,9 +14989,10 @@ fn callother_ids_share_effect_and_result_lowering() {
         );
     }
 
+    let effect_userop = u32::MAX;
     let stmt = ctx.op_to_stmt_impl(&SSAOp::CallOther {
         output: None,
-        userop: 0xffff_0001,
+        userop: effect_userop,
         inputs: vec![input],
     });
     assert_eq!(
@@ -14999,7 +15000,7 @@ fn callother_ids_share_effect_and_result_lowering() {
         Some(CStmt::Expr(CExpr::call(
             CExpr::Var("callother".to_string()),
             vec![
-                CExpr::StringLit("userop_4294901761".to_string()),
+                CExpr::StringLit(format!("userop_{effect_userop}")),
                 CExpr::Var("x30".to_string()),
             ],
         ))),

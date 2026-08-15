@@ -1505,7 +1505,7 @@ mod tests {
             &sym_map,
         );
 
-        for userop in [7, 0xffff_0001, 0xffff_0002, 0xffff_0003] {
+        for userop in [7, 0x7fff_ffff, 0x8000_0000, u32::MAX] {
             let expr = ctx.op_to_expr(&SSAOp::CallOther {
                 output: Some(SSAVar::new("X30", 1, 8)),
                 userop,
