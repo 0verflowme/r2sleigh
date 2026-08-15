@@ -357,7 +357,12 @@ impl PcodeTranslator {
 
             PcodeOp::CallOther => {
                 let userop_vn = self.require_raw_input(raw, 0, "CALLOTHER")?;
-                let userop = userop_vn.offset as u32;
+                let userop = u32::try_from(userop_vn.offset).map_err(|_| {
+                    PcodeError::InvalidOpcode(format!(
+                        "Sleigh CALLOTHER id does not fit r2il: {}",
+                        userop_vn.offset
+                    ))
+                })?;
                 let output = raw
                     .output
                     .as_ref()
@@ -732,6 +737,44 @@ mod tests {
                 assert_eq!(b.offset, 1);
             }
             _ => panic!("Expected IntAdd operation"),
+        }
+    }
+
+    #[test]
+    fn test_callother_preserves_maximum_userop_id() {
+        let translator = PcodeTranslator::default_spaces();
+        let raw = RawPcodeOp {
+            opcode: PcodeOp::CallOther as u32,
+            output: None,
+            inputs: vec![RawVarnode::new(0, u64::from(u32::MAX), 4)],
+        };
+
+        let result = translator.translate(&raw).unwrap();
+
+        match result {
+            R2ILOp::CallOther { userop, .. } => assert_eq!(userop, u32::MAX),
+            _ => panic!("Expected CallOther operation"),
+        }
+    }
+
+    #[test]
+    fn test_callother_rejects_userop_id_above_u32() {
+        let translator = PcodeTranslator::default_spaces();
+        let invalid_userop = u64::from(u32::MAX) + 1;
+        let raw = RawPcodeOp {
+            opcode: PcodeOp::CallOther as u32,
+            output: None,
+            inputs: vec![RawVarnode::new(0, invalid_userop, 8)],
+        };
+
+        let error = translator.translate(&raw).unwrap_err();
+
+        match error {
+            PcodeError::InvalidOpcode(message) => assert_eq!(
+                message,
+                format!("Sleigh CALLOTHER id does not fit r2il: {invalid_userop}")
+            ),
+            other => panic!("Expected fail-closed InvalidOpcode, got {other}"),
         }
     }
 }
