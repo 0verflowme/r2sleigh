@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use r2ssa::SourceStackAllocationContract;
 
 mod aggregate_member;
+mod private_frame_conditional_join;
 mod private_frame_value_flow;
 
 pub use aggregate_member::{
@@ -41,13 +42,17 @@ pub use aggregate_member::{
     CertifiedAggregateMemberAccessSemantics, CertifiedAggregateStructuredAccess,
     CertifiedNaturalScalarAggregateLayout,
 };
+pub use private_frame_conditional_join::{
+    CertifiedInertPrivateFrameJoinPhi, CertifiedPrivateFrameConditionalArm,
+    CertifiedPrivateFrameConditionalJoin, CertifiedPrivateFrameTransparentBranch,
+};
 pub use private_frame_value_flow::{
     CertifiedPrivateFrameLoad, CertifiedPrivateFramePhi, CertifiedPrivateFramePhiInput,
     CertifiedPrivateFrameStore, CertifiedPrivateFrameValueFlow,
     CertifiedPrivateFrameVersionDefinition,
 };
 
-pub const CERTIFICATION_SCHEMA_VERSION: u32 = 30;
+pub const CERTIFICATION_SCHEMA_VERSION: u32 = 31;
 
 /// Unforgeable run-local identity for one proof authority domain.
 ///
@@ -9159,6 +9164,7 @@ pub struct CertifiedMachineFunction {
     switch_controls: BTreeMap<u64, CertifiedSwitchControl>,
     stack_discipline: Option<CertifiedStackDiscipline>,
     private_frame_value_flows: BTreeMap<StructuredAccessId, CertifiedPrivateFrameValueFlow>,
+    private_frame_conditional_joins: BTreeMap<u64, CertifiedPrivateFrameConditionalJoin>,
     frame_preservation: Option<CertifiedFramePreservation>,
     topology: CertifiedSourceTopology,
 }
@@ -9451,6 +9457,18 @@ impl CertifiedMachineFunction {
                 &memory_statements,
                 certification.ledger(),
             );
+        let private_frame_conditional_joins =
+            private_frame_conditional_join::certified_private_frame_conditional_joins(
+                artifact,
+                &origin,
+                &topology,
+                stack_discipline.as_ref(),
+                &private_frame_value_flows,
+                &direct_controls,
+                &conditional_controls,
+                &return_controls,
+                certification.ledger(),
+            );
         let frame_preservation = certified_frame_preservation(
             artifact,
             &origin,
@@ -9477,6 +9495,7 @@ impl CertifiedMachineFunction {
             switch_controls,
             stack_discipline,
             private_frame_value_flows,
+            private_frame_conditional_joins,
             frame_preservation,
             topology,
         })
@@ -9521,6 +9540,19 @@ impl CertifiedMachineFunction {
         &self,
     ) -> &BTreeMap<StructuredAccessId, CertifiedPrivateFrameValueFlow> {
         &self.private_frame_value_flows
+    }
+
+    pub fn private_frame_conditional_join(
+        &self,
+        header: u64,
+    ) -> Option<&CertifiedPrivateFrameConditionalJoin> {
+        self.private_frame_conditional_joins.get(&header)
+    }
+
+    pub const fn private_frame_conditional_joins(
+        &self,
+    ) -> &BTreeMap<u64, CertifiedPrivateFrameConditionalJoin> {
+        &self.private_frame_conditional_joins
     }
 
     pub fn source(&self) -> &SemanticObligationInventory {
@@ -9655,6 +9687,7 @@ pub struct CertifiedMachineProjection {
     switch_controls: BTreeMap<u64, CertifiedSwitchControl>,
     stack_discipline: Option<CertifiedStackDiscipline>,
     private_frame_value_flows: BTreeMap<StructuredAccessId, CertifiedPrivateFrameValueFlow>,
+    private_frame_conditional_joins: BTreeMap<u64, CertifiedPrivateFrameConditionalJoin>,
     frame_preservation: Option<CertifiedFramePreservation>,
     residual_producers: BTreeSet<CanonicalInstructionId>,
     topology: CertifiedSourceTopology,
@@ -10177,6 +10210,18 @@ impl CertifiedMachineProjection {
                 &memory_statements,
                 certification.ledger(),
             );
+        let private_frame_conditional_joins =
+            private_frame_conditional_join::certified_private_frame_conditional_joins(
+                artifact,
+                &origin,
+                &topology,
+                stack_discipline.as_ref(),
+                &private_frame_value_flows,
+                &direct_controls,
+                &conditional_controls,
+                &return_controls,
+                certification.ledger(),
+            );
         let frame_preservation = certified_frame_preservation(
             artifact,
             &origin,
@@ -10203,6 +10248,7 @@ impl CertifiedMachineProjection {
             switch_controls,
             stack_discipline,
             private_frame_value_flows,
+            private_frame_conditional_joins,
             frame_preservation,
             residual_producers,
             topology,
@@ -10248,6 +10294,19 @@ impl CertifiedMachineProjection {
         &self,
     ) -> &BTreeMap<StructuredAccessId, CertifiedPrivateFrameValueFlow> {
         &self.private_frame_value_flows
+    }
+
+    pub fn private_frame_conditional_join(
+        &self,
+        header: u64,
+    ) -> Option<&CertifiedPrivateFrameConditionalJoin> {
+        self.private_frame_conditional_joins.get(&header)
+    }
+
+    pub const fn private_frame_conditional_joins(
+        &self,
+    ) -> &BTreeMap<u64, CertifiedPrivateFrameConditionalJoin> {
+        &self.private_frame_conditional_joins
     }
 
     pub fn source(&self) -> &SemanticObligationInventory {
