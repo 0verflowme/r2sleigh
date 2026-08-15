@@ -5741,14 +5741,27 @@ mod tests {
         }
     }
 
-    struct NativeSpanSnapshotFixture {
+    #[derive(Debug, Clone)]
+    struct NativeSpanSuccessorFixture {
+        kind: i32,
+        target: u64,
+        external: bool,
+    }
+
+    #[derive(Debug, Clone)]
+    struct NativeSpanBlockFixture {
         addr: u64,
         bytes: Vec<u8>,
+        successors: Vec<NativeSpanSuccessorFixture>,
+    }
+
+    struct NativeSpanSnapshotFixture {
+        addr: u64,
+        blocks: Vec<NativeSpanBlockFixture>,
         return_address: RadareAbi138RegisterStorageView,
         stack_pointer: RadareAbi138RegisterStorageView,
         return_address_name: String,
         stack_pointer_name: String,
-        terminal_return: bool,
         exact_private_stack: bool,
     }
 
@@ -5772,24 +5785,40 @@ mod tests {
                         0
                     },
                 function_addr: self.addr,
-                function_size: u64::try_from(self.bytes.len()).expect("fixture size fits u64"),
+                function_size: self.end().checked_sub(self.addr).expect("fixture size"),
                 bits: 64,
                 endian: RADARE_ENDIAN_LITTLE,
                 arch_id_length: 3,
                 cpu_id_length: 3,
                 function_name_length: 19,
                 revision_identity: self.addr,
-                num_blocks: 1,
-                num_external_exits: usize::from(!self.terminal_return),
-                total_source_bytes: self.bytes.len(),
+                num_blocks: self.blocks.len(),
+                num_external_exits: self.external_exits().len(),
+                total_source_bytes: self.blocks.iter().map(|block| block.bytes.len()).sum(),
                 ..Default::default()
             }
         }
 
         fn end(&self) -> u64 {
-            self.addr
-                .checked_add(u64::try_from(self.bytes.len()).expect("fixture size fits u64"))
+            self.blocks
+                .last()
+                .and_then(|block| {
+                    block.addr.checked_add(
+                        u64::try_from(block.bytes.len()).expect("fixture size fits u64"),
+                    )
+                })
                 .expect("fixture range")
+        }
+
+        fn external_exits(&self) -> Vec<u64> {
+            self.blocks
+                .iter()
+                .flat_map(|block| &block.successors)
+                .filter(|successor| successor.external)
+                .map(|successor| successor.target)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
         }
     }
 
@@ -5911,17 +5940,17 @@ mod tests {
         index: usize,
         out: *mut RadareAbi138BlockView,
     ) -> u8 {
-        if index != 0 {
-            return 0;
-        }
         // SAFETY: the callback receives the live fixture pointer.
         let fixture = unsafe { fixture(snapshot) };
+        let Some(block) = fixture.blocks.get(index) else {
+            return 0;
+        };
         // SAFETY: the capture owns one initialized output slot.
         unsafe {
             out.write(RadareAbi138BlockView {
-                addr: fixture.addr,
-                size: u64::try_from(fixture.bytes.len()).expect("fixture size fits u64"),
-                num_successors: usize::from(!fixture.terminal_return),
+                addr: block.addr,
+                size: u64::try_from(block.bytes.len()).expect("fixture size fits u64"),
+                num_successors: block.successors.len(),
                 switch_addr: u64::MAX,
             })
         };
@@ -5937,12 +5966,15 @@ mod tests {
     ) -> u8 {
         // SAFETY: the callback receives the live fixture pointer.
         let fixture = unsafe { fixture(snapshot) };
-        if block_index != 0 || offset != 0 || capacity != fixture.bytes.len() {
+        let Some(block) = fixture.blocks.get(block_index) else {
+            return 0;
+        };
+        if offset != 0 || capacity != block.bytes.len() {
             return 0;
         }
         // SAFETY: the capture-owned output has exactly the advertised capacity.
         unsafe {
-            std::ptr::copy_nonoverlapping(fixture.bytes.as_ptr(), out, capacity);
+            std::ptr::copy_nonoverlapping(block.bytes.as_ptr(), out, capacity);
         }
         1
     }
@@ -5953,20 +5985,21 @@ mod tests {
         successor_index: usize,
         out: *mut RadareAbi138SuccessorView,
     ) -> u8 {
-        if block_index != 0 || successor_index != 0 {
-            return 0;
-        }
         // SAFETY: the callback receives the live fixture pointer.
         let fixture = unsafe { fixture(snapshot) };
-        if fixture.terminal_return {
+        let Some(successor) = fixture
+            .blocks
+            .get(block_index)
+            .and_then(|block| block.successors.get(successor_index))
+        else {
             return 0;
-        }
+        };
         // SAFETY: the capture owns one initialized output slot.
         unsafe {
             out.write(RadareAbi138SuccessorView {
-                kind: 1,
-                target_addr: fixture.end(),
-                external: 1,
+                kind: successor.kind,
+                target_addr: successor.target,
+                external: u8::from(successor.external),
                 ..Default::default()
             })
         };
@@ -5974,15 +6007,13 @@ mod tests {
     }
 
     unsafe extern "C" fn external_exit(snapshot: *const c_void, index: usize, out: *mut u64) -> u8 {
-        if index != 0 {
-            return 0;
-        }
         // SAFETY: callback arguments are the live fixture and capture-owned output.
         let fixture = unsafe { fixture(snapshot) };
-        if fixture.terminal_return {
+        let external_exits = fixture.external_exits();
+        let Some(exit) = external_exits.get(index) else {
             return 0;
-        }
-        unsafe { out.write(fixture.end()) };
+        };
+        unsafe { out.write(*exit) };
         1
     }
 
@@ -6019,15 +6050,16 @@ mod tests {
         1
     }
 
-    fn trusted_x86_fixture(
-        bytes: &[u8],
+    type LiftedBlockSpans = Vec<(u64, u32, u64, u64)>;
+
+    fn trusted_x86_blocks_fixture(
+        blocks: Vec<NativeSpanBlockFixture>,
         addr: u64,
-        terminal_return: bool,
         exact_private_stack: bool,
     ) -> (
         TrustedSsaArtifact,
-        r2il::R2ILBlock,
-        Vec<(u64, u32, u64, u64)>,
+        Vec<r2il::R2ILBlock>,
+        Vec<LiftedBlockSpans>,
     ) {
         let trusted_disassembler = r2sleigh_lift::Disassembler::from_trusted_profile(
             r2sleigh_lift::TrustedSleighProfile::X86_64,
@@ -6041,7 +6073,7 @@ mod tests {
             .expect("trusted RSP register");
         let fixture = NativeSpanSnapshotFixture {
             addr,
-            bytes: bytes.to_vec(),
+            blocks,
             return_address: RadareAbi138RegisterStorageView {
                 name_length: 3,
                 offset: return_address.address.offset,
@@ -6054,7 +6086,6 @@ mod tests {
             },
             return_address_name: "RIP".to_string(),
             stack_pointer_name: "RSP".to_string(),
-            terminal_return,
             exact_private_stack,
         };
         let accessors = RadareAbi138Accessors {
@@ -6095,24 +6126,67 @@ mod tests {
             unsafe { r2source::capture_radare_abi138(&input) }.expect("owned source capture");
         let lifted = r2sleigh_lift::Disassembler::lift_owned_function(source)
             .expect("trusted production lift");
-        let block = lifted.lifted().blocks()[0].block().clone();
-        let spans = lifted.lifted().blocks()[0]
-            .instruction_spans()
+        let blocks = lifted
+            .lifted()
+            .blocks()
             .iter()
-            .map(|span| {
-                (
-                    span.addr(),
-                    span.size(),
-                    span.first_canonical_op(),
-                    span.canonical_op_count(),
-                )
+            .map(|block| block.block().clone())
+            .collect();
+        let spans = lifted
+            .lifted()
+            .blocks()
+            .iter()
+            .map(|block| {
+                block
+                    .instruction_spans()
+                    .iter()
+                    .map(|span| {
+                        (
+                            span.addr(),
+                            span.size(),
+                            span.first_canonical_op(),
+                            span.canonical_op_count(),
+                        )
+                    })
+                    .collect()
             })
             .collect();
         (
             TrustedSsaArtifact::prepare(lifted).expect("trusted production SSA"),
-            block,
+            blocks,
             spans,
         )
+    }
+
+    fn trusted_x86_fixture(
+        bytes: &[u8],
+        addr: u64,
+        terminal_return: bool,
+        exact_private_stack: bool,
+    ) -> (TrustedSsaArtifact, r2il::R2ILBlock, LiftedBlockSpans) {
+        let end = addr
+            .checked_add(u64::try_from(bytes.len()).expect("fixture size fits u64"))
+            .expect("fixture range");
+        let successors = (!terminal_return)
+            .then(|| NativeSpanSuccessorFixture {
+                kind: 1,
+                target: end,
+                external: true,
+            })
+            .into_iter()
+            .collect();
+        let (trusted, blocks, spans) = trusted_x86_blocks_fixture(
+            vec![NativeSpanBlockFixture {
+                addr,
+                bytes: bytes.to_vec(),
+                successors,
+            }],
+            addr,
+            exact_private_stack,
+        );
+        let [block] = blocks.try_into().expect("one lifted block");
+        let [spans] = spans.try_into().expect("one lifted block span set");
+        (trusted, block, spans)
     }
 
     fn trusted_native_span_fixture(
@@ -6124,6 +6198,118 @@ mod tests {
         Vec<(u64, u32, u64, u64)>,
     ) {
         trusted_x86_fixture(bytes, addr, false, false)
+    }
+
+    fn conditional_private_join_blocks(
+        addr: u64,
+        zero_op_forwarder: bool,
+    ) -> Vec<NativeSpanBlockFixture> {
+        let header_addr = addr;
+        let false_addr = header_addr + 7;
+        let false_size = 10_u64;
+        let forwarder_addr = false_addr + false_size;
+        let forwarder_size = if zero_op_forwarder { 3_u64 } else { 2_u64 };
+        let true_addr = forwarder_addr + forwarder_size;
+        let true_size = 10_u64;
+        let join_addr = true_addr + true_size;
+        let rel8 = |instruction_end: u64, target: u64| {
+            i8::try_from(
+                i64::try_from(target).expect("target fits i64")
+                    - i64::try_from(instruction_end).expect("instruction end fits i64"),
+            )
+            .expect("fixture branch fits rel8") as u8
+        };
+
+        let mut forwarder = Vec::with_capacity(usize::try_from(forwarder_size).unwrap());
+        if zero_op_forwarder {
+            forwarder.push(0x90);
+        }
+        forwarder.extend_from_slice(&[0xeb, rel8(true_addr, true_addr)]);
+
+        vec![
+            NativeSpanBlockFixture {
+                addr: header_addr,
+                bytes: vec![
+                    0x48,
+                    0x8d,
+                    0x64,
+                    0x24,
+                    0xf0, // lea rsp, [rsp-16]
+                    0xe3,
+                    rel8(false_addr, forwarder_addr), // jrcxz forwarder
+                ],
+                successors: vec![
+                    NativeSpanSuccessorFixture {
+                        kind: 0,
+                        target: forwarder_addr,
+                        external: false,
+                    },
+                    NativeSpanSuccessorFixture {
+                        kind: 1,
+                        target: false_addr,
+                        external: false,
+                    },
+                ],
+            },
+            NativeSpanBlockFixture {
+                addr: false_addr,
+                bytes: vec![
+                    0xc7,
+                    0x44,
+                    0x24,
+                    0x08,
+                    0x00,
+                    0x00,
+                    0x00,
+                    0x00, // mov dword [rsp+8], 0
+                    0xeb,
+                    rel8(forwarder_addr, join_addr), // jmp join
+                ],
+                successors: vec![NativeSpanSuccessorFixture {
+                    kind: 0,
+                    target: join_addr,
+                    external: false,
+                }],
+            },
+            NativeSpanBlockFixture {
+                addr: forwarder_addr,
+                bytes: forwarder,
+                successors: vec![NativeSpanSuccessorFixture {
+                    kind: 0,
+                    target: true_addr,
+                    external: false,
+                }],
+            },
+            NativeSpanBlockFixture {
+                addr: true_addr,
+                bytes: vec![
+                    0xc7,
+                    0x44,
+                    0x24,
+                    0x08,
+                    0x01,
+                    0x00,
+                    0x00,
+                    0x00, // mov dword [rsp+8], 1
+                    0xeb,
+                    rel8(join_addr, join_addr), // jmp join
+                ],
+                successors: vec![NativeSpanSuccessorFixture {
+                    kind: 0,
+                    target: join_addr,
+                    external: false,
+                }],
+            },
+            NativeSpanBlockFixture {
+                addr: join_addr,
+                bytes: vec![
+                    0x8b, 0x44, 0x24, 0x08, // mov eax, dword [rsp+8]
+                    0x48, 0x8d, 0x64, 0x24, 0x10, // lea rsp, [rsp+16]
+                    0xc3, // ret
+                ],
+                successors: Vec::new(),
+            },
+        ]
     }
 
     fn assert_zero_op_native_spans_are_exactly_residual(
@@ -6288,6 +6474,74 @@ mod tests {
         assert!(projection.stack_discipline().is_some());
         assert!(full.private_frame_value_flows().is_empty());
         assert!(projection.private_frame_value_flows().is_empty());
+    }
+
+    #[test]
+    fn genuine_private_frame_conditional_join_is_wired_through_public_certificates() {
+        const ADDR: u64 = 0x404000;
+        let source_blocks = conditional_private_join_blocks(ADDR, false);
+        let header = source_blocks[0].addr;
+        let join_addr = source_blocks[4].addr;
+        let (trusted, lifted, spans) = trusted_x86_blocks_fixture(source_blocks, ADDR, true);
+        assert_eq!(lifted.len(), 5);
+        assert_eq!(spans.len(), 5);
+        assert!(spans.iter().flatten().all(|span| span.3 != 0));
+
+        let full = CertifiedMachineFunction::from_artifact(&trusted)
+            .expect("full genuine conditional private-frame certificate");
+        let projection = CertifiedMachineProjection::from_artifact(&trusted)
+            .expect("projected genuine conditional private-frame certificate");
+        assert!(full.stack_discipline().is_some());
+        assert!(projection.stack_discipline().is_some());
+        assert_eq!(full.private_frame_value_flows().len(), 1);
+        assert_eq!(
+            full.private_frame_value_flows(),
+            projection.private_frame_value_flows()
+        );
+        assert_eq!(full.private_frame_conditional_joins().len(), 1);
+        assert_eq!(
+            full.private_frame_conditional_joins(),
+            projection.private_frame_conditional_joins()
+        );
+        let certificate = full
+            .private_frame_conditional_join(header)
+            .expect("header-keyed conditional join");
+        assert_eq!(certificate.join_block(), join_addr);
+        assert_eq!(certificate.true_arm().transparent().len(), 1);
+        assert!(certificate.false_arm().transparent().is_empty());
+        assert!(certificate.release().return_address_read().is_some());
+
+        let source_blocks = conditional_private_join_blocks(ADDR + 0x100, true);
+        let (trusted, lifted, spans) =
+            trusted_x86_blocks_fixture(source_blocks, ADDR + 0x100, true);
+        assert_eq!(lifted.len(), 5);
+        let zero_spans = spans
+            .iter()
+            .flatten()
+            .filter(|span| span.3 == 0)
+            .collect::<Vec<_>>();
+        assert_eq!(zero_spans.len(), 1);
+        let unsupported = trusted
+            .artifact()
+            .obligations()
+            .instructions()
+            .values()
+            .filter(|instruction| instruction.state == SemanticInstructionState::UnsupportedUnknown)
+            .map(|instruction| instruction.id)
+            .collect::<Vec<_>>();
+        assert_eq!(unsupported.len(), 1);
+
+        let full = CertifiedMachineFunction::from_artifact(&trusted)
+            .expect("full genuine zero-op-span certificate");
+        let projection = CertifiedMachineProjection::from_artifact(&trusted)
+            .expect("projected genuine zero-op-span certificate");
+        assert_eq!(full.topology(), projection.topology());
+        assert_eq!(full.topology().blocks().len(), 5);
+        assert!(full.stack_discipline().is_none());
+        assert!(projection.stack_discipline().is_none());
+        assert!(full.private_frame_conditional_joins().is_empty());
+        assert!(projection.private_frame_conditional_joins().is_empty());
+        assert!(projection.residual_producers().contains(&unsupported[0]));
     }
 
     #[test]
