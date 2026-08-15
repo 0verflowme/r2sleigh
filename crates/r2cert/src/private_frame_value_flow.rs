@@ -1074,6 +1074,7 @@ mod tests {
                 memory_statements: &statements,
                 return_controls: &returns,
             },
+            None,
             &ledger,
         )
         .expect("certified stack discipline");

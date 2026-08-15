@@ -15,11 +15,13 @@ use serde::Serialize;
 use super::{
     CERTIFICATION_SCHEMA_VERSION, CERTIFIED_PRIVATE_FRAME_CONDITIONAL_JOIN_CONTRACT_VERSION,
     CertifiedArtifactOrigin, CertifiedConditionalControl, CertifiedDirectControl,
-    CertifiedLedgerClosure, CertifiedMemoryStatement, CertifiedMemoryStatementKind,
-    CertifiedPrivateFrameStore, CertifiedPrivateFrameValueFlow, CertifiedReturnControl,
-    CertifiedSourceTerminator, CertifiedSourceTopology, CertifiedStackDiscipline,
-    CertifiedStackRelease, CertifiedTypedRegionKind, EffectDisposition, LedgerClosureError,
-    ObligationLedger, TypedRegionMapping, frame_statement_is_ledgered,
+    CertifiedFramePreservation, CertifiedLedgerClosure, CertifiedMemoryStatement,
+    CertifiedMemoryStatementKind, CertifiedPrivateFrameStore, CertifiedPrivateFrameValueFlow,
+    CertifiedReturnControl, CertifiedSourceTerminator, CertifiedSourceTopology,
+    CertifiedStackDiscipline, CertifiedStackRelease, CertifiedTypedRegionKind, EffectDisposition,
+    LedgerClosureError, ObligationLedger, TypedRegionMapping,
+    exact_frame_pointer_storage_is_unused, exact_frame_restore_for_return,
+    frame_statement_is_ledgered, replay_certified_frame_preservation,
     return_machine_state_matches_origin, try_certified_memory_statement,
 };
 
@@ -28,6 +30,37 @@ use super::{
 pub struct CertifiedPrivateFrameTransparentBranch {
     block_addr: u64,
     control: CertifiedDirectControl,
+}
+
+/// Exact source-owned transfer from an arm's terminal store into the shared
+/// join. A fallthrough carries topology only: it owns no control obligation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum CertifiedPrivateFrameJoinTransfer {
+    Direct(CertifiedDirectControl),
+    Fallthrough { block_addr: u64, target: u64 },
+}
+
+impl CertifiedPrivateFrameJoinTransfer {
+    pub const fn direct(&self) -> Option<&CertifiedDirectControl> {
+        match self {
+            Self::Direct(control) => Some(control),
+            Self::Fallthrough { .. } => None,
+        }
+    }
+
+    pub const fn block_addr(&self) -> u64 {
+        match self {
+            Self::Direct(control) => control.producer().block_addr,
+            Self::Fallthrough { block_addr, .. } => *block_addr,
+        }
+    }
+
+    pub const fn target(&self) -> u64 {
+        match self {
+            Self::Direct(control) => control.target(),
+            Self::Fallthrough { target, .. } => *target,
+        }
+    }
 }
 
 impl CertifiedPrivateFrameTransparentBranch {
@@ -48,7 +81,7 @@ pub struct CertifiedPrivateFrameConditionalArm {
     transparent: Box<[CertifiedPrivateFrameTransparentBranch]>,
     store_block: u64,
     store: CertifiedPrivateFrameStore,
-    join_transfer: CertifiedDirectControl,
+    join_transfer: CertifiedPrivateFrameJoinTransfer,
 }
 
 impl CertifiedPrivateFrameConditionalArm {
@@ -68,7 +101,7 @@ impl CertifiedPrivateFrameConditionalArm {
         &self.store
     }
 
-    pub const fn join_transfer(&self) -> &CertifiedDirectControl {
+    pub const fn join_transfer(&self) -> &CertifiedPrivateFrameJoinTransfer {
         &self.join_transfer
     }
 }
@@ -97,7 +130,10 @@ impl CertifiedInertPrivateFrameJoinPhi {
 
 /// Whole-function proof of a two-arm private-frame store join and its unique
 /// terminal load/release/return. Auxiliary direct flows retain other exact
-/// private regions used while computing the branch condition.
+/// private regions used while computing the branch condition. When the exact
+/// function actually uses a source-declared frame pointer through an exactly
+/// certified save/restore sequence, the join also retains that replayed frame
+/// certificate and the statements needed to close the function.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CertifiedPrivateFrameConditionalJoin {
     schema_version: u32,
@@ -110,6 +146,7 @@ pub struct CertifiedPrivateFrameConditionalJoin {
     joined_flow: CertifiedPrivateFrameValueFlow,
     inert_join_phis: Box<[CertifiedInertPrivateFrameJoinPhi]>,
     auxiliary_direct_flows: Box<[(StructuredAccessId, CertifiedPrivateFrameValueFlow)]>,
+    frame_preservation: Option<CertifiedFramePreservation>,
     release: CertifiedStackRelease,
     return_control: CertifiedReturnControl,
 }
@@ -155,6 +192,10 @@ impl CertifiedPrivateFrameConditionalJoin {
         &self,
     ) -> &[(StructuredAccessId, CertifiedPrivateFrameValueFlow)] {
         &self.auxiliary_direct_flows
+    }
+
+    pub const fn frame_preservation(&self) -> Option<&CertifiedFramePreservation> {
+        self.frame_preservation.as_ref()
     }
 
     pub const fn release(&self) -> &CertifiedStackRelease {
@@ -228,8 +269,11 @@ struct PrivateFrameConditionalJoinLedgerBinding<'a> {
 fn private_frame_conditional_join_ledger_binding<'a>(
     artifact: &SsaArtifact,
     origin: &CertifiedArtifactOrigin,
+    ledger: &ObligationLedger,
     join: &'a CertifiedPrivateFrameConditionalJoin,
 ) -> Option<PrivateFrameConditionalJoinLedgerBinding<'a>> {
+    let interface = origin.machine_context().source().function_interface()?;
+    let frame = join.frame_preservation();
     if join.schema_version() != CERTIFICATION_SCHEMA_VERSION
         || join.origin() != origin
         || origin.topology().entry_addr() != join.header()
@@ -248,6 +292,55 @@ fn private_frame_conditional_join_ledger_binding<'a>(
     {
         return None;
     }
+    if let Some(frame) = frame {
+        let restore = exact_frame_restore_for_return(origin, frame, join.return_control())?;
+        if replay_certified_frame_preservation(artifact, origin, ledger).as_ref() != Some(frame)
+            || frame.restores().len() != 1
+            || interface.exact_frame_pointer_storage() != Some(frame.frame_pointer_storage())
+            || interface.stack_pointer_storage() != Some(frame.stack_pointer_storage())
+            || restore.return_address_read() != join.release().return_address_read()
+            || frame.entry_save().producer().block_addr != join.header()
+            || restore.restore_read().producer().block_addr != join.join_block()
+        {
+            return None;
+        }
+    } else if interface
+        .exact_frame_pointer_storage()
+        .is_some_and(|storage| !exact_frame_pointer_storage_is_unused(artifact, storage))
+    {
+        return None;
+    }
+    for arm in [join.true_arm(), join.false_arm()] {
+        let block = origin.topology().block(arm.store_block())?;
+        if arm.store().statement().producer().block_addr != arm.store_block()
+            || arm.join_transfer().block_addr() != arm.store_block()
+            || arm.join_transfer().target() != join.join_block()
+            || block.predecessors().len() != 1
+            || block.successors() != [join.join_block()]
+        {
+            return None;
+        }
+        match arm.join_transfer() {
+            CertifiedPrivateFrameJoinTransfer::Direct(control) => {
+                if !matches!(block.terminator(), CertifiedSourceTerminator::Branch { target }
+                    if *target == join.join_block())
+                    || control.producer().block_addr != arm.store_block()
+                {
+                    return None;
+                }
+            }
+            CertifiedPrivateFrameJoinTransfer::Fallthrough { block_addr, target } => {
+                if *block_addr != arm.store_block()
+                    || *target != join.join_block()
+                    || !matches!(block.terminator(), CertifiedSourceTerminator::Fallthrough { next }
+                        if *next == join.join_block())
+                    || block.instructions().last() != Some(&arm.store().statement().producer())
+                {
+                    return None;
+                }
+            }
+        }
+    }
     let producers = origin
         .topology()
         .blocks()
@@ -261,6 +354,14 @@ fn private_frame_conditional_join_ledger_binding<'a>(
         .flat_map(|flow| flow.region().accesses())
         .map(|access| access.statement())
         .chain(join.release().return_address_read())
+        .chain(frame.into_iter().flat_map(|frame| {
+            std::iter::once(frame.entry_save()).chain(
+                frame
+                    .restores()
+                    .iter()
+                    .map(|restore| restore.restore_read()),
+            )
+        }))
     {
         if !producers.contains(&statement.producer())
             || statement.validate(origin.source()).is_err()
@@ -282,14 +383,14 @@ fn private_frame_conditional_join_ledger_binding<'a>(
         .transparent()
         .iter()
         .map(|branch| branch.control())
-        .chain(std::iter::once(join.true_arm().join_transfer()))
+        .chain(join.true_arm().join_transfer().direct())
         .chain(
             join.false_arm()
                 .transparent()
                 .iter()
                 .map(|branch| branch.control()),
         )
-        .chain(std::iter::once(join.false_arm().join_transfer()))
+        .chain(join.false_arm().join_transfer().direct())
     {
         if !producers.contains(&control.producer())
             || control.validate(origin.source()).is_err()
@@ -464,7 +565,7 @@ pub fn certify_private_frame_conditional_join_region(
     {
         return Err(LedgerClosureError::InvalidOrigin);
     }
-    let binding = private_frame_conditional_join_ledger_binding(artifact, origin, join)
+    let binding = private_frame_conditional_join_ledger_binding(artifact, origin, ledger, join)
         .ok_or(LedgerClosureError::InvalidRegionTopology)?;
     certify_private_frame_conditional_join_region_binding(
         origin,
@@ -551,9 +652,6 @@ fn certify_arm(
     controls: &BTreeMap<u64, &CertifiedDirectControl>,
     ledger: &ObligationLedger,
 ) -> Option<CertifiedPrivateFrameConditionalArm> {
-    let (transparent, transfer) = certify_arm_route(
-        source, topology, start, header, terminal, join, controls, ledger,
-    )?;
     if store.statement().producer().block_addr != terminal
         || !matches!(
             store.statement().kind(),
@@ -562,6 +660,17 @@ fn certify_arm(
     {
         return None;
     }
+    let (transparent, transfer) = certify_arm_route(
+        source,
+        topology,
+        start,
+        header,
+        terminal,
+        join,
+        store.statement().producer(),
+        controls,
+        ledger,
+    )?;
     Some(CertifiedPrivateFrameConditionalArm {
         entry_target: start,
         transparent,
@@ -578,11 +687,12 @@ fn certify_arm_route(
     header: u64,
     terminal: u64,
     join: u64,
+    store_producer: CanonicalInstructionId,
     controls: &BTreeMap<u64, &CertifiedDirectControl>,
     ledger: &ObligationLedger,
 ) -> Option<(
     Box<[CertifiedPrivateFrameTransparentBranch]>,
-    CertifiedDirectControl,
+    CertifiedPrivateFrameJoinTransfer,
 )> {
     let mut current = start;
     let mut predecessor = header;
@@ -616,14 +726,34 @@ fn certify_arm_route(
     if !seen.insert(terminal) {
         return None;
     }
-    let transfer = *controls.get(&terminal)?;
-    if transfer.validate(source).is_err()
-        || !direct_control_is_ledgered(transfer, ledger)
-        || !exact_branch_block(topology, terminal, predecessor, join, transfer, false)
-    {
+    let block = topology.block(terminal)?;
+    if block.predecessors() != [predecessor] || block.successors() != [join] {
         return None;
     }
-    Some((transparent.into_boxed_slice(), transfer.clone()))
+    let transfer = match block.terminator() {
+        CertifiedSourceTerminator::Branch { target } if *target == join => {
+            let control = *controls.get(&terminal)?;
+            if control.validate(source).is_err()
+                || !direct_control_is_ledgered(control, ledger)
+                || !exact_branch_block(topology, terminal, predecessor, join, control, false)
+            {
+                return None;
+            }
+            CertifiedPrivateFrameJoinTransfer::Direct(control.clone())
+        }
+        CertifiedSourceTerminator::Fallthrough { next }
+            if *next == join
+                && !controls.contains_key(&terminal)
+                && block.instructions().last() == Some(&store_producer) =>
+        {
+            CertifiedPrivateFrameJoinTransfer::Fallthrough {
+                block_addr: terminal,
+                target: join,
+            }
+        }
+        _ => return None,
+    };
+    Some((transparent.into_boxed_slice(), transfer))
 }
 
 fn joined_flow_stores(
@@ -871,6 +1001,7 @@ fn certify_conditional_join(
     origin: &CertifiedArtifactOrigin,
     topology: &CertifiedSourceTopology,
     stack: &CertifiedStackDiscipline,
+    frame: Option<&CertifiedFramePreservation>,
     flows: &BTreeMap<StructuredAccessId, CertifiedPrivateFrameValueFlow>,
     direct_controls: &BTreeMap<CanonicalInstructionId, CertifiedDirectControl>,
     conditional: &CertifiedConditionalControl,
@@ -893,6 +1024,28 @@ fn certify_conditional_join(
     {
         return None;
     }
+    let interface = origin.machine_context().source().function_interface()?;
+    if frame.is_none()
+        && interface
+            .exact_frame_pointer_storage()
+            .is_some_and(|storage| !exact_frame_pointer_storage_is_unused(artifact, storage))
+    {
+        return None;
+    }
+    let frame_restore = if let Some(frame) = frame {
+        let restore = exact_frame_restore_for_return(origin, frame, return_control)?;
+        if replay_certified_frame_preservation(artifact, origin, ledger).as_ref() != Some(frame)
+            || frame.restores().len() != 1
+            || interface.exact_frame_pointer_storage() != Some(frame.frame_pointer_storage())
+            || interface.stack_pointer_storage() != Some(frame.stack_pointer_storage())
+            || stack.stack_pointer_storage() != frame.stack_pointer_storage()
+        {
+            return None;
+        }
+        Some(restore)
+    } else {
+        None
+    };
     let header = conditional.producer().block_addr;
     let header_block = topology.block(header)?;
     if !header_block.predecessors().is_empty()
@@ -964,14 +1117,24 @@ fn certify_conditional_join(
         .transparent()
         .iter()
         .map(|branch| branch.control().producer())
-        .chain(std::iter::once(true_arm.join_transfer().producer()))
+        .chain(
+            true_arm
+                .join_transfer()
+                .direct()
+                .map(|control| control.producer()),
+        )
         .chain(
             false_arm
                 .transparent()
                 .iter()
                 .map(|branch| branch.control().producer()),
         )
-        .chain(std::iter::once(false_arm.join_transfer().producer()))
+        .chain(
+            false_arm
+                .join_transfer()
+                .direct()
+                .map(|control| control.producer()),
+        )
         .collect::<BTreeSet<_>>();
     if selected_direct != direct_controls.keys().copied().collect() {
         return None;
@@ -1014,6 +1177,27 @@ fn certify_conditional_join(
     }
     let return_address_read =
         exact_release_return_address_read(artifact, origin, ledger, release, *join)?;
+    if let Some(restore) = frame_restore {
+        let frame = frame?;
+        if restore.return_address_read() != release.return_address_read()
+            || frame.entry_save().producer().block_addr != header
+            || restore.restore_read().producer().block_addr != *join
+        {
+            return None;
+        }
+        for statement in [frame.entry_save(), restore.restore_read()] {
+            if statement.validate(origin.source()).is_err()
+                || try_certified_memory_statement(artifact, statement.access().inst)
+                    .ok()
+                    .flatten()
+                    .as_ref()
+                    != Some(statement)
+                || !frame_statement_is_ledgered(statement, ledger)
+            {
+                return None;
+            }
+        }
+    }
     let known = std::iter::once(conditional.producer())
         .chain(selected_direct)
         .chain(
@@ -1025,6 +1209,14 @@ fn certify_conditional_join(
         )
         .chain(std::iter::once(return_control.producer()))
         .chain(return_address_read)
+        .chain(frame.into_iter().flat_map(|frame| {
+            std::iter::once(frame.entry_save().producer()).chain(
+                frame
+                    .restores()
+                    .iter()
+                    .map(|restore| restore.restore_read().producer()),
+            )
+        }))
         .chain(inert_join_phis.iter().map(|phi| phi.producer()))
         .collect::<BTreeSet<_>>();
     if topology
@@ -1049,6 +1241,7 @@ fn certify_conditional_join(
         joined_flow: (*primary).clone(),
         inert_join_phis: inert_join_phis.into_boxed_slice(),
         auxiliary_direct_flows: auxiliary.into_boxed_slice(),
+        frame_preservation: frame.cloned(),
         release: release.clone(),
         return_control: return_control.clone(),
     })
@@ -1080,6 +1273,7 @@ pub(super) fn certified_private_frame_conditional_joins(
     origin: &CertifiedArtifactOrigin,
     topology: &CertifiedSourceTopology,
     stack: Option<&CertifiedStackDiscipline>,
+    frame: Option<&CertifiedFramePreservation>,
     flows: &BTreeMap<StructuredAccessId, CertifiedPrivateFrameValueFlow>,
     direct_controls: &BTreeMap<CanonicalInstructionId, CertifiedDirectControl>,
     conditional_controls: &BTreeMap<CanonicalInstructionId, CertifiedConditionalControl>,
@@ -1101,6 +1295,7 @@ pub(super) fn certified_private_frame_conditional_joins(
         origin,
         topology,
         stack,
+        frame,
         flows,
         direct_controls,
         conditional,
@@ -1183,6 +1378,9 @@ mod tests {
         None,
         TransparentPayload,
         WrongTerminalTarget,
+        TrueFallthrough,
+        FallthroughWrongNext,
+        FallthroughNonfinalStore,
         UseJoinPhi,
         UnsupportedSource,
         ReturnAddressRead,
@@ -1243,7 +1441,14 @@ mod tests {
             blocks.push(transparent);
         }
 
-        let mut true_terminal = R2ILBlock::new(0x5010, 4);
+        let mut true_terminal = R2ILBlock::new(
+            0x5010,
+            if mutation == RouteMutation::FallthroughWrongNext {
+                8
+            } else {
+                4
+            },
+        );
         true_terminal.push(R2ILOp::Copy {
             dst: shared.clone(),
             src: Varnode::constant(1, 4),
@@ -1253,17 +1458,34 @@ mod tests {
             addr: Varnode::constant(0x8000, 8),
             val: Varnode::constant(1, 4),
         });
-        true_terminal.push(R2ILOp::Branch {
-            target: Varnode::ram(
-                if mutation == RouteMutation::WrongTerminalTarget {
-                    0x5004
-                } else {
-                    0x5014
-                },
-                8,
-            ),
-        });
+        if mutation == RouteMutation::FallthroughNonfinalStore {
+            true_terminal.push(R2ILOp::Copy {
+                dst: Varnode::unique(0x130, 4),
+                src: Varnode::constant(9, 4),
+            });
+        } else if !matches!(
+            mutation,
+            RouteMutation::TrueFallthrough | RouteMutation::FallthroughWrongNext
+        ) {
+            true_terminal.push(R2ILOp::Branch {
+                target: Varnode::ram(
+                    if mutation == RouteMutation::WrongTerminalTarget {
+                        0x5004
+                    } else {
+                        0x5014
+                    },
+                    8,
+                ),
+            });
+        }
         blocks.push(true_terminal);
+        if mutation == RouteMutation::FallthroughWrongNext {
+            let mut wrong_next = R2ILBlock::new(0x5018, 4);
+            wrong_next.push(R2ILOp::Branch {
+                target: Varnode::ram(0x5014, 8),
+            });
+            blocks.push(wrong_next);
+        }
 
         let mut join = R2ILBlock::new(0x5014, 4);
         if mutation == RouteMutation::UnsupportedSource {
@@ -1273,6 +1495,7 @@ mod tests {
                 inputs: vec![],
             });
         }
+
         if mutation == RouteMutation::ReturnAddressRead {
             join.push(R2ILOp::Load {
                 dst: Varnode::unique(0x118, 8),
@@ -1413,6 +1636,18 @@ mod tests {
         }
     }
 
+    fn write_producer(fixture: &RouteFixture, block_addr: u64) -> CanonicalInstructionId {
+        fixture
+            .statements
+            .values()
+            .find(|statement| {
+                statement.producer().block_addr == block_addr
+                    && matches!(statement.kind(), CertifiedMemoryStatementKind::Write { .. })
+            })
+            .expect("terminal write statement")
+            .producer()
+    }
+
     #[test]
     fn accepts_zero_and_one_branch_only_forwarders() {
         for with_chain in [false, true] {
@@ -1425,18 +1660,196 @@ mod tests {
                 fixture.conditional.producer().block_addr,
                 0x5010,
                 0x5014,
+                write_producer(&fixture, 0x5010),
                 &controls,
                 &fixture.ledger,
             )
             .expect("exact arm route");
             assert_eq!(transparent.len(), usize::from(with_chain));
-            assert_eq!(transfer.producer().block_addr, 0x5010);
+            assert_eq!(transfer.block_addr(), 0x5010);
             assert_eq!(transfer.target(), 0x5014);
+            assert!(transfer.direct().is_some());
+            let (false_transparent, false_transfer) = certify_arm_route(
+                fixture.origin.source(),
+                &fixture.topology,
+                fixture.conditional.false_target(),
+                fixture.conditional.producer().block_addr,
+                0x5004,
+                0x5014,
+                write_producer(&fixture, 0x5004),
+                &controls,
+                &fixture.ledger,
+            )
+            .expect("unchanged direct false-arm route");
+            assert!(false_transparent.is_empty());
+            assert_eq!(false_transfer.block_addr(), 0x5004);
+            assert_eq!(false_transfer.target(), 0x5014);
+            assert!(false_transfer.direct().is_some());
             let inert = inert_join_phis(&fixture.artifact, &fixture.topology, 0x5014)
                 .expect("inert join phis");
             assert_eq!(inert.len(), 1);
             assert_eq!(inert[0].predecessors(), [0x5004, 0x5010]);
         }
+    }
+
+    #[test]
+    fn accepts_terminal_store_fallthrough_without_inventing_control() {
+        let fixture = route_fixture(false, RouteMutation::TrueFallthrough);
+        let controls = direct_controls_by_block(&fixture.direct).expect("controls by block");
+        assert!(!controls.contains_key(&0x5010));
+        let block = fixture.topology.block(0x5010).expect("terminal block");
+        assert_eq!(block.predecessors(), [0x5000]);
+        assert_eq!(block.successors(), [0x5014]);
+        assert!(matches!(
+            block.terminator(),
+            CertifiedSourceTerminator::Fallthrough { next: 0x5014 }
+        ));
+        let producer = write_producer(&fixture, 0x5010);
+        assert_eq!(block.instructions().last(), Some(&producer));
+        let (transparent, transfer) = certify_arm_route(
+            fixture.origin.source(),
+            &fixture.topology,
+            fixture.conditional.true_target(),
+            fixture.conditional.producer().block_addr,
+            0x5010,
+            0x5014,
+            producer,
+            &controls,
+            &fixture.ledger,
+        )
+        .expect("sealed fallthrough route");
+        assert!(transparent.is_empty());
+        assert_eq!(transfer.block_addr(), 0x5010);
+        assert_eq!(transfer.target(), 0x5014);
+        assert!(transfer.direct().is_none());
+        assert!(matches!(
+            transfer,
+            CertifiedPrivateFrameJoinTransfer::Fallthrough {
+                block_addr: 0x5010,
+                target: 0x5014,
+            }
+        ));
+        assert_eq!(
+            serde_json::to_value(&transfer).expect("serialized fallthrough transfer"),
+            serde_json::json!({
+                "Fallthrough": {
+                    "block_addr": 0x5010,
+                    "target": 0x5014,
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn refuses_mutated_fallthrough_topology_payload_control_and_polarity() {
+        let wrong_next = route_fixture(false, RouteMutation::FallthroughWrongNext);
+        let controls = direct_controls_by_block(&wrong_next.direct).unwrap();
+        let wrong_next_block = wrong_next.topology.block(0x5010).unwrap();
+        assert_eq!(wrong_next_block.successors(), [0x5018]);
+        assert!(matches!(
+            wrong_next_block.terminator(),
+            CertifiedSourceTerminator::Fallthrough { next: 0x5018 }
+        ));
+        assert!(
+            certify_arm_route(
+                wrong_next.origin.source(),
+                &wrong_next.topology,
+                wrong_next.conditional.true_target(),
+                wrong_next.conditional.producer().block_addr,
+                0x5010,
+                0x5014,
+                write_producer(&wrong_next, 0x5010),
+                &controls,
+                &wrong_next.ledger,
+            )
+            .is_none()
+        );
+
+        let exact = route_fixture(false, RouteMutation::TrueFallthrough);
+        let controls = direct_controls_by_block(&exact.direct).unwrap();
+        assert!(
+            certify_arm_route(
+                exact.origin.source(),
+                &exact.topology,
+                exact.conditional.true_target(),
+                0xdead,
+                0x5010,
+                0x5014,
+                write_producer(&exact, 0x5010),
+                &controls,
+                &exact.ledger,
+            )
+            .is_none()
+        );
+
+        let nonfinal = route_fixture(false, RouteMutation::FallthroughNonfinalStore);
+        let controls = direct_controls_by_block(&nonfinal.direct).unwrap();
+        let producer = write_producer(&nonfinal, 0x5010);
+        assert_ne!(
+            nonfinal
+                .topology
+                .block(0x5010)
+                .unwrap()
+                .instructions()
+                .last(),
+            Some(&producer)
+        );
+        assert!(
+            certify_arm_route(
+                nonfinal.origin.source(),
+                &nonfinal.topology,
+                nonfinal.conditional.true_target(),
+                nonfinal.conditional.producer().block_addr,
+                0x5010,
+                0x5014,
+                producer,
+                &controls,
+                &nonfinal.ledger,
+            )
+            .is_none()
+        );
+
+        let direct = route_fixture(false, RouteMutation::None);
+        let stray = direct
+            .direct
+            .values()
+            .find(|control| control.producer().block_addr == 0x5010)
+            .unwrap()
+            .clone();
+        let mut controls = direct_controls_by_block(&exact.direct).unwrap();
+        controls.insert(0x5010, &stray);
+        assert!(
+            certify_arm_route(
+                exact.origin.source(),
+                &exact.topology,
+                exact.conditional.true_target(),
+                exact.conditional.producer().block_addr,
+                0x5010,
+                0x5014,
+                write_producer(&exact, 0x5010),
+                &controls,
+                &exact.ledger,
+            )
+            .is_none()
+        );
+
+        let mut swapped = exact.conditional.clone();
+        std::mem::swap(&mut swapped.true_target, &mut swapped.false_target);
+        let controls = direct_controls_by_block(&exact.direct).unwrap();
+        assert!(
+            certify_arm_route(
+                exact.origin.source(),
+                &exact.topology,
+                swapped.true_target(),
+                swapped.producer().block_addr,
+                0x5010,
+                0x5014,
+                write_producer(&exact, 0x5010),
+                &controls,
+                &exact.ledger,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1451,6 +1864,7 @@ mod tests {
                 payload.conditional.producer().block_addr,
                 0x5010,
                 0x5014,
+                write_producer(&payload, 0x5010),
                 &controls,
                 &payload.ledger,
             )
@@ -1467,6 +1881,7 @@ mod tests {
                 wrong.conditional.producer().block_addr,
                 0x5010,
                 0x5014,
+                write_producer(&wrong, 0x5010),
                 &controls,
                 &wrong.ledger,
             )

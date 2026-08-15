@@ -70,6 +70,10 @@ pub struct StackAddressRoot {
 pub struct DecompilePrepFacts {
     pub canonical_value_roots: BTreeMap<SSAVar, SSAVar>,
     pub stack_address_roots: BTreeMap<SSAVar, StackAddressRoot>,
+    /// Exact address roots normalized to the entry stack pointer by machine
+    /// dataflow. Unlike `stack_address_roots`, these roots are never rebased
+    /// to a source-declared frame-pointer coordinate system.
+    pub entry_stack_address_roots: BTreeMap<SSAVar, StackAddressRoot>,
     /// Entry SSA values bound to canonical ABI parameter slots.
     pub formal_parameters: BTreeMap<SSAVar, usize>,
     /// Full-width entry ABI values that may serve as parameter address bases.
@@ -982,6 +986,10 @@ impl DecompilePrepFacts {
 
     pub fn stack_address_root_of(&self, var: &SSAVar) -> Option<&StackAddressRoot> {
         self.stack_address_roots.get(var)
+    }
+
+    pub fn entry_stack_address_root_of(&self, var: &SSAVar) -> Option<&StackAddressRoot> {
+        self.entry_stack_address_roots.get(var)
     }
 
     pub fn formal_parameter_of(&self, var: &SSAVar) -> Option<usize> {
@@ -2372,8 +2380,27 @@ impl SSAFunction {
         } else {
             self.compute_decompile_family_in_states_with_control(family_info, control)?
         };
+        // The source interface identifies the entry stack-pointer carrier, but
+        // does not certify its preservation across calls or unknown effects.
+        // Until such authority exists, do not derive entry-SP-relative facts
+        // for any function containing one of those boundaries.
+        let entry_stack_roots_are_stable = self.blocks().all(|block| {
+            block.ops.iter().all(|op| {
+                !matches!(
+                    op,
+                    SSAOp::Call { .. }
+                        | SSAOp::CallInd { .. }
+                        | SSAOp::CallDefine { .. }
+                        | SSAOp::CallOther { .. }
+                        | SSAOp::Unimplemented
+                        | SSAOp::CpuId { .. }
+                        | SSAOp::New { .. }
+                )
+            })
+        });
         let mut facts = DecompilePrepFacts::default();
         let mut declared_stack_bases = BTreeMap::new();
+        let mut entry_stack_address_size = None;
         if let Some(interface) = function_interface.filter(|interface| {
             interface.stack_slot_roles_complete()
                 && interface.stack_pointer_storage().is_some()
@@ -2381,6 +2408,9 @@ impl SSAFunction {
         }) {
             if let Some(storage) = interface.stack_pointer_storage() {
                 declared_stack_bases.insert(storage, StackAddressBase::StackPointer);
+                if entry_stack_roots_are_stable {
+                    entry_stack_address_size = Some(storage.size);
+                }
             }
             for slot in interface.stack_slots() {
                 declared_stack_bases.insert(slot.base_storage(), slot.base());
@@ -2396,6 +2426,15 @@ impl SSAFunction {
                     facts
                         .stack_address_roots
                         .insert(var.clone(), StackAddressRoot { base, offset: 0 });
+                    if entry_stack_roots_are_stable && base == StackAddressBase::StackPointer {
+                        facts.entry_stack_address_roots.insert(
+                            var.clone(),
+                            StackAddressRoot {
+                                base: StackAddressBase::StackPointer,
+                                offset: 0,
+                            },
+                        );
+                    }
                 }
             }
         }
@@ -2489,6 +2528,22 @@ impl SSAFunction {
                             root,
                         );
                     }
+                    if entry_stack_address_size.is_some_and(|size| {
+                        phi.dst.size == size
+                            && phi.sources.iter().all(|(_, source)| source.size == size)
+                    }) && let Some(root) = common_stack_root(
+                        &phi.sources,
+                        &facts.canonical_value_roots,
+                        &facts.entry_stack_address_roots,
+                        &family_state,
+                        family_info,
+                    ) {
+                        changed |= insert_stack_root(
+                            &mut facts.entry_stack_address_roots,
+                            phi.dst.clone(),
+                            root,
+                        );
+                    }
 
                     apply_phi_family_effect(phi, &mut family_state, family_info);
                 }
@@ -2496,9 +2551,7 @@ impl SSAFunction {
                 for op in &block.ops {
                     control.poll()?;
                     match op {
-                        SSAOp::Copy { dst, src }
-                        | SSAOp::Cast { dst, src }
-                        | SSAOp::New { dst, src } => {
+                        SSAOp::Copy { dst, src } | SSAOp::Cast { dst, src } => {
                             let src_root = resolve_value_root(
                                 src,
                                 &facts.canonical_value_roots,
@@ -2525,6 +2578,22 @@ impl SSAFunction {
                                 );
                                 changed |= insert_stack_root(
                                     &mut facts.stack_address_roots,
+                                    dst.clone(),
+                                    stack_root,
+                                );
+                            }
+                            if entry_stack_address_size
+                                .is_some_and(|size| dst.size == size && src.size == size)
+                                && let Some(stack_root) = resolve_stack_root(
+                                    src,
+                                    &facts.canonical_value_roots,
+                                    &facts.entry_stack_address_roots,
+                                    &family_state,
+                                    family_info,
+                                )
+                            {
+                                changed |= insert_stack_root(
+                                    &mut facts.entry_stack_address_roots,
                                     dst.clone(),
                                     stack_root,
                                 );
@@ -2566,6 +2635,22 @@ impl SSAFunction {
                                     root,
                                 );
                             }
+                            if entry_stack_address_size.is_some_and(|size| {
+                                dst.size == size && a.size == size && b.size == size
+                            }) && let Some(root) = stack_address_root_from_add(
+                                a,
+                                b,
+                                &facts.canonical_value_roots,
+                                &facts.entry_stack_address_roots,
+                                &family_state,
+                                family_info,
+                            ) {
+                                changed |= insert_stack_root(
+                                    &mut facts.entry_stack_address_roots,
+                                    dst.clone(),
+                                    root,
+                                );
+                            }
                         }
                         SSAOp::IntSub { dst, a, b } => {
                             if let Some(root) = stack_address_root_from_sub(
@@ -2584,6 +2669,22 @@ impl SSAFunction {
                                 );
                                 changed |= insert_stack_root(
                                     &mut facts.stack_address_roots,
+                                    dst.clone(),
+                                    root,
+                                );
+                            }
+                            if entry_stack_address_size.is_some_and(|size| {
+                                dst.size == size && a.size == size && b.size == size
+                            }) && let Some(root) = stack_address_root_from_sub(
+                                a,
+                                b,
+                                &facts.canonical_value_roots,
+                                &facts.entry_stack_address_roots,
+                                &family_state,
+                                family_info,
+                            ) {
+                                changed |= insert_stack_root(
+                                    &mut facts.entry_stack_address_roots,
                                     dst.clone(),
                                     root,
                                 );
@@ -3281,7 +3382,7 @@ fn apply_op_family_effect(
     kill_overlapping_family_roots(state, written);
 
     match op {
-        SSAOp::Copy { src, .. } | SSAOp::Cast { src, .. } | SSAOp::New { src, .. } => {
+        SSAOp::Copy { src, .. } | SSAOp::Cast { src, .. } => {
             let root = adapt_family_root(src, written.width).unwrap_or_else(|| dst.clone());
             let exact_root = if family_slot_is_maximal(family_info, written) {
                 dst
@@ -8589,6 +8690,24 @@ mod tests {
                     a: rbp,
                     b: make_const(0x10, 8),
                 },
+                R2ILOp::Copy {
+                    dst: make_unique(0x20, 4),
+                    src: rsp.clone(),
+                },
+                R2ILOp::Cast {
+                    dst: make_unique(0x24, 4),
+                    src: rsp.clone(),
+                },
+                R2ILOp::IntAdd {
+                    dst: make_unique(0x28, 4),
+                    a: rsp.clone(),
+                    b: make_const(1, 8),
+                },
+                R2ILOp::IntSub {
+                    dst: make_unique(0x2c, 4),
+                    a: rsp,
+                    b: make_const(1, 8),
+                },
                 R2ILOp::Return {
                     target: make_const(0, 8),
                 },
@@ -8654,6 +8773,19 @@ mod tests {
                     .map(|root| (typed_function.canonical_storage_for_var(dst), root))
             })
             .collect::<Vec<_>>();
+        let entry_op_roots = typed_function
+            .get_block(0x3000)
+            .expect("entry")
+            .ops
+            .iter()
+            .filter_map(|op| op.dst())
+            .filter_map(|dst| {
+                typed_facts
+                    .entry_stack_address_root_of(dst)
+                    .copied()
+                    .map(|root| (typed_function.canonical_storage_for_var(dst), root))
+            })
+            .collect::<Vec<_>>();
         assert!(op_roots.contains(&(
             Some(fp_storage),
             StackAddressRoot {
@@ -8675,6 +8807,45 @@ mod tests {
                     offset: -0x18,
                 }
         }));
+        assert!(entry_op_roots.contains(&(
+            Some(fp_storage),
+            StackAddressRoot {
+                base: StackAddressBase::StackPointer,
+                offset: 0,
+            },
+        )));
+        assert!(entry_op_roots.contains(&(
+            Some(sp_storage),
+            StackAddressRoot {
+                base: StackAddressBase::StackPointer,
+                offset: -0x20,
+            },
+        )));
+        assert!(entry_op_roots.iter().any(|(_, root)| {
+            *root
+                == StackAddressRoot {
+                    base: StackAddressBase::StackPointer,
+                    offset: -0x18,
+                }
+        }));
+        assert!(
+            typed_function
+                .get_block(0x3000)
+                .expect("entry")
+                .ops
+                .iter()
+                .filter_map(SSAOp::dst)
+                .filter(|dst| dst.size == 4)
+                .all(|dst| typed_facts.entry_stack_address_root_of(dst).is_none()),
+            "narrow copy/cast/add/sub values cannot carry entry-SP authority"
+        );
+        assert!(entry_op_roots.iter().any(|(_, root)| {
+            *root
+                == StackAddressRoot {
+                    base: StackAddressBase::StackPointer,
+                    offset: -0x10,
+                }
+        }));
         assert!(op_roots.iter().any(|(_, root)| {
             *root
                 == StackAddressRoot {
@@ -8694,6 +8865,205 @@ mod tests {
                 .is_empty(),
             "register names and architecture storage alone cannot grant stack roots"
         );
+    }
+
+    #[test]
+    fn entry_stack_roots_refuse_unknown_arch_calls_and_unknown_effects() {
+        let mut arch = ArchSpec::new("custom-stack-call");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("custom_sp", 0x10, 8));
+        arch.add_register(RegisterDef::new("custom_ra", 0x20, 8));
+        let sp_storage = CanonicalStorageId {
+            space: crate::CanonicalStorageSpace::Register,
+            offset: 0x10,
+            size: 8,
+        };
+        let ra_storage = CanonicalStorageId {
+            space: crate::CanonicalStorageSpace::Register,
+            offset: 0x20,
+            size: 8,
+        };
+        let interface = SourceFunctionInterface::new_exact(
+            b"custom-stack-call-roots".to_vec(),
+            "custom-unknown",
+            [],
+            SourceFunctionReturn::Void,
+            [SourceStackSlotSpec::new_local(
+                StackAddressBase::StackPointer,
+                sp_storage,
+                -8,
+                8,
+            )],
+        )
+        .expect("exact custom interface")
+        .with_return_address_storage(ra_storage)
+        .expect("custom return-address carrier")
+        .with_stack_pointer_storage(sp_storage)
+        .expect("custom stack-pointer carrier");
+
+        for (name, boundary) in [
+            (
+                "call",
+                R2ILOp::Call {
+                    target: make_const(0x5000, 8),
+                },
+            ),
+            (
+                "unknown effect",
+                R2ILOp::CallOther {
+                    output: None,
+                    userop: 7,
+                    inputs: Vec::new(),
+                },
+            ),
+            (
+                "cpu identity effect",
+                R2ILOp::CpuId {
+                    dst: make_unique(0x80, 8),
+                },
+            ),
+            (
+                "allocation effect",
+                R2ILOp::New {
+                    dst: make_unique(0x88, 8),
+                    src: make_const(8, 8),
+                },
+            ),
+        ] {
+            let blocks = vec![R2ILBlock {
+                addr: 0x3400,
+                size: 4,
+                ops: vec![
+                    R2ILOp::IntSub {
+                        dst: make_reg(0x10, 8),
+                        a: make_reg(0x10, 8),
+                        b: make_const(0x10, 8),
+                    },
+                    boundary,
+                    R2ILOp::IntAdd {
+                        dst: make_unique(0x40, 8),
+                        a: make_reg(0x10, 8),
+                        b: make_const(8, 8),
+                    },
+                    R2ILOp::Return {
+                        target: make_reg(0x20, 8),
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            }];
+            let artifact =
+                SsaArtifact::for_decompile_with_interface(&blocks, Some(&arch), interface.clone())
+                    .unwrap_or_else(|| panic!("{name} artifact must build"));
+            let facts = artifact
+                .function()
+                .decompile_prep_facts()
+                .expect("custom prep facts");
+            assert!(
+                !facts.stack_address_roots.is_empty(),
+                "{name} must preserve source-declared stack roots"
+            );
+            assert!(
+                facts.entry_stack_address_roots.is_empty(),
+                "{name} must invalidate entry-SP-relative roots"
+            );
+        }
+    }
+
+    #[test]
+    fn new_subregister_result_cannot_inherit_stack_address_authority() {
+        let mut arch = make_x86_64_prep_arch();
+        arch.add_register(RegisterDef::sub("esp", 16, 4, "rsp"));
+        arch.add_register(RegisterDef::new("rip", 32, 8));
+        let sp_storage = CanonicalStorageId {
+            space: crate::CanonicalStorageSpace::Register,
+            offset: 16,
+            size: 8,
+        };
+        let ra_storage = CanonicalStorageId {
+            space: crate::CanonicalStorageSpace::Register,
+            offset: 32,
+            size: 8,
+        };
+        let interface = SourceFunctionInterface::new_exact(
+            b"new-subregister-stack-roots".to_vec(),
+            "sysv",
+            [],
+            SourceFunctionReturn::Void,
+            [SourceStackSlotSpec::new_local(
+                StackAddressBase::StackPointer,
+                sp_storage,
+                -8,
+                8,
+            )],
+        )
+        .expect("exact stack interface")
+        .with_return_address_storage(ra_storage)
+        .expect("return-address carrier")
+        .with_stack_pointer_storage(sp_storage)
+        .expect("stack-pointer carrier");
+        let blocks = [R2ILBlock {
+            addr: 0x3480,
+            size: 4,
+            ops: vec![
+                R2ILOp::New {
+                    dst: make_reg(16, 4),
+                    src: make_reg(16, 8),
+                },
+                R2ILOp::Cast {
+                    dst: make_unique(0x90, 8),
+                    src: make_reg(16, 4),
+                },
+                R2ILOp::Load {
+                    dst: make_unique(0x98, 4),
+                    space: SpaceId::Ram,
+                    addr: make_unique(0x90, 8),
+                },
+                R2ILOp::Return {
+                    target: make_reg(32, 8),
+                },
+            ],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+        let artifact = SsaArtifact::for_decompile_with_interface(&blocks, Some(&arch), interface)
+            .expect("subregister New artifact");
+        let block = artifact.function().get_block(0x3480).expect("entry block");
+        let new_dst = block
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                SSAOp::New { dst, .. } => Some(dst),
+                _ => None,
+            })
+            .expect("New output");
+        let load_addr = block
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                SSAOp::Load { addr, .. } => Some(addr),
+                _ => None,
+            })
+            .expect("load address");
+        let facts = artifact
+            .function()
+            .decompile_prep_facts()
+            .expect("decompile prep facts");
+
+        assert!(facts.stack_address_root_of(new_dst).is_none());
+        assert!(facts.stack_address_root_of(load_addr).is_none());
+        assert!(facts.entry_stack_address_roots.is_empty());
+        let object = artifact
+            .object_for_var(load_addr, SpaceId::Ram)
+            .expect("load address object");
+        assert!(
+            !artifact
+                .objects()
+                .stack_objects
+                .values()
+                .any(|candidate| *candidate == object)
+        );
+        assert!(!artifact.objects().entry_stack_roots.contains_key(&object));
     }
 
     #[test]

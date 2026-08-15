@@ -44,8 +44,8 @@ pub use aggregate_member::{
 };
 pub use private_frame_conditional_join::{
     CertifiedInertPrivateFrameJoinPhi, CertifiedPrivateFrameConditionalArm,
-    CertifiedPrivateFrameConditionalJoin, CertifiedPrivateFrameTransparentBranch,
-    certify_private_frame_conditional_join_region,
+    CertifiedPrivateFrameConditionalJoin, CertifiedPrivateFrameJoinTransfer,
+    CertifiedPrivateFrameTransparentBranch, certify_private_frame_conditional_join_region,
 };
 pub use private_frame_value_flow::{
     CertifiedPrivateFrameLoad, CertifiedPrivateFramePhi, CertifiedPrivateFramePhiInput,
@@ -53,7 +53,7 @@ pub use private_frame_value_flow::{
     CertifiedPrivateFrameVersionDefinition,
 };
 
-pub const CERTIFICATION_SCHEMA_VERSION: u32 = 33;
+pub const CERTIFICATION_SCHEMA_VERSION: u32 = 34;
 
 /// Unforgeable run-local identity for one proof authority domain.
 ///
@@ -143,6 +143,7 @@ impl From<FunctionPrepareMode> for CertifiedPreparationMode {
 pub struct CertifiedDecompilerPreparationSnapshot {
     canonical_value_roots: Box<[(SSAVar, SSAVar)]>,
     stack_address_roots: Box<[(SSAVar, StackAddressRoot)]>,
+    entry_stack_address_roots: Box<[(SSAVar, StackAddressRoot)]>,
     formal_parameters: Box<[(SSAVar, usize)]>,
     formal_parameter_bases: Box<[(SSAVar, usize)]>,
 }
@@ -154,6 +155,10 @@ impl CertifiedDecompilerPreparationSnapshot {
 
     pub const fn stack_address_roots(&self) -> &[(SSAVar, StackAddressRoot)] {
         &self.stack_address_roots
+    }
+
+    pub const fn entry_stack_address_roots(&self) -> &[(SSAVar, StackAddressRoot)] {
+        &self.entry_stack_address_roots
     }
 
     pub const fn formal_parameters(&self) -> &[(SSAVar, usize)] {
@@ -2651,7 +2656,7 @@ pub const CERTIFIED_DIRECT_CALL_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 3;
 pub const CERTIFIED_CONDITIONAL_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 3;
 pub const CERTIFIED_SWITCH_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 3;
 pub const CERTIFIED_CARRIER_FREE_LOOP_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 3;
-pub const CERTIFIED_PRIVATE_FRAME_CONDITIONAL_JOIN_CONTRACT_VERSION: u32 = 1;
+pub const CERTIFIED_PRIVATE_FRAME_CONDITIONAL_JOIN_CONTRACT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TypedRegionMapping {
@@ -2962,17 +2967,7 @@ fn exact_terminal_frame_memory_obligations(
     return_control: &CertifiedReturnControl,
     frame: &CertifiedFramePreservation,
 ) -> Option<BTreeSet<SemanticObligationId>> {
-    if frame.origin() != origin {
-        return None;
-    }
-    let matching_restores = frame
-        .restores()
-        .iter()
-        .filter(|restore| restore.return_control() == return_control)
-        .collect::<Vec<_>>();
-    let [restore] = matching_restores.as_slice() else {
-        return None;
-    };
+    let restore = exact_frame_restore_for_return(origin, frame, return_control)?;
     let mut statements = vec![(
         frame.entry_save(),
         SemanticObligationKind::ObservableMemoryWrite,
@@ -3028,6 +3023,25 @@ fn exact_terminal_frame_memory_obligations(
         }
     }
     Some(obligations)
+}
+
+pub(crate) fn exact_frame_restore_for_return<'a>(
+    origin: &CertifiedArtifactOrigin,
+    frame: &'a CertifiedFramePreservation,
+    return_control: &CertifiedReturnControl,
+) -> Option<&'a CertifiedFrameRestore> {
+    if frame.origin() != origin || frame.origin().schema_version() != CERTIFICATION_SCHEMA_VERSION {
+        return None;
+    }
+    let matching = frame
+        .restores()
+        .iter()
+        .filter(|restore| restore.return_control() == return_control)
+        .collect::<Vec<_>>();
+    let [restore] = matching.as_slice() else {
+        return None;
+    };
+    Some(*restore)
 }
 
 fn terminal_return_obligation_is_admitted(
@@ -4931,6 +4945,11 @@ fn certified_artifact_origin(
                 .collect(),
             stack_address_roots: facts
                 .stack_address_roots
+                .iter()
+                .map(|(value, root)| (value.clone(), *root))
+                .collect(),
+            entry_stack_address_roots: facts
+                .entry_stack_address_roots
                 .iter()
                 .map(|(value, root)| (value.clone(), *root))
                 .collect(),
@@ -6917,6 +6936,8 @@ pub struct CertifiedStackDiscipline {
     stack_pointer_storage: CanonicalStorageId,
     entry_stack_pointer: MachineValueUse,
     reservation_range: CertifiedNormalizedStackRange,
+    private_ownership_range: CertifiedNormalizedStackRange,
+    implicit_active_sp_bytes: u32,
     reservation: CertifiedStackPointerAssignment,
     assignments: Box<[CertifiedStackPointerAssignment]>,
     private_regions: Box<[CertifiedPrivateStackRegion]>,
@@ -6942,6 +6963,18 @@ impl CertifiedStackDiscipline {
 
     pub const fn reservation_range(&self) -> CertifiedNormalizedStackRange {
         self.reservation_range
+    }
+
+    /// Complete entry-SP-relative envelope owned while the certified
+    /// reservation is active, including source-declared implicit bytes.
+    pub const fn private_ownership_range(&self) -> CertifiedNormalizedStackRange {
+        self.private_ownership_range
+    }
+
+    /// Exact source-declared bytes beyond the active SP included in the
+    /// private ownership envelope.
+    pub const fn implicit_active_sp_bytes(&self) -> u32 {
+        self.implicit_active_sp_bytes
     }
 
     pub const fn reservation(&self) -> &CertifiedStackPointerAssignment {
@@ -8604,10 +8637,26 @@ struct StackDisciplineEvidence {
     stack_pointer_storage: CanonicalStorageId,
     entry_stack_pointer: MachineValueUse,
     reservation_range: CertifiedNormalizedStackRange,
+    private_ownership_range: CertifiedNormalizedStackRange,
+    implicit_active_sp_bytes: u32,
     reservation: CertifiedStackPointerAssignment,
     assignments: Vec<CertifiedStackPointerAssignment>,
     private_regions: Vec<CertifiedPrivateStackRegion>,
     releases: Vec<CertifiedStackRelease>,
+}
+
+pub(crate) fn exact_frame_pointer_storage_is_unused(
+    artifact: &SsaArtifact,
+    storage: CanonicalStorageId,
+) -> bool {
+    artifact.graph().values.iter().all(|value| {
+        value.canonical_storage.is_none_or(|candidate| {
+            !certified_register_storages_overlap(candidate, storage)
+                || candidate == storage
+                    && artifact.graph().def_inst(value.id).is_none()
+                    && artifact.graph().use_sites(value.id).is_empty()
+        })
+    })
 }
 
 fn stack_discipline_evidence_from_certified_parts(
@@ -8616,10 +8665,26 @@ fn stack_discipline_evidence_from_certified_parts(
     topology: &CertifiedSourceTopology,
     memory_statements: &BTreeMap<CanonicalInstructionId, CertifiedMemoryStatement>,
     return_controls: &BTreeMap<CanonicalInstructionId, CertifiedReturnControl>,
+    frame: Option<&CertifiedFramePreservation>,
 ) -> Option<StackDisciplineEvidence> {
     let interface = artifact.machine_context().function_interface()?;
     let stack_pointer_storage = interface.stack_pointer_storage()?;
     let stack_allocation_contract = interface.stack_allocation_contract()?;
+    match frame {
+        Some(frame)
+            if interface.exact_frame_pointer_storage() != Some(frame.frame_pointer_storage()) =>
+        {
+            return None;
+        }
+        None => {
+            if let Some(storage) = interface.exact_frame_pointer_storage()
+                && !exact_frame_pointer_storage_is_unused(artifact, storage)
+            {
+                return None;
+            }
+        }
+        Some(_) => {}
+    }
     let width_bits = stack_pointer_storage.size.checked_mul(8)?;
     if width_bits == 0 || width_bits > 64 || !frame_topology_is_balanced(topology) {
         return None;
@@ -8680,6 +8745,26 @@ fn stack_discipline_evidence_from_certified_parts(
     }
 
     let mut affine = BTreeMap::new();
+    if frame.is_some_and(|frame| {
+        frame_normalized_range(
+            artifact,
+            frame.entry_save(),
+            entry_stack_pointer_value,
+            width_bits,
+            &mut affine,
+        ) != Some(frame.saved_range())
+            || frame.restores().iter().any(|restore| {
+                frame_normalized_range(
+                    artifact,
+                    restore.restore_read(),
+                    entry_stack_pointer_value,
+                    width_bits,
+                    &mut affine,
+                ) != Some(frame.saved_range())
+            })
+    }) {
+        return None;
+    }
     let mut assignment_evidence = Vec::new();
     for inst in &graph.insts {
         if inst.canonical_storage != Some(stack_pointer_storage) {
@@ -8735,6 +8820,18 @@ fn stack_discipline_evidence_from_certified_parts(
     {
         return None;
     }
+    let private_ownership_envelope =
+        stack_allocation_contract.owned_entry_relative_envelope(reservation.offset)?;
+    let private_ownership_size = u32::try_from(
+        private_ownership_envelope
+            .end
+            .checked_sub(private_ownership_envelope.start)?,
+    )
+    .ok()?;
+    let private_ownership_range = CertifiedNormalizedStackRange {
+        offset: private_ownership_envelope.start,
+        size_bytes: private_ownership_size,
+    };
 
     let return_blocks = topology
         .blocks()
@@ -8906,6 +9003,15 @@ fn stack_discipline_evidence_from_certified_parts(
         if sealed_return_reads.contains(&statement.producer()) {
             continue;
         }
+        if frame.is_some_and(|frame| {
+            *statement == *frame.entry_save()
+                || frame
+                    .restores()
+                    .iter()
+                    .any(|restore| *statement == *restore.restore_read())
+        }) {
+            continue;
+        }
         let normalized = frame_normalized_range(
             artifact,
             statement,
@@ -8922,9 +9028,12 @@ fn stack_discipline_evidence_from_certified_parts(
             }
             return None;
         };
+        if frame.is_some_and(|frame| frame_ranges_overlap(frame.saved_range(), range, width_bits)) {
+            return None;
+        }
         if statement.space() != MachineAddressSpace::Ram
             || statement.word_size_bytes() != 1
-            || !frame_range_contains(reservation_range, range)
+            || !frame_range_contains(private_ownership_range, range)
             || !frame_value_descends_from(
                 artifact,
                 statement.address().binding().value(),
@@ -8964,9 +9073,6 @@ fn stack_discipline_evidence_from_certified_parts(
             statement: statement.clone(),
             range,
         });
-    }
-    if stack_regions.is_empty() {
-        return None;
     }
     let ranges = stack_regions.keys().copied().collect::<Vec<_>>();
     for (index, range) in ranges.iter().enumerate() {
@@ -9033,6 +9139,8 @@ fn stack_discipline_evidence_from_certified_parts(
         stack_pointer_storage,
         entry_stack_pointer,
         reservation_range,
+        private_ownership_range,
+        implicit_active_sp_bytes: stack_allocation_contract.implicit_active_sp_bytes(),
         reservation: reservation.assignment.clone(),
         assignments: assignment_evidence
             .into_iter()
@@ -9059,9 +9167,36 @@ fn certified_stack_discipline(
     artifact: &SsaArtifact,
     origin: &CertifiedArtifactOrigin,
     parts: FrameCertifiedParts<'_>,
+    frame: Option<&CertifiedFramePreservation>,
     ledger: &ObligationLedger,
 ) -> Option<CertifiedStackDiscipline> {
     if !origin.is_valid() || !ledger.matches_origin(origin) {
+        return None;
+    }
+    if frame.is_some_and(|frame| {
+        frame.origin() != origin
+            || frame.origin().schema_version() != CERTIFICATION_SCHEMA_VERSION
+            || artifact
+                .machine_context()
+                .function_interface()
+                .and_then(|interface| interface.stack_pointer_storage())
+                != Some(frame.stack_pointer_storage())
+            || parts.memory_statements.get(&frame.entry_save().producer())
+                != Some(frame.entry_save())
+            || !frame_statement_is_ledgered(frame.entry_save(), ledger)
+            || frame.restores().iter().any(|restore| {
+                restore.restore_read().space() != frame.entry_save().space()
+                    || restore.restore_read().word_size_bytes()
+                        != frame.entry_save().word_size_bytes()
+                    || restore.restore_read().width_bits() != frame.entry_save().width_bits()
+                    || restore.restore_read().endianness() != frame.entry_save().endianness()
+                    || parts
+                        .memory_statements
+                        .get(&restore.restore_read().producer())
+                        != Some(restore.restore_read())
+                    || !frame_statement_is_ledgered(restore.restore_read(), ledger)
+            })
+    }) {
         return None;
     }
     let evidence = stack_discipline_evidence_from_certified_parts(
@@ -9070,6 +9205,7 @@ fn certified_stack_discipline(
         parts.topology,
         parts.memory_statements,
         parts.return_controls,
+        frame,
     )?;
     let no_obligations = BTreeSet::new();
     if evidence.assignments.iter().any(|assignment| {
@@ -9105,6 +9241,8 @@ fn certified_stack_discipline(
         stack_pointer_storage: evidence.stack_pointer_storage,
         entry_stack_pointer: evidence.entry_stack_pointer,
         reservation_range: evidence.reservation_range,
+        private_ownership_range: evidence.private_ownership_range,
+        implicit_active_sp_bytes: evidence.implicit_active_sp_bytes,
         reservation: evidence.reservation,
         assignments: evidence.assignments.into_boxed_slice(),
         private_regions: evidence.private_regions.into_boxed_slice(),
@@ -9215,6 +9353,59 @@ fn certified_frame_preservation(
             .collect::<Vec<_>>()
             .into_boxed_slice(),
     })
+}
+
+/// Replay the complete frame witness after the caller has bound `artifact` to
+/// `origin`. Both production callers enforce that artifact-authority check at
+/// their public or construction boundary before entering this kernel.
+pub(crate) fn replay_certified_frame_preservation(
+    artifact: &SsaArtifact,
+    origin: &CertifiedArtifactOrigin,
+    ledger: &ObligationLedger,
+) -> Option<CertifiedFramePreservation> {
+    if !origin.is_valid()
+        || origin.source() != artifact.obligations()
+        || !ledger.matches_origin(origin)
+    {
+        return None;
+    }
+    let projection = MachineProjection::from_artifact(artifact).ok()?;
+    projection.validate_against(artifact).ok()?;
+    let topology = certified_source_topology(artifact).ok()?;
+    if &topology != origin.topology() {
+        return None;
+    }
+    let memory_statements = certified_memory_statements(artifact).ok()?;
+    let return_controls = certified_return_controls(artifact, &topology).ok()?;
+    let mut expressions = BTreeMap::new();
+    for entity in projection.entities() {
+        let obligations = entity
+            .source_obligations()
+            .iter()
+            .copied()
+            .filter(|obligation| obligation.kind == SemanticObligationKind::LiveValueProducer)
+            .collect::<BTreeSet<_>>();
+        if obligations.is_empty() {
+            continue;
+        }
+        let expression =
+            certified_expr_from_machine(artifact, &projection, entity, obligations).ok()?;
+        if expressions.insert(entity.producer(), expression).is_some() {
+            return None;
+        }
+    }
+    certified_frame_preservation(
+        artifact,
+        origin,
+        FrameCertifiedParts {
+            projection: &projection,
+            topology: &topology,
+            expressions: &expressions,
+            memory_statements: &memory_statements,
+            return_controls: &return_controls,
+        },
+        ledger,
+    )
 }
 
 /// Machine semantics and their source-bound certification ledger.
@@ -9528,8 +9719,19 @@ impl CertifiedMachineFunction {
             memory_statements: &memory_statements,
             return_controls: &return_controls,
         };
-        let stack_discipline =
-            certified_stack_discipline(artifact, &origin, certified_parts, certification.ledger());
+        let frame_preservation = certified_frame_preservation(
+            artifact,
+            &origin,
+            certified_parts,
+            certification.ledger(),
+        );
+        let stack_discipline = certified_stack_discipline(
+            artifact,
+            &origin,
+            certified_parts,
+            frame_preservation.as_ref(),
+            certification.ledger(),
+        );
         let private_frame_value_flows =
             private_frame_value_flow::certified_private_frame_value_flows(
                 artifact,
@@ -9544,18 +9746,13 @@ impl CertifiedMachineFunction {
                 &origin,
                 &topology,
                 stack_discipline.as_ref(),
+                frame_preservation.as_ref(),
                 &private_frame_value_flows,
                 &direct_controls,
                 &conditional_controls,
                 &return_controls,
                 certification.ledger(),
             );
-        let frame_preservation = certified_frame_preservation(
-            artifact,
-            &origin,
-            certified_parts,
-            certification.ledger(),
-        );
         Ok(Self {
             origin,
             projection,
@@ -10281,8 +10478,19 @@ impl CertifiedMachineProjection {
             memory_statements: &memory_statements,
             return_controls: &return_controls,
         };
-        let stack_discipline =
-            certified_stack_discipline(artifact, &origin, certified_parts, certification.ledger());
+        let frame_preservation = certified_frame_preservation(
+            artifact,
+            &origin,
+            certified_parts,
+            certification.ledger(),
+        );
+        let stack_discipline = certified_stack_discipline(
+            artifact,
+            &origin,
+            certified_parts,
+            frame_preservation.as_ref(),
+            certification.ledger(),
+        );
         let private_frame_value_flows =
             private_frame_value_flow::certified_private_frame_value_flows(
                 artifact,
@@ -10297,18 +10505,13 @@ impl CertifiedMachineProjection {
                 &origin,
                 &topology,
                 stack_discipline.as_ref(),
+                frame_preservation.as_ref(),
                 &private_frame_value_flows,
                 &direct_controls,
                 &conditional_controls,
                 &return_controls,
                 certification.ledger(),
             );
-        let frame_preservation = certified_frame_preservation(
-            artifact,
-            &origin,
-            certified_parts,
-            certification.ledger(),
-        );
         Ok(Self {
             origin,
             projection,
@@ -11357,6 +11560,9 @@ mod tests {
         StackedPartialOverlappingStore,
         StackedUnknownPointerStore,
         StackedAtomic,
+        ImplicitPrivateStack,
+        ImplicitPrivateStackCall,
+        ImplicitPrivateStackOverlap,
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -11378,12 +11584,15 @@ mod tests {
         EntryReturnAddressOverlap,
         AccessBeforeReservation,
         AccessAfterRestoration,
+        ExactUnusedFramePointer,
+        UnpreservedFrameUse,
     }
 
     fn frameless_stack_artifact(mutation: StackDisciplineMutation) -> SsaArtifact {
         let upward = matches!(mutation, StackDisciplineMutation::HigherAddresses);
         let sp = Varnode::register(0, 8);
         let ra = Varnode::register(8, 8);
+        let fp = Varnode::register(16, 8);
         let first_address = Varnode::unique(0x100, 8);
         let second_address = Varnode::unique(0x108, 8);
         let loaded = Varnode::unique(0x110, 4);
@@ -11519,7 +11728,15 @@ mod tests {
             | StackDisciplineMutation::ExtraStackPointerWrite
             | StackDisciplineMutation::OutOfEnvelopeAccess
             | StackDisciplineMutation::AccessBeforeReservation
-            | StackDisciplineMutation::AccessAfterRestoration => {}
+            | StackDisciplineMutation::AccessAfterRestoration
+            | StackDisciplineMutation::ExactUnusedFramePointer
+            | StackDisciplineMutation::UnpreservedFrameUse => {}
+        }
+        if matches!(mutation, StackDisciplineMutation::UnpreservedFrameUse) {
+            block.push(R2ILOp::Copy {
+                dst: fp,
+                src: sp.clone(),
+            });
         }
         if !matches!(mutation, StackDisciplineMutation::MissingRestoration) {
             let amount = Varnode::constant(
@@ -11572,6 +11789,13 @@ mod tests {
         arch.addr_size = 8;
         arch.add_register(RegisterDef::new("sp", 0, 8));
         arch.add_register(RegisterDef::new("x30", 8, 8));
+        if matches!(
+            mutation,
+            StackDisciplineMutation::ExactUnusedFramePointer
+                | StackDisciplineMutation::UnpreservedFrameUse
+        ) {
+            arch.add_register(RegisterDef::new("fp", 16, 8));
+        }
         arch.add_space(AddressSpace::ram(8));
         let storage = |offset| CanonicalStorageId {
             space: CanonicalStorageSpace::Register,
@@ -11588,6 +11812,17 @@ mod tests {
         .and_then(|interface| interface.with_return_address_storage(storage(8)))
         .and_then(|interface| interface.with_stack_pointer_storage(storage(0)))
         .expect("exact frameless stack interface");
+        let interface = if matches!(
+            mutation,
+            StackDisciplineMutation::ExactUnusedFramePointer
+                | StackDisciplineMutation::UnpreservedFrameUse
+        ) {
+            interface
+                .with_frame_pointer_storage(storage(16))
+                .expect("exact unused frame-pointer identity")
+        } else {
+            interface
+        };
         let interface = if matches!(mutation, StackDisciplineMutation::MissingAllocationContract) {
             interface
         } else {
@@ -11633,6 +11868,9 @@ mod tests {
                 | FrameMutation::StackedPartialOverlappingStore
                 | FrameMutation::StackedUnknownPointerStore
                 | FrameMutation::StackedAtomic
+                | FrameMutation::ImplicitPrivateStack
+                | FrameMutation::ImplicitPrivateStackCall
+                | FrameMutation::ImplicitPrivateStackOverlap
         );
         let fp = Varnode::register(0, 8);
         let sp = Varnode::register(8, 8);
@@ -11647,6 +11885,11 @@ mod tests {
         let return_address = Varnode::unique(0x138, 8);
         let duplicate_return_address = Varnode::unique(0x140, 8);
         let adjusted_return_slot = Varnode::unique(0x148, 8);
+        let first_private_address = Varnode::unique(0x158, 8);
+        let first_private_value = Varnode::unique(0x160, 4);
+        let second_private_address = Varnode::unique(0x168, 8);
+        let second_private_value = Varnode::unique(0x170, 4);
+        let overlapping_private_address = Varnode::unique(0x178, 8);
         let mut block = R2ILBlock::new(0x3300, 4);
         if !matches!(mutation, FrameMutation::ZeroSaveRange) {
             if matches!(mutation, FrameMutation::PositiveSaveRange) {
@@ -11715,15 +11958,66 @@ mod tests {
                 });
             }
         }
+        if matches!(
+            mutation,
+            FrameMutation::ImplicitPrivateStack
+                | FrameMutation::ImplicitPrivateStackCall
+                | FrameMutation::ImplicitPrivateStackOverlap
+        ) {
+            block.push(R2ILOp::IntSub {
+                dst: first_private_address.clone(),
+                a: fp.clone(),
+                b: Varnode::constant(8, 8),
+            });
+            block.push(R2ILOp::Store {
+                space: SpaceId::Ram,
+                addr: first_private_address.clone(),
+                val: Varnode::constant(0x1122_3344, 4),
+            });
+            block.push(R2ILOp::Load {
+                dst: first_private_value.clone(),
+                space: SpaceId::Ram,
+                addr: first_private_address,
+            });
+            block.push(R2ILOp::IntSub {
+                dst: second_private_address.clone(),
+                a: fp.clone(),
+                b: Varnode::constant(4, 8),
+            });
+            block.push(R2ILOp::Store {
+                space: SpaceId::Ram,
+                addr: second_private_address.clone(),
+                val: first_private_value,
+            });
+            block.push(R2ILOp::Load {
+                dst: second_private_value,
+                space: SpaceId::Ram,
+                addr: second_private_address,
+            });
+            if matches!(mutation, FrameMutation::ImplicitPrivateStackOverlap) {
+                block.push(R2ILOp::IntAdd {
+                    dst: overlapping_private_address.clone(),
+                    a: fp.clone(),
+                    b: Varnode::constant(4, 8),
+                });
+                block.push(R2ILOp::Store {
+                    space: SpaceId::Ram,
+                    addr: overlapping_private_address,
+                    val: Varnode::constant(0, 4),
+                });
+            }
+        }
         match mutation {
             FrameMutation::OverlappingWrite => block.push(R2ILOp::Store {
                 space: SpaceId::Ram,
                 addr: fp.clone(),
                 val: Varnode::constant(0, 8),
             }),
-            FrameMutation::Call => block.push(R2ILOp::Call {
-                target: Varnode::ram(0x4400, 8),
-            }),
+            FrameMutation::Call | FrameMutation::ImplicitPrivateStackCall => {
+                block.push(R2ILOp::Call {
+                    target: Varnode::ram(0x4400, 8),
+                })
+            }
             FrameMutation::UnknownEffect => block.push(R2ILOp::CallOther {
                 output: None,
                 userop: 7,
@@ -11783,7 +12077,9 @@ mod tests {
             | FrameMutation::StackedOverlappingStore
             | FrameMutation::StackedPartialOverlappingStore
             | FrameMutation::StackedUnknownPointerStore
-            | FrameMutation::StackedAtomic => {}
+            | FrameMutation::StackedAtomic
+            | FrameMutation::ImplicitPrivateStack
+            | FrameMutation::ImplicitPrivateStackOverlap => {}
         }
         if matches!(mutation, FrameMutation::GlobalLoad) {
             block.push(R2ILOp::Load {
@@ -12034,14 +12330,23 @@ mod tests {
         let interface = if matches!(mutation, FrameMutation::MissingAllocationContract) {
             interface
         } else {
+            let growth = if matches!(mutation, FrameMutation::OppositeAllocationContract) {
+                SourceStackGrowth::HigherAddresses
+            } else {
+                SourceStackGrowth::LowerAddresses
+            };
+            let contract = if matches!(
+                mutation,
+                FrameMutation::ImplicitPrivateStack
+                    | FrameMutation::ImplicitPrivateStackCall
+                    | FrameMutation::ImplicitPrivateStackOverlap
+            ) {
+                SourceStackAllocationContract::with_implicit_active_sp_bytes(growth, 8)
+            } else {
+                SourceStackAllocationContract::new(growth)
+            };
             interface
-                .with_stack_allocation_contract(SourceStackAllocationContract::new(
-                    if matches!(mutation, FrameMutation::OppositeAllocationContract) {
-                        SourceStackGrowth::HigherAddresses
-                    } else {
-                        SourceStackGrowth::LowerAddresses
-                    },
-                ))
+                .with_stack_allocation_contract(contract)
                 .expect("exact preserved-frame stack allocation contract")
         };
         let interface = if matches!(mutation, FrameMutation::ExplicitNoSlots) {
@@ -12237,6 +12542,7 @@ mod tests {
             &topology,
             &memory,
             &returns,
+            None,
         )
     }
 
@@ -12255,6 +12561,7 @@ mod tests {
             &topology,
             &memory,
             &returns,
+            None,
         )
     }
 
@@ -12267,9 +12574,10 @@ mod tests {
     }
 
     fn certified_frameless_stack(
+        artifact_mutation: StackDisciplineMutation,
         authority_mutation: StackAuthorityMutation,
     ) -> Option<CertifiedStackDiscipline> {
-        let artifact = frameless_stack_artifact(StackDisciplineMutation::None);
+        let artifact = frameless_stack_artifact(artifact_mutation);
         let projection = MachineProjection::from_artifact(&artifact).ok()?;
         let machine_context = CertifiedMachineContext::from_artifact(&artifact).ok()?;
         let topology = certified_source_topology(&artifact).ok()?;
@@ -12344,13 +12652,111 @@ mod tests {
                 memory_statements: &memory,
                 return_controls: &returns,
             },
+            None,
             certification.ledger(),
         )
+    }
+
+    #[derive(Clone, Copy)]
+    enum PreservedStackAuthorityMutation {
+        None,
+        MissingFrame,
+        ForeignFrame,
+        MutatedSavedRange,
+        MutatedEntrySaveObject,
+    }
+
+    fn certified_preserved_stack(
+        artifact_mutation: FrameMutation,
+        authority_mutation: PreservedStackAuthorityMutation,
+    ) -> Option<CertifiedStackDiscipline> {
+        let artifact = preserved_frame_artifact(artifact_mutation);
+        let projection = MachineProjection::from_artifact(&artifact).ok()?;
+        let machine_context = CertifiedMachineContext::from_artifact(&artifact).ok()?;
+        let topology = certified_source_topology(&artifact).ok()?;
+        let memory = certified_memory_statements(&artifact).ok()?;
+        let returns = certified_return_controls(&artifact, &topology).ok()?;
+        let mut expressions = BTreeMap::new();
+        for entity in projection.entities() {
+            let source_obligations = entity
+                .source_obligations()
+                .iter()
+                .copied()
+                .filter(|id| id.kind == SemanticObligationKind::LiveValueProducer)
+                .collect::<BTreeSet<_>>();
+            if source_obligations.is_empty() {
+                continue;
+            }
+            let expression =
+                certified_expr_from_projection(&artifact, &projection, entity, source_obligations)
+                    .ok()?;
+            expressions.insert(entity.producer(), expression);
+        }
+        let origin = CertifiedArtifactOrigin {
+            schema_version: CERTIFICATION_SCHEMA_VERSION,
+            lift_provenance_schema_version: GENUINE_LIFT_PROVENANCE_SCHEMA_VERSION,
+            lift_manifest_hash: 1,
+            authority: CertifiedAuthoritySeal::new(),
+            graph_snapshot: vec![1].into_boxed_slice(),
+            prepare_mode: artifact.mode().into(),
+            decompile_preparation: None,
+            assumptions: artifact.facts().assumptions.clone(),
+            machine_context,
+            source: artifact.obligations().clone(),
+            topology: topology.clone(),
+        };
+        let mut certification = CertifiedFunction::bound(origin.source().clone(), &origin).ok()?;
+        for control in returns.values() {
+            certification.record_absorbed_return(control.clone()).ok()?;
+        }
+        for statement in memory.values() {
+            for obligation in statement.source_obligations() {
+                certification
+                    .record_absorbed_statement(*obligation, statement.clone())
+                    .ok()?;
+            }
+        }
+        for expression in expressions.values() {
+            for obligation in expression.entity().source_obligations() {
+                certification
+                    .record_absorbed_expression(*obligation, expression.clone())
+                    .ok()?;
+            }
+        }
+        let parts = FrameCertifiedParts {
+            projection: &projection,
+            topology: &topology,
+            expressions: &expressions,
+            memory_statements: &memory,
+            return_controls: &returns,
+        };
+        let mut frame =
+            certified_frame_preservation(&artifact, &origin, parts, certification.ledger())?;
+        match authority_mutation {
+            PreservedStackAuthorityMutation::None
+            | PreservedStackAuthorityMutation::MissingFrame => {}
+            PreservedStackAuthorityMutation::ForeignFrame => {
+                frame.origin.authority = CertifiedAuthoritySeal::new();
+            }
+            PreservedStackAuthorityMutation::MutatedSavedRange => {
+                frame.saved_range.offset = frame.saved_range.offset.checked_sub(4)?;
+            }
+            PreservedStackAuthorityMutation::MutatedEntrySaveObject => {
+                frame.entry_save.object = ObjectId(frame.entry_save.object.0.checked_add(1)?);
+            }
+        }
+        let frame = (!matches!(
+            authority_mutation,
+            PreservedStackAuthorityMutation::MissingFrame
+        ))
+        .then_some(&frame);
+        certified_stack_discipline(&artifact, &origin, parts, frame, certification.ledger())
     }
 
     fn terminal_frame_fixture(
         mutation: FrameMutation,
     ) -> Option<(
+        SsaArtifact,
         CertifiedArtifactOrigin,
         ObligationLedger,
         CertifiedFramePreservation,
@@ -12435,7 +12841,13 @@ mod tests {
                 ))
             })
             .collect::<Option<Vec<_>>>()?;
-        Some((origin, certification.ledger().clone(), frame, mappings))
+        Some((
+            artifact,
+            origin,
+            certification.ledger().clone(),
+            frame,
+            mappings,
+        ))
     }
 
     #[test]
@@ -12454,6 +12866,8 @@ mod tests {
         assert_eq!(evidence.stack_pointer_storage.offset, 0);
         assert_eq!(evidence.reservation_range.offset(), -16);
         assert_eq!(evidence.reservation_range.size_bytes(), 16);
+        assert_eq!(evidence.private_ownership_range, evidence.reservation_range);
+        assert_eq!(evidence.implicit_active_sp_bytes, 0);
         assert_eq!(
             evidence
                 .reservation
@@ -12510,13 +12924,35 @@ mod tests {
             ])
         );
 
-        let certificate = certified_frameless_stack(StackAuthorityMutation::None)
-            .expect("same-origin ledger seals frameless stack discipline");
+        let certificate =
+            certified_frameless_stack(StackDisciplineMutation::None, StackAuthorityMutation::None)
+                .expect("same-origin ledger seals frameless stack discipline");
+        let metadata_only = certified_frameless_stack(
+            StackDisciplineMutation::ExactUnusedFramePointer,
+            StackAuthorityMutation::None,
+        )
+        .expect("unused exact frame-pointer identity remains frameless");
+        assert_eq!(metadata_only.stack_pointer_storage().offset, 0);
+        assert!(
+            certified_frameless_stack(
+                StackDisciplineMutation::UnpreservedFrameUse,
+                StackAuthorityMutation::None,
+            )
+            .is_none(),
+            "an actual frame-pointer definition requires preservation evidence"
+        );
         assert_eq!(certificate.schema_version(), CERTIFICATION_SCHEMA_VERSION);
+        assert_eq!(
+            certificate.private_ownership_range(),
+            certificate.reservation_range()
+        );
+        assert_eq!(certificate.implicit_active_sp_bytes(), 0);
         let wire = serde_json::to_value((
             certificate.schema_version,
             certificate.stack_pointer_storage,
             certificate.reservation_range,
+            certificate.private_ownership_range,
+            certificate.implicit_active_sp_bytes,
             &certificate.reservation,
             &certificate.assignments,
             &certificate.private_regions,
@@ -12528,25 +12964,111 @@ mod tests {
             Some(u64::from(CERTIFICATION_SCHEMA_VERSION))
         );
         assert_eq!(
-            wire.get(5)
+            wire.get(7)
                 .and_then(serde_json::Value::as_array)
                 .map(Vec::len),
             Some(2)
         );
 
-        let stacked =
-            frameless_stack_evidence(&preserved_frame_artifact(FrameMutation::StackedReturn))
-                .expect("the same stack discipline seals the x86 O0 stacked-return shape");
+        let stacked = certified_preserved_stack(
+            FrameMutation::StackedReturn,
+            PreservedStackAuthorityMutation::None,
+        )
+        .expect("same-origin frame evidence seals the x86 O0 stacked-return shape");
         assert_eq!(stacked.reservation_range.offset(), -8);
         assert_eq!(stacked.releases.len(), 1);
         assert!(stacked.releases[0].post_restoration().is_some());
         assert!(stacked.releases[0].return_address_read().is_some());
+    }
 
-        let two_return = frameless_stack_evidence(&preserved_frame_two_return_artifact(
-            TwoReturnMutation::None,
+    #[test]
+    fn preserved_frame_extends_private_ownership_into_exact_implicit_sp_area() {
+        preserved_frame_evidence(&preserved_frame_artifact(
+            FrameMutation::ImplicitPrivateStack,
         ))
-        .expect("every return arm has an exact restoration and stacked return read");
-        assert_eq!(two_return.releases.len(), 2);
+        .expect("implicit private accesses preserve exact frame evidence");
+        let certificate = certified_preserved_stack(
+            FrameMutation::ImplicitPrivateStack,
+            PreservedStackAuthorityMutation::None,
+        )
+        .expect("same-origin frame mechanics open the exact implicit SP envelope");
+        assert_eq!(certificate.reservation_range().offset(), -8);
+        assert_eq!(certificate.reservation_range().size_bytes(), 8);
+        assert_eq!(certificate.private_ownership_range().offset(), -16);
+        assert_eq!(certificate.private_ownership_range().size_bytes(), 16);
+        assert_eq!(certificate.implicit_active_sp_bytes(), 8);
+        let private_ranges = certificate
+            .private_regions()
+            .iter()
+            .flat_map(CertifiedPrivateStackRegion::accesses)
+            .map(CertifiedPrivateStackAccess::range)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            private_ranges,
+            BTreeSet::from([
+                CertifiedNormalizedStackRange {
+                    offset: -16,
+                    size_bytes: 4,
+                },
+                CertifiedNormalizedStackRange {
+                    offset: -12,
+                    size_bytes: 4,
+                },
+            ])
+        );
+        assert!(private_ranges.iter().all(|range| {
+            !frame_ranges_overlap(
+                *range,
+                CertifiedNormalizedStackRange {
+                    offset: -8,
+                    size_bytes: 8,
+                },
+                64,
+            )
+        }));
+        let wire = serde_json::to_value((
+            certificate.private_ownership_range(),
+            certificate.implicit_active_sp_bytes(),
+        ))
+        .expect("serialized stack ownership fields");
+        assert_eq!(wire.get(1).and_then(serde_json::Value::as_u64), Some(8));
+        assert_eq!(
+            wire.get(0)
+                .and_then(|range| range.get("offset"))
+                .and_then(serde_json::Value::as_i64),
+            Some(-16)
+        );
+    }
+
+    #[test]
+    fn implicit_private_stack_requires_exact_frame_mechanics_and_no_calls() {
+        for mutation in [
+            PreservedStackAuthorityMutation::MissingFrame,
+            PreservedStackAuthorityMutation::ForeignFrame,
+            PreservedStackAuthorityMutation::MutatedSavedRange,
+            PreservedStackAuthorityMutation::MutatedEntrySaveObject,
+        ] {
+            assert!(
+                certified_preserved_stack(FrameMutation::ImplicitPrivateStack, mutation).is_none(),
+                "mutated frame authority must refuse"
+            );
+        }
+        assert!(
+            certified_preserved_stack(
+                FrameMutation::ImplicitPrivateStackCall,
+                PreservedStackAuthorityMutation::None,
+            )
+            .is_none(),
+            "a call invalidates the implicit active-SP area"
+        );
+        assert!(
+            certified_preserved_stack(
+                FrameMutation::ImplicitPrivateStackOverlap,
+                PreservedStackAuthorityMutation::None,
+            )
+            .is_none(),
+            "any non-mechanical access overlapping the saved frame must refuse"
+        );
     }
 
     #[test]
@@ -12580,13 +13102,6 @@ mod tests {
             .is_none(),
             "omitting one canonical memory statement must refuse the certificate"
         );
-        assert!(
-            frameless_stack_evidence(&preserved_frame_two_return_artifact(
-                TwoReturnMutation::CrossArmStore,
-            ))
-            .is_none(),
-            "an access after one arm restores SP must refuse"
-        );
         for mutation in [
             FrameMutation::StackedNoContract,
             FrameMutation::StackedWrongOffset,
@@ -12612,13 +13127,13 @@ mod tests {
             StackAuthorityMutation::OriginAuthority,
             StackAuthorityMutation::LedgerAuthority,
         ] {
-            assert!(certified_frameless_stack(mutation).is_none());
+            assert!(certified_frameless_stack(StackDisciplineMutation::None, mutation).is_none());
         }
     }
 
     #[test]
     fn terminal_return_frame_memory_requires_exact_preservation_manifest() {
-        let (origin, ledger, frame, mappings) =
+        let (_, origin, ledger, frame, mappings) =
             terminal_frame_fixture(FrameMutation::StackedReturn)
                 .expect("stacked frame terminal fixture");
         assert!(
@@ -12635,12 +13150,48 @@ mod tests {
             Err(LedgerClosureError::InvalidRegionTopology),
         );
 
-        let (origin, ledger, frame, mappings) = terminal_frame_fixture(FrameMutation::GlobalLoad)
-            .expect("frame with unrelated global read");
+        let (_, origin, ledger, frame, mappings) =
+            terminal_frame_fixture(FrameMutation::GlobalLoad)
+                .expect("frame with unrelated global read");
         assert_eq!(
             certify_terminal_return_region_with_frame(&origin, &ledger, mappings, Some(&frame),),
             Err(LedgerClosureError::InvalidRegionTopology),
         );
+    }
+
+    #[test]
+    fn frame_replay_kernel_refuses_missing_foreign_and_altered_save_restore_evidence() {
+        let (artifact, origin, ledger, frame, _) =
+            terminal_frame_fixture(FrameMutation::StackedReturn)
+                .expect("stacked frame replay fixture");
+        let replayed = replay_certified_frame_preservation(&artifact, &origin, &ledger)
+            .expect("exact frame replay");
+        assert_eq!(replayed, frame);
+
+        let mut foreign_origin = origin.clone();
+        foreign_origin.authority = CertifiedAuthoritySeal::new();
+        assert!(replay_certified_frame_preservation(&artifact, &foreign_origin, &ledger).is_none());
+
+        let mut foreign_frame = frame.clone();
+        foreign_frame.origin.authority = CertifiedAuthoritySeal::new();
+        assert_ne!(replayed, foreign_frame);
+        let mut altered_range = frame.clone();
+        altered_range.saved_range.offset -= 4;
+        assert_ne!(replayed, altered_range);
+        let mut altered_save = frame.clone();
+        altered_save.entry_save.object = ObjectId(altered_save.entry_save.object.0 + 1);
+        assert_ne!(replayed, altered_save);
+        let mut altered_restore = frame.clone();
+        altered_restore.restores[0].restore_read.object =
+            ObjectId(altered_restore.restores[0].restore_read.object.0 + 1);
+        assert_ne!(replayed, altered_restore);
+
+        for statement in [frame.entry_save(), frame.restores()[0].restore_read()] {
+            let obligation = *statement.source_obligations().iter().next().unwrap();
+            let mut incomplete = ledger.clone();
+            incomplete.effects.remove(&obligation);
+            assert!(replay_certified_frame_preservation(&artifact, &origin, &incomplete).is_none());
+        }
     }
 
     #[test]

@@ -273,6 +273,12 @@ pub struct ObjectModel {
     pub objects: BTreeMap<ObjectId, ObjectFact>,
     pub value_objects: BTreeMap<MemoryObjectKey, ObjectId>,
     pub stack_objects: BTreeMap<StackObjectKey, ObjectId>,
+    /// Machine-proven entry-SP coordinates for source-coordinate stack
+    /// objects. Missing entries are intentionally treated as unknown.
+    pub entry_stack_roots: BTreeMap<ObjectId, StackAddressRoot>,
+    /// Exact modular address width for each source-owned memory space.
+    /// Alias refinement is disabled when this source fact is unavailable.
+    pub address_bits_by_space: BTreeMap<ObjectSpaceId, u32>,
     pub parameter_objects: BTreeMap<ParameterObjectKey, ObjectId>,
     pub global_objects: BTreeMap<GlobalObjectKey, ObjectId>,
     pub escaped_unknown: BTreeMap<ObjectSpaceId, ObjectId>,
@@ -1086,12 +1092,14 @@ impl PreparedFunctionFacts {
             function.decompile_prep_facts(),
             machine_context,
         );
-        let (objects, memory) =
-            collect_object_and_memory_facts(function, graph, &addresses, &call_sites);
-        let predicates = apply_assumptions_to_predicate_facts(
-            collect_predicate_facts(function, graph),
-            assumptions,
+        let (objects, memory) = collect_object_and_memory_facts(
+            function,
+            graph,
+            &addresses,
+            &call_sites,
+            machine_context,
         );
+        let predicates = collect_predicate_facts(function, graph);
         let boundaries =
             collect_source_boundary_facts(function, graph, &call_sites, machine_context);
         let structured = collect_structured_dataflow_facts(
@@ -1135,103 +1143,129 @@ impl PreparedFunctionFacts {
     }
 }
 
-fn apply_assumptions_to_predicate_facts(
-    mut predicates: PredicateFacts,
-    assumptions: &AssumptionSet,
-) -> PredicateFacts {
-    for assumption in assumptions.iter() {
-        let (predicate_id, block_addr, predecessor, truth) =
-            match (&assumption.subject, &assumption.value) {
-                (
-                    AssumptionSubject::Predicate {
-                        predicate,
-                        block_addr,
-                        predecessor,
-                    },
-                    AssumptionValue::Branch { truth },
-                ) => (*predicate, *block_addr, *predecessor, *truth),
-                _ => continue,
-            };
-        if !predicates.predicates.contains_key(&predicate_id) {
-            continue;
-        }
-        let entry = predicates.block_assumptions.entry(block_addr).or_default();
-        if entry.iter().any(|existing| {
-            existing.predicate == predicate_id
-                && existing.predecessor == predecessor.unwrap_or(existing.predecessor)
-                && existing.truth == truth
-        }) {
-            continue;
-        }
-        entry.push(BlockAssumption {
-            predecessor: predecessor.unwrap_or(block_addr),
-            predicate: predicate_id,
-            truth,
-        });
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PredicateBranchAssumptionResolution {
+    Applied {
+        predicate: PredicateId,
+        block_addr: u64,
+        predecessor: Option<u64>,
+        truth: bool,
+    },
+    Ignored,
+    Conflict(String),
+}
+
+fn resolve_predicate_branch_assumption(
+    predicates: &PredicateFacts,
+    assumption: &crate::AnalysisAssumption,
+) -> Option<PredicateBranchAssumptionResolution> {
+    let (
+        AssumptionSubject::Predicate {
+            predicate,
+            block_addr,
+            predecessor,
+        },
+        AssumptionValue::Branch { truth },
+    ) = (&assumption.subject, &assumption.value)
+    else {
+        return None;
+    };
+    let Some(fact) = predicates.predicates.get(predicate) else {
+        return Some(PredicateBranchAssumptionResolution::Ignored);
+    };
+    if fact.block_addr != *block_addr {
+        return Some(PredicateBranchAssumptionResolution::Conflict(format!(
+            "predicate block mismatch (expected 0x{block_addr:x}, observed 0x{:x})",
+            fact.block_addr
+        )));
     }
-    predicates
+    if let Some(predecessor) = predecessor {
+        let expected = if *truth {
+            fact.true_target
+        } else {
+            fact.false_target
+        };
+        if *predecessor != expected {
+            return Some(PredicateBranchAssumptionResolution::Conflict(format!(
+                "branch predecessor 0x{predecessor:x} does not match selected edge 0x{expected:x}"
+            )));
+        }
+    }
+    Some(PredicateBranchAssumptionResolution::Applied {
+        predicate: *predicate,
+        block_addr: *block_addr,
+        predecessor: *predecessor,
+        truth: *truth,
+    })
+}
+
+fn contradictory_predicate_assumptions(
+    predicates: &PredicateFacts,
+    assumptions: &AssumptionSet,
+) -> BTreeSet<PredicateId> {
+    let mut truths = BTreeMap::<PredicateId, BTreeSet<bool>>::new();
+    for assumption in assumptions.iter() {
+        let Some(PredicateBranchAssumptionResolution::Applied {
+            predicate, truth, ..
+        }) = resolve_predicate_branch_assumption(predicates, assumption)
+        else {
+            continue;
+        };
+        truths.entry(predicate).or_default().insert(truth);
+    }
+    truths
+        .into_iter()
+        .filter_map(|(predicate, truths)| (truths.len() > 1).then_some(predicate))
+        .collect()
 }
 
 fn collect_prepared_assumption_usage(
     graph: &SsaGraph,
     objects: &ObjectModel,
-    predicates: &PredicateFacts,
+    base_predicates: &PredicateFacts,
     assumptions: &AssumptionSet,
 ) -> (Vec<PreparedAssumptionBinding>, AssumptionUsageReport) {
     let mut bindings = Vec::new();
     let mut usage = AssumptionUsageReport::default();
+    let contradictory = contradictory_predicate_assumptions(base_predicates, assumptions);
 
     for assumption in assumptions.iter() {
-        match (&assumption.subject, &assumption.value) {
-            (
-                AssumptionSubject::Predicate {
+        if let Some(resolution) = resolve_predicate_branch_assumption(base_predicates, assumption) {
+            match resolution {
+                PredicateBranchAssumptionResolution::Applied {
                     predicate,
                     block_addr,
                     predecessor,
-                },
-                AssumptionValue::Branch { truth },
-            ) => {
-                let Some(fact) = predicates.predicates.get(predicate) else {
-                    usage.mark_ignored(assumption);
-                    continue;
-                };
-                if fact.block_addr != *block_addr {
-                    usage.mark_conflict(
-                        assumption,
-                        format!(
-                            "predicate block mismatch (expected 0x{block_addr:x}, observed 0x{:x})",
-                            fact.block_addr
-                        ),
-                    );
-                    continue;
-                }
-                if let Some(pred) = predecessor {
-                    let expected = if *truth {
-                        fact.true_target
-                    } else {
-                        fact.false_target
-                    };
-                    if *pred != expected {
+                    truth,
+                } => {
+                    if contradictory.contains(&predicate) {
                         usage.mark_conflict(
                             assumption,
-                            format!(
-                                "branch predecessor 0x{pred:x} does not match selected edge 0x{expected:x}"
-                            ),
+                            format!("contradictory branch truths for predicate {}", predicate.0),
                         );
                         continue;
                     }
+                    usage.mark_applied(assumption);
+                    bindings.push(PreparedAssumptionBinding {
+                        assumption: assumption.clone(),
+                        binding: PreparedAssumptionBindingKind::Predicate {
+                            predicate,
+                            block_addr,
+                            predecessor,
+                            truth,
+                        },
+                    });
                 }
-                usage.mark_applied(assumption);
-                bindings.push(PreparedAssumptionBinding {
-                    assumption: assumption.clone(),
-                    binding: PreparedAssumptionBindingKind::Predicate {
-                        predicate: *predicate,
-                        block_addr: *block_addr,
-                        predecessor: *predecessor,
-                        truth: *truth,
-                    },
-                });
+                PredicateBranchAssumptionResolution::Ignored => {
+                    usage.mark_ignored(assumption);
+                }
+                PredicateBranchAssumptionResolution::Conflict(reason) => {
+                    usage.mark_conflict(assumption, reason);
+                }
             }
+            continue;
+        }
+        match (&assumption.subject, &assumption.value) {
             (AssumptionSubject::Register { name }, _) => {
                 let Some(value) = graph.values.iter().find(|value| {
                     value.var.version == 0
@@ -1301,6 +1335,9 @@ struct ObjectModelBuilder<'a> {
     objects: BTreeMap<ObjectId, ObjectFact>,
     value_objects: BTreeMap<MemoryObjectKey, ObjectId>,
     stack_objects: BTreeMap<StackObjectKey, ObjectId>,
+    entry_stack_roots: BTreeMap<ObjectId, StackAddressRoot>,
+    ambiguous_entry_stack_objects: BTreeSet<ObjectId>,
+    address_bits_by_space: BTreeMap<ObjectSpaceId, u32>,
     parameter_objects: BTreeMap<ParameterObjectKey, ObjectId>,
     global_objects: BTreeMap<GlobalObjectKey, ObjectId>,
     escaped_unknown: BTreeMap<ObjectSpaceId, ObjectId>,
@@ -1308,7 +1345,11 @@ struct ObjectModelBuilder<'a> {
 }
 
 impl<'a> ObjectModelBuilder<'a> {
-    fn new(facts: Option<&'a DecompilePrepFacts>, addresses: &'a AddressProvenanceFacts) -> Self {
+    fn new(
+        facts: Option<&'a DecompilePrepFacts>,
+        addresses: &'a AddressProvenanceFacts,
+        machine_context: Option<&SourceMachineContext>,
+    ) -> Self {
         let escaped_unknown_id = ObjectId(0);
         let mut objects = BTreeMap::new();
         objects.insert(
@@ -1322,12 +1363,27 @@ impl<'a> ObjectModelBuilder<'a> {
         );
         let mut escaped_unknown = BTreeMap::new();
         escaped_unknown.insert(ObjectSpaceId(SpaceId::Ram), escaped_unknown_id);
+        let address_bits_by_space = machine_context
+            .filter(|context| context.memory_model().is_coherent())
+            .map(|context| {
+                context
+                    .memory_model()
+                    .spaces()
+                    .iter()
+                    .filter(|space| space.address_bits() > 0 && space.address_bits() <= 64)
+                    .map(|space| (ObjectSpaceId(space.space()), space.address_bits()))
+                    .collect()
+            })
+            .unwrap_or_default();
         Self {
             facts,
             addresses,
             objects,
             value_objects: BTreeMap::new(),
             stack_objects: BTreeMap::new(),
+            entry_stack_roots: BTreeMap::new(),
+            ambiguous_entry_stack_objects: BTreeSet::new(),
+            address_bits_by_space,
             parameter_objects: BTreeMap::new(),
             global_objects: BTreeMap::new(),
             escaped_unknown,
@@ -1379,6 +1435,8 @@ impl<'a> ObjectModelBuilder<'a> {
             objects: self.objects,
             value_objects: self.value_objects,
             stack_objects: self.stack_objects,
+            entry_stack_roots: self.entry_stack_roots,
+            address_bits_by_space: self.address_bits_by_space,
             parameter_objects: self.parameter_objects,
             global_objects: self.global_objects,
             escaped_unknown: self.escaped_unknown,
@@ -1405,7 +1463,11 @@ impl<'a> ObjectModelBuilder<'a> {
         let _ = self.ensure_escaped_unknown(space);
         let object = if space == SpaceId::Ram {
             if let Some(root) = resolve_stack_root(self.facts, value) {
-                self.ensure_stack_object(root, space)
+                let object = self.ensure_stack_object(root, space);
+                if let Some(entry_root) = resolve_entry_stack_root(self.facts, value) {
+                    self.record_entry_stack_root(object, entry_root);
+                }
+                object
             } else if let Some(expression) = self.addresses.parameter_expression(value_id) {
                 self.ensure_parameter_object(expression.parameter, space)
             } else if let Some(address) = resolve_const_value(self.facts, value) {
@@ -1463,6 +1525,22 @@ impl<'a> ObjectModelBuilder<'a> {
         id
     }
 
+    fn record_entry_stack_root(&mut self, object: ObjectId, root: StackAddressRoot) {
+        if self.ambiguous_entry_stack_objects.contains(&object) {
+            return;
+        }
+        match self.entry_stack_roots.get(&object) {
+            Some(existing) if *existing == root => {}
+            Some(_) => {
+                self.entry_stack_roots.remove(&object);
+                self.ambiguous_entry_stack_objects.insert(object);
+            }
+            None => {
+                self.entry_stack_roots.insert(object, root);
+            }
+        }
+    }
+
     fn ensure_parameter_object(&mut self, index: usize, space: SpaceId) -> ObjectId {
         debug_assert_eq!(space, SpaceId::Ram);
         let key = ParameterObjectKey { index, space };
@@ -1516,9 +1594,10 @@ fn collect_object_and_memory_facts(
     graph: &SsaGraph,
     addresses: &AddressProvenanceFacts,
     call_sites: &CallSiteFacts,
+    machine_context: Option<&SourceMachineContext>,
 ) -> (ObjectModel, MemorySSAFacts) {
     let facts = function.decompile_prep_facts();
-    let builder = ObjectModelBuilder::new(facts, addresses);
+    let builder = ObjectModelBuilder::new(facts, addresses, machine_context);
     let object_model = builder.build(function, graph);
     let access_summaries =
         collect_access_summaries(function, graph, facts, addresses, &object_model, call_sites);
@@ -1854,12 +1933,44 @@ pub(crate) fn memory_locations_may_alias(
     if left.space != right.space {
         return false;
     }
+    let address_bits = objects
+        .address_bits_by_space
+        .get(&ObjectSpaceId(left.space))
+        .copied();
     if left.object == right.object {
-        return relative_memory_ranges_may_overlap(
+        return address_bits.is_some_and(|address_bits| {
+            modular_memory_ranges_may_overlap(
+                0,
+                &left.address,
+                left.size,
+                0,
+                &right.address,
+                right.size,
+                address_bits,
+            )
+        }) || address_bits.is_none();
+    }
+    if matches!(
+        left_object.kind,
+        ObjectKind::StackSlot { .. } | ObjectKind::FrameObject { .. }
+    ) && matches!(
+        right_object.kind,
+        ObjectKind::StackSlot { .. } | ObjectKind::FrameObject { .. }
+    ) && let (Some(left_root), Some(right_root)) = (
+        objects.entry_stack_roots.get(&left.object),
+        objects.entry_stack_roots.get(&right.object),
+    ) && left_root.base == StackAddressBase::StackPointer
+        && right_root.base == StackAddressBase::StackPointer
+        && let Some(address_bits) = address_bits
+    {
+        return modular_memory_ranges_may_overlap(
+            i128::from(left_root.offset),
             &left.address,
             left.size,
+            i128::from(right_root.offset),
             &right.address,
             right.size,
+            address_bits,
         );
     }
     match (&left_object.kind, &right_object.kind) {
@@ -1883,15 +1994,18 @@ pub(crate) fn memory_locations_may_alias(
                 address: right_base,
             },
         ) => {
-            left_space == right_space
-                && absolute_memory_ranges_may_overlap(
-                    i128::from(*left_base),
-                    &left.address,
-                    left.size,
-                    i128::from(*right_base),
-                    &right.address,
-                    right.size,
-                )
+            left_space != right_space
+                || address_bits.is_none_or(|address_bits| {
+                    modular_memory_ranges_may_overlap(
+                        i128::from(*left_base),
+                        &left.address,
+                        left.size,
+                        i128::from(*right_base),
+                        &right.address,
+                        right.size,
+                        address_bits,
+                    )
+                })
         }
         (
             ObjectKind::StackSlot {
@@ -1914,14 +2028,17 @@ pub(crate) fn memory_locations_may_alias(
                 offset: right_offset,
                 ..
             },
-        ) if left_base == right_base => absolute_memory_ranges_may_overlap(
-            i128::from(*left_offset),
-            &left.address,
-            left.size,
-            i128::from(*right_offset),
-            &right.address,
-            right.size,
-        ),
+        ) if left_base == right_base => address_bits.is_none_or(|address_bits| {
+            modular_memory_ranges_may_overlap(
+                i128::from(*left_offset),
+                &left.address,
+                left.size,
+                i128::from(*right_offset),
+                &right.address,
+                right.size,
+                address_bits,
+            )
+        }),
         (
             ObjectKind::StackSlot { .. } | ObjectKind::FrameObject { .. },
             ObjectKind::StackSlot { .. } | ObjectKind::FrameObject { .. },
@@ -1938,30 +2055,48 @@ pub(crate) fn memory_locations_may_alias(
     }
 }
 
-fn absolute_memory_ranges_may_overlap(
+fn modular_memory_ranges_may_overlap(
     left_base: i128,
     left: &RelativeMemoryAddress,
     left_size: u32,
     right_base: i128,
     right: &RelativeMemoryAddress,
     right_size: u32,
+    address_bits: u32,
 ) -> bool {
-    let (Some(left), Some(right)) = (left.exact_offset(), right.exact_offset()) else {
+    if address_bits == 0 || address_bits > 64 || left_size == 0 || right_size == 0 {
         return true;
+    }
+    let (Some(left), Some(right)) = (left.exact_offset(), right.exact_offset()) else {
+        return modular_affine_ranges_may_overlap(
+            left_base,
+            left,
+            left_size,
+            right_base,
+            right,
+            right_size,
+            address_bits,
+        );
     };
-    ranges_overlap_i128(
-        left_base + i128::from(left),
-        left_size,
-        right_base + i128::from(right),
-        right_size,
-    )
+    let modulus = 1_i128 << address_bits;
+    let left_size = i128::from(left_size);
+    let right_size = i128::from(right_size);
+    if left_size >= modulus || right_size >= modulus {
+        return true;
+    }
+    let left_start = (left_base + i128::from(left)).rem_euclid(modulus);
+    let right_start = (right_base + i128::from(right)).rem_euclid(modulus);
+    modular_intervals_overlap(left_start, left_size, right_start, right_size, modulus)
 }
 
-fn relative_memory_ranges_may_overlap(
+fn modular_affine_ranges_may_overlap(
+    left_base: i128,
     left: &RelativeMemoryAddress,
     left_size: u32,
+    right_base: i128,
     right: &RelativeMemoryAddress,
     right_size: u32,
+    address_bits: u32,
 ) -> bool {
     let (Some((left_terms, left_offset)), Some((right_terms, right_offset))) =
         (relative_affine_parts(left), relative_affine_parts(right))
@@ -1976,20 +2111,19 @@ fn relative_memory_ranges_may_overlap(
         *difference.entry(term.value).or_default() -= i128::from(term.coefficient);
     }
     difference.retain(|_, coefficient| *coefficient != 0);
-    let constant = i128::from(left_offset) - i128::from(right_offset);
-    let low = -i128::from(left_size.saturating_sub(1));
-    let high = i128::from(right_size.saturating_sub(1));
-    let modulus = difference
+    let address_modulus = 1_u128 << address_bits;
+    let congruence_modulus = difference
         .values()
         .map(|coefficient| coefficient.unsigned_abs())
-        .fold(0u128, gcd_u128);
-    if modulus == 0 {
-        return constant >= low && constant <= high;
-    }
-    let Ok(modulus) = i128::try_from(modulus) else {
+        .fold(address_modulus, gcd_u128);
+    let Ok(congruence_modulus) = i128::try_from(congruence_modulus) else {
         return true;
     };
-    let candidate = low + (constant.rem_euclid(modulus) - low).rem_euclid(modulus);
+    let constant = left_base + i128::from(left_offset) - right_base - i128::from(right_offset);
+    let low = -i128::from(left_size.saturating_sub(1));
+    let high = i128::from(right_size.saturating_sub(1));
+    let candidate =
+        low + (constant.rem_euclid(congruence_modulus) - low).rem_euclid(congruence_modulus);
     candidate <= high
 }
 
@@ -2003,10 +2137,29 @@ fn relative_affine_parts(
     }
 }
 
-fn ranges_overlap_i128(left: i128, left_size: u32, right: i128, right_size: u32) -> bool {
-    let left_end = left.saturating_add(i128::from(left_size.max(1)));
-    let right_end = right.saturating_add(i128::from(right_size.max(1)));
-    left < right_end && right < left_end
+fn modular_intervals_overlap(
+    left_start: i128,
+    left_size: i128,
+    right_start: i128,
+    right_size: i128,
+    modulus: i128,
+) -> bool {
+    let split = |start: i128, size: i128| {
+        let end = start + size;
+        if end <= modulus {
+            [(start, end), (0, 0)]
+        } else {
+            [(start, modulus), (0, end - modulus)]
+        }
+    };
+    let left = split(left_start, left_size);
+    let right = split(right_start, right_size);
+    left.into_iter().any(|(left_start, left_end)| {
+        left_start < left_end
+            && right.iter().any(|(right_start, right_end)| {
+                right_start < right_end && left_start < *right_end && *right_start < left_end
+            })
+    })
 }
 
 fn gcd_u128(mut left: u128, mut right: u128) -> u128 {
@@ -6663,6 +6816,18 @@ fn resolve_stack_root(
         .or_else(|| facts.stack_address_root_of(root).copied())
 }
 
+fn resolve_entry_stack_root(
+    facts: Option<&DecompilePrepFacts>,
+    var: &SSAVar,
+) -> Option<StackAddressRoot> {
+    let facts = facts?;
+    let root = canonical_value_root(Some(facts), var);
+    facts
+        .entry_stack_address_root_of(var)
+        .copied()
+        .or_else(|| facts.entry_stack_address_root_of(root).copied())
+}
+
 fn canonical_value_root<'a>(facts: Option<&'a DecompilePrepFacts>, var: &'a SSAVar) -> &'a SSAVar {
     let Some(facts) = facts else {
         return var;
@@ -6686,17 +6851,21 @@ fn const_value(var: &SSAVar) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use super::{
         ControlGuard, GlobalObjectKey, MemoryDefFact, MemoryLocation, MemorySSAFacts,
         MemoryUseFact, MemoryVersion, ObjectFact, ObjectId, ObjectKind, ObjectModel,
-        RelativeMemoryAddress, StructuredAccessId, memory_locations_may_alias,
+        ObjectModelBuilder, ObjectSpaceId, RelativeMemoryAddress, StructuredAccessId,
+        memory_locations_may_alias,
     };
     use crate::{
-        CanonicalStorageId, CanonicalStorageSpace, DecompilePrepFacts, InstId, InstPayload, SSAOp,
-        SSAVar, SemanticObligationKind, SourceAbiParameterSpec, SourceFunctionInterface,
-        SourceFunctionReturn, SsaArtifact, StackAddressBase, StackAddressRoot, ValueId,
+        AddressProvenanceFacts, AnalysisAssumption, AssumptionProvenance, AssumptionScope,
+        AssumptionSet, AssumptionSubject, AssumptionValue, CanonicalStorageId,
+        CanonicalStorageSpace, DecompilePrepFacts, InstId, InstPayload, SSAOp, SSAVar,
+        SemanticObligationKind, SourceAbiParameterSpec, SourceFunctionInterface,
+        SourceFunctionReturn, SourceStackSlotSpec, SsaArtifact, StackAddressBase, StackAddressRoot,
+        ValueId,
     };
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
 
@@ -6859,8 +7028,12 @@ mod tests {
                 offset: -8,
             },
         );
-        let stack_objects = super::ObjectModelBuilder::new(Some(&stack_facts), stack.addresses())
-            .build(stack.function(), stack.graph());
+        let stack_objects = super::ObjectModelBuilder::new(
+            Some(&stack_facts),
+            stack.addresses(),
+            Some(stack.machine_context()),
+        )
+        .build(stack.function(), stack.graph());
         let ram_stack = super::memory_location_for_addr(
             Some(&stack_facts),
             stack.addresses(),
@@ -7107,6 +7280,303 @@ mod tests {
     }
 
     #[test]
+    fn exact_entry_stack_coordinates_refine_cross_base_aliasing_fail_closed() {
+        let saved = ObjectId(1);
+        let local = ObjectId(2);
+        let mut objects = ObjectModel::default();
+        objects.objects.insert(
+            saved,
+            ObjectFact {
+                id: saved,
+                kind: ObjectKind::StackSlot {
+                    space: SpaceId::Ram,
+                    base: StackAddressBase::StackPointer,
+                    offset: -8,
+                },
+            },
+        );
+        objects.objects.insert(
+            local,
+            ObjectFact {
+                id: local,
+                kind: ObjectKind::StackSlot {
+                    space: SpaceId::Ram,
+                    base: StackAddressBase::FramePointer,
+                    offset: -8,
+                },
+            },
+        );
+        objects
+            .address_bits_by_space
+            .insert(ObjectSpaceId(SpaceId::Ram), 64);
+        objects.entry_stack_roots.insert(
+            saved,
+            StackAddressRoot {
+                base: StackAddressBase::StackPointer,
+                offset: -8,
+            },
+        );
+        objects.entry_stack_roots.insert(
+            local,
+            StackAddressRoot {
+                base: StackAddressBase::StackPointer,
+                offset: -16,
+            },
+        );
+        let saved_location = MemoryLocation {
+            space: SpaceId::Ram,
+            object: saved,
+            address: RelativeMemoryAddress::Exact(0),
+            size: 8,
+        };
+        let local_location = MemoryLocation {
+            space: SpaceId::Ram,
+            object: local,
+            address: RelativeMemoryAddress::Exact(0),
+            size: 4,
+        };
+        assert!(!memory_locations_may_alias(
+            &objects,
+            &saved_location,
+            &local_location
+        ));
+
+        objects.entry_stack_roots.remove(&local);
+        assert!(memory_locations_may_alias(
+            &objects,
+            &saved_location,
+            &local_location
+        ));
+        objects.entry_stack_roots.insert(
+            local,
+            StackAddressRoot {
+                base: StackAddressBase::StackPointer,
+                offset: -8,
+            },
+        );
+        assert!(memory_locations_may_alias(
+            &objects,
+            &saved_location,
+            &local_location
+        ));
+
+        objects.entry_stack_roots.insert(
+            saved,
+            StackAddressRoot {
+                base: StackAddressBase::StackPointer,
+                offset: i64::MAX,
+            },
+        );
+        objects.entry_stack_roots.insert(
+            local,
+            StackAddressRoot {
+                base: StackAddressBase::StackPointer,
+                offset: i64::MIN,
+            },
+        );
+        let two_byte_saved = MemoryLocation {
+            size: 2,
+            ..saved_location.clone()
+        };
+        assert!(memory_locations_may_alias(
+            &objects,
+            &two_byte_saved,
+            &local_location
+        ));
+
+        objects
+            .address_bits_by_space
+            .insert(ObjectSpaceId(SpaceId::Ram), 32);
+        objects.entry_stack_roots.insert(
+            saved,
+            StackAddressRoot {
+                base: StackAddressBase::StackPointer,
+                offset: i64::from(i32::MAX),
+            },
+        );
+        objects.entry_stack_roots.insert(
+            local,
+            StackAddressRoot {
+                base: StackAddressBase::StackPointer,
+                offset: i64::from(i32::MIN),
+            },
+        );
+        assert!(memory_locations_may_alias(
+            &objects,
+            &two_byte_saved,
+            &local_location
+        ));
+
+        objects.address_bits_by_space.clear();
+        assert!(memory_locations_may_alias(
+            &objects,
+            &saved_location,
+            &local_location
+        ));
+    }
+
+    #[test]
+    fn conflicting_entry_stack_coordinates_permanently_drop_alias_refinement() {
+        let addresses = AddressProvenanceFacts::default();
+        let mut builder = ObjectModelBuilder::new(None, &addresses, None);
+        let object = ObjectId(7);
+        let first = StackAddressRoot {
+            base: StackAddressBase::StackPointer,
+            offset: -16,
+        };
+        builder.record_entry_stack_root(object, first);
+        builder.record_entry_stack_root(object, first);
+        assert_eq!(builder.entry_stack_roots.get(&object), Some(&first));
+        builder.record_entry_stack_root(
+            object,
+            StackAddressRoot {
+                base: StackAddressBase::StackPointer,
+                offset: -24,
+            },
+        );
+        assert!(!builder.entry_stack_roots.contains_key(&object));
+        builder.record_entry_stack_root(object, first);
+        assert!(!builder.entry_stack_roots.contains_key(&object));
+    }
+
+    #[test]
+    fn memory_ssa_separates_saved_sp_slot_from_frame_relative_local() {
+        let sp = Varnode::register(0, 8);
+        let fp = Varnode::register(8, 8);
+        let ra = Varnode::register(16, 8);
+        let local_addr = Varnode::unique(0x100, 8);
+        let mut block = R2ILBlock::new(0x3600, 4);
+        block.push(R2ILOp::IntSub {
+            dst: sp.clone(),
+            a: sp.clone(),
+            b: Varnode::constant(8, 8),
+        });
+        block.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: sp.clone(),
+            val: fp.clone(),
+        });
+        block.push(R2ILOp::Copy {
+            dst: fp.clone(),
+            src: sp.clone(),
+        });
+        block.push(R2ILOp::IntSub {
+            dst: local_addr.clone(),
+            a: fp.clone(),
+            b: Varnode::constant(8, 8),
+        });
+        block.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: local_addr.clone(),
+            val: Varnode::constant(1, 4),
+        });
+        block.push(R2ILOp::Load {
+            dst: Varnode::unique(0x108, 4),
+            space: SpaceId::Ram,
+            addr: local_addr,
+        });
+        block.push(R2ILOp::Return { target: ra });
+
+        let mut arch = ArchSpec::new("dual-stack-coordinate-test");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("sp", 0, 8));
+        arch.add_register(RegisterDef::new("fp", 8, 8));
+        arch.add_register(RegisterDef::new("ra", 16, 8));
+        arch.add_space(r2il::AddressSpace::ram(8));
+        let storage = |offset| CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let interface = SourceFunctionInterface::new_exact(
+            b"dual-stack-coordinate-revision-1".to_vec(),
+            "test-abi",
+            [],
+            SourceFunctionReturn::Void,
+            [SourceStackSlotSpec::new_local(
+                StackAddressBase::FramePointer,
+                storage(8),
+                -8,
+                4,
+            )],
+        )
+        .and_then(|interface| interface.with_return_address_storage(storage(16)))
+        .and_then(|interface| interface.with_stack_pointer_storage(storage(0)))
+        .expect("exact dual-coordinate interface");
+        let artifact = SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface)
+            .expect("dual-coordinate artifact");
+
+        let [save] = artifact
+            .memory_defs_for_op_site(0x3600, 1)
+            .expect("saved-frame definition")
+        else {
+            panic!("one saved-frame definition")
+        };
+        let [local_store] = artifact
+            .memory_defs_for_op_site(0x3600, 4)
+            .expect("local definition")
+        else {
+            panic!("one local definition")
+        };
+        let [local_load] = artifact
+            .memory_uses_for_op_site(0x3600, 5)
+            .expect("local use")
+        else {
+            panic!("one local use")
+        };
+        assert_ne!(save.location.object, local_store.location.object);
+        assert_eq!(
+            local_store.previous_version.object,
+            local_store.location.object
+        );
+        assert_eq!(local_store.previous_version.version, 0);
+        assert_eq!(local_load.location, local_store.location);
+        assert_eq!(local_load.version, local_store.next_version);
+        assert!(matches!(
+            artifact
+                .objects()
+                .object(save.location.object)
+                .map(|object| &object.kind),
+            Some(ObjectKind::StackSlot {
+                base: StackAddressBase::StackPointer,
+                offset: -8,
+                ..
+            })
+        ));
+        assert!(matches!(
+            artifact
+                .objects()
+                .object(local_store.location.object)
+                .map(|object| &object.kind),
+            Some(ObjectKind::StackSlot {
+                base: StackAddressBase::FramePointer,
+                offset: -8,
+                ..
+            })
+        ));
+        assert_eq!(
+            artifact
+                .objects()
+                .entry_stack_roots
+                .get(&save.location.object),
+            Some(&StackAddressRoot {
+                base: StackAddressBase::StackPointer,
+                offset: -8,
+            })
+        );
+        assert_eq!(
+            artifact
+                .objects()
+                .entry_stack_roots
+                .get(&local_store.location.object),
+            Some(&StackAddressRoot {
+                base: StackAddressBase::StackPointer,
+                offset: -16,
+            })
+        );
+    }
+
+    #[test]
     fn global_object_key_order_binds_exact_typed_space() {
         let keys = [
             GlobalObjectKey {
@@ -7326,6 +7796,244 @@ mod tests {
             target: test_const(target),
         });
         block
+    }
+
+    fn predicate_assumption_diamond() -> SsaArtifact {
+        SsaArtifact::for_symbolic(
+            &[
+                conditional_block(0x9000, 0, 0x9040),
+                branch_block(0x9004, 0x9080),
+                branch_block(0x9040, 0x9080),
+                R2ILBlock::new(0x9080, 4),
+            ],
+            None,
+        )
+        .expect("predicate-assumption diamond")
+    }
+
+    fn predicate_branch_assumption(
+        predicate: &super::PredicateFact,
+        block_addr: u64,
+        predecessor: Option<u64>,
+        truth: bool,
+    ) -> AnalysisAssumption {
+        AnalysisAssumption {
+            id: Some("predicate-assumption-test".to_string()),
+            subject: AssumptionSubject::Predicate {
+                predicate: predicate.id,
+                block_addr,
+                predecessor,
+            },
+            value: AssumptionValue::Branch { truth },
+            scope: AssumptionScope::Query,
+            provenance: AssumptionProvenance::User,
+        }
+    }
+
+    fn assert_conflicting_predicate_assumption_preserves_semantics(
+        base: &SsaArtifact,
+        assumption: AnalysisAssumption,
+        expected_reason: &str,
+    ) {
+        let conditioned = base.with_assumptions(&AssumptionSet::new(vec![assumption.clone()]));
+
+        assert_predicate_assumption_preserves_source_semantics(base, &conditioned);
+        assert!(conditioned.facts().applied_assumption_bindings.is_empty());
+        assert!(conditioned.facts().assumption_usage.applied.is_empty());
+        assert!(conditioned.facts().assumption_usage.ignored.is_empty());
+        assert_eq!(conditioned.facts().assumption_usage.conflicts.len(), 1);
+        assert_eq!(
+            conditioned.facts().assumption_usage.conflicts[0].assumption,
+            assumption
+        );
+        assert_eq!(
+            conditioned.facts().assumption_usage.conflicts[0].reason,
+            expected_reason
+        );
+    }
+
+    fn assert_predicate_assumption_preserves_source_semantics(
+        base: &SsaArtifact,
+        conditioned: &SsaArtifact,
+    ) {
+        assert_eq!(conditioned.predicates(), base.predicates());
+        assert_eq!(conditioned.structured(), base.structured());
+        assert_eq!(conditioned.control_domains(), base.control_domains());
+        assert_eq!(conditioned.certificates(), base.certificates());
+        assert_eq!(conditioned.obligations(), base.obligations());
+    }
+
+    #[test]
+    fn predicate_branch_assumption_wrong_block_preserves_base_semantics() {
+        let base = predicate_assumption_diamond();
+        let predicate = base
+            .predicates()
+            .predicates
+            .values()
+            .next()
+            .expect("diamond predicate")
+            .clone();
+        let assumption = predicate_branch_assumption(
+            &predicate,
+            predicate.true_target,
+            Some(predicate.true_target),
+            true,
+        );
+
+        assert_conflicting_predicate_assumption_preserves_semantics(
+            &base,
+            assumption,
+            "predicate block mismatch (expected 0x9040, observed 0x9000)",
+        );
+    }
+
+    #[test]
+    fn predicate_branch_assumption_wrong_predecessor_preserves_base_semantics() {
+        let base = predicate_assumption_diamond();
+        let predicate = base
+            .predicates()
+            .predicates
+            .values()
+            .next()
+            .expect("diamond predicate")
+            .clone();
+        let assumption = predicate_branch_assumption(
+            &predicate,
+            predicate.block_addr,
+            Some(predicate.false_target),
+            true,
+        );
+
+        assert_conflicting_predicate_assumption_preserves_semantics(
+            &base,
+            assumption,
+            "branch predecessor 0x9004 does not match selected edge 0x9040",
+        );
+    }
+
+    #[test]
+    fn valid_predicate_branch_assumption_binds_without_mutating_source_facts() {
+        let base = predicate_assumption_diamond();
+        let predicate = base
+            .predicates()
+            .predicates
+            .values()
+            .next()
+            .expect("diamond predicate")
+            .clone();
+        let assumption = predicate_branch_assumption(
+            &predicate,
+            predicate.block_addr,
+            Some(predicate.true_target),
+            true,
+        );
+        let conditioned = base.with_assumptions(&AssumptionSet::new(vec![assumption.clone()]));
+
+        assert_predicate_assumption_preserves_source_semantics(&base, &conditioned);
+        assert_eq!(conditioned.facts().assumption_usage.applied, [assumption]);
+        assert!(conditioned.facts().assumption_usage.ignored.is_empty());
+        assert!(conditioned.facts().assumption_usage.conflicts.is_empty());
+        assert_eq!(conditioned.facts().applied_assumption_bindings.len(), 1);
+        assert!(matches!(
+            conditioned.facts().applied_assumption_bindings[0].binding,
+            super::PreparedAssumptionBindingKind::Predicate {
+                predicate: bound,
+                block_addr,
+                predecessor: Some(selected),
+                truth: true,
+            } if bound == predicate.id
+                && block_addr == predicate.block_addr
+                && selected == predicate.true_target
+        ));
+    }
+
+    #[test]
+    fn contradictory_predicate_branch_assumptions_leave_source_facts_unchanged() {
+        let base = predicate_assumption_diamond();
+        let predicate = base
+            .predicates()
+            .predicates
+            .values()
+            .next()
+            .expect("diamond predicate")
+            .clone();
+        let assumptions = AssumptionSet::new(vec![
+            predicate_branch_assumption(
+                &predicate,
+                predicate.block_addr,
+                Some(predicate.true_target),
+                true,
+            ),
+            predicate_branch_assumption(
+                &predicate,
+                predicate.block_addr,
+                Some(predicate.false_target),
+                false,
+            ),
+        ]);
+        let conditioned = base.with_assumptions(&assumptions);
+
+        assert_predicate_assumption_preserves_source_semantics(&base, &conditioned);
+        assert!(conditioned.facts().applied_assumption_bindings.is_empty());
+        assert!(conditioned.facts().assumption_usage.applied.is_empty());
+        assert!(conditioned.facts().assumption_usage.ignored.is_empty());
+        assert_eq!(conditioned.facts().assumption_usage.conflicts.len(), 2);
+        assert!(
+            conditioned
+                .facts()
+                .assumption_usage
+                .conflicts
+                .iter()
+                .all(|conflict| {
+                    conflict.reason == "contradictory branch truths for predicate 0"
+                })
+        );
+    }
+
+    #[test]
+    fn contradictory_predicate_preflight_is_input_order_independent() {
+        let base = predicate_assumption_diamond();
+        let predicate = base
+            .predicates()
+            .predicates
+            .values()
+            .next()
+            .expect("diamond predicate")
+            .clone();
+        let truth = predicate_branch_assumption(
+            &predicate,
+            predicate.block_addr,
+            Some(predicate.true_target),
+            true,
+        );
+        let falsehood = predicate_branch_assumption(
+            &predicate,
+            predicate.block_addr,
+            Some(predicate.false_target),
+            false,
+        );
+        let first =
+            base.with_assumptions(&AssumptionSet::new(vec![truth.clone(), falsehood.clone()]));
+        let second = base.with_assumptions(&AssumptionSet::new(vec![falsehood, truth]));
+
+        for conditioned in [&first, &second] {
+            assert_predicate_assumption_preserves_source_semantics(&base, conditioned);
+            assert!(conditioned.facts().applied_assumption_bindings.is_empty());
+            assert_eq!(conditioned.facts().assumption_usage.conflicts.len(), 2);
+            assert_eq!(
+                conditioned
+                    .facts()
+                    .assumption_usage
+                    .conflicts
+                    .iter()
+                    .filter_map(|conflict| match conflict.assumption.value {
+                        AssumptionValue::Branch { truth } => Some(truth),
+                        _ => None,
+                    })
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([false, true])
+            );
+        }
     }
 
     fn return_boundary_arch() -> ArchSpec {

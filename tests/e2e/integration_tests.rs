@@ -138,8 +138,117 @@ mod check_secret_phase5 {
         );
     }
 
+    fn assert_generated_matches_source(
+        scratch: &ScratchDir,
+        source: &Path,
+        generated: &str,
+        label: &str,
+        parameter_type: &str,
+    ) {
+        let generated_c = scratch.join(&format!("generated_{label}.c"));
+        let generated_o = scratch.join(&format!("generated_{label}.o"));
+        let oracle_o = scratch.join(&format!("oracle_{label}.o"));
+        let driver_c = scratch.join(&format!("driver_{label}.c"));
+        let executable = scratch.join(&format!("compare_{label}"));
+        fs::write(&generated_c, generated).expect("write generated semantic C");
+        fs::write(
+            &driver_c,
+            format!(
+                r#"#include <limits.h>
+#include <stdint.h>
+#include <stdio.h>
+
+int32_t certified_sub_100000650({parameter_type} value);
+int oracle_check_secret(int value);
+
+static int compare_one(int32_t value) {{
+	int32_t generated = certified_sub_100000650(({parameter_type})value);
+	int32_t oracle = (int32_t)oracle_check_secret((int)value);
+	if (generated != oracle) {{
+		fprintf(stderr, "mismatch input=%d generated=%d oracle=%d\n", value, generated, oracle);
+		return 1;
+	}}
+	return 0;
+}}
+
+int main(void) {{
+	static const int32_t boundary[] = {{
+		INT32_MIN, -1, 0, 0xdeac, 0xdead, 0xdeae, INT32_MAX
+	}};
+	for (unsigned i = 0; i < sizeof(boundary) / sizeof(boundary[0]); i++) {{
+		if (compare_one(boundary[i])) {{
+			return 1;
+		}}
+	}}
+	uint32_t state = UINT32_C(0x6d2b79f5);
+	for (unsigned i = 0; i < 4096U; i++) {{
+		state ^= state << 13;
+		state ^= state >> 17;
+		state ^= state << 5;
+		if (compare_one((int32_t)state)) {{
+			return 1;
+		}}
+	}}
+	return 0;
+}}
+"#,
+            ),
+        )
+        .expect("write independent comparison driver");
+
+        run_checked(
+            Command::new("clang")
+                .args([
+                    "-std=c11",
+                    "-pedantic-errors",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-c",
+                ])
+                .arg(&generated_c)
+                .arg("-o")
+                .arg(&generated_o),
+            &format!("strictly compile generated {label} semantic C"),
+        );
+        run_checked(
+            Command::new("clang")
+                .args([
+                    "-O2",
+                    "-Wno-format-security",
+                    "-Dcheck_secret=oracle_check_secret",
+                    "-Dmain=fixture_main",
+                    "-c",
+                ])
+                .arg(source)
+                .arg("-o")
+                .arg(&oracle_o),
+            &format!("compile independent {label} source oracle"),
+        );
+        run_checked(
+            Command::new("clang")
+                .args([
+                    "-std=c11",
+                    "-pedantic-errors",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                ])
+                .arg(&driver_c)
+                .arg(&generated_o)
+                .arg(&oracle_o)
+                .arg("-o")
+                .arg(&executable),
+            &format!("link {label} source-versus-CertifiedC oracle"),
+        );
+        run_checked(
+            &mut Command::new(&executable),
+            &format!("compare {label} CertifiedC with independently compiled source"),
+        );
+    }
+
     #[test]
-    fn genuine_radare_snapshot_emits_strict_o2_c_and_refuses_unsupported_o0() {
+    fn genuine_radare_snapshot_emits_and_executes_strict_o2_and_o0_certified_c() {
         let o2 = repo_path("tests/r2r/bins/r2sleigh_vuln_test_x86_64_macho_O2_v1");
         let o2_dsym = repo_path("tests/r2r/bins/r2sleigh_vuln_test_x86_64_macho_O2_v1.dSYM");
         let o0 = repo_path("tests/r2r/bins/check_secret_phase5_o0_v1/vuln_test_x86");
@@ -175,7 +284,7 @@ mod check_secret_phase5 {
         assert!(
             o2_result
                 .stdout
-                .contains("int32_t certified_sub_100000650(uint32_t"),
+                .contains("int32_t certified_sub_100000650(int32_t arg_0) {"),
             "genuine O2 capture did not reach CertifiedC:\n{}\n{}",
             o2_result.stdout,
             o2_result.stderr
@@ -183,6 +292,14 @@ mod check_secret_phase5 {
         assert!(
             o2_result.stdout.contains("r2s_bit_insert") && !o2_result.contains("r2dec residual:"),
             "O2 result must preserve the exact RAX/AL composition without residual output"
+        );
+        assert!(
+            o2_result.stdout.lines().any(|line| {
+                let line = line.trim();
+                line.starts_with("uint32_t v_")
+                    && line.ends_with(" = (uint32_t)(arg_0);")
+            }),
+            "O2 result must bind the signed source parameter to unsigned graph bits"
         );
 
         let o0_result = r2_cmd_timeout(
@@ -193,112 +310,18 @@ mod check_secret_phase5 {
         o0_result.assert_ok();
         assert_eq!(o0_result.exit_code, Some(0), "radare O0 command failed");
         assert!(
-            o0_result.contains("r2dec residual:")
-                && !o0_result.stdout.contains("certified_sub_100000650"),
-            "unsupported O0 private-stack semantics must fail closed:\n{}\n{}",
+            o0_result
+                .stdout
+                .contains("int32_t certified_sub_100000650(int32_t arg_0) {")
+                && !o0_result.contains("r2dec residual:"),
+            "genuine O0 private-frame route did not reach exact signed CertifiedC:\n{}\n{}",
             o0_result.stdout,
             o0_result.stderr
         );
 
         let scratch = ScratchDir::new();
-        let generated_c = scratch.join("generated.c");
-        let generated_o = scratch.join("generated.o");
-        let oracle_o = scratch.join("oracle.o");
-        let driver_c = scratch.join("driver.c");
-        let executable = scratch.join("compare");
-        fs::write(&generated_c, &o2_result.stdout).expect("write generated semantic C");
-        fs::write(
-            &driver_c,
-            r#"#include <limits.h>
-#include <stdint.h>
-#include <stdio.h>
-
-int32_t certified_sub_100000650(uint32_t value);
-int oracle_check_secret(int value);
-
-static int compare_one(int32_t value) {
-	int32_t generated = certified_sub_100000650((uint32_t)value);
-	int32_t oracle = (int32_t)oracle_check_secret((int)value);
-	if (generated != oracle) {
-		fprintf(stderr, "mismatch input=%d generated=%d oracle=%d\n", value, generated, oracle);
-		return 1;
-	}
-	return 0;
-}
-
-int main(void) {
-	static const int32_t boundary[] = {
-		INT32_MIN, -1, 0, 0xdeac, 0xdead, 0xdeae, INT32_MAX
-	};
-	for (unsigned i = 0; i < sizeof(boundary) / sizeof(boundary[0]); i++) {
-		if (compare_one(boundary[i])) {
-			return 1;
-		}
-	}
-	uint32_t state = UINT32_C(0x6d2b79f5);
-	for (unsigned i = 0; i < 4096U; i++) {
-		state ^= state << 13;
-		state ^= state >> 17;
-		state ^= state << 5;
-		if (compare_one((int32_t)state)) {
-			return 1;
-		}
-	}
-	return 0;
-}
-"#,
-        )
-        .expect("write independent comparison driver");
-
-        run_checked(
-            Command::new("clang")
-                .args([
-                    "-std=c11",
-                    "-pedantic-errors",
-                    "-Wall",
-                    "-Wextra",
-                    "-Werror",
-                    "-c",
-                ])
-                .arg(&generated_c)
-                .arg("-o")
-                .arg(&generated_o),
-            "strictly compile generated semantic C",
-        );
-        run_checked(
-            Command::new("clang")
-                .args([
-                    "-O2",
-                    "-Wno-format-security",
-                    "-Dcheck_secret=oracle_check_secret",
-                    "-Dmain=fixture_main",
-                    "-c",
-                ])
-                .arg(&source)
-                .arg("-o")
-                .arg(&oracle_o),
-            "compile independent source oracle",
-        );
-        run_checked(
-            Command::new("clang")
-                .args([
-                    "-std=c11",
-                    "-pedantic-errors",
-                    "-Wall",
-                    "-Wextra",
-                    "-Werror",
-                ])
-                .arg(&driver_c)
-                .arg(&generated_o)
-                .arg(&oracle_o)
-                .arg("-o")
-                .arg(&executable),
-            "link source-versus-CertifiedC oracle",
-        );
-        run_checked(
-            &mut Command::new(&executable),
-            "compare CertifiedC with independently compiled source",
-        );
+        assert_generated_matches_source(&scratch, &source, &o2_result.stdout, "O2", "int32_t");
+        assert_generated_matches_source(&scratch, &source, &o0_result.stdout, "O0", "int32_t");
     }
 
     #[cfg(target_arch = "aarch64")]

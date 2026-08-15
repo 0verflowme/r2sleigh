@@ -412,6 +412,290 @@ pub struct SourceMachineContext {
     memory_spaces_by_op: BTreeMap<(u64, usize), SpaceId>,
 }
 
+struct MachineContextIdentityWriter(Vec<u8>);
+
+impl MachineContextIdentityWriter {
+    fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    fn u8(&mut self, value: u8) {
+        self.0.push(value);
+    }
+
+    fn bool(&mut self, value: bool) {
+        self.u8(u8::from(value));
+    }
+
+    fn u32(&mut self, value: u32) {
+        self.0.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn u64(&mut self, value: u64) {
+        self.0.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn i64(&mut self, value: i64) {
+        self.0.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn usize(&mut self, value: usize) {
+        self.u64(value as u64);
+    }
+
+    fn bytes(&mut self, value: &[u8]) {
+        self.usize(value.len());
+        self.0.extend_from_slice(value);
+    }
+
+    fn string(&mut self, value: &str) {
+        self.bytes(value.as_bytes());
+    }
+
+    fn storage(&mut self, storage: CanonicalStorageId) {
+        self.u8(match storage.space {
+            CanonicalStorageSpace::Ram => 1,
+            CanonicalStorageSpace::Register => 2,
+            CanonicalStorageSpace::Unique => 3,
+            CanonicalStorageSpace::Constant => 4,
+            CanonicalStorageSpace::Custom(_) => 5,
+            CanonicalStorageSpace::Unknown => 6,
+        });
+        if let CanonicalStorageSpace::Custom(id) = storage.space {
+            self.u32(id);
+        }
+        self.u64(storage.offset);
+        self.u32(storage.size);
+    }
+
+    fn option_storage(&mut self, storage: Option<CanonicalStorageId>) {
+        match storage {
+            Some(storage) => {
+                self.u8(1);
+                self.storage(storage);
+            }
+            None => self.u8(0),
+        }
+    }
+
+    fn space(&mut self, space: SpaceId) {
+        self.u8(match space {
+            SpaceId::Ram => 1,
+            SpaceId::Register => 2,
+            SpaceId::Unique => 3,
+            SpaceId::Const => 4,
+            SpaceId::Custom(_) => 5,
+        });
+        if let SpaceId::Custom(id) = space {
+            self.u32(id);
+        }
+    }
+
+    fn stack_base(&mut self, base: StackAddressBase) {
+        self.u8(match base {
+            StackAddressBase::StackPointer => 1,
+            StackAddressBase::FramePointer => 2,
+        });
+    }
+
+    fn logical_value(&mut self, value: SourceLogicalValue) {
+        self.u32(value.type_id());
+        let carrier = value.carrier();
+        self.u8(match carrier.kind() {
+            SourceCarrierKind::Full => 1,
+            SourceCarrierKind::LowBits => 2,
+        });
+        self.u64(carrier.offset_bits());
+        self.u64(carrier.size_bits());
+    }
+
+    fn finish(self) -> Box<[u8]> {
+        self.0.into_boxed_slice()
+    }
+}
+
+fn write_memory_endianness(
+    writer: &mut MachineContextIdentityWriter,
+    endianness: MachineMemoryEndianness,
+) {
+    writer.u8(match endianness {
+        MachineMemoryEndianness::Little => 1,
+        MachineMemoryEndianness::Big => 2,
+        MachineMemoryEndianness::Mixed => 3,
+        MachineMemoryEndianness::Custom => 4,
+        MachineMemoryEndianness::Unknown => 5,
+    });
+}
+
+fn write_return_mechanism(
+    writer: &mut MachineContextIdentityWriter,
+    mechanism: Option<r2source::SourceReturnMechanism>,
+) {
+    match mechanism {
+        Some(r2source::SourceReturnMechanism::Stacked {
+            stack_offset,
+            slot_size_bytes,
+            stack_pointer_delta_bytes,
+            address_size_bytes,
+        }) => {
+            writer.u8(1);
+            writer.i64(stack_offset);
+            writer.u32(slot_size_bytes);
+            writer.u32(stack_pointer_delta_bytes);
+            writer.u32(address_size_bytes);
+        }
+        None => writer.u8(0),
+    }
+}
+
+fn write_type_graph(writer: &mut MachineContextIdentityWriter, graph: Option<&SourceTypeGraph>) {
+    let Some(graph) = graph else {
+        writer.u8(0);
+        return;
+    };
+    writer.u8(1);
+    writer.u32(graph.schema_version());
+    writer.usize(graph.types().len());
+    for source_type in graph.types() {
+        writer.u32(source_type.id());
+        match source_type.kind() {
+            SourceTypeKind::SignedInteger => writer.u8(1),
+            SourceTypeKind::UnsignedInteger => writer.u8(2),
+            SourceTypeKind::Pointer { target_type_id } => {
+                writer.u8(3);
+                writer.u32(target_type_id);
+            }
+            SourceTypeKind::Struct { aggregate_id } => {
+                writer.u8(4);
+                writer.u32(aggregate_id);
+            }
+        }
+        writer.u64(source_type.size_bits());
+        writer.u64(source_type.align_bits());
+    }
+    writer.usize(graph.aggregates().len());
+    for aggregate in graph.aggregates() {
+        writer.u32(aggregate.id());
+        writer.u32(aggregate.type_id());
+        writer.u64(aggregate.size_bits());
+        writer.u64(aggregate.align_bits());
+        writer.usize(aggregate.members().len());
+        for member in aggregate.members() {
+            writer.u32(member.member_id());
+            writer.u32(member.type_id());
+            writer.u64(member.offset_bits());
+            writer.u64(member.size_bits());
+        }
+    }
+}
+
+fn write_function_interface(
+    writer: &mut MachineContextIdentityWriter,
+    interface: Option<&SourceFunctionInterface>,
+) {
+    let Some(interface) = interface else {
+        writer.u8(0);
+        return;
+    };
+    writer.u8(1);
+    writer.u32(interface.schema_version());
+    writer.bytes(interface.revision_identity());
+    writer.string(interface.calling_convention());
+    writer.usize(interface.parameters().len());
+    for parameter in interface.parameters() {
+        writer.u32(parameter.index());
+        writer.storage(parameter.storage());
+    }
+    match interface.return_kind() {
+        SourceFunctionReturn::Void => writer.u8(0),
+        SourceFunctionReturn::Register { storage } => {
+            writer.u8(1);
+            writer.storage(storage);
+        }
+    }
+    writer.option_storage(interface.return_address_storage());
+    writer.option_storage(interface.stack_pointer_storage());
+    writer.option_storage(interface.frame_pointer_storage());
+    write_return_mechanism(writer, interface.return_mechanism());
+    match interface.stack_allocation_contract() {
+        Some(contract) => {
+            writer.u8(1);
+            writer.u8(match contract.growth() {
+                SourceStackGrowth::LowerAddresses => 1,
+                SourceStackGrowth::HigherAddresses => 2,
+            });
+            writer.u32(contract.implicit_active_sp_bytes());
+        }
+        None => writer.u8(0),
+    }
+    writer.usize(interface.stack_slots().len());
+    for slot in interface.stack_slots() {
+        writer.stack_base(slot.base());
+        writer.storage(slot.base_storage());
+        writer.i64(slot.offset());
+        writer.u32(slot.size_bytes());
+        match slot.role() {
+            SourceStackSlotRole::UnclassifiedResource => writer.u8(1),
+            SourceStackSlotRole::Local => writer.u8(2),
+            SourceStackSlotRole::ParameterHome {
+                parameter_index,
+                home_storage,
+            } => {
+                writer.u8(3);
+                writer.u32(parameter_index);
+                writer.storage(home_storage);
+            }
+        }
+    }
+    writer.usize(interface.parameter_logical_values().len());
+    for value in interface.parameter_logical_values() {
+        writer.logical_value(*value);
+    }
+    match interface.return_logical_value() {
+        Some(value) => {
+            writer.u8(1);
+            writer.logical_value(value);
+        }
+        None => writer.u8(0),
+    }
+    write_type_graph(writer, interface.type_graph());
+    writer.bool(interface.stack_slot_roles_complete());
+}
+
+fn write_call_identity(
+    writer: &mut MachineContextIdentityWriter,
+    identity: SourceCallSiteIdentity,
+) {
+    writer.u64(identity.block_addr());
+    writer.usize(identity.op_index());
+    writer.storage(identity.target());
+}
+
+fn write_call_site_interface(
+    writer: &mut MachineContextIdentityWriter,
+    interface: &SourceCallSiteInterface,
+) {
+    writer.u32(interface.schema_version());
+    writer.bytes(interface.revision_identity());
+    write_call_identity(writer, interface.identity());
+    writer.bool(interface.is_complete());
+    writer.string(interface.calling_convention());
+    writer.usize(interface.arguments().len());
+    for argument in interface.arguments() {
+        writer.u32(argument.index());
+        writer.storage(argument.storage());
+    }
+    writer.bool(interface.is_variadic());
+    writer.bool(interface.is_noreturn());
+    match interface.result() {
+        SourceCallResult::Void => writer.u8(0),
+        SourceCallResult::Register { storage } => {
+            writer.u8(1);
+            writer.storage(storage);
+        }
+    }
+}
+
 impl SourceMachineContext {
     pub(crate) fn from_blocks(blocks: &[R2ILBlock], arch: Option<&ArchSpec>) -> Self {
         Self::from_blocks_with_interfaces(blocks, arch, None, Vec::new())
@@ -641,6 +925,78 @@ impl SourceMachineContext {
         &self.memory_spaces_by_op
     }
 
+    /// Canonical, presentation-independent identity of every immutable
+    /// machine/source fact that can affect prepared semantics or certification.
+    pub(crate) fn semantic_identity_bytes(&self) -> Box<[u8]> {
+        let mut writer = MachineContextIdentityWriter::new();
+        writer.bytes(b"r2ssa-machine-context-semantic-v1");
+        writer.u32(self.schema_version);
+
+        let memory = &self.memory_model;
+        writer.u32(memory.schema_version());
+        writer.bool(memory.is_available());
+        writer.bool(memory.is_coherent());
+        writer.u32(memory.default_address_bits());
+        writer.u32(memory.alignment_bytes());
+        write_memory_endianness(&mut writer, memory.default_endianness());
+        writer.usize(memory.spaces().len());
+        for space in memory.spaces() {
+            writer.space(space.space());
+            writer.u32(space.address_bits());
+            writer.u32(space.word_size_bytes());
+            write_memory_endianness(&mut writer, space.endianness());
+        }
+
+        let abi = &self.abi_model;
+        writer.u32(abi.schema_version());
+        writer.bool(abi.is_available());
+        writer.bool(abi.is_coherent());
+        writer.usize(abi.argument_registers().len());
+        for slot in abi.argument_registers() {
+            writer.u32(slot.index());
+            writer.storage(slot.storage());
+        }
+        writer.usize(abi.return_registers().len());
+        for slot in abi.return_registers() {
+            writer.u32(slot.index());
+            writer.storage(slot.storage());
+        }
+        writer.option_storage(abi.frame_pointer_storage());
+
+        write_function_interface(&mut writer, self.function_interface.as_ref());
+
+        let mut register_storages = self
+            .register_storages_by_name
+            .values()
+            .copied()
+            .collect::<Vec<_>>();
+        register_storages.sort_unstable();
+        register_storages.dedup();
+        writer.usize(register_storages.len());
+        for storage in register_storages {
+            writer.storage(storage);
+        }
+
+        writer.usize(self.raw_call_sites_by_id.len());
+        for (call_site, identity) in &self.raw_call_sites_by_id {
+            writer.u32(call_site.0);
+            write_call_identity(&mut writer, *identity);
+        }
+        writer.bool(self.call_site_interfaces_coherent);
+        writer.usize(self.call_site_interfaces.len());
+        for interface in self.call_site_interfaces.values() {
+            write_call_site_interface(&mut writer, interface);
+        }
+
+        writer.usize(self.memory_spaces_by_op.len());
+        for ((block_addr, op_index), space) in &self.memory_spaces_by_op {
+            writer.u64(*block_addr);
+            writer.usize(*op_index);
+            writer.space(*space);
+        }
+        writer.finish()
+    }
+
     /// Rebind raw lifted memory-space identities to the completed SSA operation
     /// sites. SSA preparation may insert non-memory register-alias operations,
     /// but it must retain the order, count, and exact space identity of memory
@@ -785,6 +1141,97 @@ mod tests {
             offset,
             size,
         }
+    }
+
+    fn semantic_identity_arch(endianness: Endianness) -> ArchSpec {
+        let mut arch = ArchSpec::new("semantic-identity-test");
+        arch.addr_size = 8;
+        arch.alignment = 1;
+        arch.memory_endianness = endianness;
+        arch.add_space(AddressSpace::ram(8));
+        arch.add_register(RegisterDef::new("sp", 0, 8));
+        arch.add_register(RegisterDef::new("ra", 8, 8));
+        arch.add_register(RegisterDef::new("target", 16, 8));
+        arch.add_register(RegisterDef::new("arg", 24, 8));
+        arch
+    }
+
+    #[test]
+    fn machine_context_identity_binds_interfaces_calls_and_memory_geometry() {
+        let little = semantic_identity_arch(Endianness::Little);
+        let big = semantic_identity_arch(Endianness::Big);
+        assert_ne!(
+            SourceMachineContext::from_blocks(&[], Some(&little)).semantic_identity_bytes(),
+            SourceMachineContext::from_blocks(&[], Some(&big)).semantic_identity_bytes(),
+            "endianness is semantic identity"
+        );
+
+        let base_interface = SourceFunctionInterface::new_exact(
+            b"machine-context-return-v1".to_vec(),
+            "test-abi",
+            [],
+            SourceFunctionReturn::Void,
+            [],
+        )
+        .and_then(|interface| interface.with_return_address_storage(register_storage(8, 8)))
+        .and_then(|interface| interface.with_stack_pointer_storage(register_storage(0, 8)))
+        .expect("exact base interface");
+        let stacked_interface = base_interface
+            .clone()
+            .with_exact_stacked_return(0, 8, 8, 8)
+            .expect("exact stacked return");
+        let base = SourceMachineContext::from_blocks_with_interfaces(
+            &[],
+            Some(&little),
+            Some(base_interface),
+            Vec::new(),
+        );
+        let stacked = SourceMachineContext::from_blocks_with_interfaces(
+            &[],
+            Some(&little),
+            Some(stacked_interface),
+            Vec::new(),
+        );
+        assert_ne!(
+            base.semantic_identity_bytes(),
+            stacked.semantic_identity_bytes(),
+            "return mechanics are semantic identity"
+        );
+
+        let target = Varnode::register(16, 8);
+        let mut call_block = R2ILBlock::new(0x4000, 1);
+        call_block.push(R2ILOp::Call { target });
+        let identity = SourceCallSiteIdentity::new(0x4000, 0, register_storage(16, 8));
+        let call_interface = |complete| {
+            SourceCallSiteInterface::new(
+                b"machine-context-call-v1".to_vec(),
+                identity,
+                complete,
+                "test-abi",
+                [SourceCallArgumentSpec::new(0, register_storage(24, 8))],
+                false,
+                false,
+                SourceCallResult::Void,
+            )
+            .expect("exact call interface")
+        };
+        let incomplete = SourceMachineContext::from_blocks_with_interfaces(
+            &[call_block.clone()],
+            Some(&little),
+            None,
+            vec![call_interface(false)],
+        );
+        let complete = SourceMachineContext::from_blocks_with_interfaces(
+            &[call_block],
+            Some(&little),
+            None,
+            vec![call_interface(true)],
+        );
+        assert_ne!(
+            incomplete.semantic_identity_bytes(),
+            complete.semantic_identity_bytes(),
+            "callsite completeness is semantic identity"
+        );
     }
 
     #[test]

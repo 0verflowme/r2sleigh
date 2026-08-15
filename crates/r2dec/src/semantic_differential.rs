@@ -12,9 +12,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use r2cert::{
     CERTIFICATION_SCHEMA_VERSION, CertifiedArtifactOrigin, CertifiedControlTruthiness,
-    CertifiedMachineProjection, CertifiedMemoryExecutionPolicy, CertifiedMemoryStatement,
-    CertifiedMemoryStatementKind, CertifiedPrivateFrameConditionalArm,
-    CertifiedPrivateFrameConditionalJoin, CertifiedPrivateFrameVersionDefinition,
+    CertifiedFramePreservation, CertifiedFrameRestore, CertifiedMachineProjection,
+    CertifiedMemoryExecutionPolicy, CertifiedMemoryStatement, CertifiedMemoryStatementKind,
+    CertifiedPrivateFrameConditionalArm, CertifiedPrivateFrameConditionalJoin,
+    CertifiedPrivateFrameVersionDefinition,
 };
 use r2ssa::{
     BlockTerminator, CallBoundarySlot, CallSiteId, CanonicalInstructionId,
@@ -49,7 +50,7 @@ use crate::semantic_memory_function::CertifiedMemorySemanticCFunction;
 use crate::semantic_stmt::SemanticCBlockStepLayer;
 
 pub const SEMANTIC_DIFFERENTIAL_SCHEMA_VERSION: u32 = 8;
-pub const SEMANTIC_DIFFERENTIAL_EVALUATOR_CONTRACT_VERSION: u32 = 7;
+pub const SEMANTIC_DIFFERENTIAL_EVALUATOR_CONTRACT_VERSION: u32 = 8;
 
 fn hex_bytes(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
@@ -2991,6 +2992,114 @@ fn exact_return_address_event(
         && statement.width_bits() / 8 == slot_size_bytes
 }
 
+fn validate_private_join_frame_authority(
+    projection: &CertifiedMachineProjection,
+    join: &CertifiedPrivateFrameConditionalJoin,
+) -> Result<(), RunFailure> {
+    if projection.frame_preservation() != join.frame_preservation() {
+        return Err(RunFailure::Invalid(
+            "private join frame preservation differs from the machine projection".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn exact_private_join_frame_restore<'a>(
+    frame: &'a CertifiedFramePreservation,
+    join: &CertifiedPrivateFrameConditionalJoin,
+) -> Result<&'a CertifiedFrameRestore, RunFailure> {
+    let matching = frame
+        .restores()
+        .iter()
+        .filter(|restore| restore.return_control() == join.return_control())
+        .collect::<Vec<_>>();
+    let [restore] = matching.as_slice() else {
+        return Err(RunFailure::Invalid(
+            "private join lacks one exact frame restore".to_string(),
+        ));
+    };
+    Ok(*restore)
+}
+
+fn private_frame_entry_value(
+    artifact: &SsaArtifact,
+    projection: &CertifiedMachineProjection,
+    frame: &CertifiedFramePreservation,
+    initial: &DifferentialState,
+) -> Result<DifferentialBitVector, RunFailure> {
+    let CertifiedMemoryStatementKind::Write { value } = frame.entry_save().kind() else {
+        return Err(RunFailure::Invalid(
+            "frame entry save is not an exact write".to_string(),
+        ));
+    };
+    let boundary = if let Some(first) = frame.entry_save_copies().first() {
+        let expression = projection
+            .projection()
+            .expr(first.root())
+            .ok_or_else(|| RunFailure::Invalid("frame entry copy root is missing".to_string()))?;
+        let MachineExprKind::Copy { input } = expression.kind() else {
+            return Err(RunFailure::Invalid(
+                "frame entry copy is not bit-preserving".to_string(),
+            ));
+        };
+        let source = projection
+            .projection()
+            .expr(*input)
+            .ok_or_else(|| RunFailure::Invalid("frame entry copy input is missing".to_string()))?;
+        let MachineExprKind::Source { binding } = source.kind() else {
+            return Err(RunFailure::Invalid(
+                "frame entry copy does not begin at a source boundary".to_string(),
+            ));
+        };
+        let last = frame
+            .entry_save_copies()
+            .last()
+            .expect("checked nonempty frame entry copies");
+        let output = projection
+            .projection()
+            .entity_for_producer(last.entity().producer())
+            .map(|entity| entity.output())
+            .ok_or_else(|| RunFailure::Invalid("frame entry copy output is missing".to_string()))?;
+        if output != value.binding() {
+            return Err(RunFailure::Invalid(
+                "frame entry copy chain does not reach the saved value".to_string(),
+            ));
+        }
+        *binding
+    } else {
+        value.binding()
+    };
+    if artifact.graph().def_inst(boundary.value()).is_some()
+        || boundary.width_bits() != frame.entry_save().width_bits()
+    {
+        return Err(RunFailure::Invalid(
+            "frame entry save does not originate at an exact boundary value".to_string(),
+        ));
+    }
+    let entry = initial
+        .values
+        .get(&boundary.value())
+        .copied()
+        .ok_or(RunFailure::MissingBoundaryInput(boundary.value()))?;
+    require_width(entry, boundary.width_bits())?;
+    Ok(entry)
+}
+
+fn validate_private_frame_restored_value(
+    entry: DifferentialBitVector,
+    restored: DifferentialBitVector,
+    width_bits: u32,
+) -> Result<(), RunFailure> {
+    require_width(entry, width_bits)?;
+    require_width(restored, width_bits)?;
+    if restored != entry {
+        return Err(RunFailure::Invalid(
+            "private frame did not restore the entry frame pointer".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn execute_private_frame_join_source(
     artifact: &SsaArtifact,
     projection: &CertifiedMachineProjection,
@@ -3003,6 +3112,16 @@ fn execute_private_frame_join_source(
     let mut remaining_steps = limits.max_source_steps;
     let mut visited = BTreeSet::new();
     let result = (|| {
+        validate_private_join_frame_authority(projection, join)?;
+        let frame_restore = join
+            .frame_preservation()
+            .map(|frame| {
+                Ok((
+                    exact_private_join_frame_restore(frame, join)?,
+                    private_frame_entry_value(artifact, projection, frame, initial)?,
+                ))
+            })
+            .transpose()?;
         if !visited.insert(join.header()) {
             return Err(RunFailure::Invalid(
                 "private-join route contains a cycle".to_string(),
@@ -3094,6 +3213,20 @@ fn execute_private_frame_join_source(
             &mut remaining_steps,
             &inert,
         )?;
+        if let Some((restore, entry_frame_pointer)) = frame_restore {
+            let restored = state
+                .values
+                .get(&restore.restore_assignment().output().value())
+                .copied()
+                .ok_or_else(|| {
+                    RunFailure::Invalid("restored frame pointer is missing".to_string())
+                })?;
+            validate_private_frame_restored_value(
+                entry_frame_pointer,
+                restored,
+                restore.restore_assignment().output().width_bits(),
+            )?;
+        }
         let stack = projection.stack_discipline().ok_or_else(|| {
             RunFailure::Invalid("private join lost its stack discipline".to_string())
         })?;
@@ -5051,6 +5184,50 @@ fn private_event_matches_statement(
         )
 }
 
+fn validate_private_frame_events(
+    events: &[DifferentialMemoryEvent],
+    frame: &CertifiedFramePreservation,
+    restore: &CertifiedFrameRestore,
+) -> Result<(), RunFailure> {
+    let saves = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event.access == frame.entry_save().access())
+        .collect::<Vec<_>>();
+    let restores = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event.access == restore.restore_read().access())
+        .collect::<Vec<_>>();
+    let ([(save_index, save)], [(restore_index, restored)]) =
+        (saves.as_slice(), restores.as_slice())
+    else {
+        return Err(RunFailure::Invalid(
+            "source did not execute each exact frame access once".to_string(),
+        ));
+    };
+    if !private_event_matches_statement(save, frame.entry_save())
+        || !private_event_matches_statement(restored, restore.restore_read())
+    {
+        return Err(RunFailure::Invalid(
+            "source frame event differs from exact frame evidence".to_string(),
+        ));
+    }
+    require_width(save.value, frame.entry_save().width_bits())?;
+    require_width(restored.value, restore.restore_read().width_bits())?;
+    if save_index >= restore_index {
+        return Err(RunFailure::Invalid(
+            "source frame restore did not follow its entry save".to_string(),
+        ));
+    }
+    if save.value != restored.value {
+        return Err(RunFailure::Invalid(
+            "source frame restore value differs from its entry save".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn add_expected_private_flow(
     expected: &mut BTreeMap<
         StructuredAccessId,
@@ -5087,6 +5264,7 @@ fn private_stack_intervals(
     join: &CertifiedPrivateFrameConditionalJoin,
     initial: &DifferentialState,
 ) -> Result<Vec<(u64, u64)>, RunFailure> {
+    validate_private_join_frame_authority(projection, join)?;
     let stack = projection
         .stack_discipline()
         .ok_or_else(|| RunFailure::Invalid("private join lacks stack discipline".to_string()))?;
@@ -5102,7 +5280,8 @@ fn private_stack_intervals(
         .auxiliary_direct_flows()
         .iter()
         .map(|(_, flow)| flow.range())
-        .chain([join.joined_flow().range()]);
+        .chain([join.joined_flow().range()])
+        .chain(join.frame_preservation().map(|frame| frame.saved_range()));
     let mut intervals = BTreeSet::new();
     for range in ranges {
         let start = modular_stack_offset(entry, range.offset());
@@ -5208,6 +5387,25 @@ fn normalize_private_join_run(
             "selected arm store lacks exact joined-flow ownership".to_string(),
         ));
     }
+    let frame_restore = if let Some(frame) = join.frame_preservation() {
+        let restore = exact_private_join_frame_restore(frame, join)?;
+        for statement in [frame.entry_save(), restore.restore_read()] {
+            if expected
+                .insert(
+                    statement.access(),
+                    (statement.clone(), Some(frame.saved_range())),
+                )
+                .is_some()
+            {
+                return Err(RunFailure::Invalid(
+                    "frame memory access collides with private ownership".to_string(),
+                ));
+            }
+        }
+        Some((frame, restore))
+    } else {
+        None
+    };
     if let Some(read) = join.release().return_address_read()
         && expected
             .insert(read.access(), (read.clone(), None))
@@ -5231,7 +5429,10 @@ fn normalize_private_join_run(
     let mut consumed = BTreeSet::new();
     for event in &run.memory_events {
         let (statement, range) = expected.get(&event.access).ok_or_else(|| {
-            RunFailure::Invalid("source emitted an unaudited memory event".to_string())
+            RunFailure::Invalid(
+                "source emitted a memory event outside private, frame, and return evidence"
+                    .to_string(),
+            )
         })?;
         if !private_event_matches_statement(event, statement) || !consumed.insert(event.access) {
             return Err(RunFailure::Invalid(
@@ -5271,8 +5472,12 @@ fn normalize_private_join_run(
     }
     if consumed != expected.keys().copied().collect() {
         return Err(RunFailure::Invalid(
-            "source did not consume every expected private or return-address access".to_string(),
+            "source did not consume every expected private, frame, or return-address access"
+                .to_string(),
         ));
+    }
+    if let Some((frame, restore)) = frame_restore {
+        validate_private_frame_events(&run.memory_events, frame, restore)?;
     }
     let physical = match &run.outcome {
         DifferentialBoundaryOutcome::Returned { values } if values.len() == 1 => values[0],
@@ -6939,6 +7144,7 @@ fn semantic_write_memory(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use r2ssa::{StackAddressBase, StackAddressRoot};
     use std::ffi::c_void;
     use std::mem::size_of;
 
@@ -6963,12 +7169,13 @@ mod tests {
 
     use r2cert::{
         CERTIFIED_PRIVATE_FRAME_CONDITIONAL_JOIN_CONTRACT_VERSION, CertifiedMachineFunction,
-        CertifiedMemoryStatementKind, CertifiedTypedRegionKind, LedgerClosureError,
-        TypedRegionMapping, certify_private_frame_conditional_join_region,
+        CertifiedMemoryStatementKind, CertifiedPrivateFrameJoinTransfer, CertifiedTypedRegionKind,
+        LedgerClosureError, TypedRegionMapping, certify_private_frame_conditional_join_region,
     };
 
     use r2source::{
-        RADARE_ABI_VERSION, RADARE_CAP_EXACT_FUNCTION_INTERFACE, RADARE_CAP_EXACT_FUNCTION_TYPES,
+        RADARE_ABI_VERSION, RADARE_CAP_EXACT_FRAME_POINTER_STORAGE,
+        RADARE_CAP_EXACT_FUNCTION_INTERFACE, RADARE_CAP_EXACT_FUNCTION_TYPES,
         RADARE_CAP_EXACT_RETURN_MECHANISM, RADARE_CAP_EXACT_STACK_ALLOCATION_CONTRACT,
         RADARE_CAP_EXACT_STACK_SLOT_ROLES, RADARE_CAP_OWNED_BOUNDED_FUNCTION_IMAGE,
         RADARE_CAP_RETURN_ADDRESS_STORAGE, RADARE_CAP_REVISION, RADARE_CAP_STACK_POINTER_STORAGE,
@@ -6978,8 +7185,8 @@ mod tests {
         RadareAbi138BlockView, RadareAbi138CarrierProjection, RadareAbi138FunctionInterfaceView,
         RadareAbi138ParameterView, RadareAbi138RegisterStorageView,
         RadareAbi138ReturnMechanismView, RadareAbi138SnapshotInput, RadareAbi138SnapshotView,
-        RadareAbi138StackAllocationContractView, RadareAbi138SuccessorView,
-        RadareAbi138TypeGraphView, RadareAbi138TypeView,
+        RadareAbi138StackAllocationContractView, RadareAbi138StackSlotView,
+        RadareAbi138SuccessorView, RadareAbi138TypeGraphView, RadareAbi138TypeView,
     };
 
     #[test]
@@ -7047,6 +7254,11 @@ mod tests {
         successors: Vec<NativeSpanSuccessorFixture>,
     }
 
+    struct NativeSpanStackSlotFixture {
+        view: RadareAbi138StackSlotView,
+        strings: [String; 5],
+    }
+
     struct NativeSpanSnapshotFixture {
         addr: u64,
         blocks: Vec<NativeSpanBlockFixture>,
@@ -7055,13 +7267,17 @@ mod tests {
         calling_convention: String,
         return_address: RadareAbi138RegisterStorageView,
         stack_pointer: RadareAbi138RegisterStorageView,
+        frame_pointer: Option<RadareAbi138RegisterStorageView>,
         scalar_return: Option<RadareAbi138RegisterStorageView>,
         return_address_name: String,
         stack_pointer_name: String,
+        frame_pointer_name: Option<String>,
         scalar_return_name: Option<String>,
         parameter: Option<RadareAbi138ParameterView>,
         parameter_name: Option<String>,
+        stack_slots: Vec<NativeSpanStackSlotFixture>,
         exact_private_stack: bool,
+        implicit_active_sp_bytes: u32,
         stacked_return: bool,
         types: Vec<(i32, u64)>,
         return_type_id: u32,
@@ -7081,6 +7297,11 @@ mod tests {
                     | RADARE_CAP_EXACT_STACK_SLOT_ROLES
                     | RADARE_CAP_RETURN_ADDRESS_STORAGE
                     | RADARE_CAP_STACK_POINTER_STORAGE
+                    | if self.frame_pointer.is_some() {
+                        RADARE_CAP_EXACT_FRAME_POINTER_STORAGE
+                    } else {
+                        0
+                    }
                     | if self.parameter.is_some() {
                         RADARE_CAP_EXACT_FUNCTION_TYPES | RADARE_CAP_TYPES
                     } else {
@@ -7108,6 +7329,7 @@ mod tests {
                 num_external_exits: self.external_exits().len(),
                 total_source_bytes: self.blocks.iter().map(|block| block.bytes.len()).sum(),
                 num_types: self.types.len(),
+                num_stack_slots: self.stack_slots.len(),
                 ..Default::default()
             }
         }
@@ -7240,6 +7462,11 @@ mod tests {
                 .unwrap_or_default(),
             1 => fixture.return_address_name.as_bytes(),
             2 => fixture.stack_pointer_name.as_bytes(),
+            3 => fixture
+                .frame_pointer_name
+                .as_ref()
+                .map(String::as_bytes)
+                .unwrap_or_default(),
             _ => return 0,
         };
         // SAFETY: forwarded capture-owned output buffer.
@@ -7270,6 +7497,37 @@ mod tests {
             return 0;
         };
         unsafe { copy_fixture_string(name.as_bytes(), out, capacity) }
+    }
+
+    unsafe extern "C" fn stack_slot_view(
+        snapshot: *const c_void,
+        index: usize,
+        out: *mut RadareAbi138StackSlotView,
+    ) -> u8 {
+        let fixture = unsafe { fixture(snapshot) };
+        let Some(slot) = fixture.stack_slots.get(index) else {
+            return 0;
+        };
+        unsafe { out.write(slot.view) };
+        1
+    }
+
+    unsafe extern "C" fn stack_slot_string(
+        snapshot: *const c_void,
+        index: usize,
+        kind: i32,
+        out: *mut u8,
+        capacity: usize,
+    ) -> u8 {
+        let fixture = unsafe { fixture(snapshot) };
+        let Some(value) = fixture.stack_slots.get(index).and_then(|slot| {
+            usize::try_from(kind)
+                .ok()
+                .and_then(|kind| slot.strings.get(kind))
+        }) else {
+            return 0;
+        };
+        unsafe { copy_fixture_string(value.as_bytes(), out, capacity) }
     }
 
     unsafe extern "C" fn type_graph_view(
@@ -7441,6 +7699,19 @@ mod tests {
         1
     }
 
+    unsafe extern "C" fn frame_pointer_storage_view(
+        snapshot: *const c_void,
+        out: *mut RadareAbi138RegisterStorageView,
+    ) -> u8 {
+        // SAFETY: callback arguments are the live fixture and capture-owned output.
+        let fixture = unsafe { fixture(snapshot) };
+        let Some(frame_pointer) = fixture.frame_pointer else {
+            return 0;
+        };
+        unsafe { out.write(frame_pointer) };
+        1
+    }
+
     unsafe extern "C" fn stack_allocation_contract_view(
         snapshot: *const c_void,
         out: *mut RadareAbi138StackAllocationContractView,
@@ -7453,7 +7724,7 @@ mod tests {
         unsafe {
             out.write(RadareAbi138StackAllocationContractView {
                 growth: 1,
-                implicit_active_sp_bytes: 0,
+                implicit_active_sp_bytes: fixture.implicit_active_sp_bytes,
             })
         };
         1
@@ -7461,11 +7732,71 @@ mod tests {
 
     type LiftedBlockSpans = Vec<(u64, u32, u64, u64)>;
 
+    struct X86InterfaceFixture<'a> {
+        exact_private_stack: bool,
+        implicit_active_sp_bytes: u32,
+        stacked_return: bool,
+        frame_pointer_register: Option<&'a str>,
+        parameter_register: Option<&'a str>,
+        parameter_logical_type_id: u32,
+        parameter_carrier: RadareAbi138CarrierProjection,
+        scalar_return_register: Option<&'a str>,
+        types: Vec<(i32, u64)>,
+        return_type_id: u32,
+        return_carrier: RadareAbi138CarrierProjection,
+    }
+
     fn trusted_x86_blocks_fixture(
         blocks: Vec<NativeSpanBlockFixture>,
         addr: u64,
         exact_private_stack: bool,
         parameter_register: Option<&str>,
+    ) -> (
+        TrustedSsaArtifact,
+        Vec<r2il::R2ILBlock>,
+        Vec<LiftedBlockSpans>,
+    ) {
+        trusted_x86_blocks_fixture_with_interface(
+            blocks,
+            addr,
+            X86InterfaceFixture {
+                exact_private_stack,
+                implicit_active_sp_bytes: 0,
+                stacked_return: exact_private_stack,
+                frame_pointer_register: None,
+                parameter_register,
+                parameter_logical_type_id: 0,
+                parameter_carrier: RadareAbi138CarrierProjection {
+                    kind: 1,
+                    offset_bits: 0,
+                    size_bits: 64,
+                },
+                scalar_return_register: parameter_register.map(|_| "RAX"),
+                types: parameter_register
+                    .map(|_| vec![(2, 64), (2, 32)])
+                    .unwrap_or_default(),
+                return_type_id: if parameter_register.is_some() {
+                    1
+                } else {
+                    u32::MAX
+                },
+                return_carrier: if parameter_register.is_some() {
+                    RadareAbi138CarrierProjection {
+                        kind: 2,
+                        offset_bits: 0,
+                        size_bits: 32,
+                    }
+                } else {
+                    RadareAbi138CarrierProjection::default()
+                },
+            },
+        )
+    }
+
+    fn trusted_x86_blocks_fixture_with_interface(
+        blocks: Vec<NativeSpanBlockFixture>,
+        addr: u64,
+        interface: X86InterfaceFixture<'_>,
     ) -> (
         TrustedSsaArtifact,
         Vec<r2il::R2ILBlock>,
@@ -7481,7 +7812,17 @@ mod tests {
         let stack_pointer = trusted_disassembler
             .register("RSP")
             .expect("trusted RSP register");
-        let parameter = parameter_register.map(|name| {
+        let frame_pointer = interface.frame_pointer_register.map(|name| {
+            let register = trusted_disassembler
+                .register(name)
+                .expect("trusted frame-pointer register");
+            RadareAbi138RegisterStorageView {
+                name_length: name.len(),
+                offset: register.address.offset,
+                size: u32::try_from(register.size).expect("frame-pointer size fits u32"),
+            }
+        });
+        let parameter = interface.parameter_register.map(|name| {
             let register = trusted_disassembler
                 .register(name)
                 .expect("trusted parameter register");
@@ -7492,25 +7833,76 @@ mod tests {
                     offset: register.address.offset,
                     size: u32::try_from(register.size).expect("parameter size fits u32"),
                 },
-                logical_type_id: 0,
-                carrier: RadareAbi138CarrierProjection {
-                    kind: 1,
-                    offset_bits: 0,
-                    size_bits: 64,
-                },
+                logical_type_id: interface.parameter_logical_type_id,
+                carrier: interface.parameter_carrier,
                 ..Default::default()
             }
         });
-        let scalar_return = parameter_register.map(|_| {
+        let scalar_return = interface.scalar_return_register.map(|name| {
             let register = trusted_disassembler
-                .register("RAX")
-                .expect("trusted RAX register");
+                .register(name)
+                .expect("trusted scalar-return register");
             RadareAbi138RegisterStorageView {
-                name_length: 3,
+                name_length: name.len(),
                 offset: register.address.offset,
-                size: u32::try_from(register.size).expect("RAX size fits u32"),
+                size: u32::try_from(register.size).expect("scalar-return size fits u32"),
             }
         });
+        let stack_slots = match (
+            frame_pointer,
+            parameter,
+            interface.frame_pointer_register,
+            interface.parameter_register,
+        ) {
+            (Some(frame_pointer), Some(parameter), Some(frame_name), Some(parameter_name)) => vec![
+                NativeSpanStackSlotFixture {
+                    view: RadareAbi138StackSlotView {
+                        base: 0,
+                        base_name_length: frame_name.len(),
+                        base_offset: frame_pointer.offset,
+                        base_size: frame_pointer.size,
+                        offset: -8,
+                        size: 4,
+                        offset_valid: 1,
+                        role: 2,
+                        arg_index: 0,
+                        home_reg_length: parameter_name.len(),
+                        home_reg_offset: parameter.storage.offset,
+                        home_reg_size: parameter.storage.size,
+                        ..Default::default()
+                    },
+                    strings: [
+                        String::new(),
+                        String::new(),
+                        frame_name.to_string(),
+                        String::new(),
+                        parameter_name.to_string(),
+                    ],
+                },
+                NativeSpanStackSlotFixture {
+                    view: RadareAbi138StackSlotView {
+                        base: 0,
+                        base_name_length: frame_name.len(),
+                        base_offset: frame_pointer.offset,
+                        base_size: frame_pointer.size,
+                        offset: -4,
+                        size: 4,
+                        offset_valid: 1,
+                        role: 0,
+                        arg_index: -1,
+                        ..Default::default()
+                    },
+                    strings: [
+                        String::new(),
+                        String::new(),
+                        frame_name.to_string(),
+                        String::new(),
+                        String::new(),
+                    ],
+                },
+            ],
+            _ => Vec::new(),
+        };
         let fixture = NativeSpanSnapshotFixture {
             addr,
             blocks,
@@ -7527,31 +7919,21 @@ mod tests {
                 offset: stack_pointer.address.offset,
                 size: u32::try_from(stack_pointer.size).expect("RSP size fits u32"),
             },
+            frame_pointer,
             scalar_return,
             return_address_name: "RIP".to_string(),
             stack_pointer_name: "RSP".to_string(),
-            scalar_return_name: parameter_register.map(|_| "RAX".to_string()),
+            frame_pointer_name: interface.frame_pointer_register.map(str::to_string),
+            scalar_return_name: interface.scalar_return_register.map(str::to_string),
             parameter,
-            parameter_name: parameter_register.map(str::to_string),
-            exact_private_stack,
-            stacked_return: exact_private_stack,
-            types: parameter_register
-                .map(|_| vec![(2, 64), (2, 32)])
-                .unwrap_or_default(),
-            return_type_id: if parameter_register.is_some() {
-                1
-            } else {
-                u32::MAX
-            },
-            return_carrier: if parameter_register.is_some() {
-                RadareAbi138CarrierProjection {
-                    kind: 2,
-                    offset_bits: 0,
-                    size_bits: 32,
-                }
-            } else {
-                RadareAbi138CarrierProjection::default()
-            },
+            parameter_name: interface.parameter_register.map(str::to_string),
+            stack_slots,
+            exact_private_stack: interface.exact_private_stack,
+            implicit_active_sp_bytes: interface.implicit_active_sp_bytes,
+            stacked_return: interface.stacked_return,
+            types: interface.types,
+            return_type_id: interface.return_type_id,
+            return_carrier: interface.return_carrier,
         };
         let accessors = RadareAbi138Accessors {
             struct_size: u32::try_from(size_of::<RadareAbi138Accessors>())
@@ -7568,6 +7950,8 @@ mod tests {
             interface_storage_name: Some(interface_storage_name),
             parameter_view: Some(parameter_view),
             parameter_storage_name: Some(parameter_name),
+            stack_slot_view: Some(stack_slot_view),
+            stack_slot_string: Some(stack_slot_string),
             type_graph_view: Some(type_graph_view),
             type_view: Some(type_view),
             aggregate_view: Some(unused_aggregate_view),
@@ -7579,6 +7963,7 @@ mod tests {
             successor_view: Some(successor_view),
             external_exit: Some(external_exit),
             return_mechanism_view: Some(return_mechanism_view),
+            frame_pointer_storage_view: Some(frame_pointer_storage_view),
             stack_allocation_contract_view: Some(stack_allocation_contract_view),
             ..Default::default()
         };
@@ -7707,6 +8092,7 @@ mod tests {
                 offset: stack_pointer.address.offset,
                 size: u32::try_from(stack_pointer.size).expect("sp size fits u32"),
             },
+            frame_pointer: None,
             scalar_return: Some(RadareAbi138RegisterStorageView {
                 name_length: 2,
                 offset: x0.address.offset,
@@ -7714,6 +8100,7 @@ mod tests {
             }),
             return_address_name: "x30".into(),
             stack_pointer_name: "sp".into(),
+            frame_pointer_name: None,
             scalar_return_name: Some("x0".into()),
             parameter: Some(RadareAbi138ParameterView {
                 index: 0,
@@ -7731,7 +8118,9 @@ mod tests {
                 ..Default::default()
             }),
             parameter_name: Some("x0".into()),
+            stack_slots: Vec::new(),
             exact_private_stack: true,
+            implicit_active_sp_bytes: 0,
             stacked_return: false,
             types: vec![(1, 32)],
             return_type_id: 0,
@@ -7756,6 +8145,8 @@ mod tests {
             interface_storage_name: Some(interface_storage_name),
             parameter_view: Some(parameter_view),
             parameter_storage_name: Some(parameter_name),
+            stack_slot_view: Some(stack_slot_view),
+            stack_slot_string: Some(stack_slot_string),
             type_graph_view: Some(type_graph_view),
             type_view: Some(type_view),
             aggregate_view: Some(unused_aggregate_view),
@@ -7767,6 +8158,7 @@ mod tests {
             successor_view: Some(successor_view),
             external_exit: Some(external_exit),
             return_mechanism_view: Some(return_mechanism_view),
+            frame_pointer_storage_view: Some(frame_pointer_storage_view),
             stack_allocation_contract_view: Some(stack_allocation_contract_view),
             ..Default::default()
         };
@@ -7890,6 +8282,70 @@ mod tests {
         Vec<(u64, u32, u64, u64)>,
     ) {
         trusted_x86_fixture(bytes, addr, false, false)
+    }
+
+    fn x86_o0_framed_private_join_blocks() -> Vec<NativeSpanBlockFixture> {
+        const HEADER: u64 = 0x650;
+        const STORE_ONE: u64 = 0x660;
+        const STORE_ZERO: u64 = 0x669;
+        const JOIN: u64 = 0x670;
+
+        vec![
+            NativeSpanBlockFixture {
+                addr: HEADER,
+                bytes: vec![
+                    0x55, // push rbp
+                    0x48, 0x89, 0xe5, // mov rbp, rsp
+                    0x89, 0x7d, 0xf8, // mov dword [rbp-8], edi
+                    0x81, 0x7d, 0xf8, 0xad, 0xde, 0x00, 0x00, // cmp dword [rbp-8], 0xdead
+                    0x75, 0x09, // jne store-zero
+                ],
+                successors: vec![
+                    NativeSpanSuccessorFixture {
+                        kind: 0,
+                        target: STORE_ZERO,
+                        external: false,
+                    },
+                    NativeSpanSuccessorFixture {
+                        kind: 1,
+                        target: STORE_ONE,
+                        external: false,
+                    },
+                ],
+            },
+            NativeSpanBlockFixture {
+                addr: STORE_ONE,
+                bytes: vec![
+                    0xc7, 0x45, 0xfc, 0x01, 0x00, 0x00, 0x00, // mov dword [rbp-4], 1
+                    0xeb, 0x07, // jmp join
+                ],
+                successors: vec![NativeSpanSuccessorFixture {
+                    kind: 0,
+                    target: JOIN,
+                    external: false,
+                }],
+            },
+            NativeSpanBlockFixture {
+                addr: STORE_ZERO,
+                bytes: vec![
+                    0xc7, 0x45, 0xfc, 0x00, 0x00, 0x00, 0x00, // mov dword [rbp-4], 0
+                ],
+                successors: vec![NativeSpanSuccessorFixture {
+                    kind: 1,
+                    target: JOIN,
+                    external: false,
+                }],
+            },
+            NativeSpanBlockFixture {
+                addr: JOIN,
+                bytes: vec![
+                    0x8b, 0x45, 0xfc, // mov eax, dword [rbp-4]
+                    0x5d, // pop rbp
+                    0xc3, // ret
+                ],
+                successors: Vec::new(),
+            },
+        ]
     }
 
     fn conditional_private_join_blocks(
@@ -8237,6 +8693,497 @@ mod tests {
             "uint64_t {} = (uint64_t)(arg_0);",
             value_name(binding)
         )));
+    }
+
+    #[test]
+    fn genuine_x86_o0_rbp_red_zone_join_closes_and_matches_machine_semantics() {
+        const HEADER: u64 = 0x650;
+        const STORE_ONE: u64 = 0x660;
+        const STORE_ZERO: u64 = 0x669;
+        const JOIN: u64 = 0x670;
+
+        let (trusted, lifted, spans) = trusted_x86_blocks_fixture_with_interface(
+            x86_o0_framed_private_join_blocks(),
+            HEADER,
+            X86InterfaceFixture {
+                exact_private_stack: true,
+                implicit_active_sp_bytes: 128,
+                stacked_return: true,
+                frame_pointer_register: Some("RBP"),
+                parameter_register: Some("RDI"),
+                parameter_logical_type_id: 0,
+                parameter_carrier: RadareAbi138CarrierProjection {
+                    kind: 2,
+                    offset_bits: 0,
+                    size_bits: 32,
+                },
+                scalar_return_register: Some("RAX"),
+                types: vec![(1, 32)],
+                return_type_id: 0,
+                return_carrier: RadareAbi138CarrierProjection {
+                    kind: 2,
+                    offset_bits: 0,
+                    size_bits: 32,
+                },
+            },
+        );
+        assert_eq!(lifted.len(), 4);
+        assert_eq!(spans.len(), 4);
+        assert!(spans.iter().flatten().all(|span| span.3 != 0));
+
+        let source_interface = trusted
+            .artifact()
+            .machine_context()
+            .function_interface()
+            .expect("exact captured x86 function interface");
+        let [source_parameter] = source_interface.parameters() else {
+            panic!("one exact x86 parameter")
+        };
+        assert_eq!(source_parameter.storage().offset, 0x38);
+        assert_eq!(source_parameter.storage().size, 8);
+        let [logical_parameter] = source_interface.parameter_logical_values() else {
+            panic!("one exact logical x86 parameter")
+        };
+        assert_eq!(logical_parameter.type_id(), 0);
+        assert_eq!(
+            logical_parameter.carrier().kind(),
+            SourceCarrierKind::LowBits
+        );
+        assert_eq!(logical_parameter.carrier().offset_bits(), 0);
+        assert_eq!(logical_parameter.carrier().size_bits(), 32);
+        let type_graph = source_interface
+            .type_graph()
+            .expect("exact signed-i32 type graph");
+        let [source_type] = type_graph.types() else {
+            panic!("one exact source type")
+        };
+        assert_eq!(source_type.kind(), SourceTypeKind::SignedInteger);
+        assert_eq!(source_type.size_bits(), 32);
+        let SourceFunctionReturn::Register {
+            storage: return_storage,
+        } = source_interface.return_kind()
+        else {
+            panic!("exact RAX scalar return")
+        };
+        assert_eq!(return_storage.offset, 0);
+        assert_eq!(return_storage.size, 8);
+        let return_logical = source_interface
+            .return_logical_value()
+            .expect("exact signed-i32 return projection");
+        assert_eq!(return_logical.type_id(), 0);
+        assert_eq!(return_logical.carrier().kind(), SourceCarrierKind::LowBits);
+        assert_eq!(return_logical.carrier().offset_bits(), 0);
+        assert_eq!(return_logical.carrier().size_bits(), 32);
+        let stack_pointer_storage = source_interface
+            .stack_pointer_storage()
+            .expect("exact RSP storage");
+        assert_eq!(stack_pointer_storage.offset, 0x20);
+        assert_eq!(stack_pointer_storage.size, 8);
+        let frame_pointer_storage = source_interface
+            .exact_frame_pointer_storage()
+            .expect("exact RBP storage");
+        assert_eq!(frame_pointer_storage.offset, 0x28);
+        assert_eq!(frame_pointer_storage.size, 8);
+        let return_address_storage = source_interface
+            .return_address_storage()
+            .expect("exact RIP storage");
+        assert_eq!(return_address_storage.offset, 0x288);
+        assert_eq!(return_address_storage.size, 8);
+        let source_stack_contract = source_interface
+            .stack_allocation_contract()
+            .expect("exact lower-growing red-zone contract");
+        assert_eq!(source_stack_contract.implicit_active_sp_bytes(), 128);
+        assert!(source_interface.return_mechanism().is_some());
+        let [parameter_home, result_local] = source_interface.stack_slots() else {
+            panic!("exact parameter-home and result-local stack slots")
+        };
+        assert_eq!(parameter_home.base(), StackAddressBase::FramePointer);
+        assert_eq!(parameter_home.base_storage(), frame_pointer_storage);
+        assert_eq!(parameter_home.offset(), -8);
+        assert_eq!(parameter_home.size_bytes(), 4);
+        assert_eq!(
+            parameter_home.role(),
+            r2source::SourceStackSlotRole::ParameterHome {
+                parameter_index: 0,
+                home_storage: source_parameter.storage(),
+            }
+        );
+        assert_eq!(result_local.base(), StackAddressBase::FramePointer);
+        assert_eq!(result_local.base_storage(), frame_pointer_storage);
+        assert_eq!(result_local.offset(), -4);
+        assert_eq!(result_local.size_bytes(), 4);
+        assert_eq!(result_local.role(), r2source::SourceStackSlotRole::Local);
+
+        let prep = trusted
+            .artifact()
+            .function()
+            .decompile_prep_facts()
+            .expect("exact decompiler preparation facts");
+        let source_roots = prep
+            .stack_address_roots
+            .values()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let entry_roots = prep
+            .entry_stack_address_roots
+            .values()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        for offset in [-8, -4] {
+            assert!(source_roots.contains(&StackAddressRoot {
+                base: StackAddressBase::FramePointer,
+                offset,
+            }));
+        }
+        for offset in [-16, -12] {
+            assert!(entry_roots.contains(&StackAddressRoot {
+                base: StackAddressBase::StackPointer,
+                offset,
+            }));
+        }
+
+        let full = CertifiedMachineFunction::from_artifact(&trusted)
+            .expect("full genuine framed x86 certificate");
+        let projection = CertifiedMachineProjection::from_artifact(&trusted)
+            .expect("projected genuine framed x86 certificate");
+        let frame = full
+            .frame_preservation()
+            .expect("exact x86 frame-pointer preservation");
+        let certified_prep = full
+            .origin()
+            .decompile_preparation()
+            .expect("certified preparation snapshot");
+        assert!(!certified_prep.entry_stack_address_roots().is_empty());
+        assert_eq!(frame.frame_pointer_storage(), frame_pointer_storage);
+        assert_eq!(frame.saved_range().offset(), -8);
+        assert_eq!(frame.saved_range().size_bytes(), 8);
+        assert_eq!(frame.entry_save().producer().block_addr, HEADER);
+        let [frame_restore] = frame.restores() else {
+            panic!("one exact RBP restore")
+        };
+        assert_eq!(frame_restore.restore_read().producer().block_addr, JOIN);
+
+        let stack = full
+            .stack_discipline()
+            .expect("exact x86 implicit private-stack discipline");
+        assert_eq!(stack.reservation_range().offset(), -8);
+        assert_eq!(stack.reservation_range().size_bytes(), 8);
+        assert_eq!(stack.private_ownership_range().offset(), -136);
+        assert_eq!(stack.private_ownership_range().size_bytes(), 136);
+        assert_eq!(stack.implicit_active_sp_bytes(), 128);
+        let [release] = stack.releases() else {
+            panic!("one exact x86 stack release")
+        };
+        assert!(release.return_address_read().is_some());
+        let mut private_ranges = stack
+            .private_regions()
+            .iter()
+            .map(|region| region.accessed_range())
+            .collect::<Vec<_>>();
+        private_ranges.sort();
+        assert_eq!(
+            private_ranges
+                .iter()
+                .map(|range| (range.offset(), range.size_bytes()))
+                .collect::<Vec<_>>(),
+            [(-16, 4), (-12, 4)]
+        );
+
+        let mut flows = full
+            .private_frame_value_flows()
+            .values()
+            .collect::<Vec<_>>();
+        flows.sort_by_key(|flow| flow.range());
+        let [parameter_flow, result_flow] = flows.as_slice() else {
+            panic!("two exact x86 private-frame value flows")
+        };
+        assert_eq!(parameter_flow.range().offset(), -16);
+        assert_eq!(parameter_flow.range().size_bytes(), 4);
+        assert_eq!(parameter_flow.definitions().len(), 1);
+        assert!(
+            parameter_flow
+                .definition(parameter_flow.root_version())
+                .is_some_and(|definition| definition.store().is_some())
+        );
+        assert_eq!(result_flow.range().offset(), -12);
+        assert_eq!(result_flow.range().size_bytes(), 4);
+        assert_eq!(result_flow.definitions().len(), 3);
+        assert!(
+            result_flow
+                .definition(result_flow.root_version())
+                .is_some_and(|definition| {
+                    definition
+                        .phi()
+                        .is_some_and(|phi| phi.block_addr() == JOIN && phi.inputs().len() == 2)
+                })
+        );
+        assert_eq!(
+            full.private_frame_value_flows(),
+            projection.private_frame_value_flows()
+        );
+
+        assert_eq!(full.private_frame_conditional_joins().len(), 1);
+        let certificate = full
+            .private_frame_conditional_join(HEADER)
+            .expect("header-keyed framed x86 conditional join");
+        assert_eq!(certificate.header(), HEADER);
+        assert_eq!(certificate.join_block(), JOIN);
+        assert_eq!(certificate.condition().true_target(), STORE_ZERO);
+        assert_eq!(certificate.condition().false_target(), STORE_ONE);
+        assert_eq!(certificate.joined_flow().range().offset(), -12);
+        assert_eq!(certificate.frame_preservation(), Some(frame));
+        assert!(matches!(
+            certificate.true_arm().join_transfer(),
+            CertifiedPrivateFrameJoinTransfer::Fallthrough { block_addr, target }
+                if *block_addr == STORE_ZERO && *target == JOIN
+        ));
+        assert!(matches!(
+            certificate.false_arm().join_transfer(),
+            CertifiedPrivateFrameJoinTransfer::Direct(control)
+                if control.producer().block_addr == STORE_ONE && control.target() == JOIN
+        ));
+        assert_eq!(
+            full.private_frame_conditional_joins(),
+            projection.private_frame_conditional_joins()
+        );
+
+        let rewrite = CertifiedPrivateFrameConditionalJoinRewrite::from_artifact(&trusted)
+            .expect("genuine framed x86 private-join rewrite");
+        assert_eq!(rewrite.machine_join(), certificate);
+        let function = CertifiedPrivateFrameConditionalJoinFunction::from_artifact(&trusted)
+            .expect("closed genuine framed x86 semantic-C function");
+        assert_eq!(function.rewrite(), &rewrite);
+        assert!(function.audit().has_exact_private_frame_conditional_join());
+        let rendered = function
+            .render_certified_c()
+            .expect("strict genuine framed x86 C");
+        assert!(rendered.starts_with("#include <stdint.h>\n"));
+        assert!(rendered.contains("int32_t certified_sub_650(int32_t arg_0)"));
+        assert!(rendered.contains("UINT64_C(0xdead)"));
+        assert!(rendered.contains("UINT64_C(0x1)"));
+        assert!(rendered.contains("UINT64_C(0x0)"));
+        assert!(!rendered.contains("memory"));
+        assert!(!rendered.contains("stack"));
+        assert!(!rendered.contains("local"));
+        assert!(!rendered.contains('*'));
+
+        let entry_sp = stack.entry_stack_pointer().binding();
+        let entry_frame_pointer = match frame
+            .entry_save_copies()
+            .first()
+            .and_then(|copy| full.projection().expr(copy.root()))
+            .map(|expression| expression.kind())
+        {
+            Some(MachineExprKind::Copy { input }) => {
+                match full
+                    .projection()
+                    .expr(*input)
+                    .map(|expression| expression.kind())
+                {
+                    Some(MachineExprKind::Source { binding }) => *binding,
+                    _ => panic!("certified RBP save-copy input must be the entry source"),
+                }
+            }
+            _ => panic!("certified RBP save must retain its entry copy"),
+        };
+        let parameter = full
+            .abi_parameters()
+            .get(&0)
+            .and_then(|parameter| parameter.value())
+            .expect("exact producerless RDI parameter");
+        let seeded_byte = |byte_address: u64| ((byte_address as u8) ^ 0x5a).wrapping_add(1);
+        let seeded_state = |input: u64| {
+            let mut state = DifferentialState::for_artifact(&trusted).expect("genuine x86 state");
+            for (binding, bits) in [
+                (entry_sp, 0x8000),
+                (entry_frame_pointer, 0x1234_5678_9abc_def0),
+                (parameter.binding(), input),
+            ] {
+                assert!(
+                    state
+                        .set_value(
+                            binding.value(),
+                            DifferentialBitVector::new(binding.width_bits(), bits)
+                                .expect("exact x86 boundary value"),
+                        )
+                        .is_none()
+                );
+            }
+            for byte_address in 0x7ff0..0x8008 {
+                assert!(
+                    state
+                        .set_memory_byte(
+                            DifferentialMemoryLocation {
+                                space: MachineAddressSpace::Ram,
+                                byte_address,
+                            },
+                            seeded_byte(byte_address),
+                        )
+                        .is_none()
+                );
+            }
+            state
+        };
+        let route_steps = |arm: &CertifiedPrivateFrameConditionalArm| {
+            std::iter::once(certificate.header())
+                .chain(arm.transparent().iter().map(|branch| branch.block_addr()))
+                .chain([arm.store_block(), certificate.join_block()])
+                .map(|addr| {
+                    trusted
+                        .artifact()
+                        .graph()
+                        .block_id_for_addr(addr)
+                        .and_then(|id| trusted.artifact().graph().block(id))
+                        .map(|block| block.insts.len())
+                        .expect("sealed framed x86 route block")
+                })
+                .sum::<usize>()
+        };
+        let limits = DifferentialLimits {
+            max_source_steps: u32::try_from(
+                route_steps(certificate.true_arm()).max(route_steps(certificate.false_arm())),
+            )
+            .expect("framed x86 route steps fit u32"),
+            max_expression_nodes: 256,
+            max_memory_bytes: 64,
+        };
+        let mutation_state = seeded_state(0xdead);
+        let (raw_source, selected_true) = execute_private_frame_join_source(
+            trusted.artifact(),
+            &projection,
+            &function,
+            &mutation_state,
+            limits,
+        );
+        let raw_source = raw_source.expect("exact framed source run before normalization");
+        let selected_true = selected_true.expect("exact framed source route");
+        normalize_private_join_run(
+            trusted.artifact(),
+            &projection,
+            &function,
+            &mutation_state,
+            selected_true,
+            raw_source.clone(),
+        )
+        .expect("exact frame events normalize");
+        let save_position = raw_source
+            .memory_events
+            .iter()
+            .position(|event| event.access == frame.entry_save().access())
+            .expect("exact frame save event");
+        let restore_position = raw_source
+            .memory_events
+            .iter()
+            .position(|event| event.access == frame_restore.restore_read().access())
+            .expect("exact frame restore event");
+        let normalization_refuses = |run| {
+            matches!(
+                normalize_private_join_run(
+                    trusted.artifact(),
+                    &projection,
+                    &function,
+                    &mutation_state,
+                    selected_true,
+                    run,
+                ),
+                Err(RunFailure::Invalid(_))
+            )
+        };
+
+        let mut reversed = raw_source.clone();
+        reversed.memory_events.swap(save_position, restore_position);
+        assert!(normalization_refuses(reversed));
+
+        let mut wrong_value = raw_source.clone();
+        let restore_width = wrong_value.memory_events[restore_position]
+            .value
+            .width_bits();
+        let restore_bits = wrong_value.memory_events[restore_position].value.bits() ^ 1;
+        wrong_value.memory_events[restore_position].value =
+            DifferentialBitVector::new(restore_width, restore_bits).expect("changed frame value");
+        assert!(normalization_refuses(wrong_value));
+
+        let mut missing = raw_source.clone();
+        let mut events = missing.memory_events.into_vec();
+        events.remove(restore_position);
+        missing.memory_events = events.into_boxed_slice();
+        assert!(normalization_refuses(missing));
+
+        let mut duplicate = raw_source.clone();
+        let mut events = duplicate.memory_events.into_vec();
+        events.push(events[restore_position].clone());
+        duplicate.memory_events = events.into_boxed_slice();
+        assert!(normalization_refuses(duplicate));
+
+        let entry_frame_value =
+            private_frame_entry_value(trusted.artifact(), &projection, frame, &mutation_state)
+                .expect("exact entry frame boundary value");
+        let wrong_restored = DifferentialBitVector::new(
+            entry_frame_value.width_bits(),
+            entry_frame_value.bits() ^ 1,
+        )
+        .expect("changed restored frame value");
+        assert!(
+            validate_private_frame_restored_value(
+                entry_frame_value,
+                wrong_restored,
+                frame_restore.restore_assignment().output().width_bits(),
+            )
+            .is_err()
+        );
+
+        for (input, expected) in [
+            (0xdead, 1),
+            (0, 0),
+            (u64::MAX, 0),
+            (0xaaaa_bbbb_0000_dead, 1),
+        ] {
+            let report = check_private_frame_conditional_join_differential(
+                &trusted,
+                &seeded_state(input),
+                limits,
+            );
+            assert_eq!(
+                report.conclusion(),
+                DifferentialConclusion::NoMismatchObserved,
+                "input={input:#x}: {:?}",
+                report.disposition()
+            );
+            let DifferentialBoundaryOutcome::Returned { values } = &report
+                .source()
+                .expect("genuine framed x86 source run")
+                .outcome
+            else {
+                panic!("genuine framed x86 join must return")
+            };
+            assert_eq!(
+                values.as_ref(),
+                [DifferentialBitVector::new(32, expected).unwrap()]
+            );
+            let expected_public_memory = (0x8000..0x8008)
+                .map(|byte_address| DifferentialObservedByte {
+                    location: DifferentialMemoryLocation {
+                        space: MachineAddressSpace::Ram,
+                        byte_address,
+                    },
+                    value: seeded_byte(byte_address),
+                })
+                .collect::<Vec<_>>();
+            for run in [
+                report.source().expect("genuine framed x86 source run"),
+                report
+                    .semantic_c()
+                    .expect("genuine framed x86 semantic-C run"),
+            ] {
+                assert!(run.memory_events.is_empty());
+                assert_eq!(run.final_memory.as_ref(), expected_public_memory.as_slice());
+                assert!(
+                    run.final_memory
+                        .iter()
+                        .all(|byte| { !(0x7ff0..0x8000).contains(&byte.location.byte_address) })
+                );
+            }
+        }
     }
 
     #[test]
@@ -9534,6 +10481,6 @@ mod tests {
             })
         );
         assert_eq!(SEMANTIC_DIFFERENTIAL_SCHEMA_VERSION, 8);
-        assert_eq!(SEMANTIC_DIFFERENTIAL_EVALUATOR_CONTRACT_VERSION, 7);
+        assert_eq!(SEMANTIC_DIFFERENTIAL_EVALUATOR_CONTRACT_VERSION, 8);
     }
 }

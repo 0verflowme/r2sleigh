@@ -99,8 +99,7 @@
         "size_bytes": 37,
         "bytes_hex": "554889e5897df8817df8adde00007509c745fc01000000eb07c745fc000000008b45fc5dc3"
       },
-      "expected_decompiler_class": "Residual",
-      "expected_limitation": "Private parameter-home and two-arm red-zone local MemorySSA flows are not yet certified. No executable C may be guessed."
+      "expected_decompiler_class": "CertifiedC"
     }
   ]
 }
