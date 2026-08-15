@@ -1,6 +1,6 @@
 {
-  "schema_version": 2,
-  "fixture_set": "r2sleigh-plain-o2-x86_64-macho-sleigh-lift-v2",
+  "schema_version": 3,
+  "fixture_set": "r2sleigh-plain-o2-x86_64-macho-sleigh-lift-v3",
   "origin_manifest": "tests/r2r/fixtures/plain_o2_v1/manifest.json",
   "origin_core_capture": "tests/r2r/fixtures/plain_o2_v1/core-functions.json",
   "arch": "x86-64",
@@ -31,8 +31,8 @@
       "file_offset": 1568,
       "bytes": "554889e585f67e0d89f183fe08730a31d231c0eb6b31c05dc389ca81e2f8ffff7f89c8c1e80325ffffff0f48c1e005660fefc031f6660fefc90f1f8000000000f30f6f1437660ffec2f30f6f543710660ffeca4883c6204839f075e4660ffec8660f70c1ee660ffec1660f70c855660ffec8660f7ec839ca7411660f1f44000003049748ffc24839d175f55dc3",
       "bytes_fnv1a64": "d093eafd65854e85",
-      "r2il_fnv1a64": "a8608a0e07b42e74",
-      "ssa_fnv1a64": "5f157b6a42b65f40",
+      "r2il_fnv1a64": "d9fac0a75ea4fd0e",
+      "ssa_fnv1a64": "247ff59736b1e3ed",
       "required_native_opcodes": ["movdqu", "paddd", "pshufd"],
       "source_abi": {
         "calling_convention": "sysv_amd64",
@@ -47,84 +47,84 @@
           "address": 4294968864,
           "bytes": "554889e585f67e0d",
           "op_count": 16,
-          "ops_fnv1a64": "9307f4319d214d77",
+          "ops_fnv1a64": "c7ca72862e90a9fa",
           "op_kinds": "Copy,IntSub,Store,Copy,Copy,Copy,IntAnd,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,IntNotEqual,BoolOr,CBranch"
         },
         {
           "address": 4294968872,
           "bytes": "89f183fe08730a",
           "op_count": 14,
-          "ops_fnv1a64": "7da2d4c76d736194",
+          "ops_fnv1a64": "c9c47fc16bc45960",
           "op_kinds": "Copy,IntZExt,Copy,IntLess,IntSBorrow,IntSub,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,BoolNot,CBranch"
         },
         {
           "address": 4294968879,
           "bytes": "31d231c0eb6b",
           "op_count": 21,
-          "ops_fnv1a64": "27b956be438e3786",
+          "ops_fnv1a64": "c6c946907007ba84",
           "op_kinds": "Copy,Copy,IntXor,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,Copy,IntXor,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Branch"
         },
         {
           "address": 4294968885,
           "bytes": "31c05dc3",
           "op_count": 17,
-          "ops_fnv1a64": "bae72ec696bd116b",
+          "ops_fnv1a64": "cb20f4c87e37ca28",
           "op_kinds": "Copy,Copy,IntXor,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,Load,IntAdd,Copy,Load,IntAdd,Return"
         },
         {
           "address": 4294968889,
           "bytes": "89ca81e2f8ffff7f89c8c1e80325ffffff0f48c1e005660fefc031f6660fefc90f1f8000000000",
           "op_count": 111,
-          "ops_fnv1a64": "209443e3c4cc5003",
+          "ops_fnv1a64": "68b4456a736cc37e",
           "op_kinds": "Copy,IntZExt,Copy,Copy,IntAnd,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,IntZExt,IntAnd,Copy,IntRight,IntZExt,IntNotEqual,IntSub,IntRight,IntAnd,IntNotEqual,BoolNot,IntAnd,IntAnd,IntOr,IntEqual,IntSLess,BoolNot,IntAnd,IntAnd,IntOr,IntNotEqual,IntSLess,BoolNot,IntAnd,IntAnd,IntOr,IntEqual,BoolNot,IntAnd,IntAnd,IntOr,IntAnd,PopCount,IntAnd,IntEqual,BoolNot,IntAnd,IntAnd,IntOr,Copy,Copy,IntAnd,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,IntAnd,Copy,IntLeft,IntNotEqual,IntSub,IntLeft,IntSLess,BoolNot,IntAnd,IntAnd,IntOr,IntEqual,IntSLess,IntXor,BoolNot,IntAnd,IntAnd,IntOr,IntNotEqual,IntSLess,BoolNot,IntAnd,IntAnd,IntOr,IntEqual,BoolNot,IntAnd,IntAnd,IntOr,IntAnd,PopCount,IntAnd,IntEqual,BoolNot,IntAnd,IntAnd,IntOr,IntXor,Copy,Copy,IntXor,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,IntXor"
         },
         {
           "address": 4294968928,
           "bytes": "f30f6f1437660ffec2f30f6f543710660ffeca4883c6204839f075e4",
           "op_count": 38,
-          "ops_fnv1a64": "63a4daad9c7ef72f",
+          "ops_fnv1a64": "35b5be5bff804322",
           "op_kinds": "IntMult,IntAdd,Load,Copy,IntAdd,IntAdd,IntAdd,IntAdd,IntAdd,IntMult,IntAdd,Load,Copy,IntAdd,IntAdd,IntAdd,IntAdd,IntCarry,IntSCarry,IntAdd,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,IntLess,IntSBorrow,IntSub,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,BoolNot,CBranch"
         },
         {
           "address": 4294968956,
           "bytes": "660ffec8660f70c1ee660ffec1660f70c855660ffec8660f7ec839ca7411",
           "op_count": 153,
-          "ops_fnv1a64": "2a8ae4b41af960c6",
+          "ops_fnv1a64": "550e49b537e8f5c4",
           "op_kinds": "IntAdd,IntAdd,IntAdd,IntAdd,Copy,Copy,Copy,Copy,IntEqual,IntZExt,IntMult,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntAdd,IntAdd,IntAdd,IntAdd,IntAdd,Copy,Copy,Copy,Copy,IntEqual,IntZExt,IntMult,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntAdd,IntEqual,IntZExt,IntMult,IntAdd,IntAdd,IntAdd,IntAdd,IntAdd,Subpiece,IntZExt,Copy,IntLess,IntSBorrow,IntSub,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,CBranch"
         },
         {
           "address": 4294968986,
           "bytes": "660f1f440000",
           "op_count": 2,
-          "ops_fnv1a64": "2219b3125706bb77",
+          "ops_fnv1a64": "fcf44018979b93df",
           "op_kinds": "IntMult,IntAdd"
         },
         {
           "address": 4294968992,
           "bytes": "03049748ffc24839d175f5",
           "op_count": 35,
-          "ops_fnv1a64": "de93043dc504658f",
+          "ops_fnv1a64": "1a38e1ba9950f66b",
           "op_kinds": "IntMult,IntAdd,Load,IntCarry,Load,IntSCarry,Load,IntAdd,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,IntSCarry,IntAdd,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,IntLess,IntSBorrow,IntSub,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,BoolNot,CBranch"
         },
         {
           "address": 4294969003,
           "bytes": "5dc3",
           "op_count": 7,
-          "ops_fnv1a64": "f338ce2f352c813c",
+          "ops_fnv1a64": "5dd43e43edc87a80",
           "op_kinds": "Copy,Load,IntAdd,Copy,Load,IntAdd,Return"
         }
       ],
       "ssa_blocks": [
-        { "address": 4294968864, "size": 8, "phi_count": 0, "op_count": 16, "fnv1a64": "979eaa837ec6f118" },
-        { "address": 4294968872, "size": 7, "phi_count": 0, "op_count": 14, "fnv1a64": "386adb16301cecab" },
-        { "address": 4294968879, "size": 6, "phi_count": 0, "op_count": 21, "fnv1a64": "d16447e5a2736470" },
-        { "address": 4294968889, "size": 39, "phi_count": 0, "op_count": 119, "fnv1a64": "23935fe77881073c" },
-        { "address": 4294968928, "size": 28, "phi_count": 27, "op_count": 46, "fnv1a64": "6ed6bd58b0f13928" },
-        { "address": 4294968956, "size": 30, "phi_count": 0, "op_count": 154, "fnv1a64": "b53ee4110443575c" },
-        { "address": 4294968986, "size": 6, "phi_count": 0, "op_count": 3, "fnv1a64": "b702d081a3b1b02f" },
-        { "address": 4294968992, "size": 11, "phi_count": 103, "op_count": 42, "fnv1a64": "173c733327024636" },
-        { "address": 4294969003, "size": 2, "phi_count": 103, "op_count": 7, "fnv1a64": "79171c215ef00156" },
-        { "address": 4294968885, "size": 4, "phi_count": 0, "op_count": 17, "fnv1a64": "de106f50738cec4d" }
+        { "address": 4294968864, "size": 8, "phi_count": 0, "op_count": 16, "fnv1a64": "2bcc2e657ce11995" },
+        { "address": 4294968872, "size": 7, "phi_count": 0, "op_count": 14, "fnv1a64": "70f3371373f861ad" },
+        { "address": 4294968879, "size": 6, "phi_count": 0, "op_count": 21, "fnv1a64": "45e3997cba264213" },
+        { "address": 4294968889, "size": 39, "phi_count": 0, "op_count": 119, "fnv1a64": "5fb496f729d3b338" },
+        { "address": 4294968928, "size": 28, "phi_count": 27, "op_count": 46, "fnv1a64": "af87d6f9bb751192" },
+        { "address": 4294968956, "size": 30, "phi_count": 0, "op_count": 154, "fnv1a64": "e5fb4a8dae7b9dbc" },
+        { "address": 4294968986, "size": 6, "phi_count": 0, "op_count": 3, "fnv1a64": "2e033c41c686b7d7" },
+        { "address": 4294968992, "size": 11, "phi_count": 103, "op_count": 42, "fnv1a64": "ec63aefe155dfb2a" },
+        { "address": 4294969003, "size": 2, "phi_count": 103, "op_count": 7, "fnv1a64": "94c79501969739bf" },
+        { "address": 4294968885, "size": 4, "phi_count": 0, "op_count": 17, "fnv1a64": "b2be1e1d5b885ae6" }
       ]
     },
     {
@@ -136,8 +136,8 @@
       "file_offset": 1616,
       "bytes": "554889e531c081ffadde00000f94c05dc3",
       "bytes_fnv1a64": "696bc30ad7592da1",
-      "r2il_fnv1a64": "af17f31870fc0925",
-      "ssa_fnv1a64": "11fb796dcfd9dbf0",
+      "r2il_fnv1a64": "842dac2e03ccbe10",
+      "ssa_fnv1a64": "33305f4230bb675b",
       "source_abi": {
         "calling_convention": "sysv_amd64",
         "return_type": "int32_t",
@@ -150,12 +150,12 @@
           "address": 4294968912,
           "bytes": "554889e531c081ffadde00000f94c05dc3",
           "op_count": 32,
-          "ops_fnv1a64": "5854d32bdf4c9173",
+          "ops_fnv1a64": "62976fcc6219b86a",
           "op_kinds": "Copy,IntSub,Store,Copy,Copy,Copy,IntXor,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,IntLess,IntSBorrow,IntSub,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,Copy,Load,IntAdd,Copy,Load,IntAdd,Return"
         }
       ],
       "ssa_blocks": [
-        { "address": 4294968912, "size": 17, "phi_count": 0, "op_count": 32, "fnv1a64": "588be3ffb4b42daa" }
+        { "address": 4294968912, "size": 17, "phi_count": 0, "op_count": 32, "fnv1a64": "1df5de30cd0aeab4" }
       ]
     },
     {
@@ -167,8 +167,8 @@
       "file_offset": 1936,
       "bytes": "554889e58d0c3e29f783f16483f71431c009cf0f94c05dc3",
       "bytes_fnv1a64": "bcde133ae05d0b35",
-      "r2il_fnv1a64": "f2a28d5783f8b5bd",
-      "ssa_fnv1a64": "3348654a5dde0372",
+      "r2il_fnv1a64": "6afb3cfc527bdc1b",
+      "ssa_fnv1a64": "ad0eadcd02163413",
       "source_abi": {
         "calling_convention": "sysv_amd64",
         "return_type": "int32_t",
@@ -182,12 +182,12 @@
           "address": 4294969232,
           "bytes": "554889e58d0c3e29f783f16483f71431c009cf0f94c05dc3",
           "op_count": 66,
-          "ops_fnv1a64": "ac5dcf68faffcd45",
+          "ops_fnv1a64": "9f8de418ade15e27",
           "op_kinds": "Copy,IntSub,Store,Copy,IntMult,IntAdd,Subpiece,IntZExt,IntLess,IntSBorrow,IntSub,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,Copy,IntXor,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,Copy,IntXor,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,Copy,IntXor,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,Copy,IntOr,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,Copy,Load,IntAdd,Copy,Load,IntAdd,Return"
         }
       ],
       "ssa_blocks": [
-        { "address": 4294969232, "size": 24, "phi_count": 0, "op_count": 66, "fnv1a64": "c4e280e56eca2240" }
+        { "address": 4294969232, "size": 24, "phi_count": 0, "op_count": 66, "fnv1a64": "319c01da9ae35eb0" }
       ]
     },
     {
@@ -199,8 +199,8 @@
       "file_offset": 2736,
       "bytes": "554889e589d04863ce486bc93889540f0803440f345dc3",
       "bytes_fnv1a64": "274373379d942066",
-      "r2il_fnv1a64": "829839f01185598c",
-      "ssa_fnv1a64": "3d17008bc9796e82",
+      "r2il_fnv1a64": "a16d5acbe6f72605",
+      "ssa_fnv1a64": "8472235259b09ab2",
       "source_abi": {
         "calling_convention": "sysv_amd64",
         "return_type": "int32_t",
@@ -221,12 +221,12 @@
           "address": 4294970032,
           "bytes": "554889e589d04863ce486bc93889540f0803440f345dc3",
           "op_count": 43,
-          "ops_fnv1a64": "f8758c24df8439fd",
+          "ops_fnv1a64": "5e9ba6b79ebcbf16",
           "op_kinds": "Copy,IntSub,Store,Copy,Copy,IntZExt,IntSExt,IntSExt,IntSExt,IntMult,IntMult,Subpiece,IntSExt,IntNotEqual,Copy,IntAdd,IntMult,IntAdd,Copy,Store,IntAdd,IntMult,IntAdd,Load,IntCarry,Load,IntSCarry,Load,IntAdd,IntZExt,IntSLess,IntEqual,IntAnd,PopCount,IntAnd,IntEqual,Copy,Load,IntAdd,Copy,Load,IntAdd,Return"
         }
       ],
       "ssa_blocks": [
-        { "address": 4294970032, "size": 23, "phi_count": 0, "op_count": 43, "fnv1a64": "5614b2be3ac43140" }
+        { "address": 4294970032, "size": 23, "phi_count": 0, "op_count": 43, "fnv1a64": "8b6f2b9de58e9029" }
       ]
     }
   ]

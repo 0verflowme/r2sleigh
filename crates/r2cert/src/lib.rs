@@ -317,13 +317,15 @@ impl CertifiedMachineContext {
             }
         }
         let graph = artifact.graph();
-        let expected_sites = artifact
-            .facts()
-            .structured
-            .memory_accesses
-            .values()
-            .map(|access| (access.block_addr, access.op_index))
-            .collect::<BTreeSet<_>>();
+        let mut expected_sites = BTreeMap::new();
+        for access in artifact.facts().structured.memory_accesses.values() {
+            if expected_sites
+                .insert((access.block_addr, access.op_index), access.space)
+                .is_some_and(|prior| prior != access.space)
+            {
+                return Err(MachineBuildError::MachineContextMismatch);
+            }
+        }
         for ((block_addr, op_index), space) in source.memory_spaces_by_op() {
             let Some(instruction) = graph
                 .inst_id_for_op_site(*block_addr, *op_index)
@@ -333,16 +335,18 @@ impl CertifiedMachineContext {
             };
             if !matches!(
                 &instruction.payload,
-                r2ssa::InstPayload::Op(
-                    r2ssa::SSAOp::Load { .. }
-                        | r2ssa::SSAOp::Store { .. }
-                        | r2ssa::SSAOp::LoadLinked { .. }
-                        | r2ssa::SSAOp::StoreConditional { .. }
-                        | r2ssa::SSAOp::AtomicCAS { .. }
-                        | r2ssa::SSAOp::LoadGuarded { .. }
-                        | r2ssa::SSAOp::StoreGuarded { .. }
-                )
-            ) || !expected_sites.contains(&(*block_addr, *op_index))
+                InstPayload::Op(op) if ssa_memory_space(op) == Some(*space)
+            ) || expected_sites.get(&(*block_addr, *op_index)) != Some(space)
+                || artifact
+                    .function()
+                    .get_block(*block_addr)
+                    .and_then(|block| block.ops.get(*op_index))
+                    .is_none_or(|source_op| {
+                        !matches!(
+                            &instruction.payload,
+                            InstPayload::Op(graph_op) if graph_op == source_op
+                        )
+                    })
                 || (source.memory_model().is_available()
                     && source.memory_model().space(*space).is_none())
             {
@@ -350,7 +354,7 @@ impl CertifiedMachineContext {
             }
         }
         if expected_sites
-            .iter()
+            .keys()
             .any(|(block_addr, op_index)| source.memory_space_at(*block_addr, *op_index).is_none())
         {
             return Err(MachineBuildError::MachineContextMismatch);
@@ -371,6 +375,19 @@ impl CertifiedMachineContext {
 
     pub const fn memory_model(&self) -> &MachineMemoryModel {
         self.source.memory_model()
+    }
+}
+
+fn ssa_memory_space(op: &SSAOp) -> Option<r2il::SpaceId> {
+    match op {
+        SSAOp::Load { space, .. }
+        | SSAOp::Store { space, .. }
+        | SSAOp::LoadLinked { space, .. }
+        | SSAOp::StoreConditional { space, .. }
+        | SSAOp::AtomicCAS { space, .. }
+        | SSAOp::LoadGuarded { space, .. }
+        | SSAOp::StoreGuarded { space, .. } => Some(*space),
+        _ => None,
     }
 }
 
@@ -579,17 +596,19 @@ impl CertifiedStackSlot {
             .stack_slots
             .values()
             .filter(|slot| slot.base == self.base && slot.offset == self.offset)
-            .map(|slot| slot.object)
+            .map(|slot| (slot.object, slot.space))
             .collect::<Vec<_>>();
         match (self.object, matching_objects.as_slice()) {
             (None, []) => {}
-            (Some(actual), [expected]) if actual == *expected => {
+            (Some(actual), [(expected, r2il::SpaceId::Ram)]) if actual == *expected => {
                 if !matches!(
                     artifact.objects().object(actual).map(|fact| &fact.kind),
                     Some(
-                        ObjectKind::StackSlot { base, offset }
-                            | ObjectKind::FrameObject { base, offset }
-                    ) if *base == self.base && *offset == self.offset
+                        ObjectKind::StackSlot { space, base, offset }
+                            | ObjectKind::FrameObject { space, base, offset }
+                    ) if *space == r2il::SpaceId::Ram
+                        && *base == self.base
+                        && *offset == self.offset
                 ) {
                     return Err(MachineBuildError::MachineContextMismatch);
                 }
@@ -651,11 +670,11 @@ fn certified_stack_slots(
             .stack_slots
             .values()
             .filter(|slot| slot.base == source.base() && slot.offset == source.offset())
-            .map(|slot| slot.object)
+            .map(|slot| (slot.object, slot.space))
             .collect::<Vec<_>>();
         let object = match matching_objects.as_slice() {
             [] => None,
-            [object] => Some(*object),
+            [(object, r2il::SpaceId::Ram)] => Some(*object),
             _ => return Err(MachineBuildError::MachineContextMismatch),
         };
         let certified = CertifiedStackSlot {
@@ -6308,7 +6327,14 @@ fn try_certified_memory_statement(
         || access.id.ordinal != 0
         || graph.op_site_for_inst(inst_id) != Some((access.block_addr, access.op_index))
         || artifact.objects().object(access.object).is_none()
-        || artifact.objects().object_for_value(access.address) != Some(access.object)
+    {
+        return Ok(None);
+    }
+    if artifact
+        .function()
+        .get_block(access.block_addr)
+        .and_then(|block| block.ops.get(access.op_index))
+        != Some(op)
     {
         return Ok(None);
     }
@@ -6318,6 +6344,19 @@ fn try_certified_memory_statement(
     else {
         return Ok(None);
     };
+    if access.space != source_space
+        || ssa_memory_space(op) != Some(source_space)
+        || artifact
+            .objects()
+            .object_for_value(access.address, source_space)
+            != Some(access.object)
+        || artifact
+            .objects()
+            .object(access.object)
+            .is_none_or(|object| object.kind.space() != source_space)
+    {
+        return Ok(None);
+    }
     let Some(space_model) = model
         .space(source_space)
         .filter(|_| model.is_available() && model.is_coherent())
@@ -9832,6 +9871,27 @@ mod tests {
             .expect("source artifact")
             .obligations()
             .clone()
+    }
+
+    #[test]
+    fn memory_space_matching_rejects_ram_custom_swaps() {
+        let address = SSAVar::new("addr", 0, 8);
+        let value = SSAVar::new("value", 0, 4);
+        let load = SSAOp::Load {
+            dst: value.clone(),
+            space: SpaceId::Ram,
+            addr: address.clone(),
+        };
+        let store = SSAOp::Store {
+            space: SpaceId::Custom(7),
+            addr: address,
+            val: value,
+        };
+
+        assert_eq!(ssa_memory_space(&load), Some(SpaceId::Ram));
+        assert_ne!(ssa_memory_space(&load), Some(SpaceId::Custom(7)));
+        assert_eq!(ssa_memory_space(&store), Some(SpaceId::Custom(7)));
+        assert_ne!(ssa_memory_space(&store), Some(SpaceId::Ram));
     }
 
     #[test]

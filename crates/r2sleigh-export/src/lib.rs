@@ -8,6 +8,12 @@ use std::collections::HashSet;
 use std::fmt;
 use thiserror::Error;
 
+/// Current JSON schema for exported SSA documents.
+///
+/// This is one exact schema, not a compatibility selector. Consumers must
+/// reject any value other than this constant.
+pub const SSA_JSON_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstructionAction {
     Lift,
@@ -242,8 +248,11 @@ fn export_ssa(
     let ops_info: Vec<SSAOpInfo> = ssa_block.ops.iter().map(ssa_op_to_info).collect();
 
     match format {
-        ExportFormat::Json => serde_json::to_string_pretty(&ops_info)
-            .map_err(|e| ExportError::SerializeError(e.to_string())),
+        ExportFormat::Json => serde_json::to_string_pretty(&SSAJsonDocument {
+            schema_version: SSA_JSON_SCHEMA_VERSION,
+            operations: ops_info,
+        })
+        .map_err(|e| ExportError::SerializeError(e.to_string())),
         ExportFormat::Text => {
             let mut lines = Vec::new();
             for (idx, info) in ops_info.iter().enumerate() {
@@ -404,15 +413,22 @@ fn op_name_from_value(value: &Value) -> Option<String> {
 }
 
 #[derive(Serialize)]
-struct SSAOpInfo {
-    op: String,
+pub struct SSAOpInfo {
+    pub op: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    dst: Option<String>,
+    pub dst: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    sources: Vec<String>,
+    pub sources: Vec<String>,
+    pub operation: r2ssa::SSAOp,
 }
 
-fn ssa_op_to_info(op: &r2ssa::SSAOp) -> SSAOpInfo {
+#[derive(Serialize)]
+struct SSAJsonDocument {
+    schema_version: u32,
+    operations: Vec<SSAOpInfo>,
+}
+
+pub fn ssa_op_to_info(op: &r2ssa::SSAOp) -> SSAOpInfo {
     let op_name = serde_json::to_value(op)
         .ok()
         .and_then(|v| op_name_from_value(&v))
@@ -421,6 +437,7 @@ fn ssa_op_to_info(op: &r2ssa::SSAOp) -> SSAOpInfo {
         op: op_name,
         dst: op.dst().map(|v| v.display_name()),
         sources: op.sources().iter().map(|v| v.display_name()).collect(),
+        operation: op.clone(),
     }
 }
 
@@ -652,8 +669,40 @@ mod tests {
         let out = export_instruction(&input, InstructionAction::Ssa, ExportFormat::Json)
             .expect("ssa json");
         let parsed: Value = serde_json::from_str(&out).expect("json");
-        let arr = parsed.as_array().expect("array");
-        assert!(!arr.is_empty(), "expected non-empty ssa ops");
+        assert_eq!(parsed["schema_version"], SSA_JSON_SCHEMA_VERSION);
+        let operations = parsed["operations"].as_array().expect("operations");
+        assert!(!operations.is_empty(), "expected non-empty ssa operations");
+        assert!(
+            operations
+                .iter()
+                .all(|operation| operation.get("schema_version").is_none()),
+            "operation entries must not duplicate the document schema"
+        );
+    }
+
+    #[test]
+    fn empty_ssa_json_still_carries_document_schema() {
+        let (disasm, spec) = x86_disasm_and_spec();
+        let block = R2ILBlock::new(0x1000, 1);
+        let input = InstructionExportInput {
+            disasm: &disasm,
+            arch: &spec,
+            block: &block,
+            addr: block.addr,
+            mnemonic: "nop",
+            native_size: block.size as usize,
+        };
+
+        let out = export_instruction(&input, InstructionAction::Ssa, ExportFormat::Json)
+            .expect("empty SSA document");
+        let parsed: Value = serde_json::from_str(&out).expect("json");
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "schema_version": SSA_JSON_SCHEMA_VERSION,
+                "operations": [],
+            })
+        );
     }
 
     #[test]
@@ -987,5 +1036,27 @@ mod tests {
         let esil = export_instruction(&input, InstructionAction::Lift, ExportFormat::Esil)
             .expect("CallOther ESIL");
         assert_eq!(esil, "0x1,0x2,CALLOTHER(73),rax,=");
+    }
+
+    #[test]
+    fn ssa_json_preserves_exact_memory_space() {
+        let ram = ssa_op_to_info(&r2ssa::SSAOp::Load {
+            dst: r2ssa::SSAVar::new("dst", 1, 4),
+            space: SpaceId::Ram,
+            addr: r2ssa::SSAVar::new("addr", 1, 8),
+        });
+        let custom = ssa_op_to_info(&r2ssa::SSAOp::Load {
+            dst: r2ssa::SSAVar::new("dst", 1, 4),
+            space: SpaceId::Custom(7),
+            addr: r2ssa::SSAVar::new("addr", 1, 8),
+        });
+        let ram = serde_json::to_value(ram).expect("RAM SSA info");
+        let custom = serde_json::to_value(custom).expect("Custom SSA info");
+
+        assert!(ram.get("schema_version").is_none());
+        assert!(custom.get("schema_version").is_none());
+        assert_eq!(ram["operation"]["Load"]["space"], "Ram");
+        assert_eq!(custom["operation"]["Load"]["space"]["Custom"], 7);
+        assert_ne!(ram["operation"], custom["operation"]);
     }
 }

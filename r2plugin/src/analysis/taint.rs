@@ -1,5 +1,5 @@
 use crate::blocks::BlockSlice;
-use crate::{R2ILBlock, R2ILContext, SSAOpInfo, ssa_op_to_info};
+use crate::{R2ILBlock, R2ILContext, SSA_JSON_SCHEMA_VERSION, SSAOpInfo, ssa_op_to_info};
 use r2ssa::TaintPolicy;
 use serde::Serialize;
 use std::ffi::CString;
@@ -44,13 +44,13 @@ struct SinkHitJson {
 
 #[derive(Serialize)]
 struct TaintReportJson {
+    schema_version: u32,
     sources: Vec<TaintSourceJson>,
     sinks: Vec<TaintSinkJson>,
     sink_hits: Vec<SinkHitJson>,
     tainted_vars: Vec<TaintedVarJson>,
 }
 
-#[derive(Serialize)]
 struct TaintSummaryReportJson {
     sources: Vec<TaintSourceJson>,
     sink_hits: Vec<SinkHitJson>,
@@ -341,6 +341,7 @@ pub(crate) fn r2taint_function_json(
     tainted_vars.sort_by(|a, b| a.var.cmp(&b.var));
 
     let report = TaintReportJson {
+        schema_version: SSA_JSON_SCHEMA_VERSION,
         sources,
         sinks,
         sink_hits: collect_taint_sink_hits(&result),
@@ -418,5 +419,34 @@ pub(crate) fn r2taint_function_summary_free(summary: *mut R2TaintFunctionSummary
         unsafe {
             drop(Box::from_raw(summary));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn taint_document_versions_nested_ssa_operations_once() {
+        let op = r2ssa::SSAOp::Copy {
+            dst: r2ssa::SSAVar::new("dst", 1, 8),
+            src: r2ssa::SSAVar::new("src", 1, 8),
+        };
+        let value = serde_json::to_value(TaintReportJson {
+            schema_version: SSA_JSON_SCHEMA_VERSION,
+            sources: Vec::new(),
+            sinks: vec![TaintSinkJson {
+                block: 0x1000,
+                block_hex: "0x1000".to_string(),
+                op_idx: 0,
+                op: ssa_op_to_info(&op),
+            }],
+            sink_hits: Vec::new(),
+            tainted_vars: Vec::new(),
+        })
+        .expect("taint JSON");
+
+        assert_eq!(value["schema_version"], SSA_JSON_SCHEMA_VERSION);
+        assert!(value["sinks"][0]["op"].get("schema_version").is_none());
     }
 }

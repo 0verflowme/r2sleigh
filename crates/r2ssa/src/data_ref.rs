@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use r2il::{ArchSpec, R2ILBlock};
+use r2il::{ArchSpec, R2ILBlock, SpaceId};
 use r2sleigh_lift::Disassembler;
 use serde::{Deserialize, Serialize};
 
@@ -28,29 +28,63 @@ impl DataRefKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DataRefFact {
     pub from: u64,
     pub to: u64,
     pub kind: DataRefKind,
+    pub space: SpaceId,
+}
+
+impl Ord for DataRefFact {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.from
+            .cmp(&other.from)
+            .then_with(|| self.to.cmp(&other.to))
+            .then_with(|| self.kind.cmp(&other.kind))
+            .then_with(|| memory_space_order(self.space).cmp(&memory_space_order(other.space)))
+    }
+}
+
+impl PartialOrd for DataRefFact {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl DataRefFact {
-    const fn data(from: u64, to: u64) -> Self {
+    const fn data(from: u64, to: u64, space: SpaceId) -> Self {
         Self {
             from,
             to,
             kind: DataRefKind::Data,
+            space,
         }
     }
 
-    const fn code(from: u64, to: u64) -> Self {
+    const fn code(from: u64, to: u64, space: SpaceId) -> Self {
         Self {
             from,
             to,
             kind: DataRefKind::Code,
+            space,
         }
     }
+}
+
+fn memory_space_order(space: SpaceId) -> (u8, u32) {
+    match space {
+        SpaceId::Ram => (0, 0),
+        SpaceId::Register => (1, 0),
+        SpaceId::Unique => (2, 0),
+        SpaceId::Const => (3, 0),
+        SpaceId::Custom(id) => (4, id),
+    }
+}
+
+fn sort_and_dedup_refs(refs: &mut Vec<DataRefFact>) {
+    refs.sort();
+    refs.dedup();
 }
 
 pub fn parse_const_value(name: &str) -> Option<u64> {
@@ -206,7 +240,7 @@ pub fn data_refs_from_ssa_with_op_sources(
     let mut refs = Vec::new();
     let mut const_env: HashMap<String, u64> = HashMap::new();
     let mut addr_env: HashMap<String, MemorySlotKey> = HashMap::new();
-    let mut stack_value_env: HashMap<MemorySlotKey, u64> = HashMap::new();
+    let mut stack_value_env: HashMap<(SpaceId, MemorySlotKey), u64> = HashMap::new();
 
     for (block_idx, block) in ssa_blocks.iter().enumerate() {
         for (op_idx, op) in block.ops.iter().enumerate() {
@@ -224,31 +258,31 @@ pub fn data_refs_from_ssa_with_op_sources(
                         addr_env.insert(ssa_var_key(dst), slot);
                     }
                     if let Some(addr) = resolve_const_addr(&const_env, src) {
-                        refs.push(DataRefFact::data(from, addr));
+                        refs.push(DataRefFact::data(from, addr, SpaceId::Ram));
                     }
                 }
-                SSAOp::Load { addr, .. } => {
+                SSAOp::Load { dst, space, addr } => {
                     if let Some(target) = resolve_const_addr(&const_env, addr) {
-                        refs.push(DataRefFact::data(from, target));
+                        refs.push(DataRefFact::data(from, target, *space));
                     }
-                    if let SSAOp::Load { dst, .. } = op
-                        && let Some(slot) = resolve_memory_slot_key(&addr_env, &const_env, addr)
-                        && let Some(value) = stack_value_env.get(&slot).copied()
+                    if let Some(slot) = resolve_memory_slot_key(&addr_env, &const_env, addr)
+                        && let Some(value) = stack_value_env.get(&(*space, slot)).copied()
                     {
                         const_env.insert(ssa_var_key(dst), value);
                         if value >= 0x10000 {
-                            refs.push(DataRefFact::data(from, value));
+                            refs.push(DataRefFact::data(from, value, SpaceId::Ram));
                         }
                     }
                 }
-                SSAOp::Store { addr, val, .. } => {
+                SSAOp::Store { space, addr, val } => {
                     if let Some(target) = resolve_const_addr(&const_env, addr) {
-                        refs.push(DataRefFact::data(from, target));
+                        refs.push(DataRefFact::data(from, target, *space));
                     }
                     if let Some(value_addr) = resolve_const_addr(&const_env, val) {
-                        refs.push(DataRefFact::data(from, value_addr));
+                        refs.push(DataRefFact::data(from, value_addr, SpaceId::Ram));
                     }
                     if let Some(slot) = resolve_memory_slot_key(&addr_env, &const_env, addr) {
+                        let slot = (*space, slot);
                         if let Some(value) = resolve_const_value(&const_env, val) {
                             stack_value_env.insert(slot, value);
                         } else {
@@ -274,16 +308,16 @@ pub fn data_refs_from_ssa_with_op_sources(
                         addr_env.insert(ssa_var_key(dst), slot);
                     }
                     if let Some(addr) = parse_const_addr(&a.name) {
-                        refs.push(DataRefFact::data(from, addr));
+                        refs.push(DataRefFact::data(from, addr, SpaceId::Ram));
                     }
                     if let Some(addr) = parse_const_addr(&b.name) {
-                        refs.push(DataRefFact::data(from, addr));
+                        refs.push(DataRefFact::data(from, addr, SpaceId::Ram));
                     }
                     if let Some(target) = computed
                         .filter(|value| *value >= 0x10000)
                         .or_else(|| resolve_const_addr(&const_env, dst))
                     {
-                        refs.push(DataRefFact::data(from, target));
+                        refs.push(DataRefFact::data(from, target, SpaceId::Ram));
                     }
                 }
                 SSAOp::IntSub { dst, a, b } => {
@@ -304,16 +338,16 @@ pub fn data_refs_from_ssa_with_op_sources(
                         addr_env.insert(ssa_var_key(dst), slot);
                     }
                     if let Some(addr) = parse_const_addr(&a.name) {
-                        refs.push(DataRefFact::data(from, addr));
+                        refs.push(DataRefFact::data(from, addr, SpaceId::Ram));
                     }
                     if let Some(addr) = parse_const_addr(&b.name) {
-                        refs.push(DataRefFact::data(from, addr));
+                        refs.push(DataRefFact::data(from, addr, SpaceId::Ram));
                     }
                     if let Some(target) = computed
                         .filter(|value| *value >= 0x10000)
                         .or_else(|| resolve_const_addr(&const_env, dst))
                     {
-                        refs.push(DataRefFact::data(from, target));
+                        refs.push(DataRefFact::data(from, target, SpaceId::Ram));
                     }
                 }
                 SSAOp::PtrAdd {
@@ -330,7 +364,7 @@ pub fn data_refs_from_ssa_with_op_sources(
                         const_env.insert(ssa_var_key(dst), base_val.wrapping_add(scaled));
                     }
                     if let Some(target) = resolve_const_addr(&const_env, dst) {
-                        refs.push(DataRefFact::data(from, target));
+                        refs.push(DataRefFact::data(from, target, SpaceId::Ram));
                     }
                     if let Some(index_val) = resolve_const_value(&const_env, index)
                         && let Ok(delta) =
@@ -356,7 +390,7 @@ pub fn data_refs_from_ssa_with_op_sources(
                         const_env.insert(ssa_var_key(dst), base_val.wrapping_sub(scaled));
                     }
                     if let Some(target) = resolve_const_addr(&const_env, dst) {
-                        refs.push(DataRefFact::data(from, target));
+                        refs.push(DataRefFact::data(from, target, SpaceId::Ram));
                     }
                     if let Some(index_val) = resolve_const_value(&const_env, index)
                         && let Ok(delta) =
@@ -376,7 +410,7 @@ pub fn data_refs_from_ssa_with_op_sources(
                         addr_env.insert(ssa_var_key(dst), slot);
                     }
                     if let Some(addr) = resolve_const_addr(&const_env, src) {
-                        refs.push(DataRefFact::data(from, addr));
+                        refs.push(DataRefFact::data(from, addr, SpaceId::Ram));
                     }
                 }
                 SSAOp::IntZExt { dst, src } => {
@@ -390,7 +424,7 @@ pub fn data_refs_from_ssa_with_op_sources(
                         addr_env.insert(ssa_var_key(dst), slot);
                     }
                     if let Some(addr) = resolve_const_addr(&const_env, src) {
-                        refs.push(DataRefFact::data(from, addr));
+                        refs.push(DataRefFact::data(from, addr, SpaceId::Ram));
                     }
                 }
                 SSAOp::IntSExt { dst, src } => {
@@ -404,22 +438,22 @@ pub fn data_refs_from_ssa_with_op_sources(
                         addr_env.insert(ssa_var_key(dst), slot);
                     }
                     if let Some(addr) = resolve_const_addr(&const_env, src) {
-                        refs.push(DataRefFact::data(from, addr));
+                        refs.push(DataRefFact::data(from, addr, SpaceId::Ram));
                     }
                 }
                 SSAOp::Call { target, .. } | SSAOp::Branch { target } => {
                     if let Some(addr) = resolve_const_addr(&const_env, target) {
-                        refs.push(DataRefFact::code(from, addr));
+                        refs.push(DataRefFact::code(from, addr, SpaceId::Ram));
                     }
                 }
                 SSAOp::CallInd { target, .. } | SSAOp::BranchInd { target } => {
                     if let Some(addr) = resolve_const_addr(&const_env, target) {
-                        refs.push(DataRefFact::code(from, addr));
+                        refs.push(DataRefFact::code(from, addr, SpaceId::Ram));
                     }
                 }
                 SSAOp::CBranch { target, .. } => {
                     if let Some(addr) = resolve_const_addr(&const_env, target) {
-                        refs.push(DataRefFact::code(from, addr));
+                        refs.push(DataRefFact::code(from, addr, SpaceId::Ram));
                     }
                 }
                 _ => {}
@@ -427,8 +461,7 @@ pub fn data_refs_from_ssa_with_op_sources(
         }
     }
 
-    refs.sort_by_key(|reference| (reference.from, reference.to));
-    refs.dedup_by(|a, b| a.from == b.from && a.to == b.to);
+    sort_and_dedup_refs(&mut refs);
     refs
 }
 
@@ -475,8 +508,7 @@ pub fn data_refs_from_blocks(
     }
 
     refs.extend(data_refs_from_ssa_with_op_sources(&ssa_blocks, None));
-    refs.sort_by_key(|reference| (reference.from, reference.to, reference.kind));
-    refs.dedup_by(|a, b| a.from == b.from && a.to == b.to && a.kind == b.kind);
+    sort_and_dedup_refs(&mut refs);
     Some(refs)
 }
 
@@ -505,14 +537,14 @@ mod tests {
                 },
                 SSAOp::Load {
                     dst: var("tmp:load", 1, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: var("tmp:target", 1, 8),
                 },
             ],
         };
 
         let refs = data_refs_from_ssa_with_op_sources(&[block], None);
-        assert!(refs.contains(&DataRefFact::data(0x401000, 0xdeadbeef)));
+        assert!(refs.contains(&DataRefFact::data(0x401000, 0xdeadbeef, SpaceId::Ram)));
     }
 
     #[test]
@@ -552,14 +584,14 @@ mod tests {
                 },
                 SSAOp::Load {
                     dst: var("tmp:load", 1, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: var("tmp:target", 1, 8),
                 },
             ],
         };
 
         let refs = data_refs_from_ssa_with_op_sources(&[block_a, block_b], None);
-        assert!(refs.contains(&DataRefFact::data(0x403004, 0xdeadbeef)));
+        assert!(refs.contains(&DataRefFact::data(0x403004, 0xdeadbeef, SpaceId::Ram)));
     }
 
     #[test]
@@ -579,7 +611,7 @@ mod tests {
                 },
                 SSAOp::Load {
                     dst: var("tmp:load", 1, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: var("tmp:target", 1, 8),
                 },
             ],
@@ -587,7 +619,7 @@ mod tests {
         let op_sources = vec![vec![0x404008, 0x40400c, 0x404010]];
 
         let refs = data_refs_from_ssa_with_op_sources(&[block], Some(&op_sources));
-        assert!(refs.contains(&DataRefFact::data(0x40400c, 0x404e08)));
+        assert!(refs.contains(&DataRefFact::data(0x40400c, 0x404e08, SpaceId::Ram)));
     }
 
     #[test]
@@ -607,7 +639,7 @@ mod tests {
                 },
                 SSAOp::Load {
                     dst: var("tmp:load", 1, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: var("tmp:target", 1, 8),
                 },
             ],
@@ -615,7 +647,7 @@ mod tests {
         let op_sources = vec![vec![0x405008, 0x40500c, 0x405010]];
 
         let refs = data_refs_from_ssa_with_op_sources(&[block], Some(&op_sources));
-        assert!(refs.contains(&DataRefFact::data(0x40500c, 0x404ef8)));
+        assert!(refs.contains(&DataRefFact::data(0x40500c, 0x404ef8, SpaceId::Ram)));
     }
 
     #[test]
@@ -635,13 +667,13 @@ mod tests {
                     b: var("const:8", 0, 8),
                 },
                 SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: var("tmp:6500", 1, 8),
                     val: var("const:404d00", 0, 8),
                 },
                 SSAOp::Load {
                     dst: var("X8", 4, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: var("tmp:6500", 1, 8),
                 },
                 SSAOp::IntAdd {
@@ -650,13 +682,13 @@ mod tests {
                     b: var("const:108", 0, 8),
                 },
                 SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: var("SP", 1, 8),
                     val: var("tmp:11f80", 1, 8),
                 },
                 SSAOp::Load {
                     dst: var("X9", 1, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: var("SP", 1, 8),
                 },
                 SSAOp::IntSub {
@@ -678,7 +710,80 @@ mod tests {
         ]];
 
         let refs = data_refs_from_ssa_with_op_sources(&[block], Some(&op_sources));
-        assert!(refs.contains(&DataRefFact::data(0x100001148, 0x404e08)));
+        assert!(refs.contains(&DataRefFact::data(0x100001148, 0x404e08, SpaceId::Ram)));
+    }
+
+    #[test]
+    fn data_refs_bind_direct_memory_targets_to_exact_space() {
+        let block = SSABlock {
+            addr: 0x5000,
+            size: 8,
+            ops: vec![
+                SSAOp::Load {
+                    dst: var("tmp:ram", 1, 8),
+                    space: SpaceId::Ram,
+                    addr: var("const:50000", 0, 8),
+                },
+                SSAOp::Load {
+                    dst: var("tmp:custom", 1, 8),
+                    space: SpaceId::Custom(7),
+                    addr: var("const:50000", 0, 8),
+                },
+            ],
+        };
+        let refs = data_refs_from_ssa_with_op_sources(&[block], None);
+        assert!(refs.contains(&DataRefFact::data(0x5000, 0x50000, SpaceId::Ram)));
+        assert!(refs.contains(&DataRefFact::data(0x5000, 0x50000, SpaceId::Custom(7))));
+    }
+
+    #[test]
+    fn data_ref_shadow_state_never_crosses_memory_spaces() {
+        let slot = var("SP", 0, 8);
+        let block = SSABlock {
+            addr: 0x6000,
+            size: 24,
+            ops: vec![
+                SSAOp::Store {
+                    space: SpaceId::Ram,
+                    addr: slot.clone(),
+                    val: var("const:404d00", 0, 8),
+                },
+                SSAOp::Load {
+                    dst: var("tmp:wrong_space", 1, 8),
+                    space: SpaceId::Custom(7),
+                    addr: slot.clone(),
+                },
+                SSAOp::IntAdd {
+                    dst: var("tmp:not_a_ref", 1, 8),
+                    a: var("tmp:wrong_space", 1, 8),
+                    b: var("const:108", 0, 8),
+                },
+                SSAOp::Store {
+                    space: SpaceId::Custom(7),
+                    addr: slot.clone(),
+                    val: var("const:405000", 0, 8),
+                },
+                SSAOp::Load {
+                    dst: var("tmp:exact_space", 1, 8),
+                    space: SpaceId::Custom(7),
+                    addr: slot,
+                },
+                SSAOp::IntAdd {
+                    dst: var("tmp:is_a_ref", 1, 8),
+                    a: var("tmp:exact_space", 1, 8),
+                    b: var("const:108", 0, 8),
+                },
+            ],
+        };
+        let op_sources = vec![vec![0x6000, 0x6004, 0x6008, 0x600c, 0x6010, 0x6014]];
+        let refs = data_refs_from_ssa_with_op_sources(&[block], Some(&op_sources));
+        assert!(
+            !refs
+                .iter()
+                .any(|fact| fact.from == 0x6008 && fact.to == 0x404e08)
+        );
+        assert!(refs.contains(&DataRefFact::data(0x6010, 0x405000, SpaceId::Ram)));
+        assert!(refs.contains(&DataRefFact::data(0x6014, 0x405108, SpaceId::Ram)));
     }
 }
 

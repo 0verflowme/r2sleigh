@@ -426,6 +426,7 @@ pub(crate) fn build_detached_function_analysis_artifact(
     semantic_metadata_enabled: bool,
     reg_type_hints: &std::collections::HashMap<String, TypeHint>,
     external_context_json: &str,
+    source_snapshot: std::sync::Arc<r2engine::EngineSourceSnapshot>,
 ) -> Option<FunctionAnalysisArtifact> {
     build_detached_function_analysis_artifact_with_scope_and_semantics(
         blocks,
@@ -435,6 +436,7 @@ pub(crate) fn build_detached_function_analysis_artifact(
         semantic_metadata_enabled,
         reg_type_hints,
         external_context_json,
+        source_snapshot,
         None,
         None,
     )
@@ -450,6 +452,7 @@ pub(crate) fn build_detached_function_analysis_artifact_with_scope(
     semantic_metadata_enabled: bool,
     reg_type_hints: &std::collections::HashMap<String, TypeHint>,
     external_context_json: &str,
+    source_snapshot: std::sync::Arc<r2engine::EngineSourceSnapshot>,
     symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
 ) -> Option<FunctionAnalysisArtifact> {
     build_detached_function_analysis_artifact_with_scope_and_semantics(
@@ -460,6 +463,7 @@ pub(crate) fn build_detached_function_analysis_artifact_with_scope(
         semantic_metadata_enabled,
         reg_type_hints,
         external_context_json,
+        source_snapshot,
         symbolic_scope,
         None,
     )
@@ -475,6 +479,7 @@ pub(crate) fn build_detached_function_analysis_artifact_with_scope_and_semantics
     semantic_metadata_enabled: bool,
     reg_type_hints: &std::collections::HashMap<String, TypeHint>,
     external_context_json: &str,
+    source_snapshot: std::sync::Arc<r2engine::EngineSourceSnapshot>,
     symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
     precomputed_semantic_artifact: Option<r2sym::SemanticArtifact>,
 ) -> Option<FunctionAnalysisArtifact> {
@@ -486,6 +491,7 @@ pub(crate) fn build_detached_function_analysis_artifact_with_scope_and_semantics
         semantic_metadata_enabled,
         reg_type_hints,
         external_context_json,
+        source_snapshot,
         symbolic_scope,
         precomputed_semantic_artifact,
         true,
@@ -502,6 +508,7 @@ pub(crate) fn build_detached_function_analysis_artifact_with_scope_and_optional_
     semantic_metadata_enabled: bool,
     reg_type_hints: &std::collections::HashMap<String, TypeHint>,
     external_context_json: &str,
+    source_snapshot: std::sync::Arc<r2engine::EngineSourceSnapshot>,
     symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
     precomputed_semantic_artifact: Option<r2sym::SemanticArtifact>,
     compile_missing_semantics: bool,
@@ -517,7 +524,7 @@ pub(crate) fn build_detached_function_analysis_artifact_with_scope_and_optional_
             arch: arch.cloned(),
             ptr_bits: Some(ptr_bits),
             semantic_metadata_enabled,
-            source_snapshot: None,
+            source_snapshot: Some(source_snapshot),
             reg_type_hints: reg_type_hints.clone(),
             parsed_context: parsed_context.parsed_context,
             external_context_fallback_hash: parsed_context.fallback_hash,
@@ -539,6 +546,7 @@ pub(crate) fn build_detached_function_analysis_artifact_with_scope_and_optional_
 pub(crate) struct DataRef {
     pub(crate) from: u64,
     pub(crate) to: u64,
+    pub(crate) space: r2il::SpaceId,
     pub(crate) ref_type: String,
 }
 
@@ -563,12 +571,20 @@ pub struct R2SleighRecoveredVars {
 pub struct R2SleighDataRef {
     from: u64,
     to: u64,
+    space_kind: u32,
+    custom_space: u32,
     ref_kind: c_char,
 }
 
 pub struct R2SleighDataRefs {
     refs: Vec<R2SleighDataRef>,
 }
+
+const FFI_DATA_REF_SPACE_RAM: u32 = 0;
+const FFI_DATA_REF_SPACE_REGISTER: u32 = 1;
+const FFI_DATA_REF_SPACE_UNIQUE: u32 = 2;
+const FFI_DATA_REF_SPACE_CONST: u32 = 3;
+const FFI_DATA_REF_SPACE_CUSTOM: u32 = 4;
 
 fn push_owned_cstring(strings: &mut Vec<CString>, value: Option<&str>) -> *const c_char {
     let Some(value) = value.filter(|value| !value.is_empty()) else {
@@ -606,7 +622,18 @@ fn data_ref_from_fact(fact: &r2ssa::DataRefFact) -> DataRef {
     DataRef {
         from: fact.from,
         to: fact.to,
+        space: fact.space,
         ref_type: fact.kind.as_str().to_string(),
+    }
+}
+
+fn ffi_data_ref_space(space: r2il::SpaceId) -> (u32, u32) {
+    match space {
+        r2il::SpaceId::Ram => (FFI_DATA_REF_SPACE_RAM, 0),
+        r2il::SpaceId::Register => (FFI_DATA_REF_SPACE_REGISTER, 0),
+        r2il::SpaceId::Unique => (FFI_DATA_REF_SPACE_UNIQUE, 0),
+        r2il::SpaceId::Const => (FFI_DATA_REF_SPACE_CONST, 0),
+        r2il::SpaceId::Custom(id) => (FFI_DATA_REF_SPACE_CUSTOM, id),
     }
 }
 
@@ -614,10 +641,15 @@ fn ffi_data_refs_from_refs(refs: &[r2ssa::DataRefFact]) -> R2SleighDataRefs {
     R2SleighDataRefs {
         refs: refs
             .iter()
-            .map(|reference| R2SleighDataRef {
-                from: reference.from,
-                to: reference.to,
-                ref_kind: reference.kind.as_char() as c_char,
+            .map(|reference| {
+                let (space_kind, custom_space) = ffi_data_ref_space(reference.space);
+                R2SleighDataRef {
+                    from: reference.from,
+                    to: reference.to,
+                    space_kind,
+                    custom_space,
+                    ref_kind: reference.kind.as_char() as c_char,
+                }
             })
             .collect(),
     }
@@ -976,7 +1008,7 @@ mod tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:load", 1, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:target", 1, 8),
                 },
             ],
@@ -984,10 +1016,73 @@ mod tests {
 
         let refs = get_data_refs_from_ssa_with_op_sources(&[block], None);
         assert!(
-            refs.iter()
-                .any(|r| { r.from == 0x401000 && r.to == 0xdeadbeef && r.ref_type == "d" }),
+            refs.iter().any(|r| {
+                r.from == 0x401000
+                    && r.to == 0xdeadbeef
+                    && r.space == r2il::SpaceId::Ram
+                    && r.ref_type == "d"
+            }),
             "const add chain should emit DATA xref to the computed target"
         );
+    }
+
+    #[test]
+    fn ffi_data_refs_preserve_exact_address_space_tags() {
+        let refs = ffi_data_refs_from_refs(&[
+            r2ssa::DataRefFact {
+                from: 0x1000,
+                to: 0x2000,
+                kind: r2ssa::DataRefKind::Data,
+                space: r2il::SpaceId::Ram,
+            },
+            r2ssa::DataRefFact {
+                from: 0x1004,
+                to: 0x2000,
+                kind: r2ssa::DataRefKind::Data,
+                space: r2il::SpaceId::Register,
+            },
+            r2ssa::DataRefFact {
+                from: 0x1008,
+                to: 0x2000,
+                kind: r2ssa::DataRefKind::Data,
+                space: r2il::SpaceId::Unique,
+            },
+            r2ssa::DataRefFact {
+                from: 0x100c,
+                to: 0x2000,
+                kind: r2ssa::DataRefKind::Data,
+                space: r2il::SpaceId::Const,
+            },
+            r2ssa::DataRefFact {
+                from: 0x1010,
+                to: 0x2000,
+                kind: r2ssa::DataRefKind::Data,
+                space: r2il::SpaceId::Custom(0),
+            },
+            r2ssa::DataRefFact {
+                from: 0x1014,
+                to: 0x2000,
+                kind: r2ssa::DataRefKind::Data,
+                space: r2il::SpaceId::Custom(7),
+            },
+        ]);
+
+        let tags = refs
+            .refs
+            .iter()
+            .map(|reference| (reference.space_kind, reference.custom_space))
+            .collect::<Vec<_>>();
+        assert_eq!(tags, vec![(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (4, 7)]);
+    }
+
+    #[test]
+    fn ffi_data_ref_layout_matches_the_private_c_query_payload() {
+        assert_eq!(std::mem::offset_of!(R2SleighDataRef, from), 0);
+        assert_eq!(std::mem::offset_of!(R2SleighDataRef, to), 8);
+        assert_eq!(std::mem::offset_of!(R2SleighDataRef, space_kind), 16);
+        assert_eq!(std::mem::offset_of!(R2SleighDataRef, custom_space), 20);
+        assert_eq!(std::mem::offset_of!(R2SleighDataRef, ref_kind), 24);
+        assert!(matches!(std::mem::size_of::<R2SleighDataRef>(), 28 | 32));
     }
 
     #[test]
@@ -1067,7 +1162,7 @@ mod tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:load", 1, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:target", 1, 8),
                 },
             ],
@@ -1098,7 +1193,7 @@ mod tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:load", 1, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:target", 1, 8),
                 },
             ],
@@ -1130,7 +1225,7 @@ mod tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:load", 1, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:target", 1, 8),
                 },
             ],
@@ -1181,13 +1276,13 @@ mod tests {
                     b: r2ssa::SSAVar::new("const:8", 0, 8),
                 },
                 r2ssa::SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6500", 1, 8),
                     val: r2ssa::SSAVar::new("const:404d00", 0, 8),
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("X8", 4, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6500", 1, 8),
                 },
                 r2ssa::SSAOp::IntAdd {
@@ -1196,13 +1291,13 @@ mod tests {
                     b: r2ssa::SSAVar::new("const:108", 0, 8),
                 },
                 r2ssa::SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("SP", 1, 8),
                     val: r2ssa::SSAVar::new("tmp:11f80", 1, 8),
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("X9", 1, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("SP", 1, 8),
                 },
                 r2ssa::SSAOp::IntSub {
@@ -1244,7 +1339,7 @@ mod tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:2000", 1, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:1000", 1, 8),
                 },
             ],
@@ -1275,13 +1370,13 @@ mod tests {
                     b: r2ssa::SSAVar::new("const:fffffffffffffff8", 0, 8),
                 },
                 r2ssa::SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:slot", 1, 8),
                     val: r2ssa::SSAVar::new("rdi", 0, 8),
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:arr", 2, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:slot", 1, 8),
                 },
                 r2ssa::SSAOp::IntSExt {
@@ -1300,7 +1395,7 @@ mod tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:val", 1, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:elem", 1, 8),
                 },
             ],
@@ -1331,13 +1426,13 @@ mod tests {
                     b: r2ssa::SSAVar::new("const:fffffffffffffff8", 0, 8),
                 },
                 r2ssa::SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:slot", 1, 8),
                     val: r2ssa::SSAVar::new("rdi", 0, 8),
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:arr", 2, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:slot", 1, 8),
                 },
                 r2ssa::SSAOp::IntSExt {
@@ -1356,7 +1451,7 @@ mod tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:val", 1, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:elem", 1, 8),
                 },
             ],
@@ -1388,7 +1483,7 @@ mod tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:val", 1, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:addr", 1, 8),
                 },
             ],
@@ -1447,7 +1542,7 @@ mod tests {
                         src: r2ssa::SSAVar::new("RDI", 0, 8),
                     },
                     r2ssa::SSAOp::Store {
-                        space: "ram".to_string(),
+                        space: r2il::SpaceId::Ram,
                         addr: r2ssa::SSAVar::new("tmp:4700", 1, 8),
                         val: r2ssa::SSAVar::new("tmp:6b00", 1, 8),
                     },
@@ -1467,7 +1562,7 @@ mod tests {
                         src: r2ssa::SSAVar::new("ESI", 0, 4),
                     },
                     r2ssa::SSAOp::Store {
-                        space: "ram".to_string(),
+                        space: r2il::SpaceId::Ram,
                         addr: r2ssa::SSAVar::new("tmp:4600", 1, 8),
                         val: r2ssa::SSAVar::new("tmp:7000", 1, 4),
                     },
@@ -1507,7 +1602,7 @@ mod tests {
                     },
                     r2ssa::SSAOp::Load {
                         dst: r2ssa::SSAVar::new("tmp:11f80", 1, 8),
-                        space: "ram".to_string(),
+                        space: r2il::SpaceId::Ram,
                         addr: r2ssa::SSAVar::new("tmp:4700", 1, 8),
                     },
                     r2ssa::SSAOp::Copy {
@@ -1531,7 +1626,7 @@ mod tests {
                 ops: vec![
                     r2ssa::SSAOp::Load {
                         dst: r2ssa::SSAVar::new("tmp:11f00", 1, 4),
-                        space: "ram".to_string(),
+                        space: r2il::SpaceId::Ram,
                         addr: r2ssa::SSAVar::new("RAX", 0, 8),
                     },
                     r2ssa::SSAOp::Copy {
@@ -1584,7 +1679,7 @@ mod tests {
                         src: r2ssa::SSAVar::new("RDI", 0, 8),
                     },
                     r2ssa::SSAOp::Store {
-                        space: "ram".to_string(),
+                        space: r2il::SpaceId::Ram,
                         addr: r2ssa::SSAVar::new("tmp:4700", 1, 8),
                         val: r2ssa::SSAVar::new("tmp:6b00", 1, 8),
                     },
@@ -1594,7 +1689,7 @@ mod tests {
                         b: r2ssa::SSAVar::new("const:ffffffffffffffec", 0, 8),
                     },
                     r2ssa::SSAOp::Store {
-                        space: "ram".to_string(),
+                        space: r2il::SpaceId::Ram,
                         addr: r2ssa::SSAVar::new("tmp:4700", 2, 8),
                         val: r2ssa::SSAVar::new("ESI", 0, 4),
                     },
@@ -1611,7 +1706,7 @@ mod tests {
                     },
                     r2ssa::SSAOp::Load {
                         dst: r2ssa::SSAVar::new("tmp:11f80", 2, 8),
-                        space: "ram".to_string(),
+                        space: r2il::SpaceId::Ram,
                         addr: r2ssa::SSAVar::new("tmp:4700", 9, 8),
                     },
                     r2ssa::SSAOp::Copy {
@@ -1625,7 +1720,7 @@ mod tests {
                     },
                     r2ssa::SSAOp::Load {
                         dst: r2ssa::SSAVar::new("tmp:11f00", 5, 4),
-                        space: "ram".to_string(),
+                        space: r2il::SpaceId::Ram,
                         addr: r2ssa::SSAVar::new("tmp:4700", 10, 8),
                     },
                     r2ssa::SSAOp::IntSExt {
@@ -1644,7 +1739,7 @@ mod tests {
                     },
                     r2ssa::SSAOp::Load {
                         dst: r2ssa::SSAVar::new("tmp:11f00", 6, 4),
-                        space: "ram".to_string(),
+                        space: r2il::SpaceId::Ram,
                         addr: r2ssa::SSAVar::new("tmp:4a00", 2, 8),
                     },
                     r2ssa::SSAOp::Copy {
@@ -1988,7 +2083,7 @@ mod tests {
             ops: vec![
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:val", 1, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("rdi", 0, 8),
                 },
                 r2ssa::SSAOp::IntAdd {

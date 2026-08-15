@@ -723,8 +723,12 @@ typedef struct {
 typedef struct {
 	unsigned long long from;
 	unsigned long long to;
+	unsigned int space_kind;
+	unsigned int custom_space;
 	char ref_kind;
 } R2SleighDataRef;
+
+#define R2SLEIGH_DATA_REF_SPACE_RAM 0
 typedef struct {
 	unsigned long long addr;
 	const char *comment;
@@ -736,6 +740,17 @@ typedef struct {
 /* radare2 Deep Integration */
 
 static const R2SleighApiV2 *sleigh_lift_api_v2(void) {
+	R_STATIC_ASSERT (sizeof (((R2SleighDataRef *)0)->from) == 8);
+	R_STATIC_ASSERT (sizeof (((R2SleighDataRef *)0)->to) == 8);
+	R_STATIC_ASSERT (sizeof (((R2SleighDataRef *)0)->space_kind) == 4);
+	R_STATIC_ASSERT (sizeof (((R2SleighDataRef *)0)->custom_space) == 4);
+	R_STATIC_ASSERT (sizeof (((R2SleighDataRef *)0)->ref_kind) == 1);
+	R_STATIC_ASSERT (r_offsetof (R2SleighDataRef, from) == 0);
+	R_STATIC_ASSERT (r_offsetof (R2SleighDataRef, to) == 8);
+	R_STATIC_ASSERT (r_offsetof (R2SleighDataRef, space_kind) == 16);
+	R_STATIC_ASSERT (r_offsetof (R2SleighDataRef, custom_space) == 20);
+	R_STATIC_ASSERT (r_offsetof (R2SleighDataRef, ref_kind) == 24);
+	R_STATIC_ASSERT (sizeof (R2SleighDataRef) == 28 || sizeof (R2SleighDataRef) == 32);
 	const R2SleighApiV2 *api = r2sleigh_api_v2 ();
 	if (!api || api->abi_version != R2SLEIGH_ABI_V2
 		|| api->struct_size != sizeof (*api)
@@ -749,6 +764,8 @@ static const R2SleighApiV2 *sleigh_lift_api_v2(void) {
 		|| api->scope_symbol_size != sizeof (R2SleighScopeSymbolV2)
 		|| api->analysis_query_request_size != sizeof (R2SleighAnalysisQueryRequestV2)
 		|| api->analysis_result_view_size != sizeof (R2SleighAnalysisResultViewV2)
+		|| api->data_ref_size != sizeof (R2SleighDataRef)
+		|| api->data_ref_schema_version != R2SLEIGH_DATA_REF_SCHEMA_V2
 		|| api->planner_query_request_size != sizeof (R2SleighPlannerQueryRequestV2)
 		|| api->planner_query_response_size != sizeof (R2SleighPlannerQueryResponseV2)
 		|| api->planner_target_input_size != sizeof (R2SleighPlannerTargetInputV2)
@@ -879,7 +896,9 @@ static R2SleighRuntimeMaterializedSourcePlanV2 sleigh_v2_query_runtime_source(si
 	return response.runtime_source;
 }
 
-static char *sleigh_lift_byte_view_copy(R2SleighByteViewV2 view) {
+static R_TH_LOCAL R2SleighOwnedBytesV2 *sleigh_pending_owned_bytes = NULL;
+
+static char *sleigh_byte_view_v2_copy(R2SleighByteViewV2 view) {
 	if ((!view.data && view.len) || view.len == SIZE_MAX) {
 		return NULL;
 	}
@@ -894,24 +913,68 @@ static char *sleigh_lift_byte_view_copy(R2SleighByteViewV2 view) {
 	return copy;
 }
 
+static uint32_t sleigh_v2_owned_bytes_release(const R2SleighApiV2 *api, R2SleighOwnedBytesV2 **bytes) {
+	if (!bytes || !*bytes) {
+		return R2SLEIGH_STATUS_OK_V2;
+	}
+	if (!api || !api->owned_bytes_free) {
+		R_LOG_ERROR ("r2sleigh: retaining owned bytes because the V2 API is unavailable");
+		return R2SLEIGH_STATUS_ABI_MISMATCH_V2;
+	}
+	R2SleighOwnedBytesV2 *owned = *bytes;
+	uint32_t status = api->owned_bytes_free (owned);
+	if (status != R2SLEIGH_STATUS_OK_V2) {
+		R_LOG_ERROR ("r2sleigh: retaining owned bytes after free failure (%u)", status);
+		return status;
+	}
+	if (sleigh_pending_owned_bytes == owned) {
+		sleigh_pending_owned_bytes = NULL;
+	}
+	*bytes = NULL;
+	return R2SLEIGH_STATUS_OK_V2;
+}
+
+static uint32_t sleigh_v2_owned_bytes_release_or_preserve(const R2SleighApiV2 *api, R2SleighOwnedBytesV2 **bytes) {
+	uint32_t status = sleigh_v2_owned_bytes_release (api, bytes);
+	if (status != R2SLEIGH_STATUS_OK_V2 && bytes && *bytes) {
+		sleigh_pending_owned_bytes = *bytes;
+		*bytes = NULL;
+	}
+	return status;
+}
+
 static uint32_t sleigh_lift_owned_bytes_copy(const R2SleighApiV2 *api, R2SleighOwnedBytesV2 *bytes, char **output) {
 	if (!output) {
-		return R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
+		R2SleighOwnedBytesV2 *owned = bytes;
+		uint32_t free_status = sleigh_v2_owned_bytes_release_or_preserve (api, &owned);
+		return free_status == R2SLEIGH_STATUS_OK_V2
+			? R2SLEIGH_STATUS_INVALID_ARGUMENT_V2: free_status;
 	}
 	*output = NULL;
-	if (!api || !bytes) {
+	if (!bytes) {
 		return R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
+	}
+	if (!api || !api->owned_bytes_view || !api->owned_bytes_free) {
+		sleigh_pending_owned_bytes = bytes;
+		R_LOG_ERROR ("r2sleigh: retaining owned bytes because the V2 API is unavailable");
+		return R2SLEIGH_STATUS_ABI_MISMATCH_V2;
 	}
 	R2SleighByteViewV2 view = {0};
 	uint32_t status = api->owned_bytes_view (bytes, &view);
 	if (status == R2SLEIGH_STATUS_OK_V2) {
-		*output = sleigh_lift_byte_view_copy (view);
+		*output = sleigh_byte_view_v2_copy (view);
 		if (!*output) {
 			status = R2SLEIGH_STATUS_ENGINE_ERROR_V2;
 		}
 	}
-	uint32_t free_status = api->owned_bytes_free (bytes);
-	return status == R2SLEIGH_STATUS_OK_V2? free_status: status;
+	R2SleighOwnedBytesV2 *owned = bytes;
+	uint32_t free_status = sleigh_v2_owned_bytes_release_or_preserve (api, &owned);
+	if (free_status != R2SLEIGH_STATUS_OK_V2) {
+		free (*output);
+		*output = NULL;
+		return free_status;
+	}
+	return status;
 }
 
 static uint32_t sleigh_v2_context_create(const char *arch, R2ILContext **context) {
@@ -960,7 +1023,7 @@ static uint32_t sleigh_v2_context_arch_name(const R2ILContext *context, char **n
 	if (status != R2SLEIGH_STATUS_OK_V2) {
 		return status;
 	}
-	*name = sleigh_lift_byte_view_copy (view);
+	*name = sleigh_byte_view_v2_copy (view);
 	return *name? R2SLEIGH_STATUS_OK_V2: R2SLEIGH_STATUS_ENGINE_ERROR_V2;
 }
 
@@ -978,7 +1041,7 @@ static uint32_t sleigh_v2_context_error(const R2ILContext *context, char **messa
 	if (status != R2SLEIGH_STATUS_OK_V2) {
 		return status;
 	}
-	*message = sleigh_lift_byte_view_copy (view);
+	*message = sleigh_byte_view_v2_copy (view);
 	return *message? R2SLEIGH_STATUS_OK_V2: R2SLEIGH_STATUS_ENGINE_ERROR_V2;
 }
 
@@ -992,9 +1055,16 @@ static uint32_t sleigh_v2_context_reg_profile(const R2ILContext *context, char *
 	if (!api || !context) {
 		return R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
 	}
-	uint32_t status = api->lift_context_reg_profile (context, &bytes);
+	uint32_t status = sleigh_v2_owned_bytes_release (api, &sleigh_pending_owned_bytes);
 	if (status != R2SLEIGH_STATUS_OK_V2) {
 		return status;
+	}
+	status = api->lift_context_reg_profile (context, &bytes);
+	if (status != R2SLEIGH_STATUS_OK_V2 || !bytes) {
+		uint32_t free_status = sleigh_v2_owned_bytes_release_or_preserve (api, &bytes);
+		return free_status == R2SLEIGH_STATUS_OK_V2
+			? (status == R2SLEIGH_STATUS_OK_V2? R2SLEIGH_STATUS_ENGINE_ERROR_V2: status)
+			: free_status;
 	}
 	return sleigh_lift_owned_bytes_copy (api, bytes, profile);
 }
@@ -1110,9 +1180,16 @@ static uint32_t sleigh_v2_block_mnemonic(const R2ILContext *context, const unsig
 	if (!api) {
 		return R2SLEIGH_STATUS_ABI_MISMATCH_V2;
 	}
-	uint32_t status = api->lift_block_mnemonic (context, view, addr, &mnemonic);
+	uint32_t status = sleigh_v2_owned_bytes_release (api, &sleigh_pending_owned_bytes);
 	if (status != R2SLEIGH_STATUS_OK_V2) {
 		return status;
+	}
+	status = api->lift_block_mnemonic (context, view, addr, &mnemonic);
+	if (status != R2SLEIGH_STATUS_OK_V2 || !mnemonic) {
+		uint32_t free_status = sleigh_v2_owned_bytes_release_or_preserve (api, &mnemonic);
+		return free_status == R2SLEIGH_STATUS_OK_V2
+			? (status == R2SLEIGH_STATUS_OK_V2? R2SLEIGH_STATUS_ENGINE_ERROR_V2: status)
+			: free_status;
 	}
 	return sleigh_lift_owned_bytes_copy (api, mnemonic, text);
 }
@@ -1155,6 +1232,10 @@ static uint32_t sleigh_v2_analysis_render(uint32_t kind, const R2ILContext *cont
 	if (!api) {
 		return R2SLEIGH_STATUS_ABI_MISMATCH_V2;
 	}
+	uint32_t status = sleigh_v2_owned_bytes_release (api, &sleigh_pending_owned_bytes);
+	if (status != R2SLEIGH_STATUS_OK_V2) {
+		return status;
+	}
 	R2SleighAnalysisRenderRequestV2 request = {
 		.kind = kind,
 		.context = context,
@@ -1167,9 +1248,12 @@ static uint32_t sleigh_v2_analysis_render(uint32_t kind, const R2ILContext *cont
 		},
 	};
 	R2SleighOwnedBytesV2 *bytes = NULL;
-	uint32_t status = api->analysis_render (&request, &bytes);
-	if (status != R2SLEIGH_STATUS_OK_V2) {
-		return status;
+	status = api->analysis_render (&request, &bytes);
+	if (status != R2SLEIGH_STATUS_OK_V2 || !bytes) {
+		uint32_t free_status = sleigh_v2_owned_bytes_release_or_preserve (api, &bytes);
+		return free_status == R2SLEIGH_STATUS_OK_V2
+			? (status == R2SLEIGH_STATUS_OK_V2? R2SLEIGH_STATUS_ENGINE_ERROR_V2: status)
+			: free_status;
 	}
 	return sleigh_lift_owned_bytes_copy (api, bytes, text);
 }
@@ -1187,6 +1271,10 @@ static uint32_t sleigh_v2_scope_render(uint32_t kind, const R2ILContext *context
 	*text = NULL;
 	if (!api) {
 		return R2SLEIGH_STATUS_ABI_MISMATCH_V2;
+	}
+	uint32_t status = sleigh_v2_owned_bytes_release (api, &sleigh_pending_owned_bytes);
+	if (status != R2SLEIGH_STATUS_OK_V2) {
+		return status;
 	}
 	R2SleighScopeRenderRequestV2 request = {
 		.kind = kind,
@@ -1209,9 +1297,12 @@ static uint32_t sleigh_v2_scope_render(uint32_t kind, const R2ILContext *context
 		.merge_states = merge_states? 1: 0,
 	};
 	R2SleighOwnedBytesV2 *bytes = NULL;
-	uint32_t status = api->scope_render (&request, &bytes);
-	if (status != R2SLEIGH_STATUS_OK_V2) {
-		return status;
+	status = api->scope_render (&request, &bytes);
+	if (status != R2SLEIGH_STATUS_OK_V2 || !bytes) {
+		uint32_t free_status = sleigh_v2_owned_bytes_release_or_preserve (api, &bytes);
+		return free_status == R2SLEIGH_STATUS_OK_V2
+			? (status == R2SLEIGH_STATUS_OK_V2? R2SLEIGH_STATUS_ENGINE_ERROR_V2: status)
+			: free_status;
 	}
 	return sleigh_lift_owned_bytes_copy (api, bytes, text);
 }
@@ -1293,6 +1384,8 @@ static char *sleigh_arch = NULL;
 static char *sleigh_reg_profile = NULL;
 static char *sleigh_arch_override = NULL;
 static R_TH_LOCAL R2SleighPlannerResultV2 *sleigh_pending_target_plan = NULL;
+static R_TH_LOCAL R2SleighResponseV2 *sleigh_pending_engine_response = NULL;
+static R_TH_LOCAL R2SleighSessionV2 *sleigh_pending_engine_session = NULL;
 
 static bool sleigh_v2_planner_result_release(R2SleighPlannerResultV2 **result) {
 	if (!result || !*result) {
@@ -1478,21 +1571,6 @@ static void sleigh_engine_v2_log_error(
 		return;
 	}
 	R_LOG_ERROR ("r2sleigh: V2 engine request failed (%u)", status);
-}
-
-static char *sleigh_byte_view_v2_copy(R2SleighByteViewV2 view) {
-	if ((!view.data && view.len) || view.len == SIZE_MAX) {
-		return NULL;
-	}
-	char *copy = malloc (view.len + 1);
-	if (!copy) {
-		return NULL;
-	}
-	if (view.len) {
-		memcpy (copy, view.data, view.len);
-	}
-	copy[view.len] = '\0';
-	return copy;
 }
 
 static const char *sleigh_engine_v2_phase_name(uint32_t phase) {
@@ -1742,6 +1820,62 @@ static char *sleigh_engine_v2_response_json(const R2SleighResponseInfoV2 *info, 
 	return json;
 }
 
+static uint32_t sleigh_engine_v2_release_handles(const R2SleighApiV2 *api,
+	R2SleighResponseV2 **response, R2SleighSessionV2 **session) {
+	if ((!response || !*response) && (!session || !*session)) {
+		return R2SLEIGH_STATUS_OK_V2;
+	}
+	if (!api || !api->response_free || !api->session_free) {
+		R_LOG_ERROR ("r2sleigh: retaining V2 engine handles because the API is unavailable");
+		return R2SLEIGH_STATUS_ABI_MISMATCH_V2;
+	}
+	if (response && *response) {
+		uint32_t status = api->response_free (*response);
+		if (status != R2SLEIGH_STATUS_OK_V2) {
+			R_LOG_ERROR ("r2sleigh: retaining V2 engine response after free failure (%u)", status);
+			return status;
+		}
+		*response = NULL;
+	}
+	if (session && *session) {
+		uint32_t status = api->session_free (*session);
+		if (status != R2SLEIGH_STATUS_OK_V2) {
+			R_LOG_ERROR ("r2sleigh: retaining V2 engine session after free failure (%u)", status);
+			return status;
+		}
+		*session = NULL;
+	}
+	return R2SLEIGH_STATUS_OK_V2;
+}
+
+static uint32_t sleigh_engine_v2_release_or_preserve(const R2SleighApiV2 *api,
+	R2SleighResponseV2 **response, R2SleighSessionV2 **session) {
+	uint32_t status = sleigh_engine_v2_release_handles (api, response, session);
+	if (status != R2SLEIGH_STATUS_OK_V2) {
+		if (response && *response) {
+			sleigh_pending_engine_response = *response;
+			*response = NULL;
+		}
+		if (session && *session) {
+			sleigh_pending_engine_session = *session;
+			*session = NULL;
+		}
+	}
+	return status;
+}
+
+static uint32_t sleigh_engine_v2_retry_pending(const R2SleighApiV2 *api) {
+	return sleigh_engine_v2_release_handles (api,
+		&sleigh_pending_engine_response, &sleigh_pending_engine_session);
+}
+
+static char *sleigh_engine_v2_cleanup_error(bool json_projection, uint32_t status) {
+	return json_projection
+		? sleigh_engine_v2_error_json ("owner_cleanup", status,
+			"failed to release V2 engine ownership")
+		: NULL;
+}
+
 // Returns a malloc-owned NUL-terminated projection. Every borrowed response
 // view is consumed before response_free releases the opaque Rust owner.
 static char *sleigh_engine_execute_v2_project(uint32_t kind, uint64_t required_capability, const R2SleighEngineRequestPayloadV2 *payload, bool json_projection) {
@@ -1793,6 +1927,10 @@ static char *sleigh_engine_execute_v2_project(uint32_t kind, uint64_t required_c
 				"incompatible V2 engine API table")
 			: NULL;
 	}
+	uint32_t status = sleigh_engine_v2_retry_pending (api);
+	if (status != R2SLEIGH_STATUS_OK_V2) {
+		return sleigh_engine_v2_cleanup_error (json_projection, status);
+	}
 	if (!payload || payload->abi_version != R2SLEIGH_ABI_V2
 		|| payload->struct_size != sizeof (*payload)) {
 		R_LOG_ERROR ("r2sleigh: invalid native V2 request graph");
@@ -1809,9 +1947,13 @@ static char *sleigh_engine_execute_v2_project(uint32_t kind, uint64_t required_c
 		.required_capabilities = required_capability,
 	};
 	R2SleighSessionV2 *session = NULL;
-	uint32_t status = api->session_create (&config, &session);
+	status = api->session_create (&config, &session);
 	if (status != R2SLEIGH_STATUS_OK_V2 || !session) {
 		R_LOG_ERROR ("r2sleigh: failed to create V2 engine session (%u)", status);
+		uint32_t free_status = sleigh_engine_v2_release_or_preserve (api, NULL, &session);
+		if (free_status != R2SLEIGH_STATUS_OK_V2) {
+			return sleigh_engine_v2_cleanup_error (json_projection, free_status);
+		}
 		return json_projection
 			? sleigh_engine_v2_error_json ("session_create", status,
 				"failed to create V2 engine session")
@@ -1832,7 +1974,11 @@ static char *sleigh_engine_execute_v2_project(uint32_t kind, uint64_t required_c
 		char *message = json_projection
 			? sleigh_engine_v2_session_error_copy (api, session, status)
 			: NULL;
-		api->session_free (session);
+		uint32_t free_status = sleigh_engine_v2_release_or_preserve (api, &response, &session);
+		if (free_status != R2SLEIGH_STATUS_OK_V2) {
+			free (message);
+			return sleigh_engine_v2_cleanup_error (json_projection, free_status);
+		}
 		if (json_projection) {
 			char *json = sleigh_engine_v2_error_json ("execute", status, message);
 			free (message);
@@ -1852,8 +1998,10 @@ static char *sleigh_engine_execute_v2_project(uint32_t kind, uint64_t required_c
 			&& info.outcome != R2SLEIGH_OUTCOME_REFUSED_V2)
 		|| !info.diagnostics_json.data || !info.diagnostics_json.len) {
 		sleigh_engine_v2_log_error (api, session, status);
-		api->response_free (response);
-		api->session_free (session);
+		uint32_t free_status = sleigh_engine_v2_release_or_preserve (api, &response, &session);
+		if (free_status != R2SLEIGH_STATUS_OK_V2) {
+			return sleigh_engine_v2_cleanup_error (json_projection, free_status);
+		}
 		return json_projection
 			? sleigh_engine_v2_error_json ("response_info",
 				R2SLEIGH_STATUS_ENGINE_ERROR_V2,
@@ -1865,8 +2013,10 @@ static char *sleigh_engine_execute_v2_project(uint32_t kind, uint64_t required_c
 		if (info.phase_timings[phase_index].phase != phase_index
 			|| info.phase_timings[phase_index].status > R2SLEIGH_PHASE_STATUS_REFUSED_V2) {
 			R_LOG_ERROR ("r2sleigh: invalid V2 engine phase metadata");
-			api->response_free (response);
-			api->session_free (session);
+			uint32_t free_status = sleigh_engine_v2_release_or_preserve (api, &response, &session);
+			if (free_status != R2SLEIGH_STATUS_OK_V2) {
+				return sleigh_engine_v2_cleanup_error (json_projection, free_status);
+			}
 			return json_projection
 				? sleigh_engine_v2_error_json ("phase_metadata",
 					R2SLEIGH_STATUS_ENGINE_ERROR_V2,
@@ -1879,8 +2029,10 @@ static char *sleigh_engine_execute_v2_project(uint32_t kind, uint64_t required_c
 		|| info.phase_timings[R2SLEIGH_PHASE_FFI_CONVERSION_V2].elapsed_us
 			!= info.ffi_conversion_elapsed_us) {
 		R_LOG_ERROR ("r2sleigh: invalid V2 FFI conversion metadata");
-		api->response_free (response);
-		api->session_free (session);
+		uint32_t free_status = sleigh_engine_v2_release_or_preserve (api, &response, &session);
+		if (free_status != R2SLEIGH_STATUS_OK_V2) {
+			return sleigh_engine_v2_cleanup_error (json_projection, free_status);
+		}
 		return json_projection
 			? sleigh_engine_v2_error_json ("ffi_conversion_metadata",
 				R2SLEIGH_STATUS_ENGINE_ERROR_V2,
@@ -1907,8 +2059,11 @@ static char *sleigh_engine_execute_v2_project(uint32_t kind, uint64_t required_c
 	if (!json_projection) {
 		sleigh_engine_v2_log_semantic_kernel_warnings (info.diagnostics_json);
 	}
-	api->response_free (response);
-	api->session_free (session);
+	uint32_t free_status = sleigh_engine_v2_release_or_preserve (api, &response, &session);
+	if (free_status != R2SLEIGH_STATUS_OK_V2) {
+		free (result);
+		return sleigh_engine_v2_cleanup_error (json_projection, free_status);
+	}
 	return result;
 }
 
@@ -6431,6 +6586,15 @@ static bool sleigh_init(RAnal *anal) {
 
 static bool sleigh_fini(RAnal *anal) {
 	(void)anal;
+	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
+	uint32_t status = sleigh_v2_owned_bytes_release (api, &sleigh_pending_owned_bytes);
+	if (status != R2SLEIGH_STATUS_OK_V2) {
+		return false;
+	}
+	status = sleigh_engine_v2_retry_pending (api);
+	if (status != R2SLEIGH_STATUS_OK_V2) {
+		return false;
+	}
 	if (!sleigh_v2_planner_result_retry_pending ()) {
 		return false;
 	}
@@ -7948,6 +8112,12 @@ static RAnalRefType data_ref_type_from_kind(RAnal *anal, ut64 to_addr, char kind
 	return data_ref_type_from_json (anal, to_addr, kind? type_name: NULL);
 }
 
+static bool data_ref_targets_ram(const R2SleighDataRef *item) {
+	return item
+		&& item->space_kind == R2SLEIGH_DATA_REF_SPACE_RAM
+		&& item->custom_space == 0;
+}
+
 static bool collect_data_refs_from_typed(
 	RAnal *anal,
 	RAnalFunction *fcn,
@@ -7965,6 +8135,9 @@ static bool collect_data_refs_from_typed(
 		return false;
 	}
 	for (i = 0; i < count; i++) {
+		if (!data_ref_targets_ram (&items[i])) {
+			continue;
+		}
 		ut64 from_addr = (ut64)items[i].from;
 		ut64 to_addr = (ut64)items[i].to;
 		if (fcn && to_addr >= fcn->addr && to_addr < fcn->addr + r_anal_function_linear_size (fcn)) {

@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use r2il::SpaceId;
 use serde::{Deserialize, Serialize};
 
 use crate::address::{AddressProvenanceFacts, collect_address_provenance};
@@ -114,20 +115,151 @@ impl std::fmt::Display for SemanticId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+fn memory_space_order(space: SpaceId) -> (u8, u32) {
+    match space {
+        SpaceId::Ram => (0, 0),
+        SpaceId::Register => (1, 0),
+        SpaceId::Unique => (2, 0),
+        SpaceId::Const => (3, 0),
+        SpaceId::Custom(id) => (4, id),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ObjectSpaceId(pub SpaceId);
+
+impl Ord for ObjectSpaceId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        memory_space_order(self.0).cmp(&memory_space_order(other.0))
+    }
+}
+
+impl PartialOrd for ObjectSpaceId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MemoryObjectKey {
+    pub value: ValueId,
+    pub space: SpaceId,
+}
+
+impl Ord for MemoryObjectKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.value
+            .cmp(&other.value)
+            .then_with(|| memory_space_order(self.space).cmp(&memory_space_order(other.space)))
+    }
+}
+
+impl PartialOrd for MemoryObjectKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StackObjectKey {
+    pub root: StackAddressRoot,
+    pub space: SpaceId,
+}
+
+impl Ord for StackObjectKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.root
+            .cmp(&other.root)
+            .then_with(|| memory_space_order(self.space).cmp(&memory_space_order(other.space)))
+    }
+}
+
+impl PartialOrd for StackObjectKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ParameterObjectKey {
+    pub index: usize,
+    pub space: SpaceId,
+}
+
+impl Ord for ParameterObjectKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.index
+            .cmp(&other.index)
+            .then_with(|| memory_space_order(self.space).cmp(&memory_space_order(other.space)))
+    }
+}
+
+impl PartialOrd for ParameterObjectKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GlobalObjectKey {
-    pub space: String,
+    pub space: SpaceId,
     pub address: u64,
+}
+
+impl Ord for GlobalObjectKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        memory_space_order(self.space)
+            .cmp(&memory_space_order(other.space))
+            .then_with(|| self.address.cmp(&other.address))
+    }
+}
+
+impl PartialOrd for GlobalObjectKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObjectKind {
-    StackSlot { base: StackAddressBase, offset: i64 },
-    FrameObject { base: StackAddressBase, offset: i64 },
-    Parameter { index: usize },
-    Global { space: String, address: u64 },
-    HeapAlloc { call_site: CallSiteId },
-    EscapedUnknown,
+    StackSlot {
+        space: SpaceId,
+        base: StackAddressBase,
+        offset: i64,
+    },
+    FrameObject {
+        space: SpaceId,
+        base: StackAddressBase,
+        offset: i64,
+    },
+    Parameter {
+        space: SpaceId,
+        index: usize,
+    },
+    Global {
+        space: SpaceId,
+        address: u64,
+    },
+    HeapAlloc {
+        space: SpaceId,
+        call_site: CallSiteId,
+    },
+    EscapedUnknown {
+        space: SpaceId,
+    },
+}
+
+impl ObjectKind {
+    pub const fn space(&self) -> SpaceId {
+        match self {
+            Self::StackSlot { space, .. }
+            | Self::FrameObject { space, .. }
+            | Self::Parameter { space, .. }
+            | Self::Global { space, .. }
+            | Self::HeapAlloc { space, .. }
+            | Self::EscapedUnknown { space } => *space,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,30 +271,41 @@ pub struct ObjectFact {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ObjectModel {
     pub objects: BTreeMap<ObjectId, ObjectFact>,
-    pub value_objects: BTreeMap<ValueId, ObjectId>,
-    pub stack_objects: BTreeMap<StackAddressRoot, ObjectId>,
-    pub parameter_objects: BTreeMap<usize, ObjectId>,
+    pub value_objects: BTreeMap<MemoryObjectKey, ObjectId>,
+    pub stack_objects: BTreeMap<StackObjectKey, ObjectId>,
+    pub parameter_objects: BTreeMap<ParameterObjectKey, ObjectId>,
     pub global_objects: BTreeMap<GlobalObjectKey, ObjectId>,
-    pub escaped_unknown: Option<ObjectId>,
+    pub escaped_unknown: BTreeMap<ObjectSpaceId, ObjectId>,
 }
 
 impl ObjectModel {
-    pub fn object_for_value(&self, value: ValueId) -> Option<ObjectId> {
-        self.value_objects.get(&value).copied()
+    pub fn object_for_value(&self, value: ValueId, space: SpaceId) -> Option<ObjectId> {
+        self.value_objects
+            .get(&MemoryObjectKey { value, space })
+            .copied()
     }
 
-    pub fn object_for_var(&self, graph: &SsaGraph, value: &SSAVar) -> Option<ObjectId> {
+    pub fn object_for_var(
+        &self,
+        graph: &SsaGraph,
+        value: &SSAVar,
+        space: SpaceId,
+    ) -> Option<ObjectId> {
         graph
             .value_id_for_var(value)
-            .and_then(|value_id| self.object_for_value(value_id))
+            .and_then(|value_id| self.object_for_value(value_id, space))
     }
 
     pub fn object(&self, id: ObjectId) -> Option<&ObjectFact> {
         self.objects.get(&id)
     }
 
-    pub fn escaped_unknown_object(&self) -> Option<ObjectId> {
-        self.escaped_unknown
+    pub fn escaped_unknown_object(&self, space: SpaceId) -> Option<ObjectId> {
+        self.escaped_unknown.get(&ObjectSpaceId(space)).copied()
+    }
+
+    pub fn memory_spaces(&self) -> impl Iterator<Item = SpaceId> + '_ {
+        self.escaped_unknown.keys().map(|space| space.0)
     }
 }
 
@@ -198,11 +341,28 @@ impl RelativeMemoryAddress {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MemoryLocation {
+    pub space: SpaceId,
     pub object: ObjectId,
     pub address: RelativeMemoryAddress,
     pub size: u32,
+}
+
+impl Ord for MemoryLocation {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        memory_space_order(self.space)
+            .cmp(&memory_space_order(other.space))
+            .then_with(|| self.object.cmp(&other.object))
+            .then_with(|| self.address.cmp(&other.address))
+            .then_with(|| self.size.cmp(&other.size))
+    }
+}
+
+impl PartialOrd for MemoryLocation {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -618,6 +778,7 @@ pub struct StructuredMemoryAccessFact {
     pub id: StructuredAccessId,
     pub block_addr: u64,
     pub op_index: usize,
+    pub space: SpaceId,
     pub object: ObjectId,
     pub address: ValueId,
     pub value: Option<ValueId>,
@@ -677,6 +838,7 @@ pub struct MemoryAccessCertificate {
     pub access: StructuredAccessId,
     pub block_addr: u64,
     pub op_index: usize,
+    pub space: SpaceId,
     pub object: ObjectId,
     pub address: ValueId,
     pub value: Option<ValueId>,
@@ -687,6 +849,7 @@ pub struct MemoryAccessCertificate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StackSlotCertificate {
     pub object: ObjectId,
+    pub space: SpaceId,
     pub base: StackAddressBase,
     pub offset: i64,
     pub size: Option<u32>,
@@ -1092,7 +1255,8 @@ fn collect_prepared_assumption_usage(
             }
             (AssumptionSubject::StackSlot { base, offset }, _) => {
                 let Some((root, object)) =
-                    objects.stack_objects.iter().find_map(|(root, object)| {
+                    objects.stack_objects.iter().find_map(|(key, object)| {
+                        let root = key.root;
                         let matches_base = matches!(
                             (base.as_str(), root.base),
                             ("bp", StackAddressBase::FramePointer)
@@ -1102,7 +1266,8 @@ fn collect_prepared_assumption_usage(
                                 | ("stack", StackAddressBase::StackPointer)
                                 | ("rsp", StackAddressBase::StackPointer)
                         );
-                        (matches_base && root.offset == *offset).then_some((*root, *object))
+                        (key.space == SpaceId::Ram && matches_base && root.offset == *offset)
+                            .then_some((root, *object))
                     })
                 else {
                     usage.mark_ignored(assumption);
@@ -1130,25 +1295,29 @@ struct ObjectModelBuilder<'a> {
     facts: Option<&'a DecompilePrepFacts>,
     addresses: &'a AddressProvenanceFacts,
     objects: BTreeMap<ObjectId, ObjectFact>,
-    value_objects: BTreeMap<ValueId, ObjectId>,
-    stack_objects: BTreeMap<StackAddressRoot, ObjectId>,
-    parameter_objects: BTreeMap<usize, ObjectId>,
+    value_objects: BTreeMap<MemoryObjectKey, ObjectId>,
+    stack_objects: BTreeMap<StackObjectKey, ObjectId>,
+    parameter_objects: BTreeMap<ParameterObjectKey, ObjectId>,
     global_objects: BTreeMap<GlobalObjectKey, ObjectId>,
-    escaped_unknown: ObjectId,
+    escaped_unknown: BTreeMap<ObjectSpaceId, ObjectId>,
     next_object_id: u32,
 }
 
 impl<'a> ObjectModelBuilder<'a> {
     fn new(facts: Option<&'a DecompilePrepFacts>, addresses: &'a AddressProvenanceFacts) -> Self {
-        let escaped_unknown = ObjectId(0);
+        let escaped_unknown_id = ObjectId(0);
         let mut objects = BTreeMap::new();
         objects.insert(
-            escaped_unknown,
+            escaped_unknown_id,
             ObjectFact {
-                id: escaped_unknown,
-                kind: ObjectKind::EscapedUnknown,
+                id: escaped_unknown_id,
+                kind: ObjectKind::EscapedUnknown {
+                    space: SpaceId::Ram,
+                },
             },
         );
+        let mut escaped_unknown = BTreeMap::new();
+        escaped_unknown.insert(ObjectSpaceId(SpaceId::Ram), escaped_unknown_id);
         Self {
             facts,
             addresses,
@@ -1169,10 +1338,10 @@ impl<'a> ObjectModelBuilder<'a> {
             stack_roots.sort_unstable();
             stack_roots.dedup();
             for root in stack_roots {
-                self.ensure_stack_object(root);
+                self.ensure_stack_object(root, SpaceId::Ram);
             }
             for var in facts.stack_address_roots.keys() {
-                let _ = self.object_for_address_value(graph, var, "ram");
+                let _ = self.object_for_address_value(graph, var, SpaceId::Ram);
             }
         }
         let parameter_indices = self
@@ -1182,7 +1351,7 @@ impl<'a> ObjectModelBuilder<'a> {
             .map(|expression| expression.parameter)
             .collect::<BTreeSet<_>>();
         for parameter in parameter_indices {
-            self.ensure_parameter_object(parameter);
+            self.ensure_parameter_object(parameter, SpaceId::Ram);
         }
 
         for block in function.blocks() {
@@ -1195,7 +1364,7 @@ impl<'a> ObjectModelBuilder<'a> {
                     | SSAOp::AtomicCAS { addr, space, .. }
                     | SSAOp::LoadGuarded { addr, space, .. }
                     | SSAOp::StoreGuarded { addr, space, .. } => {
-                        let _ = self.object_for_address_value(graph, addr, space);
+                        let _ = self.object_for_address_value(graph, addr, *space);
                     }
                     _ => {}
                 }
@@ -1208,7 +1377,7 @@ impl<'a> ObjectModelBuilder<'a> {
             stack_objects: self.stack_objects,
             parameter_objects: self.parameter_objects,
             global_objects: self.global_objects,
-            escaped_unknown: Some(self.escaped_unknown),
+            escaped_unknown: self.escaped_unknown,
         }
     }
 
@@ -1216,42 +1385,43 @@ impl<'a> ObjectModelBuilder<'a> {
         &mut self,
         graph: &SsaGraph,
         value: &SSAVar,
-        space: &str,
+        space: SpaceId,
     ) -> ObjectId {
         let Some(value_id) = graph.value_id_for_var(value) else {
-            return self.escaped_unknown;
+            return self.ensure_escaped_unknown(space);
         };
-        if let Some(object) = self.value_objects.get(&value_id).copied() {
+        let key = MemoryObjectKey {
+            value: value_id,
+            space,
+        };
+        if let Some(object) = self.value_objects.get(&key).copied() {
             return object;
         }
 
-        if let Some(root) = resolve_stack_root(self.facts, value) {
-            let object = self.ensure_stack_object(root);
-            self.value_objects.insert(value_id, object);
-            return object;
-        }
-
-        if let Some(expression) = self.addresses.parameter_expression(value_id) {
-            let object = self.ensure_parameter_object(expression.parameter);
-            self.value_objects.insert(value_id, object);
-            return object;
-        }
-
-        if let Some(address) = resolve_const_value(self.facts, value) {
-            let object = self.ensure_global_object(GlobalObjectKey {
-                space: space.to_string(),
-                address,
-            });
-            self.value_objects.insert(value_id, object);
-            return object;
-        }
-
-        self.value_objects.insert(value_id, self.escaped_unknown);
-        self.escaped_unknown
+        let _ = self.ensure_escaped_unknown(space);
+        let object = if space == SpaceId::Ram {
+            if let Some(root) = resolve_stack_root(self.facts, value) {
+                self.ensure_stack_object(root, space)
+            } else if let Some(expression) = self.addresses.parameter_expression(value_id) {
+                self.ensure_parameter_object(expression.parameter, space)
+            } else if let Some(address) = resolve_const_value(self.facts, value) {
+                self.ensure_global_object(GlobalObjectKey { space, address })
+            } else {
+                self.ensure_escaped_unknown(space)
+            }
+        } else if let Some(address) = resolve_const_value(self.facts, value) {
+            self.ensure_global_object(GlobalObjectKey { space, address })
+        } else {
+            self.ensure_escaped_unknown(space)
+        };
+        self.value_objects.insert(key, object);
+        object
     }
 
-    fn ensure_stack_object(&mut self, root: StackAddressRoot) -> ObjectId {
-        if let Some(object) = self.stack_objects.get(&root).copied() {
+    fn ensure_stack_object(&mut self, root: StackAddressRoot, space: SpaceId) -> ObjectId {
+        debug_assert_eq!(space, SpaceId::Ram);
+        let key = StackObjectKey { root, space };
+        if let Some(object) = self.stack_objects.get(&key).copied() {
             return object;
         }
         let id = self.alloc_object_id();
@@ -1260,12 +1430,13 @@ impl<'a> ObjectModelBuilder<'a> {
             ObjectFact {
                 id,
                 kind: ObjectKind::StackSlot {
+                    space,
                     base: root.base,
                     offset: root.offset,
                 },
             },
         );
-        self.stack_objects.insert(root, id);
+        self.stack_objects.insert(key, id);
         id
     }
 
@@ -1279,7 +1450,7 @@ impl<'a> ObjectModelBuilder<'a> {
             ObjectFact {
                 id,
                 kind: ObjectKind::Global {
-                    space: key.space.clone(),
+                    space: key.space,
                     address: key.address,
                 },
             },
@@ -1288,8 +1459,10 @@ impl<'a> ObjectModelBuilder<'a> {
         id
     }
 
-    fn ensure_parameter_object(&mut self, index: usize) -> ObjectId {
-        if let Some(object) = self.parameter_objects.get(&index).copied() {
+    fn ensure_parameter_object(&mut self, index: usize, space: SpaceId) -> ObjectId {
+        debug_assert_eq!(space, SpaceId::Ram);
+        let key = ParameterObjectKey { index, space };
+        if let Some(object) = self.parameter_objects.get(&key).copied() {
             return object;
         }
         let id = self.alloc_object_id();
@@ -1297,10 +1470,27 @@ impl<'a> ObjectModelBuilder<'a> {
             id,
             ObjectFact {
                 id,
-                kind: ObjectKind::Parameter { index },
+                kind: ObjectKind::Parameter { space, index },
             },
         );
-        self.parameter_objects.insert(index, id);
+        self.parameter_objects.insert(key, id);
+        id
+    }
+
+    fn ensure_escaped_unknown(&mut self, space: SpaceId) -> ObjectId {
+        let key = ObjectSpaceId(space);
+        if let Some(object) = self.escaped_unknown.get(&key).copied() {
+            return object;
+        }
+        let id = self.alloc_object_id();
+        self.objects.insert(
+            id,
+            ObjectFact {
+                id,
+                kind: ObjectKind::EscapedUnknown { space },
+            },
+        );
+        self.escaped_unknown.insert(key, id);
         id
     }
 
@@ -1341,7 +1531,6 @@ fn collect_access_summaries(
     call_sites: &CallSiteFacts,
 ) -> BTreeMap<InstId, AccessSummary> {
     let mut summaries = BTreeMap::new();
-    let escaped_unknown = object_model.escaped_unknown_object().unwrap_or(ObjectId(0));
 
     for block in function.blocks() {
         for (op_idx, op) in block.ops.iter().enumerate() {
@@ -1364,7 +1553,7 @@ fn collect_access_summaries(
                         object_model,
                         graph,
                         addr,
-                        space,
+                        *space,
                         dst.size,
                     ));
                 }
@@ -1378,7 +1567,7 @@ fn collect_access_summaries(
                         object_model,
                         graph,
                         addr,
-                        space,
+                        *space,
                         val.size,
                     ));
                 }
@@ -1391,7 +1580,7 @@ fn collect_access_summaries(
                         object_model,
                         graph,
                         addr,
-                        space,
+                        *space,
                         val.size,
                     );
                     uses.push(location.clone());
@@ -1410,7 +1599,7 @@ fn collect_access_summaries(
                         object_model,
                         graph,
                         addr,
-                        space,
+                        *space,
                         expected.size.max(replacement.size),
                     );
                     uses.push(location.clone());
@@ -1418,13 +1607,19 @@ fn collect_access_summaries(
                 }
                 SSAOp::Call { .. } | SSAOp::CallInd { .. } => {
                     if call_sites.by_inst.contains_key(&inst_id) {
-                        let location = MemoryLocation {
-                            object: escaped_unknown,
-                            address: RelativeMemoryAddress::Unknown,
-                            size: 0,
-                        };
-                        uses.push(location.clone());
-                        defs.push(location);
+                        for space in object_model.memory_spaces() {
+                            let Some(object) = object_model.escaped_unknown_object(space) else {
+                                continue;
+                            };
+                            let location = MemoryLocation {
+                                space,
+                                object,
+                                address: RelativeMemoryAddress::Unknown,
+                                size: 0,
+                            };
+                            uses.push(location.clone());
+                            defs.push(location);
+                        }
                     }
                 }
                 _ => {}
@@ -1649,6 +1844,12 @@ pub(crate) fn memory_locations_may_alias(
     let Some(right_object) = objects.object(right.object) else {
         return true;
     };
+    if left_object.kind.space() != left.space || right_object.kind.space() != right.space {
+        return true;
+    }
+    if left.space != right.space {
+        return false;
+    }
     if left.object == right.object {
         return relative_memory_ranges_may_overlap(
             &left.address,
@@ -1658,7 +1859,7 @@ pub(crate) fn memory_locations_may_alias(
         );
     }
     match (&left_object.kind, &right_object.kind) {
-        (ObjectKind::EscapedUnknown, _) | (_, ObjectKind::EscapedUnknown) => true,
+        (ObjectKind::EscapedUnknown { .. }, _) | (_, ObjectKind::EscapedUnknown { .. }) => true,
         (
             ObjectKind::Parameter { .. },
             ObjectKind::StackSlot { .. } | ObjectKind::FrameObject { .. },
@@ -1670,36 +1871,44 @@ pub(crate) fn memory_locations_may_alias(
         (ObjectKind::Parameter { .. }, _) | (_, ObjectKind::Parameter { .. }) => true,
         (
             ObjectKind::Global {
-                address: left_base, ..
+                space: left_space,
+                address: left_base,
             },
             ObjectKind::Global {
+                space: right_space,
                 address: right_base,
-                ..
             },
-        ) => absolute_memory_ranges_may_overlap(
-            i128::from(*left_base),
-            &left.address,
-            left.size,
-            i128::from(*right_base),
-            &right.address,
-            right.size,
-        ),
+        ) => {
+            left_space == right_space
+                && absolute_memory_ranges_may_overlap(
+                    i128::from(*left_base),
+                    &left.address,
+                    left.size,
+                    i128::from(*right_base),
+                    &right.address,
+                    right.size,
+                )
+        }
         (
             ObjectKind::StackSlot {
                 base: left_base,
                 offset: left_offset,
+                ..
             }
             | ObjectKind::FrameObject {
                 base: left_base,
                 offset: left_offset,
+                ..
             },
             ObjectKind::StackSlot {
                 base: right_base,
                 offset: right_offset,
+                ..
             }
             | ObjectKind::FrameObject {
                 base: right_base,
                 offset: right_offset,
+                ..
             },
         ) if left_base == right_base => absolute_memory_ranges_may_overlap(
             i128::from(*left_offset),
@@ -1713,9 +1922,14 @@ pub(crate) fn memory_locations_may_alias(
             ObjectKind::StackSlot { .. } | ObjectKind::FrameObject { .. },
             ObjectKind::StackSlot { .. } | ObjectKind::FrameObject { .. },
         ) => true,
-        (ObjectKind::HeapAlloc { call_site: left }, ObjectKind::HeapAlloc { call_site: right }) => {
-            left == right
-        }
+        (
+            ObjectKind::HeapAlloc {
+                call_site: left, ..
+            },
+            ObjectKind::HeapAlloc {
+                call_site: right, ..
+            },
+        ) => left == right,
         _ => false,
     }
 }
@@ -2802,6 +3016,7 @@ fn collect_prepared_function_certificates(
                     access: *id,
                     block_addr: fact.block_addr,
                     op_index: fact.op_index,
+                    space: fact.space,
                     object: fact.object,
                     address: fact.address,
                     value: fact.value,
@@ -2816,21 +3031,31 @@ fn collect_prepared_function_certificates(
         .objects
         .iter()
         .filter_map(|(object, fact)| match fact.kind {
-            ObjectKind::StackSlot { base, offset } | ObjectKind::FrameObject { base, offset } => {
-                Some((
-                    *object,
-                    StackSlotCertificate {
-                        object: *object,
-                        base,
-                        offset,
-                        size: None,
-                    },
-                ))
+            ObjectKind::StackSlot {
+                space: SpaceId::Ram,
+                base,
+                offset,
             }
-            ObjectKind::Global { .. }
+            | ObjectKind::FrameObject {
+                space: SpaceId::Ram,
+                base,
+                offset,
+            } => Some((
+                *object,
+                StackSlotCertificate {
+                    object: *object,
+                    space: SpaceId::Ram,
+                    base,
+                    offset,
+                    size: None,
+                },
+            )),
+            ObjectKind::StackSlot { .. }
+            | ObjectKind::FrameObject { .. }
+            | ObjectKind::Global { .. }
             | ObjectKind::Parameter { .. }
             | ObjectKind::HeapAlloc { .. }
-            | ObjectKind::EscapedUnknown => None,
+            | ObjectKind::EscapedUnknown { .. } => None,
         })
         .collect();
 
@@ -3762,6 +3987,63 @@ fn unique_return_value_phi_for_block(block: &crate::function::SSABlock) -> Optio
     matches.next().is_none().then_some(first)
 }
 
+fn ram_memory_access_matches_source(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    objects: &ObjectModel,
+    access: &StructuredMemoryAccessFact,
+) -> bool {
+    if access.space != SpaceId::Ram
+        || !access.provenance_complete
+        || access.id.ordinal != 0
+        || graph.op_site_for_inst(access.id.inst) != Some((access.block_addr, access.op_index))
+        || objects.object_for_value(access.address, SpaceId::Ram) != Some(access.object)
+        || objects
+            .object(access.object)
+            .is_none_or(|object| object.kind.space() != SpaceId::Ram)
+    {
+        return false;
+    }
+    let Some(graph_inst) = graph.inst(access.id.inst) else {
+        return false;
+    };
+    let Some(prepared_op) = function
+        .get_block(access.block_addr)
+        .and_then(|block| block.ops.get(access.op_index))
+    else {
+        return false;
+    };
+    let InstPayload::Op(graph_op) = &graph_inst.payload else {
+        return false;
+    };
+    if graph_op != prepared_op {
+        return false;
+    }
+    match graph_op {
+        SSAOp::Load {
+            space: SpaceId::Ram,
+            dst,
+            addr,
+        } => {
+            !access.is_write
+                && graph.value_id_for_var(addr) == Some(access.address)
+                && graph.value_id_for_var(dst) == access.value
+                && access.width == dst.size
+        }
+        SSAOp::Store {
+            space: SpaceId::Ram,
+            addr,
+            val,
+        } => {
+            access.is_write
+                && graph.value_id_for_var(addr) == Some(access.address)
+                && graph.value_id_for_var(val) == access.value
+                && access.width == val.size
+        }
+        _ => false,
+    }
+}
+
 fn collect_stack_reload_source_certificates(
     function: &SSAFunction,
     graph: &SsaGraph,
@@ -3773,11 +4055,9 @@ fn collect_stack_reload_source_certificates(
     let mut certificates = BTreeMap::new();
     let mut ready = VecDeque::new();
 
-    for access in structured
-        .memory_accesses
-        .values()
-        .filter(|access| !access.is_write)
-    {
+    for access in structured.memory_accesses.values().filter(|access| {
+        !access.is_write && ram_memory_access_matches_source(function, graph, objects, access)
+    }) {
         let Some(value) = access.value else {
             continue;
         };
@@ -3864,11 +4144,9 @@ fn collect_stack_store_sources(
     structured: &StructuredDataflowFacts,
 ) -> BTreeMap<MemoryVersion, StackStoreSource> {
     let mut sources = BTreeMap::new();
-    for access in structured
-        .memory_accesses
-        .values()
-        .filter(|access| access.is_write)
-    {
+    for access in structured.memory_accesses.values().filter(|access| {
+        access.is_write && ram_memory_access_matches_source(function, graph, objects, access)
+    }) {
         let Some(value) = access.value else {
             continue;
         };
@@ -3935,7 +4213,11 @@ fn unique_memory_def_for_access<'a>(
         .get(&access.id.inst)
         .into_iter()
         .flatten()
-        .filter(|def| def.location.object == access.object && def.location.size == access.width);
+        .filter(|def| {
+            def.location.space == access.space
+                && def.location.object == access.object
+                && def.location.size == access.width
+        });
     let first = matches.next()?;
     matches.next().is_none().then_some(first)
 }
@@ -3950,7 +4232,9 @@ fn unique_memory_use_for_access<'a>(
         .into_iter()
         .flatten()
         .filter(|use_fact| {
-            use_fact.location.object == access.object && use_fact.location.size == access.width
+            use_fact.location.space == access.space
+                && use_fact.location.object == access.object
+                && use_fact.location.size == access.width
         });
     let first = matches.next()?;
     matches.next().is_none().then_some(first)
@@ -4006,6 +4290,7 @@ fn collect_call_result_certificates(
         };
         let input = merge_call_result_flow_predecessors(function, &out_states, block_addr);
         let output = process_call_result_flow_block(
+            function,
             block,
             graph,
             objects,
@@ -4066,6 +4351,7 @@ fn merge_call_result_flow_predecessors(
 
 #[allow(clippy::too_many_arguments)]
 fn process_call_result_flow_block(
+    function: &SSAFunction,
     block: &crate::FunctionSSABlock,
     graph: &SsaGraph,
     objects: &ObjectModel,
@@ -4184,11 +4470,17 @@ fn process_call_result_flow_block(
                     cert,
                 );
             }
-            SSAOp::Store { val, .. } => {
+            SSAOp::Store {
+                space: SpaceId::Ram,
+                val,
+                ..
+            } => {
                 let value = graph.value_id_for_var(val);
                 let stack_access = value
                     .and_then(|value| {
                         stack_memory_access_at(
+                            function,
+                            graph,
                             structured,
                             objects,
                             block.addr,
@@ -4199,7 +4491,7 @@ fn process_call_result_flow_block(
                     })
                     .or_else(|| {
                         stack_memory_access_at(
-                            structured, objects, block.addr, op_index, true, None,
+                            function, graph, structured, objects, block.addr, op_index, true, None,
                         )
                     });
                 let Some((object, offset, _access)) = stack_access else {
@@ -4227,11 +4519,17 @@ fn process_call_result_flow_block(
                     cert.owner = Some(ValueOwner::StackSlot { object, offset });
                 });
             }
-            SSAOp::Load { dst, .. } => {
+            SSAOp::Load {
+                space: SpaceId::Ram,
+                dst,
+                ..
+            } => {
                 let Some(dst_value) = graph.value_id_for_var(dst) else {
                     continue;
                 };
                 let Some((object, offset, access)) = stack_memory_access_at(
+                    function,
+                    graph,
                     structured,
                     objects,
                     block.addr,
@@ -4300,6 +4598,8 @@ fn insert_call_result_certificate(
 }
 
 fn stack_memory_access_at(
+    function: &SSAFunction,
+    graph: &SsaGraph,
     structured: &StructuredDataflowFacts,
     objects: &ObjectModel,
     block_addr: u64,
@@ -4315,6 +4615,7 @@ fn stack_memory_access_at(
                 && access.op_index == op_index
                 && access.is_write == is_write
                 && value.is_none_or(|value| access.value == Some(value))
+                && ram_memory_access_matches_source(function, graph, objects, access)
         })
         .filter_map(|(access_id, access)| {
             stack_object_offset(objects, access.object)
@@ -4877,9 +5178,13 @@ fn collect_structured_memory_access_facts(
             };
             let mut ordinal = 0u32;
             match op {
-                SSAOp::Load { dst, addr, .. }
-                | SSAOp::LoadLinked { dst, addr, .. }
-                | SSAOp::LoadGuarded { dst, addr, .. } => {
+                SSAOp::Load { dst, addr, space }
+                | SSAOp::LoadLinked {
+                    dst, addr, space, ..
+                }
+                | SSAOp::LoadGuarded {
+                    dst, addr, space, ..
+                } => {
                     if let Some(address) = graph.value_id_for_var(addr) {
                         insert_raw_memory_subeffect(
                             &mut access_facts,
@@ -4890,13 +5195,17 @@ fn collect_structured_memory_access_facts(
                             block.addr,
                             op_index,
                             address,
+                            *space,
                             graph.value_id_for_var(dst),
                             false,
                             dst.size,
                         );
                     }
                 }
-                SSAOp::Store { addr, val, .. } | SSAOp::StoreGuarded { addr, val, .. } => {
+                SSAOp::Store { addr, val, space }
+                | SSAOp::StoreGuarded {
+                    addr, val, space, ..
+                } => {
                     if let Some(address) = graph.value_id_for_var(addr) {
                         insert_raw_memory_subeffect(
                             &mut access_facts,
@@ -4907,13 +5216,16 @@ fn collect_structured_memory_access_facts(
                             block.addr,
                             op_index,
                             address,
+                            *space,
                             graph.value_id_for_var(val),
                             true,
                             val.size,
                         );
                     }
                 }
-                SSAOp::StoreConditional { addr, val, .. } => {
+                SSAOp::StoreConditional {
+                    addr, val, space, ..
+                } => {
                     if let Some(address) = graph.value_id_for_var(addr) {
                         insert_raw_memory_subeffect(
                             &mut access_facts,
@@ -4924,6 +5236,7 @@ fn collect_structured_memory_access_facts(
                             block.addr,
                             op_index,
                             address,
+                            *space,
                             None,
                             false,
                             val.size,
@@ -4937,6 +5250,7 @@ fn collect_structured_memory_access_facts(
                             block.addr,
                             op_index,
                             address,
+                            *space,
                             graph.value_id_for_var(val),
                             true,
                             val.size,
@@ -4947,6 +5261,7 @@ fn collect_structured_memory_access_facts(
                     dst,
                     addr,
                     replacement,
+                    space,
                     ..
                 } => {
                     if let Some(address) = graph.value_id_for_var(addr) {
@@ -4959,6 +5274,7 @@ fn collect_structured_memory_access_facts(
                             block.addr,
                             op_index,
                             address,
+                            *space,
                             graph.value_id_for_var(dst),
                             false,
                             replacement.size,
@@ -4972,6 +5288,7 @@ fn collect_structured_memory_access_facts(
                             block.addr,
                             op_index,
                             address,
+                            *space,
                             graph.value_id_for_var(replacement),
                             true,
                             replacement.size,
@@ -4995,6 +5312,7 @@ fn insert_raw_memory_subeffect(
     block_addr: u64,
     op_index: usize,
     address: ValueId,
+    space: SpaceId,
     value: Option<ValueId>,
     is_write: bool,
     width: u32,
@@ -5018,13 +5336,19 @@ fn insert_raw_memory_subeffect(
     };
     let matching = annotations
         .iter()
-        .filter(|location| location.size == width)
+        .filter(|location| {
+            location.size == width
+                && location.space == space
+                && objects
+                    .object(location.object)
+                    .is_some_and(|object| object.kind.space() == space)
+        })
         .collect::<Vec<_>>();
     let provenance_complete = annotations.len() == 1 && matching.len() == 1;
     let object = matching
         .first()
         .map(|location| location.object)
-        .or_else(|| objects.escaped_unknown_object())
+        .or_else(|| objects.escaped_unknown_object(space))
         .unwrap_or(ObjectId(0));
     insert_structured_memory_access(
         access_facts,
@@ -5032,6 +5356,7 @@ fn insert_raw_memory_subeffect(
         ordinal,
         block_addr,
         op_index,
+        space,
         object,
         address,
         value,
@@ -5048,6 +5373,7 @@ fn insert_structured_memory_access(
     ordinal: &mut u32,
     block_addr: u64,
     op_index: usize,
+    space: SpaceId,
     object: ObjectId,
     address: ValueId,
     value: Option<ValueId>,
@@ -5066,6 +5392,7 @@ fn insert_structured_memory_access(
             id,
             block_addr,
             op_index,
+            space,
             object,
             address,
             value,
@@ -5584,7 +5911,12 @@ fn collect_stack_call_argument_values(
         ) {
             break;
         }
-        let SSAOp::Store { val, .. } = op else {
+        let SSAOp::Store {
+            space: SpaceId::Ram,
+            val,
+            ..
+        } = op
+        else {
             continue;
         };
         let Some(value) = graph.value_id_for_var(val) else {
@@ -5592,7 +5924,10 @@ fn collect_stack_call_argument_values(
         };
 
         for (access_id, access) in structured.memory_accesses.iter().filter(|(_, access)| {
-            access.block_addr == block_addr && access.op_index == producer_idx && access.is_write
+            access.block_addr == block_addr
+                && access.op_index == producer_idx
+                && access.is_write
+                && ram_memory_access_matches_source(function, graph, objects, access)
         }) {
             if access.value != Some(value) {
                 continue;
@@ -5643,12 +5978,16 @@ fn stack_pointer_object_offset(objects: &ObjectModel, object: ObjectId) -> Optio
     let fact = objects.object(object)?;
     match fact.kind {
         ObjectKind::StackSlot {
+            space: SpaceId::Ram,
             base: StackAddressBase::StackPointer,
             offset,
+            ..
         }
         | ObjectKind::FrameObject {
+            space: SpaceId::Ram,
             base: StackAddressBase::StackPointer,
             offset,
+            ..
         } => Some(offset),
         _ => None,
     }
@@ -5661,9 +6000,16 @@ fn stack_object_offset(objects: &ObjectModel, object: ObjectId) -> Option<i64> {
 fn stack_object_root(objects: &ObjectModel, object: ObjectId) -> Option<(StackAddressBase, i64)> {
     let fact = objects.object(object)?;
     match fact.kind {
-        ObjectKind::StackSlot { base, offset } | ObjectKind::FrameObject { base, offset } => {
-            Some((base, offset))
+        ObjectKind::StackSlot {
+            space: SpaceId::Ram,
+            base,
+            offset,
         }
+        | ObjectKind::FrameObject {
+            space: SpaceId::Ram,
+            base,
+            offset,
+        } => Some((base, offset)),
         _ => None,
     }
 }
@@ -6180,32 +6526,38 @@ fn memory_location_for_addr(
     object_model: &ObjectModel,
     graph: &SsaGraph,
     addr: &SSAVar,
-    space: &str,
+    space: SpaceId,
     size: u32,
 ) -> MemoryLocation {
-    let parameter_expression = graph
-        .value_id_for_var(addr)
-        .and_then(|value| addresses.parameter_expression(value));
+    let parameter_expression = (space == SpaceId::Ram)
+        .then(|| {
+            graph
+                .value_id_for_var(addr)
+                .and_then(|value| addresses.parameter_expression(value))
+        })
+        .flatten();
     let object = object_model
-        .object_for_var(graph, addr)
+        .object_for_var(graph, addr, space)
         .or_else(|| {
-            resolve_stack_root(prep_facts, addr)
-                .and_then(|root| object_model.stack_objects.get(&root).copied())
+            resolve_stack_root(prep_facts, addr).and_then(|root| {
+                object_model
+                    .stack_objects
+                    .get(&StackObjectKey { root, space })
+                    .copied()
+            })
         })
         .or_else(|| {
             resolve_const_value(prep_facts, addr).and_then(|address| {
                 object_model
                     .global_objects
-                    .get(&GlobalObjectKey {
-                        space: space.to_string(),
-                        address,
-                    })
+                    .get(&GlobalObjectKey { space, address })
                     .copied()
             })
         })
-        .or_else(|| object_model.escaped_unknown_object())
+        .or_else(|| object_model.escaped_unknown_object(space))
         .unwrap_or(ObjectId(0));
     MemoryLocation {
+        space,
         object,
         address: parameter_expression.map_or_else(
             || {
@@ -6307,13 +6659,14 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        ControlGuard, MemoryDefFact, MemoryLocation, MemorySSAFacts, MemoryUseFact, MemoryVersion,
-        ObjectId, ObjectModel, RelativeMemoryAddress, StructuredAccessId,
+        ControlGuard, GlobalObjectKey, MemoryDefFact, MemoryLocation, MemorySSAFacts,
+        MemoryUseFact, MemoryVersion, ObjectFact, ObjectId, ObjectKind, ObjectModel,
+        RelativeMemoryAddress, StructuredAccessId, memory_locations_may_alias,
     };
     use crate::{
-        CanonicalStorageId, CanonicalStorageSpace, InstId, SSAVar, SemanticObligationKind,
-        SourceAbiParameterSpec, SourceFunctionInterface, SourceFunctionReturn, SsaArtifact,
-        ValueId,
+        CanonicalStorageId, CanonicalStorageSpace, DecompilePrepFacts, InstId, SSAVar,
+        SemanticObligationKind, SourceAbiParameterSpec, SourceFunctionInterface,
+        SourceFunctionReturn, SsaArtifact, StackAddressBase, StackAddressRoot, ValueId,
     };
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
 
@@ -6325,12 +6678,486 @@ mod tests {
         Varnode::constant(value, 8)
     }
 
+    fn dual_space_artifact(
+        mut prefix: Vec<R2ILOp>,
+        addr: Varnode,
+        arch: Option<&ArchSpec>,
+    ) -> SsaArtifact {
+        prefix.push(R2ILOp::Load {
+            dst: Varnode::unique(0x100, 8),
+            space: SpaceId::Ram,
+            addr: addr.clone(),
+        });
+        prefix.push(R2ILOp::Load {
+            dst: Varnode::unique(0x108, 8),
+            space: SpaceId::Custom(7),
+            addr,
+        });
+        SsaArtifact::for_symbolic(
+            &[R2ILBlock {
+                addr: 0x1000,
+                size: 4,
+                ops: prefix,
+                switch_info: None,
+                op_metadata: Default::default(),
+            }],
+            arch,
+        )
+        .expect("dual-space artifact")
+    }
+
+    fn dual_space_locations(artifact: &SsaArtifact) -> (MemoryLocation, MemoryLocation) {
+        let block = artifact.get_block(0x1000).expect("dual-space block");
+        let mut loads = block
+            .ops
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| matches!(op, crate::SSAOp::Load { .. }));
+        let ram_index = loads.next().expect("RAM load").0;
+        let custom_index = loads.next().expect("Custom load").0;
+        let ram = artifact
+            .memory_uses_for_op_site(0x1000, ram_index)
+            .and_then(|uses| uses.first())
+            .expect("RAM location")
+            .location
+            .clone();
+        let custom = artifact
+            .memory_uses_for_op_site(0x1000, custom_index)
+            .and_then(|uses| uses.first())
+            .expect("Custom location")
+            .location
+            .clone();
+        (ram, custom)
+    }
+
+    fn assert_dual_space_objects_are_distinct(artifact: &SsaArtifact) {
+        let (ram, custom) = dual_space_locations(artifact);
+        assert_eq!(ram.space, SpaceId::Ram);
+        assert_eq!(custom.space, SpaceId::Custom(7));
+        assert_ne!(ram.object, custom.object);
+        assert_eq!(
+            artifact
+                .objects()
+                .object(ram.object)
+                .map(|fact| fact.kind.space()),
+            Some(SpaceId::Ram)
+        );
+        assert_eq!(
+            artifact
+                .objects()
+                .object(custom.object)
+                .map(|fact| fact.kind.space()),
+            Some(SpaceId::Custom(7))
+        );
+        assert!(!memory_locations_may_alias(
+            artifact.objects(),
+            &ram,
+            &custom
+        ));
+    }
+
+    #[test]
+    fn same_value_id_is_space_keyed_for_global_stack_parameter_and_unknown_objects() {
+        let global = dual_space_artifact(Vec::new(), Varnode::constant(0x4000, 8), None);
+        assert_dual_space_objects_are_distinct(&global);
+        let (ram_global, custom_global) = dual_space_locations(&global);
+        assert!(matches!(
+            global
+                .objects()
+                .object(ram_global.object)
+                .map(|fact| &fact.kind),
+            Some(ObjectKind::Global {
+                space: SpaceId::Ram,
+                address: 0x4000
+            })
+        ));
+        assert!(matches!(
+            global
+                .objects()
+                .object(custom_global.object)
+                .map(|fact| &fact.kind),
+            Some(ObjectKind::Global {
+                space: SpaceId::Custom(7),
+                address: 0x4000
+            })
+        ));
+
+        let mut arch = ArchSpec::new("aarch64");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("x0", 0, 8));
+        arch.add_register(RegisterDef::new("sp", 16, 8));
+
+        let parameter = dual_space_artifact(Vec::new(), Varnode::register(0, 8), Some(&arch));
+        assert_dual_space_objects_are_distinct(&parameter);
+        let (ram_parameter, custom_parameter) = dual_space_locations(&parameter);
+        assert!(matches!(
+            parameter
+                .objects()
+                .object(ram_parameter.object)
+                .map(|fact| &fact.kind),
+            Some(ObjectKind::Parameter {
+                space: SpaceId::Ram,
+                index: 0
+            })
+        ));
+        assert!(matches!(
+            parameter
+                .objects()
+                .object(custom_parameter.object)
+                .map(|fact| &fact.kind),
+            Some(ObjectKind::EscapedUnknown {
+                space: SpaceId::Custom(7)
+            })
+        ));
+        assert_eq!(custom_parameter.address, RelativeMemoryAddress::Unknown);
+
+        let stack = dual_space_artifact(Vec::new(), Varnode::unique(0x80, 8), Some(&arch));
+        let stack_addr = stack
+            .get_block(0x1000)
+            .and_then(|block| {
+                block.ops.iter().find_map(|op| match op {
+                    crate::SSAOp::Load { addr, .. } => Some(addr.clone()),
+                    _ => None,
+                })
+            })
+            .expect("stack address");
+        let mut stack_facts = DecompilePrepFacts::default();
+        stack_facts.stack_address_roots.insert(
+            stack_addr.clone(),
+            StackAddressRoot {
+                base: StackAddressBase::StackPointer,
+                offset: -8,
+            },
+        );
+        let stack_objects = super::ObjectModelBuilder::new(Some(&stack_facts), stack.addresses())
+            .build(stack.function(), stack.graph());
+        let ram_stack = super::memory_location_for_addr(
+            Some(&stack_facts),
+            stack.addresses(),
+            &stack_objects,
+            stack.graph(),
+            &stack_addr,
+            SpaceId::Ram,
+            8,
+        );
+        let custom_stack = super::memory_location_for_addr(
+            Some(&stack_facts),
+            stack.addresses(),
+            &stack_objects,
+            stack.graph(),
+            &stack_addr,
+            SpaceId::Custom(7),
+            8,
+        );
+        assert_ne!(ram_stack.object, custom_stack.object);
+        assert!(!memory_locations_may_alias(
+            &stack_objects,
+            &ram_stack,
+            &custom_stack
+        ));
+        let ram_stack_kind = stack_objects
+            .object(ram_stack.object)
+            .map(|fact| &fact.kind);
+        assert!(
+            matches!(
+                ram_stack_kind,
+                Some(
+                    ObjectKind::StackSlot {
+                        space: SpaceId::Ram,
+                        ..
+                    } | ObjectKind::FrameObject {
+                        space: SpaceId::Ram,
+                        ..
+                    }
+                )
+            ),
+            "unexpected RAM stack object: {ram_stack_kind:?}"
+        );
+        assert!(matches!(
+            stack_objects
+                .object(custom_stack.object)
+                .map(|fact| &fact.kind),
+            Some(ObjectKind::EscapedUnknown {
+                space: SpaceId::Custom(7)
+            })
+        ));
+        assert_eq!(custom_stack.address, RelativeMemoryAddress::Unknown);
+
+        let unknown = dual_space_artifact(Vec::new(), Varnode::unique(0x90, 8), None);
+        assert_dual_space_objects_are_distinct(&unknown);
+        let (ram_unknown, custom_unknown) = dual_space_locations(&unknown);
+        assert!(matches!(
+            unknown
+                .objects()
+                .object(ram_unknown.object)
+                .map(|fact| &fact.kind),
+            Some(ObjectKind::EscapedUnknown {
+                space: SpaceId::Ram
+            })
+        ));
+        assert!(matches!(
+            unknown
+                .objects()
+                .object(custom_unknown.object)
+                .map(|fact| &fact.kind),
+            Some(ObjectKind::EscapedUnknown {
+                space: SpaceId::Custom(7)
+            })
+        ));
+    }
+
+    #[test]
+    fn stack_helpers_require_exact_ram_source_fact_object_and_memory_location() {
+        let mut block = R2ILBlock::new(0x1100, 4);
+        block.push(R2ILOp::Load {
+            dst: Varnode::unique(0x100, 8),
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x4000, 8),
+        });
+        let artifact = SsaArtifact::for_symbolic(&[block], None).expect("RAM load artifact");
+        let access = artifact
+            .facts()
+            .structured
+            .memory_accesses
+            .values()
+            .next()
+            .expect("RAM load access")
+            .clone();
+        let mut objects = artifact.objects().clone();
+        objects
+            .objects
+            .get_mut(&access.object)
+            .expect("RAM load object")
+            .kind = ObjectKind::StackSlot {
+            space: SpaceId::Ram,
+            base: StackAddressBase::StackPointer,
+            offset: -8,
+        };
+        let structured = artifact.facts().structured.clone();
+
+        assert!(super::ram_memory_access_matches_source(
+            artifact.function(),
+            artifact.graph(),
+            &objects,
+            &access,
+        ));
+        assert_eq!(
+            super::stack_memory_access_at(
+                artifact.function(),
+                artifact.graph(),
+                &structured,
+                &objects,
+                access.block_addr,
+                access.op_index,
+                false,
+                access.value,
+            ),
+            Some((access.object, -8, access.id))
+        );
+        let facts = artifact.facts();
+        let certificates = super::collect_prepared_function_certificates(
+            artifact.function(),
+            artifact.graph(),
+            &objects,
+            &facts.memory,
+            &facts.predicates,
+            &facts.call_sites,
+            &structured,
+        );
+        assert_eq!(
+            certificates
+                .stack_slots
+                .get(&access.object)
+                .map(|slot| slot.space),
+            Some(SpaceId::Ram)
+        );
+
+        let mut mismatched_fact = access.clone();
+        mismatched_fact.space = SpaceId::Custom(7);
+        assert!(!super::ram_memory_access_matches_source(
+            artifact.function(),
+            artifact.graph(),
+            &objects,
+            &mismatched_fact,
+        ));
+
+        let mut mismatched_objects = objects.clone();
+        mismatched_objects
+            .objects
+            .get_mut(&access.object)
+            .expect("RAM load object")
+            .kind = ObjectKind::StackSlot {
+            space: SpaceId::Custom(7),
+            base: StackAddressBase::StackPointer,
+            offset: -8,
+        };
+        assert!(!super::ram_memory_access_matches_source(
+            artifact.function(),
+            artifact.graph(),
+            &mismatched_objects,
+            &access,
+        ));
+        let certificates = super::collect_prepared_function_certificates(
+            artifact.function(),
+            artifact.graph(),
+            &mismatched_objects,
+            &facts.memory,
+            &facts.predicates,
+            &facts.call_sites,
+            &structured,
+        );
+        assert!(!certificates.stack_slots.contains_key(&access.object));
+
+        let mut mismatched_memory = artifact.facts().memory.clone();
+        for use_fact in mismatched_memory
+            .uses_by_inst
+            .get_mut(&access.id.inst)
+            .expect("RAM memory use")
+        {
+            use_fact.location.space = SpaceId::Custom(7);
+        }
+        assert!(super::unique_memory_use_for_access(&mismatched_memory, &access).is_none());
+    }
+
+    #[test]
+    fn calls_clobber_every_present_typed_memory_space() {
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push(R2ILOp::Load {
+            dst: Varnode::unique(0x100, 8),
+            space: SpaceId::Custom(7),
+            addr: Varnode::constant(0x4000, 8),
+        });
+        block.push(R2ILOp::Call {
+            target: Varnode::constant(0x2000, 8),
+        });
+        let artifact = SsaArtifact::for_symbolic(&[block], None).expect("call artifact");
+        let call_index = artifact
+            .get_block(0x1000)
+            .expect("call block")
+            .ops
+            .iter()
+            .position(|op| matches!(op, crate::SSAOp::Call { .. }))
+            .expect("call op");
+        let spaces = artifact
+            .memory_defs_for_op_site(0x1000, call_index)
+            .expect("call memory defs")
+            .iter()
+            .map(|fact| fact.location.space)
+            .collect::<Vec<_>>();
+        assert_eq!(spaces, vec![SpaceId::Ram, SpaceId::Custom(7)]);
+    }
+
+    #[test]
+    fn malformed_location_object_space_mismatch_never_proves_no_alias() {
+        let object = ObjectId(1);
+        let mut objects = ObjectModel::default();
+        objects.objects.insert(
+            object,
+            ObjectFact {
+                id: object,
+                kind: ObjectKind::Global {
+                    space: SpaceId::Ram,
+                    address: 0x4000,
+                },
+            },
+        );
+        let malformed = MemoryLocation {
+            space: SpaceId::Custom(7),
+            object,
+            address: RelativeMemoryAddress::Exact(0),
+            size: 8,
+        };
+        let valid = MemoryLocation {
+            space: SpaceId::Ram,
+            object,
+            address: RelativeMemoryAddress::Exact(0x1000),
+            size: 8,
+        };
+        assert!(memory_locations_may_alias(&objects, &malformed, &valid));
+    }
+
+    #[test]
+    fn global_object_key_order_binds_exact_typed_space() {
+        let keys = [
+            GlobalObjectKey {
+                space: SpaceId::Ram,
+                address: 0x4000,
+            },
+            GlobalObjectKey {
+                space: SpaceId::Custom(1),
+                address: 0x4000,
+            },
+            GlobalObjectKey {
+                space: SpaceId::Custom(2),
+                address: 0x4000,
+            },
+        ];
+        let expected = keys.clone();
+        let ordered = keys.into_iter().collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(ordered.len(), 3);
+        assert_eq!(ordered.into_iter().collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn global_aliasing_keeps_exact_typed_memory_spaces_disjoint() {
+        let ram = ObjectId(1);
+        let custom = ObjectId(2);
+        let mut objects = ObjectModel::default();
+        objects.objects.insert(
+            ram,
+            ObjectFact {
+                id: ram,
+                kind: ObjectKind::Global {
+                    space: SpaceId::Ram,
+                    address: 0x4000,
+                },
+            },
+        );
+        objects.objects.insert(
+            custom,
+            ObjectFact {
+                id: custom,
+                kind: ObjectKind::Global {
+                    space: SpaceId::Custom(7),
+                    address: 0x4000,
+                },
+            },
+        );
+        let location = |space, object| MemoryLocation {
+            space,
+            object,
+            address: RelativeMemoryAddress::Exact(0),
+            size: 8,
+        };
+        assert!(!memory_locations_may_alias(
+            &objects,
+            &location(SpaceId::Ram, ram),
+            &location(SpaceId::Custom(7), custom)
+        ));
+    }
+
     fn raw_memory_access(
         locations: Vec<MemoryLocation>,
         is_write: bool,
         width: u32,
     ) -> super::StructuredMemoryAccessFact {
         let inst = InstId(0);
+        let space = locations
+            .first()
+            .map_or(SpaceId::Ram, |location| location.space);
+        let mut objects = ObjectModel::default();
+        for location in &locations {
+            objects
+                .objects
+                .entry(location.object)
+                .or_insert(ObjectFact {
+                    id: location.object,
+                    kind: ObjectKind::Global {
+                        space: location.space,
+                        address: 0,
+                    },
+                });
+        }
         let mut memory = MemorySSAFacts::default();
         if is_write {
             memory.defs_by_inst.insert(
@@ -6372,12 +7199,13 @@ mod tests {
         super::insert_raw_memory_subeffect(
             &mut accesses,
             &memory,
-            &ObjectModel::default(),
+            &objects,
             inst,
             &mut ordinal,
             0x1000,
             0,
             ValueId(0),
+            space,
             Some(ValueId(1)),
             is_write,
             width,
@@ -6390,6 +7218,7 @@ mod tests {
     #[test]
     fn memory_access_provenance_ignores_duplicate_reaching_versions() {
         let location = MemoryLocation {
+            space: SpaceId::Ram,
             object: ObjectId(7),
             address: RelativeMemoryAddress::Exact(-8),
             size: 8,
@@ -6404,6 +7233,7 @@ mod tests {
     #[test]
     fn memory_access_provenance_rejects_distinct_location_ambiguity() {
         let location = MemoryLocation {
+            space: SpaceId::Ram,
             object: ObjectId(7),
             address: RelativeMemoryAddress::Exact(-8),
             size: 8,

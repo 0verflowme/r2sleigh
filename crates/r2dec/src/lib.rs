@@ -5696,7 +5696,7 @@ mod tests {
                     b: r2ssa::SSAVar::new("const:8", 0, 8),
                 },
                 SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6500", 1, 8),
                     val: r2ssa::SSAVar::new("X0", 0, 8),
                 },
@@ -5706,7 +5706,7 @@ mod tests {
                     b: r2ssa::SSAVar::new("const:4", 0, 8),
                 },
                 SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6400", 1, 8),
                     val: r2ssa::SSAVar::new("W1", 0, 4),
                 },
@@ -5715,7 +5715,7 @@ mod tests {
                     src: r2ssa::SSAVar::new("SP", 1, 8),
                 },
                 SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6780", 1, 8),
                     val: r2ssa::SSAVar::new("W2", 0, 4),
                 },
@@ -5725,7 +5725,7 @@ mod tests {
                 },
                 SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:24c00", 1, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6780", 2, 8),
                 },
                 SSAOp::IntZExt {
@@ -5739,7 +5739,7 @@ mod tests {
                 },
                 SSAOp::Load {
                     dst: r2ssa::SSAVar::new("X9", 1, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6500", 2, 8),
                 },
                 SSAOp::IntAdd {
@@ -5749,7 +5749,7 @@ mod tests {
                 },
                 SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:26b00", 1, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6400", 2, 8),
                 },
                 SSAOp::IntSExt {
@@ -5804,7 +5804,7 @@ mod tests {
                     b: r2ssa::SSAVar::new("const:8", 0, 8),
                 },
                 SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6400", 3, 8),
                     val: r2ssa::SSAVar::new("W8", 0, 4),
                 },
@@ -5815,7 +5815,7 @@ mod tests {
                 },
                 SSAOp::Load {
                     dst: r2ssa::SSAVar::new("X8", 2, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6500", 3, 8),
                 },
                 SSAOp::IntAdd {
@@ -5825,7 +5825,7 @@ mod tests {
                 },
                 SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:26b00", 2, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6400", 4, 8),
                 },
                 SSAOp::IntSExt {
@@ -5877,7 +5877,7 @@ mod tests {
                 },
                 SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:24c00", 2, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6400", 5, 8),
                 },
                 SSAOp::IntZExt {
@@ -5891,7 +5891,7 @@ mod tests {
                 },
                 SSAOp::Load {
                     dst: r2ssa::SSAVar::new("X9", 5, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6500", 4, 8),
                 },
                 SSAOp::IntAdd {
@@ -5901,7 +5901,7 @@ mod tests {
                 },
                 SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:26b00", 3, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6400", 6, 8),
                 },
                 SSAOp::IntSExt {
@@ -5953,7 +5953,7 @@ mod tests {
                 },
                 SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:24c00", 3, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6400", 7, 8),
                 },
                 SSAOp::IntZExt {
@@ -6050,7 +6050,7 @@ mod tests {
                     b: r2ssa::SSAVar::new("const:8", 0, 8),
                 },
                 SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("RSP", 1, 8),
                     val: r2ssa::SSAVar::new("RBP", 0, 8),
                 },
@@ -6064,7 +6064,7 @@ mod tests {
                     b: r2ssa::SSAVar::new("const:fffffffffffffff8", 0, 8),
                 },
                 SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:4700", 1, 8),
                     val: r2ssa::SSAVar::new("RDI", 0, 8),
                 },
@@ -6074,13 +6074,13 @@ mod tests {
                     b: r2ssa::SSAVar::new("const:fffffffffffffff4", 0, 8),
                 },
                 SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:4700", 2, 8),
                     val: r2ssa::SSAVar::new("ESI", 0, 4),
                 },
                 SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:11f80", 1, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:4700", 1, 8),
                 },
                 SSAOp::Copy {
@@ -6093,13 +6093,13 @@ mod tests {
                     b: r2ssa::SSAVar::new("const:30", 0, 8),
                 },
                 SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:4700", 3, 8),
                     val: r2ssa::SSAVar::new("ESI", 0, 4),
                 },
                 SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:11f80", 2, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:4700", 1, 8),
                 },
                 SSAOp::Copy {
@@ -6113,12 +6113,12 @@ mod tests {
                 },
                 SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:11f00", 1, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:4700", 4, 8),
                 },
                 SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:11f00", 2, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("RAX", 2, 8),
                 },
                 SSAOp::IntAdd {
@@ -6224,7 +6224,7 @@ mod tests {
                     b: r2ssa::SSAVar::new("const:8", 0, 8),
                 },
                 SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("RSP", 1, 8),
                     val: r2ssa::SSAVar::new("RBP", 0, 8),
                 },
@@ -6238,7 +6238,7 @@ mod tests {
                     b: r2ssa::SSAVar::new("const:fffffffffffffff8", 0, 8),
                 },
                 SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:4700", 1, 8),
                     val: r2ssa::SSAVar::new("RDI", 0, 8),
                 },
@@ -6248,7 +6248,7 @@ mod tests {
                     b: r2ssa::SSAVar::new("const:fffffffffffffff4", 0, 8),
                 },
                 SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:4700", 2, 8),
                     val: r2ssa::SSAVar::new("ESI", 0, 4),
                 },
@@ -6258,13 +6258,13 @@ mod tests {
                     b: r2ssa::SSAVar::new("const:fffffffffffffff0", 0, 8),
                 },
                 SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:4700", 3, 8),
                     val: r2ssa::SSAVar::new("EDX", 0, 4),
                 },
                 SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:11f00", 1, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:4700", 2, 8),
                 },
                 SSAOp::Copy {
@@ -6300,7 +6300,7 @@ mod tests {
                 },
                 SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:11f80", 1, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:4700", 1, 8),
                 },
                 SSAOp::Copy {
@@ -6318,7 +6318,7 @@ mod tests {
                     b: r2ssa::SSAVar::new("const:8", 0, 8),
                 },
                 SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:4700", 4, 8),
                     val: r2ssa::SSAVar::new("EDX", 0, 4),
                 },
@@ -6329,7 +6329,7 @@ mod tests {
                 },
                 SSAOp::Load {
                     dst: r2ssa::SSAVar::new("ECX", 1, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:4700", 5, 8),
                 },
                 SSAOp::IntAdd {
@@ -6339,7 +6339,7 @@ mod tests {
                 },
                 SSAOp::Load {
                     dst: r2ssa::SSAVar::new("EAX", 2, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:4700", 6, 8),
                 },
                 SSAOp::IntAdd {
@@ -6489,7 +6489,7 @@ mod tests {
                     b: r2ssa::SSAVar::new("const:8", 0, 8),
                 },
                 SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("RSP", 1, 8),
                     val: r2ssa::SSAVar::new("RBP", 0, 8),
                 },
@@ -6503,7 +6503,7 @@ mod tests {
                     b: r2ssa::SSAVar::new("const:fffffffffffffff8", 0, 8),
                 },
                 SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:4700", 1, 8),
                     val: r2ssa::SSAVar::new("RDI", 0, 8),
                 },
@@ -6513,7 +6513,7 @@ mod tests {
                     b: r2ssa::SSAVar::new("const:fffffffffffffff4", 0, 8),
                 },
                 SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:4700", 2, 8),
                     val: r2ssa::SSAVar::new("ESI", 0, 4),
                 },
@@ -6523,13 +6523,13 @@ mod tests {
                     b: r2ssa::SSAVar::new("const:fffffffffffffff0", 0, 8),
                 },
                 SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:4700", 3, 8),
                     val: r2ssa::SSAVar::new("EDX", 0, 4),
                 },
                 SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:11f00", 1, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:4700", 2, 8),
                 },
                 SSAOp::Copy {
@@ -6565,7 +6565,7 @@ mod tests {
                 },
                 SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:11f80", 1, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:4700", 1, 8),
                 },
                 SSAOp::Copy {
@@ -6583,7 +6583,7 @@ mod tests {
                     b: r2ssa::SSAVar::new("const:8", 0, 8),
                 },
                 SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:4700", 4, 8),
                     val: r2ssa::SSAVar::new("EDX", 0, 4),
                 },
@@ -6594,7 +6594,7 @@ mod tests {
                 },
                 SSAOp::Load {
                     dst: r2ssa::SSAVar::new("ECX", 1, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:4700", 5, 8),
                 },
                 SSAOp::IntAdd {
@@ -6604,7 +6604,7 @@ mod tests {
                 },
                 SSAOp::Load {
                     dst: r2ssa::SSAVar::new("EAX", 2, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:4700", 6, 8),
                 },
                 SSAOp::IntAdd {

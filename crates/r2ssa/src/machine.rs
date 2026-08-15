@@ -10,11 +10,54 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Serialize;
 
 use crate::function::{SsaArtifact, StackAddressBase};
-use crate::graph::{BlockId, GraphInst, GraphValue, InstId, InstPayload, ValueId};
+use crate::graph::{BlockId, GraphInst, GraphValue, InstId, InstPayload, SsaGraph, ValueId};
 use crate::machine_context::MachineMemoryEndianness;
 use crate::obligation::{CanonicalInstructionId, SemanticObligationId};
 use crate::op::SSAOp;
-use crate::semantic::{ObjectId, ObjectKind, StructuredAccessId};
+use crate::semantic::{
+    ObjectId, ObjectKind, ObjectModel, StructuredAccessId, StructuredMemoryAccessFact,
+};
+
+fn memory_access_authorities_match(
+    graph: &SsaGraph,
+    objects: &ObjectModel,
+    graph_op: &SSAOp,
+    prepared_op: &SSAOp,
+    context_space: r2il::SpaceId,
+    fact: &StructuredMemoryAccessFact,
+) -> bool {
+    if graph.op_site_for_inst(fact.id.inst) != Some((fact.block_addr, fact.op_index))
+        || fact.id.ordinal != 0
+        || fact.space != context_space
+        || graph
+            .inst(fact.id.inst)
+            .is_none_or(|inst| !matches!(&inst.payload, InstPayload::Op(op) if op == graph_op))
+        || graph_op != prepared_op
+        || graph_op.memory_space() != Some(context_space)
+        || objects.object_for_value(fact.address, context_space) != Some(fact.object)
+        || objects
+            .object(fact.object)
+            .is_none_or(|object| object.kind.space() != context_space)
+    {
+        return false;
+    }
+
+    match graph_op {
+        SSAOp::Load { dst, addr, .. } => {
+            !fact.is_write
+                && graph.value_id_for_var(addr) == Some(fact.address)
+                && fact.value == graph.value_id_for_var(dst)
+                && fact.width == dst.size
+        }
+        SSAOp::Store { addr, val, .. } => {
+            fact.is_write
+                && graph.value_id_for_var(addr) == Some(fact.address)
+                && fact.value == graph.value_id_for_var(val)
+                && fact.width == val.size
+        }
+        _ => false,
+    }
+}
 
 /// Opaque, artifact-local handle into a [`MachineExprArena`].
 ///
@@ -89,13 +132,36 @@ impl MachineValueUse {
                     && artifact.graph().op_site_for_inst(access.inst)
                         == Some((fact.block_addr, fact.op_index))
                     && artifact.objects().object(fact.object).is_some()
-                    && artifact.objects().object_for_value(fact.address) == Some(fact.object)
             })
             .ok_or(MachineBuildError::EntityMismatch(access.inst))?;
         let source_space = artifact
             .machine_context()
             .memory_space_at(fact.block_addr, fact.op_index)
             .ok_or(MachineBuildError::MachineContextMismatch)?;
+        let source_op = match &artifact
+            .graph()
+            .inst(access.inst)
+            .ok_or(MachineBuildError::EntityMismatch(access.inst))?
+            .payload
+        {
+            InstPayload::Op(op) => op,
+            _ => return Err(MachineBuildError::EntityMismatch(access.inst)),
+        };
+        let prepared_op = artifact
+            .function()
+            .get_block(fact.block_addr)
+            .and_then(|block| block.ops.get(fact.op_index))
+            .ok_or(MachineBuildError::EntityMismatch(access.inst))?;
+        if !memory_access_authorities_match(
+            artifact.graph(),
+            artifact.objects(),
+            source_op,
+            prepared_op,
+            source_space,
+            fact,
+        ) {
+            return Err(MachineBuildError::EntityMismatch(access.inst));
+        }
         let model = artifact.machine_context().memory_model();
         let space_model = model
             .space(source_space)
@@ -1156,6 +1222,15 @@ impl MachineFunction {
             .machine_context()
             .memory_space_at(fact.block_addr, fact.op_index)
             .ok_or(MachineBuildError::MachineContextMismatch)?;
+        let source_op = match &inst.payload {
+            InstPayload::Op(op @ SSAOp::Load { .. }) => op,
+            _ => return Err(MachineBuildError::EntityMismatch(inst.id)),
+        };
+        let prepared_op = artifact
+            .function()
+            .get_block(fact.block_addr)
+            .and_then(|block| block.ops.get(fact.op_index))
+            .ok_or(MachineBuildError::EntityMismatch(inst.id))?;
         let source_model = artifact.machine_context().memory_model();
         let source_space_model = source_model
             .space(source_space)
@@ -1171,7 +1246,14 @@ impl MachineFunction {
             space: MachineAddressSpace::from(source_space),
             provenance: machine_address_provenance(artifact, fact.object),
         };
-        if *object != fact.object
+        if !memory_access_authorities_match(
+            artifact.graph(),
+            artifact.objects(),
+            source_op,
+            prepared_op,
+            source_space,
+            fact,
+        ) || *object != fact.object
             || *space != MachineAddressSpace::from(source_space)
             || *endianness != source_space_model.endianness()
             || *word_size_bytes != source_space_model.word_size_bytes()
@@ -1399,10 +1481,26 @@ impl MachineBuilder {
                     .memory_space_at(access.block_addr, access.op_index);
                 let model = artifact.machine_context().memory_model();
                 let space_model = source_space.and_then(|space| model.space(space));
+                let prepared_op = artifact
+                    .function()
+                    .get_block(access.block_addr)
+                    .and_then(|block| block.ops.get(access.op_index));
                 if !access.provenance_complete
                     || access.is_write
                     || access.id.ordinal != 0
                     || access.value != Some(output.value)
+                    || prepared_op.is_none_or(|prepared_op| {
+                        source_space.is_none_or(|source_space| {
+                            !memory_access_authorities_match(
+                                graph,
+                                artifact.objects(),
+                                op,
+                                prepared_op,
+                                source_space,
+                                access,
+                            )
+                        })
+                    })
                     || inst.inputs.as_slice() != [access.address]
                     || width_bits == 0
                     || width_bits != output.width_bits
@@ -1749,22 +1847,21 @@ pub fn machine_address_provenance(
         .objects()
         .object(object)
         .map(|object| match &object.kind {
-            ObjectKind::StackSlot { base, offset } | ObjectKind::FrameObject { base, offset } => {
-                MachineAddressProvenance::Stack {
-                    base: match base {
-                        StackAddressBase::FramePointer => MachineStackBase::FramePointer,
-                        StackAddressBase::StackPointer => MachineStackBase::StackPointer,
-                    },
-                    offset: *offset,
-                }
-            }
-            ObjectKind::Parameter { index } => u32::try_from(*index)
+            ObjectKind::StackSlot { base, offset, .. }
+            | ObjectKind::FrameObject { base, offset, .. } => MachineAddressProvenance::Stack {
+                base: match base {
+                    StackAddressBase::FramePointer => MachineStackBase::FramePointer,
+                    StackAddressBase::StackPointer => MachineStackBase::StackPointer,
+                },
+                offset: *offset,
+            },
+            ObjectKind::Parameter { index, .. } => u32::try_from(*index)
                 .map(|index| MachineAddressProvenance::Parameter { index })
                 .unwrap_or(MachineAddressProvenance::Unknown),
             ObjectKind::Global { address, .. } => {
                 MachineAddressProvenance::Global { address: *address }
             }
-            ObjectKind::HeapAlloc { .. } | ObjectKind::EscapedUnknown => {
+            ObjectKind::HeapAlloc { .. } | ObjectKind::EscapedUnknown { .. } => {
                 MachineAddressProvenance::Unknown
             }
         })
@@ -2537,6 +2634,98 @@ mod tests {
         assert!(matches!(
             machine.validate_against(&artifact),
             Err(MachineBuildError::EntityMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn memory_access_authority_rejects_each_exact_space_mismatch() {
+        let artifact = artifact_with_ops([R2ILOp::Load {
+            dst: Varnode::unique(0x10, 4),
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x4000, 8),
+        }]);
+        let fact = artifact
+            .facts()
+            .structured
+            .memory_accesses
+            .values()
+            .next()
+            .expect("load fact")
+            .clone();
+        let op = match &artifact
+            .graph()
+            .inst(fact.id.inst)
+            .expect("load instruction")
+            .payload
+        {
+            InstPayload::Op(op) => op.clone(),
+            other => panic!("expected load operation, got {other:?}"),
+        };
+        assert!(memory_access_authorities_match(
+            artifact.graph(),
+            artifact.objects(),
+            &op,
+            &op,
+            SpaceId::Ram,
+            &fact,
+        ));
+
+        let mut mismatched_op = op.clone();
+        let SSAOp::Load { space, .. } = &mut mismatched_op else {
+            unreachable!();
+        };
+        *space = SpaceId::Custom(7);
+        assert!(!memory_access_authorities_match(
+            artifact.graph(),
+            artifact.objects(),
+            &mismatched_op,
+            &op,
+            SpaceId::Ram,
+            &fact,
+        ));
+        assert!(!memory_access_authorities_match(
+            artifact.graph(),
+            artifact.objects(),
+            &op,
+            &mismatched_op,
+            SpaceId::Ram,
+            &fact,
+        ));
+        assert!(!memory_access_authorities_match(
+            artifact.graph(),
+            artifact.objects(),
+            &op,
+            &op,
+            SpaceId::Custom(7),
+            &fact,
+        ));
+
+        let mut mismatched_fact = fact.clone();
+        mismatched_fact.space = SpaceId::Custom(7);
+        assert!(!memory_access_authorities_match(
+            artifact.graph(),
+            artifact.objects(),
+            &op,
+            &op,
+            SpaceId::Ram,
+            &mismatched_fact,
+        ));
+
+        let mut mismatched_objects = artifact.objects().clone();
+        mismatched_objects
+            .objects
+            .get_mut(&fact.object)
+            .expect("load object")
+            .kind = ObjectKind::EscapedUnknown {
+            space: SpaceId::Custom(7),
+        };
+        assert!(!memory_access_authorities_match(
+            artifact.graph(),
+            &mismatched_objects,
+            &op,
+            &op,
+            SpaceId::Ram,
+            &fact,
         ));
     }
 

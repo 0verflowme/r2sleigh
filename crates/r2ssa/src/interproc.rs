@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use r2il::{ArchSpec, MemoryOrdering};
+use r2il::{ArchSpec, MemoryOrdering, SpaceId};
 use serde::{Deserialize, Serialize};
 
 use crate::abi::AbiProfile;
@@ -1199,13 +1199,18 @@ fn collect_local_summary_facts(prepared: &SsaArtifact, abi: &AbiProfile) -> Loca
     for block in function.blocks() {
         for (op_idx, op) in block.ops.iter().enumerate() {
             match op {
-                SSAOp::Load { addr, dst, .. }
-                | SSAOp::LoadLinked { addr, dst, .. }
-                | SSAOp::LoadGuarded { addr, dst, .. } => {
-                    if memory_access_is_local_stack(prepared, addr) {
+                SSAOp::Load { addr, dst, space }
+                | SSAOp::LoadLinked {
+                    addr, dst, space, ..
+                }
+                | SSAOp::LoadGuarded {
+                    addr, dst, space, ..
+                } => {
+                    if memory_access_is_local_stack(prepared, addr, *space) {
                         continue;
                     }
-                    let location = classify_memory_access_location(prepared, abi, addr, dst.size);
+                    let location =
+                        classify_memory_access_location(prepared, abi, addr, *space, dst.size);
                     mark_location_arg_effect(&mut out.arg_effects, location, true, false);
                     out.memory_effects.insert(SummaryMemoryEffect {
                         kind: SummaryMemoryEffectKind::Read,
@@ -1219,12 +1224,17 @@ fn collect_local_summary_facts(prepared: &SsaArtifact, abi: &AbiProfile) -> Loca
                         });
                     }
                 }
-                SSAOp::AtomicCAS { addr, expected, .. } => {
-                    if memory_access_is_local_stack(prepared, addr) {
+                SSAOp::AtomicCAS {
+                    addr,
+                    expected,
+                    space,
+                    ..
+                } => {
+                    if memory_access_is_local_stack(prepared, addr, *space) {
                         continue;
                     }
                     let location =
-                        classify_memory_access_location(prepared, abi, addr, expected.size);
+                        classify_memory_access_location(prepared, abi, addr, *space, expected.size);
                     mark_location_arg_effect(&mut out.arg_effects, location, true, true);
                     out.memory_effects.insert(SummaryMemoryEffect {
                         kind: SummaryMemoryEffectKind::Read,
@@ -1244,11 +1254,14 @@ fn collect_local_summary_facts(prepared: &SsaArtifact, abi: &AbiProfile) -> Loca
                         },
                     });
                 }
-                SSAOp::StoreConditional { addr, val, .. } => {
-                    if memory_access_is_local_stack(prepared, addr) {
+                SSAOp::StoreConditional {
+                    addr, val, space, ..
+                } => {
+                    if memory_access_is_local_stack(prepared, addr, *space) {
                         continue;
                     }
-                    let location = classify_memory_access_location(prepared, abi, addr, val.size);
+                    let location =
+                        classify_memory_access_location(prepared, abi, addr, *space, val.size);
                     mark_location_arg_effect(&mut out.arg_effects, location, true, true);
                     out.memory_effects.insert(SummaryMemoryEffect {
                         kind: SummaryMemoryEffectKind::Read,
@@ -1275,11 +1288,15 @@ fn collect_local_summary_facts(prepared: &SsaArtifact, abi: &AbiProfile) -> Loca
                         ordering: summary_atomic_ordering(*ordering),
                     });
                 }
-                SSAOp::Store { addr, val, .. } | SSAOp::StoreGuarded { addr, val, .. } => {
-                    if memory_access_is_local_stack(prepared, addr) {
+                SSAOp::Store { addr, val, space }
+                | SSAOp::StoreGuarded {
+                    addr, val, space, ..
+                } => {
+                    if memory_access_is_local_stack(prepared, addr, *space) {
                         continue;
                     }
-                    let location = classify_memory_access_location(prepared, abi, addr, val.size);
+                    let location =
+                        classify_memory_access_location(prepared, abi, addr, *space, val.size);
                     mark_location_arg_effect(&mut out.arg_effects, location, false, true);
                     out.memory_effects.insert(SummaryMemoryEffect {
                         kind: SummaryMemoryEffectKind::Write,
@@ -1305,9 +1322,9 @@ fn collect_local_summary_facts(prepared: &SsaArtifact, abi: &AbiProfile) -> Loca
     out
 }
 
-fn memory_access_is_local_stack(prepared: &SsaArtifact, addr: &SSAVar) -> bool {
+fn memory_access_is_local_stack(prepared: &SsaArtifact, addr: &SSAVar, space: SpaceId) -> bool {
     prepared
-        .object_for_var(addr)
+        .object_for_var(addr, space)
         .and_then(|object| prepared.objects().object(object))
         .is_some_and(|object| {
             matches!(
@@ -1339,18 +1356,23 @@ fn classify_memory_access_location(
     prepared: &SsaArtifact,
     abi: &AbiProfile,
     addr: &SSAVar,
+    space: SpaceId,
     width: u32,
 ) -> SummaryMemoryLocation {
+    if space != SpaceId::Ram {
+        return unknown_location();
+    }
     let Some(value_id) = prepared.graph().value_id_for_var(addr) else {
         return unknown_location();
     };
-    classify_memory_access_location_value(prepared, abi, value_id, width, 0)
+    classify_memory_access_location_value(prepared, abi, value_id, space, width, 0)
 }
 
 fn classify_memory_access_location_value(
     prepared: &SsaArtifact,
     abi: &AbiProfile,
     value_id: ValueId,
+    space: SpaceId,
     width: u32,
     depth: u32,
 ) -> SummaryMemoryLocation {
@@ -1381,11 +1403,11 @@ fn classify_memory_access_location_value(
             }
         }
 
-        if let Some(object_id) = prepared.objects().object_for_value(*candidate)
+        if let Some(object_id) = prepared.objects().object_for_value(*candidate, space)
             && let Some(object) = prepared.objects().object(object_id)
         {
             match object.kind {
-                ObjectKind::Parameter { index } => {
+                ObjectKind::Parameter { index, .. } => {
                     return arg_location(index, None, None);
                 }
                 ObjectKind::Global { address, .. } => {
@@ -1397,7 +1419,7 @@ fn classify_memory_access_location_value(
                         range: exact_range(0, width),
                     };
                 }
-                ObjectKind::EscapedUnknown => {}
+                ObjectKind::EscapedUnknown { .. } => {}
                 _ => {}
             }
         }
@@ -1426,7 +1448,9 @@ fn classify_memory_access_location_value(
             .inputs
             .first()
             .copied()
-            .map(|src| classify_memory_access_location_value(prepared, abi, src, width, depth + 1))
+            .map(|src| {
+                classify_memory_access_location_value(prepared, abi, src, space, width, depth + 1)
+            })
             .unwrap_or_else(unknown_location),
         SSAOp::IntAdd { .. } | SSAOp::PtrAdd { .. } => {
             let Some(&left_id) = inst.inputs.first() else {
@@ -1440,7 +1464,7 @@ fn classify_memory_access_location_value(
                 abi,
                 left_id,
                 right_id,
-                AdditiveLocationCtx::new(width, depth + 1, 1, op),
+                AdditiveLocationCtx::new(space, width, depth + 1, 1, op),
             )
         }
         SSAOp::IntSub { .. } | SSAOp::PtrSub { .. } => {
@@ -1455,11 +1479,11 @@ fn classify_memory_access_location_value(
                 abi,
                 left_id,
                 right_id,
-                AdditiveLocationCtx::new(width, depth + 1, -1, op),
+                AdditiveLocationCtx::new(space, width, depth + 1, -1, op),
             )
         }
         _ if op_value_id != value_id => {
-            classify_memory_access_location_value(prepared, abi, value_id, width, depth + 1)
+            classify_memory_access_location_value(prepared, abi, value_id, space, width, depth + 1)
         }
         _ => unknown_location(),
     }
@@ -1467,6 +1491,7 @@ fn classify_memory_access_location_value(
 
 #[derive(Clone, Copy)]
 struct AdditiveLocationCtx {
+    space: SpaceId,
     width: u32,
     depth: u32,
     sign: i64,
@@ -1474,7 +1499,7 @@ struct AdditiveLocationCtx {
 }
 
 impl AdditiveLocationCtx {
-    fn new(width: u32, depth: u32, sign: i64, op: &SSAOp) -> Self {
+    fn new(space: SpaceId, width: u32, depth: u32, sign: i64, op: &SSAOp) -> Self {
         let element_scale = match op {
             SSAOp::PtrAdd { element_size, .. } | SSAOp::PtrSub { element_size, .. } => {
                 *element_size as i64
@@ -1482,6 +1507,7 @@ impl AdditiveLocationCtx {
             _ => 1,
         };
         Self {
+            space,
             width,
             depth,
             sign,
@@ -1501,8 +1527,9 @@ fn classify_memory_additive_location(
     let right_const = summary_const_value(prepared, abi, right_id, ctx.depth);
 
     if let Some(k) = right_const {
-        let mut base =
-            classify_memory_access_location_value(prepared, abi, left_id, ctx.width, ctx.depth);
+        let mut base = classify_memory_access_location_value(
+            prepared, abi, left_id, ctx.space, ctx.width, ctx.depth,
+        );
         let delta = (k as i64)
             .saturating_mul(ctx.element_scale)
             .saturating_mul(ctx.sign);
@@ -1512,8 +1539,9 @@ fn classify_memory_additive_location(
     if ctx.sign > 0
         && let Some(k) = left_const
     {
-        let mut base =
-            classify_memory_access_location_value(prepared, abi, right_id, ctx.width, ctx.depth);
+        let mut base = classify_memory_access_location_value(
+            prepared, abi, right_id, ctx.space, ctx.width, ctx.depth,
+        );
         let delta = (k as i64).saturating_mul(ctx.element_scale);
         base.range = shifted_range(base.range, delta, ctx.width);
         return base;
@@ -1964,7 +1992,9 @@ fn canonical_root_value(prepared: &SsaArtifact, value_id: ValueId) -> ValueId {
 }
 
 fn global_address_for_value_id(prepared: &SsaArtifact, value_id: ValueId) -> Option<u64> {
-    let object = prepared.objects().object_for_value(value_id)?;
+    let object = prepared
+        .objects()
+        .object_for_value(value_id, SpaceId::Ram)?;
     let object = prepared.objects().object(object)?;
     match object.kind {
         ObjectKind::Global { address, .. } => Some(address),
@@ -2789,7 +2819,14 @@ mod tests {
         };
         assert_eq!(summary_const_value(&prepared, &abi, right_id, 0), Some(2));
         assert_eq!(
-            classify_memory_access_location_value(&prepared, &abi, left_id, val.size, 0),
+            classify_memory_access_location_value(
+                &prepared,
+                &abi,
+                left_id,
+                SpaceId::Ram,
+                val.size,
+                0,
+            ),
             SummaryMemoryLocation {
                 region: SummaryMemoryRegion::Arg { index: 0 },
                 range: exact_range(0, val.size),
@@ -2801,7 +2838,7 @@ mod tests {
                 &abi,
                 left_id,
                 right_id,
-                AdditiveLocationCtx::new(val.size, 1, 1, op),
+                AdditiveLocationCtx::new(SpaceId::Ram, val.size, 1, 1, op),
             ),
             SummaryMemoryLocation {
                 region: SummaryMemoryRegion::Arg { index: 0 },
@@ -2809,13 +2846,21 @@ mod tests {
             }
         );
         assert_eq!(
-            classify_memory_access_location_value(&prepared, &abi, addr_id, val.size, 0),
+            classify_memory_access_location_value(
+                &prepared,
+                &abi,
+                addr_id,
+                SpaceId::Ram,
+                val.size,
+                0,
+            ),
             SummaryMemoryLocation {
                 region: SummaryMemoryRegion::Arg { index: 0 },
                 range: exact_range(2, val.size),
             }
         );
-        let location = classify_memory_access_location(&prepared, &abi, addr, val.size);
+        let location =
+            classify_memory_access_location(&prepared, &abi, addr, SpaceId::Ram, val.size);
         assert_eq!(
             location,
             SummaryMemoryLocation {
@@ -2870,7 +2915,14 @@ mod tests {
         };
         assert_eq!(summary_const_value(&prepared, &abi, right_id, 0), Some(1));
         assert_eq!(
-            classify_memory_access_location_value(&prepared, &abi, left_id, val.size, 0),
+            classify_memory_access_location_value(
+                &prepared,
+                &abi,
+                left_id,
+                SpaceId::Ram,
+                val.size,
+                0,
+            ),
             SummaryMemoryLocation {
                 region: SummaryMemoryRegion::Arg { index: 0 },
                 range: exact_range(0, val.size),
@@ -2882,7 +2934,7 @@ mod tests {
                 &abi,
                 left_id,
                 right_id,
-                AdditiveLocationCtx::new(val.size, 1, -1, op),
+                AdditiveLocationCtx::new(SpaceId::Ram, val.size, 1, -1, op),
             ),
             SummaryMemoryLocation {
                 region: SummaryMemoryRegion::Arg { index: 0 },
@@ -2890,13 +2942,21 @@ mod tests {
             }
         );
         assert_eq!(
-            classify_memory_access_location_value(&prepared, &abi, addr_id, val.size, 0),
+            classify_memory_access_location_value(
+                &prepared,
+                &abi,
+                addr_id,
+                SpaceId::Ram,
+                val.size,
+                0,
+            ),
             SummaryMemoryLocation {
                 region: SummaryMemoryRegion::Arg { index: 0 },
                 range: exact_range(-1, val.size),
             }
         );
-        let location = classify_memory_access_location(&prepared, &abi, addr, val.size);
+        let location =
+            classify_memory_access_location(&prepared, &abi, addr, SpaceId::Ram, val.size);
         assert_eq!(
             location,
             SummaryMemoryLocation {

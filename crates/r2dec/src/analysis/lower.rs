@@ -258,6 +258,14 @@ impl<'a> LowerCtx<'a> {
     pub(crate) fn op_to_expr(&self, op: &SSAOp) -> CExpr {
         match op {
             SSAOp::Copy { src, .. } => self.get_expr(src),
+            SSAOp::Load { dst, addr, space } if *space != r2il::SpaceId::Ram => CExpr::call(
+                CExpr::Var("r2s_unsupported_space_load".to_string()),
+                vec![
+                    CExpr::StringLit(space.to_string()),
+                    self.get_expr(addr),
+                    CExpr::UIntLit(u64::from(dst.size)),
+                ],
+            ),
             SSAOp::Load { dst, addr, .. } => {
                 let prefer_memory_access = matches!(
                     self.semantic_value_for_var(dst),
@@ -503,9 +511,11 @@ impl<'a> LowerCtx<'a> {
                 self.render_value_ref(value, depth, visited)
             }
             SemanticValue::Address(shape) => self.render_addr_shape(shape, depth, visited),
-            SemanticValue::Load { addr, size } => {
-                self.render_load_from_shape(addr, *size, depth, visited)
-            }
+            SemanticValue::Load { space, addr, size } => Some(if *space == r2il::SpaceId::Ram {
+                self.render_load_from_shape(addr, *size, depth, visited)?
+            } else {
+                self.unsupported_space_load_expr(*space, addr, *size, depth, visited)
+            }),
             SemanticValue::Unknown => None,
         }
     }
@@ -546,6 +556,27 @@ impl<'a> LowerCtx<'a> {
 
         self.render_addr_shape(shape, depth + 1, visited)
             .map(|expr| CExpr::Deref(Box::new(expr)))
+    }
+
+    fn unsupported_space_load_expr(
+        &self,
+        space: r2il::SpaceId,
+        addr: &NormalizedAddr,
+        size: u32,
+        depth: u32,
+        visited: &mut HashSet<String>,
+    ) -> CExpr {
+        let addr = self
+            .render_addr_shape(addr, depth + 1, visited)
+            .unwrap_or_else(|| CExpr::Var("r2s_unresolved_memory_address".to_string()));
+        CExpr::call(
+            CExpr::Var("r2s_unsupported_space_load".to_string()),
+            vec![
+                CExpr::StringLit(space.to_string()),
+                addr,
+                CExpr::UIntLit(u64::from(size)),
+            ],
+        )
     }
 
     fn render_addr_shape(
@@ -1630,7 +1661,7 @@ mod tests {
 
         let expr = ctx.op_to_expr(&SSAOp::Load {
             dst: SSAVar::new("tmp:5001", 1, 4),
-            space: "ram".to_string(),
+            space: r2il::SpaceId::Ram,
             addr: SSAVar::new("tmp:5000", 1, 8),
         });
         let CExpr::Deref(inner) = expr else {
@@ -1646,6 +1677,105 @@ mod tests {
             ),
             "generic lower path should cast non-pointer-like address expressions"
         );
+    }
+
+    #[test]
+    fn custom_space_load_never_becomes_an_ordinary_c_dereference() {
+        let function_names = HashMap::new();
+        let strings = HashMap::new();
+        let symbols = HashMap::new();
+        let definitions = HashMap::new();
+        let use_counts = HashMap::new();
+        let condition_vars = HashSet::new();
+        let pinned = HashSet::new();
+        let var_aliases = HashMap::new();
+        let ptr_arith = HashMap::new();
+        let stack_slots = HashMap::new();
+        let forwarded_values = HashMap::new();
+        let ctx = make_ctx(
+            &definitions,
+            &use_counts,
+            &condition_vars,
+            &pinned,
+            &var_aliases,
+            &ptr_arith,
+            &stack_slots,
+            &forwarded_values,
+            &function_names,
+            &strings,
+            &symbols,
+        );
+        let expr = ctx.op_to_expr(&SSAOp::Load {
+            dst: SSAVar::new("tmp:custom_result", 1, 4),
+            space: r2il::SpaceId::Custom(7),
+            addr: SSAVar::new("tmp:custom_addr", 1, 8),
+        });
+
+        assert!(
+            matches!(
+                expr,
+                CExpr::Call { ref func, ref args }
+                    if **func == CExpr::Var("r2s_unsupported_space_load".to_string())
+                        && args.first() == Some(&CExpr::StringLit("space7".to_string()))
+            ),
+            "custom-space memory must stay explicit and unsupported: {expr:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_load_rendering_preserves_exact_memory_space() {
+        let definitions = HashMap::new();
+        let use_counts = HashMap::new();
+        let condition_vars = HashSet::new();
+        let pinned = HashSet::new();
+        let var_aliases = HashMap::new();
+        let ptr_arith = HashMap::new();
+        let stack_slots = HashMap::new();
+        let forwarded_values = HashMap::new();
+        let function_names = HashMap::new();
+        let strings = HashMap::new();
+        let symbols = HashMap::new();
+        let ctx = make_ctx(
+            &definitions,
+            &use_counts,
+            &condition_vars,
+            &pinned,
+            &var_aliases,
+            &ptr_arith,
+            &stack_slots,
+            &forwarded_values,
+            &function_names,
+            &strings,
+            &symbols,
+        );
+        let addr = NormalizedAddr {
+            base: BaseRef::Value(ValueRef::from(SSAVar::new("tmp:addr", 1, 8))),
+            index: None,
+            scale_bytes: 0,
+            offset_bytes: 0,
+        };
+        let ram = ctx
+            .expr_for_semantic_value(&SemanticValue::Load {
+                space: r2il::SpaceId::Ram,
+                addr: addr.clone(),
+                size: 4,
+            })
+            .expect("RAM semantic load");
+        let custom = ctx
+            .expr_for_semantic_value(&SemanticValue::Load {
+                space: r2il::SpaceId::Custom(7),
+                addr,
+                size: 4,
+            })
+            .expect("Custom semantic load refusal");
+
+        assert!(matches!(ram, CExpr::Deref(_)));
+        assert!(matches!(
+            custom,
+            CExpr::Call { ref func, ref args }
+                if **func == CExpr::Var("r2s_unsupported_space_load".to_string())
+                    && args.first() == Some(&CExpr::StringLit("space7".to_string()))
+        ));
     }
 
     #[test]
@@ -1677,7 +1807,7 @@ mod tests {
 
         let expr = ctx.op_to_expr(&SSAOp::Load {
             dst: SSAVar::new("tmp:5101", 1, 4),
-            space: "ram".to_string(),
+            space: r2il::SpaceId::Ram,
             addr: SSAVar::new("arg1", 0, 8),
         });
         let CExpr::Deref(inner) = expr else {
@@ -1738,7 +1868,7 @@ mod tests {
 
         let expr = ctx.op_to_expr(&SSAOp::Load {
             dst: SSAVar::new("tmp:5002", 1, 4),
-            space: "ram".to_string(),
+            space: r2il::SpaceId::Ram,
             addr: SSAVar::new("tmp:addr", 1, 8),
         });
 
@@ -1788,7 +1918,7 @@ mod tests {
 
         let expr = ctx.op_to_expr(&SSAOp::Load {
             dst: SSAVar::new("tmp:5003", 1, 4),
-            space: "ram".to_string(),
+            space: r2il::SpaceId::Ram,
             addr: SSAVar::new("tmp:stackaddr", 1, 8),
         });
 
@@ -1837,7 +1967,7 @@ mod tests {
 
         let expr = ctx.op_to_expr(&SSAOp::Load {
             dst: SSAVar::new("tmp:5004", 1, 4),
-            space: "ram".to_string(),
+            space: r2il::SpaceId::Ram,
             addr: SSAVar::new("tmp:addr", 1, 8),
         });
 
@@ -1890,7 +2020,7 @@ mod tests {
 
         let expr = ctx.op_to_expr(&SSAOp::Load {
             dst: SSAVar::new("tmp:5005", 1, 4),
-            space: "ram".to_string(),
+            space: r2il::SpaceId::Ram,
             addr: SSAVar::new("tmp:addr", 1, 8),
         });
 
@@ -1939,7 +2069,7 @@ mod tests {
 
         let expr = ctx.op_to_expr(&SSAOp::Load {
             dst: SSAVar::new("tmp:5006", 1, 4),
-            space: "ram".to_string(),
+            space: r2il::SpaceId::Ram,
             addr: SSAVar::new("tmp:addr", 1, 8),
         });
 
@@ -2008,7 +2138,7 @@ mod tests {
 
         let expr = ctx.op_to_expr(&SSAOp::Load {
             dst: SSAVar::new("tmp:5007", 1, 4),
-            space: "ram".to_string(),
+            space: r2il::SpaceId::Ram,
             addr,
         });
 

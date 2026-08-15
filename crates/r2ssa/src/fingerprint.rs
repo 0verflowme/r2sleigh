@@ -6,12 +6,12 @@ use crate::{
     BlockId, BlockTerminator, CanonicalStorageId, CanonicalStorageSpace, GraphBlock, GraphInst,
     InstPayload, SSAOp, SsaArtifact, SsaGraph, ValueId,
 };
-use r2il::MemoryOrdering;
+use r2il::{MemoryOrdering, SpaceId};
 
 /// Version of the byte-level semantic fingerprint contract.
 ///
 /// Bump this whenever a tag or field encoding below changes.
-pub const SSA_SEMANTIC_FINGERPRINT_SCHEMA_VERSION: u32 = 1;
+pub const SSA_SEMANTIC_FINGERPRINT_SCHEMA_VERSION: u32 = 2;
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -75,6 +75,19 @@ fn hash_ordering(writer: &mut FingerprintWriter, ordering: MemoryOrdering) {
         MemoryOrdering::SeqCst => 5,
         MemoryOrdering::Unknown => 6,
     });
+}
+
+fn hash_space(writer: &mut FingerprintWriter, space: SpaceId) {
+    match space {
+        SpaceId::Ram => writer.tag(1),
+        SpaceId::Register => writer.tag(2),
+        SpaceId::Unique => writer.tag(3),
+        SpaceId::Const => writer.tag(4),
+        SpaceId::Custom(id) => {
+            writer.tag(5);
+            writer.u32(id);
+        }
+    }
 }
 
 fn hash_storage(writer: &mut FingerprintWriter, storage: Option<CanonicalStorageId>) {
@@ -152,11 +165,11 @@ fn hash_op(writer: &mut FingerprintWriter, op: &SSAOp) {
         Copy { .. } => writer.tag(2),
         Load { space, .. } => {
             writer.tag(3);
-            writer.string(space);
+            hash_space(writer, *space);
         }
         Store { space, .. } => {
             writer.tag(4);
-            writer.string(space);
+            hash_space(writer, *space);
         }
         Fence { ordering } => {
             writer.tag(5);
@@ -166,35 +179,35 @@ fn hash_op(writer: &mut FingerprintWriter, op: &SSAOp) {
             space, ordering, ..
         } => {
             writer.tag(6);
-            writer.string(space);
+            hash_space(writer, *space);
             hash_ordering(writer, *ordering);
         }
         StoreConditional {
             space, ordering, ..
         } => {
             writer.tag(7);
-            writer.string(space);
+            hash_space(writer, *space);
             hash_ordering(writer, *ordering);
         }
         AtomicCAS {
             space, ordering, ..
         } => {
             writer.tag(8);
-            writer.string(space);
+            hash_space(writer, *space);
             hash_ordering(writer, *ordering);
         }
         LoadGuarded {
             space, ordering, ..
         } => {
             writer.tag(9);
-            writer.string(space);
+            hash_space(writer, *space);
             hash_ordering(writer, *ordering);
         }
         StoreGuarded {
             space, ordering, ..
         } => {
             writer.tag(10);
-            writer.string(space);
+            hash_space(writer, *space);
             hash_ordering(writer, *ordering);
         }
         IntAdd { .. } => writer.tag(11),
@@ -537,7 +550,7 @@ mod tests {
     };
 
     use super::stable_ssa_semantic_fingerprint;
-    use crate::SsaArtifact;
+    use crate::{SSAOp, SsaArtifact};
 
     fn constant(value: u64) -> Varnode {
         Varnode::constant(value, 8)
@@ -696,6 +709,43 @@ mod tests {
             stable_ssa_semantic_fingerprint(&base),
             stable_ssa_semantic_fingerprint(&payload_artifact(MemoryOrdering::Acquire, 7, 2))
         );
+    }
+
+    fn memory_space_artifact(space: SpaceId) -> SsaArtifact {
+        SsaArtifact::for_symbolic(
+            &[R2ILBlock {
+                addr: 0x3800,
+                size: 1,
+                ops: vec![R2ILOp::Load {
+                    dst: register(0),
+                    space,
+                    addr: constant(0x4000),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            }],
+            None,
+        )
+        .expect("memory-space SSA")
+    }
+
+    #[test]
+    fn fingerprint_binds_exact_typed_memory_space() {
+        let ram = memory_space_artifact(SpaceId::Ram);
+        let custom_one = memory_space_artifact(SpaceId::Custom(1));
+        let custom_two = memory_space_artifact(SpaceId::Custom(2));
+        assert_ne!(
+            stable_ssa_semantic_fingerprint(&ram),
+            stable_ssa_semantic_fingerprint(&custom_one)
+        );
+        assert_ne!(
+            stable_ssa_semantic_fingerprint(&custom_one),
+            stable_ssa_semantic_fingerprint(&custom_two)
+        );
+        let SSAOp::Load { space, .. } = &custom_one.function().entry_block().unwrap().ops[0] else {
+            panic!("expected load");
+        };
+        assert_eq!(*space, SpaceId::Custom(1));
     }
 
     fn switch_artifact(cases: Vec<SwitchCase>) -> SsaArtifact {

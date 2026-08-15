@@ -136,6 +136,7 @@ pub const R2SLEIGH_QUERY_SYMBOLIC_TARGETS_V2: u32 = 5;
 pub const R2SLEIGH_QUERY_RUNTIME_SOURCES_V2: u32 = 6;
 pub const R2SLEIGH_QUERY_RECOVERED_VARS_V2: u32 = 7;
 pub const R2SLEIGH_QUERY_DATA_REFS_V2: u32 = 8;
+pub const R2SLEIGH_DATA_REF_SCHEMA_V2: u32 = 1;
 pub const R2SLEIGH_PLANNER_QUERY_SCHEMA_V2: u32 = 1;
 pub const R2SLEIGH_PLANNER_ANALYSIS_POLICY_V2: u32 = 1;
 pub const R2SLEIGH_PLANNER_POST_ANALYSIS_V2: u32 = 2;
@@ -1298,6 +1299,8 @@ pub struct R2SleighApiV2 {
     pub scope_symbol_size: u32,
     pub analysis_query_request_size: u32,
     pub analysis_result_view_size: u32,
+    pub data_ref_size: u32,
+    pub data_ref_schema_version: u32,
     pub planner_query_request_size: u32,
     pub planner_query_response_size: u32,
     pub planner_target_input_size: u32,
@@ -6397,6 +6400,8 @@ static API_V2: R2SleighApiV2 = R2SleighApiV2 {
     scope_symbol_size: size_of::<R2SleighScopeSymbolV2>() as u32,
     analysis_query_request_size: size_of::<R2SleighAnalysisQueryRequestV2>() as u32,
     analysis_result_view_size: size_of::<R2SleighAnalysisResultViewV2>() as u32,
+    data_ref_size: size_of::<super::types::R2SleighDataRef>() as u32,
+    data_ref_schema_version: R2SLEIGH_DATA_REF_SCHEMA_V2,
     planner_query_request_size: size_of::<R2SleighPlannerQueryRequestV2>() as u32,
     planner_query_response_size: size_of::<R2SleighPlannerQueryResponseV2>() as u32,
     planner_target_input_size: size_of::<R2SleighPlannerTargetInputV2>() as u32,
@@ -7643,7 +7648,7 @@ mod tests {
         assert_semantic_kernel_render_diagnostics(
             r2engine::EngineSemanticKernelRegion::TerminalReturnBlock,
             "terminal_return_block",
-            3,
+            r2dec::CERTIFIED_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
         );
     }
 
@@ -7653,7 +7658,7 @@ mod tests {
             (
                 r2engine::EngineSemanticKernelRegion::TerminalReturnBlock,
                 "terminal_return_block",
-                3,
+                r2dec::CERTIFIED_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
             ),
             (
                 r2engine::EngineSemanticKernelRegion::AggregateMemberTerminalReturnFunction,
@@ -9260,6 +9265,13 @@ mod tests {
             api.analysis_result_view_size as usize,
             size_of::<R2SleighAnalysisResultViewV2>()
         );
+        assert_eq!(
+            api.data_ref_size as usize,
+            size_of::<super::super::types::R2SleighDataRef>()
+        );
+        assert_eq!(api.data_ref_schema_version, R2SLEIGH_DATA_REF_SCHEMA_V2);
+        assert_ne!(api.data_ref_size, 0);
+        assert_ne!(api.data_ref_schema_version, 0);
         assert_eq!(
             api.radare_snapshot_input_size as usize,
             size_of::<R2SleighRadareSnapshotInputV2>()

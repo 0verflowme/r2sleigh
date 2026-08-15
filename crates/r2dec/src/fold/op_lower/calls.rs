@@ -739,7 +739,9 @@ impl<'a> FoldingContext<'a> {
         let preserve_stable_input_slot = binding.role == analysis::CallArgRole::Input;
         if preserve_stable_input_slot
             && let analysis::SemanticCallArg::Semantic(analysis::SemanticValue::Load {
-                addr, ..
+                space: r2il::SpaceId::Ram,
+                addr,
+                ..
             }) = &binding.arg
             && addr.index.is_none()
             && addr.offset_bytes == 0
@@ -954,10 +956,11 @@ impl<'a> FoldingContext<'a> {
                     .or_else(|| self.render_base_ref_expr(&addr.base, true, 0, &mut visited))
                     .unwrap_or_else(Self::unresolved_call_arg_expr)
             }
-            analysis::SemanticValue::Load { addr, size } => {
+            analysis::SemanticValue::Load { space, addr, size } => {
                 let mut visited = HashSet::new();
-                self.render_load_from_addr(addr, *size, 0, &mut visited)
+                self.render_semantic_load(*space, addr, *size, 0, &mut visited)
                     .or_else(|| {
+                        (*space == r2il::SpaceId::Ram).then_some(())?;
                         let addr_expr =
                             self.render_address_expr_from_addr(addr, 0, &mut visited)?;
                         Some(CExpr::Deref(Box::new(addr_expr)))
@@ -1309,9 +1312,11 @@ impl<'a> FoldingContext<'a> {
                         .render_address_expr_from_addr(addr, 0, &mut visited)
                         .or_else(|| self.render_stack_slot_address_expr_fallback(addr, 0));
                 }
-                analysis::SemanticValue::Load { addr, size }
-                    if matches!(addr.base, analysis::BaseRef::StackSlot(_)) =>
-                {
+                analysis::SemanticValue::Load {
+                    space: r2il::SpaceId::Ram,
+                    addr,
+                    size,
+                } if matches!(addr.base, analysis::BaseRef::StackSlot(_)) => {
                     if let analysis::BaseRef::StackSlot(offset) = addr.base
                         && addr.index.is_none()
                         && addr.offset_bytes == 0

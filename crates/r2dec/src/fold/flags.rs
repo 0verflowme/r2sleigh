@@ -1561,7 +1561,12 @@ impl<'a> FoldingContext<'a> {
                 | SSAOp::Subpiece { src, .. } => {
                     self.local_expr_for_var(block, idx, src, depth + 1)
                 }
-                SSAOp::Load { addr, .. } => self.local_load_expr(block, idx, addr, depth + 1),
+                SSAOp::Load {
+                    space: r2il::SpaceId::Ram,
+                    addr,
+                    ..
+                } => self.local_load_expr(block, idx, addr, depth + 1),
+                SSAOp::Load { .. } => None,
                 SSAOp::IntEqual { a, b, .. } => {
                     self.local_compare_expr(block, idx, BinaryOp::Eq, a, b, depth + 1)
                 }
@@ -1812,9 +1817,9 @@ impl<'a> FoldingContext<'a> {
         let slot = self.stack_slot_provenance_for_var(addr);
         for (store_idx, op) in block.ops[..op_idx].iter().enumerate().rev() {
             if let SSAOp::Store {
+                space: r2il::SpaceId::Ram,
                 addr: store_addr,
                 val,
-                ..
             } = op
                 && self.local_addrs_match(block, store_idx, store_addr, op_idx, addr, depth + 1)
             {

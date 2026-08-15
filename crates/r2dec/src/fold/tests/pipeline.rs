@@ -310,6 +310,7 @@ mod tests {
 
     fn stack_load_call_arg(offset: i64, size: u32) -> crate::analysis::CallArgBinding {
         let value = crate::analysis::SemanticValue::Load {
+            space: r2il::SpaceId::Ram,
             addr: crate::analysis::NormalizedAddr {
                 base: crate::analysis::BaseRef::StackSlot(offset),
                 index: None,
@@ -3599,13 +3600,13 @@ mod tests {
                 b: make_var("const:ffffffffffffffe0", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: len_slot.clone(),
                 val: len,
             },
             SSAOp::Load {
                 dst: len_load.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: len_slot,
             },
             SSAOp::Copy {
@@ -3635,13 +3636,13 @@ mod tests {
                 src: rax_3,
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: buf_slot.clone(),
                 val: buf_store,
             },
             SSAOp::Load {
                 dst: buf_load.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: buf_slot,
             },
             SSAOp::Copy {
@@ -4067,13 +4068,13 @@ mod tests {
                 src: make_var("rax", 2, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: loc_slot.clone(),
                 val: loc_store,
             },
             SSAOp::Load {
                 dst: loc_load.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: loc_slot,
             },
             SSAOp::Copy {
@@ -4082,7 +4083,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: byte_load.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("rax", 4, 8),
             },
             SSAOp::IntZExt {
@@ -4277,13 +4278,13 @@ mod tests {
                 b: make_var("const:ffffffffffffffe8", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: s_slot.clone(),
                 val: make_var("rdi", 0, 8),
             },
             SSAOp::Load {
                 dst: s_load.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: s_slot.clone(),
             },
             SSAOp::Copy {
@@ -4302,13 +4303,13 @@ mod tests {
                 b: make_var("const:fffffffffffffff8", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: len_slot.clone(),
                 val: make_var("rax", 2, 8),
             },
             SSAOp::Load {
                 dst: len_load.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: len_slot,
             },
             SSAOp::IntAdd {
@@ -4332,13 +4333,13 @@ mod tests {
                 b: make_var("const:fffffffffffffff0", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: dup_slot.clone(),
                 val: malloc_result,
             },
             SSAOp::Load {
                 dst: dup_load.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: dup_slot,
             },
             SSAOp::Copy {
@@ -4478,13 +4479,13 @@ mod tests {
                 b: make_var("const:ffffffffffffffe8", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: s_slot.clone(),
                 val: make_var("rdi", 0, 8),
             },
             SSAOp::Load {
                 dst: s_load.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: s_slot.clone(),
             },
             SSAOp::Copy {
@@ -4507,13 +4508,13 @@ mod tests {
                 src: make_var("rax", 2, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: len_slot,
                 val: make_var("tmp:6b00", 1, 8),
             },
             SSAOp::Load {
                 dst: len_load,
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:len_slot", 1, 8),
             },
         ]);
@@ -4639,13 +4640,13 @@ mod tests {
                 b: make_var("const:ffffffffffffffe8", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: s_slot.clone(),
                 val: make_var("rdi", 0, 8),
             },
             SSAOp::Load {
                 dst: s_load.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: s_slot.clone(),
             },
             SSAOp::Copy {
@@ -4664,13 +4665,13 @@ mod tests {
                 b: make_var("const:fffffffffffffff8", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: len_slot.clone(),
                 val: make_var("rax", 2, 8),
             },
             SSAOp::Load {
                 dst: len_load.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: len_slot.clone(),
             },
             SSAOp::IntAdd {
@@ -4694,18 +4695,18 @@ mod tests {
                 b: make_var("const:fffffffffffffff0", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: dup_slot.clone(),
                 val: malloc_result,
             },
             SSAOp::Load {
                 dst: dup_load.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: dup_slot.clone(),
             },
             SSAOp::Load {
                 dst: make_var("tmp:11f80", 5, 8),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: len_slot.clone(),
             },
             SSAOp::IntAdd {
@@ -4719,7 +4720,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("tmp:11f80", 6, 8),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: s_slot.clone(),
             },
             SSAOp::Copy {
@@ -4740,7 +4741,7 @@ mod tests {
             SSAOp::CallDefine { dst: memcpy_result },
             SSAOp::Load {
                 dst: final_dup_load.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: dup_slot,
             },
             SSAOp::Copy {
@@ -4809,13 +4810,13 @@ mod tests {
                 b: make_var("const:fffffffffffffff8", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:4700", 1, 8),
                 val: make_var("rax", 2, 8),
             },
             SSAOp::Load {
                 dst: make_var("tmp:11f80", 1, 8),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:4700", 1, 8),
             },
             SSAOp::Copy {
@@ -4858,7 +4859,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("tmp:11f80", 2, 8),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:4700", 2, 8),
             },
             SSAOp::Copy {
@@ -4867,7 +4868,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("tmp:11e00", 1, 1),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("rax", 4, 8),
             },
             SSAOp::IntZExt {
@@ -5786,12 +5787,12 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let block = make_block(vec![
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("ram:401000", 0, 8),
                 val: make_var("const:1", 0, 4),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("ptr", 1, 8),
                 val: make_var("value", 1, 4),
             },
@@ -5940,7 +5941,7 @@ mod tests {
             },
             // Store RAX_1 (uses RAX_1)
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("const:0x1000", 0, 8),
                 val: rax_1,
             },
@@ -6191,7 +6192,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: dst.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: addr.clone(),
             },
         ]);
@@ -6206,7 +6207,7 @@ mod tests {
 
         let expr = ctx.op_to_expr(&SSAOp::Load {
             dst,
-            space: "ram".to_string(),
+            space: r2il::SpaceId::Ram,
             addr,
         });
         let CExpr::PtrMember { member, .. } = expr else {
@@ -6228,7 +6229,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: dst.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: addr.clone(),
             },
         ]);
@@ -6241,7 +6242,7 @@ mod tests {
 
         let expr = ctx.op_to_expr(&SSAOp::Load {
             dst,
-            space: "ram".to_string(),
+            space: r2il::SpaceId::Ram,
             addr,
         });
         assert!(
@@ -6454,6 +6455,7 @@ mod tests {
         ctx.state.analysis_ctx.use_info.semantic_values.insert(
             load.display_name(),
             crate::analysis::SemanticValue::Load {
+                space: r2il::SpaceId::Ram,
                 addr: crate::analysis::NormalizedAddr {
                     base: crate::analysis::BaseRef::Value(crate::analysis::ValueRef::from(
                         arr.clone(),
@@ -6486,6 +6488,39 @@ mod tests {
             matches!(index.as_ref(), CExpr::Var(name) if name == "local_c"),
             "typed pointer locals must not survive as subscript indices, got {expr:?}"
         );
+    }
+
+    #[test]
+    fn test_semantic_load_rendering_refuses_custom_space() {
+        let ctx = FoldingContext::new(64);
+        let addr = crate::analysis::NormalizedAddr {
+            base: crate::analysis::BaseRef::Value(crate::analysis::ValueRef::from(make_var(
+                "tmp:addr", 1, 8,
+            ))),
+            index: None,
+            scale_bytes: 0,
+            offset_bytes: 0,
+        };
+        let render = |space| {
+            ctx.render_semantic_value(
+                &crate::analysis::SemanticValue::Load {
+                    space,
+                    addr: addr.clone(),
+                    size: 4,
+                },
+                0,
+                &mut HashSet::new(),
+            )
+            .expect("semantic load rendering")
+        };
+
+        assert!(matches!(render(SpaceId::Ram), CExpr::Deref(_)));
+        assert!(matches!(
+            render(SpaceId::Custom(7)),
+            CExpr::Call { ref func, ref args }
+                if **func == CExpr::Var("r2s_unsupported_space_load".to_string())
+                    && args.first() == Some(&CExpr::StringLit("space7".to_string()))
+        ));
     }
 
     #[test]
@@ -6538,6 +6573,7 @@ mod tests {
         ctx.state.analysis_ctx.use_info.semantic_values.insert(
             store_addr.display_name(),
             crate::analysis::SemanticValue::Load {
+                space: r2il::SpaceId::Ram,
                 addr: crate::analysis::NormalizedAddr {
                     base: crate::analysis::BaseRef::Value(crate::analysis::ValueRef::from(
                         len_value.clone(),
@@ -6635,6 +6671,7 @@ mod tests {
         ctx.state.analysis_ctx.use_info.semantic_values.insert(
             dst.display_name(),
             crate::analysis::SemanticValue::Load {
+                space: r2il::SpaceId::Ram,
                 addr: crate::analysis::NormalizedAddr {
                     base: crate::analysis::BaseRef::Value(crate::analysis::ValueRef::from(
                         make_var("arg1", 0, 8),
@@ -6697,6 +6734,7 @@ mod tests {
         ctx.state.analysis_ctx.use_info.semantic_values.insert(
             dst.display_name(),
             crate::analysis::SemanticValue::Load {
+                space: r2il::SpaceId::Ram,
                 addr: crate::analysis::NormalizedAddr {
                     base: crate::analysis::BaseRef::Value(crate::analysis::ValueRef::from(
                         make_var("arg1", 0, 8),
@@ -6970,6 +7008,7 @@ mod tests {
         ctx.state.analysis_ctx.use_info.semantic_values.insert(
             dst.display_name(),
             crate::analysis::SemanticValue::Load {
+                space: r2il::SpaceId::Ram,
                 addr: crate::analysis::NormalizedAddr {
                     base: crate::analysis::BaseRef::Value(crate::analysis::ValueRef::from(
                         make_var("arr", 0, 8),
@@ -7035,7 +7074,7 @@ mod tests {
                 b: make_var("const:8", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: tmp6500_1,
                 val: x0.clone(),
             },
@@ -7045,7 +7084,7 @@ mod tests {
                 b: make_var("const:4", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: tmp6400_1,
                 val: w1.clone(),
             },
@@ -7056,7 +7095,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: x9_1.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: tmp6500_2,
             },
             SSAOp::IntAdd {
@@ -7066,7 +7105,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: tmp26b00_1.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: tmp6400_2,
             },
             SSAOp::IntSExt {
@@ -7093,7 +7132,7 @@ mod tests {
                 b: make_var("const:8", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: tmp6400_3.clone(),
                 val: w2,
             },
@@ -7819,7 +7858,7 @@ mod tests {
         let dst = make_var("tmp:9301", 1, 4);
         let block = make_block(vec![SSAOp::Load {
             dst: dst.clone(),
-            space: "ram".to_string(),
+            space: r2il::SpaceId::Ram,
             addr: addr.clone(),
         }]);
 
@@ -7833,7 +7872,7 @@ mod tests {
         let stmt = ctx
             .op_to_stmt(&SSAOp::Load {
                 dst,
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr,
             })
             .expect("load should emit statement");
@@ -7861,12 +7900,43 @@ mod tests {
     }
 
     #[test]
+    fn non_ram_load_and_store_residualize_before_stack_or_pointer_lowering() {
+        let addr = make_var("tmp:space_addr", 1, 8);
+        let value = make_var("tmp:space_value", 1, 4);
+        let space = r2il::SpaceId::Custom(7);
+        let load = SSAOp::Load {
+            dst: value.clone(),
+            space,
+            addr: addr.clone(),
+        };
+        let store = SSAOp::Store {
+            space,
+            addr,
+            val: value,
+        };
+        let block = make_block(vec![load.clone(), store.clone()]);
+        let mut ctx = FoldingContext::new(64);
+        ctx.analyze_block(&block);
+
+        for (op, effect) in [(&load, "load"), (&store, "store")] {
+            let stmt = ctx
+                .op_to_stmt(op)
+                .expect("non-RAM effect must remain visible");
+            assert!(
+                matches!(&stmt, CStmt::Comment(text)
+                    if text.contains(&format!("unsupported exact memory {effect} space space7"))),
+                "non-RAM {effect} must residualize, got {stmt:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_load_generic_deref_avoids_redundant_pointer_cast() {
         let addr = make_var("arg1", 0, 8);
         let dst = make_var("tmp:9401", 1, 4);
         let block = make_block(vec![SSAOp::Load {
             dst: dst.clone(),
-            space: "ram".to_string(),
+            space: r2il::SpaceId::Ram,
             addr: addr.clone(),
         }]);
 
@@ -7880,7 +7950,7 @@ mod tests {
         let stmt = ctx
             .op_to_stmt(&SSAOp::Load {
                 dst,
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr,
             })
             .expect("load should emit statement");
@@ -8022,7 +8092,7 @@ mod tests {
                 src: zf_1,
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("const:0x2000", 0, 8),
                 val: tmp.clone(),
             },
@@ -10629,13 +10699,13 @@ mod tests {
                 src: edi_0,
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: addr.clone(),
                 val: arg_copy,
             },
             SSAOp::Load {
                 dst: loaded.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr,
             },
             SSAOp::IntNotEqual {
@@ -10672,14 +10742,24 @@ mod tests {
             .insert(saved.display_name(), "RBX_1".to_string());
 
         assert!(ctx.is_stack_frame_op(&SSAOp::Store {
-            space: "ram".to_string(),
+            space: r2il::SpaceId::Ram,
             addr: addr.clone(),
             val: saved,
         }));
         assert!(!ctx.is_stack_frame_op(&SSAOp::Store {
-            space: "ram".to_string(),
+            space: r2il::SpaceId::Ram,
             addr,
             val: make_var("value", 1, 8),
+        }));
+        assert!(!ctx.is_stack_frame_op(&SSAOp::Store {
+            space: r2il::SpaceId::Custom(7),
+            addr: make_var("RSP", 1, 8),
+            val: make_var("RBP", 1, 8),
+        }));
+        assert!(!ctx.is_stack_frame_op(&SSAOp::Load {
+            dst: make_var("RBP", 2, 8),
+            space: r2il::SpaceId::Custom(7),
+            addr: make_var("RSP", 1, 8),
         }));
     }
 
@@ -12187,7 +12267,7 @@ mod tests {
                 b: make_var("const:1", 0, 4),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("const:1000", 0, 8),
                 val: tmp,
             },
@@ -12259,7 +12339,7 @@ mod tests {
                 src: make_var("ZF", 2, 1),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("const:2000", 0, 8),
                 val: tmp2.clone(),
             },
@@ -12290,7 +12370,7 @@ mod tests {
                 b: const_neg4,
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr,
                 val: eax_1,
             },
@@ -12360,7 +12440,7 @@ mod tests {
                 b: make_var("const:fffffffffffffffc", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:retaddr", 1, 8),
                 val: make_var("EDI", 0, 4),
             },
@@ -12379,7 +12459,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("tmp:retload", 1, 4),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:retaddr", 2, 8),
             },
             SSAOp::Copy {
@@ -12507,7 +12587,7 @@ mod tests {
                 b: make_var("const:c", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:retaddr", 1, 8),
                 val: make_var("const:1", 0, 4),
             },
@@ -12522,7 +12602,7 @@ mod tests {
                 b: make_var("const:c", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:retaddr", 2, 8),
                 val: make_var("const:0", 0, 4),
             },
@@ -12538,7 +12618,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("tmp:ret", 1, 4),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:retaddr", 3, 8),
             },
             SSAOp::IntZExt {
@@ -12651,7 +12731,7 @@ mod tests {
                 b: make_var("const:fffffffffffffffc", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:retaddr", 1, 8),
                 val: make_var("const:1", 0, 4),
             },
@@ -12666,7 +12746,7 @@ mod tests {
                 b: make_var("const:fffffffffffffffc", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:retaddr", 2, 8),
                 val: make_var("const:0", 0, 4),
             },
@@ -12682,7 +12762,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("tmp:ret", 1, 4),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:retaddr", 3, 8),
             },
             SSAOp::IntZExt {
@@ -12696,7 +12776,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("RIP", 1, 8),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("RSP", 2, 8),
             },
             SSAOp::Return {
@@ -13100,7 +13180,7 @@ mod tests {
         func.get_block_mut(0x100c).expect("exit").ops = vec![
             SSAOp::Load {
                 dst: make_var("tmp:savedfp", 1, 8),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("RSP", 1, 8),
             },
             SSAOp::IntAdd {
@@ -13114,7 +13194,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("RIP", 1, 8),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("RSP", 2, 8),
             },
             SSAOp::IntAdd {
@@ -13214,13 +13294,13 @@ mod tests {
                 src: make_var("EDI", 0, 4),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:4700", 1, 8),
                 val: make_var("tmp:6a80", 1, 4),
             },
             SSAOp::Load {
                 dst: make_var("tmp:11f00", 1, 4),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:4700", 1, 8),
             },
             SSAOp::IntSub {
@@ -13258,7 +13338,7 @@ mod tests {
         func.get_block_mut(0x100c).expect("exit").ops = vec![
             SSAOp::Load {
                 dst: make_var("tmp:savedfp", 1, 8),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("RSP", 1, 8),
             },
             SSAOp::IntAdd {
@@ -13272,7 +13352,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("RIP", 1, 8),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("RSP", 2, 8),
             },
             SSAOp::IntAdd {
@@ -13371,7 +13451,7 @@ mod tests {
                 b: make_var("const:8", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("RSP", 1, 8),
                 val: make_var("tmp:27d00", 1, 8),
             },
@@ -13389,7 +13469,7 @@ mod tests {
                 src: make_var("EDI", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:4700", 1, 8),
                 val: make_var("tmp:6a80", 1, 4),
             },
@@ -13400,7 +13480,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("tmp:11f00", 1, 4),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:4700", 2, 8),
             },
             SSAOp::Copy {
@@ -13480,7 +13560,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("tmp:55400", 2, 8),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("RSP", 1, 8),
             },
             SSAOp::IntAdd {
@@ -13494,7 +13574,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("RIP", 1, 8),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("RSP", 2, 8),
             },
             SSAOp::IntAdd {
@@ -14211,6 +14291,7 @@ mod tests {
         ctx.state.analysis_ctx.use_info.semantic_values.insert(
             eax.display_name(),
             crate::analysis::SemanticValue::Load {
+                space: r2il::SpaceId::Ram,
                 addr: crate::analysis::NormalizedAddr {
                     base: crate::analysis::BaseRef::Value(crate::analysis::ValueRef::from(arr_src)),
                     index: Some(crate::analysis::ValueRef::from(idx_src)),
@@ -14277,7 +14358,7 @@ mod tests {
                 b: make_var("const:fffffffffffffff8", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: slot_arr.clone(),
                 val: rdi,
             },
@@ -14287,13 +14368,13 @@ mod tests {
                 b: make_var("const:fffffffffffffff4", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: slot_idx.clone(),
                 val: esi,
             },
             SSAOp::Load {
                 dst: idx_loaded.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: slot_idx,
             },
             SSAOp::Copy {
@@ -14315,7 +14396,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: arr_loaded.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: slot_arr,
             },
             SSAOp::Copy {
@@ -14329,7 +14410,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: load.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr,
             },
             SSAOp::Copy {
@@ -14436,6 +14517,7 @@ mod tests {
         ctx.state.analysis_ctx.use_info.semantic_values.insert(
             load_first.display_name(),
             crate::analysis::SemanticValue::Load {
+                space: r2il::SpaceId::Ram,
                 addr: crate::analysis::NormalizedAddr {
                     base: crate::analysis::BaseRef::Value(crate::analysis::ValueRef::from(
                         base.clone(),
@@ -14450,6 +14532,7 @@ mod tests {
         ctx.state.analysis_ctx.use_info.semantic_values.insert(
             load_second.display_name(),
             crate::analysis::SemanticValue::Load {
+                space: r2il::SpaceId::Ram,
                 addr: crate::analysis::NormalizedAddr {
                     base: crate::analysis::BaseRef::Value(crate::analysis::ValueRef::from(
                         base.clone(),
@@ -14560,6 +14643,7 @@ mod tests {
         ctx.state.analysis_ctx.use_info.semantic_values.insert(
             load_first.display_name(),
             crate::analysis::SemanticValue::Load {
+                space: r2il::SpaceId::Ram,
                 addr: crate::analysis::NormalizedAddr {
                     base: crate::analysis::BaseRef::Value(crate::analysis::ValueRef::from(
                         base.clone(),
@@ -14574,6 +14658,7 @@ mod tests {
         ctx.state.analysis_ctx.use_info.semantic_values.insert(
             load_second.display_name(),
             crate::analysis::SemanticValue::Load {
+                space: r2il::SpaceId::Ram,
                 addr: crate::analysis::NormalizedAddr {
                     base: crate::analysis::BaseRef::Value(crate::analysis::ValueRef::from(base)),
                     index: Some(crate::analysis::ValueRef::from(idx)),
@@ -14619,7 +14704,7 @@ mod tests {
                 b: make_var("const:8", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("RSP", 1, 8),
                 val: make_var("RBP", 0, 8),
             },
@@ -14633,7 +14718,7 @@ mod tests {
                 b: make_var("const:fffffffffffffff8", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:4700", 1, 8),
                 val: make_var("RDI", 0, 8),
             },
@@ -14643,7 +14728,7 @@ mod tests {
                 b: make_var("const:fffffffffffffff4", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:4700", 2, 8),
                 val: make_var("ESI", 0, 4),
             },
@@ -14653,13 +14738,13 @@ mod tests {
                 b: make_var("const:fffffffffffffff0", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:4700", 3, 8),
                 val: make_var("EDX", 0, 4),
             },
             SSAOp::Load {
                 dst: make_var("tmp:11f00", 1, 4),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:4700", 2, 8),
             },
             SSAOp::Copy {
@@ -14695,7 +14780,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("tmp:11f80", 1, 8),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:4700", 1, 8),
             },
             SSAOp::Copy {
@@ -14713,7 +14798,7 @@ mod tests {
                 b: make_var("const:8", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:4700", 4, 8),
                 val: make_var("EDX", 0, 4),
             },
@@ -14724,7 +14809,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("ECX", 1, 4),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:4700", 5, 8),
             },
             SSAOp::IntAdd {
@@ -14734,7 +14819,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("EAX", 2, 4),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:4700", 6, 8),
             },
             SSAOp::IntAdd {
@@ -14876,6 +14961,7 @@ mod tests {
         ctx.state.analysis_ctx.use_info.semantic_values.insert(
             ret.display_name(),
             crate::analysis::SemanticValue::Load {
+                space: r2il::SpaceId::Ram,
                 addr: crate::analysis::NormalizedAddr {
                     base: crate::analysis::BaseRef::Value(crate::analysis::ValueRef::from(arr)),
                     index: Some(crate::analysis::ValueRef::from(idx)),
@@ -14941,7 +15027,7 @@ mod tests {
                 b: make_var("const:fffffffffffffff8", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: slot_arr.clone(),
                 val: rdi,
             },
@@ -14951,13 +15037,13 @@ mod tests {
                 b: make_var("const:fffffffffffffff4", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: slot_idx.clone(),
                 val: esi,
             },
             SSAOp::Load {
                 dst: arr_loaded.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: slot_arr,
             },
             SSAOp::Copy {
@@ -14971,7 +15057,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: idx_loaded.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: slot_idx,
             },
             SSAOp::IntSub {
@@ -14995,7 +15081,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: load.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr,
             },
             SSAOp::Copy {
@@ -15128,7 +15214,7 @@ mod tests {
                 b: make_var("const:fffffffffffffff8", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: slot_arr.clone(),
                 val: rdi,
             },
@@ -15138,13 +15224,13 @@ mod tests {
                 b: make_var("const:fffffffffffffff4", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: slot_idx.clone(),
                 val: esi,
             },
             SSAOp::Load {
                 dst: arr_loaded.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: slot_arr,
             },
             SSAOp::Copy {
@@ -15153,7 +15239,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: idx_loaded.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: slot_idx,
             },
             SSAOp::Copy {
@@ -15176,7 +15262,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: load.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr,
             },
             SSAOp::Copy {
@@ -15391,7 +15477,7 @@ mod tests {
                 b: make_var("const:fffffffffffffff8", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: slot_obj.clone(),
                 val: rdi,
             },
@@ -15401,13 +15487,13 @@ mod tests {
                 b: make_var("const:fffffffffffffff4", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: slot_val.clone(),
                 val: esi,
             },
             SSAOp::Load {
                 dst: val_loaded.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: slot_val,
             },
             SSAOp::Copy {
@@ -15416,7 +15502,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: obj_loaded1.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: slot_obj.clone(),
             },
             SSAOp::Copy {
@@ -15429,13 +15515,13 @@ mod tests {
                 b: make_var("const:30", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: store_addr,
                 val: ecx1,
             },
             SSAOp::Load {
                 dst: obj_loaded2.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: slot_obj,
             },
             SSAOp::Copy {
@@ -15449,7 +15535,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: load30.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: load_addr30,
             },
             SSAOp::Copy {
@@ -15458,7 +15544,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: load0.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: rax2.clone(),
             },
             SSAOp::IntAdd {
@@ -15639,7 +15725,7 @@ mod tests {
                 b: make_var("const:8", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: slot_obj,
                 val: x0,
             },
@@ -15649,7 +15735,7 @@ mod tests {
                 b: make_var("const:4", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: slot_val,
                 val: w1,
             },
@@ -15660,7 +15746,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: load_val.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:6400", 2, 8),
             },
             SSAOp::IntZExt {
@@ -15674,7 +15760,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: x9_1.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: slot_obj_2,
             },
             SSAOp::IntAdd {
@@ -15683,7 +15769,7 @@ mod tests {
                 b: make_var("const:30", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: field_addr_30,
                 val: make_var("W8", 0, 4),
             },
@@ -15694,7 +15780,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: x8_2.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: slot_obj_3,
             },
             SSAOp::IntAdd {
@@ -15704,7 +15790,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: load_30.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: field_addr_30_load,
             },
             SSAOp::IntZExt {
@@ -15718,7 +15804,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: x9_2.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: slot_obj_4,
             },
             SSAOp::Copy {
@@ -15727,7 +15813,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: load_0.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: copy_base,
             },
             SSAOp::Copy {
@@ -15811,7 +15897,7 @@ mod tests {
                 b: make_var("const:c", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:6400", 3, 8),
                 val: make_var("W8", 0, 4),
             },
@@ -15826,7 +15912,7 @@ mod tests {
                 b: make_var("const:c", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:6400", 4, 8),
                 val: make_var("const:0", 0, 4),
             },
@@ -15869,7 +15955,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("tmp:24c00", 2, 4),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:6400", 6, 8),
             },
             SSAOp::IntZExt {
@@ -15944,7 +16030,7 @@ mod tests {
                 b: make_var("const:8", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:6400", 1, 8),
                 val: make_var("W0", 0, 4),
             },
@@ -15955,7 +16041,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("tmp:24c00", 1, 4),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:6400", 2, 8),
             },
             SSAOp::IntZExt {
@@ -16038,7 +16124,7 @@ mod tests {
                 b: make_var("const:c", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:6400", 4, 8),
                 val: make_var("const:1", 0, 4),
             },
@@ -16057,7 +16143,7 @@ mod tests {
                 src: make_var("const:0", 0, 4),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:6400", 3, 8),
                 val: make_var("const:0", 0, 4),
             },
@@ -16100,7 +16186,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("tmp:24c00", 2, 4),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:6400", 6, 8),
             },
             SSAOp::IntZExt {
@@ -16208,7 +16294,7 @@ mod tests {
                 b: make_var("const:8", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:6400", 1, 8),
                 val: make_var("W0", 0, 4),
             },
@@ -16219,7 +16305,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("tmp:24c00", 1, 4),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:6400", 2, 8),
             },
             SSAOp::IntZExt {
@@ -16302,7 +16388,7 @@ mod tests {
                 b: make_var("const:c", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:6400", 4, 8),
                 val: make_var("const:1", 0, 4),
             },
@@ -16321,7 +16407,7 @@ mod tests {
                 src: make_var("const:0", 0, 4),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:6400", 3, 8),
                 val: make_var("const:0", 0, 4),
             },
@@ -16364,7 +16450,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("tmp:24c00", 2, 4),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:6400", 6, 8),
             },
             SSAOp::IntZExt {
@@ -16457,7 +16543,7 @@ mod tests {
                     b: make_var("const:c", 0, 8),
                 },
                 SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: make_var("tmp:6400", 1, 8),
                     val: make_var("W0", 0, 4),
                 },
@@ -16467,7 +16553,7 @@ mod tests {
                     b: make_var("const:8", 0, 8),
                 },
                 SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: make_var("tmp:6400", 2, 8),
                     val: make_var("W1", 0, 4),
                 },
@@ -16478,7 +16564,7 @@ mod tests {
                 },
                 SSAOp::Load {
                     dst: make_var("tmp:24c00", 1, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: make_var("tmp:6400", 3, 8),
                 },
                 SSAOp::IntLessEqual {
@@ -16539,7 +16625,7 @@ mod tests {
                 },
                 SSAOp::Load {
                     dst: make_var("tmp:24c00", 2, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: make_var("tmp:6400", 4, 8),
                 },
                 SSAOp::IntLessEqual {
@@ -16681,7 +16767,7 @@ mod tests {
                 b: make_var("const:8", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:6400", 1, 8),
                 val: make_var("W0", 0, 4),
             },
@@ -16715,7 +16801,7 @@ mod tests {
                 b: make_var("const:c", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:6400", 6, 8),
                 val: make_var("const:0", 0, 4),
             },
@@ -16730,7 +16816,7 @@ mod tests {
                 b: make_var("const:c", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:6400", 5, 8),
                 val: make_var("const:1", 0, 4),
             },
@@ -16814,7 +16900,7 @@ mod tests {
                 b: make_var("const:c", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:6400", 1, 8),
                 val: make_var("tmp:retcopy", 1, 4),
             },
@@ -16829,7 +16915,7 @@ mod tests {
                 b: make_var("const:c", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:6400", 2, 8),
                 val: make_var("const:0", 0, 4),
             },
@@ -16845,7 +16931,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("tmp:24c00", 1, 4),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:6400", 3, 8),
             },
             SSAOp::IntZExt {
@@ -17020,7 +17106,7 @@ mod tests {
                 b: make_var("const:fffffffffffffffc", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:retaddr", 2, 8),
                 val: make_var("const:1", 0, 4),
             },
@@ -17035,7 +17121,7 @@ mod tests {
                 b: make_var("const:fffffffffffffffc", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:retaddr", 1, 8),
                 val: make_var("const:0", 0, 4),
             },
@@ -17051,7 +17137,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("RIP", 1, 8),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("RSP", 2, 8),
             },
             SSAOp::Return {
@@ -17131,7 +17217,7 @@ mod tests {
                 b: make_var("const:8", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("RSP", 1, 8),
                 val: make_var("tmp:27d00", 1, 8),
             },
@@ -17149,7 +17235,7 @@ mod tests {
                 src: make_var("EDI", 0, 4),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:4700", 1, 8),
                 val: make_var("tmp:6a80", 1, 4),
             },
@@ -17160,7 +17246,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("tmp:11f00", 1, 4),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:4700", 2, 8),
             },
             SSAOp::Copy {
@@ -17282,7 +17368,7 @@ mod tests {
                 src: make_var("EAX", 3, 4),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:4700", 3, 8),
                 val: make_var("tmp:6a80", 2, 4),
             },
@@ -17293,7 +17379,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("tmp:11f00", 2, 4),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:4700", 4, 8),
             },
             SSAOp::Copy {
@@ -17360,7 +17446,7 @@ mod tests {
                 b: make_var("const:fffffffffffffffc", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:4700", 5, 8),
                 val: make_var("const:1", 0, 4),
             },
@@ -17375,7 +17461,7 @@ mod tests {
                 b: make_var("const:fffffffffffffffc", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:4700", 6, 8),
                 val: make_var("const:0", 0, 4),
             },
@@ -17406,7 +17492,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("tmp:11f00", 3, 4),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:4700", 8, 8),
             },
             SSAOp::Copy {
@@ -17423,7 +17509,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("tmp:55400", 2, 8),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("RSP", 1, 8),
             },
             SSAOp::IntAdd {
@@ -17437,7 +17523,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("RIP", 1, 8),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("RSP", 2, 8),
             },
             SSAOp::IntAdd {
@@ -17634,13 +17720,13 @@ mod tests {
                 b: make_var("const:fffffffffffffff8", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:condaddr", 1, 8),
                 val: make_var("tmp:widen", 1, 4),
             },
             SSAOp::Load {
                 dst: make_var("tmp:condreload", 1, 4),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:condaddr", 1, 8),
             },
             SSAOp::IntNotEqual {
@@ -17660,7 +17746,7 @@ mod tests {
                 b: make_var("const:fffffffffffffffc", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:retaddr", 1, 8),
                 val: make_var("ESI", 0, 4),
             },
@@ -17675,7 +17761,7 @@ mod tests {
                 b: make_var("const:fffffffffffffffc", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:retaddr", 2, 8),
                 val: make_var("EDI", 0, 4),
             },
@@ -17691,7 +17777,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("RIP", 1, 8),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("RSP", 2, 8),
             },
             SSAOp::Return {
@@ -17775,7 +17861,7 @@ mod tests {
                 b: make_var("const:8", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("RSP", 1, 8),
                 val: make_var("tmp:27d00", 1, 8),
             },
@@ -17793,7 +17879,7 @@ mod tests {
                 src: make_var("EDI", 0, 4),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:4700", 1, 8),
                 val: make_var("tmp:6a80", 1, 4),
             },
@@ -17807,7 +17893,7 @@ mod tests {
                 src: make_var("ESI", 0, 4),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:4700", 2, 8),
                 val: make_var("tmp:6a80", 2, 4),
             },
@@ -17818,7 +17904,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("tmp:11f00", 1, 4),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:4700", 3, 8),
             },
             SSAOp::Copy {
@@ -17836,7 +17922,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("tmp:6a80", 3, 4),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:4700", 4, 8),
             },
             SSAOp::Copy {
@@ -17955,7 +18041,7 @@ mod tests {
                 src: make_var("EAX", 2, 4),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:4700", 5, 8),
                 val: make_var("tmp:6a80", 4, 4),
             },
@@ -17966,7 +18052,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("tmp:11f00", 2, 4),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:4700", 6, 8),
             },
             SSAOp::IntSExt {
@@ -17983,7 +18069,7 @@ mod tests {
                 src: make_var("RAX", 3, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:4700", 7, 8),
                 val: make_var("tmp:6b00", 1, 8),
             },
@@ -17994,7 +18080,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("tmp:11f80", 1, 8),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:4700", 8, 8),
             },
             SSAOp::Copy {
@@ -18062,7 +18148,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("tmp:11f00", 3, 4),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:4700", 9, 8),
             },
             SSAOp::Copy {
@@ -18083,7 +18169,7 @@ mod tests {
                 src: make_var("EAX", 3, 4),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:4700", 10, 8),
                 val: make_var("tmp:6a80", 5, 4),
             },
@@ -18099,7 +18185,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("tmp:11f00", 4, 4),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:4700", 11, 8),
             },
             SSAOp::Copy {
@@ -18120,7 +18206,7 @@ mod tests {
                 src: make_var("EAX", 4, 4),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:4700", 12, 8),
                 val: make_var("tmp:6a80", 6, 4),
             },
@@ -18175,7 +18261,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("tmp:11f00", 6, 4),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("tmp:4700", 14, 8),
             },
             SSAOp::Copy {
@@ -18192,7 +18278,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("tmp:55400", 2, 8),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("RSP", 1, 8),
             },
             SSAOp::IntAdd {
@@ -18206,7 +18292,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: make_var("RIP", 1, 8),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: make_var("RSP", 2, 8),
             },
             SSAOp::IntAdd {
@@ -21044,6 +21130,7 @@ mod tests {
                 proof.kind == EffectRenderProofKind::MemoryRead
                     && proof.block_addr == 0x1000
                     && proof.op_idx == 0
+                    && proof.space == Some(SpaceId::Ram)
             }),
             "certified load return must record exact memory proof"
         );
@@ -21741,7 +21828,7 @@ mod tests {
 
         let stack_load = make_block(vec![SSAOp::Load {
             dst: make_var("rax", 1, 8),
-            space: "ram".to_string(),
+            space: r2il::SpaceId::Ram,
             addr: make_var("rbp", 0, 8),
         }]);
         assert!(
@@ -22037,13 +22124,13 @@ mod tests {
             },
             SSAOp::CallDefine { dst: rax.clone() },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: slot.clone(),
                 val: rax,
             },
             SSAOp::Load {
                 dst: loaded.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: slot,
             },
             SSAOp::Copy {
@@ -22056,6 +22143,50 @@ mod tests {
             ctx.local_post_call_source_for_ssa_name_in_block(&block, &copied.display_name(), 0),
             Some(source_call),
             "stack reloads must preserve the canonical producing call source"
+        );
+    }
+
+    #[test]
+    fn local_post_call_source_refuses_custom_space_stack_shaped_reload() {
+        let mut ctx = make_x86_64_ctx();
+        let source_call = (0x1000, 0);
+        let rax = make_var("rax", 1, 8);
+        let slot = make_var("tmp:slot", 1, 8);
+        let loaded = make_var("tmp:loaded", 1, 8);
+        ctx.state
+            .analysis_ctx
+            .ownership
+            .alias_sources
+            .insert(rax.display_name(), CallSiteId::from(source_call));
+        ctx.state.analysis_ctx.use_info.definitions.insert(
+            slot.display_name(),
+            CExpr::binary(
+                BinaryOp::Add,
+                CExpr::Var("rbp".to_string()),
+                CExpr::IntLit(-8),
+            ),
+        );
+        let block = make_block(vec![
+            SSAOp::Call {
+                target: make_var("ram:401000", 0, 8),
+            },
+            SSAOp::CallDefine { dst: rax.clone() },
+            SSAOp::Store {
+                space: r2il::SpaceId::Custom(7),
+                addr: slot.clone(),
+                val: rax,
+            },
+            SSAOp::Load {
+                dst: loaded.clone(),
+                space: r2il::SpaceId::Custom(7),
+                addr: slot,
+            },
+        ]);
+
+        assert!(
+            ctx.local_post_call_source_for_ssa_name_in_block(&block, &loaded.display_name(), 0,)
+                .is_none(),
+            "stack-shaped accesses in a custom address space cannot inherit a RAM call-result home"
         );
     }
 
@@ -22094,13 +22225,13 @@ mod tests {
             },
             SSAOp::CallDefine { dst: rax.clone() },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: stored_slot,
                 val: rax,
             },
             SSAOp::Load {
                 dst: loaded.clone(),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: loaded_slot,
             },
         ]);
@@ -22143,13 +22274,13 @@ mod tests {
             prev = next;
         }
         ops.push(SSAOp::Store {
-            space: "ram".to_string(),
+            space: r2il::SpaceId::Ram,
             addr: slot.clone(),
             val: prev,
         });
         ops.push(SSAOp::Load {
             dst: loaded.clone(),
-            space: "ram".to_string(),
+            space: r2il::SpaceId::Ram,
             addr: slot,
         });
         let block = make_block(ops);
@@ -22167,7 +22298,7 @@ mod tests {
         let addr = make_var("tmp:home_addr", 1, 8);
         let val = make_var("tmp:home_val", 1, 8);
         let store = SSAOp::Store {
-            space: "ram".to_string(),
+            space: r2il::SpaceId::Ram,
             addr: addr.clone(),
             val: val.clone(),
         };
@@ -22203,7 +22334,7 @@ mod tests {
         let addr = make_var("tmp:home_addr", 1, 8);
         let val = make_var("tmp:home_val", 1, 8);
         let store = SSAOp::Store {
-            space: "ram".to_string(),
+            space: r2il::SpaceId::Ram,
             addr,
             val,
         };
@@ -22231,7 +22362,7 @@ mod tests {
         let addr = make_var("tmp:home_addr", 1, 8);
         let val = make_var("tmp:home_val", 1, 8);
         let store = SSAOp::Store {
-            space: "ram".to_string(),
+            space: r2il::SpaceId::Ram,
             addr: addr.clone(),
             val,
         };
@@ -22297,7 +22428,7 @@ mod tests {
         let addr = make_var("tmp:home_addr", 1, 8);
         let val = make_var("tmp:home_val", 1, 8);
         let store = SSAOp::Store {
-            space: "ram".to_string(),
+            space: r2il::SpaceId::Ram,
             addr: addr.clone(),
             val,
         };
@@ -22348,7 +22479,10 @@ mod tests {
         where
             F: FnOnce(&mut FoldingContext<'_>, &str, (u64, usize)) -> BTreeSet<String>,
         {
-            let arch = make_test_arch_x86_64();
+            let mut arch = make_test_arch_x86_64();
+            if install_function_facts {
+                arch.add_register(RegisterDef::new("RIP", 0x30, 8));
+            }
             let mut entry = R2ILBlock::new(0x1000, 4);
             entry.push(R2ILOp::Call {
                 target: Varnode::constant(0x401050, 8),
@@ -22372,20 +22506,87 @@ mod tests {
                 val: store_value,
             });
 
-            let prepared =
-                prepared_from_r2il_blocks(&[entry], &arch).with_name("stack_owner_fallback");
+            let prepared = if install_function_facts {
+                let register_storage = |offset| r2ssa::CanonicalStorageId {
+                    space: r2ssa::CanonicalStorageSpace::Register,
+                    offset,
+                    size: 8,
+                };
+                let frame_pointer = register_storage(0x20);
+                let stack_pointer = register_storage(0x28);
+                let return_address = register_storage(0x30);
+                let interface = r2ssa::SourceFunctionInterface::new_exact(
+                    b"post-call-stack-owner:v1".to_vec(),
+                    "sysv64",
+                    [],
+                    r2ssa::SourceFunctionReturn::Void,
+                    [r2ssa::SourceStackSlotSpec::new_local(
+                        r2ssa::StackAddressBase::FramePointer,
+                        frame_pointer,
+                        offset,
+                        8,
+                    )],
+                )
+                .and_then(|interface| interface.with_return_address_storage(return_address))
+                .and_then(|interface| interface.with_stack_pointer_storage(stack_pointer))
+                .and_then(|interface| interface.with_frame_pointer_storage(frame_pointer))
+                .expect("exact frame-local source interface");
+                r2ssa::SsaArtifact::for_decompile_with_interface(&[entry], Some(&arch), interface)
+                    .expect("prepared exact stack-owner fixture")
+                    .with_name("stack_owner_exact")
+            } else {
+                prepared_from_r2il_blocks(&[entry], &arch).with_name("stack_owner_fallback")
+            };
             let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
             if install_function_facts {
                 let source_call = (0x1000, 0);
-                let call_result_facts =
-                    test_call_result_facts_with_owner_for_source(&prepared, source_call);
-                install_stack_owner_function_facts(
-                    &mut ctx,
-                    &prepared,
-                    call_result_facts,
-                    "buf",
-                    offset,
+                let call_result_facts = test_call_result_facts(&prepared);
+                let (object, owner_offset) = call_result_facts
+                    .results_for_site(r2types::CallsiteKey {
+                        block_addr: source_call.0,
+                        op_index: source_call.1,
+                    })
+                    .find_map(|fact| match fact.owner {
+                        Some(r2ssa::ValueOwner::StackSlot { object, offset }) => {
+                            Some((object, offset))
+                        }
+                        _ => None,
+                    })
+                    .expect("exact source interface must derive the call-result stack owner");
+                let slot = prepared
+                    .certificates()
+                    .stack_slots
+                    .get(&object)
+                    .expect("derived owner must reference a certified stack slot");
+                assert_eq!(
+                    (slot.space, slot.base, slot.offset),
+                    (SpaceId::Ram, r2ssa::StackAddressBase::FramePointer, offset,),
+                    "derived owner must retain the declared RAM frame-local identity"
                 );
+                assert_eq!(owner_offset, offset);
+                let render_facts = test_render_facts(&prepared);
+                mutate_function_facts(&mut ctx, |function_facts| {
+                    function_facts.replace_type_facts(r2types::FunctionTypeFacts {
+                        stack_slots: BTreeMap::from([(
+                            StackSlotKey {
+                                base: ExternalStackBase::FramePointer,
+                                offset,
+                            },
+                            r2types::ExternalStackSlotSpec {
+                                name: "buf".to_string(),
+                                ty: Some(r2types::CTypeLike::Int {
+                                    bits: 64,
+                                    signedness: r2types::Signedness::Unsigned,
+                                }),
+                                role: r2types::ExternalStackSlotRole::Local,
+                                ..r2types::ExternalStackSlotSpec::default()
+                            },
+                        )]),
+                        ..r2types::FunctionTypeFacts::default()
+                    });
+                    function_facts.set_call_results(call_result_facts);
+                    function_facts.set_render(render_facts);
+                });
             }
             ctx.set_external_stack_vars(HashMap::from([(
                 -8,

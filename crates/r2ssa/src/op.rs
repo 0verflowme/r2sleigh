@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::var::SSAVar;
-use r2il::MemoryOrdering;
+use r2il::{MemoryOrdering, SpaceId};
 
 /// An SSA operation representing a single semantic action with versioned variables.
 ///
@@ -26,13 +26,13 @@ pub enum SSAOp {
     /// Load from memory: `dst = *[space]addr`
     Load {
         dst: SSAVar,
-        space: String,
+        space: SpaceId,
         addr: SSAVar,
     },
 
     /// Store to memory: `*[space]addr = val`
     Store {
-        space: String,
+        space: SpaceId,
         addr: SSAVar,
         val: SSAVar,
     },
@@ -43,7 +43,7 @@ pub enum SSAOp {
     /// Load-linked from memory.
     LoadLinked {
         dst: SSAVar,
-        space: String,
+        space: SpaceId,
         addr: SSAVar,
         ordering: MemoryOrdering,
     },
@@ -51,7 +51,7 @@ pub enum SSAOp {
     /// Store-conditional to memory.
     StoreConditional {
         result: Option<SSAVar>,
-        space: String,
+        space: SpaceId,
         addr: SSAVar,
         val: SSAVar,
         ordering: MemoryOrdering,
@@ -60,7 +60,7 @@ pub enum SSAOp {
     /// Atomic compare-and-swap.
     AtomicCAS {
         dst: SSAVar,
-        space: String,
+        space: SpaceId,
         addr: SSAVar,
         expected: SSAVar,
         replacement: SSAVar,
@@ -70,7 +70,7 @@ pub enum SSAOp {
     /// Guarded memory load.
     LoadGuarded {
         dst: SSAVar,
-        space: String,
+        space: SpaceId,
         addr: SSAVar,
         guard: SSAVar,
         ordering: MemoryOrdering,
@@ -78,7 +78,7 @@ pub enum SSAOp {
 
     /// Guarded memory store.
     StoreGuarded {
-        space: String,
+        space: SpaceId,
         addr: SSAVar,
         val: SSAVar,
         guard: SSAVar,
@@ -358,6 +358,20 @@ pub enum SSAOp {
 }
 
 impl SSAOp {
+    /// Exact address space touched by a memory operation.
+    pub const fn memory_space(&self) -> Option<SpaceId> {
+        match self {
+            Self::Load { space, .. }
+            | Self::Store { space, .. }
+            | Self::LoadLinked { space, .. }
+            | Self::StoreConditional { space, .. }
+            | Self::AtomicCAS { space, .. }
+            | Self::LoadGuarded { space, .. }
+            | Self::StoreGuarded { space, .. } => Some(*space),
+            _ => None,
+        }
+    }
+
     /// Get the destination variable if this operation has one.
     pub fn dst(&self) -> Option<&SSAVar> {
         use SSAOp::*;
@@ -916,7 +930,7 @@ mod tests {
     fn observable_effect_classification_distinguishes_plain_and_atomic_loads() {
         let load = SSAOp::Load {
             dst: SSAVar::new("RAX", 1, 8),
-            space: "ram".to_string(),
+            space: r2il::SpaceId::Ram,
             addr: SSAVar::new("RSP", 0, 8),
         };
         assert!(!load.has_observable_effects(false));
@@ -924,7 +938,7 @@ mod tests {
 
         let linked = SSAOp::LoadLinked {
             dst: SSAVar::new("RAX", 1, 8),
-            space: "ram".to_string(),
+            space: r2il::SpaceId::Ram,
             addr: SSAVar::new("RSP", 0, 8),
             ordering: r2il::MemoryOrdering::Relaxed,
         };
@@ -993,13 +1007,13 @@ mod tests {
     fn test_display_load_store() {
         let load = SSAOp::Load {
             dst: SSAVar::new("RAX", 1, 8),
-            space: "ram".to_string(),
+            space: r2il::SpaceId::Ram,
             addr: SSAVar::new("RSP", 0, 8),
         };
         assert_eq!(format!("{}", load), "RAX_1 = LOAD [ram]RSP_0");
 
         let store = SSAOp::Store {
-            space: "ram".to_string(),
+            space: r2il::SpaceId::Ram,
             addr: SSAVar::new("RSP", 0, 8),
             val: SSAVar::new("RAX", 1, 8),
         };
@@ -1019,7 +1033,7 @@ mod tests {
                 b: SSAVar::new("RBX", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: SSAVar::new("RSP", 0, 8),
                 val: SSAVar::new("RAX", 1, 8),
             },

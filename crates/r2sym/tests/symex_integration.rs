@@ -2122,7 +2122,7 @@ fn test_state_forking() {
     let forked = state.fork();
 
     // Original and fork should have same values
-    assert_eq!(forked.pc, state.pc);
+    assert_eq!(forked.pc(), state.pc());
     assert_eq!(
         forked.get_register("rax").as_concrete(),
         state.get_register("rax").as_concrete()

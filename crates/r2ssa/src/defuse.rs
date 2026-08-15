@@ -12,21 +12,36 @@ use crate::var::SSAVar;
 /// Information about where a variable is defined and used.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DefUseInfo {
-    /// Maps each variable (name_version) to the operation index that defines it.
-    /// A variable with version 0 has no definition (it's an input).
+    /// Presentation-only map from displayed variable names to definition sites.
+    ///
+    /// A displayed name that identifies multiple exact variables is retained
+    /// with no definition instead of selecting one of them as authoritative.
     pub definitions: HashMap<String, Option<usize>>,
 
-    /// Maps each variable (name_version) to the operation indices that use it.
+    /// Presentation-only map from displayed variable names to use sites.
     pub uses: HashMap<String, Vec<usize>>,
 
-    /// Variables that are inputs (used but never defined in this block).
+    /// Presentation names of variables that are inputs.
     pub inputs: HashSet<String>,
 
-    /// Variables that are outputs (defined but never used in this block).
+    /// Presentation names of variables that are outputs.
     pub outputs: HashSet<String>,
 
-    /// Variables that are live (defined and used within this block).
+    /// Presentation names of variables that are live.
     pub live: HashSet<String>,
+
+    /// Exact semantic def-use state. These fields are rebuilt by [`def_use`]
+    /// and intentionally excluded from the legacy presentation serialization.
+    #[serde(skip)]
+    exact_definitions: HashMap<SSAVar, Option<usize>>,
+    #[serde(skip)]
+    exact_uses: HashMap<SSAVar, Vec<usize>>,
+    #[serde(skip)]
+    exact_inputs: HashSet<SSAVar>,
+    #[serde(skip)]
+    exact_outputs: HashSet<SSAVar>,
+    #[serde(skip)]
+    exact_live: HashSet<SSAVar>,
 }
 
 impl DefUseInfo {
@@ -37,29 +52,30 @@ impl DefUseInfo {
 
     /// Get the definition site of a variable.
     pub fn get_def(&self, var: &SSAVar) -> Option<usize> {
-        let key = var.display_name();
-        self.definitions.get(&key).copied().flatten()
+        self.exact_definitions.get(var).copied().flatten()
     }
 
     /// Get all use sites of a variable.
     pub fn get_uses(&self, var: &SSAVar) -> &[usize] {
-        let key = var.display_name();
-        self.uses.get(&key).map(|v| v.as_slice()).unwrap_or(&[])
+        self.exact_uses
+            .get(var)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Check if a variable is an input to this block.
     pub fn is_input(&self, var: &SSAVar) -> bool {
-        self.inputs.contains(&var.display_name())
+        self.exact_inputs.contains(var)
     }
 
     /// Check if a variable is an output from this block.
     pub fn is_output(&self, var: &SSAVar) -> bool {
-        self.outputs.contains(&var.display_name())
+        self.exact_outputs.contains(var)
     }
 
     /// Check if a variable is live (both defined and used).
     pub fn is_live(&self, var: &SSAVar) -> bool {
-        self.live.contains(&var.display_name())
+        self.exact_live.contains(var)
     }
 
     /// Get all input variable names.
@@ -70,6 +86,37 @@ impl DefUseInfo {
     /// Get all output variable names.
     pub fn output_vars(&self) -> impl Iterator<Item = &str> {
         self.outputs.iter().map(|s| s.as_str())
+    }
+
+    fn rebuild_presentation(&mut self) {
+        self.definitions.clear();
+        self.uses.clear();
+        self.inputs.clear();
+        self.outputs.clear();
+        self.live.clear();
+
+        for (var, definition) in &self.exact_definitions {
+            self.definitions
+                .entry(var.display_name())
+                .and_modify(|existing| {
+                    if *existing != *definition {
+                        *existing = None;
+                    }
+                })
+                .or_insert(*definition);
+        }
+        for (var, uses) in &self.exact_uses {
+            let displayed_uses = self.uses.entry(var.display_name()).or_default();
+            displayed_uses.extend(uses);
+            displayed_uses.sort_unstable();
+            displayed_uses.dedup();
+        }
+        self.inputs
+            .extend(self.exact_inputs.iter().map(SSAVar::display_name));
+        self.outputs
+            .extend(self.exact_outputs.iter().map(SSAVar::display_name));
+        self.live
+            .extend(self.exact_live.iter().map(SSAVar::display_name));
     }
 }
 
@@ -127,41 +174,41 @@ pub fn def_use(block: &SSABlock) -> DefUseInfo {
     // First pass: record all definitions
     for (idx, op) in block.ops.iter().enumerate() {
         if let Some(dst) = op.dst() {
-            let key = dst.display_name();
-            info.definitions.insert(key, Some(idx));
+            info.exact_definitions.insert(dst.clone(), Some(idx));
         }
     }
 
     // Second pass: record all uses
     for (idx, op) in block.ops.iter().enumerate() {
         for src in op.sources() {
-            let key = src.display_name();
-            info.uses.entry(key).or_default().push(idx);
+            info.exact_uses.entry(src.clone()).or_default().push(idx);
         }
     }
 
     // Identify inputs: variables that are used but not defined
-    for var_name in info.uses.keys() {
-        if !info.definitions.contains_key(var_name) {
-            info.inputs.insert(var_name.clone());
+    for var in info.exact_uses.keys() {
+        if !info.exact_definitions.contains_key(var) {
+            info.exact_inputs.insert(var.clone());
             // Also record that this variable has no definition
-            info.definitions.insert(var_name.clone(), None);
+            info.exact_definitions.insert(var.clone(), None);
         }
     }
 
     // Identify outputs: variables that are defined but not used
-    for (var_name, def) in &info.definitions {
-        if def.is_some() && !info.uses.contains_key(var_name) {
-            info.outputs.insert(var_name.clone());
+    for (var, def) in &info.exact_definitions {
+        if def.is_some() && !info.exact_uses.contains_key(var) {
+            info.exact_outputs.insert(var.clone());
         }
     }
 
     // Identify live variables: defined and used
-    for (var_name, def) in &info.definitions {
-        if def.is_some() && info.uses.contains_key(var_name) {
-            info.live.insert(var_name.clone());
+    for (var, def) in &info.exact_definitions {
+        if def.is_some() && info.exact_uses.contains_key(var) {
+            info.exact_live.insert(var.clone());
         }
     }
+
+    info.rebuild_presentation();
 
     info
 }
@@ -179,8 +226,7 @@ pub fn dead_ops(block: &SSABlock) -> Vec<usize> {
 
         // Check if this operation's output is used
         if let Some(dst) = op.dst() {
-            let key = dst.display_name();
-            if !info.uses.contains_key(&key) {
+            if !info.exact_uses.contains_key(dst) {
                 dead.push(idx);
             }
         }
@@ -189,14 +235,14 @@ pub fn dead_ops(block: &SSABlock) -> Vec<usize> {
     dead
 }
 
-/// Constant propagation info: find operations that define constants.
-pub fn find_constants(block: &SSABlock) -> HashMap<String, u64> {
+/// Constant propagation info keyed by exact SSA variable identity.
+pub fn find_constants(block: &SSABlock) -> HashMap<SSAVar, u64> {
     let mut constants = HashMap::new();
 
     for op in &block.ops {
         if let SSAOp::Copy { dst, src } = op {
             if let Some(value) = src.constant_bits() {
-                constants.insert(dst.display_name(), value);
+                constants.insert(dst.clone(), value);
             }
         }
     }
@@ -208,7 +254,7 @@ pub fn find_constants(block: &SSABlock) -> HashMap<String, u64> {
 struct StoreInfo {
     block_addr: u64,
     op_idx: usize,
-    space: String,
+    space: r2il::SpaceId,
     addr: SSAVar,
     val: SSAVar,
     access_size: u32,
@@ -223,7 +269,7 @@ fn collect_store_infos(func: &SSAFunction) -> Vec<StoreInfo> {
                 stores.push(StoreInfo {
                     block_addr: block.addr,
                     op_idx,
-                    space: space.clone(),
+                    space: *space,
                     addr: addr.clone(),
                     val: val.clone(),
                     access_size: val.size,
@@ -271,7 +317,7 @@ fn add_aliasing_stores(
     slice: &mut BackwardSlice,
     worklist: &mut VecDeque<SSAVar>,
     stores: &[StoreInfo],
-    sink_space: &str,
+    sink_space: r2il::SpaceId,
     sink_addr: &SSAVar,
     sink_access_size: u32,
 ) {
@@ -297,11 +343,10 @@ fn walk_backward(
     stores: &[StoreInfo],
     slice: &mut BackwardSlice,
     worklist: &mut VecDeque<SSAVar>,
-    visited_vars: &mut HashSet<String>,
+    visited_vars: &mut HashSet<SSAVar>,
 ) {
     while let Some(var) = worklist.pop_front() {
-        let key = var.display_name();
-        if !visited_vars.insert(key) {
+        if !visited_vars.insert(var.clone()) {
             continue;
         }
 
@@ -331,14 +376,7 @@ fn walk_backward(
                         worklist.push_back(src.clone());
                     }
                     if let SSAOp::Load { space, addr, dst } = op {
-                        add_aliasing_stores(
-                            slice,
-                            worklist,
-                            stores,
-                            space.as_str(),
-                            addr,
-                            dst.size,
-                        );
+                        add_aliasing_stores(slice, worklist, stores, *space, addr, dst.size);
                     }
                 }
             }
@@ -392,24 +430,10 @@ pub fn backward_slice_from_op(func: &SSAFunction, sink: SliceOpRef) -> BackwardS
                     worklist.push_back(src.clone());
                 }
                 if let SSAOp::Load { space, addr, dst } = op {
-                    add_aliasing_stores(
-                        &mut slice,
-                        &mut worklist,
-                        &stores,
-                        space.as_str(),
-                        addr,
-                        dst.size,
-                    );
+                    add_aliasing_stores(&mut slice, &mut worklist, &stores, *space, addr, dst.size);
                 }
                 if let SSAOp::Store { space, addr, val } = op {
-                    add_aliasing_stores(
-                        &mut slice,
-                        &mut worklist,
-                        &stores,
-                        space.as_str(),
-                        addr,
-                        val.size,
-                    );
+                    add_aliasing_stores(&mut slice, &mut worklist, &stores, *space, addr, val.size);
                 }
             }
         }
@@ -537,13 +561,49 @@ mod tests {
 
         // Store RAX_1 (uses RAX_1, has side effect)
         block.push(SSAOp::Store {
-            space: "ram".to_string(),
+            space: r2il::SpaceId::Ram,
             addr: SSAVar::constant(0x1000, 8),
             val: rax_1,
         });
 
         let dead = dead_ops(&block);
         assert_eq!(dead, vec![1]); // Only op 1 is dead
+    }
+
+    #[test]
+    fn colliding_display_names_do_not_merge_def_use_or_deadness() {
+        let mut block = SSABlock::new(0x1000, 8);
+        let defined = make_var("spoof", 1, 8);
+        let distinct_used = make_var("SPOOF", 1, 8);
+        assert_eq!(defined.display_name(), distinct_used.display_name());
+        assert_ne!(defined, distinct_used);
+
+        block.push(SSAOp::Copy {
+            dst: defined.clone(),
+            src: SSAVar::constant(1, 8),
+        });
+        block.push(SSAOp::Store {
+            space: SpaceId::Ram,
+            addr: SSAVar::constant(0x1000, 8),
+            val: distinct_used.clone(),
+        });
+
+        let info = def_use(&block);
+        assert_eq!(info.get_def(&defined), Some(0));
+        assert_eq!(info.get_def(&distinct_used), None);
+        assert!(info.get_uses(&defined).is_empty());
+        assert_eq!(info.get_uses(&distinct_used), &[1]);
+        assert!(info.is_output(&defined));
+        assert!(!info.is_live(&defined));
+        assert!(info.is_input(&distinct_used));
+        assert!(!info.is_live(&distinct_used));
+        assert_eq!(dead_ops(&block), vec![0]);
+
+        assert_eq!(
+            info.definitions.get(&defined.display_name()),
+            Some(&None),
+            "ambiguous presentation must not select either exact variable"
+        );
     }
 
     #[test]
@@ -554,12 +614,12 @@ mod tests {
         let const_42 = SSAVar::constant(0x42, 8);
 
         block.push(SSAOp::Copy {
-            dst: rax_1,
+            dst: rax_1.clone(),
             src: const_42,
         });
 
         let constants = find_constants(&block);
-        assert_eq!(constants.get("RAX_1"), Some(&0x42));
+        assert_eq!(constants.get(&rax_1), Some(&0x42));
     }
 
     #[test]
@@ -571,6 +631,26 @@ mod tests {
         });
 
         assert!(find_constants(&block).is_empty());
+    }
+
+    #[test]
+    fn test_find_constants_keeps_colliding_destination_display_names_distinct() {
+        let mut block = SSABlock::new(0x1000, 4);
+        let first = make_var("spoof", 1, 8);
+        let second = make_var("SPOOF", 1, 8);
+        block.push(SSAOp::Copy {
+            dst: first.clone(),
+            src: SSAVar::constant(0x41, 8),
+        });
+        block.push(SSAOp::Copy {
+            dst: second.clone(),
+            src: SSAVar::constant(0x42, 8),
+        });
+
+        let constants = find_constants(&block);
+        assert_eq!(constants.get(&first), Some(&0x41));
+        assert_eq!(constants.get(&second), Some(&0x42));
+        assert_eq!(constants.len(), 2);
     }
 
     #[test]
@@ -612,6 +692,58 @@ mod tests {
             block_addr: 0x1000,
             op_idx: 0
         }));
+    }
+
+    #[test]
+    fn backward_slice_visits_distinct_vars_with_colliding_display_names() {
+        let raw = R2ILBlock {
+            addr: 0x1800,
+            size: 4,
+            ops: vec![R2ILOp::Copy {
+                dst: make_reg_vn(0, 8),
+                src: make_const_vn(0, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        };
+        let mut func = SSAFunction::from_blocks_raw_no_arch(&[raw]).unwrap();
+        let left = make_var("spoof", 1, 8);
+        let right = make_var("SPOOF", 1, 8);
+        let sink = make_var("sink", 1, 8);
+        assert_eq!(left.display_name(), right.display_name());
+        assert_ne!(left, right);
+        func.get_block_mut(0x1800).unwrap().ops = vec![
+            SSAOp::Copy {
+                dst: left.clone(),
+                src: SSAVar::constant(1, 8),
+            },
+            SSAOp::Copy {
+                dst: right.clone(),
+                src: SSAVar::constant(2, 8),
+            },
+            SSAOp::IntAdd {
+                dst: sink.clone(),
+                a: left,
+                b: right,
+            },
+        ];
+
+        let from_var = backward_slice_from_var(&func, &sink);
+        let from_op = backward_slice_from_op(
+            &func,
+            SliceOpRef::Op {
+                block_addr: 0x1800,
+                op_idx: 2,
+            },
+        );
+        for slice in [&from_var, &from_op] {
+            for op_idx in 0..=2 {
+                assert!(slice.ops.contains(&SliceOpRef::Op {
+                    block_addr: 0x1800,
+                    op_idx,
+                }));
+            }
+        }
     }
 
     #[test]

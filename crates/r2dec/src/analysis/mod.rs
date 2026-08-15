@@ -107,7 +107,11 @@ pub(crate) struct PassEnv<'a> {
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct UseInfo {
+    pub(crate) value_ids_by_var: HashMap<SSAVar, ValueId>,
+    pub(crate) ambiguous_value_vars: HashSet<SSAVar>,
+    pub(crate) ambiguous_value_ids: BTreeSet<ValueId>,
     pub(crate) value_ids_by_name: HashMap<String, ValueId>,
+    pub(crate) ambiguous_value_names: HashSet<String>,
     pub(crate) vars_by_value_id: BTreeMap<ValueId, SSAVar>,
     pub(crate) use_counts: HashMap<String, usize>,
     pub(crate) use_counts_by_value: BTreeMap<ValueId, usize>,
@@ -325,7 +329,11 @@ pub(crate) enum ScalarValue {
 pub(crate) enum SemanticValue {
     Scalar(ScalarValue),
     Address(NormalizedAddr),
-    Load { addr: NormalizedAddr, size: u32 },
+    Load {
+        space: r2il::SpaceId,
+        addr: NormalizedAddr,
+        size: u32,
+    },
     Unknown,
 }
 
@@ -467,6 +475,39 @@ fn lookup_name_key<'a, T>(map: &'a HashMap<String, T>, name: &str) -> Option<&'a
         })
 }
 
+fn value_ref_references_any(value: &ValueRef, ids: &BTreeSet<ValueId>) -> bool {
+    value
+        .value_id
+        .is_some_and(|value_id| ids.contains(&value_id))
+}
+
+fn normalized_addr_references_any(addr: &NormalizedAddr, ids: &BTreeSet<ValueId>) -> bool {
+    matches!(&addr.base, BaseRef::Value(value) if value_ref_references_any(value, ids))
+        || addr
+            .index
+            .as_ref()
+            .is_some_and(|value| value_ref_references_any(value, ids))
+}
+
+fn semantic_value_references_any(value: &SemanticValue, ids: &BTreeSet<ValueId>) -> bool {
+    match value {
+        SemanticValue::Scalar(ScalarValue::Root(value)) => value_ref_references_any(value, ids),
+        SemanticValue::Scalar(ScalarValue::Expr(_)) | SemanticValue::Unknown => false,
+        SemanticValue::Address(addr) | SemanticValue::Load { addr, .. } => {
+            normalized_addr_references_any(addr, ids)
+        }
+    }
+}
+
+fn call_arg_references_any(arg: &CallArgBinding, ids: &BTreeSet<ValueId>) -> bool {
+    arg.source_value_id
+        .is_some_and(|value_id| ids.contains(&value_id))
+        || matches!(
+            &arg.arg,
+            SemanticCallArg::Semantic(value) if semantic_value_references_any(value, ids)
+        )
+}
+
 impl UseInfo {
     #[allow(dead_code)]
     pub(crate) fn analyze(blocks: &[SSABlock], env: &PassEnv<'_>) -> Self {
@@ -523,96 +564,153 @@ impl UseInfo {
         use_info::preserve_authoritative_facts(self, baseline);
     }
 
-    pub(crate) fn bind_value_id(&mut self, var: &SSAVar, value_id: ValueId) {
+    pub(crate) fn bind_value_id(&mut self, var: &SSAVar, value_id: ValueId) -> Option<ValueId> {
+        let conflicting_value = self
+            .value_ids_by_var
+            .get(var)
+            .copied()
+            .filter(|existing| *existing != value_id);
+        let conflicting_var = self
+            .vars_by_value_id
+            .get(&value_id)
+            .filter(|existing| *existing != var)
+            .cloned();
+        if self.ambiguous_value_vars.contains(var)
+            || self.ambiguous_value_ids.contains(&value_id)
+            || conflicting_value.is_some()
+            || conflicting_var.is_some()
+        {
+            let mut vars = BTreeSet::from([var.clone()]);
+            if let Some(conflicting_var) = conflicting_var {
+                vars.insert(conflicting_var);
+            }
+            let mut values = BTreeSet::from([value_id]);
+            if let Some(conflicting_value) = conflicting_value {
+                values.insert(conflicting_value);
+            }
+            self.invalidate_value_bindings(vars, values);
+            return None;
+        }
+        self.value_ids_by_var.insert(var.clone(), value_id);
+
         let display = var.display_name();
-        self.value_ids_by_name.insert(display.clone(), value_id);
+        self.bind_value_name(display, value_id);
         if var.version == 0 {
-            self.value_ids_by_name.insert(var.name.clone(), value_id);
+            self.bind_value_name(var.name.clone(), value_id);
         }
         self.vars_by_value_id
             .entry(value_id)
             .or_insert_with(|| var.clone());
+        Some(value_id)
+    }
 
-        if let Some(expr) = self
-            .definitions
-            .get(&display)
-            .or_else(|| self.definitions.get(&var.name))
-            .cloned()
+    fn invalidate_value_bindings(
+        &mut self,
+        mut vars: BTreeSet<SSAVar>,
+        mut values: BTreeSet<ValueId>,
+    ) {
+        loop {
+            let prior_vars = vars.len();
+            let prior_values = values.len();
+            for var in vars.clone() {
+                if let Some(value) = self.value_ids_by_var.get(&var).copied() {
+                    values.insert(value);
+                }
+            }
+            for value in values.clone() {
+                if let Some(var) = self.vars_by_value_id.get(&value).cloned() {
+                    vars.insert(var);
+                }
+            }
+            if vars.len() == prior_vars && values.len() == prior_values {
+                break;
+            }
+        }
+
+        for value in &values {
+            self.vars_by_value_id.remove(value);
+            self.ambiguous_value_ids.insert(*value);
+            self.use_counts_by_value.remove(value);
+            self.definitions_by_value.remove(value);
+            self.semantic_values_by_value.remove(value);
+            self.copy_sources_by_value.remove(value);
+            self.ptr_arith_by_value.remove(value);
+            self.condition_values.remove(value);
+            self.call_result_source_by_value.remove(value);
+            self.stack_slots_by_value.remove(value);
+            self.stable_memory_values_by_value.remove(value);
+            self.forwarded_values_by_value.remove(value);
+        }
+        self.copy_sources_by_value
+            .retain(|dst, src| !values.contains(dst) && !values.contains(src));
+        self.semantic_values_by_value
+            .retain(|_, value| !semantic_value_references_any(value, &values));
+        self.stable_memory_values_by_value
+            .retain(|_, value| !semantic_value_references_any(value, &values));
+        self.forwarded_values_by_value.retain(|_, provenance| {
+            provenance
+                .source_value_id
+                .is_none_or(|value_id| !values.contains(&value_id))
+        });
+        self.semantic_values
+            .retain(|_, value| !semantic_value_references_any(value, &values));
+        self.frame_object_field_roots
+            .retain(|_, value| !semantic_value_references_any(value, &values));
+        self.switch_selector_roots
+            .retain(|_, value| !semantic_value_references_any(value, &values));
+        self.stable_stack_values
+            .retain(|_, value| !semantic_value_references_any(value, &values));
+        self.stable_memory_values
+            .retain(|_, value| !semantic_value_references_any(value, &values));
+        self.forwarded_values.retain(|_, provenance| {
+            provenance
+                .source_value_id
+                .is_none_or(|value_id| !values.contains(&value_id))
+        });
+        self.call_args.retain(|_, args| {
+            args.iter()
+                .all(|arg| !call_arg_references_any(arg, &values))
+        });
+        for var in vars {
+            self.value_ids_by_var.remove(&var);
+            self.ambiguous_value_vars.insert(var.clone());
+            self.invalidate_value_name(var.display_name());
+            if var.version == 0 {
+                self.invalidate_value_name(var.name);
+            }
+        }
+    }
+
+    fn invalidate_value_name(&mut self, name: String) {
+        self.value_ids_by_name.remove(&name);
+        self.ambiguous_value_names.insert(name);
+    }
+
+    fn bind_value_name(&mut self, name: String, value_id: ValueId) {
+        if self.ambiguous_value_names.contains(&name) {
+            return;
+        }
+        if let Some(existing) = self.value_ids_by_name.get(&name).copied()
+            && existing != value_id
         {
-            self.definitions_by_value.insert(value_id, expr);
+            self.value_ids_by_name.remove(&name);
+            self.ambiguous_value_names.insert(name);
+            return;
         }
-        if let Some(value) = self
-            .semantic_values
-            .get(&display)
-            .or_else(|| self.semantic_values.get(&var.name))
-            .cloned()
-        {
-            self.semantic_values_by_value.insert(value_id, value);
-        }
-        if let Some(slot) = self
-            .stack_slots
-            .get(&display)
-            .or_else(|| self.stack_slots.get(&var.name))
-            .copied()
-        {
-            self.stack_slots_by_value.insert(value_id, slot);
-        }
-        if let Some(ptr) = self
-            .ptr_arith
-            .get(&display)
-            .or_else(|| self.ptr_arith.get(&var.name))
-            .cloned()
-        {
-            self.ptr_arith_by_value.insert(value_id, ptr);
-        }
-        if let Some(prov) = self
-            .forwarded_values
-            .get(&display)
-            .or_else(|| self.forwarded_values.get(&var.name))
-            .cloned()
-        {
-            self.forwarded_values_by_value.insert(value_id, prov);
-        }
-        if let Some(use_count) = self
-            .use_counts
-            .get(&display)
-            .or_else(|| self.use_counts.get(&var.name))
-            .copied()
-        {
-            self.use_counts_by_value.insert(value_id, use_count);
-        }
-        if self.condition_vars.contains(&display) || self.condition_vars.contains(&var.name) {
-            self.condition_values.insert(value_id);
-        }
-        if let Some(source_call) = self
-            .call_result_source_by_alias
-            .get(&display)
-            .or_else(|| self.call_result_source_by_alias.get(&var.name))
-            .copied()
-        {
-            self.call_result_source_by_value
-                .insert(value_id, source_call);
-        }
+        self.value_ids_by_name.insert(name, value_id);
     }
 
     pub(crate) fn note_use_for_var(&mut self, var: &SSAVar) {
-        self.note_use_for_name(&var.display_name());
-    }
-
-    pub(crate) fn note_use_for_name(&mut self, name: &str) {
-        *self.use_counts.entry(name.to_string()).or_insert(0) += 1;
-        if let Some(value_id) = self.value_id_for_name(name) {
+        let display = var.display_name();
+        *self.use_counts.entry(display).or_insert(0) += 1;
+        if let Some(value_id) = self.exact_value_id_for_var(var) {
             *self.use_counts_by_value.entry(value_id).or_insert(0) += 1;
         }
     }
 
     pub(crate) fn note_condition_var(&mut self, var: &SSAVar) {
-        self.note_condition_name(&var.display_name());
-    }
-
-    pub(crate) fn note_condition_name(&mut self, name: &str) {
-        self.condition_vars.insert(name.to_string());
-        if let Some(value_id) = self.value_id_for_name(name) {
+        self.condition_vars.insert(var.display_name());
+        if let Some(value_id) = self.exact_value_id_for_var(var) {
             self.condition_values.insert(value_id);
         }
     }
@@ -626,9 +724,13 @@ impl UseInfo {
     }
 
     pub(crate) fn insert_stack_slot_for_var(&mut self, var: &SSAVar, slot: StackSlotProvenance) {
-        self.insert_stack_slot_for_name(&var.display_name(), slot);
+        if let Some(value_id) = self.exact_value_id_for_var(var) {
+            self.stack_slots_by_value.insert(value_id, slot);
+        }
+        self.stack_slots.insert(var.display_name(), slot);
     }
 
+    #[cfg(test)]
     pub(crate) fn insert_stack_slot_for_name(&mut self, name: &str, slot: StackSlotProvenance) {
         if let Some(value_id) = self.value_id_for_name(name) {
             self.stack_slots_by_value.insert(value_id, slot);
@@ -637,14 +739,10 @@ impl UseInfo {
     }
 
     pub(crate) fn insert_ptr_arith_for_var(&mut self, var: &SSAVar, ptr: PtrArith) {
-        self.insert_ptr_arith_for_name(&var.display_name(), ptr.clone());
-    }
-
-    pub(crate) fn insert_ptr_arith_for_name(&mut self, name: &str, ptr: PtrArith) {
-        if let Some(value_id) = self.value_id_for_name(name) {
+        if let Some(value_id) = self.exact_value_id_for_var(var) {
             self.ptr_arith_by_value.insert(value_id, ptr.clone());
         }
-        self.ptr_arith.insert(name.to_string(), ptr);
+        self.ptr_arith.insert(var.display_name(), ptr);
     }
 
     pub(crate) fn insert_forwarded_value_for_var(
@@ -652,19 +750,11 @@ impl UseInfo {
         var: &SSAVar,
         provenance: ValueProvenance,
     ) {
-        self.insert_forwarded_value_for_name(&var.display_name(), provenance);
-    }
-
-    pub(crate) fn insert_forwarded_value_for_name(
-        &mut self,
-        name: &str,
-        provenance: ValueProvenance,
-    ) {
-        if let Some(value_id) = self.value_id_for_name(name) {
+        if let Some(value_id) = self.exact_value_id_for_var(var) {
             self.forwarded_values_by_value
                 .insert(value_id, provenance.clone());
         }
-        self.forwarded_values.insert(name.to_string(), provenance);
+        self.forwarded_values.insert(var.display_name(), provenance);
     }
 
     pub(crate) fn insert_semantic_value_for_name(&mut self, name: &str, value: SemanticValue) {
@@ -689,31 +779,43 @@ impl UseInfo {
     }
 
     pub(crate) fn value_id_for_var(&self, var: &SSAVar) -> Option<ValueId> {
-        self.exact_value_id_for_var(var).or_else(|| {
-            (var.version == 0)
-                .then(|| self.value_ids_by_name.get(&var.name).copied())
-                .flatten()
-        })
+        self.exact_value_id_for_var(var)
     }
 
     pub(crate) fn exact_value_id_for_var(&self, var: &SSAVar) -> Option<ValueId> {
-        let display = var.display_name();
-        let value_id = self.value_ids_by_name.get(&display).copied()?;
+        if self.ambiguous_value_vars.contains(var) {
+            return None;
+        }
+        let value_id = self.value_ids_by_var.get(var).copied()?;
+        if self.ambiguous_value_ids.contains(&value_id) {
+            return None;
+        }
         self.vars_by_value_id
             .get(&value_id)
-            .filter(|stored| stored.display_name() == display)
+            .filter(|stored| *stored == var)
             .map(|_| value_id)
     }
 
     pub(crate) fn value_id_for_name(&self, name: &str) -> Option<ValueId> {
+        if self.ambiguous_value_names.contains(name) {
+            return None;
+        }
         self.value_ids_by_name.get(name).copied()
     }
 
     pub(crate) fn var_for_value_id(&self, value_id: ValueId) -> Option<&SSAVar> {
+        if self.ambiguous_value_ids.contains(&value_id) {
+            return None;
+        }
         self.vars_by_value_id.get(&value_id)
     }
 
     pub(crate) fn definition_for_var(&self, var: &SSAVar) -> Option<&CExpr> {
+        if self.ambiguous_value_vars.contains(var)
+            || self.ambiguous_value_names.contains(&var.display_name())
+        {
+            return None;
+        }
         self.value_id_for_var(var)
             .and_then(|value_id| self.definitions_by_value.get(&value_id))
             .or_else(|| self.definitions.get(&var.display_name()))
@@ -725,6 +827,9 @@ impl UseInfo {
     }
 
     pub(crate) fn use_count_for_name(&self, name: &str) -> usize {
+        if self.ambiguous_value_names.contains(name) {
+            return 0;
+        }
         self.value_id_for_name(name)
             .and_then(|value_id| self.use_counts_by_value.get(&value_id).copied())
             .or_else(|| lookup_name_key(&self.use_counts, name).copied())
@@ -732,10 +837,10 @@ impl UseInfo {
     }
 
     pub(crate) fn definition_for_value(&self, value_id: ValueId) -> Option<&CExpr> {
-        self.definitions_by_value.get(&value_id).or_else(|| {
-            self.var_for_value_id(value_id)
-                .and_then(|var| self.definitions.get(&var.display_name()))
-        })
+        if self.ambiguous_value_ids.contains(&value_id) {
+            return None;
+        }
+        self.definitions_by_value.get(&value_id)
     }
 
     pub(crate) fn render_definition_for_value(&self, value_id: ValueId) -> Option<&CExpr> {
@@ -745,6 +850,9 @@ impl UseInfo {
     }
 
     pub(crate) fn definition_for_name(&self, name: &str) -> Option<&CExpr> {
+        if self.ambiguous_value_names.contains(name) {
+            return None;
+        }
         self.value_id_for_name(name)
             .and_then(|value_id| self.definitions_by_value.get(&value_id))
             .or_else(|| self.definitions.get(name))
@@ -755,6 +863,11 @@ impl UseInfo {
     }
 
     pub(crate) fn semantic_value_for_var(&self, var: &SSAVar) -> Option<&SemanticValue> {
+        if self.ambiguous_value_vars.contains(var)
+            || self.ambiguous_value_names.contains(&var.display_name())
+        {
+            return None;
+        }
         self.semantic_values.get(&var.display_name()).or_else(|| {
             self.value_id_for_var(var)
                 .and_then(|value_id| self.semantic_values_by_value.get(&value_id))
@@ -762,10 +875,10 @@ impl UseInfo {
     }
 
     pub(crate) fn semantic_value_for_value(&self, value_id: ValueId) -> Option<&SemanticValue> {
-        self.semantic_values_by_value.get(&value_id).or_else(|| {
-            self.var_for_value_id(value_id)
-                .and_then(|var| self.semantic_values.get(&var.display_name()))
-        })
+        if self.ambiguous_value_ids.contains(&value_id) {
+            return None;
+        }
+        self.semantic_values_by_value.get(&value_id)
     }
 
     pub(crate) fn render_semantic_value_for_value(
@@ -778,6 +891,9 @@ impl UseInfo {
     }
 
     pub(crate) fn semantic_value_for_name(&self, name: &str) -> Option<&SemanticValue> {
+        if self.ambiguous_value_names.contains(name) {
+            return None;
+        }
         self.semantic_values.get(name).or_else(|| {
             self.value_id_for_name(name)
                 .and_then(|value_id| self.semantic_values_by_value.get(&value_id))
@@ -789,6 +905,11 @@ impl UseInfo {
     }
 
     pub(crate) fn forwarded_value_for_var(&self, var: &SSAVar) -> Option<&ValueProvenance> {
+        if self.ambiguous_value_vars.contains(var)
+            || self.ambiguous_value_names.contains(&var.display_name())
+        {
+            return None;
+        }
         self.forwarded_values.get(&var.display_name()).or_else(|| {
             self.value_id_for_var(var)
                 .and_then(|value_id| self.forwarded_values_by_value.get(&value_id))
@@ -796,10 +917,10 @@ impl UseInfo {
     }
 
     pub(crate) fn forwarded_value_for_value(&self, value_id: ValueId) -> Option<&ValueProvenance> {
-        self.forwarded_values_by_value.get(&value_id).or_else(|| {
-            self.var_for_value_id(value_id)
-                .and_then(|var| self.forwarded_values.get(&var.display_name()))
-        })
+        if self.ambiguous_value_ids.contains(&value_id) {
+            return None;
+        }
+        self.forwarded_values_by_value.get(&value_id)
     }
 
     pub(crate) fn render_forwarded_value_for_value(
@@ -812,6 +933,9 @@ impl UseInfo {
     }
 
     pub(crate) fn forwarded_value_for_name(&self, name: &str) -> Option<&ValueProvenance> {
+        if self.ambiguous_value_names.contains(name) {
+            return None;
+        }
         self.forwarded_values.get(name).or_else(|| {
             self.value_id_for_name(name)
                 .and_then(|value_id| self.forwarded_values_by_value.get(&value_id))
@@ -849,6 +973,9 @@ impl UseInfo {
     }
 
     pub(crate) fn stack_slot_for_name(&self, name: &str) -> Option<StackSlotProvenance> {
+        if self.ambiguous_value_names.contains(name) {
+            return None;
+        }
         lookup_name_key(&self.stack_slots, name).copied()
     }
 
@@ -861,6 +988,11 @@ impl UseInfo {
     }
 
     pub(crate) fn stack_slot_for_var(&self, var: &SSAVar) -> Option<StackSlotProvenance> {
+        if self.ambiguous_value_vars.contains(var)
+            || self.ambiguous_value_names.contains(&var.display_name())
+        {
+            return None;
+        }
         self.stack_slot_for_name(&var.display_name()).or_else(|| {
             self.value_id_for_var(var)
                 .and_then(|value_id| self.stack_slots_by_value.get(&value_id).copied())
@@ -868,6 +1000,11 @@ impl UseInfo {
     }
 
     pub(crate) fn ptr_arith_for_var(&self, var: &SSAVar) -> Option<&PtrArith> {
+        if self.ambiguous_value_vars.contains(var)
+            || self.ambiguous_value_names.contains(&var.display_name())
+        {
+            return None;
+        }
         self.ptr_arith.get(&var.display_name()).or_else(|| {
             self.value_id_for_var(var)
                 .and_then(|value_id| self.ptr_arith_by_value.get(&value_id))
@@ -875,12 +1012,18 @@ impl UseInfo {
     }
 
     pub(crate) fn is_condition_name(&self, name: &str) -> bool {
+        if self.ambiguous_value_names.contains(name) {
+            return false;
+        }
         self.value_id_for_name(name)
             .is_some_and(|value_id| self.condition_values.contains(&value_id))
             || self.condition_vars.contains(name)
     }
 
     pub(crate) fn call_result_source_for_name(&self, name: &str) -> Option<(u64, usize)> {
+        if self.ambiguous_value_names.contains(name) {
+            return None;
+        }
         lookup_name_key(&self.call_result_source_by_alias, name)
             .copied()
             .or_else(|| {

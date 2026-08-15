@@ -317,28 +317,30 @@ impl<'a> FoldingContext<'a> {
         if stmt_contains_memory_like_access(&stmt) {
             match op {
                 SSAOp::Load { .. } => {
-                    if let Some((address, value)) = self
+                    if let Some((space, address, value)) = self
                         .certified_memory_access_for_current_op(false)
-                        .map(|cert| (cert.address, cert.value))
+                        .map(|cert| (cert.space, cert.address, cert.value))
                     {
                         self.record_effect_render_proof_for_memory(
                             EffectRenderProofKind::MemoryRead,
                             block_addr,
                             op_idx,
+                            space,
                             address,
                             value,
                         );
                     }
                 }
                 SSAOp::Store { .. } => {
-                    if let Some((address, value)) = self
+                    if let Some((space, address, value)) = self
                         .certified_memory_access_for_current_op(true)
-                        .map(|cert| (cert.address, cert.value))
+                        .map(|cert| (cert.space, cert.address, cert.value))
                     {
                         self.record_effect_render_proof_for_memory(
                             EffectRenderProofKind::MemoryWrite,
                             block_addr,
                             op_idx,
+                            space,
                             address,
                             value,
                         );
@@ -348,14 +350,23 @@ impl<'a> FoldingContext<'a> {
                     if self.requires_certified_rendering()
                         && let Some(value) =
                             op.dst().and_then(|dst| self.prepared_value_id_for_var(dst))
-                        && let Some((block_addr, op_index, address, value)) = self
+                        && let Some((block_addr, op_index, space, address, value)) = self
                             .certified_memory_read_for_value_dependency(value)
-                            .map(|cert| (cert.block_addr, cert.op_index, cert.address, cert.value))
+                            .map(|cert| {
+                                (
+                                    cert.block_addr,
+                                    cert.op_index,
+                                    cert.space,
+                                    cert.address,
+                                    cert.value,
+                                )
+                            })
                     {
                         self.record_effect_render_proof_for_memory(
                             EffectRenderProofKind::MemoryRead,
                             block_addr,
                             op_index,
+                            space,
                             address,
                             value,
                         );

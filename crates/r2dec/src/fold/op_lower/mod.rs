@@ -691,8 +691,10 @@ impl<'a> CertifiedRenderContext<'a> {
         op_idx: usize,
         is_write: bool,
     ) -> Option<&'a r2types::MemoryAccessRenderFact> {
+        let block = self.prepared.function().get_block(block_addr)?;
+        let space = block.ops.get(op_idx)?.memory_space()?;
         self.render_facts
-            .memory_access_for_op(block_addr, op_idx, is_write)
+            .memory_access_for_op(block_addr, op_idx, is_write, space)
     }
 
     fn exact_memory_read_for_value(
@@ -732,8 +734,10 @@ impl<'a> CertifiedRenderContext<'a> {
                     cert.block_addr,
                     cert.op_index,
                     false,
+                    cert.space,
                 )?;
                 if fact.access == cert.access
+                    && fact.space == cert.space
                     && fact.address == cert.address
                     && fact.value == cert.value
                     && fact.width == cert.width
@@ -1102,6 +1106,7 @@ impl<'a> FoldingContext<'a> {
                     EffectRenderProofKind::MemoryRead,
                     cert.block_addr,
                     cert.op_index,
+                    cert.space,
                     cert.address,
                     cert.value,
                 );
@@ -1395,6 +1400,7 @@ impl<'a> FoldingContext<'a> {
                             EffectRenderProofKind::MemoryRead,
                             block_addr,
                             op_idx,
+                            fact.space,
                             fact.address,
                             fact.value,
                         );
@@ -1653,7 +1659,7 @@ impl<'a> FoldingContext<'a> {
                 }
                 return None;
             }
-            if let Some(object) = prepared.object_for_var(current) {
+            if let Some(object) = prepared.object_for_var(current, r2il::SpaceId::Ram) {
                 let identity = r2ssa::SemanticId::stack_slot(object);
                 if self
                     .certified_render_context()?
@@ -2513,7 +2519,11 @@ impl<'a> FoldingContext<'a> {
     fn exit_block_is_control_only_epilogue(&self, block: &SSABlock) -> bool {
         block.ops.iter().enumerate().all(|(op_idx, op)| match op {
             SSAOp::Return { target } => self.is_control_return_target(target),
-            SSAOp::Load { dst, .. } => {
+            SSAOp::Load {
+                dst,
+                space: r2il::SpaceId::Ram,
+                ..
+            } => {
                 self.is_control_return_target(dst)
                     || self
                         .inputs
@@ -2539,7 +2549,11 @@ impl<'a> FoldingContext<'a> {
                             || matches!(
                                 block.ops.iter().enumerate().take(op_idx).find_map(
                                     |(idx, prior)| match prior {
-                                        SSAOp::Load { dst: load_dst, .. } if load_dst == src => {
+                                        SSAOp::Load {
+                                            dst: load_dst,
+                                            space: r2il::SpaceId::Ram,
+                                            ..
+                                        } if load_dst == src => {
                                             Some(self.load_is_control_epilogue_artifact(
                                                 block, idx, load_dst,
                                             ))
@@ -2580,7 +2594,11 @@ impl<'a> FoldingContext<'a> {
                         branches_to_exit = true;
                     }
                 }
-                SSAOp::Store { addr, .. } => {
+                SSAOp::Store {
+                    space: r2il::SpaceId::Ram,
+                    addr,
+                    ..
+                } => {
                     if branches_to_exit || self.is_current_return_context_candidate(block.addr) {
                         let offset = self.stack_slot_offset_for_var(addr);
                         if offset.is_some() {
@@ -2614,7 +2632,11 @@ impl<'a> FoldingContext<'a> {
             }
             return matches!(
                 later_op,
-                SSAOp::Load { dst: load_dst, .. }
+                SSAOp::Load {
+                    dst: load_dst,
+                    space: r2il::SpaceId::Ram,
+                    ..
+                }
                     if self.load_is_control_epilogue_artifact(block, later_idx, load_dst)
             );
         }
@@ -2627,7 +2649,11 @@ impl<'a> FoldingContext<'a> {
 
         for (op_idx, op) in block.ops.iter().enumerate() {
             match op {
-                SSAOp::Load { dst, addr, .. } => {
+                SSAOp::Load {
+                    dst,
+                    space: r2il::SpaceId::Ram,
+                    addr,
+                } => {
                     if self.is_control_return_target(dst)
                         || self.load_is_control_epilogue_artifact(block, op_idx, dst)
                     {
@@ -3742,7 +3768,11 @@ impl<'a> FoldingContext<'a> {
             return expr;
         }
         let producer_load_expr = self.use_info().producers.get(&key).and_then(|op| match op {
-            SSAOp::Load { dst, addr, .. } if dst.size < addr.size => {
+            SSAOp::Load {
+                dst,
+                space: r2il::SpaceId::Ram,
+                addr,
+            } if dst.size < addr.size => {
                 let elem_ty = self
                     .type_hint_for_var(dst)
                     .unwrap_or_else(|| type_from_size(dst.size));
@@ -4691,8 +4721,8 @@ impl<'a> FoldingContext<'a> {
             analysis::SemanticValue::Address(shape) => {
                 self.render_address_expr_from_addr(shape, depth, visited)
             }
-            analysis::SemanticValue::Load { addr, size } => {
-                self.render_load_from_addr(addr, *size, depth, visited)
+            analysis::SemanticValue::Load { space, addr, size } => {
+                self.render_semantic_load(*space, addr, *size, depth, visited)
             }
             analysis::SemanticValue::Unknown => None,
         }
@@ -4765,8 +4795,8 @@ impl<'a> FoldingContext<'a> {
             Some(analysis::SemanticValue::Address(shape)) => {
                 self.render_address_expr_from_addr(shape, depth + 1, visited)
             }
-            Some(analysis::SemanticValue::Load { addr, size }) => {
-                self.render_load_from_addr(addr, *size, depth + 1, visited)
+            Some(analysis::SemanticValue::Load { space, addr, size }) => {
+                self.render_semantic_load(*space, addr, *size, depth + 1, visited)
             }
             Some(analysis::SemanticValue::Unknown) | None => self
                 .resolve_expr_from_phi_sources(&name, depth + 1, visited, false)
@@ -4936,11 +4966,14 @@ impl<'a> FoldingContext<'a> {
         match &addr.base {
             analysis::BaseRef::Value(base_ref) if addr.offset_bytes == 0 => {
                 let prepared = self.inputs.prepared_ssa?;
-                let object = prepared.object_for_var(&base_ref.var).or_else(|| {
-                    self.prepared_canonical_value_root(&base_ref.var)
-                        .and_then(|root| prepared.object_for_var(&root))
-                })?;
+                let object = prepared
+                    .object_for_var(&base_ref.var, r2il::SpaceId::Ram)
+                    .or_else(|| {
+                        self.prepared_canonical_value_root(&base_ref.var)
+                            .and_then(|root| prepared.object_for_var(&root, r2il::SpaceId::Ram))
+                    })?;
                 self.prepared_named_expr_for_memory_location(&MemoryLocation {
+                    space: r2il::SpaceId::Ram,
                     object,
                     address: r2ssa::RelativeMemoryAddress::Exact(0),
                     size: 0,
@@ -6177,6 +6210,30 @@ impl<'a> FoldingContext<'a> {
         has_subscriptable_base && self.can_render_constant_offset_as_subscript(elem_ty)
     }
 
+    fn render_semantic_load(
+        &self,
+        space: r2il::SpaceId,
+        addr: &analysis::NormalizedAddr,
+        elem_size: u32,
+        depth: u32,
+        visited: &mut HashSet<String>,
+    ) -> Option<CExpr> {
+        if space == r2il::SpaceId::Ram {
+            return self.render_load_from_addr(addr, elem_size, depth, visited);
+        }
+        let address = self
+            .render_address_expr_from_addr(addr, depth + 1, visited)
+            .unwrap_or_else(|| CExpr::Var("r2s_unresolved_memory_address".to_string()));
+        Some(CExpr::call(
+            CExpr::Var("r2s_unsupported_space_load".to_string()),
+            vec![
+                CExpr::StringLit(space.to_string()),
+                address,
+                CExpr::UIntLit(u64::from(elem_size)),
+            ],
+        ))
+    }
+
     fn render_load_from_addr(
         &self,
         addr: &analysis::NormalizedAddr,
@@ -6811,8 +6868,8 @@ impl<'a> FoldingContext<'a> {
     ) -> Option<CExpr> {
         let value = self.lookup_semantic_value(name)?;
         match value {
-            analysis::SemanticValue::Load { addr, size } => {
-                self.render_load_from_addr(addr, *size, depth, visited)
+            analysis::SemanticValue::Load { space, addr, size } => {
+                self.render_semantic_load(*space, addr, *size, depth, visited)
             }
             analysis::SemanticValue::Address(shape) => {
                 self.render_load_from_addr(shape, elem_size, depth, visited)
@@ -6973,7 +7030,11 @@ impl<'a> FoldingContext<'a> {
                 scale_bytes,
                 offset_bytes,
             }) if *scale_bytes == 0 && *offset_bytes == 0 => Some(root.var.clone()),
-            analysis::SemanticValue::Load { addr, .. } => match &addr.base {
+            analysis::SemanticValue::Load {
+                space: r2il::SpaceId::Ram,
+                addr,
+                ..
+            } => match &addr.base {
                 analysis::BaseRef::Value(root) => Some(root.var.clone()),
                 _ => None,
             },
@@ -8797,7 +8858,11 @@ impl<'a> FoldingContext<'a> {
                 &src.display_name(),
                 depth + 1,
             ),
-            SSAOp::Load { addr, .. } => {
+            SSAOp::Load {
+                space: r2il::SpaceId::Ram,
+                addr,
+                ..
+            } => {
                 let load_offset = self.extract_stack_offset_from_var(addr)?;
                 block
                     .ops
@@ -8807,6 +8872,7 @@ impl<'a> FoldingContext<'a> {
                     .rev()
                     .find_map(|(_, op)| match op {
                         SSAOp::Store {
+                            space: r2il::SpaceId::Ram,
                             addr: store_addr,
                             val,
                             ..
@@ -9005,9 +9071,11 @@ impl<'a> FoldingContext<'a> {
 
     fn semantic_stack_owner_name_for_alias(&self, alias: &str) -> Option<String> {
         match self.semantic_value_for_name(alias) {
-            Some(analysis::SemanticValue::Load { addr, .. }) => {
-                self.stack_owner_name_for_addr(addr)
-            }
+            Some(analysis::SemanticValue::Load {
+                space: r2il::SpaceId::Ram,
+                addr,
+                ..
+            }) => self.stack_owner_name_for_addr(addr),
             Some(analysis::SemanticValue::Address(addr)) => self.stack_owner_name_for_addr(addr),
             _ => None,
         }
@@ -9924,7 +9992,11 @@ impl<'a> FoldingContext<'a> {
             return None;
         }
         match self.producer_for_value(value)? {
-            SSAOp::Load { addr, .. } => self.stack_slot_offset_for_var(addr),
+            SSAOp::Load {
+                space: r2il::SpaceId::Ram,
+                addr,
+                ..
+            } => self.stack_slot_offset_for_var(addr),
             SSAOp::Copy { src, .. }
             | SSAOp::IntZExt { src, .. }
             | SSAOp::IntSExt { src, .. }
@@ -9945,7 +10017,11 @@ impl<'a> FoldingContext<'a> {
             return false;
         }
         match self.producer_for_value(value) {
-            Some(SSAOp::Load { addr, .. }) => {
+            Some(SSAOp::Load {
+                space: r2il::SpaceId::Ram,
+                addr,
+                ..
+            }) => {
                 addr == store_addr
                     || self.stack_slot_offset_for_var(addr).is_some()
                         && self.stack_slot_offset_for_var(addr)
@@ -9974,7 +10050,11 @@ impl<'a> FoldingContext<'a> {
         }
 
         let candidate = match self.producer_for_value(value) {
-            Some(SSAOp::Load { addr, .. }) => {
+            Some(SSAOp::Load {
+                space: r2il::SpaceId::Ram,
+                addr,
+                ..
+            }) => {
                 let elem_ty = self
                     .type_hint_for_var(value)
                     .unwrap_or_else(|| type_from_size(value.size));
@@ -13132,7 +13212,11 @@ impl<'a> FoldingContext<'a> {
                 continue;
             }
 
-            if let SSAOp::Store { addr, val, .. } = op
+            if let SSAOp::Store {
+                space: r2il::SpaceId::Ram,
+                addr,
+                val,
+            } = op
                 && self.is_current_return_block()
                 && let Some(offset) = self.stack_slot_offset_for_var(addr)
                 && self.state.return_stack_slots.contains(&offset)
@@ -13173,7 +13257,11 @@ impl<'a> FoldingContext<'a> {
                 continue;
             }
 
-            if let SSAOp::Load { addr, .. } = op
+            if let SSAOp::Load {
+                space: r2il::SpaceId::Ram,
+                addr,
+                ..
+            } = op
                 && block.addr == self.state.exit_block.unwrap_or(0)
                 && self.is_current_return_block()
                 && let Some(offset) = self.stack_slot_offset_for_var(addr)
@@ -13636,7 +13724,12 @@ impl<'a> FoldingContext<'a> {
         op_idx: usize,
         op: &SSAOp,
     ) -> bool {
-        let SSAOp::Store { addr, val, .. } = op else {
+        let SSAOp::Store {
+            space: r2il::SpaceId::Ram,
+            addr,
+            val,
+        } = op
+        else {
             return false;
         };
 
@@ -13853,7 +13946,15 @@ impl<'a> FoldingContext<'a> {
                 let rhs = self.assignment_rhs_with_type_policy(dst, Some(src), rhs);
                 self.assign_stmt(lhs, rhs)
             }
-            SSAOp::Load { dst, addr, .. } => {
+            SSAOp::Load { dst, addr, space } => {
+                if *space != r2il::SpaceId::Ram {
+                    return Some(self.certified_residual_comment(format!(
+                        "unsupported exact memory load space {} at 0x{:x}:{}",
+                        space,
+                        self.current_block_addr.get().unwrap_or_default(),
+                        self.current_op_idx.get().unwrap_or_default()
+                    )));
+                }
                 let lhs = self.assignment_lhs_expr(dst);
                 let elem_ty = self
                     .type_hint_for_var(dst)
@@ -13889,6 +13990,7 @@ impl<'a> FoldingContext<'a> {
                         EffectRenderProofKind::MemoryRead,
                         fact.block_addr,
                         fact.op_index,
+                        fact.space,
                         fact.address,
                         fact.value,
                     );
@@ -13928,7 +14030,15 @@ impl<'a> FoldingContext<'a> {
                 };
                 self.assign_stmt(lhs, rhs)
             }
-            SSAOp::Store { addr, val, .. } => {
+            SSAOp::Store { addr, val, space } => {
+                if *space != r2il::SpaceId::Ram {
+                    return Some(self.certified_residual_comment(format!(
+                        "unsupported exact memory store space {} at 0x{:x}:{}",
+                        space,
+                        self.current_block_addr.get().unwrap_or_default(),
+                        self.current_op_idx.get().unwrap_or_default()
+                    )));
+                }
                 if self.is_entry_arg_alias_store(addr, val) {
                     return None;
                 }
@@ -13966,8 +14076,13 @@ impl<'a> FoldingContext<'a> {
                             refusal
                         )));
                     };
-                    certified_store_fact =
-                        Some((fact.block_addr, fact.op_index, fact.address, fact.value));
+                    certified_store_fact = Some((
+                        fact.block_addr,
+                        fact.op_index,
+                        fact.space,
+                        fact.address,
+                        fact.value,
+                    ));
                     lhs
                 } else {
                     self.render_canonical_store_target_expr(addr, val.size, elem_ty.clone())
@@ -14078,11 +14193,12 @@ impl<'a> FoldingContext<'a> {
                 {
                     rhs = CExpr::cast(val_ty, rhs);
                 }
-                if let Some((block_addr, op_idx, address, value)) = certified_store_fact {
+                if let Some((block_addr, op_idx, space, address, value)) = certified_store_fact {
                     self.record_effect_render_proof_for_memory(
                         EffectRenderProofKind::MemoryWrite,
                         block_addr,
                         op_idx,
+                        space,
                         address,
                         value,
                     );
@@ -14103,7 +14219,7 @@ impl<'a> FoldingContext<'a> {
                 let call = CExpr::call(
                     CExpr::Var("load_linked".to_string()),
                     vec![
-                        CExpr::StringLit(space.clone()),
+                        CExpr::StringLit(space.to_string()),
                         self.get_expr(addr),
                         CExpr::StringLit(memory_ordering_name(ordering).to_string()),
                     ],
@@ -14120,7 +14236,7 @@ impl<'a> FoldingContext<'a> {
                 let call = CExpr::call(
                     CExpr::Var("store_conditional".to_string()),
                     vec![
-                        CExpr::StringLit(space.clone()),
+                        CExpr::StringLit(space.to_string()),
                         self.get_expr(addr),
                         self.get_expr(val),
                         CExpr::StringLit(memory_ordering_name(ordering).to_string()),
@@ -14145,7 +14261,7 @@ impl<'a> FoldingContext<'a> {
                 let call = CExpr::call(
                     CExpr::Var("atomic_cas".to_string()),
                     vec![
-                        CExpr::StringLit(space.clone()),
+                        CExpr::StringLit(space.to_string()),
                         self.get_expr(addr),
                         self.get_expr(expected),
                         self.get_expr(replacement),
@@ -14165,7 +14281,7 @@ impl<'a> FoldingContext<'a> {
                 let call = CExpr::call(
                     CExpr::Var("load_guarded".to_string()),
                     vec![
-                        CExpr::StringLit(space.clone()),
+                        CExpr::StringLit(space.to_string()),
                         self.get_expr(addr),
                         self.get_expr(guard),
                         CExpr::StringLit(memory_ordering_name(ordering).to_string()),
@@ -14182,7 +14298,7 @@ impl<'a> FoldingContext<'a> {
             } => Some(CStmt::Expr(CExpr::call(
                 CExpr::Var("store_guarded".to_string()),
                 vec![
-                    CExpr::StringLit(space.clone()),
+                    CExpr::StringLit(space.to_string()),
                     self.get_expr(addr),
                     self.get_expr(val),
                     self.get_expr(guard),

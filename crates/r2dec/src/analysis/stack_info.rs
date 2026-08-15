@@ -27,7 +27,11 @@ fn analyze_stack_vars(
     for block in blocks {
         for op in &block.ops {
             match op {
-                SSAOp::Load { addr, .. } => {
+                SSAOp::Load {
+                    space: r2il::SpaceId::Ram,
+                    addr,
+                    ..
+                } => {
                     if let Some(offset) = utils::extract_stack_offset_from_var(
                         addr,
                         &use_info.definitions,
@@ -37,7 +41,11 @@ fn analyze_stack_vars(
                         get_or_create_stack_var(scratch, offset, env);
                     }
                 }
-                SSAOp::Store { addr, val, .. } => {
+                SSAOp::Store {
+                    space: r2il::SpaceId::Ram,
+                    addr,
+                    val,
+                } => {
                     if let Some(offset) = utils::extract_stack_offset_from_var(
                         addr,
                         &use_info.definitions,
@@ -89,7 +97,11 @@ fn analyze_stack_vars(
                         merged_defs.insert(dst.display_name(), expr);
                     }
                 }
-                SSAOp::Load { dst, addr, .. } => {
+                SSAOp::Load {
+                    dst,
+                    space: r2il::SpaceId::Ram,
+                    addr,
+                } => {
                     let preserve_indirect_load_shape = matches!(
                         use_info.semantic_values.get(&dst.display_name()),
                         Some(super::SemanticValue::Scalar(super::ScalarValue::Root(root)))
@@ -551,14 +563,15 @@ fn resolve_stack_alias_from_addr_expr(
 #[cfg(test)]
 mod tests {
     use super::{
-        generic_stack_var_name, is_reserved_param_alias_name, normalize_scalar_stack_load_expr,
-        preferred_stack_alias,
+        analyze, generic_stack_var_name, is_reserved_param_alias_name,
+        normalize_scalar_stack_load_expr, preferred_stack_alias,
     };
     use crate::DecompilerConfig;
     use crate::analysis::PassEnv;
-    use crate::analysis::{StackSlotProvenance, StackSlotValueKind};
+    use crate::analysis::{StackSlotProvenance, StackSlotValueKind, UseInfo};
     use crate::ast::CExpr;
     use crate::ast::CType;
+    use r2ssa::SSAOp;
     use std::collections::HashMap;
 
     #[test]
@@ -651,5 +664,52 @@ mod tests {
     fn generic_stack_var_name_uses_local_prefix_for_negative_offsets() {
         assert_eq!(generic_stack_var_name(-0x14), "local_14");
         assert_eq!(generic_stack_var_name(0x20), "stack_20");
+    }
+
+    #[test]
+    fn stack_analysis_requires_ram_memory_space() {
+        let arch = DecompilerConfig::x86_64();
+        let param_aliases = HashMap::new();
+        let type_hints = HashMap::new();
+        let function_names = HashMap::new();
+        let strings = HashMap::new();
+        let symbols = HashMap::new();
+        let env = PassEnv {
+            ptr_size: arch.ptr_size,
+            sp_name: &arch.sp_name,
+            fp_name: &arch.fp_name,
+            ret_reg_name: arch.ret_regs.first().map(String::as_str).unwrap_or("rax"),
+            function_names: &function_names,
+            strings: &strings,
+            symbols: &symbols,
+            callee_facts: crate::analysis::empty_callee_facts(),
+            callee_resolution: None,
+            summary_view: None,
+            arg_regs: &arch.arg_regs,
+            param_register_aliases: &param_aliases,
+            caller_saved_regs: &arch.caller_saved_regs,
+            type_hints: &type_hints,
+            type_oracle: None,
+        };
+        let load_block = |space| r2ssa::FunctionSSABlock {
+            addr: 0x1000,
+            size: 4,
+            ops: vec![SSAOp::Load {
+                dst: r2ssa::SSAVar::new("tmp:loaded", 1, 4),
+                space,
+                addr: r2ssa::SSAVar::new("rbp", 0, 8),
+            }],
+            phis: Vec::new(),
+        };
+
+        let ram = analyze(&[load_block(r2il::SpaceId::Ram)], &UseInfo::default(), &env);
+        let custom = analyze(
+            &[load_block(r2il::SpaceId::Custom(7))],
+            &UseInfo::default(),
+            &env,
+        );
+
+        assert!(ram.stack_vars.contains_key(&0));
+        assert!(custom.stack_vars.is_empty());
     }
 }

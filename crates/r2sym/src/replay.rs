@@ -208,7 +208,7 @@ pub fn apply_replay_seed_to_state<'ctx>(
     seed: &ReplaySeed,
 ) {
     if let Some(entry_pc) = seed.entry_pc {
-        state.pc = entry_pc;
+        state.set_static_execution_pc(entry_pc);
     }
 
     let register_layout = ReplayRegisterLayout::from_prepared(prepared);
@@ -633,7 +633,7 @@ mod tests {
 
         seed_replay_state_for_arch(&mut state, None, None, &seed);
 
-        assert_eq!(state.pc, 0x4141);
+        assert_eq!(state.pc(), 0x4141);
         assert_eq!(state.get_register("RAX").as_concrete(), Some(0x1122));
         assert!(state.get_register("RBX").is_symbolic());
         let concrete = state.mem_read(&SymValue::concrete(0x5000, 64), 1);

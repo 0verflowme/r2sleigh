@@ -642,21 +642,22 @@ impl SourceMachineContext {
 
     /// Rebind raw lifted memory-space identities to the completed SSA operation
     /// sites. SSA preparation may insert non-memory register-alias operations,
-    /// but it must retain the order and count of memory operations in each
-    /// block. Any violation clears the map so certification fails closed.
+    /// but it must retain the order, count, and exact space identity of memory
+    /// operations in each block. Any violation clears the map so certification
+    /// fails closed.
     pub(crate) fn remap_memory_sites_to_prepared(&mut self, function: &SSAFunction) -> bool {
         let mut raw_by_block = BTreeMap::<u64, Vec<SpaceId>>::new();
         for ((block_addr, _), space) in &self.memory_spaces_by_op {
             raw_by_block.entry(*block_addr).or_default().push(*space);
         }
 
-        let mut prepared_by_block = BTreeMap::<u64, Vec<usize>>::new();
+        let mut prepared_by_block = BTreeMap::<u64, Vec<(usize, SpaceId)>>::new();
         for block in function.blocks() {
             let sites = block
                 .ops
                 .iter()
                 .enumerate()
-                .filter_map(|(op_index, op)| is_memory_op(op).then_some(op_index))
+                .filter_map(|(op_index, op)| ssa_memory_space(op).map(|space| (op_index, space)))
                 .collect::<Vec<_>>();
             if !sites.is_empty() {
                 prepared_by_block.insert(block.addr, sites);
@@ -665,9 +666,13 @@ impl SourceMachineContext {
 
         if raw_by_block.len() != prepared_by_block.len()
             || raw_by_block.iter().any(|(block_addr, raw)| {
-                prepared_by_block
-                    .get(block_addr)
-                    .is_none_or(|prepared| prepared.len() != raw.len())
+                prepared_by_block.get(block_addr).is_none_or(|prepared| {
+                    prepared.len() != raw.len()
+                        || prepared
+                            .iter()
+                            .map(|(_, space)| *space)
+                            .ne(raw.iter().copied())
+                })
             })
         {
             self.memory_spaces_by_op.clear();
@@ -680,7 +685,7 @@ impl SourceMachineContext {
                 self.memory_spaces_by_op.clear();
                 return false;
             };
-            for (op_index, space) in sites.iter().copied().zip(spaces) {
+            for ((op_index, space), _) in sites.iter().copied().zip(spaces) {
                 remapped.insert((block_addr, op_index), space);
             }
         }
@@ -689,17 +694,22 @@ impl SourceMachineContext {
     }
 }
 
+#[cfg(test)]
 fn is_memory_op(op: &SSAOp) -> bool {
-    matches!(
-        op,
-        SSAOp::Load { .. }
-            | SSAOp::Store { .. }
-            | SSAOp::LoadLinked { .. }
-            | SSAOp::StoreConditional { .. }
-            | SSAOp::AtomicCAS { .. }
-            | SSAOp::LoadGuarded { .. }
-            | SSAOp::StoreGuarded { .. }
-    )
+    ssa_memory_space(op).is_some()
+}
+
+fn ssa_memory_space(op: &SSAOp) -> Option<SpaceId> {
+    match op {
+        SSAOp::Load { space, .. }
+        | SSAOp::Store { space, .. }
+        | SSAOp::LoadLinked { space, .. }
+        | SSAOp::StoreConditional { space, .. }
+        | SSAOp::AtomicCAS { space, .. }
+        | SSAOp::LoadGuarded { space, .. }
+        | SSAOp::StoreGuarded { space, .. } => Some(*space),
+        _ => None,
+    }
 }
 
 fn collect_raw_call_site_identities(
@@ -1746,6 +1756,37 @@ mod tests {
             Some(SpaceId::Custom(7))
         );
         assert_eq!(context.memory_spaces_by_op().len(), 1);
+    }
+
+    #[test]
+    fn prepared_memory_sites_reject_swapped_space_identities() {
+        let mut block = R2ILBlock::new(0x2500, 4);
+        block.push(R2ILOp::Load {
+            dst: Varnode::unique(0x100, 4),
+            space: SpaceId::Ram,
+            addr: Varnode::register(0, 8),
+        });
+        block.push(R2ILOp::Store {
+            space: SpaceId::Custom(7),
+            addr: Varnode::register(8, 8),
+            val: Varnode::unique(0x100, 4),
+        });
+
+        let mut function =
+            SSAFunction::from_blocks_raw(&[block.clone()], None).expect("raw SSA function");
+        let prepared = &mut function.get_block_mut(0x2500).expect("prepared block").ops;
+        match &mut prepared[0] {
+            SSAOp::Load { space, .. } => *space = SpaceId::Custom(7),
+            op => panic!("expected load, got {op:?}"),
+        }
+        match &mut prepared[1] {
+            SSAOp::Store { space, .. } => *space = SpaceId::Ram,
+            op => panic!("expected store, got {op:?}"),
+        }
+
+        let mut context = SourceMachineContext::from_blocks(&[block], None);
+        assert!(!context.remap_memory_sites_to_prepared(&function));
+        assert!(context.memory_spaces_by_op().is_empty());
     }
 
     #[test]

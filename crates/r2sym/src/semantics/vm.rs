@@ -992,19 +992,20 @@ fn vm_memory_region_ref_from_object(
 ) -> Option<VmMemoryRegionRef> {
     let object = func.objects().object(object_id)?;
     let (kind, name) = match &object.kind {
-        ObjectKind::StackSlot { base, offset } | ObjectKind::FrameObject { base, offset } => (
+        ObjectKind::StackSlot { base, offset, .. }
+        | ObjectKind::FrameObject { base, offset, .. } => (
             MemoryRegionKind::Stack,
             format!("stack:{}{:+#x}", stack_base_name(*base), offset),
         ),
         ObjectKind::Global { space, address } => {
             (MemoryRegionKind::Global, format!("{space}:0x{address:x}"))
         }
-        ObjectKind::Parameter { index } => (MemoryRegionKind::Input, format!("arg{index}")),
-        ObjectKind::HeapAlloc { call_site } => (
+        ObjectKind::Parameter { index, .. } => (MemoryRegionKind::Input, format!("arg{index}")),
+        ObjectKind::HeapAlloc { call_site, .. } => (
             MemoryRegionKind::Heap,
             format!("heap_alloc@{}", call_site.0),
         ),
-        ObjectKind::EscapedUnknown => return None,
+        ObjectKind::EscapedUnknown { .. } => return None,
     };
     Some(VmMemoryRegionRef {
         id: object_id.0,

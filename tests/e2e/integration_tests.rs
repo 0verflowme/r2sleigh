@@ -48,6 +48,221 @@ mod borrowed_snapshot_provider {
     }
 }
 
+#[cfg(target_os = "macos")]
+mod check_secret_phase5 {
+    use super::*;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "r2sleigh-check-secret-{}-{}",
+                std::process::id(),
+                std::thread::current().name().unwrap_or("integration")
+            ));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).expect("create check_secret scratch directory");
+            Self(path)
+        }
+
+        fn join(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn repo_path(relative: &str) -> PathBuf {
+        ["", "../.."]
+            .into_iter()
+            .map(|prefix| Path::new(prefix).join(relative))
+            .find(|path| path.is_file() || path.is_dir())
+            .unwrap_or_else(|| panic!("missing tracked fixture: {relative}"))
+    }
+
+    fn run_checked(command: &mut Command, description: &str) {
+        let output = command
+            .output()
+            .unwrap_or_else(|error| panic!("{description}: {error}"));
+        assert!(
+            output.status.success(),
+            "{description} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn genuine_radare_snapshot_emits_strict_o2_c_and_refuses_unsupported_o0() {
+        let o2 = repo_path("tests/r2r/bins/r2sleigh_vuln_test_x86_64_macho_O2_v1");
+        let o2_dsym = repo_path("tests/r2r/bins/r2sleigh_vuln_test_x86_64_macho_O2_v1.dSYM");
+        let o0 = repo_path("tests/r2r/bins/check_secret_phase5_o0_v1/vuln_test_x86");
+        let o0_dsym = repo_path("tests/r2r/bins/check_secret_phase5_o0_v1/vuln_test_x86.dSYM");
+        let source = repo_path("tests/e2e/vuln_test.c");
+
+        for (binary, dsym, uuid) in [
+            (&o2, &o2_dsym, "71863F33-EBB2-3817-B727-130970AC1F96"),
+            (&o0, &o0_dsym, "C18C7C7F-2E60-4EF1-8EA9-373C06BE94BC"),
+        ] {
+            let output = Command::new("dwarfdump")
+                .arg("--uuid")
+                .arg(binary)
+                .arg(dsym)
+                .output()
+                .expect("run dwarfdump");
+            assert!(output.status.success(), "read fixture UUIDs");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(
+                stdout.matches(uuid).count(),
+                2,
+                "executable and dSYM must carry the same pinned UUID:\n{stdout}"
+            );
+        }
+
+        let o2_result = r2_cmd_timeout(
+            o2.to_str().expect("UTF-8 O2 fixture path"),
+            "aaa; s 0x100000650; pdd",
+            Duration::from_secs(120),
+        );
+        o2_result.assert_ok();
+        assert_eq!(o2_result.exit_code, Some(0), "radare O2 command failed");
+        assert!(
+            o2_result
+                .stdout
+                .contains("int32_t certified_sub_100000650(uint32_t"),
+            "genuine O2 capture did not reach CertifiedC:\n{}\n{}",
+            o2_result.stdout,
+            o2_result.stderr
+        );
+        assert!(
+            o2_result.stdout.contains("r2s_bit_insert") && !o2_result.contains("r2dec residual:"),
+            "O2 result must preserve the exact RAX/AL composition without residual output"
+        );
+
+        let o0_result = r2_cmd_timeout(
+            o0.to_str().expect("UTF-8 O0 fixture path"),
+            "aaa; s 0x100000650; pdd",
+            Duration::from_secs(120),
+        );
+        o0_result.assert_ok();
+        assert_eq!(o0_result.exit_code, Some(0), "radare O0 command failed");
+        assert!(
+            o0_result.contains("r2dec residual:")
+                && !o0_result.stdout.contains("certified_sub_100000650"),
+            "unsupported O0 private-stack semantics must fail closed:\n{}\n{}",
+            o0_result.stdout,
+            o0_result.stderr
+        );
+
+        let scratch = ScratchDir::new();
+        let generated_c = scratch.join("generated.c");
+        let generated_o = scratch.join("generated.o");
+        let oracle_o = scratch.join("oracle.o");
+        let driver_c = scratch.join("driver.c");
+        let executable = scratch.join("compare");
+        fs::write(&generated_c, &o2_result.stdout).expect("write generated semantic C");
+        fs::write(
+            &driver_c,
+            r#"#include <limits.h>
+#include <stdint.h>
+#include <stdio.h>
+
+int32_t certified_sub_100000650(uint32_t value);
+int oracle_check_secret(int value);
+
+static int compare_one(int32_t value) {
+	int32_t generated = certified_sub_100000650((uint32_t)value);
+	int32_t oracle = (int32_t)oracle_check_secret((int)value);
+	if (generated != oracle) {
+		fprintf(stderr, "mismatch input=%d generated=%d oracle=%d\n", value, generated, oracle);
+		return 1;
+	}
+	return 0;
+}
+
+int main(void) {
+	static const int32_t boundary[] = {
+		INT32_MIN, -1, 0, 0xdeac, 0xdead, 0xdeae, INT32_MAX
+	};
+	for (unsigned i = 0; i < sizeof(boundary) / sizeof(boundary[0]); i++) {
+		if (compare_one(boundary[i])) {
+			return 1;
+		}
+	}
+	uint32_t state = UINT32_C(0x6d2b79f5);
+	for (unsigned i = 0; i < 4096U; i++) {
+		state ^= state << 13;
+		state ^= state >> 17;
+		state ^= state << 5;
+		if (compare_one((int32_t)state)) {
+			return 1;
+		}
+	}
+	return 0;
+}
+"#,
+        )
+        .expect("write independent comparison driver");
+
+        run_checked(
+            Command::new("clang")
+                .args([
+                    "-std=c11",
+                    "-pedantic-errors",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-c",
+                ])
+                .arg(&generated_c)
+                .arg("-o")
+                .arg(&generated_o),
+            "strictly compile generated semantic C",
+        );
+        run_checked(
+            Command::new("clang")
+                .args([
+                    "-O2",
+                    "-Wno-format-security",
+                    "-Dcheck_secret=oracle_check_secret",
+                    "-Dmain=fixture_main",
+                    "-c",
+                ])
+                .arg(&source)
+                .arg("-o")
+                .arg(&oracle_o),
+            "compile independent source oracle",
+        );
+        run_checked(
+            Command::new("clang")
+                .args([
+                    "-std=c11",
+                    "-pedantic-errors",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                ])
+                .arg(&driver_c)
+                .arg(&generated_o)
+                .arg(&oracle_o)
+                .arg("-o")
+                .arg(&executable),
+            "link source-versus-CertifiedC oracle",
+        );
+        run_checked(
+            &mut Command::new(&executable),
+            "compare CertifiedC with independently compiled source",
+        );
+    }
+}
+
 // ============================================================================
 // Test fixtures
 // ============================================================================
@@ -275,6 +490,18 @@ mod ffi {
         defuse_json: String,
     }
 
+    fn assert_ssa_document(value: &Value, arch: &str) {
+        assert_eq!(
+            value.get("schema_version").and_then(Value::as_u64),
+            Some(r2sleigh_export::SSA_JSON_SCHEMA_VERSION.into()),
+            "SSA document schema mismatch for {arch}"
+        );
+        assert!(
+            value.get("operations").is_some_and(Value::is_array),
+            "SSA operations missing for {arch}"
+        );
+    }
+
     fn export_once_for_arch(
         arch: &str,
         base_bytes: &[u8],
@@ -292,10 +519,7 @@ mod ffi {
         let ssa_json = block.render(ANALYSIS_BLOCK_SSA, 0);
         let defuse_json = block.render(ANALYSIS_BLOCK_DEFUSE, 0);
         let ssa_parsed: Value = serde_json::from_str(&ssa_json).expect("valid ssa json");
-        assert!(
-            ssa_parsed.as_array().is_some(),
-            "ssa json must be an array for {arch}"
-        );
+        assert_ssa_document(&ssa_parsed, arch);
         let defuse_parsed: Value = serde_json::from_str(&defuse_json).expect("valid defuse json");
         assert!(
             defuse_parsed.get("inputs").is_some(),
@@ -403,7 +627,7 @@ mod ffi {
         let block = context.lift(&padded_bytes(&[0x48, 0x01, 0xd8]), 0x1000);
         let ssa = block.render(ANALYSIS_BLOCK_SSA, 0);
         let parsed: Value = serde_json::from_str(&ssa).expect("valid SSA JSON");
-        assert!(parsed.as_array().is_some());
+        assert_ssa_document(&parsed, "x86-64");
     }
 
     #[test]

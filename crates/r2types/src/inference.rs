@@ -145,28 +145,31 @@ impl TypeInference {
     pub fn set_prepared_ssa(&mut self, prepared: &SsaArtifact) {
         self.ssa_stack_slots.clear();
 
-        for (&value_id, object) in &prepared.objects().value_objects {
+        for (key, object) in &prepared.objects().value_objects {
+            if key.space != r2il::SpaceId::Ram {
+                continue;
+            }
             let Some(object_fact) = prepared.objects().object(*object) else {
                 continue;
             };
-            let Some(var) = prepared.graph().value(value_id).map(|value| &value.var) else {
+            let Some(var) = prepared.graph().value(key.value).map(|value| &value.var) else {
                 continue;
             };
             let root = match object_fact.kind {
-                ObjectKind::StackSlot { base, offset }
-                | ObjectKind::FrameObject { base, offset } => StackAddressRoot { base, offset },
+                ObjectKind::StackSlot {
+                    space: r2il::SpaceId::Ram,
+                    base,
+                    offset,
+                }
+                | ObjectKind::FrameObject {
+                    space: r2il::SpaceId::Ram,
+                    base,
+                    offset,
+                } => StackAddressRoot { base, offset },
                 _ => continue,
             };
             self.ssa_stack_slots
                 .insert(var.clone(), stack_slot_key_from_root(root));
-        }
-
-        if let Some(facts) = prepared.decompile_prep_facts() {
-            for (var, root) in &facts.stack_address_roots {
-                self.ssa_stack_slots
-                    .entry(var.clone())
-                    .or_insert_with(|| stack_slot_key_from_root(*root));
-            }
         }
     }
 
@@ -319,7 +322,11 @@ impl TypeInference {
                             });
                         }
                     }
-                    SSAOp::Load { dst, addr, .. } => {
+                    SSAOp::Load {
+                        dst,
+                        space: r2il::SpaceId::Ram,
+                        addr,
+                    } => {
                         let elem = self.integer_type_id(dst.size, Signedness::Unknown, arena);
                         constraints.push(Constraint::HasCapability {
                             ptr: addr.clone(),
@@ -356,7 +363,11 @@ impl TypeInference {
                             }
                         }
                     }
-                    SSAOp::Store { addr, val, .. } => {
+                    SSAOp::Store {
+                        space: r2il::SpaceId::Ram,
+                        addr,
+                        val,
+                    } => {
                         let elem = self.integer_type_id(val.size, Signedness::Unknown, arena);
                         constraints.push(Constraint::HasCapability {
                             ptr: addr.clone(),
@@ -1358,8 +1369,16 @@ fn collect_deref_consumers(
     for block in func.blocks() {
         for op in &block.ops {
             let (addr, elem_size) = match op {
-                SSAOp::Load { dst, addr, .. } => (addr, dst.size),
-                SSAOp::Store { addr, val, .. } => (addr, val.size),
+                SSAOp::Load {
+                    dst,
+                    space: r2il::SpaceId::Ram,
+                    addr,
+                } => (addr, dst.size),
+                SSAOp::Store {
+                    space: r2il::SpaceId::Ram,
+                    addr,
+                    val,
+                } => (addr, val.size),
                 _ => continue,
             };
             mark_deref_chain(addr, elem_size, defs, &mut out, &mut HashSet::new());
@@ -1710,31 +1729,117 @@ mod tests {
     #[test]
     fn test_emit_inferred_constraints_load_store_emit_has_capability() {
         let ti = TypeInference::new(64);
-        let addr = Varnode::unique(0x20, 8);
+        let ram_addr = Varnode::unique(0x20, 8);
+        let custom_addr = Varnode::unique(0x30, 8);
         let func = ssa_from_ops(
             vec![
                 R2ILOp::Load {
                     dst: Varnode::unique(0x21, 4),
                     space: SpaceId::Ram,
-                    addr: addr.clone(),
+                    addr: ram_addr.clone(),
                 },
                 R2ILOp::Store {
                     space: SpaceId::Ram,
-                    addr,
+                    addr: ram_addr,
                     val: Varnode::unique(0x22, 4),
+                },
+                R2ILOp::Load {
+                    dst: Varnode::unique(0x31, 4),
+                    space: SpaceId::Custom(7),
+                    addr: custom_addr.clone(),
+                },
+                R2ILOp::Store {
+                    space: SpaceId::Custom(7),
+                    addr: custom_addr,
+                    val: Varnode::unique(0x32, 4),
                 },
             ],
             None,
         );
         let constraints = emit_inferred_for_test(&ti, &func);
+        let mut ram_dst = None;
+        let mut custom_dst = None;
+        for op in func.blocks().flat_map(|block| &block.ops) {
+            match op {
+                SSAOp::Load {
+                    dst,
+                    space: SpaceId::Ram,
+                    ..
+                } => ram_dst = Some(dst),
+                SSAOp::Load {
+                    dst,
+                    space: SpaceId::Custom(7),
+                    ..
+                } => custom_dst = Some(dst),
+                _ => {}
+            }
+        }
+        let ram_dst = ram_dst.expect("Ram load result");
+        let custom_dst = custom_dst.expect("Custom load result");
         let cap_count = constraints
             .iter()
             .filter(|c| matches!(c, Constraint::HasCapability { .. }))
             .count();
         assert_eq!(
             cap_count, 2,
-            "load+store should emit two capability constraints"
+            "only the Ram load+store may emit C memory capabilities"
         );
+        assert!(constraints.iter().any(
+            |constraint| matches!(constraint, Constraint::SetType { var, .. } if var == ram_dst)
+        ));
+        assert!(!constraints.iter().any(
+            |constraint| matches!(constraint, Constraint::SetType { var, .. } if var == custom_dst)
+        ));
+    }
+
+    #[test]
+    fn collect_deref_consumers_requires_exact_ram_space() {
+        let ram_addr = Varnode::unique(0x40, 8);
+        let custom_addr = Varnode::unique(0x50, 8);
+        let func = ssa_from_ops(
+            vec![
+                R2ILOp::Load {
+                    dst: Varnode::unique(0x41, 4),
+                    space: SpaceId::Ram,
+                    addr: ram_addr.clone(),
+                },
+                R2ILOp::Load {
+                    dst: Varnode::unique(0x51, 8),
+                    space: SpaceId::Custom(7),
+                    addr: custom_addr.clone(),
+                },
+            ],
+            None,
+        );
+        let defs = build_def_map(&func);
+        let consumers = collect_deref_consumers(&func, &defs);
+        let ram = func
+            .blocks()
+            .flat_map(|block| &block.ops)
+            .find_map(|op| match op {
+                SSAOp::Load {
+                    space: SpaceId::Ram,
+                    addr,
+                    ..
+                } => Some(addr.display_name()),
+                _ => None,
+            })
+            .expect("Ram load address");
+        let custom = func
+            .blocks()
+            .flat_map(|block| &block.ops)
+            .find_map(|op| match op {
+                SSAOp::Load {
+                    space: SpaceId::Custom(7),
+                    addr,
+                    ..
+                } => Some(addr.display_name()),
+                _ => None,
+            })
+            .expect("Custom load address");
+
+        assert_eq!(consumers.get(&ram), Some(&4));
+        assert!(!consumers.contains_key(&custom));
     }
 
     #[test]
@@ -2138,8 +2243,33 @@ mod tests {
     fn set_prepared_ssa_uses_canonical_stack_objects_for_slot_binding() {
         let mut arch = ArchSpec::new("x86-64");
         arch.add_register(RegisterDef::new("RBP", 0x20, 8));
+        arch.add_register(RegisterDef::new("RSP", 0x28, 8));
+        arch.add_register(RegisterDef::new("RIP", 0x30, 8));
 
-        let prepared = SsaArtifact::for_decompile(
+        let register_storage = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let frame_pointer = register_storage(0x20);
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            b"canonical-stack-object-fixture".to_vec(),
+            "sysv64",
+            [],
+            r2ssa::SourceFunctionReturn::Void,
+            [r2ssa::SourceStackSlotSpec::new_local(
+                r2ssa::StackAddressBase::FramePointer,
+                frame_pointer,
+                -16,
+                4,
+            )],
+        )
+        .and_then(|interface| interface.with_return_address_storage(register_storage(0x30)))
+        .and_then(|interface| interface.with_stack_pointer_storage(register_storage(0x28)))
+        .and_then(|interface| interface.with_frame_pointer_storage(frame_pointer))
+        .expect("exact local-stack interface");
+
+        let prepared = SsaArtifact::for_decompile_with_interface(
             &[R2ILBlock {
                 addr: 0x2000,
                 size: 4,
@@ -2149,6 +2279,11 @@ mod tests {
                         a: Varnode::register(0x20, 8),
                         b: Varnode::constant(0x10, 8),
                     },
+                    R2ILOp::Load {
+                        dst: Varnode::unique(0x18, 4),
+                        space: r2il::SpaceId::Ram,
+                        addr: Varnode::unique(0x10, 8),
+                    },
                     R2ILOp::Return {
                         target: Varnode::constant(0, 8),
                     },
@@ -2157,6 +2292,7 @@ mod tests {
                 op_metadata: Default::default(),
             }],
             Some(&arch),
+            interface,
         )
         .expect("prepared SSA");
 
@@ -2193,5 +2329,61 @@ mod tests {
                 .map(|slot| slot.name.as_str()),
             Some("slot")
         );
+    }
+
+    #[test]
+    fn set_prepared_ssa_does_not_turn_custom_space_roots_into_stack_slots() {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.add_register(RegisterDef::new("RBP", 0x20, 8));
+        let prepared = SsaArtifact::for_decompile(
+            &[R2ILBlock {
+                addr: 0x2100,
+                size: 4,
+                ops: vec![
+                    R2ILOp::IntSub {
+                        dst: Varnode::unique(0x10, 8),
+                        a: Varnode::register(0x20, 8),
+                        b: Varnode::constant(0x10, 8),
+                    },
+                    R2ILOp::Load {
+                        dst: Varnode::unique(0x18, 4),
+                        space: r2il::SpaceId::Custom(7),
+                        addr: Varnode::unique(0x10, 8),
+                    },
+                    R2ILOp::Return {
+                        target: Varnode::constant(0, 8),
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            }],
+            Some(&arch),
+        )
+        .expect("prepared custom-space SSA");
+        let mut ti = TypeInference::new(64);
+        ti.set_external_stack_slots(BTreeMap::from([(
+            StackSlotKey {
+                base: ExternalStackBase::FramePointer,
+                offset: -16,
+            },
+            ExternalStackVarSpec {
+                name: "slot".to_string(),
+                ty: None,
+                base: ExternalStackBase::FramePointer,
+                role: crate::ExternalStackSlotRole::Local,
+                param_index: None,
+                param_name: None,
+                source_reg: None,
+            },
+        )]));
+        ti.set_prepared_ssa(&prepared);
+        let address = prepared
+            .graph()
+            .values
+            .iter()
+            .find(|value| value.var.name_kind().is_temporary() && value.var.size == 8)
+            .map(|value| value.var.clone())
+            .expect("custom address root");
+        assert!(ti.stack_slot_spec_for_var(&address).is_none());
     }
 }

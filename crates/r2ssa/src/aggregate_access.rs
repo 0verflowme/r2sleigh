@@ -15,7 +15,7 @@ use crate::{
     SsaGraph, StructuredAccessId, StructuredMemoryAccessFact, ValueId,
 };
 
-pub const AGGREGATE_ACCESS_PROJECTION_SCHEMA_VERSION: u32 = 1;
+pub const AGGREGATE_ACCESS_PROJECTION_SCHEMA_VERSION: u32 = 2;
 
 /// Exact scalar value carried by one projected memory effect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -37,6 +37,7 @@ pub struct AggregateAccessProjection {
     pub member_type_id: u32,
     pub byte_offset: u64,
     pub byte_width: u32,
+    pub space: SpaceId,
     pub access: StructuredAccessId,
     pub producer: InstId,
     pub binding: AggregateAccessBinding,
@@ -106,6 +107,7 @@ fn graph_type(graph: &crate::SourceTypeGraph, type_id: u32) -> Option<&crate::So
 fn exact_access_binding(
     graph: &SsaGraph,
     access: &StructuredMemoryAccessFact,
+    expected_space: SpaceId,
 ) -> Option<AggregateAccessBinding> {
     if access.id.ordinal != 0
         || graph.op_site_for_inst(access.id.inst) != Some((access.block_addr, access.op_index))
@@ -117,19 +119,21 @@ fn exact_access_binding(
         return None;
     }
     match (&instruction.payload, access.is_write) {
-        (InstPayload::Op(SSAOp::Load { dst, addr, .. }), false) => {
+        (InstPayload::Op(SSAOp::Load { dst, space, addr }), false) => {
             let address = graph.value_id_for_var(addr)?;
             let result = graph.value_id_for_var(dst)?;
-            (address == access.address
+            (*space == expected_space
+                && address == access.address
                 && access.value == Some(result)
                 && instruction.output == Some(result)
                 && dst.size == access.width)
                 .then_some(AggregateAccessBinding::Read { result })
         }
-        (InstPayload::Op(SSAOp::Store { addr, val, .. }), true) => {
+        (InstPayload::Op(SSAOp::Store { space, addr, val }), true) => {
             let address = graph.value_id_for_var(addr)?;
             let value = graph.value_id_for_var(val)?;
-            (address == access.address
+            (*space == expected_space
+                && address == access.address
                 && access.value == Some(value)
                 && instruction.output.is_none()
                 && val.size == access.width)
@@ -154,14 +158,14 @@ pub(crate) fn collect_aggregate_access_projections(
     let revision = interface.revision_identity().to_vec().into_boxed_slice();
     let mut projections = BTreeMap::new();
     for (access_id, access) in accesses {
-        if *access_id != access.id
-            || !access.provenance_complete
-            || machine_context.memory_space_at(access.block_addr, access.op_index)
-                != Some(SpaceId::Ram)
-        {
+        let Some(space) = machine_context.memory_space_at(access.block_addr, access.op_index)
+        else {
+            continue;
+        };
+        if *access_id != access.id || !access.provenance_complete || space != SpaceId::Ram {
             continue;
         }
-        let Some(binding) = exact_access_binding(graph, access) else {
+        let Some(binding) = exact_access_binding(graph, access, space) else {
             continue;
         };
         let Some(expression) = addresses.parameter_expression(access.address) else {
@@ -250,6 +254,7 @@ pub(crate) fn collect_aggregate_access_projections(
             member_type_id: member.type_id(),
             byte_offset,
             byte_width: access.width,
+            space,
             access: access.id,
             producer: access.id.inst,
             binding,
@@ -461,6 +466,7 @@ mod tests {
         assert_eq!(load.member_id, 2);
         assert_eq!(load.member_type_id, 1);
         assert_eq!((load.byte_offset, load.byte_width), (8, 4));
+        assert_eq!(load.space, SpaceId::Ram);
         assert_eq!(load.access, load_access);
         assert_eq!(load.producer, load_inst);
         let AggregateAccessBinding::Read { result } = load.binding else {
@@ -592,5 +598,25 @@ mod tests {
             positive.machine_context(),
         );
         assert!(recollected.projection(REVISION, load_id).is_none());
+
+        let mut mismatched_graph = positive.graph().clone();
+        let instruction = mismatched_graph
+            .insts
+            .get_mut(load_id.inst.0 as usize)
+            .expect("load instruction");
+        let InstPayload::Op(SSAOp::Load { space, .. }) = &mut instruction.payload else {
+            panic!("expected source load");
+        };
+        *space = SpaceId::Custom(7);
+        let recollected = collect_aggregate_access_projections(
+            &mismatched_graph,
+            positive.addresses(),
+            &positive.structured().memory_accesses,
+            positive.machine_context(),
+        );
+        assert!(
+            recollected.projection(REVISION, load_id).is_none(),
+            "a Custom source op must not reuse a Ram machine-context projection"
+        );
     }
 }

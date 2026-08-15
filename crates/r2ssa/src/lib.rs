@@ -26,6 +26,7 @@ pub mod control;
 pub mod data_ref;
 pub mod defuse;
 pub mod domtree;
+pub mod execution;
 pub mod fingerprint;
 pub mod function;
 pub mod graph;
@@ -64,6 +65,11 @@ pub use data_ref::{
 };
 pub use defuse::{
     BackwardSlice, DefUseInfo, SliceOpRef, backward_slice_from_op, backward_slice_from_var, def_use,
+};
+pub use execution::{
+    ArtifactBlockId, ArtifactInstId, ArtifactValueId, EntryStorageError, ExecutionBlockRef,
+    ExecutionEffect, ExecutionInstRef, ExecutionOpcode, ExecutionOperands, ExecutionOperation,
+    ExecutionPhiIncoming, ExecutionValueRef, ExecutionViewError, SsaExecutionView,
 };
 pub use fingerprint::{SSA_SEMANTIC_FINGERPRINT_SCHEMA_VERSION, stable_ssa_semantic_fingerprint};
 pub use function::{
@@ -123,16 +129,17 @@ pub use semantic::{
     CallSiteFact, CallSiteFacts, CallSiteId, CallsiteCertificate, CompareKind, CompareProvenance,
     ControlDomain, ControlDomainFacts, ControlDomainId, ControlGuard, GlobalObjectKey,
     IfRegionCertificate, LoopCarrierEdgeValue, LoopCarrierFact, LoopCarrierUpdateFact,
-    LoopCertificate, LoopId, MemoryAccessCertificate, MemoryDefFact, MemoryLocation, MemoryPhiFact,
-    MemorySSAFacts, MemoryUseFact, MemoryVersion, ObjectFact, ObjectId, ObjectKind, ObjectModel,
-    PredicateFact, PredicateFacts, PredicateId, PreparedAssumptionBinding,
-    PreparedAssumptionBindingKind, PreparedFunctionCertificates, PreparedFunctionFacts,
-    PreparedProofFailure, ProofNodeId, RelativeMemoryAddress, ReturnCarrier,
-    ReturnValueCertificate, SOURCE_RETURN_REGISTER_COMPOSITION_SCHEMA_VERSION, SemanticId,
-    SourceBoundaryFacts, SourceCallBoundaryFact, SourceFormalParameterFact,
-    SourceReturnAddressFact, SourceReturnBoundaryFact, SourceReturnRegisterCompositionFact,
+    LoopCertificate, LoopId, MemoryAccessCertificate, MemoryDefFact, MemoryLocation,
+    MemoryObjectKey, MemoryPhiFact, MemorySSAFacts, MemoryUseFact, MemoryVersion, ObjectFact,
+    ObjectId, ObjectKind, ObjectModel, ObjectSpaceId, ParameterObjectKey, PredicateFact,
+    PredicateFacts, PredicateId, PreparedAssumptionBinding, PreparedAssumptionBindingKind,
+    PreparedFunctionCertificates, PreparedFunctionFacts, PreparedProofFailure, ProofNodeId,
+    RelativeMemoryAddress, ReturnCarrier, ReturnValueCertificate,
+    SOURCE_RETURN_REGISTER_COMPOSITION_SCHEMA_VERSION, SemanticId, SourceBoundaryFacts,
+    SourceCallBoundaryFact, SourceFormalParameterFact, SourceReturnAddressFact,
+    SourceReturnBoundaryFact, SourceReturnRegisterCompositionFact,
     SourceReturnRegisterDefinitionFact, SourceReturnRegisterOverlayFact,
-    SourceReturnStackPointerFact, StackSlotCertificate, StructuredAccessId,
+    SourceReturnStackPointerFact, StackObjectKey, StackSlotCertificate, StructuredAccessId,
     StructuredDataflowFacts, StructuredLoopFact, StructuredLoopKind, StructuredMemoryAccessFact,
     StructuredRecursiveCallFact, SwitchCertificate, SwitchPredicateFact, ValueOwner,
 };

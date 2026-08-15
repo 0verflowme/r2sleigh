@@ -447,14 +447,22 @@ impl VariableRecovery {
         for block in func.blocks() {
             for op in &block.ops {
                 match op {
-                    SSAOp::Load { dst, addr, .. } => {
+                    SSAOp::Load {
+                        dst,
+                        space: r2il::SpaceId::Ram,
+                        addr,
+                    } => {
                         if let Some(offset) =
                             self.get_stack_offset(func, prepared, addr, &definitions)
                         {
                             self.ensure_stack_local(offset, dst.size);
                         }
                     }
-                    SSAOp::Store { addr, val, .. } => {
+                    SSAOp::Store {
+                        space: r2il::SpaceId::Ram,
+                        addr,
+                        val,
+                    } => {
                         if let Some(offset) =
                             self.get_stack_offset(func, prepared, addr, &definitions)
                         {
@@ -489,7 +497,7 @@ impl VariableRecovery {
         definitions: &HashMap<String, CExpr>,
     ) -> Option<i64> {
         if let Some(offset) = prepared
-            .and_then(|artifact| artifact.object_for_var(addr))
+            .and_then(|artifact| artifact.object_for_var(addr, r2il::SpaceId::Ram))
             .and_then(|object| prepared?.objects().object(object))
             .and_then(|object| match object.kind {
                 ObjectKind::StackSlot { offset, .. } | ObjectKind::FrameObject { offset, .. } => {
@@ -1128,7 +1136,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: SSAVar::new("tmp:len", 1, 8),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: SSAVar::new("tmp:addr", 1, 8),
             },
             SSAOp::Return {
@@ -1168,7 +1176,7 @@ mod tests {
             },
             SSAOp::Load {
                 dst: SSAVar::new("tmp:byte", 1, 1),
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: SSAVar::new("tmp:addr", 1, 8),
             },
             SSAOp::Return {
@@ -1243,7 +1251,7 @@ mod tests {
                 b: SSAVar::new("const:fffffffffffffffc", 0, 8),
             },
             SSAOp::Store {
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: SSAVar::new("tmp:addr", 1, 8),
                 val: SSAVar::new("EAX", 1, 4),
             },
@@ -1277,6 +1285,52 @@ mod tests {
             "sum",
             "a stored SSA value must not inherit the identity of its destination object"
         );
+    }
+
+    #[test]
+    fn only_ram_accesses_recover_stack_locals() {
+        let function_for_space = |space| {
+            let mut block = R2ILBlock::new(0x1000, 1);
+            block.push(R2ILOp::Return {
+                target: Varnode::constant(0, 8),
+            });
+            let mut func = SSAFunction::from_blocks_raw_no_arch(&[block]).expect("ssa function");
+            func.get_block_mut(0x1000).expect("entry").ops = vec![
+                SSAOp::IntSub {
+                    dst: SSAVar::new("tmp:load_addr", 1, 8),
+                    a: SSAVar::new("RBP", 1, 8),
+                    b: SSAVar::constant(8, 8),
+                },
+                SSAOp::Load {
+                    dst: SSAVar::new("tmp:loaded", 1, 4),
+                    space,
+                    addr: SSAVar::new("tmp:load_addr", 1, 8),
+                },
+                SSAOp::IntSub {
+                    dst: SSAVar::new("tmp:store_addr", 1, 8),
+                    a: SSAVar::new("RBP", 1, 8),
+                    b: SSAVar::constant(16, 8),
+                },
+                SSAOp::Store {
+                    space,
+                    addr: SSAVar::new("tmp:store_addr", 1, 8),
+                    val: SSAVar::new("EAX", 1, 4),
+                },
+            ];
+            func
+        };
+        let stack_offsets_for_space = |space| {
+            let mut recovery = VariableRecovery::new("rsp", "rbp", 64);
+            recovery.recover(&function_for_space(space));
+            recovery
+                .locals()
+                .into_iter()
+                .filter_map(|local| local.stack_offset)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(stack_offsets_for_space(r2il::SpaceId::Ram), vec![-16, -8]);
+        assert!(stack_offsets_for_space(r2il::SpaceId::Custom(7)).is_empty());
     }
 
     #[test]

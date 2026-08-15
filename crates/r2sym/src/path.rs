@@ -23,7 +23,7 @@ use crate::sim::{
 };
 use crate::solver::SymSolver;
 use crate::spec::ExplorationSpec;
-use crate::state::{ExitStatus, RuntimeBlockReason, SymState};
+use crate::state::{ExecutionPc, ExitStatus, RuntimeBlockReason, SymState};
 use crate::tactics::{
     SolveTacticConfig, constrain_exact_fold_inputs, constrain_exact_recurrence_candidate,
     tactic_candidates_for_constraint_graph,
@@ -141,7 +141,7 @@ fn debug_log_target_unsat_state(state: &SymState<'_>, target_addr: u64) {
     registers.sort();
     debug_target_match_unsat_log(&format!(
         "target=0x{target_addr:x} pc=0x{:x} prev_pc={} depth={} constraints={} regs=[{}]",
-        state.pc,
+        state.pc(),
         state
             .prev_pc()
             .map(|pc| format!("0x{pc:x}"))
@@ -227,7 +227,7 @@ impl<'ctx> PathResult<'ctx> {
 
     /// Get the final program counter.
     pub fn final_pc(&self) -> u64 {
-        self.state.pc
+        self.state.pc()
     }
 
     /// Get the number of path constraints.
@@ -519,6 +519,16 @@ struct ResolvedBlock<'a> {
     runtime_aliased: bool,
 }
 
+impl ResolvedBlock<'_> {
+    fn record_predecessor(self, state: &mut SymState<'_>) {
+        if self.runtime_aliased {
+            state.set_runtime_predecessor(self.runtime_addr, self.static_addr);
+        } else {
+            state.set_prev_pc(Some(self.static_addr));
+        }
+    }
+}
+
 struct StateWorklist<'ctx> {
     strategy: ExploreStrategy,
     ready: VecDeque<usize>,
@@ -540,7 +550,7 @@ impl<'ctx> StateWorklist<'ctx> {
 
     fn push(&mut self, state: SymState<'ctx>) -> usize {
         let id = self.slots.len();
-        let pc = state.pc;
+        let pc = state.pc();
         self.slots.push(Some(state));
         self.ready.push_back(id);
         self.same_pc.entry(pc).or_default().push_back(id);
@@ -629,34 +639,22 @@ impl<'ctx> StateWorklist<'ctx> {
         }
     }
 
-    fn take_same_pc(&mut self, pc: u64) -> Option<SymState<'ctx>> {
-        loop {
-            let id = {
-                let bucket = self.same_pc.get_mut(&pc)?;
-                match self.strategy {
-                    ExploreStrategy::Dfs => bucket.pop_back(),
-                    ExploreStrategy::Bfs => bucket.pop_front(),
-                    ExploreStrategy::Random => {
-                        if bucket.is_empty() {
-                            None
-                        } else if self.live_states.is_multiple_of(2) {
-                            bucket.pop_front()
-                        } else {
-                            bucket.pop_back()
-                        }
-                    }
-                }
-            }?;
-
-            let remove_bucket = self.same_pc.get(&pc).is_some_and(VecDeque::is_empty);
-            if remove_bucket {
-                self.same_pc.remove(&pc);
+    fn take_merge_compatible(&mut self, state: &SymState<'ctx>) -> Option<SymState<'ctx>> {
+        let ids = self.same_pc_ids(state.pc());
+        let matching = |id: &usize| {
+            self.state(*id)
+                .is_some_and(|candidate| state.merge_compatible_with(candidate))
+        };
+        let id = match self.strategy {
+            ExploreStrategy::Dfs => ids.iter().rev().find(|id| matching(id)),
+            ExploreStrategy::Bfs => ids.iter().find(|id| matching(id)),
+            ExploreStrategy::Random if self.live_states.is_multiple_of(2) => {
+                ids.iter().find(|id| matching(id))
             }
-
-            if let Some(state) = self.take_slot(id) {
-                return Some(state);
-            }
+            ExploreStrategy::Random => ids.iter().rev().find(|id| matching(id)),
         }
+        .copied()?;
+        self.take_slot(id)
     }
 
     fn take_slot(&mut self, id: usize) -> Option<SymState<'ctx>> {
@@ -1005,8 +1003,10 @@ impl<'ctx> DriverMode<'ctx> {
             DriverMode::Spec {
                 avoid_set, result, ..
             } => {
-                let static_pc = state.resolve_runtime_pc(state.pc).unwrap_or(state.pc);
-                if avoid_set.contains(&state.pc) || avoid_set.contains(&static_pc) {
+                let static_pc = state.effective_static_pc();
+                if avoid_set.contains(&state.pc())
+                    || static_pc.is_some_and(|pc| avoid_set.contains(&pc))
+                {
                     result.avoided_states += 1;
                     false
                 } else {
@@ -1020,11 +1020,23 @@ impl<'ctx> DriverMode<'ctx> {
 
 impl<'ctx> PathExplorer<'ctx> {
     fn state_matches_target(&self, state: &SymState<'ctx>, target_addr: u64) -> bool {
-        state.pc == target_addr || self.effective_static_pc(state) == target_addr
+        match state.execution_pc() {
+            ExecutionPc::Static => state.pc() == target_addr,
+            ExecutionPc::RuntimeAlias { static_addr } => {
+                state.pc() == target_addr || static_addr == target_addr
+            }
+            ExecutionPc::UnresolvedIndirect => false,
+        }
     }
 
     fn state_hits_any_target(&self, state: &SymState<'ctx>, targets: &HashSet<u64>) -> bool {
-        targets.contains(&state.pc) || targets.contains(&self.effective_static_pc(state))
+        match state.execution_pc() {
+            ExecutionPc::Static => targets.contains(&state.pc()),
+            ExecutionPc::RuntimeAlias { static_addr } => {
+                targets.contains(&state.pc()) || targets.contains(&static_addr)
+            }
+            ExecutionPc::UnresolvedIndirect => false,
+        }
     }
 
     fn max_inline_runahead_depth_delta(&self) -> usize {
@@ -1036,20 +1048,19 @@ impl<'ctx> PathExplorer<'ctx> {
 
     fn finalize_active_state_after_block(
         &self,
-        func: &SsaArtifact,
         state: &mut SymState<'ctx>,
-        block_runtime_addr: u64,
-        block_static_addr: u64,
+        block: ResolvedBlock<'_>,
+        transfer_generation_before_block: u64,
     ) {
-        state.pc = state
-            .remap_static_pc_to_runtime(state.pc)
-            .unwrap_or(state.pc);
-        if state.pc == block_runtime_addr
-            && let Some(next) = self.fallthrough_target(func, block_static_addr)
+        if state.control_transfer_generation() == transfer_generation_before_block
+            && state.pc() == block.runtime_addr
+            && state.effective_static_pc() == Some(block.static_addr)
+            && let Some(next) = self.fallthrough_target(block.func, block.static_addr)
         {
-            state.pc = state.remap_static_pc_to_runtime(next).unwrap_or(next);
+            state.set_static_execution_pc(next);
         }
-        state.set_prev_pc(Some(block_runtime_addr));
+        self.remap_state_pc_after_block(state, block);
+        block.record_predecessor(state);
     }
 
     fn patch_pending_exception_resume_pc(
@@ -1061,7 +1072,7 @@ impl<'ctx> PathExplorer<'ctx> {
         let Some(pending) = state.pending_exception() else {
             return;
         };
-        if state.pc != pending.handler_addr {
+        if state.pc() != pending.handler_addr {
             return;
         }
         let Some(resume_static_pc) = self.fallthrough_target(func, block_static_addr) else {
@@ -1173,7 +1184,9 @@ impl<'ctx> PathExplorer<'ctx> {
             forked.active = true;
             forked.exit_status = None;
             forked.constrain_eq(&rip, candidate);
-            forked.pc = candidate;
+            if !forked.select_runtime_execution_pc(candidate) {
+                forked.set_static_execution_pc(candidate);
+            }
             forked.set_prev_pc(None);
             forked.clear_pending_exception();
             resumed.push(forked);
@@ -1278,18 +1291,17 @@ impl<'ctx> PathExplorer<'ctx> {
         if let Some(dispatched) = self.dispatch_runtime_breakpoint(&mut state) {
             active_states.push(dispatched);
         }
-        let Some(block) = self.resolve_block(func, scope, &state) else {
-            let missing_pc = state.pc;
+        let Some(block) = self.resolve_block(func, scope, &mut state) else {
+            let missing_pc = state.pc();
             self.record_runtime_missing_block(&state, missing_pc);
             return Err(format!("missing block at 0x{missing_pc:x}"));
         };
-        let block_addr = block.runtime_addr;
         let block_static_addr = block.static_addr;
         let block_func = block.func;
 
         let mut enqueue_forked_state = |explorer: &mut Self, mut forked: SymState<'ctx>| {
             explorer.remap_state_pc_after_block(&mut forked, block);
-            forked.set_prev_pc(Some(block_addr));
+            block.record_predecessor(&mut forked);
             if forked.is_terminated() {
                 explorer.record_runtime_exit_status(&forked.exit_status);
                 explorer.stats.paths_completed += 1;
@@ -1298,6 +1310,7 @@ impl<'ctx> PathExplorer<'ctx> {
             }
         };
 
+        let transfer_generation_before_block = state.control_transfer_generation();
         match self.executor.execute_block(&mut state, block.block) {
             Ok(forked_states) => {
                 self.record_depth(state.depth);
@@ -1314,10 +1327,9 @@ impl<'ctx> PathExplorer<'ctx> {
                         block_static_addr,
                     );
                     self.finalize_active_state_after_block(
-                        block_func,
                         &mut state,
-                        block_addr,
-                        block_static_addr,
+                        block,
+                        transfer_generation_before_block,
                     );
                     active_states.push(state);
                 }
@@ -1331,42 +1343,82 @@ impl<'ctx> PathExplorer<'ctx> {
         &self,
         func: &'a SsaArtifact,
         scope: Option<&'a PreparedFunctionScope>,
-        state: &SymState<'ctx>,
+        state: &mut SymState<'ctx>,
     ) -> Option<ResolvedBlock<'a>> {
-        if let Some(block) = func.get_block(state.pc) {
-            return Some(ResolvedBlock {
-                func,
-                block,
-                static_addr: state.pc,
-                runtime_addr: state.pc,
-                runtime_aliased: false,
-            });
+        match state.execution_pc() {
+            ExecutionPc::Static => {
+                let scope_func = self.resolve_scope_function(func, scope, state.pc())?;
+                let block = scope_func.get_block(state.pc())?;
+                Some(ResolvedBlock {
+                    func: scope_func,
+                    block,
+                    static_addr: state.pc(),
+                    runtime_addr: state.pc(),
+                    runtime_aliased: false,
+                })
+            }
+            ExecutionPc::RuntimeAlias { static_addr } => {
+                let (_, candidates) = state.runtime_execution_candidates(state.pc());
+                if candidates.as_slice() != [static_addr] {
+                    return None;
+                }
+                let scope_func = self.resolve_scope_function(func, scope, static_addr)?;
+                let block = scope_func.get_block(static_addr)?;
+                Some(ResolvedBlock {
+                    func: scope_func,
+                    block,
+                    static_addr,
+                    runtime_addr: state.pc(),
+                    runtime_aliased: true,
+                })
+            }
+            ExecutionPc::UnresolvedIndirect => {
+                let runtime_pc = state.pc();
+                let static_candidate = self
+                    .resolve_scope_function(func, scope, runtime_pc)
+                    .and_then(|candidate| {
+                        candidate
+                            .get_block(runtime_pc)
+                            .map(|block| (candidate, block))
+                    });
+                let (runtime_region_present, runtime_candidates) =
+                    state.runtime_execution_candidates(runtime_pc);
+                if runtime_region_present && runtime_candidates.len() != 1 {
+                    return None;
+                }
+                let runtime_static = runtime_candidates.first().copied();
+                match (static_candidate, runtime_static) {
+                    (Some(_), Some(_)) => None,
+                    (Some((scope_func, block)), None) => {
+                        state.bind_static_execution_pc();
+                        Some(ResolvedBlock {
+                            func: scope_func,
+                            block,
+                            static_addr: runtime_pc,
+                            runtime_addr: runtime_pc,
+                            runtime_aliased: false,
+                        })
+                    }
+                    (None, Some(static_addr)) => {
+                        let scope_func = self.resolve_scope_function(func, scope, static_addr)?;
+                        let block = scope_func.get_block(static_addr)?;
+                        state.bind_runtime_execution_pc(static_addr);
+                        Some(ResolvedBlock {
+                            func: scope_func,
+                            block,
+                            static_addr,
+                            runtime_addr: runtime_pc,
+                            runtime_aliased: true,
+                        })
+                    }
+                    (None, None) => None,
+                }
+            }
         }
-        if let Some(scope_func) = self.resolve_scope_function(func, scope, state.pc)
-            && let Some(block) = scope_func.get_block(state.pc)
-        {
-            return Some(ResolvedBlock {
-                func: scope_func,
-                block,
-                static_addr: state.pc,
-                runtime_addr: state.pc,
-                runtime_aliased: false,
-            });
-        }
-        let static_addr = state.resolve_runtime_pc(state.pc)?;
-        let scope_func = self.resolve_scope_function(func, scope, static_addr)?;
-        let block = scope_func.get_block(static_addr)?;
-        Some(ResolvedBlock {
-            func: scope_func,
-            block,
-            static_addr,
-            runtime_addr: state.pc,
-            runtime_aliased: true,
-        })
     }
 
-    fn effective_static_pc(&self, state: &SymState<'ctx>) -> u64 {
-        state.resolve_runtime_pc(state.pc).unwrap_or(state.pc)
+    fn effective_static_pc(&self, state: &SymState<'ctx>) -> Option<u64> {
+        state.effective_static_pc()
     }
 
     fn dispatch_runtime_breakpoint(
@@ -1379,13 +1431,13 @@ impl<'ctx> PathExplorer<'ctx> {
         if let Some(breakpoint) = &state.runtime().active_breakpoint
             && breakpoint.breakpoint.as_concrete().is_none()
         {
-            let pc = crate::SymValue::concrete(state.pc, breakpoint.breakpoint.bits());
+            let pc = crate::SymValue::concrete(state.pc(), breakpoint.breakpoint.bits());
             if !self.solver.can_be_equal(state, &breakpoint.breakpoint, &pc) {
                 self.stats.runtime_symbolic_breakpoint_pruned += 1;
                 return None;
             }
         }
-        let dispatched = state.fork_symbolic_runtime_breakpoint_at(state.pc);
+        let dispatched = state.fork_symbolic_runtime_breakpoint_at(state.pc());
         if dispatched.is_some() {
             self.stats.runtime_symbolic_breakpoint_forks += 1;
         }
@@ -1555,8 +1607,8 @@ impl<'ctx> PathExplorer<'ctx> {
             return None;
         }
         let mut target_probe = state.fork();
-        target_probe.pc = branch.target;
-        if self.resolve_block(root, scope, &target_probe).is_none() {
+        target_probe.set_static_execution_pc(branch.target);
+        if self.resolve_block(root, scope, &mut target_probe).is_none() {
             debug_target_guidance_log(&format!(
                 "runtime_loop_exact_skip block=0x{:x} reason=missing_target target=0x{:x}",
                 block.addr, branch.target
@@ -1596,7 +1648,7 @@ impl<'ctx> PathExplorer<'ctx> {
             if let Some(dispatched) = self.dispatch_runtime_breakpoint(&mut runahead) {
                 runahead = dispatched;
             }
-            let static_pc = self.effective_static_pc(&runahead);
+            let static_pc = self.effective_static_pc(&runahead)?;
             if static_pc == branch.target {
                 debug_target_guidance_log(&format!(
                     "runtime_loop_exact_summary target=0x{:x} from=0x{:x} guard_visits={} block_steps={}",
@@ -1621,13 +1673,16 @@ impl<'ctx> PathExplorer<'ctx> {
                     return None;
                 }
             }
-            let Some(resolved) = self.resolve_block(root, scope, &runahead) else {
+            let Some(resolved) = self.resolve_block(root, scope, &mut runahead) else {
                 debug_target_guidance_log(&format!(
                     "runtime_loop_exact_skip block=0x{:x} reason=missing_block static_pc=0x{:x} runtime_pc=0x{:x}",
-                    block.addr, static_pc, runahead.pc
+                    block.addr,
+                    static_pc,
+                    runahead.pc()
                 ));
                 return None;
             };
+            let transfer_generation_before_block = runahead.control_transfer_generation();
             let forked = self
                 .executor
                 .execute_block(&mut runahead, resolved.block)
@@ -1654,10 +1709,9 @@ impl<'ctx> PathExplorer<'ctx> {
                 resolved.static_addr,
             );
             self.finalize_active_state_after_block(
-                resolved.func,
                 &mut runahead,
-                resolved.runtime_addr,
-                resolved.static_addr,
+                resolved,
+                transfer_generation_before_block,
             );
         }
         debug_target_guidance_log(&format!(
@@ -1687,11 +1741,14 @@ impl<'ctx> PathExplorer<'ctx> {
     }
 
     fn remap_state_pc_after_block(&self, state: &mut SymState<'ctx>, block: ResolvedBlock<'_>) {
-        if !block.runtime_aliased || state.pc == block.runtime_addr {
+        if !matches!(state.execution_pc(), ExecutionPc::Static) {
             return;
         }
-        if let Some(runtime_pc) = state.remap_static_pc_to_runtime(state.pc) {
-            state.pc = runtime_pc;
+        if block.runtime_aliased
+            && let Some(runtime_pc) = state.remap_static_pc_to_runtime(state.pc())
+        {
+            let static_pc = state.pc();
+            state.set_runtime_execution_pc(runtime_pc, static_pc);
         }
     }
 
@@ -1882,7 +1939,7 @@ impl<'ctx> PathExplorer<'ctx> {
         let model = self.solver.solve(&path.state)?;
 
         let mut solved = SolvedPath {
-            final_pc: path.state.pc,
+            final_pc: path.state.pc(),
             num_constraints: path.state.num_constraints(),
             ..Default::default()
         };
@@ -2066,7 +2123,7 @@ impl<'ctx> PathExplorer<'ctx> {
             return Some(state);
         }
 
-        let candidate_ids = worklist.same_pc_ids(state.pc);
+        let candidate_ids = worklist.same_pc_ids(state.pc());
         if candidate_ids.is_empty() {
             return Some(state);
         }
@@ -2136,9 +2193,11 @@ impl<'ctx> PathExplorer<'ctx> {
                 break;
             }
             if self.config.merge_states
-                && let Some(other) = worklist.take_same_pc(state.pc)
+                && let Some(other) = worklist.take_merge_compatible(&state)
             {
-                state = state.merge_with(&other);
+                state = state
+                    .merge_with(&other)
+                    .expect("worklist returned a merge-compatible state");
             }
 
             if let Some(timeout) = self.config.timeout
@@ -2149,6 +2208,9 @@ impl<'ctx> PathExplorer<'ctx> {
                 break;
             }
 
+            if matches!(state.execution_pc(), ExecutionPc::UnresolvedIndirect) {
+                let _ = self.resolve_block(func, scope, &mut state);
+            }
             match mode.on_state_popped(self, state) {
                 DriverAction::Continue(next_state) => state = *next_state,
                 DriverAction::Skip => continue,
@@ -2191,6 +2253,9 @@ impl<'ctx> PathExplorer<'ctx> {
                 }
 
                 if std::mem::take(&mut revisit_current_state) {
+                    if matches!(state.execution_pc(), ExecutionPc::UnresolvedIndirect) {
+                        let _ = self.resolve_block(func, scope, &mut state);
+                    }
                     match mode.on_state_popped(self, state) {
                         DriverAction::Continue(next_state) => state = *next_state,
                         DriverAction::Skip => continue 'worklist,
@@ -2198,8 +2263,8 @@ impl<'ctx> PathExplorer<'ctx> {
                     }
                 }
 
-                let Some(block) = self.resolve_block(func, scope, &state) else {
-                    let missing_pc = state.pc;
+                let Some(block) = self.resolve_block(func, scope, &mut state) else {
+                    let missing_pc = state.pc();
                     match mode.on_missing_block(
                         self,
                         state,
@@ -2213,6 +2278,7 @@ impl<'ctx> PathExplorer<'ctx> {
                 let block_addr = block.runtime_addr;
                 let block_static_addr = block.static_addr;
                 let block_func = block.func;
+                let transfer_generation_before_block = state.control_transfer_generation();
                 match self.executor.execute_block(&mut state, block.block) {
                     Ok(forked_states) => {
                         self.record_depth(state.depth);
@@ -2220,7 +2286,7 @@ impl<'ctx> PathExplorer<'ctx> {
                         let had_forks = !forked_states.is_empty();
                         for mut forked in forked_states {
                             self.remap_state_pc_after_block(&mut forked, block);
-                            forked.set_prev_pc(Some(block_addr));
+                            block.record_predecessor(&mut forked);
                             if mode.allow_enqueue(&forked)
                                 && let Some(forked) =
                                     self.prune_subsumed_same_pc_state(&mut worklist, forked)
@@ -2236,10 +2302,9 @@ impl<'ctx> PathExplorer<'ctx> {
                                 block_static_addr,
                             );
                             self.finalize_active_state_after_block(
-                                block_func,
                                 &mut state,
-                                block_addr,
-                                block_static_addr,
+                                block,
+                                transfer_generation_before_block,
                             );
                             if mode.allow_enqueue(&state) {
                                 let can_inline_continue = !had_forks
@@ -2354,7 +2419,9 @@ impl<'ctx> PathExplorer<'ctx> {
         guidance: &TargetGuidanceContext,
         state: &SymState<'ctx>,
     ) -> StateSummaryGuidance {
-        let static_pc = self.effective_static_pc(state);
+        let Some(static_pc) = self.effective_static_pc(state) else {
+            return StateSummaryGuidance::default();
+        };
         let Some(targets) = guidance.call_targets_by_block.get(&static_pc) else {
             return StateSummaryGuidance::default();
         };
@@ -2400,9 +2467,11 @@ impl<'ctx> PathExplorer<'ctx> {
         guidance: &TargetGuidanceContext,
         state: &SymState<'ctx>,
     ) -> bool {
-        let static_pc = self.effective_static_pc(state);
-        let runtime_continuation_bridge =
-            state.pending_exception().is_some() || state.runtime_region_for_pc(state.pc).is_some();
+        let Some(static_pc) = self.effective_static_pc(state) else {
+            return true;
+        };
+        let runtime_continuation_bridge = state.pending_exception().is_some()
+            || state.runtime_region_for_pc(state.pc()).is_some();
         if !guidance.reachable_blocks.contains(&static_pc)
             && !guidance.allow_cross_function_states
             && !runtime_continuation_bridge
@@ -2411,7 +2480,7 @@ impl<'ctx> PathExplorer<'ctx> {
             debug_target_guidance_log(&format!(
                 "cfg_prune target=0x{:x} runtime_pc=0x{:x} static_pc=0x{:x} prev_pc={} terminated={} depth={}",
                 guidance.target_addr,
-                state.pc,
+                state.pc(),
                 static_pc,
                 state
                     .prev_pc()
@@ -2492,9 +2561,11 @@ impl<'ctx> PathExplorer<'ctx> {
                 self.stats.target_guided_reorders += 1;
             }
             if self.config.merge_states
-                && let Some(other) = worklist.take_same_pc(state.pc)
+                && let Some(other) = worklist.take_merge_compatible(&state)
             {
-                state = state.merge_with(&other);
+                state = state
+                    .merge_with(&other)
+                    .expect("worklist returned a merge-compatible state");
             }
 
             if let Some(timeout) = self.config.timeout
@@ -2505,6 +2576,9 @@ impl<'ctx> PathExplorer<'ctx> {
                 break;
             }
 
+            if matches!(state.execution_pc(), ExecutionPc::UnresolvedIndirect) {
+                let _ = self.resolve_block(func, scope, &mut state);
+            }
             match mode.on_state_popped(self, state) {
                 DriverAction::Continue(next_state) => state = *next_state,
                 DriverAction::Skip => continue,
@@ -2529,10 +2603,12 @@ impl<'ctx> PathExplorer<'ctx> {
             if self.config.prune_infeasible && !self.solver.is_sat(&state) {
                 self.stats.paths_pruned += 1;
                 debug_target_guidance_log(&format!(
-                    "unsat_prune target=0x{:x} runtime_pc=0x{:x} static_pc=0x{:x} prev_pc={} terminated={} depth={} constraints={}",
+                    "unsat_prune target=0x{:x} runtime_pc=0x{:x} static_pc={} prev_pc={} terminated={} depth={} constraints={}",
                     guidance.target_addr,
-                    state.pc,
-                    self.effective_static_pc(&state),
+                    state.pc(),
+                    self.effective_static_pc(&state)
+                        .map(|pc| format!("0x{pc:x}"))
+                        .unwrap_or_else(|| "unresolved".to_string()),
                     state
                         .prev_pc()
                         .map(|pc| format!("0x{pc:x}"))
@@ -2561,6 +2637,9 @@ impl<'ctx> PathExplorer<'ctx> {
                 }
 
                 if std::mem::take(&mut revisit_current_state) {
+                    if matches!(state.execution_pc(), ExecutionPc::UnresolvedIndirect) {
+                        let _ = self.resolve_block(func, scope, &mut state);
+                    }
                     match mode.on_state_popped(self, state) {
                         DriverAction::Continue(next_state) => state = *next_state,
                         DriverAction::Skip => continue 'worklist,
@@ -2583,8 +2662,8 @@ impl<'ctx> PathExplorer<'ctx> {
                     continue 'worklist;
                 }
 
-                let Some(block) = self.resolve_block(func, scope, &state) else {
-                    let missing_pc = state.pc;
+                let Some(block) = self.resolve_block(func, scope, &mut state) else {
+                    let missing_pc = state.pc();
                     match mode.on_missing_block(
                         self,
                         state,
@@ -2637,6 +2716,7 @@ impl<'ctx> PathExplorer<'ctx> {
                 let previous_direct_call_targets = self
                     .executor
                     .replace_direct_call_fork_targets(direct_call_targets);
+                let transfer_generation_before_block = state.control_transfer_generation();
                 let execution = self.executor.execute_block(&mut state, block.block);
                 self.executor
                     .replace_direct_call_fork_targets(previous_direct_call_targets);
@@ -2657,7 +2737,7 @@ impl<'ctx> PathExplorer<'ctx> {
                         let had_forks = !forked_states.is_empty();
                         for mut forked in forked_states {
                             self.remap_state_pc_after_block(&mut forked, block);
-                            forked.set_prev_pc(Some(block_addr));
+                            block.record_predecessor(&mut forked);
                             self.enqueue_target_guided_state(
                                 &mut worklist,
                                 &mut target_heap,
@@ -2674,10 +2754,9 @@ impl<'ctx> PathExplorer<'ctx> {
                                 block_static_addr,
                             );
                             self.finalize_active_state_after_block(
-                                block_func,
                                 &mut state,
-                                block_addr,
-                                block_static_addr,
+                                block,
+                                transfer_generation_before_block,
                             );
                             if mode.allow_enqueue(&state)
                                 && self.target_enqueue_allowed(&guidance, &state)
@@ -2832,17 +2911,18 @@ impl<'ctx> PathExplorer<'ctx> {
         usize,
     ) {
         let static_pc = self.effective_static_pc(state);
-        let reachable = guidance.reachable_blocks.contains(&static_pc);
-        let runtime_continuation_bridge =
-            state.pending_exception().is_some() || state.runtime_region_for_pc(state.pc).is_some();
+        let reachable = static_pc.is_some_and(|pc| guidance.reachable_blocks.contains(&pc));
+        let runtime_continuation_bridge = state.pending_exception().is_some()
+            || state.runtime_region_for_pc(state.pc()).is_some();
         let runtime_walk_penalty = usize::from(
-            state.pending_exception().is_none() && state.runtime_region_for_pc(state.pc).is_some(),
+            state.pending_exception().is_none()
+                && state.runtime_region_for_pc(state.pc()).is_some(),
         );
         let reachability_penalty = usize::from(!(reachable || runtime_continuation_bridge));
         let distance = if reachable {
             guidance
                 .distances
-                .get(&static_pc)
+                .get(&static_pc.expect("reachable states have a static PC"))
                 .copied()
                 .unwrap_or(usize::MAX)
         } else if runtime_continuation_bridge {
@@ -2852,7 +2932,7 @@ impl<'ctx> PathExplorer<'ctx> {
         };
         let summary_rank = guidance
             .block_summary_rank
-            .get(&static_pc)
+            .get(&static_pc.unwrap_or(u64::MAX))
             .cloned()
             .unwrap_or_default();
         let summary_known_penalty = usize::from(!summary_rank.has_summary);
@@ -3242,17 +3322,69 @@ mod tests {
         worklist.push(SymState::new(&ctx, 0x1000));
 
         let first = worklist.pop_next().expect("first state should exist");
-        assert_eq!(first.pc, 0x1000);
+        assert_eq!(first.pc(), 0x1000);
 
+        let merge_key = SymState::new(&ctx, 0x1000);
         let merged = worklist
-            .take_same_pc(0x1000)
+            .take_merge_compatible(&merge_key)
             .expect("queued same-pc state should still be found");
-        assert_eq!(merged.pc, 0x1000);
+        assert_eq!(merged.pc(), 0x1000);
 
         let remaining = worklist.pop_next().expect("non-merged state should remain");
-        assert_eq!(remaining.pc, 0x2000);
+        assert_eq!(remaining.pc(), 0x2000);
         assert!(worklist.pop_next().is_none());
-        assert!(worklist.take_same_pc(0x1000).is_none());
+        assert!(worklist.take_merge_compatible(&merge_key).is_none());
+    }
+
+    #[test]
+    fn state_worklist_does_not_merge_different_phi_predecessors() {
+        let ctx = Context::thread_local();
+        let mut worklist = StateWorklist::new(ExploreStrategy::Bfs);
+        let mut queued = SymState::new(&ctx, 0x2000);
+        queued.set_prev_pc(Some(0x1000));
+        worklist.push(queued);
+
+        let mut incoming = SymState::new(&ctx, 0x2000);
+        incoming.set_prev_pc(Some(0x3000));
+        assert!(worklist.take_merge_compatible(&incoming).is_none());
+        assert_eq!(
+            worklist.pop_next().and_then(|state| state.prev_pc()),
+            Some(0x1000)
+        );
+    }
+
+    #[test]
+    fn same_address_taken_branch_is_not_rewritten_as_fallthrough() {
+        let ctx = Context::thread_local();
+        let func = SsaArtifact::for_symbolic(
+            &[
+                R2ILBlock {
+                    addr: 0x1000,
+                    size: 4,
+                    ops: vec![R2ILOp::CBranch {
+                        target: make_const(0x1000, 8),
+                        cond: make_const(1, 1),
+                    }],
+                    switch_info: None,
+                    op_metadata: Default::default(),
+                },
+                R2ILBlock {
+                    addr: 0x1004,
+                    size: 1,
+                    ops: vec![R2ILOp::Nop],
+                    switch_info: None,
+                    op_metadata: Default::default(),
+                },
+            ],
+            None,
+        )
+        .expect("symbolic function");
+        let mut explorer = PathExplorer::new(&ctx);
+        let states = explorer
+            .advance_current_block_in_scope(&func, None, SymState::new(&ctx, 0x1000))
+            .expect("same-address branch execution");
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].pc(), 0x1000);
     }
 
     #[test]
@@ -3286,7 +3418,7 @@ mod tests {
         let (state, reordered) = explorer
             .pop_target_guided_state(&mut worklist, &mut heap)
             .expect("best state should exist");
-        assert_eq!(state.pc, 0x2000);
+        assert_eq!(state.pc(), 0x2000);
         assert!(
             reordered,
             "best state should differ from DFS default candidate"
@@ -3300,7 +3432,7 @@ mod tests {
         let (state, reordered) = explorer
             .pop_target_guided_state(&mut worklist, &mut heap)
             .expect("remaining state should exist");
-        assert_eq!(state.pc, 0x1000);
+        assert_eq!(state.pc(), 0x1000);
         assert!(
             !reordered,
             "after skipping stale entries, the chosen state should match the live default candidate"
@@ -3685,6 +3817,7 @@ mod tests {
                 size: 1,
             }),
         );
+        assert!(state.select_runtime_execution_pc(0x6000_0000));
 
         let mut explorer = PathExplorer::new(&ctx);
         let found = explorer.find_path_to(&func, state, 0x6000_0004);
@@ -3727,6 +3860,7 @@ mod tests {
                 size: 1,
             }),
         );
+        assert!(state.select_runtime_execution_pc(0x6000_0000));
 
         let mut explorer = PathExplorer::new(&ctx);
         let found = explorer.find_path_to(&func, state, 0x2004);
@@ -3734,6 +3868,272 @@ mod tests {
         assert!(
             found.is_some(),
             "runtime-mapped execution should match the static source target"
+        );
+    }
+
+    #[test]
+    fn static_block_predecessor_remains_static_when_runtime_alias_overlaps() {
+        let ctx = Context::thread_local();
+        let blocks = vec![
+            R2ILBlock {
+                addr: 0x1000,
+                size: 4,
+                ops: vec![
+                    R2ILOp::Copy {
+                        dst: make_reg(RAX, 8),
+                        src: make_const(0x11, 8),
+                    },
+                    R2ILOp::Branch {
+                        target: make_const(0x1020, 8),
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x3000,
+                size: 4,
+                ops: vec![
+                    R2ILOp::Copy {
+                        dst: make_reg(RAX, 8),
+                        src: make_const(0x22, 8),
+                    },
+                    R2ILOp::Branch {
+                        target: make_const(0x1020, 8),
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1020,
+                size: 1,
+                ops: vec![R2ILOp::Nop],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ];
+        let func = SsaArtifact::for_symbolic(&blocks, None).expect("symbolic function");
+        let runtime_source =
+            SsaArtifact::for_symbolic(&[blocks[1].clone()], None).expect("runtime source function");
+        let scope = crate::PreparedFunctionScope::new(
+            0x1000,
+            vec![
+                crate::ScopedPreparedFunction {
+                    id: InterprocFunctionId(0x1000),
+                    name: Some("root".to_string()),
+                    prepared: func.clone(),
+                },
+                crate::ScopedPreparedFunction {
+                    id: InterprocFunctionId(0x3000),
+                    name: Some("runtime_source".to_string()),
+                    prepared: runtime_source,
+                },
+            ],
+        )
+        .expect("scope");
+        let join = func.get_block(0x1020).expect("join block");
+        let phi = join.phis.first().expect("join Phi");
+        assert!(
+            phi.sources
+                .iter()
+                .any(|(predecessor, _)| *predecessor == 0x1000)
+        );
+        assert!(
+            phi.sources
+                .iter()
+                .any(|(predecessor, _)| *predecessor == 0x3000)
+        );
+
+        let mut state = SymState::new(&ctx, 0x1000);
+        let _ = state.define_runtime_region("overlap", 0x1000, 0x100, true);
+        state.note_runtime_store_copy(
+            0x1000,
+            0x100,
+            Some(&crate::RuntimeValueProvenance {
+                source_addr: 0x3000,
+                size: 0x100,
+            }),
+        );
+        assert_eq!(state.resolve_runtime_pc(0x1000), Some(0x3000));
+
+        let mut explorer = PathExplorer::new(&ctx);
+        let mut after_source = explorer
+            .advance_current_block_in_scope(&func, None, state)
+            .expect("static source block execution");
+        let state = after_source.pop().expect("active join state");
+        assert!(matches!(
+            state.predecessor(),
+            Some(crate::state::ExecutionPredecessor::Static {
+                static_addr: 0x1000
+            })
+        ));
+
+        let mut after_join = explorer
+            .advance_current_block_in_scope(&func, None, state)
+            .expect("join execution");
+        let state = after_join.pop().expect("active post-join state");
+        assert_eq!(
+            state
+                .get_register_sized(&phi.dst.display_name(), phi.dst.size * 8)
+                .as_concrete(),
+            Some(0x11)
+        );
+
+        let mut runtime_state = SymState::new(&ctx, 0x1000);
+        let _ = runtime_state.define_runtime_region("overlap", 0x1000, 0x100, true);
+        runtime_state.note_runtime_store_copy(
+            0x1000,
+            0x100,
+            Some(&crate::RuntimeValueProvenance {
+                source_addr: 0x3000,
+                size: 0x100,
+            }),
+        );
+        assert!(runtime_state.select_runtime_execution_pc(0x1000));
+        assert_eq!(runtime_state.effective_static_pc(), Some(0x3000));
+
+        let mut runtime_explorer = PathExplorer::new(&ctx);
+        let mut after_runtime_source = runtime_explorer
+            .advance_current_block_in_scope(&func, Some(&scope), runtime_state)
+            .expect("runtime alias source block execution");
+        let mut runtime_state = after_runtime_source
+            .pop()
+            .expect("active runtime join state");
+        assert!(matches!(
+            runtime_state.predecessor(),
+            Some(crate::state::ExecutionPredecessor::RuntimeAlias {
+                runtime_addr: 0x1000,
+                static_addr: 0x3000,
+            })
+        ));
+        let runtime_phi_source = phi
+            .sources
+            .iter()
+            .find_map(|(predecessor, source)| (*predecessor == 0x3000).then_some(source))
+            .expect("runtime Phi source");
+        runtime_state.set_register(
+            &runtime_phi_source.display_name(),
+            SymValue::concrete(0x22, runtime_phi_source.size * 8),
+        );
+
+        let mut after_runtime_join = runtime_explorer
+            .advance_current_block_in_scope(&func, Some(&scope), runtime_state)
+            .expect("runtime-selected join execution");
+        let runtime_state = after_runtime_join
+            .pop()
+            .expect("active post-runtime-join state");
+        assert_eq!(
+            runtime_state
+                .get_register_sized(&phi.dst.display_name(), phi.dst.size * 8)
+                .as_concrete(),
+            Some(0x22)
+        );
+    }
+
+    #[test]
+    fn unresolved_indirect_pc_requires_one_exact_domain_candidate() {
+        let ctx = Context::thread_local();
+        let static_func = SsaArtifact::for_symbolic(
+            &[R2ILBlock {
+                addr: 0x1000,
+                size: 1,
+                ops: vec![R2ILOp::Nop],
+                switch_info: None,
+                op_metadata: Default::default(),
+            }],
+            None,
+        )
+        .expect("static function");
+        let runtime_source = SsaArtifact::for_symbolic(
+            &[R2ILBlock {
+                addr: 0x3000,
+                size: 1,
+                ops: vec![R2ILOp::Nop],
+                switch_info: None,
+                op_metadata: Default::default(),
+            }],
+            None,
+        )
+        .expect("runtime source function");
+        let scope = crate::PreparedFunctionScope::new(
+            0x1000,
+            vec![
+                crate::ScopedPreparedFunction {
+                    id: InterprocFunctionId(0x1000),
+                    name: Some("static".to_string()),
+                    prepared: static_func.clone(),
+                },
+                crate::ScopedPreparedFunction {
+                    id: InterprocFunctionId(0x3000),
+                    name: Some("runtime_source".to_string()),
+                    prepared: runtime_source.clone(),
+                },
+            ],
+        )
+        .expect("scope");
+
+        let mut static_only = SymState::new(&ctx, 0x2000);
+        static_only.set_unresolved_indirect_execution_pc(0x1000);
+        let mut explorer = PathExplorer::new(&ctx);
+        let states = explorer
+            .advance_current_block_in_scope(&static_func, None, static_only)
+            .expect("one static candidate should resolve");
+        assert!(matches!(
+            states[0].predecessor(),
+            Some(crate::state::ExecutionPredecessor::Static {
+                static_addr: 0x1000
+            })
+        ));
+
+        let mut runtime_only = SymState::new(&ctx, 0x2000);
+        let _ = runtime_only.define_runtime_region("runtime", 0x1000, 0x100, true);
+        runtime_only.note_runtime_store_copy(
+            0x1000,
+            0x100,
+            Some(&crate::RuntimeValueProvenance {
+                source_addr: 0x3000,
+                size: 0x100,
+            }),
+        );
+        runtime_only.set_unresolved_indirect_execution_pc(0x1000);
+        let states = explorer
+            .advance_current_block_in_scope(&runtime_source, None, runtime_only)
+            .expect("one runtime candidate should resolve");
+        assert!(matches!(
+            states[0].predecessor(),
+            Some(crate::state::ExecutionPredecessor::RuntimeAlias {
+                runtime_addr: 0x1000,
+                static_addr: 0x3000,
+            })
+        ));
+
+        let mut ambiguous = SymState::new(&ctx, 0x2000);
+        let _ = ambiguous.define_runtime_region("ambiguous", 0x1000, 0x100, true);
+        ambiguous.note_runtime_store_copy(
+            0x1000,
+            0x100,
+            Some(&crate::RuntimeValueProvenance {
+                source_addr: 0x3000,
+                size: 0x100,
+            }),
+        );
+        ambiguous.set_unresolved_indirect_execution_pc(0x1000);
+        assert!(
+            explorer
+                .advance_current_block_in_scope(&static_func, Some(&scope), ambiguous)
+                .is_err(),
+            "static and runtime candidates must be refused as ambiguous"
+        );
+
+        let mut unmapped = SymState::new(&ctx, 0x2000);
+        let _ = unmapped.define_runtime_region("unmapped", 0x1000, 0x100, true);
+        unmapped.set_unresolved_indirect_execution_pc(0x1000);
+        assert!(
+            explorer
+                .advance_current_block_in_scope(&static_func, None, unmapped)
+                .is_err(),
+            "runtime membership without an exact source mapping must be refused"
         );
     }
 
@@ -3932,12 +4332,8 @@ mod tests {
                         space: SpaceId::Ram,
                     },
                     R2ILOp::IntZExt {
-                        dst: make_reg(RAX, 4),
-                        src: make_reg(TMP0, 1),
-                    },
-                    R2ILOp::IntZExt {
                         dst: make_reg(RAX, 8),
-                        src: make_reg(RAX, 4),
+                        src: make_reg(TMP0, 1),
                     },
                     R2ILOp::Branch {
                         target: make_const(0x1010, 8),
@@ -3950,10 +4346,6 @@ mod tests {
                 switch_info: None,
                 op_metadata: Default::default(),
                 ops: vec![
-                    R2ILOp::IntZExt {
-                        dst: make_reg(RAX, 4),
-                        src: make_reg(RAX, 1),
-                    },
                     R2ILOp::IntAdd {
                         dst: make_reg(RDI, 8),
                         a: make_reg(RDI, 8),
@@ -3965,12 +4357,8 @@ mod tests {
                         space: SpaceId::Ram,
                     },
                     R2ILOp::IntZExt {
-                        dst: make_reg(RAX, 4),
-                        src: make_reg(TMP0, 1),
-                    },
-                    R2ILOp::IntZExt {
                         dst: make_reg(RAX, 8),
-                        src: make_reg(RAX, 4),
+                        src: make_reg(TMP0, 1),
                     },
                     R2ILOp::IntAnd {
                         dst: make_reg(TMP1, 1),
@@ -4003,7 +4391,6 @@ mod tests {
             },
         ];
         let func = SsaArtifact::for_symbolic(&blocks, Some(&arch)).expect("symbolic function");
-
         let mut state = SymState::new(&ctx, 0x1000);
         let region = state.define_memory_region(
             crate::MemoryRegionKind::Input,

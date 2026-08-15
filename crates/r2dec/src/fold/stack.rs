@@ -45,10 +45,17 @@ impl<'a> FoldingContext<'a> {
 
     pub(super) fn prepared_stack_offset_for_var(&self, var: &SSAVar) -> Option<i64> {
         let objects = self.prepared_objects()?;
-        let object = self.inputs.prepared_ssa?.object_for_var(var).or_else(|| {
-            self.prepared_canonical_value_root(var)
-                .and_then(|root| self.inputs.prepared_ssa?.object_for_var(&root))
-        })?;
+        let object = self
+            .inputs
+            .prepared_ssa?
+            .object_for_var(var, r2il::SpaceId::Ram)
+            .or_else(|| {
+                self.prepared_canonical_value_root(var).and_then(|root| {
+                    self.inputs
+                        .prepared_ssa?
+                        .object_for_var(&root, r2il::SpaceId::Ram)
+                })
+            })?;
         let fact = objects.object(object)?;
         match fact.kind {
             ObjectKind::StackSlot { offset, .. } | ObjectKind::FrameObject { offset, .. } => {
@@ -875,7 +882,11 @@ impl<'a> FoldingContext<'a> {
 
         match op {
             // push rbp: Store to (rsp - 8) where value is rbp
-            SSAOp::Store { addr, val, .. } => {
+            SSAOp::Store {
+                space: r2il::SpaceId::Ram,
+                addr,
+                val,
+            } => {
                 let addr_name = addr.name.to_lowercase();
                 let val_name = val.name.to_lowercase();
                 let addr_is_sp = self.inputs.arch.is_stack_pointer_name(&addr_name);
@@ -977,7 +988,11 @@ impl<'a> FoldingContext<'a> {
                 false
             }
             // pop rbp: Load from stack to fp
-            SSAOp::Load { dst, addr, .. } => {
+            SSAOp::Load {
+                dst,
+                space: r2il::SpaceId::Ram,
+                addr,
+            } => {
                 let dst_name = dst.name.to_lowercase();
                 let addr_name = addr.name.to_lowercase();
                 let addr_is_sp = self.inputs.arch.is_stack_pointer_name(&addr_name);

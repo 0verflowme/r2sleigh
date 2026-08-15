@@ -164,17 +164,6 @@ fn write_var(vn: &Varnode, disasm: &Disassembler, ctx: &mut SSAContext) -> SSAVa
     SSAVar::new(name, version, vn.size)
 }
 
-/// Convert a space ID to a string name.
-fn space_name(space: &SpaceId) -> String {
-    match space {
-        SpaceId::Ram => "ram".to_string(),
-        SpaceId::Register => "register".to_string(),
-        SpaceId::Const => "const".to_string(),
-        SpaceId::Unique => "unique".to_string(),
-        SpaceId::Custom(id) => format!("space_{}", id),
-    }
-}
-
 /// Convert an R2ILOp to an SSAOp.
 fn convert_op(op: &R2ILOp, disasm: &Disassembler, ctx: &mut SSAContext) -> SSAOp {
     use R2ILOp::*;
@@ -187,12 +176,12 @@ fn convert_op(op: &R2ILOp, disasm: &Disassembler, ctx: &mut SSAContext) -> SSAOp
 
         Load { dst, space, addr } => SSAOp::Load {
             dst: write_var(dst, disasm, ctx),
-            space: space_name(space),
+            space: *space,
             addr: read_var(addr, disasm, ctx),
         },
 
         Store { space, addr, val } => SSAOp::Store {
-            space: space_name(space),
+            space: *space,
             addr: read_var(addr, disasm, ctx),
             val: read_var(val, disasm, ctx),
         },
@@ -206,7 +195,7 @@ fn convert_op(op: &R2ILOp, disasm: &Disassembler, ctx: &mut SSAContext) -> SSAOp
             ordering,
         } => SSAOp::LoadLinked {
             dst: write_var(dst, disasm, ctx),
-            space: space_name(space),
+            space: *space,
             addr: read_var(addr, disasm, ctx),
             ordering: *ordering,
         },
@@ -218,7 +207,7 @@ fn convert_op(op: &R2ILOp, disasm: &Disassembler, ctx: &mut SSAContext) -> SSAOp
             ordering,
         } => SSAOp::StoreConditional {
             result: result.as_ref().map(|v| write_var(v, disasm, ctx)),
-            space: space_name(space),
+            space: *space,
             addr: read_var(addr, disasm, ctx),
             val: read_var(val, disasm, ctx),
             ordering: *ordering,
@@ -232,7 +221,7 @@ fn convert_op(op: &R2ILOp, disasm: &Disassembler, ctx: &mut SSAContext) -> SSAOp
             ordering,
         } => SSAOp::AtomicCAS {
             dst: write_var(dst, disasm, ctx),
-            space: space_name(space),
+            space: *space,
             addr: read_var(addr, disasm, ctx),
             expected: read_var(expected, disasm, ctx),
             replacement: read_var(replacement, disasm, ctx),
@@ -246,7 +235,7 @@ fn convert_op(op: &R2ILOp, disasm: &Disassembler, ctx: &mut SSAContext) -> SSAOp
             ordering,
         } => SSAOp::LoadGuarded {
             dst: write_var(dst, disasm, ctx),
-            space: space_name(space),
+            space: *space,
             addr: read_var(addr, disasm, ctx),
             guard: read_var(guard, disasm, ctx),
             ordering: *ordering,
@@ -258,7 +247,7 @@ fn convert_op(op: &R2ILOp, disasm: &Disassembler, ctx: &mut SSAContext) -> SSAOp
             guard,
             ordering,
         } => SSAOp::StoreGuarded {
-            space: space_name(space),
+            space: *space,
             addr: read_var(addr, disasm, ctx),
             val: read_var(val, disasm, ctx),
             guard: read_var(guard, disasm, ctx),

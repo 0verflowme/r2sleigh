@@ -616,7 +616,7 @@ fn rename_op(
             SSAOp::Load {
                 dst: dst_ssa,
                 addr: addr_ssa,
-                space: format!("{:?}", space),
+                space: *space,
             }
         }
 
@@ -626,7 +626,7 @@ fn rename_op(
             SSAOp::Store {
                 addr: addr_ssa,
                 val: val_ssa,
-                space: format!("{:?}", space),
+                space: *space,
             }
         }
         Fence { ordering } => SSAOp::Fence {
@@ -645,7 +645,7 @@ fn rename_op(
             SSAOp::LoadLinked {
                 dst: dst_ssa,
                 addr: addr_ssa,
-                space: format!("{:?}", space),
+                space: *space,
                 ordering: *ordering,
             }
         }
@@ -668,7 +668,7 @@ fn rename_op(
                 result: result_ssa,
                 addr: addr_ssa,
                 val: val_ssa,
-                space: format!("{:?}", space),
+                space: *space,
                 ordering: *ordering,
             }
         }
@@ -688,7 +688,7 @@ fn rename_op(
             defined_vars.push(dst_name);
             SSAOp::AtomicCAS {
                 dst: dst_ssa,
-                space: format!("{:?}", space),
+                space: *space,
                 addr: addr_ssa,
                 expected: expected_ssa,
                 replacement: replacement_ssa,
@@ -711,7 +711,7 @@ fn rename_op(
                 dst: dst_ssa,
                 addr: addr_ssa,
                 guard: guard_ssa,
-                space: format!("{:?}", space),
+                space: *space,
                 ordering: *ordering,
             }
         }
@@ -726,7 +726,7 @@ fn rename_op(
             let val_ssa = read_varnode(val, ctx, reg_names);
             let guard_ssa = read_varnode(guard, ctx, reg_names);
             SSAOp::StoreGuarded {
-                space: format!("{:?}", space),
+                space: *space,
                 addr: addr_ssa,
                 val: val_ssa,
                 guard: guard_ssa,

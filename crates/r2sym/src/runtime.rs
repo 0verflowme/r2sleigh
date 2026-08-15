@@ -534,7 +534,7 @@ fn apply_windows_runtime_hook<'ctx>(
                 .and_then(SymValue::as_concrete)
                 .is_some_and(page_protection_is_executable);
             let (_region_id, base_addr) =
-                state.allocate_heap_region(&format!("virtualalloc_{:x}", state.pc), size);
+                state.allocate_heap_region(&format!("virtualalloc_{:x}", state.pc()), size);
             state.register_runtime_region_alias(base_addr, size, executable);
             callconv.write_return(state, SymValue::concrete(base_addr, callconv.ret_bits()));
             CallHookResult::Fallthrough
@@ -570,7 +570,7 @@ fn apply_windows_runtime_hook<'ctx>(
                 .unwrap_or(0x100)
                 .max(1);
             let (_region_id, base_addr) =
-                state.allocate_heap_region(&format!("heapalloc_{:x}", state.pc), size);
+                state.allocate_heap_region(&format!("heapalloc_{:x}", state.pc()), size);
             callconv.write_return(state, SymValue::concrete(base_addr, callconv.ret_bits()));
             CallHookResult::Fallthrough
         }

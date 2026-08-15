@@ -299,6 +299,42 @@ fn prepared_var(prepared: &SsaArtifact, value_id: ValueId) -> Option<&SSAVar> {
     prepared.value_var(value_id)
 }
 
+fn bind_prepared_value_id(
+    use_info: &mut UseInfo,
+    view: &PreparedSemanticView,
+    var: &SSAVar,
+) -> Option<ValueId> {
+    let value_id = view.value_id_for_var(var)?;
+    use_info.bind_value_id(var, value_id)
+}
+
+fn bind_prepared_copy_ids(
+    use_info: &mut UseInfo,
+    view: &PreparedSemanticView,
+    dst: &SSAVar,
+    src: &SSAVar,
+) -> Option<(ValueId, ValueId)> {
+    let _ = bind_prepared_value_id(use_info, view, dst);
+    let _ = bind_prepared_value_id(use_info, view, src);
+    Some((
+        use_info.exact_value_id_for_var(dst)?,
+        use_info.exact_value_id_for_var(src)?,
+    ))
+}
+
+fn exact_prepared_copy_provenance(
+    src: &SSAVar,
+    src_id: ValueId,
+    stack_slot: Option<i64>,
+) -> ValueProvenance {
+    ValueProvenance {
+        source: src.display_name(),
+        source_value_id: Some(src_id),
+        source_var: Some(src.clone()),
+        stack_slot,
+    }
+}
+
 fn prepared_call_site_tuple(
     prepared: &SsaArtifact,
     inst_id: r2ssa::InstId,
@@ -815,7 +851,12 @@ fn overlay_param_home_stack_aliases(
 ) {
     for block in inputs.prepared.function().blocks() {
         for (op_idx, op) in block.ops.iter().enumerate() {
-            let SSAOp::Store { addr, val, .. } = op else {
+            let SSAOp::Store {
+                space: r2il::SpaceId::Ram,
+                addr,
+                val,
+            } = op
+            else {
                 continue;
             };
             let Some(offset) = view
@@ -888,10 +929,13 @@ fn populate_stack_offsets(view: &mut PreparedSemanticView, prepared: &SsaArtifac
             view.insert_stack_offset(var, offset);
         }
     }
-    for (&value_id, object_id) in &prepared.objects().value_objects {
+    for (key, object_id) in &prepared.objects().value_objects {
+        if key.space != r2il::SpaceId::Ram {
+            continue;
+        }
         if let Some(object) = prepared.objects().object(*object_id)
             && let Some(offset) = stack_offset_for_object_kind(&object.kind)
-            && let Some(value) = prepared_var(prepared, value_id)
+            && let Some(value) = prepared_var(prepared, key.value)
         {
             view.insert_stack_offset(value, offset);
         }
@@ -923,7 +967,12 @@ fn populate_owner_exprs(view: &mut PreparedSemanticView, inputs: &PreparedSemant
 
     for block in prepared.function().blocks() {
         for (op_idx, op) in block.ops.iter().enumerate() {
-            if let SSAOp::Load { dst, addr, .. } = op {
+            if let SSAOp::Load {
+                dst,
+                space: r2il::SpaceId::Ram,
+                addr,
+            } = op
+            {
                 let derived = prepared_direct_stack_load_offset(prepared, view, addr)
                     .and_then(|offset| {
                         local_store_owner_expr_for_offset(view, prepared, block, op_idx, offset)
@@ -936,7 +985,13 @@ fn populate_owner_exprs(view: &mut PreparedSemanticView, inputs: &PreparedSemant
                     .or_else(|| {
                         prepared
                             .memory_uses_for_op_site(block.addr, op_idx)
-                            .and_then(|facts| facts.first())
+                            .and_then(|facts| {
+                                let mut ram = facts
+                                    .iter()
+                                    .filter(|fact| fact.location.space == r2il::SpaceId::Ram);
+                                let first = ram.next()?;
+                                ram.next().is_none().then_some(first)
+                            })
                             .and_then(|fact| {
                                 let offset = fact.location.address.exact_offset()?;
                                 alias_for_memory_location(view, &fact.location)
@@ -1163,7 +1218,12 @@ fn refine_load_owner_exprs(
     let prepared = inputs.prepared;
     for block in prepared.function().blocks() {
         for (op_idx, op) in block.ops.iter().enumerate() {
-            let SSAOp::Load { dst, addr, .. } = op else {
+            let SSAOp::Load {
+                dst,
+                space: r2il::SpaceId::Ram,
+                addr,
+            } = op
+            else {
                 continue;
             };
             let candidate = prepared_direct_stack_load_offset(prepared, view, addr)
@@ -1178,7 +1238,13 @@ fn refine_load_owner_exprs(
                 .or_else(|| {
                     prepared
                         .memory_uses_for_op_site(block.addr, op_idx)
-                        .and_then(|facts| facts.first())
+                        .and_then(|facts| {
+                            let mut ram = facts
+                                .iter()
+                                .filter(|fact| fact.location.space == r2il::SpaceId::Ram);
+                            let first = ram.next()?;
+                            ram.next().is_none().then_some(first)
+                        })
                         .and_then(|fact| {
                             let offset = fact.location.address.exact_offset()?;
                             alias_for_memory_location(view, &fact.location)
@@ -1900,7 +1966,11 @@ fn authoritative_scalar_expr_for_value(
             authoritative_scalar_expr_for_value(block, view, src, depth + 1)
                 .or_else(|| scalar_owner_expr_for_value(view, src, src.size))
         }
-        SSAOp::Load { addr, .. } => view
+        SSAOp::Load {
+            space: r2il::SpaceId::Ram,
+            addr,
+            ..
+        } => view
             .stack_offset_for_var(addr)
             .and_then(|offset| preferred_stack_alias_name(view, offset))
             .map(CExpr::Var)
@@ -1975,14 +2045,19 @@ fn certified_call_result_owner_expr(
     view: &PreparedSemanticView,
 ) -> Option<CExpr> {
     match cert.owner.as_ref() {
-        Some(ValueOwner::StackSlot { object, offset }) => {
+        Some(ValueOwner::StackSlot { object, offset })
+            if prepared
+                .objects()
+                .object(*object)
+                .is_some_and(|fact| fact.kind.space() == r2il::SpaceId::Ram) =>
+        {
             prepared_stack_alias_name_for_object_offset(view, *object, *offset).map(CExpr::Var)
         }
         Some(ValueOwner::Value(value)) if *value != cert.value => {
             let var = prepared.value_var(*value)?;
             (!var.is_register()).then(|| CExpr::Var(var.display_name()))
         }
-        Some(ValueOwner::Value(_)) | None => None,
+        Some(ValueOwner::StackSlot { .. }) | Some(ValueOwner::Value(_)) | None => None,
     }
 }
 
@@ -2000,7 +2075,14 @@ fn assign_certified_call_result_owner(
         block_addr: site.0,
         op_index: site.1,
     }) {
-        if !matches!(cert.owner.as_ref(), Some(ValueOwner::StackSlot { .. })) {
+        let Some(ValueOwner::StackSlot { object, .. }) = cert.owner.as_ref() else {
+            continue;
+        };
+        if prepared
+            .objects()
+            .object(*object)
+            .is_none_or(|fact| fact.kind.space() != r2il::SpaceId::Ram)
+        {
             continue;
         }
         let Some(var) = prepared.value_var(cert.value) else {
@@ -2066,22 +2148,31 @@ fn prepared_stack_alias_expr_for_offset(view: &PreparedSemanticView, offset: i64
 }
 
 fn stack_offset_for_value(prepared: &SsaArtifact, value: &SSAVar) -> Option<i64> {
-    let object = prepared.object_for_var(value).or_else(|| {
-        prepared
-            .function()
-            .decompile_prep_facts()
-            .and_then(|facts| facts.canonical_root_of(value))
-            .and_then(|root| prepared.object_for_var(root))
-    })?;
+    let object = prepared
+        .object_for_var(value, r2il::SpaceId::Ram)
+        .or_else(|| {
+            prepared
+                .function()
+                .decompile_prep_facts()
+                .and_then(|facts| facts.canonical_root_of(value))
+                .and_then(|root| prepared.object_for_var(root, r2il::SpaceId::Ram))
+        })?;
     let fact = prepared.objects().object(object)?;
     stack_offset_for_object_kind(&fact.kind)
 }
 
 fn stack_offset_for_object_kind(kind: &ObjectKind) -> Option<i64> {
     match kind {
-        ObjectKind::StackSlot { offset, .. } | ObjectKind::FrameObject { offset, .. } => {
-            Some(*offset)
+        ObjectKind::StackSlot {
+            space: r2il::SpaceId::Ram,
+            offset,
+            ..
         }
+        | ObjectKind::FrameObject {
+            space: r2il::SpaceId::Ram,
+            offset,
+            ..
+        } => Some(*offset),
         _ => None,
     }
 }
@@ -2092,6 +2183,13 @@ fn prepared_stack_reload_param_alias_expr(
     value_id: ValueId,
 ) -> Option<CExpr> {
     let cert = prepared.stack_reload_certificate_for_value(value_id)?;
+    if prepared
+        .objects()
+        .object(cert.object)
+        .is_none_or(|fact| fact.kind.space() != r2il::SpaceId::Ram)
+    {
+        return None;
+    }
     [cert.canonical_source, cert.source]
         .into_iter()
         .filter_map(|source| prepared.value_var(source))
@@ -2644,7 +2742,7 @@ fn is_prepared_stack_address_carrier(prepared: &SsaArtifact, value: &SSAVar) -> 
     }
 
     prepared
-        .object_for_var(value)
+        .object_for_var(value, r2il::SpaceId::Ram)
         .and_then(|object_id| prepared.objects().object(object_id))
         .is_some_and(|object| stack_offset_for_object_kind(&object.kind).is_some())
 }
@@ -2702,7 +2800,12 @@ fn local_store_owner_expr_for_offset(
         .is_some_and(|name| !is_generic_prepared_stack_alias(name));
 
     for op in block.ops[..before_idx].iter().rev() {
-        let SSAOp::Store { addr, val, .. } = op else {
+        let SSAOp::Store {
+            space: r2il::SpaceId::Ram,
+            addr,
+            val,
+        } = op
+        else {
             continue;
         };
         let store_offset = view
@@ -2843,17 +2946,23 @@ fn seed_prepared_stack_facts(
         }
     }
 
-    for (&value_id, object_id) in &prepared.objects().value_objects {
+    for (key, object_id) in &prepared.objects().value_objects {
+        if key.space != r2il::SpaceId::Ram {
+            continue;
+        }
         let Some(object) = prepared.objects().object(*object_id) else {
             continue;
         };
         let Some(offset) = stack_offset_for_object_kind(&object.kind) else {
             continue;
         };
-        let Some(value) = prepared_var(prepared, value_id) else {
+        let Some(value) = prepared_var(prepared, key.value) else {
             continue;
         };
-        use_info.bind_value_id(value, value_id);
+        let value_id = key.value;
+        if use_info.bind_value_id(value, value_id).is_none() {
+            continue;
+        }
         let key = value.display_name();
         let provenance = StackSlotProvenance {
             offset,
@@ -2887,9 +2996,7 @@ fn collect_prepared_runtime_facts(
 ) {
     for block in blocks {
         for phi in &block.phis {
-            if let Some(value_id) = view.value_id_for_var(&phi.dst) {
-                use_info.bind_value_id(&phi.dst, value_id);
-            }
+            let _ = bind_prepared_value_id(use_info, view, &phi.dst);
             let dst_key = phi.dst.display_name();
             use_info.phi_sources.insert(
                 dst_key.clone(),
@@ -2904,8 +3011,7 @@ fn collect_prepared_runtime_facts(
             );
             for (_, src) in &phi.sources {
                 *use_info.use_counts.entry(src.display_name()).or_insert(0) += 1;
-                if let Some(value_id) = view.value_id_for_var(src) {
-                    use_info.bind_value_id(src, value_id);
+                if let Some(value_id) = bind_prepared_value_id(use_info, view, src) {
                     *use_info.use_counts_by_value.entry(value_id).or_insert(0) += 1;
                 }
             }
@@ -2915,24 +3021,20 @@ fn collect_prepared_runtime_facts(
         for op in &block.ops {
             for src in op.sources() {
                 *use_info.use_counts.entry(src.display_name()).or_insert(0) += 1;
-                if let Some(value_id) = view.value_id_for_var(src) {
-                    use_info.bind_value_id(src, value_id);
+                if let Some(value_id) = bind_prepared_value_id(use_info, view, src) {
                     *use_info.use_counts_by_value.entry(value_id).or_insert(0) += 1;
                 }
             }
             if let SSAOp::CBranch { cond, .. } = op {
                 use_info.condition_vars.insert(cond.display_name());
-                if let Some(value_id) = view.value_id_for_var(cond) {
-                    use_info.bind_value_id(cond, value_id);
+                if let Some(value_id) = bind_prepared_value_id(use_info, view, cond) {
                     use_info.condition_values.insert(value_id);
                 }
             }
 
             if let Some(dst) = op.dst() {
                 let dst_key = dst.display_name();
-                if let Some(value_id) = view.value_id_for_var(dst) {
-                    use_info.bind_value_id(dst, value_id);
-                }
+                let _ = bind_prepared_value_id(use_info, view, dst);
                 use_info.producers.insert(dst_key.clone(), op.clone());
                 if is_flag_like_name(&dst.name) || op_produces_predicate(op) {
                     flag_info.flag_only_values.insert(dst_key.clone());
@@ -2952,30 +3054,29 @@ fn collect_prepared_runtime_facts(
                     use_info
                         .copy_sources
                         .insert(dst_key.clone(), src_key.clone());
-                    if let (Some(dst_id), Some(src_id)) =
-                        (view.value_id_for_var(dst), view.value_id_for_var(src))
-                    {
-                        use_info.bind_value_id(dst, dst_id);
-                        use_info.bind_value_id(src, src_id);
+                    let bound_copy = bind_prepared_copy_ids(use_info, view, dst, src);
+                    let bound_dst_id = bound_copy.map(|(dst_id, _)| dst_id);
+                    let bound_src_id = bound_copy.map(|(_, src_id)| src_id);
+                    if let Some((dst_id, src_id)) = bound_copy {
                         use_info.copy_sources_by_value.insert(dst_id, src_id);
                     }
-                    let source_prov = use_info.forwarded_values.get(&src_key).cloned().unwrap_or(
-                        ValueProvenance {
-                            source: src_key.clone(),
-                            source_value_id: view.value_id_for_var(src),
-                            source_var: Some(src.clone()),
-                            stack_slot: view
-                                .stack_offset_for_var(src)
-                                .or_else(|| stack_offset_for_value(prepared, src)),
-                        },
-                    );
+                    let source_prov =
+                        use_info
+                            .forwarded_value_for_var(src)
+                            .cloned()
+                            .unwrap_or(ValueProvenance {
+                                source: src_key.clone(),
+                                source_value_id: bound_src_id,
+                                source_var: Some(src.clone()),
+                                stack_slot: view
+                                    .stack_offset_for_var(src)
+                                    .or_else(|| stack_offset_for_value(prepared, src)),
+                            });
                     use_info.forwarded_values.insert(
                         dst_key.clone(),
                         ValueProvenance {
                             source: source_prov.source.clone(),
-                            source_value_id: source_prov
-                                .source_value_id
-                                .or_else(|| view.value_id_for_var(src)),
+                            source_value_id: source_prov.source_value_id.or(bound_src_id),
                             source_var: source_prov
                                 .source_var
                                 .clone()
@@ -2986,20 +3087,17 @@ fn collect_prepared_runtime_facts(
                                 .or_else(|| stack_offset_for_value(prepared, src)),
                         },
                     );
-                    if let Some(dst_id) = view.value_id_for_var(dst) {
+                    if let (Some(dst_id), Some(src_id)) = (bound_dst_id, bound_src_id) {
                         use_info.forwarded_values_by_value.insert(
                             dst_id,
-                            ValueProvenance {
-                                source: source_prov.source,
-                                source_value_id: source_prov
-                                    .source_value_id
-                                    .or_else(|| view.value_id_for_var(src)),
-                                source_var: source_prov.source_var.or_else(|| Some(src.clone())),
-                                stack_slot: source_prov
+                            exact_prepared_copy_provenance(
+                                src,
+                                src_id,
+                                source_prov
                                     .stack_slot
                                     .or_else(|| view.stack_offset_for_var(src))
                                     .or_else(|| stack_offset_for_value(prepared, src)),
-                            },
+                            ),
                         );
                     }
                     if dst.version == 0
@@ -3013,13 +3111,17 @@ fn collect_prepared_runtime_facts(
                             .or_insert_with(|| alias.clone());
                     }
                 }
-                SSAOp::Load { dst, addr, .. } => {
+                SSAOp::Load {
+                    dst,
+                    space: r2il::SpaceId::Ram,
+                    addr,
+                } => {
                     let Some(offset) = prepared_direct_stack_load_offset(prepared, view, addr)
                     else {
                         continue;
                     };
                     let key = dst.display_name();
-                    let reload_value = view.value_id_for_var(dst);
+                    let reload_value = bind_prepared_value_id(use_info, view, dst);
                     let provenance = StackSlotProvenance {
                         offset,
                         predicate_carrier: false,
@@ -3200,9 +3302,7 @@ fn seed_prepared_value_fact(
     prepared: &SsaArtifact,
     view: &PreparedSemanticView,
 ) {
-    if let Some(value_id) = view.value_id_for_var(var) {
-        use_info.bind_value_id(var, value_id);
-    }
+    let bound_value_id = bind_prepared_value_id(use_info, view, var);
     let key = var.display_name();
     if let Some(expr) = view
         .predicate_expr_for_cond(var)
@@ -3213,7 +3313,7 @@ fn seed_prepared_value_fact(
             .definitions
             .entry(key.clone())
             .or_insert_with(|| expr.clone());
-        if let Some(value_id) = view.value_id_for_var(var) {
+        if let Some(value_id) = bound_value_id {
             use_info
                 .definitions_by_value
                 .entry(value_id)
@@ -3227,7 +3327,7 @@ fn seed_prepared_value_fact(
             .semantic_values
             .entry(key.clone())
             .or_insert_with(|| semantic_value_for_prepared_expr(view, var, expr.clone()));
-        if let Some(value_id) = view.value_id_for_var(var) {
+        if let Some(value_id) = bound_value_id {
             use_info
                 .semantic_values_by_value
                 .entry(value_id)
@@ -3240,7 +3340,7 @@ fn seed_prepared_value_fact(
             merge_prepared_stack_slot(
                 use_info,
                 &key,
-                view.value_id_for_var(var),
+                bound_value_id,
                 StackSlotProvenance {
                     offset,
                     predicate_carrier: false,
@@ -3262,7 +3362,7 @@ fn seed_prepared_value_fact(
         merge_prepared_stack_slot(
             use_info,
             &key,
-            view.value_id_for_var(var),
+            bound_value_id,
             StackSlotProvenance {
                 offset,
                 predicate_carrier: false,
@@ -3394,7 +3494,11 @@ fn record_prepared_consumed_by_call(
         match op {
             SSAOp::Call { .. } | SSAOp::CallInd { .. } => break,
             SSAOp::Branch { .. } | SSAOp::CBranch { .. } | SSAOp::Return { .. } => break,
-            SSAOp::Store { addr, val, .. } => {
+            SSAOp::Store {
+                space: r2il::SpaceId::Ram,
+                addr,
+                val,
+            } => {
                 if view
                     .stack_offset_for_var(addr)
                     .or_else(|| stack_offset_for_value(prepared, addr))
@@ -3719,6 +3823,75 @@ mod tests {
     use super::*;
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
     use r2ssa::InterprocSummarySet;
+
+    #[test]
+    fn prepared_copy_binding_rejects_shared_value_id_before_fact_seeding() {
+        let dst = SSAVar::new("dst", 1, 8);
+        let src = SSAVar::new("src", 1, 8);
+        let mut view = PreparedSemanticView::default();
+        view.value_id_by_var.insert(dst.clone(), ValueId(1));
+        view.value_id_by_var.insert(src.clone(), ValueId(1));
+        view.var_by_value_id.insert(ValueId(1), dst.clone());
+
+        let mut info = UseInfo::default();
+        let binding = bind_prepared_copy_ids(&mut info, &view, &dst, &src);
+        if let Some((dst_id, src_id)) = binding {
+            info.copy_sources_by_value.insert(dst_id, src_id);
+            info.forwarded_values_by_value.insert(
+                dst_id,
+                ValueProvenance {
+                    source: src.display_name(),
+                    source_value_id: Some(src_id),
+                    source_var: Some(src.clone()),
+                    stack_slot: None,
+                },
+            );
+        }
+
+        assert_eq!(binding, None);
+        assert!(info.copy_sources_by_value.is_empty());
+        assert!(info.forwarded_values_by_value.is_empty());
+        assert_eq!(info.value_id_for_var(&dst), None);
+        assert_eq!(info.value_id_for_var(&src), None);
+    }
+
+    #[test]
+    fn prepared_copy_provenance_ignores_colliding_display_fact() {
+        let dst = SSAVar::new("dst", 1, 8);
+        let mut src = SSAVar::constant(1, 8);
+        let mut spoof = SSAVar::constant(2, 8);
+        src.name = "same".to_string();
+        spoof.name = "same".to_string();
+        assert_eq!(src.display_name(), spoof.display_name());
+        assert_ne!(src, spoof);
+
+        let mut view = PreparedSemanticView::default();
+        view.value_id_by_var.insert(dst.clone(), ValueId(1));
+        view.value_id_by_var.insert(src.clone(), ValueId(2));
+        view.var_by_value_id.insert(ValueId(1), dst.clone());
+        view.var_by_value_id.insert(ValueId(2), src.clone());
+
+        let mut info = UseInfo::default();
+        assert_eq!(info.bind_value_id(&spoof, ValueId(3)), Some(ValueId(3)));
+        info.forwarded_values.insert(
+            src.display_name(),
+            ValueProvenance {
+                source: spoof.display_name(),
+                source_value_id: Some(ValueId(3)),
+                source_var: Some(spoof),
+                stack_slot: Some(-8),
+            },
+        );
+
+        let (dst_id, src_id) =
+            bind_prepared_copy_ids(&mut info, &view, &dst, &src).expect("exact copy binding");
+        assert_eq!((dst_id, src_id), (ValueId(1), ValueId(2)));
+        assert_eq!(info.forwarded_value_for_var(&src), None);
+
+        let provenance = exact_prepared_copy_provenance(&src, src_id, Some(-8));
+        assert_eq!(provenance.source_value_id, Some(ValueId(2)));
+        assert_eq!(provenance.source_var, Some(src));
+    }
 
     #[test]
     fn canonical_param_home_uses_rendered_header_alias_and_runtime_offset() {

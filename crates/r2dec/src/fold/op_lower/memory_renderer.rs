@@ -749,6 +749,9 @@ impl<'a> FoldingContext<'a> {
         fact: &r2types::MemoryAccessRenderFact,
         elem_ty: CType,
     ) -> Option<CExpr> {
+        if fact.space != r2il::SpaceId::Ram {
+            return None;
+        }
         if let Some(expr) = self.certified_stack_owner_expr_for_memory_fact(fact) {
             return Some(expr);
         }
@@ -806,9 +809,12 @@ impl<'a> FoldingContext<'a> {
         let Some(op_idx) = self.current_op_idx.get() else {
             return "missing current op".to_string();
         };
-        let Some(_fact) = self.certified_memory_access_for_current_op(is_write) else {
+        let Some(fact) = self.certified_memory_access_for_current_op(is_write) else {
             return format!("missing FunctionRenderFacts memory fact at 0x{block_addr:x}:{op_idx}");
         };
+        if fact.space != r2il::SpaceId::Ram {
+            return format!("unsupported exact memory space {}", fact.space);
+        }
         let (array_fact_count, member_fact_count) = self
             .inputs
             .render_facts()

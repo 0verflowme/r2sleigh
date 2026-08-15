@@ -17307,7 +17307,7 @@ mod tests {
             .expect("engine helper must attach canonical render facts");
         assert!(
             render
-                .memory_access_for_op(0x401000, 0, false)
+                .memory_access_for_op(0x401000, 0, false, r2il::SpaceId::Ram)
                 .is_some_and(|fact| fact.width == 8),
             "memory proof must travel through FunctionFacts"
         );

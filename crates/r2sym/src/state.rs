@@ -234,9 +234,13 @@ pub struct SymState<'ctx> {
     known_zero_values: Rc<BTreeSet<String>>,
     known_nonzero_values: Rc<BTreeSet<String>>,
     /// Current program counter.
-    pub pc: u64,
-    /// Previous program counter (block predecessor).
-    prev_pc: Option<u64>,
+    pc: u64,
+    /// Address domain for the current program counter.
+    execution_pc: ExecutionPc,
+    /// Exact identity of the previously executed block.
+    predecessor: Option<ExecutionPredecessor>,
+    /// Monotonic marker changed by every explicit control transfer.
+    control_transfer_generation: u64,
     /// Whether this state is still active (not terminated).
     pub active: bool,
     /// Exit status (if terminated).
@@ -251,6 +255,36 @@ pub struct SymState<'ctx> {
     symbolic_fd_inputs: Rc<HashMap<i32, SymbolicFdInput<'ctx>>>,
     /// Runtime policy/state for summaries.
     runtime: RuntimeState<'ctx>,
+}
+
+/// Exact predecessor identity retained at the block-resolution boundary.
+///
+/// Runtime and static addresses may overlap numerically, so downstream Phi
+/// selection must not infer which address domain produced the predecessor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ExecutionPredecessor {
+    Static { static_addr: u64 },
+    RuntimeAlias { runtime_addr: u64, static_addr: u64 },
+}
+
+/// Exact address domain of the current execution PC.
+///
+/// A runtime materialization may overlap a real static block numerically. The
+/// selected domain is therefore retained explicitly instead of being inferred
+/// later from the address alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ExecutionPc {
+    Static,
+    RuntimeAlias { static_addr: u64 },
+    UnresolvedIndirect,
+}
+
+impl ExecutionPredecessor {
+    pub(crate) const fn static_addr(self) -> u64 {
+        match self {
+            Self::Static { static_addr } | Self::RuntimeAlias { static_addr, .. } => static_addr,
+        }
+    }
 }
 
 /// Exit status of a symbolic execution path.
@@ -284,7 +318,9 @@ impl<'ctx> SymState<'ctx> {
             known_zero_values: Rc::new(BTreeSet::new()),
             known_nonzero_values: Rc::new(BTreeSet::new()),
             pc: entry_pc,
-            prev_pc: None,
+            execution_pc: ExecutionPc::Static,
+            predecessor: None,
+            control_transfer_generation: 0,
             active: true,
             exit_status: None,
             depth: 0,
@@ -306,7 +342,9 @@ impl<'ctx> SymState<'ctx> {
             known_zero_values: Rc::new(BTreeSet::new()),
             known_nonzero_values: Rc::new(BTreeSet::new()),
             pc: entry_pc,
-            prev_pc: None,
+            execution_pc: ExecutionPc::Static,
+            predecessor: None,
+            control_transfer_generation: 0,
             active: true,
             exit_status: None,
             depth: 0,
@@ -366,12 +404,145 @@ impl<'ctx> SymState<'ctx> {
 
     /// Get the previous program counter.
     pub(crate) fn prev_pc(&self) -> Option<u64> {
-        self.prev_pc
+        self.predecessor.map(ExecutionPredecessor::static_addr)
     }
 
-    /// Set the previous program counter.
+    pub(crate) const fn predecessor(&self) -> Option<ExecutionPredecessor> {
+        self.predecessor
+    }
+
+    pub(crate) const fn execution_pc(&self) -> ExecutionPc {
+        self.execution_pc
+    }
+
+    /// Get the current program counter without exposing mutable storage.
+    pub const fn pc(&self) -> u64 {
+        self.pc
+    }
+
+    pub(crate) const fn control_transfer_generation(&self) -> u64 {
+        self.control_transfer_generation
+    }
+
+    pub(crate) const fn effective_static_pc(&self) -> Option<u64> {
+        match self.execution_pc {
+            ExecutionPc::Static => Some(self.pc),
+            ExecutionPc::RuntimeAlias { static_addr } => Some(static_addr),
+            ExecutionPc::UnresolvedIndirect => None,
+        }
+    }
+
+    pub(crate) fn set_static_execution_pc(&mut self, pc: u64) {
+        self.pc = pc;
+        self.execution_pc = ExecutionPc::Static;
+        self.control_transfer_generation = self.control_transfer_generation.wrapping_add(1);
+    }
+
+    pub(crate) fn set_runtime_execution_pc(&mut self, runtime_addr: u64, static_addr: u64) {
+        self.pc = runtime_addr;
+        self.execution_pc = ExecutionPc::RuntimeAlias { static_addr };
+        self.control_transfer_generation = self.control_transfer_generation.wrapping_add(1);
+    }
+
+    pub(crate) fn set_unresolved_indirect_execution_pc(&mut self, pc: u64) {
+        self.pc = pc;
+        self.execution_pc = ExecutionPc::UnresolvedIndirect;
+        self.control_transfer_generation = self.control_transfer_generation.wrapping_add(1);
+    }
+
+    pub(crate) fn bind_static_execution_pc(&mut self) {
+        self.execution_pc = ExecutionPc::Static;
+    }
+
+    pub(crate) fn bind_runtime_execution_pc(&mut self, static_addr: u64) {
+        self.execution_pc = ExecutionPc::RuntimeAlias { static_addr };
+    }
+
+    /// Select an already-materialized runtime address as the next execution PC.
+    ///
+    /// This explicit boundary is required when a caller starts exploration in
+    /// copied code; numeric membership alone is intentionally not authority.
+    pub fn select_runtime_execution_pc(&mut self, runtime_addr: u64) -> bool {
+        let (_, candidates) = self.runtime_execution_candidates(runtime_addr);
+        let [static_addr] = candidates.as_slice() else {
+            return false;
+        };
+        self.set_runtime_execution_pc(runtime_addr, *static_addr);
+        true
+    }
+
+    pub(crate) fn merge_compatible_with(&self, other: &Self) -> bool {
+        self.pc == other.pc
+            && self.execution_pc == other.execution_pc
+            && self.predecessor == other.predecessor
+    }
+
+    pub(crate) fn set_loop_summary_exit(&mut self, header: u64, exit_target: u64) -> bool {
+        match self.execution_pc {
+            ExecutionPc::Static if self.pc == header => {
+                self.set_static_execution_pc(exit_target);
+                self.set_prev_pc(Some(header));
+                true
+            }
+            ExecutionPc::RuntimeAlias { static_addr } if static_addr == header => {
+                let runtime_predecessor = self.pc;
+                let mut targets = BTreeSet::new();
+                for region in self.runtime.runtime_regions.values() {
+                    if !region.executable {
+                        continue;
+                    }
+                    let Some(runtime_offset) = runtime_predecessor.checked_sub(region.runtime_base)
+                    else {
+                        continue;
+                    };
+                    if runtime_offset >= region.size {
+                        continue;
+                    }
+                    let Some(source_base) = region.source_base else {
+                        continue;
+                    };
+                    if source_base.checked_add(runtime_offset) != Some(header) {
+                        continue;
+                    }
+                    let Some(exit_offset) = exit_target.checked_sub(source_base) else {
+                        continue;
+                    };
+                    if exit_offset >= region.size {
+                        continue;
+                    }
+                    if let Some(runtime_target) = region.runtime_base.checked_add(exit_offset) {
+                        targets.insert(runtime_target);
+                    }
+                }
+                let mut targets = targets.into_iter();
+                let Some(runtime_target) = targets.next() else {
+                    return false;
+                };
+                if targets.next().is_some() {
+                    return false;
+                }
+                self.set_runtime_execution_pc(runtime_target, exit_target);
+                self.set_runtime_predecessor(runtime_predecessor, header);
+                true
+            }
+            ExecutionPc::Static
+            | ExecutionPc::RuntimeAlias { .. }
+            | ExecutionPc::UnresolvedIndirect => false,
+        }
+    }
+
+    /// Record a predecessor already known to be in the static address domain.
     pub(crate) fn set_prev_pc(&mut self, prev_pc: Option<u64>) {
-        self.prev_pc = prev_pc;
+        self.predecessor = prev_pc.map(|static_addr| ExecutionPredecessor::Static { static_addr });
+    }
+
+    /// Record a runtime predecessor together with the exact static block that
+    /// was selected by the path resolver.
+    pub(crate) fn set_runtime_predecessor(&mut self, runtime_addr: u64, static_addr: u64) {
+        self.predecessor = Some(ExecutionPredecessor::RuntimeAlias {
+            runtime_addr,
+            static_addr,
+        });
     }
 
     /// Get all registers.
@@ -481,6 +652,34 @@ impl<'ctx> SymState<'ctx> {
         let source_base = region.source_base?;
         let offset = pc.checked_sub(region.runtime_base)?;
         (offset < region.size).then_some(source_base.saturating_add(offset))
+    }
+
+    pub(crate) fn runtime_execution_candidates(&self, pc: u64) -> (bool, Vec<u64>) {
+        let mut region_present = false;
+        let mut candidates = BTreeSet::new();
+        for region in self.runtime.runtime_regions.values() {
+            let Some(region_end) = region.runtime_base.checked_add(region.size) else {
+                region_present |= pc >= region.runtime_base;
+                continue;
+            };
+            if pc < region.runtime_base || pc >= region_end {
+                continue;
+            }
+            region_present = true;
+            if !region.executable {
+                continue;
+            }
+            let Some(source_base) = region.source_base else {
+                continue;
+            };
+            let Some(offset) = pc.checked_sub(region.runtime_base) else {
+                continue;
+            };
+            if let Some(static_addr) = source_base.checked_add(offset) {
+                candidates.insert(static_addr);
+            }
+        }
+        (region_present, candidates.into_iter().collect())
     }
 
     pub fn remap_static_pc_to_runtime(&self, static_pc: u64) -> Option<u64> {
@@ -653,7 +852,7 @@ impl<'ctx> SymState<'ctx> {
         }
         self.runtime.active_breakpoint = None;
         self.seed_exception_continuation(breakpoint.exception_code, breakpoint.handler_addr);
-        self.pc = breakpoint.handler_addr;
+        self.set_static_execution_pc(breakpoint.handler_addr);
         debug_runtime_continuation_log(&format!(
             "runtime_breakpoint_dispatch pc=0x{:x} handler=0x{:x} code=0x{:x}",
             breakpoint_addr, breakpoint.handler_addr, breakpoint.exception_code
@@ -672,7 +871,7 @@ impl<'ctx> SymState<'ctx> {
         dispatched.constrain_eq(&breakpoint.breakpoint, pc);
         dispatched.runtime.active_breakpoint = None;
         dispatched.seed_exception_continuation(breakpoint.exception_code, breakpoint.handler_addr);
-        dispatched.pc = breakpoint.handler_addr;
+        dispatched.set_static_execution_pc(breakpoint.handler_addr);
         self.constrain_ne(&breakpoint.breakpoint, pc);
 
         debug_runtime_continuation_log(&format!(
@@ -767,6 +966,8 @@ impl<'ctx> SymState<'ctx> {
     pub(crate) fn semantic_fingerprint(&self) -> u64 {
         let mut hasher = DefaultHasher::new();
         self.pc.hash(&mut hasher);
+        self.execution_pc.hash(&mut hasher);
+        self.predecessor.hash(&mut hasher);
         self.active.hash(&mut hasher);
         self.exit_status.hash(&mut hasher);
         self.memory.semantic_fingerprint().hash(&mut hasher);
@@ -857,17 +1058,20 @@ impl<'ctx> SymState<'ctx> {
     }
 
     /// Merge this state with another state at the same program counter.
-    pub fn merge_with(&self, other: &SymState<'ctx>) -> Self {
+    pub fn merge_with(&self, other: &SymState<'ctx>) -> Option<Self> {
+        if !self.merge_compatible_with(other) {
+            return None;
+        }
         let cond_self = self.path_condition();
         let cond_other = other.path_condition();
         let mut merged = self.fork();
 
         merged.pc = self.pc;
-        merged.prev_pc = if self.prev_pc == other.prev_pc {
-            self.prev_pc
-        } else {
-            None
-        };
+        merged.execution_pc = self.execution_pc;
+        merged.predecessor = self.predecessor;
+        merged.control_transfer_generation = self
+            .control_transfer_generation
+            .max(other.control_transfer_generation);
         merged.active = self.active && other.active;
         merged.exit_status = None;
         merged.depth = self.depth.max(other.depth);
@@ -1007,7 +1211,7 @@ impl<'ctx> SymState<'ctx> {
                 .is_some_and(|other_source| other_source == source)
         });
 
-        merged
+        Some(merged)
     }
 
     /// Add a path constraint.
@@ -1252,7 +1456,9 @@ impl<'ctx> SymState<'ctx> {
             known_zero_values: self.known_zero_values.clone(),
             known_nonzero_values: self.known_nonzero_values.clone(),
             pc: self.pc,
-            prev_pc: self.prev_pc,
+            execution_pc: self.execution_pc,
+            predecessor: self.predecessor,
+            control_transfer_generation: self.control_transfer_generation,
             active: self.active,
             exit_status: self.exit_status.clone(),
             depth: self.depth,
@@ -1546,7 +1752,8 @@ impl<'ctx> std::fmt::Debug for SymState<'ctx> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SymState")
             .field("pc", &format!("0x{:x}", self.pc))
-            .field("prev_pc", &self.prev_pc.map(|pc| format!("0x{:x}", pc)))
+            .field("execution_pc", &self.execution_pc)
+            .field("predecessor", &self.predecessor)
             .field("registers", &self.registers.len())
             .field("constraints", &self.num_constraints())
             .field("depth", &self.depth)
@@ -1568,7 +1775,7 @@ mod tests {
         let ctx = Context::thread_local();
 
         let state = SymState::new(&ctx, 0x1000);
-        assert_eq!(state.pc, 0x1000);
+        assert_eq!(state.pc(), 0x1000);
         assert!(state.active);
         assert_eq!(state.depth, 0);
     }
@@ -1608,10 +1815,10 @@ mod tests {
 
         let mut state = SymState::new(&ctx, 0x1000);
         state.set_concrete("rax", 42, 64);
-        state.pc = 0x2000;
+        state.set_static_execution_pc(0x2000);
 
         let forked = state.fork();
-        assert_eq!(forked.pc, 0x2000);
+        assert_eq!(forked.pc(), 0x2000);
         assert_eq!(forked.get_register("rax").as_concrete(), Some(42));
     }
 
@@ -1667,7 +1874,9 @@ mod tests {
         state_b.add_constraint(x_b.to_bv(&ctx).eq(BV::from_u64(1, 32)));
         state_b.set_register("rax", SymValue::concrete(2, 64));
 
-        let merged = state_a.merge_with(&state_b);
+        let merged = state_a
+            .merge_with(&state_b)
+            .expect("same-predecessor states should merge");
         let merged_rax = merged.get_register("rax");
 
         let solver = Solver::new();
@@ -1696,6 +1905,22 @@ mod tests {
     }
 
     #[test]
+    fn semantic_fingerprint_separates_predecessor_identity() {
+        let ctx = Context::thread_local();
+        let mut first = SymState::new(&ctx, 0x2000);
+        first.set_prev_pc(Some(0x1000));
+        let mut second = first.fork();
+        second.set_prev_pc(Some(0x3000));
+        assert_ne!(first.semantic_fingerprint(), second.semantic_fingerprint());
+
+        let mut runtime = first.fork();
+        runtime.set_runtime_predecessor(0x1000, 0x1000);
+        assert_ne!(first.semantic_fingerprint(), runtime.semantic_fingerprint());
+        assert!(!first.merge_compatible_with(&second));
+        assert!(!first.merge_compatible_with(&runtime));
+    }
+
+    #[test]
     fn test_merge_memory_preserves_region_only_present_on_one_side() {
         let ctx = Context::thread_local();
 
@@ -1715,7 +1940,9 @@ mod tests {
             1,
         );
 
-        let merged = state_a.merge_with(&state_b);
+        let merged = state_a
+            .merge_with(&state_b)
+            .expect("same-predecessor states should merge");
         let merged_byte = merged.mem_read(&SymValue::concrete(0x9000, 64), 1);
 
         let solver = Solver::new();
@@ -1867,9 +2094,9 @@ mod tests {
             .expect("runtime continuation should resume");
 
         assert_eq!(resumed, Some(0x6000_0010));
-        state.pc = 0x6000_0020;
+        assert!(state.select_runtime_execution_pc(0x6000_0020));
         assert!(state.dispatch_runtime_breakpoint_if_ready());
-        assert_eq!(state.pc, 0x401000);
+        assert_eq!(state.pc(), 0x401000);
         assert!(state.pending_exception().is_some());
     }
 
@@ -1916,9 +2143,9 @@ mod tests {
                 .expect("debug-register continuation should resume"),
             Some(0x6000_0010)
         );
-        state.pc = 0x6000_0030;
+        assert!(state.select_runtime_execution_pc(0x6000_0030));
         assert!(state.dispatch_runtime_breakpoint_if_ready());
-        assert_eq!(state.pc, 0x401000);
+        assert_eq!(state.pc(), 0x401000);
         assert!(state.pending_exception().is_some());
     }
 }

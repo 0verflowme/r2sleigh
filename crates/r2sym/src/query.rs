@@ -907,7 +907,7 @@ fn route_uses_summary_guidance(
 }
 
 fn state_is_continuation_seed<'ctx>(state: &SymState<'ctx>) -> bool {
-    state.pending_exception().is_some() || state.runtime_region_for_pc(state.pc).is_some()
+    state.pending_exception().is_some() || state.runtime_region_for_pc(state.pc()).is_some()
 }
 
 fn stats_show_summary_guidance(stats: &ExploreStats) -> bool {
@@ -1743,7 +1743,7 @@ fn continuation_seed_states<'ctx>(
 }
 
 fn rank_continuation_seeds<'ctx>(mut seeds: Vec<SymState<'ctx>>) -> Vec<SymState<'ctx>> {
-    seeds.sort_by_key(|state| (state.num_constraints(), state.depth, state.pc));
+    seeds.sort_by_key(|state| (state.num_constraints(), state.depth, state.pc()));
     seeds.truncate(CONTINUATION_SEEDED_STATE_CAP);
     seeds
 }

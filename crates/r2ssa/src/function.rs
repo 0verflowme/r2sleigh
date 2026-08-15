@@ -116,6 +116,12 @@ impl PartialEq for SsaArtifactAuthority {
 
 impl Eq for SsaArtifactAuthority {}
 
+impl std::hash::Hash for SsaArtifactAuthority {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&Arc::as_ptr(&self.0), state);
+    }
+}
+
 fn coherent_function_interface(
     machine_context: &SourceMachineContext,
 ) -> Option<&SourceFunctionInterface> {
@@ -791,10 +797,10 @@ impl SsaArtifact {
         self.graph.op_site_for_inst(inst_id)
     }
 
-    pub fn object_for_var(&self, var: &SSAVar) -> Option<ObjectId> {
+    pub fn object_for_var(&self, var: &SSAVar, space: r2il::SpaceId) -> Option<ObjectId> {
         self.graph
             .value_id_for_var(var)
-            .and_then(|value_id| self.objects().object_for_value(value_id))
+            .and_then(|value_id| self.objects().object_for_value(value_id, space))
     }
 
     pub fn memory_uses_for_op_site(
@@ -5099,7 +5105,7 @@ mod tests {
         function.get_block_mut(0x1214).expect("return block").ops = vec![
             SSAOp::Load {
                 dst: load,
-                space: "ram".to_string(),
+                space: r2il::SpaceId::Ram,
                 addr: SSAVar::new("RDI", 0, 8),
             },
             SSAOp::Return {
@@ -5402,7 +5408,9 @@ mod tests {
                 .objects()
                 .object(uses[0].location.object)
                 .map(|fact| &fact.kind),
-            Some(&crate::semantic::ObjectKind::EscapedUnknown)
+            Some(&crate::semantic::ObjectKind::EscapedUnknown {
+                space: r2il::SpaceId::Ram,
+            })
         );
     }
 

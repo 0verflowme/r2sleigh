@@ -948,9 +948,19 @@ mod tests {
                 assert!(parsed.get("size").is_some(), "lift json must have size");
             }
             InstructionAction::Ssa => {
+                assert_eq!(
+                    parsed
+                        .get("schema_version")
+                        .and_then(serde_json::Value::as_u64),
+                    Some(r2sleigh_export::SSA_JSON_SCHEMA_VERSION.into()),
+                    "ssa json must carry the current document schema"
+                );
                 assert!(
-                    parsed.as_array().is_some_and(|ops| !ops.is_empty()),
-                    "ssa json must contain non-empty array"
+                    parsed
+                        .get("operations")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|operations| !operations.is_empty()),
+                    "ssa json must contain non-empty operations"
                 );
             }
             InstructionAction::Defuse => {

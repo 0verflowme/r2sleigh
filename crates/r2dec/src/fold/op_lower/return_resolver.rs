@@ -32,6 +32,7 @@ impl<'a> FoldingContext<'a> {
             .certificates()
             .stack_slots
             .values()
+            .filter(|slot| slot.space == r2il::SpaceId::Ram)
             .map(|slot| slot.object)
             .collect::<HashSet<_>>();
 
@@ -48,7 +49,12 @@ impl<'a> FoldingContext<'a> {
             else {
                 return false;
             };
-            if let SSAOp::Load { dst, .. } = op {
+            if let SSAOp::Load {
+                dst,
+                space: r2il::SpaceId::Ram,
+                ..
+            } = op
+            {
                 let certified_stack_load =
                     prepared
                         .certificates()
@@ -57,6 +63,7 @@ impl<'a> FoldingContext<'a> {
                         .any(|cert| {
                             cert.access.inst == inst
                                 && !cert.is_write
+                                && cert.space == r2il::SpaceId::Ram
                                 && stack_objects.contains(&cert.object)
                         });
                 let return_control_load =
@@ -95,7 +102,10 @@ impl<'a> FoldingContext<'a> {
             .certificates()
             .stack_slots
             .values()
-            .filter_map(|slot| (slot.offset == slot_offset).then_some(slot.object));
+            .filter_map(|slot| {
+                (slot.space == r2il::SpaceId::Ram && slot.offset == slot_offset)
+                    .then_some(slot.object)
+            });
         let stack_object = stack_objects.next()?;
         if stack_objects.next().is_some() {
             return None;
@@ -108,7 +118,10 @@ impl<'a> FoldingContext<'a> {
             .memory_accesses
             .values()
             .filter(|cert| {
-                !cert.is_write && cert.block_addr == merge_block && cert.object == stack_object
+                !cert.is_write
+                    && cert.space == r2il::SpaceId::Ram
+                    && cert.block_addr == merge_block
+                    && cert.object == stack_object
             })
         {
             let Some(load_value) = load.value else {
@@ -174,6 +187,7 @@ impl<'a> FoldingContext<'a> {
                 .values()
                 .find(|cert| {
                     cert.is_write
+                        && cert.space == r2il::SpaceId::Ram
                         && cert.access.inst == store_inst
                         && cert.object == stack_object
                         && cert.width == load.width
@@ -272,7 +286,13 @@ impl<'a> FoldingContext<'a> {
             for (op_idx, op) in block.ops.iter().enumerate() {
                 let inst = prepared.graph().inst_id_for_op_site(*block_addr, op_idx)?;
                 if inst == evidence.store_inst {
-                    if !matches!(op, SSAOp::Store { .. }) {
+                    if !matches!(
+                        op,
+                        SSAOp::Store {
+                            space: r2il::SpaceId::Ram,
+                            ..
+                        }
+                    ) {
                         return None;
                     }
                     continue;

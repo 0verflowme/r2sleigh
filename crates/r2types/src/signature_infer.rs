@@ -158,11 +158,22 @@ fn certified_memory_parameter(
     prepared: &SsaArtifact,
     access: &r2ssa::MemoryAccessCertificate,
 ) -> Option<usize> {
+    if access.space != r2il::SpaceId::Ram
+        || prepared
+            .machine_context()
+            .memory_space_at(access.block_addr, access.op_index)
+            != Some(access.space)
+    {
+        return None;
+    }
     prepared
         .objects()
         .object(access.object)
         .and_then(|object| match object.kind {
-            ObjectKind::Parameter { index } => Some(index),
+            ObjectKind::Parameter {
+                space: r2il::SpaceId::Ram,
+                index,
+            } => Some(index),
             _ => None,
         })
         .or_else(|| {
@@ -307,13 +318,20 @@ fn certified_parameter_home_aliases(
     let mut writes = HashMap::<r2ssa::ObjectId, Vec<&r2ssa::MemoryAccessCertificate>>::new();
     for access in prepared.certificates().memory_accesses.values() {
         if access.is_write
+            && access.space == r2il::SpaceId::Ram
             && prepared
                 .objects()
                 .object(access.object)
                 .is_some_and(|object| {
                     matches!(
                         object.kind,
-                        ObjectKind::StackSlot { .. } | ObjectKind::FrameObject { .. }
+                        ObjectKind::StackSlot {
+                            space: r2il::SpaceId::Ram,
+                            ..
+                        } | ObjectKind::FrameObject {
+                            space: r2il::SpaceId::Ram,
+                            ..
+                        }
                     )
                 })
         {
@@ -342,7 +360,9 @@ fn certified_parameter_home_aliases(
             .certificates()
             .memory_accesses
             .values()
-            .filter(|access| !access.is_write && access.object == object)
+            .filter(|access| {
+                !access.is_write && access.space == r2il::SpaceId::Ram && access.object == object
+            })
         {
             if load.width != store.width || load.width != parameter.ssa_var.size {
                 continue;
@@ -1534,12 +1554,40 @@ mod tests {
         arch.add_register(r2il::RegisterDef::new("x0", 0, 8));
         arch.add_register(r2il::RegisterDef::new("w0", 0, 4));
         arch.add_register(r2il::RegisterDef::new("sp", 16, 8));
+        arch.add_register(r2il::RegisterDef::new("lr", 24, 8));
         arch
+    }
+
+    fn aarch64_prepared_with_stack_slot(
+        block: r2il::R2ILBlock,
+        stack_slot: r2ssa::SourceStackSlotSpec,
+    ) -> SsaArtifact {
+        let register_storage = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let parameter = register_storage(0);
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            b"aarch64-stack-fixture".to_vec(),
+            "aarch64",
+            [r2ssa::SourceAbiParameterSpec::new(0, parameter)],
+            r2ssa::SourceFunctionReturn::Void,
+            [stack_slot],
+        )
+        .and_then(|interface| interface.with_return_address_storage(register_storage(24)))
+        .and_then(|interface| interface.with_stack_pointer_storage(register_storage(16)))
+        .expect("exact AArch64 stack interface");
+        SsaArtifact::for_decompile_with_interface(
+            &[block],
+            Some(&aarch64_parameter_arch()),
+            interface,
+        )
+        .expect("prepared exact AArch64 stack fixture")
     }
 
     #[test]
     fn prepared_signature_recovers_unsigned_byte_pointee_through_certified_stack_reload() {
-        let arch = aarch64_parameter_arch();
         let mut block = r2il::R2ILBlock::new(0x1000, 4);
         block.push(r2il::R2ILOp::IntSub {
             dst: r2il::Varnode::unique(0x10, 8),
@@ -1565,7 +1613,19 @@ mod tests {
             dst: r2il::Varnode::unique(0x40, 4),
             src: r2il::Varnode::unique(0x30, 1),
         });
-        let prepared = SsaArtifact::for_decompile(&[block], Some(&arch)).expect("prepared SSA");
+        let prepared = aarch64_prepared_with_stack_slot(
+            block,
+            r2ssa::SourceStackSlotSpec::new_local(
+                r2ssa::StackAddressBase::StackPointer,
+                r2ssa::CanonicalStorageId {
+                    space: r2ssa::CanonicalStorageSpace::Register,
+                    offset: 16,
+                    size: 8,
+                },
+                -8,
+                1,
+            ),
+        );
         let pattern_blocks = prepared.local_ssa_blocks();
         let recovered = [RecoveredSignatureParam {
             name: "code".to_string(),
@@ -1590,7 +1650,6 @@ mod tests {
 
     #[test]
     fn prepared_signature_recovers_unsigned_scalar_through_certified_stack_reload() {
-        let arch = aarch64_parameter_arch();
         let mut block = r2il::R2ILBlock::new(0x1000, 4);
         block.push(r2il::R2ILOp::IntSub {
             dst: r2il::Varnode::unique(0x10, 8),
@@ -1616,7 +1675,27 @@ mod tests {
             target: r2il::Varnode::constant(0x2000, 8),
             cond: r2il::Varnode::unique(0x30, 1),
         });
-        let prepared = SsaArtifact::for_decompile(&[block], Some(&arch)).expect("prepared SSA");
+        let stack_pointer = r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset: 16,
+            size: 8,
+        };
+        let parameter = r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset: 0,
+            size: 8,
+        };
+        let prepared = aarch64_prepared_with_stack_slot(
+            block,
+            r2ssa::SourceStackSlotSpec::new_parameter_home(
+                r2ssa::StackAddressBase::StackPointer,
+                stack_pointer,
+                -8,
+                8,
+                0,
+                parameter,
+            ),
+        );
         let pattern_blocks = prepared.local_ssa_blocks();
         let recovered = [RecoveredSignatureParam {
             name: "length".to_string(),
@@ -1647,7 +1726,6 @@ mod tests {
 
     #[test]
     fn overwritten_stack_home_does_not_alias_parameter_signedness() {
-        let arch = aarch64_parameter_arch();
         let mut block = r2il::R2ILBlock::new(0x1000, 4);
         block.push(r2il::R2ILOp::IntSub {
             dst: r2il::Varnode::unique(0x10, 8),
@@ -1669,7 +1747,27 @@ mod tests {
             space: r2il::SpaceId::Ram,
             addr: r2il::Varnode::unique(0x10, 8),
         });
-        let prepared = SsaArtifact::for_decompile(&[block], Some(&arch)).expect("prepared SSA");
+        let stack_pointer = r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset: 16,
+            size: 8,
+        };
+        let parameter = r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset: 0,
+            size: 8,
+        };
+        let prepared = aarch64_prepared_with_stack_slot(
+            block,
+            r2ssa::SourceStackSlotSpec::new_parameter_home(
+                r2ssa::StackAddressBase::StackPointer,
+                stack_pointer,
+                -8,
+                8,
+                0,
+                parameter,
+            ),
+        );
         let recovered = [RecoveredSignatureParam {
             name: "value".to_string(),
             arg_index: 0,

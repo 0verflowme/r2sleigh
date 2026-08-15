@@ -1,8 +1,8 @@
 use crate::blocks::BlockSlice;
 use crate::context::require_ctx_view;
 use crate::{
-    ExportFormat, InstructionAction, InstructionExportInput, R2ILBlock, R2ILContext, SSAOpInfo,
-    export_instruction, ssa_op_to_info,
+    ExportFormat, InstructionAction, InstructionExportInput, R2ILBlock, R2ILContext,
+    SSA_JSON_SCHEMA_VERSION, SSAOpInfo, export_instruction, ssa_op_to_info,
 };
 use serde::Serialize;
 use std::ffi::{CStr, CString};
@@ -89,7 +89,7 @@ struct SSABlockJson {
 }
 
 #[derive(Serialize)]
-struct SSAFunctionJson {
+struct SSAFunctionBodyJson {
     name: Option<String>,
     entry: u64,
     entry_hex: String,
@@ -127,12 +127,13 @@ struct PreparedSsaFactsJson {
 
 #[derive(Serialize)]
 struct PreparedSSAFunctionJson {
+    schema_version: u32,
     #[serde(flatten)]
-    function: SSAFunctionJson,
+    function: SSAFunctionBodyJson,
     prepared: PreparedSsaFactsJson,
 }
 
-fn build_ssa_function_json(ssa_func: &r2ssa::SSAFunction) -> SSAFunctionJson {
+fn build_ssa_function_json(ssa_func: &r2ssa::SSAFunction) -> SSAFunctionBodyJson {
     let mut json_blocks = Vec::new();
     for &addr in ssa_func.block_addrs() {
         if let Some(block) = ssa_func.get_block(addr) {
@@ -158,7 +159,7 @@ fn build_ssa_function_json(ssa_func: &r2ssa::SSAFunction) -> SSAFunctionJson {
             });
         }
     }
-    SSAFunctionJson {
+    SSAFunctionBodyJson {
         name: ssa_func.name.clone(),
         entry: ssa_func.entry,
         entry_hex: format!("0x{:x}", ssa_func.entry),
@@ -205,6 +206,7 @@ fn prepared_ssa_function_json_string(artifact: &r2ssa::SsaArtifact) -> Option<St
         })
         .collect::<Option<Vec<_>>>()?;
     serde_json::to_string_pretty(&PreparedSSAFunctionJson {
+        schema_version: SSA_JSON_SCHEMA_VERSION,
         function: build_ssa_function_json(artifact.function()),
         prepared: PreparedSsaFactsJson {
             formal_parameters,
@@ -257,9 +259,10 @@ struct SSAOptStatsJson {
 
 #[derive(Serialize)]
 struct SSAFunctionOptJson {
+    schema_version: u32,
     optimized: bool,
     stats: SSAOptStatsJson,
-    function: SSAFunctionJson,
+    function: SSAFunctionBodyJson,
 }
 
 /// Get optimized function-level SSA as JSON (includes phi nodes).
@@ -284,6 +287,7 @@ pub(crate) fn r2ssa_function_opt_json(
         };
     let stats = ssa_func.optimize(&r2ssa::OptimizationConfig::default());
     let report = SSAFunctionOptJson {
+        schema_version: SSA_JSON_SCHEMA_VERSION,
         optimized: true,
         stats: SSAOptStatsJson {
             iterations: stats.iterations,
@@ -629,5 +633,76 @@ pub(crate) fn r2ssa_backward_slice_json(
     match serde_json::to_string_pretty(&json) {
         Ok(s) => CString::new(s).map_or(ptr::null_mut(), |c| c.into_raw()),
         Err(_) => ptr::null_mut(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn function_body_with_one_op() -> SSAFunctionBodyJson {
+        let op = r2ssa::SSAOp::Copy {
+            dst: r2ssa::SSAVar::new("dst", 1, 8),
+            src: r2ssa::SSAVar::new("src", 1, 8),
+        };
+        SSAFunctionBodyJson {
+            name: Some("test".to_string()),
+            entry: 0x1000,
+            entry_hex: "0x1000".to_string(),
+            num_blocks: 1,
+            blocks: vec![SSABlockJson {
+                addr: 0x1000,
+                addr_hex: "0x1000".to_string(),
+                size: 1,
+                phis: Vec::new(),
+                ops: vec![ssa_op_to_info(&op)],
+            }],
+        }
+    }
+
+    #[test]
+    fn prepared_ssa_document_versions_operations_once() {
+        let value = serde_json::to_value(PreparedSSAFunctionJson {
+            schema_version: SSA_JSON_SCHEMA_VERSION,
+            function: function_body_with_one_op(),
+            prepared: PreparedSsaFactsJson {
+                formal_parameters: Vec::new(),
+                parameter_addresses: Vec::new(),
+            },
+        })
+        .expect("prepared SSA JSON");
+
+        assert_eq!(value["schema_version"], SSA_JSON_SCHEMA_VERSION);
+        assert!(value["blocks"][0]["ops"][0].get("schema_version").is_none());
+    }
+
+    #[test]
+    fn optimized_ssa_document_carries_current_schema() {
+        let value = serde_json::to_value(SSAFunctionOptJson {
+            schema_version: SSA_JSON_SCHEMA_VERSION,
+            optimized: true,
+            stats: SSAOptStatsJson {
+                iterations: 0,
+                sccp_constants_found: 0,
+                sccp_edges_pruned: 0,
+                sccp_blocks_removed: 0,
+                constants_propagated: 0,
+                ops_simplified: 0,
+                copies_propagated: 0,
+                phis_simplified: 0,
+                cse_replacements: 0,
+                dce_removed_ops: 0,
+                dce_removed_phis: 0,
+            },
+            function: function_body_with_one_op(),
+        })
+        .expect("optimized SSA JSON");
+
+        assert_eq!(value["schema_version"], SSA_JSON_SCHEMA_VERSION);
+        assert!(
+            value["function"]["blocks"][0]["ops"][0]
+                .get("schema_version")
+                .is_none()
+        );
     }
 }

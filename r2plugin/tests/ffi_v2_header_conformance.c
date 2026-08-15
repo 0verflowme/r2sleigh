@@ -2,6 +2,12 @@
 
 #include <stddef.h>
 
+static int data_ref_contract_matches(const R2SleighApiV2 *api, uint32_t size, uint32_t schema_version) {
+	return api
+		&& api->data_ref_size == size
+		&& api->data_ref_schema_version == schema_version;
+}
+
 int main(void) {
 	R2SleighFunctionContext function_context = {
 		.schema_version = R2SLEIGH_FUNCTION_CONTEXT_SCHEMA_V2,
@@ -244,6 +250,8 @@ int main(void) {
 		|| api->scope_symbol_size != sizeof (R2SleighScopeSymbolV2)
 		|| api->analysis_query_request_size != sizeof (R2SleighAnalysisQueryRequestV2)
 		|| api->analysis_result_view_size != sizeof (R2SleighAnalysisResultViewV2)
+		|| api->data_ref_size == 0
+		|| api->data_ref_schema_version != R2SLEIGH_DATA_REF_SCHEMA_V2
 		|| api->planner_query_request_size != sizeof (R2SleighPlannerQueryRequestV2)
 		|| api->planner_query_response_size != sizeof (R2SleighPlannerQueryResponseV2)
 		|| api->planner_target_input_size != sizeof (R2SleighPlannerTargetInputV2)
@@ -282,6 +290,11 @@ int main(void) {
 		|| !api->planner_result_view || !api->planner_result_copy
 		|| !api->planner_result_free) {
 		return 1;
+	}
+	if (!data_ref_contract_matches (api, api->data_ref_size, R2SLEIGH_DATA_REF_SCHEMA_V2)
+		|| data_ref_contract_matches (api, api->data_ref_size + 1, R2SLEIGH_DATA_REF_SCHEMA_V2)
+		|| data_ref_contract_matches (api, api->data_ref_size, R2SLEIGH_DATA_REF_SCHEMA_V2 + 1)) {
+		return 14;
 	}
 	if (api->planner_query (&planner_query, &planner_response) != R2SLEIGH_STATUS_OK_V2
 		|| planner_response.abi_version != R2SLEIGH_ABI_V2

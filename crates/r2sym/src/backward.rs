@@ -1004,7 +1004,7 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
         location: &r2ssa::MemoryLocation,
         value: &SymValue<'ctx>,
     ) -> bool {
-        let Some(r2ssa::ObjectKind::Parameter { index }) = self
+        let Some(r2ssa::ObjectKind::Parameter { index, .. }) = self
             .func
             .objects()
             .object(location.object)

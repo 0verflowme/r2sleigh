@@ -2732,6 +2732,19 @@ struct SourceMemoryAccess {
     source_space: r2il::SpaceId,
 }
 
+fn memory_space_authorities_match(
+    graph_space: r2il::SpaceId,
+    prepared_space: r2il::SpaceId,
+    context_space: r2il::SpaceId,
+    fact_space: r2il::SpaceId,
+    object_space: r2il::SpaceId,
+) -> bool {
+    graph_space == prepared_space
+        && graph_space == context_space
+        && graph_space == fact_space
+        && graph_space == object_space
+}
+
 fn source_memory_access(
     artifact: &SsaArtifact,
     inst: r2ssa::InstId,
@@ -2754,44 +2767,68 @@ fn source_memory_access(
         .machine_context()
         .memory_space_at(block_addr, op_index)
         .ok_or_else(|| RunFailure::Invalid("prepared memory space is missing".to_string()))?;
-    let (address, value, width_bits, source_space) =
+    let (address, value, width_bits, graph_space, prepared_space) =
         match (&graph_inst.payload, prepared_op) {
             (
-                InstPayload::Op(SSAOp::Load { dst, addr, .. }),
+                InstPayload::Op(SSAOp::Load {
+                    dst,
+                    space: graph_space,
+                    addr,
+                }),
                 SSAOp::Load {
                     dst: prepared_dst,
+                    space: prepared_space,
                     addr: prepared_addr,
-                    ..
                 },
-            ) if !is_write && dst == prepared_dst && addr == prepared_addr => (
-                artifact.graph().value_id_for_var(addr).ok_or_else(|| {
-                    RunFailure::Invalid("SSA load address is missing".to_string())
-                })?,
-                artifact.graph().value_id_for_var(dst),
-                dst.size
-                    .checked_mul(8)
-                    .ok_or_else(|| RunFailure::Invalid("load width overflow".to_string()))?,
-                source_space,
-            ),
+            ) if !is_write
+                && dst == prepared_dst
+                && addr == prepared_addr
+                && graph_space == prepared_space
+                && *graph_space == source_space =>
+            {
+                (
+                    artifact.graph().value_id_for_var(addr).ok_or_else(|| {
+                        RunFailure::Invalid("SSA load address is missing".to_string())
+                    })?,
+                    artifact.graph().value_id_for_var(dst),
+                    dst.size
+                        .checked_mul(8)
+                        .ok_or_else(|| RunFailure::Invalid("load width overflow".to_string()))?,
+                    *graph_space,
+                    *prepared_space,
+                )
+            }
             (
-                InstPayload::Op(SSAOp::Store { addr, val, .. }),
+                InstPayload::Op(SSAOp::Store {
+                    space: graph_space,
+                    addr,
+                    val,
+                }),
                 SSAOp::Store {
+                    space: prepared_space,
                     addr: prepared_addr,
                     val: prepared_value,
-                    ..
                 },
-            ) if is_write && addr == prepared_addr && val == prepared_value => (
-                artifact.graph().value_id_for_var(addr).ok_or_else(|| {
-                    RunFailure::Invalid("SSA store address is missing".to_string())
-                })?,
-                Some(artifact.graph().value_id_for_var(val).ok_or_else(|| {
-                    RunFailure::Invalid("SSA store value is missing".to_string())
-                })?),
-                val.size
-                    .checked_mul(8)
-                    .ok_or_else(|| RunFailure::Invalid("store width overflow".to_string()))?,
-                source_space,
-            ),
+            ) if is_write
+                && addr == prepared_addr
+                && val == prepared_value
+                && graph_space == prepared_space
+                && *graph_space == source_space =>
+            {
+                (
+                    artifact.graph().value_id_for_var(addr).ok_or_else(|| {
+                        RunFailure::Invalid("SSA store address is missing".to_string())
+                    })?,
+                    Some(artifact.graph().value_id_for_var(val).ok_or_else(|| {
+                        RunFailure::Invalid("SSA store value is missing".to_string())
+                    })?),
+                    val.size
+                        .checked_mul(8)
+                        .ok_or_else(|| RunFailure::Invalid("store width overflow".to_string()))?,
+                    *graph_space,
+                    *prepared_space,
+                )
+            }
             _ => {
                 return Err(RunFailure::Invalid(
                     "graph memory operation differs from prepared SSA".to_string(),
@@ -2801,8 +2838,13 @@ fn source_memory_access(
     let id = StructuredAccessId { inst, ordinal: 0 };
     let object = artifact
         .objects()
-        .object_for_value(address)
+        .object_for_value(address, source_space)
         .ok_or_else(|| RunFailure::Unsupported("memory object is unresolved".to_string()))?;
+    let object_space = artifact
+        .objects()
+        .object(object)
+        .map(|object| object.kind.space())
+        .ok_or_else(|| RunFailure::Unsupported("memory object fact is missing".to_string()))?;
     let facts = artifact
         .facts()
         .structured
@@ -2819,6 +2861,13 @@ fn source_memory_access(
         || fact.id != id
         || fact.is_write != is_write
         || fact.object != object
+        || !memory_space_authorities_match(
+            graph_space,
+            prepared_space,
+            source_space,
+            fact.space,
+            object_space,
+        )
         || fact.address != address
         || fact.value != value
         || fact.width.checked_mul(8) != Some(width_bits)
@@ -5668,6 +5717,25 @@ mod tests {
         RadareAbi138RegisterStorageView, RadareAbi138SnapshotInput, RadareAbi138SnapshotView,
         RadareAbi138SuccessorView,
     };
+
+    #[test]
+    fn source_memory_space_authority_rejects_each_mismatch() {
+        let exact = [r2il::SpaceId::Ram; 5];
+        assert!(memory_space_authorities_match(
+            exact[0], exact[1], exact[2], exact[3], exact[4]
+        ));
+
+        for mismatched_authority in 0..exact.len() {
+            let mut spaces = exact;
+            spaces[mismatched_authority] = r2il::SpaceId::Custom(7);
+            assert!(
+                !memory_space_authorities_match(
+                    spaces[0], spaces[1], spaces[2], spaces[3], spaces[4]
+                ),
+                "authority {mismatched_authority} must bind the exact memory space"
+            );
+        }
+    }
 
     struct NativeSpanSnapshotFixture {
         addr: u64,

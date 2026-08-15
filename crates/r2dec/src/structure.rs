@@ -3741,15 +3741,24 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             let return_stmt = CStmt::Return(Some(expr.clone()));
             self.fold_ctx
                 .record_certified_call_render_proofs_for_stmt(&return_stmt)?;
-            if let Some((read_block, read_op, address, read_value)) = self
+            if let Some((read_block, read_op, space, address, read_value)) = self
                 .fold_ctx
                 .certified_memory_read_for_value_dependency(source)
-                .map(|cert| (cert.block_addr, cert.op_index, cert.address, cert.value))
+                .map(|cert| {
+                    (
+                        cert.block_addr,
+                        cert.op_index,
+                        cert.space,
+                        cert.address,
+                        cert.value,
+                    )
+                })
             {
                 self.fold_ctx.record_effect_render_proof_for_memory(
                     EffectRenderProofKind::MemoryRead,
                     read_block,
                     read_op,
+                    space,
                     address,
                     read_value,
                 );
@@ -3924,15 +3933,24 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             op_idx,
             Some(value),
         );
-        if let Some((read_block, read_op, address, read_value)) = self
+        if let Some((read_block, read_op, space, address, read_value)) = self
             .fold_ctx
             .certified_memory_read_for_value_dependency(value)
-            .map(|cert| (cert.block_addr, cert.op_index, cert.address, cert.value))
+            .map(|cert| {
+                (
+                    cert.block_addr,
+                    cert.op_index,
+                    cert.space,
+                    cert.address,
+                    cert.value,
+                )
+            })
         {
             self.fold_ctx.record_effect_render_proof_for_memory(
                 EffectRenderProofKind::MemoryRead,
                 read_block,
                 read_op,
+                space,
                 address,
                 read_value,
             );

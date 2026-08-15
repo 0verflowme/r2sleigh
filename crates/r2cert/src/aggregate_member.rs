@@ -20,7 +20,7 @@ use super::{
     CertifiedMemoryExecutionPolicy, CertifiedMemoryStatement, CertifiedMemoryStatementKind,
 };
 
-pub const CERTIFIED_AGGREGATE_MEMBER_ACCESS_CONTRACT_VERSION: u32 = 1;
+pub const CERTIFIED_AGGREGATE_MEMBER_ACCESS_CONTRACT_VERSION: u32 = 2;
 
 /// Complete naturally aligned scalar layout reached through one pointer type.
 ///
@@ -65,6 +65,7 @@ pub struct CertifiedAggregateStructuredAccess {
     is_write: bool,
     width_bytes: u32,
     provenance_complete: bool,
+    space: MachineAddressSpace,
 }
 
 impl CertifiedAggregateStructuredAccess {
@@ -102,6 +103,10 @@ impl CertifiedAggregateStructuredAccess {
 
     pub const fn provenance_complete(&self) -> bool {
         self.provenance_complete
+    }
+
+    pub const fn space(&self) -> MachineAddressSpace {
+        self.space
     }
 }
 
@@ -307,6 +312,29 @@ fn certified_natural_scalar_layout(
     })
 }
 
+fn source_plain_memory_space(
+    payload: &r2ssa::InstPayload,
+    is_write: bool,
+) -> Option<r2il::SpaceId> {
+    match (payload, is_write) {
+        (r2ssa::InstPayload::Op(r2ssa::SSAOp::Load { space, .. }), false)
+        | (r2ssa::InstPayload::Op(r2ssa::SSAOp::Store { space, .. }), true) => Some(*space),
+        _ => None,
+    }
+}
+
+fn exact_ram_aggregate_space_authority(
+    projection_space: r2il::SpaceId,
+    machine_context_space: Option<r2il::SpaceId>,
+    source_space: Option<r2il::SpaceId>,
+    statement_space: MachineAddressSpace,
+) -> bool {
+    projection_space == r2il::SpaceId::Ram
+        && machine_context_space == Some(projection_space)
+        && source_space == Some(projection_space)
+        && statement_space == MachineAddressSpace::from(projection_space)
+}
+
 fn try_certified_aggregate_member_access(
     artifact: &SsaArtifact,
     origin: &CertifiedArtifactOrigin,
@@ -328,6 +356,7 @@ fn try_certified_aggregate_member_access(
         || projection.source_revision_identity.as_ref() != interface.revision_identity()
         || projection.access != access_key
         || projection.producer != access_key.inst
+        || projection.space != r2il::SpaceId::Ram
     {
         return Ok(None);
     }
@@ -383,7 +412,7 @@ fn try_certified_aggregate_member_access(
         || artifact
             .machine_context()
             .memory_space_at(structured.block_addr, structured.op_index)
-            != Some(r2il::SpaceId::Ram)
+            != Some(projection.space)
         || artifact.graph().op_site_for_inst(access_key.inst)
             != Some((structured.block_addr, structured.op_index))
         || !address_expression.terms.is_empty()
@@ -428,7 +457,7 @@ fn try_certified_aggregate_member_access(
         || memory_statement.object() != structured.object
         || memory_statement.address().binding().value() != structured.address
         || memory_statement.address().memory_access() != Some(access_key)
-        || memory_statement.space() != MachineAddressSpace::Ram
+        || memory_statement.space() != MachineAddressSpace::from(projection.space)
         || memory_statement.width_bits() != width_bits
         || memory_statement.execution()
             != CertifiedMemoryExecutionPolicy::ExactlyOnceInSourceOrderViaHelper
@@ -444,18 +473,29 @@ fn try_certified_aggregate_member_access(
     let Some(instruction) = artifact.graph().inst(projection.producer) else {
         return Err(MachineBuildError::MissingInstruction(projection.producer));
     };
+    if !exact_ram_aggregate_space_authority(
+        projection.space,
+        artifact
+            .machine_context()
+            .memory_space_at(structured.block_addr, structured.op_index),
+        source_plain_memory_space(&instruction.payload, structured.is_write),
+        memory_statement.space(),
+    ) {
+        return Ok(None);
+    }
     let semantics = match (
         &instruction.payload,
         projection.binding,
         memory_statement.kind(),
     ) {
         (
-            r2ssa::InstPayload::Op(r2ssa::SSAOp::Load { dst, addr, .. }),
+            r2ssa::InstPayload::Op(r2ssa::SSAOp::Load { dst, space, addr }),
             AggregateAccessBinding::Read { result },
             CertifiedMemoryStatementKind::Read {
                 result: certified_result,
             },
-        ) if artifact.graph().value_id_for_var(addr) == Some(structured.address)
+        ) if *space == projection.space
+            && artifact.graph().value_id_for_var(addr) == Some(structured.address)
             && artifact.graph().value_id_for_var(dst) == Some(result)
             && structured.value == Some(result)
             && !structured.is_write
@@ -470,12 +510,13 @@ fn try_certified_aggregate_member_access(
             }
         }
         (
-            r2ssa::InstPayload::Op(r2ssa::SSAOp::Store { addr, val, .. }),
+            r2ssa::InstPayload::Op(r2ssa::SSAOp::Store { space, addr, val }),
             AggregateAccessBinding::Write { value },
             CertifiedMemoryStatementKind::Write {
                 value: certified_value,
             },
-        ) if artifact.graph().value_id_for_var(addr) == Some(structured.address)
+        ) if *space == projection.space
+            && artifact.graph().value_id_for_var(addr) == Some(structured.address)
             && artifact.graph().value_id_for_var(val) == Some(value)
             && structured.value == Some(value)
             && structured.is_write
@@ -514,12 +555,57 @@ fn try_certified_aggregate_member_access(
             is_write: structured.is_write,
             width_bytes: structured.width,
             provenance_complete: structured.provenance_complete,
+            space: MachineAddressSpace::from(projection.space),
         },
-        space: MachineAddressSpace::Ram,
+        space: MachineAddressSpace::from(projection.space),
         semantics,
         memory_statement: memory_statement.clone(),
         memory_obligation,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aggregate_space_authority_requires_exact_ram_agreement() {
+        assert!(exact_ram_aggregate_space_authority(
+            r2il::SpaceId::Ram,
+            Some(r2il::SpaceId::Ram),
+            Some(r2il::SpaceId::Ram),
+            MachineAddressSpace::Ram,
+        ));
+
+        for mutation in [
+            exact_ram_aggregate_space_authority(
+                r2il::SpaceId::Custom(7),
+                Some(r2il::SpaceId::Custom(7)),
+                Some(r2il::SpaceId::Custom(7)),
+                MachineAddressSpace::Custom(7),
+            ),
+            exact_ram_aggregate_space_authority(
+                r2il::SpaceId::Ram,
+                Some(r2il::SpaceId::Custom(7)),
+                Some(r2il::SpaceId::Ram),
+                MachineAddressSpace::Ram,
+            ),
+            exact_ram_aggregate_space_authority(
+                r2il::SpaceId::Ram,
+                Some(r2il::SpaceId::Ram),
+                Some(r2il::SpaceId::Custom(7)),
+                MachineAddressSpace::Ram,
+            ),
+            exact_ram_aggregate_space_authority(
+                r2il::SpaceId::Ram,
+                Some(r2il::SpaceId::Ram),
+                Some(r2il::SpaceId::Ram),
+                MachineAddressSpace::Custom(7),
+            ),
+        ] {
+            assert!(!mutation);
+        }
+    }
 }
 
 pub(super) fn certified_aggregate_member_accesses(

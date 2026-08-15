@@ -224,6 +224,8 @@ typedef struct R2ILFunctionBlocks R2ILFunctionBlocks;
 
 #define R2SLEIGH_QUERY_DATA_REFS_V2 8
 
+#define R2SLEIGH_DATA_REF_SCHEMA_V2 1
+
 #define R2SLEIGH_PLANNER_QUERY_SCHEMA_V2 1
 
 #define R2SLEIGH_PLANNER_ANALYSIS_POLICY_V2 1
@@ -694,6 +696,8 @@ typedef struct R2SleighApiV2 {
   uint32_t scope_symbol_size;
   uint32_t analysis_query_request_size;
   uint32_t analysis_result_view_size;
+  uint32_t data_ref_size;
+  uint32_t data_ref_schema_version;
   uint32_t planner_query_request_size;
   uint32_t planner_query_response_size;
   uint32_t planner_target_input_size;

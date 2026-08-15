@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
+use r2il::SpaceId;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -44,6 +45,36 @@ impl AddressProvenanceFacts {
 struct AffineScalar {
     terms: BTreeMap<ValueId, i128>,
     constant: i128,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SpillSlotKey {
+    root: StackAddressRoot,
+    space: SpaceId,
+}
+
+fn memory_space_order(space: SpaceId) -> (u8, u32) {
+    match space {
+        SpaceId::Ram => (0, 0),
+        SpaceId::Register => (1, 0),
+        SpaceId::Unique => (2, 0),
+        SpaceId::Const => (3, 0),
+        SpaceId::Custom(id) => (4, id),
+    }
+}
+
+impl Ord for SpillSlotKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.root
+            .cmp(&other.root)
+            .then_with(|| memory_space_order(self.space).cmp(&memory_space_order(other.space)))
+    }
+}
+
+impl PartialOrd for SpillSlotKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl AffineScalar {
@@ -91,8 +122,8 @@ struct AddressCollector<'a> {
     expressions: BTreeMap<ValueId, ParameterAddressExpression>,
     scalar_memo: HashMap<ValueId, Option<AffineScalar>>,
     scalar_visiting: HashSet<ValueId>,
-    stack_in: BTreeMap<u64, BTreeMap<StackAddressRoot, ParameterAddressExpression>>,
-    stack_out: BTreeMap<u64, BTreeMap<StackAddressRoot, ParameterAddressExpression>>,
+    stack_in: BTreeMap<u64, BTreeMap<SpillSlotKey, ParameterAddressExpression>>,
+    stack_out: BTreeMap<u64, BTreeMap<SpillSlotKey, ParameterAddressExpression>>,
 }
 
 impl<'a> AddressCollector<'a> {
@@ -172,7 +203,7 @@ impl<'a> AddressCollector<'a> {
     fn merge_predecessor_stack(
         &self,
         block_addr: u64,
-    ) -> BTreeMap<StackAddressRoot, ParameterAddressExpression> {
+    ) -> BTreeMap<SpillSlotKey, ParameterAddressExpression> {
         let predecessors = self.function.predecessors(block_addr);
         let known = predecessors
             .iter()
@@ -196,8 +227,8 @@ impl<'a> AddressCollector<'a> {
     fn transfer_block(
         &mut self,
         block_addr: u64,
-        mut stack: BTreeMap<StackAddressRoot, ParameterAddressExpression>,
-    ) -> (BTreeMap<StackAddressRoot, ParameterAddressExpression>, bool) {
+        mut stack: BTreeMap<SpillSlotKey, ParameterAddressExpression>,
+    ) -> (BTreeMap<SpillSlotKey, ParameterAddressExpression>, bool) {
         let Some(block) = self.function.get_block(block_addr) else {
             return (stack, false);
         };
@@ -221,8 +252,15 @@ impl<'a> AddressCollector<'a> {
         }
         for op in &block.ops {
             match op {
-                SSAOp::Store { addr, val, .. } | SSAOp::StoreGuarded { addr, val, .. } => {
-                    if let Some(slot) = self.stack_root(addr) {
+                SSAOp::Store { space, addr, val }
+                | SSAOp::StoreGuarded {
+                    space, addr, val, ..
+                } => {
+                    if let Some(root) = self.stack_root(addr) {
+                        let slot = SpillSlotKey {
+                            root,
+                            space: *space,
+                        };
                         if let Some(expression) = self.expression_for_var(val) {
                             stack.insert(slot, expression);
                         } else {
@@ -230,13 +268,21 @@ impl<'a> AddressCollector<'a> {
                         }
                     }
                 }
-                SSAOp::Load { dst, addr, .. }
-                | SSAOp::LoadLinked { dst, addr, .. }
-                | SSAOp::LoadGuarded { dst, addr, .. } => {
-                    if let Some(expression) = self
-                        .stack_root(addr)
-                        .and_then(|slot| stack.get(&slot).cloned())
-                    {
+                SSAOp::Load { dst, space, addr }
+                | SSAOp::LoadLinked {
+                    dst, space, addr, ..
+                }
+                | SSAOp::LoadGuarded {
+                    dst, space, addr, ..
+                } => {
+                    if let Some(expression) = self.stack_root(addr).and_then(|root| {
+                        stack
+                            .get(&SpillSlotKey {
+                                root,
+                                space: *space,
+                            })
+                            .cloned()
+                    }) {
                         changed |= self.insert_expression(dst, expression);
                     }
                 }
@@ -468,7 +514,11 @@ pub(crate) fn collect_address_provenance(
 mod tests {
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
 
-    use crate::{ObjectKind, RelativeMemoryAddress, SSAOp, SsaArtifact};
+    use crate::{
+        CanonicalStorageId, CanonicalStorageSpace, ObjectKind, RelativeMemoryAddress, SSAOp,
+        SourceAbiParameterSpec, SourceFunctionInterface, SourceFunctionReturn, SourceStackSlotSpec,
+        SsaArtifact, StackAddressBase,
+    };
 
     fn aarch64_two_arg_arch() -> ArchSpec {
         let mut arch = ArchSpec::new("aarch64");
@@ -527,6 +577,100 @@ mod tests {
                 .addresses()
                 .parameter_expression(value.id)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn parameter_spill_reload_provenance_is_bound_to_exact_memory_space() {
+        let mut arch = aarch64_two_arg_arch();
+        arch.add_register(RegisterDef::new("lr", 24, 8));
+        let register_storage = |offset| CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let parameter_storage = register_storage(0);
+        let stack_pointer_storage = register_storage(16);
+        let return_address_storage = register_storage(24);
+        let interface = SourceFunctionInterface::new_exact(
+            b"exact-space-parameter-spill".to_vec(),
+            "aarch64-test",
+            [SourceAbiParameterSpec::new(0, parameter_storage)],
+            SourceFunctionReturn::Void,
+            [SourceStackSlotSpec::new_local(
+                StackAddressBase::StackPointer,
+                stack_pointer_storage,
+                -8,
+                8,
+            )],
+        )
+        .and_then(|interface| interface.with_return_address_storage(return_address_storage))
+        .and_then(|interface| interface.with_stack_pointer_storage(stack_pointer_storage))
+        .expect("exact source interface");
+
+        let mut block = R2ILBlock::new(0x1100, 4);
+        block.push(R2ILOp::IntSub {
+            dst: Varnode::unique(0x10, 8),
+            a: Varnode::register(16, 8),
+            b: Varnode::constant(8, 8),
+        });
+        block.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x10, 8),
+            val: Varnode::register(0, 8),
+        });
+        block.push(R2ILOp::Load {
+            dst: Varnode::unique(0x20, 8),
+            space: SpaceId::Custom(7),
+            addr: Varnode::unique(0x10, 8),
+        });
+        block.push(R2ILOp::Store {
+            space: SpaceId::Custom(7),
+            addr: Varnode::unique(0x10, 8),
+            val: Varnode::register(0, 8),
+        });
+        block.push(R2ILOp::Load {
+            dst: Varnode::unique(0x28, 8),
+            space: SpaceId::Custom(7),
+            addr: Varnode::unique(0x10, 8),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode::register(24, 8),
+        });
+
+        let artifact = SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface)
+            .expect("decompile artifact");
+        let loaded_values = artifact
+            .get_block(0x1100)
+            .expect("entry block")
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                SSAOp::Load { dst, space, .. } if *space == SpaceId::Custom(7) => artifact
+                    .graph()
+                    .value_id_for_var(dst)
+                    .map(|value| (dst.name.clone(), value)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(loaded_values.len(), 2);
+        let crossed = loaded_values
+            .iter()
+            .find(|(name, _)| name.starts_with("tmp:20"))
+            .expect("cross-space reload")
+            .1;
+        let exact = loaded_values
+            .iter()
+            .find(|(name, _)| name.starts_with("tmp:28"))
+            .expect("same-space reload")
+            .1;
+        assert!(artifact.addresses().parameter_expression(crossed).is_none());
+        assert_eq!(
+            artifact
+                .addresses()
+                .parameter_expression(exact)
+                .map(|expression| expression.parameter),
+            Some(0)
         );
     }
 
@@ -770,7 +914,7 @@ mod tests {
                 .objects()
                 .object(uses[0].location.object)
                 .map(|object| &object.kind),
-            Some(ObjectKind::Parameter { index: 0 })
+            Some(ObjectKind::Parameter { index: 0, .. })
         ));
         assert!(matches!(
             &uses[0].location.address,

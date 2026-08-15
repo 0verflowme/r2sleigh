@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use r2il::SpaceId;
 use r2ssa::{FunctionSSABlock, SSAOp, SSAVar, SsaArtifact};
 use z3::Context;
 
@@ -393,8 +394,13 @@ pub fn summarize_residual_runtime_loop<'ctx>(
             SymValue::new_symbolic(ctx, &summary_name, carried.bits),
         );
     }
-    summarized.pc = branch.target;
-    summarized.set_prev_pc(Some(block.addr));
+    if !summarized.set_loop_summary_exit(block.addr, branch.target) {
+        return refused(
+            block.addr,
+            Some(branch.target),
+            "runtime_loop_execution_domain_unresolved",
+        );
+    }
 
     LoopSummary {
         kind: LoopSummaryKind::Residual,
@@ -426,6 +432,9 @@ pub fn derive_loop_transition_system<'ctx>(
             &mut reasons,
             "runtime_loop_memory_write_transition_unsupported",
         );
+    }
+    if block_has_non_ram_memory(block) {
+        push_unique_reason(&mut reasons, "runtime_loop_non_ram_memory_unsupported");
     }
 
     if state_value_at_block_entry(state, block, &branch.counter).is_none() {
@@ -851,8 +860,9 @@ fn apply_exact_transition_system<'ctx>(
             summarized.get_register_sized(&recurrence.phi, recurrence.bits),
         );
     }
-    summarized.pc = system.exit_target;
-    summarized.set_prev_pc(Some(system.header));
+    if !summarized.set_loop_summary_exit(system.header, system.exit_target) {
+        return None;
+    }
     let exact_recurrences = exact_recurrence_evidence_from_system(system);
     let exact_folds = exact_fold_evidence_from_recurrences(&exact_recurrences);
 
@@ -1011,17 +1021,38 @@ fn discover_loop_transitions(
                     |var, value| LoopTransitionExpr::XorConst { var, value },
                 ));
             }
-            SSAOp::Load { dst, addr, .. } if carried.contains(dst.display_name().as_str()) => {
+            SSAOp::Load {
+                dst,
+                addr,
+                space: SpaceId::Ram,
+            } if carried.contains(dst.display_name().as_str()) => {
                 transitions.push(LoopTransitionExpr::Load {
                     addr: addr.display_name(),
                     bytes: dst.size,
                 });
             }
-            SSAOp::Store { addr, val, .. } => {
+            SSAOp::Store {
+                addr,
+                val,
+                space: SpaceId::Ram,
+            } => {
                 transitions.push(LoopTransitionExpr::Store {
                     addr: addr.display_name(),
                     value: val.display_name(),
                 });
+            }
+            SSAOp::Load { space, .. }
+            | SSAOp::LoadLinked { space, .. }
+            | SSAOp::StoreConditional { space, .. }
+            | SSAOp::AtomicCAS { space, .. }
+            | SSAOp::LoadGuarded { space, .. }
+            | SSAOp::StoreGuarded { space, .. }
+                if *space != SpaceId::Ram =>
+            {
+                transitions.push(LoopTransitionExpr::Unknown);
+            }
+            SSAOp::Store { space, .. } if *space != SpaceId::Ram => {
+                transitions.push(LoopTransitionExpr::Unknown);
             }
             _ => {}
         }
@@ -1468,16 +1499,15 @@ fn memory_term_for_var(
     value: &SSAVar,
 ) -> Option<LoopMemoryTerm> {
     let (addr, bytes) = block.ops.iter().find_map(|op| match op {
-        SSAOp::Load { dst, addr, .. } if dst.display_name() == value.display_name() => {
-            Some((addr, dst.size))
-        }
+        SSAOp::Load {
+            dst,
+            addr,
+            space: SpaceId::Ram,
+        } if dst == value => Some((addr, dst.size)),
         _ => None,
     })?;
     let base = state_value_at_block_entry(state, block, addr).and_then(|value| value.as_concrete());
-    let addr_is_loop_carried = block
-        .phis
-        .iter()
-        .any(|phi| phi.dst.display_name() == addr.display_name());
+    let addr_is_loop_carried = block.phis.iter().any(|phi| phi.dst == *addr);
     let stride = if addr_is_loop_carried {
         memory_stride_for_addr_var(block, state, addr)
     } else {
@@ -1660,6 +1690,19 @@ fn block_has_memory_writes(block: &FunctionSSABlock) -> bool {
                 | SSAOp::AtomicCAS { .. }
                 | SSAOp::StoreGuarded { .. }
         )
+    })
+}
+
+fn block_has_non_ram_memory(block: &FunctionSSABlock) -> bool {
+    block.ops.iter().any(|op| match op {
+        SSAOp::Load { space, .. }
+        | SSAOp::Store { space, .. }
+        | SSAOp::LoadLinked { space, .. }
+        | SSAOp::StoreConditional { space, .. }
+        | SSAOp::AtomicCAS { space, .. }
+        | SSAOp::LoadGuarded { space, .. }
+        | SSAOp::StoreGuarded { space, .. } => *space != SpaceId::Ram,
+        _ => false,
     })
 }
 
@@ -2140,7 +2183,7 @@ mod tests {
         assert_eq!(summary.kind, LoopSummaryKind::Exact);
         assert_eq!(summary.exact_recurrences, exact_recurrences);
         let summarized = summary.resulting_state.expect("state");
-        assert_eq!(summarized.pc, 0x2000);
+        assert_eq!(summarized.pc(), 0x2000);
         assert_eq!(
             summarized.get_register_sized("RBX_2", 64).as_concrete(),
             Some(40)
@@ -2149,6 +2192,35 @@ mod tests {
             summarized.get_register_sized("RCX_2", 64).as_concrete(),
             Some(10)
         );
+
+        let mut runtime_state = state.fork();
+        let _ = runtime_state.define_runtime_region("loop_copy", 0x5000, 0x2000, true);
+        runtime_state.note_runtime_store_copy(
+            0x5000,
+            0x2000,
+            Some(&crate::RuntimeValueProvenance {
+                source_addr: 0x1000,
+                size: 0x2000,
+            }),
+        );
+        assert!(runtime_state.select_runtime_execution_pc(0x5000));
+        let summary = apply_exact_transition_system(&ctx, &runtime_state, &system)
+            .expect("runtime-domain summary");
+        let summarized = summary.resulting_state.expect("runtime-domain state");
+        assert_eq!(summarized.pc(), 0x6000);
+        assert!(matches!(
+            summarized.execution_pc(),
+            crate::state::ExecutionPc::RuntimeAlias {
+                static_addr: 0x2000
+            }
+        ));
+        assert!(matches!(
+            summarized.predecessor(),
+            Some(crate::state::ExecutionPredecessor::RuntimeAlias {
+                runtime_addr: 0x5000,
+                static_addr: 0x1000,
+            })
+        ));
     }
 
     #[test]
@@ -2249,7 +2321,7 @@ mod tests {
                     b: const_var(1, 8),
                 },
                 SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: var("RAX", 0, 8),
                     val: var("RCX", 1, 8),
                 },
@@ -2312,7 +2384,7 @@ mod tests {
                 },
                 SSAOp::Load {
                     dst: var("TMP", 0, 1),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: ptr_phi,
                 },
                 SSAOp::IntXor {
@@ -2377,6 +2449,99 @@ mod tests {
     }
 
     #[test]
+    fn refuses_custom_space_fold_even_when_ram_exists_at_the_same_address() {
+        let counter_phi = var("RCX", 2, 8);
+        let ptr_phi = var("RDI", 2, 8);
+        let acc_phi = var("RBX", 2, 8);
+        let block = FunctionSSABlock {
+            addr: 0x1000,
+            size: 4,
+            phis: vec![
+                PhiNode {
+                    dst: counter_phi.clone(),
+                    sources: vec![(0x900, var("RCX", 0, 8)), (0x1008, var("RCX", 1, 8))],
+                    canonical_storage: None,
+                },
+                PhiNode {
+                    dst: ptr_phi.clone(),
+                    sources: vec![(0x900, var("RDI", 0, 8)), (0x1008, var("RDI", 1, 8))],
+                    canonical_storage: None,
+                },
+                PhiNode {
+                    dst: acc_phi.clone(),
+                    sources: vec![(0x900, var("RBX", 0, 8)), (0x1008, var("RBX", 1, 8))],
+                    canonical_storage: None,
+                },
+            ],
+            ops: vec![
+                SSAOp::IntAdd {
+                    dst: var("RCX", 1, 8),
+                    a: counter_phi.clone(),
+                    b: const_var(1, 8),
+                },
+                SSAOp::IntAdd {
+                    dst: var("RDI", 1, 8),
+                    a: ptr_phi.clone(),
+                    b: const_var(1, 8),
+                },
+                SSAOp::Load {
+                    dst: var("TMP", 0, 1),
+                    space: r2il::SpaceId::Custom(7),
+                    addr: ptr_phi,
+                },
+                SSAOp::IntXor {
+                    dst: var("RBX", 1, 8),
+                    a: acc_phi,
+                    b: var("TMP", 0, 1),
+                },
+            ],
+        };
+        let ctx = Context::thread_local();
+        let mut state = SymState::new(&ctx, 0x1000);
+        state.set_prev_pc(Some(0x900));
+        state.set_register("RCX_0", SymValue::concrete(0, 64));
+        state.set_register("RDI_0", SymValue::concrete(0x5000, 64));
+        state.set_register("RBX_0", SymValue::concrete(0xaa, 64));
+        state.mem_write(
+            &SymValue::concrete(0x5000, 64),
+            &SymValue::concrete(1, 8),
+            1,
+        );
+        state.mem_write(
+            &SymValue::concrete(0x5001, 64),
+            &SymValue::concrete(2, 8),
+            1,
+        );
+        state.mem_write(
+            &SymValue::concrete(0x5002, 64),
+            &SymValue::concrete(3, 8),
+            1,
+        );
+        let branch = super::RuntimeLoopBranch {
+            counter: counter_phi,
+            threshold: 3,
+            target: 0x2000,
+        };
+
+        let system = derive_loop_transition_system(&block, &state, &branch, 0, 3);
+        assert!(!system.is_exact());
+        assert!(
+            system
+                .reasons
+                .contains(&"runtime_loop_non_ram_memory_unsupported".to_string())
+        );
+        assert!(system.recurrences.iter().any(|recurrence| {
+            recurrence.phi == "RBX_2"
+                && matches!(
+                    &recurrence.kind,
+                    LoopRecurrenceKind::Unsupported(reason)
+                        if reason == "fold_operand_not_memory_term"
+                )
+        }));
+        assert!(apply_exact_transition_system(&ctx, &state, &system).is_none());
+    }
+
+    #[test]
     fn derives_exact_xor_symbolic_input_fold_summary() {
         let counter_phi = var("RCX", 2, 8);
         let ptr_phi = var("RDI", 2, 8);
@@ -2414,7 +2579,7 @@ mod tests {
                 },
                 SSAOp::Load {
                     dst: var("TMP", 0, 1),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: ptr_phi,
                 },
                 SSAOp::IntXor {
@@ -2502,7 +2667,7 @@ mod tests {
                 },
                 SSAOp::Load {
                     dst: var("TMP", 0, 1),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: ptr_phi,
                 },
                 SSAOp::IntAdd {
@@ -2584,7 +2749,7 @@ mod tests {
                 },
                 SSAOp::Load {
                     dst: var("TMP", 0, 1),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: ptr_phi,
                 },
                 SSAOp::IntLeft {
@@ -2710,7 +2875,7 @@ mod tests {
                 },
                 SSAOp::Load {
                     dst: var("TMP", 0, 1),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: ptr_phi,
                 },
                 SSAOp::IntXor {

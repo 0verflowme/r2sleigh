@@ -31,7 +31,8 @@ use ffi_v2::{R2SleighContextParam, R2SleighInterprocSeed, R2SleighInterprocSessi
 use analysis::ssa::{r2il_block_defuse_json, r2il_block_to_ssa_json};
 use r2il::{ArchSpec, R2ILBlock, R2ILOp, SwitchCase, SwitchInfo, Varnode, validate_block_full};
 use r2sleigh_export::{
-    ExportFormat, InstructionAction, InstructionExportInput, export_instruction, op_json_named,
+    ExportFormat, InstructionAction, InstructionExportInput, SSA_JSON_SCHEMA_VERSION, SSAOpInfo,
+    export_instruction, op_json_named, ssa_op_to_info,
 };
 use r2sleigh_lift::{Disassembler, SemanticMetadataOptions, build_arch_spec};
 use std::ffi::{CStr, CString};
@@ -1315,23 +1316,14 @@ pub(crate) fn r2il_block_varnodes(ctx: *const R2ILContext, block: *const R2ILBlo
     };
 
     let blk = unsafe { &*block };
-    let mut seen: HashSet<(u8, u64, u32)> = HashSet::new();
+    let mut seen: HashSet<VarnodeKey> = HashSet::new();
     let mut varnodes: Vec<VarnodeInfo> = Vec::new();
 
     for op in &blk.ops {
         for vn in op_all_varnodes(op) {
-            let space_id = match vn.space {
-                r2il::SpaceId::Const => 0,
-                r2il::SpaceId::Register => 1,
-                r2il::SpaceId::Ram => 2,
-                r2il::SpaceId::Unique => 3,
-                r2il::SpaceId::Custom(n) => 4 + (n as u8),
-            };
-            let key = (space_id, vn.offset, vn.size);
-            if seen.contains(&key) {
+            if !seen.insert(varnode_key(vn)) {
                 continue;
             }
-            seen.insert(key);
 
             let (name, space_str) = match vn.space {
                 r2il::SpaceId::Const => (format!("0x{:x}", vn.offset), space_label(vn.space)),
@@ -1606,7 +1598,7 @@ fn varnode_to_json(vn: &Varnode, disasm: &Disassembler) -> Option<serde_json::Va
     Some(json)
 }
 
-#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 struct VarnodeKey {
     space: r2il::SpaceId,
     offset: u64,
@@ -1941,113 +1933,6 @@ fn op_all_varnodes(op: &R2ILOp) -> Vec<&Varnode> {
 // ============================================================================
 // SSA Functions
 // ============================================================================
-
-/// SSA operation info for JSON output.
-#[derive(Serialize)]
-struct SSAOpInfo {
-    op: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    dst: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    sources: Vec<String>,
-}
-
-/// Convert SSAOp to JSON-serializable info.
-fn ssa_op_to_info(op: &r2ssa::SSAOp) -> SSAOpInfo {
-    use r2ssa::SSAOp::*;
-
-    let op_name = match op {
-        Phi { .. } => "Phi",
-        Copy { .. } => "Copy",
-        Load { .. } => "Load",
-        Store { .. } => "Store",
-        Fence { .. } => "Fence",
-        LoadLinked { .. } => "LoadLinked",
-        StoreConditional { .. } => "StoreConditional",
-        AtomicCAS { .. } => "AtomicCAS",
-        LoadGuarded { .. } => "LoadGuarded",
-        StoreGuarded { .. } => "StoreGuarded",
-        IntAdd { .. } => "IntAdd",
-        IntSub { .. } => "IntSub",
-        IntMult { .. } => "IntMult",
-        IntDiv { .. } => "IntDiv",
-        IntSDiv { .. } => "IntSDiv",
-        IntRem { .. } => "IntRem",
-        IntSRem { .. } => "IntSRem",
-        IntNegate { .. } => "IntNegate",
-        IntCarry { .. } => "IntCarry",
-        IntSCarry { .. } => "IntSCarry",
-        IntSBorrow { .. } => "IntSBorrow",
-        IntAnd { .. } => "IntAnd",
-        IntOr { .. } => "IntOr",
-        IntXor { .. } => "IntXor",
-        IntNot { .. } => "IntNot",
-        IntLeft { .. } => "IntLeft",
-        IntRight { .. } => "IntRight",
-        IntSRight { .. } => "IntSRight",
-        IntEqual { .. } => "IntEqual",
-        IntNotEqual { .. } => "IntNotEqual",
-        IntLess { .. } => "IntLess",
-        IntSLess { .. } => "IntSLess",
-        IntLessEqual { .. } => "IntLessEqual",
-        IntSLessEqual { .. } => "IntSLessEqual",
-        IntZExt { .. } => "IntZExt",
-        IntSExt { .. } => "IntSExt",
-        BoolNot { .. } => "BoolNot",
-        BoolAnd { .. } => "BoolAnd",
-        BoolOr { .. } => "BoolOr",
-        BoolXor { .. } => "BoolXor",
-        Piece { .. } => "Piece",
-        Subpiece { .. } => "Subpiece",
-        PopCount { .. } => "PopCount",
-        Lzcount { .. } => "Lzcount",
-        Branch { .. } => "Branch",
-        CBranch { .. } => "CBranch",
-        BranchInd { .. } => "BranchInd",
-        Call { .. } => "Call",
-        CallInd { .. } => "CallInd",
-        CallDefine { .. } => "CallDefine",
-        Return { .. } => "Return",
-        FloatAdd { .. } => "FloatAdd",
-        FloatSub { .. } => "FloatSub",
-        FloatMult { .. } => "FloatMult",
-        FloatDiv { .. } => "FloatDiv",
-        FloatNeg { .. } => "FloatNeg",
-        FloatAbs { .. } => "FloatAbs",
-        FloatSqrt { .. } => "FloatSqrt",
-        FloatCeil { .. } => "FloatCeil",
-        FloatFloor { .. } => "FloatFloor",
-        FloatRound { .. } => "FloatRound",
-        FloatNaN { .. } => "FloatNaN",
-        FloatEqual { .. } => "FloatEqual",
-        FloatNotEqual { .. } => "FloatNotEqual",
-        FloatLess { .. } => "FloatLess",
-        FloatLessEqual { .. } => "FloatLessEqual",
-        Int2Float { .. } => "Int2Float",
-        Float2Int { .. } => "Float2Int",
-        FloatFloat { .. } => "FloatFloat",
-        Trunc { .. } => "Trunc",
-        CallOther { .. } => "CallOther",
-        Nop => "Nop",
-        Unimplemented => "Unimplemented",
-        CpuId { .. } => "CpuId",
-        Breakpoint => "Breakpoint",
-        PtrAdd { .. } => "PtrAdd",
-        PtrSub { .. } => "PtrSub",
-        SegmentOp { .. } => "SegmentOp",
-        New { .. } => "New",
-        Cast { .. } => "Cast",
-        Extract { .. } => "Extract",
-        Insert { .. } => "Insert",
-        Select { .. } => "Select",
-    };
-
-    SSAOpInfo {
-        op: op_name.to_string(),
-        dst: op.dst().map(|v| v.display_name()),
-        sources: op.sources().iter().map(|v| v.display_name()).collect(),
-    }
-}
 
 // Remaining taint/SSA/CFG/sym surfaces are implemented under r2plugin/src/analysis/.
 
@@ -5508,6 +5393,39 @@ mod tests {
     use serde_json::Value;
     use std::ffi::{CStr, CString};
 
+    #[test]
+    fn varnode_dedup_key_preserves_full_custom_space_id() {
+        let low = Varnode::new(r2il::SpaceId::Custom(0), 0x1234, 8);
+        let high = Varnode::new(r2il::SpaceId::Custom(256), 0x1234, 8);
+
+        assert_ne!(varnode_key(&low), varnode_key(&high));
+        assert_eq!(
+            HashSet::from([varnode_key(&low), varnode_key(&high)]).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn c_data_ref_query_refuses_mismatched_record_contract_before_cast() {
+        let source = include_str!("../r_anal_sleigh.c");
+        let table_size_check = source
+            .find("api->struct_size != sizeof (*api)")
+            .expect("C consumer must reject mismatched API tables");
+        let record_size_check = source
+            .find("api->data_ref_size != sizeof (R2SleighDataRef)")
+            .expect("C consumer must reject mismatched data-ref strides");
+        let record_schema_check = source
+            .find("api->data_ref_schema_version != R2SLEIGH_DATA_REF_SCHEMA_V2")
+            .expect("C consumer must reject mismatched data-ref schemas");
+        let record_cast = source
+            .find("const R2SleighDataRef *typed_items")
+            .expect("C consumer must retain the typed data-ref boundary");
+
+        assert!(table_size_check < record_size_check);
+        assert!(record_size_check < record_cast);
+        assert!(record_schema_check < record_cast);
+    }
+
     fn signature_param_candidate(
         name: &str,
         ty: r2types::CTypeLike,
@@ -5549,7 +5467,7 @@ mod tests {
     }
 
     #[test]
-    fn c_plugin_decj_projects_owned_v2_response_as_structured_json() {
+    fn c_plugin_decj_projects_v2_responses_and_refuses_without_borrowed_snapshot() {
         let c_source = include_str!("../r_anal_sleigh.c");
         let project_start = c_source
             .find("static char *sleigh_engine_execute_v2_project(")
@@ -5567,7 +5485,7 @@ mod tests {
             .map(|offset| bytes + offset)
             .expect("structured JSON projection");
         let free = project[json..]
-            .find("api->response_free (response)")
+            .find("sleigh_engine_v2_release_or_preserve (api, &response, &session)")
             .map(|offset| json + offset)
             .expect("opaque response owner release");
         assert!(
@@ -5631,9 +5549,12 @@ mod tests {
             "the exact decj command must route before the backward-compatible dec command"
         );
         assert!(
-            c_source.contains("Usage: a:sla.decj [name|addr]")
-                && c_source.contains("sleigh_decompile_execute (anal, fcn, true)"),
-            "decj must expose help and reuse the same typed V2 decompile input path"
+            c_source.contains(
+                "sla.decj is unavailable outside radare2's borrowed-snapshot decompiler provider; use pdd."
+            ) && c_source.contains("sleigh_decompile_execute (anal, NULL, true)")
+                && c_source.contains("\"borrowed_snapshot_required\"")
+                && c_source.contains("R2SLEIGH_STATUS_UNSUPPORTED_V2"),
+            "direct decj must return a structured refusal instead of constructing source authority"
         );
         assert!(
             c_source.contains("pj_knull (pj, \"rendered_output\")")
@@ -5762,119 +5683,53 @@ mod tests {
     }
 
     #[test]
-    fn c_plugin_preflights_before_lift_and_snapshot_collection() {
+    fn c_plugin_decompile_uses_only_the_borrowed_snapshot_provider() {
         let c_source = include_str!("../r_anal_sleigh.c");
-        let typed_start = c_source
-            .find("static bool sleigh_typed_function_context_build(")
-            .expect("typed context builder");
-        let typed_end = c_source[typed_start..]
-            .find("static bool sleigh_interproc_scope_build(")
-            .map(|offset| typed_start + offset)
-            .expect("function after typed context builder");
-        let typed_builder = &c_source[typed_start..typed_end];
-        let limited_snapshot = typed_builder
-            .find("typed->snapshot = sleigh_function_context_api.snapshot_collect_with_limits")
-            .expect("bounded snapshot collection");
-        let unavailable_snapshot = typed_builder
-            .find("if (!sleigh_function_context_api.snapshot_available)")
-            .expect("bounded snapshot availability refusal");
-        let copied_context_preflight = typed_builder
-            .find("sleigh_typed_context_preflight")
-            .expect("post-collection typed context validation");
+        let direct_start = c_source
+            .find("static char *sleigh_decompile_execute(RAnal *anal")
+            .expect("direct-command refusal helper");
+        let direct_end = c_source[direct_start..]
+            .find("static RCodeMeta *sleigh_decompile(")
+            .map(|offset| direct_start + offset)
+            .expect("borrowed-snapshot provider after direct refusal");
+        let direct = &c_source[direct_start..direct_end];
         assert!(
-            unavailable_snapshot < limited_snapshot && limited_snapshot < copied_context_preflight,
-            "global type limits must be applied by radare2 before plugin-side copied-context validation"
+            direct.contains("direct decompile commands cannot construct source authority")
+                && direct.contains("borrowed_snapshot_required")
         );
-        for cap in [
-            "R2SLEIGH_MAX_CONTEXT_ITEMS_V2",
-            "R2SLEIGH_MAX_NESTED_ITEMS_V2",
-            "R2SLEIGH_MAX_AGGREGATE_STRING_BYTES_V2",
-            "R2SLEIGH_MAX_AGGREGATE_JSON_BYTES_V2",
+        for forbidden in [
+            "get_context (",
+            "sleigh_engine_function_preflight",
+            "lift_function_blocks",
+            "snapshot_collect",
+            "sleigh_engine_execute_v2 (",
         ] {
             assert!(
-                typed_builder[..limited_snapshot].contains(cap),
-                "bounded snapshot must receive {cap} before collection"
+                !direct.contains(forbidden),
+                "direct decompile refusal must not construct authority via {forbidden:?}"
             );
         }
-        assert!(
-            !typed_builder.contains("snapshot_collect_unlimited (")
-                && !typed_builder.contains("r_anal_types_snapshot ("),
-            "bounded V2 context collection must not call legacy unbounded collectors"
-        );
-        let resolver_start = c_source
-            .find("static bool sleigh_resolve_function_context_api(void)")
-            .expect("bounded snapshot resolver");
-        let resolver_end = c_source[resolver_start..]
-            .find("static void sleigh_report_missing_function_context_api(void)")
-            .map(|offset| resolver_start + offset)
-            .expect("function after bounded snapshot resolver");
-        let resolver = &c_source[resolver_start..resolver_end];
-        assert!(
-            resolver.contains(
-                "dlsym (RTLD_DEFAULT, \"r_anal_function_snapshot_collect_with_limits\")",
-            ) && resolver.contains(
-                "dlsym (RTLD_DEFAULT, \"r_anal_function_snapshot_free\")",
-            ) && resolver.contains(
-                "snapshot_available = sleigh_function_context_api.snapshot_collect_with_limits",
-            ) && resolver.contains(
-                "sleigh_function_context_api.available = sleigh_function_context_api.snapshot_available",
-            ),
-            "the exact runtime resolver must require bounded collect and matching free ownership"
-        );
 
-        let start = c_source
-            .find("static RCodeMeta *sleigh_decompile(")
-            .expect("decompiler provider callback");
-        let end = c_source[start..]
+        let provider_start = direct_end;
+        let provider_end = c_source[provider_start..]
             .find("static char *sleigh_cmd(")
-            .map(|offset| start + offset)
+            .map(|offset| provider_start + offset)
             .expect("command callback after decompiler provider");
-        let decompile = &c_source[start..end];
-        let preflight = decompile
-            .find("sleigh_engine_function_preflight")
-            .expect("decompile CFG preflight");
-        let context = decompile
-            .find("get_context (anal)")
-            .expect("architecture context lookup");
-        let lift = decompile
-            .find("sleigh_engine_lift_function_blocks")
-            .expect("bounded function lift");
-        let snapshot = decompile
-            .find("sleigh_typed_function_context_build")
-            .expect("typed snapshot collection");
+        let provider = &c_source[provider_start..provider_end];
         assert!(
-            preflight < context,
-            "CFG cap must precede provider context work"
+            provider.contains("const R2SleighRadareSnapshotInputV2 source")
+                && provider.contains(".snapshot = snapshot")
+                && provider.contains(".accessors = &sleigh_radare_accessors")
+                && provider.contains(".radare_snapshot = &source")
+                && provider.contains("R2SLEIGH_CAP_OPAQUE_RADARE_SNAPSHOT_V2")
+                && provider.contains("sleigh_engine_execute_v2 (")
         );
-        assert!(preflight < lift, "CFG and byte caps must precede lifting");
-        assert!(
-            lift < snapshot,
-            "operation cap must precede snapshot collection"
-        );
-        assert!(
-            decompile.contains("R2SLEIGH_MAX_FUNCTION_BLOCKS_V2")
-                || c_source.contains("R2SLEIGH_MAX_FUNCTION_BLOCKS_V2"),
-            "C preflight must consume generated V2 cap constants"
-        );
-
-        let type_start = c_source
-            .find("if (!strncmp (cmd, \"sla.types\"")
-            .expect("type-function command");
-        let type_end = c_source[type_start..]
-            .find("/* ========== Function-level SSA commands ========== */")
-            .map(|offset| type_start + offset)
-            .expect("command after type-function");
-        let type_command = &c_source[type_start..type_end];
-        let type_preflight = type_command
-            .find("sleigh_engine_function_preflight")
-            .expect("type-function CFG preflight");
-        let type_lift = type_command
-            .find("sleigh_engine_lift_function_blocks")
-            .expect("bounded type-function lift");
-        let type_snapshot = type_command
-            .find("sleigh_typed_function_context_build")
-            .expect("typed snapshot collection");
-        assert!(type_preflight < type_lift && type_lift < type_snapshot);
+        for forbidden in ["get_context (", "lift_function_blocks", "snapshot_collect"] {
+            assert!(
+                !provider.contains(forbidden),
+                "borrowed-snapshot provider must not rebuild source state via {forbidden:?}"
+            );
+        }
     }
 
     #[test]
@@ -6125,16 +5980,29 @@ mod tests {
                 "C plugin glue must not declare or call legacy direct decompile ABI {forbidden:?}"
             );
         }
+        let provider_start = c_source
+            .find("static RCodeMeta *sleigh_decompile(const RAnalFunctionSnapshot *snapshot)")
+            .expect("borrowed-snapshot decompiler provider");
+        let provider_end = c_source[provider_start..]
+            .find("static char *sleigh_cmd(")
+            .map(|offset| provider_start + offset)
+            .expect("command callback after provider");
+        let provider = &c_source[provider_start..provider_end];
         assert!(
-            c_source.contains("sleigh_engine_execute_v2 (")
-                && c_source.contains("R2SLEIGH_REQUEST_DECOMPILE_V2")
-                && c_source.contains("R2SleighEngineRequestPayloadV2 request_payload")
-                && !c_source.contains(concat!(
-                    "r2sleigh_engine_",
-                    "decompile_function (&decompile_input)"
-                )),
-            "C plugin glue must route decompile exclusively through the V2 engine boundary"
+            provider.contains("const R2SleighRadareSnapshotInputV2 source")
+                && provider.contains(".snapshot = snapshot")
+                && provider.contains(".accessors = &sleigh_radare_accessors")
+                && provider.contains("const R2SleighEngineRequestPayloadV2 payload")
+                && provider.contains(".radare_snapshot = &source")
+                && provider.contains("R2SLEIGH_REQUEST_DECOMPILE_V2")
+                && provider.contains("R2SLEIGH_CAP_OPAQUE_RADARE_SNAPSHOT_V2")
+                && provider.contains("sleigh_engine_execute_v2 ("),
+            "C plugin glue must route borrowed snapshots exclusively through the native V2 boundary"
         );
+        assert!(!c_source.contains(concat!(
+            "r2sleigh_engine_",
+            "decompile_function (&decompile_input)"
+        )));
     }
 
     fn register_param(
@@ -6274,10 +6142,24 @@ mod tests {
     }
 
     #[cfg(feature = "x86")]
-    fn block_has_varnode_metadata(block: &R2ILBlock) -> bool {
+    fn block_has_inline_varnode_metadata(block: &R2ILBlock) -> bool {
         block.ops.iter().any(|op| {
             op.output().is_some_and(|vn| vn.meta.is_some())
                 || op.inputs().into_iter().any(|vn| vn.meta.is_some())
+        })
+    }
+
+    #[cfg(feature = "x86")]
+    fn block_has_advisory_semantic_metadata(block: &R2ILBlock) -> bool {
+        block.op_metadata.values().any(|metadata| {
+            metadata.memory_class.is_some()
+                || metadata.endianness.is_some()
+                || metadata.memory_ordering.is_some()
+                || metadata.permissions.is_some()
+                || metadata.valid_range.is_some()
+                || metadata.bank_id.is_some()
+                || metadata.segment_id.is_some()
+                || metadata.atomic_kind.is_some()
         })
     }
 
@@ -6315,24 +6197,34 @@ mod tests {
         let ctx = r2il_arch_init(arch.as_ptr());
         assert!(!ctx.is_null());
 
-        let mut bytes = vec![0x31, 0xC0];
+        // mov eax, dword ptr [rbp - 4]
+        let mut bytes = vec![0x8b, 0x45, 0xfc];
         bytes.resize(16, 0);
 
         let enabled_block = r2il_lift(ctx, bytes.as_ptr(), bytes.len(), 0x1000);
         assert!(!enabled_block.is_null());
+        let enabled = unsafe { &*enabled_block };
         assert!(
-            block_has_varnode_metadata(unsafe { &*enabled_block }),
-            "default lift should annotate register varnodes"
+            !block_has_inline_varnode_metadata(enabled),
+            "semantic enrichment must not mutate canonical varnodes"
         );
+        assert!(
+            block_has_advisory_semantic_metadata(enabled),
+            "default lift should retain advisory memory facts out of band"
+        );
+        let enabled_ops = enabled.ops.clone();
         drop_test_block(enabled_block);
 
         r2il_set_semantic_metadata_enabled(ctx, false);
         let disabled_block = r2il_lift(ctx, bytes.as_ptr(), bytes.len(), 0x1000);
         assert!(!disabled_block.is_null());
+        let disabled = unsafe { &*disabled_block };
         assert!(
-            !block_has_varnode_metadata(unsafe { &*disabled_block }),
-            "disabled semantic metadata must be passed to single-instruction lift"
+            !block_has_inline_varnode_metadata(disabled)
+                && !block_has_advisory_semantic_metadata(disabled),
+            "disabled semantic metadata must suppress only out-of-band enrichment"
         );
+        assert_eq!(enabled_ops, disabled.ops);
 
         drop_test_block(disabled_block);
         drop_test_context(ctx);
@@ -6345,24 +6237,40 @@ mod tests {
         let ctx = r2il_arch_init(arch.as_ptr());
         assert!(!ctx.is_null());
 
-        let mut bytes = vec![0x31, 0xC0];
+        // mov eax, dword ptr [rbp - 4]
+        let mut bytes = vec![0x8b, 0x45, 0xfc];
         bytes.resize(16, 0);
 
-        let enabled_block = r2il_lift_block(ctx, bytes.as_ptr(), bytes.len(), 0x1000, 2);
+        let enabled_block = r2il_lift_block(ctx, bytes.as_ptr(), bytes.len(), 0x1000, 3);
         assert!(!enabled_block.is_null());
+        let enabled = unsafe { &*enabled_block };
         assert!(
-            block_has_varnode_metadata(unsafe { &*enabled_block }),
-            "default block lift should annotate register varnodes"
+            !block_has_inline_varnode_metadata(enabled),
+            "block enrichment must not mutate canonical varnodes"
         );
+        assert!(
+            block_has_advisory_semantic_metadata(enabled),
+            "default block lift should retain advisory memory facts out of band"
+        );
+        let enabled_ops = enabled.ops.clone();
         drop_test_block(enabled_block);
 
         r2il_set_semantic_metadata_enabled(ctx, false);
-        let disabled_block = r2il_lift_block(ctx, bytes.as_ptr(), bytes.len(), 0x1000, 2);
+        let disabled_block = r2il_lift_block(ctx, bytes.as_ptr(), bytes.len(), 0x1000, 3);
         assert!(!disabled_block.is_null());
+        let disabled = unsafe { &*disabled_block };
         assert!(
-            !block_has_varnode_metadata(unsafe { &*disabled_block }),
-            "disabled semantic metadata must be passed to block lift"
+            !block_has_inline_varnode_metadata(disabled)
+                && !block_has_advisory_semantic_metadata(disabled),
+            "disabled semantic metadata must suppress only out-of-band block enrichment"
         );
+        assert!(
+            disabled
+                .op_metadata
+                .values()
+                .all(|metadata| metadata.instruction_addr.is_some())
+        );
+        assert_eq!(enabled_ops, disabled.ops);
 
         drop_test_block(disabled_block);
         drop_test_context(ctx);
@@ -6974,7 +6882,7 @@ mod tests {
             size: 4,
             ops: vec![
                 r2ssa::SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:sp8", 1, 8),
                     val: r2ssa::SSAVar::new("W0", 0, 4),
                 },
@@ -7982,6 +7890,147 @@ mod tests {
 mod integration_tests {
     use super::*;
 
+    fn x86_register_storage(arch: &ArchSpec, name: &str) -> r2ssa::CanonicalStorageId {
+        let register = arch.get_register(name).expect("x86-64 source register");
+        r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset: register.offset,
+            size: register.size,
+        }
+    }
+
+    fn x86_exact_test_snapshot(
+        arch: &ArchSpec,
+        revision: &str,
+        parameter_registers: &[&str],
+        parameter_homes: &[(u32, i64, u32)],
+        local_slots: &[(i64, u32)],
+        first_parameter_has_exact_struct_pointer: bool,
+        call_sites: Vec<r2ssa::SourceCallSiteInterface>,
+    ) -> std::sync::Arc<r2engine::EngineSourceSnapshot> {
+        let revision = revision.as_bytes().to_vec();
+        let parameter_storages = parameter_registers
+            .iter()
+            .map(|name| x86_register_storage(arch, name))
+            .collect::<Vec<_>>();
+        let parameters = parameter_storages
+            .iter()
+            .enumerate()
+            .map(|(index, storage)| r2ssa::SourceAbiParameterSpec::new(index as u32, *storage))
+            .collect::<Vec<_>>();
+        let rbp = x86_register_storage(arch, "RBP");
+        let mut stack_slots = parameter_homes
+            .iter()
+            .map(|(parameter, offset, size)| {
+                r2ssa::SourceStackSlotSpec::new_parameter_home(
+                    r2ssa::StackAddressBase::FramePointer,
+                    rbp,
+                    *offset,
+                    *size,
+                    *parameter,
+                    parameter_storages[*parameter as usize],
+                )
+            })
+            .collect::<Vec<_>>();
+        stack_slots.extend(local_slots.iter().map(|(offset, size)| {
+            r2ssa::SourceStackSlotSpec::new_local(
+                r2ssa::StackAddressBase::FramePointer,
+                rbp,
+                *offset,
+                *size,
+            )
+        }));
+        let return_kind = r2ssa::SourceFunctionReturn::Register {
+            storage: x86_register_storage(arch, "RAX"),
+        };
+        let interface = if first_parameter_has_exact_struct_pointer {
+            let scalar_carrier =
+                r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::LowBits, 0, 32);
+            let parameter_logical_values = parameters
+                .iter()
+                .enumerate()
+                .map(|(index, _)| {
+                    if index == 0 {
+                        r2ssa::SourceLogicalValue::new(
+                            2,
+                            r2ssa::SourceCarrierProjection::new(
+                                r2ssa::SourceCarrierKind::Full,
+                                0,
+                                64,
+                            ),
+                        )
+                    } else {
+                        r2ssa::SourceLogicalValue::new(1, scalar_carrier)
+                    }
+                })
+                .collect::<Vec<_>>();
+            let type_graph = r2ssa::SourceTypeGraph::new(
+                [
+                    r2ssa::SourceType::new(
+                        0,
+                        r2ssa::SourceTypeKind::Struct { aggregate_id: 0 },
+                        56 * 8,
+                        32,
+                    ),
+                    r2ssa::SourceType::new(1, r2ssa::SourceTypeKind::SignedInteger, 32, 32),
+                    r2ssa::SourceType::new(
+                        2,
+                        r2ssa::SourceTypeKind::Pointer { target_type_id: 0 },
+                        64,
+                        64,
+                    ),
+                ],
+                [r2ssa::SourceAggregateLayout::new(
+                    0,
+                    0,
+                    56 * 8,
+                    32,
+                    "FixtureStruct",
+                    (0..14).map(|index| {
+                        r2ssa::SourceAggregateMember::new(
+                            index,
+                            1,
+                            u64::from(index) * 32,
+                            32,
+                            format!("field_{index}"),
+                        )
+                    }),
+                )],
+            )
+            .expect("x86-64 pointer parameter type graph");
+            r2ssa::SourceFunctionInterface::new_exact_with_logical_types(
+                revision.clone(),
+                "sysv64",
+                parameters,
+                return_kind,
+                stack_slots,
+                parameter_logical_values,
+                Some(r2ssa::SourceLogicalValue::new(1, scalar_carrier)),
+                Some(type_graph),
+            )
+        } else {
+            r2ssa::SourceFunctionInterface::new_exact(
+                revision.clone(),
+                "sysv64",
+                parameters,
+                return_kind,
+                stack_slots,
+            )
+        }
+        .and_then(|interface| {
+            interface.with_return_address_storage(x86_register_storage(arch, "RIP"))
+        })
+        .and_then(|interface| {
+            interface.with_stack_pointer_storage(x86_register_storage(arch, "RSP"))
+        })
+        .and_then(|interface| interface.with_frame_pointer_storage(rbp))
+        .expect("exact x86-64 test source interface");
+        std::sync::Arc::new(
+            r2engine::EngineSourceSnapshot::new(revision, Some(interface), call_sites)
+                .expect("immutable x86-64 test source snapshot"),
+        )
+    }
+
     fn test_function_context(external_context: &CString) -> R2SleighFunctionContext {
         R2SleighFunctionContext {
             schema_version: 3,
@@ -8174,13 +8223,9 @@ mod integration_tests {
             r2engine::EngineExecutionControl::default(),
         )
         .expect("decompile output should be produced");
-        assert!(
-            output.output.contains("r2dec residual:")
-                && !output
-                    .output
-                    .starts_with("allocation_ptr dbg.alloc_wrapper("),
-            "{}",
-            output.output
+        assert_eq!(
+            output.output,
+            "/* r2dec fallback: skipped decompilation for dbg.alloc_wrapper (engine analysis requires an immutable source snapshot) */"
         );
 
         drop_test_context(ctx);
@@ -8715,7 +8760,7 @@ mod integration_tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:v", 1, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:base", 1, 8),
                 },
                 r2ssa::SSAOp::IntAdd {
@@ -8725,7 +8770,7 @@ mod integration_tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:v2", 1, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:base_4", 1, 8),
                 },
             ],
@@ -8797,7 +8842,7 @@ mod integration_tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:v", 1, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:base", 1, 8),
                 },
             ],
@@ -8833,7 +8878,7 @@ mod integration_tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:a0", 1, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:base_a", 1, 8),
                 },
                 r2ssa::SSAOp::IntAdd {
@@ -8842,7 +8887,7 @@ mod integration_tests {
                     b: r2ssa::SSAVar::new("const:4", 0, 8),
                 },
                 r2ssa::SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:base_a_4", 1, 8),
                     val: r2ssa::SSAVar::new("tmp:a1", 1, 4),
                 },
@@ -8852,7 +8897,7 @@ mod integration_tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:b0", 1, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:base_b", 1, 8),
                 },
             ],
@@ -8919,7 +8964,7 @@ mod integration_tests {
     }
 
     #[test]
-    fn direct_call_targets_typed_reports_copied_constant_indirect_call_target() {
+    fn detached_direct_call_targets_refuse_without_immutable_snapshot() {
         let arch = CString::new("x86-64").expect("valid arch");
         let ctx = r2il_arch_init(arch.as_ptr());
         assert!(!ctx.is_null(), "context should initialize");
@@ -8952,22 +8997,11 @@ mod integration_tests {
             func_name.as_ptr(),
         );
         assert!(
-            !out.is_null(),
-            "typed direct target payload should not be null"
+            out.is_null(),
+            "detached blocks must not regain source authority through the legacy target query"
         );
-        let mut count = 0usize;
-        let items = r2sleigh_u64_array_items(out, &mut count);
-        assert!(
-            !items.is_null(),
-            "typed direct target items should not be null"
-        );
-        let targets = unsafe { std::slice::from_raw_parts(items, count) }.to_vec();
-
-        r2sleigh_u64_array_free(out);
         drop_test_block(raw_block);
         drop_test_context(ctx);
-
-        assert_eq!(targets, vec![0x2000]);
     }
 
     #[test]
@@ -8989,7 +9023,7 @@ mod integration_tests {
                     b: r2ssa::SSAVar::new("const:8", 0, 8),
                 },
                 r2ssa::SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6500", 1, 8),
                     val: r2ssa::SSAVar::new("X0", 0, 8),
                 },
@@ -8999,7 +9033,7 @@ mod integration_tests {
                     b: r2ssa::SSAVar::new("const:4", 0, 8),
                 },
                 r2ssa::SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6400", 1, 8),
                     val: r2ssa::SSAVar::new("W1", 0, 4),
                 },
@@ -9010,7 +9044,7 @@ mod integration_tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("X9", 1, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6500", 2, 8),
                 },
                 r2ssa::SSAOp::IntAdd {
@@ -9019,7 +9053,7 @@ mod integration_tests {
                     b: r2ssa::SSAVar::new("const:30", 0, 8),
                 },
                 r2ssa::SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6400", 3, 8),
                     val: r2ssa::SSAVar::new("W8", 0, 4),
                 },
@@ -9030,7 +9064,7 @@ mod integration_tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("X9", 2, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6500", 4, 8),
                 },
                 r2ssa::SSAOp::Copy {
@@ -9039,7 +9073,7 @@ mod integration_tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:24c00", 3, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6780", 1, 8),
                 },
             ],
@@ -9075,7 +9109,7 @@ mod integration_tests {
                     b: r2ssa::SSAVar::new("const:8", 0, 8),
                 },
                 r2ssa::SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6500", 1, 8),
                     val: r2ssa::SSAVar::new("X0", 0, 8),
                 },
@@ -9085,7 +9119,7 @@ mod integration_tests {
                     b: r2ssa::SSAVar::new("const:4", 0, 8),
                 },
                 r2ssa::SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6400", 1, 8),
                     val: r2ssa::SSAVar::new("W1", 0, 4),
                 },
@@ -9096,7 +9130,7 @@ mod integration_tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("X9", 1, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6500", 2, 8),
                 },
                 r2ssa::SSAOp::IntAdd {
@@ -9105,7 +9139,7 @@ mod integration_tests {
                     b: r2ssa::SSAVar::new("const:30", 0, 8),
                 },
                 r2ssa::SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6400", 3, 8),
                     val: r2ssa::SSAVar::new("W8", 0, 4),
                 },
@@ -9116,7 +9150,7 @@ mod integration_tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("X9", 2, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6500", 4, 8),
                 },
                 r2ssa::SSAOp::Copy {
@@ -9125,7 +9159,7 @@ mod integration_tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:24c00", 3, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6780", 1, 8),
                 },
             ],
@@ -9190,7 +9224,7 @@ mod integration_tests {
                     b: r2ssa::SSAVar::new("const:8", 0, 8),
                 },
                 r2ssa::SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6500", 1, 8),
                     val: r2ssa::SSAVar::new("X0", 0, 8),
                 },
@@ -9200,7 +9234,7 @@ mod integration_tests {
                     b: r2ssa::SSAVar::new("const:4", 0, 8),
                 },
                 r2ssa::SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6400", 1, 8),
                     val: r2ssa::SSAVar::new("W1", 0, 4),
                 },
@@ -9211,7 +9245,7 @@ mod integration_tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("X9", 1, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6500", 2, 8),
                 },
                 r2ssa::SSAOp::IntAdd {
@@ -9221,7 +9255,7 @@ mod integration_tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:26b00", 1, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6400", 2, 8),
                 },
                 r2ssa::SSAOp::IntSExt {
@@ -9244,7 +9278,7 @@ mod integration_tests {
                     b: r2ssa::SSAVar::new("const:8", 0, 8),
                 },
                 r2ssa::SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6400", 3, 8),
                     val: r2ssa::SSAVar::new("W8", 0, 4),
                 },
@@ -9255,7 +9289,7 @@ mod integration_tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("X9", 5, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6500", 3, 8),
                 },
                 r2ssa::SSAOp::IntAdd {
@@ -9265,7 +9299,7 @@ mod integration_tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:26b00", 3, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6400", 6, 8),
                 },
                 r2ssa::SSAOp::IntSExt {
@@ -9289,7 +9323,7 @@ mod integration_tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:24c00", 3, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6400", 7, 8),
                 },
             ],
@@ -9322,7 +9356,7 @@ mod integration_tests {
                     b: r2ssa::SSAVar::new("const:8", 0, 8),
                 },
                 r2ssa::SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6500", 1, 8),
                     val: r2ssa::SSAVar::new("X0", 0, 8),
                 },
@@ -9332,7 +9366,7 @@ mod integration_tests {
                     b: r2ssa::SSAVar::new("const:4", 0, 8),
                 },
                 r2ssa::SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6400", 1, 8),
                     val: r2ssa::SSAVar::new("W1", 0, 4),
                 },
@@ -9341,7 +9375,7 @@ mod integration_tests {
                     src: r2ssa::SSAVar::new("SP", 1, 8),
                 },
                 r2ssa::SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6780", 1, 8),
                     val: r2ssa::SSAVar::new("W2", 0, 4),
                 },
@@ -9351,7 +9385,7 @@ mod integration_tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:24c00", 1, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6780", 2, 8),
                 },
                 r2ssa::SSAOp::IntZExt {
@@ -9365,7 +9399,7 @@ mod integration_tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("X9", 1, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6500", 2, 8),
                 },
                 r2ssa::SSAOp::IntAdd {
@@ -9375,7 +9409,7 @@ mod integration_tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:26b00", 1, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6400", 2, 8),
                 },
                 r2ssa::SSAOp::IntSExt {
@@ -9410,7 +9444,7 @@ mod integration_tests {
                     b: r2ssa::SSAVar::new("const:8", 0, 8),
                 },
                 r2ssa::SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6400", 3, 8),
                     val: r2ssa::SSAVar::new("W8", 0, 4),
                 },
@@ -9421,7 +9455,7 @@ mod integration_tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("X9", 5, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6500", 4, 8),
                 },
                 r2ssa::SSAOp::IntAdd {
@@ -9431,7 +9465,7 @@ mod integration_tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:26b00", 3, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6400", 6, 8),
                 },
                 r2ssa::SSAOp::IntSExt {
@@ -9463,7 +9497,7 @@ mod integration_tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:24c00", 3, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6400", 7, 8),
                 },
             ],
@@ -9486,7 +9520,7 @@ mod integration_tests {
                     b: r2ssa::SSAVar::new("const:8", 0, 8),
                 },
                 r2ssa::SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6500", 1, 8),
                     val: r2ssa::SSAVar::new("X0", 0, 8),
                 },
@@ -9496,7 +9530,7 @@ mod integration_tests {
                     b: r2ssa::SSAVar::new("const:4", 0, 8),
                 },
                 r2ssa::SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6400", 1, 8),
                     val: r2ssa::SSAVar::new("W1", 0, 4),
                 },
@@ -9505,7 +9539,7 @@ mod integration_tests {
                     src: r2ssa::SSAVar::new("SP", 1, 8),
                 },
                 r2ssa::SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6780", 1, 8),
                     val: r2ssa::SSAVar::new("W2", 0, 4),
                 },
@@ -9515,7 +9549,7 @@ mod integration_tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:24c00", 1, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6780", 2, 8),
                 },
                 r2ssa::SSAOp::IntZExt {
@@ -9529,7 +9563,7 @@ mod integration_tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("X9", 1, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6500", 2, 8),
                 },
                 r2ssa::SSAOp::IntAdd {
@@ -9539,7 +9573,7 @@ mod integration_tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:26b00", 1, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6400", 2, 8),
                 },
                 r2ssa::SSAOp::IntSExt {
@@ -9594,7 +9628,7 @@ mod integration_tests {
                     b: r2ssa::SSAVar::new("const:8", 0, 8),
                 },
                 r2ssa::SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6400", 3, 8),
                     val: r2ssa::SSAVar::new("W8", 0, 4),
                 },
@@ -9605,7 +9639,7 @@ mod integration_tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("X8", 2, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6500", 3, 8),
                 },
                 r2ssa::SSAOp::IntAdd {
@@ -9615,7 +9649,7 @@ mod integration_tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:26b00", 2, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6400", 4, 8),
                 },
                 r2ssa::SSAOp::IntSExt {
@@ -9667,7 +9701,7 @@ mod integration_tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:24c00", 2, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6400", 5, 8),
                 },
                 r2ssa::SSAOp::IntZExt {
@@ -9681,7 +9715,7 @@ mod integration_tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("X9", 5, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6500", 4, 8),
                 },
                 r2ssa::SSAOp::IntAdd {
@@ -9691,7 +9725,7 @@ mod integration_tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:26b00", 3, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6400", 6, 8),
                 },
                 r2ssa::SSAOp::IntSExt {
@@ -9743,7 +9777,7 @@ mod integration_tests {
                 },
                 r2ssa::SSAOp::Load {
                     dst: r2ssa::SSAVar::new("tmp:24c00", 3, 4),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: r2ssa::SSAVar::new("tmp:6400", 7, 8),
                 },
                 r2ssa::SSAOp::IntZExt {
@@ -9899,27 +9933,49 @@ mod integration_tests {
                 bits: 64,
                 signedness: r2types::Signedness::Signed,
             }),
-            params: vec![r2types::FunctionParamSpec {
-                name: "arg1".to_string(),
-                ty: Some(r2types::CTypeLike::Int {
-                    bits: 64,
-                    signedness: r2types::Signedness::Signed,
-                }),
-            }],
+            params: vec![
+                r2types::FunctionParamSpec {
+                    name: "arg0".to_string(),
+                    ty: None,
+                },
+                r2types::FunctionParamSpec {
+                    name: "arg1".to_string(),
+                    ty: Some(r2types::CTypeLike::Int {
+                        bits: 64,
+                        signedness: r2types::Signedness::Signed,
+                    }),
+                },
+            ],
         };
         let parsed_context = r2types::ParsedExternalContext {
             current_signature: Some(host_signature.clone()),
             merged_signature: Some(host_signature),
-            register_params: vec![r2types::ExternalRegisterParamSpec {
-                name: "arg1".to_string(),
-                ty: Some(r2types::CTypeLike::Int {
-                    bits: 64,
-                    signedness: r2types::Signedness::Signed,
-                }),
-                reg: "RDI".to_string(),
-            }],
+            register_params: vec![
+                r2types::ExternalRegisterParamSpec {
+                    name: "arg0".to_string(),
+                    ty: None,
+                    reg: "RDI".to_string(),
+                },
+                r2types::ExternalRegisterParamSpec {
+                    name: "arg1".to_string(),
+                    ty: Some(r2types::CTypeLike::Int {
+                        bits: 64,
+                        signedness: r2types::Signedness::Signed,
+                    }),
+                    reg: "RSI".to_string(),
+                },
+            ],
             ..r2types::ParsedExternalContext::default()
         };
+        let source_snapshot = x86_exact_test_snapshot(
+            &arch,
+            "sum-array/rev1",
+            &["RDI", "RSI"],
+            &[(0, -8, 8), (1, -12, 4)],
+            &[(-16, 4), (-20, 4)],
+            true,
+            Vec::new(),
+        );
         let response = r2engine::EngineSession::new(8).decompile_function_from_input(
             r2engine::EngineFunctionDecompileRequestInput::single_function(
                 r2engine::EngineFunctionInput {
@@ -9928,7 +9984,7 @@ mod integration_tests {
                     blocks,
                     arch: Some(arch.clone()),
                     semantic_metadata_enabled: false,
-                    source_snapshot: None,
+                    source_snapshot: Some(source_snapshot),
                 },
                 Some(64),
                 parsed_context,
@@ -9966,7 +10022,7 @@ mod integration_tests {
 
     #[test]
     #[cfg(feature = "x86")]
-    fn lifted_x86_struct_array_analysis_artifact_surfaces_local_struct_override() {
+    fn lifted_x86_struct_array_analysis_artifact_does_not_fabricate_local_struct() {
         fn decode_hex(bytes: &str) -> Vec<u8> {
             let bytes = bytes.as_bytes();
             assert_eq!(bytes.len() % 2, 0, "hex input must have even length");
@@ -10010,6 +10066,15 @@ mod integration_tests {
             false,
             &std::collections::HashMap::new(),
             "{}",
+            x86_exact_test_snapshot(
+                &arch,
+                "struct-array-analysis/rev1",
+                &["RDI", "RSI", "RDX"],
+                &[(0, -8, 8), (1, -12, 4), (2, -16, 4)],
+                &[],
+                true,
+                Vec::new(),
+            ),
         )
         .expect("analysis artifact");
 
@@ -10023,102 +10088,31 @@ mod integration_tests {
             .map(r2types::render_c_type_like)
             .unwrap_or_default();
         let compact = rendered.replace(' ', "");
+        // Exact source types belong to the trusted prepared-semantic path. The
+        // detached legacy type-fact layer must not synthesize a second struct
+        // authority from presentation context plus lifted address arithmetic.
+        assert!(!compact.starts_with("struct") || !compact.ends_with('*'));
         assert!(
-            compact.starts_with("struct")
-                && compact.ends_with('*')
-                && !compact.eq_ignore_ascii_case("void*"),
-            "expected lifted-byte x86 artifact to override arg0 to a struct pointer, got signature={:?}, slot_overrides={:?}, slot_fields={:?}, type_db={:?}, raw_structs={:?}, raw_diagnostics={:?}, pattern_ssa_blocks={:?}",
-            artifact.function_facts.type_facts().merged_signature,
-            artifact.function_facts.type_facts().slot_type_overrides,
-            artifact.function_facts.type_facts().slot_field_profiles,
+            artifact
+                .function_facts
+                .type_facts()
+                .slot_type_overrides
+                .is_empty()
+        );
+        assert!(
             artifact
                 .function_facts
                 .type_facts()
                 .external_type_db
-                .structs,
-            raw_structs,
-            raw_diagnostics,
-            pattern_ssa_blocks
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "x86")]
-    fn lifted_x86_struct_array_detached_artifact_with_live_context_keeps_struct_override() {
-        fn decode_hex(bytes: &str) -> Vec<u8> {
-            let bytes = bytes.as_bytes();
-            assert_eq!(bytes.len() % 2, 0, "hex input must have even length");
-            bytes
-                .chunks_exact(2)
-                .map(|pair| {
-                    let hi = (pair[0] as char).to_digit(16).expect("valid hex") as u8;
-                    let lo = (pair[1] as char).to_digit(16).expect("valid hex") as u8;
-                    (hi << 4) | lo
-                })
-                .collect()
-        }
-
-        let (arch, disasm) = create_disassembler_for_arch("x86-64").expect("disassembler");
-        let bytes = decode_hex(
-            "f30f1efa554889e548897df88975f48955f08b45f44863d04889d048c1e0034829d048c1e0034889c2488b45f84801c28b45f08942088b45f44863d04889d048c1e0034829d048c1e0034889c2488b45f84801d08b48088b45f44863d04889d048c1e0034829d048c1e0034889c2488b45f84801d08b403401c85dc3",
-        );
-        let block = disasm
-            .lift_block(&bytes, 0x40182f, 124)
-            .expect("lifted block");
-        let blocks = vec![block];
-        let reg_type_hints = crate::types::collect_register_type_hints(&blocks, &disasm);
-        let external_context = serde_json::json!({
-            "signature": {
-                "name": "dbg.test_struct_array_index",
-                "ret": "int32_t",
-                "callconv": "amd64",
-                "params": [
-                    {"name": "arr", "type": "void *"},
-                    {"name": "idx", "type": "int32_t"},
-                    {"name": "v", "type": "int32_t"}
-                ]
-            },
-            "base_types": []
-        })
-        .to_string();
-
-        let artifact = crate::types::build_detached_function_analysis_artifact(
-            &blocks,
-            "dbg.test_struct_array_index",
-            Some(&arch),
-            64,
-            true,
-            &reg_type_hints,
-            &external_context,
-        )
-        .expect("analysis artifact");
-
-        let type_facts = artifact.function_facts.type_facts();
-        let struct_pointer = type_facts
-            .slot_type_overrides
-            .get(&0)
-            .expect("slot 0 local struct override");
-        let struct_name = struct_pointer
-            .strip_prefix("struct ")
-            .and_then(|name| name.strip_suffix(" *"))
-            .filter(|name| name.starts_with("sla_struct_"))
-            .expect("generated local struct pointer");
-        assert!(
-            type_facts
-                .external_type_db
                 .structs
-                .contains_key(struct_name),
-            "expected live-context detached artifact to keep the local struct override, got merged_signature={:?}, slot_overrides={:?}, slot_fields={:?}, type_db={:?}",
-            type_facts.merged_signature,
-            type_facts.slot_type_overrides,
-            type_facts.slot_field_profiles,
-            type_facts.external_type_db.structs
+                .is_empty()
         );
+        assert!(raw_structs.0.is_empty());
     }
 
     #[test]
     #[cfg(feature = "x86")]
-    fn lifted_x86_struct_array_detached_artifact_keeps_sparse_field_offsets() {
+    fn lifted_x86_struct_array_detached_artifact_with_live_context_does_not_fabricate_struct() {
         fn decode_hex(bytes: &str) -> Vec<u8> {
             let bytes = bytes.as_bytes();
             assert_eq!(bytes.len() % 2, 0, "hex input must have even length");
@@ -10164,48 +10158,89 @@ mod integration_tests {
             true,
             &reg_type_hints,
             &external_context,
+            x86_exact_test_snapshot(
+                &arch,
+                "struct-array-live-context/rev1",
+                &["RDI", "RSI", "RDX"],
+                &[(0, -8, 8), (1, -12, 4), (2, -16, 4)],
+                &[],
+                true,
+                Vec::new(),
+            ),
         )
         .expect("analysis artifact");
 
         let type_facts = artifact.function_facts.type_facts();
-        let struct_pointer = type_facts
-            .slot_type_overrides
-            .get(&0)
-            .expect("slot 0 local struct override");
-        let struct_name = struct_pointer
-            .strip_prefix("struct ")
-            .and_then(|name| name.strip_suffix(" *"))
-            .filter(|name| name.starts_with("sla_struct_"))
-            .expect("generated local struct pointer");
-        let struct_decl = artifact
-            .writeback_plan
-            .struct_decls
-            .iter()
-            .find(|decl| decl.name == struct_name)
-            .expect("expected local struct decl");
-        let field_offsets = struct_decl
-            .fields
-            .iter()
-            .map(|field| (field.offset, field.name.as_str()))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            field_offsets,
-            vec![(8, "f_8"), (0x34, "f_34")],
-            "expected sparse field offsets to survive writeback plan, got {:?}",
-            struct_decl.fields
-        );
+        assert!(type_facts.slot_type_overrides.is_empty());
+        assert!(type_facts.slot_field_profiles.is_empty());
+        assert!(type_facts.external_type_db.structs.is_empty());
+    }
 
-        let db_struct = type_facts
-            .external_type_db
-            .structs
-            .get(struct_name)
-            .expect("expected merged struct in type db");
-        assert_eq!(
-            db_struct.fields.keys().copied().collect::<Vec<_>>(),
-            vec![8, 0x34],
-            "expected sparse field offsets in merged type db, got {:?}",
-            db_struct.fields
+    #[test]
+    #[cfg(feature = "x86")]
+    fn lifted_x86_struct_array_detached_artifact_does_not_fabricate_sparse_fields() {
+        fn decode_hex(bytes: &str) -> Vec<u8> {
+            let bytes = bytes.as_bytes();
+            assert_eq!(bytes.len() % 2, 0, "hex input must have even length");
+            bytes
+                .chunks_exact(2)
+                .map(|pair| {
+                    let hi = (pair[0] as char).to_digit(16).expect("valid hex") as u8;
+                    let lo = (pair[1] as char).to_digit(16).expect("valid hex") as u8;
+                    (hi << 4) | lo
+                })
+                .collect()
+        }
+
+        let (arch, disasm) = create_disassembler_for_arch("x86-64").expect("disassembler");
+        let bytes = decode_hex(
+            "f30f1efa554889e548897df88975f48955f08b45f44863d04889d048c1e0034829d048c1e0034889c2488b45f84801c28b45f08942088b45f44863d04889d048c1e0034829d048c1e0034889c2488b45f84801d08b48088b45f44863d04889d048c1e0034829d048c1e0034889c2488b45f84801d08b403401c85dc3",
         );
+        let block = disasm
+            .lift_block(&bytes, 0x40182f, 124)
+            .expect("lifted block");
+        let blocks = vec![block];
+        let reg_type_hints = crate::types::collect_register_type_hints(&blocks, &disasm);
+        let external_context = serde_json::json!({
+            "signature": {
+                "name": "dbg.test_struct_array_index",
+                "ret": "int32_t",
+                "callconv": "amd64",
+                "params": [
+                    {"name": "arr", "type": "void *"},
+                    {"name": "idx", "type": "int32_t"},
+                    {"name": "v", "type": "int32_t"}
+                ]
+            },
+            "base_types": []
+        })
+        .to_string();
+
+        let artifact = crate::types::build_detached_function_analysis_artifact(
+            &blocks,
+            "dbg.test_struct_array_index",
+            Some(&arch),
+            64,
+            true,
+            &reg_type_hints,
+            &external_context,
+            x86_exact_test_snapshot(
+                &arch,
+                "struct-array-sparse-fields/rev1",
+                &["RDI", "RSI", "RDX"],
+                &[(0, -8, 8), (1, -12, 4), (2, -16, 4)],
+                &[],
+                true,
+                Vec::new(),
+            ),
+        )
+        .expect("analysis artifact");
+
+        let type_facts = artifact.function_facts.type_facts();
+        assert!(type_facts.slot_type_overrides.is_empty());
+        assert!(type_facts.slot_field_profiles.is_empty());
+        assert!(type_facts.external_type_db.structs.is_empty());
+        assert!(artifact.writeback_plan.struct_decls.is_empty());
     }
     #[test]
     #[cfg(feature = "x86")]
@@ -10246,6 +10281,45 @@ mod integration_tests {
             "base_types": []
         })
         .to_string();
+        let (call_op_index, call_target) = block
+            .ops
+            .iter()
+            .enumerate()
+            .find_map(|(op_index, op)| match op {
+                R2ILOp::Call { target } => Some((op_index, target)),
+                _ => None,
+            })
+            .expect("one lifted direct call");
+        let revision = "alloc-wrapper2/rev1";
+        let call_site = r2ssa::SourceCallSiteInterface::new(
+            revision.as_bytes().to_vec(),
+            r2ssa::SourceCallSiteIdentity::new(
+                block.addr,
+                call_op_index,
+                r2ssa::CanonicalStorageId::from_varnode(call_target),
+            ),
+            true,
+            "sysv64",
+            [r2ssa::SourceCallArgumentSpec::new(
+                0,
+                x86_register_storage(&arch, "RDI"),
+            )],
+            false,
+            false,
+            r2ssa::SourceCallResult::Register {
+                storage: x86_register_storage(&arch, "RAX"),
+            },
+        )
+        .expect("exact alloc-wrapper2 callsite interface");
+        let source_snapshot = x86_exact_test_snapshot(
+            &arch,
+            revision,
+            &["RDI"],
+            &[(0, -8, 8)],
+            &[],
+            false,
+            vec![call_site],
+        );
 
         let artifact = crate::types::build_detached_function_analysis_artifact(
             std::slice::from_ref(&block),
@@ -10255,6 +10329,7 @@ mod integration_tests {
             true,
             &reg_type_hints,
             &external_context,
+            std::sync::Arc::clone(&source_snapshot),
         )
         .expect("analysis artifact");
         assert_eq!(
@@ -10285,7 +10360,7 @@ mod integration_tests {
             blocks: vec![block],
             arch: Some(arch),
             semantic_metadata_enabled: true,
-            source_snapshot: None,
+            source_snapshot: Some(source_snapshot),
         };
         let response = r2engine::EngineSession::new(4).decompile_function_from_input(
             r2engine::EngineFunctionDecompileRequestInput::single_function(

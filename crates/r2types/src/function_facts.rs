@@ -547,6 +547,7 @@ impl FunctionRenderFacts {
         block_addr: u64,
         op_index: usize,
         is_write: bool,
+        space: r2il::SpaceId,
         address: r2ssa::ValueId,
         value: Option<r2ssa::ValueId>,
     ) -> Option<r2ssa::SemanticId> {
@@ -556,7 +557,7 @@ impl FunctionRenderFacts {
             .iter()
             .filter_map(|id| match self.certified_effects.get(id) {
                 Some(CertifiedEffect::Memory { fact, .. })
-                    if fact.address == address && fact.value == value =>
+                    if fact.space == space && fact.address == address && fact.value == value =>
                 {
                     Some(*id)
                 }
@@ -583,8 +584,10 @@ impl FunctionRenderFacts {
         block_addr: u64,
         op_index: usize,
         is_write: bool,
+        space: r2il::SpaceId,
     ) -> Option<&MemoryAccessRenderFact> {
-        self.memory_effects_by_op
+        let mut matching = self
+            .memory_effects_by_op
             .get(&(block_addr, op_index, is_write))?
             .iter()
             .filter_map(|id| {
@@ -592,7 +595,9 @@ impl FunctionRenderFacts {
                     .get(id)
                     .and_then(CertifiedEffect::memory_fact)
             })
-            .find(|fact| fact.width > 0)
+            .filter(|fact| fact.space == space && fact.width > 0);
+        let first = matching.next()?;
+        matching.next().is_none().then_some(first)
     }
 
     pub fn memory_access(
@@ -1130,6 +1135,7 @@ pub struct MemoryAccessRenderFact {
     pub access: r2ssa::StructuredAccessId,
     pub block_addr: u64,
     pub op_index: usize,
+    pub space: r2il::SpaceId,
     pub object: r2ssa::ObjectId,
     pub address: r2ssa::ValueId,
     pub value: Option<r2ssa::ValueId>,
@@ -3536,6 +3542,7 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
                         access: cert.access,
                         block_addr: cert.block_addr,
                         op_index: cert.op_index,
+                        space: cert.space,
                         object: cert.object,
                         address: cert.address,
                         value: cert.value,
@@ -4976,7 +4983,43 @@ mod tests {
         arch.add_register(RegisterDef::new("rsi", 0x18, 8));
         arch.add_register(RegisterDef::sub("esi", 0x18, 4, "rsi"));
         arch.add_register(RegisterDef::new("rbp", 0x20, 8));
+        arch.add_register(RegisterDef::new("rsp", 0x28, 8));
+        arch.add_register(RegisterDef::new("rip", 0x30, 8));
         arch
+    }
+
+    fn x86_stack_home_prepared(blocks: &[R2ILBlock]) -> r2ssa::SsaArtifact {
+        let register_storage = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let frame_pointer = register_storage(0x20);
+        let parameter = register_storage(0x10);
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            b"x86-stack-home-fixture".to_vec(),
+            "sysv64",
+            [r2ssa::SourceAbiParameterSpec::new(0, parameter)],
+            r2ssa::SourceFunctionReturn::Void,
+            [r2ssa::SourceStackSlotSpec::new_parameter_home(
+                r2ssa::StackAddressBase::FramePointer,
+                frame_pointer,
+                -8,
+                8,
+                0,
+                parameter,
+            )],
+        )
+        .and_then(|interface| interface.with_return_address_storage(register_storage(0x30)))
+        .and_then(|interface| interface.with_stack_pointer_storage(register_storage(0x28)))
+        .and_then(|interface| interface.with_frame_pointer_storage(frame_pointer))
+        .expect("exact x86 stack-home interface");
+        r2ssa::SsaArtifact::for_decompile_with_interface(
+            blocks,
+            Some(&x86_stack_home_arch()),
+            interface,
+        )
+        .expect("prepared exact stack-home fixture")
     }
 
     fn x86_stack_home_param_slots() -> ParamSlotResolver {
@@ -5009,8 +5052,7 @@ mod tests {
         block.push(R2ILOp::Return {
             target: Varnode::unique(0x108, 8),
         });
-        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
-            .expect("prepared");
+        let prepared = x86_stack_home_prepared(&[block]);
         let signature = FunctionSignatureSpec {
             ret_type: Some(CTypeLike::Int {
                 bits: 64,
@@ -5106,7 +5148,7 @@ mod tests {
             .values()
             .filter(|effect| effect.kind() == CertifiedEffectKind::Return)
             .count();
-        assert_eq!(certified_entities, 2);
+        assert_eq!(certified_entities, 3);
         assert!(
             render
                 .certified_entities
@@ -5448,7 +5490,7 @@ mod tests {
             space: SpaceId::Ram,
             addr: Varnode::unique(0x118, 8),
         });
-        r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch())).expect("prepared")
+        x86_stack_home_prepared(&[block])
     }
 
     #[test]
@@ -5802,6 +5844,7 @@ mod tests {
                             access,
                             block_addr: 0x401000,
                             op_index: 4,
+                            space: r2il::SpaceId::Ram,
                             object,
                             address: r2ssa::ValueId(52),
                             value: Some(value),
@@ -5900,9 +5943,11 @@ mod tests {
         assert_eq!(
             facts
                 .render()
-                .and_then(|render| render.memory_access_for_op(0x401000, 4, true))
-                .map(|memory| (memory.access, memory.value, memory.width)),
-            Some((access, Some(value), 8)),
+                .and_then(|render| {
+                    render.memory_access_for_op(0x401000, 4, true, r2il::SpaceId::Ram)
+                })
+                .map(|memory| (memory.access, memory.space, memory.value, memory.width)),
+            Some((access, r2il::SpaceId::Ram, Some(value), 8)),
             "memory access proof must travel through FunctionFacts"
         );
         assert_eq!(
@@ -5986,6 +6031,7 @@ mod tests {
                         access,
                         block_addr: 0x401000,
                         op_index: 4,
+                        space: r2il::SpaceId::Ram,
                         object,
                         address: r2ssa::ValueId(52),
                         value: Some(value),
@@ -6080,6 +6126,68 @@ mod tests {
                 .array_access_for_op(0x401000, 4, false, 0, 4, Some(4))
                 .is_none(),
             "wrong memory-access identity must not authorize array rendering"
+        );
+    }
+
+    #[test]
+    fn memory_access_lookup_requires_exact_address_space() {
+        let ram_access = r2ssa::StructuredAccessId {
+            inst: r2ssa::InstId(7),
+            ordinal: 0,
+        };
+        let custom_access = r2ssa::StructuredAccessId {
+            inst: r2ssa::InstId(7),
+            ordinal: 1,
+        };
+        let effect = |access, space| {
+            let id = r2ssa::SemanticId::memory_access(access);
+            (
+                id,
+                CertifiedEffect::Memory {
+                    id,
+                    fact: MemoryAccessRenderFact {
+                        access,
+                        block_addr: 0x401000,
+                        op_index: 4,
+                        space,
+                        object: r2ssa::ObjectId(3),
+                        address: r2ssa::ValueId(52),
+                        value: Some(r2ssa::ValueId(51)),
+                        is_write: false,
+                        width: 4,
+                        materialize_result: false,
+                        control_domain: test_control_domain(),
+                    },
+                },
+            )
+        };
+        let ram_id = r2ssa::SemanticId::memory_access(ram_access);
+        let custom_id = r2ssa::SemanticId::memory_access(custom_access);
+        let render = FunctionRenderFacts {
+            certified_effects: BTreeMap::from([
+                effect(ram_access, r2il::SpaceId::Ram),
+                effect(custom_access, r2il::SpaceId::Custom(7)),
+            ]),
+            memory_effects_by_op: BTreeMap::from([((0x401000, 4, false), vec![ram_id, custom_id])]),
+            ..FunctionRenderFacts::default()
+        };
+
+        assert_eq!(
+            render
+                .memory_access_for_op(0x401000, 4, false, r2il::SpaceId::Ram)
+                .map(|fact| fact.access),
+            Some(ram_access)
+        );
+        assert_eq!(
+            render
+                .memory_access_for_op(0x401000, 4, false, r2il::SpaceId::Custom(7))
+                .map(|fact| fact.access),
+            Some(custom_access)
+        );
+        assert!(
+            render
+                .memory_access_for_op(0x401000, 4, false, r2il::SpaceId::Custom(8))
+                .is_none()
         );
     }
 

@@ -4,7 +4,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-const CAPTURE_JSON: &str = include_str!("../tests/plain_o2_lift_v2.json");
+const CAPTURE_JSON: &str = include_str!("../tests/plain_o2_lift_v3.json");
 const ORIGIN_MANIFEST_JSON: &str =
     include_str!("../../tests/r2r/fixtures/plain_o2_v1/manifest.json");
 const ORIGIN_CORE_JSON: &str =
@@ -179,10 +179,10 @@ fn source_bytes(artifact: &str) -> &'static [u8] {
 }
 
 fn assert_origin(capture: &LiftCapture, function: &FunctionCapture) {
-    assert_eq!(capture.schema_version, 2);
+    assert_eq!(capture.schema_version, 3);
     assert_eq!(
         capture.fixture_set,
-        "r2sleigh-plain-o2-x86_64-macho-sleigh-lift-v2"
+        "r2sleigh-plain-o2-x86_64-macho-sleigh-lift-v3"
     );
     assert_eq!(
         capture.origin_manifest,
@@ -480,6 +480,11 @@ fn assert_function_capture(function_name: &str) {
     ));
     assert_eq!(first_ssa, second_ssa, "deterministic SSA reconstruction");
     let ssa: Value = serde_json::from_str(&first_ssa).expect("prepared SSA JSON");
+    assert_eq!(
+        ssa["schema_version"],
+        crate::SSA_JSON_SCHEMA_VERSION,
+        "prepared SSA JSON must carry the current document schema"
+    );
     let actual_ssa_hash = json_fnv1a64(ssa.clone());
     if actual_ssa_hash != function.ssa_fnv1a64 {
         capture_mismatches.push(format!(

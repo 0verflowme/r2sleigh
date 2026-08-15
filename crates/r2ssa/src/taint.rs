@@ -678,7 +678,7 @@ mod tests {
         assert!(policy.is_sink(&call_ind_op, 0));
 
         let store_op = SSAOp::Store {
-            space: "ram".to_string(),
+            space: r2il::SpaceId::Ram,
             addr: make_var("RAX", 1),
             val: make_var("RBX", 0),
         };
@@ -704,7 +704,7 @@ mod tests {
         assert!(!policy.is_sink(&call_op, 0));
 
         let store_op = SSAOp::Store {
-            space: "ram".to_string(),
+            space: r2il::SpaceId::Ram,
             addr: make_var("RAX", 1),
             val: make_var("RBX", 0),
         };
@@ -974,7 +974,7 @@ mod tests {
         assert!(policy.is_source(&other, 0).is_none());
 
         let store = SSAOp::Store {
-            space: "ram".to_string(),
+            space: r2il::SpaceId::Ram,
             addr: SSAVar::new("RAX", 1, 8),
             val: SSAVar::new("RBX", 0, 8),
         };

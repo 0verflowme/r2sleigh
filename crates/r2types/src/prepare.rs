@@ -411,7 +411,11 @@ pub fn recover_signature_params_from_ssa(
                         stack_addr_temps.insert(dst_key, (base.clone(), offset));
                     }
                 }
-                SSAOp::Load { dst, addr, .. } => {
+                SSAOp::Load {
+                    dst,
+                    space: r2il::SpaceId::Ram,
+                    addr,
+                } => {
                     let addr_key = ssa_var_block_key(block.addr, addr);
                     if !control_return_targets.contains(&ssa_var_key(dst))
                         && let Some((base, offset)) = stack_addr_temps.get(&addr_key)
@@ -547,7 +551,11 @@ pub fn recover_vars_from_ssa_with_prep_facts(
                         stack_addr_temps.insert(dst_key, (base.clone(), offset, is_frame_base));
                     }
                 }
-                SSAOp::Store { addr, val, .. } => {
+                SSAOp::Store {
+                    space: r2il::SpaceId::Ram,
+                    addr,
+                    val,
+                } => {
                     let addr_key = ssa_var_block_key(block.addr, addr);
                     if let Some((base, offset, is_frame_base)) = stack_addr_temps.get(&addr_key) {
                         let type_override = if pointer_var_keys.contains(&ssa_var_key(val)) {
@@ -574,7 +582,11 @@ pub fn recover_vars_from_ssa_with_prep_facts(
                         );
                     }
                 }
-                SSAOp::Load { dst, addr, .. } => {
+                SSAOp::Load {
+                    dst,
+                    space: r2il::SpaceId::Ram,
+                    addr,
+                } => {
                     let addr_key = ssa_var_block_key(block.addr, addr);
                     if !control_return_targets.contains(&ssa_var_key(dst))
                         && let Some((base, offset, is_frame_base)) = stack_addr_temps.get(&addr_key)
@@ -1221,13 +1233,41 @@ fn infer_pointer_var_keys_from_ssa(
                         );
                     }
                 }
-                SSAOp::Load { addr, .. }
-                | SSAOp::Store { addr, .. }
-                | SSAOp::LoadLinked { addr, .. }
-                | SSAOp::StoreConditional { addr, .. }
-                | SSAOp::LoadGuarded { addr, .. }
-                | SSAOp::StoreGuarded { addr, .. }
-                | SSAOp::AtomicCAS { addr, .. } => {
+                SSAOp::Load {
+                    space: r2il::SpaceId::Ram,
+                    addr,
+                    ..
+                }
+                | SSAOp::Store {
+                    space: r2il::SpaceId::Ram,
+                    addr,
+                    ..
+                }
+                | SSAOp::LoadLinked {
+                    space: r2il::SpaceId::Ram,
+                    addr,
+                    ..
+                }
+                | SSAOp::StoreConditional {
+                    space: r2il::SpaceId::Ram,
+                    addr,
+                    ..
+                }
+                | SSAOp::LoadGuarded {
+                    space: r2il::SpaceId::Ram,
+                    addr,
+                    ..
+                }
+                | SSAOp::StoreGuarded {
+                    space: r2il::SpaceId::Ram,
+                    addr,
+                    ..
+                }
+                | SSAOp::AtomicCAS {
+                    space: r2il::SpaceId::Ram,
+                    addr,
+                    ..
+                } => {
                     pointer_vars.insert(ssa_var_key(addr));
                 }
                 _ => {}
@@ -1331,7 +1371,11 @@ fn infer_pointer_var_keys_from_ssa(
                             changed |= pointer_vars.insert(dst_key);
                         }
                     }
-                    SSAOp::Store { addr, val, .. } => {
+                    SSAOp::Store {
+                        space: r2il::SpaceId::Ram,
+                        addr,
+                        val,
+                    } => {
                         if let Some(slot) =
                             stack_addr_slots.get(&ssa_var_block_key(block.addr, addr))
                         {
@@ -1344,7 +1388,11 @@ fn infer_pointer_var_keys_from_ssa(
                             }
                         }
                     }
-                    SSAOp::Load { dst, addr, .. } => {
+                    SSAOp::Load {
+                        dst,
+                        space: r2il::SpaceId::Ram,
+                        addr,
+                    } => {
                         if let Some(slot) =
                             stack_addr_slots.get(&ssa_var_block_key(block.addr, addr))
                         {
@@ -1447,7 +1495,11 @@ fn infer_pointer_pointee_width_bytes(
                 SSAOp::SegmentOp { dst, offset, .. } => {
                     add_pointer_pointee_flow_edge(&mut adjacency, pointer_vars, dst, offset)
                 }
-                SSAOp::Load { dst, addr, .. } => {
+                SSAOp::Load {
+                    dst,
+                    space: r2il::SpaceId::Ram,
+                    addr,
+                } => {
                     let addr_key = ssa_var_key(addr);
                     if pointer_vars.contains(&addr_key) {
                         widths.entry(addr_key).or_default().insert(dst.size);
@@ -1462,7 +1514,11 @@ fn infer_pointer_pointee_width_bytes(
                         }
                     }
                 }
-                SSAOp::Store { addr, val, .. } => {
+                SSAOp::Store {
+                    space: r2il::SpaceId::Ram,
+                    addr,
+                    val,
+                } => {
                     let addr_key = ssa_var_key(addr);
                     if pointer_vars.contains(&addr_key) {
                         widths.entry(addr_key).or_default().insert(val.size);
@@ -2108,7 +2164,7 @@ mod tests {
                 SSAOp::Load {
                     dst: SSAVar::new("tmp:value", 1, 4),
                     addr: SSAVar::new("tmp:address", 1, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                 },
                 SSAOp::IntSub {
                     dst: SSAVar::new("EDI", 1, 4),
@@ -2146,7 +2202,7 @@ mod tests {
                 SSAOp::Load {
                     dst: SSAVar::new("tmp:stack_arg", 1, 8),
                     addr: SSAVar::new("tmp:sp8", 1, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                 },
             ],
         };
@@ -2171,6 +2227,127 @@ mod tests {
     }
 
     #[test]
+    fn only_ram_accesses_recover_stack_params_and_locals() {
+        let block_for_space = |space| SSABlock {
+            addr: 0x401000,
+            size: 16,
+            ops: vec![
+                SSAOp::IntAdd {
+                    dst: SSAVar::new("tmp:incoming", 1, 8),
+                    a: SSAVar::new("rsp", 0, 8),
+                    b: SSAVar::constant(8, 8),
+                },
+                SSAOp::Load {
+                    dst: SSAVar::new("tmp:stack_arg", 1, 8),
+                    space,
+                    addr: SSAVar::new("tmp:incoming", 1, 8),
+                },
+                SSAOp::IntSub {
+                    dst: SSAVar::new("tmp:local", 1, 8),
+                    a: SSAVar::new("rbp", 1, 8),
+                    b: SSAVar::constant(8, 8),
+                },
+                SSAOp::Store {
+                    space,
+                    addr: SSAVar::new("tmp:local", 1, 8),
+                    val: SSAVar::new("tmp:value", 1, 4),
+                },
+            ],
+        };
+
+        let ram = block_for_space(r2il::SpaceId::Ram);
+        let custom = block_for_space(r2il::SpaceId::Custom(7));
+        let ram_params = recover_signature_params_from_ssa(
+            std::slice::from_ref(&ram),
+            Some("x86-64"),
+            &HashMap::new(),
+            true,
+            64,
+        );
+        let custom_params = recover_signature_params_from_ssa(
+            std::slice::from_ref(&custom),
+            Some("x86-64"),
+            &HashMap::new(),
+            true,
+            64,
+        );
+        assert!(ram_params.iter().any(|param| param.arg_index == 6));
+        assert!(!custom_params.iter().any(|param| param.arg_index == 6));
+
+        let ram_vars = recover_vars_from_ssa(&[ram], Some("x86-64"), &HashMap::new(), true);
+        let custom_vars = recover_vars_from_ssa(&[custom], Some("x86-64"), &HashMap::new(), true);
+        assert!(ram_vars.iter().any(|var| var.kind == "s" && var.delta == 8));
+        assert!(
+            ram_vars
+                .iter()
+                .any(|var| var.kind == "b" && var.delta == -8)
+        );
+        assert!(
+            !custom_vars
+                .iter()
+                .any(|var| matches!(var.kind.as_str(), "s" | "b"))
+        );
+    }
+
+    #[test]
+    fn custom_stack_home_does_not_create_abi_pointer_evidence() {
+        let blocks_for_space = |space| {
+            vec![SSABlock {
+                addr: 0x401000,
+                size: 16,
+                ops: vec![
+                    SSAOp::IntSub {
+                        dst: SSAVar::new("tmp:home", 1, 8),
+                        a: SSAVar::new("rbp", 1, 8),
+                        b: SSAVar::constant(8, 8),
+                    },
+                    SSAOp::Copy {
+                        dst: SSAVar::new("tmp:saved_arg", 1, 8),
+                        src: SSAVar::new("rdi", 0, 8),
+                    },
+                    SSAOp::Store {
+                        space,
+                        addr: SSAVar::new("tmp:home", 1, 8),
+                        val: SSAVar::new("tmp:saved_arg", 1, 8),
+                    },
+                    SSAOp::Load {
+                        dst: SSAVar::new("tmp:base", 1, 8),
+                        space,
+                        addr: SSAVar::new("tmp:home", 1, 8),
+                    },
+                    SSAOp::Load {
+                        dst: SSAVar::new("tmp:value", 1, 4),
+                        space,
+                        addr: SSAVar::new("tmp:base", 1, 8),
+                    },
+                ],
+            }]
+        };
+        let param_type_for_space = |space| {
+            recover_signature_params_from_ssa(
+                &blocks_for_space(space),
+                Some("x86-64"),
+                &HashMap::new(),
+                false,
+                64,
+            )
+            .into_iter()
+            .find(|param| param.arg_index == 0)
+            .expect("rdi parameter")
+            .initial_ty
+        };
+
+        assert!(matches!(
+            param_type_for_space(r2il::SpaceId::Ram),
+            crate::CTypeLike::Pointer(_)
+        ));
+        assert!(matches!(
+            param_type_for_space(r2il::SpaceId::Custom(7)),
+            crate::CTypeLike::Int { .. }
+        ));
+    }
+
+    #[test]
     fn recovered_signature_params_follow_pointer_through_stack_home_and_indexed_load() {
         let entry = SSABlock {
             addr: 0x401000,
@@ -2188,7 +2365,7 @@ mod tests {
                 SSAOp::Store {
                     addr: SSAVar::new("tmp:home", 1, 8),
                     val: SSAVar::new("tmp:saved_arg", 1, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                 },
             ],
         };
@@ -2204,7 +2381,7 @@ mod tests {
                 SSAOp::Load {
                     dst: SSAVar::new("tmp:base", 1, 8),
                     addr: SSAVar::new("tmp:home_reload", 1, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                 },
                 SSAOp::Copy {
                     dst: SSAVar::new("rax", 3, 8),
@@ -2227,7 +2404,7 @@ mod tests {
                 SSAOp::Load {
                     dst: SSAVar::new("tmp:value", 1, 4),
                     addr: SSAVar::new("tmp:element", 1, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                 },
             ],
         };
@@ -2267,17 +2444,17 @@ mod tests {
                 SSAOp::Store {
                     addr: SSAVar::new("tmp:slot", 1, 8),
                     val: SSAVar::new("x1", 0, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                 },
                 SSAOp::Load {
                     dst: SSAVar::new("x9", 1, 8),
                     addr: SSAVar::new("tmp:slot", 1, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                 },
                 SSAOp::Load {
                     dst: SSAVar::new("tmp:value", 1, 1),
                     addr: SSAVar::new("x9", 2, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                 },
             ],
         };
@@ -2316,7 +2493,7 @@ mod tests {
                 SSAOp::Load {
                     dst: SSAVar::new("tmp:value", 1, 4),
                     addr: SSAVar::new("tmp:element", 1, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                 },
             ],
         };
@@ -2348,7 +2525,7 @@ mod tests {
                 SSAOp::Store {
                     addr: home,
                     val: SSAVar::new("x0", 0, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                 },
             ],
         };
@@ -2364,7 +2541,7 @@ mod tests {
                 SSAOp::Load {
                     dst: base.clone(),
                     addr: reload,
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                 },
                 SSAOp::IntSExt {
                     dst: wide_index.clone(),
@@ -2383,7 +2560,7 @@ mod tests {
                 SSAOp::Load {
                     dst: SSAVar::new("tmp:value", 1, 4),
                     addr: element,
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                 },
             ],
         };
@@ -2414,7 +2591,7 @@ mod tests {
                 SSAOp::Load {
                     dst: SSAVar::new("tmp:stack_arg", 1, 8),
                     addr: SSAVar::new("tmp:sp8", 1, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                 },
             ],
         };
@@ -2443,7 +2620,7 @@ mod tests {
                     b: SSAVar::constant(12, 8),
                 },
                 SSAOp::Store {
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: slot_addr.clone(),
                     val: SSAVar::constant(1, 4),
                 },
@@ -2493,7 +2670,7 @@ mod tests {
                 SSAOp::Load {
                     dst: SSAVar::new("rip", 1, 8),
                     addr: SSAVar::new("rsp", 2, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                 },
                 SSAOp::Return {
                     target: SSAVar::new("rip", 1, 8),
@@ -2521,7 +2698,7 @@ mod tests {
                 SSAOp::Load {
                     dst: SSAVar::new("tmp:value", 1, 8),
                     addr: SSAVar::new("tmp:not_stack", 1, 8),
-                    space: "ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                 },
             ],
         };

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use r2il::SpaceId;
 use r2ssa::{
     FunctionSemanticSummary, InterprocFunctionId, SSAOp, SSAVar, SSAVarNameKind, SsaArtifact,
     StackAddressRoot, SummaryAllocationEffect, SummaryArgEffect, SummaryAtomicEffect,
@@ -6489,9 +6490,23 @@ pub(super) fn large_cfg_memory_transfers(func: &SsaArtifact) -> BTreeSet<LargeCf
                         copy_binary_load_source_if_unambiguous(dst, a, b, &mut load_sources);
                     }
                 }
-                SSAOp::Load { dst, addr, .. }
-                | SSAOp::LoadLinked { dst, addr, .. }
-                | SSAOp::LoadGuarded { dst, addr, .. } => {
+                SSAOp::Load {
+                    dst,
+                    space: SpaceId::Ram,
+                    addr,
+                }
+                | SSAOp::LoadLinked {
+                    dst,
+                    space: SpaceId::Ram,
+                    addr,
+                    ..
+                }
+                | SSAOp::LoadGuarded {
+                    dst,
+                    space: SpaceId::Ram,
+                    addr,
+                    ..
+                } => {
                     if let Some(region) = rooted_region(addr, &roots) {
                         load_sources.insert(
                             dst.clone(),
@@ -6504,9 +6519,23 @@ pub(super) fn large_cfg_memory_transfers(func: &SsaArtifact) -> BTreeSet<LargeCf
                         );
                     }
                 }
-                SSAOp::Store { addr, val, .. }
-                | SSAOp::StoreGuarded { addr, val, .. }
-                | SSAOp::StoreConditional { addr, val, .. } => {
+                SSAOp::Store {
+                    space: SpaceId::Ram,
+                    addr,
+                    val,
+                }
+                | SSAOp::StoreGuarded {
+                    space: SpaceId::Ram,
+                    addr,
+                    val,
+                    ..
+                }
+                | SSAOp::StoreConditional {
+                    space: SpaceId::Ram,
+                    addr,
+                    val,
+                    ..
+                } => {
                     if let (Some(dst_arg), Some(src_arg)) = (
                         rooted_arg_var(addr, &roots),
                         loaded_source(val, &load_sources).and_then(|source| {
@@ -7921,9 +7950,23 @@ fn transfer_worker_block(
                     insert_exact_control_source_value(&mut state, dst, control_args);
                 }
             }
-            SSAOp::Load { dst, addr, .. }
-            | SSAOp::LoadLinked { dst, addr, .. }
-            | SSAOp::LoadGuarded { dst, addr, .. } => {
+            SSAOp::Load {
+                dst,
+                space: SpaceId::Ram,
+                addr,
+            }
+            | SSAOp::LoadLinked {
+                dst,
+                space: SpaceId::Ram,
+                addr,
+                ..
+            }
+            | SSAOp::LoadGuarded {
+                dst,
+                space: SpaceId::Ram,
+                addr,
+                ..
+            } => {
                 dataflow_kill_load_source_aliases(dst, &mut state);
                 if let Some(stack_root) = dataflow_stack_root(stack_address_roots, addr)
                     && let Some(root) = exact_dataflow_value(state.stack_values.get(&stack_root))
@@ -7959,7 +8002,11 @@ fn transfer_worker_block(
                     insert_exact_load_source_value(&mut state, dst, source);
                 }
             }
-            SSAOp::Store { addr, val, .. } => {
+            SSAOp::Store {
+                space: SpaceId::Ram,
+                addr,
+                val,
+            } => {
                 if let Some(stack_root) = dataflow_stack_root(stack_address_roots, addr) {
                     if let Some(root) = dataflow_rooted_region(val, &state) {
                         insert_exact_dataflow_value(&mut state.stack_values, &stack_root, root);
@@ -7997,7 +8044,11 @@ fn transfer_worker_block(
                 }
             }
             SSAOp::StoreGuarded {
-                addr, val, guard, ..
+                space: SpaceId::Ram,
+                addr,
+                val,
+                guard,
+                ..
             } => {
                 let control_args =
                     dataflow_control_args_from_operand(guard, &state).unwrap_or_default();
@@ -10358,13 +10409,13 @@ mod tests {
             phis: Vec::new(),
             ops: vec![
                 SSAOp::Store {
-                    space: "Ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: slot_addr.clone(),
                     val: SSAVar::new("RDI", 0, 8),
                 },
                 SSAOp::Load {
                     dst: saved_ptr.clone(),
-                    space: "Ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: slot_addr,
                 },
                 SSAOp::IntAdd {
@@ -10374,7 +10425,7 @@ mod tests {
                 },
                 SSAOp::Load {
                     dst: loaded_byte.clone(),
-                    space: "Ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: indexed_ptr,
                 },
             ],
@@ -10395,6 +10446,157 @@ mod tests {
     }
 
     #[test]
+    fn worker_dataflow_rejects_custom_stack_spill_at_same_address() {
+        let slot_addr = SSAVar::new("tmp:slot_addr", 1, 8);
+        let stack_root = StackAddressRoot {
+            base: r2ssa::StackAddressBase::FramePointer,
+            offset: -0x18,
+        };
+        let stack_roots = BTreeMap::from([(slot_addr.clone(), stack_root)]);
+        let state_for_space = |space| {
+            let saved_ptr = SSAVar::new("tmp:saved_ptr", 1, 8);
+            let loaded_byte = SSAVar::new("tmp:loaded_byte", 1, 1);
+            let block = r2ssa::function::SSABlock {
+                addr: 0x4240,
+                size: 4,
+                phis: Vec::new(),
+                ops: vec![
+                    SSAOp::Store {
+                        space,
+                        addr: slot_addr.clone(),
+                        val: SSAVar::new("RDI", 0, 8),
+                    },
+                    SSAOp::Load {
+                        dst: saved_ptr.clone(),
+                        space,
+                        addr: slot_addr.clone(),
+                    },
+                    SSAOp::Load {
+                        dst: loaded_byte.clone(),
+                        space,
+                        addr: saved_ptr,
+                    },
+                ],
+            };
+            let state = transfer_worker_block(
+                &block,
+                &WorkerDataflowState::default(),
+                None,
+                Some(&stack_roots),
+            );
+            dataflow_loaded_source(&loaded_byte, &state)
+        };
+
+        assert_eq!(
+            state_for_space(SpaceId::Ram).map(|source| source.location.region),
+            Some(SummaryMemoryRegion::Arg { index: 0 })
+        );
+        assert_eq!(state_for_space(SpaceId::Custom(7)), None);
+    }
+
+    #[test]
+    fn worker_dataflow_observes_only_ram_arg_and_global_memory_at_same_address() {
+        let arg_addr = SSAVar::new("RDI", 0, 8);
+        let global_addr = SSAVar::new("ram:0xa000", 0, 8);
+        let ram_arg_load = SSAVar::new("tmp:ram_arg_load", 1, 1);
+        let custom_arg_load = SSAVar::new("tmp:custom_arg_load", 1, 1);
+        let block = r2ssa::function::SSABlock {
+            addr: 0x4260,
+            size: 4,
+            phis: Vec::new(),
+            ops: vec![
+                SSAOp::Load {
+                    dst: ram_arg_load.clone(),
+                    space: SpaceId::Ram,
+                    addr: arg_addr.clone(),
+                },
+                SSAOp::Load {
+                    dst: custom_arg_load.clone(),
+                    space: SpaceId::Custom(7),
+                    addr: arg_addr,
+                },
+                SSAOp::Load {
+                    dst: SSAVar::new("tmp:ram_global_load", 1, 4),
+                    space: SpaceId::Ram,
+                    addr: global_addr.clone(),
+                },
+                SSAOp::Load {
+                    dst: SSAVar::new("tmp:custom_global_load", 1, 4),
+                    space: SpaceId::Custom(7),
+                    addr: global_addr,
+                },
+                SSAOp::Store {
+                    space: SpaceId::Ram,
+                    addr: SSAVar::new("RSI", 0, 8),
+                    val: SSAVar::constant(1, 1),
+                },
+                SSAOp::Store {
+                    space: SpaceId::Custom(7),
+                    addr: SSAVar::new("RSI", 0, 8),
+                    val: SSAVar::constant(2, 1),
+                },
+            ],
+        };
+        let mut observations = BlockWorkerObservations::default();
+
+        let state = transfer_worker_block(
+            &block,
+            &WorkerDataflowState::default(),
+            Some(&mut observations),
+            None,
+        );
+
+        assert!(dataflow_loaded_source(&ram_arg_load, &state).is_some());
+        assert_eq!(dataflow_loaded_source(&custom_arg_load, &state), None);
+        assert_eq!(observations.global_loads.len(), 1);
+        assert_eq!(
+            observations.global_loads[0].source.location.region,
+            SummaryMemoryRegion::Global { address: 0xa000 }
+        );
+        assert_eq!(observations.memory_writes.len(), 1);
+        assert_eq!(
+            observations.memory_writes[0].location.region,
+            SummaryMemoryRegion::Arg { index: 1 }
+        );
+    }
+
+    #[test]
+    fn large_cfg_transfer_requires_ram_load_and_store_spaces() {
+        let arch = aarch64_test_arch();
+        let transfers_for_spaces = |load_space, store_space| {
+            let loaded = Varnode::unique(0xd0, 1);
+            let mut block = R2ILBlock::new(0x4270, 4);
+            block.push(R2ILOp::Load {
+                dst: loaded.clone(),
+                space: load_space,
+                addr: Varnode::register(0x08, 8),
+            });
+            block.push(R2ILOp::Store {
+                space: store_space,
+                addr: Varnode::register(0x00, 8),
+                val: loaded,
+            });
+            let artifact = SsaArtifact::for_symbolic(&[block], Some(&arch))
+                .expect("same-address transfer fixture SSA");
+            large_cfg_memory_transfers(&artifact)
+        };
+        let expected = LargeCfgMemoryTransfer {
+            block_addr: 0x4270,
+            dst_arg: 0,
+            src_arg: 1,
+            size: 1,
+        };
+
+        assert_eq!(
+            transfers_for_spaces(SpaceId::Ram, SpaceId::Ram),
+            BTreeSet::from([expected])
+        );
+        assert!(transfers_for_spaces(SpaceId::Custom(7), SpaceId::Ram).is_empty());
+        assert!(transfers_for_spaces(SpaceId::Ram, SpaceId::Custom(7)).is_empty());
+        assert!(transfers_for_spaces(SpaceId::Custom(7), SpaceId::Custom(7)).is_empty());
+    }
+
+    #[test]
     fn worker_dataflow_records_offset_arg_memory_write() {
         let ptr = SSAVar::new("tmp:out_plus_hash", 1, 8);
         let value = SSAVar::new("tmp:hash_value", 1, 8);
@@ -10409,7 +10611,7 @@ mod tests {
                     b: SSAVar::constant(8, 8),
                 },
                 SSAOp::Store {
-                    space: "Ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: ptr,
                     val: value,
                 },
@@ -10457,7 +10659,7 @@ mod tests {
             ops: vec![
                 SSAOp::Load {
                     dst: loaded_byte.clone(),
-                    space: "Ram".to_string(),
+                    space: r2il::SpaceId::Ram,
                     addr: SSAVar::new("RDI", 0, 8),
                 },
                 SSAOp::IntZExt {
