@@ -20,12 +20,12 @@ use r2ssa::{
     PredicateId, RelativeMemoryAddress, SEMANTIC_OBLIGATION_SCHEMA_VERSION,
     SOURCE_CALL_SITE_INTERFACE_SCHEMA_VERSION, SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION, SSAOp,
     SSAVar, SemanticInstructionState, SemanticObligationComponent, SemanticObligationId,
-    SemanticObligationInventory, SemanticObligationKind, SourceCallResult, SourceCallSiteIdentity,
-    SourceCarrierKind, SourceFunctionInterface, SourceFunctionReturn, SourceLogicalValue,
-    SourceMachineContext, SourceReturnBoundaryFact, SourceReturnRegisterCompositionFact,
-    SourceReturnRegisterDefinitionFact, SourceReturnStackPointerFact, SsaArtifact,
-    SsaArtifactAuthority, StackAddressBase, StackAddressRoot, StructuredAccessId,
-    StructuredLoopKind, TrustedSsaArtifact, ValueId,
+    SemanticObligationInventory, SemanticObligationKind, SemanticSourceSite, SourceCallResult,
+    SourceCallSiteIdentity, SourceCarrierKind, SourceFunctionInterface, SourceFunctionReturn,
+    SourceLogicalValue, SourceMachineContext, SourceReturnBoundaryFact,
+    SourceReturnRegisterCompositionFact, SourceReturnRegisterDefinitionFact,
+    SourceReturnStackPointerFact, SsaArtifact, SsaArtifactAuthority, StackAddressBase,
+    StackAddressRoot, StructuredAccessId, StructuredLoopKind, TrustedSsaArtifact, ValueId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -37,7 +37,7 @@ pub use aggregate_member::{
     CertifiedNaturalScalarAggregateLayout,
 };
 
-pub const CERTIFICATION_SCHEMA_VERSION: u32 = 27;
+pub const CERTIFICATION_SCHEMA_VERSION: u32 = 28;
 
 /// Unforgeable run-local identity for one proof authority domain.
 ///
@@ -972,7 +972,7 @@ impl CertifiedMemoryStatement {
             MachineType::Address { width_bits, space, .. }
                 if *width_bits == self.address.binding().width_bits() && *space == self.space
         );
-        if source_obligation.source_inst != self.access.inst
+        if source_obligation.source.graph_inst() != Some(self.access.inst)
             || source_obligation.inputs != expected_inputs
             || self.address.memory_access() != Some(self.access)
             || !address_type_matches
@@ -1122,7 +1122,7 @@ impl CertifiedDirectCall {
             .obligations()
             .get(&self.call_obligation)
             .ok_or(CertificationError::UnknownObligation(self.call_obligation))?;
-        if call.source_inst != self.source_inst
+        if call.source.graph_inst() != Some(self.source_inst)
             || call.inputs != [self.target_value.binding().value()]
         {
             return Err(CertificationError::ObligationNotMapped(
@@ -1171,7 +1171,7 @@ impl CertifiedDirectCall {
                 .ok_or(CertificationError::UnknownObligation(
                     argument.source_obligation,
                 ))?;
-            if obligation.source_inst != self.source_inst
+            if obligation.source.graph_inst() != Some(self.source_inst)
                 || obligation.inputs != [argument.value.binding().value()]
             {
                 return Err(CertificationError::ObligationNotMapped(
@@ -1228,7 +1228,7 @@ impl CertifiedDirectControl {
         let obligation = source.obligations().get(&self.source_obligation).ok_or(
             CertificationError::UnknownObligation(self.source_obligation),
         )?;
-        if obligation.source_inst != self.source_inst
+        if obligation.source.graph_inst() != Some(self.source_inst)
             || obligation.inputs != [self.target_value.binding().value()]
         {
             return Err(CertificationError::ObligationNotMapped(
@@ -1325,9 +1325,9 @@ impl CertifiedConditionalControl {
         let transfer = source.obligations().get(&self.transfer_obligation).ok_or(
             CertificationError::UnknownObligation(self.transfer_obligation),
         )?;
-        if predicate.source_inst != self.source_inst
+        if predicate.source.graph_inst() != Some(self.source_inst)
             || predicate.inputs != [self.condition.binding().value()]
-            || transfer.source_inst != self.source_inst
+            || transfer.source.graph_inst() != Some(self.source_inst)
             || transfer.inputs
                 != [
                     self.target_value.binding().value(),
@@ -1558,7 +1558,7 @@ impl CertifiedReturnControl {
         let terminal = source.obligations().get(&self.return_obligation).ok_or(
             CertificationError::UnknownObligation(self.return_obligation),
         )?;
-        if terminal.source_inst != self.source_inst
+        if terminal.source.graph_inst() != Some(self.source_inst)
             || terminal.inputs != [self.control_target.binding().value()]
         {
             return Err(CertificationError::ObligationNotMapped(
@@ -1580,7 +1580,7 @@ impl CertifiedReturnControl {
                 .ok_or(CertificationError::UnknownObligation(
                     returned.source_obligation,
                 ))?;
-            if obligation.source_inst != self.source_inst
+            if obligation.source.graph_inst() != Some(self.source_inst)
                 || obligation.inputs != [returned.value.binding().value()]
             {
                 return Err(CertificationError::ObligationNotMapped(
@@ -1608,7 +1608,9 @@ impl CertifiedReturnControl {
                 .ordered_values()
                 .map(|value| value.binding().value())
                 .collect::<Vec<_>>();
-            if obligation.source_inst != self.source_inst || obligation.inputs != inputs {
+            if obligation.source.graph_inst() != Some(self.source_inst)
+                || obligation.inputs != inputs
+            {
                 return Err(CertificationError::ObligationNotMapped(
                     composition.source_obligation,
                 ));
@@ -2180,6 +2182,16 @@ fn validate_source(source: &SemanticObligationInventory) -> Result<(), Certifica
     } else {
         Err(CertificationError::IncompleteSourceInventory)
     }
+}
+
+fn source_site_mismatch(
+    id: CanonicalInstructionId,
+    source: SemanticSourceSite,
+) -> MachineBuildError {
+    source.graph_inst().map_or(
+        MachineBuildError::ObligationSourceMismatch(id),
+        MachineBuildError::ObligationMismatch,
+    )
 }
 
 /// Proof that one transformation accounted for all of its declared inputs.
@@ -4940,8 +4952,11 @@ fn certified_direct_calls(
         let Some(disposition) = artifact.obligations().instructions().get(&producer) else {
             return Err(MachineBuildError::TopologyMismatch);
         };
-        let Some(inst) = graph.inst(disposition.inst) else {
-            return Err(MachineBuildError::MissingInstruction(disposition.inst));
+        let Some(inst_id) = disposition.source.graph_inst() else {
+            return Err(MachineBuildError::TopologyMismatch);
+        };
+        let Some(inst) = graph.inst(inst_id) else {
+            return Err(MachineBuildError::MissingInstruction(inst_id));
         };
         let Some((block_addr, op_index)) = graph.op_site_for_inst(inst.id) else {
             return Err(MachineBuildError::TopologyMismatch);
@@ -5129,7 +5144,8 @@ fn call_argument_origin_before_boundary(
             .obligations()
             .instructions()
             .get(&producer)
-            .and_then(|instruction| artifact.graph().inst(instruction.inst));
+            .and_then(|instruction| instruction.source.graph_inst())
+            .and_then(|instruction| artifact.graph().inst(instruction));
         if let Some(source_inst) = source_inst
             && matches!(source_inst.payload, InstPayload::Op(SSAOp::Copy { .. }))
             && let [input] = source_inst.inputs.as_slice()
@@ -5199,8 +5215,11 @@ fn certified_direct_controls(
         let Some(disposition) = artifact.obligations().instructions().get(&producer) else {
             return Err(MachineBuildError::TopologyMismatch);
         };
-        let Some(inst) = graph.inst(disposition.inst) else {
-            return Err(MachineBuildError::MissingInstruction(disposition.inst));
+        let Some(inst_id) = disposition.source.graph_inst() else {
+            return Err(MachineBuildError::TopologyMismatch);
+        };
+        let Some(inst) = graph.inst(inst_id) else {
+            return Err(MachineBuildError::MissingInstruction(inst_id));
         };
         let Some((block_addr, op_index)) = graph.op_site_for_inst(inst.id) else {
             return Err(MachineBuildError::TopologyMismatch);
@@ -5250,7 +5269,8 @@ fn certified_direct_controls(
                 .obligations()
                 .get(&obligation)
                 .is_none_or(|source| {
-                    source.source_inst != inst.id || source.inputs.as_slice() != inst.inputs
+                    source.source.graph_inst() != Some(inst.id)
+                        || source.inputs.as_slice() != inst.inputs
                 })
         {
             continue;
@@ -5317,8 +5337,11 @@ fn certified_conditional_controls(
         let Some(disposition) = artifact.obligations().instructions().get(&producer) else {
             return Err(MachineBuildError::TopologyMismatch);
         };
-        let Some(inst) = graph.inst(disposition.inst) else {
-            return Err(MachineBuildError::MissingInstruction(disposition.inst));
+        let Some(inst_id) = disposition.source.graph_inst() else {
+            return Err(MachineBuildError::TopologyMismatch);
+        };
+        let Some(inst) = graph.inst(inst_id) else {
+            return Err(MachineBuildError::MissingInstruction(inst_id));
         };
         let Some((block_addr, op_index)) = graph.op_site_for_inst(inst.id) else {
             return Err(MachineBuildError::TopologyMismatch);
@@ -5435,9 +5458,13 @@ fn certified_return_controls(
             .instructions()
             .get(&producer)
             .ok_or(MachineBuildError::TopologyMismatch)?;
+        let inst_id = disposition
+            .source
+            .graph_inst()
+            .ok_or(MachineBuildError::TopologyMismatch)?;
         let inst = graph
-            .inst(disposition.inst)
-            .ok_or(MachineBuildError::MissingInstruction(disposition.inst))?;
+            .inst(inst_id)
+            .ok_or(MachineBuildError::MissingInstruction(inst_id))?;
         let (block_addr, op_index) = graph
             .op_site_for_inst(inst.id)
             .ok_or(MachineBuildError::TopologyMismatch)?;
@@ -5801,8 +5828,11 @@ fn certified_switch_topologies(
         let Some(disposition) = source.instructions().get(&producer) else {
             return Err(MachineBuildError::TopologyMismatch);
         };
-        let Some(instruction) = graph.inst(disposition.inst) else {
-            return Err(MachineBuildError::MissingInstruction(disposition.inst));
+        let Some(inst_id) = disposition.source.graph_inst() else {
+            return Err(MachineBuildError::TopologyMismatch);
+        };
+        let Some(instruction) = graph.inst(inst_id) else {
+            return Err(MachineBuildError::MissingInstruction(inst_id));
         };
         let Some((block_addr, op_index)) = graph.op_site_for_inst(instruction.id) else {
             return Err(MachineBuildError::TopologyMismatch);
@@ -5825,7 +5855,8 @@ fn certified_switch_topologies(
             || disposition.state != SemanticInstructionState::LiveObligation
             || disposition.obligations != BTreeSet::from([obligation])
             || source.obligations().get(&obligation).is_none_or(|fact| {
-                fact.source_inst != instruction.id || fact.inputs != instruction.inputs
+                fact.source.graph_inst() != Some(instruction.id)
+                    || fact.inputs != instruction.inputs
             })
         {
             continue;
@@ -6367,7 +6398,7 @@ fn try_certified_memory_statement(
         .obligations()
         .get(&obligation)
         .is_some_and(|candidate| {
-            candidate.source_inst == inst_id && candidate.inputs == expected_inputs
+            candidate.source.graph_inst() == Some(inst_id) && candidate.inputs == expected_inputs
         });
     let sibling_obligations_are_plain = disposition.obligations.iter().all(|candidate| {
         *candidate == obligation
@@ -7375,18 +7406,20 @@ fn frame_affine_register_assignment_matches(
     else {
         return false;
     };
-    frame_affine_register_assignment_for_inst(
-        artifact,
-        projection,
-        instruction.inst,
-        entry_stack_pointer,
-        stack_pointer_storage,
-        frame_pointer_storage,
-        width_bits,
-        affine,
-    )
-    .as_ref()
-        == Some(assignment)
+    instruction.source.graph_inst().is_some_and(|inst| {
+        frame_affine_register_assignment_for_inst(
+            artifact,
+            projection,
+            inst,
+            entry_stack_pointer,
+            stack_pointer_storage,
+            frame_pointer_storage,
+            width_bits,
+            affine,
+        )
+        .as_ref()
+            == Some(assignment)
+    })
 }
 
 fn frame_copy_for_inst(
@@ -8057,7 +8090,8 @@ fn frame_evidence_from_certified_parts(
             .obligations()
             .instructions()
             .get(&control.producer())?
-            .inst;
+            .source
+            .graph_inst()?;
         let return_escapes_frame = std::iter::once(control.control_target())
             .chain(control.values().iter().map(CertifiedReturnValue::value))
             .chain(
@@ -8393,7 +8427,9 @@ impl CertifiedMachineFunction {
             let inst_id = artifact
                 .graph()
                 .def_inst(machine_entity.output().value())
-                .ok_or(MachineBuildError::EntityMismatch(r2ssa::InstId(u32::MAX)))?;
+                .ok_or(MachineBuildError::ObligationSourceMismatch(
+                    machine_entity.producer(),
+                ))?;
             let expression = certified_expr_from_machine(
                 artifact,
                 &projection,
@@ -8466,18 +8502,19 @@ impl CertifiedMachineFunction {
                 continue;
             }
             if !absorbed_controls.insert(obligation) {
-                return Err(MachineBuildError::ObligationMismatch(
-                    artifact
-                        .obligations()
-                        .obligations()
-                        .get(&obligation)
-                        .map(|fact| fact.source_inst)
-                        .unwrap_or(r2ssa::InstId(u32::MAX)),
+                let source_inst = artifact
+                    .obligations()
+                    .obligations()
+                    .get(&obligation)
+                    .map(|fact| fact.source);
+                return Err(source_inst.map_or(
+                    MachineBuildError::ObligationSourceMismatch(obligation.instruction),
+                    |source| source_site_mismatch(obligation.instruction, source),
                 ));
             }
             certification
                 .record_absorbed_switch_control(control.clone())
-                .map_err(|_| MachineBuildError::ObligationMismatch(r2ssa::InstId(u32::MAX)))?;
+                .map_err(|_| MachineBuildError::ObligationSourceMismatch(obligation.instruction))?;
         }
         for control in return_controls.values() {
             if control
@@ -8514,12 +8551,13 @@ impl CertifiedMachineFunction {
         }
 
         for expression in expressions.values() {
-            let inst_id = artifact
+            let producer = expression.entity().producer();
+            let source_inst = artifact
                 .obligations()
                 .instructions()
-                .get(&expression.entity().producer())
-                .map(|source| source.inst)
-                .unwrap_or(r2ssa::InstId(u32::MAX));
+                .get(&producer)
+                .map(|source| source.source)
+                .ok_or(MachineBuildError::ObligationSourceMismatch(producer))?;
             let pending_obligations = expression
                 .entity()
                 .source_obligations()
@@ -8529,11 +8567,11 @@ impl CertifiedMachineFunction {
                 .collect::<Vec<_>>();
             for obligation in pending_obligations {
                 if !absorbed.insert(obligation) {
-                    return Err(MachineBuildError::ObligationMismatch(inst_id));
+                    return Err(source_site_mismatch(producer, source_inst));
                 }
                 certification
                     .record_absorbed_expression(obligation, expression.clone())
-                    .map_err(|_| MachineBuildError::ObligationMismatch(inst_id))?;
+                    .map_err(|_| source_site_mismatch(producer, source_inst))?;
             }
         }
 
@@ -8544,8 +8582,9 @@ impl CertifiedMachineFunction {
             .filter(|obligation| obligation.id.kind == SemanticObligationKind::LiveValueProducer)
         {
             if !absorbed.contains(&obligation.id) {
-                return Err(MachineBuildError::ObligationMismatch(
-                    obligation.source_inst,
+                return Err(source_site_mismatch(
+                    obligation.id.instruction,
+                    obligation.source,
                 ));
             }
         }
@@ -8858,8 +8897,10 @@ impl CertifiedMachineProjection {
                     }) && !candidate_memory_statements.contains_key(&instruction.id)
                 })
                 .filter_map(|instruction| {
-                    graph
-                        .inst(instruction.inst)
+                    instruction
+                        .source
+                        .graph_inst()
+                        .and_then(|inst| graph.inst(inst))
                         .and_then(|instruction| instruction.output)
                 }),
         );
@@ -8872,8 +8913,10 @@ impl CertifiedMachineProjection {
                     instruction.state == SemanticInstructionState::UnsupportedUnknown
                 })
                 .filter_map(|instruction| {
-                    graph
-                        .inst(instruction.inst)
+                    instruction
+                        .source
+                        .graph_inst()
+                        .and_then(|inst| graph.inst(inst))
                         .and_then(|instruction| instruction.output)
                 }),
         );
@@ -8884,9 +8927,9 @@ impl CertifiedMachineProjection {
                 if blocked_outputs.contains(&entity.output().value()) {
                     continue;
                 }
-                let inst_id = graph
-                    .def_inst(entity.output().value())
-                    .ok_or(MachineBuildError::EntityMismatch(r2ssa::InstId(u32::MAX)))?;
+                let inst_id = graph.def_inst(entity.output().value()).ok_or(
+                    MachineBuildError::ObligationSourceMismatch(entity.producer()),
+                )?;
                 let inst = graph
                     .inst(inst_id)
                     .ok_or(MachineBuildError::MissingInstruction(inst_id))?;
@@ -8905,8 +8948,10 @@ impl CertifiedMachineProjection {
 
         let mut residual_producers = BTreeSet::new();
         for instruction in artifact.obligations().instructions().values() {
-            let blocked_output = graph
-                .inst(instruction.inst)
+            let blocked_output = instruction
+                .source
+                .graph_inst()
+                .and_then(|inst| graph.inst(inst))
                 .and_then(|inst| inst.output)
                 .is_some_and(|output| blocked_outputs.contains(&output));
             if instruction.state == SemanticInstructionState::UnsupportedUnknown || blocked_output {
@@ -9033,8 +9078,10 @@ impl CertifiedMachineProjection {
 
         let mut residualized = BTreeSet::new();
         for instruction in artifact.obligations().instructions().values() {
-            let blocked_output = graph
-                .inst(instruction.inst)
+            let blocked_output = instruction
+                .source
+                .graph_inst()
+                .and_then(|inst| graph.inst(inst))
                 .and_then(|inst| inst.output)
                 .is_some_and(|output| blocked_outputs.contains(&output));
             let has_memory_obligation = instruction.obligations.iter().any(|obligation| {
@@ -9102,14 +9149,14 @@ impl CertifiedMachineProjection {
                     || absorbed_calls.contains(obligation)
                     || absorbed_controls.contains(obligation)
                 {
-                    return Err(MachineBuildError::ObligationMismatch(instruction.inst));
+                    return Err(source_site_mismatch(instruction.id, instruction.source));
                 }
                 if !residualized.insert(*obligation) {
-                    return Err(MachineBuildError::ObligationMismatch(instruction.inst));
+                    return Err(source_site_mismatch(instruction.id, instruction.source));
                 }
                 certification
                     .residualize(*obligation, reason)
-                    .map_err(|_| MachineBuildError::ObligationMismatch(instruction.inst))?;
+                    .map_err(|_| source_site_mismatch(instruction.id, instruction.source))?;
             }
         }
 
@@ -9128,9 +9175,9 @@ impl CertifiedMachineProjection {
             if source_obligations.is_empty() {
                 continue;
             }
-            let inst_id = graph
-                .def_inst(entity.output().value())
-                .ok_or(MachineBuildError::EntityMismatch(r2ssa::InstId(u32::MAX)))?;
+            let inst_id = graph.def_inst(entity.output().value()).ok_or(
+                MachineBuildError::ObligationSourceMismatch(entity.producer()),
+            )?;
             let expression = certified_expr_from_projection(
                 artifact,
                 &projection,
@@ -9167,8 +9214,9 @@ impl CertifiedMachineProjection {
             .filter(|obligation| obligation.id.kind == SemanticObligationKind::LiveValueProducer)
         {
             if absorbed.contains(&obligation.id) == residualized.contains(&obligation.id) {
-                return Err(MachineBuildError::ObligationMismatch(
-                    obligation.source_inst,
+                return Err(source_site_mismatch(
+                    obligation.id.instruction,
+                    obligation.source,
                 ));
             }
         }
@@ -9187,8 +9235,9 @@ impl CertifiedMachineProjection {
             })
         {
             if absorbed_calls.contains(&obligation.id) == residualized.contains(&obligation.id) {
-                return Err(MachineBuildError::ObligationMismatch(
-                    obligation.source_inst,
+                return Err(source_site_mismatch(
+                    obligation.id.instruction,
+                    obligation.source,
                 ));
             }
         }
@@ -9208,8 +9257,9 @@ impl CertifiedMachineProjection {
             })
         {
             if absorbed_controls.contains(&obligation.id) == residualized.contains(&obligation.id) {
-                return Err(MachineBuildError::ObligationMismatch(
-                    obligation.source_inst,
+                return Err(source_site_mismatch(
+                    obligation.id.instruction,
+                    obligation.source,
                 ));
             }
         }
@@ -9228,8 +9278,9 @@ impl CertifiedMachineProjection {
         {
             if absorbed_statements.contains(&obligation.id) == residualized.contains(&obligation.id)
             {
-                return Err(MachineBuildError::ObligationMismatch(
-                    obligation.source_inst,
+                return Err(source_site_mismatch(
+                    obligation.id.instruction,
+                    obligation.source,
                 ));
             }
         }
@@ -9623,7 +9674,13 @@ fn certified_source_topology(
                 .iter()
                 .map(|instruction| instruction.id)
                 .collect()
-        || instruction_ids != source.instructions().keys().copied().collect()
+        || instruction_ids
+            != source
+                .instructions()
+                .values()
+                .filter(|instruction| instruction.source.graph_inst().is_some())
+                .map(|instruction| instruction.id)
+                .collect()
     {
         return Err(MachineBuildError::TopologyMismatch);
     }
@@ -9641,9 +9698,9 @@ fn certified_expr_from_machine(
     source_obligations: BTreeSet<SemanticObligationId>,
 ) -> Result<CertifiedExpr, MachineBuildError> {
     let graph = artifact.graph();
-    let inst_id = graph
-        .def_inst(machine_entity.output().value())
-        .ok_or(MachineBuildError::EntityMismatch(r2ssa::InstId(u32::MAX)))?;
+    let inst_id = graph.def_inst(machine_entity.output().value()).ok_or(
+        MachineBuildError::ObligationSourceMismatch(machine_entity.producer()),
+    )?;
     let inst = graph
         .inst(inst_id)
         .ok_or(MachineBuildError::MissingInstruction(inst_id))?;
@@ -9696,9 +9753,9 @@ fn certified_expr_from_projection(
     source_obligations: BTreeSet<SemanticObligationId>,
 ) -> Result<CertifiedExpr, MachineBuildError> {
     let graph = artifact.graph();
-    let inst_id = graph
-        .def_inst(machine_entity.output().value())
-        .ok_or(MachineBuildError::EntityMismatch(r2ssa::InstId(u32::MAX)))?;
+    let inst_id = graph.def_inst(machine_entity.output().value()).ok_or(
+        MachineBuildError::ObligationSourceMismatch(machine_entity.producer()),
+    )?;
     let inst = graph
         .inst(inst_id)
         .ok_or(MachineBuildError::MissingInstruction(inst_id))?;

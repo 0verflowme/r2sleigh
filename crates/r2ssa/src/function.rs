@@ -147,6 +147,63 @@ pub enum SsaArtifactProvenanceKind {
     TrustedSource,
 }
 
+/// Exact native instruction coverage derived only from one genuine lift.
+///
+/// This is retained beside canonical P-code rather than being materialized as
+/// a synthetic R2IL operation. Its canonical-operation range binds the native
+/// bytes to the exact translator output from the same lift event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct GenuineNativeInstructionSpan {
+    block_addr: u64,
+    instruction_addr: u64,
+    size: u32,
+    first_canonical_op: u64,
+    canonical_op_count: u64,
+}
+
+impl GenuineNativeInstructionSpan {
+    pub const fn block_addr(self) -> u64 {
+        self.block_addr
+    }
+
+    pub const fn instruction_addr(self) -> u64 {
+        self.instruction_addr
+    }
+
+    pub const fn size(self) -> u32 {
+        self.size
+    }
+
+    pub const fn first_canonical_op(self) -> u64 {
+        self.first_canonical_op
+    }
+
+    pub const fn canonical_op_count(self) -> u64 {
+        self.canonical_op_count
+    }
+}
+
+fn genuine_native_instruction_spans(
+    lifted: &GenuineLiftedFunction,
+) -> Vec<GenuineNativeInstructionSpan> {
+    lifted
+        .blocks()
+        .iter()
+        .flat_map(|block| {
+            let block_addr = block.block().addr;
+            block.instruction_spans().iter().copied().map(move |span| {
+                GenuineNativeInstructionSpan {
+                    block_addr,
+                    instruction_addr: span.addr(),
+                    size: span.size(),
+                    first_canonical_op: span.first_canonical_op(),
+                    canonical_op_count: span.canonical_op_count(),
+                }
+            })
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 enum SsaArtifactProvenance {
     Manual,
@@ -423,6 +480,7 @@ impl SsaArtifact {
             .iter()
             .map(|block| block.block().clone())
             .collect::<Vec<_>>();
+        let native_spans = genuine_native_instruction_spans(lifted);
         let arch = lifted.arch_spec();
         let machine_context = SourceMachineContext::from_blocks_with_interfaces(
             &blocks,
@@ -440,14 +498,22 @@ impl SsaArtifact {
             return Err(SsaPrepareError::MalformedInput);
         }
         control.poll()?;
-        Self::new_with_context_control_and_provenance(
+        let mut artifact = Self::new_with_context_control_and_provenance(
             function,
             FunctionPrepareMode::Decompile,
             machine_context,
             SsaArtifactProvenance::GenuineLiftOnly(lifted.authority().clone()),
             control,
         )
-        .map_err(Into::into)
+        .map_err(SsaPrepareError::from)?;
+        if !artifact
+            .facts
+            .obligations
+            .bind_genuine_native_spans(native_spans)
+        {
+            return Err(SsaPrepareError::MalformedInput);
+        }
+        Ok(artifact)
     }
 
     /// Build analysis-only decompiler SSA from one complete genuine lift.
@@ -787,6 +853,7 @@ impl TrustedSsaArtifact {
             .iter()
             .map(|block| block.block().clone())
             .collect::<Vec<_>>();
+        let native_spans = genuine_native_instruction_spans(genuine);
         let interface = source
             .function_interface()
             .cloned()
@@ -807,7 +874,7 @@ impl TrustedSsaArtifact {
             return Err(SsaPrepareError::MalformedInput);
         }
         control.poll()?;
-        let artifact = SsaArtifact::new_with_context_control_and_provenance(
+        let mut artifact = SsaArtifact::new_with_context_control_and_provenance(
             function,
             FunctionPrepareMode::Decompile,
             machine_context,
@@ -815,6 +882,13 @@ impl TrustedSsaArtifact {
             control,
         )
         .map_err(SsaPrepareError::from)?;
+        if !artifact
+            .facts
+            .obligations
+            .bind_genuine_native_spans(native_spans)
+        {
+            return Err(SsaPrepareError::MalformedInput);
+        }
         Ok(Self {
             artifact,
             lift_authority,
@@ -837,7 +911,9 @@ impl TrustedSsaArtifact {
         &self.lift_authority
     }
 
-    /// Exact immutable blocks retained from the same trusted lift event.
+    /// Exact canonical Sleigh P-code retained from the trusted lift event.
+    /// Native spans, including zero-op spans, remain separate source evidence
+    /// in the artifact obligation inventory.
     pub fn source_blocks(&self) -> &[R2ILBlock] {
         &self.source_blocks
     }

@@ -856,6 +856,8 @@ dependencies = [
  "postcard",
  "r2cert",
  "r2il",
+ "r2sleigh-lift",
+ "r2source",
  "r2ssa",
  "r2sym",
  "r2types",

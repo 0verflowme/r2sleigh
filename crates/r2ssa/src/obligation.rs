@@ -15,7 +15,7 @@ use crate::graph::{InstId, InstPayload, SsaGraph, ValueId};
 use crate::op::SSAOp;
 use crate::semantic::{SourceBoundaryFacts, StructuredDataflowFacts};
 
-pub const SEMANTIC_OBLIGATION_SCHEMA_VERSION: u32 = 4;
+pub const SEMANTIC_OBLIGATION_SCHEMA_VERSION: u32 = 5;
 
 /// Stable location of one canonical SSA instruction.
 ///
@@ -32,6 +32,12 @@ pub struct CanonicalInstructionId {
 pub enum CanonicalInstructionSite {
     Phi(CanonicalStorageId),
     Op(u64),
+    /// One exact native instruction span for which the trusted translator
+    /// emitted no canonical P-code and supplied no no-effect authority.
+    NativeSpan {
+        instruction_addr: u64,
+        size: u32,
+    },
 }
 
 impl std::fmt::Display for CanonicalInstructionId {
@@ -47,6 +53,14 @@ impl std::fmt::Display for CanonicalInstructionId {
             CanonicalInstructionSite::Op(ordinal) => {
                 write!(f, "0x{:x}:op:{ordinal}", self.block_addr)
             }
+            CanonicalInstructionSite::NativeSpan {
+                instruction_addr,
+                size,
+            } => write!(
+                f,
+                "0x{:x}:native:0x{instruction_addr:x}:{size}",
+                self.block_addr
+            ),
         }
     }
 }
@@ -163,6 +177,32 @@ pub enum SemanticInstructionState {
     UnsupportedUnknown,
 }
 
+/// Exact source owner for one semantic site.
+///
+/// Graph instructions and genuine zero-op native spans are disjoint by type;
+/// callers cannot silently coerce a native span into a fabricated `InstId`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum SemanticSourceSite {
+    GraphInstruction(InstId),
+    GenuineNativeSpan(crate::GenuineNativeInstructionSpan),
+}
+
+impl SemanticSourceSite {
+    pub const fn graph_inst(self) -> Option<InstId> {
+        match self {
+            Self::GraphInstruction(inst) => Some(inst),
+            Self::GenuineNativeSpan(_) => None,
+        }
+    }
+
+    pub const fn native_span(self) -> Option<crate::GenuineNativeInstructionSpan> {
+        match self {
+            Self::GraphInstruction(_) => None,
+            Self::GenuineNativeSpan(span) => Some(span),
+        }
+    }
+}
+
 impl std::fmt::Display for SemanticInstructionState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let label = match self {
@@ -178,8 +218,7 @@ impl std::fmt::Display for SemanticInstructionState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SemanticInstructionDisposition {
     pub id: CanonicalInstructionId,
-    /// Artifact-local lookup handle. This is deliberately not part of `id`.
-    pub inst: InstId,
+    pub source: SemanticSourceSite,
     pub state: SemanticInstructionState,
     pub obligations: BTreeSet<SemanticObligationId>,
 }
@@ -187,8 +226,7 @@ pub struct SemanticInstructionDisposition {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SemanticObligation {
     pub id: SemanticObligationId,
-    /// Artifact-local lookup handle. This is deliberately not part of `id`.
-    pub source_inst: InstId,
+    pub source: SemanticSourceSite,
     /// Exact canonical values needed to realize this obligation.
     pub inputs: Vec<ValueId>,
 }
@@ -218,6 +256,7 @@ pub struct SemanticObligationInventory {
     instructions: BTreeMap<CanonicalInstructionId, SemanticInstructionDisposition>,
     obligations: BTreeMap<SemanticObligationId, SemanticObligation>,
     by_inst: BTreeMap<InstId, CanonicalInstructionId>,
+    native_spans: BTreeMap<CanonicalInstructionId, crate::GenuineNativeInstructionSpan>,
     construction_failures: Vec<ObligationInventoryFailure>,
     unstructured_cycle_blocks: BTreeSet<u64>,
 }
@@ -230,6 +269,7 @@ impl SemanticObligationInventory {
             instructions: BTreeMap::new(),
             obligations: BTreeMap::new(),
             by_inst: BTreeMap::new(),
+            native_spans: BTreeMap::new(),
             construction_failures: Vec::new(),
             unstructured_cycle_blocks: BTreeSet::new(),
         }
@@ -602,7 +642,7 @@ impl SemanticObligationInventory {
                     obligation_id,
                     SemanticObligation {
                         id: obligation_id,
-                        source_inst: inst.id,
+                        source: SemanticSourceSite::GraphInstruction(inst.id),
                         inputs: explicit_inputs
                             .remove(&(inst.id, kind, component))
                             .unwrap_or_else(|| inst.inputs.clone()),
@@ -614,13 +654,71 @@ impl SemanticObligationInventory {
                 id,
                 SemanticInstructionDisposition {
                     id,
-                    inst: inst.id,
+                    source: SemanticSourceSite::GraphInstruction(inst.id),
                     state,
                     obligations: obligation_ids,
                 },
             );
         }
         inventory
+    }
+
+    /// Bind exact genuine native spans to this inventory. Zero-op spans are
+    /// retained as explicit unsupported obligations without synthesizing an
+    /// R2IL or SSA instruction. This is private to the genuine-lift boundary.
+    pub(crate) fn bind_genuine_native_spans(
+        &mut self,
+        spans: impl IntoIterator<Item = crate::GenuineNativeInstructionSpan>,
+    ) -> bool {
+        for span in spans {
+            let id = CanonicalInstructionId {
+                block_addr: span.block_addr(),
+                site: CanonicalInstructionSite::NativeSpan {
+                    instruction_addr: span.instruction_addr(),
+                    size: span.size(),
+                },
+            };
+            if self.native_spans.insert(id, span).is_some() {
+                return false;
+            }
+            if span.canonical_op_count() != 0 {
+                continue;
+            }
+            let obligation_id = SemanticObligationId {
+                instruction: id,
+                kind: SemanticObligationKind::VolatileOrUnknownEffect,
+                component: SemanticObligationComponent::Whole,
+            };
+            let mut obligations = BTreeSet::new();
+            obligations.insert(obligation_id);
+            if self
+                .instructions
+                .insert(
+                    id,
+                    SemanticInstructionDisposition {
+                        id,
+                        source: SemanticSourceSite::GenuineNativeSpan(span),
+                        state: SemanticInstructionState::UnsupportedUnknown,
+                        obligations,
+                    },
+                )
+                .is_some()
+                || self
+                    .obligations
+                    .insert(
+                        obligation_id,
+                        SemanticObligation {
+                            id: obligation_id,
+                            source: SemanticSourceSite::GenuineNativeSpan(span),
+                            inputs: Vec::new(),
+                        },
+                    )
+                    .is_some()
+            {
+                return false;
+            }
+        }
+        true
     }
 
     pub fn instruction_for_inst(&self, inst: InstId) -> Option<&SemanticInstructionDisposition> {
@@ -643,6 +741,13 @@ impl SemanticObligationInventory {
         &self.instructions
     }
 
+    /// Exact source-derived native spans bound at the genuine-lift boundary.
+    pub fn native_spans(
+        &self,
+    ) -> &BTreeMap<CanonicalInstructionId, crate::GenuineNativeInstructionSpan> {
+        &self.native_spans
+    }
+
     pub fn obligations(&self) -> &BTreeMap<SemanticObligationId, SemanticObligation> {
         &self.obligations
     }
@@ -656,17 +761,41 @@ impl SemanticObligationInventory {
     }
 
     pub fn is_complete(&self) -> bool {
+        let zero_op_span_count = self
+            .native_spans
+            .values()
+            .filter(|span| span.canonical_op_count() == 0)
+            .count();
         if self.schema_version != SEMANTIC_OBLIGATION_SCHEMA_VERSION
             || !self.construction_failures.is_empty()
             || !self.unstructured_cycle_blocks.is_empty()
-            || self.instructions.len() != self.source_instruction_count
+            || self.instructions.len() != self.source_instruction_count + zero_op_span_count
             || self.by_inst.len() != self.source_instruction_count
         {
             return false;
         }
         for (id, instruction) in &self.instructions {
             if instruction.id != *id
-                || self.by_inst.get(&instruction.inst) != Some(id)
+                || match instruction.source {
+                    SemanticSourceSite::GraphInstruction(inst) => {
+                        self.by_inst.get(&inst) != Some(id)
+                    }
+                    SemanticSourceSite::GenuineNativeSpan(source_span) => {
+                        self.native_spans.get(id).is_none_or(|span| {
+                            span.canonical_op_count() != 0
+                                || *span != source_span
+                                || id.block_addr != span.block_addr()
+                                || !matches!(
+                                    id.site,
+                                    CanonicalInstructionSite::NativeSpan {
+                                        instruction_addr,
+                                        size,
+                                    } if instruction_addr == span.instruction_addr()
+                                        && size == span.size()
+                                )
+                        })
+                    }
+                }
                 || !instruction.obligations.iter().all(|obligation_id| {
                     obligation_id.instruction == *id
                         && self
@@ -674,7 +803,7 @@ impl SemanticObligationInventory {
                             .get(obligation_id)
                             .is_some_and(|obligation| {
                                 obligation.id == *obligation_id
-                                    && obligation.source_inst == instruction.inst
+                                    && obligation.source == instruction.source
                             })
                 })
             {
@@ -693,7 +822,7 @@ impl SemanticObligationInventory {
             if self
                 .instructions
                 .get(id)
-                .map(|instruction| instruction.inst)
+                .and_then(|instruction| instruction.source.graph_inst())
                 != Some(*inst)
             {
                 return false;
@@ -705,9 +834,23 @@ impl SemanticObligationInventory {
                     .instructions
                     .get(&id.instruction)
                     .is_none_or(|instruction| {
-                        instruction.inst != obligation.source_inst
+                        instruction.source != obligation.source
                             || !instruction.obligations.contains(id)
                     })
+            {
+                return false;
+            }
+        }
+        for (id, span) in &self.native_spans {
+            if id.block_addr != span.block_addr()
+                || !matches!(
+                    id.site,
+                    CanonicalInstructionSite::NativeSpan {
+                        instruction_addr,
+                        size,
+                    } if instruction_addr == span.instruction_addr() && size == span.size()
+                )
+                || (span.canonical_op_count() == 0) != self.instructions.contains_key(id)
             {
                 return false;
             }
@@ -2185,7 +2328,7 @@ mod tests {
             .values_mut()
             .next()
             .expect("source obligation");
-        obligation.source_inst = InstId(u32::MAX);
+        obligation.source = SemanticSourceSite::GraphInstruction(InstId(u32::MAX));
         assert!(!inventory.is_complete());
     }
 

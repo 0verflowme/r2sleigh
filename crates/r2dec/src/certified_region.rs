@@ -18,7 +18,7 @@ use r2cert::{
     TypedRegionMapping,
 };
 use r2ssa::{
-    CanonicalInstructionId, CanonicalStorageId, SemanticInstructionState,
+    CanonicalInstructionId, CanonicalInstructionSite, CanonicalStorageId, SemanticInstructionState,
     SemanticObligationComponent, SemanticObligationId, SemanticObligationInventory,
     SemanticObligationKind,
 };
@@ -274,6 +274,37 @@ fn require_source_block(
     topology
         .block(block_addr)
         .ok_or(RegionBuildError::MissingBlock(block_addr))
+}
+
+fn block_source_instruction_order(
+    source: &SemanticObligationInventory,
+    block: &r2cert::CertifiedSourceBlock,
+) -> Vec<CanonicalInstructionId> {
+    let mut ordered = block.instructions().to_vec();
+    let mut native = source
+        .native_spans()
+        .iter()
+        .filter(|(id, span)| id.block_addr == block.addr() && span.canonical_op_count() == 0)
+        .map(|(id, span)| (*id, *span))
+        .collect::<Vec<_>>();
+    native.sort_unstable_by_key(|(id, span)| {
+        (
+            span.first_canonical_op(),
+            span.instruction_addr(),
+            span.size(),
+            *id,
+        )
+    });
+    for (id, span) in native {
+        let insertion = ordered
+            .iter()
+            .position(|candidate| {
+                matches!(candidate.site, CanonicalInstructionSite::Op(ordinal) if ordinal >= span.first_canonical_op())
+            })
+            .unwrap_or(ordered.len());
+        ordered.insert(insertion, id);
+    }
+    ordered
 }
 
 fn ledger_expression_inputs(
@@ -950,34 +981,34 @@ impl CertifiedSingleBlockAccounting {
         let mut instructions = Vec::with_capacity(source.instructions().len());
         let mut mappings = Vec::with_capacity(source.obligations().len());
 
-        for id in source_block.instructions() {
+        for id in block_source_instruction_order(source, source_block) {
             let disposition = source
                 .instructions()
-                .get(id)
-                .ok_or(RegionBuildError::MissingSourceInstruction(*id))?;
-            let expression_producer = expression_entities.get(id).map(|entity| entity.producer());
+                .get(&id)
+                .ok_or(RegionBuildError::MissingSourceInstruction(id))?;
+            let expression_producer = expression_entities.get(&id).map(|entity| entity.producer());
             let statement_producer = statement_entities
-                .get(id)
+                .get(&id)
                 .map(|statement| statement.producer());
-            let call_producer = direct_call_entities.get(id).map(|call| call.producer());
+            let call_producer = direct_call_entities.get(&id).map(|call| call.producer());
             let control_producer = direct_control_entities
-                .get(id)
+                .get(&id)
                 .map(|control| control.producer())
                 .or_else(|| {
                     conditional_control_entities
-                        .get(id)
+                        .get(&id)
                         .map(|control| control.producer())
                 })
                 .or_else(|| {
                     switch_control_entities
-                        .get(id)
+                        .get(&id)
                         .map(|control| control.producer())
                 });
             let return_producer = return_control_entities
-                .get(id)
+                .get(&id)
                 .map(|control| control.producer());
             instructions.push(CertifiedRegionInstruction {
-                source: *id,
+                source: id,
                 state: disposition.state,
                 expression_producer,
                 statement_producer,
@@ -986,7 +1017,7 @@ impl CertifiedSingleBlockAccounting {
                 return_producer,
             });
             for obligation in &disposition.obligations {
-                let mapping = if let Some(mechanics_owner) = frame_mechanics.get(id) {
+                let mapping = if let Some(mechanics_owner) = frame_mechanics.get(&id) {
                     if !mechanics_owner.source_obligations().contains(obligation) {
                         return Err(RegionBuildError::ExpressionObligationMismatch(*obligation));
                     }
@@ -996,9 +1027,9 @@ impl CertifiedSingleBlockAccounting {
                     let exact_ledger_owner = match obligation.kind {
                         SemanticObligationKind::LiveValueProducer => {
                             effect.disposition()
-                                == &(EffectDisposition::AbsorbedIntoExpression { producer: *id })
+                                == &(EffectDisposition::AbsorbedIntoExpression { producer: id })
                                 && effect.expression_evidence().is_some_and(|expression| {
-                                    expression.entity().producer() == *id
+                                    expression.entity().producer() == id
                                         && expression
                                             .entity()
                                             .source_obligations()
@@ -1008,9 +1039,9 @@ impl CertifiedSingleBlockAccounting {
                         SemanticObligationKind::ObservableMemoryRead
                         | SemanticObligationKind::ObservableMemoryWrite => {
                             effect.disposition()
-                                == &(EffectDisposition::AbsorbedIntoStatement { producer: *id })
+                                == &(EffectDisposition::AbsorbedIntoStatement { producer: id })
                                 && effect.statement_evidence().is_some_and(|statement| {
-                                    statement.producer() == *id
+                                    statement.producer() == id
                                         && statement.source_obligations().contains(obligation)
                                 })
                         }
@@ -1020,9 +1051,9 @@ impl CertifiedSingleBlockAccounting {
                         return Err(RegionBuildError::ExpressionObligationMismatch(*obligation));
                     }
                     (
-                        RegionObligationDisposition::AbsorbedIntoFrameMechanics { producer: *id },
+                        RegionObligationDisposition::AbsorbedIntoFrameMechanics { producer: id },
                         Some(RegionTypedOwner::FrameMechanics {
-                            source_producer: *id,
+                            source_producer: id,
                             frame_pointer_storage: mechanics_owner.frame_pointer_storage(),
                             saved_range: mechanics_owner.saved_range(),
                             return_producers: mechanics_owner
@@ -1031,7 +1062,7 @@ impl CertifiedSingleBlockAccounting {
                                 .into_boxed_slice(),
                         }),
                     )
-                } else if let Some(mechanics_owner) = return_mechanics.get(id) {
+                } else if let Some(mechanics_owner) = return_mechanics.get(&id) {
                     if !mechanics_owner.source_obligations().contains(obligation) {
                         return Err(RegionBuildError::ExpressionObligationMismatch(*obligation));
                     }
@@ -1041,9 +1072,9 @@ impl CertifiedSingleBlockAccounting {
                     let exact_source_owner = match obligation.kind {
                         SemanticObligationKind::LiveValueProducer => {
                             effect.disposition()
-                                == &(EffectDisposition::AbsorbedIntoExpression { producer: *id })
+                                == &(EffectDisposition::AbsorbedIntoExpression { producer: id })
                                 && effect.expression_evidence().is_some_and(|expression| {
-                                    expression.entity().producer() == *id
+                                    expression.entity().producer() == id
                                         && expression
                                             .entity()
                                             .source_obligations()
@@ -1052,9 +1083,9 @@ impl CertifiedSingleBlockAccounting {
                         }
                         SemanticObligationKind::ObservableMemoryRead => {
                             effect.disposition()
-                                == &(EffectDisposition::AbsorbedIntoStatement { producer: *id })
+                                == &(EffectDisposition::AbsorbedIntoStatement { producer: id })
                                 && effect.statement_evidence().is_some_and(|statement| {
-                                    statement.producer() == *id
+                                    statement.producer() == id
                                         && statement.source_obligations().contains(obligation)
                                 })
                         }
@@ -1064,9 +1095,9 @@ impl CertifiedSingleBlockAccounting {
                         return Err(RegionBuildError::ExpressionObligationMismatch(*obligation));
                     }
                     (
-                        RegionObligationDisposition::AbsorbedIntoReturn { producer: *id },
+                        RegionObligationDisposition::AbsorbedIntoReturn { producer: id },
                         Some(RegionTypedOwner::ReturnMechanics {
-                            source_producer: *id,
+                            source_producer: id,
                             return_producers: mechanics_owner
                                 .return_producers()
                                 .to_vec()
@@ -1074,16 +1105,16 @@ impl CertifiedSingleBlockAccounting {
                         }),
                     )
                 } else if obligation.kind == SemanticObligationKind::LiveValueProducer {
-                    if let Some(entity) = expression_entities.get(id) {
+                    if let Some(entity) = expression_entities.get(&id) {
                         if !entity.source_obligations().contains(obligation) {
                             return Err(RegionBuildError::ExpressionObligationMismatch(
                                 *obligation,
                             ));
                         }
                         (
-                            RegionObligationDisposition::AbsorbedIntoExpression { producer: *id },
+                            RegionObligationDisposition::AbsorbedIntoExpression { producer: id },
                             Some(RegionTypedOwner::Expression {
-                                producer: *id,
+                                producer: id,
                                 root: entity.root(),
                             }),
                         )
@@ -1095,28 +1126,28 @@ impl CertifiedSingleBlockAccounting {
                             None,
                         )
                     } else {
-                        return Err(RegionBuildError::MissingExpression(*id));
+                        return Err(RegionBuildError::MissingExpression(id));
                     }
                 } else if matches!(
                     obligation.kind,
                     SemanticObligationKind::ObservableMemoryRead
                         | SemanticObligationKind::ObservableMemoryWrite
                 ) && statement_entities
-                    .get(id)
+                    .get(&id)
                     .is_some_and(|statement| statement.source_obligations().contains(obligation))
                 {
                     let [effect] = ledger.effects(*obligation) else {
                         return Err(RegionBuildError::StatementObligationMismatch(*obligation));
                     };
                     if effect.disposition()
-                        != &(EffectDisposition::AbsorbedIntoStatement { producer: *id })
+                        != &(EffectDisposition::AbsorbedIntoStatement { producer: id })
                     {
                         return Err(RegionBuildError::StatementObligationMismatch(*obligation));
                     }
                     (
-                        RegionObligationDisposition::AbsorbedIntoStatement { producer: *id },
+                        RegionObligationDisposition::AbsorbedIntoStatement { producer: id },
                         Some(RegionTypedOwner::Statement {
-                            producer: *id,
+                            producer: id,
                             component: obligation.component,
                         }),
                     )
@@ -1124,22 +1155,22 @@ impl CertifiedSingleBlockAccounting {
                     obligation.kind,
                     SemanticObligationKind::Call | SemanticObligationKind::CallArgument
                 ) && direct_call_entities
-                    .get(id)
+                    .get(&id)
                     .is_some_and(|call| call.source_obligations().contains(obligation))
                 {
                     let [effect] = ledger.effects(*obligation) else {
                         return Err(RegionBuildError::CallObligationMismatch(*obligation));
                     };
                     if effect.disposition()
-                        != &(EffectDisposition::AbsorbedIntoCall { producer: *id })
-                        || effect.direct_call_evidence() != direct_call_entities.get(id).copied()
+                        != &(EffectDisposition::AbsorbedIntoCall { producer: id })
+                        || effect.direct_call_evidence() != direct_call_entities.get(&id).copied()
                     {
                         return Err(RegionBuildError::CallObligationMismatch(*obligation));
                     }
                     (
-                        RegionObligationDisposition::AbsorbedIntoCall { producer: *id },
+                        RegionObligationDisposition::AbsorbedIntoCall { producer: id },
                         Some(RegionTypedOwner::Call {
-                            producer: *id,
+                            producer: id,
                             component: obligation.component,
                         }),
                     )
@@ -1148,30 +1179,30 @@ impl CertifiedSingleBlockAccounting {
                     SemanticObligationKind::ControlPredicate
                         | SemanticObligationKind::ControlTransfer
                 ) && (direct_control_entities
-                    .get(id)
+                    .get(&id)
                     .is_some_and(|control| control.source_obligation() == *obligation)
                     || conditional_control_entities
-                        .get(id)
+                        .get(&id)
                         .is_some_and(|control| control.source_obligations().contains(obligation))
                     || switch_control_entities
-                        .get(id)
+                        .get(&id)
                         .is_some_and(|control| control.source_obligation() == *obligation))
                 {
                     let [effect] = ledger.effects(*obligation) else {
                         return Err(RegionBuildError::ControlObligationMismatch(*obligation));
                     };
                     if effect.disposition()
-                        != &(EffectDisposition::AbsorbedIntoControl { producer: *id })
-                        || switch_control_entities.contains_key(id)
+                        != &(EffectDisposition::AbsorbedIntoControl { producer: id })
+                        || switch_control_entities.contains_key(&id)
                             && effect.switch_control_evidence()
-                                != switch_control_entities.get(id).copied()
+                                != switch_control_entities.get(&id).copied()
                     {
                         return Err(RegionBuildError::ControlObligationMismatch(*obligation));
                     }
                     (
-                        RegionObligationDisposition::AbsorbedIntoControl { producer: *id },
+                        RegionObligationDisposition::AbsorbedIntoControl { producer: id },
                         Some(RegionTypedOwner::Control {
-                            producer: *id,
+                            producer: id,
                             component: obligation.component,
                         }),
                     )
@@ -1179,21 +1210,21 @@ impl CertifiedSingleBlockAccounting {
                     obligation.kind,
                     SemanticObligationKind::Return | SemanticObligationKind::ReturnValue
                 ) && return_control_entities
-                    .get(id)
+                    .get(&id)
                     .is_some_and(|control| control.source_obligations().contains(obligation))
                 {
                     let [effect] = ledger.effects(*obligation) else {
                         return Err(RegionBuildError::ReturnObligationMismatch(*obligation));
                     };
                     if effect.disposition()
-                        != &(EffectDisposition::AbsorbedIntoReturn { producer: *id })
+                        != &(EffectDisposition::AbsorbedIntoReturn { producer: id })
                     {
                         return Err(RegionBuildError::ReturnObligationMismatch(*obligation));
                     }
                     (
-                        RegionObligationDisposition::AbsorbedIntoReturn { producer: *id },
+                        RegionObligationDisposition::AbsorbedIntoReturn { producer: id },
                         Some(RegionTypedOwner::Return {
-                            producer: *id,
+                            producer: id,
                             component: obligation.component,
                         }),
                     )
@@ -1371,7 +1402,7 @@ impl CertifiedSingleBlockAccounting {
         let source_block = self.topology.block(self.block_addr);
         let expected_instructions = source_block
             .into_iter()
-            .flat_map(|block| block.instructions().iter().copied())
+            .flat_map(|block| block_source_instruction_order(&self.source, block))
             .collect::<BTreeSet<_>>();
         let expected_obligations = expected_instructions
             .iter()
@@ -1766,7 +1797,7 @@ impl CertifiedSingleBlockAccounting {
             .topology
             .blocks()
             .iter()
-            .flat_map(|block| block.instructions().iter().copied())
+            .flat_map(|block| block_source_instruction_order(&self.source, block))
             .collect::<Vec<_>>();
         let certified_return_controls = self
             .topology
@@ -2015,13 +2046,12 @@ impl CertifiedSingleBlockAccounting {
         }
         if self.topology.schema_version() != CERTIFICATION_SCHEMA_VERSION
             || source_block.is_none_or(|block| {
-                block.instructions()
+                block_source_instruction_order(&self.source, block)
                     != self
                         .instructions
                         .iter()
                         .map(|instruction| instruction.source)
                         .collect::<Vec<_>>()
-                        .as_slice()
             })
         {
             invalid.push("region instructions do not match retained source topology".to_string());

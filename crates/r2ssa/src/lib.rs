@@ -67,10 +67,10 @@ pub use defuse::{
 };
 pub use fingerprint::{SSA_SEMANTIC_FINGERPRINT_SCHEMA_VERSION, stable_ssa_semantic_fingerprint};
 pub use function::{
-    CFGRiskSummary, DecompilePrepFacts, DefRef, DefSite, FunctionPrepareMode, PhiNode,
-    SSABlock as FunctionSSABlock, SSAFunction, SourceRef, SourceSite, SsaArtifact,
-    SsaArtifactAuthority, SsaArtifactProvenanceKind, StackAddressBase, StackAddressRoot,
-    SwitchInfo, TrustedSsaArtifact,
+    CFGRiskSummary, DecompilePrepFacts, DefRef, DefSite, FunctionPrepareMode,
+    GenuineNativeInstructionSpan, PhiNode, SSABlock as FunctionSSABlock, SSAFunction, SourceRef,
+    SourceSite, SsaArtifact, SsaArtifactAuthority, SsaArtifactProvenanceKind, StackAddressBase,
+    StackAddressRoot, SwitchInfo, TrustedSsaArtifact,
 };
 pub use graph::{
     BlockId, GraphBlock, GraphInst, GraphValue, InstId, InstPayload, SsaGraph, UseSite, ValueId,
@@ -108,7 +108,7 @@ pub use obligation::{
     ObligationInventoryFailure, ObligationInventoryFailureKind, SEMANTIC_OBLIGATION_SCHEMA_VERSION,
     SemanticInstructionDisposition, SemanticInstructionState, SemanticMemoryOrdering,
     SemanticObligation, SemanticObligationComponent, SemanticObligationId,
-    SemanticObligationInventory, SemanticObligationKind,
+    SemanticObligationInventory, SemanticObligationKind, SemanticSourceSite,
 };
 pub use op::SSAOp;
 pub use optimize::{DecompilePrepConfig, OptimizationConfig, OptimizationStats, optimize_function};

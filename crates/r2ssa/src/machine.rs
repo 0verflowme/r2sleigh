@@ -592,6 +592,10 @@ pub enum MachineBuildError {
     DuplicateEntity(ValueId),
     EntityMismatch(InstId),
     ObligationMismatch(InstId),
+    /// A source obligation has no coherent graph-instruction owner. This keeps
+    /// first-class native spans keyed by exact source identity instead of
+    /// coercing them into a fabricated `InstId`.
+    ObligationSourceMismatch(CanonicalInstructionId),
     UnsupportedOperation {
         inst: InstId,
         op: Box<SSAOp>,

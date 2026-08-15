@@ -279,7 +279,7 @@ fn captured_return_mechanism_matches_arch(
 }
 
 /// Schema of the exact lift-origin manifest retained by genuine blocks.
-pub const GENUINE_LIFT_PROVENANCE_SCHEMA_VERSION: u32 = 1;
+pub const GENUINE_LIFT_PROVENANCE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug)]
 struct GenuineLiftAuthorityState {
@@ -372,6 +372,8 @@ pub struct GenuineLiftedBlock {
 pub struct GenuineInstructionSpan {
     addr: u64,
     size: u32,
+    first_canonical_op: u64,
+    canonical_op_count: u64,
 }
 
 impl GenuineInstructionSpan {
@@ -381,6 +383,19 @@ impl GenuineInstructionSpan {
 
     pub const fn size(self) -> u32 {
         self.size
+    }
+
+    /// First operation in the exact canonical P-code stream for this native
+    /// instruction. Zero-op spans point at the next canonical operation.
+    pub const fn first_canonical_op(self) -> u64 {
+        self.first_canonical_op
+    }
+
+    /// Number of exact canonical P-code operations emitted for this native
+    /// instruction. Zero means the trusted translator supplied no semantics;
+    /// it does not by itself prove that the instruction is effect-free.
+    pub const fn canonical_op_count(self) -> u64 {
+        self.canonical_op_count
     }
 }
 
@@ -658,19 +673,42 @@ impl GenuineLiftedFunction {
 
 fn genuine_instruction_spans_cover_block(block: &GenuineLiftedBlock) -> bool {
     let mut expected = block.block.addr;
+    let mut expected_op = 0usize;
     if block.instruction_spans.is_empty() {
         return false;
     }
     for span in block.instruction_spans.iter() {
-        if span.addr != expected || span.size == 0 {
+        if span.addr != expected
+            || span.size == 0
+            || usize::try_from(span.first_canonical_op) != Ok(expected_op)
+        {
             return false;
         }
         let Some(next) = expected.checked_add(u64::from(span.size)) else {
             return false;
         };
+        let Ok(op_count) = usize::try_from(span.canonical_op_count) else {
+            return false;
+        };
+        let Some(next_op) = expected_op.checked_add(op_count) else {
+            return false;
+        };
+        if next_op > block.block.ops.len()
+            || (expected_op..next_op).any(|op_index| {
+                block
+                    .block
+                    .op_metadata(op_index)
+                    .and_then(|metadata| metadata.instruction_addr)
+                    != Some(span.addr)
+            })
+        {
+            return false;
+        }
         expected = next;
+        expected_op = next_op;
     }
     block.block.addr.checked_add(u64::from(block.block.size)) == Some(expected)
+        && expected_op == block.block.ops.len()
 }
 
 fn constant_control_target(target: &Varnode) -> Option<u64> {
@@ -925,6 +963,8 @@ fn stable_genuine_function_manifest_hash(
         for span in block.instruction_spans() {
             update(&mut hash, &span.addr().to_le_bytes());
             update(&mut hash, &span.size().to_le_bytes());
+            update(&mut hash, &span.first_canonical_op().to_le_bytes());
+            update(&mut hash, &span.canonical_op_count().to_le_bytes());
         }
         for successor in successors {
             update(&mut hash, &successor.to_le_bytes());
@@ -1382,7 +1422,9 @@ impl Disassembler {
         block_size: usize,
         enrichment: Option<SemanticMetadataOptions>,
     ) -> Result<(R2ILBlock, Vec<GenuineInstructionSpan>)> {
-        let mut combined_block = R2ILBlock::new(addr, block_size as u32);
+        let block_size_u32 = u32::try_from(block_size)
+            .map_err(|_| LiftError::Parse("block size exceeds r2il range".to_string()))?;
+        let mut combined_block = R2ILBlock::new(addr, block_size_u32);
         let mut instruction_spans = Vec::new();
         let mut offset = 0usize;
 
@@ -1392,7 +1434,11 @@ impl Disassembler {
                 break;
             }
 
-            let instr_addr = addr + offset as u64;
+            let offset_u64 = u64::try_from(offset)
+                .map_err(|_| LiftError::Parse("instruction offset exceeds u64".to_string()))?;
+            let instr_addr = addr
+                .checked_add(offset_u64)
+                .ok_or_else(|| LiftError::Parse("instruction address overflows".to_string()))?;
 
             // libsla requires at least 16 bytes; pad if necessary
             let lift_bytes: Vec<u8> = if remaining.len() < Self::MIN_BYTES {
@@ -1421,12 +1467,21 @@ impl Disassembler {
                         // Prevent infinite loop on zero-size instruction
                         break;
                     }
+                    let base_op_index = combined_block.ops.len();
+                    let canonical_op_count = ops.len();
+                    let first_canonical_op = u64::try_from(base_op_index).map_err(|_| {
+                        LiftError::Parse("canonical P-code index exceeds u64".to_string())
+                    })?;
+                    let canonical_op_count = u64::try_from(canonical_op_count).map_err(|_| {
+                        LiftError::Parse("canonical P-code count exceeds u64".to_string())
+                    })?;
                     instruction_spans.push(GenuineInstructionSpan {
                         addr: instr_addr,
                         size: instr_size_u32,
+                        first_canonical_op,
+                        canonical_op_count,
                     });
 
-                    let base_op_index = combined_block.ops.len();
                     let mut instr_op_metadata = op_metadata;
                     // Append all ops from this instruction
                     for op in ops {
@@ -1449,7 +1504,8 @@ impl Disassembler {
         }
 
         // Update the block size to reflect actual bytes consumed
-        combined_block.size = offset as u32;
+        combined_block.size = u32::try_from(offset)
+            .map_err(|_| LiftError::Parse("lifted block size exceeds r2il range".to_string()))?;
 
         Ok((combined_block, instruction_spans))
     }
@@ -3103,6 +3159,103 @@ mod tests {
             authorities.len(),
             2,
             "authority hashing must use opaque event identity"
+        );
+    }
+
+    #[test]
+    fn genuine_zero_op_instructions_preserve_exact_native_spans_without_changing_pcode() {
+        const ADDR: u64 = 0x401000;
+        const BYTES: &[u8] = &[0x90, 0x31, 0xc0, 0x90];
+
+        let disassembler = Disassembler::from_trusted_profile(TrustedSleighProfile::X86_64)
+            .expect("trusted x86-64 disassembler");
+        let lifted = disassembler
+            .lift_genuine_block(BYTES, ADDR, BYTES.len())
+            .expect("genuine NOP/XOR/NOP block");
+        let canonical_ops = lifted.block().ops.clone();
+        let canonical_metadata = lifted.block().op_metadata.clone();
+        let spans = lifted
+            .instruction_spans()
+            .iter()
+            .map(|span| {
+                (
+                    span.addr(),
+                    span.size(),
+                    span.first_canonical_op(),
+                    span.canonical_op_count(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let xor_op_count = u64::try_from(canonical_ops.len()).expect("canonical op count fits u64");
+        assert_eq!(
+            spans,
+            vec![
+                (ADDR, 1, 0, 0),
+                (ADDR + 1, 2, 0, xor_op_count),
+                (ADDR + 3, 1, xor_op_count, 0),
+            ]
+        );
+        assert!(
+            !canonical_ops.is_empty(),
+            "XOR must retain canonical P-code"
+        );
+        assert!(
+            !canonical_ops
+                .iter()
+                .any(|op| matches!(op, R2ILOp::Unimplemented))
+        );
+        assert!(
+            canonical_metadata
+                .values()
+                .all(|metadata| metadata.instruction_addr == Some(ADDR + 1))
+        );
+
+        assert_eq!(lifted.source_bytes(), BYTES);
+        assert_eq!(lifted.block().ops, canonical_ops);
+        assert_eq!(lifted.block().op_metadata, canonical_metadata);
+    }
+
+    #[test]
+    fn genuine_consecutive_all_zero_op_spans_remain_first_class_native_evidence() {
+        const ADDR: u64 = 0x402000;
+        const BYTES: &[u8] = &[0x90, 0x90, 0x90];
+
+        let disassembler = Disassembler::from_trusted_profile(TrustedSleighProfile::X86_64)
+            .expect("trusted x86-64 disassembler");
+        let lifted = disassembler
+            .lift_genuine_block(BYTES, ADDR, BYTES.len())
+            .expect("genuine consecutive NOP block");
+
+        assert!(lifted.block().ops.is_empty());
+        assert!(lifted.block().op_metadata.is_empty());
+        assert_eq!(lifted.source_bytes(), BYTES);
+        assert_eq!(
+            lifted
+                .instruction_spans()
+                .iter()
+                .map(|span| {
+                    (
+                        span.addr(),
+                        span.size(),
+                        span.first_canonical_op(),
+                        span.canonical_op_count(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![(ADDR, 1, 0, 0), (ADDR + 1, 1, 0, 0), (ADDR + 2, 1, 0, 0),]
+        );
+    }
+
+    #[test]
+    fn genuine_instruction_span_address_overflow_fails_closed() {
+        let disassembler = Disassembler::from_trusted_profile(TrustedSleighProfile::X86_64)
+            .expect("trusted x86-64 disassembler");
+
+        assert!(
+            disassembler
+                .lift_genuine_block(&[0x90, 0x90], u64::MAX, 2)
+                .is_err()
         );
     }
 

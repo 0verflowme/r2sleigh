@@ -41,7 +41,7 @@ use crate::semantic_function::CertifiedSemanticCFunction;
 use crate::semantic_memory_function::CertifiedMemorySemanticCFunction;
 use crate::semantic_stmt::SemanticCBlockStepLayer;
 
-pub const SEMANTIC_DIFFERENTIAL_SCHEMA_VERSION: u32 = 6;
+pub const SEMANTIC_DIFFERENTIAL_SCHEMA_VERSION: u32 = 7;
 pub const SEMANTIC_DIFFERENTIAL_EVALUATOR_CONTRACT_VERSION: u32 = 6;
 
 fn hex_bytes(bytes: &[u8]) -> String {
@@ -93,6 +93,13 @@ impl From<CanonicalInstructionId> for CanonicalInstructionIdWire {
                 offset_hex: format!("0x{:016x}", storage.offset),
                 size_bytes: storage.size,
             },
+            CanonicalInstructionSite::NativeSpan {
+                instruction_addr,
+                size,
+            } => CanonicalInstructionSiteWire::NativeSpan {
+                instruction_addr_hex: format!("0x{instruction_addr:016x}"),
+                size_bytes: size,
+            },
         };
         Self {
             block_addr_hex: format!("0x{:016x}", value.block_addr),
@@ -110,6 +117,10 @@ enum CanonicalInstructionSiteWire {
     Phi {
         space: String,
         offset_hex: String,
+        size_bytes: u32,
+    },
+    NativeSpan {
+        instruction_addr_hex: String,
         size_bytes: u32,
     },
 }
@@ -5644,6 +5655,462 @@ fn semantic_write_memory(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::c_void;
+    use std::mem::size_of;
+
+    use r2source::{
+        RADARE_ABI_VERSION, RADARE_CAP_EXACT_FUNCTION_INTERFACE, RADARE_CAP_EXACT_STACK_SLOT_ROLES,
+        RADARE_CAP_OWNED_BOUNDED_FUNCTION_IMAGE, RADARE_CAP_RETURN_ADDRESS_STORAGE,
+        RADARE_CAP_REVISION, RADARE_CAP_STACK_POINTER_STORAGE, RADARE_CAP_STACK_SLOTS,
+        RADARE_ENDIAN_LITTLE, RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION,
+        RADARE_SNAPSHOT_ACCESSOR_SCHEMA_VERSION, RadareAbi138Accessors, RadareAbi138BlockView,
+        RadareAbi138FunctionInterfaceView, RadareAbi138ParameterView,
+        RadareAbi138RegisterStorageView, RadareAbi138SnapshotInput, RadareAbi138SnapshotView,
+        RadareAbi138SuccessorView,
+    };
+
+    struct NativeSpanSnapshotFixture {
+        addr: u64,
+        bytes: Vec<u8>,
+        return_address: RadareAbi138RegisterStorageView,
+        stack_pointer: RadareAbi138RegisterStorageView,
+        return_address_name: String,
+        stack_pointer_name: String,
+    }
+
+    impl NativeSpanSnapshotFixture {
+        fn top(&self) -> RadareAbi138SnapshotView {
+            RadareAbi138SnapshotView {
+                schema_version: RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION,
+                struct_size: u32::try_from(size_of::<RadareAbi138SnapshotView>())
+                    .expect("snapshot view size fits u32"),
+                capabilities: RADARE_CAP_REVISION
+                    | RADARE_CAP_OWNED_BOUNDED_FUNCTION_IMAGE
+                    | RADARE_CAP_EXACT_FUNCTION_INTERFACE
+                    | RADARE_CAP_STACK_SLOTS
+                    | RADARE_CAP_EXACT_STACK_SLOT_ROLES
+                    | RADARE_CAP_RETURN_ADDRESS_STORAGE
+                    | RADARE_CAP_STACK_POINTER_STORAGE,
+                function_addr: self.addr,
+                function_size: u64::try_from(self.bytes.len()).expect("fixture size fits u64"),
+                bits: 64,
+                endian: RADARE_ENDIAN_LITTLE,
+                arch_id_length: 3,
+                cpu_id_length: 3,
+                function_name_length: 19,
+                revision_identity: self.addr,
+                num_blocks: 1,
+                num_external_exits: 1,
+                total_source_bytes: self.bytes.len(),
+                ..Default::default()
+            }
+        }
+
+        fn end(&self) -> u64 {
+            self.addr
+                .checked_add(u64::try_from(self.bytes.len()).expect("fixture size fits u64"))
+                .expect("fixture range")
+        }
+    }
+
+    unsafe fn fixture<'a>(snapshot: *const c_void) -> &'a NativeSpanSnapshotFixture {
+        // SAFETY: every callback is invoked synchronously with the live fixture
+        // pointer supplied to `capture_radare_abi138` below.
+        unsafe { &*snapshot.cast::<NativeSpanSnapshotFixture>() }
+    }
+
+    unsafe fn copy_fixture_string(value: &[u8], out: *mut u8, capacity: usize) -> u8 {
+        if capacity != value.len().saturating_add(1) {
+            return 0;
+        }
+        // SAFETY: the audited capture boundary supplies exactly `capacity`
+        // writable bytes and this helper checks the required length first.
+        unsafe {
+            std::ptr::copy_nonoverlapping(value.as_ptr(), out, value.len());
+            out.add(value.len()).write(0);
+        }
+        1
+    }
+
+    unsafe extern "C" fn snapshot_view(
+        snapshot: *const c_void,
+        out: *mut RadareAbi138SnapshotView,
+    ) -> u8 {
+        // SAFETY: callback arguments are the live fixture and capture-owned output.
+        unsafe { out.write(fixture(snapshot).top()) };
+        1
+    }
+
+    unsafe extern "C" fn arch_id(_snapshot: *const c_void, out: *mut u8, capacity: usize) -> u8 {
+        // SAFETY: forwarded capture-owned output buffer.
+        unsafe { copy_fixture_string(b"x86", out, capacity) }
+    }
+
+    unsafe extern "C" fn cpu_id(_snapshot: *const c_void, out: *mut u8, capacity: usize) -> u8 {
+        // SAFETY: forwarded capture-owned output buffer.
+        unsafe { copy_fixture_string(b"x86", out, capacity) }
+    }
+
+    unsafe extern "C" fn function_name(
+        _snapshot: *const c_void,
+        out: *mut u8,
+        capacity: usize,
+    ) -> u8 {
+        // SAFETY: forwarded capture-owned output buffer.
+        unsafe { copy_fixture_string(b"native_span_fixture", out, capacity) }
+    }
+
+    unsafe extern "C" fn interface_view(
+        snapshot: *const c_void,
+        out: *mut RadareAbi138FunctionInterfaceView,
+    ) -> u8 {
+        // SAFETY: the callback receives the live fixture pointer.
+        let fixture = unsafe { fixture(snapshot) };
+        // SAFETY: the capture owns one initialized output slot.
+        unsafe {
+            out.write(RadareAbi138FunctionInterfaceView {
+                calling_convention_length: 4,
+                return_kind: 1,
+                return_address_storage: fixture.return_address,
+                stack_pointer_storage: fixture.stack_pointer,
+                stack_resources_complete: 1,
+                stack_slot_roles_complete: 1,
+                complete: 1,
+                return_type_id: u32::MAX,
+                ..Default::default()
+            })
+        };
+        1
+    }
+
+    unsafe extern "C" fn interface_calling_convention(
+        _snapshot: *const c_void,
+        out: *mut u8,
+        capacity: usize,
+    ) -> u8 {
+        // SAFETY: forwarded capture-owned output buffer.
+        unsafe { copy_fixture_string(b"sysv", out, capacity) }
+    }
+
+    unsafe extern "C" fn interface_storage_name(
+        snapshot: *const c_void,
+        kind: i32,
+        out: *mut u8,
+        capacity: usize,
+    ) -> u8 {
+        // SAFETY: the callback receives the live fixture pointer.
+        let fixture = unsafe { fixture(snapshot) };
+        let name = match kind {
+            1 => fixture.return_address_name.as_bytes(),
+            2 => fixture.stack_pointer_name.as_bytes(),
+            _ => return 0,
+        };
+        // SAFETY: forwarded capture-owned output buffer.
+        unsafe { copy_fixture_string(name, out, capacity) }
+    }
+
+    unsafe extern "C" fn unused_parameter_view(
+        _snapshot: *const c_void,
+        _index: usize,
+        _out: *mut RadareAbi138ParameterView,
+    ) -> u8 {
+        0
+    }
+
+    unsafe extern "C" fn unused_parameter_name(
+        _snapshot: *const c_void,
+        _index: usize,
+        _out: *mut u8,
+        _capacity: usize,
+    ) -> u8 {
+        0
+    }
+
+    unsafe extern "C" fn block_view(
+        snapshot: *const c_void,
+        index: usize,
+        out: *mut RadareAbi138BlockView,
+    ) -> u8 {
+        if index != 0 {
+            return 0;
+        }
+        // SAFETY: the callback receives the live fixture pointer.
+        let fixture = unsafe { fixture(snapshot) };
+        // SAFETY: the capture owns one initialized output slot.
+        unsafe {
+            out.write(RadareAbi138BlockView {
+                addr: fixture.addr,
+                size: u64::try_from(fixture.bytes.len()).expect("fixture size fits u64"),
+                num_successors: 1,
+                switch_addr: u64::MAX,
+            })
+        };
+        1
+    }
+
+    unsafe extern "C" fn block_bytes(
+        snapshot: *const c_void,
+        block_index: usize,
+        offset: usize,
+        out: *mut u8,
+        capacity: usize,
+    ) -> u8 {
+        // SAFETY: the callback receives the live fixture pointer.
+        let fixture = unsafe { fixture(snapshot) };
+        if block_index != 0 || offset != 0 || capacity != fixture.bytes.len() {
+            return 0;
+        }
+        // SAFETY: the capture-owned output has exactly the advertised capacity.
+        unsafe {
+            std::ptr::copy_nonoverlapping(fixture.bytes.as_ptr(), out, capacity);
+        }
+        1
+    }
+
+    unsafe extern "C" fn successor_view(
+        snapshot: *const c_void,
+        block_index: usize,
+        successor_index: usize,
+        out: *mut RadareAbi138SuccessorView,
+    ) -> u8 {
+        if block_index != 0 || successor_index != 0 {
+            return 0;
+        }
+        // SAFETY: the callback receives the live fixture pointer.
+        let fixture = unsafe { fixture(snapshot) };
+        // SAFETY: the capture owns one initialized output slot.
+        unsafe {
+            out.write(RadareAbi138SuccessorView {
+                kind: 1,
+                target_addr: fixture.end(),
+                external: 1,
+                ..Default::default()
+            })
+        };
+        1
+    }
+
+    unsafe extern "C" fn external_exit(snapshot: *const c_void, index: usize, out: *mut u64) -> u8 {
+        if index != 0 {
+            return 0;
+        }
+        // SAFETY: callback arguments are the live fixture and capture-owned output.
+        unsafe { out.write(fixture(snapshot).end()) };
+        1
+    }
+
+    fn trusted_native_span_fixture(
+        bytes: &[u8],
+        addr: u64,
+    ) -> (
+        TrustedSsaArtifact,
+        r2il::R2ILBlock,
+        Vec<(u64, u32, u64, u64)>,
+    ) {
+        let trusted_arch = r2sleigh_lift::create_x86_64_spec();
+        let register = |name: &str| {
+            trusted_arch
+                .registers
+                .iter()
+                .find(|register| register.name.eq_ignore_ascii_case(name))
+                .unwrap_or_else(|| panic!("missing trusted {name} register"))
+        };
+        let return_address = register("rip");
+        let stack_pointer = register("rsp");
+        let fixture = NativeSpanSnapshotFixture {
+            addr,
+            bytes: bytes.to_vec(),
+            return_address: RadareAbi138RegisterStorageView {
+                name_length: return_address.name.len(),
+                offset: return_address.offset,
+                size: return_address.size,
+            },
+            stack_pointer: RadareAbi138RegisterStorageView {
+                name_length: stack_pointer.name.len(),
+                offset: stack_pointer.offset,
+                size: stack_pointer.size,
+            },
+            return_address_name: return_address.name.clone(),
+            stack_pointer_name: stack_pointer.name.clone(),
+        };
+        let accessors = RadareAbi138Accessors {
+            struct_size: u32::try_from(size_of::<RadareAbi138Accessors>())
+                .expect("accessor size fits u32"),
+            abi_version: RADARE_ABI_VERSION,
+            snapshot_schema_version: RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION,
+            accessor_schema_version: RADARE_SNAPSHOT_ACCESSOR_SCHEMA_VERSION,
+            snapshot_view: Some(snapshot_view),
+            arch_id: Some(arch_id),
+            cpu_id: Some(cpu_id),
+            function_name: Some(function_name),
+            interface_view: Some(interface_view),
+            interface_calling_convention: Some(interface_calling_convention),
+            interface_storage_name: Some(interface_storage_name),
+            parameter_view: Some(unused_parameter_view),
+            parameter_storage_name: Some(unused_parameter_name),
+            block_view: Some(block_view),
+            block_bytes: Some(block_bytes),
+            successor_view: Some(successor_view),
+            external_exit: Some(external_exit),
+            ..Default::default()
+        };
+        let input = RadareAbi138SnapshotInput {
+            struct_size: u32::try_from(size_of::<RadareAbi138SnapshotInput>())
+                .expect("input size fits u32"),
+            abi_version: RADARE_ABI_VERSION,
+            snapshot_schema_version: RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION,
+            accessor_schema_version: RADARE_SNAPSHOT_ACCESSOR_SCHEMA_VERSION,
+            snapshot: (&fixture as *const NativeSpanSnapshotFixture).cast(),
+            accessors: &accessors,
+        };
+        // SAFETY: the fixture and immutable callback table remain live for the
+        // full synchronous capture and every callback obeys the exact ABI.
+        let source =
+            unsafe { r2source::capture_radare_abi138(&input) }.expect("owned source capture");
+        let lifted = r2sleigh_lift::Disassembler::lift_owned_function(source)
+            .expect("trusted production lift");
+        let block = lifted.lifted().blocks()[0].block().clone();
+        let spans = lifted.lifted().blocks()[0]
+            .instruction_spans()
+            .iter()
+            .map(|span| {
+                (
+                    span.addr(),
+                    span.size(),
+                    span.first_canonical_op(),
+                    span.canonical_op_count(),
+                )
+            })
+            .collect();
+        (
+            TrustedSsaArtifact::prepare(lifted).expect("trusted production SSA"),
+            block,
+            spans,
+        )
+    }
+
+    fn assert_zero_op_native_spans_are_exactly_residual(
+        trusted: &TrustedSsaArtifact,
+        canonical: &r2il::R2ILBlock,
+        expected_zero_span_count: usize,
+    ) -> Vec<CanonicalInstructionId> {
+        let source = &trusted.source_blocks()[0];
+        assert_eq!(source.addr, canonical.addr);
+        assert_eq!(source.size, canonical.size);
+        assert_eq!(source.ops, canonical.ops);
+        assert_eq!(source.op_metadata, canonical.op_metadata);
+
+        let inventory = trusted.artifact().obligations();
+        assert!(inventory.is_complete());
+        let zero_spans = inventory
+            .native_spans()
+            .iter()
+            .filter(|(_, span)| span.canonical_op_count() == 0)
+            .collect::<Vec<_>>();
+        assert_eq!(zero_spans.len(), expected_zero_span_count);
+
+        let mut zero_ids = Vec::with_capacity(zero_spans.len());
+        let mut zero_obligations = Vec::with_capacity(zero_spans.len());
+        for (id, span) in zero_spans {
+            assert_eq!(id.block_addr, source.addr);
+            assert!(matches!(
+                id.site,
+                CanonicalInstructionSite::NativeSpan {
+                    instruction_addr,
+                    size,
+                } if instruction_addr == span.instruction_addr() && size == span.size()
+            ));
+            let disposition = inventory
+                .instructions()
+                .get(id)
+                .expect("zero-op span disposition");
+            assert_eq!(
+                disposition.state,
+                SemanticInstructionState::UnsupportedUnknown
+            );
+            assert_eq!(disposition.source.native_span(), Some(*span));
+            assert_eq!(disposition.source.graph_inst(), None);
+            let obligation_id = r2ssa::SemanticObligationId {
+                instruction: *id,
+                kind: r2ssa::SemanticObligationKind::VolatileOrUnknownEffect,
+                component: r2ssa::SemanticObligationComponent::Whole,
+            };
+            assert_eq!(
+                disposition.obligations,
+                BTreeSet::from([obligation_id]),
+                "one exact Whole unknown obligation per zero-op span"
+            );
+            let obligation = inventory
+                .obligations()
+                .get(&obligation_id)
+                .expect("zero-op span obligation");
+            assert_eq!(obligation.source, disposition.source);
+            assert!(obligation.inputs.is_empty());
+            zero_ids.push(*id);
+            zero_obligations.push(obligation_id);
+        }
+
+        let certified = CertifiedMachineProjection::from_artifact(trusted)
+            .expect("fail-closed machine projection");
+        for (id, obligation) in zero_ids.iter().zip(&zero_obligations) {
+            assert!(certified.residual_producers().contains(id));
+            assert_eq!(certified.ledger().effects(*obligation).len(), 1);
+            assert!(matches!(
+                certified.ledger().effects(*obligation)[0].disposition(),
+                r2cert::EffectDisposition::Residualized { .. }
+            ));
+        }
+        zero_ids
+    }
+
+    #[test]
+    fn genuine_mixed_zero_op_spans_use_production_trusted_ssa_wiring() {
+        const ADDR: u64 = 0x401000;
+        let (trusted, canonical, spans) =
+            trusted_native_span_fixture(&[0x90, 0x31, 0xc0, 0x90], ADDR);
+
+        let canonical_op_count =
+            u64::try_from(canonical.ops.len()).expect("canonical op count fits u64");
+        assert!(!canonical.ops.is_empty());
+        assert_eq!(
+            spans,
+            vec![
+                (ADDR, 1, 0, 0),
+                (ADDR + 1, 2, 0, canonical_op_count),
+                (ADDR + 3, 1, canonical_op_count, 0),
+            ]
+        );
+        assert_zero_op_native_spans_are_exactly_residual(&trusted, &canonical, 2);
+    }
+
+    #[test]
+    fn genuine_all_zero_op_spans_residualize_and_refuse_differential_admission() {
+        const ADDR: u64 = 0x402000;
+        let (trusted, canonical, spans) = trusted_native_span_fixture(&[0x90, 0x90, 0x90], ADDR);
+
+        assert!(canonical.ops.is_empty());
+        assert!(canonical.op_metadata.is_empty());
+        assert_eq!(
+            spans,
+            vec![(ADDR, 1, 0, 0), (ADDR + 1, 1, 0, 0), (ADDR + 2, 1, 0, 0)]
+        );
+        let zero_ids = assert_zero_op_native_spans_are_exactly_residual(&trusted, &canonical, 3);
+        assert_eq!(zero_ids.len(), 3);
+
+        let initial = DifferentialState::for_artifact(&trusted).expect("differential state");
+        let report =
+            check_block_differential(&trusted, ADDR, &initial, DifferentialLimits::default());
+        assert_eq!(report.admission(), DifferentialCandidateAdmission::Residual);
+        assert_eq!(report.conclusion(), DifferentialConclusion::Incomplete);
+        assert!(matches!(
+            report.disposition(),
+            DifferentialCaseDisposition::CandidateNotAdmitted {
+                admission: DifferentialCandidateAdmission::Residual,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn rendered_conditional_oracle_observes_polarity_and_arm_order() {
         let state = ExecutionState {
@@ -5891,5 +6358,41 @@ mod tests {
         })
         .expect("stack type JSON");
         assert_eq!(stack["ty"]["provenance"]["offset"], i64::MIN.to_string());
+    }
+
+    #[test]
+    fn native_span_instruction_identity_has_exact_json_coordinates() {
+        #[derive(Serialize)]
+        struct InstructionRecord {
+            #[serde(serialize_with = "serialize_canonical_instruction_id")]
+            instruction: CanonicalInstructionId,
+        }
+
+        let encoded = serde_json::to_value(InstructionRecord {
+            instruction: CanonicalInstructionId {
+                block_addr: 0x401000,
+                site: CanonicalInstructionSite::NativeSpan {
+                    instruction_addr: 0x401003,
+                    size: 2,
+                },
+            },
+        })
+        .expect("native span JSON");
+
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "instruction": {
+                    "block_addr_hex": "0x0000000000401000",
+                    "site": {
+                        "kind": "native_span",
+                        "instruction_addr_hex": "0x0000000000401003",
+                        "size_bytes": 2,
+                    },
+                },
+            })
+        );
+        assert_eq!(SEMANTIC_DIFFERENTIAL_SCHEMA_VERSION, 7);
+        assert_eq!(SEMANTIC_DIFFERENTIAL_EVALUATOR_CONTRACT_VERSION, 6);
     }
 }

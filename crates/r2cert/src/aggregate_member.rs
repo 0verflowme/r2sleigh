@@ -436,7 +436,7 @@ fn try_certified_aggregate_member_access(
         || memory_obligation.kind != expected_obligation_kind
         || memory_obligation.component
             != SemanticObligationComponent::MemoryAccess(access_key.ordinal)
-        || source_obligation.source_inst != projection.producer
+        || source_obligation.source.graph_inst() != Some(projection.producer)
     {
         return Ok(None);
     }

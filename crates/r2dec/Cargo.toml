@@ -18,4 +18,6 @@ serde.workspace = true
 default = []
 
 [dev-dependencies]
+r2sleigh-lift = { path = "../r2sleigh-lift", features = ["x86"] }
+r2source = { path = "../r2source" }
 serde_json.workspace = true
