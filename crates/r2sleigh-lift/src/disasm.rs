@@ -8,8 +8,8 @@ use libsla::{
     IntSign, OpCode, PcodeDisassembly, PcodeInstruction, PseudoOp, Sleigh, VarnodeData,
 };
 use r2il::{
-    AtomicKind, MemoryClass, MemoryOrdering, MemoryPermissions, OpMetadata, PointerHint, R2ILBlock,
-    R2ILOp, ScalarKind, SpaceId, StorageClass, Varnode, select_register_name,
+    MemoryClass, MemoryPermissions, PointerHint, R2ILBlock, R2ILOp, ScalarKind, SpaceId,
+    StorageClass, Varnode, select_register_name,
 };
 use r2source::SourceEndianness;
 use r2source::{
@@ -21,7 +21,6 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use crate::translate::{self, PcodeSource};
-use crate::userops::{ARM64_PAUTH_AUTH_USEROP, ARM64_PAUTH_SIGN_USEROP, ARM64_PAUTH_STRIP_USEROP};
 use crate::{LiftError, Result};
 
 /// A disassembler that uses libsla to lift instructions to r2il.
@@ -1349,11 +1348,6 @@ impl Disassembler {
         options: SemanticMetadataOptions,
     ) -> Result<R2ILBlock> {
         let mut block = self.lift_canonical(bytes, addr)?;
-        let mnemonic = self
-            .disasm_native(bytes, addr)
-            .map(|(m, _)| m)
-            .unwrap_or_default();
-        self.normalize_memory_semantics(&mut block, &mnemonic);
         self.annotate_semantic_metadata(&mut block, options);
         Ok(block)
     }
@@ -1577,24 +1571,15 @@ impl Disassembler {
         Ok(block)
     }
 
-    fn normalize_memory_semantics(&self, block: &mut R2ILBlock, mnemonic: &str) {
-        normalize_memory_semantics_with_hints(
-            block,
-            &self.arch_name,
-            mnemonic,
-            |idx| self.userop_name(idx).map(str::to_string),
-            |name| {
-                self.register(name)
-                    .ok()
-                    .and_then(|vn| self.translate_varnode(&vn).ok())
-            },
-        );
-    }
-
     fn annotate_semantic_metadata(&self, block: &mut R2ILBlock, options: SemanticMetadataOptions) {
-        annotate_semantic_metadata_with_hints(block, &self.arch_name, options, |vn| {
+        // Inference runs against an analysis copy so advisory varnode hints can
+        // contribute to out-of-band op metadata without altering canonical
+        // Sleigh operations or operands.
+        let mut analysis = block.clone();
+        annotate_semantic_metadata_with_hints(&mut analysis, &self.arch_name, options, |vn| {
             self.register_name(vn)
         });
+        block.op_metadata = analysis.op_metadata;
     }
 
     /// Translate a single P-code instruction to an r2il operation.
@@ -2528,345 +2513,10 @@ fn annotate_semantic_metadata_with_hints<F>(
     }
 }
 
-fn normalize_memory_semantics_with_hints<F, G>(
-    block: &mut R2ILBlock,
-    arch_name: &str,
-    mnemonic: &str,
-    userop_name: F,
-    resolve_register: G,
-) where
-    F: Fn(u32) -> Option<String>,
-    G: Fn(&str) -> Option<Varnode>,
-{
-    let arch = arch_name.to_ascii_lowercase();
-    let token = mnemonic
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-
-    let mut replaced_fence_userop = false;
-    for op_index in 0..block.ops.len() {
-        let replacement = match &block.ops[op_index] {
-            R2ILOp::CallOther {
-                output,
-                userop,
-                inputs: _,
-            } => {
-                let name = userop_name(*userop).unwrap_or_default();
-                if output.is_none() && is_fence_userop_name(&name) {
-                    Some(R2ILOp::Fence {
-                        ordering: MemoryOrdering::SeqCst,
-                    })
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        };
-        if let Some(new_op) = replacement {
-            block.ops[op_index] = new_op;
-            set_memory_hints(
-                block,
-                op_index,
-                Some(AtomicKind::Fence),
-                Some(MemoryOrdering::SeqCst),
-            );
-            replaced_fence_userop = true;
-        }
-    }
-
-    if is_fence_mnemonic(&token)
-        && !replaced_fence_userop
-        && !block
-            .ops
-            .iter()
-            .any(|op| matches!(op, R2ILOp::Fence { .. }))
-    {
-        let op_index = block.ops.len();
-        block.push_with_metadata(
-            R2ILOp::Fence {
-                ordering: MemoryOrdering::SeqCst,
-            },
-            Some(OpMetadata {
-                atomic_kind: Some(AtomicKind::Fence),
-                memory_ordering: Some(MemoryOrdering::SeqCst),
-                ..Default::default()
-            }),
-        );
-        set_memory_hints(
-            block,
-            op_index,
-            Some(AtomicKind::Fence),
-            Some(MemoryOrdering::SeqCst),
-        );
-    }
-
-    if block.ops.is_empty()
-        && is_arm64_arch_name(&arch)
-        && let Some(op) = pointer_auth_userop_from_mnemonic(&token, mnemonic, &resolve_register)
-    {
-        block.push_with_metadata(
-            op,
-            Some(OpMetadata {
-                instruction_addr: Some(block.addr),
-                ..Default::default()
-            }),
-        );
-    }
-
-    let op_ordering = ordering_from_mnemonic_token(&token);
-    let lr_like = (arch.contains("riscv") && token.starts_with("lr."))
-        || (arch.contains("arm") && token.starts_with("ldrex"));
-    if lr_like
-        && let Some((op_index, dst, space, addr)) =
-            block.ops.iter().enumerate().find_map(|(i, op)| match op {
-                R2ILOp::Load { dst, space, addr } if *space == SpaceId::Ram => {
-                    Some((i, dst.clone(), *space, addr.clone()))
-                }
-                _ => None,
-            })
-    {
-        block.ops[op_index] = R2ILOp::LoadLinked {
-            dst,
-            space,
-            addr,
-            ordering: op_ordering,
-        };
-        set_memory_hints(
-            block,
-            op_index,
-            Some(AtomicKind::LoadLinked),
-            Some(op_ordering),
-        );
-    }
-
-    let sc_like = (arch.contains("riscv") && token.starts_with("sc."))
-        || (arch.contains("arm") && token.starts_with("strex"));
-    if sc_like
-        && let Some((op_index, space, addr, val)) =
-            block.ops.iter().enumerate().find_map(|(i, op)| match op {
-                R2ILOp::Store { space, addr, val } if *space == SpaceId::Ram => {
-                    Some((i, *space, addr.clone(), val.clone()))
-                }
-                _ => None,
-            })
-    {
-        let result_candidate = storeconditional_result_from_mnemonic(mnemonic, &resolve_register)
-            .or_else(|| nearest_register_output(block, op_index));
-        block.ops[op_index] = R2ILOp::StoreConditional {
-            result: result_candidate,
-            space,
-            addr,
-            val,
-            ordering: op_ordering,
-        };
-        set_memory_hints(
-            block,
-            op_index,
-            Some(AtomicKind::StoreConditional),
-            Some(op_ordering),
-        );
-    }
-
-    if arch.contains("riscv") && token.starts_with("amo") {
-        for op_index in 0..block.ops.len() {
-            let is_memory = matches!(
-                block.ops[op_index],
-                R2ILOp::Load {
-                    space: SpaceId::Ram,
-                    ..
-                } | R2ILOp::Store {
-                    space: SpaceId::Ram,
-                    ..
-                } | R2ILOp::LoadLinked {
-                    space: SpaceId::Ram,
-                    ..
-                } | R2ILOp::StoreConditional {
-                    space: SpaceId::Ram,
-                    ..
-                } | R2ILOp::AtomicCAS {
-                    space: SpaceId::Ram,
-                    ..
-                } | R2ILOp::LoadGuarded {
-                    space: SpaceId::Ram,
-                    ..
-                } | R2ILOp::StoreGuarded {
-                    space: SpaceId::Ram,
-                    ..
-                }
-            );
-            if is_memory {
-                set_memory_hints(
-                    block,
-                    op_index,
-                    Some(AtomicKind::ReadModifyWrite),
-                    Some(op_ordering),
-                );
-            }
-        }
-    }
-}
-
-fn is_arm64_arch_name(arch: &str) -> bool {
-    arch.contains("aarch64") || arch.contains("arm64")
-}
-
-fn pointer_auth_userop_for_token(token: &str) -> Option<u32> {
-    if token.starts_with("aut") {
-        Some(ARM64_PAUTH_AUTH_USEROP)
-    } else if token.starts_with("xpac") {
-        Some(ARM64_PAUTH_STRIP_USEROP)
-    } else if token.starts_with("pac") {
-        Some(ARM64_PAUTH_SIGN_USEROP)
-    } else {
-        None
-    }
-}
-
-fn pointer_auth_operands(mnemonic: &str) -> Vec<&str> {
-    mnemonic
-        .split_once(char::is_whitespace)
-        .map(|(_, operands)| operands)
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|operand| !operand.is_empty())
-        .collect()
-}
-
-fn pointer_auth_userop_from_mnemonic<G>(
-    token: &str,
-    mnemonic: &str,
-    resolve_register: &G,
-) -> Option<R2ILOp>
-where
-    G: Fn(&str) -> Option<Varnode>,
-{
-    let userop = pointer_auth_userop_for_token(token)?;
-    let operands = pointer_auth_operands(mnemonic);
-    let dst_name = operands.first().copied().or(match token {
-        "pacibsp" | "paciasp" | "autibsp" | "autiasp" | "xpaclri" => Some("x30"),
-        _ => None,
-    })?;
-    let dst = resolve_register(dst_name)?;
-    let mut inputs = Vec::new();
-    inputs.push(dst.clone());
-    for operand in operands.iter().skip(1).copied() {
-        if let Some(input) = resolve_register(operand) {
-            inputs.push(input);
-        }
-    }
-    if operands.len() <= 1
-        && matches!(token, "pacibsp" | "paciasp" | "autibsp" | "autiasp")
-        && let Some(sp) = resolve_register("sp")
-    {
-        inputs.push(sp);
-    }
-    Some(R2ILOp::CallOther {
-        output: Some(dst),
-        userop,
-        inputs,
-    })
-}
-
-fn set_memory_hints(
-    block: &mut R2ILBlock,
-    op_index: usize,
-    atomic_kind: Option<AtomicKind>,
-    ordering: Option<MemoryOrdering>,
-) {
-    let meta = block.op_metadata.entry(op_index).or_default();
-    if let Some(kind) = atomic_kind {
-        meta.atomic_kind = Some(kind);
-    }
-    if let Some(ord) = ordering {
-        meta.memory_ordering = Some(ord);
-    }
-}
-
-fn nearest_register_output(block: &R2ILBlock, pivot_index: usize) -> Option<Varnode> {
-    if pivot_index > 0
-        && let Some(vn) = block.ops[..pivot_index]
-            .iter()
-            .rev()
-            .filter_map(R2ILOp::output)
-            .find(|vn| vn.space == SpaceId::Register && vn.size > 0)
-    {
-        return Some(vn.clone());
-    }
-
-    block
-        .ops
-        .iter()
-        .skip(pivot_index.saturating_add(1))
-        .filter_map(R2ILOp::output)
-        .find(|vn| vn.space == SpaceId::Register && vn.size > 0)
-        .cloned()
-}
-
-fn storeconditional_result_from_mnemonic<G>(mnemonic: &str, resolve_register: G) -> Option<Varnode>
-where
-    G: Fn(&str) -> Option<Varnode>,
-{
-    let mut parts = mnemonic.trim().splitn(2, char::is_whitespace);
-    let _op = parts.next()?;
-    let operands = parts.next()?.trim();
-    if operands.is_empty() {
-        return None;
-    }
-
-    let first_operand = operands.split(',').next()?.trim();
-    let reg_name = first_operand.trim_matches(|c| matches!(c, '[' | ']' | '(' | ')' | '{' | '}'));
-    if reg_name.is_empty() {
-        return None;
-    }
-    resolve_register(reg_name)
-}
-
-fn is_fence_userop_name(name: &str) -> bool {
-    let normalized = name.trim().to_ascii_lowercase();
-    matches!(
-        normalized.as_str(),
-        "fence"
-            | "fence.i"
-            | "sfence.vm"
-            | "sfence.vma"
-            | "datamemorybarrier"
-            | "datasynchronizationbarrier"
-            | "instructionsynchronizationbarrier"
-    )
-}
-
-fn is_fence_mnemonic(token: &str) -> bool {
-    let token = token.trim().to_ascii_lowercase();
-    token == "fence"
-        || token == "fence.i"
-        || token == "sfence.vm"
-        || token == "sfence.vma"
-        || token.starts_with("dmb")
-        || token.starts_with("dsb")
-        || token.starts_with("isb")
-}
-
-fn ordering_from_mnemonic_token(token: &str) -> MemoryOrdering {
-    let t = token.to_ascii_lowercase();
-    let has_aq = t.contains(".aq");
-    let has_rl = t.contains(".rl");
-    if t.contains(".aqrl") || (has_aq && has_rl) {
-        MemoryOrdering::AcqRel
-    } else if has_aq {
-        MemoryOrdering::Acquire
-    } else if has_rl {
-        MemoryOrdering::Release
-    } else {
-        MemoryOrdering::Relaxed
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use r2il::OpMetadata;
 
     const PINNED_ARM64_O2_LOAD_BLOCK_ADDR: u64 = 0x1_0000_05b4;
     const PINNED_ARM64_O2_LOAD_BLOCK: &[u8] = &[
@@ -2882,20 +2532,6 @@ mod tests {
 
     fn reg(offset: u64, size: u32) -> Varnode {
         Varnode::register(offset, size)
-    }
-
-    fn ram_addr(offset: u64, size: u32) -> Varnode {
-        Varnode::new(SpaceId::Ram, offset, size)
-    }
-
-    fn arm64_reg(name: &str) -> Option<Varnode> {
-        match name {
-            "x16" => Some(reg(16 * 8, 8)),
-            "x17" => Some(reg(17 * 8, 8)),
-            "x30" | "lr" => Some(reg(30 * 8, 8)),
-            "sp" => Some(reg(31 * 8, 8)),
-            _ => None,
-        }
     }
 
     #[test]
@@ -3247,6 +2883,174 @@ mod tests {
         );
     }
 
+    #[cfg(any(feature = "arm", feature = "riscv"))]
+    fn assert_public_lifts_preserve_canonical_ops(
+        disassembler: &Disassembler,
+        bytes: &[u8],
+        addr: u64,
+    ) -> R2ILBlock {
+        let mut padded = bytes.to_vec();
+        padded.resize(Disassembler::MIN_BYTES, 0);
+        let canonical = disassembler
+            .lift_canonical(&padded, addr)
+            .expect("canonical Sleigh lift");
+        let default = disassembler
+            .lift(&padded, addr)
+            .expect("default public lift");
+        let disabled = disassembler
+            .lift_with_options(
+                &padded,
+                addr,
+                SemanticMetadataOptions {
+                    enabled: false,
+                    ..Default::default()
+                },
+            )
+            .expect("public lift without advisory metadata");
+
+        assert_eq!(default.ops, canonical.ops);
+        assert_eq!(disabled.ops, canonical.ops);
+        canonical
+    }
+
+    #[cfg(any(feature = "arm", feature = "riscv"))]
+    fn assert_native_instruction(
+        disassembler: &Disassembler,
+        bytes: &[u8],
+        addr: u64,
+        expected_token: &str,
+    ) {
+        let mut padded = bytes.to_vec();
+        padded.resize(Disassembler::MIN_BYTES, 0);
+        let (instruction, size) = disassembler
+            .disasm_native(&padded, addr)
+            .expect("native instruction decode");
+        assert_eq!(size, bytes.len());
+        assert_eq!(
+            instruction
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase(),
+            expected_token
+        );
+    }
+
+    #[cfg(feature = "arm")]
+    #[test]
+    fn aarch64_pauth_and_barrier_retain_only_canonical_sleigh_semantics() {
+        const PACIBSP: &[u8] = &[0x7f, 0x23, 0x03, 0xd5];
+        const DMB_ISH: &[u8] = &[0xbf, 0x3b, 0x03, 0xd5];
+        const ADDR: u64 = 0x410000;
+
+        let mut disassembler =
+            Disassembler::from_trusted_profile(TrustedSleighProfile::Aarch64AppleSilicon)
+                .expect("trusted Apple AArch64 disassembler");
+        assert_native_instruction(&disassembler, PACIBSP, ADDR, "pacibsp");
+        assert_native_instruction(&disassembler, DMB_ISH, ADDR + PACIBSP.len() as u64, "dmb");
+        let pacibsp = assert_public_lifts_preserve_canonical_ops(&disassembler, PACIBSP, ADDR);
+        assert!(
+            pacibsp.ops.is_empty(),
+            "zero-P-code PACIBSP must not acquire fabricated CallOther semantics"
+        );
+
+        let genuine = disassembler
+            .lift_genuine_block(PACIBSP, ADDR, PACIBSP.len())
+            .expect("genuine PACIBSP lift");
+        assert!(genuine.block().ops.is_empty());
+        assert_eq!(genuine.source_bytes(), PACIBSP);
+        assert_eq!(
+            genuine
+                .instruction_spans()
+                .iter()
+                .map(|span| {
+                    (
+                        span.addr(),
+                        span.size(),
+                        span.first_canonical_op(),
+                        span.canonical_op_count(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![(ADDR, 4, 0, 0)]
+        );
+
+        let barrier = assert_public_lifts_preserve_canonical_ops(
+            &disassembler,
+            DMB_ISH,
+            ADDR + PACIBSP.len() as u64,
+        );
+        let genuine_userops = barrier
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                R2ILOp::CallOther { userop, .. } => Some(*userop),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !genuine_userops.is_empty(),
+            "DMB must retain the translator's numeric CallOther evidence"
+        );
+        assert!(
+            !barrier
+                .ops
+                .iter()
+                .any(|op| matches!(op, R2ILOp::Fence { .. }))
+        );
+
+        disassembler.set_userop_map(HashMap::from([(genuine_userops[0], "fence".to_string())]));
+        let overridden = assert_public_lifts_preserve_canonical_ops(
+            &disassembler,
+            DMB_ISH,
+            ADDR + PACIBSP.len() as u64,
+        );
+        assert_eq!(overridden.ops, barrier.ops);
+    }
+
+    #[cfg(feature = "riscv")]
+    #[test]
+    fn riscv_atomic_bytes_retain_only_canonical_sleigh_semantics() {
+        const FENCE_IORW_IORW: &[u8] = &[0x0f, 0x00, 0xf0, 0x0f];
+        const LR_W_A0_A1: &[u8] = &[0x2f, 0xa5, 0x05, 0x10];
+        const SC_W_A0_A1_A2: &[u8] = &[0x2f, 0x25, 0xb6, 0x18];
+        const AMOADD_W_AQRL_A0_A1_A2: &[u8] = &[0x2f, 0x25, 0xb6, 0x06];
+        const ADDR: u64 = 0x420000;
+
+        let disassembler = Disassembler::from_trusted_profile(TrustedSleighProfile::RiscV64Gc)
+            .expect("trusted RV64GC disassembler");
+        for (index, (bytes, expected_token)) in [
+            (FENCE_IORW_IORW, "fence"),
+            (LR_W_A0_A1, "lr.w"),
+            (SC_W_A0_A1_A2, "sc.w"),
+            (AMOADD_W_AQRL_A0_A1_A2, "amoadd.w.aqrl"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_native_instruction(
+                &disassembler,
+                bytes,
+                ADDR + (index as u64 * 4),
+                expected_token,
+            );
+            let canonical = assert_public_lifts_preserve_canonical_ops(
+                &disassembler,
+                bytes,
+                ADDR + (index as u64 * 4),
+            );
+            assert!(
+                !canonical.ops.iter().any(|op| matches!(
+                    op,
+                    R2ILOp::Fence { .. }
+                        | R2ILOp::LoadLinked { .. }
+                        | R2ILOp::StoreConditional { .. }
+                )),
+                "mnemonic-derived atomic operations must not be synthesized"
+            );
+        }
+    }
+
     #[test]
     fn genuine_instruction_span_address_overflow_fails_closed() {
         let disassembler = Disassembler::from_trusted_profile(TrustedSleighProfile::X86_64)
@@ -3542,233 +3346,6 @@ mod tests {
         assert!(
             GenuineFunctionLayout::new(b"revision".to_vec(), 0x1000, [range], [0x1010]).is_err()
         );
-    }
-
-    #[test]
-    fn normalization_fence_userop_rewrites_to_fence() {
-        let mut block = R2ILBlock::new(0x1000, 4);
-        block.push(R2ILOp::CallOther {
-            output: None,
-            userop: 7,
-            inputs: vec![],
-        });
-
-        normalize_memory_semantics_with_hints(
-            &mut block,
-            "riscv64",
-            "addi x0, x0, 0",
-            |idx| {
-                if idx == 7 {
-                    Some("fence".to_string())
-                } else {
-                    None
-                }
-            },
-            |_| None,
-        );
-
-        assert!(matches!(block.ops[0], R2ILOp::Fence { .. }));
-        let meta = block.op_metadata.get(&0).expect("metadata for op 0");
-        assert_eq!(meta.atomic_kind, Some(AtomicKind::Fence));
-        assert_eq!(meta.memory_ordering, Some(MemoryOrdering::SeqCst));
-    }
-
-    #[test]
-    fn normalization_arm64_pointer_auth_register_form_becomes_named_userop() {
-        let mut block = R2ILBlock::new(0x1000, 4);
-
-        normalize_memory_semantics_with_hints(
-            &mut block,
-            "aarch64",
-            "autda x16, x17",
-            |_| None,
-            arm64_reg,
-        );
-
-        match &block.ops[0] {
-            R2ILOp::CallOther {
-                output: Some(output),
-                userop,
-                inputs,
-            } => {
-                assert_eq!(*userop, ARM64_PAUTH_AUTH_USEROP);
-                assert_eq!(*output, reg(16 * 8, 8));
-                assert_eq!(inputs, &vec![reg(16 * 8, 8), reg(17 * 8, 8)]);
-            }
-            other => panic!("expected pointer-auth CallOther, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn normalization_arm64_pointer_auth_stack_form_preserves_lr_and_sp_evidence() {
-        let mut block = R2ILBlock::new(0x2000, 4);
-
-        normalize_memory_semantics_with_hints(&mut block, "arm64", "pacibsp", |_| None, arm64_reg);
-
-        match &block.ops[0] {
-            R2ILOp::CallOther {
-                output: Some(output),
-                userop,
-                inputs,
-            } => {
-                assert_eq!(*userop, ARM64_PAUTH_SIGN_USEROP);
-                assert_eq!(*output, reg(30 * 8, 8));
-                assert_eq!(inputs, &vec![reg(30 * 8, 8), reg(31 * 8, 8)]);
-            }
-            other => panic!("expected stack pointer-auth CallOther, got {other:?}"),
-        }
-        assert_eq!(
-            block.op_metadata(0).and_then(|meta| meta.instruction_addr),
-            Some(0x2000)
-        );
-    }
-
-    #[test]
-    fn normalization_lr_rewrites_load_to_loadlinked() {
-        let mut block = R2ILBlock::new(0x1000, 4);
-        block.push(R2ILOp::Load {
-            dst: reg(0, 8),
-            space: SpaceId::Ram,
-            addr: reg(8, 8),
-        });
-
-        normalize_memory_semantics_with_hints(
-            &mut block,
-            "riscv64",
-            "lr.w.aq a0,(a1)",
-            |_| None,
-            |_| None,
-        );
-
-        match &block.ops[0] {
-            R2ILOp::LoadLinked { ordering, .. } => {
-                assert_eq!(*ordering, MemoryOrdering::Acquire);
-            }
-            other => panic!("expected LoadLinked, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn normalization_sc_rewrites_store_to_storeconditional() {
-        let mut block = R2ILBlock::new(0x1000, 4);
-        block.push(R2ILOp::Copy {
-            dst: reg(0, 4),
-            src: reg(4, 4),
-        });
-        block.push(R2ILOp::Store {
-            space: SpaceId::Ram,
-            addr: reg(8, 8),
-            val: reg(12, 8),
-        });
-
-        normalize_memory_semantics_with_hints(
-            &mut block,
-            "riscv64",
-            "sc.w.rl a0,a1,(a2)",
-            |_| None,
-            |name| {
-                if name.eq_ignore_ascii_case("a0") {
-                    Some(reg(32, 8))
-                } else {
-                    None
-                }
-            },
-        );
-
-        match &block.ops[1] {
-            R2ILOp::StoreConditional {
-                result, ordering, ..
-            } => {
-                assert_eq!(*ordering, MemoryOrdering::Release);
-                assert_eq!(result.as_ref().map(|v| (v.offset, v.size)), Some((32, 8)));
-            }
-            other => panic!("expected StoreConditional, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn normalization_amo_adds_metadata() {
-        let mut block = R2ILBlock::new(0x1000, 4);
-        block.push(R2ILOp::Load {
-            dst: reg(0, 8),
-            space: SpaceId::Ram,
-            addr: ram_addr(0x2000, 8),
-        });
-        block.push(R2ILOp::Store {
-            space: SpaceId::Ram,
-            addr: ram_addr(0x2000, 8),
-            val: reg(8, 8),
-        });
-
-        normalize_memory_semantics_with_hints(
-            &mut block,
-            "riscv64",
-            "amoadd.w.aqrl a0,a1,(a2)",
-            |_| None,
-            |_| None,
-        );
-
-        for op_index in 0..2usize {
-            let meta = block
-                .op_metadata
-                .get(&op_index)
-                .expect("metadata for amo op");
-            assert_eq!(meta.atomic_kind, Some(AtomicKind::ReadModifyWrite));
-            assert_eq!(meta.memory_ordering, Some(MemoryOrdering::AcqRel));
-        }
-    }
-
-    #[test]
-    fn normalization_ambiguous_mnemonic_keeps_ops() {
-        let mut block = R2ILBlock::new(0x1000, 4);
-        block.push(R2ILOp::Store {
-            space: SpaceId::Ram,
-            addr: reg(0, 8),
-            val: reg(8, 8),
-        });
-
-        normalize_memory_semantics_with_hints(
-            &mut block,
-            "riscv64",
-            "add x1,x2,x3",
-            |_| None,
-            |_| None,
-        );
-
-        assert!(matches!(block.ops[0], R2ILOp::Store { .. }));
-    }
-
-    #[test]
-    fn normalization_sc_fallback_picks_nearest_register_output() {
-        let mut block = R2ILBlock::new(0x1000, 4);
-        block.push(R2ILOp::Copy {
-            dst: reg(0, 8),
-            src: reg(4, 8),
-        });
-        block.push(R2ILOp::Copy {
-            dst: reg(16, 8),
-            src: reg(20, 8),
-        });
-        block.push(R2ILOp::Store {
-            space: SpaceId::Ram,
-            addr: reg(8, 8),
-            val: reg(12, 8),
-        });
-
-        normalize_memory_semantics_with_hints(
-            &mut block,
-            "riscv64",
-            "sc.w.rl unknown,a1,(a2)",
-            |_| None,
-            |_| None,
-        );
-
-        match &block.ops[2] {
-            R2ILOp::StoreConditional { result, .. } => {
-                assert_eq!(result.as_ref().map(|v| (v.offset, v.size)), Some((16, 8)));
-            }
-            other => panic!("expected StoreConditional, got {other:?}"),
-        }
     }
 
     fn reg_name_resolver<'a>(
