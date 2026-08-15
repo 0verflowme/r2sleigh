@@ -32,7 +32,7 @@ pub const R2SLEIGH_CAPABILITIES_V2: u64 = R2SLEIGH_CAP_DECOMPILE_V2
     | R2SLEIGH_CAP_PLANNER_QUERY_V2
     | R2SLEIGH_CAP_OPAQUE_RADARE_SNAPSHOT_V2;
 pub const R2SLEIGH_RADARE_ABI_V2: u32 = 138;
-pub const R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2: u32 = 10;
+pub const R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2: u32 = 11;
 pub const R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2: u32 = 4;
 
 pub const R2SLEIGH_STATUS_OK_V2: u32 = 0;
@@ -363,6 +363,7 @@ pub struct R2SleighRadareReturnMechanismViewV2 {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct R2SleighRadareStackAllocationContractViewV2 {
     pub growth: i32,
+    pub implicit_active_sp_bytes: u32,
 }
 
 #[repr(C)]
@@ -4347,6 +4348,16 @@ mod tests {
             std::mem::offset_of!(r2source::RadareAbi138StackAllocationContractView, growth)
         );
         assert_eq!(
+            std::mem::offset_of!(
+                R2SleighRadareStackAllocationContractViewV2,
+                implicit_active_sp_bytes
+            ),
+            std::mem::offset_of!(
+                r2source::RadareAbi138StackAllocationContractView,
+                implicit_active_sp_bytes
+            )
+        );
+        assert_eq!(
             std::mem::offset_of!(R2SleighRadareAccessorsV2, stack_allocation_contract_view),
             std::mem::offset_of!(
                 r2source::RadareAbi138Accessors,
@@ -4372,7 +4383,7 @@ mod tests {
         let api = unsafe { &*r2sleigh_api_v2() };
         assert_eq!(api.abi_version, R2SLEIGH_ABI_V2);
         assert_eq!(api.radare_abi_version, R2SLEIGH_RADARE_ABI_V2);
-        assert_eq!(R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2, 10);
+        assert_eq!(R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2, 11);
         assert_eq!(R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2, 4);
         assert_eq!(api.struct_size as usize, size_of::<R2SleighApiV2>());
         assert_eq!(api.request_size as usize, size_of::<R2SleighRequestV2>());

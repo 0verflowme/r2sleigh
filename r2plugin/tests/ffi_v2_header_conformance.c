@@ -64,6 +64,10 @@ int main(void) {
 		.accessor_schema_version = R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2,
 		.accessors = &radare_accessors,
 	};
+	R2SleighRadareStackAllocationContractViewV2 stack_allocation = {
+		.growth = 1,
+		.implicit_active_sp_bytes = 128,
+	};
 	R2SleighSwitchCaseV2 switch_case = {
 		.value = 1,
 		.target = 0x402000,
@@ -91,8 +95,10 @@ int main(void) {
 	request_payload.radare_snapshot = &radare_snapshot;
 	const R2SleighApiV2 *api = r2sleigh_api_v2 ();
 	if (R2SLEIGH_RADARE_ABI_V2 != 138
-		|| R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 != 10
+		|| R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 != 11
 		|| R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2 != 4
+		|| stack_allocation.growth != 1
+		|| stack_allocation.implicit_active_sp_bytes != 128
 		|| radare_snapshot.struct_size != sizeof (R2SleighRadareSnapshotInputV2)
 		|| radare_snapshot.accessors != &radare_accessors
 		|| radare_accessors.struct_size != sizeof (R2SleighRadareAccessorsV2)

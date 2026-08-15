@@ -24,7 +24,7 @@ pub use r2source::{
     StackAddressBase,
 };
 
-pub const MACHINE_CONTEXT_SCHEMA_VERSION: u32 = 13;
+pub const MACHINE_CONTEXT_SCHEMA_VERSION: u32 = 14;
 /// One canonical register carrier in the immutable ABI snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct MachineAbiRegisterSlot {

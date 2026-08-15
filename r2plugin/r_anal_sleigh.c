@@ -22,11 +22,11 @@
 #if R2SLEIGH_RADARE_ABI_V2 != 138
 #error "r2sleigh generated V2 header must target exactly radare2 ABI 138"
 #endif
-#if R_ANAL_FUNCTION_SNAPSHOT_SCHEMA_VERSION != 10
-#error "r2sleigh borrowed snapshot transport requires function snapshot schema 10"
+#if R_ANAL_FUNCTION_SNAPSHOT_SCHEMA_VERSION != 11
+#error "r2sleigh borrowed snapshot transport requires function snapshot schema 11"
 #endif
-#if R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 != 10
-#error "r2sleigh generated V2 header must target function snapshot schema 10"
+#if R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 != 11
+#error "r2sleigh generated V2 header must target function snapshot schema 11"
 #endif
 #if R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2 != 4
 #error "r2sleigh generated V2 header must target snapshot accessor schema 4"
@@ -579,6 +579,7 @@ static uint8_t sleigh_radare_stack_allocation_contract_view(const void *opaque, 
 			opaque, &source)) {
 		return 0;
 	}
+	destination->implicit_active_sp_bytes = source.implicit_active_sp_bytes;
 	switch (source.growth) {
 	case R_ANAL_SNAPSHOT_STACK_GROWTH_LOWER:
 		destination->growth = 1;

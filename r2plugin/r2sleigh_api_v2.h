@@ -31,7 +31,7 @@ typedef struct R2ILBlock R2ILBlock;
 
 #define R2SLEIGH_RADARE_ABI_V2 138
 
-#define R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 10
+#define R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 11
 
 #define R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2 4
 
@@ -653,6 +653,7 @@ typedef struct R2SleighRadareReturnMechanismViewV2 {
 
 typedef struct R2SleighRadareStackAllocationContractViewV2 {
   int32_t growth;
+  uint32_t implicit_active_sp_bytes;
 } R2SleighRadareStackAllocationContractViewV2;
 
 typedef struct R2SleighRadareAccessorsV2 {

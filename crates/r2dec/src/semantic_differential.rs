@@ -7450,7 +7450,12 @@ mod tests {
         if !fixture.exact_private_stack {
             return 0;
         }
-        unsafe { out.write(RadareAbi138StackAllocationContractView { growth: 1 }) };
+        unsafe {
+            out.write(RadareAbi138StackAllocationContractView {
+                growth: 1,
+                implicit_active_sp_bytes: 0,
+            })
+        };
         1
     }
 

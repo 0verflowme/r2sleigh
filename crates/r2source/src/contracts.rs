@@ -63,7 +63,7 @@ pub enum StackAddressBase {
     StackPointer,
 }
 
-pub const SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION: u32 = 9;
+pub const SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION: u32 = 10;
 pub const SOURCE_CALL_SITE_INTERFACE_SCHEMA_VERSION: u32 = 1;
 pub const SOURCE_TYPE_GRAPH_SCHEMA_VERSION: u32 = 1;
 
@@ -550,19 +550,81 @@ pub enum SourceStackGrowth {
 /// Revision-bound stack-allocation authority supplied by the immutable source
 /// snapshot. While an exact SP move in `growth` remains live and unrestored,
 /// the half-open interval between the entry SP and that moved SP belongs to the
-/// callee. Absence grants no allocation or red-zone authority.
+/// callee. `implicit_active_sp_bytes` describes exactly that many bytes beyond
+/// the active SP in the growth direction, including when the active SP still
+/// equals its entry value. This is geometric authority only: a consumer must
+/// independently prove that no intervening call or other source-declared
+/// invalidation can overwrite the implicit area while any certified value is
+/// live. Absence grants no allocation or implicit-stack authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct SourceStackAllocationContract {
     growth: SourceStackGrowth,
+    implicit_active_sp_bytes: u32,
 }
 
 impl SourceStackAllocationContract {
+    /// Construct the exact legacy envelope with no implicit bytes beyond the
+    /// active SP. Wire producers for the current schema must still transport
+    /// the explicit zero field.
     pub const fn new(growth: SourceStackGrowth) -> Self {
-        Self { growth }
+        Self::with_implicit_active_sp_bytes(growth, 0)
+    }
+
+    pub const fn with_implicit_active_sp_bytes(
+        growth: SourceStackGrowth,
+        implicit_active_sp_bytes: u32,
+    ) -> Self {
+        Self {
+            growth,
+            implicit_active_sp_bytes,
+        }
     }
 
     pub const fn growth(self) -> SourceStackGrowth {
         self.growth
+    }
+
+    pub const fn implicit_active_sp_bytes(self) -> u32 {
+        self.implicit_active_sp_bytes
+    }
+
+    /// Return the exact half-open entry-SP-relative geometric envelope for
+    /// `active_sp_offset`. The active offset must move in the source-owned
+    /// growth direction (or remain zero), and all endpoint arithmetic is
+    /// checked. This does not prove the implicit portion survives a call.
+    pub fn owned_entry_relative_envelope(
+        self,
+        active_sp_offset: i64,
+    ) -> Option<std::ops::Range<i64>> {
+        let implicit_bytes = i64::from(self.implicit_active_sp_bytes);
+        match self.growth {
+            SourceStackGrowth::LowerAddresses if active_sp_offset <= 0 => {
+                Some(active_sp_offset.checked_sub(implicit_bytes)?..0)
+            }
+            SourceStackGrowth::HigherAddresses if active_sp_offset >= 0 => {
+                Some(0..active_sp_offset.checked_add(implicit_bytes)?)
+            }
+            SourceStackGrowth::LowerAddresses | SourceStackGrowth::HigherAddresses => None,
+        }
+    }
+
+    /// Check that one non-empty byte range is wholly inside the exact owned
+    /// envelope for the supplied active SP. This rejects endpoint overflow,
+    /// opposite-direction SP movement, and ranges crossing either boundary.
+    pub fn owns_entry_relative_range(
+        self,
+        active_sp_offset: i64,
+        offset: i64,
+        size_bytes: u32,
+    ) -> bool {
+        if size_bytes == 0 {
+            return false;
+        }
+        let Some(end) = offset.checked_add(i64::from(size_bytes)) else {
+            return false;
+        };
+        self.owned_entry_relative_envelope(active_sp_offset)
+            .is_some_and(|envelope| offset >= envelope.start && end <= envelope.end)
     }
 
     pub fn owns_entry_relative_reservation(self, offset: i64, size_bytes: u32) -> bool {
@@ -2092,5 +2154,43 @@ mod tests {
             exact.with_stack_allocation_contract(higher),
             Err(SourceFunctionInterfaceError::InvalidStackAllocationContract)
         );
+    }
+
+    #[test]
+    fn stack_allocation_contract_checks_implicit_active_sp_envelopes() {
+        let lower = SourceStackAllocationContract::with_implicit_active_sp_bytes(
+            SourceStackGrowth::LowerAddresses,
+            128,
+        );
+        assert_eq!(lower.implicit_active_sp_bytes(), 128);
+        assert_eq!(lower.owned_entry_relative_envelope(0), Some(-128..0));
+        assert_eq!(lower.owned_entry_relative_envelope(-32), Some(-160..0));
+        assert_eq!(lower.owned_entry_relative_envelope(1), None);
+        assert_eq!(lower.owned_entry_relative_envelope(i64::MIN), None);
+        assert!(lower.owns_entry_relative_range(0, -128, 128));
+        assert!(lower.owns_entry_relative_range(-32, -160, 128));
+        assert!(lower.owns_entry_relative_range(-32, -32, 32));
+        assert!(!lower.owns_entry_relative_range(0, -129, 128));
+        assert!(!lower.owns_entry_relative_range(0, -128, 0));
+        assert!(!lower.owns_entry_relative_range(0, -1, 2));
+
+        let higher = SourceStackAllocationContract::with_implicit_active_sp_bytes(
+            SourceStackGrowth::HigherAddresses,
+            128,
+        );
+        assert_eq!(higher.owned_entry_relative_envelope(0), Some(0..128));
+        assert_eq!(higher.owned_entry_relative_envelope(32), Some(0..160));
+        assert_eq!(higher.owned_entry_relative_envelope(-1), None);
+        assert_eq!(higher.owned_entry_relative_envelope(i64::MAX), None);
+        assert!(higher.owns_entry_relative_range(0, 0, 128));
+        assert!(higher.owns_entry_relative_range(32, 32, 128));
+        assert!(higher.owns_entry_relative_range(32, 0, 32));
+        assert!(!higher.owns_entry_relative_range(0, 1, 128));
+        assert!(!higher.owns_entry_relative_range(i64::MAX, i64::MAX, 1));
+
+        let no_implicit = SourceStackAllocationContract::new(SourceStackGrowth::LowerAddresses);
+        assert_eq!(no_implicit.owned_entry_relative_envelope(0), Some(0..0));
+        assert!(!no_implicit.owns_entry_relative_range(0, 0, 1));
+        assert!(no_implicit.owns_entry_relative_range(-16, -16, 16));
     }
 }
