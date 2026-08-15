@@ -13557,7 +13557,7 @@ mod tests {
             (
                 EngineSemanticKernelRegion::TerminalReturnBlock,
                 r2dec::CERTIFIED_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-                3,
+                4,
             ),
             (
                 EngineSemanticKernelRegion::AggregateMemberTerminalReturnFunction,
