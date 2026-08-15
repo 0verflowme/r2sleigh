@@ -11,8 +11,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use r2cert::{
-    CERTIFICATION_SCHEMA_VERSION, CertifiedArtifactOrigin, CertifiedMachineProjection,
-    CertifiedMemoryExecutionPolicy, CertifiedMemoryStatementKind,
+    CERTIFICATION_SCHEMA_VERSION, CertifiedArtifactOrigin, CertifiedControlTruthiness,
+    CertifiedMachineProjection, CertifiedMemoryExecutionPolicy, CertifiedMemoryStatement,
+    CertifiedMemoryStatementKind, CertifiedPrivateFrameConditionalArm,
+    CertifiedPrivateFrameConditionalJoin, CertifiedPrivateFrameVersionDefinition,
 };
 use r2ssa::{
     BlockTerminator, CallBoundarySlot, CallSiteId, CanonicalInstructionId,
@@ -22,7 +24,8 @@ use r2ssa::{
     MachineExprKind, MachineMemoryEndianness, MachineOvershiftBehavior, MachineShiftKind,
     MachineSignedness, MachineStackBase, MachineType, MachineValueBinding, MachineValueUse,
     ObjectId, SSAOp, SemanticInstructionState, SourceCallResult, SourceCallSiteIdentity,
-    SourceFunctionReturn, SsaArtifact, StructuredAccessId, TrustedSsaArtifact, ValueId,
+    SourceCarrierKind, SourceFunctionReturn, SourceTypeKind, SsaArtifact, StructuredAccessId,
+    TrustedSsaArtifact, ValueId,
 };
 use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Serialize, Serializer};
@@ -30,6 +33,10 @@ use serde::{Serialize, Serializer};
 use crate::certified_call::CertifiedDirectCallBlockRegion;
 use crate::certified_if_return::{
     CertifiedConditionalReturnArm, CertifiedConditionalReturnFunction,
+};
+use crate::certified_private_frame_join::{
+    CertifiedPrivateFrameConditionalJoinFunction, CertifiedPrivateFrameJoinValue,
+    CertifiedPrivateFrameJoinValueOrigin,
 };
 use crate::certified_region::{CertifiedSingleBlockAccounting, RegionObligationDisposition};
 use crate::certified_return::CertifiedTerminalReturnBlockRegion;
@@ -41,8 +48,8 @@ use crate::semantic_function::CertifiedSemanticCFunction;
 use crate::semantic_memory_function::CertifiedMemorySemanticCFunction;
 use crate::semantic_stmt::SemanticCBlockStepLayer;
 
-pub const SEMANTIC_DIFFERENTIAL_SCHEMA_VERSION: u32 = 7;
-pub const SEMANTIC_DIFFERENTIAL_EVALUATOR_CONTRACT_VERSION: u32 = 6;
+pub const SEMANTIC_DIFFERENTIAL_SCHEMA_VERSION: u32 = 8;
+pub const SEMANTIC_DIFFERENTIAL_EVALUATOR_CONTRACT_VERSION: u32 = 7;
 
 fn hex_bytes(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
@@ -292,6 +299,7 @@ pub enum DifferentialCandidateKind {
     MemoryTerminalReturnFunction,
     DirectCallRegion,
     ConditionalReturnFunction,
+    PrivateFrameConditionalJoinFunction,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -354,6 +362,20 @@ impl DifferentialCandidateIdentity {
         let candidate_kind = DifferentialCandidateKind::ConditionalReturnFunction;
         let encoded = postcard::to_stdvec(&(candidate_kind, function))
             .map_err(|error| format!("conditional-return function encoding failed: {error}"))?;
+        Ok(Self {
+            evaluator_contract_version: SEMANTIC_DIFFERENTIAL_EVALUATOR_CONTRACT_VERSION,
+            candidate_kind,
+            exact_candidate_postcard_hex: hex_bytes(&encoded),
+        })
+    }
+
+    fn from_private_frame_conditional_join_function(
+        function: &CertifiedPrivateFrameConditionalJoinFunction,
+    ) -> Result<Self, String> {
+        let candidate_kind = DifferentialCandidateKind::PrivateFrameConditionalJoinFunction;
+        let encoded = postcard::to_stdvec(&(candidate_kind, function)).map_err(|error| {
+            format!("private-frame conditional-join function encoding failed: {error}")
+        })?;
         Ok(Self {
             evaluator_contract_version: SEMANTIC_DIFFERENTIAL_EVALUATOR_CONTRACT_VERSION,
             candidate_kind,
@@ -2071,6 +2093,202 @@ pub fn check_conditional_return_differential(
     )
 }
 
+/// Execute one audited private-frame conditional-join function through
+/// independent canonical-SSA and sealed typed-rewrite evaluators. This is one
+/// caller-supplied bounded test case, not a proof or a rendered-C oracle.
+pub fn check_private_frame_conditional_join_differential(
+    trusted: &TrustedSsaArtifact,
+    initial: &DifferentialState,
+    limits: DifferentialLimits,
+) -> DifferentialReport {
+    let artifact = trusted.artifact();
+    let entry = artifact.function().entry;
+    let certified = match CertifiedMachineProjection::from_artifact(trusted) {
+        Ok(certified) => certified,
+        Err(error) => {
+            let mut report = issued_report(
+                initial,
+                entry,
+                limits,
+                DifferentialCandidateAdmission::Refused,
+                DifferentialConclusion::InvalidArtifact,
+                DifferentialCaseDisposition::InvalidArtifact {
+                    reason: format!("artifact certification failed: {error}"),
+                },
+                None,
+                None,
+            );
+            report.artifact_identity = None;
+            return report;
+        }
+    };
+    let requested_identity = match DifferentialArtifactIdentity::from_origin(certified.origin()) {
+        Ok(identity) => identity,
+        Err(reason) => {
+            let mut report = issued_report(
+                initial,
+                entry,
+                limits,
+                DifferentialCandidateAdmission::NotEvaluated,
+                DifferentialConclusion::HarnessFailure,
+                DifferentialCaseDisposition::HarnessFailure { reason },
+                None,
+                None,
+            );
+            report.artifact_identity = None;
+            return report;
+        }
+    };
+    let invalid_input = |reason| {
+        let mut report = issued_report(
+            initial,
+            entry,
+            limits,
+            DifferentialCandidateAdmission::NotEvaluated,
+            DifferentialConclusion::InvalidInput,
+            DifferentialCaseDisposition::InvalidInput { reason },
+            None,
+            None,
+        );
+        report.artifact_identity = Some(requested_identity.clone());
+        report
+    };
+    if limits.max_source_steps == 0
+        || limits.max_expression_nodes == 0
+        || limits.max_memory_bytes == 0
+    {
+        return invalid_input("differential limits must all be nonzero".to_string());
+    }
+    if initial.origin != *certified.origin() {
+        return invalid_input(
+            "differential state belongs to a different certified artifact origin".to_string(),
+        );
+    }
+    if let Err(reason) = validate_initial_state(artifact, entry, initial) {
+        return invalid_input(reason);
+    }
+    if let Err(reason) = validate_private_join_initial_state(artifact, initial) {
+        return invalid_input(reason);
+    }
+    if initial.memory.len() > limits.max_memory_bytes as usize {
+        let mut report = issued_report(
+            initial,
+            entry,
+            limits,
+            DifferentialCandidateAdmission::NotEvaluated,
+            DifferentialConclusion::Incomplete,
+            DifferentialCaseDisposition::BudgetExceeded {
+                side: DifferentialSide::Both,
+            },
+            None,
+            None,
+        );
+        report.artifact_identity = Some(requested_identity);
+        return report;
+    }
+    let function = match CertifiedPrivateFrameConditionalJoinFunction::from_artifact(trusted) {
+        Ok(function) => function,
+        Err(error) => {
+            return candidate_not_admitted(
+                initial,
+                entry,
+                limits,
+                DifferentialCandidateAdmission::Residual,
+                format!("private-frame conditional join was not admitted: {error}"),
+            );
+        }
+    };
+    if function.origin() != certified.origin()
+        || !function.audit().has_exact_private_frame_conditional_join()
+    {
+        return candidate_not_admitted(
+            initial,
+            entry,
+            limits,
+            DifferentialCandidateAdmission::Refused,
+            "private-frame conditional join failed exact audit".to_string(),
+        );
+    }
+    let candidate_identity =
+        match DifferentialCandidateIdentity::from_private_frame_conditional_join_function(&function)
+        {
+            Ok(identity) => identity,
+            Err(reason) => {
+                let mut report = issued_report(
+                    initial,
+                    entry,
+                    limits,
+                    DifferentialCandidateAdmission::NotEvaluated,
+                    DifferentialConclusion::HarnessFailure,
+                    DifferentialCaseDisposition::HarnessFailure { reason },
+                    None,
+                    None,
+                );
+                report.artifact_identity = Some(requested_identity);
+                return report;
+            }
+        };
+    if let Err(reason) =
+        audit_semantic_expression_layer(&certified, function.rewrite().expression_layer())
+    {
+        let mut report = issued_report(
+            initial,
+            entry,
+            limits,
+            DifferentialCandidateAdmission::NotEvaluated,
+            DifferentialConclusion::HarnessFailure,
+            DifferentialCaseDisposition::HarnessFailure { reason },
+            None,
+            None,
+        );
+        report.candidate_identity = Some(candidate_identity);
+        return report;
+    }
+    if let Err(failure) = validate_private_join_memory_domain(
+        artifact,
+        &certified,
+        function.rewrite().machine_join(),
+        initial,
+    ) {
+        let mut report = report_failure(initial, entry, limits, DifferentialSide::Both, failure);
+        report.candidate_identity = Some(candidate_identity);
+        return report;
+    }
+    let (source, selected_true) =
+        execute_private_frame_join_source(artifact, &certified, &function, initial, limits);
+    let source = match (source, selected_true) {
+        (Ok(run), Some(selected_true)) => {
+            let trace = DifferentialObservedTrace {
+                memory_events: run.memory_events.clone(),
+                final_memory: run.final_memory.clone(),
+            };
+            normalize_private_join_run(artifact, &certified, &function, initial, selected_true, run)
+                .map_err(|failure| FailedRun { failure, trace })
+        }
+        (result, _) => result,
+    };
+    let semantic_c = execute_private_frame_join_semantic(artifact, &function, initial, limits)
+        .and_then(|run| {
+            project_private_join_semantic_memory(&certified, &function, initial, run).map_err(
+                |failure| FailedRun {
+                    failure,
+                    trace: DifferentialObservedTrace {
+                        memory_events: Box::new([]),
+                        final_memory: Box::new([]),
+                    },
+                },
+            )
+        });
+    finish_report(
+        initial,
+        Some(candidate_identity),
+        entry,
+        limits,
+        source,
+        semantic_c,
+    )
+}
+
 fn validate_initial_state(
     artifact: &SsaArtifact,
     block_addr: u64,
@@ -2137,6 +2355,20 @@ fn validate_initial_state(
     Ok(())
 }
 
+fn validate_private_join_initial_state(
+    artifact: &SsaArtifact,
+    initial: &DifferentialState,
+) -> Result<(), String> {
+    for value in initial.values.keys() {
+        if artifact.graph().def_inst(*value).is_some() {
+            return Err(format!(
+                "private-join initial state attempts to replace function-local producer {value:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn audit_semantic_translation(
     certified: &CertifiedMachineProjection,
     layer: &SemanticCBlockStepLayer,
@@ -2178,6 +2410,49 @@ fn audit_semantic_translation(
         let mut expected_sources = certified_expr.inputs().clone();
         expected_sources.insert(entity.producer());
         if semantic_root.source_instructions() != &expected_sources {
+            return Err("semantic root provenance differs from certified inputs".to_string());
+        }
+        audit_semantic_expr_pair(
+            machine,
+            semantic,
+            machine_entity.root(),
+            entity.root(),
+            &mut seen,
+        )?;
+    }
+    Ok(())
+}
+
+fn audit_semantic_expression_layer(
+    certified: &CertifiedMachineProjection,
+    semantic: &SemanticCExpressionLayer,
+) -> Result<(), String> {
+    let machine = certified.projection();
+    let mut seen = BTreeSet::new();
+    let mut outputs = BTreeSet::new();
+    for entity in semantic.entities() {
+        if !outputs.insert(entity.output()) {
+            return Err("semantic expression layer has an ambiguous output binding".to_string());
+        }
+        let machine_entity = machine
+            .entity_for_producer(entity.producer())
+            .ok_or_else(|| "semantic entity lacks a machine counterpart".to_string())?;
+        let certified_expr = certified
+            .expression_for_producer(entity.producer())
+            .ok_or_else(|| "semantic entity lacks certified expression evidence".to_string())?;
+        if certified_expr.root() != machine_entity.root()
+            || certified_expr.entity().producer() != entity.producer()
+            || entity.output() != machine_entity.output()
+            || entity.source_obligations() != certified_expr.entity().source_obligations()
+        {
+            return Err("semantic entity differs from certified machine evidence".to_string());
+        }
+        let root = semantic
+            .expr(entity.root())
+            .ok_or_else(|| "semantic entity root is missing".to_string())?;
+        let mut expected_sources = certified_expr.inputs().clone();
+        expected_sources.insert(entity.producer());
+        if root.source_instructions() != &expected_sources {
             return Err("semantic root provenance differs from certified inputs".to_string());
         }
         audit_semantic_expr_pair(
@@ -2580,6 +2855,319 @@ fn execute_conditional_source(
             failure,
             trace: observed_trace(&state),
         }),
+    }
+}
+
+fn execute_private_join_block(
+    artifact: &SsaArtifact,
+    block_addr: u64,
+    state: &mut ExecutionState,
+    remaining_steps: &mut u32,
+    inert_phis: &BTreeMap<CanonicalInstructionId, (ValueId, Box<[u64]>)>,
+) -> Result<(), RunFailure> {
+    let graph = artifact.graph();
+    let block = graph
+        .block_id_for_addr(block_addr)
+        .and_then(|id| graph.block(id))
+        .ok_or_else(|| RunFailure::Invalid("private-join route block is missing".to_string()))?;
+    let mut consumed = BTreeSet::new();
+    for inst_id in &block.insts {
+        if *remaining_steps == 0 {
+            return Err(RunFailure::BudgetExceeded);
+        }
+        *remaining_steps -= 1;
+        let inst = graph.inst(*inst_id).ok_or_else(|| {
+            RunFailure::Invalid("private-join instruction is missing".to_string())
+        })?;
+        if let InstPayload::Phi { predecessors } = &inst.payload {
+            let producer = artifact
+                .obligations()
+                .instruction_for_inst(*inst_id)
+                .map(|instruction| instruction.id)
+                .ok_or_else(|| {
+                    RunFailure::Invalid("inert phi lacks source identity".to_string())
+                })?;
+            let (output, expected_predecessors) = inert_phis.get(&producer).ok_or_else(|| {
+                RunFailure::Unsupported("uncertified phi on private-join route".to_string())
+            })?;
+            let actual_predecessors = predecessors
+                .iter()
+                .map(|predecessor| graph.block(*predecessor).map(|block| block.addr))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    RunFailure::Invalid("inert phi predecessor is missing".to_string())
+                })?;
+            if inst.output != Some(*output)
+                || actual_predecessors.as_slice() != expected_predecessors.as_ref()
+                || !consumed.insert(producer)
+            {
+                return Err(RunFailure::Invalid(
+                    "inert phi differs from its exact certificate".to_string(),
+                ));
+            }
+            continue;
+        }
+        execute_source_inst(artifact, state, *inst_id)?;
+    }
+    if consumed.len() != inert_phis.len() {
+        return Err(RunFailure::Invalid(
+            "certified inert phi was not consumed exactly once".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn private_join_route<'a>(
+    join: &'a CertifiedPrivateFrameConditionalJoin,
+    target: u64,
+) -> Result<(&'a CertifiedPrivateFrameConditionalArm, bool), RunFailure> {
+    if target == join.condition().true_target()
+        && target == join.true_arm().entry_target()
+        && target != join.false_arm().entry_target()
+    {
+        Ok((join.true_arm(), true))
+    } else if target == join.condition().false_target()
+        && target == join.false_arm().entry_target()
+        && target != join.true_arm().entry_target()
+    {
+        Ok((join.false_arm(), false))
+    } else {
+        Err(RunFailure::Invalid(
+            "source branch target differs from sealed arm polarity".to_string(),
+        ))
+    }
+}
+
+fn exact_source_direct_target(artifact: &SsaArtifact, block_addr: u64) -> Result<u64, RunFailure> {
+    let block = artifact
+        .function()
+        .cfg()
+        .get_block(block_addr)
+        .ok_or_else(|| RunFailure::Invalid("direct-control source block is missing".to_string()))?;
+    let target = match block.terminator {
+        BlockTerminator::Branch { target } | BlockTerminator::Fallthrough { next: target } => {
+            target
+        }
+        _ => {
+            return Err(RunFailure::Invalid(
+                "certified arm control is not a direct source transfer".to_string(),
+            ));
+        }
+    };
+    if block.successors() != [target] {
+        return Err(RunFailure::Invalid(
+            "direct source successor differs from its terminator".to_string(),
+        ));
+    }
+    Ok(target)
+}
+
+fn modular_stack_offset(value: DifferentialBitVector, offset: i64) -> u64 {
+    value.bits().wrapping_add_signed(offset) & width_mask(value.width_bits())
+}
+
+fn exact_exit_stack_pointer(
+    entry: DifferentialBitVector,
+    actual: DifferentialBitVector,
+    stack_pointer_delta_bytes: Option<u32>,
+) -> bool {
+    if entry.width_bits() != actual.width_bits() {
+        return false;
+    }
+    let delta = stack_pointer_delta_bytes.map(i64::from).unwrap_or(0);
+    actual.bits() == modular_stack_offset(entry, delta)
+}
+
+fn exact_return_address_event(
+    event: &DifferentialMemoryEvent,
+    statement: &CertifiedMemoryStatement,
+    entry: DifferentialBitVector,
+    stack_offset: i64,
+    slot_size_bytes: u32,
+) -> bool {
+    private_event_matches_statement(event, statement)
+        && event.byte_address == modular_stack_offset(entry, stack_offset)
+        && event.width_bits / 8 == slot_size_bytes
+        && statement.width_bits() / 8 == slot_size_bytes
+}
+
+fn execute_private_frame_join_source(
+    artifact: &SsaArtifact,
+    projection: &CertifiedMachineProjection,
+    function: &CertifiedPrivateFrameConditionalJoinFunction,
+    initial: &DifferentialState,
+    limits: DifferentialLimits,
+) -> (InterpreterResult, Option<bool>) {
+    let join = function.rewrite().machine_join();
+    let mut state = ExecutionState::from(initial);
+    let mut remaining_steps = limits.max_source_steps;
+    let mut visited = BTreeSet::new();
+    let result = (|| {
+        if !visited.insert(join.header()) {
+            return Err(RunFailure::Invalid(
+                "private-join route contains a cycle".to_string(),
+            ));
+        }
+        execute_private_join_block(
+            artifact,
+            join.header(),
+            &mut state,
+            &mut remaining_steps,
+            &BTreeMap::new(),
+        )?;
+        let target = source_conditional_target(artifact, join.header(), &state)?;
+        let (arm, selected_true) = private_join_route(join, target)?;
+        let mut next = arm.entry_target();
+        for transparent in arm.transparent() {
+            if transparent.block_addr() != next {
+                return Err(RunFailure::Invalid(
+                    "transparent arm chain is not source ordered".to_string(),
+                ));
+            }
+            if !visited.insert(next) {
+                return Err(RunFailure::Invalid(
+                    "private-join route contains a cycle".to_string(),
+                ));
+            }
+            execute_private_join_block(
+                artifact,
+                next,
+                &mut state,
+                &mut remaining_steps,
+                &BTreeMap::new(),
+            )?;
+            let source_target = exact_source_direct_target(artifact, next)?;
+            if source_target != transparent.control().target() {
+                return Err(RunFailure::Invalid(
+                    "transparent control target differs from source".to_string(),
+                ));
+            }
+            next = source_target;
+        }
+        if next != arm.store_block() || arm.join_transfer().target() != join.join_block() {
+            return Err(RunFailure::Invalid(
+                "sealed arm does not terminate at the shared join".to_string(),
+            ));
+        }
+        if !visited.insert(arm.store_block()) {
+            return Err(RunFailure::Invalid(
+                "private-join route contains a cycle".to_string(),
+            ));
+        }
+        execute_private_join_block(
+            artifact,
+            arm.store_block(),
+            &mut state,
+            &mut remaining_steps,
+            &BTreeMap::new(),
+        )?;
+        if exact_source_direct_target(artifact, arm.store_block())? != arm.join_transfer().target()
+        {
+            return Err(RunFailure::Invalid(
+                "arm store transfer target differs from source".to_string(),
+            ));
+        }
+        let inert = join
+            .inert_join_phis()
+            .iter()
+            .map(|phi| {
+                (
+                    phi.producer(),
+                    (phi.output(), phi.predecessors().to_vec().into_boxed_slice()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        if inert.len() != join.inert_join_phis().len() {
+            return Err(RunFailure::Invalid(
+                "duplicate certified inert phi identity".to_string(),
+            ));
+        }
+        if !visited.insert(join.join_block()) {
+            return Err(RunFailure::Invalid(
+                "private-join route contains a cycle".to_string(),
+            ));
+        }
+        execute_private_join_block(
+            artifact,
+            join.join_block(),
+            &mut state,
+            &mut remaining_steps,
+            &inert,
+        )?;
+        let stack = projection.stack_discipline().ok_or_else(|| {
+            RunFailure::Invalid("private join lost its stack discipline".to_string())
+        })?;
+        let entry_sp = semantic_value_use(
+            artifact,
+            join.header(),
+            &ExecutionState::from(initial),
+            stack.entry_stack_pointer(),
+            None,
+        )?;
+        let restored = state
+            .values
+            .get(&join.release().restoration().output().value())
+            .copied()
+            .ok_or_else(|| RunFailure::Invalid("restored stack pointer is missing".to_string()))?;
+        if restored != entry_sp {
+            return Err(RunFailure::Invalid(
+                "private frame did not restore the entry stack pointer".to_string(),
+            ));
+        }
+        let mechanism = artifact
+            .machine_context()
+            .function_interface()
+            .and_then(|interface| interface.return_mechanism());
+        let exit_value = if let Some(exit) = join.release().exit_stack_pointer().value() {
+            let value = state
+                .values
+                .get(&exit.binding().value())
+                .copied()
+                .ok_or_else(|| {
+                    RunFailure::Invalid("certified exit stack pointer is missing".to_string())
+                })?;
+            require_width(value, exit.binding().width_bits())?;
+            if let Some(post) = join.release().post_restoration()
+                && post.output() != exit.binding()
+            {
+                return Err(RunFailure::Invalid(
+                    "post-restoration assignment differs from exit stack pointer".to_string(),
+                ));
+            }
+            value
+        } else {
+            restored
+        };
+        if !exact_exit_stack_pointer(
+            entry_sp,
+            exit_value,
+            mechanism.map(|mechanism| mechanism.stack_pointer_delta_bytes()),
+        ) {
+            return Err(RunFailure::Invalid(
+                "dynamic exit stack pointer differs from the exact source return mechanism"
+                    .to_string(),
+            ));
+        }
+        let block = artifact
+            .graph()
+            .block_id_for_addr(join.join_block())
+            .and_then(|id| artifact.graph().block(id))
+            .ok_or_else(|| RunFailure::Invalid("shared join block is missing".to_string()))?;
+        let run = observed_source_run(artifact, block, state.clone())?;
+        Ok((run, selected_true))
+    })();
+    match result {
+        Ok((run, selected_true)) => (
+            source_terminalize_run(artifact, join.join_block(), Ok(run)),
+            Some(selected_true),
+        ),
+        Err(failure) => (
+            Err(FailedRun {
+                failure,
+                trace: observed_trace(&state),
+            }),
+            None,
+        ),
     }
 }
 
@@ -3447,6 +4035,9 @@ fn execute_semantic_inner(
                 expressions: layer.accounting().expression_layer(),
                 state,
                 reads: &reads,
+                output_roots: None,
+                rewritten_reads: None,
+                consumed_rewrites: None,
                 memo: BTreeMap::new(),
                 visiting: BTreeSet::new(),
                 remaining_nodes: remaining_expression_nodes,
@@ -3722,6 +4313,9 @@ struct SemanticEvaluator<'a> {
     expressions: &'a SemanticCExpressionLayer,
     state: &'a ExecutionState,
     reads: &'a BTreeMap<StructuredAccessId, CachedMemoryRead>,
+    output_roots: Option<&'a BTreeMap<MachineValueBinding, SemanticCExprId>>,
+    rewritten_reads: Option<&'a BTreeMap<StructuredAccessId, DifferentialBitVector>>,
+    consumed_rewrites: Option<&'a mut BTreeSet<StructuredAccessId>>,
     memo: BTreeMap<SemanticCExprId, DifferentialBitVector>,
     visiting: BTreeSet<SemanticCExprId>,
     remaining_nodes: &'a mut u32,
@@ -3758,7 +4352,15 @@ impl SemanticEvaluator<'_> {
                         "semantic input width mismatch".to_string(),
                     ));
                 }
-                semantic_binding_value(self.artifact, self.block_addr, self.state, *binding)?
+                if let Some(root) = self
+                    .output_roots
+                    .and_then(|outputs| outputs.get(binding))
+                    .copied()
+                {
+                    self.eval(root)?
+                } else {
+                    semantic_binding_value(self.artifact, self.block_addr, self.state, *binding)?
+                }
             }
             SemanticCExprKind::Constant { binding, value } => {
                 if binding.width_bits() != width || value.width_bits() != width {
@@ -3777,26 +4379,50 @@ impl SemanticEvaluator<'_> {
                 address,
                 width_bits,
             } => {
-                let address = self.eval(*address)?;
-                let cached = self.reads.get(access).ok_or_else(|| {
-                    RunFailure::Invalid(
-                        "memory-read expression has no exactly-once statement event".to_string(),
-                    )
-                })?;
-                if cached.producer.block_addr != self.block_addr
-                    || cached.object != *object
-                    || cached.space != *space
-                    || cached.endianness != *endianness
-                    || cached.word_size_bytes != *word_size_bytes
-                    || cached.byte_address != address.bits
-                    || cached.width_bits != *width_bits
-                    || *width_bits != width
+                if let Some(value) = self
+                    .rewritten_reads
+                    .and_then(|rewrites| rewrites.get(access))
+                    .copied()
                 {
-                    return Err(RunFailure::Invalid(
-                        "memory-read expression differs from statement event".to_string(),
-                    ));
+                    if *width_bits != width || value.width_bits() != width {
+                        return Err(RunFailure::Invalid(
+                            "private memory rewrite width mismatch".to_string(),
+                        ));
+                    }
+                    let consumed = self.consumed_rewrites.as_deref_mut().ok_or_else(|| {
+                        RunFailure::Invalid(
+                            "private memory rewrite lacks consumption accounting".to_string(),
+                        )
+                    })?;
+                    if !consumed.insert(*access) {
+                        return Err(RunFailure::Invalid(
+                            "private memory rewrite was consumed more than once".to_string(),
+                        ));
+                    }
+                    value
+                } else {
+                    let address = self.eval(*address)?;
+                    let cached = self.reads.get(access).ok_or_else(|| {
+                        RunFailure::Invalid(
+                            "memory-read expression has no exactly-once statement event"
+                                .to_string(),
+                        )
+                    })?;
+                    if cached.producer.block_addr != self.block_addr
+                        || cached.object != *object
+                        || cached.space != *space
+                        || cached.endianness != *endianness
+                        || cached.word_size_bytes != *word_size_bytes
+                        || cached.byte_address != address.bits
+                        || cached.width_bits != *width_bits
+                        || *width_bits != width
+                    {
+                        return Err(RunFailure::Invalid(
+                            "memory-read expression differs from statement event".to_string(),
+                        ));
+                    }
+                    cached.value
                 }
-                cached.value
             }
             SemanticCExprKind::Copy { input } => {
                 let value = self.eval(*input)?;
@@ -4089,6 +4715,621 @@ impl SemanticEvaluator<'_> {
         self.memo.insert(id, result);
         Ok(result)
     }
+}
+
+fn private_join_output_index(
+    layer: &SemanticCExpressionLayer,
+) -> Result<BTreeMap<MachineValueBinding, SemanticCExprId>, RunFailure> {
+    let mut outputs = BTreeMap::new();
+    for entity in layer.entities() {
+        if outputs.insert(entity.output(), entity.root()).is_some() {
+            return Err(RunFailure::Invalid(
+                "private-join expression output is ambiguous".to_string(),
+            ));
+        }
+    }
+    Ok(outputs)
+}
+
+fn evaluate_private_join_value(
+    artifact: &SsaArtifact,
+    layer: &SemanticCExpressionLayer,
+    outputs: &BTreeMap<MachineValueBinding, SemanticCExprId>,
+    state: &ExecutionState,
+    value: &CertifiedPrivateFrameJoinValue,
+    remaining_nodes: &mut u32,
+) -> Result<DifferentialBitVector, RunFailure> {
+    let binding = value.value().binding();
+    let result = match value.origin() {
+        CertifiedPrivateFrameJoinValueOrigin::Produced { producer, root } => {
+            let entity = layer.entity_for_producer(*producer).ok_or_else(|| {
+                RunFailure::Invalid("produced rewrite value has no semantic entity".to_string())
+            })?;
+            if entity.output() != binding || entity.root() != *root {
+                return Err(RunFailure::Invalid(
+                    "produced rewrite value differs from its sealed entity".to_string(),
+                ));
+            }
+            let empty_reads = BTreeMap::new();
+            let mut evaluator = SemanticEvaluator {
+                artifact,
+                block_addr: producer.block_addr,
+                expressions: layer,
+                state,
+                reads: &empty_reads,
+                output_roots: Some(outputs),
+                rewritten_reads: None,
+                consumed_rewrites: None,
+                memo: BTreeMap::new(),
+                visiting: BTreeSet::new(),
+                remaining_nodes,
+            };
+            evaluator.eval(*root)?
+        }
+        CertifiedPrivateFrameJoinValueOrigin::Constant(constant) => {
+            if value.value().constant() != Some(*constant) {
+                return Err(RunFailure::Invalid(
+                    "constant rewrite value differs from its machine use".to_string(),
+                ));
+            }
+            semantic_bitvector(constant.width_bits(), constant.bits())?
+        }
+        CertifiedPrivateFrameJoinValueOrigin::AbiParameter { index, storage } => {
+            if !matches!(
+                layer.input_origins().get(&binding),
+                Some(crate::semantic_c::SemanticCInputOrigin::AbiParameter {
+                    index: actual_index,
+                    storage: actual_storage,
+                }) if actual_index == index && actual_storage == storage
+            ) {
+                return Err(RunFailure::Invalid(
+                    "ABI rewrite value differs from its sealed input origin".to_string(),
+                ));
+            }
+            semantic_binding_value(artifact, artifact.function().entry, state, binding)?
+        }
+    };
+    require_width(result, binding.width_bits())?;
+    Ok(result)
+}
+
+fn eval_private_join_root(
+    artifact: &SsaArtifact,
+    layer: &SemanticCExpressionLayer,
+    outputs: &BTreeMap<MachineValueBinding, SemanticCExprId>,
+    state: &ExecutionState,
+    root: SemanticCExprId,
+    rewrites: &BTreeMap<StructuredAccessId, DifferentialBitVector>,
+    remaining_nodes: &mut u32,
+) -> Result<(DifferentialBitVector, BTreeSet<StructuredAccessId>), RunFailure> {
+    let empty_reads = BTreeMap::new();
+    let mut consumed = BTreeSet::new();
+    let value = {
+        let mut evaluator = SemanticEvaluator {
+            artifact,
+            block_addr: artifact.function().entry,
+            expressions: layer,
+            state,
+            reads: &empty_reads,
+            output_roots: Some(outputs),
+            rewritten_reads: Some(rewrites),
+            consumed_rewrites: Some(&mut consumed),
+            memo: BTreeMap::new(),
+            visiting: BTreeSet::new(),
+            remaining_nodes,
+        };
+        evaluator.eval(root)?
+    };
+    Ok((value, consumed))
+}
+
+fn runtime_rewrite_consumption_is_valid(
+    consumed: &BTreeSet<StructuredAccessId>,
+    sealed: &BTreeMap<StructuredAccessId, DifferentialBitVector>,
+) -> bool {
+    consumed.iter().all(|access| sealed.contains_key(access))
+}
+
+fn exact_semantic_scalar_carrier_relation(
+    kind: SourceCarrierKind,
+    offset_bits: u64,
+    size_bits: u64,
+    physical_width: u32,
+    logical_width: u32,
+) -> bool {
+    offset_bits == 0
+        && size_bits == u64::from(logical_width)
+        && match kind {
+            SourceCarrierKind::Full => logical_width == physical_width,
+            SourceCarrierKind::LowBits => logical_width < physical_width,
+        }
+}
+
+fn project_semantic_logical_return(
+    layer: &SemanticCExpressionLayer,
+    physical: DifferentialBitVector,
+) -> Result<DifferentialBitVector, RunFailure> {
+    let projection = layer
+        .function_interface()
+        .and_then(|interface| interface.return_projection())
+        .ok_or_else(|| {
+            RunFailure::Invalid("private join lacks a logical return projection".to_string())
+        })?;
+    if !matches!(projection.physical_ty(), MachineType::Integer { .. })
+        || !matches!(projection.logical_ty(), MachineType::Integer { .. })
+        || projection.physical_ty().width_bits() != physical.width_bits()
+        || !exact_semantic_scalar_carrier_relation(
+            projection.carrier().kind(),
+            projection.carrier().offset_bits(),
+            projection.carrier().size_bits(),
+            projection.physical_ty().width_bits(),
+            projection.logical_ty().width_bits(),
+        )
+    {
+        return Err(RunFailure::Invalid(
+            "private join logical return projection is incoherent".to_string(),
+        ));
+    }
+    semantic_bitvector(projection.logical_ty().width_bits(), physical.bits())
+}
+
+fn project_source_logical_return(
+    artifact: &SsaArtifact,
+    physical: DifferentialBitVector,
+) -> Result<DifferentialBitVector, RunFailure> {
+    let interface = artifact
+        .machine_context()
+        .function_interface()
+        .ok_or_else(|| RunFailure::Invalid("source function interface is missing".to_string()))?;
+    let SourceFunctionReturn::Register { storage } = interface.return_kind() else {
+        return Err(RunFailure::Invalid(
+            "source private join is not a scalar register return".to_string(),
+        ));
+    };
+    let physical_width = storage
+        .size
+        .checked_mul(8)
+        .ok_or_else(|| RunFailure::Invalid("source return width overflow".to_string()))?;
+    let logical = interface
+        .return_logical_value()
+        .ok_or_else(|| RunFailure::Invalid("source logical return value is missing".to_string()))?;
+    let source_type = interface
+        .type_graph()
+        .and_then(|graph| {
+            usize::try_from(logical.type_id())
+                .ok()
+                .and_then(|id| graph.types().get(id))
+        })
+        .ok_or_else(|| RunFailure::Invalid("source logical return type is missing".to_string()))?;
+    if source_type.id() != logical.type_id() {
+        return Err(RunFailure::Invalid(
+            "source logical return type identity is incoherent".to_string(),
+        ));
+    }
+    let logical_width = u32::try_from(source_type.size_bits())
+        .ok()
+        .filter(|width| matches!(width, 8 | 16 | 32 | 64))
+        .ok_or_else(|| RunFailure::Invalid("source logical return width is invalid".to_string()))?;
+    let carrier = logical.carrier();
+    let exact_carrier = carrier.offset_bits() == 0
+        && carrier.size_bits() == u64::from(logical_width)
+        && matches!(
+            source_type.kind(),
+            SourceTypeKind::SignedInteger | SourceTypeKind::UnsignedInteger
+        )
+        && match carrier.kind() {
+            SourceCarrierKind::Full => logical_width == physical_width,
+            SourceCarrierKind::LowBits => logical_width < physical_width,
+        };
+    if physical.width_bits() != physical_width || !exact_carrier {
+        return Err(RunFailure::Invalid(
+            "source logical return carrier is incoherent".to_string(),
+        ));
+    }
+    semantic_bitvector(logical_width, physical.bits())
+}
+
+fn execute_private_frame_join_semantic(
+    artifact: &SsaArtifact,
+    function: &CertifiedPrivateFrameConditionalJoinFunction,
+    initial: &DifferentialState,
+    limits: DifferentialLimits,
+) -> InterpreterResult {
+    let rewrite = function.rewrite();
+    let layer = rewrite.expression_layer();
+    let state = ExecutionState::from(initial);
+    let result = (|| {
+        if rewrite.joined_select().truthiness() != CertifiedControlTruthiness::NonZeroIsTrue
+            || rewrite.joined_select().condition().binding().width_bits() != 8
+        {
+            return Err(RunFailure::Invalid(
+                "private join condition policy is not exact nonzero truthiness".to_string(),
+            ));
+        }
+        let outputs = private_join_output_index(layer)?;
+        let mut remaining_nodes = limits.max_expression_nodes;
+        let mut direct = BTreeMap::new();
+        for substitution in rewrite.direct_substitutions() {
+            let replacement = evaluate_private_join_value(
+                artifact,
+                layer,
+                &outputs,
+                &state,
+                substitution.replacement(),
+                &mut remaining_nodes,
+            )?;
+            if direct
+                .insert(substitution.load_access(), replacement)
+                .is_some()
+            {
+                return Err(RunFailure::Invalid(
+                    "duplicate direct private-memory rewrite".to_string(),
+                ));
+            }
+        }
+        let (condition, consumed_direct) = eval_private_join_root(
+            artifact,
+            layer,
+            &outputs,
+            &state,
+            rewrite.joined_select().condition_root(),
+            &direct,
+            &mut remaining_nodes,
+        )?;
+        if !runtime_rewrite_consumption_is_valid(&consumed_direct, &direct)
+            || condition.width_bits() != 8
+        {
+            return Err(RunFailure::Invalid(
+                "condition DAG consumed an unsealed direct rewrite".to_string(),
+            ));
+        }
+        let selected = if condition.bits() != 0 {
+            rewrite.joined_select().true_value()
+        } else {
+            rewrite.joined_select().false_value()
+        };
+        let selected = evaluate_private_join_value(
+            artifact,
+            layer,
+            &outputs,
+            &state,
+            selected,
+            &mut remaining_nodes,
+        )?;
+        let joined = BTreeMap::from([(rewrite.joined_select().load_access(), selected)]);
+        let (physical, consumed_joined) = eval_private_join_root(
+            artifact,
+            layer,
+            &outputs,
+            &state,
+            rewrite.joined_select().return_root(),
+            &joined,
+            &mut remaining_nodes,
+        )?;
+        if !runtime_rewrite_consumption_is_valid(&consumed_joined, &joined) {
+            return Err(RunFailure::Invalid(
+                "return DAG consumed an unsealed joined rewrite".to_string(),
+            ));
+        }
+        let logical = project_semantic_logical_return(layer, physical)?;
+        Ok(DifferentialObservedRun {
+            outcome: DifferentialBoundaryOutcome::Returned {
+                values: vec![logical].into_boxed_slice(),
+            },
+            outputs: Box::new([]),
+            memory_events: Box::new([]),
+            final_memory: state
+                .memory
+                .iter()
+                .map(|(location, value)| DifferentialObservedByte {
+                    location: *location,
+                    value: *value,
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        })
+    })();
+    result.map_err(|failure| FailedRun {
+        failure,
+        trace: observed_trace(&state),
+    })
+}
+
+fn private_event_matches_statement(
+    event: &DifferentialMemoryEvent,
+    statement: &CertifiedMemoryStatement,
+) -> bool {
+    event.producer == statement.producer()
+        && event.access == statement.access()
+        && event.object == statement.object()
+        && event.space == statement.space()
+        && event.width_bits == statement.width_bits()
+        && event.endianness == statement.endianness()
+        && matches!(
+            (event.kind, statement.kind()),
+            (
+                DifferentialMemoryEventKind::Read,
+                CertifiedMemoryStatementKind::Read { .. }
+            ) | (
+                DifferentialMemoryEventKind::Write,
+                CertifiedMemoryStatementKind::Write { .. }
+            )
+        )
+}
+
+fn add_expected_private_flow(
+    expected: &mut BTreeMap<
+        StructuredAccessId,
+        (
+            CertifiedMemoryStatement,
+            Option<r2cert::CertifiedNormalizedStackRange>,
+        ),
+    >,
+    flow: &r2cert::CertifiedPrivateFrameValueFlow,
+    include_stores: impl Fn(&CertifiedMemoryStatement) -> bool,
+) -> Result<(), RunFailure> {
+    for access in flow.region().accesses() {
+        let statement = access.statement();
+        let include = matches!(statement.kind(), CertifiedMemoryStatementKind::Read { .. })
+            || include_stores(statement);
+        if include
+            && expected
+                .insert(
+                    statement.access(),
+                    (statement.clone(), Some(access.range())),
+                )
+                .is_some()
+        {
+            return Err(RunFailure::Invalid(
+                "private memory access has duplicate dynamic ownership".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn private_stack_intervals(
+    projection: &CertifiedMachineProjection,
+    join: &CertifiedPrivateFrameConditionalJoin,
+    initial: &DifferentialState,
+) -> Result<Vec<(u64, u64)>, RunFailure> {
+    let stack = projection
+        .stack_discipline()
+        .ok_or_else(|| RunFailure::Invalid("private join lacks stack discipline".to_string()))?;
+    let entry = initial
+        .values
+        .get(&stack.entry_stack_pointer().binding().value())
+        .copied()
+        .ok_or(RunFailure::MissingBoundaryInput(
+            stack.entry_stack_pointer().binding().value(),
+        ))?;
+    require_width(entry, stack.entry_stack_pointer().binding().width_bits())?;
+    let ranges = join
+        .auxiliary_direct_flows()
+        .iter()
+        .map(|(_, flow)| flow.range())
+        .chain([join.joined_flow().range()]);
+    let mut intervals = BTreeSet::new();
+    for range in ranges {
+        let start = modular_stack_offset(entry, range.offset());
+        let end = start
+            .checked_add(u64::from(range.size_bytes()))
+            .ok_or_else(|| RunFailure::Invalid("private stack range end overflow".to_string()))?;
+        intervals.insert((start, end));
+    }
+    Ok(intervals.into_iter().collect())
+}
+
+fn validate_private_join_memory_domain(
+    artifact: &SsaArtifact,
+    projection: &CertifiedMachineProjection,
+    join: &CertifiedPrivateFrameConditionalJoin,
+    initial: &DifferentialState,
+) -> Result<(), RunFailure> {
+    let mut intervals = private_stack_intervals(projection, join, initial)?;
+    if let Some(read) = join.release().return_address_read() {
+        let stack = projection.stack_discipline().ok_or_else(|| {
+            RunFailure::Invalid("private join lacks stack discipline".to_string())
+        })?;
+        let entry = initial
+            .values
+            .get(&stack.entry_stack_pointer().binding().value())
+            .copied()
+            .ok_or(RunFailure::MissingBoundaryInput(
+                stack.entry_stack_pointer().binding().value(),
+            ))?;
+        let mechanism = artifact
+            .machine_context()
+            .function_interface()
+            .and_then(|interface| interface.return_mechanism())
+            .ok_or_else(|| {
+                RunFailure::Invalid(
+                    "stacked return-address read lacks exact source mechanism".to_string(),
+                )
+            })?;
+        if read.width_bits() / 8 != mechanism.slot_size_bytes() {
+            return Err(RunFailure::Invalid(
+                "return-address read size differs from source mechanism".to_string(),
+            ));
+        }
+        let start = modular_stack_offset(entry, mechanism.stack_offset());
+        let end = start
+            .checked_add(u64::from(mechanism.slot_size_bytes()))
+            .ok_or_else(|| RunFailure::Invalid("return-address range overflow".to_string()))?;
+        intervals.push((start, end));
+    } else if artifact
+        .machine_context()
+        .function_interface()
+        .and_then(|interface| interface.return_mechanism())
+        .is_some()
+    {
+        return Err(RunFailure::Invalid(
+            "stacked source mechanism lacks certified return-address read".to_string(),
+        ));
+    }
+    for (start, end) in intervals {
+        for byte_address in start..end {
+            let location = DifferentialMemoryLocation {
+                space: MachineAddressSpace::Ram,
+                byte_address,
+            };
+            if !initial.memory.contains_key(&location) {
+                return Err(RunFailure::MemoryOutOfDomain(location));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn normalize_private_join_run(
+    artifact: &SsaArtifact,
+    projection: &CertifiedMachineProjection,
+    function: &CertifiedPrivateFrameConditionalJoinFunction,
+    initial: &DifferentialState,
+    selected_true: bool,
+    mut run: DifferentialObservedRun,
+) -> Result<DifferentialObservedRun, RunFailure> {
+    let join = function.rewrite().machine_join();
+    let selected_store = if selected_true {
+        join.true_arm().store().statement()
+    } else {
+        join.false_arm().store().statement()
+    };
+    let mut expected = BTreeMap::new();
+    for (_, flow) in join.auxiliary_direct_flows() {
+        add_expected_private_flow(&mut expected, flow, |_| true)?;
+        if flow.definitions().iter().any(|definition| {
+            !matches!(definition, CertifiedPrivateFrameVersionDefinition::Store(_))
+        }) {
+            return Err(RunFailure::Invalid(
+                "auxiliary private flow is not direct".to_string(),
+            ));
+        }
+    }
+    add_expected_private_flow(&mut expected, join.joined_flow(), |statement| {
+        statement.access() == selected_store.access()
+    })?;
+    if !expected.contains_key(&selected_store.access()) {
+        return Err(RunFailure::Invalid(
+            "selected arm store lacks exact joined-flow ownership".to_string(),
+        ));
+    }
+    if let Some(read) = join.release().return_address_read()
+        && expected
+            .insert(read.access(), (read.clone(), None))
+            .is_some()
+    {
+        return Err(RunFailure::Invalid(
+            "return-address read collides with a private access".to_string(),
+        ));
+    }
+    let intervals = private_stack_intervals(projection, join, initial)?;
+    let stack = projection
+        .stack_discipline()
+        .ok_or_else(|| RunFailure::Invalid("private join lacks stack discipline".to_string()))?;
+    let entry_sp = initial
+        .values
+        .get(&stack.entry_stack_pointer().binding().value())
+        .copied()
+        .ok_or(RunFailure::MissingBoundaryInput(
+            stack.entry_stack_pointer().binding().value(),
+        ))?;
+    let mut consumed = BTreeSet::new();
+    for event in &run.memory_events {
+        let (statement, range) = expected.get(&event.access).ok_or_else(|| {
+            RunFailure::Invalid("source emitted an unaudited memory event".to_string())
+        })?;
+        if !private_event_matches_statement(event, statement) || !consumed.insert(event.access) {
+            return Err(RunFailure::Invalid(
+                "source memory event differs from exact audited ownership".to_string(),
+            ));
+        }
+        if let Some(range) = range {
+            let expected_address = modular_stack_offset(entry_sp, range.offset());
+            if event.byte_address != expected_address || event.width_bits / 8 != range.size_bytes()
+            {
+                return Err(RunFailure::Invalid(
+                    "private access differs from its exact audited range".to_string(),
+                ));
+            }
+        } else {
+            let mechanism = artifact
+                .machine_context()
+                .function_interface()
+                .and_then(|interface| interface.return_mechanism())
+                .ok_or_else(|| {
+                    RunFailure::Invalid(
+                        "return-address event lacks exact source mechanism".to_string(),
+                    )
+                })?;
+            if !exact_return_address_event(
+                event,
+                statement,
+                entry_sp,
+                mechanism.stack_offset(),
+                mechanism.slot_size_bytes(),
+            ) {
+                return Err(RunFailure::Invalid(
+                    "return-address event differs from exact source mechanism".to_string(),
+                ));
+            }
+        }
+    }
+    if consumed != expected.keys().copied().collect() {
+        return Err(RunFailure::Invalid(
+            "source did not consume every expected private or return-address access".to_string(),
+        ));
+    }
+    let physical = match &run.outcome {
+        DifferentialBoundaryOutcome::Returned { values } if values.len() == 1 => values[0],
+        _ => {
+            return Err(RunFailure::Invalid(
+                "private join did not produce one scalar return".to_string(),
+            ));
+        }
+    };
+    let logical = project_source_logical_return(artifact, physical)?;
+    run.outcome = DifferentialBoundaryOutcome::Returned {
+        values: vec![logical].into_boxed_slice(),
+    };
+    run.outputs = Box::new([]);
+    run.memory_events = Box::new([]);
+    run.final_memory = run
+        .final_memory
+        .into_vec()
+        .into_iter()
+        .filter(|byte| {
+            byte.location.space != MachineAddressSpace::Ram
+                || intervals.iter().all(|(start, end)| {
+                    byte.location.byte_address < *start || byte.location.byte_address >= *end
+                })
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    Ok(run)
+}
+
+fn project_private_join_semantic_memory(
+    projection: &CertifiedMachineProjection,
+    function: &CertifiedPrivateFrameConditionalJoinFunction,
+    initial: &DifferentialState,
+    mut run: DifferentialObservedRun,
+) -> Result<DifferentialObservedRun, RunFailure> {
+    let intervals =
+        private_stack_intervals(projection, function.rewrite().machine_join(), initial)?;
+    run.final_memory = run
+        .final_memory
+        .into_vec()
+        .into_iter()
+        .filter(|byte| {
+            byte.location.space != MachineAddressSpace::Ram
+                || intervals.iter().all(|(start, end)| {
+                    byte.location.byte_address < *start || byte.location.byte_address >= *end
+                })
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    Ok(run)
 }
 
 fn observed_source_run(
@@ -5748,6 +6989,38 @@ mod tests {
     };
 
     #[test]
+    fn runtime_rewrite_consumption_accepts_one_short_circuit_select_arm() {
+        let left = StructuredAccessId {
+            inst: r2ssa::InstId(10),
+            ordinal: 0,
+        };
+        let right = StructuredAccessId {
+            inst: r2ssa::InstId(11),
+            ordinal: 0,
+        };
+        let foreign = StructuredAccessId {
+            inst: r2ssa::InstId(12),
+            ordinal: 0,
+        };
+        let sealed = BTreeMap::from([
+            (left, DifferentialBitVector::new(8, 1).unwrap()),
+            (right, DifferentialBitVector::new(8, 0).unwrap()),
+        ]);
+        assert!(runtime_rewrite_consumption_is_valid(
+            &BTreeSet::from([left]),
+            &sealed,
+        ));
+        assert!(runtime_rewrite_consumption_is_valid(
+            &BTreeSet::from([right]),
+            &sealed,
+        ));
+        assert!(!runtime_rewrite_consumption_is_valid(
+            &BTreeSet::from([foreign]),
+            &sealed,
+        ));
+    }
+
+    #[test]
     fn source_memory_space_authority_rejects_each_mismatch() {
         let exact = [r2il::SpaceId::Ram; 5];
         assert!(memory_space_authorities_match(
@@ -6967,6 +8240,286 @@ mod tests {
         assert!(!rendered.contains("local"));
         assert_eq!(rendered.matches("return ").count(), 1);
 
+        let entry_sp = stack.entry_stack_pointer().binding();
+        let parameter = rewrite
+            .expression_layer()
+            .function_interface()
+            .and_then(|interface| interface.parameters().first())
+            .and_then(|parameter| parameter.value())
+            .expect("exact RCX boundary binding");
+        let seeded_state = |condition: u64, include_parameter: bool, include_memory: bool| {
+            let mut state = DifferentialState::for_artifact(&trusted).expect("genuine state");
+            assert!(
+                state
+                    .set_value(
+                        entry_sp.value(),
+                        DifferentialBitVector::new(entry_sp.width_bits(), 0x8000)
+                            .expect("entry rsp"),
+                    )
+                    .is_none()
+            );
+            if include_parameter {
+                assert!(
+                    state
+                        .set_value(
+                            parameter.value(),
+                            DifferentialBitVector::new(parameter.width_bits(), condition)
+                                .expect("RCX condition"),
+                        )
+                        .is_none()
+                );
+            }
+            if include_memory {
+                for byte_address in 0x7fe0..0x8008 {
+                    assert!(
+                        state
+                            .set_memory_byte(
+                                DifferentialMemoryLocation {
+                                    space: MachineAddressSpace::Ram,
+                                    byte_address,
+                                },
+                                0,
+                            )
+                            .is_none()
+                    );
+                }
+            }
+            state
+        };
+        let route_steps = |arm: &CertifiedPrivateFrameConditionalArm| {
+            std::iter::once(certificate.header())
+                .chain(arm.transparent().iter().map(|branch| branch.block_addr()))
+                .chain([arm.store_block(), certificate.join_block()])
+                .map(|addr| {
+                    trusted
+                        .artifact()
+                        .graph()
+                        .block_id_for_addr(addr)
+                        .and_then(|id| trusted.artifact().graph().block(id))
+                        .map(|block| block.insts.len())
+                        .expect("sealed route graph block")
+                })
+                .sum::<usize>()
+        };
+        let maximum_steps =
+            route_steps(certificate.true_arm()).max(route_steps(certificate.false_arm()));
+        let limits = DifferentialLimits {
+            max_source_steps: u32::try_from(maximum_steps).expect("route steps fit u32"),
+            max_expression_nodes: 256,
+            max_memory_bytes: 64,
+        };
+        let mechanism = trusted
+            .artifact()
+            .machine_context()
+            .function_interface()
+            .and_then(|interface| interface.return_mechanism())
+            .expect("exact stacked return mechanism");
+        let entry_bits = DifferentialBitVector::new(64, 0x8000).unwrap();
+        let physical_return = DifferentialBitVector::new(64, 0xffff_ffff_0000_0001).unwrap();
+        assert_eq!(
+            project_source_logical_return(trusted.artifact(), physical_return),
+            Ok(DifferentialBitVector::new(32, 1).unwrap())
+        );
+        assert_eq!(
+            project_semantic_logical_return(rewrite.expression_layer(), physical_return),
+            Ok(DifferentialBitVector::new(32, 1).unwrap())
+        );
+        assert!(
+            project_source_logical_return(
+                trusted.artifact(),
+                DifferentialBitVector::new(32, 1).unwrap(),
+            )
+            .is_err()
+        );
+        assert!(!exact_semantic_scalar_carrier_relation(
+            SourceCarrierKind::Full,
+            0,
+            32,
+            64,
+            32,
+        ));
+        assert!(!exact_semantic_scalar_carrier_relation(
+            SourceCarrierKind::LowBits,
+            0,
+            64,
+            64,
+            64,
+        ));
+        assert!(exact_semantic_scalar_carrier_relation(
+            SourceCarrierKind::LowBits,
+            0,
+            32,
+            64,
+            32,
+        ));
+        assert!(exact_exit_stack_pointer(
+            entry_bits,
+            DifferentialBitVector::new(64, 0x8008).unwrap(),
+            Some(mechanism.stack_pointer_delta_bytes()),
+        ));
+        assert!(!exact_exit_stack_pointer(
+            entry_bits,
+            DifferentialBitVector::new(64, 0x8000).unwrap(),
+            Some(mechanism.stack_pointer_delta_bytes()),
+        ));
+        assert!(exact_exit_stack_pointer(entry_bits, entry_bits, None));
+        let return_address_read = certificate
+            .release()
+            .return_address_read()
+            .expect("stacked return-address read");
+        let mut return_address_event = DifferentialMemoryEvent {
+            producer: return_address_read.producer(),
+            access: return_address_read.access(),
+            object: return_address_read.object(),
+            kind: DifferentialMemoryEventKind::Read,
+            space: return_address_read.space(),
+            byte_address: 0x8000,
+            width_bits: return_address_read.width_bits(),
+            endianness: return_address_read.endianness(),
+            value: DifferentialBitVector::new(return_address_read.width_bits(), 0).unwrap(),
+        };
+        assert!(exact_return_address_event(
+            &return_address_event,
+            return_address_read,
+            entry_bits,
+            mechanism.stack_offset(),
+            mechanism.slot_size_bytes(),
+        ));
+        return_address_event.byte_address = return_address_event.byte_address.wrapping_add(1);
+        assert!(!exact_return_address_event(
+            &return_address_event,
+            return_address_read,
+            entry_bits,
+            mechanism.stack_offset(),
+            mechanism.slot_size_bytes(),
+        ));
+        assert_eq!(
+            modular_stack_offset(DifferentialBitVector::new(64, 4).unwrap(), -8),
+            u64::MAX - 3,
+        );
+
+        let mut foreign_local_seed = seeded_state(0, true, true);
+        assert!(
+            trusted
+                .artifact()
+                .graph()
+                .def_inst(false_store_value.binding().value())
+                .is_some()
+        );
+        assert!(
+            foreign_local_seed
+                .set_value(
+                    false_store_value.binding().value(),
+                    DifferentialBitVector::new(false_store_value.binding().width_bits(), 0)
+                        .expect("unselected arm value"),
+                )
+                .is_none()
+        );
+        let foreign_local = check_private_frame_conditional_join_differential(
+            &trusted,
+            &foreign_local_seed,
+            limits,
+        );
+        assert_eq!(
+            foreign_local.conclusion(),
+            DifferentialConclusion::InvalidInput
+        );
+        assert!(matches!(
+            foreign_local.disposition(),
+            DifferentialCaseDisposition::InvalidInput { reason }
+                if reason.contains("function-local producer")
+        ));
+        for (condition, expected) in [(0, 1), (1, 0), (u64::MAX, 0)] {
+            let report = check_private_frame_conditional_join_differential(
+                &trusted,
+                &seeded_state(condition, true, true),
+                limits,
+            );
+            assert_eq!(
+                report.conclusion(),
+                DifferentialConclusion::NoMismatchObserved
+            );
+            assert_eq!(report.disposition(), &DifferentialCaseDisposition::Matched);
+            assert_eq!(
+                report
+                    .candidate_identity()
+                    .expect("private join candidate identity")
+                    .candidate_kind(),
+                DifferentialCandidateKind::PrivateFrameConditionalJoinFunction
+            );
+            let DifferentialBoundaryOutcome::Returned { values } =
+                &report.source().expect("source run").outcome
+            else {
+                panic!("source private join must return")
+            };
+            assert_eq!(
+                values.as_ref(),
+                [DifferentialBitVector::new(32, expected).unwrap()]
+            );
+            assert!(report.source().unwrap().memory_events.is_empty());
+            assert_eq!(report.source().unwrap().final_memory.len(), 28);
+        }
+
+        let missing_input = check_private_frame_conditional_join_differential(
+            &trusted,
+            &seeded_state(0, false, true),
+            limits,
+        );
+        assert_eq!(
+            missing_input.conclusion(),
+            DifferentialConclusion::Incomplete
+        );
+        assert!(matches!(
+            missing_input.disposition(),
+            DifferentialCaseDisposition::MissingBoundaryInput { value, .. }
+                if *value == parameter.value()
+        ));
+        let missing_memory = check_private_frame_conditional_join_differential(
+            &trusted,
+            &seeded_state(0, true, false),
+            limits,
+        );
+        assert_eq!(
+            missing_memory.conclusion(),
+            DifferentialConclusion::Incomplete
+        );
+        assert!(matches!(
+            missing_memory.disposition(),
+            DifferentialCaseDisposition::MemoryOutOfDomain { .. }
+        ));
+        let budget_boundary = check_private_frame_conditional_join_differential(
+            &trusted,
+            &seeded_state(0, true, true),
+            DifferentialLimits {
+                max_source_steps: u32::try_from(route_steps(certificate.true_arm()))
+                    .expect("route steps fit u32"),
+                ..limits
+            },
+        );
+        assert_eq!(
+            budget_boundary.conclusion(),
+            DifferentialConclusion::NoMismatchObserved
+        );
+        let budget_short = check_private_frame_conditional_join_differential(
+            &trusted,
+            &seeded_state(0, true, true),
+            DifferentialLimits {
+                max_source_steps: u32::try_from(route_steps(certificate.true_arm()) - 1)
+                    .expect("route steps fit u32"),
+                ..limits
+            },
+        );
+        assert_eq!(
+            budget_short.conclusion(),
+            DifferentialConclusion::Incomplete
+        );
+        assert!(matches!(
+            budget_short.disposition(),
+            DifferentialCaseDisposition::BudgetExceeded {
+                side: DifferentialSide::SourceSsa
+            }
+        ));
+
         let foreign_blocks = conditional_private_join_blocks(ADDR + 0x200, false);
         let foreign_header = foreign_blocks[0].addr;
         let (foreign_trusted, _, _) =
@@ -7081,6 +8634,16 @@ mod tests {
                 | Err(PrivateFrameConditionalJoinRewriteError::MissingStackDiscipline)
         ));
         assert!(CertifiedPrivateFrameConditionalJoinFunction::from_artifact(&trusted).is_err());
+        let refused_state = DifferentialState::for_artifact(&trusted).expect("zero-span state");
+        let refused = check_private_frame_conditional_join_differential(
+            &trusted,
+            &refused_state,
+            DifferentialLimits::default(),
+        );
+        assert_eq!(
+            refused.admission(),
+            DifferentialCandidateAdmission::Residual
+        );
     }
 
     #[test]
@@ -7364,7 +8927,7 @@ mod tests {
                 },
             })
         );
-        assert_eq!(SEMANTIC_DIFFERENTIAL_SCHEMA_VERSION, 7);
-        assert_eq!(SEMANTIC_DIFFERENTIAL_EVALUATOR_CONTRACT_VERSION, 6);
+        assert_eq!(SEMANTIC_DIFFERENTIAL_SCHEMA_VERSION, 8);
+        assert_eq!(SEMANTIC_DIFFERENTIAL_EVALUATOR_CONTRACT_VERSION, 7);
     }
 }

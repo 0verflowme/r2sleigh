@@ -167,7 +167,7 @@ pub use semantic_differential::{
     SEMANTIC_DIFFERENTIAL_EVALUATOR_CONTRACT_VERSION, SEMANTIC_DIFFERENTIAL_SCHEMA_VERSION,
     check_block_differential, check_conditional_return_differential,
     check_direct_call_differential, check_memory_terminal_return_differential,
-    check_terminal_return_differential,
+    check_private_frame_conditional_join_differential, check_terminal_return_differential,
 };
 pub use semantic_function::{
     CERTIFIED_SEMANTIC_C_FUNCTION_SCHEMA_VERSION, CertifiedSemanticCFunction,
