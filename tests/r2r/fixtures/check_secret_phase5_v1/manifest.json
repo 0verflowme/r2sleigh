@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "fixture_set": "check-secret-x86_64-macho-phase5-v1",
+  "immutability_policy": "Every listed source, executable, debug companion, UUID, function range, and byte sequence is immutable. Any change requires a new versioned fixture set.",
+  "purpose": "Exercise the genuine radare2 snapshot, DWARF interface, Sleigh lift, SSA, certification, and semantic-C path at O0 and O2 without reconstructing authority in the test.",
+  "source": {
+    "path": "tests/e2e/vuln_test.c",
+    "sha256": "187557b24b8d0c8e13faf57e735c2894ea6dcdb7f99f7689e4ed2fcadd6364c5",
+    "function": "check_secret",
+    "contract": "returns 1 exactly when the signed 32-bit input equals 0xdead, otherwise returns 0"
+  },
+  "build_environment": {
+    "host_arch": "arm64",
+    "host_os": "macOS 26.5.1 (25F80)",
+    "compiler_driver": "/usr/bin/clang",
+    "compiler_version": "Apple clang version 21.0.0 (clang-2100.1.1.101)",
+    "sdk_path": "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+    "sdk_version": "26.5",
+    "deployment_target": "26.0"
+  },
+  "artifacts": [
+    {
+      "id": "check-secret-o2-x86_64-macho-v1",
+      "optimization": "O2",
+      "compiler_command": "clang -arch x86_64 -Wl,-no_pie -O2 -g -fno-stack-protector -o tests/r2r/bins/r2sleigh_vuln_test_x86_64_macho_O2_v1 tests/e2e/vuln_test.c",
+      "executable": {
+        "path": "tests/r2r/bins/r2sleigh_vuln_test_x86_64_macho_O2_v1",
+        "size_bytes": 24480,
+        "sha256": "f223535d0a5974e5af3b997b7f5e3ac6adc9e00895d281e3e304e3adce42fe29",
+        "uuid": "71863F33-EBB2-3817-B727-130970AC1F96"
+      },
+      "debug_companion": {
+        "path": "tests/r2r/bins/r2sleigh_vuln_test_x86_64_macho_O2_v1.dSYM",
+        "uuid": "71863F33-EBB2-3817-B727-130970AC1F96",
+        "files": [
+          {
+            "path": "Contents/Info.plist",
+            "size_bytes": 666,
+            "sha256": "641d91f1dca8cdfb25d3674cc871bc0f710de02cc3e4f6ad2529c070613b72dd"
+          },
+          {
+            "path": "Contents/Resources/DWARF/r2sleigh_vuln_test_x86_64_macho_O2_v1",
+            "size_bytes": 35168,
+            "sha256": "2c794f3ab817a196b546b4b40f2f89bbfdb9190a8c241ebbfa53381caec86121"
+          },
+          {
+            "path": "Contents/Resources/Relocations/x86_64/r2sleigh_vuln_test_x86_64_macho_O2_v1.yml",
+            "size_bytes": 139,
+            "sha256": "295ef993f10e899a6bc063ac20ba48b81af5c593faf84fd7fe4fd22269f75b59"
+          }
+        ]
+      },
+      "function": {
+        "symbol": "_check_secret",
+        "start_vaddr": "0x100000650",
+        "next_symbol_vaddr": "0x100000670",
+        "code_end_vaddr_exclusive": "0x100000661",
+        "size_bytes": 17,
+        "bytes_hex": "554889e531c081ffadde00000f94c05dc3"
+      },
+      "expected_decompiler_class": "CertifiedC"
+    },
+    {
+      "id": "check-secret-o0-x86_64-macho-v1",
+      "optimization": "O0",
+      "compiler_command": "clang -arch x86_64 -Wl,-no_pie -O0 -g -fno-stack-protector -o tests/r2r/bins/check_secret_phase5_o0_v1/vuln_test_x86 tests/e2e/vuln_test.c",
+      "executable": {
+        "path": "tests/r2r/bins/check_secret_phase5_o0_v1/vuln_test_x86",
+        "size_bytes": 24616,
+        "sha256": "179ecc32ce93e1d2b9f1ee782f6d74a36a501cc9fbb0273655771a068b6d5199",
+        "uuid": "C18C7C7F-2E60-4EF1-8EA9-373C06BE94BC"
+      },
+      "debug_companion": {
+        "path": "tests/r2r/bins/check_secret_phase5_o0_v1/vuln_test_x86.dSYM",
+        "uuid": "C18C7C7F-2E60-4EF1-8EA9-373C06BE94BC",
+        "files": [
+          {
+            "path": "Contents/Info.plist",
+            "size_bytes": 642,
+            "sha256": "7ed7d5199c9941884877e7132205cd59f4fadd6eb7be63d76e46da99c004916d"
+          },
+          {
+            "path": "Contents/Resources/DWARF/vuln_test_x86",
+            "size_bytes": 28704,
+            "sha256": "c734311a7a7c66b6eff5342e37e1b3d16ec0351e7090439d7c80d151491a8ae2"
+          },
+          {
+            "path": "Contents/Resources/Relocations/x86_64/vuln_test_x86.yml",
+            "size_bytes": 107,
+            "sha256": "9c1e45d92cd49baf277723412a5339c1ad6f07f005e01fb563535b59a0fc5e3a"
+          }
+        ]
+      },
+      "function": {
+        "symbol": "_check_secret",
+        "start_vaddr": "0x100000650",
+        "next_symbol_vaddr": "0x100000680",
+        "code_end_vaddr_exclusive": "0x100000675",
+        "size_bytes": 37,
+        "bytes_hex": "554889e5897df8817df8adde00007509c745fc01000000eb07c745fc000000008b45fc5dc3"
+      },
+      "expected_decompiler_class": "Residual",
+      "expected_limitation": "Private parameter-home and two-arm red-zone local MemorySSA flows are not yet certified. No executable C may be guessed."
+    }
+  ]
+}

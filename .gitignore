@@ -19,6 +19,10 @@ com.apple.kernel
 # Generated files
 *.r2il
 *.dSYM/
+!tests/r2r/bins/r2sleigh_vuln_test_x86_64_macho_O2_v1.dSYM/
+!tests/r2r/bins/r2sleigh_vuln_test_x86_64_macho_O2_v1.dSYM/**
+!tests/r2r/bins/check_secret_phase5_o0_v1/vuln_test_x86.dSYM/
+!tests/r2r/bins/check_secret_phase5_o0_v1/vuln_test_x86.dSYM/**
 mutants.out/
 mutants.out.old/
 **/mutants.out/

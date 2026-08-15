@@ -1,0 +1,5 @@
+---
+triple:          'x86_64-apple-darwin'
+binary-path:     '../e2e/vuln_test_x86'
+relocations:     []
+...
