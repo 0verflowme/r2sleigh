@@ -2194,3 +2194,60 @@ mod tests {
         assert!(no_implicit.owns_entry_relative_range(-16, -16, 16));
     }
 }
+
+/// Machine carriers radare2 knows from its register profile.
+///
+/// These are deliberately separate from [`SourceFunctionInterface`]. Which
+/// register holds a return address, and which one is the stack pointer, are
+/// properties of the machine: radare2 resolves them from register aliases and
+/// they are available whether or not any ABI was recovered. The interface, by
+/// contrast, describes an ABI — parameters, calling convention, return type —
+/// and exists only when debug information supplied one.
+///
+/// Carrying both in one structure is what previously made the machine carriers
+/// unreachable without debug information, because the whole structure was
+/// captured all-or-nothing. Keeping them apart lets a function be reasoned
+/// about on its machine facts while its ABI facts stay honestly absent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SourceMachineRoles {
+    return_address_storage: Option<CanonicalStorageId>,
+    stack_pointer_storage: Option<CanonicalStorageId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceMachineRolesError {
+    InvalidRegisterStorage,
+}
+
+impl SourceMachineRoles {
+    /// Build the machine carriers, rejecting any storage that is not a
+    /// well-formed register location.
+    pub fn new(
+        return_address_storage: Option<CanonicalStorageId>,
+        stack_pointer_storage: Option<CanonicalStorageId>,
+    ) -> Result<Self, SourceMachineRolesError> {
+        if return_address_storage.is_some_and(|storage| !valid_register_storage(storage))
+            || stack_pointer_storage.is_some_and(|storage| !valid_register_storage(storage))
+        {
+            return Err(SourceMachineRolesError::InvalidRegisterStorage);
+        }
+        Ok(Self {
+            return_address_storage,
+            stack_pointer_storage,
+        })
+    }
+
+    pub const fn return_address_storage(&self) -> Option<CanonicalStorageId> {
+        self.return_address_storage
+    }
+
+    pub const fn stack_pointer_storage(&self) -> Option<CanonicalStorageId> {
+        self.stack_pointer_storage
+    }
+
+    /// True when neither carrier is known, which is the state of a source that
+    /// could not resolve its register aliases at all.
+    pub const fn is_empty(&self) -> bool {
+        self.return_address_storage.is_none() && self.stack_pointer_storage.is_none()
+    }
+}

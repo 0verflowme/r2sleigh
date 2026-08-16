@@ -1090,6 +1090,45 @@ unsafe fn capture_stack_allocation_contract(
 
 type CapturedInterface = (SourceFunctionInterface, Box<[Box<str>]>);
 
+/// Read the machine carriers radare2 resolved from its register profile.
+///
+/// This is independent of the ABI interface on purpose: radare2 advertises the
+/// return-address and stack-pointer capabilities from register aliases, which
+/// it knows with or without debug information. Capturing them here keeps them
+/// reachable for functions whose ABI was never recovered, instead of losing
+/// them because the surrounding interface could not be captured.
+unsafe fn capture_machine_roles(
+    snapshot: *const c_void,
+    accessors: &RadareAbi138Accessors,
+    top: &RadareAbi138SnapshotView,
+) -> Result<SourceMachineRoles, RadareAbi138CaptureError> {
+    let has_return_address = top.capabilities & RADARE_CAP_RETURN_ADDRESS_STORAGE != 0;
+    let has_stack_pointer = top.capabilities & RADARE_CAP_STACK_POINTER_STORAGE != 0;
+    if !has_return_address && !has_stack_pointer {
+        return Ok(SourceMachineRoles::default());
+    }
+    let view_fn = required(accessors.interface_view, "interface_view")?;
+    let mut view = RadareAbi138FunctionInterfaceView::default();
+    // SAFETY: callback validity is guaranteed by the caller.
+    callback_ok(unsafe { view_fn(snapshot, &mut view) }, "interface_view")?;
+    let return_address_storage = if has_return_address {
+        Some(storage(view.return_address_storage)?)
+    } else if absent_storage(view.return_address_storage) {
+        None
+    } else {
+        return Err(RadareAbi138CaptureError::InactivePayload);
+    };
+    let stack_pointer_storage = if has_stack_pointer {
+        Some(storage(view.stack_pointer_storage)?)
+    } else if absent_storage(view.stack_pointer_storage) {
+        None
+    } else {
+        return Err(RadareAbi138CaptureError::InactivePayload);
+    };
+    SourceMachineRoles::new(return_address_storage, stack_pointer_storage)
+        .map_err(|_| RadareAbi138CaptureError::InvalidInterface)
+}
+
 unsafe fn capture_interface(
     snapshot: *const c_void,
     accessors: &RadareAbi138Accessors,
@@ -1765,6 +1804,9 @@ pub unsafe fn capture_radare_abi138(
     } else {
         None
     };
+    // SAFETY: the interface view is a fixed-size out-parameter read under the
+    // same stable top view as every other child access.
+    let machine_roles = unsafe { capture_machine_roles(input.snapshot, &accessors, &first) }?;
     let function_interface = captured_interface
         .as_ref()
         .map(|(interface, _)| interface.clone());
@@ -1810,6 +1852,7 @@ pub unsafe fn capture_radare_abi138(
         advisory_calls,
         Box::from(revision),
         function_interface,
+        machine_roles,
         captured_fields,
         DiagnosticIdentity(first.revision_identity),
     )
@@ -2108,6 +2151,47 @@ mod tests {
             std::mem::offset_of!(RadareAbi138Accessors, return_mechanism_view)
                 + size_of::<Option<RadareReturnMechanismViewFn>>()
         );
+    }
+
+    #[test]
+    fn machine_carrier_capabilities_do_not_require_an_exact_interface() {
+        // radare2 resolves the return-address and stack-pointer carriers from
+        // register aliases, which it knows with or without debug information.
+        // Advertising them must therefore not require the exact-interface
+        // capability, otherwise every function without an ABI loses its
+        // machine carriers as well.
+        let machine_only = RADARE_CAP_REVISION
+            | RADARE_CAP_OWNED_BOUNDED_FUNCTION_IMAGE
+            | RADARE_CAP_RETURN_ADDRESS_STORAGE
+            | RADARE_CAP_STACK_POINTER_STORAGE;
+        assert_eq!(validate_top(&valid_top(machine_only)), Ok(()));
+        assert_eq!(machine_only & RADARE_CAP_EXACT_FUNCTION_INTERFACE, 0);
+    }
+
+    #[test]
+    fn machine_roles_reject_a_carrier_the_capability_did_not_advertise() {
+        assert_eq!(
+            SourceMachineRoles::new(
+                Some(CanonicalStorageId {
+                    space: CanonicalStorageSpace::Register,
+                    offset: 0,
+                    size: 0,
+                }),
+                None,
+            ),
+            Err(SourceMachineRolesError::InvalidRegisterStorage)
+        );
+        let roles = SourceMachineRoles::new(
+            Some(CanonicalStorageId {
+                space: CanonicalStorageSpace::Register,
+                offset: 16,
+                size: 8,
+            }),
+            None,
+        )
+        .expect("a well formed return address carrier is accepted");
+        assert!(!roles.is_empty());
+        assert!(roles.stack_pointer_storage().is_none());
     }
 
     #[test]

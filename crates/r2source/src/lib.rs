@@ -390,6 +390,7 @@ struct SnapshotState {
     advisory_calls: Box<[AdvisoryCallSite]>,
     source_revision_identity: Box<[u8]>,
     function_interface: Option<SourceFunctionInterface>,
+    machine_roles: SourceMachineRoles,
     captured_fields: CapturedSourceFields,
     diagnostics: DiagnosticIdentity,
 }
@@ -415,6 +416,7 @@ impl OwnedFunctionSnapshot {
         advisory_calls: Box<[AdvisoryCallSite]>,
         source_revision_identity: Box<[u8]>,
         function_interface: Option<SourceFunctionInterface>,
+        machine_roles: SourceMachineRoles,
         captured_fields: CapturedSourceFields,
         diagnostics: DiagnosticIdentity,
     ) -> Result<Self, SnapshotValidationError> {
@@ -449,6 +451,20 @@ impl OwnedFunctionSnapshot {
         }
         if captured_fields.function_interface != function_interface.is_some() {
             return Err(SnapshotValidationError::InvalidFunctionInterface);
+        }
+        // The machine carriers and an ABI that names the same carriers describe
+        // one machine. If both are present they must agree, otherwise the two
+        // views of the function contradict each other.
+        if let Some(interface) = &function_interface
+            && !machine_roles.is_empty()
+        {
+            if interface.return_address_storage().is_some()
+                && interface.return_address_storage() != machine_roles.return_address_storage()
+                || interface.stack_pointer_storage().is_some()
+                    && interface.stack_pointer_storage() != machine_roles.stack_pointer_storage()
+            {
+                return Err(SnapshotValidationError::InvalidFunctionInterface);
+            }
         }
         if let Some(interface) = &function_interface {
             if interface.revision_identity() != source_revision_identity.as_ref()
@@ -505,6 +521,7 @@ impl OwnedFunctionSnapshot {
             advisory_calls,
             source_revision_identity,
             function_interface,
+            machine_roles,
             captured_fields,
             diagnostics,
         })))
@@ -536,6 +553,14 @@ impl OwnedFunctionSnapshot {
 
     pub fn function_interface(&self) -> Option<&SourceFunctionInterface> {
         self.0.function_interface.as_ref()
+    }
+
+    /// Borrow the machine carriers radare2 resolved from its register profile.
+    ///
+    /// These are present whether or not an ABI was recovered, so a function
+    /// with no interface can still be reasoned about on its machine facts.
+    pub fn machine_roles(&self) -> &SourceMachineRoles {
+        &self.0.machine_roles
     }
 
     pub fn captured_fields(&self) -> CapturedSourceFields {
@@ -603,6 +628,7 @@ mod tests {
             Box::new([]),
             Box::from([7]),
             None,
+            SourceMachineRoles::default(),
             CapturedSourceFields {
                 bounded_function_image: true,
                 function_interface: false,
@@ -692,6 +718,7 @@ mod tests {
                 valid.advisory_calls().to_vec().into_boxed_slice(),
                 valid.source_revision_identity().into(),
                 valid.function_interface().cloned(),
+                *valid.machine_roles(),
                 valid.captured_fields(),
                 valid.diagnostic_identity(),
             ),
@@ -724,6 +751,7 @@ mod tests {
             Box::new([]),
             Box::from([7]),
             Some(interface.clone()),
+            SourceMachineRoles::default(),
             captured_fields,
             valid.diagnostic_identity(),
         )
@@ -768,6 +796,7 @@ mod tests {
                 Box::new([]),
                 Box::from([7]),
                 Some(wrong_machine_width),
+                SourceMachineRoles::default(),
                 narrow_fields,
                 valid.diagnostic_identity(),
             ),
@@ -785,6 +814,7 @@ mod tests {
                 Box::new([]),
                 Box::from([7]),
                 Some(interface.clone()),
+                SourceMachineRoles::default(),
                 missing_frame_pointer,
                 valid.diagnostic_identity(),
             ),
@@ -802,6 +832,7 @@ mod tests {
                 Box::new([]),
                 Box::from([7]),
                 Some(interface.clone()),
+                SourceMachineRoles::default(),
                 missing_stack_allocation_contract,
                 valid.diagnostic_identity(),
             ),
@@ -844,6 +875,7 @@ mod tests {
                 Box::new([]),
                 Box::from([7]),
                 Some(interface_without_frame_pointer.clone()),
+                SourceMachineRoles::default(),
                 captured_fields,
                 valid.diagnostic_identity(),
             ),
@@ -859,6 +891,7 @@ mod tests {
             Box::new([]),
             Box::from([7]),
             Some(interface_without_frame_pointer),
+            SourceMachineRoles::default(),
             fields_without_frame_pointer,
             valid.diagnostic_identity(),
         )
@@ -881,6 +914,7 @@ mod tests {
                 Box::new([]),
                 Box::from([7]),
                 Some(interface.clone()),
+                SourceMachineRoles::default(),
                 missing_return_mechanism,
                 valid.diagnostic_identity(),
             ),
@@ -898,6 +932,7 @@ mod tests {
                 Box::new([]),
                 Box::from([7]),
                 None,
+                SourceMachineRoles::default(),
                 mechanism_without_interface,
                 valid.diagnostic_identity(),
             ),
@@ -915,6 +950,7 @@ mod tests {
                 Box::new([]),
                 Box::from([7]),
                 None,
+                SourceMachineRoles::default(),
                 frame_pointer_without_interface,
                 valid.diagnostic_identity(),
             ),
@@ -943,6 +979,7 @@ mod tests {
                 Box::new([]),
                 Box::from([7]),
                 Some(wrong_revision),
+                SourceMachineRoles::default(),
                 captured_fields,
                 valid.diagnostic_identity(),
             ),
