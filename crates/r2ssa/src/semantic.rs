@@ -2348,19 +2348,25 @@ fn collect_source_boundary_facts(
             let mut return_address = None;
             let mut exit_stack_pointer = None;
             let mut complete = false;
-            if let Some(machine_context) = machine_context.filter(|context| {
-                context.abi_model().is_available() && context.abi_model().is_coherent()
-            }) {
+            // Machine exit state and return values are separate questions. The
+            // carriers holding the return address and the stack pointer come
+            // from the machine, so they are recoverable for any function; the
+            // values a return carries are an ABI question and stay gated on a
+            // coherent ABI. Gating both on the ABI is what previously left a
+            // function without debug information with no exit facts at all.
+            if let Some(machine_context) = machine_context {
+                let abi_is_coherent = machine_context.abi_model().is_available()
+                    && machine_context.abi_model().is_coherent();
+                let stack_pointer_storage = machine_context.stack_pointer_carrier();
+                let return_address_storage = machine_context.return_address_carrier();
                 let return_slots = machine_context.abi_model().return_registers();
-                let stack_pointer_storage = machine_context
-                    .function_interface()
-                    .and_then(|interface| interface.stack_pointer_storage());
-                let return_address_storage = machine_context
-                    .function_interface()
-                    .and_then(|interface| interface.return_address_storage());
-                match machine_context
-                    .function_interface()
-                    .map(|interface| interface.return_kind())
+                match abi_is_coherent
+                    .then(|| {
+                        machine_context
+                            .function_interface()
+                            .map(|interface| interface.return_kind())
+                    })
+                    .flatten()
                 {
                     Some(SourceFunctionReturn::Void) => complete = true,
                     Some(SourceFunctionReturn::Register { .. }) => {

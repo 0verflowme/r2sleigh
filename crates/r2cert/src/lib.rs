@@ -5558,12 +5558,13 @@ fn certified_return_controls(
             continue;
         }
         let boundary = boundary.expect("checked complete return boundary");
-        let Some(interface) = artifact.machine_context().function_interface() else {
-            continue;
-        };
+        // The carriers holding the return address and the stack pointer are
+        // machine facts, so a return's exit state is provable without an ABI.
+        // What the return *carries* remains an ABI question and is certified
+        // separately.
         let (Some(return_address_storage), Some(stack_pointer_storage)) = (
-            interface.return_address_storage(),
-            interface.stack_pointer_storage(),
+            artifact.machine_context().return_address_carrier(),
+            artifact.machine_context().stack_pointer_carrier(),
         ) else {
             continue;
         };
@@ -6562,12 +6563,11 @@ pub(crate) fn return_machine_state_matches_origin(
     origin: &CertifiedArtifactOrigin,
     ledger: &ObligationLedger,
 ) -> bool {
-    let Some(interface) = origin.machine_context().source().function_interface() else {
-        return false;
-    };
+    // Exit machine state is proven against the machine's own carriers, which
+    // exist whether or not an ABI was recovered.
     let (Some(return_address_storage), Some(stack_pointer_storage)) = (
-        interface.return_address_storage(),
-        interface.stack_pointer_storage(),
+        origin.machine_context().source().return_address_carrier(),
+        origin.machine_context().source().stack_pointer_carrier(),
     ) else {
         return false;
     };

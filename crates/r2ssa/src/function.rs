@@ -27,7 +27,7 @@ use crate::defuse::{BackwardSlice, SliceOpRef, backward_slice_from_op, backward_
 use crate::domtree::DomTree;
 use crate::graph::SsaGraph;
 use crate::machine_context::{
-    SourceCallSiteInterface, SourceFunctionInterface, SourceMachineContext,
+    SourceCallSiteInterface, SourceFunctionInterface, SourceMachineContext, SourceMachineRoles,
 };
 use crate::naming::{ARCH_DERIVED_CACHE_MAX_ENTRIES, ArchCacheTag, cached_register_name_map};
 use crate::op::SSAOp;
@@ -368,6 +368,7 @@ impl SsaArtifact {
                 blocks,
                 arch,
                 function_interface,
+                SourceMachineRoles::default(),
                 call_site_interfaces,
             ),
         ))
@@ -423,6 +424,7 @@ impl SsaArtifact {
             blocks,
             arch,
             function_interface,
+            SourceMachineRoles::default(),
             call_site_interfaces,
         );
         Some(Self::new_with_context(
@@ -448,6 +450,7 @@ impl SsaArtifact {
             blocks,
             arch,
             function_interface,
+            SourceMachineRoles::default(),
             call_site_interfaces,
         );
         let function = SSAFunction::from_blocks_for_decompile_with_interface_and_control(
@@ -497,6 +500,7 @@ impl SsaArtifact {
             &blocks,
             Some(arch),
             Some(function_interface),
+            SourceMachineRoles::default(),
             call_site_interfaces,
         );
         let function = SSAFunction::from_blocks_for_decompile_with_interface_and_control(
@@ -873,6 +877,7 @@ impl TrustedSsaArtifact {
             &blocks,
             Some(&arch),
             source.function_interface().cloned(),
+            *source.machine_roles(),
             Vec::new(),
         );
         let function = SSAFunction::from_blocks_for_decompile_with_interface_and_control(

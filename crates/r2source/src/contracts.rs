@@ -2208,7 +2208,7 @@ mod tests {
 /// unreachable without debug information, because the whole structure was
 /// captured all-or-nothing. Keeping them apart lets a function be reasoned
 /// about on its machine facts while its ABI facts stay honestly absent.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SourceMachineRoles {
     return_address_storage: Option<CanonicalStorageId>,
     stack_pointer_storage: Option<CanonicalStorageId>,

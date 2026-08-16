@@ -19,7 +19,8 @@ pub use r2source::{
     SourceCallResult, SourceCallSiteIdentity, SourceCallSiteInterface,
     SourceCallSiteInterfaceError, SourceCarrierKind, SourceCarrierProjection,
     SourceFunctionInterface, SourceFunctionInterfaceError, SourceFunctionReturn,
-    SourceLogicalValue, SourceStackAllocationContract, SourceStackGrowth, SourceStackSlotRole,
+    SourceLogicalValue, SourceMachineRoles, SourceStackAllocationContract, SourceStackGrowth,
+    SourceStackSlotRole,
     SourceStackSlotSpec, SourceType, SourceTypeGraph, SourceTypeGraphError, SourceTypeKind,
     StackAddressBase,
 };
@@ -488,6 +489,7 @@ pub struct SourceMachineContext {
     architecture_family: MachineArchitectureFamily,
     memory_model: MachineMemoryModel,
     function_interface: Option<SourceFunctionInterface>,
+    machine_roles: SourceMachineRoles,
     abi_model: MachineAbiModel,
     register_storages_by_name: BTreeMap<String, CanonicalStorageId>,
     raw_call_sites_by_id: BTreeMap<CallSiteId, SourceCallSiteIdentity>,
@@ -782,13 +784,14 @@ fn write_call_site_interface(
 
 impl SourceMachineContext {
     pub(crate) fn from_blocks(blocks: &[R2ILBlock], arch: Option<&ArchSpec>) -> Self {
-        Self::from_blocks_with_interfaces(blocks, arch, None, Vec::new())
+        Self::from_blocks_with_interfaces(blocks, arch, None, SourceMachineRoles::default(), Vec::new())
     }
 
     pub(crate) fn from_blocks_with_interfaces(
         blocks: &[R2ILBlock],
         arch: Option<&ArchSpec>,
         function_interface: Option<SourceFunctionInterface>,
+        machine_roles: SourceMachineRoles,
         call_site_interfaces: Vec<SourceCallSiteInterface>,
     ) -> Self {
         let register_storages_by_name: BTreeMap<String, CanonicalStorageId> = arch
@@ -933,6 +936,7 @@ impl SourceMachineContext {
             architecture_family,
             memory_model,
             function_interface,
+            machine_roles,
             abi_model,
             register_storages_by_name,
             raw_call_sites_by_id,
@@ -960,6 +964,34 @@ impl SourceMachineContext {
 
     pub const fn function_interface(&self) -> Option<&SourceFunctionInterface> {
         self.function_interface.as_ref()
+    }
+
+    /// Borrow the machine carriers the source resolved from its register
+    /// profile. These are available whether or not an ABI was recovered.
+    pub const fn machine_roles(&self) -> &SourceMachineRoles {
+        &self.machine_roles
+    }
+
+    /// The carrier holding the return address, preferring the ABI's own
+    /// declaration and falling back to the machine's.
+    ///
+    /// Both name the same register when both exist, which the source enforces
+    /// when it captures them; the fallback is what keeps this answerable for a
+    /// function whose ABI was never recovered.
+    pub fn return_address_carrier(&self) -> Option<CanonicalStorageId> {
+        self.function_interface
+            .as_ref()
+            .and_then(|interface| interface.return_address_storage())
+            .or_else(|| self.machine_roles.return_address_storage())
+    }
+
+    /// The carrier holding the stack pointer, resolved like
+    /// [`Self::return_address_carrier`].
+    pub fn stack_pointer_carrier(&self) -> Option<CanonicalStorageId> {
+        self.function_interface
+            .as_ref()
+            .and_then(|interface| interface.stack_pointer_storage())
+            .or_else(|| self.machine_roles.stack_pointer_storage())
     }
 
     pub const fn return_mechanism(&self) -> Option<r2source::SourceReturnMechanism> {
@@ -1310,12 +1342,14 @@ mod tests {
             &[],
             Some(&little),
             Some(base_interface),
+            SourceMachineRoles::default(),
             Vec::new(),
         );
         let stacked = SourceMachineContext::from_blocks_with_interfaces(
             &[],
             Some(&little),
             Some(stacked_interface),
+            SourceMachineRoles::default(),
             Vec::new(),
         );
         assert_ne!(
@@ -1345,12 +1379,14 @@ mod tests {
             &[call_block.clone()],
             Some(&little),
             None,
+            SourceMachineRoles::default(),
             vec![call_interface(false)],
         );
         let complete = SourceMachineContext::from_blocks_with_interfaces(
             &[call_block],
             Some(&little),
             None,
+            SourceMachineRoles::default(),
             vec![call_interface(true)],
         );
         assert_ne!(
@@ -1574,6 +1610,7 @@ mod tests {
             &[],
             Some(&arch),
             Some(make()),
+            SourceMachineRoles::default(),
             Vec::new(),
         );
         assert!(!without_roles.abi_model().is_coherent());
@@ -1586,6 +1623,7 @@ mod tests {
                     .with_return_address_storage(return_address)
                     .expect("return-address role"),
             ),
+            SourceMachineRoles::default(),
             Vec::new(),
         );
         assert!(!return_only.abi_model().is_coherent());
@@ -1599,6 +1637,7 @@ mod tests {
                     .and_then(|interface| interface.with_stack_pointer_storage(stack_pointer))
                     .expect("exact machine roles"),
             ),
+            SourceMachineRoles::default(),
             Vec::new(),
         );
         assert!(complete.abi_model().is_coherent());
@@ -1618,6 +1657,7 @@ mod tests {
                 .and_then(|interface| interface.with_stack_pointer_storage(stack_pointer))
                 .expect("compatibility interface remains representable for refusal diagnostics"),
             ),
+            SourceMachineRoles::default(),
             Vec::new(),
         );
         assert!(
@@ -1638,6 +1678,7 @@ mod tests {
                     })
                     .expect("standalone binding is architecture-independent"),
             ),
+            SourceMachineRoles::default(),
             Vec::new(),
         );
         assert!(!narrow.abi_model().is_coherent());
@@ -1655,6 +1696,7 @@ mod tests {
                     })
                     .expect("standalone binding cannot inspect ArchSpec parentage"),
             ),
+            SourceMachineRoles::default(),
             Vec::new(),
         );
         assert!(!subregister_sp.abi_model().is_coherent());
@@ -1670,6 +1712,7 @@ mod tests {
                     .and_then(|interface| interface.with_stack_pointer_storage(stack_pointer))
                     .expect("standalone binding cannot inspect ArchSpec parentage"),
             ),
+            SourceMachineRoles::default(),
             Vec::new(),
         );
         assert!(!subregister_ra.abi_model().is_coherent());
@@ -1704,6 +1747,7 @@ mod tests {
             &[],
             Some(&arch),
             Some(exact.clone()),
+            SourceMachineRoles::default(),
             Vec::new(),
         );
         assert!(coherent.abi_model().is_coherent());
@@ -1713,6 +1757,7 @@ mod tests {
             &[],
             Some(&arch),
             Some(make()),
+            SourceMachineRoles::default(),
             Vec::new(),
         );
         assert!(absent.abi_model().is_coherent());
@@ -1731,6 +1776,7 @@ mod tests {
             &[],
             Some(&subregister),
             Some(exact.clone()),
+            SourceMachineRoles::default(),
             Vec::new(),
         );
         assert!(!context.abi_model().is_coherent());
@@ -1743,6 +1789,7 @@ mod tests {
             &[],
             Some(&wrong_machine_width),
             Some(exact.clone()),
+            SourceMachineRoles::default(),
             Vec::new(),
         );
         assert!(!context.abi_model().is_coherent());
@@ -1753,6 +1800,7 @@ mod tests {
             &[],
             Some(&word_addressed),
             Some(exact.clone()),
+            SourceMachineRoles::default(),
             Vec::new(),
         );
         assert!(!context.abi_model().is_coherent());
@@ -1763,6 +1811,7 @@ mod tests {
             &[],
             Some(&wrong_ram_width),
             Some(exact),
+            SourceMachineRoles::default(),
             Vec::new(),
         );
         assert!(!context.abi_model().is_coherent());
@@ -1813,6 +1862,7 @@ mod tests {
             &[],
             Some(&arch),
             Some(make_explicit(frame_pointer)),
+            SourceMachineRoles::default(),
             Vec::new(),
         );
         assert!(coherent.abi_model().is_coherent());
@@ -1829,6 +1879,7 @@ mod tests {
                 stack_pointer,
                 return_address,
             )),
+            SourceMachineRoles::default(),
             Vec::new(),
         );
         assert!(slot_derived.abi_model().is_coherent());
@@ -1851,6 +1902,7 @@ mod tests {
             &[],
             Some(&arch),
             Some(absent),
+            SourceMachineRoles::default(),
             Vec::new(),
         );
         assert!(absent.abi_model().is_coherent());
@@ -1893,6 +1945,7 @@ mod tests {
             &[],
             Some(&arch),
             Some(narrow_interface),
+            SourceMachineRoles::default(),
             Vec::new(),
         );
         assert!(!narrow.abi_model().is_coherent());
@@ -1912,6 +1965,7 @@ mod tests {
                 stack_pointer,
                 return_address,
             )),
+            SourceMachineRoles::default(),
             Vec::new(),
         );
         assert!(!subregister.abi_model().is_coherent());
@@ -1945,6 +1999,7 @@ mod tests {
             &[],
             Some(&arch),
             Some(overlapping),
+            SourceMachineRoles::default(),
             Vec::new(),
         );
         assert!(!overlapping.abi_model().is_coherent());
@@ -2377,6 +2432,7 @@ mod tests {
             &[],
             None,
             Some(interface),
+            SourceMachineRoles::default(),
             Vec::new(),
         );
         assert!(context.abi_model().is_available());
@@ -2405,6 +2461,7 @@ mod tests {
             &[],
             Some(&arch),
             Some(interface),
+            SourceMachineRoles::default(),
             Vec::new(),
         );
 
