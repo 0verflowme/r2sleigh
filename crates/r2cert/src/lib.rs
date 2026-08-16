@@ -1536,10 +1536,18 @@ pub struct CertifiedReturnControl {
     exit_stack_pointer: CertifiedExitStackPointer,
     values: Box<[CertifiedReturnValue]>,
     register_compositions: Box<[CertifiedReturnRegisterComposition]>,
+    values_known: bool,
     return_obligation: SemanticObligationId,
 }
 
 impl CertifiedReturnControl {
+    /// False when no ABI described what this return carries, so an empty value
+    /// list means unknown rather than void. A renderer must not present such a
+    /// return as carrying nothing.
+    pub const fn values_known(&self) -> bool {
+        self.values_known
+    }
+
     pub const fn producer(&self) -> CanonicalInstructionId {
         self.producer
     }
@@ -5598,6 +5606,7 @@ fn certified_return_controls(
         let Some(CertifiedReturnShapes {
             values,
             register_compositions,
+            values_known,
         }) = certified_return_shapes(artifact, inst.id, producer, boundary)?
         else {
             continue;
@@ -5627,6 +5636,7 @@ fn certified_return_controls(
             exit_stack_pointer,
             values: values.into_boxed_slice(),
             register_compositions: register_compositions.into_boxed_slice(),
+            values_known,
             return_obligation,
         };
         control
@@ -5642,6 +5652,10 @@ fn certified_return_controls(
 struct CertifiedReturnShapes {
     values: Vec<CertifiedReturnValue>,
     register_compositions: Vec<CertifiedReturnRegisterComposition>,
+    /// False when no ABI described what this return carries. The shapes are
+    /// then empty because nothing was established, not because the return was
+    /// proven to carry nothing.
+    values_known: bool,
 }
 
 fn certified_return_shapes(
@@ -5675,10 +5689,19 @@ fn certified_return_shapes(
         .values
         .len()
         .saturating_add(boundary.register_compositions.len());
+    // Without a coherent ABI nothing describes what this return carries. That
+    // is a missing description, not a proof that it carries nothing, so the
+    // shapes are empty and explicitly marked unknown. The exit machine state
+    // is proven separately and still holds.
+    if !machine_context.abi_model().is_available() || !machine_context.abi_model().is_coherent() {
+        return Ok(Some(CertifiedReturnShapes {
+            values: Vec::new(),
+            register_compositions: Vec::new(),
+            values_known: false,
+        }));
+    }
     if !boundary.complete
         || boundary.at != boundary_at
-        || !machine_context.abi_model().is_available()
-        || !machine_context.abi_model().is_coherent()
         || supplied_slots.len() != supplied_count
         || supplied_slots != expected_slots
     {
@@ -5724,6 +5747,7 @@ fn certified_return_shapes(
     Ok(Some(CertifiedReturnShapes {
         values,
         register_compositions,
+        values_known: true,
     }))
 }
 

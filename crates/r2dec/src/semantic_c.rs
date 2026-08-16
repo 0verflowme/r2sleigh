@@ -1910,13 +1910,17 @@ fn derive_return_mechanics_plan(
         let Some(control) = certified.return_control_for_producer(producer) else {
             continue;
         };
-        let Some(interface) = interface else {
-            return Err(SemanticCError::InvalidReturnMechanics(producer));
-        };
-        if interface.return_address_storage() != Some(control.return_address().storage())
-            || interface.stack_pointer_storage() != Some(control.exit_stack_pointer().storage())
-            || control.return_address().value() != control.control_target()
+        // With no ABI the machine carriers are the authority, and the control
+        // was already proven against them when it was certified. An interface,
+        // when one exists, must still name the same carriers.
+        if let Some(interface) = interface
+            && (interface.return_address_storage() != Some(control.return_address().storage())
+                || interface.stack_pointer_storage()
+                    != Some(control.exit_stack_pointer().storage()))
         {
+            return Err(SemanticCError::InvalidReturnMechanics(producer));
+        }
+        if control.return_address().value() != control.control_target() {
             return Err(SemanticCError::InvalidReturnMechanics(producer));
         }
         for obligation in control.source_obligations() {

@@ -2448,7 +2448,7 @@ static bool sleigh_artifact_plan_init(SleighArtifactPlan *plan, RAnal *anal,
 	const ut64 type_epoch = r_anal_types_dirty_epoch (anal);
 	SleighArtifactRevision revision = {0};
 	if (!r_core_function_snapshot_at (core, fcn->addr,
-			sleigh_artifact_revision_cb, &revision)
+			sleigh_artifact_revision_cb, &revision, NULL)
 			|| !revision.captured || !revision.revision
 			|| r_anal_function_dirty_epoch (fcn) != function_epoch
 			|| r_anal_types_dirty_epoch (anal) != type_epoch) {

@@ -755,26 +755,31 @@ fn genuine_block_successors(block: &GenuineLiftedBlock) -> Result<Vec<u64>> {
             .ok_or_else(|| {
                 LiftError::Parse("genuine conditional branch target is not constant".to_string())
             }),
-        Some(R2ILOp::BranchInd { .. }) => {
-            let switch = block.block.switch_info.as_ref().ok_or_else(|| {
-                LiftError::Parse(
-                    "unresolved indirect branch cannot receive closed function authority"
-                        .to_string(),
-                )
-            })?;
-            let mut successors = switch
-                .cases
-                .iter()
-                .map(|case| case.target)
-                .collect::<Vec<_>>();
-            let default = switch.default_target.ok_or_else(|| {
-                LiftError::Parse("closed switch requires an exact default target".to_string())
-            })?;
-            successors.push(default);
-            successors.sort_unstable();
-            successors.dedup();
-            Ok(successors)
-        }
+        // An indirect branch whose target the lift did not resolve leaves this
+        // function through an address the machine does not know, so it
+        // contributes no edge back into the function's own blocks. It is not
+        // treated as a proof that control stops here: the operation that
+        // produced the target is still in the block and still carries its own
+        // obligation.
+        //
+        // A resolved jump table is a different case. Its targets are the
+        // function's own blocks, so the advisory graph names edges the machine
+        // does not, and the comparison against that graph refuses the function
+        // rather than silently dropping them.
+        Some(R2ILOp::BranchInd { .. }) => match block.block.switch_info.as_ref() {
+            Some(switch) => {
+                let mut successors = switch
+                    .cases
+                    .iter()
+                    .map(|case| case.target)
+                    .collect::<Vec<_>>();
+                successors.extend(switch.default_target);
+                successors.sort_unstable();
+                successors.dedup();
+                Ok(successors)
+            }
+            None => Ok(Vec::new()),
+        },
         Some(R2ILOp::Call { .. } | R2ILOp::CallInd { .. }) | None => Ok(vec![fallthrough]),
         Some(_) => unreachable!("control-flow filter returned a non-control operation"),
     }
@@ -866,9 +871,11 @@ fn typed_genuine_block_successors(
             .ok_or_else(|| {
                 LiftError::Parse("trusted conditional branch target is not constant".to_string())
             }),
-        Some(R2ILOp::BranchInd { .. }) => Err(LiftError::Unsupported(
-            "advisory source switch metadata cannot close an indirect branch".to_string(),
-        )),
+        // See genuine_block_successors: an unresolved indirect branch names no
+        // edge back into this function. When the source block carries switch
+        // metadata the comparison against the advisory graph is what refuses
+        // the function, and it reports the disagreement it actually found.
+        Some(R2ILOp::BranchInd { .. }) => Ok(Vec::new()),
         // A call leaves the block by falling through to the next instruction.
         // Where it goes in between is a property of the callee, not of this
         // function's control flow, so it contributes no successor of its own.
