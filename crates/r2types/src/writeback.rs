@@ -976,14 +976,10 @@ impl TypeWritebackAnalysis {
         }
         let prior_facts = self.function_facts.clone();
         let prior_plan = self.plan.clone();
-        let Some(applied_constraints) =
-            SourceOwnedFunctionFacts::enrich_report_from_source_for_decompile(
-                self.source.as_ref(),
-                &mut self.function_facts,
-            )
-        else {
-            return false;
-        };
+        let applied_constraints = SourceOwnedFunctionFacts::enrich_report_from_source_for_decompile(
+            self.source.as_ref(),
+            &mut self.function_facts,
+        );
         if applied_constraints > 0
             && !self.refresh_plan_after_source_constraints(&prior_facts, applied_constraints)
         {

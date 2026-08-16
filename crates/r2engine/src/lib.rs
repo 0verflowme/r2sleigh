@@ -4076,13 +4076,12 @@ impl EngineSession {
 
         poll_engine_execution(&request.execution, EnginePhase::Symbolic, &metrics)?;
         let artifact_started = Instant::now();
-        let Some(artifact) = build_engine_analysis_artifact(&request, analysis.as_ref()) else {
-            poll_engine_execution(&request.execution, EnginePhase::Types, &metrics)?;
-            return Err(engine_execution_refusal(
-                "failed to construct semantic/type analysis artifact".to_string(),
-                EnginePhase::Types,
-                metrics,
-            ));
+        let artifact = match build_engine_analysis_artifact(&request, analysis.as_ref()) {
+            Ok(artifact) => artifact,
+            Err(reason) => {
+                poll_engine_execution(&request.execution, EnginePhase::Types, &metrics)?;
+                return Err(engine_execution_refusal(reason, EnginePhase::Types, metrics));
+            }
         };
         let artifact_elapsed = artifact_started.elapsed();
         if artifact.function_facts().semantic_artifact().is_some() {
@@ -5825,10 +5824,14 @@ fn build_prepared_interproc_summary_set(
     )
 }
 
+/// Build the analysis artifact, naming the cause when one cannot be built.
+///
+/// The reason is surfaced to the user, so every exit below says which stage
+/// declined and why rather than collapsing to a single opaque failure.
 fn build_engine_analysis_artifact(
     request: &EngineAnalyzeRequest,
     analysis: &EngineAnalysis,
-) -> Option<EngineAnalysisArtifact> {
+) -> Result<EngineAnalysisArtifact, String> {
     let trusted_ssa = request
         .parsed_context
         .assumptions
@@ -5856,7 +5859,11 @@ fn build_engine_analysis_artifact(
                 r2ssa::PreparedInterprocSummaryError::ArchitectureMismatch
                 | r2ssa::PreparedInterprocSummaryError::UnknownOrIncoherentMachineContext,
             ) => None,
-            Err(_) => return None,
+            Err(error) => {
+                return Err(format!(
+                    "interprocedural summary construction failed: {error:?}"
+                ));
+            }
         }
     } else {
         None
@@ -5906,35 +5913,32 @@ fn build_engine_analysis_artifact(
             )
         })
     })();
-    if request
-        .execution
-        .refusal_reason(EnginePhase::Types)
-        .is_some()
-    {
-        return None;
+    if let Some(reason) = request.execution.refusal_reason(EnginePhase::Types) {
+        return Err(format!("type analysis stopped: {reason}"));
     }
     let mut writeback_request = r2types::TypeWritebackAnalysisRequest::new(
         Arc::clone(&semantic_analysis.ssa_func),
         request.parsed_context.clone(),
     )
-    .ok()?;
+    .map_err(|error| format!("type writeback request rejected the source: {error:?}"))?;
     if let Some(semantic_artifact) = semantic_artifact {
         writeback_request = writeback_request
             .with_semantic_artifact(semantic_artifact)
-            .ok()?;
+            .map_err(|error| {
+                format!("type writeback request rejected the semantic artifact: {error:?}")
+            })?;
     }
     if let Some(interproc_summary_set) = interproc_summary_set {
         writeback_request = writeback_request
             .with_interproc_summary(interproc_summary_set)
-            .ok()?;
+            .map_err(|error| {
+                format!("type writeback request rejected the interprocedural summary: {error:?}")
+            })?;
     }
-    let writeback = r2types::build_source_owned_type_writeback_analysis(writeback_request).ok()?;
-    if request
-        .execution
-        .refusal_reason(EnginePhase::Certification)
-        .is_some()
-    {
-        return None;
+    let writeback = r2types::build_source_owned_type_writeback_analysis(writeback_request)
+        .map_err(|error| format!("type writeback analysis failed: {error:?}"))?;
+    if let Some(reason) = request.execution.refusal_reason(EnginePhase::Certification) {
+        return Err(format!("certification stopped: {reason}"));
     }
     EngineAnalysisArtifact::new(
         writeback,
@@ -5942,6 +5946,9 @@ fn build_engine_analysis_artifact(
         // only accompany its exact retained SSA allocation.
         trusted_ssa,
     )
+    .ok_or_else(|| {
+        "trusted SSA authority does not accompany its own type analysis source".to_string()
+    })
 }
 
 fn maybe_compile_semantic_artifact_for_analysis(

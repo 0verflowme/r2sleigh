@@ -1665,21 +1665,37 @@ impl SourceOwnedFunctionFacts {
         compatible
     }
 
+    /// Attach the decompile evidence the source can support.
+    ///
+    /// Parameter-slot resolution needs a coherent ABI. When the source does not
+    /// carry one there are no parameter slots to resolve, so the steps keyed on
+    /// them have nothing to do; every other piece of evidence is still valid and
+    /// is still attached. Returns how many call-argument type constraints were
+    /// applied.
     pub(crate) fn enrich_report_from_source_for_decompile(
         source: &r2ssa::SsaArtifact,
         report: &mut FunctionFacts,
-    ) -> Option<usize> {
-        let param_slots = exact_source_param_slot_resolver(source)?;
+    ) -> usize {
+        let param_slots = exact_source_param_slot_resolver(source);
         let mut enriched = report.clone();
         let mut usage = source.facts().assumption_usage.clone();
         usage.extend(enriched.assumption_usage());
         enriched.assumption_usage = usage;
         enriched.attach_prepared_decompile_evidence(source);
-        enriched.populate_certified_parameter_exprs(source, &param_slots);
+        if let Some(param_slots) = param_slots.as_ref() {
+            enriched.populate_certified_parameter_exprs(source, param_slots);
+        }
         enriched.normalize_field_certificates_from_external_layout();
-        enriched.populate_member_access_render_facts_from_field_certificates(source, &param_slots);
+        if let Some(param_slots) = param_slots.as_ref() {
+            enriched.populate_member_access_render_facts_from_field_certificates(
+                source,
+                param_slots,
+            );
+        }
         enriched.populate_certified_loop_carrier_types();
-        enriched.populate_array_access_render_facts_from_scalar_candidates(source, &param_slots);
+        if let Some(param_slots) = param_slots.as_ref() {
+            enriched.populate_array_access_render_facts_from_scalar_candidates(source, param_slots);
+        }
         let applied_constraints = enriched.apply_certified_call_argument_type_constraints(
             source
                 .machine_context()
@@ -1687,7 +1703,7 @@ impl SourceOwnedFunctionFacts {
                 .default_address_bits(),
         );
         *report = enriched;
-        Some(applied_constraints)
+        applied_constraints
     }
 }
 
