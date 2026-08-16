@@ -63,7 +63,6 @@ pub const R2SLEIGH_PHASE_COUNT_V2: usize = 11;
 pub const R2SLEIGH_PHASE_STATUS_NOT_EXECUTED_V2: u32 = 0;
 pub const R2SLEIGH_PHASE_STATUS_EXECUTED_V2: u32 = 1;
 pub const R2SLEIGH_PHASE_STATUS_FOLDED_V2: u32 = 2;
-pub const R2SLEIGH_PHASE_STATUS_REUSED_V2: u32 = 3;
 pub const R2SLEIGH_PHASE_STATUS_REFUSED_V2: u32 = 4;
 pub const R2SLEIGH_SOURCE_STORAGE_RAM_V2: u32 = 1;
 pub const R2SLEIGH_SOURCE_STORAGE_REGISTER_V2: u32 = 2;
@@ -88,7 +87,6 @@ pub const R2SLEIGH_ANALYSIS_FUNCTION_SLICE_V2: u32 = 13;
 pub const R2SLEIGH_ANALYSIS_FUNCTION_TAINT_V2: u32 = 14;
 pub const R2SLEIGH_ANALYSIS_FUNCTION_CFG_ASCII_V2: u32 = 15;
 pub const R2SLEIGH_ANALYSIS_FUNCTION_CFG_JSON_V2: u32 = 16;
-pub const R2SLEIGH_ANALYSIS_ENGINE_CACHE_STATS_V2: u32 = 17;
 pub const R2SLEIGH_QUERY_BLOCK_VALUES_V2: u32 = 1;
 pub const R2SLEIGH_QUERY_TAINT_SUMMARY_V2: u32 = 2;
 pub const R2SLEIGH_QUERY_ANNOTATIONS_V2: u32 = 3;
@@ -875,7 +873,6 @@ pub struct R2SleighApiV2 {
     pub analysis_result_view:
         extern "C" fn(*const R2SleighAnalysisResultV2, *mut R2SleighAnalysisResultViewV2) -> u32,
     pub analysis_result_free: extern "C" fn(*mut R2SleighAnalysisResultV2) -> u32,
-    pub engine_cache_reset: extern "C" fn() -> u32,
     pub planner_query: extern "C" fn(
         *const R2SleighPlannerQueryRequestV2,
         *mut R2SleighPlannerQueryResponseV2,
@@ -1696,7 +1693,6 @@ fn engine_phase_status(status: r2engine::EnginePhaseStatus) -> u32 {
         r2engine::EnginePhaseStatus::NotExecuted => R2SLEIGH_PHASE_STATUS_NOT_EXECUTED_V2,
         r2engine::EnginePhaseStatus::Executed => R2SLEIGH_PHASE_STATUS_EXECUTED_V2,
         r2engine::EnginePhaseStatus::Folded => R2SLEIGH_PHASE_STATUS_FOLDED_V2,
-        r2engine::EnginePhaseStatus::Reused => R2SLEIGH_PHASE_STATUS_REUSED_V2,
         r2engine::EnginePhaseStatus::Refused => R2SLEIGH_PHASE_STATUS_REFUSED_V2,
     }
 }
@@ -2518,23 +2514,6 @@ extern "C" fn analysis_render(
         let argument = CString::new(argument)
             .map_err(|_| BoundaryError::invalid("analysis render argument contains NUL"))?;
 
-        if request.kind == R2SLEIGH_ANALYSIS_ENGINE_CACHE_STATS_V2 {
-            if !request.context.is_null() || request.num_blocks != 0 {
-                return Err(BoundaryError::invalid(
-                    "cache-stats render does not accept lift handles",
-                ));
-            }
-            let raw = super::types::r2sleigh_engine_cache_stats_json();
-            if raw.is_null() {
-                return Err(BoundaryError::engine("cache-stats render failed"));
-            }
-            let bytes = unsafe { CString::from_raw(raw) };
-            let handle =
-                lock_lift_registry().insert_owned_bytes(0, R2SleighOwnedBytesV2 { bytes })?;
-            unsafe { *output = handle };
-            return Ok(());
-        }
-
         let block_handles = unsafe {
             checked_slice(
                 request.blocks,
@@ -2838,14 +2817,6 @@ extern "C" fn analysis_result_free(result: *mut R2SleighAnalysisResultV2) -> u32
     })
 }
 
-extern "C" fn engine_cache_reset() -> u32 {
-    catch_unwind(AssertUnwindSafe(|| {
-        super::types::r2sleigh_engine_cache_stats_reset();
-        R2SLEIGH_STATUS_OK_V2
-    }))
-    .unwrap_or(R2SLEIGH_STATUS_PANIC_V2)
-}
-
 fn planner_mode(mode: r2engine::EngineAnalysisMode) -> u32 {
     match mode {
         r2engine::EngineAnalysisMode::Fast => R2SLEIGH_MODE_FAST_V2,
@@ -3123,7 +3094,6 @@ static API_V2: R2SleighApiV2 = R2SleighApiV2 {
     analysis_query,
     analysis_result_view,
     analysis_result_free,
-    engine_cache_reset,
     planner_query,
 };
 

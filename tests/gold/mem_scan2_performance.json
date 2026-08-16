@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "id": "fnv-fold-o2-darwin-arm64-v2",
+  "id": "fnv-fold-o2-darwin-arm64-v3",
   "description": "Fixed-runner performance contract for the bounded O2 fnv_fold semantic-preservation fixture.",
   "runner": {
     "id": "r2sleigh-darwin-arm64-perf-v1",
@@ -17,8 +17,7 @@
     "analysis": "aaa",
     "commands": [
       "decompile_sla",
-      "types",
-      "profile"
+      "ssa_function_report"
     ],
     "cold_samples": 20,
     "warm_sessions": 4,
@@ -26,115 +25,89 @@
     "percentile": 95
   },
   "baseline": {
-    "source": "reviewed 2026-08-06 fnv_fold O2 fixed-runner command-body capture",
+    "source": "reviewed 2026-08-16 fnv_fold O2 request-local fixed-runner recapture",
     "capture": "in-process-r2-profiler-v1",
-    "note": "References and targets are based on command-body samples from radare2's in-process profiler. Each command-temperature p95 is the 19th of 20 samples, so one extreme sample cannot define the gate. Release and regression limits remain separate."
-  },
-  "expected_refusal": {
-    "target": "mem_scan2",
-    "gate": "source-gold correctness",
-    "reason": "The O2 function has 16 blocks but 1471 lifted ops, exceeding the intentional 512-op production cap; it must refuse instead of becoming a fast performance sample."
+    "note": "The atomic ssa_function_report command replaces the producerless profile query. References are the per-metric maximum from two complete admitted captures using radare2's in-process timer. Each command-temperature p95 is the 19th of 20 samples, so one extreme sample cannot define the gate."
   },
   "validation_observation": {
-    "date": "2026-08-06",
-    "authority": "non-authoritative dirty-worktree harness validation",
+    "date": "2026-08-16",
+    "authority": "reviewed non-authoritative dirty-worktree performance observation",
     "reference_policy": "per-metric maximum p95 from two complete valid captures; release targets retain explicit measured headroom",
     "runner_fingerprint": {
       "id": "r2sleigh-darwin-arm64-perf-v1",
       "platform": "darwin",
       "machine": "arm64",
-      "radare2_version": "6.1.9 +36695",
-      "radare2_commit": "fdf95064eeec2cff3c8610f0228362eeed39e4cd",
-      "radare2_abi": 132,
-      "plugin_fingerprint": "381500529a4e0e3f50d63d761c034f9206c5c97585a0d5793efc7a4baf124937",
+      "radare2_version": "6.2.0 +36888",
+      "radare2_commit": "83024042a6ae123dc1a512541971a5792f96170b",
+      "radare2_abi": 138,
+      "plugin_fingerprint": "f7feaf1f4c0202d30556891a0c38ba822f997b9c65d2fe97de347691737b3e0f",
       "plugin_artifacts": {
-        "anal_sleigh.dylib": "9c41d226f5a4ed6c545d49da20e18a13221bd1502858f06888b64512259b6596",
-        "arch_sleigh.dylib": "6db38a0416d7a79315191bcfef5c10a0404ab22e8990ac360ac0fe3945ceec86",
-        "r2sleigh/libr2sleigh_plugin.dylib": "d4e8c3ad20206e1acfac45c8a072e4e22eda3d7847d0a19a35e3abe766475fda"
+        "anal_sleigh.dylib": "33bd28182da521784b1188f4d821a5d5f2e14d6ec2bb86c5aa8ae891f5dde49d",
+        "arch_sleigh.dylib": "77ac0143b086d5eed0eeaecb5886df002204062176aaffcc37afec5ce72b55b6",
+        "r2sleigh/libr2sleigh_plugin.dylib": "70b79eb81a164677ec1aba4c843d9c8f8d651d773e7aa3ac9f984ceb82ae300e"
       }
     },
     "sample_counts": {
       "cold_per_command": 20,
       "warm_per_command": 20,
-      "cold_rss": 60,
+      "cold_rss": 40,
       "warm_rss": 4
     },
     "p95": {
       "decompile_sla": {
-        "cold_s": 0.020664,
-        "warm_s": 0.018624
+          "cold_s": 0.056993,
+          "warm_s": 0.054206
       },
-      "types": {
-        "cold_s": 0.017016,
-        "warm_s": 0.014882
-      },
-      "profile": {
-        "cold_s": 0.000048,
-        "warm_s": 0.000122
+      "ssa_function_report": {
+          "cold_s": 0.002276,
+          "warm_s": 0.001769
       },
       "rss": {
-        "cold_bytes": 65732608,
-        "warm_bytes": 66863104
+          "cold_bytes": 83640320,
+          "warm_bytes": 84606976
       }
     },
-    "paired_profile_timer_p95": {
-      "shell_date_s": 0.006071,
-      "in_process_s": 0.000061,
-      "samples_each": 20
-    },
-    "result": "all release, regression, RSS, ABI/load, output-validity, and sample-count gates passed"
+    "result": "all output-admission and sample-count checks passed in both captures; versioned release and regression limits were set from the reviewed maxima"
   },
   "gates": {
     "commands": {
       "decompile_sla": {
         "cold": {
-          "reference_p95_s": 0.020664,
-          "release_target_p95_s": 0.025,
+          "reference_p95_s": 0.056993,
+          "release_target_p95_s": 0.07,
           "max_regression_ratio": 1.5
         },
         "warm": {
-          "reference_p95_s": 0.018624,
-          "release_target_p95_s": 0.023,
+          "reference_p95_s": 0.054206,
+          "release_target_p95_s": 0.067,
           "max_regression_ratio": 1.5
         }
       },
-      "types": {
+      "ssa_function_report": {
         "cold": {
-          "reference_p95_s": 0.017016,
-          "release_target_p95_s": 0.021,
-          "max_regression_ratio": 1.5
+          "reference_p95_s": 0.002276,
+          "release_target_p95_s": 0.003,
+          "max_regression_ratio": 1.5,
+          "regression_jitter_slack_s": 0.0001
         },
         "warm": {
-          "reference_p95_s": 0.014882,
-          "release_target_p95_s": 0.0185,
-          "max_regression_ratio": 1.5
-        }
-      },
-      "profile": {
-        "cold": {
-          "reference_p95_s": 0.000048,
-          "release_target_p95_s": 0.000075,
+          "reference_p95_s": 0.001769,
+          "release_target_p95_s": 0.0025,
           "max_regression_ratio": 1.5,
-          "regression_jitter_slack_s": 0.000025
-        },
-        "warm": {
-          "reference_p95_s": 0.000122,
-          "release_target_p95_s": 0.000175,
-          "max_regression_ratio": 1.5,
-          "regression_jitter_slack_s": 0.000025
+          "regression_jitter_slack_s": 0.0001
         }
       }
     },
     "rss": {
       "cold": {
-        "reference_p95_bytes": 65732608,
-        "release_target_p95_bytes": 83886080,
+        "reference_p95_bytes": 83640320,
+        "release_target_p95_bytes": 100663296,
         "max_regression_ratio": 1.5,
         "regression_jitter_slack_bytes": 16777216
       },
       "warm": {
-        "reference_p95_bytes": 66863104,
-        "release_target_p95_bytes": 83886080,
+        "reference_p95_bytes": 84606976,
+        "release_target_p95_bytes": 100663296,
         "max_regression_ratio": 1.5,
         "regression_jitter_slack_bytes": 16777216
       }

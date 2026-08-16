@@ -32,7 +32,26 @@ DISCOVERY_ONE_TARGET = json.dumps(
     [{"name": "sym._IOMalloc", "offset": 0x1000, "nbbs": 2, "size": 32}]
 )
 VALID_DEC = "int _IOMalloc(void) {\n  return 0;\n}\n"
-VALID_JSON = "{}\n"
+VALID_PAYLOAD = {
+    "schema_version": 1,
+    "entry": 0x1000,
+    "entry_hex": "0x1000",
+    "num_blocks": 1,
+    "blocks": [
+        {
+            "addr": 0x1000,
+            "addr_hex": "0x1000",
+            "size": 4,
+            "phis": [],
+            "ops": [],
+        }
+    ],
+    "prepared": {
+        "formal_parameters": [],
+        "parameter_addresses": [],
+    },
+}
+VALID_JSON = json.dumps(VALID_PAYLOAD)
 
 
 class KernelSmokeTests(unittest.TestCase):
@@ -87,9 +106,157 @@ class KernelSmokeTests(unittest.TestCase):
             cmd_result(VALID_DEC),
             cmd_result(VALID_DEC),
             cmd_result(VALID_JSON),
-            cmd_result(VALID_JSON),
-            cmd_result(VALID_JSON),
         ]
+
+    def test_smoke_runs_decompile_and_ssa_report_probes_in_order(self):
+        exit_code, report, calls, _ = self.run_harness(self.valid_target_responses())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            set(report["targets"][0]["commands"]),
+            {
+                "decompile_sla",
+                "decompile_pdd",
+                "decompile_pdD",
+                "ssa_function_report",
+            },
+        )
+        self.assertEqual(
+            [call.args[2].rsplit("; ", 1)[-1] for call in calls[1:]],
+            ["pdd", "pdd", "pdD", "a:sla.debug.ssa.func"],
+        )
+        self.assertIs(
+            report["targets"][0]["commands"]["ssa_function_report"]["ssa_report_valid"],
+            True,
+        )
+
+    def test_strict_fails_invalid_ssa_function_report(self):
+        responses = self.valid_target_responses()
+        payload = {**VALID_PAYLOAD, "num_blocks": 0, "blocks": []}
+        responses[-1] = cmd_result(json.dumps(payload))
+
+        exit_code, report, _, _ = self.run_harness(responses)
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn(
+            "invalid_ssa_function_report",
+            {failure["kind"] for failure in report["failures"]},
+        )
+
+    def test_strict_fails_ssa_report_for_another_target(self):
+        responses = self.valid_target_responses()
+        payload = {**VALID_PAYLOAD, "entry": 0x2000, "entry_hex": "0x2000"}
+        responses[-1] = cmd_result(json.dumps(payload))
+
+        exit_code, report, _, _ = self.run_harness(responses)
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn(
+            "invalid_ssa_function_report",
+            {failure["kind"] for failure in report["failures"]},
+        )
+
+    def test_strict_fails_missing_future_or_wrong_type_ssa_report_schema(self):
+        def without(key):
+            return {name: value for name, value in VALID_PAYLOAD.items() if name != key}
+
+        invalid_payloads = (
+            (without("schema_version"), "missing"),
+            ({**VALID_PAYLOAD, "schema_version": 2}, "future"),
+            ({**VALID_PAYLOAD, "schema_version": "1"}, "wrong type"),
+        )
+        for payload, label in invalid_payloads:
+            with self.subTest(label=label):
+                responses = self.valid_target_responses()
+                responses[-1] = cmd_result(json.dumps(payload))
+
+                exit_code, report, _, _ = self.run_harness(responses)
+
+                self.assertEqual(exit_code, 1)
+                self.assertIn(
+                    "invalid_ssa_function_report",
+                    {failure["kind"] for failure in report["failures"]},
+                )
+
+    def test_strict_fails_missing_wrong_or_noop_ssa_report_shapes(self):
+        def without(key):
+            return {name: value for name, value in VALID_PAYLOAD.items() if name != key}
+
+        def block(**changes):
+            return {
+                **VALID_PAYLOAD,
+                "blocks": [{**VALID_PAYLOAD["blocks"][0], **changes}],
+            }
+
+        def block_without(key):
+            item = {
+                name: value
+                for name, value in VALID_PAYLOAD["blocks"][0].items()
+                if name != key
+            }
+            return {**VALID_PAYLOAD, "blocks": [item]}
+
+        def prepared(**changes):
+            return {
+                **VALID_PAYLOAD,
+                "prepared": {**VALID_PAYLOAD["prepared"], **changes},
+            }
+
+        def prepared_without(key):
+            facts = {
+                name: value
+                for name, value in VALID_PAYLOAD["prepared"].items()
+                if name != key
+            }
+            return {**VALID_PAYLOAD, "prepared": facts}
+
+        invalid_payloads = (
+            ({}, "no-op object"),
+            (without("entry"), "missing entry"),
+            ({**VALID_PAYLOAD, "entry": True}, "wrong entry type"),
+            (without("entry_hex"), "missing entry_hex"),
+            ({**VALID_PAYLOAD, "entry_hex": "0x2000"}, "wrong entry_hex"),
+            (without("num_blocks"), "missing num_blocks"),
+            ({**VALID_PAYLOAD, "num_blocks": 2}, "block-count mismatch"),
+            (without("blocks"), "missing blocks"),
+            ({**VALID_PAYLOAD, "blocks": [{}]}, "no-op block"),
+            (block(addr="0x1000"), "wrong block addr type"),
+            (block(addr_hex="0x2000"), "wrong block addr_hex"),
+            (block_without("size"), "missing block size"),
+            (block(size=0), "non-positive block size"),
+            (block(phis={}), "wrong phis type"),
+            (block(ops={}), "wrong ops type"),
+            (
+                block(addr=0x2000, addr_hex="0x2000"),
+                "missing entry block",
+            ),
+            (without("prepared"), "missing prepared"),
+            ({**VALID_PAYLOAD, "prepared": {}}, "no-op prepared"),
+            (
+                prepared_without("formal_parameters"),
+                "missing formal parameters",
+            ),
+            (prepared(formal_parameters={}), "wrong formal parameters type"),
+            (
+                prepared_without("parameter_addresses"),
+                "missing parameter addresses",
+            ),
+            (prepared(parameter_addresses={}), "wrong parameter addresses type"),
+        )
+        for payload, label in invalid_payloads:
+            with self.subTest(label=label):
+                responses = self.valid_target_responses()
+                responses[-1] = cmd_result(json.dumps(payload))
+
+                exit_code, report, _, _ = self.run_harness(responses)
+
+                self.assertEqual(exit_code, 1)
+                command = report["targets"][0]["commands"]["ssa_function_report"]
+                self.assertIs(command["ssa_report_valid"], False)
+                self.assertIn(
+                    "invalid_ssa_function_report",
+                    {failure["kind"] for failure in report["failures"]},
+                )
 
     def test_strict_fails_missing_target(self):
         exit_code, report, calls, _ = self.run_harness(
@@ -117,8 +284,6 @@ class KernelSmokeTests(unittest.TestCase):
             cmd_result(VALID_DEC),
             cmd_result(VALID_DEC),
             cmd_result("not json\n"),
-            cmd_result("also not json\n"),
-            cmd_result(""),
         ]
         exit_code, report, _, _ = self.run_harness(responses)
 
@@ -126,9 +291,10 @@ class KernelSmokeTests(unittest.TestCase):
         json_failures = [
             (failure["kind"], failure["command"]) for failure in report["failures"]
         ]
-        self.assertIn(("json_parse", "types"), json_failures)
-        self.assertIn(("json_parse", "profile"), json_failures)
-        self.assertIn(("json_parse", "symex"), json_failures)
+        self.assertEqual(
+            json_failures,
+            [("json_parse", "ssa_function_report")],
+        )
 
     def test_strict_fails_decompiler_fallback_text(self):
         responses = self.valid_target_responses()

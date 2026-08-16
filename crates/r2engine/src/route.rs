@@ -5,8 +5,6 @@ use r2ssa::{CFGRiskSummary, SSAFunction, SsaArtifact};
 use r2types::{DecompileCapabilityView, FunctionFacts, FunctionTypeFacts};
 use serde::{Deserialize, Serialize};
 
-use crate::EngineCachePlan;
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct EngineFunctionIdentity {
     pub function_addr: u64,
@@ -101,8 +99,6 @@ pub enum EngineRequestKind {
     Decompile,
     Types,
     SymbolicQuery,
-    Profile,
-    DebugFacts,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -264,24 +260,10 @@ pub struct EngineTypeRouteDecision {
     pub apply_artifact_signature_hint: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum EngineProfileRouteKind {
-    MetricsSnapshot,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EngineProfileRouteDecision {
-    pub request: EngineRequestKind,
-    pub plan: EnginePlan,
-    pub kind: EngineProfileRouteKind,
-    pub reason: Option<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineTypedRouteDecision {
     Decompile(Box<EngineRouteDecision>),
     Types(EngineTypeRouteDecision),
-    Profile(EngineProfileRouteDecision),
 }
 
 impl EngineTypedRouteDecision {
@@ -289,7 +271,6 @@ impl EngineTypedRouteDecision {
         match self {
             Self::Decompile(decision) => decision.request,
             Self::Types(decision) => decision.request,
-            Self::Profile(decision) => decision.request,
         }
     }
 
@@ -297,7 +278,6 @@ impl EngineTypedRouteDecision {
         match self {
             Self::Decompile(decision) => decision.plan,
             Self::Types(decision) => decision.plan,
-            Self::Profile(decision) => decision.plan,
         }
     }
 
@@ -305,28 +285,27 @@ impl EngineTypedRouteDecision {
         match self {
             Self::Decompile(decision) => decision.route.reason.clone(),
             Self::Types(decision) => decision.reason.clone(),
-            Self::Profile(decision) => decision.reason.clone(),
         }
     }
 
     pub fn refusal(&self) -> Option<String> {
         match self {
             Self::Decompile(decision) => decision.route.fallback_comment.clone(),
-            Self::Types(_) | Self::Profile(_) => None,
+            Self::Types(_) => None,
         }
     }
 
     pub fn proof_coverage(&self) -> Option<r2sym::ProofCoverage> {
         match self {
             Self::Decompile(decision) => Some(decision.route.proof_coverage.clone()),
-            Self::Types(_) | Self::Profile(_) => None,
+            Self::Types(_) => None,
         }
     }
 
     pub fn render_permission(&self) -> Option<r2sym::RenderPermission> {
         match self {
             Self::Decompile(decision) => Some(decision.route.render_permission.clone()),
-            Self::Types(_) | Self::Profile(_) => None,
+            Self::Types(_) => None,
         }
     }
 
@@ -346,16 +325,11 @@ impl EngineTypedRouteDecision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineRequestPlan {
     pub decision: EngineTypedRouteDecision,
-    pub cache: EngineCachePlan,
 }
 
 impl EngineRequestPlan {
     pub fn new(decision: EngineTypedRouteDecision) -> Self {
-        let request = decision.request();
-        Self {
-            decision,
-            cache: EngineCachePlan::for_request(request),
-        }
+        Self { decision }
     }
 
     pub fn decompile(decision: EngineRouteDecision) -> Self {
@@ -364,10 +338,6 @@ impl EngineRequestPlan {
 
     pub fn types(decision: EngineTypeRouteDecision) -> Self {
         Self::new(EngineTypedRouteDecision::Types(decision))
-    }
-
-    pub fn profile(decision: EngineProfileRouteDecision) -> Self {
-        Self::new(EngineTypedRouteDecision::Profile(decision))
     }
 
     pub fn request(&self) -> EngineRequestKind {
@@ -618,7 +588,6 @@ pub fn select_engine_plan(
             }
         }
         EngineRequestKind::SymbolicQuery => EnginePlan::SemanticStructured,
-        EngineRequestKind::Profile | EngineRequestKind::DebugFacts => EnginePlan::PreparedOnly,
         EngineRequestKind::Decompile => match route {
             Some(route) if route.kind == r2types::DecompileRouteKind::FallbackComment => {
                 EnginePlan::RefuseWithEvidence
@@ -666,19 +635,6 @@ pub fn plan_type_request(
         cfg_summary,
         caller_prefers_bounded_type_plan,
     ))
-}
-
-pub fn profile_route_decision() -> EngineProfileRouteDecision {
-    EngineProfileRouteDecision {
-        request: EngineRequestKind::Profile,
-        plan: select_engine_plan(EngineRequestKind::Profile, None, None),
-        kind: EngineProfileRouteKind::MetricsSnapshot,
-        reason: Some("session cache metrics snapshot".to_string()),
-    }
-}
-
-pub fn plan_profile_request() -> EngineRequestPlan {
-    EngineRequestPlan::profile(profile_route_decision())
 }
 
 pub(crate) fn semantic_route_plan(

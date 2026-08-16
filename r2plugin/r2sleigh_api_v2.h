@@ -89,8 +89,6 @@ typedef struct R2ILBlock R2ILBlock;
 
 #define R2SLEIGH_PHASE_STATUS_FOLDED_V2 2
 
-#define R2SLEIGH_PHASE_STATUS_REUSED_V2 3
-
 #define R2SLEIGH_PHASE_STATUS_REFUSED_V2 4
 
 #define R2SLEIGH_SOURCE_STORAGE_RAM_V2 1
@@ -138,8 +136,6 @@ typedef struct R2ILBlock R2ILBlock;
 #define R2SLEIGH_ANALYSIS_FUNCTION_CFG_ASCII_V2 15
 
 #define R2SLEIGH_ANALYSIS_FUNCTION_CFG_JSON_V2 16
-
-#define R2SLEIGH_ANALYSIS_ENGINE_CACHE_STATS_V2 17
 
 #define R2SLEIGH_QUERY_BLOCK_VALUES_V2 1
 
@@ -500,7 +496,6 @@ typedef struct R2SleighApiV2 {
   uint32_t (*analysis_result_view)(const struct R2SleighAnalysisResultV2*,
                                    struct R2SleighAnalysisResultViewV2*);
   uint32_t (*analysis_result_free)(struct R2SleighAnalysisResultV2*);
-  uint32_t (*engine_cache_reset)(void);
   uint32_t (*planner_query)(const struct R2SleighPlannerQueryRequestV2*,
                             struct R2SleighPlannerQueryResponseV2*);
 } R2SleighApiV2;

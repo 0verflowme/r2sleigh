@@ -755,7 +755,7 @@ static const R2SleighApiV2 *sleigh_lift_api_v2(void) {
 		|| !api->owned_bytes_view || !api->owned_bytes_free
 		|| !api->analysis_render
 		|| !api->analysis_query || !api->analysis_result_view
-		|| !api->analysis_result_free || !api->engine_cache_reset
+		|| !api->analysis_result_free
 		|| !api->planner_query) {
 		return NULL;
 	}
@@ -1227,11 +1227,6 @@ static bool sleigh_v2_analysis_result_release(R2SleighAnalysisResultV2 **result)
 	return true;
 }
 
-static uint32_t sleigh_v2_engine_cache_reset(void) {
-	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
-	return api? api->engine_cache_reset (): R2SLEIGH_STATUS_ABI_MISMATCH_V2;
-}
-
 /* Per-architecture context (lazy init)
  *
  * WARNING: These globals are NOT thread-safe. This plugin assumes
@@ -1409,12 +1404,22 @@ static const char *sleigh_engine_v2_phase_status_name(uint32_t status) {
 		return "executed";
 	case R2SLEIGH_PHASE_STATUS_FOLDED_V2:
 		return "folded";
-	case R2SLEIGH_PHASE_STATUS_REUSED_V2:
-		return "reused";
 	case R2SLEIGH_PHASE_STATUS_REFUSED_V2:
 		return "refused";
 	default:
 		return "unknown";
+	}
+}
+
+static bool sleigh_engine_v2_phase_status_is_valid(uint32_t status) {
+	switch (status) {
+	case R2SLEIGH_PHASE_STATUS_NOT_EXECUTED_V2:
+	case R2SLEIGH_PHASE_STATUS_EXECUTED_V2:
+	case R2SLEIGH_PHASE_STATUS_FOLDED_V2:
+	case R2SLEIGH_PHASE_STATUS_REFUSED_V2:
+		return true;
+	default:
+		return false;
 	}
 }
 
@@ -1789,7 +1794,7 @@ static char *sleigh_engine_execute_v2_project(uint32_t kind, uint64_t required_c
 	size_t phase_index;
 	for (phase_index = 0; phase_index < info.num_phase_timings; phase_index++) {
 		if (info.phase_timings[phase_index].phase != phase_index
-			|| info.phase_timings[phase_index].status > R2SLEIGH_PHASE_STATUS_REFUSED_V2) {
+			|| !sleigh_engine_v2_phase_status_is_valid (info.phase_timings[phase_index].status)) {
 			R_LOG_ERROR ("r2sleigh: invalid V2 engine phase metadata");
 			uint32_t free_status = sleigh_engine_v2_release_or_preserve (api, &response, &session);
 			if (free_status != R2SLEIGH_STATUS_OK_V2) {
@@ -3570,10 +3575,6 @@ static void sleigh_profile_clear(void) {
 	sleigh_profile_entries = NULL;
 	sleigh_profile_count = 0;
 	sleigh_profile_cap = 0;
-	uint32_t reset_status = sleigh_v2_engine_cache_reset ();
-	if (reset_status != R2SLEIGH_STATUS_OK_V2) {
-		R_LOG_ERROR ("r2sleigh: engine cache reset failed (%u)", reset_status);
-	}
 }
 
 static SleighProfileEntry *sleigh_profile_entry_get(ut64 addr, const char *name) {
@@ -3603,9 +3604,6 @@ static SleighProfileEntry *sleigh_profile_entry_get(ut64 addr, const char *name)
 
 static void sleigh_profile_add(RAnal *anal, const RAnalFunction *fcn, SleighProfileStage stage, ut64 elapsed_us) {
 	(void)anal;
-	if (!elapsed_us) {
-		return;
-	}
 	const char *name = (fcn && fcn->name)? fcn->name: NULL;
 	ut64 addr = fcn? fcn->addr: UT64_MAX;
 	SleighProfileEntry *entry = sleigh_profile_entry_get (addr, name);
@@ -3658,9 +3656,6 @@ static char *sleigh_profile_json(RAnal *anal) {
 	}
 	size_t max_items = SLEIGH_PROFILE_MAX_DEFAULT;
 	SleighProfileEntry **items = NULL;
-	char *engine_cache = NULL;
-	(void)sleigh_v2_analysis_render (R2SLEIGH_ANALYSIS_ENGINE_CACHE_STATS_V2,
-		NULL, NULL, 0, 0, NULL, &engine_cache);
 	if (sleigh_profile_count > 0) {
 		items = calloc (sleigh_profile_count, sizeof (*items));
 		if (items) {
@@ -3674,10 +3669,6 @@ static char *sleigh_profile_json(RAnal *anal) {
 	pj_kb (pj, "enabled", true);
 	pj_kn (pj, "count", sleigh_profile_count);
 	pj_kn (pj, "max", max_items);
-	if (engine_cache && *engine_cache) {
-		pj_k (pj, "engine_cache");
-		pj_raw (pj, engine_cache);
-	}
 	pj_ka (pj, "functions");
 	size_t shown = 0;
 	if (items) {
@@ -3700,7 +3691,6 @@ static char *sleigh_profile_json(RAnal *anal) {
 	pj_end (pj);
 	pj_end (pj);
 	free (items);
-	free (engine_cache);
 	return pj_drain (pj);
 }
 
@@ -4010,7 +4000,6 @@ static bool sleigh_direct_sla_debug_only_command(const char *cmd) {
 		return true;
 	}
 	return cmd_matches_exact_or_arg (cmd, "sla.arch")
-		|| cmd_matches_exact_or_arg (cmd, "sla.types")
 		|| cmd_matches_exact_or_arg (cmd, "sla.profilej")
 		|| cmd_matches_exact_or_arg (cmd, "sla.assumptions-")
 		|| cmd_matches_exact_or_arg (cmd, "sla.assumptions")
@@ -4571,11 +4560,6 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		free (defuse_json);
 		(void)sleigh_v2_block_release (&block);
 		return strdup("");
-	}
-
-	if (!strncmp (cmd, "sla.types", 9) && (!cmd[9] || isspace ((unsigned char)cmd[9]))) {
-		R_LOG_ERROR ("r2sleigh: sla.types cannot construct source authority from live mutable analysis state");
-		return strdup ("");
 	}
 
 	/* ========== Function-level SSA commands ========== */

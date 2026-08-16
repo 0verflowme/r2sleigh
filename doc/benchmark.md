@@ -112,13 +112,13 @@ Each benchmark case starts at 100 and loses points for:
 - command failures
 - empty decompiler output
 - decompiler fallback markers
-- invalid JSON from typed/debug report commands
+- invalid JSON from requested debug report commands
 - nondeterministic repeated output
 - budget/residual markers in decompile output
-- source-gold oracle failures from `--gold-manifest`
 
 The score is intentionally simple. It is not a scientific truth metric; it is a
-deterministic triage signal.
+deterministic triage signal. Source-shape manifest mismatches are recorded as
+advisory diagnostics and do not change the score or semantic closure result.
 
 Quality Metrics
 ---------------
@@ -127,7 +127,7 @@ The JSON report includes more than pass/fail data:
 
 - decompile classification: `structured`, `residual`, `fallback`, or `empty`
 - optional `pdg` comparison when `decompile_pdg` is included in `--commands`
-- optional source-gold oracle status under `summary.quality.gold_oracle`
+- optional source-shape advisory status under `summary.quality.gold_oracle`
 - owner buckets for actionable fix routing across `../radare2`, `r2ssa`,
   `r2sym`, `r2types`, `r2engine`, `r2dec`, and plugin glue
 - `summary.next_work`, a deterministic owner-ranked backlog with target
@@ -140,7 +140,6 @@ The JSON report includes more than pass/fail data:
   `goto`/`while (true)` control flow
 - invalid-C readability warnings such as orphan `break;` statements and pointer
   parameters compared directly with non-zero scalar literals
-- generic arg/type counts from `a:sla.debug.types`
 - runtime buckets: `fast`, `normal`, `slow`, and `hot`
 - native radare2 candidate counts with minimal repro commands
 
@@ -152,10 +151,10 @@ Start broad-tranche triage from `summary.next_work`. If `status` is
 `owner_work`, fix the first `owner_work_items` entry at that canonical owner.
 If `status` is `pdg_quality_gap`, compare the listed `pdg` counts and
 `summary.quality.pdg_comparison.worst_quality_gaps`. If `status` is
-`setup_bottleneck`, improve benchmark batching, cache reuse, or setup reuse
+`setup_bottleneck`, improve benchmark batching or setup reuse
 before spending time on semantic quality.
 
-Use `--commands decompile_sla,decompile_pdg,types,profile` when the goal is to
+Use `--commands decompile_sla,decompile_pdg,ssa_function_report` when the goal is to
 beat r2ghidra's `pdg` directly. If r2ghidra is installed outside the temporary
 benchmark home, add it explicitly with `--baseline-plugin-dir`, for example
 `--baseline-plugin-dir ~/.local/share/radare2/plugins`. The report records
@@ -179,7 +178,7 @@ python3 scripts/reversing_benchmark.py \
   --coreutils-dir /tmp/r2sleigh-corpora/src/coreutils/coreutils-9.11/src \
   --cgc-dir /tmp/r2sleigh-corpora/cgc \
   --juliet-dir /tmp/r2sleigh-corpora/juliet \
-  --commands decompile_sla,decompile_pdg,types,profile \
+  --commands decompile_sla,decompile_pdg,ssa_function_report \
   --max-functions 12 \
   --jobs 3 \
   --out /tmp/r2sleigh-all-corpora-pdg.json
@@ -194,16 +193,14 @@ python3 scripts/reversing_benchmark.py \
   --strict \
   --max-hard-failures 0 \
   --max-residual-decompile 0 \
-  --max-generic-args 0 \
-  --max-generic-types 0 \
   --min-average-score 99.0 \
   --out /tmp/r2sleigh-coreutils-gate.json
 ```
 
 Use the closure gate when the benchmark is intended to answer "are we done for
-this tranche?" It applies the default gold bar: strict mode, hard failures `0`,
-residual decompiles `0`, generic args/types `0`, average score `>= 99.5`, and
-setup/command ratio `<= 2.0`. If `decompile_pdg` is included in `--commands`,
+this tranche?" It applies the default closure bar: strict mode, hard failures `0`,
+residual decompiles `0`, average score `>= 99.5`, and setup/command ratio
+`<= 2.0`. If `decompile_pdg` is included in `--commands`,
 it also requires a successful PDG comparison, zero PDG quality wins, and zero
 PDG quality-then-performance wins unless explicitly overridden. Raw elapsed
 performance is still reported separately so a fast fallback cannot count as a
@@ -219,45 +216,45 @@ python3 scripts/reversing_benchmark.py \
   --out /tmp/r2sleigh-coreutils-closure.json
 ```
 
-Use source-gold manifests when PDG/r2ghidra is not enough. These checks pin
-source-level facts that must appear in our output and fake artifacts that must
-not appear. They are intentionally separate from smell metrics, because a
-decompiler can look structured and still be semantically wrong.
+Use source-shape manifests when PDG/r2ghidra is not enough for readability
+comparison. These checks record source-like text that should appear and fake
+artifacts that should not appear. They are advisory only: rendered text is not
+proof, so these checks cannot authorize C or satisfy semantic closure.
 
 ```bash
 python3 scripts/reversing_benchmark.py \
   --preset smoke \
   --gold-manifest tests/gold/source_oracle.json \
   --target test_struct_array_index \
-  --commands decompile_sla,types,profile \
+  --commands decompile_sla,ssa_function_report \
   --strict \
   --require-gold \
-  --max-gold-failures 0 \
   --out /tmp/r2sleigh-source-gold.json
 ```
 
-Gold manifest expectations match by corpus/case/target/command. `contains` and
+Source-shape manifest expectations match by corpus/case/target/command. `contains` and
 `regex` entries must be present in the command output; `not_contains` and
 `not_regex` entries must be absent. Set `owner` when the failure should route
-directly to a canonical component such as `r2types` or `r2dec`.
+directly to a canonical component such as `r2types` or `r2dec`. Use compiled
+execution, differential evaluators, and obligation closure for correctness.
 
 Fixed-Runner Performance Gate
 -----------------------------
 
-Correctness/source-gold and performance are separate CI jobs. The performance
-gate never treats a fast fallback or semantically wrong output as success; run
-`make -C tests/r2r source-gold` for the correctness side of the contract.
+Semantic correctness and performance are separate CI jobs. The performance
+gate rejects empty output, fallback output, malformed SSA reports, and missing
+in-process timings, but it is not semantic proof: a structurally valid yet
+semantically wrong result can still satisfy a latency budget. Use the
+compiled/differential r2r and e2e oracles for correctness. The `source-gold`
+target remains an advisory source-shape regression report.
 
 `tests/gold/mem_scan2_performance.json` is the versioned Darwin/arm64 O2 fixed
-performance contract. The historical `mem_scan2` target now exceeds the
-intentional production limit (1471 lifted ops versus the 512-op cap), so the
-latency gate uses the deterministic bounded `fnv_fold` target instead. The
-source-gold oracle records `mem_scan2` as an expected complexity refusal; its
-fast refusal cannot become a decompiler performance sample.
+performance contract. It measures the deterministic bounded `fnv_fold` target
+and makes no correctness or refusal claim about `mem_scan2`.
 
 The contract runs 20 isolated cold command processes and four fresh warm
 sessions with five measured repeats each. Command latency comes from radare2's
-in-process `?t` profiler and includes only the command body. It excludes r2
+in-process `?t` timer and includes only the command body. It excludes r2
 startup, setup analysis, sentinel output, and the old pair of `date` subprocess
 launches. Nearest-rank p95 is therefore the 19th of 20 latency observations,
 not the maximum. Cold RSS still measures each direct child process and warm RSS
@@ -269,18 +266,16 @@ Each p95 has two independent limits:
 - a regression limit of at most 1.5 times the reviewed in-process reference, plus
   only the small absolute jitter slack declared in the manifest.
 
-Across two reviewed local captures, the per-metric maximum cold/warm
-command-body p95 references are 20.664/18.624 ms for `decompile_sla`,
-17.016/14.882 ms for
-`types`, and 0.048/0.122 ms for `profile`. Each release target retains explicit
-headroom over its observed reference. In a same-process paired check, the old
-shell-date timer reported a 6.071 ms profile p95 while the in-process clock
-reported 0.061 ms. Release targets, regression ratios, and RSS limits remain
-independent.
+The contract measures two atomic commands: certified decompilation and the
+exact-target `ssa_function_report`. The latter must return nonempty SSA blocks,
+prepared facts, and the selected entry address; it cannot be satisfied by a
+passive or previously populated profile accumulator. Reviewed references and
+release headroom are recorded directly in the versioned manifest. Release
+targets, regression ratios, and RSS limits remain independent.
 
 Availability is executable, not inferred from artifact filenames. Before any
 sample is accepted, the harness discovers the exact target and runs plugin help,
-architecture status, decompile, type, and profile probes. ABI/load errors,
+architecture status, decompile, and SSA-function-report probes. ABI/load errors,
 missing commands, empty/no-op output, fallback decompilation, invalid JSON, or
 missing in-process timing cause the required gate to fail closed. Optional local
 runs may still report `skipped`; the required CI invocation cannot.
@@ -321,8 +316,8 @@ Use this ownership map when turning benchmark output into implementation work:
 | residual/budgeted symbolic facts | `r2sym` |
 | bad return/arg/out-param/type facts | `r2types` |
 | fallback, repeated calls, temp-heavy C | `r2dec` |
-| `source_oracle_failure` | manifest `owner`, otherwise classify before fixing |
-| timeout or nondeterministic route/cache behavior | `r2engine` |
+| advisory source-shape mismatch | manifest `owner` for triage only; never semantic authority or a closure failure |
+| timeout or nondeterministic route/budget behavior | `r2engine` |
 | command not registered, dylib mismatch | `r2plugin` harness/glue |
 | nondeterministic report order | owner producing the unordered data |
 

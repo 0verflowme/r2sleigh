@@ -25,7 +25,7 @@ Owners
   applicability, ambiguity, and refusal policy.
 - `r2types`: type/layout/signature projection from typed context and semantic
   evidence.
-- `r2engine`: route selection by proof coverage, cache keys, budgets, and
+- `r2engine`: request-local route selection by proof coverage, budgets, and
   refusal.
 - `r2dec`: rendering only from render permissions, certificates, and residuals.
 - `r2plugin`: typed context collection, FFI, command dispatch, and apply/render
@@ -63,8 +63,9 @@ Rules
 3. Name hints are weak evidence only. They cannot grant executable C authority.
 4. Cache hits and budget caps never justify semantics.
 5. Any downstream cleanup that hides missing upstream facts is a correctness bug.
-6. Closure gates must fail on incomplete status, timeouts, source-oracle
-   failures, fake semantics, undefined identifiers, and raw temp/stack leaks.
+6. Closure gates must fail on incomplete status, timeouts, executable semantic
+   oracle failures, fake semantics, undefined identifiers, and raw temp/stack
+   leaks. Source-shape text comparisons remain advisory.
 
 Current Implementation State
 ----------------------------

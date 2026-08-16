@@ -15,7 +15,7 @@ The system we are aiming for has these properties:
 - one canonical SSA/dataflow layer
 - one canonical semantic artifact with explicit evidence
 - one canonical combined `FunctionFacts` contract
-- one canonical engine session and route planner
+- one canonical request orchestrator and route planner
 - one typed radare2 context seam
 - one planner surface for query, types, and decompilation
 - one replay/trace validation loop
@@ -29,7 +29,7 @@ gained one coherent, mathematically disciplined analysis engine.
 Current State (May 2026)
 ------------------------
 
-The foundation reset is mostly complete. The project is now typed-session-first:
+The foundation reset is mostly complete. The project is now typed-request-first:
 `r2plugin` is mostly orchestration glue, and semantic ownership sits in the Rust
 crates that own the facts.
 
@@ -38,14 +38,14 @@ Current ownership shape:
 - `r2ssa`: SSA, def-use, prepared facts, deterministic dataflow inputs.
 - `r2sym`: semantic artifacts, evidence, summaries, replay/query behavior.
 - `r2types`: canonical `FunctionFacts`, type projection, writeback facts.
-- `r2engine`: session orchestration, route planning, artifact cache keys, cost model.
+- `r2engine`: request orchestration, route planning, execution metrics, cost model.
 - `r2dec`: lowering, structuring, and rendering from canonical facts.
 - `r2plugin`: radare2 command dispatch, typed context collection, FFI, apply/render glue.
 - `../radare2`: typed seam provider and validation target.
 
 Recent high-value progress:
 
-- removed major JSON-shaped internal seams from analysis/session paths
+- removed major JSON-shaped internal seams from analysis/request paths
 - moved plugin analysis toward typed radare2 context collection
 - consolidated `anal.sla.*` knobs away from the normal user workflow
 - tied analysis depth to normal radare2 depth (`aa`, `aaa`, `aaaa`)
@@ -65,14 +65,14 @@ Recent high-value progress:
   write/escape evidence; role signatures may still contribute concrete
   types/names, but not fake out-param behavior
 - added explicit benchmark strict-threshold gates for hard failures, residual
-  decompiles, generic args/types, and average score
+  decompiles, and average score
 - cleaned focused Coreutils quality: no generic args, no residual decompile
   markers, no generated `sla_struct_*` signature leaks, and no remaining
   generic type residue in the focused/fair `max_functions=100` gate
 - kept benchmark outputs and local corpus artifacts out of source control
-- expanded r2r/plugin validation around typed sessions and decompiler behavior
+- expanded r2r/plugin validation around typed requests and decompiler behavior
 - added the initial `r2engine` crate so plugin decompile routing can move out of
-  command glue and into an explicit session/planner boundary
+  command glue and into an explicit request/planner boundary
 - added the first certifying decompiler proof spine:
   `CheckedClaim`, proof failures, proof coverage, and render permissions
 - added prepared SSA certificate surfaces for control, expression, memory,
@@ -94,7 +94,12 @@ Recent high-value progress:
 - updated plugin/r2r coverage for certified C, proof residuals, and raw artifact
   rejection; `tests/r2r` is green on 95 plugin tests
 
-Current benchmark signal:
+Archived pre-removal benchmark signal (not current authority):
+
+The generic argument/type totals below came from the deleted detached
+type-report command. Fresh benchmark reports no longer emit or gate on those
+metrics; genuine type evidence is checked through `afcfj`/`afvj` and compiled
+or differential fixtures.
 
 - focused Tier 1 Coreutils, `max_functions=12`: green
 - focused/fair Tier 1 Coreutils, `max_functions=100`: green on `603` targets
@@ -148,7 +153,7 @@ that gate:
 This means the benchmark average is not a sufficient closure metric. The next
 roadmap phase is certifying correctness: every rendered high-level construct
 must be backed by checked canonical facts, and unknown structure must stay as a
-residual or refusal. Cache reuse, budget caps, and bounded workers remain
+residual or refusal. Summary reuse, budget caps, and bounded workers remain
 necessary engineering controls, but they are not the correctness solution.
 
 Latest certifying proof-loop status:
@@ -409,8 +414,8 @@ Still blocking gold closure:
   when new non-name summary families justify it
 - recurring source-gold closure gates still need expansion, but the manual
   fake loop/switch control cases now run in normal r2r
-- full route ownership in `r2engine` across decompile, type, query, cache, and
-  refusal decisions
+- full route ownership in `r2engine` across decompile, type, query, execution
+  metrics, and refusal decisions
 - the next concrete proof checkpoint is call-output/signature projection
   closure: prove call-output/writeback effects and exact signature projections
   from canonical certificates, then delete the remaining downstream rescue
@@ -427,7 +432,7 @@ too much heuristic glue.
 The intended fact flow is:
 
 `radare2 typed context + lifted IL -> r2ssa canonical facts -> r2sym semantic
-evidence -> r2types constraints -> r2engine route/cache/session -> r2dec render`
+evidence -> r2types constraints -> r2engine request/route execution -> r2dec render`
 
 The intended certifying render flow is:
 
@@ -441,7 +446,7 @@ Where:
   ambiguity/refusal policy.
 - `r2types` proves type/layout/signature projections from semantic and typed
   context evidence.
-- `r2engine` routes by proof coverage, cost, cache state, and refusal policy.
+- `r2engine` routes by proof coverage, cost, budgets, and refusal policy.
 - `r2dec` renders only from render permissions and explicit residuals.
 - `r2plugin` exposes and applies results; it does not make semantic claims.
 
@@ -478,7 +483,7 @@ Still needed for closure-quality output:
 Rewrite targets:
 
 - `r2engine` becomes the single orchestration brain for decompile, type, query,
-  profile, cache, refusal, and route decisions.
+  execution metrics, refusal, and route decisions.
 - `r2sym` summary classification becomes evidence-first. Symbol names are weak
   hints, not semantic ownership.
 - `r2ssa` owns canonical stack slots, ABI callsite provenance, return
@@ -488,8 +493,8 @@ Rewrite targets:
   assumptions.
 - `r2dec` renders canonical facts and explicit residuals. It must not invent
   missing control flow, repair type policy, or hide placeholder facts.
-- `r2plugin` calls typed session APIs and applies results. It should not own
-  route policy, summary policy, cache strategy, or semantic repair.
+- `r2plugin` calls typed request APIs and applies results. It should not own
+  route policy, summary policy, budget policy, or semantic repair.
 
 Known Heuristic Debt
 --------------------
@@ -508,10 +513,9 @@ expanded:
 - fixed semantic worker island caps instead of evidence-ranked scheduling
 - plugin-side detached summary/decompile orchestration
 - large decompiler thread stack as a workaround for recursive structuring
-- split cache layers with weak artifact/render hit rates
-- benchmark averages that can mask incomplete status, timeouts, source-oracle
-  failures, or fake-output classes
-- source-gold checks that are not yet promoted into recurring acceptance
+- benchmark averages that can mask incomplete status, timeouts, executable
+  semantic-oracle failures, or fake-output classes
+- source-shape checks that are not yet exercised in recurring advisory reports
 
 Budgets and residuals are not debt when they are explicit and honest. They
 become debt only when they hide missing upstream facts or fabricate semantics.
@@ -528,7 +532,8 @@ Strategic Principles
      additional verbs.
 
 3. Optimize for practical asymptotics.
-   - use `O(1)` or `O(log n)` lookup for metadata, indexes, summaries, and caches
+   - use `O(1)` or `O(log n)` lookup for metadata, indexes, summaries, and local
+     memoization
    - use `O(n)` passes over blocks, SSA ops, and fact sets where possible
    - use bounded search where search is unavoidable
    - reuse summaries and incrementally recompute instead of rediscovering facts
@@ -539,7 +544,7 @@ Strategic Principles
    - if output only works because of a downstream patch, fix the upstream fact
 
 5. Determinism beats cleverness.
-   - stable ordering and stable cache keys are correctness requirements
+   - stable ordering and stable semantic fingerprints are correctness requirements
 
 6. Refusal is better than silent nonsense.
    - budgets, residual reasons, confidence, and evidence must stay explicit
@@ -547,7 +552,7 @@ Strategic Principles
 7. Proof beats appearance.
    - high-level C is allowed only after a checker grants render permission
    - failed proof obligations become residuals or refusals, not prettier guesses
-   - cache and caps can make analysis cheaper, but cannot justify semantics
+   - summary reuse and caps can make analysis cheaper, but cannot justify semantics
 
 Certifying Decompiler Execution Plan
 ------------------------------------
@@ -572,8 +577,8 @@ Success criteria:
 
 - incomplete proof means residual/refusal
 - benchmark closure fails if fake-output counters are non-zero
-- average score cannot override incomplete status, timeouts, or source-oracle
-  failure
+- average score cannot override incomplete status, timeouts, or executable
+  semantic-oracle failure; source-shape comparisons remain advisory
 
 ### Phase 1 - Control Certificates
 
@@ -677,20 +682,19 @@ Owner:
 
 Deliverables:
 
-- proof coverage metrics in route/session reports
-- render route selected from available certificates, summaries, budgets, and
-  cache state
+- proof coverage metrics in request reports
+- render route selected from available certificates, summaries, and budgets
 - typed refusal policy for timeout, solver budget, missing certificate, and
   ambiguous evidence
-- cache keys that include proof-relevant inputs and schema versions
+- request-local preparation bound to proof-relevant inputs and schema versions
 
 Success criteria:
 
 - route policy exists in one crate
-- repeated requests reuse checked artifacts
+- repeated requests deterministically rebuild the same checked artifacts
 - caps prevent blowups but do not convert unknowns into semantics
 
-### Phase 6 - Proof-Aware Benchmarks And Source-Gold Closure
+### Phase 6 - Proof-Aware Benchmarks And Semantic Closure
 
 Owners:
 
@@ -699,8 +703,8 @@ Owners:
 Deliverables:
 
 - proof/fake-output counters in benchmark reports
-- source-gold checks promoted for generated kernel-like programs and manual
-  tricky cases
+- source-shape checks retained as advisory diagnostics for generated
+  kernel-like programs and manual tricky cases
 - closure-gate mode that fails on incomplete status, timeouts, oracle failures,
   fake-output counters, fake stack slots, missing summary-role certificates,
   proof coverage gaps, undefined identifiers, and temp/stack leaks
@@ -709,7 +713,8 @@ Deliverables:
 Success criteria:
 
 - closure is impossible when status is incomplete
-- source-gold failures block "gold" claims even if average score is high
+- executable semantic-oracle failures block closure even if average score is
+  high; source-shape mismatches block only source-likeness claims
 - every failure family is assigned to a canonical owner before feature work
 
 Completed proof-closure work:
@@ -1469,7 +1474,7 @@ Done:
 - query routing is planner-gated
 - target-local narrowing has explicit ambiguity handling
 - native worker summaries are first-class artifacts, not decompiler hacks
-- semantic schema/cache versioning is explicit
+- semantic schema/fingerprint versioning is explicit
 
 Remaining:
 
@@ -1506,7 +1511,8 @@ Done:
 - `r2types::FunctionTypeFacts` is the canonical type/layout/signature payload
 - semantic role hints strengthen signatures and aggregate identity
 - generated local aggregates no longer override authoritative semantic roles
-- focused Coreutils generic args/types are clean
+- archived focused Coreutils type metrics were clean before the detached probe
+  was removed; current type regressions require genuine host/compiled coverage
 - field/layout certificates are retained through type facts and merged function
   facts
 - proof coverage is available to downstream route/render decisions
@@ -1573,7 +1579,7 @@ Done:
 - focused Coreutils benchmark
 - broad Coreutils strict gate at `max_binaries=108`, `max_functions=12`
 - closure-gate benchmark thresholds for hard failures, residual decompiles,
-  generic args/types, average score, setup/command ratio, and optional
+  average score, setup/command ratio, and optional
   quality-aware PDG wins
 - owner-bucket benchmark triage so remaining failures point at `../radare2`,
   `r2ssa`, `r2sym`, `r2types`, `r2engine`, `r2dec`, or plugin glue
@@ -1586,7 +1592,7 @@ Remaining:
 - CGC gate after broad Coreutils quality holds
 - Juliet/CWE gate after CGC signal is stable
 - recurring real kernel smoke gate, local-only
-- trend reports that highlight slowest commands, residual families, generic type
+- trend reports that highlight slowest commands, residual families, host type
   regressions, owner buckets, PDG losses, setup bottlenecks, and candidate
   radare2 issues
 
@@ -1635,7 +1641,7 @@ Deliverables:
   permissions; initial spine is done, closure checks still need expansion
 - control/expression/memory/layout/callsite certificates are surfaced; array,
   out-param, signature, and summary-role proof remain blocking
-- single route/session/cache owner in `r2engine`
+- single route and request-execution owner in `r2engine`
 - evidence-first summary classifier in `r2sym`
 - canonical callsite, stack-slot, return, memory-region, and switch facts in
   `r2ssa`
@@ -1688,7 +1694,7 @@ function request.
 Deliverables:
 
 - route planning for decompile/type/query requests
-- typed artifact cache keys and invalidation boundaries
+- immutable request-local analysis preparation
 - engine metrics for planning, SSA, semantic, type, and render costs
 - migration of plugin decompile/type/query orchestration into `r2engine`
 - removal of duplicated planner logic from plugin glue
@@ -1697,7 +1703,7 @@ Success criteria:
 
 - plugin commands call `r2engine` for orchestration
 - `r2dec` renders selected routes instead of owning global scheduling decisions
-- repeated requests reuse engine artifacts deterministically
+- repeated requests deterministically rebuild the same canonical artifacts
 - small-function fast paths do not pay semantic-worker setup costs unnecessarily
 
 ### P0c - Shared Assumptions And Role Registry
@@ -1765,7 +1771,7 @@ Success criteria:
 - fewer downstream local heuristics
 - better helper-call rendering
 - stronger return and out-param facts
-- summaries are cached once and consumed many times
+- summary-cache entries are computed once and consumed many times
 
 ### P2 - Semantic Type Algebra V2
 
@@ -1888,9 +1894,9 @@ Make repeated analysis cheaper and more predictable.
 
 Deliverables:
 
-- stronger typed caches
-- deterministic cache keys
-- explicit invalidation boundaries
+- stronger typed summary reuse
+- deterministic semantic fingerprints
+- explicit dependency boundaries
 - budget-aware scheduling
 - fewer repeated full-function passes
 - reuse prepared summaries across query, types, and decompiler
@@ -1939,11 +1945,11 @@ This is the closure bar for claiming a closure phase moved the engine toward a r
 gold-standard state:
 
 - Coreutils broad closure gate passes with hard failures `0`, residual
-  decompiles `0`, generic args `0`, generic types `0`, average score `>= 99.5`,
-  and setup/command ratio `<= 2.0`.
-- Closure gates fail if report status is incomplete, command/source-oracle
-  timeouts are non-zero, or source-oracle failures are non-zero. Average score
-  is never allowed to override these.
+  decompiles `0`, average score `>= 99.5`, and setup/command ratio `<= 2.0`.
+- Closure gates fail if report status is incomplete, command or executable
+  semantic-oracle timeouts are non-zero, or semantic-oracle failures are
+  non-zero. Average score is never allowed to override these; source-shape
+  advisories are reported independently.
 - Fake-semantics counters are `0`: fake loops, fake switches, fake case values,
   fake stack slots, fake call arguments, fake signatures, and name-only semantic
   roles.
@@ -1956,7 +1962,7 @@ gold-standard state:
   bucketed to its canonical owner before implementation work starts.
 - Kernel smoke remains local-only and strict when a kernelcache is available.
 - Benchmark reports include owner buckets, worst targets, slowest commands,
-  generic/residual counts, setup timing, cache reuse, and PDG deltas.
+  residual/artifact counts, setup timing, summary reuse, and PDG deltas.
 - Any fix that changes rendered C adds a regression that proves the output is
   backed by canonical facts or is visibly marked summary/residual.
 
@@ -2014,10 +2020,9 @@ Next:
 State:
 
 - canonical `FunctionFacts` path is established
-- focused Coreutils hard failures, residuals, generic args, and generic types
-  are clean
-- broad Coreutils is closure-clean for hard failures, residuals, generic args,
-  and generic types
+- focused and broad Coreutils decompile closure is clean for hard failures and
+  residuals; current type accuracy is checked through genuine host facts and
+  compiled/differential fixtures rather than a detached type-report command
 - generated aggregate leakage is fixed for current hot targets
 - field/layout certificates are retained and exposed through merged function
   facts
@@ -2035,8 +2040,8 @@ Next:
 
 State:
 
-- initial crate exists for session orchestration, route planning, cache keys,
-  and shared engine helpers
+- initial crate exists for request orchestration, route planning, and shared
+  engine helpers
 - plugin decompile paths already use parts of the engine boundary
 - proof coverage and render permissions are now part of the decompile route
 - type proof coverage is merged into route/render decisions
@@ -2044,10 +2049,11 @@ State:
 Next:
 
 - route all decompile/type/query decisions by proof coverage, render
-  permission, budget, cache state, and refusal policy
+  permission, budget, and refusal policy
 - own all decompile/type/query route decisions
 - absorb duplicated route policy from `r2dec` and plugin glue
-- own session-level artifact/render reuse and metrics
+- own request-local phase metrics and any future reuse only after realistic
+  traces prove it lowers latency or RSS
 - expose typed request/response APIs for plugin commands
 
 ### `r2dec`
@@ -2165,7 +2171,8 @@ Do not spend roadmap energy on:
 - decompiler-local policy that should live upstream
 - pretending hard analyses are `O(1)`
 - hiding residual/budget behavior to make reports look green
-- using cache hits, caps, or average scores as substitutes for semantic proof
+- using summary-cache hits, caps, or average scores as substitutes for semantic
+  proof
 - rendering high-level C when the matching proof obligation failed
 - adding per-function patches when a registry, summary, or typed seam is the
   correct owner

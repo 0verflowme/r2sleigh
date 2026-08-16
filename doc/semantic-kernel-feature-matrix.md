@@ -68,7 +68,7 @@ output using the renderer under test.
 | Differential execution | Prepared SSA and the generic typed semantic-C AST run from identical state and compare returns, observable memory, calls, traps, and bounded termination. |
 | Compiled C | Generated strict C is compiled and executed against an independent oracle; syntax-only compilation and renderer-derived expected output are insufficient. |
 | Generalization | Renaming symbols, relocating addresses, changing cosmetic names, and using equivalent compiler variants cannot change authority. Held-out functions using the same generic constructs are required. |
-| FFI | One generated ABI-137/V2 table transports the exact snapshot-schema-6/source-schema-7 interface. No legacy compatibility branch or direct manual ABI may authorize analysis. |
+| FFI | One generated ABI-138/V2 table transports the exact snapshot-schema-11/accessor-schema-4/source-interface-schema-10 contract. No legacy compatibility branch or direct manual ABI may authorize analysis. |
 | Failure | Missing or ambiguous evidence residualizes/refuses. It never falls through to heuristic executable C. |
 
 Production code may name generic semantic constructs such as memory, return,

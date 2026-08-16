@@ -2621,7 +2621,6 @@ fn r2sleigh_engine_decompile_trusted_output(
         function_input,
         Some(ptr_bits),
         r2types::ParsedExternalContext::default(),
-        0,
     )
     .with_input_quality(r2engine::EngineFunctionInputQuality::complete(block_count))
     .with_execution_control(execution)
@@ -2655,7 +2654,6 @@ fn r2sleigh_engine_type_function_trusted_output(
             function: trusted_engine_function_input(&trusted),
             ptr_bits: Some(ptr_bits),
             parsed_context: r2types::ParsedExternalContext::default(),
-            external_context_fallback_hash: 0,
             scope_facts: r2engine::InterprocScopeFacts::empty(),
             interproc_max_iters: 1,
             interproc_converged: false,
@@ -2668,7 +2666,7 @@ fn r2sleigh_engine_type_function_trusted_output(
         .analysis
         .with_execution_control(execution)
         .with_trusted_ssa(trusted);
-    let response = match types::engine_session().type_function_checked(
+    let response = match r2engine::EngineSession::new().type_function_checked(
         r2engine::EngineTypeAnalysisRequest::from_interproc_budget(request.analysis, 1, false),
     ) {
         Ok(response) => response,
@@ -4650,7 +4648,7 @@ fn function_annotations_for_ffi(
     blocks: *const *const R2ILBlock,
     num_blocks: usize,
 ) -> Option<Vec<FcnAnnotation>> {
-    let input = types::build_function_input(ctx, blocks, num_blocks, 0, ptr::null())?;
+    let input = types::build_function_input(ctx, blocks, num_blocks)?;
 
     let semantic_by_addr: std::collections::HashMap<u64, String> = input
         .blocks
@@ -8905,7 +8903,7 @@ mod integration_tests {
             true,
             Vec::new(),
         );
-        let response = r2engine::EngineSession::new(8).decompile_function_from_input(
+        let response = r2engine::EngineSession::new().decompile_function_from_input(
             r2engine::EngineFunctionDecompileRequestInput::single_function(
                 r2engine::EngineFunctionInput {
                     function_name: "sym._sum_array".to_string(),
@@ -8917,7 +8915,6 @@ mod integration_tests {
                 },
                 Some(64),
                 parsed_context,
-                0,
             ),
         );
         let len_home_objects = response

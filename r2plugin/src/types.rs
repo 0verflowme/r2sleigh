@@ -1,181 +1,15 @@
 use crate::blocks::BlockSlice;
 use crate::context::{PluginCtxView, require_ctx_view};
-use crate::helpers::{effective_ptr_bits, resolve_function_name};
 use crate::{ArchSpec, R2ILBlock, R2ILContext};
 #[cfg(test)]
 use crate::{InferredParamJson, InferredSignatureCcJson};
 use std::ffi::CString;
-#[cfg(test)]
-use std::hash::Hash;
 use std::os::raw::c_char;
 use std::ptr;
-use std::sync::OnceLock;
 
 pub(crate) struct FunctionInput<'a> {
     pub(crate) ctx: PluginCtxView<'a>,
     pub(crate) blocks: BlockSlice,
-    pub(crate) function_name: String,
-}
-
-pub(crate) type FunctionAnalysis = r2engine::EngineAnalysis;
-
-#[cfg(test)]
-type FunctionAnalysisCacheKey = r2engine::AnalysisCacheKey;
-#[cfg(test)]
-type FunctionRequestKey = r2engine::EngineRequestKey;
-
-#[cfg(test)]
-fn hash_debug_payload<T: std::fmt::Debug>(value: &T) -> u64 {
-    r2engine::stable_fnv1a_debug_hash(value)
-}
-
-#[cfg(test)]
-fn hash_optional_arch(arch: Option<&ArchSpec>) -> u64 {
-    arch.map(hash_debug_payload).unwrap_or(0)
-}
-
-#[cfg(test)]
-pub(crate) fn hash_string_payload(payload: &str) -> u64 {
-    r2engine::stable_fnv1a_hash(payload)
-}
-
-#[cfg(test)]
-fn hash_value<T: Hash>(value: &T) -> u64 {
-    r2engine::stable_fnv1a_hash(value)
-}
-
-#[cfg(test)]
-fn hash_blocks(blocks: &[R2ILBlock]) -> u64 {
-    r2engine::stable_blocks_hash(blocks)
-}
-
-#[allow(clippy::too_many_arguments)]
-#[cfg(test)]
-fn function_request_key_parts_hashed(
-    function_name: &str,
-    function_addr: u64,
-    arch: Option<&ArchSpec>,
-    blocks: &[R2ILBlock],
-    semantic_metadata_enabled: bool,
-    typed_context_hash: u64,
-    assumptions_hash: u64,
-    interproc_scope_hash: u64,
-    interproc_max_iterations: usize,
-    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
-) -> Option<FunctionRequestKey> {
-    let analysis = FunctionAnalysisCacheKey::from_hashes(
-        function_addr,
-        hash_string_payload(function_name),
-        hash_optional_arch(arch),
-        hash_blocks(blocks),
-        typed_context_hash,
-        assumptions_hash,
-        r2engine::function_analysis_depth_hash(semantic_metadata_enabled),
-        None,
-    );
-    let interproc_budget_hash = hash_value(&(
-        "interproc-scope-budget-v1",
-        interproc_scope_hash,
-        interproc_max_iterations,
-    ));
-    Some(FunctionRequestKey::from_request_hashes(
-        analysis,
-        function_addr,
-        typed_context_hash,
-        assumptions_hash,
-        r2engine::function_analysis_depth_hash(semantic_metadata_enabled),
-        arch.map(effective_ptr_bits).unwrap_or(64),
-        0,
-        interproc_budget_hash,
-        r2sym::stable_scope_hash(symbolic_scope),
-    ))
-}
-
-#[allow(clippy::too_many_arguments)]
-#[cfg(test)]
-fn function_request_key_parts(
-    function_name: &str,
-    arch: Option<&ArchSpec>,
-    blocks: &[R2ILBlock],
-    semantic_metadata_enabled: bool,
-    external_context_json: &str,
-    interproc_scope_hash: u64,
-    interproc_max_iterations: usize,
-    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
-) -> Option<FunctionRequestKey> {
-    let ptr_bits = arch.map(effective_ptr_bits).unwrap_or(64);
-    let parsed = r2engine::parse_external_context_json_for_engine(external_context_json, ptr_bits);
-    function_request_key_parts_hashed(
-        function_name,
-        0,
-        arch,
-        blocks,
-        semantic_metadata_enabled,
-        parsed.context_identity_hash,
-        parsed.assumptions_hash,
-        interproc_scope_hash,
-        interproc_max_iterations,
-        symbolic_scope,
-    )
-}
-
-#[cfg(test)]
-fn session_context_identity_hash(external_context_json: &str, ptr_bits: u32) -> u64 {
-    r2engine::parse_external_context_json_for_engine(external_context_json, ptr_bits)
-        .context_identity_hash
-}
-
-pub(crate) struct FunctionFactsStore {
-    engine_session: r2engine::EngineSession,
-}
-
-impl FunctionFactsStore {
-    fn new() -> Self {
-        Self {
-            engine_session: r2engine::EngineSession::default(),
-        }
-    }
-}
-
-pub(crate) fn function_facts_store() -> &'static FunctionFactsStore {
-    static STORE: OnceLock<FunctionFactsStore> = OnceLock::new();
-    STORE.get_or_init(FunctionFactsStore::new)
-}
-
-pub(crate) fn engine_session() -> &'static r2engine::EngineSession {
-    &function_facts_store().engine_session
-}
-
-fn cache_counters_json(counters: r2engine::CacheCounters) -> String {
-    let hits = counters.hits;
-    let misses = counters.misses;
-    let insertions = counters.insertions;
-    let evictions = counters.evictions;
-    let lookups = counters.total_lookups();
-    format!(
-        "{{\"hits\":{hits},\"misses\":{misses},\"lookups\":{lookups},\"insertions\":{insertions},\"evictions\":{evictions}}}"
-    )
-}
-
-pub(crate) fn r2sleigh_engine_cache_stats_json() -> *mut c_char {
-    let profile = engine_session().profile(r2engine::EngineProfileRequest {
-        reset_after_read: false,
-    });
-    let metrics = profile.metrics;
-    let analysis = metrics.analysis;
-    let total = profile.total;
-    let json = format!(
-        "{{\"analysis\":{},\"total\":{}}}",
-        cache_counters_json(analysis),
-        cache_counters_json(total)
-    );
-    CString::new(json).map_or(ptr::null_mut(), |c| c.into_raw())
-}
-
-pub(crate) fn r2sleigh_engine_cache_stats_reset() {
-    let _ = engine_session().profile(r2engine::EngineProfileRequest {
-        reset_after_read: true,
-    });
 }
 
 #[cfg(test)]
@@ -209,43 +43,16 @@ pub(crate) fn build_function_input<'a>(
     ctx: *const R2ILContext,
     blocks: *const *const crate::R2ILBlock,
     num_blocks: usize,
-    fcn_addr: u64,
-    fcn_name: *const c_char,
 ) -> Option<FunctionInput<'a>> {
     let ctx = require_ctx_view(ctx)?;
     let blocks = unsafe { BlockSlice::from_ffi(blocks, num_blocks)? };
-    Some(FunctionInput {
-        ctx,
-        blocks,
-        function_name: resolve_function_name(fcn_addr, fcn_name),
-    })
-}
-
-pub(crate) fn build_function_analysis_from_parts(
-    function_name: &str,
-    blocks: &[R2ILBlock],
-    arch: Option<&ArchSpec>,
-) -> Option<FunctionAnalysis> {
-    engine_session().prepare_analysis(function_name, blocks, arch)
-}
-
-pub(crate) fn build_function_analysis(input: &FunctionInput<'_>) -> Option<FunctionAnalysis> {
-    build_function_analysis_from_parts(
-        &input.function_name,
-        input.blocks.as_slice(),
-        input.ctx.arch,
-    )
+    Some(FunctionInput { ctx, blocks })
 }
 
 #[cfg(test)]
 pub(crate) type InterprocScopeFacts = r2engine::InterprocScopeFacts;
 #[cfg(test)]
 pub(crate) type InterprocSeedEntry = r2engine::InterprocSeedEntry;
-
-#[cfg(test)]
-pub(crate) fn empty_interproc_scope_facts() -> InterprocScopeFacts {
-    r2engine::InterprocScopeFacts::empty()
-}
 
 #[cfg(test)]
 pub(crate) fn interproc_scope_facts_from_seed_entries<I>(entries: I) -> InterprocScopeFacts
@@ -261,38 +68,6 @@ where
     I: IntoIterator<Item = InterprocSeedEntry>,
 {
     r2engine::interproc_scope_facts_from_typed_seed_entries(entries)
-}
-
-pub(crate) fn infer_signature_cc_from_analysis(
-    input: &FunctionInput<'_>,
-    analysis: &FunctionAnalysis,
-) -> Option<r2types::InferredSignature> {
-    let ptr_bits = input
-        .ctx
-        .arch
-        .as_ref()
-        .map(|arch| effective_ptr_bits(arch))
-        .unwrap_or(64);
-    r2engine::infer_signature_from_analysis_with_register_names(
-        r2engine::EngineSignatureInferenceWithRegisterNamesRequest {
-            function_name: &input.function_name,
-            arch: input.ctx.arch,
-            ptr_bits,
-            semantic_metadata_enabled: input.ctx.semantic_metadata_enabled,
-            r2il_blocks: input.blocks.as_slice(),
-            reg_type_hints: std::collections::HashMap::new(),
-            analysis,
-        },
-        |vn| input.ctx.disasm.register_name(vn),
-    )
-}
-
-#[allow(dead_code)]
-pub(crate) fn infer_signature_cc_inner(
-    input: &FunctionInput<'_>,
-) -> Option<r2types::InferredSignature> {
-    let analysis = build_function_analysis(input)?;
-    infer_signature_cc_from_analysis(input, &analysis)
 }
 
 #[cfg(test)]
@@ -681,7 +456,7 @@ fn recover_vars_for_ffi(
     num_blocks: usize,
     _fcn_addr: u64,
 ) -> Option<Vec<VarProt>> {
-    let input = build_function_input(ctx, blocks, num_blocks, 0, ptr::null())?;
+    let input = build_function_input(ctx, blocks, num_blocks)?;
     let ssa_blocks = build_var_recovery_ssa_blocks(input.blocks.as_slice(), input.ctx.arch)?;
 
     let semantic_metadata_enabled = input.ctx.semantic_metadata_enabled;
@@ -749,7 +524,7 @@ fn data_refs_for_ffi(
     num_blocks: usize,
     _fcn_addr: u64,
 ) -> Option<Vec<r2ssa::DataRefFact>> {
-    let input = build_function_input(ctx, blocks, num_blocks, 0, ptr::null())?;
+    let input = build_function_input(ctx, blocks, num_blocks)?;
     r2ssa::data_refs_from_blocks(input.blocks.as_slice(), input.ctx.arch, input.ctx.disasm)
 }
 
@@ -819,10 +594,6 @@ mod tests {
             target: r2il::Varnode::constant(value, 8),
         });
         vec![block]
-    }
-
-    fn empty_interproc_hash() -> u64 {
-        empty_interproc_scope_facts().identity_hash()
     }
 
     #[test]
@@ -2048,292 +1819,5 @@ mod tests {
         let (mips_args, _, _) = recover_vars_arch_profile(Some(&mips));
         assert_eq!(mips_args.len(), 4, "mips should expose a0..a3 args");
         assert!(mips_args[0].1.contains(&"$a0"));
-    }
-
-    #[test]
-    fn function_request_key_distinguishes_symbolic_scope() {
-        let arch = ArchSpec::new("x86-64");
-        let root_blocks = const_return_blocks(0x1000, 0);
-        let helper_a_blocks = const_return_blocks(0x2000, 1);
-        let helper_b_blocks = const_return_blocks(0x2000, 2);
-
-        let root_prepared =
-            r2ssa::SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic ssa");
-        let helper_a_prepared = r2ssa::SsaArtifact::for_symbolic(&helper_a_blocks, Some(&arch))
-            .expect("helper a symbolic ssa");
-        let helper_b_prepared = r2ssa::SsaArtifact::for_symbolic(&helper_b_blocks, Some(&arch))
-            .expect("helper b symbolic ssa");
-
-        let scope_a = r2sym::PreparedFunctionScope::new(
-            0x1000,
-            vec![
-                r2sym::ScopedPreparedFunction {
-                    id: r2ssa::InterprocFunctionId(0x1000),
-                    name: Some("root".to_string()),
-                    prepared: root_prepared.clone(),
-                },
-                r2sym::ScopedPreparedFunction {
-                    id: r2ssa::InterprocFunctionId(0x2000),
-                    name: Some("helper".to_string()),
-                    prepared: helper_a_prepared,
-                },
-            ],
-        )
-        .expect("scope a");
-        let scope_b = r2sym::PreparedFunctionScope::new(
-            0x1000,
-            vec![
-                r2sym::ScopedPreparedFunction {
-                    id: r2ssa::InterprocFunctionId(0x1000),
-                    name: Some("root".to_string()),
-                    prepared: root_prepared,
-                },
-                r2sym::ScopedPreparedFunction {
-                    id: r2ssa::InterprocFunctionId(0x2000),
-                    name: Some("helper".to_string()),
-                    prepared: helper_b_prepared,
-                },
-            ],
-        )
-        .expect("scope b");
-        let interproc_hash = empty_interproc_hash();
-
-        let key_without_scope = function_request_key_parts(
-            "root",
-            Some(&arch),
-            &root_blocks,
-            true,
-            "{}",
-            interproc_hash,
-            1,
-            None,
-        )
-        .expect("root-only cache key");
-        let key_a = function_request_key_parts(
-            "root",
-            Some(&arch),
-            &root_blocks,
-            true,
-            "{}",
-            interproc_hash,
-            1,
-            Some(&scope_a),
-        )
-        .expect("scoped cache key a");
-        let key_a_repeat = function_request_key_parts(
-            "root",
-            Some(&arch),
-            &root_blocks,
-            true,
-            "{}",
-            interproc_hash,
-            1,
-            Some(&scope_a),
-        )
-        .expect("scoped cache key a repeat");
-        let key_b = function_request_key_parts(
-            "root",
-            Some(&arch),
-            &root_blocks,
-            true,
-            "{}",
-            interproc_hash,
-            1,
-            Some(&scope_b),
-        )
-        .expect("scoped cache key b");
-
-        assert_eq!(
-            key_a, key_a_repeat,
-            "same symbolic scope should hash stably"
-        );
-        assert_ne!(
-            key_without_scope, key_a,
-            "scope-aware artifacts must not alias the root-only cache key"
-        );
-        assert_ne!(
-            key_a, key_b,
-            "different helper closures must not alias the same analysis request identity"
-        );
-    }
-
-    #[test]
-    fn function_request_key_distinguishes_function_name() {
-        let arch = ArchSpec::new("x86-64");
-        let blocks = const_return_blocks(0x1000, 0);
-        let interproc_hash = empty_interproc_hash();
-        let first = function_request_key_parts(
-            "sym.first",
-            Some(&arch),
-            &blocks,
-            true,
-            "{}",
-            interproc_hash,
-            1,
-            None,
-        )
-        .expect("first cache key");
-        let second = function_request_key_parts(
-            "sym.second",
-            Some(&arch),
-            &blocks,
-            true,
-            "{}",
-            interproc_hash,
-            1,
-            None,
-        )
-        .expect("second cache key");
-
-        assert_ne!(
-            first, second,
-            "name-sensitive writeback artifacts must not alias across functions"
-        );
-    }
-
-    #[test]
-    fn function_request_key_distinguishes_interproc_iteration_budget() {
-        let arch = ArchSpec::new("x86-64");
-        let blocks = const_return_blocks(0x1000, 0);
-        let scope_hash = interproc_scope_facts_from_seed_entries([(
-            0x2000,
-            Some("sym.imp.malloc".to_string()),
-            Some(1),
-        )])
-        .identity_hash();
-        let first = function_request_key_parts(
-            "sym.root",
-            Some(&arch),
-            &blocks,
-            true,
-            "{}",
-            scope_hash,
-            1,
-            None,
-        )
-        .expect("low budget cache key");
-        let second = function_request_key_parts(
-            "sym.root",
-            Some(&arch),
-            &blocks,
-            true,
-            "{}",
-            scope_hash,
-            4,
-            None,
-        )
-        .expect("high budget cache key");
-
-        assert_ne!(
-            first, second,
-            "interproc summary artifacts must invalidate when the fixpoint budget changes"
-        );
-    }
-
-    #[test]
-    fn function_request_key_uses_typed_context_identity() {
-        let arch = ArchSpec::new("x86-64");
-        let blocks = const_return_blocks(0x1000, 0);
-        let first_context = r#"{"context":{"schema_version":1,"dirty_epoch":7,"context_hash":42},"signature":{"name":"sym.root"}}"#;
-        let reordered_context = r#"{"signature":{"name":"sym.root"},"context":{"context_hash":42,"dirty_epoch":7,"schema_version":1}}"#;
-        let changed_epoch_context = r#"{"context":{"schema_version":1,"dirty_epoch":8,"context_hash":42},"signature":{"name":"sym.root"}}"#;
-        let changed_type_epoch_context = r#"{"context":{"schema_version":1,"dirty_epoch":7,"type_dirty_epoch":2,"context_hash":42},"signature":{"name":"sym.root"}}"#;
-        let interproc_hash = empty_interproc_hash();
-
-        let first = function_request_key_parts(
-            "sym.root",
-            Some(&arch),
-            &blocks,
-            true,
-            first_context,
-            interproc_hash,
-            1,
-            None,
-        )
-        .expect("first cache key");
-        let reordered = function_request_key_parts(
-            "sym.root",
-            Some(&arch),
-            &blocks,
-            true,
-            reordered_context,
-            interproc_hash,
-            1,
-            None,
-        )
-        .expect("reordered cache key");
-        let changed_epoch = function_request_key_parts(
-            "sym.root",
-            Some(&arch),
-            &blocks,
-            true,
-            changed_epoch_context,
-            interproc_hash,
-            1,
-            None,
-        )
-        .expect("changed epoch cache key");
-        let changed_type_epoch = function_request_key_parts(
-            "sym.root",
-            Some(&arch),
-            &blocks,
-            true,
-            changed_type_epoch_context,
-            interproc_hash,
-            1,
-            None,
-        )
-        .expect("changed type epoch cache key");
-
-        assert_eq!(
-            first, reordered,
-            "typed radare2 context identity should avoid raw JSON order sensitivity"
-        );
-        assert_ne!(
-            first, changed_epoch,
-            "dirty epoch must invalidate cached session facts"
-        );
-        assert_ne!(
-            first, changed_type_epoch,
-            "global type epoch must invalidate cached session facts"
-        );
-    }
-
-    #[test]
-    fn function_request_key_distinguishes_function_address() {
-        let arch = ArchSpec::new("x86-64");
-        let blocks = const_return_blocks(0x1000, 0);
-        let interproc_hash = empty_interproc_hash();
-        let first = function_request_key_parts_hashed(
-            "sym.root",
-            0x1000,
-            Some(&arch),
-            &blocks,
-            true,
-            session_context_identity_hash("{}", 64),
-            0,
-            interproc_hash,
-            1,
-            None,
-        )
-        .expect("first cache key");
-        let second = function_request_key_parts_hashed(
-            "sym.root",
-            0x2000,
-            Some(&arch),
-            &blocks,
-            true,
-            session_context_identity_hash("{}", 64),
-            0,
-            interproc_hash,
-            1,
-            None,
-        )
-        .expect("second cache key");
-
-        assert_ne!(
-            first, second,
-            "session analysis request identities must not alias across function addresses"
-        );
     }
 }

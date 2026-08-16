@@ -1,8 +1,8 @@
 //! Syntax highlighting for rendered C text.
 //!
-//! This is intentionally a post-render presentation pass. The decompiler and
-//! engine caches continue to carry plain C; terminal callers can opt into ANSI
-//! highlighting at the final display boundary.
+//! This is intentionally a post-render presentation pass. The decompiler emits
+//! plain C; terminal callers can opt into ANSI highlighting at the final display
+//! boundary.
 
 const RESET: &str = "\x1b[0m";
 const COMMENT: &str = "\x1b[90m";

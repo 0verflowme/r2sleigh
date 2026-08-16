@@ -20,7 +20,7 @@ Reads anal.arch and anal.bits from radare2:
 - riscv + 32 bits -> riscv32
 - mips -> mips
 
-Override with: a:sla.arch x86-64
+Maintainer override: `a:sla.debug.arch x86-64`
 
 Plugin Callbacks
 ----------------
@@ -36,34 +36,32 @@ Command Reference
 
 Instruction-Level:
 - a:sla -- Status and help
-- a:sla.info -- Architecture info
-- a:sla.arch [name] -- Get/set architecture
-- a:sla.json -- R2IL ops as JSON
-- a:sla.regs -- Registers read/written
-- a:sla.mem -- Memory accesses
-- a:sla.vars -- All varnodes
-- a:sla.ssa -- SSA for instruction
-- a:sla.defuse -- Def-use analysis
+- a:sla.debug.info -- Architecture info
+- a:sla.debug.arch [name] -- Get/set architecture
+- a:sla.debug.json -- R2IL ops as JSON
+- a:sla.debug.regs -- Registers read/written
+- a:sla.debug.mem -- Memory accesses
+- a:sla.debug.vars -- All varnodes
+- a:sla.debug.ssa -- SSA for instruction
+- a:sla.debug.defuse -- Def-use analysis
 
 Function-Level:
-- a:sla.ssa.func -- Function SSA with phi nodes
-- a:sla.ssa.func.opt -- Optimized function SSA
-- a:sla.defuse.func -- Function-wide def-use
-- a:sla.dom -- Dominator tree
-- a:sla.cfg -- ASCII CFG
-- a:sla.cfg.json -- CFG as JSON
-- a:sla.taint -- Taint analysis
-- a:sla.slice [var] -- Backward slice
+- a:sla.debug.ssa.func -- Function SSA with phi nodes
+- a:sla.debug.ssa.func.opt -- Optimized function SSA
+- a:sla.debug.defuse.func -- Function-wide def-use
+- a:sla.debug.dom -- Dominator tree
+- a:sla.debug.cfg -- ASCII CFG
+- a:sla.debug.cfg.json -- CFG as JSON
+- a:sla.debug.taint -- Taint analysis
+- a:sla.debug.slice [var] -- Backward slice
 - pdd -- Decompile through radare2's bounded borrowed-snapshot provider
-
-Both a:sla and a:sleigh prefixes work.
 
 Direct `a:sla.dec` and `a:sla.decj` requests are intentionally unavailable:
 they do not run inside radare2's locked snapshot transaction and therefore
-cannot construct source authority. `pdd` receives one ABI-138/schema-10 borrowed
-snapshot, deep-copies it synchronously, and either completes from that immutable
-source or refuses. It never falls back to live blocks, names, or detached test
-metadata.
+cannot construct source authority. `pdd` receives one ABI-138/snapshot-schema-11
+borrowed snapshot through accessor-schema 4, deep-copies it synchronously into
+source-interface-schema 10, and either completes from that immutable source or
+refuses. It never falls back to live blocks, names, or detached test metadata.
 
 Detached symbolic commands are unavailable for the same reason. This includes
 `a:sla.sym`, `a:sla.sym.paths`, `a:sym.runj`, the `a:sym.explore*` and
@@ -90,9 +88,9 @@ operation in radare2; the plugin never reparses or imports DWARF during
 analysis or decompilation.
 
 Snapshot-owned type inference and writeback are not yet exposed through a
-radare2 host callback. Direct `a:sla.types` therefore refuses instead of using
-detached state. Type/writeback integration tests must not be restored until an
-equivalent locked snapshot transaction exists for that host path.
+radare2 host callback, so no detached r2sleigh type-report command is exposed.
+Type/writeback integration must use an equivalent locked snapshot transaction;
+radare2's `afcfj` and `afvj` remain the genuine host-owned inspection path.
 
 DATA xrefs are applied automatically during function analysis (`af`) and reference
 analysis (`aar`) via plugin callbacks.
@@ -159,9 +157,11 @@ Native analysis depth:
 | `aaa` | balanced signatures, xrefs, and type facts |
 | `aaaa` | aggressive taint, interproc, and type write-back |
 
-r2sleigh does not expose public `anal.*` tuning keys. Detailed engine inspection
-lives under debug commands such as `a:sla.debug.profilej` and
-`a:sla.debug.types`.
+r2sleigh does not expose public `anal.*` tuning keys. `a:sla.debug.profilej` is
+a passive local timing accumulator: run a successful command such as
+`a:sla.debug.ssa.func` first, then read the profile. There is no detached
+type-report command; host type state is inspected with radare2's `afcfj` and
+`afvj` commands until a locked snapshot-owned type callback exists.
 
 Kernel smoke harness:
 
@@ -176,13 +176,14 @@ R2SLEIGH_KERNELCACHE=/path/to/kernelcache \
 
 The harness is advisory and local-only: no kernel binaries or generated smoke
 reports are committed. It probes representative kernel helpers and records
-normalized decompile, type, and profile output for regression triage.
+normalized decompile and exact-target SSA-function JSON for regression triage. Host type state
+is inspected separately through radare2's `afcfj` and `afvj` commands.
 By default the report keeps hashes, sizes, and line counts while redacting the
 local kernel path and stdout/stderr previews. Use `--include-sensitive` only for
 local triage when full paths and text previews are needed.
 
 Strict mode returns non-zero for missing requested targets, zero discovered
-functions, malformed profile/type JSON, decompiler fallback comments, and
+functions, malformed or wrong-target SSA-function JSON, decompiler fallback comments, and
 radare2 command return failures. The harness mirrors the r2r/e2e plugin
 isolation knobs where practical: `--plugin-dir` defaults to
 `R2SLEIGH_PLUGIN_DIR`, `R2R_PLUGIN_DIR`, or `R2_LIBR_PLUGINS`, and `--tmpdir`

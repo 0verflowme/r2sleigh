@@ -34,12 +34,11 @@ impl EngineAnalyzeRequest {
 struct EngineSession;
 
 impl EngineSession {
-    fn new(_: usize) -> Self {
-        Self
-    }
+    // The old cache-sized constructor is deliberately absent.
+    // Keep this spacing stable so the UI diagnostic fixture remains readable
+    // when cache policy is removed from the stateless engine orchestrator.
 
     fn decompile_summary(&self, _: EngineSummaryDecompileRequest) {}
-    fn cached_analyze(&self) {}
 }
 
 enum EngineSemanticMode {
@@ -172,9 +171,8 @@ fn main() {
     let _ = r2engine::should_use_direct_named_native_worker_type_projection();
     r2engine::auto_callback_plan_for_policy();
     let session = EngineSession;
-    let _ = EngineSession::new(256);
+    // No cache constructor belongs at this plugin boundary.
     session.decompile_summary(EngineSummaryDecompileRequest::guarded_worker_summary());
-    session.cached_analyze();
     let _ = EngineFunctionDecompileRequest::full_semantics_for_function();
     let _ = EngineAnalyzeRequest::from_input_with_compile_missing_semantics();
     build_interproc_summary_set_with_scope_facts();

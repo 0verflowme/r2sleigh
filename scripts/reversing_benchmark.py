@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, TypeVar, cast
 
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 14
 FIXED_PERFORMANCE_GATE_SCHEMA_VERSION = 1
 DEFAULT_TMPDIR = "/tmp/r2sleigh-reversing-benchmark-tmp"
 DEFAULT_OUT = "/tmp/r2sleigh-reversing-benchmark.json"
@@ -69,11 +69,6 @@ TEMP_ARTIFACT_RE = re.compile(
 BARE_REGISTER_ARTIFACT_RE = re.compile(
     r"\b(?:RAX|RBX|RCX|RDX|RSI|RDI|RBP|RSP|RIP|"
     r"EAX|EBX|ECX|EDX|ESI|EDI|EBP|ESP|X[0-9]+|W[0-9]+|R[0-9]+)\b"
-)
-GENERIC_NAME_RE = re.compile(r"^(?:arg|param|var)[._]?[0-9]+$", re.IGNORECASE)
-GENERIC_TYPE_RE = re.compile(
-    r"(?:\b(?:unknown|undefined|unk)\b|void\s*\*)",
-    re.IGNORECASE,
 )
 UNSAMPLED_CODE_NAME_RE = re.compile(
     r"^(?:fcn|sub)\.[0-9a-f]+$",
@@ -204,20 +199,17 @@ TARGET_COMMAND_DEFS: dict[str, str] = {
     "decompile_sla": "pdd",
     "decompile_pdd": "pdd",
     "decompile_pdg": "pdg",
-    "types": "a:sla.debug.types",
-    "profile": "a:sla.debug.profilej",
+    "ssa_function_report": "a:sla.debug.ssa.func",
 }
-DEFAULT_TARGET_COMMANDS = ("decompile_sla", "decompile_pdd", "types", "profile")
-TIER1_TARGET_COMMANDS = ("decompile_sla", "types", "profile")
+DEFAULT_TARGET_COMMANDS = ("decompile_sla", "decompile_pdd", "ssa_function_report")
+TIER1_TARGET_COMMANDS = ("decompile_sla", "ssa_function_report")
 DECOMPILE_COMMAND_PREFIX = "decompile_"
-DECOMPILE_REPEAT_COMMANDS = ("decompile_sla", "decompile_pdg", "types", "profile")
+DECOMPILE_REPEAT_COMMANDS = ("decompile_sla", "decompile_pdg", "ssa_function_report")
 BASELINE_COMMANDS = {"decompile_pdg"}
 QUALITY_RANK = {"empty": 0, "fallback": 1, "residual": 2, "structured": 3}
 QUALITY_GATE_FAILURES = {
     "argn_leak",
     "comment_only_decompile",
-    "decompile_header_return_mismatch",
-    "decompile_header_signature_mismatch",
     "empty_loop_body",
     "fake_call_arg",
     "fake_stack_slot",
@@ -250,8 +242,6 @@ FAILURE_OWNER = {
     "argn_leak": "r2types",
     "comment_only_decompile": "r2dec",
     "command_return": "r2plugin",
-    "decompile_header_return_mismatch": "r2types",
-    "decompile_header_signature_mismatch": "r2types",
     "decompiler_fallback": "r2dec",
     "discovery_parse": "radare2",
     "discovery_return": "radare2",
@@ -262,6 +252,7 @@ FAILURE_OWNER = {
     "fake_signature": "r2types",
     "fake_switch_case": "r2ssa",
     "fake_while_break_wrapper": "r2dec",
+    "invalid_ssa_function_report": "r2ssa",
     "json_parse": "r2plugin",
     "missing_return_nonvoid": "r2dec",
     "misleading_summary_role": "r2dec",
@@ -287,8 +278,6 @@ FAILURE_PRIMARY_TAXONOMY = {
     "argn_leak": "readability",
     "comment_only_decompile": "structural",
     "command_return": "structural",
-    "decompile_header_return_mismatch": "type",
-    "decompile_header_signature_mismatch": "type",
     "decompiler_fallback": "structural",
     "discovery_parse": "structural",
     "discovery_return": "structural",
@@ -299,6 +288,7 @@ FAILURE_PRIMARY_TAXONOMY = {
     "fake_signature": "type",
     "fake_switch_case": "semantic",
     "fake_while_break_wrapper": "structural",
+    "invalid_ssa_function_report": "semantic",
     "json_parse": "structural",
     "missing_return_nonvoid": "semantic",
     "misleading_summary_role": "semantic",
@@ -332,56 +322,20 @@ GOLD_CATEGORY_DIAGNOSTIC_TAXONOMY = {
 }
 def primary_failure_taxonomy(kind: str, failure: dict[str, Any]) -> str:
     if kind == "nondeterministic_output":
-        return "performance" if failure.get("command") == "profile" else "semantic"
+        return "semantic"
     return FAILURE_PRIMARY_TAXONOMY.get(kind, "unclassified")
 OWNER_ACTIONS = {
     "radare2": "extend typed radare2 collectors, discovery aliases, or native analysis metadata",
     "r2ssa": "push missing CFG, def-use, stack, or callsite facts into prepared SSA facts",
     "r2sym": "add structural semantic evidence, summaries, or explicit refusal policy",
     "r2types": "project canonical semantic evidence into FunctionTypeFacts and writeback facts",
-    "r2engine": "fix route selection, cache reuse, budget, or determinism policy",
+    "r2engine": "fix route selection, request execution, budget, or determinism policy",
     "r2dec": "render only canonical facts and improve structuring from summary-backed evidence",
     "r2plugin": "fix command dispatch, FFI, or typed session plumbing without adding policy",
     "unknown": "classify the failure into a canonical owner before implementing a fix",
 }
 CANONICAL_GOLD_OWNERS = frozenset(owner for owner in OWNER_ACTIONS if owner != "unknown")
-CACHE_COUNTER_FIELDS = ("hits", "misses", "lookups", "insertions", "evictions")
 TARGET_ALIAS_PREFIXES = {"sym", "dbg"}
-CACHE_METRIC_KEYS = (
-    "summary_cache",
-    "semantic_summary_cache",
-    "interproc_summary_cache",
-    "type_summary_cache",
-    "cache",
-)
-FAST_PATH_BOOL_FIELDS = (
-    "fast_path",
-    "fastpath",
-    "summary_fast_path",
-    "cache_fast_path",
-    "cache_hit",
-    "summary_hit",
-)
-FAST_PATH_COUNTER_FIELDS = (
-    "fast_path_hits",
-    "fast_path_misses",
-    "summary_hits",
-    "summary_misses",
-    "target_summary_rank_hits",
-    "target_pruned_summary_contradiction",
-)
-SEMANTIC_SUMMARY_COUNT_FIELDS = (
-    "closure_functions",
-    "helper_functions",
-    "derived_summaries",
-    "summary_attempted",
-    "summary_budget_exhausted",
-    "summary_scc_count",
-    "native_region_summary_count",
-    "native_worker_summary_count",
-    "region_count",
-    "memory_fact_count",
-)
 COREUTILS_PRIORITY = (
     "ls",
     "cp",
@@ -548,6 +502,15 @@ def nonnegative_int(value: str) -> int:
     if parsed < 0:
         raise argparse.ArgumentTypeError(f"expected non-negative integer, got {value!r}")
     return parsed
+
+
+def _parse_base0_int(value: Any) -> int | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return int(value, 0)
+    except ValueError:
+        return None
 
 
 def default_jobs() -> int:
@@ -737,14 +700,6 @@ def parse_args() -> argparse.Namespace:
         help="repeat per-function reports to detect output nondeterminism",
     )
     parser.add_argument(
-        "--cache-probe",
-        action="store_true",
-        help=(
-            "run a repeated decompile/types/profile sequence to measure same-session "
-            "engine analysis reuse"
-        ),
-    )
-    parser.add_argument(
         "--timeout",
         type=int,
         default=DEFAULT_TIMEOUT,
@@ -766,7 +721,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "apply the default closure quality gate: strict mode, no hard failures, "
-            "no residuals/generic type debt, average score >= 99.5, and setup/command ratio "
+            "no residuals, average score >= 99.5, and setup/command ratio "
             "<= 2.0 unless thresholds are overridden; gold manifest coverage is separate "
             "and requires --require-gold"
         ),
@@ -782,18 +737,6 @@ def parse_args() -> argparse.Namespace:
         type=nonnegative_int,
         default=None,
         help="strict quality gate: maximum allowed residual decompile command count",
-    )
-    parser.add_argument(
-        "--max-generic-args",
-        type=nonnegative_int,
-        default=None,
-        help="strict quality gate: maximum allowed generic argument-name count",
-    )
-    parser.add_argument(
-        "--max-generic-types",
-        type=nonnegative_int,
-        default=None,
-        help="strict quality gate: maximum allowed generic type count",
     )
     parser.add_argument(
         "--min-average-score",
@@ -834,12 +777,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--max-gold-failures",
-        type=nonnegative_int,
-        default=None,
-        help="deprecated compatibility option; source-shape mismatches are advisory",
-    )
-    parser.add_argument(
         "--require-gold",
         action="store_true",
         help="strict manifest-coverage gate: fail when no source-shape expectations were exercised",
@@ -873,20 +810,12 @@ def apply_preset_defaults(args: argparse.Namespace) -> None:
             args.commands = ",".join(TIER1_TARGET_COMMANDS)
     elif args.preset == "full":
         pass
-    if getattr(args, "cache_probe", False):
-        args.repeat = max(2, int(getattr(args, "repeat", 1) or 1))
-        if not args.commands:
-            args.commands = ",".join(TIER1_TARGET_COMMANDS)
     if getattr(args, "closure_gate", False):
         args.strict = True
         if args.max_hard_failures is None:
             args.max_hard_failures = 0
         if args.max_residual_decompile is None:
             args.max_residual_decompile = 0
-        if args.max_generic_args is None:
-            args.max_generic_args = 0
-        if args.max_generic_types is None:
-            args.max_generic_types = 0
         if args.min_average_score is None:
             args.min_average_score = 99.5
         if args.max_setup_command_ratio is None:
@@ -1631,35 +1560,6 @@ def decompile_quality(text: str) -> dict[str, Any]:
         }
     )
     return metrics
-
-
-def generic_type_metrics(payload: dict[str, Any]) -> dict[str, int]:
-    generic_arg_count = 0
-    generic_type_count = 0
-
-    def inspect_name_type(name: Any, typ: Any) -> None:
-        nonlocal generic_arg_count, generic_type_count
-        if isinstance(name, str) and GENERIC_NAME_RE.search(normalize_symbol(name)):
-            generic_arg_count += 1
-        if isinstance(typ, str) and GENERIC_TYPE_RE.search(typ):
-            generic_type_count += 1
-
-    inspect_name_type(payload.get("name"), payload.get("ret_type"))
-    params = payload.get("params")
-    if isinstance(params, list):
-        for param in params:
-            if not isinstance(param, dict):
-                continue
-            inspect_name_type(param.get("name") or param.get("reg"), param.get("type") or param.get("ctype"))
-    locals_payload = payload.get("locals")
-    if isinstance(locals_payload, list):
-        for local in locals_payload:
-            if isinstance(local, dict):
-                inspect_name_type(local.get("name"), local.get("type") or local.get("ctype"))
-    return {
-        "generic_arg_count": generic_arg_count,
-        "generic_type_count": generic_type_count,
-    }
 
 
 def local_radare2_library_path(r2: str) -> str:
@@ -2572,166 +2472,6 @@ def is_sampleable_function(fcn: dict[str, Any]) -> bool:
     return True
 
 
-def cache_counter_metrics(payload: Any) -> dict[str, int] | None:
-    if not isinstance(payload, dict):
-        return None
-    out: dict[str, int] = {}
-    for field in CACHE_COUNTER_FIELDS:
-        value = payload.get(field)
-        if isinstance(value, int) and not isinstance(value, bool):
-            out[field] = value
-    return out or None
-
-
-def engine_cache_metrics(payload: Any) -> dict[str, dict[str, int]] | None:
-    if not isinstance(payload, dict):
-        return None
-    out: dict[str, dict[str, int]] = {}
-    for partition in ("analysis", "total"):
-        counters = cache_counter_metrics(payload.get(partition))
-        if counters:
-            out[partition] = counters
-    return out or None
-
-
-def payload_cache_metrics(payload: Any) -> dict[str, Any] | None:
-    if not isinstance(payload, dict):
-        return None
-    out: dict[str, Any] = {}
-    engine_cache = engine_cache_metrics(payload.get("engine_cache"))
-    if engine_cache:
-        out["engine_cache"] = engine_cache
-    for key in CACHE_METRIC_KEYS:
-        counters = cache_counter_metrics(payload.get(key))
-        if counters:
-            out[key] = counters
-    return out or None
-
-
-def cache_metrics_have_hits(metrics: Any) -> bool:
-    if isinstance(metrics, dict):
-        hit_value = metrics.get("hits")
-        if isinstance(hit_value, int) and not isinstance(hit_value, bool) and hit_value > 0:
-            return True
-        return any(cache_metrics_have_hits(value) for value in metrics.values())
-    return False
-
-
-def phase_timing_metrics(payload: Any) -> dict[str, int] | None:
-    if not isinstance(payload, list):
-        return None
-    out: dict[str, int] = {}
-    for item in payload:
-        if not isinstance(item, dict):
-            continue
-        phase = item.get("phase")
-        elapsed = item.get("elapsed_us")
-        if isinstance(phase, str) and isinstance(elapsed, int) and not isinstance(elapsed, bool):
-            out[phase] = out.get(phase, 0) + elapsed
-    return dict(sorted(out.items())) or None
-
-
-def plan_variant(value: Any) -> str | None:
-    if isinstance(value, str):
-        return value
-    if isinstance(value, dict) and len(value) == 1:
-        key = next(iter(value))
-        return str(key)
-    return None
-
-
-def command_fast_path_metrics(payload: Any, cache_metrics: dict[str, Any] | None = None) -> dict[str, Any] | None:
-    if not isinstance(payload, dict):
-        return None
-    out: dict[str, Any] = {}
-    for field in FAST_PATH_BOOL_FIELDS:
-        value = payload.get(field)
-        if isinstance(value, bool):
-            out[field] = value
-    for field in FAST_PATH_COUNTER_FIELDS:
-        value = payload.get(field)
-        if isinstance(value, int) and not isinstance(value, bool):
-            out[field] = value
-
-    timings = phase_timing_metrics(payload.get("phase_timings"))
-    if timings:
-        out["phase_timings_us"] = timings
-        for phase in ("interproc_summary", "semantic_summary", "semantic_artifact"):
-            if phase in timings:
-                out[f"{phase}_us"] = timings[phase]
-
-    interproc = payload.get("interproc")
-    if isinstance(interproc, dict):
-        for source_key, dest_key in (
-            ("callsite_count", "interproc_callsite_count"),
-            ("iterations", "interproc_iterations"),
-            ("max_iterations", "interproc_max_iterations"),
-        ):
-            value = interproc.get(source_key)
-            if isinstance(value, int) and not isinstance(value, bool):
-                out[dest_key] = value
-        if isinstance(interproc.get("converged"), bool):
-            out["interproc_converged"] = interproc["converged"]
-        if "summary" in interproc:
-            out["interproc_has_summary"] = interproc.get("summary") is not None
-
-    compiled = payload.get("compiled_semantics")
-    if not isinstance(compiled, dict):
-        compiled = payload.get("semantic")
-    if isinstance(compiled, dict):
-        for source_key, dest_key in (
-            ("granularity", "semantic_granularity"),
-            ("execution", "semantic_execution"),
-            ("slice_class", "slice_class"),
-        ):
-            value = compiled.get(source_key)
-            if isinstance(value, str):
-                out[dest_key] = value
-        for field in SEMANTIC_SUMMARY_COUNT_FIELDS:
-            value = compiled.get(field)
-            if isinstance(value, int) and not isinstance(value, bool):
-                out[field] = value
-        if compiled.get("granularity") == "summary_only":
-            out["summary_only"] = True
-
-    plans = payload.get("plans")
-    if isinstance(plans, dict):
-        for source_key, dest_key in (
-            ("artifact_build", "artifact_build_plan"),
-            ("query", "query_plan"),
-            ("type_plan", "type_plan"),
-            ("decompile", "decompile_plan"),
-        ):
-            variant = plan_variant(plans.get(source_key))
-            if variant:
-                out[dest_key] = variant
-    for source_key, dest_key in (
-        ("query_plan", "query_plan"),
-        ("type_plan", "type_plan"),
-        ("decompile_plan", "decompile_plan"),
-    ):
-        variant = plan_variant(compiled.get(source_key)) if isinstance(compiled, dict) else None
-        if variant and dest_key not in out:
-            out[dest_key] = variant
-
-    prefer_bounded = payload.get("prefer_bounded_type_plan")
-    if isinstance(prefer_bounded, bool):
-        out["prefer_bounded_type_plan"] = prefer_bounded
-    if cache_metrics is not None:
-        out["cache_hit"] = cache_metrics_have_hits(cache_metrics)
-    if "summary_fast_path" not in out:
-        summary_fast_path = bool(
-            out.get("summary_only")
-            or out.get("type_plan") == "VmSummaryOnly"
-            or out.get("decompile_plan") in {"NativeSummaryIslands", "VmSummaryOnly"}
-            or int(out.get("native_region_summary_count") or 0) > 0
-            or int(out.get("native_worker_summary_count") or 0) > 0
-        )
-        if summary_fast_path or out:
-            out["summary_fast_path"] = summary_fast_path
-    return out or None
-
-
 def command_summary(
     name: str,
     result: CmdResult,
@@ -2750,42 +2490,50 @@ def command_summary(
     }
     if result.stderr.strip():
         entry["stderr"] = summarize_text(result.stderr, include_preview=include_sensitive)
-    if name in ("types", "profile"):
+    if name == "ssa_function_report":
         try:
             payload = parse_json_payload(result.stdout)
             entry["json_kind"] = type(payload).__name__
-            if name == "types" and isinstance(payload, dict):
-                params = payload.get("params")
-                mutations = payload.get("mutation_plan", {}).get("mutations") if isinstance(payload.get("mutation_plan"), dict) else None
-                entry["type_metrics"] = {
-                    "ret_type": payload.get("ret_type") if isinstance(payload.get("ret_type"), str) else None,
-                    "param_count": len(params) if isinstance(params, list) else None,
-                    "mutation_count": len(mutations) if isinstance(mutations, list) else None,
-                    **generic_type_metrics(payload),
-                }
             if isinstance(payload, dict):
-                cache_metrics = payload_cache_metrics(payload)
-                if cache_metrics:
-                    entry["cache_metrics"] = cache_metrics
-                fast_path_metrics = command_fast_path_metrics(payload, cache_metrics)
-                if fast_path_metrics:
-                    entry["fast_path_metrics"] = fast_path_metrics
-            if name == "profile" and isinstance(payload, dict):
-                cache_metrics = entry.get("cache_metrics") if isinstance(entry.get("cache_metrics"), dict) else {}
-                engine_cache = (
-                    cache_metrics.get("engine_cache")
-                    if isinstance(cache_metrics.get("engine_cache"), dict)
-                    else None
+                blocks = payload.get("blocks")
+                function_entry = payload.get("entry")
+                blocks_well_formed = isinstance(blocks, list) and all(
+                    isinstance(block, dict)
+                    and isinstance(block.get("addr"), int)
+                    and not isinstance(block.get("addr"), bool)
+                    and isinstance(block.get("addr_hex"), str)
+                    and _parse_base0_int(block.get("addr_hex")) == block.get("addr")
+                    and isinstance(block.get("size"), int)
+                    and not isinstance(block.get("size"), bool)
+                    and block.get("size") > 0
+                    and isinstance(block.get("phis"), list)
+                    and isinstance(block.get("ops"), list)
+                    for block in blocks
                 )
-                profile_metrics = {
-                    "count": payload.get("count") if isinstance(payload.get("count"), int) else None,
-                }
-                if engine_cache:
-                    profile_metrics["engine_cache"] = engine_cache
-                entry["profile_metrics"] = {
-                    key: value
-                    for key, value in profile_metrics.items()
-                    if value is not None
+                entry_block_present = (
+                    isinstance(function_entry, int)
+                    and not isinstance(function_entry, bool)
+                    and isinstance(blocks, list)
+                    and any(
+                        isinstance(block, dict)
+                        and block.get("addr") == function_entry
+                        for block in blocks
+                    )
+                )
+                prepared = payload.get("prepared")
+                entry["ssa_function_report_metrics"] = {
+                    "schema_version": payload.get("schema_version"),
+                    "entry": function_entry,
+                    "entry_hex": payload.get("entry_hex"),
+                    "num_blocks": payload.get("num_blocks"),
+                    "block_count": len(blocks) if isinstance(blocks, list) else None,
+                    "blocks_well_formed": blocks_well_formed,
+                    "entry_block_present": entry_block_present,
+                    "prepared_object": isinstance(prepared, dict),
+                    "formal_parameters_list": isinstance(prepared, dict)
+                    and isinstance(prepared.get("formal_parameters"), list),
+                    "parameter_addresses_list": isinstance(prepared, dict)
+                    and isinstance(prepared.get("parameter_addresses"), list),
                 }
         except ValueError as exc:
             entry["json_error"] = str(exc)
@@ -2809,6 +2557,7 @@ def command_summary(
 
 def annotate_payload_admission(
     event: dict[str, Any],
+    target: dict[str, Any],
     command: str,
     result: CmdResult,
 ) -> None:
@@ -2816,7 +2565,7 @@ def annotate_payload_admission(
         return
     summary = command_summary(command, result, False)
     valid, reason = _fixed_performance_command_output_valid(
-        {"commands": {command: summary}},
+        {"addr": target.get("addr"), "commands": {command: summary}},
         command,
     )
     event["payload_valid"] = valid
@@ -3743,7 +3492,7 @@ def collect_target_batched(
             returncode=section_returncode,
             batch_elapsed=batch_elapsed,
         )
-        annotate_payload_admission(event, name, section_result)
+        annotate_payload_admission(event, target, name, section_result)
         archive_command_result(
             raw_output_archive,
             case=case,
@@ -4081,7 +3830,7 @@ def collect_targets_batched_case(
             batch_elapsed=batch_elapsed,
             section_status=section_status,
         )
-        annotate_payload_admission(event, command_name, section_result)
+        annotate_payload_admission(event, target, command_name, section_result)
         archive_command_result(
             raw_output_archive,
             case=case,
@@ -4300,7 +4049,7 @@ def collect_target_command_retries(
         event["child_max_rss_bytes"] = result.child_max_rss_bytes
         event["attribution_mode"] = "command_retry"
         event["retry_origin"] = retry_origin
-        annotate_payload_admission(event, name, result)
+        annotate_payload_admission(event, target, name, result)
         archive_command_result(
             raw_output_archive,
             case=case,
@@ -4551,7 +4300,7 @@ def collect_target(
         )
         event["temperature"] = "cold"
         event["child_max_rss_bytes"] = result.child_max_rss_bytes
-        annotate_payload_admission(event, name, result)
+        annotate_payload_admission(event, target, name, result)
         archive_command_result(
             raw_output_archive,
             case=case,
@@ -4616,25 +4365,10 @@ def _quality_gate_result_ready(result: dict[str, Any]) -> bool:
     return isinstance(result.get("decompile_quality"), dict)
 
 
-def _type_metric_signature(types_entry: Any) -> tuple[str | None, int | None]:
-    if not isinstance(types_entry, dict):
-        return None, None
-    metrics = types_entry.get("type_metrics")
-    if not isinstance(metrics, dict):
-        return None, None
-    ret_type = metrics.get("ret_type")
-    param_count = metrics.get("param_count")
-    return (
-        ret_type if isinstance(ret_type, str) else None,
-        param_count if isinstance(param_count, int) and not isinstance(param_count, bool) else None,
-    )
-
-
 def quality_gate_failures_for_result(
     target_name: Any,
     command: str,
     result: dict[str, Any],
-    commands: dict[str, Any],
 ) -> list[dict[str, Any]]:
     if command in BASELINE_COMMANDS or not command.startswith(DECOMPILE_COMMAND_PREFIX):
         return []
@@ -4756,30 +4490,6 @@ def quality_gate_failures_for_result(
             stack_address_leak_count=int(quality.get("stack_address_leak_count") or 0),
         )
 
-    type_ret, type_params = _type_metric_signature(commands.get("types"))
-    header_ret = quality.get("header_ret_type")
-    header_params = quality.get("header_param_count")
-    if isinstance(header_ret, str) and type_ret:
-        if is_void_type(header_ret) != is_void_type(type_ret):
-            add(
-                "decompile_header_return_mismatch",
-                types_ret_type=type_ret,
-                decompile_ret_type=header_ret,
-            )
-        elif _normalized_c_type(header_ret) != _normalized_c_type(type_ret):
-            add(
-                "decompile_header_signature_mismatch",
-                reason="return type differs",
-                types_ret_type=type_ret,
-                decompile_ret_type=header_ret,
-            )
-    if isinstance(header_params, int) and type_params is not None and header_params != type_params:
-        add(
-            "decompile_header_signature_mismatch",
-            reason="parameter count differs",
-            types_param_count=type_params,
-            decompile_param_count=header_params,
-        )
     return failures
 
 
@@ -4869,7 +4579,18 @@ def collect_failures(case_result: dict[str, Any]) -> list[dict[str, Any]]:
                 continue
             if result.get("returncode") is not None and result.get("returncode") != 0:
                 failures.append({"kind": "command_return", "target": target_name, "command": command})
-            if result.get("json_error"):
+            elif command == "ssa_function_report":
+                valid, reason = _fixed_performance_command_output_valid(target, command)
+                if not valid:
+                    failures.append(
+                        {
+                            "kind": "invalid_ssa_function_report",
+                            "target": target_name,
+                            "command": command,
+                            "reason": reason or "SSA function report payload was rejected",
+                        }
+                    )
+            elif result.get("json_error"):
                 failures.append({"kind": "json_parse", "target": target_name, "command": command})
             if result.get("empty") is True:
                 failures.append({"kind": "empty_decompile", "target": target_name, "command": command})
@@ -4877,23 +4598,15 @@ def collect_failures(case_result: dict[str, Any]) -> list[dict[str, Any]]:
                 failures.append({"kind": "decompiler_fallback", "target": target_name, "command": command})
             repeat = result.get("repeat")
             if isinstance(repeat, dict) and repeat.get("stable") is False:
-                observation = {
-                    "kind": "unnormalized_profile_repeat_mismatch",
-                    "target": target_name,
-                    "command": command,
-                }
-                if command == "profile":
-                    measurement_observations.append(observation)
-                else:
-                    failures.append(
-                        {
-                            "kind": "nondeterministic_output",
-                            "target": target_name,
-                            "command": command,
-                        }
-                    )
+                failures.append(
+                    {
+                        "kind": "nondeterministic_output",
+                        "target": target_name,
+                        "command": command,
+                    }
+                )
             failures.extend(
-                quality_gate_failures_for_result(target_name, command, result, commands)
+                quality_gate_failures_for_result(target_name, command, result)
             )
     for failure in failures:
         kind = str(failure.get("kind") or "unknown")
@@ -4906,94 +4619,6 @@ def collect_failures(case_result: dict[str, Any]) -> list[dict[str, Any]]:
     )
     case_result["measurement_observations"] = measurement_observations
     return failures
-def add_cache_counter_totals(dest: dict[str, int], source: dict[str, Any]) -> None:
-    for field in CACHE_COUNTER_FIELDS:
-        value = source.get(field)
-        if isinstance(value, int) and not isinstance(value, bool):
-            dest[field] = dest.get(field, 0) + value
-
-
-def add_engine_cache_totals(
-    dest: dict[str, dict[str, int]], source: dict[str, Any]
-) -> None:
-    for partition in ("analysis", "total"):
-        counters = source.get(partition)
-        if isinstance(counters, dict):
-            add_cache_counter_totals(dest.setdefault(partition, {}), counters)
-
-
-def cache_total_name(name: str) -> str:
-    aliases = {
-        "summary_cache": "summary",
-        "engine_cache": "engine",
-    }
-    if name in aliases:
-        return aliases[name]
-    if name.endswith("_cache"):
-        return name[: -len("_cache")]
-    return name
-
-
-def add_cache_metrics_totals(
-    engine_dest: dict[str, dict[str, int]],
-    cache_dest: dict[str, dict[str, int]],
-    source: dict[str, Any],
-) -> None:
-    for name, metrics in source.items():
-        if not isinstance(name, str) or not isinstance(metrics, dict):
-            continue
-        if name == "engine_cache":
-            add_engine_cache_totals(engine_dest, metrics)
-            continue
-        add_cache_counter_totals(cache_dest.setdefault(cache_total_name(name), {}), metrics)
-
-
-def fast_path_totals_template() -> dict[str, Any]:
-    return {
-        "summary_fast_path_count": 0,
-        "summary_only_count": 0,
-        "cache_hit_commands": 0,
-        "semantic_granularity": {},
-        "phase_timings_us": {},
-        "counters": {},
-    }
-
-
-def add_fast_path_totals(dest: dict[str, Any], source: dict[str, Any]) -> None:
-    if source.get("summary_fast_path") is True:
-        dest["summary_fast_path_count"] += 1
-    if source.get("summary_only") is True:
-        dest["summary_only_count"] += 1
-    if source.get("cache_hit") is True:
-        dest["cache_hit_commands"] += 1
-    granularity = source.get("semantic_granularity")
-    if isinstance(granularity, str) and granularity:
-        buckets = dest["semantic_granularity"]
-        buckets[granularity] = buckets.get(granularity, 0) + 1
-    phase_timings = source.get("phase_timings_us")
-    if isinstance(phase_timings, dict):
-        totals = dest["phase_timings_us"]
-        for phase, elapsed in phase_timings.items():
-            if isinstance(phase, str) and isinstance(elapsed, int) and not isinstance(elapsed, bool):
-                totals[phase] = totals.get(phase, 0) + elapsed
-    counters = dest["counters"]
-    for field in FAST_PATH_COUNTER_FIELDS + SEMANTIC_SUMMARY_COUNT_FIELDS:
-        value = source.get(field)
-        if isinstance(value, int) and not isinstance(value, bool):
-            counters[field] = counters.get(field, 0) + value
-
-
-def finalized_fast_path_totals(totals: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "summary_fast_path_count": totals["summary_fast_path_count"],
-        "summary_only_count": totals["summary_only_count"],
-        "cache_hit_commands": totals["cache_hit_commands"],
-        "semantic_granularity": dict(sorted(totals["semantic_granularity"].items())),
-        "phase_timings_us": dict(sorted(totals["phase_timings_us"].items())),
-        "counters": dict(sorted(totals["counters"].items())),
-    }
-
-
 def score_case(case_result: dict[str, Any]) -> int:
     penalty_by_kind = {
         "discovery_return": 25,
@@ -5012,13 +4637,12 @@ def score_case(case_result: dict[str, Any]) -> int:
         "timeout": 10,
         "argn_leak": 6,
         "comment_only_decompile": 12,
-        "decompile_header_return_mismatch": 12,
-        "decompile_header_signature_mismatch": 8,
         "fake_call_arg": 10,
         "fake_stack_slot": 10,
         "fake_signature": 10,
         "fake_switch_case": 10,
         "fake_while_break_wrapper": 10,
+        "invalid_ssa_function_report": 10,
         "missing_return_nonvoid": 10,
         "misleading_summary_role": 8,
         "missing_semantic_claims": 8,
@@ -5309,8 +4933,6 @@ def _target_examples_for_owner(
                 "count": count,
                 "hard_failures": int(target.get("hard_failures") or 0),
                 "residual_commands": int(target.get("residual_commands") or 0),
-                "generic_arg_count": int(target.get("generic_arg_count") or 0),
-                "generic_type_count": int(target.get("generic_type_count") or 0),
                 "elapsed_s": _float_value(target.get("elapsed_s")),
             }
         )
@@ -5319,8 +4941,6 @@ def _target_examples_for_owner(
             -int(item.get("count") or 0),
             -int(item.get("hard_failures") or 0),
             -int(item.get("residual_commands") or 0),
-            -int(item.get("generic_arg_count") or 0),
-            -int(item.get("generic_type_count") or 0),
             -_float_value(item.get("elapsed_s")),
             str(item.get("corpus") or ""),
             str(item.get("case") or ""),
@@ -5610,8 +5230,6 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
         "unclassified_mismatches": 0,
     }
     owner_buckets: dict[str, int] = {}
-    generic_arg_total = 0
-    generic_type_total = 0
     decompile_metric_totals = {
         "argn_leak_total": 0,
         "comment_only_decompile_total": 0,
@@ -5642,10 +5260,6 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
         "warm": {"count": 0, "elapsed_s": 0.0},
     }
     child_max_rss_values: list[int] = []
-    engine_cache_totals: dict[str, dict[str, int]] = {}
-    cache_totals: dict[str, dict[str, int]] = {}
-    fast_path_totals = fast_path_totals_template()
-
     def record_child_rss(record: Any) -> None:
         if not isinstance(record, dict):
             return
@@ -5722,8 +5336,6 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
             ]
             target_elapsed_s = 0.0
             target_residual_count = 0
-            target_generic_arg_count = 0
-            target_generic_type_count = 0
             target_owner_buckets: dict[str, int] = {}
             for failure in target_failures:
                 owner = str(
@@ -5820,31 +5432,6 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
                             target_owner_buckets["r2sym"] = (
                                 target_owner_buckets.get("r2sym", 0) + 1
                             )
-                type_metrics = result.get("type_metrics")
-                if isinstance(type_metrics, dict):
-                    generic_arg_count = int(type_metrics.get("generic_arg_count") or 0)
-                    generic_type_count = int(type_metrics.get("generic_type_count") or 0)
-                    generic_arg_total += generic_arg_count
-                    generic_type_total += generic_type_count
-                    target_generic_arg_count += generic_arg_count
-                    target_generic_type_count += generic_type_count
-                    generic_total = generic_arg_count + generic_type_count
-                    if generic_total:
-                        owner_buckets["r2types"] = owner_buckets.get("r2types", 0) + generic_total
-                        target_owner_buckets["r2types"] = (
-                            target_owner_buckets.get("r2types", 0) + generic_total
-                        )
-                profile_metrics = result.get("profile_metrics")
-                cache_metrics = result.get("cache_metrics")
-                if isinstance(cache_metrics, dict):
-                    add_cache_metrics_totals(engine_cache_totals, cache_totals, cache_metrics)
-                elif isinstance(profile_metrics, dict):
-                    engine_cache = profile_metrics.get("engine_cache")
-                    if isinstance(engine_cache, dict):
-                        add_engine_cache_totals(engine_cache_totals, engine_cache)
-                fast_path_metrics = result.get("fast_path_metrics")
-                if isinstance(fast_path_metrics, dict):
-                    add_fast_path_totals(fast_path_totals, fast_path_metrics)
                 gold_oracle = result.get("gold_oracle")
                 if isinstance(gold_oracle, dict):
                     gold_oracle_totals["commands"] += 1
@@ -5890,8 +5477,6 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
             if (
                 hard_failure_count
                 or target_residual_count
-                or target_generic_arg_count
-                or target_generic_type_count
                 or target_elapsed_s >= 1.0
             ):
                 target_rollups.append(
@@ -5902,8 +5487,6 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
                         "family": target_family(target_name),
                         "hard_failures": hard_failure_count,
                         "residual_commands": target_residual_count,
-                        "generic_arg_count": target_generic_arg_count,
-                        "generic_type_count": target_generic_type_count,
                         "elapsed_s": round(target_elapsed_s, 6),
                         "failure_kinds": sorted(
                             {str(failure.get("kind") or "unknown") for failure in target_failures}
@@ -5924,8 +5507,6 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
         key=lambda item: (
             -int(item.get("hard_failures") or 0),
             -int(item.get("residual_commands") or 0),
-            -int(item.get("generic_arg_count") or 0),
-            -int(item.get("generic_type_count") or 0),
             -float(item.get("elapsed_s") or 0),
             str(item.get("corpus") or ""),
             str(item.get("case") or ""),
@@ -5965,17 +5546,6 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
             if child_max_rss_values
             else None,
         },
-        "cache": {
-            "engine": {
-                key: dict(sorted(value.items()))
-                for key, value in sorted(engine_cache_totals.items())
-            },
-            **{
-                key: dict(sorted(value.items()))
-                for key, value in sorted(cache_totals.items())
-            },
-        },
-        "fast_paths": finalized_fast_path_totals(fast_path_totals),
         "quality": {
             "decompile": dict(sorted(decompile_quality_buckets.items())),
             "decompile_by_family": {
@@ -5989,8 +5559,6 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
             "manual_gate_failures": dict(sorted(quality_gate_failures.items())),
             "gold_oracle": dict(sorted(gold_oracle_totals.items())),
             **decompile_metric_totals,
-            "generic_arg_total": generic_arg_total,
-            "generic_type_total": generic_type_total,
             "radare2_candidate_count": radare2_candidates,
             "pdg_comparison": pdg_summary,
         },
@@ -6084,6 +5652,7 @@ def _hard_failure_count(report: dict[str, Any]) -> int:
         "discovery_parse",
         "discovery_return",
         "empty_decompile",
+        "invalid_ssa_function_report",
         "json_parse",
         "missing_target",
         "radare2_candidate",
@@ -6100,12 +5669,10 @@ def owner_for_failure(kind: Any, command: Any = None) -> str:
     if owner:
         return owner
     command_name = str(command or "")
-    if command_name == "types":
-        return "r2types"
     if command_name.startswith(DECOMPILE_COMMAND_PREFIX):
         return "r2dec"
-    if command_name == "profile":
-        return "r2engine"
+    if command_name == "ssa_function_report":
+        return "r2ssa"
     return "unknown"
 
 
@@ -6136,14 +5703,6 @@ def strict_quality_gate(args: argparse.Namespace, report: dict[str, Any]) -> dic
         "residual_decompile": {
             "value": int(_summary_metric(report, ("summary", "quality", "decompile", "residual"), 0) or 0),
             "max": getattr(args, "max_residual_decompile", None),
-        },
-        "generic_args": {
-            "value": int(_summary_metric(report, ("summary", "quality", "generic_arg_total"), 0) or 0),
-            "max": getattr(args, "max_generic_args", None),
-        },
-        "generic_types": {
-            "value": int(_summary_metric(report, ("summary", "quality", "generic_type_total"), 0) or 0),
-            "max": getattr(args, "max_generic_types", None),
         },
         "fake_semantics": {
             "value": fake_semantics_total,
@@ -6379,22 +5938,6 @@ def compare_reports(before: dict[str, Any], after: dict[str, Any]) -> dict[str, 
             _summary_metric(before, ("summary", "timing", "command_s")),
             _summary_metric(after, ("summary", "timing", "command_s")),
         ),
-        "engine_cache_total_hits": _metric_delta(
-            _summary_metric(before, ("summary", "cache", "engine", "total", "hits")),
-            _summary_metric(after, ("summary", "cache", "engine", "total", "hits")),
-        ),
-        "engine_cache_total_misses": _metric_delta(
-            _summary_metric(before, ("summary", "cache", "engine", "total", "misses")),
-            _summary_metric(after, ("summary", "cache", "engine", "total", "misses")),
-        ),
-        "summary_cache_hits": _metric_delta(
-            _summary_metric(before, ("summary", "cache", "summary", "hits")),
-            _summary_metric(after, ("summary", "cache", "summary", "hits")),
-        ),
-        "summary_fast_path_count": _metric_delta(
-            _summary_metric(before, ("summary", "fast_paths", "summary_fast_path_count")),
-            _summary_metric(after, ("summary", "fast_paths", "summary_fast_path_count")),
-        ),
         "average_score": _metric_delta(
             _summary_metric(before, ("summary", "average_score")),
             _summary_metric(after, ("summary", "average_score")),
@@ -6407,14 +5950,6 @@ def compare_reports(before: dict[str, Any], after: dict[str, Any]) -> dict[str, 
         "residual_decompile_count": _metric_delta(
             _summary_metric(before, ("summary", "quality", "decompile", "residual")),
             _summary_metric(after, ("summary", "quality", "decompile", "residual")),
-        ),
-        "generic_arg_total": _metric_delta(
-            _summary_metric(before, ("summary", "quality", "generic_arg_total")),
-            _summary_metric(after, ("summary", "quality", "generic_arg_total")),
-        ),
-        "generic_type_total": _metric_delta(
-            _summary_metric(before, ("summary", "quality", "generic_type_total")),
-            _summary_metric(after, ("summary", "quality", "generic_type_total")),
         ),
         "radare2_candidate_count": _metric_delta(
             _summary_metric(before, ("summary", "quality", "radare2_candidate_count")),
@@ -6564,7 +6099,6 @@ def benchmark_execution_config(
         "plugin_hash": plugin_info.get("hash"),
         "analysis": args.analysis,
         "repeat": max(1, args.repeat),
-        "cache_probe": bool(getattr(args, "cache_probe", False)),
         "closure_gate": bool(getattr(args, "closure_gate", False)),
         "timeout": args.timeout,
         "execution_mode": execution_mode,
@@ -6582,10 +6116,7 @@ def benchmark_execution_config(
         "manifest": args.manifest or "",
         "gold_manifest": getattr(args, "gold_manifest", "") or "",
         "gold_manifest_hash": gold_manifest_hash(getattr(args, "gold_manifest", "")),
-        "source_shape_advisory": {
-            "authority": "advisory",
-            "max_gold_failures_ignored": getattr(args, "max_gold_failures", None),
-        },
+        "source_shape_advisory": {"authority": "advisory"},
         "manifest_only": bool(args.manifest_only),
         "override_manifest_max_functions": bool(
             getattr(args, "override_manifest_max_functions", False)
@@ -6599,8 +6130,6 @@ def benchmark_execution_config(
         "strict_thresholds": {
             "max_hard_failures": getattr(args, "max_hard_failures", None),
             "max_residual_decompile": getattr(args, "max_residual_decompile", None),
-            "max_generic_args": getattr(args, "max_generic_args", None),
-            "max_generic_types": getattr(args, "max_generic_types", None),
             "min_average_score": getattr(args, "min_average_score", None),
             "max_setup_command_ratio": getattr(args, "max_setup_command_ratio", None),
             "require_pdg_comparison": bool(getattr(args, "require_pdg_comparison", False)),
@@ -6693,7 +6222,6 @@ def worst_targets(cases: list[dict[str, Any]]) -> dict[str, Any]:
     timeouts: list[dict[str, Any]] = []
     not_reached: list[dict[str, Any]] = []
     fallbacks: list[dict[str, Any]] = []
-    generic_types: list[dict[str, Any]] = []
     retry_attribution: dict[str, int] = {}
     for case in cases:
         for target in case.get("targets", []):
@@ -6748,32 +6276,13 @@ def worst_targets(cases: list[dict[str, Any]]) -> dict[str, Any]:
                             "elapsed_s": result.get("elapsed_s", 0),
                         }
                     )
-                type_metrics = result.get("type_metrics")
-                if isinstance(type_metrics, dict):
-                    generic_count = int(type_metrics.get("generic_arg_count") or 0) + int(
-                        type_metrics.get("generic_type_count") or 0
-                    )
-                    if generic_count:
-                        generic_types.append(
-                            {
-                                "case": case.get("name"),
-                                "corpus": case.get("corpus"),
-                                "target": target_name,
-                                "generic_count": generic_count,
-                                "generic_args": int(type_metrics.get("generic_arg_count") or 0),
-                                "generic_types": int(type_metrics.get("generic_type_count") or 0),
-                                "ret_type": type_metrics.get("ret_type"),
-                            }
-                        )
     timeouts.sort(key=lambda item: (-float(item.get("elapsed_s") or 0), str(item.get("case") or ""), str(item.get("target") or "")))
     not_reached.sort(key=lambda item: (str(item.get("case") or ""), str(item.get("target") or ""), str(item.get("command") or "")))
     fallbacks.sort(key=lambda item: (str(item.get("family") or ""), str(item.get("case") or ""), str(item.get("target") or ""), str(item.get("command") or "")))
-    generic_types.sort(key=lambda item: (-int(item.get("generic_count") or 0), str(item.get("case") or ""), str(item.get("target") or "")))
     return {
         "timeouts": timeouts[:20],
         "not_reached": not_reached[:40],
         "fallbacks": fallbacks[:40],
-        "generic_type_targets": generic_types[:20],
         "retry_attribution": dict(sorted(retry_attribution.items())),
     }
 
@@ -7069,19 +6578,50 @@ def _fixed_performance_command_output_valid(
         rejected_classes = {"empty"} if load_probe else {"empty", "fallback"}
         if quality.get("classification") in rejected_classes:
             return False, f"decompiler produced {quality.get('classification')} output"
-    elif command == "types":
-        metrics = entry.get("type_metrics")
+    elif command == "ssa_function_report":
+        metrics = entry.get("ssa_function_report_metrics")
         if entry.get("json_kind") != "dict" or not isinstance(metrics, dict):
-            return False, "types command did not produce its typed JSON object"
-        if not isinstance(metrics.get("ret_type"), str):
-            return False, "types JSON lacks a return type"
-    elif command == "profile":
-        metrics = entry.get("profile_metrics")
-        if entry.get("json_kind") != "dict" or not isinstance(metrics, dict):
-            return False, "profile command did not produce its profile JSON object"
-        count = metrics.get("count")
-        if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
-            return False, "profile JSON lacks a positive sample count"
+            return False, "SSA function report command did not produce its JSON object"
+        schema_version = metrics.get("schema_version")
+        if (
+            not isinstance(schema_version, int)
+            or isinstance(schema_version, bool)
+            or schema_version != 1
+        ):
+            return False, "SSA function report JSON schema version is not 1"
+        function_entry = metrics.get("entry")
+        if not isinstance(function_entry, int) or isinstance(function_entry, bool):
+            return False, "SSA function report JSON lacks its numeric entry"
+        entry_hex = metrics.get("entry_hex")
+        entry_hex_addr = _parse_base0_int(entry_hex)
+        if entry_hex_addr != function_entry:
+            return False, "SSA function report entry_hex does not match its numeric entry"
+        num_blocks = metrics.get("num_blocks")
+        block_count = metrics.get("block_count")
+        if not isinstance(num_blocks, int) or isinstance(num_blocks, bool) or num_blocks <= 0:
+            return False, "SSA function report JSON lacks its positive num_blocks"
+        if (
+            not isinstance(block_count, int)
+            or isinstance(block_count, bool)
+            or block_count <= 0
+            or block_count != num_blocks
+        ):
+            return False, "SSA function report block list does not match num_blocks"
+        if metrics.get("blocks_well_formed") is not True:
+            return False, "SSA function report JSON contains a malformed block"
+        if metrics.get("entry_block_present") is not True:
+            return False, "SSA function report JSON lacks its entry block"
+        if metrics.get("prepared_object") is not True:
+            return False, "SSA function report JSON lacks its prepared object"
+        if metrics.get("formal_parameters_list") is not True:
+            return False, "SSA function report prepared facts lack formal_parameters"
+        if metrics.get("parameter_addresses_list") is not True:
+            return False, "SSA function report prepared facts lack parameter_addresses"
+        target_addr = target.get("addr")
+        if not isinstance(target_addr, int) or isinstance(target_addr, bool):
+            return False, "SSA function report target address is absent"
+        if function_entry != target_addr or entry_hex_addr != target_addr:
+            return False, "SSA function report entry does not match the selected target"
     return True, None
 
 
@@ -7160,7 +6700,7 @@ def fixed_performance_plugin_probe(
             reasons.append("plugin decompiler provider is absent or a no-op")
         if "sla: loaded architecture '" not in status_text:
             reasons.append("plugin status did not load a Sleigh architecture")
-        probe_target = {"commands": {}}
+        probe_target = {"addr": target.get("addr"), "commands": {}}
         command_probes: dict[str, dict[str, Any]] = {}
         for command in contract["commands"]:
             command_result = CmdResult(

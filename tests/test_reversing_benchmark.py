@@ -48,6 +48,43 @@ DISCOVERY = json.dumps(
     ]
 )
 
+def ssa_function_report_payload(entry: int = 0x1000) -> dict:
+    return {
+        "schema_version": 1,
+        "entry": entry,
+        "entry_hex": f"0x{entry:x}",
+        "num_blocks": 1,
+        "blocks": [
+            {
+                "addr": entry,
+                "addr_hex": f"0x{entry:x}",
+                "size": 4,
+                "phis": [],
+                "ops": [],
+            }
+        ],
+        "prepared": {
+            "formal_parameters": [],
+            "parameter_addresses": [],
+        },
+    }
+
+
+def ssa_function_report(entry: int = 0x1000) -> str:
+    return json.dumps(ssa_function_report_payload(entry), separators=(",", ":"))
+
+
+def ssa_function_report_summary(entry: int = 0x1000) -> dict:
+    return benchmark.command_summary(
+        "ssa_function_report",
+        cmd_result(ssa_function_report(entry)),
+        False,
+    )
+
+
+SSA_FUNCTION_REPORT = ssa_function_report()
+SSA_CHECK_SECRET_REPORT = ssa_function_report(0x3000)
+
 
 def batched_stdout(entries):
     lines = []
@@ -582,8 +619,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
                     cmd_result(DISCOVERY),
                     cmd_result("int check_secret(void) {\n  return 1;\n}\n"),
                     cmd_result("int check_secret(void) {\n  return 1;\n}\n"),
-                    cmd_result('{"ret_type":"int","params":[],"mutation_plan":{"mutations":[]}}\n'),
-                    cmd_result('{"count":1}\n'),
+                    cmd_result(f"{SSA_CHECK_SECRET_REPORT}\n"),
                 ]
             )
 
@@ -610,9 +646,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
 
         self.assertEqual(result["score"], 100)
         self.assertEqual(result["failures"], [])
-        self.assertEqual(result["targets"][0]["commands"]["types"]["json_kind"], "dict")
-        self.assertEqual(len(result["targets"][0]["command_events"]), 4)
-        self.assertFalse(result["targets"][0]["commands"]["types"]["event"]["timeout"])
+        self.assertEqual(len(result["targets"][0]["command_events"]), 3)
         self.assertEqual(
             result["targets"][0]["commands"]["decompile_sla"]["decompile_quality"]["classification"],
             "structured",
@@ -658,8 +692,64 @@ class ReversingBenchmarkTests(unittest.TestCase):
         failure_kinds = {failure["kind"] for failure in result["failures"]}
         self.assertIn("decompiler_fallback", failure_kinds)
         self.assertIn("empty_decompile", failure_kinds)
-        self.assertIn("json_parse", failure_kinds)
+        self.assertIn("invalid_ssa_function_report", failure_kinds)
         self.assertLess(result["score"], 100)
+
+    def test_run_case_rejects_wrong_target_ssa_function_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "sample"
+            binary.write_bytes(b"\x00")
+            responses = iter(
+                [
+                    cmd_result(DISCOVERY),
+                    cmd_result('{"name":"sym.check_secret","ops":[]}\n'),
+                    cmd_result(DISCOVERY),
+                    cmd_result("int check_secret(void) {\n  return 1;\n}\n"),
+                    cmd_result("int check_secret(void) {\n  return 1;\n}\n"),
+                    cmd_result(f"{SSA_FUNCTION_REPORT}\n"),
+                ]
+            )
+
+            def runner(r2, path, cmd, timeout, env):
+                return next(responses)
+
+            case = benchmark.BinaryCase(
+                name="sample",
+                path=binary,
+                corpus="unit",
+                analysis="aaa",
+                targets=("check_secret",),
+                max_functions=4,
+            )
+            result = benchmark.run_case(
+                "r2",
+                case,
+                30,
+                1,
+                False,
+                {},
+                runner=runner,
+            )
+
+        self.assertEqual(
+            result["failures"],
+            [
+                {
+                    "kind": "invalid_ssa_function_report",
+                    "target": "sym.check_secret",
+                    "command": "ssa_function_report",
+                    "reason": "SSA function report entry does not match the selected target",
+                    "primary_failure_taxonomy": "semantic",
+                }
+            ],
+        )
+        self.assertEqual(result["score"], 90)
+        summary = benchmark.aggregate([result])
+        self.assertEqual(summary["quality"]["owner_buckets"], {"r2ssa": 1})
+        self.assertEqual(
+            benchmark._hard_failure_count({"summary": summary}),
+            1,
+        )
 
     def test_collect_failures_reports_timeout_without_cascading_noise(self):
         failures = benchmark.collect_failures(
@@ -709,13 +799,6 @@ class ReversingBenchmarkTests(unittest.TestCase):
                 {
                     "name": "sym.hot",
                     "commands": {
-                        "types": {
-                            "returncode": 0,
-                            "type_metrics": {
-                                "ret_type": "void",
-                                "param_count": 2,
-                            },
-                        },
                         "decompile_sla": {
                             "returncode": 0,
                             "timeout": False,
@@ -739,8 +822,6 @@ class ReversingBenchmarkTests(unittest.TestCase):
             {
                 "argn_leak",
                 "comment_only_decompile",
-                "decompile_header_return_mismatch",
-                "decompile_header_signature_mismatch",
                 "empty_loop_body",
                 "fake_stack_slot",
                 "fake_while_break_wrapper",
@@ -755,7 +836,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
                 for failure in failures
             )
         )
-        self.assertLessEqual(benchmark.score_case(case_result), 34)
+        self.assertLess(benchmark.score_case(case_result), 100)
 
     def test_phase0_primary_failure_taxonomy_is_total_for_known_kinds(self):
         known = (
@@ -780,9 +861,9 @@ class ReversingBenchmarkTests(unittest.TestCase):
             set(benchmark.FAILURE_PRIMARY_TAXONOMY.values()),
         )
         self.assertEqual(
-            "performance",
+            "semantic",
             benchmark.primary_failure_taxonomy(
-                "nondeterministic_output", {"command": "profile"}
+                "nondeterministic_output", {"command": "ssa_function_report"}
             ),
         )
         self.assertEqual(
@@ -792,14 +873,22 @@ class ReversingBenchmarkTests(unittest.TestCase):
             ),
         )
 
-    def test_profile_repeat_mismatch_is_measurement_observation_not_failure(self):
+    def test_ssa_function_report_repeat_mismatch_is_a_failure(self):
+        ssa_summary = benchmark.command_summary(
+            "ssa_function_report",
+            cmd_result(SSA_FUNCTION_REPORT),
+            False,
+        )
+        ssa_summary["returncode"] = 0
+        ssa_summary["repeat"] = {"stable": False}
         case_result = {
             "discovery": {"returncode": 0, "function_count": 1},
             "targets": [
                 {
                     "name": "sym.sample",
+                    "addr": 0x1000,
                     "commands": {
-                        "profile": {"returncode": 0, "repeat": {"stable": False}},
+                        "ssa_function_report": ssa_summary,
                         "decompile_sla": {"returncode": 0, "repeat": {"stable": False}},
                     },
                 }
@@ -809,19 +898,10 @@ class ReversingBenchmarkTests(unittest.TestCase):
         failures = benchmark.collect_failures(case_result)
 
         self.assertEqual(
-            ["nondeterministic_output"],
+            ["nondeterministic_output", "nondeterministic_output"],
             [failure["kind"] for failure in failures],
         )
-        self.assertEqual(
-            [
-                {
-                    "kind": "unnormalized_profile_repeat_mismatch",
-                    "target": "sym.sample",
-                    "command": "profile",
-                }
-            ],
-            case_result["measurement_observations"],
-        )
+        self.assertEqual([], case_result["measurement_observations"])
 
     def test_gold_oracle_exact_c_mismatch_is_advisory_to_closure(self):
         case = benchmark.BinaryCase(
@@ -869,15 +949,12 @@ class ReversingBenchmarkTests(unittest.TestCase):
                 "closure_gate": True,
                 "max_hard_failures": 0,
                 "max_residual_decompile": None,
-                "max_generic_args": None,
-                "max_generic_types": None,
                 "min_average_score": None,
                 "max_setup_command_ratio": None,
                 "require_pdg_comparison": False,
                 "max_pdg_quality_wins": None,
                 "max_pdg_perf_wins": None,
                 "max_pdg_quality_then_perf_wins": None,
-                "max_gold_failures": 0,
                 "require_gold": True,
             },
         )()
@@ -904,8 +981,6 @@ class ReversingBenchmarkTests(unittest.TestCase):
                 "reversing_benchmark.py",
                 "--closure-gate",
                 "--require-gold",
-                "--max-gold-failures",
-                "0",
                 "--gold-manifest",
                 str(manifest_path),
                 "--commands",
@@ -934,7 +1009,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertEqual(main_report["strict_quality_gate"]["status"], "ok")
         self.assertEqual(
             main_report["benchmark_config"]["source_shape_advisory"],
-            {"authority": "advisory", "max_gold_failures_ignored": 0},
+            {"authority": "advisory"},
         )
 
     def test_execution_and_requested_gold_provenance_coverage_remain_hard(self):
@@ -959,8 +1034,6 @@ class ReversingBenchmarkTests(unittest.TestCase):
                 "closure_gate": False,
                 "max_hard_failures": 0,
                 "max_residual_decompile": None,
-                "max_generic_args": None,
-                "max_generic_types": None,
                 "min_average_score": None,
                 "max_setup_command_ratio": None,
                 "require_pdg_comparison": False,
@@ -1104,8 +1177,6 @@ class ReversingBenchmarkTests(unittest.TestCase):
                 "closure_gate": False,
                 "max_hard_failures": None,
                 "max_residual_decompile": None,
-                "max_generic_args": None,
-                "max_generic_types": None,
                 "min_average_score": None,
                 "max_setup_command_ratio": None,
                 "require_pdg_comparison": False,
@@ -1256,8 +1327,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
                     cmd_result(DISCOVERY),
                     cmd_result("int check_secret(void) {\n  return 1;\n}\n"),
                     cmd_result("int check_secret(void) {\n  return 1;\n}\n"),
-                    cmd_result('{"ret_type":"int","params":[],"mutation_plan":{"mutations":[]}}\n'),
-                    cmd_result('{"count":1}\n'),
+                    cmd_result(f"{SSA_CHECK_SECRET_REPORT}\n"),
                 ]
             )
 
@@ -1285,15 +1355,9 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertIn("radare2_candidate", {failure["kind"] for failure in result["failures"]})
         self.assertEqual(result["native_discovery"]["function_count"], 0)
 
-    def test_quality_metrics_count_temp_and_generic_types(self):
+    def test_quality_metrics_count_temp_and_stack_smells(self):
         quality = benchmark.decompile_quality(
             "int f(int len) {\n  int len;\n  return tmp:_1 + X29_1 + &local_1;\n}\n"
-        )
-        type_metrics = benchmark.generic_type_metrics(
-            {
-                "ret_type": "undefined",
-                "params": [{"name": "arg1", "type": "void *"}, {"name": "len", "type": "size_t"}],
-            }
         )
 
         self.assertEqual(quality["classification"], "structured")
@@ -1306,22 +1370,6 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertEqual(quality["shadowed_param_count"], 1)
         self.assertEqual(quality["readability_smell_count"], 4)
         self.assertEqual(quality["source_smell_count"], 3)
-        self.assertEqual(type_metrics["generic_arg_count"], 1)
-        self.assertEqual(type_metrics["generic_type_count"], 2)
-
-    def test_quality_metrics_do_not_count_source_grade_fixed_width_types_as_generic(self):
-        type_metrics = benchmark.generic_type_metrics(
-            {
-                "ret_type": "int32_t",
-                "params": [
-                    {"name": "hash", "type": "uint64_t"},
-                    {"name": "buf", "type": "uint8_t *"},
-                ],
-            }
-        )
-
-        self.assertEqual(type_metrics["generic_arg_count"], 0)
-        self.assertEqual(type_metrics["generic_type_count"], 0)
 
     def test_quality_metrics_count_readability_noise(self):
         quality = benchmark.decompile_quality(
@@ -1611,12 +1659,12 @@ class ReversingBenchmarkTests(unittest.TestCase):
         stdout = "\n".join(
             [
                 "ignored prefix",
-                benchmark.batched_time_marker("START", "types", 0),
+                benchmark.batched_time_marker("START", "ssa_function_report", 0),
                 "1000000000",
-                benchmark.batched_section_start("types", 0),
-                '{"ret_type":"int"}',
-                benchmark.batched_section_end("types", 0),
-                benchmark.batched_time_marker("END", "types", 0),
+                benchmark.batched_section_start("ssa_function_report", 0),
+                SSA_FUNCTION_REPORT,
+                benchmark.batched_section_end("ssa_function_report", 0),
+                benchmark.batched_time_marker("END", "ssa_function_report", 0),
                 "1500000000",
                 benchmark.batched_section_start("decompile_sla", 0),
                 "int f(void) {",
@@ -1629,37 +1677,49 @@ class ReversingBenchmarkTests(unittest.TestCase):
         sections = benchmark.parse_batched_sections(stdout)
         _sections, timings = benchmark.parse_batched_output(stdout)
 
-        self.assertEqual(sections[("types", 0)], '{"ret_type":"int"}\n')
-        self.assertEqual(timings[("types", 0)], (1000000000, 1500000000))
+        self.assertEqual(sections[("ssa_function_report", 0)], f"{SSA_FUNCTION_REPORT}\n")
+        self.assertEqual(
+            timings[("ssa_function_report", 0)],
+            (1000000000, 1500000000),
+        )
         self.assertIn("return 1", sections[("decompile_sla", 0)])
 
     def test_in_process_timer_is_removed_from_payload_and_charges_only_command(self):
         stdout = "\n".join(
             [
-                benchmark.batched_section_start("profile", 0),
-                '{"count":1}',
+                benchmark.batched_section_start("ssa_function_report", 0),
+                SSA_FUNCTION_REPORT,
                 "0.000123",
-                benchmark.batched_time_marker("ELAPSED", "profile", 0),
-                benchmark.batched_section_end("profile", 0),
+                benchmark.batched_time_marker("ELAPSED", "ssa_function_report", 0),
+                benchmark.batched_section_end("ssa_function_report", 0),
             ]
         )
 
         sections, timings = benchmark.parse_batched_output(stdout)
         byte_sections = benchmark.parse_batched_sections_bytes(stdout.encode())
 
-        self.assertEqual(sections[("profile", 0)], '{"count":1}\n')
-        self.assertEqual(byte_sections[("profile", 0)], b'{"count":1}\n')
+        self.assertEqual(sections[("ssa_function_report", 0)], f"{SSA_FUNCTION_REPORT}\n")
         self.assertEqual(
-            timings[("profile", 0)],
+            byte_sections[("ssa_function_report", 0)],
+            f"{SSA_FUNCTION_REPORT}\n".encode(),
+        )
+        self.assertEqual(
+            timings[("ssa_function_report", 0)],
             (benchmark.IN_PROCESS_TIMER_START_NS, 123_000),
         )
         self.assertEqual(
-            benchmark.timing_elapsed_s(*timings[("profile", 0)]),
+            benchmark.timing_elapsed_s(*timings[("ssa_function_report", 0)]),
             0.000123,
         )
-        script = "; ".join(benchmark.batched_timed_command("profile", 0, "a:sla.debug.profilej"))
-        self.assertIn("?t a:sla.debug.profilej", script)
-        self.assertNotIn("!date", script)
+        wrapped = benchmark.batched_timed_command(
+            "ssa_function_report",
+            0,
+            benchmark.TARGET_COMMAND_DEFS["ssa_function_report"],
+        )
+        self.assertEqual(wrapped[1], "?t a:sla.debug.ssa.func")
+        self.assertNotIn(";", wrapped[1])
+        self.assertNotIn(">", wrapped[1])
+        self.assertNotIn("!date", "; ".join(wrapped))
 
     def test_isolated_command_event_excludes_process_and_setup_overhead(self):
         case = benchmark.BinaryCase(
@@ -1672,11 +1732,11 @@ class ReversingBenchmarkTests(unittest.TestCase):
         )
         stdout = "\n".join(
             [
-                benchmark.batched_section_start("profile", 0),
-                '{"count":1}',
+                benchmark.batched_section_start("ssa_function_report", 0),
+                SSA_FUNCTION_REPORT,
                 "0.000123",
-                benchmark.batched_time_marker("ELAPSED", "profile", 0),
-                benchmark.batched_section_end("profile", 0),
+                benchmark.batched_time_marker("ELAPSED", "ssa_function_report", 0),
+                benchmark.batched_section_end("ssa_function_report", 0),
             ]
         )
         seen_scripts = []
@@ -1696,14 +1756,17 @@ class ReversingBenchmarkTests(unittest.TestCase):
             None,
             1,
             runner,
-            {"profile": "a:sla.debug.profilej"},
+            {"ssa_function_report": "a:sla.debug.ssa.func"},
         )
 
         event = target["command_events"][0]
         self.assertEqual(event["elapsed_s"], 0.000123)
         self.assertEqual(event["timer"], "r2_prof")
-        self.assertEqual(target["commands"]["profile"]["elapsed_s"], 0.000123)
-        self.assertEqual(target["commands"]["profile"]["stdout"]["bytes"], 12)
+        self.assertEqual(target["commands"]["ssa_function_report"]["elapsed_s"], 0.000123)
+        self.assertEqual(
+            target["commands"]["ssa_function_report"]["stdout"]["bytes"],
+            len(SSA_FUNCTION_REPORT.encode()) + 1,
+        )
         self.assertNotIn("!date", seen_scripts[0])
 
     def test_parse_batched_output_tracks_started_and_completed_sections(self):
@@ -1804,18 +1867,16 @@ class ReversingBenchmarkTests(unittest.TestCase):
             case,
             0x1000,
             2,
-            benchmark.target_commands(("decompile_sla", "types", "profile")),
+            benchmark.target_commands(("decompile_sla", "ssa_function_report")),
         )
 
         self.assertEqual(
             [(name, repeat_idx) for name, repeat_idx, _marker, _command in sections],
             [
                 ("decompile_sla", 0),
-                ("types", 0),
-                ("profile", 0),
+                ("ssa_function_report", 0),
                 ("decompile_sla", 1),
-                ("types", 1),
-                ("profile", 1),
+                ("ssa_function_report", 1),
             ],
         )
 
@@ -1862,7 +1923,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertEqual(archive_summary["record_count"], 2)
         self.assertTrue(all(event.get("raw_output_metadata") for event in events))
 
-    def test_run_case_batched_scores_clean_outputs_and_reports_analysis_cache_hits(self):
+    def test_run_case_batched_scores_clean_outputs_and_summarizes_ssa_report(self):
         with tempfile.TemporaryDirectory() as tmp:
             binary = Path(tmp) / "sample"
             binary.write_bytes(b"\x00")
@@ -1874,16 +1935,9 @@ class ReversingBenchmarkTests(unittest.TestCase):
                     benchmark.batched_section_start("t0_decompile_pdd", 0),
                     "int check_secret(void) {\n  return 1;\n}",
                     benchmark.batched_section_end("t0_decompile_pdd", 0),
-                    benchmark.batched_section_start("t0_types", 0),
-                    '{"ret_type":"int","params":[],"mutation_plan":{"mutations":[]}}',
-                    benchmark.batched_section_end("t0_types", 0),
-                    benchmark.batched_section_start("t0_profile", 0),
-                    (
-                        '{"count":1,'
-                        '"engine_cache":{"analysis":{"hits":1,"misses":2,"lookups":3,"insertions":2,"evictions":0},'
-                        '"total":{"hits":1,"misses":2,"lookups":3,"insertions":2,"evictions":0}}}'
-                    ),
-                    benchmark.batched_section_end("t0_profile", 0),
+                    benchmark.batched_section_start("t0_ssa_function_report", 0),
+                    SSA_CHECK_SECRET_REPORT,
+                    benchmark.batched_section_end("t0_ssa_function_report", 0),
                 ]
             )
             responses = iter(
@@ -1923,70 +1977,13 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertIn("setup_event", target)
         self.assertEqual(result["score"], 100)
         self.assertEqual(
-            target["commands"]["profile"]["profile_metrics"]["engine_cache"]["total"]["hits"],
-            1,
-        )
-        self.assertNotIn(
-            "artifacts",
-            target["commands"]["profile"]["profile_metrics"]["engine_cache"],
+            target["commands"]["ssa_function_report"]["ssa_function_report_metrics"],
+            ssa_function_report_summary(0x3000)["ssa_function_report_metrics"],
         )
         self.assertEqual(
             target["commands"]["decompile_pdd"]["decompile_quality"]["classification"],
             "structured",
         )
-
-    def test_command_summary_exposes_type_summary_fast_path_metrics(self):
-        payload = {
-            "ret_type": "int",
-            "params": [],
-            "mutation_plan": {"mutations": []},
-            "summary_cache": {
-                "hits": 4,
-                "misses": 1,
-                "lookups": 5,
-                "insertions": 1,
-                "evictions": 0,
-            },
-            "interproc": {
-                "callsite_count": 3,
-                "iterations": 1,
-                "max_iterations": 4,
-                "converged": True,
-                "summary": {"root": "sym.worker"},
-            },
-            "compiled_semantics": {
-                "granularity": "summary_only",
-                "execution": "native",
-                "slice_class": "record_stream",
-                "summary_attempted": 1,
-                "summary_budget_exhausted": 0,
-                "summary_scc_count": 2,
-                "native_worker_summary_count": 2,
-                "native_region_summary_count": 1,
-            },
-            "plans": {
-                "type_plan": {"VmSummaryOnly": {"reason": "summary"}},
-                "decompile": {"NativeSummaryIslands": {"reason": "summary"}},
-            },
-            "phase_timings": [
-                {"phase": "interproc_summary", "elapsed_us": 10},
-                {"phase": "semantic_summary", "elapsed_us": 20},
-                {"phase": "semantic_artifact", "elapsed_us": 0},
-            ],
-        }
-
-        entry = benchmark.command_summary("types", cmd_result(json.dumps(payload)), False)
-
-        self.assertEqual(entry["cache_metrics"]["summary_cache"]["hits"], 4)
-        self.assertTrue(entry["fast_path_metrics"]["cache_hit"])
-        self.assertTrue(entry["fast_path_metrics"]["summary_fast_path"])
-        self.assertTrue(entry["fast_path_metrics"]["summary_only"])
-        self.assertEqual(entry["fast_path_metrics"]["semantic_granularity"], "summary_only")
-        self.assertEqual(entry["fast_path_metrics"]["type_plan"], "VmSummaryOnly")
-        self.assertEqual(entry["fast_path_metrics"]["decompile_plan"], "NativeSummaryIslands")
-        self.assertEqual(entry["fast_path_metrics"]["interproc_iterations"], 1)
-        self.assertTrue(entry["fast_path_metrics"]["interproc_has_summary"])
-        self.assertEqual(entry["fast_path_metrics"]["phase_timings_us"]["semantic_summary"], 20)
 
     def test_adaptive_batch_timeout_preserves_successful_sections_and_marks_not_reached(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1996,12 +1993,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
                 [
                     ("t0_decompile_sla", 0, "int a(void) {\n  return 1;\n}"),
                     ("t0_decompile_pdd", 0, "int a(void) {\n  return 1;\n}"),
-                    (
-                        "t0_types",
-                        0,
-                        '{"ret_type":"int","params":[],"mutation_plan":{"mutations":[]}}',
-                    ),
-                    ("t0_profile", 0, '{"count":1}'),
+                    ("t0_ssa_function_report", 0, SSA_FUNCTION_REPORT),
                 ]
             )
             responses = iter(
@@ -2149,7 +2141,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
                         "requested": None,
                         "setup_event": {"elapsed_s": 0.5},
                         "commands": {
-                            "types": {
+                            "decompile_pdd": {
                                 "elapsed_s": 2.0,
                                 "runtime_bucket": "fast",
                             },
@@ -2170,15 +2162,10 @@ class ReversingBenchmarkTests(unittest.TestCase):
                                     "artifact_count": 4,
                                 },
                             },
-                            "profile": {
+                            "ssa_function_report": {
+                                **ssa_function_report_summary(),
                                 "elapsed_s": 0.25,
                                 "runtime_bucket": "fast",
-                                "profile_metrics": {
-                                    "engine_cache": {
-                                        "analysis": {"hits": 1, "misses": 2},
-                                        "total": {"hits": 1, "misses": 2},
-                                    }
-                                },
                             },
                         },
                     }
@@ -2193,8 +2180,8 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertEqual(summary["timing"]["case_setup_s"], 3.0)
         self.assertEqual(summary["timing"]["target_setup_s"], 0.5)
         self.assertEqual(summary["timing"]["command_s"], 4.75)
-        self.assertEqual(summary["cache"]["engine"]["total"]["hits"], 1)
-        self.assertNotIn("artifacts", summary["cache"]["engine"])
+        self.assertNotIn("cache", summary)
+        self.assertNotIn("fast_paths", summary)
         self.assertEqual(
             summary["quality"]["decompile_by_family"],
             {"unknown": {"fallback": 1, "structured": 1}},
@@ -2257,7 +2244,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
                                     "elapsed_s": 0.25,
                                 },
                                 {
-                                    "command": "types",
+                                    "command": "decompile_pdd",
                                     "temperature": "cold",
                                     "elapsed_s": 0.5,
                                     "child_max_rss_bytes": 200,
@@ -2268,7 +2255,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
                                     "elapsed_s": 10.0,
                                 },
                                 {
-                                    "command": "profile",
+                                    "command": "ssa_function_report",
                                     "temperature": "cold",
                                     "elapsed_s": 9.0,
                                     "section_status": benchmark.BATCH_SECTION_NOT_REACHED,
@@ -2289,55 +2276,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
             },
         )
         self.assertEqual(summary["memory"], {"peak_child_rss_bytes": 300})
-        self.assertEqual(benchmark.SCHEMA_VERSION, 11)
-
-    def test_aggregate_summarizes_cache_and_summary_fast_paths(self):
-        summary = benchmark.aggregate(
-            [
-                {
-                    "name": "sample",
-                    "corpus": "unit",
-                    "score": 100,
-                    "failures": [],
-                    "targets": [
-                        {
-                            "name": "sym.worker",
-                            "commands": {
-                                "types": {
-                                    "elapsed_s": 0.1,
-                                    "runtime_bucket": "fast",
-                                    "cache_metrics": {
-                                        "summary_cache": {"hits": 4, "misses": 1, "lookups": 5},
-                                    },
-                                    "fast_path_metrics": {
-                                        "cache_hit": True,
-                                        "summary_fast_path": True,
-                                        "summary_only": True,
-                                        "semantic_granularity": "summary_only",
-                                        "summary_attempted": 1,
-                                        "native_worker_summary_count": 2,
-                                        "phase_timings_us": {
-                                            "interproc_summary": 10,
-                                            "semantic_summary": 20,
-                                        },
-                                    },
-                                }
-                            },
-                        }
-                    ],
-                }
-            ]
-        )
-
-        self.assertEqual(summary["cache"]["summary"]["hits"], 4)
-        self.assertNotIn("decompile", summary["cache"])
-        self.assertEqual(summary["fast_paths"]["summary_fast_path_count"], 1)
-        self.assertEqual(summary["fast_paths"]["summary_only_count"], 1)
-        self.assertEqual(summary["fast_paths"]["cache_hit_commands"], 1)
-        self.assertEqual(summary["fast_paths"]["semantic_granularity"], {"summary_only": 1})
-        self.assertEqual(summary["fast_paths"]["phase_timings_us"]["semantic_summary"], 20)
-        self.assertEqual(summary["fast_paths"]["counters"]["summary_attempted"], 1)
-        self.assertEqual(summary["fast_paths"]["counters"]["native_worker_summary_count"], 2)
+        self.assertEqual(benchmark.SCHEMA_VERSION, 14)
 
     def test_aggregate_reports_worst_targets_by_actionable_signal(self):
         summary = benchmark.aggregate(
@@ -2357,13 +2296,6 @@ class ReversingBenchmarkTests(unittest.TestCase):
                                     "elapsed_s": 0.2,
                                     "decompile_quality": {"classification": "residual"},
                                 },
-                                "types": {
-                                    "elapsed_s": 0.1,
-                                    "type_metrics": {
-                                        "generic_arg_count": 6,
-                                        "generic_type_count": 1,
-                                    },
-                                },
                             },
                         },
                         {
@@ -2372,13 +2304,6 @@ class ReversingBenchmarkTests(unittest.TestCase):
                                 "decompile_sla": {
                                     "elapsed_s": 0.3,
                                     "decompile_quality": {"classification": "structured"},
-                                },
-                                "types": {
-                                    "elapsed_s": 0.2,
-                                    "type_metrics": {
-                                        "generic_arg_count": 2,
-                                        "generic_type_count": 3,
-                                    },
                                 },
                             },
                         },
@@ -2398,35 +2323,33 @@ class ReversingBenchmarkTests(unittest.TestCase):
 
         self.assertEqual(
             [target["target"] for target in summary["worst_targets"]],
-            ["sym.hash_worker", "sym.residual_loop", "dbg.string_scan"],
+            ["sym.hash_worker", "sym.residual_loop"],
         )
         self.assertEqual(summary["worst_targets"][0]["hard_failures"], 1)
         self.assertEqual(summary["worst_targets"][0]["failure_kinds"], ["timeout"])
         self.assertEqual(summary["worst_targets"][1]["residual_commands"], 1)
-        self.assertEqual(summary["worst_targets"][1]["generic_arg_count"], 6)
-        self.assertEqual(summary["worst_targets"][2]["generic_type_count"], 3)
         self.assertEqual(summary["worst_targets"][0]["elapsed_s"], 2.0)
         self.assertEqual(
             summary["quality"]["owner_buckets"],
-            {"r2engine": 1, "r2sym": 1, "r2types": 12},
+            {"r2engine": 1, "r2sym": 1},
         )
         self.assertEqual(summary["worst_targets"][0]["owner_buckets"], {"r2engine": 1})
         self.assertEqual(
             summary["worst_targets"][1]["owner_buckets"],
-            {"r2sym": 1, "r2types": 7},
+            {"r2sym": 1},
         )
         self.assertEqual(summary["next_work"]["status"], "owner_work")
         self.assertEqual(
             summary["next_work"]["blocking_owners"],
-            ["r2types", "r2engine", "r2sym"],
+            ["r2engine", "r2sym"],
         )
         self.assertEqual(
             summary["next_work"]["owner_work_items"][0]["action"],
-            benchmark.OWNER_ACTIONS["r2types"],
+            benchmark.OWNER_ACTIONS["r2engine"],
         )
         self.assertEqual(
             [target["target"] for target in summary["next_work"]["owner_work_items"][0]["targets"]],
-            ["sym.residual_loop", "dbg.string_scan"],
+            ["sym.hash_worker"],
         )
         self.assertEqual(summary["next_work"]["setup"]["status"], "ok")
 
@@ -2585,7 +2508,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
                     "returncode": -11,
                     "section_status": "started_failed",
                 },
-                "types": {
+                "ssa_function_report": {
                     "returncode": None,
                     "section_status": "not_reached",
                 },
@@ -2595,7 +2518,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertTrue(benchmark.target_has_retryable_command(target))
         self.assertEqual(
             benchmark.retryable_command_names(target),
-            {"decompile_pdg", "types"},
+            {"decompile_pdg", "ssa_function_report"},
         )
         self.assertEqual(benchmark.timed_out_command_names(target), set())
 
@@ -2615,14 +2538,6 @@ class ReversingBenchmarkTests(unittest.TestCase):
                                 "attribution_mode": "command",
                                 "retry_origin": "target_timeout",
                                 "decompile_quality": {"classification": "empty"},
-                            },
-                            "types": {
-                                "elapsed_s": 0.2,
-                                "type_metrics": {
-                                    "generic_arg_count": 1,
-                                    "generic_type_count": 2,
-                                    "ret_type": "void*",
-                                },
                             },
                         },
                     },
@@ -2644,7 +2559,6 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertEqual(worst["timeouts"][0]["target"], "sym.binop")
         self.assertEqual(worst["timeouts"][0]["retry_origin"], "target_timeout")
         self.assertEqual(worst["fallbacks"][0]["family"], "quote_options")
-        self.assertEqual(worst["generic_type_targets"][0]["generic_count"], 3)
         self.assertEqual(worst["retry_attribution"]["command"], 1)
         self.assertEqual(worst["retry_attribution"]["command:command"], 1)
 
@@ -2747,7 +2661,9 @@ class ReversingBenchmarkTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             binary = Path(tmp) / "sample"
             binary.write_bytes(b"\x00")
-            commands = benchmark.target_commands(("decompile_sla", "types"))
+            commands = benchmark.target_commands(
+                ("decompile_sla", "ssa_function_report")
+            )
             cached_case = {
                 "targets": [
                     {
@@ -2791,11 +2707,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
             )
             batch_stdout = batched_stdout(
                 [
-                    (
-                        "t0_types",
-                        0,
-                        '{"ret_type":"int","params":[],"mutation_plan":{"mutations":[]}}',
-                    )
+                    ("t0_ssa_function_report", 0, SSA_FUNCTION_REPORT)
                 ]
             )
             seen_commands = []
@@ -2825,10 +2737,13 @@ class ReversingBenchmarkTests(unittest.TestCase):
                 commands,
             )
 
-        self.assertIn("a:sla.debug.types", seen_commands[0])
+        self.assertIn("a:sla.debug.ssa.func", seen_commands[0])
         self.assertNotIn("a:sla.dec", seen_commands[0])
         self.assertTrue(outputs[0]["commands"]["decompile_sla"]["resumed_from_checkpoint"])
-        self.assertEqual(outputs[0]["commands"]["types"]["returncode"], 0)
+        self.assertEqual(
+            outputs[0]["commands"]["ssa_function_report"]["returncode"],
+            0,
+        )
         self.assertEqual(outputs[0]["resumed_batch_events"][0]["child_max_rss_bytes"], 900)
         self.assertEqual(
             benchmark.aggregate(
@@ -2856,7 +2771,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertFalse(
             benchmark.case_result_has_incomplete_work(
                 {"targets": outputs},
-                ("decompile_sla", "types"),
+                ("decompile_sla", "ssa_function_report"),
             )
         )
 
@@ -2870,7 +2785,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
                                 "case": "sample",
                                 "corpus": "unit",
                                 "target": "sym.f",
-                                "command": "types",
+                                "command": "ssa_function_report",
                                 "repeat_idx": 0,
                                 "started_at": 2.0,
                                 "ended_at": 3.0,
@@ -2897,7 +2812,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
         ]
         self.assertEqual(
             [event["command"] for event in benchmark.collect_command_events(cases)],
-            ["decompile_sla", "types"],
+            ["decompile_sla", "ssa_function_report"],
         )
 
         before = {
@@ -2909,17 +2824,15 @@ class ReversingBenchmarkTests(unittest.TestCase):
                 "failures_by_kind": {"command_return": 1, "json_parse": 1},
                 "quality": {
                     "decompile": {"residual": 5},
-                    "generic_arg_total": 9,
-                    "generic_type_total": 12,
                     "radare2_candidate_count": 2,
                 },
-                "next_work": {"status": "owner_work", "blocking_owners": ["r2types"]},
+                "next_work": {"status": "owner_work", "blocking_owners": ["r2dec"]},
                 "slowest_commands": [
                     {
                         "corpus": "unit",
                         "case": "sample",
                         "target": "sym.f",
-                        "command": "types",
+                        "command": "ssa_function_report",
                         "elapsed_s": 10.0,
                     }
                 ],
@@ -2934,8 +2847,6 @@ class ReversingBenchmarkTests(unittest.TestCase):
                 "failures_by_kind": {},
                 "quality": {
                     "decompile": {"residual": 2},
-                    "generic_arg_total": 4,
-                    "generic_type_total": 5,
                     "radare2_candidate_count": 0,
                 },
                 "next_work": {"status": "clean", "blocking_owners": []},
@@ -2944,7 +2855,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
                         "corpus": "unit",
                         "case": "sample",
                         "target": "sym.f",
-                        "command": "types",
+                        "command": "ssa_function_report",
                         "elapsed_s": 3.0,
                     }
                 ],
@@ -2978,13 +2889,17 @@ class ReversingBenchmarkTests(unittest.TestCase):
                     {
                         "batch_event": shared_batch,
                         "command_events": [
-                            {"case": "sample", "command": "types", "started_at": 1.1}
+                            {"case": "sample", "command": "decompile_sla", "started_at": 1.1}
                         ],
                     },
                     {
                         "batch_event": {**shared_batch, "target": "sym.b"},
                         "command_events": [
-                            {"case": "sample", "command": "profile", "started_at": 1.2}
+                            {
+                                "case": "sample",
+                                "command": "ssa_function_report",
+                                "started_at": 1.2,
+                            }
                         ],
                     },
                 ]
@@ -2995,7 +2910,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
 
         self.assertEqual(
             [event["command"] for event in events],
-            ["case_batch", "types", "profile"],
+            ["case_batch", "decompile_sla", "ssa_function_report"],
         )
 
     def test_strict_quality_gate_checks_broad_quality_thresholds(self):
@@ -3005,8 +2920,6 @@ class ReversingBenchmarkTests(unittest.TestCase):
             {
                 "max_hard_failures": 0,
                 "max_residual_decompile": 2,
-                "max_generic_args": 4,
-                "max_generic_types": 5,
                 "min_average_score": 99.0,
                 "max_setup_command_ratio": 1.5,
                 "require_pdg_comparison": True,
@@ -3022,8 +2935,6 @@ class ReversingBenchmarkTests(unittest.TestCase):
                 "timing": {"setup_to_command_ratio": 2.0},
                 "quality": {
                     "decompile": {"residual": 3},
-                    "generic_arg_total": 4,
-                    "generic_type_total": 8,
                     "pdg_comparison": {
                         "successful_common_targets": 0,
                         "quality": {"pdg": 1},
@@ -3041,7 +2952,6 @@ class ReversingBenchmarkTests(unittest.TestCase):
             {failure["metric"] for failure in gate["failures"]},
             {
                 "average_score",
-                "generic_types",
                 "hard_failures",
                 "pdg_perf_wins",
                 "pdg_quality_wins",
@@ -3051,7 +2961,6 @@ class ReversingBenchmarkTests(unittest.TestCase):
                 "setup_command_ratio",
             },
         )
-        self.assertEqual(gate["checks"]["generic_args"]["value"], 4)
 
     def test_closure_gate_fails_incomplete_and_fake_semantics_even_with_high_score(self):
         args = type(
@@ -3061,8 +2970,6 @@ class ReversingBenchmarkTests(unittest.TestCase):
                 "closure_gate": True,
                 "max_hard_failures": 0,
                 "max_residual_decompile": 0,
-                "max_generic_args": 0,
-                "max_generic_types": 0,
                 "min_average_score": 99.5,
                 "max_setup_command_ratio": None,
                 "require_pdg_comparison": False,
@@ -3088,8 +2995,6 @@ class ReversingBenchmarkTests(unittest.TestCase):
                     "summary_pseudo_call_total": 0,
                     "raw_temp_stack_leak_total": 1,
                     "undefined_identifier_return_total": 1,
-                    "generic_arg_total": 0,
-                    "generic_type_total": 0,
                     "gold_oracle": {"advisory_mismatches": 0, "expectations": 0},
                     "pdg_comparison": {},
                 },
@@ -3152,7 +3057,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertEqual(args.max_functions, 12)
         self.assertEqual(args.timeout, 120)
         self.assertEqual(args.batch_target_size, 0)
-        self.assertEqual(args.commands, "decompile_sla,types,profile")
+        self.assertEqual(args.commands, "decompile_sla,ssa_function_report")
 
     def test_closure_gate_does_not_promote_source_shape_advisories(self):
         args = type(
@@ -3165,13 +3070,11 @@ class ReversingBenchmarkTests(unittest.TestCase):
                 "timeout": benchmark.DEFAULT_TIMEOUT,
                 "max_binaries_per_corpus": benchmark.DEFAULT_MAX_BINARIES_PER_CORPUS,
                 "batch_target_size": 0,
-                "commands": "decompile_sla,decompile_pdg,types,profile",
+                "commands": "decompile_sla,decompile_pdg,ssa_function_report",
                 "closure_gate": True,
                 "strict": False,
                 "max_hard_failures": None,
                 "max_residual_decompile": None,
-                "max_generic_args": None,
-                "max_generic_types": None,
                 "min_average_score": None,
                 "max_setup_command_ratio": None,
                 "require_pdg_comparison": False,
@@ -3186,58 +3089,13 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertTrue(args.strict)
         self.assertEqual(args.max_hard_failures, 0)
         self.assertEqual(args.max_residual_decompile, 0)
-        self.assertEqual(args.max_generic_args, 0)
-        self.assertEqual(args.max_generic_types, 0)
         self.assertEqual(args.min_average_score, 99.5)
         self.assertEqual(args.max_setup_command_ratio, 2.0)
-        self.assertFalse(hasattr(args, "max_gold_failures"))
         self.assertFalse(hasattr(args, "require_gold"))
         self.assertTrue(args.require_pdg_comparison)
         self.assertEqual(args.max_pdg_quality_wins, 0)
         self.assertIsNone(args.max_pdg_perf_wins)
         self.assertEqual(args.max_pdg_quality_then_perf_wins, 0)
-
-    def test_cache_probe_defaults_to_repeated_tier1_commands(self):
-        args = type(
-            "Args",
-            (),
-            {
-                "preset": "",
-                "focused_coreutils": False,
-                "max_functions": benchmark.DEFAULT_MAX_FUNCTIONS,
-                "timeout": benchmark.DEFAULT_TIMEOUT,
-                "max_binaries_per_corpus": benchmark.DEFAULT_MAX_BINARIES_PER_CORPUS,
-                "batch_target_size": 0,
-                "commands": "",
-                "repeat": 1,
-                "cache_probe": True,
-                "isolate_commands": False,
-                "r2": "r2",
-                "analysis": "aaa",
-                "include_sensitive": False,
-                "manifest": "",
-                "manifest_only": False,
-                "no_repo_fixtures": False,
-                "target": [],
-                "baseline_plugin_dir": [],
-            },
-        )()
-
-        benchmark.apply_preset_defaults(args)
-        config = benchmark.benchmark_execution_config(
-            args,
-            {"hash": "plugin-a", "files": []},
-            total_jobs=1,
-            case_jobs=1,
-            command_jobs=1,
-        )
-
-        self.assertEqual(args.repeat, 2)
-        self.assertEqual(args.commands, "decompile_sla,types,profile")
-        self.assertTrue(config["cache_probe"])
-        self.assertEqual(config["repeat"], 2)
-        self.assertFalse(config["raw_output_archive"])
-        self.assertIsNone(config["raw_output_archive_root_hash"])
 
     def test_manifest_max_functions_can_be_overridden_for_broad_runs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3388,7 +3246,6 @@ class ReversingBenchmarkTests(unittest.TestCase):
 
         self.assertEqual(config["schema"], benchmark.FIXED_PERFORMANCE_GATE_SCHEMA_VERSION)
         self.assertEqual(config["contract"]["target"], "fnv_fold")
-        self.assertEqual(config["expected_refusal"]["target"], "mem_scan2")
         self.assertEqual(config["contract"]["cold_samples"], 20)
         self.assertEqual(config["contract"]["warm_sessions"], 4)
         self.assertEqual(config["contract"]["warm_samples_per_session"], 5)
@@ -3397,7 +3254,11 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertEqual(len(config["contract"]["binary_sha256"]), 64)
         self.assertEqual(
             config["validation_observation"]["runner_fingerprint"]["radare2_abi"],
-            132,
+            138,
+        )
+        self.assertEqual(
+            config["contract"]["commands"],
+            ["decompile_sla", "ssa_function_report"],
         )
         for command_gate in config["gates"]["commands"].values():
             for limit in command_gate.values():
@@ -3601,6 +3462,170 @@ class ReversingBenchmarkTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "non-maximum p95 rank"):
                 benchmark.load_fixed_performance_config(path)
 
+    def test_ssa_function_report_summary_and_admission_require_prepared_blocks(self):
+        valid_summary = benchmark.command_summary(
+            "ssa_function_report",
+            cmd_result(SSA_FUNCTION_REPORT),
+            False,
+        )
+
+        self.assertEqual(valid_summary["json_kind"], "dict")
+        self.assertEqual(
+            valid_summary["ssa_function_report_metrics"],
+            {
+                "schema_version": 1,
+                "entry": 0x1000,
+                "entry_hex": "0x1000",
+                "num_blocks": 1,
+                "block_count": 1,
+                "blocks_well_formed": True,
+                "entry_block_present": True,
+                "prepared_object": True,
+                "formal_parameters_list": True,
+                "parameter_addresses_list": True,
+            },
+        )
+        self.assertEqual(
+            benchmark._fixed_performance_command_output_valid(
+                {
+                    "addr": 0x1000,
+                    "commands": {"ssa_function_report": valid_summary},
+                },
+                "ssa_function_report",
+            ),
+            (True, None),
+        )
+
+        valid_payload = ssa_function_report_payload()
+
+        def top(key, value):
+            return {**valid_payload, key: value}
+
+        def without_top(key):
+            return {name: value for name, value in valid_payload.items() if name != key}
+
+        def block(**changes):
+            return {**valid_payload, "blocks": [{**valid_payload["blocks"][0], **changes}]}
+
+        def block_without(key):
+            item = {
+                name: value
+                for name, value in valid_payload["blocks"][0].items()
+                if name != key
+            }
+            return {**valid_payload, "blocks": [item]}
+
+        def prepared(**changes):
+            return {
+                **valid_payload,
+                "prepared": {**valid_payload["prepared"], **changes},
+            }
+
+        def prepared_without(key):
+            facts = {
+                name: value
+                for name, value in valid_payload["prepared"].items()
+                if name != key
+            }
+            return {**valid_payload, "prepared": facts}
+
+        invalid_payloads = (
+            ([], "JSON object"),
+            (without_top("schema_version"), "schema version"),
+            (top("schema_version", 2), "schema version"),
+            (top("schema_version", True), "schema version"),
+            (top("schema_version", "1"), "schema version"),
+            (without_top("entry"), "numeric entry"),
+            (top("entry", "0x1000"), "numeric entry"),
+            (top("entry", True), "numeric entry"),
+            (without_top("entry_hex"), "entry_hex"),
+            (top("entry_hex", "not-an-address"), "entry_hex"),
+            (top("entry_hex", "0x2000"), "entry_hex"),
+            (without_top("num_blocks"), "positive num_blocks"),
+            (top("num_blocks", 0), "positive num_blocks"),
+            (top("num_blocks", True), "positive num_blocks"),
+            (top("num_blocks", 2), "does not match num_blocks"),
+            (without_top("blocks"), "does not match num_blocks"),
+            (top("blocks", {}), "does not match num_blocks"),
+            (top("blocks", []), "does not match num_blocks"),
+            (top("blocks", [None]), "malformed block"),
+            (block_without("addr"), "malformed block"),
+            (block(addr="0x1000"), "malformed block"),
+            (block(addr=True), "malformed block"),
+            (block_without("addr_hex"), "malformed block"),
+            (block(addr_hex="not-an-address"), "malformed block"),
+            (block(addr_hex="0x2000"), "malformed block"),
+            (block_without("size"), "malformed block"),
+            (block(size=0), "malformed block"),
+            (block(size=True), "malformed block"),
+            (block_without("phis"), "malformed block"),
+            (block(phis={}), "malformed block"),
+            (block_without("ops"), "malformed block"),
+            (block(ops={}), "malformed block"),
+            (
+                block(addr=0x2000, addr_hex="0x2000"),
+                "entry block",
+            ),
+            (without_top("prepared"), "prepared object"),
+            (top("prepared", []), "prepared object"),
+            (prepared_without("formal_parameters"), "formal_parameters"),
+            (prepared(formal_parameters={}), "formal_parameters"),
+            (prepared_without("parameter_addresses"), "parameter_addresses"),
+            (prepared(parameter_addresses={}), "parameter_addresses"),
+            (
+                {
+                    "schema_version": 1,
+                    "entry": 0x1000,
+                    "entry_hex": "0x1000",
+                    "num_blocks": 1,
+                    "blocks": [{}],
+                    "prepared": {},
+                },
+                "malformed block",
+            ),
+        )
+        for payload, expected_reason in invalid_payloads:
+            with self.subTest(expected_reason=expected_reason):
+                summary = benchmark.command_summary(
+                    "ssa_function_report",
+                    cmd_result(json.dumps(payload)),
+                    False,
+                )
+                target = {
+                    "name": "sym.sample",
+                    "addr": 0x1000,
+                    "commands": {"ssa_function_report": summary},
+                }
+                valid, reason = benchmark._fixed_performance_command_output_valid(
+                    target,
+                    "ssa_function_report",
+                )
+                self.assertFalse(valid)
+                self.assertIn(expected_reason, reason or "")
+                failures = benchmark.collect_failures(
+                    {
+                        "discovery": {"returncode": 0, "function_count": 1},
+                        "targets": [target],
+                    }
+                )
+                self.assertEqual(len(failures), 1)
+                self.assertEqual(failures[0]["kind"], "invalid_ssa_function_report")
+                self.assertEqual(failures[0]["primary_failure_taxonomy"], "semantic")
+                self.assertIn(expected_reason, failures[0]["reason"])
+                self.assertEqual(benchmark.score_case({"failures": failures}), 90)
+                self.assertEqual(
+                    benchmark._hard_failure_count(
+                        {
+                            "summary": {
+                                "failures_by_kind": {
+                                    "invalid_ssa_function_report": 1,
+                                }
+                            }
+                        }
+                    ),
+                    1,
+                )
+
     def test_fixed_performance_probe_rejects_stale_abi_and_noop_plugin(self):
         config = benchmark.load_fixed_performance_config(
             ROOT / "tests" / "gold" / "mem_scan2_performance.json"
@@ -3618,8 +3643,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
                     ("plugin_help", 0, "| pdd - borrowed-snapshot provider"),
                     ("plugin_status", 0, "sla: loaded architecture 'x86'"),
                     ("decompile_sla", 0, ""),
-                    ("types", 0, ""),
-                    ("profile", 0, ""),
+                    ("ssa_function_report", 0, ""),
                 ]
             )
         )
@@ -3629,8 +3653,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
                     ("plugin_help", 0, "| pdd - borrowed-snapshot provider"),
                     ("plugin_status", 0, "sla: loaded architecture 'x86'"),
                     ("decompile_sla", 0, "int f(void) { return 1; }"),
-                    ("types", 0, '{"ret_type":"int","params":[]}'),
-                    ("profile", 0, '{"count":1}'),
+                    ("ssa_function_report", 0, SSA_FUNCTION_REPORT),
                 ]
             )
         )
@@ -3651,13 +3674,14 @@ class ReversingBenchmarkTests(unittest.TestCase):
             {},
             mock.Mock(side_effect=[discovery, noop]),
         )
+        healthy_runner = mock.Mock(side_effect=[discovery, healthy])
         healthy_probe = benchmark.fixed_performance_plugin_probe(
             config,
             "r2",
             Path("/tmp/sample"),
             30,
             {},
-            mock.Mock(side_effect=[discovery, healthy]),
+            healthy_runner,
         )
 
         self.assertEqual(stale_probe["status"], "failed")
@@ -3668,6 +3692,10 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertTrue(
             all(item["valid"] for item in healthy_probe["commands"].values())
         )
+        probe_script = healthy_runner.call_args_list[1].args[2]
+        self.assertIn("a:sla.debug.ssa.func", probe_script)
+        self.assertNotIn("a:sla.debug.profilej", probe_script)
+        self.assertNotIn(">/dev/null", probe_script)
 
     def test_fixed_performance_availability_executes_and_requires_abi_probe(self):
         config = benchmark.load_fixed_performance_config(
@@ -3705,7 +3733,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertIn("plugin ABI/load probe: stale ABI", availability["reasons"])
 
     def test_fixed_performance_measurements_refuse_noop_or_external_timing(self):
-        commands = ("decompile_sla", "types", "profile")
+        commands = ("decompile_sla", "ssa_function_report")
         measurements = {
             "commands": {
                 command: {"cold": [], "warm": []} for command in commands
@@ -3714,20 +3742,13 @@ class ReversingBenchmarkTests(unittest.TestCase):
             "invalid_samples": [],
         }
         target = {
+            "addr": 0x1000,
             "commands": {
                 "decompile_sla": {
                     "stdout": {"bytes": 0},
                     "decompile_quality": {"classification": "empty"},
                 },
-                "types": {
-                    "stdout": {"bytes": 2},
-                    "json_kind": "dict",
-                },
-                "profile": {
-                    "stdout": {"bytes": 11},
-                    "json_kind": "dict",
-                    "profile_metrics": {"count": 1},
-                },
+                "ssa_function_report": ssa_function_report_summary(),
             },
             "command_events": [
                 {
@@ -3737,8 +3758,12 @@ class ReversingBenchmarkTests(unittest.TestCase):
                     "returncode": 0,
                     "timeout": False,
                     "elapsed_s": 0.000001,
-                    "timed": command != "profile",
-                    "timer": "r2_prof" if command != "profile" else "legacy_or_fallback",
+                    "timed": command != "ssa_function_report",
+                    "timer": (
+                        "r2_prof"
+                        if command != "ssa_function_report"
+                        else "legacy_or_fallback"
+                    ),
                     "child_max_rss_bytes": 123,
                 }
                 for command in commands
@@ -3756,7 +3781,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
             all(not values["cold"] for values in measurements["commands"].values())
         )
         self.assertEqual(measurements["rss"]["cold"], [])
-        self.assertEqual(len(measurements["invalid_samples"]), 3)
+        self.assertEqual(len(measurements["invalid_samples"]), 2)
 
     def test_fixed_performance_runner_schedules_cold_and_fresh_warm_sessions(self):
         config_path = ROOT / "tests" / "gold" / "mem_scan2_performance.json"
@@ -3791,20 +3816,11 @@ class ReversingBenchmarkTests(unittest.TestCase):
                         "stdout": {"bytes": 24},
                         "decompile_quality": {"classification": "structured"},
                     }
-                elif command == "types":
-                    command_entries[command] = {
-                        "stdout": {"bytes": 24},
-                        "json_kind": "dict",
-                        "type_metrics": {"ret_type": "int"},
-                    }
-                elif command == "profile":
-                    command_entries[command] = {
-                        "stdout": {"bytes": 24},
-                        "json_kind": "dict",
-                        "profile_metrics": {"count": 1},
-                    }
+                elif command == "ssa_function_report":
+                    command_entries[command] = ssa_function_report_summary()
             target = {
                 "requested": config["contract"]["target"],
+                "addr": 0x1000,
                 "command_events": events,
                 "commands": command_entries,
             }

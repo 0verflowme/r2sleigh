@@ -106,7 +106,6 @@ struct ApiV2 {
     analysis_query: usize,
     analysis_result_view: usize,
     analysis_result_free: usize,
-    engine_cache_reset: usize,
     planner_query: usize,
 }
 

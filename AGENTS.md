@@ -13,7 +13,7 @@ is a gold-standard radare2 analysis engine where:
 - one canonical fact has one canonical owner
 - facts flow through typed contracts, not JSON reparsing
 - decompiler, types, symbolic execution, and radare2 core views agree
-- expensive work is summarized, cached, and reused
+- expensive work is summarized and reused only when real session traces prove value
 - output is deterministic
 - architecture and API seams may be rewritten whenever the rewrite is cleaner
 
@@ -47,7 +47,7 @@ belongs there. Most semantic/type/cache/route fixes should move upstream.
 7. `r2types::FunctionTypeFacts` is the canonical type/layout/signature payload.
 8. `r2sym::SemanticArtifact` is the canonical semantic artifact.
 9. `r2sym` owns semantic policy and evidence; consumers interpret it.
-10. `r2engine` owns session orchestration, route selection, cache reuse, and
+10. `r2engine` owns request orchestration, route selection, and
     refusal/fallback policy.
 11. Symbol names are hints, not authoritative semantic ownership.
 12. Deterministic ordering beats cleverness.
@@ -182,7 +182,7 @@ same class of bug:
 - hardcoded role signatures overriding stronger typed context
 - decompiler-side call argument repair hiding missing callsite provenance
 - decompiler-side stack placeholder cleanup hiding missing stack-slot facts
-- plugin-side route/fallback decisions that bypass typed session policy
+- plugin-side route/fallback decisions that bypass typed request policy
 
 Correct responses:
 
@@ -255,9 +255,9 @@ Use this map by default:
   - canonical `FunctionTypeFacts`
   - canonical combined `FunctionFacts`
 - `crates/r2engine`
-  - typed session orchestration
-  - route selection for decompile/type/query/profile requests
-  - analysis/artifact cache keys and invalidation boundaries
+  - typed request orchestration
+  - route selection for decompile/type/query requests
+  - refusal boundaries and request-local execution metrics
   - shared cost/metrics/refusal policy
   - cross-crate request/response API used by plugin glue
 - `crates/r2dec`
@@ -293,8 +293,6 @@ These are the preferred subsystem seams:
   - canonical type/layout/signature payload
 - `r2types::FunctionFacts`
   - canonical combined type+semantic payload
-- `r2engine::{AnalysisCacheKey, ArtifactCacheKey}`
-  - canonical session cache/invalidation surfaces
 - `r2engine` typed request/response APIs
   - canonical orchestration surface for plugin command paths
 - `r2dec::SemanticRoutePlan`
@@ -375,7 +373,7 @@ When current architecture blocks correctness, composability, or efficiency:
 Avoid:
 
 - plugin-side reparsing
-- plugin-side route/session/cache policy
+- plugin-side route or request policy
 - decompiler-side type policy
 - decompiler-side call argument or stack-slot repair that should be a canonical fact
 - consumer-local semantic policy that should live in `r2sym`
@@ -649,7 +647,7 @@ Do not claim the seam is fixed without both sides being green.
 
 1. Put semantic policy in `r2sym`.
 2. Put evidence and ambiguity in canonical artifact/evidence types.
-3. Put session routing in `r2engine` and semantic capability plans in `r2sym`.
+3. Put request routing in `r2engine` and semantic capability plans in `r2sym`.
 4. Let `r2types` / `r2dec` consume those plans; do not reinvent them.
 5. Add solver-budget and determinism coverage where applicable.
 
@@ -660,7 +658,7 @@ Do not claim the seam is fixed without both sides being green.
    evidence.
 3. Put summary policy/evidence in `r2sym`.
 4. Put signature/type projection in `r2types`.
-5. Put route selection/cache reuse in `r2engine`.
+5. Put route selection and any trace-proven reuse in `r2engine`.
 6. Put rendering only in `r2dec`.
 7. Add a negative test for the fake-output class you are preventing.
 
@@ -711,7 +709,7 @@ There are two different block types in `r2ssa`:
 | `crates/r2sym/src/semantics/native_worker.rs` | changing native-worker summary classification or evidence |
 | `crates/r2types/src/` | changing type inference, layouts, canonical function facts |
 | `crates/r2types/src/role_registry.rs` | changing role/signature hints or canonical helper signatures |
-| `crates/r2engine/src/` | changing session orchestration, route selection, cache keys, or engine metrics |
+| `crates/r2engine/src/` | changing request orchestration, route selection, or engine metrics |
 | `crates/r2dec/src/` | changing lowering, structuring, rendering |
 | `r2plugin/src/lib.rs` | changing plugin-side Rust logic and JSON payloads |
 | `r2plugin/r_anal_sleigh.c` | changing command dispatch/help or C-side integration |

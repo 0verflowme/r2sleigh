@@ -7,7 +7,7 @@ fn detached_production_input_refuses_before_legacy_certified_c() {
     block.push(R2ILOp::Return {
         target: Varnode::constant(0, 8),
     });
-    let response = EngineSession::new(4).decompile_function_from_input(
+    let response = EngineSession::new().decompile_function_from_input(
         EngineFunctionDecompileRequestInput::single_function(
             EngineFunctionInput {
                 function_name: "legacy_route_interlock".to_string(),
@@ -19,7 +19,6 @@ fn detached_production_input_refuses_before_legacy_certified_c() {
             },
             Some(64),
             r2types::ParsedExternalContext::default(),
-            0,
         ),
     );
     let route = response

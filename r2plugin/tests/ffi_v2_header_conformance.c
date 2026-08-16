@@ -161,7 +161,7 @@ int main(void) {
 		|| !api->owned_bytes_view || !api->owned_bytes_free
 		|| !api->analysis_render || !api->analysis_query
 		|| !api->analysis_result_view || !api->analysis_result_free
-		|| !api->engine_cache_reset || !api->planner_query) {
+		|| !api->planner_query) {
 		return 1;
 	}
 	if (!data_ref_contract_matches (api, api->data_ref_size, R2SLEIGH_DATA_REF_SCHEMA_V2)

@@ -1,7 +1,7 @@
 pub(crate) fn run_engine_decompile(
     input: r2engine::EngineFunctionDecompileRequestInput,
 ) -> r2engine::EngineDecompileResponse {
-    crate::types::engine_session().decompile_function_from_input(input)
+    r2engine::EngineSession::new().decompile_function_from_input(input)
 }
 
 #[cfg(test)]

@@ -107,7 +107,7 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 wx 48837df8000000000000000000000000
 s 0 >/dev/null
-a:sla.debug.ssa | jq -c 'length>0 and (.[0]|has("op")) and (tostring|contains("RBP_"))'
+a:sla.debug.ssa | jq -c '(.schema_version==1) and (.operations|length>0) and (.operations[0]|has("op")) and (.operations|tostring|contains("RBP_"))'
 EOF_CMDS
 RUN
 
@@ -120,20 +120,7 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 wx 4883c001000000000000000000000000
 s 0 >/dev/null
-a:sla.debug.ssa | jq -c '([.[]|select(.op=="IntAdd")]|length)==1 and ([.[]|select(.op=="IntAdd")][0].dst=="RAX_1") and (([.[]|select(.op=="IntAdd")][0].sources|index("RAX_0"))!=null)'
-EOF_CMDS
-RUN
-
-NAME=types_ignore_epilogue_return_address_as_stack_argument
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-s `isq~check_secret[0]` >/dev/null
-af
-a:sla.debug.types | jq -c '(.params | length) == 1 and .params[0].name == "arg0" and ([.var_type_candidates[]? | select(.isarg and .name == "arg6")] | length) == 0'
+a:sla.debug.ssa | jq -c '(.schema_version==1) and ([.operations[]|select(.op=="IntAdd")]|length)==1 and ([.operations[]|select(.op=="IntAdd")][0].dst=="RAX_1") and (([.operations[]|select(.op=="IntAdd")][0].sources|index("RAX_0"))!=null)'
 EOF_CMDS
 RUN
 
@@ -343,20 +330,6 @@ CMDS=<<EOF_CMDS
 s `isq~check_secret[0]` >/dev/null
 af
 a:sla.debug.slice ZF_1 | jq -c '.sink_var == "ZF_1"'
-EOF_CMDS
-RUN
-
-NAME=types_interproc_wrapper_uses_cached_callee_payload
-FILE=bins/test_func_x86
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-true
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-aaaa
-s `isq~alloc_wrapper2[0]` >/dev/null
-af
-a:sla.debug.types | jq -c '(.ret_type == "allocation_ptr") and (.interproc.summary != null) and (((.interproc.scope.payloads // []) | length) >= 1)'
 EOF_CMDS
 RUN
 

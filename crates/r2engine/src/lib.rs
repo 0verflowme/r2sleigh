@@ -2,13 +2,12 @@
 //!
 //! Fact ownership stays in the lower crates: SSA in `r2ssa`, semantic artifacts
 //! in `r2sym`, type facts in `r2types`, and rendering in `r2dec`. This crate is
-//! the session-level scheduler/cache boundary that decides which artifacts are
-//! needed for a request. Only immutable SSA analysis is reused across requests;
-//! request-specific semantic, type, and render artifacts are never cached.
+//! the request-level scheduler boundary that decides which artifacts are
+//! needed for a request. Analysis artifacts are built directly for each
+//! source snapshot request.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::OpenOptions;
-use std::hash::Hash;
 use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,23 +21,18 @@ use r2types::{
 };
 use serde::{Deserialize, Serialize};
 
-mod cache;
 mod route;
-mod stable_hash;
 
-use cache::SessionCache;
-pub use cache::{CacheCounters, EngineSessionCacheMetrics};
 pub use route::{
     DecompileProbeDecision, EngineDiagnostics, EngineFunctionIdentity, EnginePlan,
-    EngineProfileRouteDecision, EngineProfileRouteKind, EngineRequestKind, EngineRequestPlan,
-    EngineRouteContext, EngineRouteDecision, EngineSemanticKernelRegion,
-    EngineSemanticKernelRender, EngineTypeRouteDecision, EngineTypeRouteKind,
-    EngineTypedRouteDecision, cfg_guard_reason, cfg_guard_reason_from_summary,
-    plan_profile_request, plan_type_request, prefer_symbolic_large_worker_decompile,
-    profile_route_decision, select_engine_plan, semantic_artifact_needs_fallback_type_payload,
-    semantic_or_cfg_prefers_bounded_type_plan, should_guard_program_orchestrator_decompile,
-    should_use_prepared_semantic_view, type_cfg_allows_semantic_plan, type_cfg_bounded_reason,
-    type_cfg_forces_bounded_plan, type_cfg_prefers_bounded_plan, type_route_decision,
+    EngineRequestKind, EngineRequestPlan, EngineRouteContext, EngineRouteDecision,
+    EngineSemanticKernelRegion, EngineSemanticKernelRender, EngineTypeRouteDecision,
+    EngineTypeRouteKind, EngineTypedRouteDecision, cfg_guard_reason, cfg_guard_reason_from_summary,
+    plan_type_request, prefer_symbolic_large_worker_decompile, select_engine_plan,
+    semantic_artifact_needs_fallback_type_payload, semantic_or_cfg_prefers_bounded_type_plan,
+    should_guard_program_orchestrator_decompile, should_use_prepared_semantic_view,
+    type_cfg_allows_semantic_plan, type_cfg_bounded_reason, type_cfg_forces_bounded_plan,
+    type_cfg_prefers_bounded_plan, type_route_decision,
 };
 #[cfg(test)]
 use route::{
@@ -49,14 +43,6 @@ use route::{
     decompile_probe_decision_for_identity, decompile_route_decision,
     proof_coverage_from_type_facts, raw_cfg_risk_summary_for_preprobe,
 };
-pub use stable_hash::{
-    stable_arch_hash, stable_blocks_hash, stable_fnv1a_bytes, stable_fnv1a_debug_hash,
-    stable_fnv1a_hash,
-};
-
-pub const ENGINE_SCHEMA_VERSION: u32 = 11;
-pub const ENGINE_SOURCE_SNAPSHOT_SCHEMA_VERSION: u32 = 6;
-pub const DEFAULT_ENGINE_CACHE_LIMIT: usize = 256;
 pub const SYMBOLIC_PATHS_LIMIT: usize = 32;
 pub const SYMBOLIC_PATHS_CALL_FREE_MAX_STATES: usize = 16;
 pub const SYMBOLIC_PATHS_CALL_FREE_MAX_DEPTH: usize = 64;
@@ -89,7 +75,6 @@ const MISSING_SOURCE_SNAPSHOT_REFUSAL: &str =
 /// revision identity or upgrade absent interface data into authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineSourceSnapshot {
-    schema_version: u32,
     revision_identity: Box<[u8]>,
     function_interface: Option<r2ssa::SourceFunctionInterface>,
     call_site_interfaces: Box<[r2ssa::SourceCallSiteInterface]>,
@@ -147,15 +132,10 @@ impl EngineSourceSnapshot {
             }
         }
         Ok(Self {
-            schema_version: ENGINE_SOURCE_SNAPSHOT_SCHEMA_VERSION,
             revision_identity: revision_identity.into_boxed_slice(),
             function_interface,
             call_site_interfaces: call_site_interfaces.into_boxed_slice(),
         })
-    }
-
-    pub const fn schema_version(&self) -> u32 {
-        self.schema_version
     }
 
     pub const fn revision_identity(&self) -> &[u8] {
@@ -168,12 +148,6 @@ impl EngineSourceSnapshot {
 
     pub const fn call_site_interfaces(&self) -> &[r2ssa::SourceCallSiteInterface] {
         &self.call_site_interfaces
-    }
-
-    /// Deterministic identity of every exact source byte retained by this
-    /// snapshot, including logical carriers, reachable layouts, and callsites.
-    pub fn payload_identity(&self) -> u64 {
-        stable_fnv1a_debug_hash(self)
     }
 }
 
@@ -453,31 +427,6 @@ pub struct EngineExternalCalleeInput {
     pub signature: EngineExternalSignatureInput,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EngineParsedExternalContext {
-    pub parsed_context: r2types::ParsedExternalContext,
-    pub fallback_hash: u64,
-    pub context_identity_hash: u64,
-    pub assumptions_hash: u64,
-}
-
-pub fn parse_external_context_json_for_engine(
-    json_str: &str,
-    ptr_bits: u32,
-) -> EngineParsedExternalContext {
-    let parsed_context = r2types::parse_external_context_json(json_str, ptr_bits);
-    let fallback_hash = stable_fnv1a_hash(json_str);
-    let context_identity_hash =
-        session_context_identity_hash_from_parsed(&parsed_context, fallback_hash);
-    let assumptions_hash = assumptions_identity_hash(&parsed_context.assumptions);
-    EngineParsedExternalContext {
-        parsed_context,
-        fallback_hash,
-        context_identity_hash,
-        assumptions_hash,
-    }
-}
-
 pub fn parse_typed_external_context(
     input: EngineExternalContextInput,
     ptr_bits: u32,
@@ -519,23 +468,6 @@ pub fn parse_typed_external_context(
     }
 
     r2types::parse_external_context(raw, ptr_bits)
-}
-
-pub fn parse_typed_external_context_for_engine(
-    input: EngineExternalContextInput,
-    ptr_bits: u32,
-) -> EngineParsedExternalContext {
-    let parsed_context = parse_typed_external_context(input, ptr_bits);
-    let fallback_hash = 0;
-    let context_identity_hash =
-        session_context_identity_hash_from_parsed(&parsed_context, fallback_hash);
-    let assumptions_hash = assumptions_identity_hash(&parsed_context.assumptions);
-    EngineParsedExternalContext {
-        parsed_context,
-        fallback_hash,
-        context_identity_hash,
-        assumptions_hash,
-    }
 }
 
 fn engine_external_signature_input_is_empty(signature: &EngineExternalSignatureInput) -> bool {
@@ -1015,7 +947,6 @@ pub enum EnginePhaseStatus {
     /// The phase executed inside the elapsed span attributed to another
     /// boundary. Its zero duration means "not separately measured", not free.
     Folded,
-    Reused,
     Refused,
 }
 
@@ -2241,236 +2172,6 @@ impl EngineRenderTarget {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AnalysisCacheKey {
-    #[serde(deserialize_with = "deserialize_engine_schema_version")]
-    pub schema_version: u32,
-    pub source_snapshot_schema_version: Option<u32>,
-    pub source_revision_identity: Option<Box<[u8]>>,
-    pub source_payload_identity: Option<u64>,
-    pub function_name_hash: u64,
-    pub arch_hash: u64,
-    pub blocks_hash: u64,
-}
-
-fn deserialize_engine_schema_version<'de, D>(deserializer: D) -> Result<u32, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let schema_version = u32::deserialize(deserializer)?;
-    if schema_version == ENGINE_SCHEMA_VERSION {
-        Ok(schema_version)
-    } else {
-        Err(serde::de::Error::custom(format_args!(
-            "unsupported r2engine cache-key schema version {schema_version}; expected {ENGINE_SCHEMA_VERSION}"
-        )))
-    }
-}
-
-impl AnalysisCacheKey {
-    pub fn from_immutable_parts(
-        function_name: &str,
-        arch: Option<&r2il::ArchSpec>,
-        blocks: &[R2ILBlock],
-        source_snapshot: Option<&EngineSourceSnapshot>,
-    ) -> Self {
-        Self::from_immutable_hashes(
-            stable_fnv1a_hash(&function_name),
-            stable_arch_hash(arch),
-            stable_blocks_hash(blocks),
-            source_snapshot,
-        )
-    }
-
-    pub fn from_immutable_hashes(
-        function_name_hash: u64,
-        arch_hash: u64,
-        blocks_hash: u64,
-        source_snapshot: Option<&EngineSourceSnapshot>,
-    ) -> Self {
-        Self {
-            schema_version: ENGINE_SCHEMA_VERSION,
-            source_snapshot_schema_version: source_snapshot
-                .map(EngineSourceSnapshot::schema_version),
-            source_revision_identity: source_snapshot
-                .map(|snapshot| snapshot.revision_identity().to_vec().into_boxed_slice()),
-            source_payload_identity: source_snapshot.map(EngineSourceSnapshot::payload_identity),
-            function_name_hash,
-            arch_hash,
-            blocks_hash,
-        }
-    }
-
-    /// Compatibility constructor. Request-specific arguments do not
-    /// participate in immutable analysis identity.
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_parts(
-        _function_addr: u64,
-        function_name: &str,
-        arch: Option<&r2il::ArchSpec>,
-        blocks: &[R2ILBlock],
-        _typed_context_hash: u64,
-        _assumptions_hash: u64,
-        _analysis_depth: &str,
-        source_snapshot: Option<&EngineSourceSnapshot>,
-    ) -> Self {
-        Self::from_immutable_parts(function_name, arch, blocks, source_snapshot)
-    }
-
-    /// Compatibility constructor. Request-specific hashes do not participate
-    /// in immutable analysis identity.
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_hashes(
-        _function_addr: u64,
-        function_name_hash: u64,
-        arch_hash: u64,
-        blocks_hash: u64,
-        _typed_context_hash: u64,
-        _assumptions_hash: u64,
-        _analysis_depth_hash: u64,
-        source_snapshot: Option<&EngineSourceSnapshot>,
-    ) -> Self {
-        Self::from_immutable_hashes(function_name_hash, arch_hash, blocks_hash, source_snapshot)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum EngineCacheLayer {
-    Analysis,
-    MetricsSnapshot,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum EngineCacheReuse {
-    Miss,
-    Hit,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct EngineCachePlan {
-    pub request: EngineRequestKind,
-    pub layer: EngineCacheLayer,
-    pub lookup: bool,
-    pub store_on_miss: bool,
-}
-
-impl EngineCachePlan {
-    pub fn lookup_store(request: EngineRequestKind, layer: EngineCacheLayer) -> Self {
-        Self {
-            request,
-            layer,
-            lookup: true,
-            store_on_miss: true,
-        }
-    }
-
-    pub fn disabled(request: EngineRequestKind, layer: EngineCacheLayer) -> Self {
-        Self {
-            request,
-            layer,
-            lookup: false,
-            store_on_miss: false,
-        }
-    }
-
-    pub fn for_request(request: EngineRequestKind) -> Self {
-        match request {
-            EngineRequestKind::Decompile
-            | EngineRequestKind::Types
-            | EngineRequestKind::SymbolicQuery
-            | EngineRequestKind::DebugFacts => {
-                Self::lookup_store(request, EngineCacheLayer::Analysis)
-            }
-            EngineRequestKind::Profile => {
-                Self::disabled(request, EngineCacheLayer::MetricsSnapshot)
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EngineCacheReuseDecision {
-    pub request: EngineRequestKind,
-    pub layer: EngineCacheLayer,
-    pub reuse: EngineCacheReuse,
-}
-
-impl EngineCacheReuseDecision {
-    pub fn from_lookup(
-        request: EngineRequestKind,
-        layer: EngineCacheLayer,
-        cache_hit: bool,
-    ) -> Self {
-        Self {
-            request,
-            layer,
-            reuse: if cache_hit {
-                EngineCacheReuse::Hit
-            } else {
-                EngineCacheReuse::Miss
-            },
-        }
-    }
-
-    pub fn is_hit(&self) -> bool {
-        matches!(self.reuse, EngineCacheReuse::Hit)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct EngineCacheLookup<T> {
-    pub value: Option<T>,
-    pub decision: EngineCacheReuseDecision,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EngineRequestKey {
-    pub analysis: AnalysisCacheKey,
-    pub function_addr: u64,
-    pub typed_context_hash: u64,
-    pub assumptions_hash: u64,
-    pub analysis_depth_hash: u64,
-    pub ptr_bits: u32,
-    pub reg_type_hints_hash: u64,
-    pub interproc_budget_hash: u64,
-    pub symbolic_scope_hash: u64,
-    pub semantic_schema_version: u32,
-    pub semantic_claim_schema_version: u32,
-}
-
-impl EngineRequestKey {
-    /// Builds a complete request identity from the immutable analysis key and
-    /// every request-specific input hash.
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_request_hashes(
-        analysis: AnalysisCacheKey,
-        function_addr: u64,
-        typed_context_hash: u64,
-        assumptions_hash: u64,
-        analysis_depth_hash: u64,
-        ptr_bits: u32,
-        reg_type_hints_hash: u64,
-        interproc_budget_hash: u64,
-        symbolic_scope_hash: u64,
-    ) -> Self {
-        Self {
-            analysis,
-            function_addr,
-            typed_context_hash,
-            assumptions_hash,
-            analysis_depth_hash,
-            ptr_bits,
-            reg_type_hints_hash,
-            interproc_budget_hash,
-            symbolic_scope_hash,
-            semantic_schema_version: r2sym::SEMANTIC_ARTIFACT_SCHEMA_VERSION,
-            semantic_claim_schema_version: r2sym::SEMANTIC_CLAIM_SCHEMA_VERSION,
-        }
-    }
-}
-
 pub fn decompile_callee_resolution_facts(
     prepared: &SsaArtifact,
     function_facts: &FunctionFacts,
@@ -2540,8 +2241,6 @@ pub fn decompiler_input_from_prepared_facts(
 
 #[derive(Debug, Clone)]
 pub struct EngineMetrics {
-    /// True when this request reused the immutable session analysis.
-    pub cache_hit: bool,
     pub planning_time: Duration,
     pub ssa_time: Duration,
     pub semantic_time: Duration,
@@ -2555,7 +2254,6 @@ pub struct EngineMetrics {
 impl Default for EngineMetrics {
     fn default() -> Self {
         Self {
-            cache_hit: false,
             planning_time: Duration::default(),
             ssa_time: Duration::default(),
             semantic_time: Duration::default(),
@@ -3251,236 +2949,6 @@ mod kani_proofs {
             assert!(!prefers_bounded);
         }
     }
-
-    #[kani::proof]
-    fn cache_plan_layers_are_owned_by_request_kind_and_profile_fails_closed() {
-        let request = match kani::any::<u8>() % 5 {
-            0 => EngineRequestKind::Decompile,
-            1 => EngineRequestKind::Types,
-            2 => EngineRequestKind::SymbolicQuery,
-            3 => EngineRequestKind::DebugFacts,
-            _ => EngineRequestKind::Profile,
-        };
-
-        let plan = EngineCachePlan::for_request(request);
-
-        assert_eq!(plan.request, request);
-        match request {
-            EngineRequestKind::Decompile
-            | EngineRequestKind::Types
-            | EngineRequestKind::SymbolicQuery
-            | EngineRequestKind::DebugFacts => {
-                assert_eq!(plan.layer, EngineCacheLayer::Analysis);
-                assert!(plan.lookup);
-                assert!(plan.store_on_miss);
-            }
-            EngineRequestKind::Profile => {
-                assert_eq!(plan.layer, EngineCacheLayer::MetricsSnapshot);
-                assert!(!plan.lookup);
-                assert!(!plan.store_on_miss);
-            }
-        }
-
-        if !plan.lookup || !plan.store_on_miss {
-            assert_eq!(request, EngineRequestKind::Profile);
-        }
-    }
-
-    #[kani::proof]
-    fn analysis_cache_key_changes_only_when_immutable_inputs_change() {
-        let function_addr = kani::any::<u64>();
-        let function_name_hash = kani::any::<u64>();
-        let arch_hash = kani::any::<u64>();
-        let blocks_hash = kani::any::<u64>();
-        let typed_context_hash = kani::any::<u64>();
-        let assumptions_hash = kani::any::<u64>();
-        let analysis_depth_hash = kani::any::<u64>();
-
-        let base = AnalysisCacheKey::from_hashes(
-            function_addr,
-            function_name_hash,
-            arch_hash,
-            blocks_hash,
-            typed_context_hash,
-            assumptions_hash,
-            analysis_depth_hash,
-            None,
-        );
-
-        assert_eq!(
-            base,
-            AnalysisCacheKey::from_hashes(
-                function_addr.wrapping_add(1),
-                function_name_hash,
-                arch_hash,
-                blocks_hash,
-                typed_context_hash,
-                assumptions_hash,
-                analysis_depth_hash,
-                None,
-            )
-        );
-        assert!(
-            base != AnalysisCacheKey::from_hashes(
-                function_addr,
-                function_name_hash.wrapping_add(1),
-                arch_hash,
-                blocks_hash,
-                typed_context_hash,
-                assumptions_hash,
-                analysis_depth_hash,
-                None,
-            )
-        );
-        assert!(
-            base != AnalysisCacheKey::from_hashes(
-                function_addr,
-                function_name_hash,
-                arch_hash.wrapping_add(1),
-                blocks_hash,
-                typed_context_hash,
-                assumptions_hash,
-                analysis_depth_hash,
-                None,
-            )
-        );
-        assert!(
-            base != AnalysisCacheKey::from_hashes(
-                function_addr,
-                function_name_hash,
-                arch_hash,
-                blocks_hash.wrapping_add(1),
-                typed_context_hash,
-                assumptions_hash,
-                analysis_depth_hash,
-                None,
-            )
-        );
-        assert_eq!(
-            base,
-            AnalysisCacheKey::from_hashes(
-                function_addr,
-                function_name_hash,
-                arch_hash,
-                blocks_hash,
-                typed_context_hash.wrapping_add(1),
-                assumptions_hash,
-                analysis_depth_hash,
-                None,
-            )
-        );
-        assert_eq!(
-            base,
-            AnalysisCacheKey::from_hashes(
-                function_addr,
-                function_name_hash,
-                arch_hash,
-                blocks_hash,
-                typed_context_hash,
-                assumptions_hash.wrapping_add(1),
-                analysis_depth_hash,
-                None,
-            )
-        );
-        assert_eq!(
-            base,
-            AnalysisCacheKey::from_hashes(
-                function_addr,
-                function_name_hash,
-                arch_hash,
-                blocks_hash,
-                typed_context_hash,
-                assumptions_hash,
-                analysis_depth_hash.wrapping_add(1),
-                None,
-            )
-        );
-    }
-
-    #[kani::proof]
-    fn request_keys_include_analysis_and_orchestration_inputs() {
-        let analysis = AnalysisCacheKey::from_hashes(
-            kani::any(),
-            kani::any(),
-            kani::any(),
-            kani::any(),
-            kani::any(),
-            kani::any(),
-            kani::any(),
-            None,
-        );
-        let interproc_budget_hash = kani::any::<u64>();
-        let symbolic_scope_hash = kani::any::<u64>();
-
-        let function_addr = kani::any::<u64>();
-        let typed_context_hash = kani::any::<u64>();
-        let assumptions_hash = kani::any::<u64>();
-        let analysis_depth_hash = kani::any::<u64>();
-        let ptr_bits = kani::any::<u32>();
-        let reg_type_hints_hash = kani::any::<u64>();
-        let request_key = EngineRequestKey::from_request_hashes(
-            analysis.clone(),
-            function_addr,
-            typed_context_hash,
-            assumptions_hash,
-            analysis_depth_hash,
-            ptr_bits,
-            reg_type_hints_hash,
-            interproc_budget_hash,
-            symbolic_scope_hash,
-        );
-        assert!(
-            request_key
-                != EngineRequestKey::from_request_hashes(
-                    AnalysisCacheKey::from_hashes(
-                        0,
-                        analysis.function_name_hash,
-                        analysis.arch_hash,
-                        analysis.blocks_hash,
-                        0,
-                        0,
-                        0,
-                        None,
-                    ),
-                    function_addr.wrapping_add(1),
-                    typed_context_hash,
-                    assumptions_hash,
-                    analysis_depth_hash,
-                    ptr_bits,
-                    reg_type_hints_hash,
-                    interproc_budget_hash,
-                    symbolic_scope_hash,
-                )
-        );
-        assert!(
-            request_key
-                != EngineRequestKey::from_request_hashes(
-                    analysis.clone(),
-                    function_addr,
-                    typed_context_hash,
-                    assumptions_hash,
-                    analysis_depth_hash,
-                    ptr_bits,
-                    reg_type_hints_hash,
-                    interproc_budget_hash.wrapping_add(1),
-                    symbolic_scope_hash,
-                )
-        );
-        assert!(
-            request_key
-                != EngineRequestKey::from_request_hashes(
-                    analysis,
-                    function_addr,
-                    typed_context_hash,
-                    assumptions_hash,
-                    analysis_depth_hash,
-                    ptr_bits,
-                    reg_type_hints_hash,
-                    interproc_budget_hash,
-                    symbolic_scope_hash.wrapping_add(1),
-                )
-        );
-    }
 }
 
 pub fn interproc_direct_call_targets(analysis: &EngineAnalysis) -> Vec<u64> {
@@ -3633,25 +3101,17 @@ pub struct EngineAnalysisArtifact {
 #[derive(Debug, Clone, Default)]
 pub struct InterprocScopeFacts {
     summaries: BTreeMap<r2ssa::InterprocFunctionId, r2ssa::FunctionSemanticSummary>,
-    identity_hash: u64,
 }
 
 impl InterprocScopeFacts {
     pub fn new(
         summaries: BTreeMap<r2ssa::InterprocFunctionId, r2ssa::FunctionSemanticSummary>,
     ) -> Self {
-        Self {
-            identity_hash: interproc_scope_identity_hash(&summaries),
-            summaries,
-        }
+        Self { summaries }
     }
 
     pub fn empty() -> Self {
         Self::new(BTreeMap::new())
-    }
-
-    pub fn identity_hash(&self) -> u64 {
-        self.identity_hash
     }
 
     pub fn summaries(
@@ -3921,7 +3381,6 @@ pub struct EngineAnalyzeRequest {
     pub semantic_metadata_enabled: bool,
     pub reg_type_hints: HashMap<String, r2types::TypeHint>,
     pub parsed_context: r2types::ParsedExternalContext,
-    pub external_context_fallback_hash: u64,
     pub scope_facts: InterprocScopeFacts,
     pub interproc_max_iterations: usize,
     pub symbolic_scope: Option<r2sym::PreparedFunctionScope>,
@@ -3942,7 +3401,6 @@ pub struct EngineAnalyzeRequestParts {
     pub semantic_metadata_enabled: bool,
     pub reg_type_hints: HashMap<String, r2types::TypeHint>,
     pub parsed_context: r2types::ParsedExternalContext,
-    pub external_context_fallback_hash: u64,
     pub scope_facts: InterprocScopeFacts,
     pub interproc_max_iterations: usize,
     pub symbolic_scope: Option<r2sym::PreparedFunctionScope>,
@@ -4065,7 +3523,6 @@ pub struct EngineAnalyzeRequestInput {
     pub semantic_metadata_enabled: bool,
     pub reg_type_hints: HashMap<String, r2types::TypeHint>,
     pub parsed_context: r2types::ParsedExternalContext,
-    pub external_context_fallback_hash: u64,
     pub scope_facts: InterprocScopeFacts,
     pub interproc_max_iterations: usize,
     pub symbolic_scope: Option<r2sym::PreparedFunctionScope>,
@@ -4079,7 +3536,6 @@ pub struct EngineAnalyzeFunctionRequestInput {
     pub ptr_bits: Option<u32>,
     pub reg_type_hints: HashMap<String, r2types::TypeHint>,
     pub parsed_context: r2types::ParsedExternalContext,
-    pub external_context_fallback_hash: u64,
     pub scope_facts: InterprocScopeFacts,
     pub interproc_max_iterations: usize,
     pub symbolic_scope: Option<r2sym::PreparedFunctionScope>,
@@ -4151,7 +3607,6 @@ impl EngineAnalyzeRequest {
             semantic_metadata_enabled: parts.semantic_metadata_enabled,
             reg_type_hints: parts.reg_type_hints,
             parsed_context: parts.parsed_context,
-            external_context_fallback_hash: parts.external_context_fallback_hash,
             scope_facts: parts.scope_facts,
             interproc_max_iterations: parts.interproc_max_iterations,
             symbolic_scope: parts.symbolic_scope,
@@ -4171,8 +3626,7 @@ impl EngineAnalyzeRequest {
     ///
     /// The exact retained lift replaces every detached identity, block,
     /// architecture, source snapshot, type hint, external context, scope, and
-    /// precomputed-semantic input. Trusted authority is never inserted into
-    /// the stable analysis cache.
+    /// precomputed-semantic input. Trusted authority remains request-local.
     pub fn with_trusted_ssa(mut self, trusted: Arc<r2ssa::TrustedSsaArtifact>) -> Self {
         let function_addr = trusted.source().function().address();
         self.function_name = format!("fcn_{function_addr:x}");
@@ -4184,7 +3638,6 @@ impl EngineAnalyzeRequest {
         self.semantic_metadata_enabled = true;
         self.reg_type_hints.clear();
         self.parsed_context = r2types::ParsedExternalContext::default();
-        self.external_context_fallback_hash = 0;
         self.scope_facts = InterprocScopeFacts::empty();
         self.interproc_max_iterations = 1;
         self.symbolic_scope = None;
@@ -4240,7 +3693,6 @@ fn engine_analyze_request_input_from_function(
         semantic_metadata_enabled: input.function.semantic_metadata_enabled,
         reg_type_hints: input.reg_type_hints,
         parsed_context: input.parsed_context,
-        external_context_fallback_hash: input.external_context_fallback_hash,
         scope_facts: input.scope_facts,
         interproc_max_iterations: input.interproc_max_iterations,
         symbolic_scope: input.symbolic_scope,
@@ -4265,7 +3717,6 @@ fn engine_analyze_request_parts_from_input(
         semantic_metadata_enabled: input.semantic_metadata_enabled,
         reg_type_hints: input.reg_type_hints,
         parsed_context: input.parsed_context,
-        external_context_fallback_hash: input.external_context_fallback_hash,
         scope_facts: input.scope_facts,
         interproc_max_iterations: input.interproc_max_iterations,
         symbolic_scope: input.symbolic_scope,
@@ -4277,8 +3728,6 @@ fn engine_analyze_request_parts_from_input(
 #[derive(Debug, Clone)]
 pub struct EngineAnalyzeResponse {
     pub artifact: EngineAnalysisArtifact,
-    pub analysis_cache_hit: bool,
-    pub request_key: EngineRequestKey,
     pub metrics: EngineMetrics,
     pub diagnostics: EngineDiagnostics,
 }
@@ -4305,7 +3754,6 @@ pub struct EngineFunctionDecompileRequestInput {
     function: EngineFunctionInput,
     ptr_bits: Option<u32>,
     parsed_context: r2types::ParsedExternalContext,
-    external_context_fallback_hash: u64,
     scope_facts: InterprocScopeFacts,
     interproc_max_iterations: usize,
     symbolic_scope: Option<r2sym::PreparedFunctionScope>,
@@ -4319,14 +3767,12 @@ impl EngineFunctionDecompileRequestInput {
         function: EngineFunctionInput,
         ptr_bits: Option<u32>,
         parsed_context: r2types::ParsedExternalContext,
-        external_context_fallback_hash: u64,
     ) -> Self {
         let function_block_count = function.blocks.len();
         Self {
             function,
             ptr_bits,
             parsed_context,
-            external_context_fallback_hash,
             scope_facts: InterprocScopeFacts::empty(),
             interproc_max_iterations: 1,
             symbolic_scope: None,
@@ -4334,19 +3780,6 @@ impl EngineFunctionDecompileRequestInput {
             execution: EngineExecutionControl::default(),
             trusted_ssa: None,
         }
-    }
-
-    pub fn single_function_from_engine_context(
-        function: EngineFunctionInput,
-        ptr_bits: Option<u32>,
-        external_context: EngineParsedExternalContext,
-    ) -> Self {
-        Self::single_function(
-            function,
-            ptr_bits,
-            external_context.parsed_context,
-            external_context.fallback_hash,
-        )
     }
 
     pub fn with_input_quality(mut self, input_quality: EngineFunctionInputQuality) -> Self {
@@ -4407,7 +3840,6 @@ impl EngineFunctionDecompileRequest {
                     ptr_bits: input.ptr_bits,
                     reg_type_hints: HashMap::new(),
                     parsed_context: input.parsed_context,
-                    external_context_fallback_hash: input.external_context_fallback_hash,
                     scope_facts: input.scope_facts,
                     interproc_max_iterations: input.interproc_max_iterations,
                     symbolic_scope: input.symbolic_scope,
@@ -4644,8 +4076,6 @@ pub struct EngineInterprocSummaryReportRequest {
 #[derive(Debug, Clone)]
 pub struct EngineInterprocSummaryReportResponse {
     pub report: EngineInterprocSummaryJson,
-    pub analysis_cache_hit: bool,
-    pub request_key: EngineRequestKey,
     pub metrics: EngineMetrics,
     pub diagnostics: EngineDiagnostics,
 }
@@ -4655,7 +4085,6 @@ pub struct EngineFunctionAnalysisArtifactRequestInput {
     pub function: EngineFunctionInput,
     pub ptr_bits: Option<u32>,
     pub parsed_context: r2types::ParsedExternalContext,
-    pub external_context_fallback_hash: u64,
     pub scope_facts: InterprocScopeFacts,
     pub interproc_max_iterations: usize,
     pub symbolic_scope: Option<r2sym::PreparedFunctionScope>,
@@ -4666,7 +4095,6 @@ pub struct EngineFunctionAnalysisReportRequestInput {
     pub function: EngineFunctionInput,
     pub ptr_bits: Option<u32>,
     pub parsed_context: r2types::ParsedExternalContext,
-    pub external_context_fallback_hash: u64,
     pub scope_facts: InterprocScopeFacts,
     pub interproc_max_iters: usize,
     pub interproc_converged: bool,
@@ -4684,7 +4112,6 @@ impl EngineFunctionAnalysisArtifactRequest {
                     ptr_bits: input.ptr_bits,
                     reg_type_hints: HashMap::new(),
                     parsed_context: input.parsed_context,
-                    external_context_fallback_hash: input.external_context_fallback_hash,
                     scope_facts: input.scope_facts,
                     interproc_max_iterations: input.interproc_max_iterations,
                     symbolic_scope: input.symbolic_scope,
@@ -4709,7 +4136,6 @@ impl EngineFunctionAnalysisArtifactRequest {
                     ptr_bits: input.ptr_bits,
                     reg_type_hints: HashMap::new(),
                     parsed_context: input.parsed_context,
-                    external_context_fallback_hash: input.external_context_fallback_hash,
                     scope_facts: input.scope_facts,
                     interproc_max_iterations: input.interproc_max_iterations,
                     symbolic_scope: input.symbolic_scope,
@@ -4775,7 +4201,6 @@ impl EngineFunctionAnalysisReportRequest {
                     ptr_bits: input.ptr_bits,
                     reg_type_hints: HashMap::new(),
                     parsed_context: input.parsed_context,
-                    external_context_fallback_hash: input.external_context_fallback_hash,
                     scope_facts: input.scope_facts,
                     interproc_max_iterations: input.interproc_max_iters,
                     symbolic_scope: input.symbolic_scope,
@@ -4804,7 +4229,6 @@ impl EngineFunctionAnalysisReportRequest {
                     ptr_bits: input.ptr_bits,
                     reg_type_hints: HashMap::new(),
                     parsed_context: input.parsed_context,
-                    external_context_fallback_hash: input.external_context_fallback_hash,
                     scope_facts: input.scope_facts,
                     interproc_max_iterations: input.interproc_max_iters,
                     symbolic_scope: input.symbolic_scope,
@@ -4852,22 +4276,7 @@ pub struct EngineTypeAnalysisResponse {
     pub route_decision: EngineTypeRouteDecision,
     pub callsite_count: usize,
     pub current_summary: Option<r2ssa::FunctionSemanticSummary>,
-    pub analysis_cache_hit: bool,
-    pub request_key: Option<EngineRequestKey>,
     pub metrics: EngineMetrics,
-    pub diagnostics: EngineDiagnostics,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct EngineProfileRequest {
-    pub reset_after_read: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct EngineProfileResponse {
-    pub route_decision: EngineProfileRouteDecision,
-    pub metrics: EngineSessionCacheMetrics,
-    pub total: CacheCounters,
     pub diagnostics: EngineDiagnostics,
 }
 
@@ -4879,97 +4288,12 @@ pub struct EngineDecompileResponse {
     pub diagnostics: EngineDiagnostics,
 }
 
-pub struct EngineSession {
-    analysis_cache: SessionCache<AnalysisCacheKey, EngineAnalysis>,
-}
-
-impl Default for EngineSession {
-    fn default() -> Self {
-        Self::new(DEFAULT_ENGINE_CACHE_LIMIT)
-    }
-}
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EngineSession;
 
 impl EngineSession {
-    pub fn new(cache_limit: usize) -> Self {
-        Self {
-            analysis_cache: SessionCache::new(cache_limit),
-        }
-    }
-
-    pub fn cached_analysis(&self, key: &AnalysisCacheKey) -> Option<Arc<EngineAnalysis>> {
-        self.cached_analysis_with_decision(EngineRequestKind::DebugFacts, key)
-            .value
-    }
-
-    pub fn cached_analysis_with_decision(
-        &self,
-        request: EngineRequestKind,
-        key: &AnalysisCacheKey,
-    ) -> EngineCacheLookup<Arc<EngineAnalysis>> {
-        let value = self.analysis_cache.get_arc(key);
-        let decision = EngineCacheReuseDecision::from_lookup(
-            request,
-            EngineCacheLayer::Analysis,
-            value.is_some(),
-        );
-        EngineCacheLookup { value, decision }
-    }
-
-    pub(crate) fn insert_analysis(
-        &self,
-        key: AnalysisCacheKey,
-        analysis: EngineAnalysis,
-    ) -> Arc<EngineAnalysis> {
-        self.analysis_cache.insert(key, analysis)
-    }
-
-    pub fn cache_metrics(&self) -> EngineSessionCacheMetrics {
-        EngineSessionCacheMetrics {
-            analysis: self.analysis_cache.counters(),
-        }
-    }
-
-    pub fn reset_cache_metrics(&self) {
-        self.analysis_cache.reset_counters();
-    }
-
-    pub fn profile(&self, request: EngineProfileRequest) -> EngineProfileResponse {
-        let route_decision = profile_route_decision();
-        let metrics = if request.reset_after_read {
-            EngineSessionCacheMetrics {
-                analysis: self.analysis_cache.take_counters(),
-            }
-        } else {
-            self.cache_metrics()
-        };
-        EngineProfileResponse {
-            route_decision: route_decision.clone(),
-            total: metrics.total(),
-            metrics,
-            diagnostics: EngineRequestPlan::profile(route_decision).diagnostics(),
-        }
-    }
-
-    pub fn prepare_analysis(
-        &self,
-        _function_name: &str,
-        _blocks: &[R2ILBlock],
-        _arch: Option<&r2il::ArchSpec>,
-    ) -> Option<EngineAnalysis> {
-        // This legacy boundary cannot name an immutable source revision. It
-        // must therefore refuse instead of creating a source-free authority.
-        None
-    }
-
-    pub fn prepare_analysis_shared(
-        &self,
-        _function_name: &str,
-        _blocks: &[R2ILBlock],
-        _arch: Option<&r2il::ArchSpec>,
-    ) -> Option<Arc<EngineAnalysis>> {
-        // The checked request API owns source identity and is the only public
-        // path allowed to populate the semantic-analysis cache.
-        None
+    pub const fn new() -> Self {
+        Self
     }
 
     pub fn analyze(&self, request: EngineAnalyzeRequest) -> Option<EngineAnalyzeResponse> {
@@ -4995,13 +4319,13 @@ impl EngineSession {
                 metrics,
             ));
         }
-        let request_key = function_request_key(&request);
         metrics.record_phase(
             EnginePhase::SnapshotContext,
             EnginePhaseStatus::Executed,
             phase_started.elapsed(),
         );
-        self.analyze_with_key(request, request_key, started, metrics)
+        let ssa_control = request.execution.ssa_execution_control();
+        self.analyze_with_ssa_control(request, started, metrics, &ssa_control)
     }
 
     pub fn interproc_summary_report(
@@ -5034,46 +4358,29 @@ impl EngineSession {
         });
         Some(EngineInterprocSummaryReportResponse {
             report,
-            analysis_cache_hit: response.analysis_cache_hit,
-            request_key: response.request_key,
             metrics: response.metrics,
             diagnostics: response.diagnostics,
         })
     }
 
-    fn analyze_with_key(
+    fn analyze_with_ssa_control<C: r2ssa::SsaWorkControl + ?Sized>(
         &self,
         request: EngineAnalyzeRequest,
-        request_key: EngineRequestKey,
-        started: Instant,
-        metrics: EngineMetrics,
-    ) -> Result<EngineAnalyzeResponse, EngineExecutionRefusal> {
-        let ssa_control = request.execution.ssa_execution_control();
-        self.analyze_with_key_and_ssa_control(request, request_key, started, metrics, &ssa_control)
-    }
-
-    fn analyze_with_key_and_ssa_control<C: r2ssa::SsaWorkControl + ?Sized>(
-        &self,
-        request: EngineAnalyzeRequest,
-        request_key: EngineRequestKey,
         started: Instant,
         mut metrics: EngineMetrics,
         ssa_control: &C,
     ) -> Result<EngineAnalyzeResponse, EngineExecutionRefusal> {
         poll_engine_execution(&request.execution, EnginePhase::Ssa, &metrics)?;
         let ssa_started = Instant::now();
-        let (analysis, analysis_cache_hit) = if let Some(trusted) = request.trusted_ssa.as_ref() {
+        let analysis = if let Some(trusted) = request.trusted_ssa.as_ref() {
             ssa_control
                 .poll()
                 .map_err(|error| ssa_prepare_execution_refusal(error.into(), metrics.clone()))?;
             let ssa_func = Arc::new(trusted.artifact().clone());
-            (
-                Arc::new(EngineAnalysis {
-                    pattern_ssa_func: Arc::clone(&ssa_func),
-                    ssa_func,
-                }),
-                false,
-            )
+            Arc::new(EngineAnalysis {
+                pattern_ssa_func: Arc::clone(&ssa_func),
+                ssa_func,
+            })
         } else {
             let Some(source_snapshot) = request.source_snapshot.as_deref() else {
                 return Err(engine_execution_refusal(
@@ -5082,16 +4389,8 @@ impl EngineSession {
                     metrics,
                 ));
             };
-            let analysis_key = function_analysis_cache_key(
-                &request.function_name,
-                request.arch.as_ref(),
-                &request.blocks,
-                Some(source_snapshot),
-            );
-            if let Some(cached) = self.cached_analysis(&analysis_key) {
-                (cached, true)
-            } else {
-                let analysis = match build_engine_analysis_from_parts_with_control(
+            Arc::new(
+                match build_engine_analysis_from_parts_with_control(
                     &request.function_name,
                     &request.blocks,
                     request.arch.as_ref(),
@@ -5107,27 +4406,19 @@ impl EngineSession {
                         );
                         return Err(ssa_prepare_execution_refusal(error, metrics));
                     }
-                };
-                (self.insert_analysis(analysis_key, analysis), false)
-            }
-        };
-        let ssa_status = if analysis_cache_hit {
-            EnginePhaseStatus::Reused
-        } else {
-            EnginePhaseStatus::Executed
-        };
-        metrics.record_phase(EnginePhase::Ssa, ssa_status, ssa_started.elapsed());
-        let obligation_status = if analysis_cache_hit {
-            EnginePhaseStatus::Reused
-        } else {
-            EnginePhaseStatus::Folded
+                },
+            )
         };
         metrics.record_phase(
+            EnginePhase::Ssa,
+            EnginePhaseStatus::Executed,
+            ssa_started.elapsed(),
+        );
+        metrics.record_phase(
             EnginePhase::Obligations,
-            obligation_status,
+            EnginePhaseStatus::Folded,
             Duration::default(),
         );
-        metrics.cache_hit = analysis_cache_hit;
         metrics.ssa_time = ssa_started.elapsed();
 
         poll_engine_execution(&request.execution, EnginePhase::Symbolic, &metrics)?;
@@ -5158,8 +4449,6 @@ impl EngineSession {
         metrics.planning_time = started.elapsed();
         Ok(EngineAnalyzeResponse {
             artifact,
-            analysis_cache_hit,
-            request_key,
             metrics,
             diagnostics: EngineDiagnostics::default(),
         })
@@ -5259,8 +4548,6 @@ impl EngineSession {
                 route_decision: preprobe.route_decision,
                 callsite_count: 0,
                 current_summary: None,
-                analysis_cache_hit: false,
-                request_key: None,
                 metrics: preprobe_metrics,
                 diagnostics: EngineDiagnostics::default(),
             });
@@ -5309,10 +4596,7 @@ impl EngineSession {
             route_decision,
             callsite_count,
             current_summary,
-            analysis_cache_hit: analyze_response.analysis_cache_hit,
-            request_key: Some(analyze_response.request_key),
             metrics: EngineMetrics {
-                cache_hit: analyze_response.metrics.cache_hit,
                 planning_time: started.elapsed(),
                 ..analyze_response.metrics
             },
@@ -6850,168 +6134,6 @@ fn decompile_route_output_from_function_facts(
     }
 }
 
-pub fn function_analysis_cache_key(
-    function_name: &str,
-    arch: Option<&r2il::ArchSpec>,
-    blocks: &[R2ILBlock],
-    source_snapshot: Option<&EngineSourceSnapshot>,
-) -> AnalysisCacheKey {
-    AnalysisCacheKey::from_immutable_parts(function_name, arch, blocks, source_snapshot)
-}
-
-pub fn function_request_key(request: &EngineAnalyzeRequest) -> EngineRequestKey {
-    let canonicalized;
-    let request = if request.trusted_ssa.is_some() {
-        canonicalized = request.clone().canonicalize_trusted();
-        &canonicalized
-    } else {
-        request
-    };
-    let mut analysis = function_analysis_cache_key(
-        &request.function_name,
-        request.arch.as_ref(),
-        &request.blocks,
-        request.source_snapshot.as_deref(),
-    );
-    if let Some(trusted) = request.trusted_ssa.as_ref() {
-        analysis.source_snapshot_schema_version =
-            Some(r2ssa::RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION);
-        analysis.source_revision_identity = Some(
-            trusted
-                .source()
-                .source_revision_identity()
-                .to_vec()
-                .into_boxed_slice(),
-        );
-        analysis.source_payload_identity = Some(trusted.source().diagnostic_identity().value());
-    }
-    EngineRequestKey::from_request_hashes(
-        analysis,
-        request.function_addr,
-        session_context_identity_hash_from_parsed(
-            &request.parsed_context,
-            request.external_context_fallback_hash,
-        ),
-        assumptions_identity_hash(&request.parsed_context.assumptions),
-        function_analysis_depth_hash(request.semantic_metadata_enabled),
-        request.ptr_bits,
-        register_type_hints_identity_hash(&request.reg_type_hints),
-        stable_fnv1a_hash(&(
-            "interproc-scope-budget-v1",
-            request.scope_facts.identity_hash(),
-            request.interproc_max_iterations,
-            request.include_interproc_summary_set,
-            request.semantic_mode,
-            request
-                .precomputed_semantic_artifact
-                .as_ref()
-                .map(stable_fnv1a_debug_hash),
-        )),
-        request_scope_identity_hash(request.symbolic_scope.as_ref()),
-    )
-}
-
-/// Exact engine identity for a prepared symbolic scope.
-///
-/// `r2sym::stable_scope_hash` intentionally ignores presentation names. Those
-/// names affect engine-built semantic artifacts, so the request boundary adds
-/// both scoped and prepared function names in deterministic function order.
-pub fn request_scope_identity_hash(scope: Option<&r2sym::PreparedFunctionScope>) -> u64 {
-    let Some(scope) = scope else {
-        return 0;
-    };
-    let functions = scope
-        .functions()
-        .values()
-        .enumerate()
-        .map(|(order, function)| {
-            (
-                order,
-                function.id.0,
-                function.name.as_deref(),
-                function.prepared.function().name.as_deref(),
-            )
-        })
-        .collect::<Vec<_>>();
-    stable_fnv1a_hash(&(
-        "r2engine-request-scope-v1",
-        r2sym::stable_scope_hash(Some(scope)),
-        scope.root_id().0,
-        functions,
-    ))
-}
-
-pub fn register_type_hints_identity_hash(hints: &HashMap<String, r2types::TypeHint>) -> u64 {
-    if hints.is_empty() {
-        return 0;
-    }
-    let mut entries = hints
-        .iter()
-        .map(|(register, hint)| {
-            let rank = match hint.rank {
-                r2types::TypeHintRank::Integer => 1_u8,
-                r2types::TypeHintRank::Float => 2_u8,
-                r2types::TypeHintRank::Pointer => 3_u8,
-            };
-            (register.as_str(), rank, hint.ty.as_str())
-        })
-        .collect::<Vec<_>>();
-    entries.sort_unstable();
-    stable_fnv1a_hash(&("r2engine-register-type-hints-v1", entries))
-}
-
-pub fn assumptions_identity_hash(assumptions: &r2ssa::AssumptionSet) -> u64 {
-    if assumptions.is_empty() {
-        return 0;
-    }
-    let mut item_hashes = assumptions
-        .iter()
-        .map(stable_fnv1a_debug_hash)
-        .collect::<Vec<_>>();
-    item_hashes.sort_unstable();
-    stable_fnv1a_hash(&("r2ssa-assumptions-v1", item_hashes))
-}
-
-pub fn function_analysis_depth_hash(semantic_metadata_enabled: bool) -> u64 {
-    stable_fnv1a_hash(&("function-analysis-artifact-v2", semantic_metadata_enabled))
-}
-
-pub fn session_context_identity_hash_from_parsed(
-    parsed: &r2types::ParsedExternalContext,
-    fallback_hash: u64,
-) -> u64 {
-    match (
-        parsed.context_hash,
-        parsed.context_dirty_epoch,
-        parsed.type_dirty_epoch,
-    ) {
-        (None, None, None) => fallback_hash,
-        (context_hash, dirty_epoch, type_dirty_epoch) => stable_fnv1a_hash(&(
-            "radare2-typed-context",
-            parsed.context_schema_version,
-            context_hash.unwrap_or(fallback_hash),
-            dirty_epoch,
-            type_dirty_epoch,
-        )),
-    }
-}
-
-pub fn rename_engine_analysis_artifact(
-    artifact: EngineAnalysisArtifact,
-    function_name: &str,
-) -> EngineAnalysisArtifact {
-    let ssa_func = Arc::new(artifact.ssa_func.as_ref().clone().with_name(function_name));
-    EngineAnalysisArtifact {
-        pattern_ssa_func: Arc::clone(&ssa_func),
-        ssa_func,
-        // Renaming clones the SSA artifact and therefore intentionally drops
-        // the exact trusted wrapper instead of certifying a divergent owner.
-        trusted_ssa: None,
-        function_facts: artifact.function_facts,
-        writeback_plan: artifact.writeback_plan,
-    }
-}
-
 #[cfg(test)]
 fn build_engine_analysis_from_parts(
     function_name: &str,
@@ -7386,8 +6508,7 @@ fn build_engine_analysis_artifact(
     Some(EngineAnalysisArtifact {
         ssa_func: semantic_analysis.ssa_func,
         pattern_ssa_func: semantic_analysis.pattern_ssa_func,
-        // Trusted capture authority is deliberately request-local and is
-        // never stored in or replayed from the stable analysis cache.
+        // Trusted capture authority is deliberately request-local.
         trusted_ssa,
         function_facts,
         writeback_plan,
@@ -7857,12 +6978,6 @@ fn external_enum_has_variants(external_type_db: &r2types::ExternalTypeDb, name: 
             .get(&key)
             .is_some_and(|en| !en.variants.is_empty())
     })
-}
-
-fn interproc_scope_identity_hash(
-    summaries: &BTreeMap<r2ssa::InterprocFunctionId, r2ssa::FunctionSemanticSummary>,
-) -> u64 {
-    stable_fnv1a_debug_hash(summaries)
 }
 
 pub fn block_guard_fallback_comment(
@@ -8762,48 +7877,6 @@ mod tests {
     }
 
     #[test]
-    fn external_context_json_for_engine_owns_identity_hashes() {
-        let empty = parse_external_context_json_for_engine("{}", 64);
-        assert_eq!(empty.fallback_hash, stable_fnv1a_hash("{}"));
-        assert_eq!(empty.context_identity_hash, empty.fallback_hash);
-        assert_eq!(empty.assumptions_hash, 0);
-
-        let first = parse_external_context_json_for_engine(
-            r#"{
-                "context": {
-                    "schema_version": 2,
-                    "dirty_epoch": 11,
-                    "type_dirty_epoch": 13,
-                    "context_hash": 3735928559
-                },
-                "assumptions": [
-                    {"subject": {"register": {"name": "rdi"}}, "value": {"constant": {"value": 7}}}
-                ]
-            }"#,
-            64,
-        );
-        let reordered = parse_external_context_json_for_engine(
-            r#"{
-                "assumptions": [
-                    {"value": {"constant": {"value": 7}}, "subject": {"register": {"name": "rdi"}}}
-                ],
-                "context": {
-                    "context_hash": 3735928559,
-                    "type_dirty_epoch": 13,
-                    "dirty_epoch": 11,
-                    "schema_version": 2
-                }
-            }"#,
-            64,
-        );
-
-        assert_ne!(first.context_identity_hash, first.fallback_hash);
-        assert_eq!(first.context_identity_hash, reordered.context_identity_hash);
-        assert_eq!(first.assumptions_hash, reordered.assumptions_hash);
-        assert_ne!(first.assumptions_hash, 0);
-    }
-
-    #[test]
     fn typed_external_context_owner_ignores_raw_fallback_and_preserves_typed_inputs() {
         let parsed = parse_typed_external_context(
             EngineExternalContextInput {
@@ -9010,87 +8083,6 @@ mod tests {
             Vec::<r2ssa::SourceStackSlotSpec>::new(),
         )
         .expect("source function interface")
-    }
-
-    fn exact_source_snapshot_function_interface(
-        revision_identity: &[u8],
-        member_count: u32,
-        scalar_bits: u64,
-    ) -> r2ssa::SourceFunctionInterface {
-        let scalar_bytes = u32::try_from(scalar_bits / 8).expect("test scalar width");
-        let aggregate_bits = u64::from(member_count) * scalar_bits;
-        let members = (0..member_count).map(|index| {
-            r2ssa::SourceAggregateMember::new(
-                index,
-                1,
-                u64::from(index) * scalar_bits,
-                scalar_bits,
-                format!("field_{index}"),
-            )
-        });
-        let graph = r2ssa::SourceTypeGraph::new(
-            [
-                r2ssa::SourceType::new(
-                    0,
-                    r2ssa::SourceTypeKind::Struct { aggregate_id: 0 },
-                    aggregate_bits,
-                    scalar_bits,
-                ),
-                r2ssa::SourceType::new(
-                    1,
-                    r2ssa::SourceTypeKind::SignedInteger,
-                    scalar_bits,
-                    scalar_bits,
-                ),
-                r2ssa::SourceType::new(
-                    2,
-                    r2ssa::SourceTypeKind::Pointer { target_type_id: 0 },
-                    64,
-                    64,
-                ),
-            ],
-            [r2ssa::SourceAggregateLayout::new(
-                0,
-                0,
-                aggregate_bits,
-                scalar_bits,
-                "DemoStruct",
-                members,
-            )],
-        )
-        .expect("valid exact source graph");
-        let register = |offset| r2ssa::CanonicalStorageId {
-            space: r2ssa::CanonicalStorageSpace::Register,
-            offset,
-            size: 8,
-        };
-        let scalar_carrier = if scalar_bytes == 8 {
-            r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::Full, 0, scalar_bits)
-        } else {
-            r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::LowBits, 0, scalar_bits)
-        };
-        r2ssa::SourceFunctionInterface::new_with_logical_types(
-            revision_identity.to_vec(),
-            "sysv",
-            [
-                r2ssa::SourceAbiParameterSpec::new(0, register(0)),
-                r2ssa::SourceAbiParameterSpec::new(1, register(8)),
-            ],
-            r2ssa::SourceFunctionReturn::Register {
-                storage: register(16),
-            },
-            Vec::<r2ssa::SourceStackSlotSpec>::new(),
-            [
-                r2ssa::SourceLogicalValue::new(
-                    2,
-                    r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::Full, 0, 64),
-                ),
-                r2ssa::SourceLogicalValue::new(1, scalar_carrier),
-            ],
-            Some(r2ssa::SourceLogicalValue::new(1, scalar_carrier)),
-            Some(graph),
-        )
-        .expect("valid exact source function interface")
     }
 
     fn source_snapshot_terminal_function()
@@ -9601,7 +8593,7 @@ mod tests {
         .expect("handmade fixture remains analyzable");
         assert_handmade_analysis_only(&artifact);
 
-        let response = EngineSession::new(4).decompile_function_from_input(
+        let response = EngineSession::new().decompile_function_from_input(
             EngineFunctionDecompileRequestInput::single_function(
                 EngineFunctionInput {
                     function_name: function_name.to_string(),
@@ -9613,7 +8605,6 @@ mod tests {
                 },
                 Some(64),
                 r2types::ParsedExternalContext::default(),
-                0,
             ),
         );
         assert!(response.diagnostics.semantic_kernel_render.is_none());
@@ -9665,7 +8656,7 @@ mod tests {
         .expect("prepared aggregate load");
         assert_handmade_analysis_only(&prepared_load);
 
-        let load = EngineSession::new(4).decompile_function_from_input(
+        let load = EngineSession::new().decompile_function_from_input(
             EngineFunctionDecompileRequestInput::single_function(
                 EngineFunctionInput {
                     function_name: "sym.production_aggregate_member_load".to_string(),
@@ -9677,7 +8668,6 @@ mod tests {
                 },
                 Some(64),
                 r2types::ParsedExternalContext::default(),
-                0,
             ),
         );
         assert!(load.diagnostics.semantic_kernel_render.is_none());
@@ -9685,7 +8675,7 @@ mod tests {
 
         let (store_blocks, store_arch, store_snapshot) =
             source_snapshot_aggregate_member_store_function();
-        let store = EngineSession::new(4).decompile_function_from_input(
+        let store = EngineSession::new().decompile_function_from_input(
             EngineFunctionDecompileRequestInput::single_function(
                 EngineFunctionInput {
                     function_name: "sym.production_aggregate_member_store".to_string(),
@@ -9697,7 +8687,6 @@ mod tests {
                 },
                 Some(64),
                 r2types::ParsedExternalContext::default(),
-                0,
             ),
         );
         assert!(store.diagnostics.semantic_kernel_render.is_none());
@@ -9725,7 +8714,7 @@ mod tests {
         )
         .expect("prepared aggregate near miss");
         assert_handmade_analysis_only(&prepared_near_miss);
-        let refused = EngineSession::new(4).decompile_function_from_input(
+        let refused = EngineSession::new().decompile_function_from_input(
             EngineFunctionDecompileRequestInput::single_function(
                 EngineFunctionInput {
                     function_name: "sym.production_aggregate_member_near_miss".to_string(),
@@ -9737,7 +8726,6 @@ mod tests {
                 },
                 Some(64),
                 r2types::ParsedExternalContext::default(),
-                0,
             ),
         );
         assert!(
@@ -9753,7 +8741,7 @@ mod tests {
     #[test]
     fn handmade_direct_call_return_fixture_refuses_certified_c() {
         let (blocks, arch, source_snapshot) = source_snapshot_direct_call_return_function();
-        let prepared = EngineSession::new(4)
+        let prepared = EngineSession::new()
             .analyze(EngineAnalyzeRequest::full_semantics_for_function(
                 EngineAnalyzeFunctionRequestInput {
                     function: EngineFunctionInput {
@@ -9767,7 +8755,6 @@ mod tests {
                     ptr_bits: Some(64),
                     reg_type_hints: HashMap::new(),
                     parsed_context: r2types::ParsedExternalContext::default(),
-                    external_context_fallback_hash: 0,
                     scope_facts: InterprocScopeFacts::empty(),
                     interproc_max_iterations: 1,
                     symbolic_scope: None,
@@ -9777,7 +8764,7 @@ mod tests {
             ))
             .expect("prepared call/return analysis");
         assert_handmade_analysis_only(prepared.artifact.ssa_func.as_ref());
-        let response = EngineSession::new(4).decompile_function_from_input(
+        let response = EngineSession::new().decompile_function_from_input(
             EngineFunctionDecompileRequestInput::single_function(
                 EngineFunctionInput {
                     function_name: "sym.production_direct_call_return".to_string(),
@@ -9789,7 +8776,6 @@ mod tests {
                 },
                 Some(64),
                 r2types::ParsedExternalContext::default(),
-                0,
             ),
         );
         assert!(response.diagnostics.semantic_kernel_render.is_none());
@@ -9803,7 +8789,7 @@ mod tests {
             )
             .expect("snapshot without exact callsite interface"),
         );
-        let refused = EngineSession::new(4).decompile_function_from_input(
+        let refused = EngineSession::new().decompile_function_from_input(
             EngineFunctionDecompileRequestInput::single_function(
                 EngineFunctionInput {
                     function_name: "sym.production_direct_call_return".to_string(),
@@ -9815,7 +8801,6 @@ mod tests {
                 },
                 Some(64),
                 r2types::ParsedExternalContext::default(),
-                0,
             ),
         );
         assert!(
@@ -9843,7 +8828,7 @@ mod tests {
     #[test]
     fn handmade_switch_return_fixture_refuses_certified_c() {
         let (blocks, arch, source_snapshot) = source_snapshot_switch_return_function();
-        let prepared = EngineSession::new(4)
+        let prepared = EngineSession::new()
             .analyze(EngineAnalyzeRequest::full_semantics_for_function(
                 EngineAnalyzeFunctionRequestInput {
                     function: EngineFunctionInput {
@@ -9857,7 +8842,6 @@ mod tests {
                     ptr_bits: Some(64),
                     reg_type_hints: HashMap::new(),
                     parsed_context: r2types::ParsedExternalContext::default(),
-                    external_context_fallback_hash: 0,
                     scope_facts: InterprocScopeFacts::empty(),
                     interproc_max_iterations: 1,
                     symbolic_scope: None,
@@ -9868,7 +8852,7 @@ mod tests {
             .expect("prepared switch-return analysis");
         assert_handmade_analysis_only(prepared.artifact.ssa_func.as_ref());
 
-        let response = EngineSession::new(4).decompile_function_from_input(
+        let response = EngineSession::new().decompile_function_from_input(
             EngineFunctionDecompileRequestInput::single_function(
                 EngineFunctionInput {
                     function_name: "sym.production_switch_return".to_string(),
@@ -9880,7 +8864,6 @@ mod tests {
                 },
                 Some(64),
                 r2types::ParsedExternalContext::default(),
-                0,
             ),
         );
         assert!(response.diagnostics.semantic_kernel_render.is_none());
@@ -9918,7 +8901,7 @@ mod tests {
             .expect("snapshot without function interface"),
         );
         for source_snapshot in [missing_interface, wrong_storage] {
-            let refused = EngineSession::new(4).decompile_function_from_input(
+            let refused = EngineSession::new().decompile_function_from_input(
                 EngineFunctionDecompileRequestInput::single_function(
                     EngineFunctionInput {
                         function_name: "sym.production_switch_return".to_string(),
@@ -9930,7 +8913,6 @@ mod tests {
                     },
                     Some(64),
                     r2types::ParsedExternalContext::default(),
-                    0,
                 ),
             );
             assert!(
@@ -9946,7 +8928,7 @@ mod tests {
     #[test]
     fn handmade_carrier_free_loop_return_fixture_refuses_certified_c() {
         let (blocks, arch, source_snapshot) = source_snapshot_carrier_free_loop_return_function();
-        let prepared = EngineSession::new(4)
+        let prepared = EngineSession::new()
             .analyze(EngineAnalyzeRequest::full_semantics_for_function(
                 EngineAnalyzeFunctionRequestInput {
                     function: EngineFunctionInput {
@@ -9960,7 +8942,6 @@ mod tests {
                     ptr_bits: Some(64),
                     reg_type_hints: HashMap::new(),
                     parsed_context: r2types::ParsedExternalContext::default(),
-                    external_context_fallback_hash: 0,
                     scope_facts: InterprocScopeFacts::empty(),
                     interproc_max_iterations: 1,
                     symbolic_scope: None,
@@ -9971,7 +8952,7 @@ mod tests {
             .expect("prepared carrier-free loop-return analysis");
         assert_handmade_analysis_only(prepared.artifact.ssa_func.as_ref());
 
-        let response = EngineSession::new(4).decompile_function_from_input(
+        let response = EngineSession::new().decompile_function_from_input(
             EngineFunctionDecompileRequestInput::single_function(
                 EngineFunctionInput {
                     function_name: "sym.production_carrier_free_loop_return".to_string(),
@@ -9983,7 +8964,6 @@ mod tests {
                 },
                 Some(64),
                 r2types::ParsedExternalContext::default(),
-                0,
             ),
         );
         assert!(response.diagnostics.semantic_kernel_render.is_none());
@@ -10021,7 +9001,7 @@ mod tests {
             .expect("snapshot without loop function interface"),
         );
         for source_snapshot in [missing_interface, wrong_storage] {
-            let refused = EngineSession::new(4).decompile_function_from_input(
+            let refused = EngineSession::new().decompile_function_from_input(
                 EngineFunctionDecompileRequestInput::single_function(
                     EngineFunctionInput {
                         function_name: "sym.production_carrier_free_loop_return".to_string(),
@@ -10033,7 +9013,6 @@ mod tests {
                     },
                     Some(64),
                     r2types::ParsedExternalContext::default(),
-                    0,
                 ),
             );
             assert!(
@@ -10060,10 +9039,6 @@ mod tests {
         )
         .expect("coherent source snapshot");
 
-        assert_eq!(
-            snapshot.schema_version(),
-            ENGINE_SOURCE_SNAPSHOT_SCHEMA_VERSION
-        );
         assert_eq!(snapshot.revision_identity(), revision);
         assert_eq!(snapshot.function_interface(), Some(&function_interface));
         assert_eq!(snapshot.call_site_interfaces(), &[second, first]);
@@ -10108,256 +9083,6 @@ mod tests {
                 vec![first, same_location_other_target],
             ),
             Err(EngineSourceSnapshotError::DuplicateCallSiteLocation)
-        );
-    }
-
-    #[test]
-    fn analysis_cache_key_partitions_exact_source_snapshot_revisions() {
-        let blocks = const_return_blocks(0x401000, 0);
-        let first = EngineSourceSnapshot::new(b"revision-a".to_vec(), None, Vec::new())
-            .expect("first source snapshot");
-        let same = EngineSourceSnapshot::new(b"revision-a".to_vec(), None, Vec::new())
-            .expect("same source snapshot identity");
-        let changed = EngineSourceSnapshot::new(b"revision-b".to_vec(), None, Vec::new())
-            .expect("changed source snapshot");
-        let key = AnalysisCacheKey::from_parts(
-            0x401000,
-            "sym.snapshot",
-            None,
-            &blocks,
-            0,
-            0,
-            "aa",
-            Some(&first),
-        );
-
-        assert_eq!(
-            key,
-            AnalysisCacheKey::from_parts(
-                0x401000,
-                "sym.snapshot",
-                None,
-                &blocks,
-                0,
-                0,
-                "aa",
-                Some(&same),
-            )
-        );
-        assert_ne!(
-            key,
-            AnalysisCacheKey::from_parts(
-                0x401000,
-                "sym.snapshot",
-                None,
-                &blocks,
-                0,
-                0,
-                "aa",
-                Some(&changed),
-            )
-        );
-        assert_ne!(
-            key,
-            AnalysisCacheKey::from_parts(0x401000, "sym.snapshot", None, &blocks, 0, 0, "aa", None,)
-        );
-        assert_eq!(
-            key.source_snapshot_schema_version,
-            Some(ENGINE_SOURCE_SNAPSHOT_SCHEMA_VERSION)
-        );
-        assert_eq!(
-            key.source_revision_identity.as_deref(),
-            Some(b"revision-a".as_slice())
-        );
-
-        let stack_snapshot = |offset| {
-            let interface = source_snapshot_function_interface(b"revision-sp")
-                .with_stack_pointer_storage(r2ssa::CanonicalStorageId {
-                    space: r2ssa::CanonicalStorageSpace::Register,
-                    offset,
-                    size: 8,
-                })
-                .expect("disjoint typed stack pointer");
-            EngineSourceSnapshot::new(b"revision-sp".to_vec(), Some(interface), Vec::new())
-                .expect("stack-pointer source snapshot")
-        };
-        let stack_key = AnalysisCacheKey::from_parts(
-            0x401000,
-            "sym.snapshot",
-            None,
-            &blocks,
-            0,
-            0,
-            "aa",
-            Some(&stack_snapshot(0x20)),
-        );
-        let changed_stack_key = AnalysisCacheKey::from_parts(
-            0x401000,
-            "sym.snapshot",
-            None,
-            &blocks,
-            0,
-            0,
-            "aa",
-            Some(&stack_snapshot(0x28)),
-        );
-        assert_ne!(
-            stack_key, changed_stack_key,
-            "typed SP coordinates participate in source-snapshot cache identity"
-        );
-
-        let session = EngineSession::new(4);
-        let mut request = EngineAnalyzeRequest {
-            function_name: "sym.snapshot".to_string(),
-            function_addr: 0x401000,
-            blocks,
-            arch: None,
-            source_snapshot: Some(Arc::new(first)),
-            trusted_ssa: None,
-            ptr_bits: 64,
-            semantic_metadata_enabled: false,
-            reg_type_hints: HashMap::new(),
-            parsed_context: r2types::ParsedExternalContext::default(),
-            external_context_fallback_hash: 0,
-            scope_facts: InterprocScopeFacts::empty(),
-            interproc_max_iterations: 1,
-            symbolic_scope: None,
-            precomputed_semantic_artifact: None,
-            semantic_mode: EngineSemanticMode::Optional,
-            include_interproc_summary_set: false,
-            execution: EngineExecutionControl::default(),
-        };
-        let first_response = session
-            .analyze(request.clone())
-            .expect("first revision analysis");
-        assert!(!first_response.analysis_cache_hit);
-
-        request.source_snapshot = Some(Arc::new(changed));
-        let changed_response = session
-            .analyze(request.clone())
-            .expect("changed revision analysis");
-        assert!(!changed_response.analysis_cache_hit);
-        let repeated_response = session
-            .analyze(request)
-            .expect("repeated revision analysis");
-        assert!(repeated_response.analysis_cache_hit);
-    }
-
-    #[test]
-    fn analysis_cache_key_partitions_exact_layout_and_carrier_payloads() {
-        let revision = b"same-claimed-source-revision";
-        let snapshot = |member_count, scalar_bits| {
-            EngineSourceSnapshot::new(
-                revision.to_vec(),
-                Some(exact_source_snapshot_function_interface(
-                    revision,
-                    member_count,
-                    scalar_bits,
-                )),
-                Vec::new(),
-            )
-            .expect("valid exact source snapshot")
-        };
-        let baseline = snapshot(14, 32);
-        let changed_layout = snapshot(15, 32);
-        let changed_carrier = snapshot(14, 64);
-
-        let baseline_key = AnalysisCacheKey::from_immutable_hashes(1, 2, 3, Some(&baseline));
-        let layout_key = AnalysisCacheKey::from_immutable_hashes(1, 2, 3, Some(&changed_layout));
-        let carrier_key = AnalysisCacheKey::from_immutable_hashes(1, 2, 3, Some(&changed_carrier));
-
-        assert_eq!(
-            baseline_key.source_revision_identity,
-            layout_key.source_revision_identity
-        );
-        assert_eq!(
-            baseline_key.source_revision_identity,
-            carrier_key.source_revision_identity
-        );
-        assert_ne!(
-            baseline_key.source_payload_identity,
-            layout_key.source_payload_identity
-        );
-        assert_ne!(
-            baseline_key.source_payload_identity,
-            carrier_key.source_payload_identity
-        );
-        assert_ne!(baseline_key, layout_key);
-        assert_ne!(baseline_key, carrier_key);
-        assert_eq!(
-            baseline
-                .function_interface()
-                .and_then(r2ssa::SourceFunctionInterface::type_graph)
-                .expect("retained graph")
-                .aggregates()[0]
-                .members()[13]
-                .offset_bits(),
-            52 * 8
-        );
-    }
-
-    #[test]
-    fn analysis_cache_key_partitions_exact_stack_slot_role_and_home_payloads() {
-        let revision = b"same-stack-slot-role-revision";
-        let register = |offset| r2ssa::CanonicalStorageId {
-            space: r2ssa::CanonicalStorageSpace::Register,
-            offset,
-            size: 8,
-        };
-        let stack_base = register(64);
-        let snapshot = |slot| {
-            let interface = r2ssa::SourceFunctionInterface::new_exact(
-                revision.to_vec(),
-                "sysv",
-                [
-                    r2ssa::SourceAbiParameterSpec::new(0, register(0)),
-                    r2ssa::SourceAbiParameterSpec::new(1, register(8)),
-                ],
-                r2ssa::SourceFunctionReturn::Void,
-                [slot],
-            )
-            .expect("exact classified stack slot");
-            EngineSourceSnapshot::new(revision.to_vec(), Some(interface), Vec::new())
-                .expect("exact source snapshot")
-        };
-        let local = snapshot(r2ssa::SourceStackSlotSpec::new_local(
-            r2ssa::StackAddressBase::FramePointer,
-            stack_base,
-            -8,
-            8,
-        ));
-        let first_home = snapshot(r2ssa::SourceStackSlotSpec::new_parameter_home(
-            r2ssa::StackAddressBase::FramePointer,
-            stack_base,
-            -8,
-            8,
-            0,
-            register(0),
-        ));
-        let second_home = snapshot(r2ssa::SourceStackSlotSpec::new_parameter_home(
-            r2ssa::StackAddressBase::FramePointer,
-            stack_base,
-            -8,
-            8,
-            1,
-            register(8),
-        ));
-
-        let local_key = AnalysisCacheKey::from_immutable_hashes(1, 2, 3, Some(&local));
-        let first_home_key = AnalysisCacheKey::from_immutable_hashes(1, 2, 3, Some(&first_home));
-        let second_home_key = AnalysisCacheKey::from_immutable_hashes(1, 2, 3, Some(&second_home));
-
-        assert_eq!(local.revision_identity(), first_home.revision_identity());
-        assert_eq!(local.revision_identity(), second_home.revision_identity());
-        assert_ne!(local, first_home);
-        assert_ne!(first_home, second_home);
-        assert_ne!(
-            local_key.source_payload_identity,
-            first_home_key.source_payload_identity
-        );
-        assert_ne!(
-            first_home_key.source_payload_identity,
-            second_home_key.source_payload_identity
         );
     }
 
@@ -10412,7 +9137,6 @@ mod tests {
                 ptr_bits: Some(64),
                 reg_type_hints: HashMap::new(),
                 parsed_context: r2types::ParsedExternalContext::default(),
-                external_context_fallback_hash: 0,
                 scope_facts: InterprocScopeFacts::empty(),
                 interproc_max_iterations: 1,
                 symbolic_scope: None,
@@ -10424,7 +9148,7 @@ mod tests {
             &snapshot
         ));
 
-        let response = EngineSession::new(4)
+        let response = EngineSession::new()
             .analyze(request)
             .expect("snapshot-backed analysis");
         let context = response.artifact.ssa_func.machine_context();
@@ -10470,10 +9194,10 @@ mod tests {
     }
 
     #[test]
-    fn absent_source_snapshot_refuses_without_preparing_or_caching_ssa() {
+    fn absent_source_snapshot_refuses_before_ssa_construction() {
         let blocks = const_return_blocks(0x401000, 0);
         let arch = x86_64_result_arch();
-        let session = EngineSession::new(4);
+        let session = EngineSession::new();
         let request =
             EngineAnalyzeRequest::full_semantics_for_function(EngineAnalyzeFunctionRequestInput {
                 function: EngineFunctionInput {
@@ -10487,7 +9211,6 @@ mod tests {
                 ptr_bits: Some(64),
                 reg_type_hints: HashMap::new(),
                 parsed_context: r2types::ParsedExternalContext::default(),
-                external_context_fallback_hash: 0,
                 scope_facts: InterprocScopeFacts::empty(),
                 interproc_max_iterations: 1,
                 symbolic_scope: None,
@@ -10500,17 +9223,6 @@ mod tests {
             .expect_err("missing source snapshot must refuse");
         assert_eq!(refusal.reason, MISSING_SOURCE_SNAPSHOT_REFUSAL);
         assert_eq!(refusal.phase, EnginePhase::SnapshotContext);
-        assert!(
-            session
-                .prepare_analysis("sym.no_snapshot", &blocks, Some(&arch))
-                .is_none()
-        );
-        assert!(
-            session
-                .prepare_analysis_shared("sym.no_snapshot", &blocks, Some(&arch))
-                .is_none()
-        );
-        assert_eq!(session.cache_metrics().analysis, CacheCounters::default());
     }
 
     #[test]
@@ -10526,8 +9238,8 @@ mod tests {
         });
         let mut parsed_context = r2types::ParsedExternalContext::default();
         parsed_context.assumptions =
-            r2ssa::AssumptionSet::new(vec![cache_register_assumption("rdi-seven", "RDI", 7)]);
-        let response = EngineSession::new(4)
+            r2ssa::AssumptionSet::new(vec![register_assumption("rdi-seven", "RDI", 7)]);
+        let response = EngineSession::new()
             .analyze_checked(EngineAnalyzeRequest {
                 function_name: "sym.assumed".to_string(),
                 function_addr: 0x401000,
@@ -10539,7 +9251,6 @@ mod tests {
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
                 parsed_context,
-                external_context_fallback_hash: 0,
                 scope_facts: InterprocScopeFacts::empty(),
                 interproc_max_iterations: 1,
                 symbolic_scope: None,
@@ -11533,8 +10244,6 @@ mod tests {
             },
             callsite_count: 0,
             current_summary: None,
-            analysis_cache_hit: false,
-            request_key: None,
             metrics: EngineMetrics::default(),
             diagnostics: EngineDiagnostics::default(),
         };
@@ -11603,8 +10312,6 @@ mod tests {
             },
             callsite_count: 3,
             current_summary: None,
-            analysis_cache_hit: false,
-            request_key: None,
             metrics: EngineMetrics::default(),
             diagnostics: EngineDiagnostics::default(),
         };
@@ -11813,7 +10520,6 @@ mod tests {
             semantic_metadata_enabled: false,
             reg_type_hints: HashMap::new(),
             parsed_context: r2types::parse_external_context_json("{}", 64),
-            external_context_fallback_hash: 0,
             scope_facts: InterprocScopeFacts::empty(),
             interproc_max_iterations: 1,
             symbolic_scope: None,
@@ -11852,7 +10558,6 @@ mod tests {
             semantic_metadata_enabled: true,
             reg_type_hints: HashMap::new(),
             parsed_context: r2types::parse_external_context_json("{}", 32),
-            external_context_fallback_hash: 7,
             scope_facts: InterprocScopeFacts::empty(),
             interproc_max_iterations: 2,
             symbolic_scope: None,
@@ -11891,7 +10596,6 @@ mod tests {
                 ptr_bits: Some(32),
                 reg_type_hints: HashMap::new(),
                 parsed_context: r2types::parse_external_context_json("{}", 32),
-                external_context_fallback_hash: 9,
                 scope_facts: InterprocScopeFacts::empty(),
                 interproc_max_iterations: 1,
                 symbolic_scope: None,
@@ -11991,7 +10695,6 @@ mod tests {
             ptr_bits: Some(64),
             reg_type_hints: HashMap::new(),
             parsed_context: r2types::parse_external_context_json("{}", 64),
-            external_context_fallback_hash: 0,
             scope_facts: InterprocScopeFacts::empty(),
             interproc_max_iterations: 1,
             symbolic_scope: None,
@@ -12223,7 +10926,7 @@ mod tests {
         }
     }
 
-    fn cache_register_assumption(id: &str, name: &str, value: u64) -> r2ssa::AnalysisAssumption {
+    fn register_assumption(id: &str, name: &str, value: u64) -> r2ssa::AnalysisAssumption {
         r2ssa::AnalysisAssumption {
             id: Some(id.to_string()),
             subject: r2ssa::AssumptionSubject::Register {
@@ -12785,264 +11488,8 @@ mod tests {
     }
 
     #[test]
-    fn engine_request_key_tracks_typed_context_and_assumptions() {
-        let arch = r2il::ArchSpec::new("x86-64");
-        let blocks = const_return_blocks(0x401000, 0);
-        let analysis =
-            AnalysisCacheKey::from_immutable_parts("sym.main", Some(&arch), &blocks, None);
-        let first = EngineRequestKey::from_request_hashes(
-            analysis.clone(),
-            0x401000,
-            1,
-            2,
-            stable_fnv1a_hash("aaa"),
-            64,
-            0,
-            3,
-            0,
-        );
-        let changed_assumption = EngineRequestKey::from_request_hashes(
-            analysis.clone(),
-            0x401000,
-            1,
-            9,
-            stable_fnv1a_hash("aaa"),
-            64,
-            0,
-            3,
-            0,
-        );
-        let changed_context = EngineRequestKey::from_request_hashes(
-            analysis,
-            0x401000,
-            8,
-            2,
-            stable_fnv1a_hash("aaa"),
-            64,
-            0,
-            3,
-            0,
-        );
-
-        assert_ne!(first, changed_assumption);
-        assert_ne!(first, changed_context);
-        assert_eq!(first.analysis, changed_assumption.analysis);
-        assert_eq!(first.analysis, changed_context.analysis);
-    }
-
-    #[test]
-    fn engine_request_key_rejects_v3_and_missing_v4_request_fields() {
-        let legacy_v3 = serde_json::json!({
-            "analysis": {
-                "schema_version": 3,
-                "function_addr": 0x401000u64,
-                "function_name_hash": 1,
-                "arch_hash": 2,
-                "blocks_hash": 3,
-                "typed_context_hash": 4,
-                "assumptions_hash": 5,
-                "analysis_depth_hash": 6
-            },
-            "interproc_budget_hash": 7,
-            "symbolic_scope_hash": 8,
-            "semantic_schema_version": r2sym::SEMANTIC_ARTIFACT_SCHEMA_VERSION,
-            "semantic_claim_schema_version": r2sym::SEMANTIC_CLAIM_SCHEMA_VERSION
-        });
-        assert!(serde_json::from_value::<EngineRequestKey>(legacy_v3).is_err());
-
-        let key = EngineRequestKey::from_request_hashes(
-            AnalysisCacheKey::from_immutable_hashes(1, 2, 3, None),
-            0x401000,
-            4,
-            5,
-            6,
-            64,
-            7,
-            8,
-            9,
-        );
-        let encoded = serde_json::to_value(&key).expect("serialize v4 engine request key");
-        assert_eq!(encoded["analysis"]["schema_version"], ENGINE_SCHEMA_VERSION);
-        assert_eq!(
-            serde_json::from_value::<EngineRequestKey>(encoded.clone())
-                .expect("round-trip v4 engine request key"),
-            key
-        );
-
-        for field in [
-            "function_addr",
-            "typed_context_hash",
-            "assumptions_hash",
-            "analysis_depth_hash",
-            "ptr_bits",
-            "reg_type_hints_hash",
-        ] {
-            let mut missing = encoded.clone();
-            missing
-                .as_object_mut()
-                .expect("request key JSON object")
-                .remove(field);
-            assert!(
-                serde_json::from_value::<EngineRequestKey>(missing).is_err(),
-                "missing {field} must fail closed"
-            );
-        }
-    }
-
-    #[test]
-    fn request_scope_identity_separates_name_order_collisions() {
-        let root = r2ssa::SsaArtifact::for_symbolic(&const_return_blocks(0x401000, 0), None)
-            .expect("root prepared");
-        let helper = r2ssa::SsaArtifact::for_symbolic(&const_return_blocks(0x402000, 1), None)
-            .expect("helper prepared");
-        let left = r2sym::PreparedFunctionScope::new(
-            0x401000,
-            vec![
-                r2sym::ScopedPreparedFunction {
-                    id: r2ssa::InterprocFunctionId(0x401000),
-                    name: Some("sym.root".to_string()),
-                    prepared: root.clone().with_name("sym.root"),
-                },
-                r2sym::ScopedPreparedFunction {
-                    id: r2ssa::InterprocFunctionId(0x402000),
-                    name: Some("sym.helper".to_string()),
-                    prepared: helper.clone().with_name("sym.helper"),
-                },
-            ],
-        )
-        .expect("left scope");
-        let reordered_names = r2sym::PreparedFunctionScope::new(
-            0x401000,
-            vec![
-                r2sym::ScopedPreparedFunction {
-                    id: r2ssa::InterprocFunctionId(0x401000),
-                    name: Some("sym.helper".to_string()),
-                    prepared: root.with_name("sym.helper"),
-                },
-                r2sym::ScopedPreparedFunction {
-                    id: r2ssa::InterprocFunctionId(0x402000),
-                    name: Some("sym.root".to_string()),
-                    prepared: helper.with_name("sym.root"),
-                },
-            ],
-        )
-        .expect("scope with reordered names");
-
-        assert_eq!(
-            r2sym::stable_scope_hash(Some(&left)),
-            r2sym::stable_scope_hash(Some(&reordered_names)),
-            "upstream semantic scope identity intentionally ignores names"
-        );
-        assert_ne!(
-            request_scope_identity_hash(Some(&left)),
-            request_scope_identity_hash(Some(&reordered_names)),
-            "engine request identity must include name placement in scope order"
-        );
-    }
-
-    #[test]
-    fn function_request_key_hashes_parsed_assumptions_separately() {
-        let blocks = const_return_blocks(0x401000, 0);
-        let parsed_context = r2types::ParsedExternalContext {
-            context_schema_version: Some(1),
-            context_dirty_epoch: Some(7),
-            type_dirty_epoch: Some(3),
-            context_hash: Some(42),
-            ..r2types::ParsedExternalContext::default()
-        };
-        let base_request = EngineAnalyzeRequest {
-            function_name: "sym.main".to_string(),
-            function_addr: 0x401000,
-            blocks,
-            arch: None,
-            source_snapshot: Some(test_source_snapshot("sym.main/rev1")),
-            trusted_ssa: None,
-            ptr_bits: 64,
-            semantic_metadata_enabled: false,
-            reg_type_hints: HashMap::new(),
-            parsed_context,
-            external_context_fallback_hash: 0xfeed,
-            scope_facts: InterprocScopeFacts::empty(),
-            interproc_max_iterations: 1,
-            symbolic_scope: None,
-            precomputed_semantic_artifact: None,
-            semantic_mode: EngineSemanticMode::Full,
-            include_interproc_summary_set: true,
-            execution: EngineExecutionControl::default(),
-        };
-        let base = function_request_key(&base_request);
-
-        let mut changed_assumption_request = base_request.clone();
-        changed_assumption_request.parsed_context.assumptions =
-            r2ssa::AssumptionSet::new(vec![cache_register_assumption("rdi-one", "rdi", 1)]);
-        let changed_assumption = function_request_key(&changed_assumption_request);
-
-        assert_eq!(
-            base.typed_context_hash,
-            changed_assumption.typed_context_hash
-        );
-        assert_ne!(base.assumptions_hash, changed_assumption.assumptions_hash);
-        assert_eq!(base.analysis, changed_assumption.analysis);
-        assert_ne!(base, changed_assumption);
-
-        let mut reordered_first = base_request.clone();
-        reordered_first.parsed_context.assumptions = r2ssa::AssumptionSet::new(vec![
-            cache_register_assumption("rdi-one", "rdi", 1),
-            cache_register_assumption("rsi-two", "rsi", 2),
-        ]);
-        let mut reordered_second = base_request.clone();
-        reordered_second.parsed_context.assumptions = r2ssa::AssumptionSet::new(vec![
-            cache_register_assumption("rsi-two", "rsi", 2),
-            cache_register_assumption("rdi-one", "rdi", 1),
-        ]);
-        assert_eq!(
-            function_request_key(&reordered_first),
-            function_request_key(&reordered_second),
-            "assumption identity should be deterministic and order-insensitive"
-        );
-
-        let mut changed_ptr_bits_request = base_request.clone();
-        changed_ptr_bits_request.ptr_bits = 32;
-        let changed_ptr_bits = function_request_key(&changed_ptr_bits_request);
-        assert_eq!(base.analysis, changed_ptr_bits.analysis);
-        assert_ne!(base, changed_ptr_bits);
-
-        let integer_hint = r2types::TypeHint {
-            rank: r2types::TypeHintRank::Integer,
-            ty: "uint64_t".to_string(),
-        };
-        let pointer_hint = r2types::TypeHint::pointer();
-        let mut first_hint_order = base_request.clone();
-        first_hint_order
-            .reg_type_hints
-            .insert("rsi".to_string(), pointer_hint.clone());
-        first_hint_order
-            .reg_type_hints
-            .insert("rdi".to_string(), integer_hint.clone());
-        let mut second_hint_order = base_request.clone();
-        second_hint_order
-            .reg_type_hints
-            .insert("rdi".to_string(), integer_hint);
-        second_hint_order
-            .reg_type_hints
-            .insert("rsi".to_string(), pointer_hint);
-        let first_hint_key = function_request_key(&first_hint_order);
-        let second_hint_key = function_request_key(&second_hint_order);
-        assert_eq!(first_hint_key, second_hint_key);
-        assert_eq!(base.analysis, first_hint_key.analysis);
-        assert_ne!(base, first_hint_key);
-
-        let mut changed_config_request = base_request;
-        changed_config_request.semantic_metadata_enabled = true;
-        let changed_config = function_request_key(&changed_config_request);
-        assert_eq!(base.assumptions_hash, changed_config.assumptions_hash);
-        assert_ne!(base.analysis_depth_hash, changed_config.analysis_depth_hash);
-        assert_eq!(base.analysis, changed_config.analysis);
-    }
-
-    #[test]
-    fn analyze_uncached_reports_planning_time() {
-        let session = EngineSession::new(4);
+    fn analyze_reports_planning_time() {
+        let session = EngineSession::new();
         let request = EngineAnalyzeRequest {
             function_name: "sym.zero".to_string(),
             function_addr: 0x401000,
@@ -13054,7 +11501,6 @@ mod tests {
             semantic_metadata_enabled: false,
             reg_type_hints: HashMap::new(),
             parsed_context: r2types::ParsedExternalContext::default(),
-            external_context_fallback_hash: 0,
             scope_facts: InterprocScopeFacts::empty(),
             interproc_max_iterations: 1,
             symbolic_scope: None,
@@ -13063,9 +11509,7 @@ mod tests {
             include_interproc_summary_set: true,
             execution: EngineExecutionControl::default(),
         };
-        let response = session
-            .analyze(request.clone())
-            .expect("analysis should succeed");
+        let response = session.analyze(request).expect("analysis should succeed");
 
         assert!(response.metrics.planning_time > Duration::default());
         assert_eq!(response.metrics.phase_timings.len(), EnginePhase::ALL.len());
@@ -13083,19 +11527,6 @@ mod tests {
             EnginePhaseStatus::Executed
         );
 
-        let reused = session
-            .analyze(request)
-            .expect("cached analysis should succeed");
-        assert_eq!(reused.metrics.phase_timings.len(), EnginePhase::ALL.len());
-        assert_eq!(
-            reused.metrics.phase_timings[2].status,
-            EnginePhaseStatus::Reused
-        );
-        assert_eq!(
-            reused.metrics.phase_timings[3].status,
-            EnginePhaseStatus::Reused
-        );
-
         let decompiled = session.decompile_function_from_input(
             EngineFunctionDecompileRequestInput::single_function(
                 EngineFunctionInput {
@@ -13108,7 +11539,6 @@ mod tests {
                 },
                 Some(64),
                 r2types::ParsedExternalContext::default(),
-                0,
             ),
         );
         assert_eq!(
@@ -13140,7 +11570,6 @@ mod tests {
             ptr_bits: Some(64),
             reg_type_hints: HashMap::new(),
             parsed_context: r2types::ParsedExternalContext::default(),
-            external_context_fallback_hash: 0,
             scope_facts: InterprocScopeFacts::empty(),
             interproc_max_iterations: 1,
             symbolic_scope: None,
@@ -13221,7 +11650,6 @@ mod tests {
                     ptr_bits: Some(64),
                     reg_type_hints: HashMap::new(),
                     parsed_context: r2types::ParsedExternalContext::default(),
-                    external_context_fallback_hash: 0,
                     scope_facts: InterprocScopeFacts::empty(),
                     interproc_max_iterations: 1,
                     symbolic_scope: None,
@@ -13269,7 +11697,6 @@ mod tests {
                     ptr_bits: Some(64),
                     reg_type_hints: HashMap::new(),
                     parsed_context: r2types::ParsedExternalContext::default(),
-                    external_context_fallback_hash: 0,
                     scope_facts: InterprocScopeFacts::empty(),
                     interproc_max_iterations: 1,
                     symbolic_scope: None,
@@ -13340,7 +11767,7 @@ mod tests {
 
     #[test]
     fn legacy_route_metadata_cannot_promote_handmade_fixtures() {
-        let session = EngineSession::new(4);
+        let session = EngineSession::new();
         let mut terminal = controlled_semantic_kernel_render_request(&session);
         assert_handmade_analysis_only(terminal.prepared_ssa.as_ref());
         terminal
@@ -13358,7 +11785,7 @@ mod tests {
 
     #[test]
     fn semantic_kernel_near_miss_preserves_legacy_fallback_without_c() {
-        let session = EngineSession::new(4);
+        let session = EngineSession::new();
         let mut request = controlled_r2dec_render_request();
         let fallback = "/* forced near-miss legacy fallback */";
         request
@@ -13390,8 +11817,8 @@ mod tests {
     }
 
     #[test]
-    fn r2dec_inner_stops_map_to_engine_refusals_without_output_or_cache_mutation() {
-        let session = EngineSession::new(4);
+    fn r2dec_inner_stops_map_to_engine_refusals_without_native_output() {
+        let session = EngineSession::new();
         let request = controlled_r2dec_render_request();
         let decompiler_input = decompiler_input_for_engine_request(&request);
         let legacy_output = r2dec::Decompiler::new(request.render_target.to_decompiler_config())
@@ -13406,7 +11833,6 @@ mod tests {
         let total_polls = counting.polls.get();
         assert!(total_polls > 3, "r2dec pipeline must expose inner polls");
 
-        let cache_before = session.cache_metrics();
         let mut observed = HashMap::new();
         for stop_at in 1..=total_polls {
             let stop = StopRenderAtPoll::new(stop_at, r2ssa::SsaExecutionStopReason::Cancelled);
@@ -13515,7 +11941,6 @@ mod tests {
             assert!(response.output.starts_with("/* r2dec fallback:"));
             assert!(!response.output.contains("() {"));
         }
-        assert_eq!(session.cache_metrics(), cache_before);
     }
 
     #[test]
@@ -13710,7 +12135,7 @@ mod tests {
 
     #[test]
     fn handmade_terminal_cannot_reach_semantic_kernel_renderer() {
-        let session = EngineSession::new(4);
+        let session = EngineSession::new();
         let request = controlled_semantic_kernel_render_request(&session);
         assert_handmade_analysis_only(request.prepared_ssa.as_ref());
         let refused =
@@ -13721,7 +12146,7 @@ mod tests {
 
     #[test]
     fn handmade_aggregate_member_cannot_reach_semantic_kernel_renderer() {
-        let session = EngineSession::new(4);
+        let session = EngineSession::new();
         let request = controlled_aggregate_member_render_request(&session);
         assert_handmade_analysis_only(request.prepared_ssa.as_ref());
         let refused =
@@ -13739,13 +12164,12 @@ mod tests {
         let mut metrics = EngineMetrics::default();
         poll_engine_execution(&request.execution, EnginePhase::SnapshotContext, &metrics)?;
         let phase_started = Instant::now();
-        let request_key = function_request_key(&request);
         metrics.record_phase(
             EnginePhase::SnapshotContext,
             EnginePhaseStatus::Executed,
             phase_started.elapsed(),
         );
-        session.analyze_with_key_and_ssa_control(request, request_key, started, metrics, control)
+        session.analyze_with_ssa_control(request, started, metrics, control)
     }
 
     enum SsaPollTrigger {
@@ -13777,18 +12201,12 @@ mod tests {
     }
 
     #[test]
-    fn analyze_checked_maps_mid_ssa_cancellation_without_caching_partial_artifact() {
-        let session = EngineSession::new(4);
+    fn analyze_checked_maps_mid_ssa_cancellation() {
+        let session = EngineSession::new();
         let cancellation = EngineCancellationToken::default();
         let request =
             controlled_ssa_test_request("sym.ssa_cancelled", const_return_blocks(0x611000, 7))
                 .with_cancellation(cancellation.clone());
-        let analysis_key = function_analysis_cache_key(
-            &request.function_name,
-            request.arch.as_ref(),
-            &request.blocks,
-            request.source_snapshot.as_deref(),
-        );
         let control = DeterministicSsaControl {
             polls: Cell::new(0),
             stop_at: 10,
@@ -13806,20 +12224,13 @@ mod tests {
             refusal.metrics.phase_timings[EnginePhase::Ssa as usize].status,
             EnginePhaseStatus::Refused
         );
-        assert!(session.cached_analysis(&analysis_key).is_none());
     }
 
     #[test]
-    fn analyze_checked_maps_mid_ssa_deadline_without_caching_partial_artifact() {
-        let session = EngineSession::new(4);
+    fn analyze_checked_maps_mid_ssa_deadline() {
+        let session = EngineSession::new();
         let request =
             controlled_ssa_test_request("sym.ssa_deadline", const_return_blocks(0x612000, 9));
-        let analysis_key = function_analysis_cache_key(
-            &request.function_name,
-            request.arch.as_ref(),
-            &request.blocks,
-            request.source_snapshot.as_deref(),
-        );
         let control = DeterministicSsaControl {
             polls: Cell::new(0),
             stop_at: 10,
@@ -13840,20 +12251,12 @@ mod tests {
             refusal.metrics.phase_timings[EnginePhase::Ssa as usize].status,
             EnginePhaseStatus::Refused
         );
-        assert!(session.cached_analysis(&analysis_key).is_none());
     }
 
     #[test]
     fn analyze_checked_keeps_malformed_ssa_distinct_from_execution_stops() {
-        let session = EngineSession::new(4);
+        let session = EngineSession::new();
         let request = controlled_ssa_test_request("sym.ssa_malformed", Vec::new());
-        let analysis_key = function_analysis_cache_key(
-            &request.function_name,
-            request.arch.as_ref(),
-            &request.blocks,
-            request.source_snapshot.as_deref(),
-        );
-
         let refusal = session
             .analyze_checked(request)
             .expect_err("malformed SSA input must fail closed");
@@ -13869,11 +12272,10 @@ mod tests {
             refusal.metrics.phase_timings[EnginePhase::Ssa as usize].status,
             EnginePhaseStatus::Refused
         );
-        assert!(session.cached_analysis(&analysis_key).is_none());
     }
 
     #[test]
-    fn controlled_ssa_build_is_unchanged_and_cache_hits_skip_worklist_polling() {
+    fn controlled_ssa_build_is_unchanged() {
         let blocks = const_return_blocks(0x613000, 11);
         let snapshot = test_source_snapshot("sym.ssa_same/rev1");
         let prepared = build_engine_analysis_from_parts("sym.ssa_same", &blocks, None, &snapshot)
@@ -13901,22 +12303,6 @@ mod tests {
             &controlled.ssa_func,
             &controlled.pattern_ssa_func
         ));
-
-        let session = EngineSession::new(4);
-        let request = controlled_ssa_test_request("sym.ssa_cached", blocks);
-        session
-            .analyze_checked(request.clone())
-            .expect("cache priming analysis");
-        let stopped = DeterministicSsaControl {
-            polls: Cell::new(0),
-            stop_at: 1,
-            trigger: SsaPollTrigger::Stop(r2ssa::SsaExecutionStopReason::Cancelled),
-            downstream: None,
-        };
-        let response = analyze_with_injected_ssa_control(&session, request, &stopped)
-            .expect("cache hit must not enter SSA worklists");
-        assert!(response.analysis_cache_hit);
-        assert_eq!(stopped.polls.get(), 0);
     }
 
     #[test]
@@ -13954,7 +12340,6 @@ mod tests {
                 ptr_bits: Some(64),
                 reg_type_hints: HashMap::new(),
                 parsed_context: r2types::ParsedExternalContext::default(),
-                external_context_fallback_hash: 0,
                 scope_facts: InterprocScopeFacts::empty(),
                 interproc_max_iterations: 1,
                 symbolic_scope: None,
@@ -13963,7 +12348,7 @@ mod tests {
             })
             .with_cancellation(cancellation);
 
-        let refusal = EngineSession::new(4)
+        let refusal = EngineSession::new()
             .analyze_checked(request)
             .expect_err("pre-cancelled analysis must fail closed");
         assert_eq!(refusal.phase, EnginePhase::SnapshotContext);
@@ -13998,11 +12383,10 @@ mod tests {
             },
             Some(64),
             r2types::ParsedExternalContext::default(),
-            0,
         )
         .with_deadline(deadline);
 
-        let response = EngineSession::new(4).decompile_function_from_input(input);
+        let response = EngineSession::new().decompile_function_from_input(input);
         assert!(
             response
                 .output
@@ -14043,14 +12427,13 @@ mod tests {
             },
             Some(64),
             r2types::ParsedExternalContext::default(),
-            0,
         )
         .with_deadline(deadline)
         .with_cancellation(cancellation.clone());
         assert_eq!(input.execution.deadline(), Some(deadline));
         cancellation.cancel();
 
-        let response = EngineSession::new(4).decompile_function_from_input(input);
+        let response = EngineSession::new().decompile_function_from_input(input);
 
         assert!(
             response
@@ -14058,133 +12441,6 @@ mod tests {
                 .contains("cancelled before snapshot_context")
         );
         assert!(!response.output.contains("uint64_t sym_combined"));
-    }
-
-    #[test]
-    fn cache_and_request_keys_partition_their_inputs() {
-        let arch = r2il::ArchSpec::new("x86-64");
-        let blocks = const_return_blocks(0x401000, 0);
-        let analysis = AnalysisCacheKey::from_parts(
-            0x401000,
-            "sym.main",
-            Some(&arch),
-            &blocks,
-            0x10,
-            0x20,
-            "aaa",
-            None,
-        );
-        let changed_typed_context = AnalysisCacheKey::from_parts(
-            0x401000,
-            "sym.main",
-            Some(&arch),
-            &blocks,
-            0x11,
-            0x20,
-            "aaa",
-            None,
-        );
-        let changed_assumptions = AnalysisCacheKey::from_parts(
-            0x401000,
-            "sym.main",
-            Some(&arch),
-            &blocks,
-            0x10,
-            0x21,
-            "aaa",
-            None,
-        );
-
-        assert_eq!(analysis, changed_typed_context);
-        assert_eq!(analysis, changed_assumptions);
-
-        let request_key = EngineRequestKey::from_request_hashes(
-            analysis.clone(),
-            0x401000,
-            0x10,
-            0x20,
-            0x25,
-            64,
-            0x28,
-            0x30,
-            0x40,
-        );
-        let changed_interproc_budget = EngineRequestKey::from_request_hashes(
-            analysis.clone(),
-            0x401000,
-            0x10,
-            0x20,
-            0x25,
-            64,
-            0x28,
-            0x31,
-            0x40,
-        );
-        let changed_symbolic_scope = EngineRequestKey::from_request_hashes(
-            analysis, 0x401000, 0x10, 0x20, 0x25, 64, 0x28, 0x30, 0x41,
-        );
-
-        assert_ne!(request_key, changed_interproc_budget);
-        assert_ne!(request_key, changed_symbolic_scope);
-    }
-
-    #[test]
-    fn session_cache_metrics_track_hits_misses_and_evictions() {
-        let session = EngineSession::new(2);
-        let blocks = const_return_blocks(0x1000, 0);
-        let snapshot = test_source_snapshot("cache-metrics/rev1");
-        let key1 = function_analysis_cache_key("a", None, &blocks, Some(&snapshot));
-        let key2 = function_analysis_cache_key("b", None, &blocks, Some(&snapshot));
-        let key3 = function_analysis_cache_key("c", None, &blocks, Some(&snapshot));
-        let analysis1 = build_engine_analysis_from_parts("a", &blocks, None, &snapshot).expect("a");
-        let analysis2 = build_engine_analysis_from_parts("b", &blocks, None, &snapshot).expect("b");
-        let analysis3 = build_engine_analysis_from_parts("c", &blocks, None, &snapshot).expect("c");
-
-        assert!(session.cached_analysis(&key1).is_none());
-        session.insert_analysis(key1.clone(), analysis1);
-        session.insert_analysis(key2.clone(), analysis2);
-        assert!(session.cached_analysis(&key1).is_some());
-        session.insert_analysis(key3, analysis3);
-        assert!(session.cached_analysis(&key2).is_none());
-
-        let metrics = session.cache_metrics();
-        assert_eq!(
-            metrics.analysis,
-            CacheCounters {
-                hits: 1,
-                misses: 2,
-                insertions: 3,
-                evictions: 1,
-            }
-        );
-        assert_eq!(metrics.total().total_lookups(), 3);
-    }
-
-    #[test]
-    fn session_cache_metrics_track_only_reusable_analysis() {
-        let session = EngineSession::new(4);
-        let blocks = const_return_blocks(0x2000, 0);
-        let snapshot = test_source_snapshot("cache-reuse/rev1");
-        let analysis = AnalysisCacheKey::from_parts(
-            0x2000,
-            "a",
-            None,
-            &blocks,
-            1,
-            2,
-            "types-only",
-            Some(&snapshot),
-        );
-        let reusable =
-            build_engine_analysis_from_parts("a", &blocks, None, &snapshot).expect("analysis");
-
-        assert!(session.cached_analysis(&analysis).is_none());
-        session.insert_analysis(analysis.clone(), reusable);
-        assert!(session.cached_analysis(&analysis).is_some());
-
-        let metrics = session.cache_metrics();
-        assert_eq!(metrics.analysis.hits, 1);
-        assert_eq!(metrics.analysis.misses, 1);
     }
 
     #[test]
@@ -14462,34 +12718,6 @@ mod tests {
     }
 
     #[test]
-    fn analysis_cache_refreshes_recency_and_evicts_oldest() {
-        let session = EngineSession::new(2);
-        let blocks = const_return_blocks(0x1000, 0);
-        let snapshot = test_source_snapshot("cache-recency/rev1");
-        let key1 = function_analysis_cache_key("a", None, &blocks, Some(&snapshot));
-        let key2 = function_analysis_cache_key("b", None, &blocks, Some(&snapshot));
-        let key3 = function_analysis_cache_key("c", None, &blocks, Some(&snapshot));
-
-        session.insert_analysis(
-            key1.clone(),
-            build_engine_analysis_from_parts("a", &blocks, None, &snapshot).expect("a"),
-        );
-        session.insert_analysis(
-            key2.clone(),
-            build_engine_analysis_from_parts("b", &blocks, None, &snapshot).expect("b"),
-        );
-        assert!(session.cached_analysis(&key1).is_some());
-        session.insert_analysis(
-            key3.clone(),
-            build_engine_analysis_from_parts("c", &blocks, None, &snapshot).expect("c"),
-        );
-
-        assert!(session.cached_analysis(&key1).is_some());
-        assert!(session.cached_analysis(&key2).is_none());
-        assert!(session.cached_analysis(&key3).is_some());
-    }
-
-    #[test]
     fn decompile_probe_decision_guards_named_large_worker() {
         let mut blocks = const_return_blocks(0x4b30, 0);
         for idx in 0..210 {
@@ -14619,7 +12847,7 @@ mod tests {
             ("sym.over_blocks", 0xb000, over_blocks),
             ("sym.over_ops", 0xc000, vec![over_ops]),
         ] {
-            let session = EngineSession::new(4);
+            let session = EngineSession::new();
             let response = session.decompile_function_from_input(
                 EngineFunctionDecompileRequestInput::single_function(
                     EngineFunctionInput {
@@ -14634,7 +12862,6 @@ mod tests {
                     },
                     Some(64),
                     r2types::ParsedExternalContext::default(),
-                    0,
                 ),
             );
             assert!(
@@ -14651,9 +12878,6 @@ mod tests {
                     .map(|route| route.kind),
                 Some(r2types::DecompileRouteKind::FallbackComment)
             );
-            let metrics = session.cache_metrics();
-            assert_eq!(metrics.analysis.misses, 0);
-            assert_eq!(metrics.analysis.insertions, 0);
         }
     }
 
@@ -15020,11 +13244,6 @@ mod tests {
         assert_eq!(
             typed_summary.return_relation,
             r2ssa::SummaryReturnRelation::Arg(0)
-        );
-        assert_ne!(
-            name_only.identity_hash(),
-            typed.identity_hash(),
-            "summary linkage must participate in cache identity"
         );
     }
 
@@ -15883,13 +14102,13 @@ mod tests {
     }
 
     #[test]
-    fn type_function_uses_engine_summary_preprobe_without_analysis_cache_lookup() {
+    fn type_function_uses_engine_summary_preprobe() {
         let mut blocks = const_return_blocks(0x55a0, 0);
         for idx in 0..210 {
             blocks.push(R2ILBlock::new(0x5600 + idx, 1));
         }
         let parsed_context = r2types::parse_external_context_json("{}", 64);
-        let session = EngineSession::new(8);
+        let session = EngineSession::new();
 
         let response = session
             .type_function(EngineTypeAnalysisRequest {
@@ -15904,7 +14123,6 @@ mod tests {
                     semantic_metadata_enabled: false,
                     reg_type_hints: HashMap::new(),
                     parsed_context,
-                    external_context_fallback_hash: 0,
                     scope_facts: InterprocScopeFacts::empty(),
                     interproc_max_iterations: 1,
                     symbolic_scope: None,
@@ -15939,7 +14157,7 @@ mod tests {
             blocks.push(R2ILBlock::new(0x5600 + idx, 1));
         }
         let parsed_context = r2types::parse_external_context_json("{}", 64);
-        let session = EngineSession::new(8);
+        let session = EngineSession::new();
 
         let payload = session
             .type_function_report_payload(EngineFunctionAnalysisReportRequest {
@@ -15954,7 +14172,6 @@ mod tests {
                     semantic_metadata_enabled: false,
                     reg_type_hints: HashMap::new(),
                     parsed_context,
-                    external_context_fallback_hash: 0,
                     scope_facts: InterprocScopeFacts::empty(),
                     interproc_max_iterations: 1,
                     symbolic_scope: None,
@@ -16000,7 +14217,6 @@ mod tests {
                 },
                 ptr_bits: Some(64),
                 parsed_context: r2types::ParsedExternalContext::default(),
-                external_context_fallback_hash: 0x5678,
                 scope_facts: InterprocScopeFacts::empty(),
                 interproc_max_iters: 5,
                 interproc_converged: true,
@@ -16018,7 +14234,6 @@ mod tests {
         assert_eq!(request.analysis.semantic_mode, EngineSemanticMode::Full);
         assert!(request.analysis.include_interproc_summary_set);
         assert_eq!(request.analysis.interproc_max_iterations, 5);
-        assert_eq!(request.analysis.external_context_fallback_hash, 0x5678);
         assert_eq!(request.interproc_max_iters, 5);
         assert!(request.interproc_converged);
         assert_eq!(request.writeback_budget.global_max_links, 7);
@@ -16031,32 +14246,30 @@ mod tests {
         let request = EngineFunctionAnalysisArtifactRequest::full_semantics_for_function(
             EngineFunctionAnalysisArtifactRequestInput {
                 function: EngineFunctionInput {
-                    function_name: "dbg.cached".to_string(),
+                    function_name: "dbg.artifact".to_string(),
                     function_addr: 0x6600,
                     blocks: Vec::new(),
                     arch: None,
-                    source_snapshot: Some(test_source_snapshot("dbg.cached/rev1")),
+                    source_snapshot: Some(test_source_snapshot("dbg.artifact/rev1")),
                     semantic_metadata_enabled: false,
                 },
                 ptr_bits: Some(64),
                 parsed_context: r2types::ParsedExternalContext::default(),
-                external_context_fallback_hash: 0xabc,
                 scope_facts: InterprocScopeFacts::empty(),
                 interproc_max_iterations: 9,
                 symbolic_scope: None,
             },
         );
 
-        assert_eq!(request.analysis.function_name, "dbg.cached");
+        assert_eq!(request.analysis.function_name, "dbg.artifact");
         assert_eq!(request.analysis.function_addr, 0x6600);
         assert_eq!(request.analysis.ptr_bits, 64);
         assert_eq!(request.analysis.semantic_mode, EngineSemanticMode::Full);
         assert!(request.analysis.include_interproc_summary_set);
         assert_eq!(request.analysis.interproc_max_iterations, 9);
-        assert_eq!(request.analysis.external_context_fallback_hash, 0xabc);
         assert!(
             request.analysis.reg_type_hints.is_empty(),
-            "request identity builder owns default register-hint policy"
+            "request builder owns default register-hint policy"
         );
     }
 
@@ -16064,7 +14277,7 @@ mod tests {
     fn decompile_function_uses_engine_summary_preprobe_without_plugin_policy() {
         let blocks = const_return_blocks(0x401000, 0);
         let parsed_context = r2types::parse_external_context_json("{}", 64);
-        let session = EngineSession::new(8);
+        let session = EngineSession::new();
 
         let response = session.decompile_function(EngineFunctionDecompileRequest {
             input_quality: None,
@@ -16079,7 +14292,6 @@ mod tests {
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
                 parsed_context,
-                external_context_fallback_hash: 0,
                 scope_facts: InterprocScopeFacts::empty(),
                 interproc_max_iterations: 1,
                 symbolic_scope: None,
@@ -16102,7 +14314,7 @@ mod tests {
     fn decompile_function_from_input_refuses_incomplete_lifted_function() {
         let blocks = const_return_blocks(0x401000, 0);
         let parsed_context = r2types::parse_external_context_json("{}", 64);
-        let session = EngineSession::new(8);
+        let session = EngineSession::new();
 
         let response = session.decompile_function_from_input(EngineFunctionDecompileRequestInput {
             function: EngineFunctionInput {
@@ -16115,7 +14327,6 @@ mod tests {
             },
             ptr_bits: Some(64),
             parsed_context,
-            external_context_fallback_hash: 0,
             scope_facts: InterprocScopeFacts::empty(),
             interproc_max_iterations: 1,
             symbolic_scope: None,
@@ -16173,7 +14384,7 @@ mod tests {
     fn decompile_function_from_input_refuses_inconsistent_lift_quality() {
         let blocks = const_return_blocks(0x401000, 0);
         let parsed_context = r2types::parse_external_context_json("{}", 64);
-        let session = EngineSession::new(8);
+        let session = EngineSession::new();
 
         let response = session.decompile_function_from_input(EngineFunctionDecompileRequestInput {
             function: EngineFunctionInput {
@@ -16186,7 +14397,6 @@ mod tests {
             },
             ptr_bits: Some(64),
             parsed_context,
-            external_context_fallback_hash: 0,
             scope_facts: InterprocScopeFacts::empty(),
             interproc_max_iterations: 1,
             symbolic_scope: None,
@@ -16228,7 +14438,7 @@ mod tests {
     #[test]
     fn decompile_function_from_input_refuses_zero_lifted_function() {
         let parsed_context = r2types::parse_external_context_json("{}", 64);
-        let session = EngineSession::new(8);
+        let session = EngineSession::new();
 
         let response = session.decompile_function_from_input(EngineFunctionDecompileRequestInput {
             function: EngineFunctionInput {
@@ -16241,7 +14451,6 @@ mod tests {
             },
             ptr_bits: Some(64),
             parsed_context,
-            external_context_fallback_hash: 0,
             scope_facts: InterprocScopeFacts::empty(),
             interproc_max_iterations: 1,
             symbolic_scope: None,
@@ -16289,7 +14498,7 @@ mod tests {
     #[test]
     fn decompile_function_from_input_refuses_zero_expected_blocks() {
         let parsed_context = r2types::parse_external_context_json("{}", 64);
-        let session = EngineSession::new(8);
+        let session = EngineSession::new();
 
         let response = session.decompile_function_from_input(EngineFunctionDecompileRequestInput {
             function: EngineFunctionInput {
@@ -16302,7 +14511,6 @@ mod tests {
             },
             ptr_bits: Some(64),
             parsed_context,
-            external_context_fallback_hash: 0,
             scope_facts: InterprocScopeFacts::empty(),
             interproc_max_iterations: 1,
             symbolic_scope: None,
@@ -16343,7 +14551,7 @@ mod tests {
     fn decompile_function_from_input_attaches_complete_input_quality() {
         let blocks = const_return_blocks(0x401000, 0);
         let parsed_context = r2types::parse_external_context_json("{}", 64);
-        let session = EngineSession::new(8);
+        let session = EngineSession::new();
 
         let response = session.decompile_function_from_input(EngineFunctionDecompileRequestInput {
             function: EngineFunctionInput {
@@ -16356,7 +14564,6 @@ mod tests {
             },
             ptr_bits: Some(64),
             parsed_context,
-            external_context_fallback_hash: 0,
             scope_facts: InterprocScopeFacts::empty(),
             interproc_max_iterations: 1,
             symbolic_scope: None,
@@ -16380,7 +14587,7 @@ mod tests {
     fn decompile_function_refuses_incomplete_optional_input_quality() {
         let blocks = const_return_blocks(0x401000, 0);
         let parsed_context = r2types::parse_external_context_json("{}", 64);
-        let session = EngineSession::new(8);
+        let session = EngineSession::new();
 
         let response = session.decompile_function(EngineFunctionDecompileRequest {
             input_quality: Some(EngineFunctionInputQuality {
@@ -16402,7 +14609,6 @@ mod tests {
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
                 parsed_context,
-                external_context_fallback_hash: 0,
                 scope_facts: InterprocScopeFacts::empty(),
                 interproc_max_iterations: 1,
                 symbolic_scope: None,
@@ -16438,7 +14644,7 @@ mod tests {
     fn decompile_function_uses_canonical_display_identity_without_raw_payloads() {
         let blocks = const_return_blocks(0x401000, 0);
         let parsed_context = r2types::parse_external_context_json("{}", 64);
-        let session = EngineSession::new(8);
+        let session = EngineSession::new();
 
         let response = session.decompile_function(EngineFunctionDecompileRequest {
             input_quality: None,
@@ -16453,7 +14659,6 @@ mod tests {
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
                 parsed_context,
-                external_context_fallback_hash: 0,
                 scope_facts: InterprocScopeFacts::empty(),
                 interproc_max_iterations: 1,
                 symbolic_scope: None,
@@ -16485,7 +14690,7 @@ mod tests {
     fn decompile_function_does_not_invent_raw_payload_callee_names() {
         let blocks = direct_call_return_blocks(0x401000, 0x5000);
         let parsed_context = r2types::parse_external_context_json("{}", 64);
-        let session = EngineSession::new(8);
+        let session = EngineSession::new();
 
         let response = session.decompile_function(EngineFunctionDecompileRequest {
             input_quality: None,
@@ -16500,7 +14705,6 @@ mod tests {
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
                 parsed_context,
-                external_context_fallback_hash: 0,
                 scope_facts: InterprocScopeFacts::empty(),
                 interproc_max_iterations: 1,
                 symbolic_scope: None,
@@ -16530,7 +14734,7 @@ mod tests {
     fn decompile_function_does_not_invent_raw_payload_strings() {
         let blocks = const_return_blocks(0x401000, 0x6000);
         let parsed_context = r2types::parse_external_context_json("{}", 64);
-        let session = EngineSession::new(8);
+        let session = EngineSession::new();
 
         let response = session.decompile_function(EngineFunctionDecompileRequest {
             input_quality: None,
@@ -16545,7 +14749,6 @@ mod tests {
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
                 parsed_context,
-                external_context_fallback_hash: 0,
                 scope_facts: InterprocScopeFacts::empty(),
                 interproc_max_iterations: 1,
                 symbolic_scope: None,
@@ -16577,7 +14780,6 @@ mod tests {
                 },
                 ptr_bits: Some(64),
                 parsed_context: r2types::ParsedExternalContext::default(),
-                external_context_fallback_hash: 0x1234,
                 scope_facts: InterprocScopeFacts::empty(),
                 interproc_max_iterations: 3,
                 symbolic_scope: None,
@@ -16593,7 +14795,6 @@ mod tests {
         assert_eq!(request.analysis.semantic_mode, EngineSemanticMode::Full);
         assert!(request.analysis.include_interproc_summary_set);
         assert_eq!(request.analysis.interproc_max_iterations, 3);
-        assert_eq!(request.analysis.external_context_fallback_hash, 0x1234);
     }
 
     #[test]
@@ -16666,7 +14867,7 @@ mod tests {
     }
 
     #[test]
-    fn request_plans_cover_decompile_types_and_profile_cache_layers() {
+    fn request_plans_cover_decompile_and_types() {
         let blocks = const_return_blocks(0x3010, 0);
         let prepared = r2ssa::SsaArtifact::for_decompile(&blocks, None).expect("prepared");
         let cfg_summary = prepared.function().cfg_risk_summary();
@@ -16676,23 +14877,11 @@ mod tests {
             plan_decompile_request("sym.simple", &function_facts, Some(&prepared), &cfg_summary);
         assert_eq!(decompile.request(), EngineRequestKind::Decompile);
         assert_eq!(decompile.engine_plan(), EnginePlan::FastLocal);
-        assert_eq!(decompile.cache.layer, EngineCacheLayer::Analysis);
-        assert!(decompile.cache.lookup);
-        assert!(decompile.cache.store_on_miss);
         assert_eq!(decompile.diagnostics().plan, Some(EnginePlan::FastLocal));
 
         let types = plan_type_request(&function_facts, &cfg_summary, false);
         assert_eq!(types.request(), EngineRequestKind::Types);
         assert_eq!(types.engine_plan(), EnginePlan::PreparedOnly);
-        assert_eq!(types.cache.layer, EngineCacheLayer::Analysis);
-        assert!(types.cache.lookup);
-
-        let profile = plan_profile_request();
-        assert_eq!(profile.request(), EngineRequestKind::Profile);
-        assert_eq!(profile.engine_plan(), EnginePlan::PreparedOnly);
-        assert_eq!(profile.cache.layer, EngineCacheLayer::MetricsSnapshot);
-        assert!(!profile.cache.lookup);
-        assert!(!profile.cache.store_on_miss);
     }
 
     #[test]
@@ -16710,7 +14899,7 @@ mod tests {
         .expect("scope");
         let z3_ctx = z3::Context::thread_local();
         let symbols = r2sym::FunctionSymbolSnapshot::default();
-        let session = EngineSession::new(4);
+        let session = EngineSession::new();
 
         let response = session.symbolic_paths(EngineSymbolicPathsRequest {
             context: EngineSymbolicContextRequest {
@@ -16747,7 +14936,7 @@ mod tests {
         let cancellation = EngineCancellationToken::default();
         cancellation.cancel();
 
-        let result = EngineSession::new(4).symbolic_paths_with_execution_control(
+        let result = EngineSession::new().symbolic_paths_with_execution_control(
             EngineSymbolicPathsRequest {
                 context: EngineSymbolicContextRequest {
                     z3_ctx: &z3_ctx,
@@ -16873,7 +15062,7 @@ mod tests {
             .expect("conditioned scope");
         let z3_ctx = z3::Context::thread_local();
         let symbols = r2sym::FunctionSymbolSnapshot::default();
-        let session = EngineSession::new(4);
+        let session = EngineSession::new();
 
         let response = session.symbolic_summary(EngineSymbolicSummaryRequest {
             context: EngineSymbolicContextRequest {
@@ -16898,81 +15087,6 @@ mod tests {
     }
 
     #[test]
-    fn engine_profile_snapshots_cache_metrics_with_route_decision() {
-        let session = EngineSession::new(4);
-        let blocks = const_return_blocks(0x403000, 0);
-        let analysis =
-            AnalysisCacheKey::from_parts(0x403000, "sym.profile", None, &blocks, 1, 2, "aa", None);
-        let _ = session.cached_analysis_with_decision(EngineRequestKind::Decompile, &analysis);
-        let profile = session.profile(EngineProfileRequest {
-            reset_after_read: true,
-        });
-
-        assert_eq!(
-            profile.route_decision.kind,
-            EngineProfileRouteKind::MetricsSnapshot
-        );
-        assert_eq!(profile.metrics.analysis.misses, 1);
-        assert_eq!(profile.total.misses, 1);
-        assert_eq!(
-            session
-                .profile(EngineProfileRequest::default())
-                .total
-                .misses,
-            0
-        );
-    }
-
-    #[test]
-    fn profile_reset_conserves_concurrent_cache_counter_updates() {
-        const WORKER_COUNT: usize = 4;
-        const LOOKUPS_PER_WORKER: usize = 4_000;
-        const SNAPSHOT_COUNT: usize = 256;
-
-        let session = Arc::new(EngineSession::new(4));
-        let blocks = const_return_blocks(0x404000, 0);
-        let key = function_analysis_cache_key("sym.profile.concurrent", None, &blocks, None);
-        let barrier = Arc::new(std::sync::Barrier::new(WORKER_COUNT + 1));
-        let workers = (0..WORKER_COUNT)
-            .map(|_| {
-                let session = Arc::clone(&session);
-                let key = key.clone();
-                let barrier = Arc::clone(&barrier);
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    for _ in 0..LOOKUPS_PER_WORKER {
-                        assert!(session.cached_analysis(&key).is_none());
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
-
-        barrier.wait();
-        let mut observed_misses = 0_u64;
-        for _ in 0..SNAPSHOT_COUNT {
-            observed_misses += session
-                .profile(EngineProfileRequest {
-                    reset_after_read: true,
-                })
-                .total
-                .misses;
-            std::thread::yield_now();
-        }
-        for worker in workers {
-            worker.join().expect("cache lookup worker");
-        }
-        observed_misses += session
-            .profile(EngineProfileRequest {
-                reset_after_read: true,
-            })
-            .total
-            .misses;
-
-        assert_eq!(observed_misses, (WORKER_COUNT * LOOKUPS_PER_WORKER) as u64);
-        assert_eq!(session.cache_metrics().analysis.misses, 0);
-    }
-
-    #[test]
     fn request_plan_preserves_refusal_diagnostics() {
         let comment = "/* r2dec fallback: semantic evidence unavailable */".to_string();
         let route = test_decompile_route(
@@ -16990,7 +15104,6 @@ mod tests {
         let diagnostics = request_plan.diagnostics();
 
         assert_eq!(request_plan.engine_plan(), EnginePlan::RefuseWithEvidence);
-        assert_eq!(request_plan.cache.layer, EngineCacheLayer::Analysis);
         assert_eq!(diagnostics.refusal, Some(comment.clone()));
         assert_eq!(diagnostics.route_reason, Some(comment.clone()));
         assert_eq!(
@@ -17146,51 +15259,6 @@ mod tests {
         assert!(
             route.kind != r2types::DecompileRouteKind::Standard,
             "dense summary-only table-walk evidence must not authorize native C route: {route:?}"
-        );
-    }
-
-    #[test]
-    fn cache_lookup_decisions_report_repeated_analysis_reuse() {
-        let session = EngineSession::new(4);
-        let blocks = const_return_blocks(0x403000, 0);
-        let snapshot = test_source_snapshot("sym.cache/rev1");
-        let analysis = AnalysisCacheKey::from_parts(
-            0x403000,
-            "sym.cache",
-            None,
-            &blocks,
-            1,
-            2,
-            "aa",
-            Some(&snapshot),
-        );
-
-        let miss = session.cached_analysis_with_decision(EngineRequestKind::Decompile, &analysis);
-        assert!(miss.value.is_none());
-        assert_eq!(miss.decision.reuse, EngineCacheReuse::Miss);
-
-        session.insert_analysis(
-            analysis.clone(),
-            build_engine_analysis_from_parts("sym.cache", &blocks, None, &snapshot)
-                .expect("analysis"),
-        );
-        let hit = session.cached_analysis_with_decision(EngineRequestKind::Decompile, &analysis);
-        assert!(hit.value.is_some());
-        assert!(hit.decision.is_hit());
-
-        let metrics = session.cache_metrics();
-        assert_eq!(
-            metrics.counters_for_layer(EngineCacheLayer::Analysis),
-            CacheCounters {
-                hits: 1,
-                misses: 1,
-                insertions: 1,
-                evictions: 0,
-            }
-        );
-        assert_eq!(
-            metrics.counters_for_layer(EngineCacheLayer::MetricsSnapshot),
-            metrics.total()
         );
     }
 

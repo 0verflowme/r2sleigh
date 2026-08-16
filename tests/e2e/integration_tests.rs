@@ -40,13 +40,95 @@ fn detached_symbolic_command_families_require_a_borrowed_snapshot() {
         "a prefix collision must not enter the snapshot refusal route"
     );
 
-    let profile = r2_cmd(vuln_test_binary(), "a:sla.debug.profilej");
+    let removed_types = r2_cmd(vuln_test_binary(), "a:sla.debug.types");
+    removed_types.assert_ok();
+    assert!(
+        removed_types.contains("Unknown subcommand")
+            && !removed_types.contains("cannot construct source authority"),
+        "the deleted detached type-report command must not remain as a refusal shim"
+    );
+
+    let profile = r2_cmd(
+        vuln_test_binary(),
+        "aaa; s entry0; a:sla.debug.ssa.func >/dev/null; a:sla.debug.profilej",
+    );
     profile.assert_ok();
     let profile_json: Value = profile.parse_json().expect("profile command JSON");
     assert!(
         profile_json.get("enabled") == Some(&Value::Bool(true))
+            && profile_json
+                .get("count")
+                .and_then(Value::as_u64)
+                .is_some_and(|count| count > 0)
+            && profile_json.get("max").is_some_and(Value::is_u64)
+            && profile_json
+                .get("functions")
+                .and_then(Value::as_array)
+                .is_some_and(|functions| !functions.is_empty())
+            && profile_json.get("engine_cache").is_none()
             && !profile.contains("borrowed function snapshot provider"),
-        "the harmless profile command must remain outside the snapshot refusal route"
+        "the harmless profile command must expose only local timing profile data outside the snapshot refusal route"
+    );
+}
+
+#[test]
+fn genuine_host_type_facts_preserve_struct_array_signature() {
+    let seek = "e bin.dbginfo=true; oo; aaa; s `isq~test_struct_array_index$[0]`";
+    let signature = r2_cmd(vuln_test_binary(), &format!("{seek}; afcfj"));
+    signature.assert_ok();
+    let signature_json: Value = signature.parse_json().expect("afcfj signature JSON");
+    let functions = signature_json.as_array().expect("afcfj function array");
+    assert_eq!(
+        functions.len(),
+        1,
+        "afcfj must identify one current function"
+    );
+    let function = &functions[0];
+    assert!(
+        function
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| name.ends_with("test_struct_array_index"))
+            && function.get("return") == Some(&Value::String("int".to_string()))
+            && function.get("count") == Some(&Value::from(3))
+            && function.get("args")
+                == Some(&serde_json::json!([
+                    {"name": "arr", "type": "DemoStruct *"},
+                    {"name": "idx", "type": "int"},
+                    {"name": "v", "type": "int"}
+                ])),
+        "host afcfj must retain the exact DWARF-backed struct-array signature: {}",
+        signature.stdout
+    );
+
+    let variables = r2_cmd(vuln_test_binary(), &format!("{seek}; afvj"));
+    variables.assert_ok();
+    let variables_json: Value = variables.parse_json().expect("afvj variables JSON");
+    let entries: Vec<&Value> = ["reg", "sp", "bp"]
+        .into_iter()
+        .flat_map(|kind| {
+            variables_json
+                .get(kind)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .collect();
+    let exact_host_type = |name: &str, accepted: &[&str]| {
+        entries.iter().any(|entry| {
+            entry.get("name").and_then(Value::as_str) == Some(name)
+                && entry
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|ty| accepted.contains(&ty))
+        })
+    };
+    assert!(
+        exact_host_type("arr", &["DemoStruct *"])
+            && exact_host_type("idx", &["int", "signed int"])
+            && exact_host_type("v", &["int", "signed int"]),
+        "host afvj must retain the struct pointer and both signed scalar inputs: {}",
+        variables.stdout
     );
 }
 
@@ -124,6 +206,178 @@ mod check_secret_phase5 {
             .map(|prefix| Path::new(prefix).join(relative))
             .find(|path| path.is_file() || path.is_dir())
             .unwrap_or_else(|| panic!("missing tracked fixture: {relative}"))
+    }
+
+    fn manifest_str<'a>(value: &'a Value, key: &str, context: &str) -> &'a str {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("missing string {context}.{key}"))
+    }
+
+    fn manifest_u64(value: &Value, key: &str, context: &str) -> u64 {
+        value
+            .get(key)
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| panic!("missing integer {context}.{key}"))
+    }
+
+    fn file_sha256(path: &Path) -> String {
+        let output = Command::new("shasum")
+            .args(["-a", "256"])
+            .arg(path)
+            .output()
+            .unwrap_or_else(|error| panic!("hash {}: {error}", path.display()));
+        assert!(
+            output.status.success(),
+            "hash {} failed: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("shasum output must be UTF-8")
+            .split_whitespace()
+            .next()
+            .expect("shasum output must contain a digest")
+            .to_owned()
+    }
+
+    fn assert_manifest_file(path: &Path, file: &Value, context: &str) {
+        let metadata =
+            fs::metadata(path).unwrap_or_else(|error| panic!("stat {}: {error}", path.display()));
+        assert_eq!(
+            metadata.len(),
+            manifest_u64(file, "size_bytes", context),
+            "fixture size drifted: {}",
+            path.display()
+        );
+        assert_eq!(
+            file_sha256(path),
+            manifest_str(file, "sha256", context),
+            "fixture digest drifted: {}",
+            path.display()
+        );
+    }
+
+    fn assert_check_secret_manifest() {
+        let manifest_path = repo_path("tests/r2r/fixtures/check_secret_phase5_v1/manifest.json");
+        let manifest: Value = serde_json::from_str(
+            &fs::read_to_string(&manifest_path).expect("read check_secret fixture manifest"),
+        )
+        .expect("parse check_secret fixture manifest");
+        let artifacts = manifest
+            .get("artifacts")
+            .and_then(Value::as_array)
+            .expect("check_secret manifest artifacts");
+        assert_eq!(artifacts.len(), 2, "check_secret manifest artifact count");
+
+        for artifact in artifacts {
+            let id = manifest_str(artifact, "id", "artifact");
+            let executable = artifact
+                .get("executable")
+                .unwrap_or_else(|| panic!("missing executable for {id}"));
+            let binary = repo_path(manifest_str(executable, "path", id));
+            assert_manifest_file(&binary, executable, &format!("{id}.executable"));
+
+            let debug = artifact
+                .get("debug_companion")
+                .unwrap_or_else(|| panic!("missing debug companion for {id}"));
+            let debug_root = repo_path(manifest_str(debug, "path", id));
+            let debug_files = debug
+                .get("files")
+                .and_then(Value::as_array)
+                .unwrap_or_else(|| panic!("missing debug companion files for {id}"));
+            assert!(!debug_files.is_empty(), "empty debug companion for {id}");
+            for file in debug_files {
+                let relative = manifest_str(file, "path", id);
+                assert_manifest_file(
+                    &debug_root.join(relative),
+                    file,
+                    &format!("{id}.debug_companion.{relative}"),
+                );
+            }
+
+            let function = artifact
+                .get("function")
+                .unwrap_or_else(|| panic!("missing function for {id}"));
+            let start = manifest_str(function, "start_vaddr", id);
+            let size = manifest_u64(function, "size_bytes", id);
+            let expected_bytes = manifest_str(function, "bytes_hex", id);
+            assert_eq!(
+                expected_bytes.len() as u64,
+                size * 2,
+                "function byte declaration is malformed for {id}"
+            );
+            let actual_bytes = r2_cmd(
+                binary.to_str().expect("UTF-8 fixture path"),
+                &format!("p8 {size} @ {start}"),
+            );
+            actual_bytes.assert_ok();
+            assert_eq!(
+                actual_bytes.stdout.trim(),
+                expected_bytes,
+                "exact function bytes drifted for {id}"
+            );
+        }
+    }
+
+    fn normalize_pdd_output(output: &str) -> String {
+        output
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn marked_pdd_section(output: &str, marker: &str, repeat: usize, label: &str) -> String {
+        let start = format!("__R2SLEIGH_PDD_{marker}_START_{repeat}__");
+        let end = format!("__R2SLEIGH_PDD_{marker}_END_{repeat}__");
+        let mut active = false;
+        let mut completed = false;
+        let mut lines = Vec::new();
+        for line in output.lines() {
+            if line == start {
+                assert!(!active, "duplicate {label} pdd start marker {repeat}");
+                active = true;
+                continue;
+            }
+            if line == end {
+                assert!(active, "{label} pdd end marker {repeat} preceded its start");
+                completed = true;
+                break;
+            }
+            if active {
+                lines.push(line);
+            }
+        }
+        assert!(active, "missing {label} pdd start marker {repeat}");
+        assert!(completed, "missing {label} pdd end marker {repeat}");
+        lines.join("\n")
+    }
+
+    fn repeated_pdd(binary: &Path, label: &str) -> e2e::R2Result {
+        let marker = format!("CHECK_SECRET_{label}");
+        let mut result = r2_cmd_timeout(
+            binary.to_str().expect("UTF-8 fixture path"),
+            &format!(
+                "aaa; s 0x100000650; ?e __R2SLEIGH_PDD_{marker}_START_0__; pdd; \
+                 ?e __R2SLEIGH_PDD_{marker}_END_0__; \
+                 ?e __R2SLEIGH_PDD_{marker}_START_1__; pdd; \
+                 ?e __R2SLEIGH_PDD_{marker}_END_1__"
+            ),
+            Duration::from_secs(120),
+        );
+        result.assert_ok();
+        assert_eq!(result.exit_code, Some(0), "radare {label} command failed");
+        let first = marked_pdd_section(&result.stdout, &marker, 0, label);
+        let second = marked_pdd_section(&result.stdout, &marker, 1, label);
+        assert_eq!(
+            normalize_pdd_output(&first),
+            normalize_pdd_output(&second),
+            "request-local {label} pdd rebuild must be deterministic"
+        );
+        result.stdout = first;
+        result
     }
 
     fn run_checked(command: &mut Command, description: &str) {
@@ -249,6 +503,7 @@ int main(void) {{
 
     #[test]
     fn genuine_radare_snapshot_emits_and_executes_strict_o2_and_o0_certified_c() {
+        assert_check_secret_manifest();
         let o2 = repo_path("tests/r2r/bins/r2sleigh_vuln_test_x86_64_macho_O2_v1");
         let o2_dsym = repo_path("tests/r2r/bins/r2sleigh_vuln_test_x86_64_macho_O2_v1.dSYM");
         let o0 = repo_path("tests/r2r/bins/check_secret_phase5_o0_v1/vuln_test_x86");
@@ -274,13 +529,7 @@ int main(void) {{
             );
         }
 
-        let o2_result = r2_cmd_timeout(
-            o2.to_str().expect("UTF-8 O2 fixture path"),
-            "aaa; s 0x100000650; pdd",
-            Duration::from_secs(120),
-        );
-        o2_result.assert_ok();
-        assert_eq!(o2_result.exit_code, Some(0), "radare O2 command failed");
+        let o2_result = repeated_pdd(&o2, "O2");
         assert!(
             o2_result
                 .stdout
@@ -296,19 +545,12 @@ int main(void) {{
         assert!(
             o2_result.stdout.lines().any(|line| {
                 let line = line.trim();
-                line.starts_with("uint32_t v_")
-                    && line.ends_with(" = (uint32_t)(arg_0);")
+                line.starts_with("uint32_t v_") && line.ends_with(" = (uint32_t)(arg_0);")
             }),
             "O2 result must bind the signed source parameter to unsigned graph bits"
         );
 
-        let o0_result = r2_cmd_timeout(
-            o0.to_str().expect("UTF-8 O0 fixture path"),
-            "aaa; s 0x100000650; pdd",
-            Duration::from_secs(120),
-        );
-        o0_result.assert_ok();
-        assert_eq!(o0_result.exit_code, Some(0), "radare O0 command failed");
+        let o0_result = repeated_pdd(&o0, "O0");
         assert!(
             o0_result
                 .stdout
@@ -317,6 +559,46 @@ int main(void) {{
             "genuine O0 private-frame route did not reach exact signed CertifiedC:\n{}\n{}",
             o0_result.stdout,
             o0_result.stderr
+        );
+
+        let o0_afcf = r2_cmd_timeout(
+            o0.to_str().expect("UTF-8 O0 fixture path"),
+            "aaa; s 0x100000650; afcfj",
+            Duration::from_secs(120),
+        );
+        o0_afcf.assert_ok();
+        let o0_afcf_json: Value = o0_afcf.parse_json().expect("O0 afcfj JSON");
+        assert_eq!(
+            o0_afcf_json,
+            serde_json::json!([{
+                "name": "check_secret",
+                "return": "int",
+                "args": [{"name": "x", "type": "int"}],
+                "count": 1
+            }]),
+            "O0 host signature must preserve the signed 32-bit source interface"
+        );
+
+        let o0_afv = r2_cmd_timeout(
+            o0.to_str().expect("UTF-8 O0 fixture path"),
+            "aaa; s 0x100000650; afvj",
+            Duration::from_secs(120),
+        );
+        o0_afv.assert_ok();
+        let o0_afv_json: Value = o0_afv.parse_json().expect("O0 afvj JSON");
+        assert_eq!(
+            o0_afv_json,
+            serde_json::json!({
+                "reg": [],
+                "sp": [],
+                "bp": [{
+                    "name": "x",
+                    "kind": "arg",
+                    "type": "int",
+                    "ref": {"base": "RBP", "offset": -8}
+                }]
+            }),
+            "O0 host variables must preserve the exact RBP-8 signed argument frame"
         );
 
         let scratch = ScratchDir::new();
@@ -349,10 +631,7 @@ int main(void) {{
             "link genuine ARM64 O0 fixture",
         );
         run_checked(
-            Command::new("dsymutil")
-                .arg(&binary)
-                .arg("-o")
-                .arg(&dsym),
+            Command::new("dsymutil").arg(&binary).arg("-o").arg(&dsym),
             "build genuine ARM64 dSYM",
         );
         let result = r2_cmd_timeout(
@@ -399,16 +678,14 @@ int main(void) {{
         assert!(
             result.stdout.lines().any(|line| {
                 let line = line.trim();
-                line.starts_with("uint32_t v_")
-                    && line.ends_with(" = (uint32_t)(arg_0);")
+                line.starts_with("uint32_t v_") && line.ends_with(" = (uint32_t)(arg_0);")
             }),
             "genuine ARM64 capture did not bind signed source input to unsigned graph bits:\n{}",
             result.stdout
         );
         let diagnostic_text = format!("{}\n{}", result.stdout, result.stderr).to_ascii_lowercase();
         assert!(
-            !diagnostic_text.contains("r2dec residual:")
-                && !diagnostic_text.contains("refus"),
+            !diagnostic_text.contains("r2dec residual:") && !diagnostic_text.contains("refus"),
             "the certified ARM64 route must not residualize or refuse:\n{}\n{}",
             result.stdout,
             result.stderr
@@ -832,32 +1109,28 @@ mod ffi {
         assert_eq!(first_defuse, second_defuse, "defuse mismatch for {}", arch);
     }
 
-    fn mem_access_has_addr_storage_class(mem_access_json: &str, storage_class: &str) -> bool {
+    fn mem_access_has_memory_class(mem_access_json: &str, memory_class: &str) -> bool {
         let parsed: Value = serde_json::from_str(mem_access_json).expect("valid mem_access json");
         parsed.as_array().is_some_and(|items| {
             items.iter().any(|item| {
-                item.get("addr_detail")
-                    .and_then(Value::as_object)
-                    .and_then(|detail| detail.get("meta"))
-                    .and_then(Value::as_object)
-                    .and_then(|meta| meta.get("storage_class"))
+                item.get("memory_class")
                     .and_then(Value::as_str)
-                    == Some(storage_class)
+                    == Some(memory_class)
             })
         })
     }
 
-    fn mem_access_has_addr_pointer_hint(mem_access_json: &str, pointer_hint: &str) -> bool {
+    fn mem_access_has_structural_stack(
+        mem_access_json: &str,
+        stack_base: &str,
+        stack_offset: i64,
+    ) -> bool {
         let parsed: Value = serde_json::from_str(mem_access_json).expect("valid mem_access json");
         parsed.as_array().is_some_and(|items| {
             items.iter().any(|item| {
-                item.get("addr_detail")
-                    .and_then(Value::as_object)
-                    .and_then(|detail| detail.get("meta"))
-                    .and_then(Value::as_object)
-                    .and_then(|meta| meta.get("pointer_hint"))
-                    .and_then(Value::as_str)
-                    == Some(pointer_hint)
+                item.get("stack").and_then(Value::as_bool) == Some(true)
+                    && item.get("stack_base").and_then(Value::as_str) == Some(stack_base)
+                    && item.get("stack_offset").and_then(Value::as_i64) == Some(stack_offset)
             })
         })
     }
@@ -908,8 +1181,8 @@ mod ffi {
         };
         let block = context.lift(&padded_bytes(&[0x48, 0x8b, 0x04, 0x24]), 0x1000);
         let memory = block.render(ANALYSIS_BLOCK_MEMORY, 0);
-        assert!(mem_access_has_addr_storage_class(&memory, "stack"));
-        assert!(mem_access_has_addr_pointer_hint(&memory, "pointer_like"));
+        assert!(mem_access_has_memory_class(&memory, "stack"));
+        assert!(mem_access_has_structural_stack(&memory, "RSP", 0));
     }
 
     #[test]
@@ -925,14 +1198,14 @@ mod ffi {
         {
             let enabled = context.lift(&bytes, 0x1000);
             let memory = enabled.render(ANALYSIS_BLOCK_MEMORY, 0);
-            assert!(mem_access_has_addr_storage_class(&memory, "stack"));
-            assert!(mem_access_has_addr_pointer_hint(&memory, "pointer_like"));
+            assert!(mem_access_has_memory_class(&memory, "stack"));
+            assert!(mem_access_has_structural_stack(&memory, "RSP", 0));
         }
         context.set_semantic_metadata(false);
         let disabled = context.lift(&bytes, 0x2000);
         let memory = disabled.render(ANALYSIS_BLOCK_MEMORY, 0);
-        assert!(!mem_access_has_addr_storage_class(&memory, "stack"));
-        assert!(!mem_access_has_addr_pointer_hint(&memory, "pointer_like"));
+        assert!(!mem_access_has_memory_class(&memory, "stack"));
+        assert!(mem_access_has_structural_stack(&memory, "RSP", 0));
     }
 
     fn assert_riscv_lift(arch: &str) {

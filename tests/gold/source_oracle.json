@@ -134,31 +134,6 @@
       }
     },
     {
-      "id": "repo-stress-tiny-vm-types-route",
-      "corpus": "repo-fixtures",
-      "case": "stress_test_x86",
-      "target": "tiny_vm_dispatch",
-      "command": "types",
-      "owner": "r2engine",
-      "checks": {
-        "semantic": {
-          "contains": [
-            "\"execution\":\"Vm\"",
-            "\"VmSummaryOnly\""
-          ],
-          "not_contains": [
-            "\"execution\":\"Native\"",
-            "\"summary return unresolved\""
-          ]
-        },
-        "cosmetic": {
-          "contains": [
-            "\"function_name\":\"dbg.tiny_vm_dispatch\""
-          ]
-        }
-      }
-    },
-    {
       "id": "repo-vuln-struct-array-index",
       "corpus": ["repo-fixtures", "manual"],
       "case": "vuln_test_x86",
@@ -184,26 +159,6 @@
             "*(arr +",
             "[idx].f_8",
             "[idx].f_34"
-          ]
-        }
-      }
-    },
-    {
-      "id": "manual-mem-scan2-types-preserve-source-size",
-      "corpus": "manual",
-      "case": "r2sleigh_manual_limits_O2",
-      "target": "mem_scan2",
-      "command": "types",
-      "owner": "r2types",
-      "checks": {
-        "type": {
-          "contains": [
-            "\"ret_type\":\"size_t\"",
-            "\"name\":\"n\",\"type\":\"size_t\""
-          ],
-          "not_contains": [
-            "\"ret_type\":\"uint8_t\"",
-            "\"name\":\"n\",\"type\":\"uint8_t\""
           ]
         }
       }

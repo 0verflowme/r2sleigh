@@ -33,7 +33,7 @@ DEFAULT_TARGETS = (
     "_os_ref_release",
 )
 
-JSON_COMMANDS = frozenset({"profile", "types"})
+JSON_COMMANDS = frozenset({"ssa_function_report"})
 DECOMPILER_COMMANDS = frozenset({"decompile_sla", "decompile_pdd", "decompile_pdD"})
 DECOMPILER_FALLBACK_MARKERS = (
     "r2dec fallback:",
@@ -220,6 +220,15 @@ def parse_json_payload(text: str) -> Any:
     raise ValueError("no JSON payload found")
 
 
+def parse_base0_int(value: Any) -> int | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return int(value, 0)
+    except ValueError:
+        return None
+
+
 def redacted_path(path: Path) -> str:
     return f"<redacted:{path.name}>"
 
@@ -348,8 +357,7 @@ def collect_target(
         "decompile_sla": "pdd",
         "decompile_pdd": "pdd",
         "decompile_pdD": "pdD",
-        "types": "a:sla.debug.types",
-        "profile": "a:sla.debug.profilej",
+        "ssa_function_report": "a:sla.debug.ssa.func",
     }
     out: dict[str, Any] = dict(target)
     out["commands"] = {}
@@ -366,7 +374,49 @@ def collect_target(
             )
         if name in JSON_COMMANDS:
             try:
-                entry["json_kind"] = type(parse_json_payload(result.stdout)).__name__
+                payload = parse_json_payload(result.stdout)
+                entry["json_kind"] = type(payload).__name__
+                if name == "ssa_function_report" and isinstance(payload, dict):
+                    blocks = payload.get("blocks")
+                    function_entry = payload.get("entry")
+                    entry_hex_addr = parse_base0_int(payload.get("entry_hex"))
+                    num_blocks = payload.get("num_blocks")
+                    schema_version = payload.get("schema_version")
+                    blocks_well_formed = (
+                        isinstance(blocks, list)
+                        and bool(blocks)
+                        and all(
+                            isinstance(block, dict)
+                            and type(block.get("addr")) is int
+                            and parse_base0_int(block.get("addr_hex"))
+                            == block.get("addr")
+                            and type(block.get("size")) is int
+                            and block.get("size") > 0
+                            and isinstance(block.get("phis"), list)
+                            and isinstance(block.get("ops"), list)
+                            for block in blocks
+                        )
+                    )
+                    entry_block_present = blocks_well_formed and any(
+                        block.get("addr") == function_entry for block in blocks
+                    )
+                    prepared = payload.get("prepared")
+                    entry["ssa_report_valid"] = (
+                        type(schema_version) is int
+                        and schema_version == 1
+                        and type(function_entry) is int
+                        and function_entry == addr
+                        and entry_hex_addr == addr
+                        and type(num_blocks) is int
+                        and num_blocks > 0
+                        and isinstance(blocks, list)
+                        and num_blocks == len(blocks)
+                        and blocks_well_formed
+                        and entry_block_present
+                        and isinstance(prepared, dict)
+                        and isinstance(prepared.get("formal_parameters"), list)
+                        and isinstance(prepared.get("parameter_addresses"), list)
+                    )
             except ValueError as exc:
                 entry["json_error"] = str(exc)
         if name in DECOMPILER_COMMANDS:
@@ -427,6 +477,18 @@ def collect_failures(
                         "target": target_name,
                         "command": command,
                         "error": result.get("json_error"),
+                    }
+                )
+            if (
+                command == "ssa_function_report"
+                and not result.get("json_error")
+                and result.get("ssa_report_valid") is not True
+            ):
+                failures.append(
+                    {
+                        "kind": "invalid_ssa_function_report",
+                        "target": target_name,
+                        "command": command,
                     }
                 )
             if command in DECOMPILER_COMMANDS and result.get("fallback_marker"):

@@ -650,10 +650,10 @@ rustc_session::declare_lint!(
     /// ### Why is this bad?
     ///
     /// `r2dec` is a renderer. Route/refusal policy belongs in `r2engine`, where
-    /// it can account for cache state, prepared facts, semantic evidence,
-    /// budgets, and request kind consistently. If `r2dec` grows route helpers
-    /// again, consumers can bypass engine refusal policy and make summary/fake C
-    /// look like native reconstruction.
+    /// it can account for prepared facts, semantic evidence, budgets, and request
+    /// kind consistently. If `r2dec` grows route helpers again, consumers can
+    /// bypass engine refusal policy and make summary/fake C look like native
+    /// reconstruction.
     ///
     /// ### Example
     ///
@@ -735,7 +735,7 @@ rustc_session::declare_lint!(
     ///
     /// The decompile route is part of the canonical `FunctionFacts` contract.
     /// A separate route argument lets r2engine or direct callers render summary
-    /// output under a policy that differs from the facts payload and cache key.
+    /// output under a policy that differs from the facts payload and route authority.
     ///
     /// ### Example
     ///
@@ -815,7 +815,7 @@ rustc_session::declare_lint!(
     /// `r2engine` owns route selection, but the render boundary must carry that
     /// decision through `FunctionFacts::decompile_route`. Passing a route as a
     /// sibling argument recreates the removed r2engine/r2dec side channel and
-    /// can diverge from cache identity and facts-owned refusal state.
+    /// can diverge from facts-owned route and refusal state.
     ///
     /// ### Example
     ///
@@ -841,7 +841,7 @@ rustc_session::declare_lint!(
     ///
     /// Decompile rendering needs one completed typed evidence contract. Letting
     /// separate call sites attach subsets of the contract creates divergent
-    /// cache keys, route decisions, and renderer permissions.
+    /// semantic identities, route decisions, and renderer permissions.
     ///
     /// ### Example
     ///
@@ -867,9 +867,8 @@ rustc_session::declare_lint!(
     /// ### Why is this bad?
     ///
     /// Summary decompile is still part of the decompile product path. If guard
-    /// state or fallback comments live on the request, cache keys and render
-    /// decisions can diverge from the canonical `FunctionFacts::decompile_route`
-    /// contract.
+    /// state or fallback comments live on the request, render decisions can
+    /// diverge from the canonical `FunctionFacts::decompile_route` contract.
     ///
     /// ### Example
     ///
@@ -899,7 +898,7 @@ rustc_session::declare_lint!(
     /// Summary-only decompile must not be a decompile product path without the
     /// prepared SSA / `FunctionFacts` spine. Keeping a public request type or
     /// session method for summary decompile lets callers bypass prepared SSA,
-    /// route/cache identity, and certified render evidence.
+    /// route authority, and certified render evidence.
     ///
     /// ### Example
     ///
@@ -924,7 +923,7 @@ rustc_session::declare_lint!(
     /// ### Why is this bad?
     ///
     /// Plugin and user-facing decompile paths must enter through
-    /// `EngineFunctionDecompileRequest` so route policy, cache identity,
+    /// `EngineFunctionDecompileRequest` so route policy, source identity,
     /// prepared SSA evidence, and `FunctionFacts` render contracts stay on the
     /// engine-owned function decompile spine. Public lower-level decompile
     /// entrypoints let callers bypass that policy.
@@ -954,9 +953,9 @@ rustc_session::declare_lint!(
     ///
     /// Render receives the canonical evidence contract. Clearing semantics
     /// while building `r2dec::DecompilerContext` makes the renderer see a
-    /// different contract than route planning and cache keys saw. The route or
-    /// refusal must be expressed in `FunctionFacts::decompile_route` before
-    /// render starts.
+    /// different contract than route planning and downstream consumers saw. The
+    /// route or refusal must be expressed in `FunctionFacts::decompile_route`
+    /// before render starts.
     ///
     /// ### Example
     ///
@@ -1009,7 +1008,7 @@ rustc_session::declare_lint!(
     /// Decompile refusal and fallback output are route decisions. A request
     /// field such as `fallback_comment` can disagree with
     /// `FunctionFacts::decompile_route`, letting render output be controlled by
-    /// a side channel that cache keys and downstream consumers do not own.
+    /// a side channel that canonical facts and downstream consumers do not own.
     ///
     /// ### Example
     ///
@@ -1029,14 +1028,14 @@ rustc_session::declare_lint!(
 rustc_session::declare_lint!(
     /// ### What it does
     ///
-    /// Warns when production `r2engine` exposes direct artifact-cache mutation
-    /// APIs outside the normal request path.
+    /// Warns when production code reintroduces whole-analysis cache mutation
+    /// APIs outside request-local engine execution.
     ///
     /// ### Why is this bad?
     ///
-    /// Analysis/artifact cache reuse is session policy. Public cache-key or
-    /// alias invalidation APIs let plugin glue decide engine cache ownership
-    /// and can bypass the typed request/FunctionFacts identity.
+    /// Whole-analysis caching was removed because realistic plugin sessions
+    /// showed no reuse. Public cache or alias invalidation APIs would recreate
+    /// an unmeasured authority-bearing side channel.
     ///
     /// ### Example
     ///
@@ -1044,10 +1043,11 @@ rustc_session::declare_lint!(
     /// session.clear_analysis_artifacts_for_function(&key, hash);
     /// ```
     ///
-    /// Let `EngineSession::{analyze,decompile_function}` own reuse.
+    /// Keep analysis request-local; retain only separately justified local
+    /// memoization.
     pub R2ENGINE_CACHE_POLICY_OWNERSHIP,
     Warn,
-    "r2engine cache mutation policy must stay inside engine request handling"
+    "whole-analysis cache mutation APIs are forbidden"
 );
 
 rustc_session::declare_lint!(
@@ -1058,8 +1058,8 @@ rustc_session::declare_lint!(
     ///
     /// ### Why is this bad?
     ///
-    /// `FunctionFacts` is the canonical evidence spine. A generic cache artifact
-    /// bag with `route` or `semantic_artifact` fields creates a second owner for
+    /// `FunctionFacts` is the canonical evidence spine. A generic artifact bag
+    /// with `route` or `semantic_artifact` fields creates a second owner for
     /// render/refusal policy or semantic evidence and can drift from the facts
     /// handed to `r2dec`.
     ///
@@ -1115,7 +1115,7 @@ rustc_session::declare_lint!(
     /// `FunctionFacts::decompile_route` is the single render contract. Recomputing
     /// an `EngineRouteDecision` while building `r2dec::DecompilerInput` creates a
     /// second route authority and can diverge from the facts payload used for
-    /// cache identity and downstream rendering.
+    /// downstream rendering.
     ///
     /// ### Example
     ///
@@ -1138,10 +1138,10 @@ rustc_session::declare_lint!(
     ///
     /// ### Why is this bad?
     ///
-    /// Normal decompile requests must enter through `EngineSession` so cache,
-    /// route diagnostics, refusal policy, and render permission stay owned by
-    /// `r2engine`. A production-visible raw `DecompilerInput` constructor gives
-    /// callers a side door into `r2dec`.
+    /// Normal decompile requests must enter through `EngineSession` so request
+    /// preparation, route diagnostics, refusal policy, and render permission stay
+    /// owned by `r2engine`. A production-visible raw `DecompilerInput`
+    /// constructor gives callers a side door into `r2dec`.
     ///
     /// ### Example
     ///
@@ -1167,8 +1167,8 @@ rustc_session::declare_lint!(
     /// Prepared SSA callsite, call-result, control, and render certificates are
     /// part of the single typed `FunctionFacts` contract. If `r2engine` builds
     /// or attaches those maps piecemeal, future callers can create partial
-    /// evidence payloads whose route/cache identity says "decompile" while the
-    /// renderer sees missing proof.
+    /// evidence payloads whose route identity says "decompile" while the renderer
+    /// sees missing proof.
     ///
     /// ### Example
     ///
@@ -1250,7 +1250,7 @@ rustc_session::declare_lint!(
     /// Type/layout/signature facts are part of the `FunctionFacts` render
     /// contract. Public setters such as `set_type_facts`, `with_type_facts`, or
     /// mutable type-fact accessors let callers alter render evidence without
-    /// carrying the matching route/refusal/cache contract.
+    /// carrying the matching route/refusal contract.
     ///
     /// ### Example
     ///
@@ -2029,7 +2029,7 @@ rustc_session::declare_lint!(
     /// Building `FunctionFacts` for decompile is an engine-owned orchestration
     /// path. If plugin glue calls `r2types` type-writeback assembly APIs or
     /// constructs `FunctionFacts` directly, it creates a second FunctionFacts
-    /// producer that can drift from route/refusal/cache policy.
+    /// producer that can drift from route/refusal policy.
     ///
     /// ### Example
     ///
@@ -2507,15 +2507,15 @@ rustc_session::declare_lint!(
 rustc_session::declare_lint!(
     /// ### What it does
     ///
-    /// Warns when production `r2plugin` code owns engine/session policy such as
-    /// caches, bounded-route preferences, semantic mode selection, or summary
-    /// fallback assembly.
+    /// Warns when production `r2plugin` code owns engine policy such as
+    /// bounded-route preferences, semantic mode selection, or summary fallback
+    /// assembly.
     ///
     /// ### Why is this bad?
     ///
-    /// `r2plugin` is FFI and command glue. Session cache ownership, route
-    /// selection, budget/depth policy, and fallback/refusal construction belong
-    /// in `r2engine` so every command sees one canonical policy.
+    /// `r2plugin` is FFI and command glue. Route selection, budget/depth policy,
+    /// and fallback/refusal construction belong in `r2engine` so every command
+    /// sees one canonical policy.
     ///
     /// ### Example
     ///
@@ -2524,7 +2524,7 @@ rustc_session::declare_lint!(
     ///     caller_prefers_bounded_type_plan: true,
     ///     // plugin-owned route policy
     /// }
-    /// engine_session().type_function(...);
+    /// EngineSession::new().type_function(...);
     /// r2engine::function_analysis_report_payload_from_type_response(...);
     /// r2engine::EngineAnalyzeRequest::full_semantics(...);
     /// ```
@@ -2532,7 +2532,7 @@ rustc_session::declare_lint!(
     /// Use instead an engine-owned request builder or policy decision.
     pub R2PLUGIN_ENGINE_POLICY_OWNERSHIP,
     Warn,
-    "r2plugin must not own engine route/cache/session/fallback policy"
+    "r2plugin must not own engine route/budget/fallback policy"
 );
 
 rustc_session::declare_lint!(
@@ -2543,10 +2543,10 @@ rustc_session::declare_lint!(
     ///
     /// ### Why is this bad?
     ///
-    /// Decompile metadata affects callee identity, artifact cache keys, and
-    /// the public function name passed through `FunctionFacts`/`r2engine`. If
-    /// the plugin parses aliases or picks display names, the radare2 command
-    /// path can drift from engine-owned route and cache policy.
+    /// Decompile metadata affects callee identity, source-bound analysis facts,
+    /// and the public function name passed through `FunctionFacts`/`r2engine`.
+    /// If the plugin parses aliases or picks display names, the radare2 command
+    /// path can drift from engine-owned route policy.
     ///
     /// ### Example
     ///
@@ -2600,7 +2600,7 @@ rustc_session::declare_lint!(
     /// Positive executable-C plugin tests should exercise the same
     /// `EngineSession::decompile_function` path as `pdd` / `a:sla.dec`.
     /// Direct prepared-input renderer tests normalize a bypass around engine
-    /// cache, route diagnostics, and request construction.
+    /// request preparation, route diagnostics, and request construction.
     ///
     /// ### Example
     ///
@@ -2628,7 +2628,7 @@ rustc_session::declare_lint!(
     ///
     /// Plugin tests are integration contracts for the public command path. A
     /// direct `DecompilerInput` bridge bypasses `r2engine` request construction,
-    /// route selection, cache identity, and refusal policy even when the test
+    /// route selection, source identity, and refusal policy even when the test
     /// only asserts residual text.
     ///
     /// ### Example
@@ -2784,7 +2784,7 @@ rustc_session::declare_lint!(
     ///
     /// Decompile-one-function is an engine request. If plugin glue constructs
     /// renderer inputs, renderer instances, AST builders, or direct lowering
-    /// calls, it bypasses `r2engine` route selection, cache identity, fallback
+    /// calls, it bypasses `r2engine` route selection, source identity, fallback
     /// policy, and the final `FunctionFacts` render contract.
     ///
     /// ### Example
@@ -3074,10 +3074,9 @@ rustc_session::declare_lint!(
     ///
     /// ### Why is this bad?
     ///
-    /// Fallback/refusal text is route policy. `r2engine` owns the route,
-    /// refusal, and cache decision, so it must construct engine-owned
-    /// fallback comments from typed `FunctionFacts` instead of importing
-    /// renderer helper policy.
+    /// Fallback/refusal text is route policy. `r2engine` owns the route and
+    /// refusal decision, so it must construct engine-owned fallback comments
+    /// from typed `FunctionFacts` instead of importing renderer helper policy.
     ///
     /// ### Example
     ///
@@ -3407,7 +3406,7 @@ impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
                 cx,
                 R2PLUGIN_ENGINE_POLICY_OWNERSHIP,
                 item.span,
-                "r2plugin must delegate cache/session/route policy to r2engine",
+                "r2plugin must delegate route/budget/fallback policy to r2engine",
             );
         }
 
@@ -4795,7 +4794,7 @@ impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
                 cx,
                 R2PLUGIN_ENGINE_POLICY_OWNERSHIP,
                 expr.span,
-                "r2plugin must delegate route/cache/session/fallback decisions to r2engine",
+                "r2plugin must delegate route/budget/fallback decisions to r2engine",
             );
         }
 
@@ -6601,12 +6600,7 @@ fn plugin_engine_policy_ownership_item(cx: &LateContext<'_>, item: &Item<'_>) ->
                 "pub extern \"C\" fn r2dec_named_native_worker_summary",
                 "pub extern \"C\" fn r2dec_semantic_worker_linearization_scope_ffi",
                 "pub extern \"C\" fn r2dec_block_guard_comment_ffi",
-                "fn r2sleigh_session_artifact_cache_key",
-                "fn r2sleigh_alias_function_analysis_artifact_cache",
-                "fn function_analysis_artifact_cache_identity_hash_with_parsed_context_and_scope_facts",
-                "fn alias_cached_function_analysis_artifact",
                 "fn build_interproc_summary_set_with_scope_facts",
-                "fn get_cached_function_analysis_artifact_with_parsed_context_and_scope_facts",
                 "fn function_root_interproc_summary",
                 "pub fn interproc_root_summary",
                 "struct EngineInterprocRootSummaryRequest",
@@ -6623,24 +6617,12 @@ fn plugin_engine_policy_ownership_item(cx: &LateContext<'_>, item: &Item<'_>) ->
                 "struct TypeWritebackInferenceInput",
                 "struct FunctionAnalysisSharedBundle",
             ];
-            banned_items
-                .iter()
-                .any(|needle| snippet.contains(needle))
+            banned_items.iter().any(|needle| snippet.contains(needle))
                 || (snippet.contains("fn build_function_analysis_shared_bundle")
                     && snippet.contains("EngineAnalyzeRequest::full_semantics_for_function"))
                 || (snippet.contains(
-                    "fn function_analysis_artifact_cache_identity_hash_with_parsed_context_and_scope_facts",
-                ) && snippet.contains("EngineAnalyzeRequest::full_semantics_for_function"))
-                || (snippet.contains(
                     "fn build_function_analysis_artifact_with_scope_context_and_scope_facts",
                 ) && snippet.contains("EngineAnalyzeRequest::full_semantics_for_function"))
-                || (snippet.contains(
-                    "fn get_cached_function_analysis_artifact_with_parsed_context_and_scope_facts",
-                ) && snippet.contains("EngineAnalyzeRequest::full_semantics_for_function"))
-                || (snippet.contains("fn r2sleigh_session_artifact_cache_key")
-                    && (snippet.contains("interproc_iter.max")
-                        || snippet.contains("interproc_max_iters.max")
-                        || snippet.contains("TypeWritebackInferenceInput {")))
                 || (snippet.contains("fn infer_signature_cc_from_analysis")
                     && snippet.contains("collect_register_type_hints"))
                 || (snippet.contains("fn recover_vars_for_ffi")
@@ -6672,15 +6654,6 @@ fn plugin_engine_policy_ownership_expr(cx: &LateContext<'_>, expr: &Expr<'_>) ->
             {
                 return true;
             }
-            if expr_path_last_segment_is(callee, "new")
-                && cx
-                    .sess()
-                    .source_map()
-                    .span_to_snippet(expr.span)
-                    .is_ok_and(|snippet| snippet.contains("EngineSession::new"))
-            {
-                return true;
-            }
             [
                 "render_semantic_worker_linearization",
                 "compile_summary_dense_worker_artifact_from_interproc_summary",
@@ -6695,10 +6668,6 @@ fn plugin_engine_policy_ownership_expr(cx: &LateContext<'_>, expr: &Expr<'_>) ->
                 "decompile_route_decision",
                 "function_analysis_report_payload_from_type_response",
                 "auto_callback_plan_for_policy",
-                "r2sleigh_session_artifact_cache_key",
-                "r2sleigh_alias_function_analysis_artifact_cache",
-                "function_analysis_artifact_cache_identity_hash_with_parsed_context_and_scope_facts",
-                "alias_cached_function_analysis_artifact",
                 "build_interproc_summary_set_with_scope_facts",
                 "solve_interproc_summary_set",
                 "full_semantics",
@@ -6712,10 +6681,7 @@ fn plugin_engine_policy_ownership_expr(cx: &LateContext<'_>, expr: &Expr<'_>) ->
         ExprKind::MethodCall(method, _, _, _) => {
             matches!(
                 method.ident.as_str(),
-                "cached_analyze"
-                    | "decompile_summary"
-                    | "decompile_summary_preprobe"
-                    | "type_function"
+                "decompile_summary" | "decompile_summary_preprobe" | "type_function"
             )
         }
         ExprKind::Struct(qpath, fields, _) => {
@@ -8303,7 +8269,7 @@ fn r2engine_render_semantic_route_has_no_route_side_channel() {
         .unwrap_or_else(|| panic!("missing {marker} in {}", path.display()));
     let rest = &source[start..];
     let end = rest
-        .find("\npub fn function_analysis_cache_key")
+        .find("\n#[cfg(test)]\nfn build_engine_analysis_from_parts(")
         .unwrap_or_else(|| panic!("missing decompile_route_output_from_function_facts end marker"));
     let route_output_body = &rest[..end];
     assert!(
@@ -8423,7 +8389,7 @@ fn r2engine_decompile_does_not_replan_after_functionfacts_stamping() {
     ] {
         assert!(
             !body.contains(forbidden),
-            "EngineSession::decompile must not replan or restamp decompile route after FunctionFacts cache-key stamping: {forbidden:?}"
+            "EngineSession::decompile must not replan or restamp the facts-owned decompile route: {forbidden:?}"
         );
     }
 
@@ -9836,7 +9802,6 @@ fn r2engine_decompile_raw_request_stays_private() {
         "pub function:",
         "pub ptr_bits:",
         "pub parsed_context:",
-        "pub external_context_fallback_hash:",
         "pub scope_facts:",
         "pub interproc_max_iterations:",
         "pub symbolic_scope:",
@@ -9849,7 +9814,6 @@ fn r2engine_decompile_raw_request_stays_private() {
     }
     for required in [
         "pub fn single_function(",
-        "pub fn single_function_from_engine_context(",
         "pub fn with_input_quality(",
         "scope_facts: InterprocScopeFacts::empty()",
         "interproc_max_iterations: 1",
@@ -9920,12 +9884,16 @@ fn r2engine_raw_decompiler_input_helper_is_test_only() {
 }
 
 #[test]
-fn r2engine_artifact_cache_is_private_and_render_cache_is_absent() {
+fn r2engine_whole_analysis_and_render_caches_are_absent() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let engine_path = root.join("crates/r2engine/src/lib.rs");
     let plugin_lib_path = root.join("r2plugin/src/lib.rs");
     let plugin_decompiler_path = root.join("r2plugin/src/decompiler.rs");
     let plugin_types_path = root.join("r2plugin/src/types.rs");
+    let plugin_ffi_path = root.join("r2plugin/src/ffi_v2.rs");
+    let plugin_c_path = root.join("r2plugin/r_anal_sleigh.c");
+    let plugin_build_path = root.join("r2plugin/build.rs");
+    let plugin_header_path = root.join("r2plugin/r2sleigh_api_v2.h");
     let engine_source = std::fs::read_to_string(&engine_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", engine_path.display()));
     let plugin_lib = std::fs::read_to_string(&plugin_lib_path)
@@ -9934,8 +9902,21 @@ fn r2engine_artifact_cache_is_private_and_render_cache_is_absent() {
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", plugin_decompiler_path.display()));
     let plugin_types = std::fs::read_to_string(&plugin_types_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", plugin_types_path.display()));
+    let plugin_ffi = std::fs::read_to_string(&plugin_ffi_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", plugin_ffi_path.display()));
+    let plugin_c = std::fs::read_to_string(&plugin_c_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", plugin_c_path.display()));
+    let plugin_build = std::fs::read_to_string(&plugin_build_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", plugin_build_path.display()));
+    let plugin_header = std::fs::read_to_string(&plugin_header_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", plugin_header_path.display()));
 
     for forbidden in [
+        "mod cache;",
+        "SessionCache<",
+        "analysis_cache:",
+        "cached_analysis",
+        "insert_analysis",
         "pub use cache::{CacheCounters, EngineSessionCacheMetrics, SessionCache}",
         "pub use cache::SessionCache",
         "pub fn cached_artifacts",
@@ -9966,10 +9947,16 @@ fn r2engine_artifact_cache_is_private_and_render_cache_is_absent() {
         ("r2plugin/src/lib.rs", plugin_lib.as_str()),
         ("r2plugin/src/decompiler.rs", plugin_decompiler.as_str()),
         ("r2plugin/src/types.rs", plugin_types.as_str()),
+        ("r2plugin/src/ffi_v2.rs", plugin_ffi.as_str()),
+        ("r2plugin/r_anal_sleigh.c", plugin_c.as_str()),
+        ("r2plugin/build.rs", plugin_build.as_str()),
+        ("r2plugin/r2sleigh_api_v2.h", plugin_header.as_str()),
     ] {
         for forbidden in [
             "RenderCacheKey",
             "SessionCache",
+            "engine_cache_reset",
+            "ENGINE_CACHE_STATS",
             "cached_render",
             "insert_render",
             "cached_artifacts",
@@ -9981,6 +9968,45 @@ fn r2engine_artifact_cache_is_private_and_render_cache_is_absent() {
             );
         }
     }
+}
+
+#[test]
+fn r2plugin_phase_metadata_rejects_retired_status_values() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let plugin_c_path = root.join("r2plugin/r_anal_sleigh.c");
+    let plugin_c = std::fs::read_to_string(&plugin_c_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", plugin_c_path.display()));
+    let start = plugin_c
+        .find("static bool sleigh_engine_v2_phase_status_is_valid")
+        .expect("missing exact V2 phase-status validator");
+    let rest = &plugin_c[start..];
+    let end = rest
+        .find("\n}\n")
+        .expect("missing exact V2 phase-status validator end");
+    let validator = &rest[..end];
+    for required in [
+        "case R2SLEIGH_PHASE_STATUS_NOT_EXECUTED_V2:",
+        "case R2SLEIGH_PHASE_STATUS_EXECUTED_V2:",
+        "case R2SLEIGH_PHASE_STATUS_FOLDED_V2:",
+        "case R2SLEIGH_PHASE_STATUS_REFUSED_V2:",
+        "default:",
+        "return false;",
+    ] {
+        assert!(
+            validator.contains(required),
+            "phase-status validator must explicitly handle {required:?}"
+        );
+    }
+    assert!(
+        !validator.contains("> R2SLEIGH_PHASE_STATUS_REFUSED_V2"),
+        "phase-status validation must not admit the retired numeric status 3 by range"
+    );
+    assert!(
+        plugin_c.contains(
+            "!sleigh_engine_v2_phase_status_is_valid (info.phase_timings[phase_index].status)"
+        ),
+        "response metadata validation must use the exact status whitelist"
+    );
 }
 
 #[test]
