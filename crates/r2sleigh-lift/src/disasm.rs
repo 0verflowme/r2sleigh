@@ -725,17 +725,40 @@ fn genuine_block_successors(block: &GenuineLiftedBlock) -> Result<Vec<u64>> {
         .ok_or_else(|| LiftError::Parse("genuine block has no native instruction".to_string()))?
         .addr;
     for (op_index, op) in block.block.ops.iter().enumerate() {
-        if matches!(
-            op,
-            R2ILOp::Branch { .. }
-                | R2ILOp::CBranch { .. }
-                | R2ILOp::BranchInd { .. }
-                | R2ILOp::Return { .. }
-        ) && block
-            .block
-            .op_metadata(op_index)
-            .and_then(|metadata| metadata.instruction_addr)
-            != Some(last_instruction)
+        // Only an operation that decides where this block goes has to be its
+        // last instruction. An indirect branch the lift could not resolve
+        // decides nothing, and traps are modelled that way: Ghidra lifts a
+        // guard instruction such as `brk` into a user operation writing pc
+        // followed by a branch through it, which routinely sits mid-block.
+        //
+        // Exempting it cannot let a wrong successor set through. If such a
+        // branch were really this block's terminator, the block would name no
+        // successors while the advisory graph names its edges, and comparing
+        // the two refuses the function.
+        // P-code has control flow inside a single instruction. Sleigh lifts
+        // AArch64 `ccmp`, for example, into a conditional branch that skips the
+        // rest of that instruction's own operations by targeting the next
+        // instruction. Such a branch never leaves the block, so it decides no
+        // successor and may sit anywhere in it.
+        let target_stays_in_block = |target: &_| {
+            constant_control_target(target).is_some_and(|addr| {
+                addr > block.block.addr
+                    && addr <= block.block.addr.saturating_add(u64::from(block.block.size))
+            })
+        };
+        let decides_successors = match op {
+            R2ILOp::Branch { target } => !target_stays_in_block(target),
+            R2ILOp::CBranch { target, .. } => !target_stays_in_block(target),
+            R2ILOp::Return { .. } => true,
+            R2ILOp::BranchInd { .. } => block.block.switch_info.is_some(),
+            _ => false,
+        };
+        if decides_successors
+            && block
+                .block
+                .op_metadata(op_index)
+                .and_then(|metadata| metadata.instruction_addr)
+                != Some(last_instruction)
         {
             return Err(LiftError::Parse(
                 "genuine basic block contains instructions after a control terminator".to_string(),
