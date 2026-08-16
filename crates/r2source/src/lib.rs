@@ -233,7 +233,7 @@ impl OwnedFunctionImage {
                     successor.kind,
                     AdvisorySuccessorKind::SwitchCase | AdvisorySuccessorKind::SwitchDefault
                 );
-                if is_switch != has_switch
+                if is_switch && !has_switch
                     || matches!(successor.kind, AdvisorySuccessorKind::SwitchCase)
                         != successor.case_value.is_some()
                 {
@@ -260,7 +260,13 @@ impl OwnedFunctionImage {
                     observed_external.insert(successor.target);
                 }
             }
-            if has_switch && (switch_case_count == 0 || switch_default_count != 1) {
+            // A dispatch block must name at least one case. Its default is
+            // optional, because a switch whose input is proven in range has no
+            // default edge, and the source describes exactly the edges that
+            // exist rather than requiring a synthetic one. A dispatch block may
+            // additionally carry the linear flow edge, so non-switch successors
+            // are not evidence of an inconsistent block.
+            if has_switch && (switch_case_count == 0 || switch_default_count > 1) {
                 return false;
             }
         }
