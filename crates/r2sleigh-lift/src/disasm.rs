@@ -713,25 +713,31 @@ fn constant_control_target(target: &Varnode) -> Option<u64> {
         .then_some(target.offset)
 }
 
-/// True when this control operation decides where the block goes.
+/// True when this operation is p-code control flow internal to one machine
+/// instruction rather than the block's terminator.
 ///
-/// A branch whose constant target lands inside the block it belongs to never
-/// leaves it, so it is p-code control flow internal to one instruction rather
-/// than the block's terminator. Sleigh emits these routinely: a conditional
-/// move becomes a conditional branch over the move, targeting the following
-/// instruction.
-fn control_op_leaves_block(op: &R2ILOp, block: &GenuineLiftedBlock) -> bool {
-    let stays_inside = |target: &_| {
-        constant_control_target(target).is_some_and(|addr| {
-            addr > block.block.addr
-                && addr <= block.block.addr.saturating_add(u64::from(block.block.size))
-        })
+/// Sleigh emits these routinely: a conditional move becomes a conditional
+/// branch over the move, and a conditional compare branches over the rest of
+/// its own operations. Both target the following instruction, which is exactly
+/// what an ordinary branch to the next block targets, so the target alone
+/// cannot tell them apart. What distinguishes them is that further operations
+/// of the same instruction still follow: a terminator is the last thing its
+/// instruction does.
+fn control_op_is_intra_instruction(block: &GenuineLiftedBlock, op_index: usize) -> bool {
+    let Some(instruction) = block
+        .block
+        .op_metadata(op_index)
+        .and_then(|metadata| metadata.instruction_addr)
+    else {
+        return false;
     };
-    match op {
-        R2ILOp::Branch { target } => !stays_inside(target),
-        R2ILOp::CBranch { target, .. } => !stays_inside(target),
-        _ => true,
-    }
+    (op_index + 1..block.block.ops.len()).any(|later| {
+        block
+            .block
+            .op_metadata(later)
+            .and_then(|metadata| metadata.instruction_addr)
+            == Some(instruction)
+    })
 }
 
 fn genuine_block_successors(block: &GenuineLiftedBlock) -> Result<Vec<u64>> {
@@ -763,7 +769,7 @@ fn genuine_block_successors(block: &GenuineLiftedBlock) -> Result<Vec<u64>> {
         // successor and may sit anywhere in it.
         let decides_successors = match op {
             R2ILOp::Branch { .. } | R2ILOp::CBranch { .. } => {
-                control_op_leaves_block(op, block)
+                !control_op_is_intra_instruction(block, op_index)
             }
             R2ILOp::Return { .. } => true,
             R2ILOp::BranchInd { .. } => block.block.switch_info.is_some(),
@@ -785,8 +791,10 @@ fn genuine_block_successors(block: &GenuineLiftedBlock) -> Result<Vec<u64>> {
         .block
         .ops
         .iter()
+        .enumerate()
         .rev()
-        .find(|op| op.is_control_flow() && control_op_leaves_block(op, block));
+        .find(|(index, op)| op.is_control_flow() && !control_op_is_intra_instruction(block, *index))
+        .map(|(_, op)| op);
     match control {
         Some(R2ILOp::Return { .. }) => Ok(Vec::new()),
         Some(R2ILOp::Branch { target }) => constant_control_target(target)
@@ -901,8 +909,10 @@ fn typed_genuine_block_successors(
         .block
         .ops
         .iter()
+        .enumerate()
         .rev()
-        .find(|op| op.is_control_flow() && control_op_leaves_block(op, block));
+        .find(|(index, op)| op.is_control_flow() && !control_op_is_intra_instruction(block, *index))
+        .map(|(_, op)| op);
     match control {
         Some(R2ILOp::Return { .. }) => Ok(Vec::new()),
         Some(R2ILOp::Branch { target }) => constant_control_target(target)
