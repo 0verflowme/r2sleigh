@@ -73,7 +73,12 @@ impl CodeGenerator {
         }
 
         if func.params.is_empty() {
-            self.output.push_str("void");
+            // An empty list is only `void` when it was actually recovered.
+            // Otherwise leave it unspecified rather than asserting the function
+            // takes no arguments.
+            if func.params_known {
+                self.output.push_str("void");
+            }
         }
 
         self.output.push_str(")\n{\n");
@@ -1149,6 +1154,7 @@ mod tests {
                 CExpr::var("a"),
                 CExpr::var("b"),
             )))],
+        params_known: true,
         };
 
         let code = generate(&func);
@@ -1324,6 +1330,7 @@ mod tests {
                 },
             ],
             body: vec![CStmt::Return(None)],
+        params_known: true,
         };
 
         let code = generate(&func);

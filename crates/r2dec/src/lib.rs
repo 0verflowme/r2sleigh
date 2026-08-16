@@ -1473,7 +1473,7 @@ fn append_semantic_summary_return_comment_to_function_if_needed(
 }
 
 fn residual_function_for_render_boundary(func_name: &str, reason: &str) -> CFunction {
-    let mut func = CFunction::new(func_name.to_string(), CType::Unknown);
+    let mut func = CFunction::new(func_name.to_string(), CType::Unknown).with_unknown_params();
     func.body = vec![CStmt::comment(sanitize_comment_text(reason))];
     func
 }
@@ -3012,6 +3012,9 @@ impl Decompiler {
             params,
             locals,
             body,
+            // Parameters here come from the render signature, so an empty list
+            // is a recovered empty list rather than an unknown one.
+            params_known: true,
         };
         append_semantic_summary_return_to_function_if_needed(
             &mut c_function,
@@ -4766,6 +4769,7 @@ mod tests {
             name: "late_prune".to_string(),
             ret_type: CType::i64(),
             params: Vec::new(),
+            params_known: true,
             locals: Vec::new(),
             body: vec![
                 CStmt::Expr(CExpr::assign(
@@ -9370,6 +9374,7 @@ mod tests {
             name: "dbg.gettext_quote".to_string(),
             ret_type: CType::ptr(CType::Int(8)),
             params: Vec::new(),
+            params_known: true,
             locals: Vec::new(),
             body: vec![CStmt::Expr(CExpr::call(
                 CExpr::var("sym.rpl_mbrtoc32"),
@@ -9419,6 +9424,7 @@ mod tests {
             name: "dbg.return_arg_summary".to_string(),
             ret_type: CType::ptr(CType::Int(8)),
             params: Vec::new(),
+            params_known: true,
             locals: Vec::new(),
             body: vec![CStmt::Expr(CExpr::call(
                 CExpr::var("summary_worker"),
@@ -9468,6 +9474,7 @@ mod tests {
             name: "dbg.alloc_wrapper2".to_string(),
             ret_type: CType::ptr(CType::Int(8)),
             params: Vec::new(),
+            params_known: true,
             locals: Vec::new(),
             body: vec![CStmt::Expr(CExpr::call(
                 CExpr::var("sym.imp.malloc"),

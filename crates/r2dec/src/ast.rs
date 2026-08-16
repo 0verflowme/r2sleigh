@@ -690,6 +690,11 @@ pub struct CFunction {
     pub locals: Vec<CLocal>,
     /// Function body.
     pub body: Vec<CStmt>,
+    /// False when the parameter list was never recovered, as opposed to being
+    /// recovered and found empty. An empty list prints as `(void)`, which
+    /// asserts the function takes no arguments; a function whose interface is
+    /// unknown must not make that claim.
+    pub params_known: bool,
 }
 
 /// A function parameter.
@@ -721,7 +726,15 @@ impl CFunction {
             params: Vec::new(),
             locals: Vec::new(),
             body: Vec::new(),
+            params_known: true,
         }
+    }
+
+    /// Mark the parameter list as unrecovered, so it is not rendered as a
+    /// proven-empty `(void)` list.
+    pub fn with_unknown_params(mut self) -> Self {
+        self.params_known = false;
+        self
     }
 
     /// Add a parameter.

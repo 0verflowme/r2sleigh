@@ -413,6 +413,7 @@ mod tests {
             params: Vec::new(),
             locals: Vec::new(),
             body,
+            params_known: true,
         }
     }
 
