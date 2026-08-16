@@ -2493,6 +2493,7 @@ fn audit_semantic_expr_pair(
         (
             MachineExprKind::Source {
                 binding: machine_binding,
+                ..
             },
             SemanticCExprKind::Input {
                 binding: semantic_binding,
@@ -2501,7 +2502,7 @@ fn audit_semantic_expr_pair(
             let source_is_produced = machine.entity_for_output(machine_binding.value()).is_some();
             let semantic_input_type = semantic.inputs().get(semantic_binding);
             if (source_is_produced && semantic_input_type.is_some())
-                || (!source_is_produced && semantic_input_type != Some(machine_expr.ty()))
+                || (!source_is_produced && semantic_input_type.map(|(ty, _)| ty) != Some(machine_expr.ty()))
             {
                 return Err("semantic input classification differs from machine evidence".into());
             }
@@ -3046,7 +3047,7 @@ fn private_frame_entry_value(
             .projection()
             .expr(*input)
             .ok_or_else(|| RunFailure::Invalid("frame entry copy input is missing".to_string()))?;
-        let MachineExprKind::Source { binding } = source.kind() else {
+        let MachineExprKind::Source { binding, .. } = source.kind() else {
             return Err(RunFailure::Invalid(
                 "frame entry copy does not begin at a source boundary".to_string(),
             ));
@@ -8997,7 +8998,7 @@ mod tests {
                     .expr(*input)
                     .map(|expression| expression.kind())
                 {
-                    Some(MachineExprKind::Source { binding }) => *binding,
+                    Some(MachineExprKind::Source { binding, .. }) => *binding,
                     _ => panic!("certified RBP save-copy input must be the entry source"),
                 }
             }

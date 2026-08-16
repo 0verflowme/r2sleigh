@@ -427,6 +427,15 @@ pub enum SemanticCInputOrigin {
         index: u32,
         storage: CanonicalStorageId,
     },
+    /// A narrower read of a parameter's own carrier, such as the low half of an
+    /// argument register holding a 32-bit argument. The value is that
+    /// parameter truncated to `width_bits`, so it must be rendered as an
+    /// explicit truncation rather than as the parameter itself.
+    AbiParameterLowBits {
+        index: u32,
+        storage: CanonicalStorageId,
+        width_bits: u32,
+    },
     StackSlot {
         base: StackAddressBase,
         offset: i64,
@@ -874,7 +883,7 @@ pub struct SemanticCExpressionLayer {
     expressions: Box<[SemanticCExpr]>,
     entities: Box<[SemanticCEntity]>,
     function_interface: Option<SemanticCFunctionInterface>,
-    inputs: BTreeMap<MachineValueBinding, MachineType>,
+    inputs: BTreeMap<MachineValueBinding, (MachineType, Option<CanonicalStorageId>)>,
     input_origins: BTreeMap<MachineValueBinding, SemanticCInputOrigin>,
     return_mechanics: SemanticCReturnMechanicsOwnership,
     frame_mechanics: SemanticCFrameMechanicsOwnership,
@@ -1696,6 +1705,7 @@ fn certified_entry_stack_pointer_input(
 fn classify_input(
     binding: MachineValueBinding,
     ty: &MachineType,
+    storage: Option<CanonicalStorageId>,
     interface: Option<&SemanticCFunctionInterface>,
     private_entry_stack_pointer: Option<&CertifiedPrivateEntryStackPointerInput>,
 ) -> SemanticCInputOrigin {
@@ -1715,6 +1725,31 @@ fn classify_input(
         return SemanticCInputOrigin::AbiParameter {
             index: parameter.index(),
             storage: parameter.storage(),
+        };
+    }
+    // A machine that aliases registers reads a parameter through a narrower
+    // location than the one it was declared in: an x86-64 `int` argument is
+    // declared in RDI and read as EDI. The value is the parameter truncated,
+    // which is only sound when the read starts at the parameter's own carrier
+    // and is strictly narrower than it. Anything else, including a read that
+    // starts part-way into the carrier, stays unclassified.
+    if let Some(storage) = storage
+        && let Some(parameter) = interface
+            .into_iter()
+            .flat_map(SemanticCFunctionInterface::parameters)
+            .find(|parameter| {
+                let declared = parameter.storage();
+                declared.space == storage.space
+                    && declared.offset == storage.offset
+                    && storage.size < declared.size
+                    && storage.size > 0
+            })
+        && storage.size.checked_mul(8) == Some(binding.width_bits())
+    {
+        return SemanticCInputOrigin::AbiParameterLowBits {
+            index: parameter.index(),
+            storage: parameter.storage(),
+            width_bits: binding.width_bits(),
         };
     }
     let MachineType::Address {
@@ -2751,12 +2786,13 @@ impl SemanticCExpressionLayer {
         let input_origins = builder
             .inputs
             .iter()
-            .map(|(binding, ty)| {
+            .map(|(binding, (ty, storage))| {
                 (
                     *binding,
                     classify_input(
                         *binding,
                         ty,
+                        *storage,
                         function_interface.as_ref(),
                         private_entry_stack_pointer,
                     ),
@@ -2829,7 +2865,9 @@ impl SemanticCExpressionLayer {
             .find(|entity| entity.producer == producer)
     }
 
-    pub const fn inputs(&self) -> &BTreeMap<MachineValueBinding, MachineType> {
+    pub const fn inputs(
+        &self,
+    ) -> &BTreeMap<MachineValueBinding, (MachineType, Option<CanonicalStorageId>)> {
         &self.inputs
     }
 
@@ -3968,7 +4006,7 @@ struct SemanticCBuilder<'a> {
     root_outputs: BTreeMap<MachineExprId, (MachineValueBinding, CanonicalInstructionId)>,
     translated: BTreeMap<MachineExprId, SemanticCExprId>,
     expressions: Vec<SemanticCExpr>,
-    inputs: BTreeMap<MachineValueBinding, MachineType>,
+    inputs: BTreeMap<MachineValueBinding, (MachineType, Option<CanonicalStorageId>)>,
 }
 
 fn exact_self_xor_zero_value(
@@ -4046,7 +4084,7 @@ impl SemanticCBuilder<'_> {
                 source_instructions.insert(origin);
             }
             match expression.kind() {
-                MachineExprKind::Source { binding } => {
+                MachineExprKind::Source { binding, .. } => {
                     if let Some(dependency) = self.output_producers.get(&binding.value()).copied() {
                         if !self.certified_producers.contains(&dependency) {
                             return Err(SemanticCError::UncertifiedDependency {
@@ -4115,7 +4153,7 @@ impl SemanticCBuilder<'_> {
             source_instructions.insert(origin);
         }
         let kind = match machine_expr.kind() {
-            MachineExprKind::Source { binding } => {
+            MachineExprKind::Source { binding, storage } => {
                 if let Some(dependency) = self.output_producers.get(&binding.value()).copied() {
                     if !self.certified_producers.contains(&dependency) {
                         let producer = machine_expr.origin().unwrap_or(dependency);
@@ -4125,8 +4163,9 @@ impl SemanticCBuilder<'_> {
                         });
                     }
                     source_instructions.insert(dependency);
-                } else if let Some(existing) =
-                    self.inputs.insert(*binding, machine_expr.ty().clone())
+                } else if let Some((existing, _)) = self
+                    .inputs
+                    .insert(*binding, (machine_expr.ty().clone(), *storage))
                     && existing != *machine_expr.ty()
                 {
                     return Err(SemanticCError::InconsistentInputType(binding.value()));
@@ -4490,6 +4529,37 @@ pub(crate) fn render_parameter_graph_binding_prologue(
     Ok(output)
 }
 
+/// Declare the inputs that are narrower reads of a parameter's own carrier.
+///
+/// Each is the parameter truncated to the width the machine actually read, so
+/// it is emitted as an explicit truncation. Rendering it as the parameter
+/// itself would silently widen the read.
+pub(crate) fn render_projected_parameter_inputs(
+    semantic: &SemanticCExpressionLayer,
+) -> Result<String, SemanticCError> {
+    let mut output = String::new();
+    for (binding, origin) in semantic.input_origins() {
+        let SemanticCInputOrigin::AbiParameterLowBits {
+            index, width_bits, ..
+        } = origin
+        else {
+            continue;
+        };
+        if *width_bits != binding.width_bits() {
+            return Err(SemanticCError::InvalidCertifiedFunctionInterface);
+        }
+        let ty = storage_type(&MachineType::Integer {
+            width_bits: *width_bits,
+            signedness: MachineSignedness::Unsigned,
+        })?;
+        output.push_str(&format!(
+            "\t{ty} {} = ({ty})(arg_{index});\n",
+            value_name(*binding)
+        ));
+    }
+    Ok(output)
+}
+
 pub(crate) fn value_name(binding: MachineValueBinding) -> String {
     format!("v_{}", binding.value().0)
 }
@@ -4697,7 +4767,10 @@ mod return_mechanics_tests {
     fn translate_projection_root(
         projection: &MachineProjection,
         producer: CanonicalInstructionId,
-    ) -> (SemanticCExpr, BTreeMap<MachineValueBinding, MachineType>) {
+    ) -> (
+        SemanticCExpr,
+        BTreeMap<MachineValueBinding, (MachineType, Option<CanonicalStorageId>)>,
+    ) {
         let output_producers = MachineView(projection).output_producers();
         let certified_producers = projection
             .entities()
@@ -5097,7 +5170,7 @@ mod return_mechanics_tests {
             xor_projection(4, Varnode::register(0, 4), Varnode::constant(1, 4));
         let (_, inputs) = translate_projection_root(&machine, producer);
         let inputs = inputs.into_iter().collect::<Vec<_>>();
-        let [(binding, input_ty)] = inputs.as_slice() else {
+        let [(binding, (input_ty, _))] = inputs.as_slice() else {
             panic!("one exact graph input")
         };
         assert_eq!(input_ty, &graph_ty);
@@ -5866,7 +5939,10 @@ mod return_mechanics_tests {
             expressions: expressions.into_boxed_slice(),
             entities: entities.into_boxed_slice(),
             function_interface: None,
-            inputs: BTreeMap::from([(base_binding, base_ty), (overlay_binding, overlay_ty)]),
+            inputs: BTreeMap::from([
+                (base_binding, (base_ty, None)),
+                (overlay_binding, (overlay_ty, None)),
+            ]),
             input_origins: BTreeMap::new(),
             return_mechanics: SemanticCReturnMechanicsOwnership::default(),
             frame_mechanics: SemanticCFrameMechanicsOwnership::default(),

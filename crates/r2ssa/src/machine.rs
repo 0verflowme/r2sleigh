@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
+use crate::CanonicalStorageId;
 use crate::function::{SsaArtifact, StackAddressBase};
 use crate::graph::{BlockId, GraphInst, GraphValue, InstId, InstPayload, SsaGraph, ValueId};
 use crate::machine_context::MachineMemoryEndianness;
@@ -431,6 +432,11 @@ pub enum MachineCastKind {
 pub enum MachineExprKind {
     Source {
         binding: MachineValueBinding,
+        /// The machine location this value came from, when it has one. A
+        /// consumer needs it to recognise that a value is a narrower read of a
+        /// location it already knows, such as the low half of an argument
+        /// register.
+        storage: Option<CanonicalStorageId>,
     },
     Constant {
         binding: MachineValueBinding,
@@ -961,7 +967,7 @@ impl MachineFunction {
             }
             self.validate_expr_type(id, expr)?;
             match &expr.kind {
-                MachineExprKind::Source { binding } => {
+                MachineExprKind::Source { binding, .. } => {
                     let value = artifact
                         .graph()
                         .value(binding.value)
@@ -1015,7 +1021,7 @@ impl MachineFunction {
         };
         let same_width = |child: &MachineExpr| child.ty.width_bits() == expr.ty.width_bits();
         let valid = match &expr.kind {
-            MachineExprKind::Source { binding } | MachineExprKind::Constant { binding, .. } => {
+            MachineExprKind::Source { binding, .. } | MachineExprKind::Constant { binding, .. } => {
                 expr.ty == integer_type(binding.width_bits, MachineSignedness::Unsigned)
                     || expr.ty
                         == MachineType::Bool {
@@ -1333,7 +1339,10 @@ impl MachineBuilder {
                 value: bit_vector(value.id, binding.width_bits, bits)?,
             }
         } else {
-            MachineExprKind::Source { binding }
+            MachineExprKind::Source {
+                binding,
+                storage: value.canonical_storage,
+            }
         };
         let id = self.push(ty, None, kind);
         self.value_nodes.insert(key, id);
@@ -1375,7 +1384,10 @@ impl MachineBuilder {
                 value: bit_vector(value.id, binding.width_bits, bits)?,
             }
         } else {
-            MachineExprKind::Source { binding }
+            MachineExprKind::Source {
+                binding,
+                storage: value.canonical_storage,
+            }
         };
         let id = self.push(ty, None, kind);
         self.address_nodes.insert(key, id);
@@ -1939,7 +1951,7 @@ fn operand_leaf_binding(
     expr: MachineExprId,
 ) -> Option<MachineValueBinding> {
     match arena.get(expr)?.kind {
-        MachineExprKind::Source { binding } | MachineExprKind::Constant { binding, .. } => {
+        MachineExprKind::Source { binding, .. } | MachineExprKind::Constant { binding, .. } => {
             Some(binding)
         }
         MachineExprKind::Extract { input, lsb_bits: 0 } => operand_leaf_binding(arena, input),
@@ -2392,7 +2404,8 @@ mod tests {
                 binding: MachineValueBinding {
                     value: ValueId(7),
                     width_bits: 64,
-                }
+                },
+                ..
             }
         ));
     }

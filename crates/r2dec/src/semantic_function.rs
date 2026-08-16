@@ -11,7 +11,8 @@ use crate::certified_return::{CertifiedTerminalReturnBlockRegion, TerminalReturn
 use crate::semantic_c::{
     SemanticCError, SemanticCFunctionReturn, SemanticCHelperSet, SemanticCInputOrigin,
     insert_semantic_c_helpers, logical_return_type, render_logical_parameter_declarations,
-    render_logical_return_statement, render_parameter_graph_binding_prologue, storage_type,
+    render_logical_return_statement, render_parameter_graph_binding_prologue,
+    render_projected_parameter_inputs, storage_type,
     value_name,
 };
 
@@ -195,6 +196,7 @@ impl CertifiedSemanticCFunction {
         output.push_str(&render_logical_parameter_declarations(interface)?);
         output.push_str(") {\n");
         output.push_str(&render_parameter_graph_binding_prologue(interface)?);
+        output.push_str(&render_projected_parameter_inputs(expressions)?);
         for step in self.region.layer().steps() {
             let Some(reference) = step.value() else {
                 continue;
