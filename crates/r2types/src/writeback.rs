@@ -11526,7 +11526,7 @@ mod tests {
     }
 
     #[test]
-    fn source_owned_enrichment_refuses_missing_interface_without_mutation() {
+    fn source_owned_enrichment_without_interface_claims_no_parameters() {
         let mut arch = r2il::ArchSpec::new("x86-64");
         arch.add_register(r2il::RegisterDef::new("rax", 0, 8));
         let source = Arc::new(
@@ -11535,10 +11535,18 @@ mod tests {
         );
         let request = TypeWritebackAnalysisRequest::new(source, ParsedExternalContext::default())
             .expect("matching assumptions");
-        assert_eq!(
-            build_source_owned_type_writeback_analysis(request)
-                .expect_err("missing exact interface cannot produce source-owned analysis"),
-            TypeWritebackAnalysisError::SourceEnrichmentFailed
+        // A source without an exact interface still yields an analysis: the
+        // absence of an ABI is a fact about the source, not a failure. What it
+        // must never do is invent the parameters it could not resolve.
+        let analysis = build_source_owned_type_writeback_analysis(request)
+            .expect("a source without an exact interface still yields an analysis");
+        assert!(
+            analysis.signature().params.is_empty(),
+            "no interface must not produce parameters"
+        );
+        assert!(
+            analysis.plan().signature.params.is_empty(),
+            "no interface must not produce a parameterised writeback plan"
         );
     }
 
