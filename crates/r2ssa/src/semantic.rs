@@ -525,6 +525,11 @@ pub struct SourceReturnBoundaryFact {
     /// False when the current source facts cannot distinguish void from an
     /// unresolved return carrier or cannot recover declared exit machine state.
     pub complete: bool,
+    /// True when the exit machine state alone is fully recovered: the return
+    /// address carrier and the exit stack pointer are both known. This is
+    /// independent of whether any ABI described the values the return carries,
+    /// so it holds for functions with no recovered ABI at all.
+    pub machine_state_complete: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2348,6 +2353,7 @@ fn collect_source_boundary_facts(
             let mut return_address = None;
             let mut exit_stack_pointer = None;
             let mut complete = false;
+            let mut machine_state_complete = false;
             // Machine exit state and return values are separate questions. The
             // carriers holding the return address and the stack pointer come
             // from the machine, so they are recoverable for any function; the
@@ -2431,6 +2437,8 @@ fn collect_source_boundary_facts(
                     return_address = exact_return_address_fact(graph, inst, storage);
                     complete &= return_address.is_some();
                 }
+                machine_state_complete =
+                    return_address.is_some() && exit_stack_pointer.is_some();
             }
             facts.returns.insert(
                 inst.id,
@@ -2441,6 +2449,7 @@ fn collect_source_boundary_facts(
                     register_compositions,
                     exit_stack_pointer,
                     complete,
+                    machine_state_complete,
                 },
             );
         }

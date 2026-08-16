@@ -3075,14 +3075,13 @@ pub fn certify_terminal_return_region_with_frame(
     mappings: impl IntoIterator<Item = TypedRegionMapping>,
     frame: Option<&CertifiedFramePreservation>,
 ) -> Result<CertifiedLedgerClosure, LedgerClosureError> {
+    // An ABI is not required to close a terminal return region: exit machine
+    // state is proven from the machine's own carriers just above, and the
+    // values a return carries are certified separately and residualize when no
+    // ABI describes them.
     if !origin.is_valid()
         || !ledger.matches_origin(origin)
         || !return_machine_state_matches_origin(origin, ledger)
-        || origin
-            .machine_context()
-            .source()
-            .function_interface()
-            .is_none()
     {
         return Err(LedgerClosureError::InvalidOrigin);
     }
