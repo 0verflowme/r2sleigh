@@ -16,7 +16,7 @@ use r2source::{
     AdvisorySuccessorKind, CanonicalStorageId, CanonicalStorageSpace, MachineProfile,
     OwnedFunctionSnapshot, SourceFunctionInterface,
 };
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -789,21 +789,26 @@ fn validate_genuine_function_cfg(
         .iter()
         .map(|block| block.addr)
         .collect::<HashSet<_>>();
-    let external_exits = layout
-        .external_exits
-        .iter()
-        .copied()
-        .collect::<HashSet<_>>();
+    // A successor that is not one of this function's block starts leaves the
+    // function. What must never happen is a target landing part-way into a
+    // block, because that would mean the lift decoded an instruction boundary
+    // the block layout does not have. Requiring instead that every exit appear
+    // in the source's declared exit list would refuse ordinary tail calls: the
+    // source builds that list from the function it analysed, which records no
+    // successor for a branch leaving the function at all.
+    let lands_offcut = |target: u64| {
+        !starts.contains(&target)
+            && layout.blocks.iter().any(|block| {
+                target > block.addr() && target < block.addr().saturating_add(u64::from(block.size()))
+            })
+    };
     let mut internal_successors = HashMap::<u64, Vec<u64>>::new();
     let mut successor_manifest = Vec::with_capacity(blocks.len());
     for block in blocks {
         let successors = genuine_block_successors(block)?;
-        if successors
-            .iter()
-            .any(|successor| !starts.contains(successor) && !external_exits.contains(successor))
-        {
+        if successors.iter().copied().any(lands_offcut) {
             return Err(LiftError::Parse(
-                "genuine function has an undeclared control-flow exit".to_string(),
+                "genuine function branches into the middle of one of its blocks".to_string(),
             ));
         }
         internal_successors.insert(
@@ -922,7 +927,30 @@ fn validate_owned_snapshot_cfg(
             .map(|successor| (successor.kind(), successor.target(), successor.case_value()))
             .collect::<Vec<_>>();
         advisory.sort_unstable();
-        if machine != advisory {
+        // The two graphs are scoped differently and cannot be compared for
+        // equality. The advisory graph is the function radare2 analysed, so it
+        // stops at the function's edge: a tail call records no successor at
+        // all, because its target is another function. The machine graph
+        // describes the instructions, so it sees that branch.
+        //
+        // What must hold is that the lift did not lose or invent flow *inside*
+        // the function: every edge landing on one of this function's own blocks
+        // must appear in both. An edge leaving them is the function exiting,
+        // which the machine may know about and radare2 may not.
+        let block_starts = source
+            .image()
+            .blocks()
+            .iter()
+            .map(|block| block.address())
+            .collect::<BTreeSet<_>>();
+        let internal = |successors: &[(AdvisorySuccessorKind, u64, Option<u64>)]| {
+            successors
+                .iter()
+                .copied()
+                .filter(|(_, target, _)| block_starts.contains(target))
+                .collect::<Vec<_>>()
+        };
+        if internal(&machine) != internal(&advisory) {
             return Err(LiftError::Parse(
                 "machine-derived CFG differs from the owned advisory source CFG".to_string(),
             ));
